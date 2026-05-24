@@ -1,0 +1,4 @@
+name = "press"
+description = "Magazine layout. Display-serif headlines, feature image per post, two-column body on wide screens."
+screenshot = "static/screenshot.png"
+reading_width_px = 720

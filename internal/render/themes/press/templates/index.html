@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="{{ site.language }}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ site.title }}</title>
+<meta name="description" content="{{ site.description }}">
+<link rel="alternate" type="application/atom+xml" href="{{ site.feed_url|safe }}">
+<link rel="stylesheet" href="{{ site.static_css_url|safe }}">
+</head>
+<body class="press page-index">
+<header class="masthead">
+  <h1 class="masthead-title">{{ site.title }}</h1>
+  {% if site.description %}<p class="masthead-tagline">{{ site.description }}</p>{% endif %}
+</header>
+<main>
+<ul class="grid">
+{% for post in posts %}
+  <li class="grid-card">
+    <a href="{{ post.url|safe }}">
+      <div class="grid-card-meta">
+        {% if post.tags %}<span class="grid-card-tag">{{ post.tags[0] }}</span>{% endif %}
+        <time class="grid-card-date" datetime="{{ post.date }}">{{ post.date_display }}</time>
+      </div>
+      <h2 class="grid-card-title">{{ post.title }}</h2>
+      {% if post.summary %}<p class="grid-card-summary">{{ post.summary }}</p>{% endif %}
+      <p class="grid-card-byline">By {{ site.author }}</p>
+    </a>
+  </li>
+{% endfor %}
+</ul>
+</main>
+<footer class="site-footer">
+  <p>© {{ site.author }} · <a href="{{ site.feed_url|safe }}">feed</a></p>
+</footer>
+</body>
+</html>

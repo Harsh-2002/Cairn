@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="{{ site.language }}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ site.title }}</title>
+<meta name="description" content="{{ site.description }}">
+<link rel="alternate" type="application/atom+xml" href="{{ site.feed_url|safe }}">
+<link rel="stylesheet" href="{{ site.static_css_url|safe }}">
+</head>
+<body class="stones page-index">
+<header class="masthead">
+  <h1 class="brand">{{ site.title }}</h1>
+  {% if site.description %}<p class="tagline">{{ site.description }}</p>{% endif %}
+</header>
+<main>
+<ul class="post-list">
+{% for post in posts %}
+  <li class="post-row">
+    <a class="post-link" href="{{ post.url|safe }}">
+      <span class="post-title">{{ post.title }}</span>
+      <time class="post-date" datetime="{{ post.date }}">{{ post.date_display }}</time>
+    </a>
+    {% if post.summary %}<p class="post-summary">{{ post.summary }}</p>{% endif %}
+  </li>
+{% endfor %}
+</ul>
+</main>
+<footer class="site-footer">
+  <p>© {{ site.author }} · <a href="{{ site.feed_url|safe }}">feed</a></p>
+</footer>
+</body>
+</html>

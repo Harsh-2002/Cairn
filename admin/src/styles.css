@@ -1,0 +1,246 @@
+/* —— "The Cairn": editorial topography ——
+   Newsreader for prose and titles, with optical sizing so the editor's
+   3rem title and the 18px body actually use different letterforms.
+   Funnel Display for UI labels, used in tracked caps where it reads
+   as a label rather than copy. JetBrains Mono for slug + hash. */
+
+:root {
+  --paper: #f6f1e7;
+  --paper-low: #efe9da;
+  --paper-deep: #e7dfca;
+  --paper-shadow: #ddd3b8;
+
+  --ink: #1c1a18;
+  --ink-muted: #5f5a52;
+  --ink-faint: #94897c;
+
+  --rule: #e0d6bd;
+  --rule-strong: #c9bf9f;
+
+  --accent: #b8501a;
+  --accent-soft: #b8501a14;
+  --accent-hover: #9c4314;
+
+  --slate: #2a2620;
+  --slate-soft: #2a26200a;
+
+  --success: #3f5b3a;
+  --success-soft: #3f5b3a14;
+  --warning: #b58330;
+  --error: #8a3618;
+
+  --sidebar-w: 268px;
+  --topbar-h: 56px;
+  --editor-max-w: 720px;
+
+  --r-sm: 4px;
+  --r-md: 8px;
+  --r-lg: 12px;
+
+  --shadow-sm: 0 1px 2px rgba(28, 26, 24, 0.04);
+  --shadow-md: 0 2px 8px rgba(28, 26, 24, 0.06);
+  --shadow-lg: 0 12px 32px rgba(28, 26, 24, 0.08);
+
+  --font-display: "Newsreader", "Iowan Old Style", "Apple Garamond", "Georgia", serif;
+  --font-ui: "Funnel Display", -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", monospace;
+
+  --ease-out: cubic-bezier(0.2, 0.7, 0.2, 1);
+  --ease-in-out: cubic-bezier(0.5, 0, 0.2, 1);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --paper: #18161a;
+    --paper-low: #1f1c1c;
+    --paper-deep: #25211f;
+    --paper-shadow: #322c26;
+    --ink: #f1e9d8;
+    --ink-muted: #9a8f7e;
+    --ink-faint: #66604f;
+    --rule: #2a2520;
+    --rule-strong: #38322a;
+    --accent: #d96f37;
+    --accent-soft: #d96f3722;
+    --accent-hover: #e98448;
+    --slate: #f1e9d8;
+    --slate-soft: #f1e9d80a;
+    --success-soft: #6e8a5722;
+  }
+}
+
+* { box-sizing: border-box; }
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--font-ui);
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+button { font-family: inherit; cursor: pointer; }
+input, textarea { font-family: inherit; }
+#app { height: 100vh; }
+
+/* —— Page-load orchestration: one moment of delight, then quiet —— */
+
+@keyframes rise {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes saved-sweep {
+  0% { background-position: 100% 0; }
+  100% { background-position: 0 0; }
+}
+
+/* —— Milkdown/Crepe token inheritance —— */
+
+.milkdown {
+  --crepe-color-background: var(--paper);
+  --crepe-color-on-background: var(--ink);
+  --crepe-color-surface: var(--paper-deep);
+  --crepe-color-surface-low: var(--paper-shadow);
+  --crepe-color-on-surface: var(--ink);
+  --crepe-color-on-surface-variant: var(--ink-muted);
+  --crepe-color-outline: var(--rule);
+  --crepe-color-primary: var(--accent);
+  --crepe-color-secondary: var(--paper-deep);
+  --crepe-color-on-secondary: var(--ink);
+  --crepe-color-inverse: var(--ink);
+  --crepe-color-on-inverse: var(--paper);
+  --crepe-color-inline-code: var(--accent);
+  --crepe-color-error: var(--error);
+  --crepe-color-hover: var(--paper-shadow);
+  --crepe-color-selected: var(--accent-soft);
+  --crepe-color-inline-area: var(--paper-deep);
+  --crepe-shadow-1: var(--shadow-sm);
+  --crepe-shadow-2: var(--shadow-md);
+  --crepe-font-title: var(--font-display);
+  --crepe-font-default: var(--font-display);
+  --crepe-font-code: var(--font-mono);
+}
+
+.milkdown {
+  background: transparent !important;
+  color: var(--ink) !important;
+  padding: 0 !important;
+}
+
+.milkdown .ProseMirror {
+  font-family: var(--font-display) !important;
+  font-size: 18px !important;
+  line-height: 1.72 !important;
+  color: var(--ink) !important;
+  outline: none !important;
+  min-height: 60vh !important;
+  padding: 1rem 0 6rem !important;
+  font-variation-settings: "opsz" 16;
+}
+
+.milkdown .ProseMirror p { margin: 0 0 1.1em !important; }
+
+.milkdown .ProseMirror h1,
+.milkdown .ProseMirror h2,
+.milkdown .ProseMirror h3 {
+  font-family: var(--font-display) !important;
+  font-weight: 600 !important;
+  letter-spacing: -0.012em !important;
+  margin-top: 1.6em !important;
+  margin-bottom: 0.5em !important;
+  font-variation-settings: "opsz" 60;
+}
+
+.milkdown .ProseMirror h1 { font-size: 1.85em !important; font-variation-settings: "opsz" 72; }
+.milkdown .ProseMirror h2 { font-size: 1.4em !important; }
+.milkdown .ProseMirror h3 { font-size: 1.15em !important; }
+
+.milkdown .ProseMirror code,
+.milkdown .ProseMirror pre {
+  font-family: var(--font-mono) !important;
+  font-size: 0.88em !important;
+}
+
+.milkdown .ProseMirror :is(code):not(pre code) {
+  background: var(--paper-shadow) !important;
+  padding: 0.1em 0.35em !important;
+  border-radius: var(--r-sm) !important;
+  color: var(--accent) !important;
+}
+
+.milkdown .ProseMirror pre {
+  background: var(--paper-deep) !important;
+  border: 1px solid var(--rule) !important;
+  border-radius: var(--r-md) !important;
+  padding: 0.9em 1.1em !important;
+  line-height: 1.5 !important;
+  overflow-x: auto;
+}
+
+.milkdown .ProseMirror blockquote {
+  border-left: 3px solid var(--accent) !important;
+  padding-left: 1em !important;
+  color: var(--ink-muted) !important;
+  font-style: italic !important;
+  margin: 1.5em 0 !important;
+}
+
+.milkdown .ProseMirror a {
+  color: var(--accent) !important;
+  text-decoration: underline !important;
+  text-decoration-thickness: 1px !important;
+  text-underline-offset: 0.2em !important;
+  text-decoration-color: var(--rule-strong) !important;
+  transition: text-decoration-color 120ms var(--ease-out);
+}
+.milkdown .ProseMirror a:hover { text-decoration-color: var(--accent) !important; }
+
+.milkdown .ProseMirror hr {
+  border: 0 !important;
+  border-top: 1px solid var(--rule-strong) !important;
+  margin: 2em 0 !important;
+}
+
+.milkdown :is(milkdown-slash-menu, milkdown-link-edit, milkdown-link-preview,
+    milkdown-image-block-menu, milkdown-toolbar) {
+  background: var(--paper-deep) !important;
+  border: 1px solid var(--rule) !important;
+  box-shadow: var(--shadow-md) !important;
+  border-radius: var(--r-md) !important;
+  font-family: var(--font-ui) !important;
+}
+
+.milkdown milkdown-slash-menu [role="option"] {
+  font-family: var(--font-ui) !important;
+  font-size: 0.85rem !important;
+  color: var(--ink) !important;
+}
+.milkdown milkdown-slash-menu [role="option"]:hover,
+.milkdown milkdown-slash-menu [role="option"][data-active="true"] {
+  background: var(--accent-soft) !important;
+  color: var(--ink) !important;
+}
+
+.milkdown .ProseMirror ::selection { background: var(--accent-soft); }
+
+/* —— Focus rings in the accent, not browser blue —— */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+input:focus, button:focus, textarea:focus { outline: none; }
+input:focus-visible, button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}

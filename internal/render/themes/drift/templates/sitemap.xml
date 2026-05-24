@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+<url><loc>{{ site.home_url|safe }}</loc><lastmod>{{ feed_updated }}</lastmod></url>
+{% for post in posts %}<url><loc>{{ post.url|safe }}</loc><lastmod>{{ post.lastmod }}</lastmod></url>
+{% endfor %}</urlset>

@@ -1,0 +1,77 @@
+name: Determinism
+
+on:
+  push:
+    branches: [main, "rewrite/go"]
+  pull_request:
+    branches: [main, "rewrite/go"]
+  schedule:
+    - cron: "0 6 * * *"
+
+jobs:
+  build-and-hash:
+    name: build (${{ matrix.os }} / ${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            arch: x86_64
+            runner: ubuntu-latest
+          - os: linux
+            arch: aarch64
+            runner: ubuntu-24.04-arm
+          - os: macos
+            arch: aarch64
+            runner: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+      - name: go build
+        run: |
+          CGO_ENABLED=0 go build -o ./cairn ./cmd/cairn
+      - name: Build site (run 1)
+        run: ./cairn build examples/blog -o /tmp/site1
+      - name: Build site (run 2)
+        run: ./cairn build examples/blog -o /tmp/site2
+      - name: Compare in-machine builds (must be byte-identical)
+        run: diff -r /tmp/site1 /tmp/site2
+      - name: Hash this machine's output
+        run: |
+          cd /tmp/site1
+          find . -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum > /tmp/cairn-site-hash.txt
+          echo "Hash: $(cat /tmp/cairn-site-hash.txt)"
+      - name: Upload hash
+        uses: actions/upload-artifact@v4
+        with:
+          name: site-hash-${{ matrix.os }}-${{ matrix.arch }}
+          path: /tmp/cairn-site-hash.txt
+
+  cross-platform-hash-match:
+    name: cross-platform hash comparison
+    needs: build-and-hash
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all hashes
+        uses: actions/download-artifact@v4
+        with:
+          path: hashes/
+      - name: Verify all machines produced the same site hash
+        run: |
+          set -e
+          first=$(cat hashes/site-hash-linux-x86_64/cairn-site-hash.txt | cut -d' ' -f1)
+          echo "Reference (linux-x86_64): $first"
+          for f in hashes/site-hash-*/cairn-site-hash.txt; do
+            h=$(cut -d' ' -f1 < "$f")
+            name=$(dirname "$f" | sed 's|hashes/||')
+            echo "$name: $h"
+            if [ "$h" != "$first" ]; then
+              echo "::error::$name produced a different hash than linux-x86_64"
+              exit 1
+            fi
+          done
+          echo "All machines produced the same site hash. Determinism holds."

@@ -1,0 +1,4 @@
+- [x] write the architecture
+- [x] critique the architecture
+- [ ] ship Phase 0
+- [ ] ship Phase 1

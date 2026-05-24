@@ -1,0 +1,4 @@
+name = "stones"
+description = "Quiet editorial layout. Serif body, single column, generous whitespace, dark-mode aware."
+screenshot = "static/screenshot.png"
+reading_width_px = 680

@@ -1,0 +1,17 @@
+# Docker image for the published release. Consumes the statically-linked
+# musl binaries produced by the release workflow's build matrix — the
+# image is `FROM scratch` so the runtime contains nothing but the binary
+# and ca-certificates (needed for the GitHub / Notion / S3 APIs).
+#
+# This is *not* the same Dockerfile as .github/action/Dockerfile, which
+# builds from source on demand and is used by the reusable Action wrapper.
+
+FROM scratch AS amd64
+COPY --chmod=0755 .docker/cairn-amd64 /usr/local/bin/cairn
+
+FROM scratch AS arm64
+COPY --chmod=0755 .docker/cairn-arm64 /usr/local/bin/cairn
+
+FROM ${TARGETARCH:-amd64}
+COPY --from=alpine:3 /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+ENTRYPOINT ["/usr/local/bin/cairn"]

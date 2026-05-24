@@ -1,0 +1,4 @@
+name = "drift"
+description = "Dark-mode-first technical blog. Geometric sans, indigo accent, prominent code blocks, optional TOC sidebar."
+screenshot = "static/screenshot.png"
+reading_width_px = 720

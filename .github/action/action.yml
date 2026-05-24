@@ -1,0 +1,30 @@
+name: "Cairn"
+description: "Build a Cairn blog and (optionally) deploy it."
+author: "Cairn contributors"
+branding:
+  icon: "feather"
+  color: "gray-dark"
+
+inputs:
+  source:
+    description: "Path to the Cairn source root (the directory containing cairn.toml)."
+    required: false
+    default: "."
+  output:
+    description: "Where to write the rendered site."
+    required: false
+    default: "_site"
+
+outputs:
+  site:
+    description: "Path to the rendered site directory."
+    value: ${{ inputs.output }}
+
+runs:
+  using: "docker"
+  image: "Dockerfile"
+  args:
+    - "build"
+    - ${{ inputs.source }}
+    - "-o"
+    - ${{ inputs.output }}

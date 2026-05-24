@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+<title>{{ site.title }}</title>
+<subtitle>{{ site.description }}</subtitle>
+<link href="{{ site.home_url|safe }}"/>
+<link rel="self" href="{{ site.feed_url|safe }}"/>
+<id>{{ site.home_url|safe }}</id>
+<updated>{{ feed_updated }}</updated>
+<author><name>{{ site.author }}</name></author>
+{% for post in posts %}<entry>
+<title>{{ post.title }}</title>
+<link href="{{ post.url|safe }}"/>
+<id>{{ post.url|safe }}</id>
+<updated>{{ post.lastmod }}</updated>
+<published>{{ post.date }}</published>
+{% if post.summary %}<summary>{{ post.summary }}</summary>{% endif %}
+<content type="html">{{ post.html }}</content>
+</entry>
+{% endfor %}</feed>

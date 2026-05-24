@@ -1,0 +1,97 @@
+name: Release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  prepare:
+    name: Compute version and delete previous release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.tag.outputs.version }}
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compute DDMMYY tag
+        id: tag
+        run: |
+          v=$(date -u +%d%m%y)
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "tag=v$v" >> "$GITHUB_OUTPUT"
+      - name: Delete previous release(s) and tags
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          for tag in $(gh release list --json tagName --jq '.[].tagName'); do
+            gh release delete "$tag" --yes --cleanup-tag || true
+          done
+
+  build:
+    name: Build (${{ matrix.target.goos }}/${{ matrix.target.goarch }})
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - { goos: linux,   goarch: amd64, artifact: cairn-linux-amd64.tar.gz }
+          - { goos: linux,   goarch: arm64, artifact: cairn-linux-arm64.tar.gz }
+          - { goos: darwin,  goarch: amd64, artifact: cairn-darwin-amd64.tar.gz }
+          - { goos: darwin,  goarch: arm64, artifact: cairn-darwin-arm64.tar.gz }
+          - { goos: windows, goarch: amd64, artifact: cairn-windows-amd64.zip   }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+      - name: Build
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.target.goos }}
+          GOARCH: ${{ matrix.target.goarch }}
+        run: |
+          mkdir -p dist
+          out="cairn"
+          [ "$GOOS" = "windows" ] && out="cairn.exe"
+          go build -ldflags="-s -w" -o "$out" ./cmd/cairn
+          if [ "${{ matrix.target.goos }}" = "windows" ]; then
+            zip -j "dist/${{ matrix.target.artifact }}" "$out"
+          else
+            tar czf "dist/${{ matrix.target.artifact }}" "$out"
+          fi
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target.artifact }}
+          path: dist/${{ matrix.target.artifact }}
+
+  publish:
+    name: Publish release
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+      - name: Flatten + compute SHA256SUMS
+        run: |
+          mkdir -p flat
+          find dist -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec cp {} flat/ \;
+          cd flat
+          sha256sum * > SHA256SUMS
+          ls -la
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ needs.prepare.outputs.tag }}" flat/* \
+            --title "${{ needs.prepare.outputs.tag }}" \
+            --notes "Cairn release ${{ needs.prepare.outputs.tag }}"

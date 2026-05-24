@@ -1,0 +1,310 @@
+/* Drift — dark-mode-first technical blog.
+   Geometric sans throughout, indigo accent, tight density,
+   accent-bordered code blocks. Light mode is the @media override. */
+
+:root {
+  --bg: #0E0F12;
+  --bg-elevated: #16181D;
+  --ink: #E6E8EC;
+  --muted: #8A93A3;
+  --rule: #232730;
+  --accent: #7C7BFF;
+  --accent-bright: #9D9CFF;
+  --code-bg: #0A0B0E;
+  --code-ink: #D6DAE2;
+  --tag-bg: #1B1E26;
+  --sans: "Inter", "IBM Plex Sans", system-ui, -apple-system,
+          "Segoe UI", "Roboto", sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, "Menlo", "Consolas", monospace;
+  --measure: 720px;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #FBFBFD;
+    --bg-elevated: #F5F5FA;
+    --ink: #1A1B1F;
+    --muted: #62687A;
+    --rule: #E2E4EB;
+    --accent: #5C5BFF;
+    --accent-bright: #4848D6;
+    --code-bg: #0A0B0E;       /* Drift keeps a dark code block in light mode */
+    --code-ink: #D6DAE2;
+    --tag-bg: #ECECF5;
+  }
+}
+
+* { box-sizing: border-box; }
+
+html { -webkit-text-size-adjust: 100%; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 16px;
+  line-height: 1.55;
+  font-feature-settings: "kern", "liga", "ss01";
+  text-rendering: optimizeLegibility;
+}
+
+.topbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 1rem 1.5rem;
+  border-bottom: 1px solid var(--rule);
+}
+
+.brand {
+  font-weight: 600;
+  font-size: 0.95rem;
+  letter-spacing: 0.02em;
+  color: var(--ink);
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.brand-mark {
+  color: var(--accent);
+  font-weight: 700;
+}
+
+.nav {
+  display: flex;
+  gap: 1.2rem;
+}
+
+.nav a {
+  color: var(--muted);
+  text-decoration: none;
+  font-size: 0.9rem;
+  letter-spacing: 0.02em;
+}
+
+.nav a:hover { color: var(--accent-bright); }
+
+main {
+  max-width: var(--measure);
+  margin: 0 auto;
+  padding: 2.5rem 1.5rem;
+}
+
+/* Index */
+.intro {
+  color: var(--muted);
+  margin: 0 0 2rem;
+  font-size: 1.05rem;
+}
+
+.card-list { list-style: none; padding: 0; margin: 0; }
+
+.card {
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  margin-bottom: 0.9rem;
+  background: var(--bg-elevated);
+  transition: border-color 0.15s, transform 0.15s;
+}
+
+.card:hover {
+  border-color: var(--accent);
+}
+
+.card a {
+  display: block;
+  padding: 1.25rem 1.4rem;
+  color: var(--ink);
+  text-decoration: none;
+}
+
+.card-title {
+  margin: 0 0 0.25rem;
+  font-size: 1.2rem;
+  font-weight: 600;
+  letter-spacing: -0.005em;
+}
+
+.card-summary {
+  margin: 0 0 0.75rem;
+  color: var(--muted);
+  font-size: 0.95rem;
+}
+
+.card-meta {
+  margin: 0;
+  font-size: 0.82rem;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.card-meta .tag {
+  background: var(--tag-bg);
+  color: var(--accent-bright);
+  padding: 0.1em 0.5em;
+  border-radius: 3px;
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  margin-right: 0.2em;
+}
+
+/* Post page */
+.post-header {
+  border-bottom: 1px solid var(--rule);
+  padding-bottom: 1.5rem;
+  margin-bottom: 2rem;
+}
+
+.post-title {
+  margin: 0 0 0.5rem;
+  font-size: 2rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  line-height: 1.18;
+}
+
+.post-meta {
+  margin: 0;
+  font-size: 0.9rem;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.post-meta .tag {
+  color: var(--accent-bright);
+  font-family: var(--mono);
+  font-size: 0.82rem;
+}
+
+.post-body { font-size: 1rem; }
+
+.post-body p { margin: 1.1em 0; }
+
+.post-body h2,
+.post-body h3,
+.post-body h4 {
+  font-family: var(--sans);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  margin: 2em 0 0.6em;
+}
+
+.post-body h2 {
+  font-size: 1.4rem;
+  border-bottom: 2px solid var(--accent);
+  padding-bottom: 0.3em;
+  display: inline-block;
+}
+
+.post-body h3 { font-size: 1.15rem; }
+
+.post-body a {
+  color: var(--accent);
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+}
+.post-body a:hover { color: var(--accent-bright); }
+
+.post-body img,
+.post-body video {
+  max-width: 100%;
+  height: auto;
+  display: block;
+  margin: 1.5em auto;
+  border-radius: 4px;
+}
+
+.post-body blockquote {
+  border-left: 2px solid var(--accent);
+  background: var(--bg-elevated);
+  margin: 1.5em 0;
+  padding: 0.5em 1.25em;
+  color: var(--muted);
+  border-radius: 0 4px 4px 0;
+}
+
+.post-body code {
+  font-family: var(--mono);
+  font-size: 0.9em;
+  background: var(--code-bg);
+  color: var(--code-ink);
+  padding: 0.15em 0.4em;
+  border-radius: 3px;
+}
+
+.post-body pre {
+  font-family: var(--mono);
+  font-size: 0.88rem;
+  line-height: 1.55;
+  background: var(--code-bg);
+  color: var(--code-ink);
+  padding: 1rem 1.2rem;
+  border-radius: 4px;
+  border-left: 3px solid var(--accent);
+  overflow-x: auto;
+  margin: 1.5em 0;
+}
+
+.post-body pre code {
+  background: transparent;
+  padding: 0;
+  font-size: inherit;
+  color: inherit;
+}
+
+.post-body table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 0.93em;
+  margin: 1.5em 0;
+}
+
+.post-body th,
+.post-body td {
+  padding: 0.5em 0.75em;
+  border-bottom: 1px solid var(--rule);
+  text-align: left;
+}
+
+.post-body th {
+  color: var(--muted);
+  font-weight: 600;
+  font-size: 0.82em;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.post-body hr {
+  border: none;
+  border-top: 1px solid var(--rule);
+  margin: 2.5em 0;
+}
+
+.post-footer {
+  margin-top: 3rem;
+  padding-top: 1.5rem;
+  border-top: 1px solid var(--rule);
+  font-size: 0.9rem;
+}
+
+.post-footer .back { color: var(--accent); text-decoration: none; }
+.post-footer .back:hover { color: var(--accent-bright); }
+
+.site-footer {
+  margin-top: 3rem;
+  padding: 1.5rem 0 2.5rem;
+  text-align: center;
+  font-size: 0.82rem;
+  color: var(--muted);
+  border-top: 1px solid var(--rule);
+}
+
+@media (max-width: 640px) {
+  .topbar { padding: 0.8rem 1.1rem; }
+  .post-title { font-size: 1.6rem; }
+  main { padding-top: 1.5rem; }
+}

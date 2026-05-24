@@ -1,0 +1,50 @@
+name: E2E Publish Smoke
+
+# Manual trigger only — exercises the full cairn init + cairn build flow
+# against each (theme × deploy) combination and asserts the expected
+# artifacts land in _site/ and .github/workflows/.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        theme: [stones, drift, press]
+        deploy: [github-pages, cloudflare-pages]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+      - name: Build cairn
+        run: CGO_ENABLED=0 go build -o ./cairn ./cmd/cairn
+
+      - name: cairn init (theme=${{ matrix.theme }} deploy=${{ matrix.deploy }})
+        run: |
+          ./cairn init /tmp/blog \
+            --title "E2E ${{ matrix.theme }} ${{ matrix.deploy }}" \
+            --base-url "https://example.invalid" \
+            --author "E2E" \
+            --theme "${{ matrix.theme }}" \
+            --deploy "${{ matrix.deploy }}"
+
+      - name: Verify scaffold
+        run: |
+          test -f /tmp/blog/cairn.toml
+          test -f /tmp/blog/content/posts/hello-world.md
+          test -f /tmp/blog/.github/workflows/cairn.yml
+
+      - name: cairn build
+        run: ./cairn build /tmp/blog -o /tmp/blog/_site
+
+      - name: Verify build output
+        run: |
+          test -f /tmp/blog/_site/index.html
+          test -f /tmp/blog/_site/feed.xml
+          test -f /tmp/blog/_site/sitemap.xml
+          test -d /tmp/blog/_site/hello-world

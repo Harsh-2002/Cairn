@@ -1,0 +1,9 @@
+[site]
+title = "Cairn — Reference Blog"
+description = "The reference deployment Cairn dogfoods against."
+base_url = "https://cairn.example.com"
+author = "Cairn"
+language = "en"
+
+[content]
+posts_dir = "content/posts"
