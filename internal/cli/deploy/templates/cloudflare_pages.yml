@@ -13,10 +13,12 @@ jobs:
       deployments: write
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
       - name: Install Cairn
-        run: cargo install --git https://github.com/Harsh-2002/Cairn --locked cairn
+        run: go install github.com/Harsh-2002/Cairn/cmd/cairn@latest
       - name: Build site
         run: cairn build . -o _site
       - name: Deploy to Cloudflare Pages

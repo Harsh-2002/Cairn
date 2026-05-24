@@ -50,6 +50,18 @@ func runBuild(source, output string) error {
 	if err := r.BuildToDir(posts, output); err != nil {
 		return err
 	}
-	fmt.Printf("Built %d posts to %s\n", len(posts), output)
+	published, drafts := 0, 0
+	for _, p := range posts {
+		if p.Frontmatter.Draft {
+			drafts++
+		} else {
+			published++
+		}
+	}
+	if drafts > 0 {
+		fmt.Printf("Built %d post(s) to %s (%d draft(s) skipped)\n", published, output, drafts)
+	} else {
+		fmt.Printf("Built %d post(s) to %s\n", published, output)
+	}
 	return nil
 }
