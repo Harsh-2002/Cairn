@@ -1,0 +1,378 @@
+//! S3 request-body parsers. Each takes a raw `&[u8]` body and returns a typed result,
+//! folding any malformed input — invalid UTF-8, unbalanced tags, missing required fields,
+//! out-of-range numbers — to [`Error::MalformedXml`]. Parsers never panic.
+//!
+//! quick-xml's reader rejects *mismatched* end tags (`check_end_names`) but treats a body
+//! that simply ends with elements still open as a clean EOF. To make every parser total we
+//! drive the reader through [`Sax`], which tracks element depth and rejects a body that
+//! reaches EOF with any element still open.
+
+use cairn_types::{Error, VersioningState};
+use quick_xml::Reader;
+use quick_xml::events::Event;
+
+/// Map any quick-xml error into the canonical malformed-XML error.
+fn malformed() -> Error {
+    Error::MalformedXml
+}
+
+/// One decoded SAX event handed to a parser callback.
+enum Sax<'a> {
+    /// An opening tag with its local name (namespace prefix stripped).
+    Open(Vec<u8>),
+    /// Decoded, entity-unescaped text content.
+    Text(std::borrow::Cow<'a, str>),
+    /// A closing tag with its local name.
+    Close(Vec<u8>),
+}
+
+/// Drive an XML body through a callback, validating well-formedness and element balance.
+///
+/// The callback sees [`Sax::Open`]/[`Sax::Text`]/[`Sax::Close`] events in document order and
+/// may return `Err(MalformedXml)` to reject a semantically invalid body. Self-closing tags
+/// surface as an `Open` immediately followed by a `Close`. A body that ends with any element
+/// still open is rejected as malformed.
+fn drive<F>(body: &[u8], mut on_event: F) -> Result<(), Error>
+where
+    F: FnMut(Sax<'_>) -> Result<(), Error>,
+{
+    // Validate UTF-8 up front so the borrowed reader is sound and bad encodings are rejected
+    // as malformed rather than surfacing mid-parse.
+    let s = std::str::from_utf8(body).map_err(|_| malformed())?;
+    let mut reader = Reader::from_str(s);
+    let cfg = reader.config_mut();
+    cfg.trim_text(true);
+
+    let mut depth: u32 = 0;
+    loop {
+        match reader.read_event().map_err(|_| malformed())? {
+            Event::Start(e) => {
+                depth += 1;
+                on_event(Sax::Open(local(e.name())))?;
+            }
+            Event::Empty(e) => {
+                // A self-closing tag is an open immediately followed by a close.
+                let name = local(e.name());
+                on_event(Sax::Open(name.clone()))?;
+                on_event(Sax::Close(name))?;
+            }
+            Event::Text(t) => {
+                let text = t.unescape().map_err(|_| malformed())?;
+                on_event(Sax::Text(text))?;
+            }
+            Event::CData(t) => {
+                let text = t.decode().map_err(|_| malformed())?;
+                on_event(Sax::Text(text))?;
+            }
+            Event::End(e) => {
+                // quick-xml's check_end_names guarantees this matches the open, but guard
+                // against an underflow regardless.
+                depth = depth.checked_sub(1).ok_or_else(malformed)?;
+                on_event(Sax::Close(local(e.name())))?;
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    if depth != 0 {
+        // The body ended with elements still open.
+        return Err(malformed());
+    }
+    Ok(())
+}
+
+/// The local element name of an event, as owned bytes (namespace prefix stripped).
+fn local(name: quick_xml::name::QName<'_>) -> Vec<u8> {
+    quick_xml::name::LocalName::from(name).as_ref().to_vec()
+}
+
+// ===========================================================================================
+// CompleteMultipartUpload
+// ===========================================================================================
+
+/// Parse a `CompleteMultipartUpload` body into `(part_number, etag)` pairs, in document
+/// order. ETags are returned with any surrounding quotes stripped (S3 clients quote them).
+///
+/// # Errors
+/// Returns [`Error::MalformedXml`] if the body is not well-formed, a `PartNumber` is missing
+/// or not a valid `u16`, or an `ETag` is missing.
+pub fn parse_complete_multipart(body: &[u8]) -> Result<Vec<(u16, String)>, Error> {
+    let mut out = Vec::new();
+    let mut in_part = false;
+    let mut cur_field: Option<Vec<u8>> = None;
+    let mut part_number: Option<u16> = None;
+    let mut etag: Option<String> = None;
+
+    drive(body, |ev| {
+        match ev {
+            Sax::Open(name) => {
+                if name == b"Part" {
+                    in_part = true;
+                    part_number = None;
+                    etag = None;
+                    cur_field = None;
+                } else if in_part {
+                    cur_field = Some(name);
+                }
+            }
+            Sax::Text(text) => {
+                if in_part {
+                    if let Some(field) = &cur_field {
+                        if field == b"PartNumber" {
+                            part_number =
+                                Some(text.trim().parse::<u16>().map_err(|_| malformed())?);
+                        } else if field == b"ETag" {
+                            etag = Some(unquote(text.trim()));
+                        }
+                    }
+                }
+            }
+            Sax::Close(name) => {
+                if name == b"Part" {
+                    let pn = part_number.take().ok_or_else(malformed)?;
+                    let et = etag.take().ok_or_else(malformed)?;
+                    out.push((pn, et));
+                    in_part = false;
+                }
+                cur_field = None;
+            }
+        }
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+// ===========================================================================================
+// Delete (multi-object delete request)
+// ===========================================================================================
+
+/// Parse a `Delete` body into `(quiet, objects)` where each object is `(key, version_id?)`.
+///
+/// # Errors
+/// Returns [`Error::MalformedXml`] if the body is not well-formed or an `<Object>` lacks a
+/// `<Key>`.
+// The `(quiet, [(key, version_id?)])` shape is the operation's wire result and is part of the
+// crate's public contract, so it is kept inline rather than aliased.
+#[allow(clippy::type_complexity)]
+pub fn parse_delete(body: &[u8]) -> Result<(bool, Vec<(String, Option<String>)>), Error> {
+    let mut quiet = false;
+    let mut objects = Vec::new();
+    let mut in_object = false;
+    let mut cur_field: Option<Vec<u8>> = None;
+    let mut key: Option<String> = None;
+    let mut version_id: Option<String> = None;
+
+    drive(body, |ev| {
+        match ev {
+            Sax::Open(name) => {
+                if name == b"Object" {
+                    in_object = true;
+                    key = None;
+                    version_id = None;
+                    cur_field = None;
+                } else {
+                    cur_field = Some(name);
+                }
+            }
+            Sax::Text(text) => {
+                if let Some(field) = &cur_field {
+                    if field == b"Quiet" && !in_object {
+                        quiet = text.trim().eq_ignore_ascii_case("true");
+                    } else if in_object && field == b"Key" {
+                        key = Some(text.into_owned());
+                    } else if in_object && field == b"VersionId" {
+                        version_id = Some(text.into_owned());
+                    }
+                }
+            }
+            Sax::Close(name) => {
+                if name == b"Object" {
+                    let k = key.take().ok_or_else(malformed)?;
+                    objects.push((k, version_id.take()));
+                    in_object = false;
+                }
+                cur_field = None;
+            }
+        }
+        Ok(())
+    })?;
+    Ok((quiet, objects))
+}
+
+// ===========================================================================================
+// Tagging
+// ===========================================================================================
+
+/// Parse a `Tagging` body into `(key, value)` tag pairs.
+///
+/// # Errors
+/// Returns [`Error::MalformedXml`] if the body is not well-formed or a `<Tag>` lacks a
+/// `<Key>` or `<Value>`.
+pub fn parse_tagging(body: &[u8]) -> Result<Vec<(String, String)>, Error> {
+    let mut out = Vec::new();
+    let mut in_tag = false;
+    let mut cur_field: Option<Vec<u8>> = None;
+    let mut key: Option<String> = None;
+    let mut value: Option<String> = None;
+
+    drive(body, |ev| {
+        match ev {
+            Sax::Open(name) => {
+                if name == b"Tag" {
+                    in_tag = true;
+                    key = None;
+                    value = None;
+                    cur_field = None;
+                } else if in_tag {
+                    cur_field = Some(name);
+                }
+            }
+            Sax::Text(text) => {
+                if in_tag {
+                    if let Some(field) = &cur_field {
+                        if field == b"Key" {
+                            key = Some(text.into_owned());
+                        } else if field == b"Value" {
+                            value = Some(text.into_owned());
+                        }
+                    }
+                }
+            }
+            Sax::Close(name) => {
+                if name == b"Tag" {
+                    let k = key.take().ok_or_else(malformed)?;
+                    let v = value.take().ok_or_else(malformed)?;
+                    out.push((k, v));
+                    in_tag = false;
+                }
+                cur_field = None;
+            }
+        }
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+// ===========================================================================================
+// VersioningConfiguration
+// ===========================================================================================
+
+/// Parse a `VersioningConfiguration` body into a [`VersioningState`]. An absent or empty
+/// `<Status>` maps to [`VersioningState::Unversioned`]; `Enabled`/`Suspended` map directly.
+///
+/// # Errors
+/// Returns [`Error::MalformedXml`] if the body is not well-formed or `<Status>` carries an
+/// unrecognized value.
+pub fn parse_versioning_configuration(body: &[u8]) -> Result<VersioningState, Error> {
+    let mut state = VersioningState::Unversioned;
+    let mut in_status = false;
+
+    drive(body, |ev| {
+        match ev {
+            Sax::Open(name) => {
+                if name == b"Status" {
+                    in_status = true;
+                }
+            }
+            Sax::Text(text) => {
+                if in_status {
+                    state = match text.trim() {
+                        "Enabled" => VersioningState::Enabled,
+                        "Suspended" => VersioningState::Suspended,
+                        "" => VersioningState::Unversioned,
+                        _ => return Err(malformed()),
+                    };
+                }
+            }
+            Sax::Close(name) => {
+                if name == b"Status" {
+                    in_status = false;
+                }
+            }
+        }
+        Ok(())
+    })?;
+    Ok(state)
+}
+
+// ===========================================================================================
+// CORSConfiguration
+// ===========================================================================================
+
+/// One parsed CORS rule. A simplified projection of the S3 `CORSRule` element sufficient for
+/// Cairn's preflight/response handling.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CorsRule {
+    /// `AllowedOrigin` values.
+    pub allowed_origins: Vec<String>,
+    /// `AllowedMethod` values.
+    pub allowed_methods: Vec<String>,
+    /// `AllowedHeader` values.
+    pub allowed_headers: Vec<String>,
+    /// `ExposeHeader` values.
+    pub expose_headers: Vec<String>,
+    /// `MaxAgeSeconds`, if present.
+    pub max_age_seconds: Option<u32>,
+}
+
+/// Parse a `CORSConfiguration` body into a list of [`CorsRule`]s.
+///
+/// # Errors
+/// Returns [`Error::MalformedXml`] if the body is not well-formed or a `MaxAgeSeconds` is not
+/// a valid `u32`.
+pub fn parse_cors_configuration(body: &[u8]) -> Result<Vec<CorsRule>, Error> {
+    let mut rules = Vec::new();
+    let mut in_rule = false;
+    let mut cur_field: Option<Vec<u8>> = None;
+    let mut rule = CorsRule::default();
+
+    drive(body, |ev| {
+        match ev {
+            Sax::Open(name) => {
+                if name == b"CORSRule" {
+                    in_rule = true;
+                    rule = CorsRule::default();
+                    cur_field = None;
+                } else if in_rule {
+                    cur_field = Some(name);
+                }
+            }
+            Sax::Text(text) => {
+                if in_rule {
+                    if let Some(field) = &cur_field {
+                        match field.as_slice() {
+                            b"AllowedOrigin" => rule.allowed_origins.push(text.into_owned()),
+                            b"AllowedMethod" => rule.allowed_methods.push(text.into_owned()),
+                            b"AllowedHeader" => rule.allowed_headers.push(text.into_owned()),
+                            b"ExposeHeader" => rule.expose_headers.push(text.into_owned()),
+                            b"MaxAgeSeconds" => {
+                                rule.max_age_seconds =
+                                    Some(text.trim().parse::<u32>().map_err(|_| malformed())?);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            Sax::Close(name) => {
+                if name == b"CORSRule" {
+                    rules.push(std::mem::take(&mut rule));
+                    in_rule = false;
+                }
+                cur_field = None;
+            }
+        }
+        Ok(())
+    })?;
+    Ok(rules)
+}
+
+/// Strip a single pair of surrounding ASCII double quotes from an ETag wire value.
+fn unquote(s: &str) -> String {
+    let bytes = s.as_bytes();
+    if bytes.len() >= 2 && bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"' {
+        s[1..s.len() - 1].to_owned()
+    } else {
+        s.to_owned()
+    }
+}

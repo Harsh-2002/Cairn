@@ -5,6 +5,7 @@
 use crate::model::{self, engine_err};
 use crate::range::{prefix_upper_bound, successor};
 use crate::writer::Writer;
+use cairn_types::MetaError;
 use cairn_types::authz::PublicAccessBlock;
 use cairn_types::bucket::{Bucket, ConfigAspect, ConfigDoc};
 use cairn_types::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
@@ -16,7 +17,6 @@ use cairn_types::meta::{
 use cairn_types::object::ObjectVersionRow;
 use cairn_types::time::Timestamp;
 use cairn_types::traits::MetadataStore;
-use cairn_types::MetaError;
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -32,7 +32,8 @@ pub struct SqliteMetadataStore {
 
 impl std::fmt::Debug for SqliteMetadataStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SqliteMetadataStore").finish_non_exhaustive()
+        f.debug_struct("SqliteMetadataStore")
+            .finish_non_exhaustive()
     }
 }
 
@@ -83,7 +84,14 @@ fn list_impl(
     let mut seen_cp = std::collections::HashSet::new();
 
     'outer: loop {
-        let rows = fetch_rows(conn, bucket, &seek, upper.as_deref(), latest_only, LIST_BATCH + 1)?;
+        let rows = fetch_rows(
+            conn,
+            bucket,
+            &seek,
+            upper.as_deref(),
+            latest_only,
+            LIST_BATCH + 1,
+        )?;
         if rows.is_empty() {
             break;
         }
@@ -156,7 +164,8 @@ fn fetch_rows(
         stmt.query_map(params![bucket, seek, rusqlite::types::Null, limit], map)
     }
     .map_err(engine_err)?;
-    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(engine_err)
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(engine_err)
 }
 
 #[async_trait::async_trait]
@@ -168,9 +177,13 @@ impl MetadataStore for SqliteMetadataStore {
     async fn get_bucket(&self, name: &BucketName) -> Result<Option<Bucket>, MetaError> {
         let name = name.as_str().to_owned();
         self.with_read(move |conn| {
-            conn.query_row("SELECT * FROM buckets WHERE name=?1", params![name], model::bucket_from_row)
-                .optional()
-                .map_err(engine_err)
+            conn.query_row(
+                "SELECT * FROM buckets WHERE name=?1",
+                params![name],
+                model::bucket_from_row,
+            )
+            .optional()
+            .map_err(engine_err)
         })
         .await
     }
@@ -179,14 +192,18 @@ impl MetadataStore for SqliteMetadataStore {
         let owner = owner.map(|o| o.0.clone());
         self.with_read(move |conn| {
             let (sql, bind): (&str, Vec<String>) = match &owner {
-                Some(o) => ("SELECT * FROM buckets WHERE owner_id=?1 ORDER BY name", vec![o.clone()]),
+                Some(o) => (
+                    "SELECT * FROM buckets WHERE owner_id=?1 ORDER BY name",
+                    vec![o.clone()],
+                ),
                 None => ("SELECT * FROM buckets ORDER BY name", vec![]),
             };
             let mut stmt = conn.prepare(sql).map_err(engine_err)?;
             let rows = stmt
                 .query_map(rusqlite::params_from_iter(bind), model::bucket_from_row)
                 .map_err(engine_err)?;
-            rows.collect::<rusqlite::Result<Vec<_>>>().map_err(engine_err)
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(engine_err)
         })
         .await
     }
@@ -214,12 +231,15 @@ impl MetadataStore for SqliteMetadataStore {
     async fn get_account_public_access_block(&self) -> Result<PublicAccessBlock, MetaError> {
         self.with_read(move |conn| {
             let v: Option<String> = conn
-                .query_row("SELECT v FROM account_config WHERE k='public_access_block'", [], |r| {
-                    r.get(0)
-                })
+                .query_row(
+                    "SELECT v FROM account_config WHERE k='public_access_block'",
+                    [],
+                    |r| r.get(0),
+                )
                 .optional()
                 .map_err(engine_err)?;
-            Ok(v.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default())
+            Ok(v.and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default())
         })
         .await
     }
@@ -264,7 +284,11 @@ impl MetadataStore for SqliteMetadataStore {
         key: &ObjectKey,
         version: &VersionId,
     ) -> Result<Option<ObjectVersionRow>, MetaError> {
-        let (b, k, v) = (bucket.as_str().to_owned(), key.as_str().to_owned(), version.as_str().to_owned());
+        let (b, k, v) = (
+            bucket.as_str().to_owned(),
+            key.as_str().to_owned(),
+            version.as_str().to_owned(),
+        );
         self.with_read(move |conn| {
             conn.query_row(
                 "SELECT * FROM object_versions WHERE bucket_name=?1 AND key=?2 AND version_id=?3",
@@ -283,7 +307,8 @@ impl MetadataStore for SqliteMetadataStore {
         query: &ListQuery,
     ) -> Result<ListPage<ObjectSummary>, MetaError> {
         let (b, q) = (bucket.as_str().to_owned(), query.clone());
-        self.with_read(move |conn| list_impl(conn, &b, &q, true)).await
+        self.with_read(move |conn| list_impl(conn, &b, &q, true))
+            .await
     }
 
     async fn list_versions(
@@ -292,7 +317,8 @@ impl MetadataStore for SqliteMetadataStore {
         query: &ListQuery,
     ) -> Result<ListPage<ObjectSummary>, MetaError> {
         let (b, q) = (bucket.as_str().to_owned(), query.clone());
-        self.with_read(move |conn| list_impl(conn, &b, &q, false)).await
+        self.with_read(move |conn| list_impl(conn, &b, &q, false))
+            .await
     }
 
     async fn enumerate_storage_paths(
@@ -311,14 +337,20 @@ impl MetadataStore for SqliteMetadataStore {
                 )
                 .map_err(engine_err)?;
             let rows = stmt
-                .query_map(params![b, cursor, i64::from(batch) + 1], |r| r.get::<_, String>(0))
+                .query_map(params![b, cursor, i64::from(batch) + 1], |r| {
+                    r.get::<_, String>(0)
+                })
                 .map_err(engine_err)?
                 .collect::<rusqlite::Result<Vec<_>>>()
                 .map_err(engine_err)?;
             let truncated = rows.len() > batch as usize;
             let mut items: Vec<String> = rows;
             items.truncate(batch as usize);
-            let next_cursor = if truncated { items.last().cloned() } else { None };
+            let next_cursor = if truncated {
+                items.last().cloned()
+            } else {
+                None
+            };
             Ok(ListPage {
                 items: items.into_iter().map(StoragePath::from_string).collect(),
                 common_prefixes: Vec::new(),
@@ -335,7 +367,11 @@ impl MetadataStore for SqliteMetadataStore {
         key: &ObjectKey,
         version: &VersionId,
     ) -> Result<Vec<(String, String)>, MetaError> {
-        let (b, k, v) = (bucket.as_str().to_owned(), key.as_str().to_owned(), version.as_str().to_owned());
+        let (b, k, v) = (
+            bucket.as_str().to_owned(),
+            key.as_str().to_owned(),
+            version.as_str().to_owned(),
+        );
         self.with_read(move |conn| {
             let mut stmt = conn
                 .prepare_cached(
@@ -352,12 +388,19 @@ impl MetadataStore for SqliteMetadataStore {
         .await
     }
 
-    async fn get_multipart(&self, upload: &UploadId) -> Result<Option<MultipartSession>, MetaError> {
+    async fn get_multipart(
+        &self,
+        upload: &UploadId,
+    ) -> Result<Option<MultipartSession>, MetaError> {
         let id = upload.as_str().to_owned();
         self.with_read(move |conn| {
-            conn.query_row("SELECT * FROM multipart_uploads WHERE id=?1", params![id], model::multipart_from_row)
-                .optional()
-                .map_err(engine_err)
+            conn.query_row(
+                "SELECT * FROM multipart_uploads WHERE id=?1",
+                params![id],
+                model::multipart_from_row,
+            )
+            .optional()
+            .map_err(engine_err)
         })
         .await
     }
@@ -425,10 +468,13 @@ impl MetadataStore for SqliteMetadataStore {
             let mut stmt = conn
                 .prepare_cached("SELECT * FROM multipart_uploads WHERE updated_at < ?1 LIMIT ?2")
                 .map_err(engine_err)?;
-            stmt.query_map(params![older_than.0, i64::from(batch)], model::multipart_from_row)
-                .map_err(engine_err)?
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(engine_err)
+            stmt.query_map(
+                params![older_than.0, i64::from(batch)],
+                model::multipart_from_row,
+            )
+            .map_err(engine_err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(engine_err)
         })
         .await
     }
@@ -439,7 +485,11 @@ impl MetadataStore for SqliteMetadataStore {
         key: &ObjectKey,
         version: &VersionId,
     ) -> Result<Option<ReplicationStatus>, MetaError> {
-        let (b, k, v) = (bucket.as_str().to_owned(), key.as_str().to_owned(), version.as_str().to_owned());
+        let (b, k, v) = (
+            bucket.as_str().to_owned(),
+            key.as_str().to_owned(),
+            version.as_str().to_owned(),
+        );
         self.with_read(move |conn| {
             let s: Option<String> = conn
                 .query_row(
@@ -480,9 +530,13 @@ impl MetadataStore for SqliteMetadataStore {
     ) -> Result<Option<UserWithBearerHash>, MetaError> {
         let id = access_key_id.to_owned();
         self.with_read(move |conn| {
-            conn.query_row("SELECT * FROM users WHERE access_key_id=?1", params![id], model::user_with_bearer_from_row)
-                .optional()
-                .map_err(engine_err)
+            conn.query_row(
+                "SELECT * FROM users WHERE access_key_id=?1",
+                params![id],
+                model::user_with_bearer_from_row,
+            )
+            .optional()
+            .map_err(engine_err)
         })
         .await
     }
@@ -493,10 +547,14 @@ impl MetadataStore for SqliteMetadataStore {
     ) -> Result<Option<UserSigV4Credentials>, MetaError> {
         let id = access_key_id.to_owned();
         self.with_read(move |conn| {
-            conn.query_row("SELECT * FROM users WHERE sigv4_access_key_id=?1", params![id], model::user_sigv4_from_row)
-                .optional()
-                .map_err(engine_err)
-                .map(Option::flatten)
+            conn.query_row(
+                "SELECT * FROM users WHERE sigv4_access_key_id=?1",
+                params![id],
+                model::user_sigv4_from_row,
+            )
+            .optional()
+            .map_err(engine_err)
+            .map(Option::flatten)
         })
         .await
     }
@@ -512,7 +570,9 @@ impl MetadataStore for SqliteMetadataStore {
 
     async fn list_users(&self) -> Result<Vec<User>, MetaError> {
         self.with_read(move |conn| {
-            let mut stmt = conn.prepare("SELECT * FROM users ORDER BY created_at").map_err(engine_err)?;
+            let mut stmt = conn
+                .prepare("SELECT * FROM users ORDER BY created_at")
+                .map_err(engine_err)?;
             stmt.query_map([], model::user_from_row)
                 .map_err(engine_err)?
                 .collect::<rusqlite::Result<Vec<_>>>()

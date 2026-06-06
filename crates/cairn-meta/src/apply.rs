@@ -4,10 +4,10 @@
 //! and the upsert are atomic with respect to every other writer (ARCH §11.6).
 
 use crate::model::{self, engine_err, repl_op_str, repl_status_str, storage_class_str, to_json};
+use cairn_types::MetaError;
 use cairn_types::id::{BucketName, ObjectKey, StoragePath, VersionId};
 use cairn_types::meta::{IfNoneMatch, Mutation, MutationOutcome, OutboxEntry, Precondition};
 use cairn_types::object::{ETag, ObjectVersionRow};
-use cairn_types::MetaError;
 use rusqlite::{Connection, OptionalExtension, params};
 
 type R<T> = Result<T, MetaError>;
@@ -15,10 +15,19 @@ type R<T> = Result<T, MetaError>;
 /// Apply a mutation, returning its typed outcome or a typed error.
 pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
     match m {
-        Mutation::PutObjectVersion { row, precondition, replication } => {
-            put_version(conn, *row, &precondition, replication)
-        }
-        Mutation::CreateDeleteMarker { bucket, key, version_id, owner_id, now, replication } => {
+        Mutation::PutObjectVersion {
+            row,
+            precondition,
+            replication,
+        } => put_version(conn, *row, &precondition, replication),
+        Mutation::CreateDeleteMarker {
+            bucket,
+            key,
+            version_id,
+            owner_id,
+            now,
+            replication,
+        } => {
             let row = ObjectVersionRow {
                 id: uuid::Uuid::new_v4().simple().to_string(),
                 bucket,
@@ -49,9 +58,11 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             }
             Ok(MutationOutcome::DeleteMarker { version_id })
         }
-        Mutation::DeleteVersion { bucket, key, version_id } => {
-            delete_version(conn, &bucket, &key, &version_id)
-        }
+        Mutation::DeleteVersion {
+            bucket,
+            key,
+            version_id,
+        } => delete_version(conn, &bucket, &key, &version_id),
         Mutation::CreateMultipart(s) => {
             conn.execute(
                 "INSERT INTO multipart_uploads
@@ -96,25 +107,41 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
                 ],
             )
             .map_err(engine_err)?;
-            Ok(MutationOutcome::PartRecorded { superseded: superseded.map(StoragePath::from_string) })
+            Ok(MutationOutcome::PartRecorded {
+                superseded: superseded.map(StoragePath::from_string),
+            })
         }
         Mutation::ClaimMultipart(upload_id) => claim_multipart(conn, &upload_id),
-        Mutation::CompleteMultipart { upload_id, row, precondition, replication } => {
+        Mutation::CompleteMultipart {
+            upload_id,
+            row,
+            precondition,
+            replication,
+        } => {
             let bucket = row.bucket.clone();
             let key = row.key.clone();
             check_precondition(conn, &bucket, &key, &precondition)?;
             let version_id = row.version_id.clone();
             let superseded = upsert_version(conn, *row)?;
-            conn.execute("DELETE FROM multipart_uploads WHERE id=?1", params![upload_id.as_str()])
-                .map_err(engine_err)?;
+            conn.execute(
+                "DELETE FROM multipart_uploads WHERE id=?1",
+                params![upload_id.as_str()],
+            )
+            .map_err(engine_err)?;
             if let Some(e) = replication {
                 enqueue(conn, &e)?;
             }
-            Ok(MutationOutcome::MultipartCompleted { superseded, version_id })
+            Ok(MutationOutcome::MultipartCompleted {
+                superseded,
+                version_id,
+            })
         }
         Mutation::AbortMultipart(upload_id) => {
-            conn.execute("DELETE FROM multipart_uploads WHERE id=?1", params![upload_id.as_str()])
-                .map_err(engine_err)?;
+            conn.execute(
+                "DELETE FROM multipart_uploads WHERE id=?1",
+                params![upload_id.as_str()],
+            )
+            .map_err(engine_err)?;
             Ok(MutationOutcome::Ack)
         }
         Mutation::CreateBucket(b) => {
@@ -135,13 +162,20 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             Ok(MutationOutcome::Ack)
         }
         Mutation::DeleteBucket(name) => {
-            conn.execute("DELETE FROM bucket_config WHERE bucket_name=?1", params![name.as_str()])
-                .map_err(engine_err)?;
+            conn.execute(
+                "DELETE FROM bucket_config WHERE bucket_name=?1",
+                params![name.as_str()],
+            )
+            .map_err(engine_err)?;
             conn.execute("DELETE FROM buckets WHERE name=?1", params![name.as_str()])
                 .map_err(engine_err)?;
             Ok(MutationOutcome::Ack)
         }
-        Mutation::SetBucketConfig { bucket, aspect, doc } => {
+        Mutation::SetBucketConfig {
+            bucket,
+            aspect,
+            doc,
+        } => {
             let aspect_s = config_aspect_str(aspect);
             match doc {
                 Some(d) => conn.execute(
@@ -180,7 +214,12 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             .map_err(engine_err)?;
             Ok(MutationOutcome::Ack)
         }
-        Mutation::PutObjectTags { bucket, key, version_id, tags } => {
+        Mutation::PutObjectTags {
+            bucket,
+            key,
+            version_id,
+            tags,
+        } => {
             conn.execute(
                 "DELETE FROM object_tags WHERE bucket_name=?1 AND key=?2 AND version_id=?3",
                 params![bucket.as_str(), key.as_str(), version_id.as_str()],
@@ -195,7 +234,11 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             }
             Ok(MutationOutcome::Ack)
         }
-        Mutation::DeleteObjectTags { bucket, key, version_id } => {
+        Mutation::DeleteObjectTags {
+            bucket,
+            key,
+            version_id,
+        } => {
             conn.execute(
                 "DELETE FROM object_tags WHERE bucket_name=?1 AND key=?2 AND version_id=?3",
                 params![bucket.as_str(), key.as_str(), version_id.as_str()],
@@ -245,7 +288,13 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
                 .query_row(
                     "SELECT bucket_name, key, version_id FROM replication_outbox WHERE id=?1",
                     params![id],
-                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)),
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                        ))
+                    },
                 )
                 .optional()
                 .map_err(engine_err)?
@@ -263,7 +312,11 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             .map_err(engine_err)?;
             Ok(MutationOutcome::Ack)
         }
-        Mutation::MarkReplicationFailed { id, error, next_attempt_at } => {
+        Mutation::MarkReplicationFailed {
+            id,
+            error,
+            next_attempt_at,
+        } => {
             match next_attempt_at {
                 Some(t) => conn.execute(
                     "UPDATE replication_outbox SET attempts=attempts+1, last_error=?2, next_attempt_at=?3, status='pending' WHERE id=?1",
@@ -282,7 +335,14 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
                 "INSERT INTO activity (id, action, bucket, key, size, etag, actor, at)
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
                 params![
-                    e.id, e.action, e.bucket, e.key, e.size.map(|s| s as i64), e.etag, e.actor, e.at.0
+                    e.id,
+                    e.action,
+                    e.bucket,
+                    e.key,
+                    e.size.map(|s| s as i64),
+                    e.etag,
+                    e.actor,
+                    e.at.0
                 ],
             )
             .map_err(engine_err)?;
@@ -303,7 +363,10 @@ fn put_version(
     if let Some(e) = replication {
         enqueue(conn, &e)?;
     }
-    Ok(MutationOutcome::Put { superseded, version_id })
+    Ok(MutationOutcome::Put {
+        superseded,
+        version_id,
+    })
 }
 
 /// Replace any existing row at (bucket,key,version_id) — capturing its blob for reclamation —
@@ -320,7 +383,11 @@ fn upsert_version(conn: &Connection, row: ObjectVersionRow) -> R<Option<StorageP
         .flatten();
     conn.execute(
         "DELETE FROM object_versions WHERE bucket_name=?1 AND key=?2 AND version_id=?3",
-        params![row.bucket.as_str(), row.key.as_str(), row.version_id.as_str()],
+        params![
+            row.bucket.as_str(),
+            row.key.as_str(),
+            row.version_id.as_str()
+        ],
     )
     .map_err(engine_err)?;
     demote_latest(conn, &row.bucket, &row.key)?;
@@ -406,12 +473,18 @@ fn delete_version(
             .optional()
             .map_err(engine_err)?;
         if let Some(id) = promote {
-            conn.execute("UPDATE object_versions SET is_latest=1 WHERE id=?1", params![id])
-                .map_err(engine_err)?;
+            conn.execute(
+                "UPDATE object_versions SET is_latest=1 WHERE id=?1",
+                params![id],
+            )
+            .map_err(engine_err)?;
             promoted = true;
         }
     }
-    Ok(MutationOutcome::Deleted { freed, promoted_latest: promoted })
+    Ok(MutationOutcome::Deleted {
+        freed,
+        promoted_latest: promoted,
+    })
 }
 
 fn claim_multipart(conn: &Connection, upload_id: &cairn_types::UploadId) -> R<MutationOutcome> {
@@ -527,4 +600,3 @@ fn config_aspect_str(a: cairn_types::bucket::ConfigAspect) -> &'static str {
 pub fn aspect_str(a: cairn_types::bucket::ConfigAspect) -> &'static str {
     config_aspect_str(a)
 }
-

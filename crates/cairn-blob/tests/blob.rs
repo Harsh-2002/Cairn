@@ -1,0 +1,261 @@
+//! Gate tests for the local blob store: durable round-trips, compression fidelity and ETag
+//! invariance, range reads against compressed blobs, the incompressibility heuristic, the size
+//! ceiling, multipart assembly, path safety, and bounded reconciliation.
+
+use bytes::Bytes;
+use cairn_blob::LocalBlobStore;
+use cairn_types::bucket::{CompressionAlgorithm, CompressionPolicy};
+use cairn_types::testing::SetReconcileOracle;
+use cairn_types::*;
+
+fn body(data: Vec<u8>) -> BodyStream {
+    Box::pin(futures_util::stream::once(
+        async move { Ok(Bytes::from(data)) },
+    ))
+}
+
+/// A body delivered in several chunks, to exercise the streaming/compression boundary logic.
+fn chunked_body(data: Vec<u8>, chunk: usize) -> BodyStream {
+    let chunks: Vec<Bytes> = data
+        .chunks(chunk.max(1))
+        .map(Bytes::copy_from_slice)
+        .collect();
+    Box::pin(futures_util::stream::iter(chunks.into_iter().map(Ok)))
+}
+
+fn opts(compression: Option<CompressionPolicy>, content_type: &str) -> StageOptions {
+    StageOptions {
+        compression,
+        extra_checksums: ChecksumSet::none(),
+        size_ceiling: 100 * 1024 * 1024,
+        content_type: content_type.to_owned(),
+    }
+}
+
+async fn read_all(store: &LocalBlobStore, path: &StoragePath, range: Option<ByteRange>) -> Vec<u8> {
+    use futures_util::StreamExt;
+    let handle = store.open(path, range).await.unwrap();
+    let mut out = Vec::new();
+    let mut body = handle.body;
+    while let Some(c) = body.next().await {
+        out.extend_from_slice(&c.unwrap());
+    }
+    out
+}
+
+#[tokio::test]
+async fn uncompressed_roundtrip_and_etag() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let b = BucketName::parse("bkt").unwrap();
+    let staged = store
+        .stage(&b, body(b"hello world".to_vec()), opts(None, "text/plain"))
+        .await
+        .unwrap();
+    assert_eq!(staged.etag.as_str(), "5eb63bbbe01eeed093cb22bb8f5acdc3"); // md5("hello world")
+    assert_eq!(staged.size_logical, 11);
+    assert!(matches!(
+        staged.compression,
+        CompressionDescriptor::Uncompressed
+    ));
+    assert_eq!(
+        read_all(&store, &staged.storage_path, None).await,
+        b"hello world"
+    );
+    // The uncompressed path exposes a zero-copy hint.
+    let handle = store.open(&staged.storage_path, None).await.unwrap();
+    assert!(handle.zero_copy.is_some());
+}
+
+#[tokio::test]
+async fn compression_is_transparent_and_etag_invariant() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let b = BucketName::parse("bkt").unwrap();
+    let data: Vec<u8> = b"the quick brown fox "
+        .iter()
+        .copied()
+        .cycle()
+        .take(10_000)
+        .collect();
+    let policy = CompressionPolicy {
+        algorithm: CompressionAlgorithm::Zstd,
+        block_size: 1024,
+    };
+
+    let plain = store
+        .stage(&b, body(data.clone()), opts(None, "text/plain"))
+        .await
+        .unwrap();
+    let comp = store
+        .stage(
+            &b,
+            chunked_body(data.clone(), 333),
+            opts(Some(policy), "text/plain"),
+        )
+        .await
+        .unwrap();
+
+    // ETag is the plaintext MD5 either way (ARCH §10.2).
+    assert_eq!(plain.etag.as_str(), comp.etag.as_str());
+    assert!(matches!(
+        comp.compression,
+        CompressionDescriptor::Compressed { .. }
+    ));
+    // Compressible data shrinks on disk.
+    assert!(comp.size_physical < comp.size_logical);
+    assert_eq!(comp.size_logical, data.len() as u64);
+
+    // Full read is transparent.
+    assert_eq!(read_all(&store, &comp.storage_path, None).await, data);
+    // A range starting mid-block near the end (the case block compression exists for).
+    let range = ByteRange {
+        offset: 5000,
+        length: 1234,
+    };
+    assert_eq!(
+        read_all(&store, &comp.storage_path, Some(range)).await,
+        &data[5000..6234]
+    );
+    // A compressed read offers no zero-copy hint.
+    assert!(
+        store
+            .open(&comp.storage_path, Some(range))
+            .await
+            .unwrap()
+            .zero_copy
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn precompressed_content_type_stored_raw() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let b = BucketName::parse("bkt").unwrap();
+    let policy = CompressionPolicy {
+        algorithm: CompressionAlgorithm::Zstd,
+        block_size: 1024,
+    };
+    // Even with a compression policy, image/* is stored uncompressed.
+    let staged = store
+        .stage(&b, body(vec![1u8; 5000]), opts(Some(policy), "image/jpeg"))
+        .await
+        .unwrap();
+    assert!(matches!(
+        staged.compression,
+        CompressionDescriptor::Uncompressed
+    ));
+}
+
+#[tokio::test]
+async fn size_ceiling_aborts() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let b = BucketName::parse("bkt").unwrap();
+    let mut o = opts(None, "application/octet-stream");
+    o.size_ceiling = 100;
+    let err = store.stage(&b, body(vec![0u8; 500]), o).await.unwrap_err();
+    assert!(matches!(err, BlobError::SizeExceeded));
+    // The aborted staging artifact is cleaned up.
+    let staging = dir.path().join(".staging");
+    let mut count = 0;
+    let mut rd = tokio::fs::read_dir(&staging).await.unwrap();
+    while let Some(e) = rd.next_entry().await.unwrap() {
+        if e.file_type().await.unwrap().is_file() {
+            count += 1;
+        }
+    }
+    assert_eq!(count, 0, "staging temp file removed on failure");
+}
+
+#[tokio::test]
+async fn multipart_assembly_roundtrip() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let b = BucketName::parse("bkt").unwrap();
+    let upload = UploadId::generate();
+    let p1 = store
+        .stage_part(&upload, 1, body(b"part-one-".to_vec()), 1 << 20)
+        .await
+        .unwrap();
+    let p2 = store
+        .stage_part(&upload, 2, body(b"part-two".to_vec()), 1 << 20)
+        .await
+        .unwrap();
+    let refs = vec![
+        PartRef {
+            part_number: 1,
+            storage_path: p1.storage_path.clone(),
+            size: p1.size,
+        },
+        PartRef {
+            part_number: 2,
+            storage_path: p2.storage_path.clone(),
+            size: p2.size,
+        },
+    ];
+    let assembled = store
+        .assemble(&b, &refs, opts(None, "text/plain"))
+        .await
+        .unwrap();
+    assert_eq!(assembled.size_logical, (p1.size + p2.size));
+    assert_eq!(
+        read_all(&store, &assembled.storage_path, None).await,
+        b"part-one-part-two"
+    );
+    store.delete_session(&upload).await.unwrap();
+    store.delete_session(&upload).await.unwrap(); // idempotent
+}
+
+#[tokio::test]
+async fn reconcile_reclaims_orphans_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let b = BucketName::parse("bkt").unwrap();
+    let keep = store
+        .stage(&b, body(b"keep".to_vec()), opts(None, "text/plain"))
+        .await
+        .unwrap();
+    let orphan = store
+        .stage(&b, body(b"orphan".to_vec()), opts(None, "text/plain"))
+        .await
+        .unwrap();
+
+    // The oracle says only `keep` is referenced by metadata.
+    let mut live = std::collections::HashSet::new();
+    live.insert(keep.storage_path.as_str().to_owned());
+    let oracle = SetReconcileOracle {
+        live_paths: live,
+        live_uploads: Default::default(),
+    };
+
+    let report = store
+        .reconcile(&oracle, ReconcileOpts::default())
+        .await
+        .unwrap();
+    assert_eq!(report.orphans_reclaimed, 1);
+    // keep is still readable, orphan is gone.
+    assert_eq!(read_all(&store, &keep.storage_path, None).await, b"keep");
+    assert!(matches!(
+        store.open(&orphan.storage_path, None).await,
+        Err(BlobError::NotFound)
+    ));
+}
+
+#[tokio::test]
+async fn delete_is_idempotent_and_paths_are_safe() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let b = BucketName::parse("bkt").unwrap();
+    let staged = store
+        .stage(&b, body(b"x".to_vec()), opts(None, "text/plain"))
+        .await
+        .unwrap();
+    store.delete(&staged.storage_path).await.unwrap();
+    store.delete(&staged.storage_path).await.unwrap(); // idempotent: absence is success
+
+    // A traversal path is rejected structurally.
+    let evil = StoragePath::from_string("../../../etc/passwd".to_owned());
+    assert!(store.open(&evil, None).await.is_err());
+}

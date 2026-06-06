@@ -11,9 +11,9 @@ mod schema;
 mod store;
 mod writer;
 
+use cairn_types::MetaError;
 use cairn_types::id::{StoragePath, UploadId};
 use cairn_types::traits::ReconcileOracle;
-use cairn_types::MetaError;
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::Connection;
@@ -79,7 +79,11 @@ pub fn open(db_path: &Path, opts: &OpenOptions) -> Result<SqliteMetadataStore, M
         .execute_batch(&format!(
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous={};",
-            if opts.synchronous_full { "FULL" } else { "NORMAL" }
+            if opts.synchronous_full {
+                "FULL"
+            } else {
+                "NORMAL"
+            }
         ))
         .map_err(map)?;
     apply_common_pragmas(&write_conn, opts).map_err(map)?;
@@ -108,12 +112,17 @@ pub fn open(db_path: &Path, opts: &OpenOptions) -> Result<SqliteMetadataStore, M
 pub fn open_in_memory() -> Result<SqliteMetadataStore, MetaError> {
     // A uniquely-named shared-cache in-memory DB so the write conn and read pool see the same
     // data. Randomised to isolate concurrent tests.
-    let name = format!("file:cairn-mem-{}?mode=memory&cache=shared", uuid::Uuid::new_v4().simple());
+    let name = format!(
+        "file:cairn-mem-{}?mode=memory&cache=shared",
+        uuid::Uuid::new_v4().simple()
+    );
     let map = |e: rusqlite::Error| MetaError::Engine(e.to_string());
     let flags = rusqlite::OpenFlags::default() | rusqlite::OpenFlags::SQLITE_OPEN_URI;
 
     let write_conn = Connection::open_with_flags(&name, flags).map_err(map)?;
-    write_conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;").map_err(map)?;
+    write_conn
+        .execute_batch("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;")
+        .map_err(map)?;
     schema::run_migrations(&write_conn).map_err(map)?;
     let writer = Writer::spawn(write_conn, None);
 
@@ -131,7 +140,9 @@ impl SqliteMetadataStore {
     /// A reconciliation oracle backed by this store, for the blob store's `reconcile`.
     #[must_use]
     pub fn reconcile_oracle(&self) -> SqliteReconcileOracle {
-        SqliteReconcileOracle { pool: self.pool.clone() }
+        SqliteReconcileOracle {
+            pool: self.pool.clone(),
+        }
     }
 }
 
@@ -143,7 +154,8 @@ pub struct SqliteReconcileOracle {
 
 impl std::fmt::Debug for SqliteReconcileOracle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SqliteReconcileOracle").finish_non_exhaustive()
+        f.debug_struct("SqliteReconcileOracle")
+            .finish_non_exhaustive()
     }
 }
 
@@ -155,7 +167,9 @@ impl ReconcileOracle for SqliteReconcileOracle {
         tokio::task::spawn_blocking(move || {
             let conn = pool.get().map_err(|e| MetaError::Engine(e.to_string()))?;
             let mut stmt = conn
-                .prepare_cached("SELECT EXISTS(SELECT 1 FROM object_versions WHERE storage_path=?1)")
+                .prepare_cached(
+                    "SELECT EXISTS(SELECT 1 FROM object_versions WHERE storage_path=?1)",
+                )
                 .map_err(|e| MetaError::Engine(e.to_string()))?;
             paths
                 .iter()

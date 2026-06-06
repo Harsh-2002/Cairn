@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc eb506362e67c9cbb0173199f7a1ccff3ebad2c305a547c406d04edde0f622254 # shrinks to mut input = AuthzInput { requester: Anonymous, action: GetObject, resource: Object { bucket: BucketName(my-bucket), key: ObjectKey(photos/a.jpg) }, bucket_owner: UserId(owner), account_bpa: PublicAccessBlock { block_public_acls: false, ignore_public_acls: true, block_public_policy: false, restrict_public_buckets: false }, bucket_bpa: PublicAccessBlock { block_public_acls: false, ignore_public_acls: false, block_public_policy: false, restrict_public_buckets: false }, policy: None, bucket_acl: None, object_acl: Some(Acl { owner: UserId(owner), grants: [Grant { grantee: User(UserId(owner)), permission: FullControl }, Grant { grantee: AllUsers, permission: Read }] }), ownership_mode: BucketOwnerPreferred, context: RequestContext { source: 10.0.0.5, secure_transport: true, referer: None, user_agent: Some("aws-cli/2.0"), now: Timestamp(1700000000000ms), prefix: None, delimiter: None, max_keys: None, canned_acl: None, content_sha256: None, version_id: None, existing_tags: [], request_tags: [] } }

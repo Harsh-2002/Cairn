@@ -5,8 +5,8 @@
 //! then acknowledges every caller whose mutation was in that batch.
 
 use crate::apply::apply;
-use cairn_types::meta::{Mutation, MutationOutcome};
 use cairn_types::MetaError;
+use cairn_types::meta::{Mutation, MutationOutcome};
 use rusqlite::Connection;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
@@ -38,7 +38,10 @@ impl Writer {
     /// been made durable.
     pub async fn submit(&self, mutation: Mutation) -> Result<MutationOutcome, MetaError> {
         let (ack_tx, ack_rx) = oneshot::channel();
-        self.tx.send((mutation, ack_tx)).await.map_err(|_| MetaError::WriterClosed)?;
+        self.tx
+            .send((mutation, ack_tx))
+            .await
+            .map_err(|_| MetaError::WriterClosed)?;
         ack_rx.await.map_err(|_| MetaError::WriterClosed)?
     }
 }
@@ -91,7 +94,10 @@ fn commit_batch(conn: &Connection, batch: Vec<WriteRequest>) {
     for (idx, (mutation, ack)) in batch.into_iter().enumerate() {
         let sp = format!("sp{idx}");
         if conn.execute_batch(&format!("SAVEPOINT {sp}")).is_err() {
-            acks.push((ack, Err(MetaError::Engine("failed to open savepoint".to_owned()))));
+            acks.push((
+                ack,
+                Err(MetaError::Engine("failed to open savepoint".to_owned())),
+            ));
             continue;
         }
         match apply(conn, mutation) {

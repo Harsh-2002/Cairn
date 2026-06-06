@@ -151,8 +151,11 @@ pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
             applied_at INTEGER NOT NULL
         );",
     )?;
-    let applied: i64 = conn
-        .query_row("SELECT COALESCE(MAX(version), 0) FROM schema_migrations", [], |r| r.get(0))?;
+    let applied: i64 = conn.query_row(
+        "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+        [],
+        |r| r.get(0),
+    )?;
     for m in MIGRATIONS {
         if m.version <= applied {
             continue;

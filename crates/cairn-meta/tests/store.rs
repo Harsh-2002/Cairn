@@ -6,7 +6,13 @@ use cairn_types::object::{CompressionDescriptor, ETag, ObjectVersionRow, Storage
 use cairn_types::traits::{MetadataStore, ReconcileOracle};
 use cairn_types::*;
 
-fn row(bucket: &BucketName, key: &str, version: VersionId, etag: &str, with_blob: bool) -> ObjectVersionRow {
+fn row(
+    bucket: &BucketName,
+    key: &str,
+    version: VersionId,
+    etag: &str,
+    with_blob: bool,
+) -> ObjectVersionRow {
     ObjectVersionRow {
         id: uuid::Uuid::new_v4().simple().to_string(),
         bucket: bucket.clone(),
@@ -33,7 +39,11 @@ fn row(bucket: &BucketName, key: &str, version: VersionId, etag: &str, with_blob
 }
 
 fn put(row: ObjectVersionRow, pc: Precondition) -> Mutation {
-    Mutation::PutObjectVersion { row: Box::new(row), precondition: pc, replication: None }
+    Mutation::PutObjectVersion {
+        row: Box::new(row),
+        precondition: pc,
+        replication: None,
+    }
 }
 
 #[tokio::test]
@@ -41,7 +51,13 @@ async fn put_is_visible_only_after_commit() {
     let store = cairn_meta::open_in_memory().unwrap();
     let b = BucketName::parse("bkt").unwrap();
     let k = ObjectKey::parse("k").unwrap();
-    store.submit(put(row(&b, "k", VersionId::null(), "e1", true), Precondition::default())).await.unwrap();
+    store
+        .submit(put(
+            row(&b, "k", VersionId::null(), "e1", true),
+            Precondition::default(),
+        ))
+        .await
+        .unwrap();
     // The submit future only resolved after the commit, so the row is immediately visible.
     let got = store.current_version(&b, &k).await.unwrap().unwrap();
     assert_eq!(got.etag.as_str(), "e1");
@@ -51,13 +67,22 @@ async fn put_is_visible_only_after_commit() {
 async fn conditional_write_atomic() {
     let store = cairn_meta::open_in_memory().unwrap();
     let b = BucketName::parse("bkt").unwrap();
-    store.submit(put(row(&b, "k", VersionId::null(), "e1", true), Precondition::default())).await.unwrap();
+    store
+        .submit(put(
+            row(&b, "k", VersionId::null(), "e1", true),
+            Precondition::default(),
+        ))
+        .await
+        .unwrap();
 
     // If-None-Match: * must fail now that the object exists.
     let err = store
         .submit(put(
             row(&b, "k", VersionId::null(), "e2", true),
-            Precondition { if_match: None, if_none_match: Some(IfNoneMatch::Any) },
+            Precondition {
+                if_match: None,
+                if_none_match: Some(IfNoneMatch::Any),
+            },
         ))
         .await
         .unwrap_err();
@@ -67,11 +92,23 @@ async fn conditional_write_atomic() {
     store
         .submit(put(
             row(&b, "k", VersionId::null(), "e3", true),
-            Precondition { if_match: Some(ETag::from_string("e1".into())), if_none_match: None },
+            Precondition {
+                if_match: Some(ETag::from_string("e1".into())),
+                if_none_match: None,
+            },
         ))
         .await
         .unwrap();
-    assert_eq!(store.current_version(&b, &ObjectKey::parse("k").unwrap()).await.unwrap().unwrap().etag.as_str(), "e3");
+    assert_eq!(
+        store
+            .current_version(&b, &ObjectKey::parse("k").unwrap())
+            .await
+            .unwrap()
+            .unwrap()
+            .etag
+            .as_str(),
+        "e3"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -79,7 +116,13 @@ async fn group_commit_isolates_failed_mutations() {
     let store = cairn_meta::open_in_memory().unwrap();
     let b = BucketName::parse("bkt").unwrap();
     // Seed one object so the failing precondition has something to collide with.
-    store.submit(put(row(&b, "exists", VersionId::null(), "e", true), Precondition::default())).await.unwrap();
+    store
+        .submit(put(
+            row(&b, "exists", VersionId::null(), "e", true),
+            Precondition::default(),
+        ))
+        .await
+        .unwrap();
 
     // Fire many concurrent submits: 49 distinct successful puts + 1 doomed conditional put.
     let mut handles = Vec::new();
@@ -87,8 +130,11 @@ async fn group_commit_isolates_failed_mutations() {
         let s = store.clone();
         let bb = b.clone();
         handles.push(tokio::spawn(async move {
-            s.submit(put(row(&bb, &format!("k{i:03}"), VersionId::null(), "e", true), Precondition::default()))
-                .await
+            s.submit(put(
+                row(&bb, &format!("k{i:03}"), VersionId::null(), "e", true),
+                Precondition::default(),
+            ))
+            .await
         }));
     }
     let s = store.clone();
@@ -96,7 +142,10 @@ async fn group_commit_isolates_failed_mutations() {
     let doomed = tokio::spawn(async move {
         s.submit(put(
             row(&bb, "exists", VersionId::null(), "e2", true),
-            Precondition { if_match: None, if_none_match: Some(IfNoneMatch::Any) },
+            Precondition {
+                if_match: None,
+                if_none_match: Some(IfNoneMatch::Any),
+            },
         ))
         .await
     });
@@ -104,11 +153,17 @@ async fn group_commit_isolates_failed_mutations() {
     for h in handles {
         h.await.unwrap().expect("distinct puts must all commit");
     }
-    assert!(matches!(doomed.await.unwrap(), Err(MetaError::PreconditionFailed)));
+    assert!(matches!(
+        doomed.await.unwrap(),
+        Err(MetaError::PreconditionFailed)
+    ));
 
     // The doomed mutation's rollback must not have touched its batch-mates: exactly 50 objects.
     let counts = store.aggregate_counts().await.unwrap();
-    assert_eq!(counts.objects, 50, "all successful puts committed, the failed one isolated");
+    assert_eq!(
+        counts.objects, 50,
+        "all successful puts committed, the failed one isolated"
+    );
 }
 
 #[tokio::test]
@@ -120,18 +175,59 @@ async fn versioning_history_and_promotion() {
     let v2 = VersionId::from_string("00000002".into());
     let v3 = VersionId::from_string("00000003".into());
     for v in [&v1, &v2, &v3] {
-        store.submit(put(row(&b, "doc", v.clone(), "e", true), Precondition::default())).await.unwrap();
+        store
+            .submit(put(
+                row(&b, "doc", v.clone(), "e", true),
+                Precondition::default(),
+            ))
+            .await
+            .unwrap();
     }
-    assert_eq!(store.current_version(&b, &k).await.unwrap().unwrap().version_id, v3);
+    assert_eq!(
+        store
+            .current_version(&b, &k)
+            .await
+            .unwrap()
+            .unwrap()
+            .version_id,
+        v3
+    );
 
     let del = store
-        .submit(Mutation::DeleteVersion { bucket: b.clone(), key: k.clone(), version_id: v3.clone() })
+        .submit(Mutation::DeleteVersion {
+            bucket: b.clone(),
+            key: k.clone(),
+            version_id: v3.clone(),
+        })
         .await
         .unwrap();
-    assert!(matches!(del, MutationOutcome::Deleted { promoted_latest: true, .. }));
-    assert_eq!(store.current_version(&b, &k).await.unwrap().unwrap().version_id, v2);
+    assert!(matches!(
+        del,
+        MutationOutcome::Deleted {
+            promoted_latest: true,
+            ..
+        }
+    ));
+    assert_eq!(
+        store
+            .current_version(&b, &k)
+            .await
+            .unwrap()
+            .unwrap()
+            .version_id,
+        v2
+    );
 
-    let all = store.list_versions(&b, &ListQuery { limit: 100, ..Default::default() }).await.unwrap();
+    let all = store
+        .list_versions(
+            &b,
+            &ListQuery {
+                limit: 100,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     assert_eq!(all.items.len(), 2);
 }
 
@@ -140,14 +236,24 @@ async fn listing_prefix_delimiter_and_pagination() {
     let store = cairn_meta::open_in_memory().unwrap();
     let b = BucketName::parse("bkt").unwrap();
     for k in ["a/1", "a/2", "a/3", "b/1", "c"] {
-        store.submit(put(row(&b, k, VersionId::null(), "e", true), Precondition::default())).await.unwrap();
+        store
+            .submit(put(
+                row(&b, k, VersionId::null(), "e", true),
+                Precondition::default(),
+            ))
+            .await
+            .unwrap();
     }
 
     // Delimiter groups a/* and b/* into common prefixes; c is a direct object.
     let page = store
         .list_current(
             &b,
-            &ListQuery { delimiter: Some("/".into()), limit: 100, ..Default::default() },
+            &ListQuery {
+                delimiter: Some("/".into()),
+                limit: 100,
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -157,7 +263,14 @@ async fn listing_prefix_delimiter_and_pagination() {
 
     // Prefix a/ with no delimiter returns the three objects.
     let page = store
-        .list_current(&b, &ListQuery { prefix: Some("a/".into()), limit: 100, ..Default::default() })
+        .list_current(
+            &b,
+            &ListQuery {
+                prefix: Some("a/".into()),
+                limit: 100,
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
     assert_eq!(page.items.len(), 3);
@@ -167,7 +280,14 @@ async fn listing_prefix_delimiter_and_pagination() {
     let mut cursor = None;
     loop {
         let page = store
-            .list_current(&b, &ListQuery { cursor: cursor.clone(), limit: 2, ..Default::default() })
+            .list_current(
+                &b,
+                &ListQuery {
+                    cursor: cursor.clone(),
+                    limit: 2,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         all.extend(page.items.iter().map(|i| i.key.as_str().to_owned()));
@@ -206,7 +326,13 @@ async fn create_bucket_conflict() {
         region: "us-east-1".to_owned(),
         compression: None,
     };
-    store.submit(Mutation::CreateBucket(Box::new(bucket.clone()))).await.unwrap();
-    let err = store.submit(Mutation::CreateBucket(Box::new(bucket))).await.unwrap_err();
+    store
+        .submit(Mutation::CreateBucket(Box::new(bucket.clone())))
+        .await
+        .unwrap();
+    let err = store
+        .submit(Mutation::CreateBucket(Box::new(bucket)))
+        .await
+        .unwrap_err();
     assert!(matches!(err, MetaError::Conflict));
 }

@@ -1,6 +1,7 @@
 //! Conversions between SQL rows and domain types, and the enum<->text mappings. Complex
 //! fields (compression descriptor, user metadata, ACL, checksums) are stored as JSON.
 
+use cairn_types::auth::Role;
 use cairn_types::authz::{Acl, OwnershipMode};
 use cairn_types::bucket::{Bucket, CompressionPolicy, VersioningState};
 use cairn_types::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
@@ -11,7 +12,6 @@ use cairn_types::meta::{
 use cairn_types::object::{
     ChecksumValue, CompressionDescriptor, ETag, ObjectVersionRow, StorageClass, UserMetadata,
 };
-use cairn_types::auth::Role;
 use cairn_types::time::Timestamp;
 use rusqlite::Row;
 use rusqlite::types::Type;
@@ -162,7 +162,9 @@ pub fn object_version_from_row(row: &Row) -> rusqlite::Result<ObjectVersionRow> 
         size_physical: row.get::<_, i64>("size_physical")? as u64,
         etag: ETag::from_string(row.get("etag")?),
         content_type: row.get("content_type")?,
-        storage_path: row.get::<_, Option<String>>("storage_path")?.map(StoragePath::from_string),
+        storage_path: row
+            .get::<_, Option<String>>("storage_path")?
+            .map(StoragePath::from_string),
         compression,
         storage_class: storage_class_from(&row.get::<_, String>("storage_class")?),
         cold_locator: row.get("cold_locator")?,
@@ -193,11 +195,11 @@ pub fn object_summary_from_row(row: &Row) -> rusqlite::Result<ObjectSummary> {
 }
 
 pub fn bucket_from_row(row: &Row) -> rusqlite::Result<Bucket> {
-    let compression: Option<CompressionPolicy> = match row.get::<_, Option<String>>("compression")?
-    {
-        Some(s) => Some(json_col(&s)?),
-        None => None,
-    };
+    let compression: Option<CompressionPolicy> =
+        match row.get::<_, Option<String>>("compression")? {
+            Some(s) => Some(json_col(&s)?),
+            None => None,
+        };
     Ok(Bucket {
         name: BucketName::parse(&row.get::<_, String>("name")?)
             .unwrap_or_else(|_| unreachable_bucket()),
@@ -259,7 +261,10 @@ pub fn user_from_row(row: &Row) -> rusqlite::Result<User> {
 }
 
 pub fn user_with_bearer_from_row(row: &Row) -> rusqlite::Result<UserWithBearerHash> {
-    Ok(UserWithBearerHash { user: user_from_row(row)?, secret_hash: row.get("secret_hash")? })
+    Ok(UserWithBearerHash {
+        user: user_from_row(row)?,
+        secret_hash: row.get("secret_hash")?,
+    })
 }
 
 pub fn user_sigv4_from_row(row: &Row) -> rusqlite::Result<Option<UserSigV4Credentials>> {
