@@ -1,0 +1,23 @@
+[package]
+name = "cairn-s3-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+cairn-s3 = { path = ".." }
+
+[[bin]]
+name = "chunked_decoder"
+path = "fuzz_targets/chunked_decoder.rs"
+test = false
+doc = false
+bench = false
+
+# Detach from the parent workspace; cargo-fuzz builds this with a nightly toolchain.
+[workspace]
