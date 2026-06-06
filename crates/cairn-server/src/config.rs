@@ -41,6 +41,11 @@ pub struct Config {
     pub request_timeout_secs: u64,
     /// Hard per-object size ceiling, in bytes.
     pub max_object_size: u64,
+    /// The region label returned by the location operation and used in SigV4 scope checks.
+    pub region: String,
+    /// The 32-byte master key (64 hex chars) for envelope-encrypting secrets at rest. Required
+    /// in production; absent, a fixed development key is used (insecure, for local testing).
+    pub master_key: Option<String>,
     /// Log verbosity filter (e.g. `info`, `cairn=debug`).
     pub log_level: String,
     /// Log output format.
@@ -61,6 +66,8 @@ impl Default for Config {
             concurrency_limit: 1024,
             request_timeout_secs: 300,
             max_object_size: 5 * 1024 * 1024 * 1024 * 1024, // 5 TiB
+            region: "us-east-1".to_owned(),
+            master_key: None,
             log_level: "info".to_owned(),
             log_format: LogFormat::Text,
             dev_auth: false,

@@ -58,21 +58,23 @@ impl S3Service {
         }
     }
 
-    /// Handle a routed request, translating any error to an S3 XML error response.
-    pub async fn handle(&self, req: S3Request) -> S3Response {
+    /// Handle a routed request, translating any error to an S3 XML error response. The body is
+    /// passed separately from the request head so the head stays `Sync` for borrowing across
+    /// awaits; only body-consuming operations (object PUT) receive it.
+    pub async fn handle(&self, req: S3Request, body: cairn_types::BodyStream) -> S3Response {
         let request_id = req.request_id.clone();
         let resource = resource_path(&req);
-        match self.dispatch(req).await {
+        match self.dispatch(req, body).await {
             Ok(resp) => resp,
             Err(e) => error_response(&e, &resource, &request_id),
         }
     }
 
-    async fn dispatch(&self, req: S3Request) -> Result<S3Response> {
+    async fn dispatch(&self, req: S3Request, body: cairn_types::BodyStream) -> Result<S3Response> {
         match (&req.method, req.bucket.is_some(), req.key.is_some()) {
             (&Method::GET, false, _) => self.list_buckets(&req).await,
             (_, true, false) => self.bucket_op(req).await,
-            (_, true, true) => self.object_op(req).await,
+            (_, true, true) => self.object_op(req, body).await,
             _ => Err(Error::NotImplemented),
         }
     }
@@ -88,9 +90,9 @@ impl S3Service {
         }
     }
 
-    async fn object_op(&self, req: S3Request) -> Result<S3Response> {
+    async fn object_op(&self, req: S3Request, body: cairn_types::BodyStream) -> Result<S3Response> {
         match req.method {
-            Method::PUT => self.put_object(req).await,
+            Method::PUT => self.put_object(req, body).await,
             Method::GET => self.get_object(&req).await,
             Method::HEAD => self.head_object(&req).await,
             Method::DELETE => self.delete_object(&req).await,
@@ -213,7 +215,11 @@ impl S3Service {
 
     // --- object operations ---
 
-    async fn put_object(&self, req: S3Request) -> Result<S3Response> {
+    async fn put_object(
+        &self,
+        req: S3Request,
+        raw_body: cairn_types::BodyStream,
+    ) -> Result<S3Response> {
         let bucket = self.authorized_bucket_owned(&req).await?;
         let key = req.key.clone().expect("key present");
 
@@ -241,9 +247,9 @@ impl S3Service {
             .unwrap_or(false);
         let request_id = req.request_id.clone();
         let body = if streaming {
-            decode_stream(req.body, ChunkDecoder::unsigned(self.max_object_size))
+            decode_stream(raw_body, ChunkDecoder::unsigned(self.max_object_size))
         } else {
-            req.body
+            raw_body
         };
 
         let opts = StageOptions {

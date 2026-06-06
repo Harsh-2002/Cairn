@@ -27,8 +27,6 @@ pub struct S3Request {
     pub secure: bool,
     /// A correlation id echoed in the response and error documents.
     pub request_id: String,
-    /// The raw request body (the handler applies chunk decoding where signalled).
-    pub body: cairn_types::BodyStream,
 }
 
 impl S3Request {

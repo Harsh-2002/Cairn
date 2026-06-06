@@ -48,8 +48,8 @@ fn req(
     query: &[(&str, &str)],
     headers: &[(&str, &str)],
     body: Vec<u8>,
-) -> S3Request {
-    S3Request {
+) -> (S3Request, cairn_types::BodyStream) {
+    let request = S3Request {
         method,
         bucket: bucket.map(|b| BucketName::parse(b).unwrap()),
         key: key.map(|k| ObjectKey::parse(k).unwrap()),
@@ -65,10 +65,16 @@ fn req(
         source: IpAddr::V4(Ipv4Addr::LOCALHOST),
         secure: false,
         request_id: "req-1".to_owned(),
-        body: Box::pin(futures_util::stream::once(
+    };
+    let body: cairn_types::BodyStream =
+        Box::pin(futures_util::stream::once(
             async move { Ok(Bytes::from(body)) },
-        )),
-    }
+        ));
+    (request, body)
+}
+
+async fn send(svc: &S3Service, parts: (S3Request, cairn_types::BodyStream)) -> S3Response {
+    svc.handle(parts.0, parts.1).await
 }
 
 async fn drain(resp: S3Response) -> (StatusCode, Vec<(String, String)>, Vec<u8>) {
@@ -97,18 +103,22 @@ async fn full_object_lifecycle() {
 
     // Create bucket.
     let (st, _, _) = drain(
-        h.svc
-            .handle(req(Method::PUT, Some("my-bucket"), None, &[], &[], vec![]))
-            .await,
+        send(
+            &h.svc,
+            req(Method::PUT, Some("my-bucket"), None, &[], &[], vec![]),
+        )
+        .await,
     )
     .await;
     assert_eq!(st, StatusCode::OK);
 
     // Duplicate create -> 409.
     let (st, _, _) = drain(
-        h.svc
-            .handle(req(Method::PUT, Some("my-bucket"), None, &[], &[], vec![]))
-            .await,
+        send(
+            &h.svc,
+            req(Method::PUT, Some("my-bucket"), None, &[], &[], vec![]),
+        )
+        .await,
     )
     .await;
     assert_eq!(st, StatusCode::CONFLICT);
@@ -122,7 +132,7 @@ async fn full_object_lifecycle() {
         &[("content-type", "text/plain")],
         b"hello world".to_vec(),
     );
-    let (st, hdrs, _) = drain(h.svc.handle(put).await).await;
+    let (st, hdrs, _) = drain(send(&h.svc, put).await).await;
     assert_eq!(st, StatusCode::OK);
     assert_eq!(
         header(&hdrs, "etag"),
@@ -131,16 +141,18 @@ async fn full_object_lifecycle() {
 
     // GET it back.
     let (st, hdrs, body) = drain(
-        h.svc
-            .handle(req(
+        send(
+            &h.svc,
+            req(
                 Method::GET,
                 Some("my-bucket"),
                 Some("docs/a.txt"),
                 &[],
                 &[],
                 vec![],
-            ))
-            .await,
+            ),
+        )
+        .await,
     )
     .await;
     assert_eq!(st, StatusCode::OK);
@@ -150,16 +162,18 @@ async fn full_object_lifecycle() {
 
     // HEAD.
     let (st, hdrs, body) = drain(
-        h.svc
-            .handle(req(
+        send(
+            &h.svc,
+            req(
                 Method::HEAD,
                 Some("my-bucket"),
                 Some("docs/a.txt"),
                 &[],
                 &[],
                 vec![],
-            ))
-            .await,
+            ),
+        )
+        .await,
     )
     .await;
     assert_eq!(st, StatusCode::OK);
@@ -168,16 +182,18 @@ async fn full_object_lifecycle() {
 
     // Ranged GET -> 206.
     let (st, hdrs, body) = drain(
-        h.svc
-            .handle(req(
+        send(
+            &h.svc,
+            req(
                 Method::GET,
                 Some("my-bucket"),
                 Some("docs/a.txt"),
                 &[],
                 &[("range", "bytes=0-4")],
                 vec![],
-            ))
-            .await,
+            ),
+        )
+        .await,
     )
     .await;
     assert_eq!(st, StatusCode::PARTIAL_CONTENT);
@@ -186,32 +202,36 @@ async fn full_object_lifecycle() {
 
     // Conditional If-None-Match with the current ETag -> 304.
     let (st, _, _) = drain(
-        h.svc
-            .handle(req(
+        send(
+            &h.svc,
+            req(
                 Method::GET,
                 Some("my-bucket"),
                 Some("docs/a.txt"),
                 &[],
                 &[("if-none-match", "\"5eb63bbbe01eeed093cb22bb8f5acdc3\"")],
                 vec![],
-            ))
-            .await,
+            ),
+        )
+        .await,
     )
     .await;
     assert_eq!(st, StatusCode::NOT_MODIFIED);
 
     // LIST objects (v2).
     let (st, _, body) = drain(
-        h.svc
-            .handle(req(
+        send(
+            &h.svc,
+            req(
                 Method::GET,
                 Some("my-bucket"),
                 None,
                 &[("list-type", "2")],
                 &[],
                 vec![],
-            ))
-            .await,
+            ),
+        )
+        .await,
     )
     .await;
     assert_eq!(st, StatusCode::OK);
@@ -220,32 +240,36 @@ async fn full_object_lifecycle() {
 
     // DELETE.
     let (st, _, _) = drain(
-        h.svc
-            .handle(req(
+        send(
+            &h.svc,
+            req(
                 Method::DELETE,
                 Some("my-bucket"),
                 Some("docs/a.txt"),
                 &[],
                 &[],
                 vec![],
-            ))
-            .await,
+            ),
+        )
+        .await,
     )
     .await;
     assert_eq!(st, StatusCode::NO_CONTENT);
 
     // GET after delete -> 404.
     let (st, _, _) = drain(
-        h.svc
-            .handle(req(
+        send(
+            &h.svc,
+            req(
                 Method::GET,
                 Some("my-bucket"),
                 Some("docs/a.txt"),
                 &[],
                 &[],
                 vec![],
-            ))
-            .await,
+            ),
+        )
+        .await,
     )
     .await;
     assert_eq!(st, StatusCode::NOT_FOUND);
@@ -255,9 +279,11 @@ async fn full_object_lifecycle() {
 async fn streaming_chunked_put_is_deframed() {
     let h = harness().await;
     drain(
-        h.svc
-            .handle(req(Method::PUT, Some("strm"), None, &[], &[], vec![]))
-            .await,
+        send(
+            &h.svc,
+            req(Method::PUT, Some("strm"), None, &[], &[], vec![]),
+        )
+        .await,
     )
     .await;
 
@@ -282,23 +308,18 @@ async fn streaming_chunked_put_is_deframed() {
         ],
         chunked,
     );
-    let (st, hdrs, _) = drain(h.svc.handle(put).await).await;
+    let (st, hdrs, _) = drain(send(&h.svc, put).await).await;
     assert_eq!(st, StatusCode::OK);
     // ETag is the MD5 of the DE-FRAMED plaintext, not the framed body.
     let want_etag = format!("\"{}\"", md5_hex(payload));
     assert_eq!(header(&hdrs, "etag"), Some(want_etag.as_str()));
 
     let (st, _, body) = drain(
-        h.svc
-            .handle(req(
-                Method::GET,
-                Some("strm"),
-                Some("obj"),
-                &[],
-                &[],
-                vec![],
-            ))
-            .await,
+        send(
+            &h.svc,
+            req(Method::GET, Some("strm"), Some("obj"), &[], &[], vec![]),
+        )
+        .await,
     )
     .await;
     assert_eq!(st, StatusCode::OK);

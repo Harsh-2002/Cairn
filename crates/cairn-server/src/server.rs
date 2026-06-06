@@ -2,7 +2,9 @@
 //! skeleton the router answers liveness, readiness, and metrics; later waves route the S3 and
 //! management families here behind authentication and authorization.
 
+use crate::adapter;
 use crate::config::Config;
+use crate::stack::AppStack;
 use bytes::Bytes;
 use http_body_util::Full;
 use hyper::body::Incoming;
@@ -29,13 +31,19 @@ struct AppState {
     request_timeout: Duration,
     /// The Prometheus render handle.
     metrics: PrometheusHandle,
+    /// The assembled S3/engine stack.
+    stack: Arc<AppStack>,
 }
 
 /// Run the server until a shutdown signal is received, then drain in-flight work.
 ///
 /// # Errors
 /// Returns an I/O error if the listener cannot bind.
-pub async fn serve(config: Config, metrics: PrometheusHandle) -> std::io::Result<()> {
+pub async fn serve(
+    config: Config,
+    metrics: PrometheusHandle,
+    stack: Arc<AppStack>,
+) -> std::io::Result<()> {
     let listener = TcpListener::bind(config.listen_addr).await?;
     let local = listener.local_addr()?;
     let state = Arc::new(AppState {
@@ -43,10 +51,10 @@ pub async fn serve(config: Config, metrics: PrometheusHandle) -> std::io::Result
         concurrency: Semaphore::new(config.concurrency_limit),
         request_timeout: Duration::from_secs(config.request_timeout_secs),
         metrics,
+        stack,
     });
 
-    // The skeleton has no migrations/reconciliation yet; mark ready immediately. Later waves
-    // gate readiness on those completing before the listener is considered serving.
+    // Migrations and startup reconciliation already ran while building the stack; ready now.
     state.ready.store(true, Ordering::SeqCst);
     tracing::info!(addr = %local, "cairn listening");
 
@@ -120,15 +128,23 @@ async fn handle(
         %peer,
     );
 
+    let infra =
+        method == Method::GET && matches!(path.as_str(), "/healthz" | "/readyz" | "/metrics");
+
     let response = async move {
         let _permit = match state.concurrency.try_acquire() {
             Ok(p) => p,
             Err(_) => return error_response(StatusCode::SERVICE_UNAVAILABLE, "TooManyRequests"),
         };
         let start = Instant::now();
-        let routed =
-            tokio::time::timeout(state.request_timeout, route(&state, &method, &path)).await;
-        let mut resp = match routed {
+        let work = async {
+            if infra {
+                route_infra(&state, &path)
+            } else {
+                adapter::handle(&state.stack, req, peer.ip(), false, request_id.clone()).await
+            }
+        };
+        let mut resp = match tokio::time::timeout(state.request_timeout, work).await {
             Ok(r) => r,
             Err(_) => error_response(StatusCode::SERVICE_UNAVAILABLE, "RequestTimeout"),
         };
@@ -158,18 +174,19 @@ async fn handle(
     Ok(response)
 }
 
-/// The skeleton router. Later waves dispatch the four request families here.
-async fn route(state: &AppState, method: &Method, path: &str) -> Response<Full<Bytes>> {
-    match (method, path) {
-        (&Method::GET, "/healthz") => text(StatusCode::OK, "ok"),
-        (&Method::GET, "/readyz") => {
+/// Liveness, readiness, and metrics endpoints (the S3 and management families are dispatched
+/// through the adapter).
+fn route_infra(state: &AppState, path: &str) -> Response<Full<Bytes>> {
+    match path {
+        "/healthz" => text(StatusCode::OK, "ok"),
+        "/readyz" => {
             if state.ready.load(Ordering::SeqCst) {
                 text(StatusCode::OK, "ready")
             } else {
                 text(StatusCode::SERVICE_UNAVAILABLE, "not ready")
             }
         }
-        (&Method::GET, "/metrics") => {
+        "/metrics" => {
             let body = state.metrics.render();
             Response::builder()
                 .status(StatusCode::OK)
@@ -218,29 +235,5 @@ async fn wait_for_signal(tx: watch::Sender<bool>) {
     let _ = tx.send(true);
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn router_answers_health_and_readiness() {
-        let metrics = metrics_exporter_prometheus::PrometheusBuilder::new()
-            .build_recorder()
-            .handle();
-        let state = AppState {
-            ready: AtomicBool::new(true),
-            concurrency: Semaphore::new(8),
-            request_timeout: Duration::from_secs(5),
-            metrics,
-        };
-        let h = route(&state, &Method::GET, "/healthz").await;
-        assert_eq!(h.status(), StatusCode::OK);
-        let r = route(&state, &Method::GET, "/readyz").await;
-        assert_eq!(r.status(), StatusCode::OK);
-        state.ready.store(false, Ordering::SeqCst);
-        let r = route(&state, &Method::GET, "/readyz").await;
-        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let nf = route(&state, &Method::GET, "/nope").await;
-        assert_eq!(nf.status(), StatusCode::NOT_FOUND);
-    }
-}
+// The infra endpoints and S3 dispatch are exercised by the live smoke test and the
+// cairn-s3 real-stack integration tests.

@@ -16,6 +16,12 @@ path = "src/main.rs"
 
 [dependencies]
 cairn-types.workspace = true
+cairn-s3.workspace = true
+cairn-meta.workspace = true
+cairn-blob.workspace = true
+cairn-crypto.workspace = true
+cairn-auth.workspace = true
+cairn-authz.workspace = true
 
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "signal", "macros", "time", "sync", "io-util"] }
 hyper = { workspace = true, features = ["server", "http1", "http2"] }

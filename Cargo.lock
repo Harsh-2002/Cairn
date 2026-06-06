@@ -312,6 +312,12 @@ name = "cairn-server"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "cairn-auth",
+ "cairn-authz",
+ "cairn-blob",
+ "cairn-crypto",
+ "cairn-meta",
+ "cairn-s3",
  "cairn-types",
  "clap",
  "figment",
