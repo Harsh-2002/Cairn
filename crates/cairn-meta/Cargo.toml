@@ -1,0 +1,28 @@
+[package]
+name = "cairn-meta"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "SQLite metadata store for Cairn: single group-committing writer + WAL read pool."
+
+[lints]
+workspace = true
+
+[dependencies]
+cairn-types.workspace = true
+async-trait.workspace = true
+rusqlite = { workspace = true, features = ["bundled"] }
+r2d2.workspace = true
+r2d2_sqlite.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "macros"] }
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+cairn-types = { workspace = true, features = ["testing"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+tempfile.workspace = true
+proptest.workspace = true
