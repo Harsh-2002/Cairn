@@ -1,0 +1,34 @@
+[package]
+name = "cairn-types"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Shared domain types, error tree, and the trait spine for Cairn."
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+futures-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+
+# Only pulled in for the in-memory doubles.
+futures-util = { workspace = true, optional = true }
+md-5 = { workspace = true, optional = true }
+hex = { workspace = true, optional = true }
+
+[features]
+# Canonical in-memory test doubles for every trait. Enabled by downstream crates
+# as a dev-dependency so the whole engine is unit-testable without disk or sqlite.
+testing = ["dep:futures-util", "dep:md-5", "dep:hex"]
+
+[dev-dependencies]
+cairn-types = { path = ".", features = ["testing"] }
+futures-util.workspace = true
+tokio = { workspace = true, features = ["rt", "macros"] }

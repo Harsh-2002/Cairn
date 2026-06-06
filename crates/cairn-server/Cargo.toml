@@ -1,0 +1,40 @@
+[package]
+name = "cairn-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The Cairn server binary: wiring, HTTP stack, middleware, and lifecycle."
+default-run = "cairn"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "cairn"
+path = "src/main.rs"
+
+[dependencies]
+cairn-types.workspace = true
+
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "signal", "macros", "time", "sync", "io-util"] }
+hyper = { workspace = true, features = ["server", "http1", "http2"] }
+hyper-util = { workspace = true, features = ["tokio", "server-auto", "service"] }
+http.workspace = true
+http-body-util.workspace = true
+bytes.workspace = true
+futures-util = { workspace = true, features = ["std"] }
+
+clap.workspace = true
+figment.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+tracing.workspace = true
+tracing-subscriber.workspace = true
+metrics.workspace = true
+metrics-exporter-prometheus.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }

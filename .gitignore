@@ -1,0 +1,13 @@
+/target
+/reference
+**/*.rs.bk
+*.profraw
+/ui/node_modules
+/ui/dist
+.DS_Store
+/data
+*.db
+*.db-wal
+*.db-shm
+fuzz/target
+fuzz/corpus

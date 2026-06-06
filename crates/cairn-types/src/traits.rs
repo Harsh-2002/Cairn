@@ -1,0 +1,291 @@
+//! The trait spine (ARCH §12). The protocol and control layers depend only on these
+//! interfaces; every concrete backend (`cairn-meta`, `cairn-blob`, `cairn-crypto`,
+//! `cairn-auth`, `cairn-authz`, `cairn-replication`) is replaceable, and the whole engine
+//! is unit-testable against the in-memory doubles in [`crate::testing`].
+//!
+//! Async methods use `#[async_trait]` so the traits stay object-safe (dyn-compatible) and
+//! their futures are `Send` on the multi-threaded runtime; the per-call boxing is negligible
+//! against disk/network I/O. Zero-copy of object *bytes* is handled by the [`BlobReadHandle`]
+//! fast-path hint, not by the control-flow futures.
+
+use crate::auth::{AuthOutcome, RequestView};
+use crate::authz::{AuthzInput, Decision, PublicAccessBlock};
+use crate::blob::{
+    BlobReadHandle, ByteRange, PartRef, ReconcileOpts, ReconcileReport, StageOptions, StagedBlob,
+    StagedPart,
+};
+use crate::bucket::{Bucket, ConfigAspect, ConfigDoc};
+use crate::crypto::{Nonce, Sealed, Signature};
+use crate::error::{BlobError, CryptoError, MetaError, ReplicationError};
+use crate::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
+use crate::meta::{
+    ActivityEntry, ListPage, ListQuery, MultipartSession, Mutation, MutationOutcome, ObjectSummary,
+    OutboxEntry, PartRecord, ReplicationStatus, StoreCounts, User, UserSigV4Credentials,
+    UserWithBearerHash,
+};
+use crate::object::ObjectVersionRow;
+use crate::replication::ReplicatedObject;
+use crate::time::Timestamp;
+use async_trait::async_trait;
+
+/// The blob store owns object bytes on some medium and knows nothing of S3, identity, or
+/// metadata. The local-filesystem implementation lives in `cairn-blob` and is the only place
+/// that performs filesystem syscalls; the durable commit sequence (fsync file → rename →
+/// fsync dir) is its invariant.
+#[async_trait]
+pub trait BlobStore: Send + Sync {
+    /// Stage a single object durably from a body stream, computing the plaintext MD5 and any
+    /// requested checksums, applying compression, and enforcing the size ceiling. On `Ok` the
+    /// blob is durable. Writes no metadata; does not verify client checksums.
+    async fn stage(
+        &self,
+        bucket: &BucketName,
+        body: crate::BodyStream,
+        opts: StageOptions,
+    ) -> Result<StagedBlob, BlobError>;
+
+    /// Open a committed blob for reading, transparently decompressing, optionally for a range
+    /// expressed in logical (plaintext) coordinates.
+    async fn open(
+        &self,
+        path: &StoragePath,
+        range: Option<ByteRange>,
+    ) -> Result<BlobReadHandle, BlobError>;
+
+    /// Idempotently delete a committed blob (absence is success).
+    async fn delete(&self, path: &StoragePath) -> Result<(), BlobError>;
+
+    /// Stage one multipart part durably, reporting its plaintext size and MD5.
+    async fn stage_part(
+        &self,
+        upload: &UploadId,
+        part_number: u16,
+        body: crate::BodyStream,
+        size_ceiling: u64,
+    ) -> Result<StagedPart, BlobError>;
+
+    /// Assemble ordered parts into one durably-committed blob, applying compression during
+    /// the assembly pass.
+    async fn assemble(
+        &self,
+        bucket: &BucketName,
+        parts: &[PartRef],
+        opts: StageOptions,
+    ) -> Result<StagedBlob, BlobError>;
+
+    /// Idempotently delete all of a session's staged parts.
+    async fn delete_session(&self, upload: &UploadId) -> Result<(), BlobError>;
+
+    /// Reconcile on-disk blobs against the metadata, reclaiming orphans. Bounded in memory:
+    /// it streams the filesystem and consults the batched membership `oracle`.
+    async fn reconcile(
+        &self,
+        oracle: &dyn ReconcileOracle,
+        opts: ReconcileOpts,
+    ) -> Result<ReconcileReport, BlobError>;
+}
+
+/// A bounded membership oracle for reconciliation: tells the blob store which storage paths
+/// and upload sessions the metadata still references, without materializing the keyspace.
+#[async_trait]
+pub trait ReconcileOracle: Send + Sync {
+    /// For each candidate path, whether a metadata row references it.
+    async fn live_blobs(&self, candidates: &[StoragePath]) -> Result<Vec<bool>, MetaError>;
+
+    /// Whether an upload session still exists.
+    async fn live_session(&self, upload: &UploadId) -> Result<bool, MetaError>;
+}
+
+/// The source-of-truth metadata store. All writes go through [`submit`](MetadataStore::submit)
+/// (the single group-committing writer); all reads use the snapshot read pool. Every
+/// enumeration is paged and bounded.
+#[async_trait]
+pub trait MetadataStore: Send + Sync {
+    /// Submit a mutation to the group-committing writer. The returned future resolves only
+    /// after the batch containing this mutation has been made durable.
+    async fn submit(&self, mutation: Mutation) -> Result<MutationOutcome, MetaError>;
+
+    // --- buckets ---
+    /// Look up a bucket.
+    async fn get_bucket(&self, name: &BucketName) -> Result<Option<Bucket>, MetaError>;
+    /// List buckets, optionally only those owned by `owner`.
+    async fn list_buckets(&self, owner: Option<&UserId>) -> Result<Vec<Bucket>, MetaError>;
+    /// Get a bucket configuration aspect document.
+    async fn get_bucket_config(
+        &self,
+        name: &BucketName,
+        aspect: ConfigAspect,
+    ) -> Result<Option<ConfigDoc>, MetaError>;
+    /// Get the account-wide Block Public Access singleton.
+    async fn get_account_public_access_block(&self) -> Result<PublicAccessBlock, MetaError>;
+    /// Whether the bucket has no current objects (for delete).
+    async fn is_bucket_empty(&self, name: &BucketName) -> Result<bool, MetaError>;
+
+    // --- object versions ---
+    /// Get the current version of a key (None if absent or hidden by a delete marker handled
+    /// by the caller).
+    async fn current_version(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<Option<ObjectVersionRow>, MetaError>;
+    /// Get a specific version.
+    async fn get_version(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version: &VersionId,
+    ) -> Result<Option<ObjectVersionRow>, MetaError>;
+    /// Page current objects under a prefix (half-open range seek), excluding delete markers.
+    async fn list_current(
+        &self,
+        bucket: &BucketName,
+        query: &ListQuery,
+    ) -> Result<ListPage<ObjectSummary>, MetaError>;
+    /// Page all versions and delete markers under a prefix.
+    async fn list_versions(
+        &self,
+        bucket: &BucketName,
+        query: &ListQuery,
+    ) -> Result<ListPage<ObjectSummary>, MetaError>;
+    /// Page storage paths for reconciliation and force-empty (bounded).
+    async fn enumerate_storage_paths(
+        &self,
+        bucket: &BucketName,
+        cursor: Option<&str>,
+        batch: u32,
+    ) -> Result<ListPage<StoragePath>, MetaError>;
+    /// Get an object version's tags.
+    async fn get_object_tags(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version: &VersionId,
+    ) -> Result<Vec<(String, String)>, MetaError>;
+
+    // --- multipart ---
+    /// Get a multipart session.
+    async fn get_multipart(&self, upload: &UploadId)
+    -> Result<Option<MultipartSession>, MetaError>;
+    /// List a session's parts (after `part_number_marker`).
+    async fn list_parts(
+        &self,
+        upload: &UploadId,
+        part_number_marker: u16,
+        limit: u32,
+    ) -> Result<ListPage<PartRecord>, MetaError>;
+    /// List active multipart uploads under a prefix.
+    async fn list_multipart_uploads(
+        &self,
+        bucket: &BucketName,
+        query: &ListQuery,
+    ) -> Result<ListPage<MultipartSession>, MetaError>;
+    /// Page sessions older than `older_than` for the sweeper.
+    async fn enumerate_stale_sessions(
+        &self,
+        older_than: Timestamp,
+        batch: u32,
+    ) -> Result<Vec<MultipartSession>, MetaError>;
+
+    // --- replication ---
+    /// Get an object version's replication status.
+    async fn object_replication_status(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version: &VersionId,
+    ) -> Result<Option<ReplicationStatus>, MetaError>;
+    /// Claim a batch of due replication entries (a write; routed through the writer
+    /// internally by the implementation, exposed here for the worker pool).
+    async fn claim_replication_batch(
+        &self,
+        limit: u32,
+        now: Timestamp,
+    ) -> Result<Vec<OutboxEntry>, MetaError>;
+
+    // --- users ---
+    /// Look up a user by Bearer access-key id (returns the stored secret hash).
+    async fn user_by_bearer_key(
+        &self,
+        access_key_id: &str,
+    ) -> Result<Option<UserWithBearerHash>, MetaError>;
+    /// Look up a user by SigV4 access-key id (returns the encrypted secret).
+    async fn user_by_sigv4_key(
+        &self,
+        access_key_id: &str,
+    ) -> Result<Option<UserSigV4Credentials>, MetaError>;
+    /// Count users (for bootstrap gating).
+    async fn count_users(&self) -> Result<u64, MetaError>;
+    /// List all users.
+    async fn list_users(&self) -> Result<Vec<User>, MetaError>;
+
+    // --- audit & aggregates ---
+    /// List recent activity (most recent first), up to `limit`.
+    async fn list_activity(&self, limit: u32) -> Result<Vec<ActivityEntry>, MetaError>;
+    /// Aggregate store counts.
+    async fn aggregate_counts(&self) -> Result<StoreCounts, MetaError>;
+}
+
+/// An authenticator examines a library-neutral request view and yields one of three
+/// outcomes. Implementations are composed into an ordered chain whose first applicable
+/// outcome decides (ARCH §12.3, §14).
+#[async_trait]
+pub trait Authenticator: Send + Sync {
+    /// Attempt authentication.
+    async fn authenticate(&self, view: &RequestView<'_>) -> AuthOutcome;
+}
+
+/// The authorization engine: a pure function from fetched inputs to an allow/deny decision,
+/// with the fixed evaluation order of ARCH §15.3. No I/O.
+pub trait AuthorizationEngine: Send + Sync {
+    /// Evaluate a request.
+    fn evaluate(&self, input: &AuthzInput) -> Decision;
+}
+
+/// A replication destination abstracted as an S3-compatible client. A fake sink in tests
+/// records intents and can simulate retryable/terminal failures.
+#[async_trait]
+pub trait ReplicationSink: Send + Sync {
+    /// Put an object with its metadata, tags, and ACL as the rule dictates.
+    async fn put_object(&self, object: ReplicatedObject) -> Result<(), ReplicationError>;
+
+    /// Propagate a deletion or delete marker.
+    async fn delete_marker(
+        &self,
+        key: &ObjectKey,
+        version: &VersionId,
+    ) -> Result<(), ReplicationError>;
+}
+
+/// The cryptography facility: envelope encryption of secrets at rest and constant-time
+/// comparison. Key handling is isolated here.
+pub trait Crypto: Send + Sync {
+    /// Envelope-encrypt a secret under the master key.
+    fn seal(&self, plaintext: &[u8]) -> Result<Sealed, CryptoError>;
+    /// Decrypt a sealed secret (the plaintext is returned in a zeroizing container by the
+    /// implementation).
+    fn open(&self, ciphertext: &[u8], nonce: &Nonce) -> Result<Vec<u8>, CryptoError>;
+    /// Constant-time byte comparison.
+    fn ct_eq(&self, a: &[u8], b: &[u8]) -> bool;
+}
+
+/// The clock, injected wherever time governs behaviour so it is tested deterministically.
+pub trait Clock: Send + Sync {
+    /// The current time.
+    fn now(&self) -> Timestamp;
+}
+
+/// Signing and verification of Cairn's signed public-read URLs (a Cairn extension).
+pub trait PublicUrl: Send + Sync {
+    /// Sign a public-read URL over the method, escaped path, and expiry.
+    fn sign(&self, method: &str, escaped_path: &str, expiry: Timestamp) -> Signature;
+    /// Verify a signed public-read URL in constant time, including the expiry check.
+    fn verify(
+        &self,
+        method: &str,
+        escaped_path: &str,
+        expiry: Timestamp,
+        signature: &Signature,
+        now: Timestamp,
+    ) -> bool;
+}
