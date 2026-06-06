@@ -12,10 +12,35 @@ UI, and a CLI — shipped as **one static binary**.
 
 ## Status
 
-Built wave by wave against ARCH §32. **Wave 0 (seam freeze) is complete**: the workspace, the
-trait spine (`cairn-types`), the canonical in-memory test doubles, and the server skeleton
-(HTTP stack, middleware, health/readiness/metrics, config validation, graceful shutdown) all
-build — including a verified static `musl` binary — and the gate tests pass.
+Built wave by wave against ARCH §32. **Cairn already runs as an S3 server.**
+
+- **Wave 0 (seam freeze)** — complete: workspace, the 8-trait spine (`cairn-types`), in-memory
+  test doubles, server skeleton (HTTP stack, middleware, health/readiness/metrics, config
+  validation, graceful shutdown), CI, and a verified static `musl` binary.
+- **Wave 1 (foundations)** — complete: `cairn-meta` (group-committing SQLite writer + WAL read
+  pool), `cairn-blob` (durable commit + block compression + reconcile), `cairn-auth` (SigV4 +
+  Bearer, AWS `get-vanilla` vector), `cairn-crypto`, `cairn-authz` (policy/ACL/BPA engine),
+  `cairn-xml`.
+- **Wave 2 (protocol core)** — in progress: the SigV4 streaming **chunked decoder** (F-5) with
+  fuzz target; the S3 service (bucket CRUD; object PUT/GET/HEAD/DELETE with ranges, conditionals,
+  streaming uploads, listing); wired into the binary with `cairn bootstrap`. **Remaining:**
+  multipart, copy, bulk-delete, and the aws-sdk-s3 conformance matrix.
+
+~190 tests pass; `clippy -D warnings` and `rustfmt` are clean.
+
+### Try it
+
+```sh
+cargo build --bin cairn
+export CAIRN_DATA_DIR=/tmp/cairn CAIRN_DB_PATH=/tmp/cairn/cairn.db
+export CAIRN_MASTER_KEY=$(openssl rand -hex 32)
+./target/debug/cairn bootstrap          # prints admin credentials once
+./target/debug/cairn serve &            # serves on 127.0.0.1:9000
+AUTH="Authorization: Bearer <id>.<secret>"   # from bootstrap output
+curl -X PUT -H "$AUTH" http://127.0.0.1:9000/my-bucket
+curl -X PUT -H "$AUTH" --data-binary "hello cairn" http://127.0.0.1:9000/my-bucket/hi.txt
+curl -H "$AUTH" http://127.0.0.1:9000/my-bucket/hi.txt     # -> hello cairn
+```
 
 ## Workspace layout
 
