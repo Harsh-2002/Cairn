@@ -1,0 +1,28 @@
+[package]
+name = "cairn-auth"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Authentication for Cairn: SigV4 (header + presigned + streaming), Bearer, dev chain."
+
+[lints]
+workspace = true
+
+[features]
+# Compiles the development authentication bypass into the build (loopback-guarded). Release
+# builds omit this feature so the bypass cannot ship.
+dev-auth = []
+
+[dependencies]
+cairn-types.workspace = true
+async-trait.workspace = true
+sha2.workspace = true
+sha1.workspace = true
+hmac.workspace = true
+hex.workspace = true
+subtle.workspace = true
+
+[dev-dependencies]
+cairn-types = { workspace = true, features = ["testing"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
