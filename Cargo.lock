@@ -341,6 +341,7 @@ dependencies = [
  "cairn-authz",
  "cairn-blob",
  "cairn-crypto",
+ "cairn-lifecycle",
  "cairn-meta",
  "cairn-s3",
  "cairn-types",

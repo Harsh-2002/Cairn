@@ -56,6 +56,14 @@ pub async fn serve(
 
     // Migrations and startup reconciliation already ran while building the stack; ready now.
     state.ready.store(true, Ordering::SeqCst);
+
+    // Background subsystems: the multipart sweeper and the lifecycle scanner.
+    crate::background::spawn(
+        state.stack.clone(),
+        Duration::from_secs(3600),
+        86_400,
+        Duration::from_secs(3600),
+    );
     tracing::info!(addr = %local, "cairn listening");
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);

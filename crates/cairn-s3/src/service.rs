@@ -138,6 +138,38 @@ impl S3Service {
             Method::DELETE if req.has_query("policy") => {
                 self.clear_bucket_config(&req, ConfigAspect::Policy).await
             }
+            Method::GET if req.has_query("lifecycle") => {
+                self.get_bucket_doc(
+                    &req,
+                    ConfigAspect::Lifecycle,
+                    "NoSuchLifecycleConfiguration",
+                )
+                .await
+            }
+            Method::PUT if req.has_query("lifecycle") => {
+                self.put_bucket_config(req, body, ConfigAspect::Lifecycle)
+                    .await
+            }
+            Method::DELETE if req.has_query("lifecycle") => {
+                self.clear_bucket_config(&req, ConfigAspect::Lifecycle)
+                    .await
+            }
+            Method::GET if req.has_query("replication") => {
+                self.get_bucket_doc(
+                    &req,
+                    ConfigAspect::Replication,
+                    "ReplicationConfigurationNotFoundError",
+                )
+                .await
+            }
+            Method::PUT if req.has_query("replication") => {
+                self.put_bucket_config(req, body, ConfigAspect::Replication)
+                    .await
+            }
+            Method::DELETE if req.has_query("replication") => {
+                self.clear_bucket_config(&req, ConfigAspect::Replication)
+                    .await
+            }
             Method::PUT => self.create_bucket(&req).await,
             Method::DELETE => self.delete_bucket(&req).await,
             Method::HEAD => self.head_bucket(&req).await,
@@ -1300,10 +1332,14 @@ fn bucket_action(req: &S3Request) -> Result<Action> {
         Method::PUT if q("tagging") => PutBucketTagging,
         Method::PUT if q("cors") => PutBucketCors,
         Method::PUT if q("policy") => PutBucketPolicy,
+        Method::PUT if q("lifecycle") => PutLifecycleConfiguration,
+        Method::PUT if q("replication") => PutReplicationConfiguration,
         Method::PUT => CreateBucket,
         Method::DELETE if q("tagging") => PutBucketTagging,
         Method::DELETE if q("cors") => PutBucketCors,
         Method::DELETE if q("policy") => PutBucketPolicy,
+        Method::DELETE if q("lifecycle") => PutLifecycleConfiguration,
+        Method::DELETE if q("replication") => PutReplicationConfiguration,
         Method::DELETE => DeleteBucket,
         Method::HEAD => ListBucket,
         Method::GET if q("location") => GetBucketLocation,
@@ -1313,6 +1349,8 @@ fn bucket_action(req: &S3Request) -> Result<Action> {
         Method::GET if q("tagging") => GetBucketTagging,
         Method::GET if q("cors") => GetBucketCors,
         Method::GET if q("policy") => GetBucketPolicy,
+        Method::GET if q("lifecycle") => GetLifecycleConfiguration,
+        Method::GET if q("replication") => GetReplicationConfiguration,
         Method::POST if q("delete") => DeleteObject,
         Method::GET => ListBucket,
         _ => return Err(Error::NotImplemented),

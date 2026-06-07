@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 mod adapter;
+mod background;
 mod config;
 mod observability;
 mod server;
