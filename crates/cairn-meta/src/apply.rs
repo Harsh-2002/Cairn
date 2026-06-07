@@ -260,6 +260,25 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             .map_err(engine_err)?;
             Ok(MutationOutcome::Ack)
         }
+        Mutation::SetObjectAcl {
+            bucket,
+            key,
+            version_id,
+            acl,
+        } => {
+            // Replace the version row's `acl` JSON column; `None` stores SQL NULL (clears it).
+            conn.execute(
+                "UPDATE object_versions SET acl=?4 WHERE bucket_name=?1 AND key=?2 AND version_id=?3",
+                params![
+                    bucket.as_str(),
+                    key.as_str(),
+                    version_id.as_str(),
+                    acl.as_ref().map(to_json),
+                ],
+            )
+            .map_err(engine_err)?;
+            Ok(MutationOutcome::Ack)
+        }
         Mutation::CreateUser(rec) => {
             let c = model::user_record_columns(&rec);
             conn.execute(

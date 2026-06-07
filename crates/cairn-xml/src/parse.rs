@@ -7,7 +7,7 @@
 //! drive the reader through [`Sax`], which tracks element depth and rejects a body that
 //! reaches EOF with any element still open.
 
-use cairn_types::{Error, VersioningState};
+use cairn_types::{Acl, Error, Grant, Grantee, Permission, UserId, VersioningState};
 use quick_xml::Reader;
 use quick_xml::events::Event;
 
@@ -365,6 +365,126 @@ pub fn parse_cors_configuration(body: &[u8]) -> Result<Vec<CorsRule>, Error> {
         Ok(())
     })?;
     Ok(rules)
+}
+
+// ===========================================================================================
+// AccessControlPolicy (PutBucketAcl / PutObjectAcl request body)
+// ===========================================================================================
+
+/// Parse an S3 `<AccessControlPolicy>` body into an [`Acl`].
+///
+/// The document carries an `<Owner>` (whose `<ID>` becomes the ACL owner) and an
+/// `<AccessControlList>` of `<Grant>` elements. Each grant names a grantee and a permission:
+///
+/// - A `CanonicalUser` grantee is identified by its `<ID>` and maps to [`Grantee::User`].
+/// - A `Group` grantee is identified by its `<URI>`; the three well-known AWS group URIs map
+///   to [`Grantee::AllUsers`], [`Grantee::AuthenticatedUsers`] and [`Grantee::LogDelivery`].
+///
+/// The grantee kind is conveyed on the wire by the `xsi:type` attribute, but the SAX driver
+/// strips attributes, so the kind is inferred structurally from whether the grantee carries an
+/// `<ID>` (canonical user) or a `<URI>` (group) — which is unambiguous in well-formed S3 ACLs.
+///
+/// Permissions map from the S3 tokens `FULL_CONTROL`/`READ`/`WRITE`/`READ_ACP`/`WRITE_ACP`.
+///
+/// # Errors
+/// Returns [`Error::MalformedXml`] if the body is not well-formed, the `<Owner>` has no `<ID>`,
+/// a `<Grant>` lacks a grantee identity or permission, a group `<URI>` is unrecognized, or a
+/// `<Permission>` token is unknown.
+pub fn parse_access_control_policy(body: &[u8]) -> Result<Acl, Error> {
+    let mut owner_id: Option<String> = None;
+    let mut grants: Vec<Grant> = Vec::new();
+
+    // Nesting flags: an ACL is shallow, but a grantee `<ID>` must be told apart from the owner
+    // `<ID>`, so track whether we are inside the owner block versus a grant's grantee block.
+    let mut in_owner = false;
+    let mut in_grant = false;
+    let mut in_grantee = false;
+    let mut cur_field: Option<Vec<u8>> = None;
+
+    // Per-grant accumulators.
+    let mut grantee_id: Option<String> = None;
+    let mut grantee_uri: Option<String> = None;
+    let mut permission: Option<Permission> = None;
+
+    drive(body, |ev| {
+        match ev {
+            Sax::Open(name) => match name.as_slice() {
+                b"Owner" => in_owner = true,
+                b"Grant" => {
+                    in_grant = true;
+                    grantee_id = None;
+                    grantee_uri = None;
+                    permission = None;
+                }
+                b"Grantee" if in_grant => in_grantee = true,
+                _ => cur_field = Some(name),
+            },
+            Sax::Text(text) => {
+                if let Some(field) = &cur_field {
+                    match field.as_slice() {
+                        b"ID" if in_owner && !in_grantee => {
+                            owner_id = Some(text.trim().to_owned());
+                        }
+                        b"ID" if in_grantee => grantee_id = Some(text.trim().to_owned()),
+                        b"URI" if in_grantee => grantee_uri = Some(text.trim().to_owned()),
+                        b"Permission" if in_grant => {
+                            permission = Some(parse_permission(text.trim())?);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Sax::Close(name) => {
+                match name.as_slice() {
+                    b"Owner" => in_owner = false,
+                    b"Grantee" => in_grantee = false,
+                    b"Grant" => {
+                        let grantee = match (&grantee_id, &grantee_uri) {
+                            (Some(id), _) => Grantee::User(UserId(id.clone())),
+                            (None, Some(uri)) => parse_group_uri(uri)?,
+                            (None, None) => return Err(malformed()),
+                        };
+                        let perm = permission.take().ok_or_else(malformed)?;
+                        grants.push(Grant {
+                            grantee,
+                            permission: perm,
+                        });
+                        in_grant = false;
+                    }
+                    _ => {}
+                }
+                cur_field = None;
+            }
+        }
+        Ok(())
+    })?;
+
+    let owner = UserId(owner_id.ok_or_else(malformed)?);
+    Ok(Acl { owner, grants })
+}
+
+/// Map an S3 permission token to a [`Permission`].
+fn parse_permission(token: &str) -> Result<Permission, Error> {
+    match token {
+        "FULL_CONTROL" => Ok(Permission::FullControl),
+        "READ" => Ok(Permission::Read),
+        "WRITE" => Ok(Permission::Write),
+        "READ_ACP" => Ok(Permission::ReadAcp),
+        "WRITE_ACP" => Ok(Permission::WriteAcp),
+        _ => Err(malformed()),
+    }
+}
+
+/// Map a well-known AWS group URI to a group [`Grantee`].
+fn parse_group_uri(uri: &str) -> Result<Grantee, Error> {
+    match uri {
+        "http://acs.amazonaws.com/groups/global/AllUsers" => Ok(Grantee::AllUsers),
+        "http://acs.amazonaws.com/groups/global/AuthenticatedUsers" => {
+            Ok(Grantee::AuthenticatedUsers)
+        }
+        "http://acs.amazonaws.com/groups/s3/LogDelivery" => Ok(Grantee::LogDelivery),
+        _ => Err(malformed()),
+    }
 }
 
 /// Strip a single pair of surrounding ASCII double quotes from an ETag wire value.

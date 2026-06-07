@@ -162,6 +162,18 @@ pub enum Mutation {
         /// The version.
         version_id: VersionId,
     },
+    /// Set (or clear) an object version's ACL document (the `PutObjectAcl` commit point). The new
+    /// ACL replaces the version row's stored `acl` column; `None` clears it (ARCH §13.3/§15.4).
+    SetObjectAcl {
+        /// The bucket.
+        bucket: BucketName,
+        /// The key.
+        key: ObjectKey,
+        /// The version whose ACL is replaced.
+        version_id: VersionId,
+        /// The new ACL document, or `None` to clear it.
+        acl: Option<Acl>,
+    },
     /// Create a user (with credentials).
     CreateUser(Box<UserRecord>),
     /// Update a user's mutable fields.

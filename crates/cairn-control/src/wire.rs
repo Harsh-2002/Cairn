@@ -250,16 +250,15 @@ pub struct ActivityListResp {
 // ---------------------------------------------------------------------------------------
 
 /// `GET /buckets/{name}/config` response. Each aspect is the parsed JSON document the store
-/// holds for that aspect, or `null` when the aspect is unset. `quota_bytes` is `null` because
-/// the byte quota is enforced inside the writer's commit transaction and is not exposed as a
-/// readable config document by the trait spine (see the crate notes).
+/// holds for that aspect, or `null` when the aspect is unset. `quota_bytes` is the configured
+/// per-bucket byte quota (`null` when the bucket has no quota), read via `get_bucket_quota`.
 #[derive(Debug, Serialize)]
 pub struct BucketConfigResp {
     /// The versioning state.
     pub versioning: &'static str,
     /// The ownership mode.
     pub ownership_mode: &'static str,
-    /// The byte quota, if readable (always `null` over the current trait spine).
+    /// The configured per-bucket byte quota, or `null` when the bucket has no quota set.
     pub quota_bytes: Option<u64>,
     /// The bucket policy document, or `null`.
     pub policy: Option<Value>,

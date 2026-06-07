@@ -309,3 +309,219 @@ fn opts() -> StageOptions {
         content_type: "application/octet-stream".to_owned(),
     }
 }
+
+/// Plant one replication-outbox entry by committing a version that carries it, returning its id.
+async fn plant_outbox_entry(
+    meta: &InMemoryMetadataStore,
+    bucket: &BucketName,
+    key: &ObjectKey,
+    version: &VersionId,
+    id: &str,
+) {
+    let entry = cairn_types::meta::OutboxEntry {
+        id: id.to_owned(),
+        bucket: bucket.clone(),
+        key: key.clone(),
+        version_id: version.clone(),
+        operation: cairn_types::meta::ReplicationOp::ObjectCreate,
+        rule_id: "rule-1".to_owned(),
+        attempts: 0,
+        next_attempt_at: Timestamp::EPOCH,
+        status: cairn_types::meta::ReplicationStatus::Pending,
+        last_error: None,
+    };
+    let row = ObjectVersionRow {
+        id: uuid::Uuid::new_v4().simple().to_string(),
+        bucket: bucket.clone(),
+        key: key.clone(),
+        version_id: version.clone(),
+        is_latest: true,
+        is_delete_marker: false,
+        size_logical: 3,
+        size_physical: 3,
+        etag: cairn_types::object::ETag::from_string("e".to_owned()),
+        content_type: "text/plain".to_owned(),
+        storage_path: Some(StoragePath::from_string(format!(
+            "{}/{}",
+            bucket.as_str(),
+            version.as_str()
+        ))),
+        compression: CompressionDescriptor::Uncompressed,
+        storage_class: StorageClass::Standard,
+        cold_locator: None,
+        owner_id: UserId::generate(),
+        user_metadata: Vec::new(),
+        acl: None,
+        checksums: Vec::new(),
+        replication_status: Some(cairn_types::meta::ReplicationStatus::Pending),
+        created_at: Timestamp::EPOCH,
+        updated_at: Timestamp::EPOCH,
+    };
+    meta.submit(Mutation::PutObjectVersion {
+        row: Box::new(row),
+        precondition: Precondition::default(),
+        replication: Some(entry),
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn list_failed_replication_returns_only_terminal_entries() {
+    let meta = InMemoryMetadataStore::new();
+    let bucket = BucketName::parse("repl-bucket").unwrap();
+    let key = ObjectKey::parse("k").unwrap();
+    let v1 = VersionId::from_string("00000001".to_owned());
+    let v2 = VersionId::from_string("00000002".to_owned());
+
+    // Two outbox entries: one we will leave pending, one we will mark terminally failed.
+    plant_outbox_entry(&meta, &bucket, &key, &v1, "pending-1").await;
+    plant_outbox_entry(&meta, &bucket, &key, &v2, "doomed-1").await;
+
+    // Nothing has failed yet.
+    assert!(meta.list_failed_replication(100).await.unwrap().is_empty());
+
+    // Mark the second entry terminal (next_attempt_at = None per the engine's terminal marking).
+    meta.submit(Mutation::MarkReplicationFailed {
+        id: "doomed-1".to_owned(),
+        error: "destination unreachable".to_owned(),
+        next_attempt_at: None,
+    })
+    .await
+    .unwrap();
+
+    let failed = meta.list_failed_replication(100).await.unwrap();
+    assert_eq!(failed.len(), 1, "only the terminal entry is reported");
+    assert_eq!(failed[0].id, "doomed-1");
+    assert_eq!(failed[0].version_id, v2);
+    assert_eq!(failed[0].attempts, 1);
+    assert_eq!(
+        failed[0].last_error.as_deref(),
+        Some("destination unreachable")
+    );
+
+    // A retryable failure (next_attempt_at = Some) is NOT terminal and must not be listed.
+    meta.submit(Mutation::MarkReplicationFailed {
+        id: "pending-1".to_owned(),
+        error: "transient".to_owned(),
+        next_attempt_at: Some(Timestamp::from_secs(60)),
+    })
+    .await
+    .unwrap();
+    let failed = meta.list_failed_replication(100).await.unwrap();
+    assert_eq!(
+        failed.len(),
+        1,
+        "the retryable entry stays out of the failed list"
+    );
+    assert_eq!(failed[0].id, "doomed-1");
+
+    // The limit is honoured.
+    assert!(meta.list_failed_replication(0).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn get_bucket_quota_round_trips_set_and_clear() {
+    let meta = InMemoryMetadataStore::new();
+    let bucket = BucketName::parse("quota-bucket").unwrap();
+
+    // No quota set initially.
+    assert_eq!(meta.get_bucket_quota(&bucket).await.unwrap(), None);
+
+    // Setting a quota is readable back.
+    meta.submit(Mutation::SetBucketQuota {
+        bucket: bucket.clone(),
+        quota_bytes: Some(1_048_576),
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        meta.get_bucket_quota(&bucket).await.unwrap(),
+        Some(1_048_576)
+    );
+
+    // Clearing it (None) returns to unlimited.
+    meta.submit(Mutation::SetBucketQuota {
+        bucket: bucket.clone(),
+        quota_bytes: None,
+    })
+    .await
+    .unwrap();
+    assert_eq!(meta.get_bucket_quota(&bucket).await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn set_object_acl_replaces_the_version_acl() {
+    use cairn_types::authz::{Acl, Grant, Grantee, Permission};
+
+    let blob = InMemoryBlobStore::new();
+    let meta = InMemoryMetadataStore::new();
+    let bucket = BucketName::parse("acl-bucket").unwrap();
+    let key = ObjectKey::parse("obj").unwrap();
+    let owner = UserId::generate();
+
+    let staged = blob.stage(&bucket, body(b"data"), opts()).await.unwrap();
+    let version = VersionId::null();
+    let row = row_from(
+        &staged,
+        &bucket,
+        &key,
+        version.clone(),
+        &owner,
+        Timestamp::EPOCH,
+    );
+    meta.submit(Mutation::PutObjectVersion {
+        row: Box::new(row),
+        precondition: Precondition::default(),
+        replication: None,
+    })
+    .await
+    .unwrap();
+
+    // The freshly-put object has no ACL.
+    let got = meta
+        .get_version(&bucket, &key, &version)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(got.acl.is_none());
+
+    // Setting an ACL replaces the version's `acl` column.
+    let acl = Acl {
+        owner: owner.clone(),
+        grants: vec![Grant {
+            grantee: Grantee::AllUsers,
+            permission: Permission::Read,
+        }],
+    };
+    meta.submit(Mutation::SetObjectAcl {
+        bucket: bucket.clone(),
+        key: key.clone(),
+        version_id: version.clone(),
+        acl: Some(acl.clone()),
+    })
+    .await
+    .unwrap();
+    let got = meta
+        .get_version(&bucket, &key, &version)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(got.acl, Some(acl));
+
+    // Clearing it (None) removes the ACL again.
+    meta.submit(Mutation::SetObjectAcl {
+        bucket: bucket.clone(),
+        key: key.clone(),
+        version_id: version.clone(),
+        acl: None,
+    })
+    .await
+    .unwrap();
+    let got = meta
+        .get_version(&bucket, &key, &version)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(got.acl.is_none());
+}

@@ -4,13 +4,13 @@
 
 use super::*;
 use crate::parse::{
-    CorsRule, parse_complete_multipart, parse_cors_configuration, parse_delete, parse_tagging,
-    parse_versioning_configuration,
+    CorsRule, parse_access_control_policy, parse_complete_multipart, parse_cors_configuration,
+    parse_delete, parse_tagging, parse_versioning_configuration,
 };
 use cairn_types::{
-    Bucket, BucketName, ETag, ListPage, MultipartSession, MultipartStatus, ObjectKey,
-    ObjectSummary, OwnershipMode, PartRecord, StorageClass, StoragePath, Timestamp, UploadId,
-    UserId, VersionId, VersioningState,
+    Bucket, BucketName, ChecksumAlgorithm, ChecksumValue, ETag, Grantee, ListPage,
+    MultipartSession, MultipartStatus, ObjectKey, ObjectSummary, OwnershipMode, PartRecord,
+    Permission, StorageClass, StoragePath, Timestamp, UploadId, UserId, VersionId, VersioningState,
 };
 
 // -------------------------------------------------------------------------------------------
@@ -216,6 +216,53 @@ fn copy_object_result_shape() {
 }
 
 #[test]
+fn copy_part_result_shape() {
+    let etag = ETag::from_md5_hex("beef".to_owned());
+    let xml = copy_part_result(&etag, Timestamp(1_750_000_000_000));
+    assert!(xml.contains("<CopyPartResult"));
+    assert!(xml.contains("<ETag>&quot;beef&quot;</ETag>"));
+    assert!(xml.contains("<LastModified>2025-"));
+}
+
+#[test]
+fn get_object_attributes_single_part() {
+    let etag = ETag::from_md5_hex("d41d8cd9".to_owned());
+    let xml = get_object_attributes(&etag, 1234, StorageClass::Standard, &[], None);
+    // The ETag is rendered UNQUOTED for GetObjectAttributes.
+    assert!(xml.contains("<ETag>d41d8cd9</ETag>"), "{xml}");
+    assert!(xml.contains("<ObjectSize>1234</ObjectSize>"));
+    assert!(xml.contains("<StorageClass>STANDARD</StorageClass>"));
+    // No checksum block and no ObjectParts for a single-part object with no checksums.
+    assert!(!xml.contains("<Checksum>"));
+    assert!(!xml.contains("<ObjectParts>"));
+}
+
+#[test]
+fn get_object_attributes_with_checksum_and_parts() {
+    let etag = ETag::from_md5_hex("abc-2".to_owned());
+    let checksums = vec![ChecksumValue {
+        algorithm: ChecksumAlgorithm::Crc32c,
+        value: "AAAAAA==".to_owned(),
+    }];
+    let parts: Vec<(u16, u64)> = vec![(1, 5_242_880), (2, 8)];
+    let xml = get_object_attributes(
+        &etag,
+        5_242_888,
+        StorageClass::Standard,
+        &checksums,
+        Some(&parts),
+    );
+    assert!(
+        xml.contains("<Checksum><ChecksumCRC32C>AAAAAA==</ChecksumCRC32C></Checksum>"),
+        "{xml}"
+    );
+    assert!(xml.contains("<ObjectParts><TotalPartsCount>2</TotalPartsCount>"));
+    assert!(xml.contains("<Part><PartNumber>1</PartNumber><Size>5242880</Size></Part>"));
+    assert!(xml.contains("<Part><PartNumber>2</PartNumber><Size>8</Size></Part>"));
+    assert!(xml.contains("<ObjectSize>5242888</ObjectSize>"));
+}
+
+#[test]
 fn delete_result_shape() {
     let deleted = vec![
         ("a".to_owned(), None),
@@ -358,6 +405,77 @@ fn cors_unescapes_entities() {
     assert_eq!(rules[0].allowed_origins[0], "https://a.example?x=1&y=2");
 }
 
+#[test]
+fn round_trip_access_control_policy() {
+    let body = "<AccessControlPolicy xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+        <Owner><ID>owner-1</ID><DisplayName>owner-1</DisplayName></Owner>\
+        <AccessControlList>\
+            <Grant>\
+                <Grantee xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"CanonicalUser\">\
+                    <ID>owner-1</ID><DisplayName>owner-1</DisplayName>\
+                </Grantee>\
+                <Permission>FULL_CONTROL</Permission>\
+            </Grant>\
+            <Grant>\
+                <Grantee xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"Group\">\
+                    <URI>http://acs.amazonaws.com/groups/global/AllUsers</URI>\
+                </Grantee>\
+                <Permission>READ</Permission>\
+            </Grant>\
+            <Grant>\
+                <Grantee xsi:type=\"Group\">\
+                    <URI>http://acs.amazonaws.com/groups/global/AuthenticatedUsers</URI>\
+                </Grantee>\
+                <Permission>WRITE</Permission>\
+            </Grant>\
+            <Grant>\
+                <Grantee xsi:type=\"CanonicalUser\"><ID>reader-9</ID></Grantee>\
+                <Permission>READ_ACP</Permission>\
+            </Grant>\
+        </AccessControlList>\
+        </AccessControlPolicy>";
+    let acl = parse_access_control_policy(body.as_bytes()).unwrap();
+    assert_eq!(acl.owner, UserId("owner-1".to_owned()));
+    assert_eq!(acl.grants.len(), 4);
+    assert_eq!(
+        acl.grants[0].grantee,
+        Grantee::User(UserId("owner-1".to_owned()))
+    );
+    assert_eq!(acl.grants[0].permission, Permission::FullControl);
+    assert_eq!(acl.grants[1].grantee, Grantee::AllUsers);
+    assert_eq!(acl.grants[1].permission, Permission::Read);
+    assert_eq!(acl.grants[2].grantee, Grantee::AuthenticatedUsers);
+    assert_eq!(acl.grants[2].permission, Permission::Write);
+    assert_eq!(
+        acl.grants[3].grantee,
+        Grantee::User(UserId("reader-9".to_owned()))
+    );
+    assert_eq!(acl.grants[3].permission, Permission::ReadAcp);
+}
+
+#[test]
+fn access_control_policy_log_delivery_and_write_acp() {
+    let body = "<AccessControlPolicy>\
+        <Owner><ID>o</ID></Owner>\
+        <AccessControlList>\
+            <Grant><Grantee xsi:type=\"Group\"><URI>http://acs.amazonaws.com/groups/s3/LogDelivery</URI></Grantee>\
+                <Permission>WRITE_ACP</Permission></Grant>\
+        </AccessControlList>\
+        </AccessControlPolicy>";
+    let acl = parse_access_control_policy(body.as_bytes()).unwrap();
+    assert_eq!(acl.grants[0].grantee, Grantee::LogDelivery);
+    assert_eq!(acl.grants[0].permission, Permission::WriteAcp);
+}
+
+#[test]
+fn access_control_policy_empty_grant_list() {
+    let body = "<AccessControlPolicy><Owner><ID>o</ID></Owner>\
+        <AccessControlList></AccessControlList></AccessControlPolicy>";
+    let acl = parse_access_control_policy(body.as_bytes()).unwrap();
+    assert_eq!(acl.owner, UserId("o".to_owned()));
+    assert!(acl.grants.is_empty());
+}
+
 // -------------------------------------------------------------------------------------------
 // Malformed-input: every parser returns Err, never panics
 // -------------------------------------------------------------------------------------------
@@ -434,6 +552,44 @@ fn malformed_cors() {
         b"<CORSConfiguration><CORSRule><MaxAgeSeconds>soon</MaxAgeSeconds></CORSRule></CORSConfiguration>",
     ));
     assert_malformed(parse_cors_configuration(&[0xff, 0xff]));
+}
+
+#[test]
+fn malformed_access_control_policy() {
+    // Owner present but no ID.
+    assert_malformed(parse_access_control_policy(
+        b"<AccessControlPolicy><Owner></Owner><AccessControlList></AccessControlList></AccessControlPolicy>",
+    ));
+    // Grant with an unknown permission token.
+    assert_malformed(parse_access_control_policy(
+        b"<AccessControlPolicy><Owner><ID>o</ID></Owner><AccessControlList>\
+          <Grant><Grantee xsi:type=\"CanonicalUser\"><ID>u</ID></Grantee><Permission>BOGUS</Permission></Grant>\
+          </AccessControlList></AccessControlPolicy>",
+    ));
+    // Grant with a grantee but no permission.
+    assert_malformed(parse_access_control_policy(
+        b"<AccessControlPolicy><Owner><ID>o</ID></Owner><AccessControlList>\
+          <Grant><Grantee xsi:type=\"CanonicalUser\"><ID>u</ID></Grantee></Grant>\
+          </AccessControlList></AccessControlPolicy>",
+    ));
+    // Grant with a permission but no grantee identity.
+    assert_malformed(parse_access_control_policy(
+        b"<AccessControlPolicy><Owner><ID>o</ID></Owner><AccessControlList>\
+          <Grant><Grantee xsi:type=\"CanonicalUser\"></Grantee><Permission>READ</Permission></Grant>\
+          </AccessControlList></AccessControlPolicy>",
+    ));
+    // Unknown group URI.
+    assert_malformed(parse_access_control_policy(
+        b"<AccessControlPolicy><Owner><ID>o</ID></Owner><AccessControlList>\
+          <Grant><Grantee xsi:type=\"Group\"><URI>http://example.com/bogus</URI></Grantee><Permission>READ</Permission></Grant>\
+          </AccessControlList></AccessControlPolicy>",
+    ));
+    // Unbalanced.
+    assert_malformed(parse_access_control_policy(
+        b"<AccessControlPolicy><Owner><ID>o</ID>",
+    ));
+    // Invalid UTF-8.
+    assert_malformed(parse_access_control_policy(&[0xff, 0xfe]));
 }
 
 // -------------------------------------------------------------------------------------------

@@ -15,8 +15,8 @@
 #![forbid(unsafe_code)]
 
 use cairn_types::{
-    Bucket, ETag, ListPage, MultipartSession, ObjectSummary, PartRecord, StorageClass, Timestamp,
-    VersioningState,
+    Bucket, ChecksumAlgorithm, ChecksumValue, ETag, ListPage, MultipartSession, ObjectSummary,
+    PartRecord, StorageClass, Timestamp, VersioningState,
 };
 use quick_xml::Writer;
 use quick_xml::events::{BytesDecl, BytesText, Event};
@@ -25,7 +25,10 @@ use std::io::Cursor;
 mod parse;
 mod timefmt;
 
-pub use parse::{CorsRule, parse_complete_multipart, parse_cors_configuration, parse_delete};
+pub use parse::{
+    CorsRule, parse_access_control_policy, parse_complete_multipart, parse_cors_configuration,
+    parse_delete,
+};
 pub use parse::{parse_tagging, parse_versioning_configuration};
 pub use timefmt::format_iso8601;
 
@@ -472,6 +475,82 @@ pub fn list_multipart_uploads_result(
 pub fn copy_object_result(etag: &ETag, last_modified: Timestamp) -> String {
     let mut w = new_doc();
     w.create_element("CopyObjectResult")
+        .with_attribute(("xmlns", "http://s3.amazonaws.com/doc/2006-03-01/"))
+        .write_inner_content(|w| {
+            leaf(w, "LastModified", &format_iso8601(last_modified));
+            etag_leaf(w, "ETag", etag);
+            Ok(())
+        })
+        .expect("infallible");
+    finish(w)
+}
+
+/// The `<Checksum>` algorithm element name for a [`ChecksumAlgorithm`].
+fn checksum_element(alg: ChecksumAlgorithm) -> &'static str {
+    match alg {
+        ChecksumAlgorithm::Crc32 => "ChecksumCRC32",
+        ChecksumAlgorithm::Crc32c => "ChecksumCRC32C",
+        ChecksumAlgorithm::Sha1 => "ChecksumSHA1",
+        ChecksumAlgorithm::Sha256 => "ChecksumSHA256",
+    }
+}
+
+/// `GetObjectAttributesResponse` (ARCH §21.3, §34.3). Renders the subset of attributes Cairn
+/// stores: the (unquoted) `ETag`, the `Checksum` block for any client-supplied checksums, the
+/// `ObjectParts` enumeration for multipart objects, the `StorageClass`, and the `ObjectSize`.
+///
+/// `parts` is the assembled object's `(part_number, size)` list when it is known to be a
+/// multipart object (its parts are still recorded), or `None` for a single-part object — S3
+/// omits `<ObjectParts>` entirely in that case.
+#[must_use]
+pub fn get_object_attributes(
+    etag: &ETag,
+    object_size: u64,
+    storage_class: StorageClass,
+    checksums: &[ChecksumValue],
+    parts: Option<&[(u16, u64)]>,
+) -> String {
+    let mut w = new_doc();
+    w.create_element("GetObjectAttributesResponse")
+        .with_attribute(("xmlns", "http://s3.amazonaws.com/doc/2006-03-01/"))
+        .write_inner_content(|w| {
+            // The ETag here is rendered UNQUOTED, matching the AWS GetObjectAttributes shape
+            // (unlike the quoted ETag of listings and the response header).
+            leaf(w, "ETag", etag.as_str());
+            if !checksums.is_empty() {
+                w.create_element("Checksum").write_inner_content(|w| {
+                    for c in checksums {
+                        leaf(w, checksum_element(c.algorithm), &c.value);
+                    }
+                    Ok(())
+                })?;
+            }
+            if let Some(parts) = parts {
+                w.create_element("ObjectParts").write_inner_content(|w| {
+                    leaf(w, "TotalPartsCount", &parts.len().to_string());
+                    for (number, size) in parts {
+                        w.create_element("Part").write_inner_content(|w| {
+                            leaf(w, "PartNumber", &number.to_string());
+                            leaf(w, "Size", &size.to_string());
+                            Ok(())
+                        })?;
+                    }
+                    Ok(())
+                })?;
+            }
+            leaf(w, "StorageClass", storage_class_str(storage_class));
+            leaf(w, "ObjectSize", &object_size.to_string());
+            Ok(())
+        })
+        .expect("infallible");
+    finish(w)
+}
+
+/// `CopyPartResult` for `UploadPartCopy` (the ETag is rendered quoted, like `CopyObjectResult`).
+#[must_use]
+pub fn copy_part_result(etag: &ETag, last_modified: Timestamp) -> String {
+    let mut w = new_doc();
+    w.create_element("CopyPartResult")
         .with_attribute(("xmlns", "http://s3.amazonaws.com/doc/2006-03-01/"))
         .write_inner_content(|w| {
             leaf(w, "LastModified", &format_iso8601(last_modified));

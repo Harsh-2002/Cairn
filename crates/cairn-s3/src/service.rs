@@ -219,7 +219,7 @@ impl S3Service {
                     .await
             }
             Method::GET if req.has_query("acl") => self.get_bucket_acl(&req).await,
-            Method::PUT if req.has_query("acl") => self.put_bucket_acl(&req).await,
+            Method::PUT if req.has_query("acl") => self.put_bucket_acl(req, body).await,
             Method::GET if req.has_query("publicAccessBlock") => {
                 self.get_public_access_block(&req).await
             }
@@ -263,14 +263,14 @@ impl S3Service {
         )
         .await?;
         match req.method {
-            // A copy-source part is UploadPartCopy, not a body upload; until that is implemented
-            // reject it rather than corrupt the part with the request body.
+            // A copy-source part is UploadPartCopy: stage a ranged copy of the source object as a
+            // part rather than treating the (empty) request body as the part content.
             Method::PUT
                 if req.has_query("uploadId")
                     && req.query("partNumber").is_some()
                     && req.header("x-amz-copy-source").is_some() =>
             {
-                Err(Error::NotImplemented)
+                self.upload_part_copy(&req).await
             }
             Method::PUT if req.has_query("uploadId") && req.query("partNumber").is_some() => {
                 self.upload_part(req, body).await
@@ -282,6 +282,8 @@ impl S3Service {
             Method::GET if req.has_query("tagging") => self.get_object_tagging(&req).await,
             Method::DELETE if req.has_query("tagging") => self.delete_object_tagging(&req).await,
             Method::GET if req.has_query("acl") => self.get_object_acl(&req).await,
+            Method::PUT if req.has_query("acl") => self.put_object_acl(&req, body).await,
+            Method::GET if req.has_query("attributes") => self.get_object_attributes(&req).await,
             // An UNRECOGNIZED object subresource must never fall through to a data-plane handler
             // (a PUT object?acl must not overwrite the object body). Answer NotImplemented.
             _ if unhandled_object_subresource(&req) => Err(Error::NotImplemented),
@@ -786,6 +788,96 @@ impl S3Service {
         Ok(S3Response::status(StatusCode::OK)
             .with_header("etag", format!("\"{}\"", staged.md5_hex))
             .with_header("x-amz-request-id", &req.request_id))
+    }
+
+    /// `UploadPartCopy` (ARCH §21.3, §34.3): stage a part from a range of an existing object
+    /// rather than from a request body. The copy source (`/bucket/key[?versionId]`) and the
+    /// optional `x-amz-copy-source-range` are parsed; the source range is opened from the blob
+    /// store (logical coordinates), restaged as a part, recorded, and a `CopyPartResult` carrying
+    /// the part ETag and last-modified time is returned.
+    async fn upload_part_copy(&self, req: &S3Request) -> Result<S3Response> {
+        let _dest_bucket = self.fetch_bucket(req).await?;
+        let upload_id = UploadId::from_string(req.query("uploadId").unwrap_or_default().to_owned());
+        let part_number: u16 = req
+            .query("partNumber")
+            .and_then(|s| s.parse().ok())
+            .filter(|n| (1..=10_000).contains(n))
+            .ok_or_else(|| Error::InvalidArgument("partNumber out of range".to_owned()))?;
+        if self.meta.get_multipart(&upload_id).await?.is_none() {
+            return Err(Error::NoSuchUpload);
+        }
+
+        // Resolve the copy source object version (reusing the copy-source parser and the
+        // copy-source-if-* precondition checks shared with CopyObject).
+        let raw_source = req.header("x-amz-copy-source").unwrap_or_default();
+        let (src_bucket_s, src_key_s, src_version) = parse_copy_source(raw_source)
+            .ok_or_else(|| Error::InvalidArgument("bad copy source".to_owned()))?;
+        let src_bucket = BucketName::parse(&src_bucket_s)?;
+        let src_key = ObjectKey::parse(&src_key_s)?;
+        let src_row = match src_version {
+            Some(v) => self
+                .meta
+                .get_version(&src_bucket, &src_key, &VersionId::from_string(v))
+                .await?
+                .ok_or(Error::NoSuchVersion)?,
+            None => self
+                .meta
+                .current_version(&src_bucket, &src_key)
+                .await?
+                .ok_or(Error::NoSuchKey)?,
+        };
+        if src_row.is_delete_marker {
+            return Err(Error::NoSuchKey);
+        }
+        check_copy_source_conditions(req, &src_row)?;
+        let src_path = src_row.storage_path.clone().ok_or(Error::NoSuchKey)?;
+
+        // Parse the optional copy-source range (logical bytes of the source object). An absent
+        // header copies the whole object.
+        let range =
+            parse_copy_source_range(req.header("x-amz-copy-source-range"), src_row.size_logical)?;
+
+        // Open the source range and feed its logical bytes into the part stager, re-tagging blob
+        // read errors as body errors so the source can drive `stage_part`.
+        let handle = self.blob.open(&src_path, range).await?;
+        let src_stream: cairn_types::BodyStream =
+            {
+                use futures_util::StreamExt;
+                Box::pin(handle.body.map(|r| {
+                    r.map_err(|e| cairn_types::error::BodyError::Transport(e.to_string()))
+                }))
+            };
+        let staged = self
+            .blob
+            .stage_part(&upload_id, part_number, src_stream, self.max_object_size)
+            .await
+            .map_err(map_stage_err)?;
+
+        let part = cairn_types::meta::PartRecord {
+            part_number,
+            size: staged.size,
+            etag: staged.md5_hex.clone(),
+            storage_path: staged.storage_path.clone(),
+            checksum: None,
+        };
+        if let MutationOutcome::PartRecorded {
+            superseded: Some(old),
+        } = self
+            .meta
+            .submit(Mutation::RecordPart { upload_id, part })
+            .await?
+        {
+            let _ = self.blob.delete(&old).await;
+        }
+
+        let etag = ETag::from_md5_hex(staged.md5_hex.clone());
+        let body = cairn_xml::copy_part_result(&etag, self.clock.now());
+        let mut resp =
+            S3Response::xml(StatusCode::OK, body).with_header("x-amz-request-id", &req.request_id);
+        if !src_row.version_id.is_null() {
+            resp = resp.with_header("x-amz-copy-source-version-id", src_row.version_id.as_str());
+        }
+        Ok(resp)
     }
 
     async fn complete_multipart(
@@ -1365,15 +1457,20 @@ impl S3Service {
             .with_header("x-amz-request-id", &req.request_id))
     }
 
-    async fn put_bucket_acl(&self, req: &S3Request) -> Result<S3Response> {
-        let bucket = self.fetch_bucket(req).await?;
+    /// `PutBucketAcl` (ARCH §13.2, §15.4): set the bucket ACL from either a canned `x-amz-acl`
+    /// header or a parsed `AccessControlPolicy` request body. ACLs are disabled under
+    /// `BucketOwnerEnforced` ownership (S3: `AccessControlListNotSupported`).
+    async fn put_bucket_acl(
+        &self,
+        req: S3Request,
+        body: cairn_types::BodyStream,
+    ) -> Result<S3Response> {
+        let bucket = self.fetch_bucket(&req).await?;
         // ACLs are disabled under BucketOwnerEnforced (S3: AccessControlListNotSupported).
         if bucket.ownership_mode == OwnershipMode::BucketOwnerEnforced {
             return Err(Error::NotImplemented);
         }
-        let canned = req.header("x-amz-acl").ok_or(Error::NotImplemented)?;
-        let acl = cairn_authz::expand_canned_acl(canned, &bucket.owner_id)
-            .ok_or_else(|| Error::InvalidArgument("invalid request body".to_owned()))?;
+        let acl = self.resolve_acl_input(&req, body, &bucket.owner_id).await?;
         let doc = serde_json::to_string(&acl)
             .map_err(|_| Error::Internal("config (de)serialization failed".to_owned()))?;
         self.meta
@@ -1393,6 +1490,77 @@ impl S3Service {
             .unwrap_or_else(|| default_owner_acl(&bucket.owner_id));
         Ok(S3Response::xml(StatusCode::OK, acl_to_xml(&acl))
             .with_header("x-amz-request-id", &req.request_id))
+    }
+
+    /// `GetObjectAttributes` (ARCH §21.3, §34.3): return an object's metadata attributes —
+    /// `ETag`, `ObjectSize`, `StorageClass`, any stored `Checksum`, and `ObjectParts` when the
+    /// object is multipart and its parts can still be enumerated. Cairn discards a session's part
+    /// rows on completion, so `ObjectParts` is omitted for completed multipart objects (S3 also
+    /// returns it only while the parts are retrievable).
+    async fn get_object_attributes(&self, req: &S3Request) -> Result<S3Response> {
+        let (row, _bucket) = self.resolve_object(req).await?;
+        let body = cairn_xml::get_object_attributes(
+            &row.etag,
+            row.size_logical,
+            row.storage_class,
+            &row.checksums,
+            None,
+        );
+        let mut resp =
+            S3Response::xml(StatusCode::OK, body).with_header("x-amz-request-id", &req.request_id);
+        if !row.version_id.is_null() {
+            resp = resp.with_header("x-amz-version-id", row.version_id.as_str());
+        }
+        resp = resp.with_header("last-modified", http_date(row.updated_at));
+        Ok(resp)
+    }
+
+    /// `PutObjectAcl` (ARCH §13.3, §15.4): replace the current (or `?versionId`) object version's
+    /// ACL with either a canned `x-amz-acl` header or a parsed `AccessControlPolicy` request body.
+    /// ACLs are disabled under `BucketOwnerEnforced` ownership (S3: `AccessControlListNotSupported`).
+    async fn put_object_acl(
+        &self,
+        req: &S3Request,
+        body: cairn_types::BodyStream,
+    ) -> Result<S3Response> {
+        let (row, bucket) = self.resolve_object(req).await?;
+        // Under BucketOwnerEnforced ownership ACLs are disabled; reject with the
+        // AccessControlListNotSupported semantics (mapped to NotImplemented, as PutBucketAcl does).
+        if bucket.ownership_mode == OwnershipMode::BucketOwnerEnforced {
+            return Err(Error::NotImplemented);
+        }
+        let acl = self.resolve_acl_input(req, body, &bucket.owner_id).await?;
+        self.meta
+            .submit(Mutation::SetObjectAcl {
+                bucket: bucket.name,
+                key: row.key,
+                version_id: row.version_id,
+                acl: Some(acl),
+            })
+            .await?;
+        Ok(S3Response::status(StatusCode::OK).with_header("x-amz-request-id", &req.request_id))
+    }
+
+    /// Resolve the ACL an ACL-setting request asks for: a canned `x-amz-acl` header takes
+    /// precedence; otherwise an `AccessControlPolicy` request body is parsed. An empty body with
+    /// no canned header is rejected as a malformed request.
+    async fn resolve_acl_input(
+        &self,
+        req: &S3Request,
+        body: cairn_types::BodyStream,
+        owner: &cairn_types::id::UserId,
+    ) -> Result<Acl> {
+        if let Some(canned) = req.header("x-amz-acl") {
+            return cairn_authz::expand_canned_acl(canned, owner)
+                .ok_or_else(|| Error::InvalidArgument("invalid canned ACL".to_owned()));
+        }
+        let doc = drain_body(body, 256 * 1024).await?;
+        if doc.iter().all(u8::is_ascii_whitespace) {
+            return Err(Error::InvalidArgument(
+                "missing x-amz-acl or AccessControlPolicy body".to_owned(),
+            ));
+        }
+        cairn_xml::parse_access_control_policy(&doc)
     }
 
     async fn get_public_access_block(&self, req: &S3Request) -> Result<S3Response> {
@@ -1822,7 +1990,8 @@ fn build_context(req: &S3Request, now: cairn_types::Timestamp) -> RequestContext
 
 /// Known S3 object subresource selectors that we do NOT serve via a handler; their presence must
 /// route to NotImplemented rather than fall through to a data-plane handler (which would let
-/// `PUT key?acl` overwrite the object body). `acl` GET is handled earlier; PUT/DELETE land here.
+/// `PUT key?acl` overwrite the object body). `acl` (GET/PUT) and `attributes` (GET) are handled
+/// earlier; an `acl` DELETE — which S3 has no operation for — lands here.
 const UNHANDLED_OBJECT_SUBRESOURCES: &[&str] = &[
     "acl",
     "retention",
@@ -1830,7 +1999,6 @@ const UNHANDLED_OBJECT_SUBRESOURCES: &[&str] = &[
     "torrent",
     "restore",
     "select",
-    "attributes",
 ];
 
 /// Known S3 bucket subresource selectors we do not serve (handled ones are matched earlier).
@@ -2019,6 +2187,7 @@ fn object_action(req: &S3Request) -> Result<Action> {
         Method::DELETE if q("tagging") => DeleteObjectTagging,
         Method::GET if q("acl") => GetObjectAcl,
         Method::PUT if q("acl") => PutObjectAcl,
+        Method::GET if q("attributes") => GetObjectAttributes,
         Method::GET if q("uploadId") => ListMultipartUploadParts,
         Method::DELETE if q("uploadId") => AbortMultipartUpload,
         // The multipart lifecycle (initiate/complete/upload-part) has no distinct action variant;
@@ -2172,6 +2341,26 @@ fn parse_range(header: Option<&str>, total: u64) -> Result<Option<ByteRange>> {
         }
     };
     Ok(Some(ByteRange { offset, length }))
+}
+
+/// Parse an `x-amz-copy-source-range` header into a [`ByteRange`] over the source object's
+/// logical bytes. The header form is `bytes=first-last` with both bounds present and inclusive
+/// (S3 does not accept the open-ended or suffix forms here). An absent header copies the whole
+/// object (returns `None`).
+fn parse_copy_source_range(header: Option<&str>, total: u64) -> Result<Option<ByteRange>> {
+    let Some(h) = header else { return Ok(None) };
+    let spec = h.trim().strip_prefix("bytes=").ok_or(Error::InvalidRange)?;
+    let (start_s, end_s) = spec.split_once('-').ok_or(Error::InvalidRange)?;
+    let start: u64 = start_s.trim().parse().map_err(|_| Error::InvalidRange)?;
+    let end: u64 = end_s.trim().parse().map_err(|_| Error::InvalidRange)?;
+    if start > end || start >= total {
+        return Err(Error::InvalidRange);
+    }
+    let length = (end.min(total - 1) - start) + 1;
+    Ok(Some(ByteRange {
+        offset: start,
+        length,
+    }))
 }
 
 /// The SigV4 signed-streaming sentinel: the body is an `aws-chunked` stream whose per-chunk

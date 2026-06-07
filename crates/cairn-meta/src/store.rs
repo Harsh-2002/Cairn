@@ -288,6 +288,26 @@ impl MetadataStore for SqliteMetadataStore {
         .await
     }
 
+    async fn get_bucket_quota(&self, bucket: &BucketName) -> Result<Option<u64>, MetaError> {
+        let name = bucket.as_str().to_owned();
+        self.with_read(move |conn| {
+            // `quota_bytes` is a nullable column added in migration v2; the outer `Option`
+            // distinguishes "no such bucket", the inner `Option` distinguishes "no quota set".
+            let quota: Option<Option<i64>> = conn
+                .query_row(
+                    "SELECT quota_bytes FROM buckets WHERE name=?1",
+                    params![name],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(engine_err)?;
+            // Both "no such bucket" and "quota NULL" present to the reader as "no quota". A stored
+            // negative is clamped to 0 defensively (writes only ever store non-negative values).
+            Ok(quota.flatten().map(|q| q.max(0) as u64))
+        })
+        .await
+    }
+
     async fn is_bucket_empty(&self, name: &BucketName) -> Result<bool, MetaError> {
         let name = name.as_str().to_owned();
         self.with_read(move |conn| {
@@ -561,6 +581,24 @@ impl MetadataStore for SqliteMetadataStore {
                 )
                 .map_err(engine_err)?;
             stmt.query_map(params![now.0, i64::from(limit)], model::outbox_from_row)
+                .map_err(engine_err)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(engine_err)
+        })
+        .await
+    }
+
+    async fn list_failed_replication(&self, limit: u32) -> Result<Vec<OutboxEntry>, MetaError> {
+        // Terminal entries are those the engine marked `status='failed'` (retries exhausted, no
+        // further attempt scheduled — see `MarkReplicationFailed { next_attempt_at: None }`). The
+        // `idx_outbox_status_next` index serves this status-prefixed range. Most-recently-due first.
+        self.with_read(move |conn| {
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT * FROM replication_outbox WHERE status='failed' ORDER BY next_attempt_at DESC LIMIT ?1",
+                )
+                .map_err(engine_err)?;
+            stmt.query_map(params![i64::from(limit)], model::outbox_from_row)
                 .map_err(engine_err)?
                 .collect::<rusqlite::Result<Vec<_>>>()
                 .map_err(engine_err)

@@ -474,14 +474,19 @@ impl ControlService {
                 Err(e) => return ControlResponse::error_internal(&e),
             };
 
+        // The byte quota is enforced inside the writer's commit transaction; the dedicated
+        // reader surfaces the configured `buckets.quota_bytes` value (null when unlimited).
+        let quota_bytes = match self.meta.get_bucket_quota(&bucket_name).await {
+            Ok(q) => q,
+            Err(e) => return ControlResponse::error_internal(&e.to_string()),
+        };
+
         ControlResponse::json(
             StatusCode::OK,
             &wire::BucketConfigResp {
                 versioning: wire::versioning_str(bucket.versioning),
                 ownership_mode: wire::ownership_str(bucket.ownership_mode),
-                // The byte quota is enforced inside the writer's commit transaction and is not
-                // exposed as a readable document by the trait spine; reported as null.
-                quota_bytes: None,
+                quota_bytes,
                 policy,
                 cors,
                 tagging,
@@ -911,27 +916,30 @@ impl ControlService {
     // Replication operations (ARCH §22.2)
     // -----------------------------------------------------------------------------------
 
-    /// `GET /replication/failed`: list outbox entries in a failed/terminal state.
-    ///
-    /// LIMITATION: the [`MetadataStore`] trait exposes no reader for failed/terminal outbox
-    /// entries — only `claim_replication_batch`, which returns *pending* due entries. Surfacing
-    /// the failed set requires a new trait method on the frozen `cairn-types` spine, so this
-    /// endpoint currently returns an empty list. The response shape is the contract one so the
-    /// reader can be wired in without a wire-format change once the trait gains a failed-entry
-    /// reader.
+    /// `GET /replication/failed`: list outbox entries the engine has marked terminal/failed,
+    /// most recently due first, bounded by `?limit=` (default and ceiling [`PAGE_LIMIT`]).
     async fn failed_replication(&self, query: &[(String, String)]) -> ControlResponse {
-        // The limit is parsed and clamped so the eventual reader inherits the same bound; it is
-        // unused while the listing is necessarily empty.
-        let _limit = find_query(query, "limit")
+        let limit = find_query(query, "limit")
             .and_then(|v| v.parse::<u32>().ok())
             .map_or(PAGE_LIMIT, |v| v.clamp(1, PAGE_LIMIT));
 
-        ControlResponse::json(
-            StatusCode::OK,
-            &wire::FailedReplicationResp {
-                entries: Vec::new(),
-            },
-        )
+        let entries = match self.meta.list_failed_replication(limit).await {
+            Ok(e) => e,
+            Err(e) => return ControlResponse::error_internal(&e.to_string()),
+        };
+        let entries = entries
+            .into_iter()
+            .map(|e| wire::FailedReplicationEntry {
+                bucket: e.bucket.as_str().to_owned(),
+                key: e.key.as_str().to_owned(),
+                version_id: e.version_id.as_str().to_owned(),
+                error: e.last_error,
+                attempts: e.attempts,
+                next_attempt_at_ms: e.next_attempt_at.as_millis(),
+            })
+            .collect();
+
+        ControlResponse::json(StatusCode::OK, &wire::FailedReplicationResp { entries })
     }
 
     // -----------------------------------------------------------------------------------

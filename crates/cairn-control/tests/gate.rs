@@ -1026,6 +1026,163 @@ async fn failed_replication_lists_empty_and_is_gated() {
 }
 
 #[tokio::test]
+async fn failed_replication_reflects_a_planted_terminal_entry() {
+    let h = harness();
+    let a = admin();
+
+    // Plant a replication outbox entry by committing a version that carries it, then mark it
+    // terminally failed the way the replication engine does (next_attempt_at = None).
+    let bucket = BucketName::parse("repl").unwrap();
+    let key = ObjectKey::parse("photo.jpg").unwrap();
+    let version = VersionId::from_string("00000001".to_owned());
+    let entry = cairn_types::meta::OutboxEntry {
+        id: "outbox-1".to_owned(),
+        bucket: bucket.clone(),
+        key: key.clone(),
+        version_id: version.clone(),
+        operation: cairn_types::meta::ReplicationOp::ObjectCreate,
+        rule_id: "rule-1".to_owned(),
+        attempts: 0,
+        next_attempt_at: cairn_types::time::Timestamp(0),
+        status: cairn_types::meta::ReplicationStatus::Pending,
+        last_error: None,
+    };
+    let now = h.clock.now();
+    let row = ObjectVersionRow {
+        id: uuid::Uuid::new_v4().simple().to_string(),
+        bucket: bucket.clone(),
+        key: key.clone(),
+        version_id: version.clone(),
+        is_latest: true,
+        is_delete_marker: false,
+        size_logical: 4,
+        size_physical: 4,
+        etag: ETag::from_md5_hex("deadbeef".to_owned()),
+        content_type: "image/jpeg".to_owned(),
+        storage_path: Some(cairn_types::id::StoragePath::from_string(
+            "repl/00000001".to_owned(),
+        )),
+        compression: CompressionDescriptor::Uncompressed,
+        storage_class: StorageClass::Standard,
+        cold_locator: None,
+        owner_id: UserId("admin".to_owned()),
+        user_metadata: Vec::new(),
+        acl: None,
+        checksums: Vec::new(),
+        replication_status: Some(cairn_types::meta::ReplicationStatus::Pending),
+        created_at: now,
+        updated_at: now,
+    };
+    h.meta
+        .submit(Mutation::PutObjectVersion {
+            row: Box::new(row),
+            precondition: Precondition::default(),
+            replication: Some(entry),
+        })
+        .await
+        .unwrap();
+    h.meta
+        .submit(Mutation::MarkReplicationFailed {
+            id: "outbox-1".to_owned(),
+            error: "destination unreachable".to_owned(),
+            next_attempt_at: None,
+        })
+        .await
+        .unwrap();
+
+    // The endpoint now reports the terminal entry with its real fields.
+    let resp = h
+        .svc
+        .handle(
+            &Method::GET,
+            "/replication/failed",
+            &[("limit".to_owned(), "10".to_owned())],
+            Some(&a),
+            Bytes::new(),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::OK);
+    let v = json(&resp);
+    let entries = v["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["bucket"], "repl");
+    assert_eq!(entries[0]["key"], "photo.jpg");
+    assert_eq!(entries[0]["version_id"], "00000001");
+    assert_eq!(entries[0]["error"], "destination unreachable");
+    assert_eq!(entries[0]["attempts"], 1);
+    assert!(entries[0]["next_attempt_at_ms"].is_i64());
+}
+
+#[tokio::test]
+async fn config_reports_a_set_quota() {
+    let h = harness();
+    let a = admin();
+    make_bucket(&h, &a, "limited").await;
+
+    // Before any quota is set the config view reports null.
+    let resp = h
+        .svc
+        .handle(
+            &Method::GET,
+            "/buckets/limited/config",
+            &[],
+            Some(&a),
+            Bytes::new(),
+        )
+        .await;
+    assert!(json(&resp)["quota_bytes"].is_null());
+
+    // Set a quota through the management endpoint.
+    let resp = h
+        .svc
+        .handle(
+            &Method::PUT,
+            "/buckets/limited/quota",
+            &[],
+            Some(&a),
+            Bytes::from_static(br#"{"quota_bytes":1048576}"#),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::NO_CONTENT);
+
+    // The config view now reports the configured quota via get_bucket_quota.
+    let resp = h
+        .svc
+        .handle(
+            &Method::GET,
+            "/buckets/limited/config",
+            &[],
+            Some(&a),
+            Bytes::new(),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::OK);
+    assert_eq!(json(&resp)["quota_bytes"], 1_048_576);
+
+    // Clearing the quota returns the config view to null.
+    h.svc
+        .handle(
+            &Method::PUT,
+            "/buckets/limited/quota",
+            &[],
+            Some(&a),
+            Bytes::from_static(br#"{"quota_bytes":null}"#),
+        )
+        .await;
+    let resp = h
+        .svc
+        .handle(
+            &Method::GET,
+            "/buckets/limited/config",
+            &[],
+            Some(&a),
+            Bytes::new(),
+        )
+        .await;
+    assert!(json(&resp)["quota_bytes"].is_null());
+}
+
+#[tokio::test]
 async fn config_mutations_record_activity() {
     let h = harness();
     let a = admin();

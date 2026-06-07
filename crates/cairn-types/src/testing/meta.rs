@@ -24,6 +24,10 @@ type VKey = (String, String, String); // (bucket, key, version_id)
 #[derive(Default)]
 struct State {
     buckets: BTreeMap<String, Bucket>,
+    /// Per-bucket byte quota (`buckets.quota_bytes`), absent when unlimited. The double does not
+    /// enforce the quota (that lives in the SQLite writer), but it records the configured value so
+    /// `get_bucket_quota` round-trips a `SetBucketQuota`.
+    bucket_quotas: HashMap<String, u64>,
     config: HashMap<(String, ConfigAspect), ConfigDoc>,
     account_bpa: PublicAccessBlock,
     versions: BTreeMap<VKey, ObjectVersionRow>,
@@ -389,9 +393,20 @@ impl MetadataStore for InMemoryMetadataStore {
                 }
                 Ok(MutationOutcome::Ack)
             }
-            Mutation::SetBucketQuota { .. } => {
-                // The in-memory double does not model quota enforcement (that lives in the SQLite
-                // writer's commit transaction); accept the mutation as a no-op.
+            Mutation::SetBucketQuota {
+                bucket,
+                quota_bytes,
+            } => {
+                // The double does not enforce the quota (that lives in the SQLite writer's commit
+                // transaction); it records the configured value so `get_bucket_quota` reads it back.
+                match quota_bytes {
+                    Some(q) => {
+                        st.bucket_quotas.insert(bucket.as_str().to_owned(), q);
+                    }
+                    None => {
+                        st.bucket_quotas.remove(bucket.as_str());
+                    }
+                }
                 Ok(MutationOutcome::Ack)
             }
             Mutation::SetAccountPublicAccessBlock(bpa) => {
@@ -424,6 +439,22 @@ impl MetadataStore for InMemoryMetadataStore {
                     key.as_str().to_owned(),
                     version_id.as_str().to_owned(),
                 ));
+                Ok(MutationOutcome::Ack)
+            }
+            Mutation::SetObjectAcl {
+                bucket,
+                key,
+                version_id,
+                acl,
+            } => {
+                let vk = (
+                    bucket.as_str().to_owned(),
+                    key.as_str().to_owned(),
+                    version_id.as_str().to_owned(),
+                );
+                if let Some(row) = st.versions.get_mut(&vk) {
+                    row.acl = acl;
+                }
                 Ok(MutationOutcome::Ack)
             }
             Mutation::CreateUser(rec) => {
@@ -505,6 +536,16 @@ impl MetadataStore for InMemoryMetadataStore {
 
     async fn get_account_public_access_block(&self) -> Result<PublicAccessBlock, MetaError> {
         Ok(self.state.lock().unwrap().account_bpa)
+    }
+
+    async fn get_bucket_quota(&self, bucket: &BucketName) -> Result<Option<u64>, MetaError> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .bucket_quotas
+            .get(bucket.as_str())
+            .copied())
     }
 
     async fn is_bucket_empty(&self, name: &BucketName) -> Result<bool, MetaError> {
@@ -739,6 +780,21 @@ impl MetadataStore for InMemoryMetadataStore {
             .take(limit as usize)
             .cloned()
             .collect())
+    }
+
+    async fn list_failed_replication(&self, limit: u32) -> Result<Vec<OutboxEntry>, MetaError> {
+        let st = self.state.lock().unwrap();
+        // Terminal entries are those the engine marked `Failed` (retries exhausted). Return them
+        // most-recently-due first, matching the SQLite reader's `ORDER BY next_attempt_at DESC`.
+        let mut failed: Vec<OutboxEntry> = st
+            .outbox
+            .iter()
+            .filter(|e| e.status == ReplicationStatus::Failed)
+            .cloned()
+            .collect();
+        failed.sort_by_key(|e| std::cmp::Reverse(e.next_attempt_at));
+        failed.truncate(limit as usize);
+        Ok(failed)
     }
 
     async fn user_by_bearer_key(

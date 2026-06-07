@@ -2032,3 +2032,515 @@ async fn cors_preflight_match_and_no_match() {
     .await;
     assert_eq!(st, StatusCode::FORBIDDEN);
 }
+
+/// Create a bucket and switch it out of `BucketOwnerEnforced` so ACLs are in force.
+async fn acl_enabled_bucket(h: &Harness, bucket: &str) {
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some(bucket), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some(bucket),
+                None,
+                &[("ownershipControls", "")],
+                &[],
+                b"<OwnershipControls><Rule><ObjectOwnership>ObjectWriter</ObjectOwnership></Rule></OwnershipControls>".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "ownership controls set");
+}
+
+#[tokio::test]
+async fn upload_part_copy_roundtrip() {
+    let h = harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("upcb"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+
+    // A source object large enough that a copied range plus a tail still satisfy the 5 MiB part
+    // floor. The first 5 MiB will be copied into part 1.
+    let mut source = vec![b'a'; 5 * 1024 * 1024];
+    source.extend_from_slice(&vec![b'b'; 1024]);
+    drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("upcb"),
+                Some("source.bin"),
+                &[],
+                &[],
+                source.clone(),
+            ),
+        )
+        .await,
+    )
+    .await;
+
+    // Initiate a multipart upload for the destination.
+    let (_, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::POST,
+                Some("upcb"),
+                Some("dest.bin"),
+                &[("uploads", "")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    let upload_id = between(
+        &String::from_utf8(body).unwrap(),
+        "<UploadId>",
+        "</UploadId>",
+    );
+
+    // Part 1: UploadPartCopy of the first 5 MiB of the source object (bytes 0..5MiB-1).
+    let copy_range = format!("bytes=0-{}", 5 * 1024 * 1024 - 1);
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("upcb"),
+                Some("dest.bin"),
+                &[("uploadId", upload_id.as_str()), ("partNumber", "1")],
+                &[
+                    ("x-amz-copy-source", "/upcb/source.bin"),
+                    ("x-amz-copy-source-range", copy_range.as_str()),
+                ],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "UploadPartCopy returns 200");
+    let xml = String::from_utf8(body).unwrap();
+    assert!(
+        xml.contains("<CopyPartResult"),
+        "CopyPartResult body: {xml}"
+    );
+    let etag1 = between(&xml, "<ETag>", "</ETag>");
+
+    // Part 2: a small regular body part (the tail).
+    let part2 = b"the-copied-tail".to_vec();
+    let (st, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("upcb"),
+                Some("dest.bin"),
+                &[("uploadId", upload_id.as_str()), ("partNumber", "2")],
+                &[],
+                part2.clone(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let etag2 = header(&hdrs, "etag").unwrap().to_owned();
+
+    // Complete: part 1's ETag came back quoted in the XML; part 2's came back quoted in a header.
+    let complete = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag1}</ETag></Part>\
+         <Part><PartNumber>2</PartNumber><ETag>{etag2}</ETag></Part></CompleteMultipartUpload>"
+    );
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::POST,
+                Some("upcb"),
+                Some("dest.bin"),
+                &[("uploadId", upload_id.as_str())],
+                &[],
+                complete.into_bytes(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "complete multipart");
+
+    // Verify the assembled object is the copied range followed by the body tail.
+    let (st, _, got) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("upcb"),
+                Some("dest.bin"),
+                &[],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let mut expected = vec![b'a'; 5 * 1024 * 1024];
+    expected.extend_from_slice(&part2);
+    assert_eq!(got.len(), expected.len());
+    assert_eq!(got, expected, "UploadPartCopy bytes round-trip");
+}
+
+#[tokio::test]
+async fn upload_part_copy_whole_object_no_range() {
+    let h = harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("upcw"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    let part1 = vec![b'z'; 5 * 1024 * 1024];
+    drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("upcw"),
+                Some("whole.bin"),
+                &[],
+                &[],
+                part1.clone(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    let (_, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::POST,
+                Some("upcw"),
+                Some("out.bin"),
+                &[("uploads", "")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    let upload_id = between(
+        &String::from_utf8(body).unwrap(),
+        "<UploadId>",
+        "</UploadId>",
+    );
+    // No x-amz-copy-source-range: the whole source object is copied into the part.
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("upcw"),
+                Some("out.bin"),
+                &[("uploadId", upload_id.as_str()), ("partNumber", "1")],
+                &[("x-amz-copy-source", "/upcw/whole.bin")],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let etag1 = between(&String::from_utf8(body).unwrap(), "<ETag>", "</ETag>");
+    let complete = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag1}</ETag></Part></CompleteMultipartUpload>"
+    );
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::POST,
+                Some("upcw"),
+                Some("out.bin"),
+                &[("uploadId", upload_id.as_str())],
+                &[],
+                complete.into_bytes(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _, got) = drain(
+        send(
+            &h.svc,
+            req(Method::GET, Some("upcw"), Some("out.bin"), &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(got, part1);
+}
+
+#[tokio::test]
+async fn get_object_attributes_returns_size_and_etag() {
+    let h = harness().await;
+    let etag = put_simple(&h, "attrb", "obj").await;
+    let etag_bare = etag.trim_matches('"').to_owned();
+
+    let (st, hdrs, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("attrb"),
+                Some("obj"),
+                &[("attributes", "")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let xml = String::from_utf8(body).unwrap();
+    assert!(
+        xml.contains("<GetObjectAttributesResponse"),
+        "attributes body: {xml}"
+    );
+    // "conditional" is 11 bytes.
+    assert!(xml.contains("<ObjectSize>11</ObjectSize>"), "{xml}");
+    // The ETag is rendered UNQUOTED in GetObjectAttributes.
+    assert!(
+        xml.contains(&format!("<ETag>{etag_bare}</ETag>")),
+        "etag {etag_bare} in {xml}"
+    );
+    assert!(xml.contains("<StorageClass>STANDARD</StorageClass>"));
+    assert!(header(&hdrs, "last-modified").is_some());
+}
+
+#[tokio::test]
+async fn put_object_acl_canned_and_body_roundtrip() {
+    let h = harness().await;
+    acl_enabled_bucket(&h, "oaclb").await;
+    drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("oaclb"),
+                Some("k"),
+                &[],
+                &[],
+                b"the-body".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+
+    // PUT ?acl with a canned header must NOT overwrite the body and must persist the ACL.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("oaclb"),
+                Some("k"),
+                &[("acl", "")],
+                &[("x-amz-acl", "public-read")],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "canned put_object_acl");
+
+    // The object body is unchanged.
+    let (_, _, body) = drain(
+        send(
+            &h.svc,
+            req(Method::GET, Some("oaclb"), Some("k"), &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(body, b"the-body");
+
+    // GET ?acl reflects the canned public-read grant (AllUsers READ).
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("oaclb"),
+                Some("k"),
+                &[("acl", "")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let xml = String::from_utf8(body).unwrap();
+    assert!(
+        xml.contains("AllUsers"),
+        "public-read AllUsers grant: {xml}"
+    );
+    assert!(xml.contains("<Permission>READ</Permission>"), "{xml}");
+
+    // Now PUT ?acl with an AccessControlPolicy BODY (private — only the owner has FULL_CONTROL).
+    let acl_body = b"<AccessControlPolicy>\
+        <Owner><ID>admin</ID></Owner>\
+        <AccessControlList>\
+            <Grant><Grantee xsi:type=\"CanonicalUser\"><ID>admin</ID></Grantee><Permission>FULL_CONTROL</Permission></Grant>\
+        </AccessControlList>\
+        </AccessControlPolicy>"
+        .to_vec();
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("oaclb"),
+                Some("k"),
+                &[("acl", "")],
+                &[],
+                acl_body,
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "body put_object_acl");
+
+    // GET ?acl now reflects the private ACL — no AllUsers grant remains.
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("oaclb"),
+                Some("k"),
+                &[("acl", "")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let xml = String::from_utf8(body).unwrap();
+    assert!(
+        !xml.contains("AllUsers"),
+        "private ACL has no AllUsers: {xml}"
+    );
+    assert!(
+        xml.contains("<Permission>FULL_CONTROL</Permission>"),
+        "{xml}"
+    );
+}
+
+#[tokio::test]
+async fn put_object_acl_rejected_under_enforced_ownership() {
+    let h = harness().await;
+    // A default bucket is BucketOwnerEnforced: ACLs are not supported.
+    let _ = put_simple(&h, "enfb", "k").await;
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("enfb"),
+                Some("k"),
+                &[("acl", "")],
+                &[("x-amz-acl", "public-read")],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::NOT_IMPLEMENTED,
+        "ACLs disabled under BucketOwnerEnforced"
+    );
+}
+
+#[tokio::test]
+async fn put_bucket_acl_accepts_body_document() {
+    let h = harness().await;
+    acl_enabled_bucket(&h, "baclb").await;
+    let acl_body = b"<AccessControlPolicy>\
+        <Owner><ID>admin</ID></Owner>\
+        <AccessControlList>\
+            <Grant><Grantee xsi:type=\"CanonicalUser\"><ID>admin</ID></Grantee><Permission>FULL_CONTROL</Permission></Grant>\
+            <Grant><Grantee xsi:type=\"Group\"><URI>http://acs.amazonaws.com/groups/global/AllUsers</URI></Grantee><Permission>READ</Permission></Grant>\
+        </AccessControlList>\
+        </AccessControlPolicy>"
+        .to_vec();
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("baclb"),
+                None,
+                &[("acl", "")],
+                &[],
+                acl_body,
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "PUT bucket?acl with a body document");
+
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("baclb"),
+                None,
+                &[("acl", "")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let xml = String::from_utf8(body).unwrap();
+    assert!(xml.contains("AllUsers"), "bucket ACL body persisted: {xml}");
+    assert!(xml.contains("<Permission>READ</Permission>"));
+}

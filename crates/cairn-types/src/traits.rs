@@ -202,6 +202,16 @@ pub trait MetadataStore: Send + Sync {
         limit: u32,
         now: Timestamp,
     ) -> Result<Vec<OutboxEntry>, MetaError>;
+    /// List replication-outbox entries the engine has marked terminal/failed (status `Failed`,
+    /// i.e. retries exhausted with no further attempt scheduled), most recently due first, up to
+    /// `limit`. The control plane surfaces these for operator attention (ARCH §20.5/§22.2).
+    async fn list_failed_replication(&self, limit: u32) -> Result<Vec<OutboxEntry>, MetaError>;
+
+    // --- bucket quota ---
+    /// Read a bucket's optional byte quota (`buckets.quota_bytes`), `None` when the bucket has
+    /// no quota set. The quota is enforced inside the writer's commit transaction (ARCH §27.5);
+    /// this reader exposes the configured value to the control plane.
+    async fn get_bucket_quota(&self, bucket: &BucketName) -> Result<Option<u64>, MetaError>;
 
     // --- users ---
     /// Look up a user by Bearer access-key id (returns the stored secret hash).

@@ -408,3 +408,206 @@ async fn create_bucket_conflict() {
         .unwrap_err();
     assert!(matches!(err, MetaError::Conflict));
 }
+
+/// Create a versioning-enabled bucket so quota/ACL fixtures have a parent row to read/update.
+fn bucket(name: &str) -> Bucket {
+    Bucket {
+        name: BucketName::parse(name).unwrap(),
+        owner_id: UserId::generate(),
+        created_at: Timestamp(1),
+        versioning: VersioningState::Enabled,
+        ownership_mode: OwnershipMode::BucketOwnerEnforced,
+        region: "us-east-1".to_owned(),
+        compression: None,
+    }
+}
+
+/// Commit one object version carrying a replication outbox entry, returning the entry id.
+async fn plant_outbox(
+    store: &cairn_meta::SqliteMetadataStore,
+    b: &BucketName,
+    key: &str,
+    version: VersionId,
+    id: &str,
+) {
+    let entry = OutboxEntry {
+        id: id.to_owned(),
+        bucket: b.clone(),
+        key: ObjectKey::parse(key).unwrap(),
+        version_id: version.clone(),
+        operation: ReplicationOp::ObjectCreate,
+        rule_id: "rule-1".to_owned(),
+        attempts: 0,
+        next_attempt_at: Timestamp(0),
+        status: ReplicationStatus::Pending,
+        last_error: None,
+    };
+    store
+        .submit(Mutation::PutObjectVersion {
+            row: Box::new(row(b, key, version, "e", true)),
+            precondition: Precondition::default(),
+            replication: Some(entry),
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn list_failed_replication_reports_terminal_entries_only() {
+    let store = cairn_meta::open_in_memory().unwrap();
+    let b = BucketName::parse("bkt").unwrap();
+    store
+        .submit(Mutation::CreateBucket(Box::new(bucket("bkt"))))
+        .await
+        .unwrap();
+
+    let v1 = VersionId::from_string("00000001".into());
+    let v2 = VersionId::from_string("00000002".into());
+    plant_outbox(&store, &b, "k1", v1.clone(), "pending-1").await;
+    plant_outbox(&store, &b, "k2", v2.clone(), "doomed-1").await;
+
+    // Nothing terminal yet.
+    assert!(store.list_failed_replication(100).await.unwrap().is_empty());
+
+    // Mark one entry terminally failed (next_attempt_at = None).
+    store
+        .submit(Mutation::MarkReplicationFailed {
+            id: "doomed-1".to_owned(),
+            error: "destination unreachable".to_owned(),
+            next_attempt_at: None,
+        })
+        .await
+        .unwrap();
+
+    let failed = store.list_failed_replication(100).await.unwrap();
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].id, "doomed-1");
+    assert_eq!(failed[0].version_id, v2);
+    assert_eq!(failed[0].attempts, 1);
+    assert_eq!(
+        failed[0].last_error.as_deref(),
+        Some("destination unreachable")
+    );
+
+    // A retryable failure (next_attempt_at = Some) stays pending and out of the failed list.
+    store
+        .submit(Mutation::MarkReplicationFailed {
+            id: "pending-1".to_owned(),
+            error: "transient".to_owned(),
+            next_attempt_at: Some(Timestamp(60_000)),
+        })
+        .await
+        .unwrap();
+    let failed = store.list_failed_replication(100).await.unwrap();
+    assert_eq!(failed.len(), 1, "retryable entry is not terminal");
+    assert_eq!(failed[0].id, "doomed-1");
+
+    // The limit is honoured.
+    assert!(store.list_failed_replication(0).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn get_bucket_quota_reads_the_column() {
+    let store = cairn_meta::open_in_memory().unwrap();
+    let b = BucketName::parse("quotab").unwrap();
+
+    // A bucket that does not exist reads as no-quota (None), not an error.
+    assert_eq!(store.get_bucket_quota(&b).await.unwrap(), None);
+
+    store
+        .submit(Mutation::CreateBucket(Box::new(bucket("quotab"))))
+        .await
+        .unwrap();
+    // A freshly created bucket has quota_bytes = NULL.
+    assert_eq!(store.get_bucket_quota(&b).await.unwrap(), None);
+
+    // Setting the quota is read back from the buckets.quota_bytes column.
+    store
+        .submit(Mutation::SetBucketQuota {
+            bucket: b.clone(),
+            quota_bytes: Some(4_096),
+        })
+        .await
+        .unwrap();
+    assert_eq!(store.get_bucket_quota(&b).await.unwrap(), Some(4_096));
+
+    // Clearing it returns to NULL/None.
+    store
+        .submit(Mutation::SetBucketQuota {
+            bucket: b.clone(),
+            quota_bytes: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(store.get_bucket_quota(&b).await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn set_object_acl_updates_the_version_row() {
+    use cairn_types::authz::{Acl, Grant, Grantee, Permission};
+
+    let store = cairn_meta::open_in_memory().unwrap();
+    let b = BucketName::parse("aclb").unwrap();
+    let k = ObjectKey::parse("obj").unwrap();
+    store
+        .submit(Mutation::CreateBucket(Box::new(bucket("aclb"))))
+        .await
+        .unwrap();
+
+    let v = VersionId::from_string("00000001".into());
+    store
+        .submit(put(
+            row(&b, "obj", v.clone(), "e", true),
+            Precondition::default(),
+        ))
+        .await
+        .unwrap();
+    assert!(
+        store
+            .get_version(&b, &k, &v)
+            .await
+            .unwrap()
+            .unwrap()
+            .acl
+            .is_none()
+    );
+
+    let acl = Acl {
+        owner: UserId::generate(),
+        grants: vec![Grant {
+            grantee: Grantee::AllUsers,
+            permission: Permission::Read,
+        }],
+    };
+    store
+        .submit(Mutation::SetObjectAcl {
+            bucket: b.clone(),
+            key: k.clone(),
+            version_id: v.clone(),
+            acl: Some(acl.clone()),
+        })
+        .await
+        .unwrap();
+    let got = store.get_version(&b, &k, &v).await.unwrap().unwrap();
+    assert_eq!(got.acl, Some(acl));
+
+    // Clearing it stores SQL NULL and reads back as None.
+    store
+        .submit(Mutation::SetObjectAcl {
+            bucket: b.clone(),
+            key: k.clone(),
+            version_id: v.clone(),
+            acl: None,
+        })
+        .await
+        .unwrap();
+    assert!(
+        store
+            .get_version(&b, &k, &v)
+            .await
+            .unwrap()
+            .unwrap()
+            .acl
+            .is_none()
+    );
+}
