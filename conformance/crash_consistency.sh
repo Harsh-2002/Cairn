@@ -116,28 +116,24 @@ put_http="$(curl -s -o /dev/null -w '%{http_code}' \
 note "PUT returned HTTP ${put_http:-<none>}"
 
 sleep 0.5
-server_alive=0
-kill -0 "$SRV" 2>/dev/null && server_alive=1
 
-# The only reliable signal that the seam fired is the server dying on the armed PUT: the
-# `blob_after_durable=panic` action aborts the in-flight write *after* the blob is durable but
-# *before* the metadata commit, so the process exits with the blob present and no row. A merely
-# larger blob count is NOT proof of arming — a *successful* PUT also writes a (live, referenced)
-# blob — so we deliberately do not infer arming from `count_blobs`.
+# `blob_after_durable=panic` aborts only the in-flight PUT *task* (after the blob is durable,
+# before the metadata commit); tokio isolates the panic, so the server PROCESS stays up. The
+# reliable arming signal is therefore: the PUT did NOT return 200 (the connection was dropped by
+# the panic) AND a new durable blob appeared since before the PUT (the orphan). A successful PUT
+# returns 200; a missing bucket returns 4xx with no new blob.
+blobs_after="$(count_blobs)"
 ARMED=0
-if [ "$server_alive" -eq 0 ]; then
-  note "server process died on the armed PUT — the fault seam fired"
+if [ "$put_http" != "200" ] && [ "$blobs_after" -gt "$blobs_before" ]; then
+  note "PUT aborted (HTTP ${put_http:-<none>}) and a new blob appeared — the fault seam fired, leaving an orphan"
   ARMED=1
 else
-  note "server survived the PUT (HTTP ${put_http:-<none>}) — the env-armed seam did not fire"
+  note "PUT returned HTTP ${put_http:-<none>} with no new orphan — the env-armed seam did not fire"
 fi
-: "$blobs_before"  # retained for symmetry with the dry-validation accounting below
 
 # --- 5. stop the server -------------------------------------------------------------------------
-if [ "$server_alive" -eq 1 ]; then
-  note "stopping server"
-  kill "$SRV" 2>/dev/null || true
-fi
+note "stopping server"
+kill "$SRV" 2>/dev/null || true
 wait "$SRV" 2>/dev/null || true
 SRV=""
 

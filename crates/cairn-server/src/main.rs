@@ -370,6 +370,11 @@ fn run_server(cfg: Config) -> ExitCode {
     observability::init_tracing(&cfg.log_level, cfg.log_format);
     let metrics = observability::init_metrics();
 
+    // Arm the fault-injection registry from $FAILPOINTS (only in `failpoints` builds, used by the
+    // crash-consistency harness). The scenario must outlive the server, so it is held here.
+    #[cfg(feature = "failpoints")]
+    let _fail_scenario = fail::FailScenario::setup();
+
     let rt = match runtime() {
         Ok(rt) => rt,
         Err(e) => {

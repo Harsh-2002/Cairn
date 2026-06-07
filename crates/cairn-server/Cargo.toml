@@ -14,13 +14,14 @@ workspace = true
 # Arms the fault-injection seams in the durable commit path (via cairn-blob) so a sibling
 # crash-harness/verification agent can build the server with the fail seams active. No
 # production code path depends on this; it only enables `cairn-blob`'s `failpoints` feature.
-failpoints = ["cairn-blob/failpoints"]
+failpoints = ["cairn-blob/failpoints", "dep:fail"]
 
 [[bin]]
 name = "cairn"
 path = "src/main.rs"
 
 [dependencies]
+fail = { workspace = true, optional = true }
 cairn-types.workspace = true
 cairn-s3.workspace = true
 cairn-meta.workspace = true

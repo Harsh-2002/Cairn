@@ -402,6 +402,7 @@ dependencies = [
  "cairn-types",
  "cairn-ui",
  "clap",
+ "fail",
  "figment",
  "futures-util",
  "http",
