@@ -1,5 +1,5 @@
 <script>
-  import { api } from "../lib/api.js";
+  import { api, s3 } from "../lib/api.js";
   import { bytes, count, whenMs } from "../lib/format.js";
   import { navigate } from "../lib/router.js";
   import BucketConfig from "./BucketConfig.svelte";
@@ -12,6 +12,8 @@
   let error = $state("");
   let loading = $state(true);
   let prefix = $state("");
+  let busy = $state(false);
+  let fileInput;
 
   async function loadDetail() {
     try {
@@ -38,21 +40,78 @@
     }
   }
 
+  async function refresh() {
+    await loadObjects();
+    await loadDetail();
+  }
+
   function applyPrefix(e) {
     e.preventDefault();
     loadObjects();
   }
 
-  // Re-run whenever the bucket name from the route changes.
+  async function upload(e) {
+    const files = e.target.files;
+    if (!files || !files.length) return;
+    busy = true;
+    error = "";
+    try {
+      for (const f of files) {
+        await s3.putObject(name, (prefix || "") + f.name, f);
+      }
+      await refresh();
+    } catch (err) {
+      error = err.message || "Upload failed.";
+    } finally {
+      busy = false;
+      if (fileInput) fileInput.value = "";
+    }
+  }
+
+  async function download(key) {
+    error = "";
+    try {
+      const blob = await s3.getObjectBlob(name, key);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = key.split("/").pop() || key;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      error = err.message || "Download failed.";
+    }
+  }
+
+  async function remove(key) {
+    if (!confirm(`Delete "${key}"? This cannot be undone.`)) return;
+    busy = true;
+    error = "";
+    try {
+      await s3.deleteObject(name, key);
+      await refresh();
+    } catch (err) {
+      error = err.message || "Delete failed.";
+    } finally {
+      busy = false;
+    }
+  }
+
+  // Re-run whenever the bucket name from the route changes. The loads are kicked off in a
+  // microtask so their synchronous prop reads don't run inside the effect's tracking scope (which
+  // otherwise re-ran the effect and clobbered the freshly-loaded list back to empty).
   $effect(() => {
-    // touch `name` so the effect tracks it
     void name;
     detail = null;
     objects = [];
     next = null;
     prefix = "";
-    loadDetail();
-    loadObjects();
+    queueMicrotask(() => {
+      loadDetail();
+      loadObjects();
+    });
   });
 </script>
 
@@ -106,43 +165,78 @@
 {/key}
 
 <h2>Objects</h2>
-<form class="toolbar" onsubmit={applyPrefix}>
-  <input placeholder="prefix filter" bind:value={prefix} autocomplete="off" />
-  <button type="submit">Filter</button>
+<div class="toolbar">
+  <form class="row" onsubmit={applyPrefix} style="gap:8px;">
+    <input placeholder="prefix filter" bind:value={prefix} autocomplete="off" />
+    <button type="submit">Filter</button>
+    <button
+      type="button"
+      onclick={() => {
+        prefix = "";
+        loadObjects();
+      }}>Clear</button
+    >
+  </form>
+  <span class="spacer"></span>
+  <input
+    type="file"
+    multiple
+    bind:this={fileInput}
+    onchange={upload}
+    style="display:none"
+  />
   <button
-    type="button"
-    onclick={() => {
-      prefix = "";
-      loadObjects();
-    }}>Clear</button
+    class="primary"
+    disabled={busy}
+    onclick={() => fileInput && fileInput.click()}
   >
-</form>
+    {busy ? "Working…" : "Upload"}
+  </button>
+</div>
+{#if prefix}
+  <p class="muted" style="margin:-8px 0 12px;font-size:0.85rem;">
+    Uploads will be prefixed with <span class="mono">{prefix}</span>.
+  </p>
+{/if}
 
 {#if loading}
   <p class="muted">Loading…</p>
 {:else if objects.length === 0}
   <div class="empty">No objects{prefix ? ` under "${prefix}"` : ""}.</div>
 {:else}
-  <table>
-    <thead>
-      <tr>
-        <th>Key</th>
-        <th class="num">Size</th>
-        <th>ETag</th>
-        <th>Last modified</th>
-      </tr>
-    </thead>
-    <tbody>
-      {#each objects as o (o.key)}
+  <div class="table-wrap">
+    <table>
+      <thead>
         <tr>
-          <td class="mono">{o.key}</td>
-          <td class="num">{bytes(o.size)}</td>
-          <td class="mono">{o.etag}</td>
-          <td>{whenMs(o.last_modified_ms)}</td>
+          <th>Key</th>
+          <th class="num">Size</th>
+          <th>ETag</th>
+          <th>Last modified</th>
+          <th></th>
         </tr>
-      {/each}
-    </tbody>
-  </table>
+      </thead>
+      <tbody>
+        {#each objects as o (o.key)}
+          <tr>
+            <td class="mono">{o.key}</td>
+            <td class="num">{bytes(o.size)}</td>
+            <td class="mono">{o.etag}</td>
+            <td>{whenMs(o.last_modified_ms)}</td>
+            <td>
+              <div class="actions">
+                <button class="sm" onclick={() => download(o.key)}>
+                  Download
+                </button>
+                <button class="sm danger" disabled={busy} onclick={() => remove(o.key)}>
+                  Delete
+                </button>
+              </div>
+            </td>
+          </tr>
+        {/each}
+      </tbody>
+    </table>
+  </div>
   {#if next}
     <p class="muted" style="margin-top:0.8rem;">
       More results available (next token: <span class="mono">{next}</span>).

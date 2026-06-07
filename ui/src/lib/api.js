@@ -177,3 +177,47 @@ export const api = {
 
   activity: (limit = 50) => request("GET", `/activity?limit=${limit}`),
 };
+
+// Object data plane. The S3 API (served at the root, path-style) accepts the same
+// Bearer credential as the management API, so the browser can upload, download,
+// preview, and delete object bytes directly — no separate SDK or signing needed.
+function s3headers() {
+  const h = {};
+  const tok = loadToken();
+  if (tok) h.Authorization = `Bearer ${tok}`;
+  return h;
+}
+
+function objectPath(bucket, key) {
+  const k = String(key).split("/").map(encodeURIComponent).join("/");
+  return `/${encodeURIComponent(bucket)}/${k}`;
+}
+
+export const s3 = {
+  objectPath,
+  async putObject(bucket, key, file) {
+    const res = await fetch(objectPath(bucket, key), {
+      method: "PUT",
+      headers: {
+        ...s3headers(),
+        "Content-Type": file.type || "application/octet-stream",
+      },
+      body: file,
+    });
+    if (!res.ok) throw new ApiError(`upload failed (${res.status})`, res.status);
+  },
+  async getObjectBlob(bucket, key) {
+    const res = await fetch(objectPath(bucket, key), { headers: s3headers() });
+    if (!res.ok)
+      throw new ApiError(`download failed (${res.status})`, res.status);
+    return await res.blob();
+  },
+  async deleteObject(bucket, key) {
+    const res = await fetch(objectPath(bucket, key), {
+      method: "DELETE",
+      headers: s3headers(),
+    });
+    if (!res.ok && res.status !== 204)
+      throw new ApiError(`delete failed (${res.status})`, res.status);
+  },
+};
