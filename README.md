@@ -12,21 +12,27 @@ UI, and a CLI — shipped as **one static binary**.
 
 ## Status
 
-Built wave by wave against ARCH §32. **Cairn already runs as an S3 server.**
+All build waves (ARCH §32, Phases 0–14) are complete. **Cairn is a runnable, S3-compatible
+server, validated against a real AWS SDK.**
 
-- **Wave 0 (seam freeze)** — complete: workspace, the 8-trait spine (`cairn-types`), in-memory
-  test doubles, server skeleton (HTTP stack, middleware, health/readiness/metrics, config
-  validation, graceful shutdown), CI, and a verified static `musl` binary.
-- **Wave 1 (foundations)** — complete: `cairn-meta` (group-committing SQLite writer + WAL read
-  pool), `cairn-blob` (durable commit + block compression + reconcile), `cairn-auth` (SigV4 +
-  Bearer, AWS `get-vanilla` vector), `cairn-crypto`, `cairn-authz` (policy/ACL/BPA engine),
-  `cairn-xml`.
-- **Wave 2 (protocol core)** — in progress: the SigV4 streaming **chunked decoder** (F-5) with
-  fuzz target; the S3 service (bucket CRUD; object PUT/GET/HEAD/DELETE with ranges, conditionals,
-  streaming uploads, listing); wired into the binary with `cairn bootstrap`. **Remaining:**
-  multipart, copy, bulk-delete, and the aws-sdk-s3 conformance matrix.
+- **Foundations** — the 8-trait spine + in-memory doubles; `cairn-meta` (group-committing SQLite
+  writer + WAL read pool, savepoint-isolated batches); `cairn-blob` (durable commit with
+  directory fsync + range-friendly block compression + bounded reconcile); `cairn-auth` (SigV4
+  header/presigned + Bearer, validated against the AWS `get-vanilla` vector); `cairn-crypto`
+  (AES-256-GCM envelope), `cairn-authz` (policy/ACL/BPA/ownership engine), `cairn-xml`.
+- **S3 surface** — the SigV4 streaming **chunked decoder** (F-5) with fuzz target; bucket CRUD;
+  object PUT/GET/HEAD/DELETE (ranges, conditionals, streaming uploads, checksums); listing
+  v1/v2 + versions; multipart; copy; bulk delete; versioning, tagging, CORS, policy, lifecycle,
+  replication subresources; the full authorization pipeline.
+- **Engines** — lifecycle scanner + multipart sweeper + metrics refresher run in the background;
+  outbox-driven replication engine.
+- **Control plane** — management JSON API (`/api/v1`) + embedded **Svelte UI** (`/ui/`) + CLI
+  (`bootstrap`, `integrity`, `validate-config`, `serve`); **native TLS** (rustls + aws-lc-rs).
 
-~190 tests pass; `clippy -D warnings` and `rustfmt` are clean.
+**Verification:** 242 unit/integration/property tests + a doctest suite; `clippy -D warnings`
+and `rustfmt` clean; a verified static `musl` binary; the chunked decoder benchmarks at
+**~1 GiB/s**; and a **boto3 conformance suite** drives the running server through the full object
+lifecycle (incl. real SigV4 + aws-chunked streaming + multipart + versioning + tagging).
 
 ### Try it
 
@@ -40,7 +46,12 @@ AUTH="Authorization: Bearer <id>.<secret>"   # from bootstrap output
 curl -X PUT -H "$AUTH" http://127.0.0.1:9000/my-bucket
 curl -X PUT -H "$AUTH" --data-binary "hello cairn" http://127.0.0.1:9000/my-bucket/hi.txt
 curl -H "$AUTH" http://127.0.0.1:9000/my-bucket/hi.txt     # -> hello cairn
+# then open http://127.0.0.1:9000/ui/ for the management UI
 ```
+
+Run the AWS-SDK conformance suite: `pip install boto3 && bash conformance/run.sh`.
+See [`docs/`](./docs) for the operations guide, the backup/restore procedure, and the S3 API
+support matrix.
 
 ## Workspace layout
 

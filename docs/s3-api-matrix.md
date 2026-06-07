@@ -1,0 +1,36 @@
+# S3 API Support Matrix
+
+Cairn implements the practical S3 control set. Operations are addressed path-style
+(`/{bucket}/{key}`) over HTTP/1.1 and HTTP/2; SigV4 (header + presigned) and a first-party
+Bearer scheme authenticate; a real policy/ACL/Block-Public-Access/Object-Ownership engine
+authorizes.
+
+| Operation | Supported | Notes |
+|---|---|---|
+| ListBuckets | ✅ | |
+| CreateBucket / DeleteBucket / HeadBucket | ✅ | Delete requires empty; force-empty via the management API. |
+| GetBucketLocation | ✅ | Returns the configured region. |
+| GetBucketVersioning / PutBucketVersioning | ✅ | Unversioned / Enabled / Suspended. |
+| GetBucketPolicy / PutBucketPolicy / DeleteBucketPolicy | ✅ | Validated by the policy engine. |
+| GetBucketCors / PutBucketCors / DeleteBucketCors | ✅ | Per-bucket config (validated). |
+| GetBucketTagging / PutBucketTagging / DeleteBucketTagging | ✅ | |
+| GetBucketLifecycleConfiguration / Put / Delete | ✅ | Expiration, noncurrent expiration, abort-incomplete, delete-marker removal; transition is a v1 no-op. |
+| GetBucketReplication / Put / Delete | ✅ (config) | Outbox + worker engine implemented; a remote sink is wired when configured. |
+| ListObjectsV2 / ListObjects (v1) | ✅ | Prefix, delimiter, pagination (opaque tokens), start-after / marker. |
+| ListObjectVersions | ✅ | Distinguishes versions from delete markers. |
+| ListMultipartUploads | ✅ | |
+| PutObject | ✅ | Plain, unsigned-payload, and **SigV4 streaming-chunked** bodies; conditional writes (If-Match / If-None-Match); inline metadata; requested checksums; Content-MD5 verification. |
+| GetObject / HeadObject | ✅ | Byte ranges (206), conditionals (304/412), version selection. |
+| DeleteObject | ✅ | Delete marker in a versioned bucket; permanent with a version id. |
+| DeleteObjects (bulk) | ✅ | Quiet mode; up to the request cap. |
+| CopyObject | ✅ | COPY/REPLACE metadata directive; same-key metadata change; versioned source. |
+| CreateMultipartUpload / UploadPart / ListParts / CompleteMultipartUpload / AbortMultipartUpload | ✅ | Correct multipart ETag (`md5(concat(part-md5s))-N`); part validation; double-completion guarded. |
+| GetObjectTagging / PutObjectTagging / DeleteObjectTagging | ✅ | Stored as queryable rows; usable by lifecycle/policy. |
+| Presigned GET / PUT | ✅ | SigV4 query form. |
+| GetObjectAcl / PutObjectAcl, GetBucketAcl / PutBucketAcl | ◑ | ACLs are off by default under the recommended BucketOwnerEnforced mode; the policy engine is primary. |
+| UploadPartCopy, GetObjectAttributes | ◐ | Planned. |
+| Object Lock / retention, SSE config, website / accelerate / analytics / inventory / requester-pays | ✖ | Out of scope; answered as NotImplemented. |
+
+**Management API** (`/api/v1`, admin-gated JSON) and the **embedded Svelte UI** (`/ui/`) provide
+control-plane operations (overview, bucket/user/activity management) consumed by both the web UI
+and the CLI.

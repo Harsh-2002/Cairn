@@ -65,6 +65,41 @@ jobs:
           name: cairn-x86_64-musl
           path: target/x86_64-unknown-linux-musl/release/cairn
 
+  conformance:
+    name: boto3 conformance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - run: pip install boto3
+      - run: cargo build --bin cairn
+      - name: Drive Cairn with the AWS SDK (real SigV4 + aws-chunked streaming, the F-5 path)
+        run: BIN=target/debug/cairn PY=python3 bash conformance/run.sh
+
+  fuzz-smoke:
+    name: fuzz smoke (chunked decoder)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-fuzz
+      - run: cargo fuzz run chunked_decoder -- -max_total_time=60
+        working-directory: crates/cairn-s3
+
+  benches:
+    name: benchmarks compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo bench --workspace --no-run
+
   coverage:
     name: coverage
     runs-on: ubuntu-latest
