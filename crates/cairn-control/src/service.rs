@@ -7,7 +7,7 @@
 use crate::wire;
 use bytes::Bytes;
 use cairn_types::auth::{Principal, Role};
-use cairn_types::bucket::{Bucket, VersioningState};
+use cairn_types::bucket::{Bucket, ConfigAspect, ConfigDoc, VersioningState};
 use cairn_types::id::{BucketName, UserId};
 use cairn_types::meta::{ListQuery, Mutation, MutationOutcome, StoreCounts, User, UserRecord};
 use cairn_types::traits::{BlobStore, Clock, Crypto, MetadataStore};
@@ -66,6 +66,14 @@ impl ControlResponse {
 
     fn error_internal(message: &str) -> Self {
         Self::error(StatusCode::INTERNAL_SERVER_ERROR, message)
+    }
+
+    /// An empty `204 No Content` response.
+    fn no_content() -> Self {
+        Self {
+            status: StatusCode::NO_CONTENT,
+            body: Vec::new(),
+        }
     }
 }
 
@@ -136,8 +144,22 @@ impl ControlService {
             (&Method::DELETE, ["buckets", name]) => self.delete_bucket(name).await,
             (&Method::GET, ["buckets", name, "objects"]) => self.list_objects(name, query).await,
 
+            (&Method::GET, ["buckets", name, "config"]) => self.bucket_config(name).await,
+            (&Method::PUT, ["buckets", name, "versioning"]) => {
+                self.set_versioning(name, &body).await
+            }
+            (&Method::PUT, ["buckets", name, "quota"]) => self.set_quota(name, &body).await,
+            (&Method::PUT, ["buckets", name, "policy"]) => self.set_policy(name, &body).await,
+            (&Method::DELETE, ["buckets", name, "policy"]) => self.delete_policy(name).await,
+
             (&Method::GET, ["users"]) => self.list_users().await,
             (&Method::POST, ["users"]) => self.create_user(&body).await,
+            (&Method::PATCH, ["users", id]) => self.patch_user(id, &body).await,
+            (&Method::POST, ["users", id, "rotate-credentials"]) => {
+                self.rotate_credentials(id).await
+            }
+
+            (&Method::GET, ["replication", "failed"]) => self.failed_replication(query).await,
 
             (&Method::GET, ["activity"]) => self.activity(query).await,
 
@@ -376,10 +398,7 @@ impl ControlService {
         self.record_activity("DeleteBucket", Some(bucket_name.as_str()), None)
             .await;
 
-        ControlResponse {
-            status: StatusCode::NO_CONTENT,
-            body: Vec::new(),
-        }
+        ControlResponse::no_content()
     }
 
     async fn list_objects(&self, name: &str, query: &[(String, String)]) -> ControlResponse {
@@ -428,6 +447,216 @@ impl ControlService {
                 next: page.next_cursor,
             },
         )
+    }
+
+    // -----------------------------------------------------------------------------------
+    // Bucket configuration (ARCH §22.2)
+    // -----------------------------------------------------------------------------------
+
+    /// `GET /buckets/{name}/config`: the bucket's versioning + ownership state alongside each
+    /// configuration aspect document (parsed back to JSON, or `null` when unset).
+    async fn bucket_config(&self, name: &str) -> ControlResponse {
+        let bucket_name = match BucketName::parse(name) {
+            Ok(n) => n,
+            Err(_) => return ControlResponse::not_found(),
+        };
+        let bucket = match self.meta.get_bucket(&bucket_name).await {
+            Ok(Some(b)) => b,
+            Ok(None) => return ControlResponse::not_found(),
+            Err(e) => return ControlResponse::error_internal(&e.to_string()),
+        };
+
+        // Each aspect is an opaque stored document; surface it as parsed JSON so the UI can
+        // render it, falling back to a JSON string if it is not itself JSON.
+        let (policy, cors, tagging, lifecycle, acl, public_access_block) =
+            match self.read_aspects(&bucket_name).await {
+                Ok(aspects) => aspects,
+                Err(e) => return ControlResponse::error_internal(&e),
+            };
+
+        ControlResponse::json(
+            StatusCode::OK,
+            &wire::BucketConfigResp {
+                versioning: wire::versioning_str(bucket.versioning),
+                ownership_mode: wire::ownership_str(bucket.ownership_mode),
+                // The byte quota is enforced inside the writer's commit transaction and is not
+                // exposed as a readable document by the trait spine; reported as null.
+                quota_bytes: None,
+                policy,
+                cors,
+                tagging,
+                lifecycle,
+                acl,
+                public_access_block,
+            },
+        )
+    }
+
+    /// Read the six exposed config aspects of a bucket, each rendered as JSON (or `None` when
+    /// unset). Returns the documents in the response's declared order, or an error string on a
+    /// store failure.
+    #[allow(clippy::type_complexity)]
+    async fn read_aspects(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<
+        (
+            Option<serde_json::Value>,
+            Option<serde_json::Value>,
+            Option<serde_json::Value>,
+            Option<serde_json::Value>,
+            Option<serde_json::Value>,
+            Option<serde_json::Value>,
+        ),
+        String,
+    > {
+        let read = |aspect: ConfigAspect| async move {
+            match self.meta.get_bucket_config(bucket, aspect).await {
+                Ok(Some(doc)) => Ok(Some(config_doc_to_json(&doc))),
+                Ok(None) => Ok(None),
+                Err(e) => Err(e.to_string()),
+            }
+        };
+        Ok((
+            read(ConfigAspect::Policy).await?,
+            read(ConfigAspect::Cors).await?,
+            read(ConfigAspect::Tagging).await?,
+            read(ConfigAspect::Lifecycle).await?,
+            read(ConfigAspect::Acl).await?,
+            read(ConfigAspect::PublicAccessBlock).await?,
+        ))
+    }
+
+    /// `PUT /buckets/{name}/versioning`: set the bucket's versioning state.
+    async fn set_versioning(&self, name: &str, body: &Bytes) -> ControlResponse {
+        let bucket_name = match self.require_bucket(name).await {
+            Ok(n) => n,
+            Err(resp) => return resp,
+        };
+        let req: wire::SetVersioningReq = match serde_json::from_slice(body) {
+            Ok(r) => r,
+            Err(e) => return ControlResponse::bad_request(&e.to_string()),
+        };
+        let state = match wire::parse_versioning(&req.status) {
+            Some(s) => s,
+            None => {
+                return ControlResponse::bad_request(
+                    "status must be Enabled, Suspended, or Unversioned",
+                );
+            }
+        };
+
+        if let Err(e) = self
+            .meta
+            .submit(Mutation::SetVersioning {
+                bucket: bucket_name.clone(),
+                state,
+            })
+            .await
+        {
+            return ControlResponse::error_internal(&e.to_string());
+        }
+
+        self.record_activity("SetVersioning", Some(bucket_name.as_str()), None)
+            .await;
+        ControlResponse::no_content()
+    }
+
+    /// `PUT /buckets/{name}/quota`: set or clear the bucket's byte quota.
+    async fn set_quota(&self, name: &str, body: &Bytes) -> ControlResponse {
+        let bucket_name = match self.require_bucket(name).await {
+            Ok(n) => n,
+            Err(resp) => return resp,
+        };
+        let req: wire::SetQuotaReq = match serde_json::from_slice(body) {
+            Ok(r) => r,
+            Err(e) => return ControlResponse::bad_request(&e.to_string()),
+        };
+
+        if let Err(e) = self
+            .meta
+            .submit(Mutation::SetBucketQuota {
+                bucket: bucket_name.clone(),
+                quota_bytes: req.quota_bytes,
+            })
+            .await
+        {
+            return ControlResponse::error_internal(&e.to_string());
+        }
+
+        self.record_activity("SetBucketQuota", Some(bucket_name.as_str()), None)
+            .await;
+        ControlResponse::no_content()
+    }
+
+    /// `PUT /buckets/{name}/policy`: validate the raw policy JSON via `cairn_authz::parse_policy`
+    /// and store it as the bucket's `Policy` config aspect.
+    async fn set_policy(&self, name: &str, body: &Bytes) -> ControlResponse {
+        let bucket_name = match self.require_bucket(name).await {
+            Ok(n) => n,
+            Err(resp) => return resp,
+        };
+
+        // The body is the raw policy JSON document. Validate it before storing so a malformed
+        // policy is rejected at the edge rather than failing open later (ARCH §15.5).
+        let policy_json = match std::str::from_utf8(body) {
+            Ok(s) => s,
+            Err(_) => return ControlResponse::bad_request("policy must be valid UTF-8 JSON"),
+        };
+        if let Err(e) = cairn_authz::parse_policy(policy_json) {
+            return ControlResponse::bad_request(&format!("invalid policy: {e}"));
+        }
+
+        if let Err(e) = self
+            .meta
+            .submit(Mutation::SetBucketConfig {
+                bucket: bucket_name.clone(),
+                aspect: ConfigAspect::Policy,
+                doc: Some(ConfigDoc(policy_json.to_owned())),
+            })
+            .await
+        {
+            return ControlResponse::error_internal(&e.to_string());
+        }
+
+        self.record_activity("PutBucketPolicy", Some(bucket_name.as_str()), None)
+            .await;
+        ControlResponse::no_content()
+    }
+
+    /// `DELETE /buckets/{name}/policy`: clear the bucket's policy.
+    async fn delete_policy(&self, name: &str) -> ControlResponse {
+        let bucket_name = match self.require_bucket(name).await {
+            Ok(n) => n,
+            Err(resp) => return resp,
+        };
+
+        if let Err(e) = self
+            .meta
+            .submit(Mutation::SetBucketConfig {
+                bucket: bucket_name.clone(),
+                aspect: ConfigAspect::Policy,
+                doc: None,
+            })
+            .await
+        {
+            return ControlResponse::error_internal(&e.to_string());
+        }
+
+        self.record_activity("DeleteBucketPolicy", Some(bucket_name.as_str()), None)
+            .await;
+        ControlResponse::no_content()
+    }
+
+    /// Parse a bucket name and confirm the bucket exists, mapping the two failure modes to the
+    /// shared `404` responses used across the config endpoints.
+    async fn require_bucket(&self, name: &str) -> Result<BucketName, ControlResponse> {
+        let bucket_name = BucketName::parse(name).map_err(|_| ControlResponse::not_found())?;
+        match self.meta.get_bucket(&bucket_name).await {
+            Ok(Some(_)) => Ok(bucket_name),
+            Ok(None) => Err(ControlResponse::not_found()),
+            Err(e) => Err(ControlResponse::error_internal(&e.to_string())),
+        }
     }
 
     // -----------------------------------------------------------------------------------
@@ -525,6 +754,186 @@ impl ControlService {
         )
     }
 
+    /// `PATCH /users/{id}`: update a user's mutable fields (activation and/or role). Absent
+    /// fields are left unchanged. Returns the updated public user view.
+    async fn patch_user(&self, id: &str, body: &Bytes) -> ControlResponse {
+        let req: wire::PatchUserReq = match serde_json::from_slice(body) {
+            Ok(r) => r,
+            Err(e) => return ControlResponse::bad_request(&e.to_string()),
+        };
+        let new_role = match req.role.as_deref().map(wire::parse_role) {
+            Some(Some(r)) => Some(r),
+            Some(None) => {
+                return ControlResponse::bad_request("role must be administrator or member");
+            }
+            None => None,
+        };
+        if req.is_active.is_none() && new_role.is_none() {
+            return ControlResponse::bad_request("nothing to update");
+        }
+
+        let user_id = UserId(id.to_owned());
+        // Load the current full record so the unchanged fields (display name, credentials,
+        // SigV4 material) survive the update intact.
+        let mut record = match self.load_user_record(&user_id).await {
+            Ok(Some(r)) => r,
+            Ok(None) => return ControlResponse::not_found(),
+            Err(resp) => return resp,
+        };
+
+        if let Some(role) = new_role {
+            record.user.role = role;
+        }
+        if let Some(active) = req.is_active {
+            record.user.is_active = active;
+        }
+        record.user.updated_at = self.clock.now();
+
+        // A pure deactivation (no role change) goes through the dedicated mutation; any field
+        // that the record-preserving path must carry goes through UpdateUser.
+        if new_role.is_none() && req.is_active == Some(false) {
+            if let Err(e) = self
+                .meta
+                .submit(Mutation::DeactivateUser(user_id.clone()))
+                .await
+            {
+                return ControlResponse::error_internal(&e.to_string());
+            }
+        } else if let Err(e) = self
+            .meta
+            .submit(Mutation::UpdateUser(Box::new(record.clone())))
+            .await
+        {
+            return ControlResponse::error_internal(&e.to_string());
+        }
+
+        self.record_activity("UpdateUser", None, None).await;
+
+        ControlResponse::json(
+            StatusCode::OK,
+            &wire::PatchUserResp {
+                id: record.user.id.to_string(),
+                display_name: record.user.display_name,
+                access_key_id: record.user.access_key_id,
+                role: wire::role_str(record.user.role),
+                is_active: record.user.is_active,
+            },
+        )
+    }
+
+    /// `POST /users/{id}/rotate-credentials`: mint a fresh Bearer secret for the existing user,
+    /// persist only its hash, and return the plaintext exactly once.
+    async fn rotate_credentials(&self, id: &str) -> ControlResponse {
+        let user_id = UserId(id.to_owned());
+        let mut record = match self.load_user_record(&user_id).await {
+            Ok(Some(r)) => r,
+            Ok(None) => return ControlResponse::not_found(),
+            Err(resp) => return resp,
+        };
+
+        let secret = generate_secret();
+        record.bearer_secret_hash = cairn_auth::hash_bearer_secret(&secret);
+        record.user.updated_at = self.clock.now();
+        let access_key_id = record.user.access_key_id.clone();
+
+        if let Err(e) = self
+            .meta
+            .submit(Mutation::UpdateUser(Box::new(record)))
+            .await
+        {
+            return ControlResponse::error_internal(&e.to_string());
+        }
+
+        self.record_activity("RotateCredentials", None, None).await;
+
+        ControlResponse::json(
+            StatusCode::OK,
+            &wire::RotateCredentialsResp {
+                bearer_access_key_id: access_key_id,
+                bearer_secret: secret,
+            },
+        )
+    }
+
+    /// Reconstruct a full [`UserRecord`] for `id` from the read surface the trait spine exposes:
+    /// the public [`User`] fields come from the user listing, the Bearer secret hash from the
+    /// Bearer-key lookup, and any SigV4 secret material from the SigV4-key lookup. The trait has
+    /// no by-id record reader, so this is the faithful reconstruction the update path needs.
+    ///
+    /// Returns `Ok(None)` when no such user exists, and an error [`ControlResponse`] on a store
+    /// failure.
+    async fn load_user_record(&self, id: &UserId) -> Result<Option<UserRecord>, ControlResponse> {
+        let users = self
+            .meta
+            .list_users()
+            .await
+            .map_err(|e| ControlResponse::error_internal(&e.to_string()))?;
+        let Some(user) = users.into_iter().find(|u: &User| &u.id == id) else {
+            return Ok(None);
+        };
+
+        let bearer = self
+            .meta
+            .user_by_bearer_key(&user.access_key_id)
+            .await
+            .map_err(|e| ControlResponse::error_internal(&e.to_string()))?;
+        let Some(bearer) = bearer else {
+            // The user is listed but its credential row is missing; treat as not found rather
+            // than fabricating a hash.
+            return Ok(None);
+        };
+
+        let (sigv4_secret_ciphertext, sigv4_secret_nonce) =
+            match user.sigv4_access_key_id.as_deref() {
+                Some(key) => {
+                    let creds = self
+                        .meta
+                        .user_by_sigv4_key(key)
+                        .await
+                        .map_err(|e| ControlResponse::error_internal(&e.to_string()))?;
+                    match creds {
+                        Some(c) => (Some(c.secret_ciphertext), Some(c.secret_nonce)),
+                        None => (None, None),
+                    }
+                }
+                None => (None, None),
+            };
+
+        Ok(Some(UserRecord {
+            user,
+            bearer_secret_hash: bearer.secret_hash,
+            sigv4_secret_ciphertext,
+            sigv4_secret_nonce,
+        }))
+    }
+
+    // -----------------------------------------------------------------------------------
+    // Replication operations (ARCH §22.2)
+    // -----------------------------------------------------------------------------------
+
+    /// `GET /replication/failed`: list outbox entries in a failed/terminal state.
+    ///
+    /// LIMITATION: the [`MetadataStore`] trait exposes no reader for failed/terminal outbox
+    /// entries — only `claim_replication_batch`, which returns *pending* due entries. Surfacing
+    /// the failed set requires a new trait method on the frozen `cairn-types` spine, so this
+    /// endpoint currently returns an empty list. The response shape is the contract one so the
+    /// reader can be wired in without a wire-format change once the trait gains a failed-entry
+    /// reader.
+    async fn failed_replication(&self, query: &[(String, String)]) -> ControlResponse {
+        // The limit is parsed and clamped so the eventual reader inherits the same bound; it is
+        // unused while the listing is necessarily empty.
+        let _limit = find_query(query, "limit")
+            .and_then(|v| v.parse::<u32>().ok())
+            .map_or(PAGE_LIMIT, |v| v.clamp(1, PAGE_LIMIT));
+
+        ControlResponse::json(
+            StatusCode::OK,
+            &wire::FailedReplicationResp {
+                entries: Vec::new(),
+            },
+        )
+    }
+
     // -----------------------------------------------------------------------------------
     // Activity
     // -----------------------------------------------------------------------------------
@@ -597,6 +1006,13 @@ fn compression_ratio(counts: &StoreCounts) -> f64 {
     } else {
         counts.logical_bytes as f64 / counts.physical_bytes as f64
     }
+}
+
+/// Render a stored config document as JSON: if the document text is itself JSON, return the
+/// parsed value so the UI sees structured data; otherwise return it as a JSON string so the
+/// response is always valid JSON.
+fn config_doc_to_json(doc: &ConfigDoc) -> serde_json::Value {
+    serde_json::from_str(&doc.0).unwrap_or_else(|_| serde_json::Value::String(doc.0.clone()))
 }
 
 /// A high-entropy URL-safe Bearer secret (32 random bytes, hex-encoded).

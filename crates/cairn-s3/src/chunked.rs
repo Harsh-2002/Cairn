@@ -309,9 +309,22 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.ct_eq(b).into()
 }
 
+/// The marker prefix the body stream carries when a signed chunk fails its signature check, so
+/// the ingest path can map the failure to an authentication error (`SignatureDoesNotMatch`)
+/// rather than a generic internal error. See [`is_signature_failure`].
+pub const CHUNK_SIGNATURE_FAILURE_MARKER: &str = "aws-chunked: chunk signature mismatch";
+
+/// Whether a propagated body-error message denotes a signed-streaming chunk-signature failure.
+#[must_use]
+pub fn is_signature_failure(message: &str) -> bool {
+    message.contains(CHUNK_SIGNATURE_FAILURE_MARKER)
+}
+
 /// Wrap a raw request body stream in `decoder`, yielding a stream of de-framed payload bytes.
 /// A decode error terminates the stream with a [`BodyError`]; the downstream blob stager treats
-/// that as a failed upload and reclaims the staging artifact.
+/// that as a failed upload and reclaims the staging artifact. A signed-chunk signature mismatch
+/// is tagged with [`CHUNK_SIGNATURE_FAILURE_MARKER`] so the ingest path can surface it as an
+/// authentication failure.
 ///
 /// [`BodyError`]: cairn_types::error::BodyError
 pub fn decode_stream(
@@ -348,7 +361,12 @@ pub fn decode_stream(
                     let mut out = Vec::new();
                     if let Err(e) = st.decoder.push(&chunk, &mut out) {
                         st.done = true;
-                        return Some((Err(BodyError::Transport(e.to_string())), st));
+                        let msg = if e == DecodeError::SignatureMismatch {
+                            CHUNK_SIGNATURE_FAILURE_MARKER.to_owned()
+                        } else {
+                            e.to_string()
+                        };
+                        return Some((Err(BodyError::Transport(msg)), st));
                     }
                     st.pending.extend(out);
                 }

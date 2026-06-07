@@ -17,6 +17,7 @@ fn admin() -> Principal {
         access_key_id: "k".to_owned(),
         role: Role::Administrator,
         method: AuthMethod::Bearer,
+        chunk_signing: None,
     }
 }
 
@@ -51,6 +52,18 @@ fn req(
     headers: &[(&str, &str)],
     body: Vec<u8>,
 ) -> (S3Request, cairn_types::BodyStream) {
+    req_with_principal(method, bucket, key, query, headers, body, admin())
+}
+
+fn req_with_principal(
+    method: Method,
+    bucket: Option<&str>,
+    key: Option<&str>,
+    query: &[(&str, &str)],
+    headers: &[(&str, &str)],
+    body: Vec<u8>,
+    principal: Principal,
+) -> (S3Request, cairn_types::BodyStream) {
     let request = S3Request {
         method,
         bucket: bucket.map(|b| BucketName::parse(b).unwrap()),
@@ -63,7 +76,7 @@ fn req(
             .iter()
             .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
             .collect(),
-        principal: Some(admin()),
+        principal: Some(principal),
         source: IpAddr::V4(Ipv4Addr::LOCALHOST),
         secure: false,
         request_id: "req-1".to_owned(),
@@ -305,7 +318,8 @@ async fn streaming_chunked_put_is_deframed() {
         Some("obj"),
         &[],
         &[
-            ("x-amz-content-sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"),
+            // Unsigned streaming: de-frame without verifying a per-chunk signature chain.
+            ("x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD"),
             ("content-type", "text/plain"),
         ],
         chunked,
@@ -329,6 +343,503 @@ async fn streaming_chunked_put_is_deframed() {
         body, payload,
         "streaming body must be de-framed to the original payload"
     );
+}
+
+/// Build a SigV4 signed `aws-chunked` body for `payloads` and the matching signed-streaming
+/// context, using cairn-auth's signing primitives the way a real client would. The returned
+/// context seeds the decoder's per-chunk chain; `tamper` flips a payload byte AFTER signing so
+/// the chain no longer verifies.
+fn signed_streaming(
+    payloads: &[&[u8]],
+    tamper: bool,
+) -> (Vec<u8>, cairn_types::ChunkSigningContext) {
+    use sha2::Digest;
+    let secret = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
+    let amzdate = "20260101T000000Z";
+    let scope = "20260101/us-east-1/s3/aws4_request";
+    let seed = "0000000000000000000000000000000000000000000000000000000000000000";
+    let key = cairn_auth::streaming_signing_key(secret, "20260101", "us-east-1");
+
+    let mut prev = seed.to_owned();
+    let mut body = Vec::new();
+    // The wire stream carries each payload chunk then a terminating zero-size chunk.
+    let mut chunks: Vec<&[u8]> = payloads.to_vec();
+    chunks.push(b"");
+    for p in &chunks {
+        let hash = hex::encode(sha2::Sha256::digest(p));
+        let sts = cairn_auth::chunk_string_to_sign(amzdate, scope, &prev, &hash);
+        let sig = cairn_auth::compute_signature(&key, &sts);
+        body.extend_from_slice(format!("{:x};chunk-signature={}\r\n", p.len(), sig).as_bytes());
+        body.extend_from_slice(p);
+        body.extend_from_slice(b"\r\n");
+        prev = sig;
+    }
+    body.extend_from_slice(b"\r\n"); // trailer terminator
+
+    if tamper {
+        // Corrupt the first payload byte: signed, but the chunk hash no longer matches.
+        let first = payloads.first().copied().unwrap_or(b"");
+        if let Some(pos) = body.windows(first.len()).position(|w| w == first) {
+            body[pos] ^= 0xff;
+        }
+    }
+
+    let ctx = cairn_types::ChunkSigningContext {
+        seed_signature: seed.to_owned(),
+        signing_key: key,
+        amz_date: amzdate.to_owned(),
+        scope: scope.to_owned(),
+    };
+    (body, ctx)
+}
+
+fn signed_streaming_principal(ctx: cairn_types::ChunkSigningContext) -> Principal {
+    let mut p = admin();
+    p.chunk_signing = Some(ctx);
+    p
+}
+
+#[tokio::test]
+async fn signed_streaming_put_with_valid_chain_succeeds() {
+    let h = harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("sgn"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+
+    let payload: &[u8] = b"the quick brown fox jumps over the lazy dog";
+    let (body, ctx) = signed_streaming(&[payload], false);
+    let put = req_with_principal(
+        Method::PUT,
+        Some("sgn"),
+        Some("ok"),
+        &[],
+        &[
+            ("x-amz-content-sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"),
+            ("content-type", "application/octet-stream"),
+        ],
+        body,
+        signed_streaming_principal(ctx),
+    );
+    let (st, hdrs, _) = drain(send(&h.svc, put).await).await;
+    assert_eq!(st, StatusCode::OK, "valid signed chain must be accepted");
+    assert_eq!(
+        header(&hdrs, "etag"),
+        Some(format!("\"{}\"", md5_hex(payload)).as_str())
+    );
+
+    // And the de-framed plaintext round-trips.
+    let (st, _, got) = drain(
+        send(
+            &h.svc,
+            req(Method::GET, Some("sgn"), Some("ok"), &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(got, payload);
+}
+
+#[tokio::test]
+async fn signed_streaming_put_with_wrong_chunk_signature_is_rejected() {
+    let h = harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("bad"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+
+    let payload: &[u8] = b"the quick brown fox jumps over the lazy dog";
+    let (body, ctx) = signed_streaming(&[payload], true);
+    let put = req_with_principal(
+        Method::PUT,
+        Some("bad"),
+        Some("tampered"),
+        &[],
+        &[
+            ("x-amz-content-sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"),
+            ("content-type", "application/octet-stream"),
+        ],
+        body,
+        signed_streaming_principal(ctx),
+    );
+    let (st, _, _) = drain(send(&h.svc, put).await).await;
+    assert_eq!(
+        st,
+        StatusCode::FORBIDDEN,
+        "a tampered signed-streaming chunk must be rejected"
+    );
+
+    // The object must NOT have been stored.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(Method::GET, Some("bad"), Some("tampered"), &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::NOT_FOUND,
+        "tampered upload must not be stored"
+    );
+}
+
+#[tokio::test]
+async fn signed_streaming_sentinel_without_context_is_rejected() {
+    let h = harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("noctx"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+
+    // A signed sentinel but no SigV4 streaming context on the principal (e.g. it never went
+    // through the header path) is invalid and must be refused before any bytes are stored.
+    let (body, _ctx) = signed_streaming(&[b"data"], false);
+    let put = req_with_principal(
+        Method::PUT,
+        Some("noctx"),
+        Some("k"),
+        &[],
+        &[("x-amz-content-sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD")],
+        body,
+        admin(), // chunk_signing is None
+    );
+    let (st, _, _) = drain(send(&h.svc, put).await).await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+}
+
+// The test harness clock is fixed at 1_700_000_000s = Tue, 14 Nov 2023 22:13:20 GMT, so an
+// object PUT through it has that last-modified. These bracket it for time-based conditionals.
+const BEFORE_LM: &str = "Sat, 01 Jan 2022 00:00:00 GMT";
+const AFTER_LM: &str = "Wed, 01 Jan 2025 00:00:00 GMT";
+
+/// PUT a small object into a fresh bucket, returning its quoted ETag.
+async fn put_simple(h: &Harness, bucket: &str, key: &str) -> String {
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some(bucket), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    let (st, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some(bucket),
+                Some(key),
+                &[],
+                &[],
+                b"conditional".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    header(&hdrs, "etag").unwrap().to_owned()
+}
+
+#[tokio::test]
+async fn conditional_get_modified_since_returns_304() {
+    let h = harness().await;
+    put_simple(&h, "cond", "obj").await;
+
+    // Not modified since a date AFTER last-modified => 304.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("cond"),
+                Some("obj"),
+                &[],
+                &[("if-modified-since", AFTER_LM)],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_MODIFIED);
+
+    // Modified since a date BEFORE last-modified => normal 200.
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("cond"),
+                Some("obj"),
+                &[],
+                &[("if-modified-since", BEFORE_LM)],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(body, b"conditional");
+}
+
+#[tokio::test]
+async fn conditional_get_unmodified_since_returns_412() {
+    let h = harness().await;
+    put_simple(&h, "cond2", "obj").await;
+
+    // The object WAS modified after this date => If-Unmodified-Since fails => 412.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("cond2"),
+                Some("obj"),
+                &[],
+                &[("if-unmodified-since", BEFORE_LM)],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::PRECONDITION_FAILED);
+}
+
+#[tokio::test]
+async fn conditional_head_returns_304_and_412() {
+    let h = harness().await;
+    let etag = put_simple(&h, "cond3", "obj").await;
+
+    // HEAD with If-None-Match matching the ETag => 304.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::HEAD,
+                Some("cond3"),
+                Some("obj"),
+                &[],
+                &[("if-none-match", etag.as_str())],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_MODIFIED, "conditional HEAD must 304");
+
+    // HEAD with If-Match not matching => 412.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::HEAD,
+                Some("cond3"),
+                Some("obj"),
+                &[],
+                &[("if-match", "\"deadbeefdeadbeefdeadbeefdeadbeef\"")],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::PRECONDITION_FAILED,
+        "conditional HEAD must 412"
+    );
+
+    // HEAD with If-Modified-Since after last-modified => 304.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::HEAD,
+                Some("cond3"),
+                Some("obj"),
+                &[],
+                &[("if-modified-since", AFTER_LM)],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_MODIFIED);
+}
+
+#[tokio::test]
+async fn copy_source_if_match_and_modified_since_preconditions() {
+    let h = harness().await;
+    let etag = put_simple(&h, "src", "k").await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("dst"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+
+    // Copy with a non-matching x-amz-copy-source-if-match => 412.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("dst"),
+                Some("c1"),
+                &[],
+                &[
+                    ("x-amz-copy-source", "/src/k"),
+                    (
+                        "x-amz-copy-source-if-match",
+                        "\"00000000000000000000000000000000\"",
+                    ),
+                ],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::PRECONDITION_FAILED);
+
+    // Copy with a matching if-match and a satisfied if-unmodified-since => succeeds.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("dst"),
+                Some("c2"),
+                &[],
+                &[
+                    ("x-amz-copy-source", "/src/k"),
+                    ("x-amz-copy-source-if-match", etag.as_str()),
+                    ("x-amz-copy-source-if-unmodified-since", AFTER_LM),
+                ],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    // Copy with x-amz-copy-source-if-modified-since AFTER last-modified (not modified) => 412.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("dst"),
+                Some("c3"),
+                &[],
+                &[
+                    ("x-amz-copy-source", "/src/k"),
+                    ("x-amz-copy-source-if-modified-since", AFTER_LM),
+                ],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::PRECONDITION_FAILED);
+}
+
+fn sha256_b64(data: &[u8]) -> String {
+    use base64::Engine;
+    use sha2::Digest;
+    base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(data))
+}
+
+#[tokio::test]
+async fn put_with_matching_checksum_succeeds() {
+    let h = harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("cks"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+
+    let payload = b"checksum me please".to_vec();
+    let want = sha256_b64(&payload);
+    let put = req(
+        Method::PUT,
+        Some("cks"),
+        Some("good"),
+        &[],
+        &[("x-amz-checksum-sha256", want.as_str())],
+        payload,
+    );
+    let (st, _, _) = drain(send(&h.svc, put).await).await;
+    assert_eq!(st, StatusCode::OK, "matching checksum must be accepted");
+}
+
+#[tokio::test]
+async fn put_with_mismatching_checksum_is_bad_digest_and_not_stored() {
+    let h = harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("cks2"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+
+    let payload = b"checksum me please".to_vec();
+    // A checksum computed over different bytes -> mismatch.
+    let wrong = sha256_b64(b"some other content entirely");
+    let put = req(
+        Method::PUT,
+        Some("cks2"),
+        Some("bad"),
+        &[],
+        &[("x-amz-checksum-sha256", wrong.as_str())],
+        payload,
+    );
+    let (st, _, _) = drain(send(&h.svc, put).await).await;
+    assert_eq!(
+        st,
+        StatusCode::BAD_REQUEST,
+        "mismatching checksum must be BadDigest"
+    );
+
+    // The object must not have been stored.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(Method::GET, Some("cks2"), Some("bad"), &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
 }
 
 fn md5_hex(data: &[u8]) -> String {

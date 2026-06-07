@@ -281,6 +281,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "cairn-auth",
+ "cairn-authz",
  "cairn-types",
  "futures-util",
  "http",

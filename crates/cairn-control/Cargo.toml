@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 cairn-types.workspace = true
 cairn-auth.workspace = true
+cairn-authz.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 http.workspace = true

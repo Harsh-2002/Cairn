@@ -76,12 +76,13 @@ impl AuthChain {
         };
         let secret = String::from_utf8_lossy(&secret).into_owned();
         match sigv4::verify_header(view, &parsed, &secret, self.clock.now()) {
-            Ok(method) => AuthOutcome::Authenticated(sigv4::principal(
+            Ok(auth) => AuthOutcome::Authenticated(sigv4::principal(
                 creds.user.id,
                 creds.user.display_name,
                 parsed.access_key_id,
                 creds.user.role,
-                method,
+                auth.method,
+                auth.chunk_signing,
             )),
             Err(e) => AuthOutcome::Denied(e),
         }
@@ -105,12 +106,15 @@ impl AuthChain {
         };
         let secret = String::from_utf8_lossy(&secret).into_owned();
         match sigv4::verify_presigned(view, &parsed, expires, &secret, self.clock.now()) {
+            // Presigned requests sign a fixed payload hash (`UNSIGNED-PAYLOAD`); they never carry
+            // a streaming chunk chain, so there is no signed-streaming context.
             Ok(method) => AuthOutcome::Authenticated(sigv4::principal(
                 creds.user.id,
                 creds.user.display_name,
                 parsed.access_key_id,
                 creds.user.role,
                 method,
+                None,
             )),
             Err(e) => AuthOutcome::Denied(e),
         }
@@ -133,6 +137,8 @@ impl AuthChain {
                         access_key_id: id,
                         role: ub.user.role,
                         method: AuthMethod::Bearer,
+                        // Bearer auth has no SigV4 streaming chain.
+                        chunk_signing: None,
                     })
                 } else {
                     AuthOutcome::Denied(AuthError::SignatureMismatch)
@@ -173,5 +179,6 @@ fn dev_principal() -> Principal {
         access_key_id: "dev".to_owned(),
         role: Role::Administrator,
         method: AuthMethod::Development,
+        chunk_signing: None,
     }
 }

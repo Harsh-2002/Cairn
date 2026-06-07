@@ -99,6 +99,46 @@ async fn sigv4_header_roundtrip_authenticates() {
             assert_eq!(p.access_key_id, AKID);
             assert_eq!(p.method, AuthMethod::SigV4Header);
             assert_eq!(p.display_name, "alice");
+            // A non-streaming body carries no signed-streaming context.
+            assert!(p.chunk_signing.is_none());
+        }
+        other => panic!("expected authenticated, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn sigv4_streaming_header_populates_chunk_signing_context() {
+    let (chain, _) = setup().await;
+    let host = "s3.example.com";
+    // The streaming sentinel is what is signed as the canonical payload hash.
+    let sentinel = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD";
+    let base = vec![
+        ("host".to_owned(), host.to_owned()),
+        ("x-amz-date".to_owned(), "20150830T123600Z".to_owned()),
+        ("x-amz-content-sha256".to_owned(), sentinel.to_owned()),
+    ];
+    let auth = sign("PUT", "/bucket/key", &base, sentinel);
+
+    let mut headers = base.clone();
+    headers.push(("authorization".to_owned(), auth.clone()));
+    let mut v = view(&headers, host);
+    v.method = "PUT";
+
+    match chain.authenticate(&v).await {
+        AuthOutcome::Authenticated(p) => {
+            let ctx = p
+                .chunk_signing
+                .expect("streaming sentinel should populate chunk_signing");
+            // The seed is the request signature (the chain's first prev_signature) and the scope
+            // and amz-date thread through verbatim.
+            assert_eq!(ctx.scope, "20150830/us-east-1/s3/aws4_request");
+            assert_eq!(ctx.amz_date, "20150830T123600Z");
+            assert_eq!(
+                ctx.signing_key,
+                cairn_auth::streaming_signing_key(SECRET, "20150830", "us-east-1")
+            );
+            // The seed signature is the same value carried in the Authorization header.
+            assert!(auth.ends_with(&format!("Signature={}", ctx.seed_signature)));
         }
         other => panic!("expected authenticated, got {other:?}"),
     }
@@ -136,7 +176,10 @@ async fn bearer_roundtrip_and_anonymous() {
     )];
     let v = view(&headers, "s3.example.com");
     match chain.authenticate(&v).await {
-        AuthOutcome::Authenticated(p) => assert_eq!(p.method, AuthMethod::Bearer),
+        AuthOutcome::Authenticated(p) => {
+            assert_eq!(p.method, AuthMethod::Bearer);
+            assert!(p.chunk_signing.is_none());
+        }
         other => panic!("expected bearer auth, got {other:?}"),
     }
 

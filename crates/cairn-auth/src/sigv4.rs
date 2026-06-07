@@ -4,7 +4,7 @@
 //! and signature are all exercised end to end.
 
 use crate::crypto_util::{hmac_sha256, parse_amz_date, percent_decode, sha256_hex, uri_encode};
-use cairn_types::auth::{AuthMethod, Principal, RequestView};
+use cairn_types::auth::{AuthMethod, ChunkSigningContext, Principal, RequestView};
 use cairn_types::error::AuthError;
 use cairn_types::time::Timestamp;
 use subtle::ConstantTimeEq;
@@ -204,14 +204,29 @@ fn signed_header_pairs(view: &RequestView<'_>, names: &[String]) -> Vec<(String,
     pairs
 }
 
+/// The streaming-payload sentinel: the body is an `aws-chunked` stream whose per-chunk signature
+/// chain is seeded by this request's header signature (ARCH §14.3, §21.7).
+const STREAMING_SENTINEL: &str = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD";
+
+/// The outcome of a successful header-form SigV4 verification: the auth method and, when the
+/// body is a signed chunk stream, the context the ingest decoder seeds its chain from.
+#[derive(Debug)]
+pub struct HeaderAuth {
+    /// The established auth method.
+    pub method: AuthMethod,
+    /// The signed-streaming context, when `x-amz-content-sha256` is the streaming sentinel.
+    pub chunk_signing: Option<ChunkSigningContext>,
+}
+
 /// Verify a header-form SigV4 request, given the (decrypted) secret. Returns the established
-/// auth method on success.
+/// auth method on success, plus a signed-streaming context when the request body is a
+/// `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` chunk stream.
 pub fn verify_header(
     view: &RequestView<'_>,
     parsed: &ParsedSig,
     secret: &str,
     now: Timestamp,
-) -> Result<AuthMethod, AuthError> {
+) -> Result<HeaderAuth, AuthError> {
     if parsed.service != "s3" {
         return Err(AuthError::Malformed);
     }
@@ -249,7 +264,18 @@ pub fn verify_header(
         .ct_eq(parsed.signature.as_bytes())
         .into()
     {
-        Ok(AuthMethod::SigV4Header)
+        // For the signed-streaming sentinel, hand the ingest decoder the seed signature and the
+        // derived streaming signing key so it can verify the rolling per-chunk chain.
+        let chunk_signing = (payload_hash == STREAMING_SENTINEL).then(|| ChunkSigningContext {
+            seed_signature: expected,
+            signing_key: crate::streaming_signing_key(secret, &parsed.scope_date, &parsed.region),
+            amz_date: amzdate.to_owned(),
+            scope: parsed.scope(),
+        });
+        Ok(HeaderAuth {
+            method: AuthMethod::SigV4Header,
+            chunk_signing,
+        })
     } else {
         Err(AuthError::SignatureMismatch)
     }
@@ -323,7 +349,9 @@ fn find_query(query: &str, key: &str) -> Option<String> {
     None
 }
 
-/// Build a principal from a verified request and the looked-up user fields.
+/// Build a principal from a verified request and the looked-up user fields. `chunk_signing`
+/// carries the signed-streaming context for header-form SigV4 with the streaming sentinel, and is
+/// `None` for presigned, non-streaming, or Bearer auth.
 #[must_use]
 pub fn principal(
     user_id: cairn_types::id::UserId,
@@ -331,6 +359,7 @@ pub fn principal(
     access_key_id: String,
     role: cairn_types::auth::Role,
     method: AuthMethod,
+    chunk_signing: Option<ChunkSigningContext>,
 ) -> Principal {
     Principal {
         user_id,
@@ -338,6 +367,7 @@ pub fn principal(
         access_key_id,
         role,
         method,
+        chunk_signing,
     }
 }
 

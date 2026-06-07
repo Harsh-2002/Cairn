@@ -2,9 +2,9 @@
 //! objects. Handlers depend only on the trait spine; the authorization wiring here is the
 //! owner/admin baseline (the full policy/ACL/anonymous pipeline lands in Wave 3).
 
-use crate::chunked::{ChunkDecoder, decode_stream};
+use crate::chunked::{ChunkDecoder, ChunkVerifier, decode_stream};
 use crate::error_map::error_response;
-use crate::httpdate::http_date;
+use crate::httpdate::{http_date, parse_http_date};
 use crate::request::{S3Body, S3Request, S3Response};
 use base64::Engine;
 use cairn_types::auth::{Principal, RequesterClass, Role};
@@ -20,7 +20,8 @@ use cairn_types::meta::{
     ClaimOutcome, IfNoneMatch, ListQuery, MultipartSession, Mutation, MutationOutcome, Precondition,
 };
 use cairn_types::object::{
-    ChecksumAlgorithm, ChecksumSet, CompressionDescriptor, ETag, ObjectVersionRow, StorageClass,
+    ChecksumAlgorithm, ChecksumSet, ChecksumValue, CompressionDescriptor, ETag, ObjectVersionRow,
+    StorageClass,
 };
 use cairn_types::traits::{AuthorizationEngine, BlobStore, Clock, MetadataStore};
 use http::{Method, StatusCode};
@@ -390,17 +391,10 @@ impl S3Service {
         let user_metadata = user_metadata(&req);
         let content_md5 = req.header("content-md5").map(str::to_owned);
 
-        // De-frame SigV4 streaming bodies (the F-5 fix); plain bodies pass through.
-        let streaming = req
-            .header("x-amz-content-sha256")
-            .map(|v| v.starts_with("STREAMING"))
-            .unwrap_or(false);
+        // De-frame SigV4 streaming bodies (the F-5 fix); plain bodies pass through. A signed
+        // sentinel selects the signature-verifying decoder seeded from the principal's context.
         let request_id = req.request_id.clone();
-        let body = if streaming {
-            decode_stream(raw_body, ChunkDecoder::unsigned(self.max_object_size))
-        } else {
-            raw_body
-        };
+        let body = streaming_body(&req, raw_body, self.max_object_size)?;
 
         let opts = StageOptions {
             compression: bucket.compression,
@@ -408,7 +402,11 @@ impl S3Service {
             size_ceiling: self.max_object_size,
             content_type: content_type.clone(),
         };
-        let staged = self.blob.stage(&bucket.name, body, opts).await?;
+        let staged = self
+            .blob
+            .stage(&bucket.name, body, opts)
+            .await
+            .map_err(map_stage_err)?;
 
         // Verify any client-supplied Content-MD5 against the computed plaintext MD5.
         if let Some(cm) = content_md5 {
@@ -419,6 +417,12 @@ impl S3Service {
                 let _ = self.blob.delete(&staged.storage_path).await;
                 return Err(Error::BadDigest);
             }
+        }
+
+        // Verify any client-supplied x-amz-checksum-* against the computed checksum (§21.1).
+        if let Err(e) = verify_client_checksums(&req, &staged.checksums) {
+            let _ = self.blob.delete(&staged.storage_path).await;
+            return Err(e);
         }
 
         let versioned = bucket.versioning == VersioningState::Enabled;
@@ -497,7 +501,7 @@ impl S3Service {
     async fn get_object(&self, req: &S3Request) -> Result<S3Response> {
         let (row, _bucket) = self.resolve_object(req).await?;
         if let Some(resp) = conditional_short_circuit(req, &row) {
-            return Ok(resp);
+            return Ok(resp.with_header("x-amz-request-id", &req.request_id));
         }
         let range = parse_range(req.header("range"), row.size_logical)?;
         let storage = row.storage_path.clone().ok_or(Error::NoSuchKey)?;
@@ -529,6 +533,10 @@ impl S3Service {
 
     async fn head_object(&self, req: &S3Request) -> Result<S3Response> {
         let (row, _bucket) = self.resolve_object(req).await?;
+        if let Some(resp) = conditional_short_circuit(req, &row) {
+            // Conditional HEAD returns the bare 304/412 status (no body, per S3).
+            return Ok(resp.with_header("x-amz-request-id", &req.request_id));
+        }
         let resp = object_headers(S3Response::status(StatusCode::OK), &row)
             .with_header("content-length", row.size_logical.to_string())
             .with_header("x-amz-request-id", &req.request_id);
@@ -626,19 +634,12 @@ impl S3Service {
         if self.meta.get_multipart(&upload_id).await?.is_none() {
             return Err(Error::NoSuchUpload);
         }
-        let streaming = req
-            .header("x-amz-content-sha256")
-            .map(|v| v.starts_with("STREAMING"))
-            .unwrap_or(false);
-        let body = if streaming {
-            decode_stream(raw_body, ChunkDecoder::unsigned(self.max_object_size))
-        } else {
-            raw_body
-        };
+        let body = streaming_body(&req, raw_body, self.max_object_size)?;
         let staged = self
             .blob
             .stage_part(&upload_id, part_number, body, self.max_object_size)
-            .await?;
+            .await
+            .map_err(map_stage_err)?;
         let part = cairn_types::meta::PartRecord {
             part_number,
             size: staged.size,
@@ -891,6 +892,8 @@ impl S3Service {
         if src_row.is_delete_marker {
             return Err(Error::NoSuchKey);
         }
+        // Evaluate any x-amz-copy-source-if-* preconditions against the source version (§21.6).
+        check_copy_source_conditions(req, &src_row)?;
         let src_path = src_row.storage_path.clone().ok_or(Error::NoSuchKey)?;
 
         let replace = req
@@ -1738,20 +1741,76 @@ fn object_headers(resp: S3Response, row: &ObjectVersionRow) -> S3Response {
     resp
 }
 
-/// For GET: return a 304/412 short-circuit when conditional headers dictate it.
+/// For GET and HEAD: return a 304/412 short-circuit when conditional headers dictate it (§21.2).
+/// Evaluates If-Match / If-Unmodified-Since (412 conditions) and If-None-Match / If-Modified-Since
+/// (304 conditions). Per RFC 7232 / S3, If-Match takes precedence over If-Unmodified-Since and
+/// If-None-Match over If-Modified-Since; the time comparisons use the object's last-modified
+/// (`updated_at`). A malformed date header is ignored.
 fn conditional_short_circuit(req: &S3Request, row: &ObjectVersionRow) -> Option<S3Response> {
     let etag = row.etag.as_str();
-    if let Some(inm) = req.header("if-none-match") {
-        if inm.trim() == "*" || inm.split(',').any(|t| t.trim().trim_matches('"') == etag) {
-            return Some(S3Response::status(StatusCode::NOT_MODIFIED));
-        }
-    }
+    let last_modified = row.updated_at;
+
+    // 412 group: If-Match, else If-Unmodified-Since.
     if let Some(im) = req.header("if-match") {
         if im.trim() != "*" && !im.split(',').any(|t| t.trim().trim_matches('"') == etag) {
             return Some(S3Response::status(StatusCode::PRECONDITION_FAILED));
         }
+    } else if let Some(date) = req.header("if-unmodified-since").and_then(parse_http_date) {
+        // Fail if the object was modified after the supplied date.
+        if last_modified.as_secs() > date.as_secs() {
+            return Some(S3Response::status(StatusCode::PRECONDITION_FAILED));
+        }
+    }
+
+    // 304 group: If-None-Match, else If-Modified-Since.
+    if let Some(inm) = req.header("if-none-match") {
+        if inm.trim() == "*" || inm.split(',').any(|t| t.trim().trim_matches('"') == etag) {
+            return Some(S3Response::status(StatusCode::NOT_MODIFIED));
+        }
+    } else if let Some(date) = req.header("if-modified-since").and_then(parse_http_date) {
+        // Not modified since the supplied date => 304.
+        if last_modified.as_secs() <= date.as_secs() {
+            return Some(S3Response::status(StatusCode::NOT_MODIFIED));
+        }
     }
     None
+}
+
+/// Evaluate the `x-amz-copy-source-if-*` preconditions against the source object version (§21.6).
+/// Every failed precondition fails the copy with [`Error::PreconditionFailed`] (412); a copy never
+/// returns 304. Time comparisons use the source's last-modified (`updated_at`); a malformed date
+/// header is ignored.
+fn check_copy_source_conditions(req: &S3Request, src: &ObjectVersionRow) -> Result<()> {
+    let etag = src.etag.as_str();
+    let last_modified = src.updated_at;
+
+    if let Some(im) = req.header("x-amz-copy-source-if-match") {
+        if im.trim() != "*" && !im.split(',').any(|t| t.trim().trim_matches('"') == etag) {
+            return Err(Error::PreconditionFailed);
+        }
+    }
+    if let Some(inm) = req.header("x-amz-copy-source-if-none-match") {
+        if inm.trim() == "*" || inm.split(',').any(|t| t.trim().trim_matches('"') == etag) {
+            return Err(Error::PreconditionFailed);
+        }
+    }
+    if let Some(date) = req
+        .header("x-amz-copy-source-if-unmodified-since")
+        .and_then(parse_http_date)
+    {
+        if last_modified.as_secs() > date.as_secs() {
+            return Err(Error::PreconditionFailed);
+        }
+    }
+    if let Some(date) = req
+        .header("x-amz-copy-source-if-modified-since")
+        .and_then(parse_http_date)
+    {
+        if last_modified.as_secs() <= date.as_secs() {
+            return Err(Error::PreconditionFailed);
+        }
+    }
+    Ok(())
 }
 
 fn precondition(req: &S3Request) -> Precondition {
@@ -1802,6 +1861,63 @@ fn parse_range(header: Option<&str>, total: u64) -> Result<Option<ByteRange>> {
     Ok(Some(ByteRange { offset, length }))
 }
 
+/// The SigV4 signed-streaming sentinel: the body is an `aws-chunked` stream whose per-chunk
+/// signature chain must be verified.
+const SIGNED_STREAMING_SENTINEL: &str = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD";
+
+/// Map a staging error to an S3 error, surfacing a signed-streaming chunk-signature mismatch as
+/// an authentication failure rather than a generic internal error (the staged blob is already
+/// reclaimed by the stager when its body stream errors).
+fn map_stage_err(e: cairn_types::error::BlobError) -> Error {
+    use cairn_types::error::{BlobError, BodyError};
+    if let BlobError::Body(BodyError::Transport(msg)) = &e {
+        if crate::chunked::is_signature_failure(msg) {
+            return Error::SignatureDoesNotMatch;
+        }
+    }
+    e.into()
+}
+
+/// Select the body decoder for a (possibly streaming) upload (the F-5 fix). For the signed
+/// sentinel, build a signature-verifying decoder seeded from the principal's signed-streaming
+/// context — a signed sentinel with no SigV4 streaming context is invalid and is rejected. Other
+/// `STREAMING-*` sentinels (`STREAMING-UNSIGNED-PAYLOAD[-TRAILER]`) de-frame without verifying.
+/// Non-streaming bodies pass through unchanged.
+fn streaming_body(
+    req: &S3Request,
+    raw_body: cairn_types::BodyStream,
+    max_payload: u64,
+) -> Result<cairn_types::BodyStream> {
+    let sentinel = req.header("x-amz-content-sha256");
+    let streaming = sentinel
+        .map(|v| v.starts_with("STREAMING"))
+        .unwrap_or(false);
+    if !streaming {
+        return Ok(raw_body);
+    }
+    if sentinel == Some(SIGNED_STREAMING_SENTINEL) {
+        // Signed streaming: the per-chunk chain is seeded by the request signature carried on the
+        // principal. Without that context the signed sentinel cannot be verified, so refuse it.
+        let ctx = req
+            .principal
+            .as_ref()
+            .and_then(|p| p.chunk_signing.as_ref())
+            .ok_or(Error::SignatureDoesNotMatch)?;
+        let verifier = ChunkVerifier {
+            key: ctx.signing_key,
+            amzdate: ctx.amz_date.clone(),
+            scope: ctx.scope.clone(),
+            prev_signature: ctx.seed_signature.clone(),
+        };
+        Ok(decode_stream(
+            raw_body,
+            ChunkDecoder::signed(max_payload, verifier),
+        ))
+    } else {
+        Ok(decode_stream(raw_body, ChunkDecoder::unsigned(max_payload)))
+    }
+}
+
 fn requested_checksums(req: &S3Request) -> ChecksumSet {
     let mut algos = Vec::new();
     if let Some(a) = req.header("x-amz-sdk-checksum-algorithm") {
@@ -1819,6 +1935,35 @@ fn requested_checksums(req: &S3Request) -> ChecksumSet {
         }
     }
     ChecksumSet(algos)
+}
+
+/// Compare each client-supplied `x-amz-checksum-{algo}` header (base64) against the corresponding
+/// computed checksum from the staged result (§21.1). Returns [`Error::BadDigest`] on mismatch and
+/// [`Error::InvalidDigest`] when a checksum header has no computed counterpart (its algorithm was
+/// not staged — it should have been requested via `extra_checksums`). The `x-amz-checksum-algorithm`
+/// selector header (no per-algorithm value) is ignored here.
+fn verify_client_checksums(req: &S3Request, computed: &[ChecksumValue]) -> Result<()> {
+    for (name, supplied) in &req.headers {
+        let Some(algo_name) = name.strip_prefix("x-amz-checksum-") else {
+            continue;
+        };
+        // `x-amz-checksum-algorithm` is a selector, not a digest value.
+        if algo_name.eq_ignore_ascii_case("algorithm") {
+            continue;
+        }
+        let Some(algo) = checksum_algo(algo_name) else {
+            continue;
+        };
+        let got = computed
+            .iter()
+            .find(|c| c.algorithm == algo)
+            .ok_or(Error::InvalidDigest)?;
+        // S3 carries these base64-encoded; compare the trimmed base64 strings directly.
+        if got.value != supplied.trim() {
+            return Err(Error::BadDigest);
+        }
+    }
+    Ok(())
 }
 
 fn checksum_algo(name: &str) -> Option<ChecksumAlgorithm> {

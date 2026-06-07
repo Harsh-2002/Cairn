@@ -21,6 +21,7 @@ fn admin() -> Principal {
         access_key_id: "cairn_admin".to_owned(),
         role: Role::Administrator,
         method: AuthMethod::Bearer,
+        chunk_signing: None,
     }
 }
 
@@ -31,6 +32,7 @@ fn member() -> Principal {
         access_key_id: "cairn_bob".to_owned(),
         role: Role::Member,
         method: AuthMethod::Bearer,
+        chunk_signing: None,
     }
 }
 
@@ -514,6 +516,542 @@ async fn bad_create_bucket_body_is_400() {
         )
         .await;
     assert_eq!(resp.status, StatusCode::BAD_REQUEST);
+}
+
+async fn make_bucket(h: &Harness, a: &Principal, name: &str) {
+    let body = format!(r#"{{"name":"{name}"}}"#);
+    let resp = h
+        .svc
+        .handle(&Method::POST, "/buckets", &[], Some(a), Bytes::from(body))
+        .await;
+    assert_eq!(resp.status, StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn bucket_config_get_reflects_aspects() {
+    let h = harness();
+    let a = admin();
+    make_bucket(&h, &a, "cfg").await;
+
+    // Initially every aspect is null and state is the bucket defaults.
+    let resp = h
+        .svc
+        .handle(
+            &Method::GET,
+            "/buckets/cfg/config",
+            &[],
+            Some(&a),
+            Bytes::new(),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::OK);
+    let v = json(&resp);
+    assert_eq!(v["versioning"], "unversioned");
+    assert_eq!(v["ownership_mode"], "bucket-owner-enforced");
+    assert!(v["quota_bytes"].is_null());
+    assert!(v["policy"].is_null());
+    assert!(v["cors"].is_null());
+    assert!(v["tagging"].is_null());
+    assert!(v["lifecycle"].is_null());
+    assert!(v["acl"].is_null());
+    assert!(v["public_access_block"].is_null());
+
+    // Missing bucket -> 404.
+    let resp = h
+        .svc
+        .handle(
+            &Method::GET,
+            "/buckets/missing/config",
+            &[],
+            Some(&a),
+            Bytes::new(),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::NOT_FOUND);
+
+    // Non-admin -> 403.
+    let m = member();
+    let resp = h
+        .svc
+        .handle(
+            &Method::GET,
+            "/buckets/cfg/config",
+            &[],
+            Some(&m),
+            Bytes::new(),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn set_versioning_updates_state() {
+    let h = harness();
+    let a = admin();
+    make_bucket(&h, &a, "vers").await;
+
+    let resp = h
+        .svc
+        .handle(
+            &Method::PUT,
+            "/buckets/vers/versioning",
+            &[],
+            Some(&a),
+            Bytes::from_static(br#"{"status":"Enabled"}"#),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::NO_CONTENT);
+    assert!(resp.body.is_empty());
+
+    let b = h
+        .meta
+        .get_bucket(&BucketName::parse("vers").unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(b.versioning, VersioningState::Enabled);
+
+    // Suspended round-trips through the config view.
+    h.svc
+        .handle(
+            &Method::PUT,
+            "/buckets/vers/versioning",
+            &[],
+            Some(&a),
+            Bytes::from_static(br#"{"status":"Suspended"}"#),
+        )
+        .await;
+    let resp = h
+        .svc
+        .handle(
+            &Method::GET,
+            "/buckets/vers/config",
+            &[],
+            Some(&a),
+            Bytes::new(),
+        )
+        .await;
+    assert_eq!(json(&resp)["versioning"], "suspended");
+
+    // Bad status -> 400.
+    let resp = h
+        .svc
+        .handle(
+            &Method::PUT,
+            "/buckets/vers/versioning",
+            &[],
+            Some(&a),
+            Bytes::from_static(br#"{"status":"On"}"#),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::BAD_REQUEST);
+
+    // Missing bucket -> 404.
+    let resp = h
+        .svc
+        .handle(
+            &Method::PUT,
+            "/buckets/nope/versioning",
+            &[],
+            Some(&a),
+            Bytes::from_static(br#"{"status":"Enabled"}"#),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::NOT_FOUND);
+
+    // Non-admin -> 403.
+    let m = member();
+    let resp = h
+        .svc
+        .handle(
+            &Method::PUT,
+            "/buckets/vers/versioning",
+            &[],
+            Some(&m),
+            Bytes::from_static(br#"{"status":"Enabled"}"#),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn set_quota_is_accepted() {
+    let h = harness();
+    let a = admin();
+    make_bucket(&h, &a, "quota").await;
+
+    let resp = h
+        .svc
+        .handle(
+            &Method::PUT,
+            "/buckets/quota/quota",
+            &[],
+            Some(&a),
+            Bytes::from_static(br#"{"quota_bytes":1048576}"#),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::NO_CONTENT);
+
+    // Clearing the quota (null) is also accepted.
+    let resp = h
+        .svc
+        .handle(
+            &Method::PUT,
+            "/buckets/quota/quota",
+            &[],
+            Some(&a),
+            Bytes::from_static(br#"{"quota_bytes":null}"#),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::NO_CONTENT);
+
+    // Bad body -> 400.
+    let resp = h
+        .svc
+        .handle(
+            &Method::PUT,
+            "/buckets/quota/quota",
+            &[],
+            Some(&a),
+            Bytes::from_static(b"not json"),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn policy_put_validates_and_get_round_trips() {
+    let h = harness();
+    let a = admin();
+    make_bucket(&h, &a, "pol").await;
+
+    let policy = br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::pol/*"}]}"#;
+    let resp = h
+        .svc
+        .handle(
+            &Method::PUT,
+            "/buckets/pol/policy",
+            &[],
+            Some(&a),
+            Bytes::from_static(policy),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::NO_CONTENT);
+
+    // The stored policy is surfaced as structured JSON by the config view.
+    let resp = h
+        .svc
+        .handle(
+            &Method::GET,
+            "/buckets/pol/config",
+            &[],
+            Some(&a),
+            Bytes::new(),
+        )
+        .await;
+    let v = json(&resp);
+    assert_eq!(v["policy"]["Version"], "2012-10-17");
+
+    // A malformed policy is rejected at the edge -> 400, and is not stored.
+    let resp = h
+        .svc
+        .handle(
+            &Method::PUT,
+            "/buckets/pol/policy",
+            &[],
+            Some(&a),
+            Bytes::from_static(br#"{"not":"a policy"}"#),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::BAD_REQUEST);
+    let resp = h
+        .svc
+        .handle(
+            &Method::GET,
+            "/buckets/pol/config",
+            &[],
+            Some(&a),
+            Bytes::new(),
+        )
+        .await;
+    // The earlier valid policy still stands.
+    assert_eq!(json(&resp)["policy"]["Version"], "2012-10-17");
+
+    // Delete clears it.
+    let resp = h
+        .svc
+        .handle(
+            &Method::DELETE,
+            "/buckets/pol/policy",
+            &[],
+            Some(&a),
+            Bytes::new(),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::NO_CONTENT);
+    let resp = h
+        .svc
+        .handle(
+            &Method::GET,
+            "/buckets/pol/config",
+            &[],
+            Some(&a),
+            Bytes::new(),
+        )
+        .await;
+    assert!(json(&resp)["policy"].is_null());
+
+    // Non-admin cannot set a policy.
+    let m = member();
+    let resp = h
+        .svc
+        .handle(
+            &Method::PUT,
+            "/buckets/pol/policy",
+            &[],
+            Some(&m),
+            Bytes::from_static(policy),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::FORBIDDEN);
+}
+
+/// Create a user via the API and return (id, access_key_id).
+async fn create_member(h: &Harness, a: &Principal) -> (String, String) {
+    let resp = h
+        .svc
+        .handle(
+            &Method::POST,
+            "/users",
+            &[],
+            Some(a),
+            Bytes::from_static(br#"{"display_name":"Carol","role":"member"}"#),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::CREATED);
+    let v = json(&resp);
+    (
+        v["id"].as_str().unwrap().to_owned(),
+        v["bearer_access_key_id"].as_str().unwrap().to_owned(),
+    )
+}
+
+#[tokio::test]
+async fn patch_user_changes_role_and_deactivates() {
+    let h = harness();
+    let a = admin();
+    let (id, key_id) = create_member(&h, &a).await;
+
+    // Promote to administrator.
+    let resp = h
+        .svc
+        .handle(
+            &Method::PATCH,
+            &format!("/users/{id}"),
+            &[],
+            Some(&a),
+            Bytes::from_static(br#"{"role":"administrator"}"#),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::OK);
+    let v = json(&resp);
+    assert_eq!(v["role"], "administrator");
+    assert_eq!(v["is_active"], true);
+
+    // The change is durable and preserved the credential (bearer key unchanged).
+    let stored = h.meta.user_by_bearer_key(&key_id).await.unwrap().unwrap();
+    assert_eq!(stored.user.role, Role::Administrator);
+
+    // Deactivate.
+    let resp = h
+        .svc
+        .handle(
+            &Method::PATCH,
+            &format!("/users/{id}"),
+            &[],
+            Some(&a),
+            Bytes::from_static(br#"{"is_active":false}"#),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::OK);
+    assert_eq!(json(&resp)["is_active"], false);
+    let stored = h.meta.user_by_bearer_key(&key_id).await.unwrap().unwrap();
+    assert!(!stored.user.is_active);
+
+    // Empty patch -> 400.
+    let resp = h
+        .svc
+        .handle(
+            &Method::PATCH,
+            &format!("/users/{id}"),
+            &[],
+            Some(&a),
+            Bytes::from_static(b"{}"),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::BAD_REQUEST);
+
+    // Bad role -> 400.
+    let resp = h
+        .svc
+        .handle(
+            &Method::PATCH,
+            &format!("/users/{id}"),
+            &[],
+            Some(&a),
+            Bytes::from_static(br#"{"role":"root"}"#),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::BAD_REQUEST);
+
+    // Unknown user -> 404.
+    let resp = h
+        .svc
+        .handle(
+            &Method::PATCH,
+            "/users/does-not-exist",
+            &[],
+            Some(&a),
+            Bytes::from_static(br#"{"is_active":false}"#),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::NOT_FOUND);
+
+    // Non-admin -> 403.
+    let m = member();
+    let resp = h
+        .svc
+        .handle(
+            &Method::PATCH,
+            &format!("/users/{id}"),
+            &[],
+            Some(&m),
+            Bytes::from_static(br#"{"is_active":true}"#),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn rotate_credentials_mints_new_secret() {
+    let h = harness();
+    let a = admin();
+    let (id, key_id) = create_member(&h, &a).await;
+    let before = h.meta.user_by_bearer_key(&key_id).await.unwrap().unwrap();
+
+    let resp = h
+        .svc
+        .handle(
+            &Method::POST,
+            &format!("/users/{id}/rotate-credentials"),
+            &[],
+            Some(&a),
+            Bytes::new(),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::OK);
+    let v = json(&resp);
+    assert_eq!(v["bearer_access_key_id"], key_id.as_str());
+    let new_secret = v["bearer_secret"].as_str().unwrap();
+    assert!(!new_secret.is_empty());
+
+    // The stored hash now matches the freshly returned secret, and differs from before.
+    let after = h.meta.user_by_bearer_key(&key_id).await.unwrap().unwrap();
+    assert_eq!(
+        after.secret_hash,
+        cairn_auth::hash_bearer_secret(new_secret)
+    );
+    assert_ne!(after.secret_hash, before.secret_hash);
+
+    // Unknown user -> 404.
+    let resp = h
+        .svc
+        .handle(
+            &Method::POST,
+            "/users/nobody/rotate-credentials",
+            &[],
+            Some(&a),
+            Bytes::new(),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::NOT_FOUND);
+
+    // Non-admin -> 403.
+    let m = member();
+    let resp = h
+        .svc
+        .handle(
+            &Method::POST,
+            &format!("/users/{id}/rotate-credentials"),
+            &[],
+            Some(&m),
+            Bytes::new(),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn failed_replication_lists_empty_and_is_gated() {
+    let h = harness();
+    let a = admin();
+
+    let resp = h
+        .svc
+        .handle(
+            &Method::GET,
+            "/replication/failed",
+            &[("limit".to_owned(), "10".to_owned())],
+            Some(&a),
+            Bytes::new(),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::OK);
+    let v = json(&resp);
+    assert!(v["entries"].as_array().unwrap().is_empty());
+
+    // Non-admin -> 403.
+    let m = member();
+    let resp = h
+        .svc
+        .handle(
+            &Method::GET,
+            "/replication/failed",
+            &[],
+            Some(&m),
+            Bytes::new(),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn config_mutations_record_activity() {
+    let h = harness();
+    let a = admin();
+    make_bucket(&h, &a, "audit").await;
+    h.svc
+        .handle(
+            &Method::PUT,
+            "/buckets/audit/versioning",
+            &[],
+            Some(&a),
+            Bytes::from_static(br#"{"status":"Enabled"}"#),
+        )
+        .await;
+
+    let resp = h
+        .svc
+        .handle(&Method::GET, "/activity", &[], Some(&a), Bytes::new())
+        .await;
+    let v = json(&resp);
+    let actions: Vec<&str> = v["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["action"].as_str().unwrap())
+        .collect();
+    assert!(actions.contains(&"SetVersioning"));
 }
 
 // Keep the versioning enum referenced so a future contract change is caught at compile time.

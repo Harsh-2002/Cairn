@@ -35,7 +35,9 @@ pub type BlobStream =
     Pin<Box<dyn futures_core::Stream<Item = Result<Bytes, error::BlobError>> + Send>>;
 
 // --- Convenience re-exports of the most-used items ---
-pub use auth::{AuthMethod, AuthOutcome, Principal, RequestView, RequesterClass, Role};
+pub use auth::{
+    AuthMethod, AuthOutcome, ChunkSigningContext, Principal, RequestView, RequesterClass, Role,
+};
 pub use authz::{
     Acl, Action, AuthzInput, Decision, DenyReason, Effect, Grant, Grantee, OwnershipMode,
     Permission, Policy, PublicAccessBlock, RequestContext, Resource, Statement,

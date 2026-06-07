@@ -6,6 +6,7 @@ use cairn_types::auth::Role;
 use cairn_types::authz::OwnershipMode;
 use cairn_types::bucket::VersioningState;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 // ---------------------------------------------------------------------------------------
 // Enum wire encodings (the contract fixes these lowercase strings explicitly)
@@ -46,6 +47,19 @@ pub fn parse_role(s: &str) -> Option<Role> {
     match s {
         "administrator" => Some(Role::Administrator),
         "member" => Some(Role::Member),
+        _ => None,
+    }
+}
+
+/// Parse the versioning-state string used by `PUT /buckets/{name}/versioning` into a
+/// [`VersioningState`]. The body uses the S3 capitalized spelling (`"Enabled"`, `"Suspended"`,
+/// `"Unversioned"`).
+#[must_use]
+pub fn parse_versioning(s: &str) -> Option<VersioningState> {
+    match s {
+        "Enabled" => Some(VersioningState::Enabled),
+        "Suspended" => Some(VersioningState::Suspended),
+        "Unversioned" => Some(VersioningState::Unversioned),
         _ => None,
     }
 }
@@ -229,6 +243,118 @@ pub struct ActivityListEntry {
 pub struct ActivityListResp {
     /// The entries, most recent first.
     pub entries: Vec<ActivityListEntry>,
+}
+
+// ---------------------------------------------------------------------------------------
+// Bucket configuration
+// ---------------------------------------------------------------------------------------
+
+/// `GET /buckets/{name}/config` response. Each aspect is the parsed JSON document the store
+/// holds for that aspect, or `null` when the aspect is unset. `quota_bytes` is `null` because
+/// the byte quota is enforced inside the writer's commit transaction and is not exposed as a
+/// readable config document by the trait spine (see the crate notes).
+#[derive(Debug, Serialize)]
+pub struct BucketConfigResp {
+    /// The versioning state.
+    pub versioning: &'static str,
+    /// The ownership mode.
+    pub ownership_mode: &'static str,
+    /// The byte quota, if readable (always `null` over the current trait spine).
+    pub quota_bytes: Option<u64>,
+    /// The bucket policy document, or `null`.
+    pub policy: Option<Value>,
+    /// The CORS document, or `null`.
+    pub cors: Option<Value>,
+    /// The tag-set document, or `null`.
+    pub tagging: Option<Value>,
+    /// The lifecycle document, or `null`.
+    pub lifecycle: Option<Value>,
+    /// The ACL document, or `null`.
+    pub acl: Option<Value>,
+    /// The bucket-level public-access-block document, or `null`.
+    pub public_access_block: Option<Value>,
+}
+
+/// `PUT /buckets/{name}/versioning` request body.
+#[derive(Debug, Deserialize)]
+pub struct SetVersioningReq {
+    /// The desired state (`"Enabled"`, `"Suspended"`, or `"Unversioned"`).
+    pub status: String,
+}
+
+/// `PUT /buckets/{name}/quota` request body.
+#[derive(Debug, Deserialize)]
+pub struct SetQuotaReq {
+    /// The new byte quota, or `null` to remove the limit.
+    pub quota_bytes: Option<u64>,
+}
+
+// ---------------------------------------------------------------------------------------
+// User management
+// ---------------------------------------------------------------------------------------
+
+/// `PATCH /users/{id}` request body. Absent fields are left unchanged.
+#[derive(Debug, Deserialize)]
+pub struct PatchUserReq {
+    /// Activate or deactivate the user.
+    #[serde(default)]
+    pub is_active: Option<bool>,
+    /// Change the user's role (`"administrator"` or `"member"`).
+    #[serde(default)]
+    pub role: Option<String>,
+}
+
+/// `PATCH /users/{id}` response body (the updated public user view).
+#[derive(Debug, Serialize)]
+pub struct PatchUserResp {
+    /// The user id.
+    pub id: String,
+    /// The display name.
+    pub display_name: String,
+    /// The Bearer access-key id.
+    pub access_key_id: String,
+    /// The role.
+    pub role: &'static str,
+    /// Whether the user is active.
+    pub is_active: bool,
+}
+
+/// `POST /users/{id}/rotate-credentials` response body. The fresh Bearer secret is shown
+/// exactly once; only its hash is retained server-side.
+#[derive(Debug, Serialize)]
+pub struct RotateCredentialsResp {
+    /// The Bearer access-key id (unchanged by rotation).
+    pub bearer_access_key_id: String,
+    /// The freshly minted Bearer secret (shown once).
+    pub bearer_secret: String,
+}
+
+// ---------------------------------------------------------------------------------------
+// Replication operations
+// ---------------------------------------------------------------------------------------
+
+/// One entry in the failed-replication listing.
+#[derive(Debug, Serialize)]
+pub struct FailedReplicationEntry {
+    /// The bucket.
+    pub bucket: String,
+    /// The key.
+    pub key: String,
+    /// The version id concerned.
+    pub version_id: String,
+    /// The last error recorded, if any.
+    pub error: Option<String>,
+    /// The retry attempt count.
+    pub attempts: u32,
+    /// When the entry is next due, in epoch milliseconds.
+    pub next_attempt_at_ms: i64,
+}
+
+/// `GET /replication/failed` response.
+#[derive(Debug, Serialize)]
+pub struct FailedReplicationResp {
+    /// The failed/terminal outbox entries.
+    pub entries: Vec<FailedReplicationEntry>,
 }
 
 // ---------------------------------------------------------------------------------------

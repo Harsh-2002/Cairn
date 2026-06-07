@@ -31,6 +31,38 @@ pub enum AuthMethod {
     PublicUrl,
 }
 
+/// The SigV4 signed-streaming context a header-form principal carries when the request body is a
+/// `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` chunk stream. The ingest decoder seeds its rolling
+/// per-chunk signature chain from [`seed_signature`] and verifies each chunk with the derived
+/// [`signing_key`]. Present only for SigV4 header auth with the streaming sentinel; `None`
+/// otherwise (presigned, non-streaming, or Bearer).
+///
+/// [`seed_signature`]: ChunkSigningContext::seed_signature
+/// [`signing_key`]: ChunkSigningContext::signing_key
+#[derive(Clone, PartialEq, Eq)]
+pub struct ChunkSigningContext {
+    /// The request signature just computed/verified, seeding the per-chunk chain.
+    pub seed_signature: String,
+    /// The SigV4 streaming signing key derived from the secret, scope date, and region.
+    pub signing_key: [u8; 32],
+    /// The request `X-Amz-Date` header value (the `amz-date` each chunk is signed under).
+    pub amz_date: String,
+    /// The credential scope string `<date>/<region>/s3/aws4_request`.
+    pub scope: String,
+}
+
+impl std::fmt::Debug for ChunkSigningContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Redact the signing key (it is derived from the user's secret).
+        f.debug_struct("ChunkSigningContext")
+            .field("seed_signature", &self.seed_signature)
+            .field("signing_key", &"<redacted>")
+            .field("amz_date", &self.amz_date)
+            .field("scope", &self.scope)
+            .finish()
+    }
+}
+
 /// An authenticated identity carried through authorization and into handlers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Principal {
@@ -44,6 +76,8 @@ pub struct Principal {
     pub role: Role,
     /// How authentication succeeded.
     pub method: AuthMethod,
+    /// The SigV4 signed-streaming context, when the request body is a signed chunk stream.
+    pub chunk_signing: Option<ChunkSigningContext>,
 }
 
 /// The class of requester, decided by the pipeline before authorization.
