@@ -21,6 +21,7 @@ use cairn_types::blob::{
 use cairn_types::error::BlobError;
 use cairn_types::id::{BucketName, StoragePath, UploadId};
 use cairn_types::object::{CompressionDescriptor, ETag};
+use cairn_types::time::Timestamp;
 use cairn_types::traits::{BlobStore, ReconcileOracle};
 use futures_util::StreamExt;
 use std::path::{Component, Path, PathBuf};
@@ -74,11 +75,56 @@ impl LocalBlobStore {
         }
         Ok(self.data_root.join(rel))
     }
+
+    /// Verify that the data root and its staging directory live on a single filesystem, as the
+    /// commit protocol's atomic rename requires (ARCH §2.4, §9.2): a cross-device rename fails
+    /// with `EXDEV` and would break durability. The server calls this at startup so a
+    /// misconfiguration (for example a staging directory bind-mounted from another filesystem)
+    /// fails fast with a clear diagnostic instead of a generic error at the first write.
+    ///
+    /// # Errors
+    /// Returns [`BlobError`] if either path cannot be stat'd, or [`BlobError::Io`] with a
+    /// descriptive message if the two reside on different filesystems.
+    #[cfg(unix)]
+    pub fn check_single_filesystem(&self) -> Result<(), BlobError> {
+        use std::os::unix::fs::MetadataExt;
+        let root = &**self.data_root;
+        let staging = self.data_root.join(STAGING);
+        let root_dev = std::fs::metadata(root).map_err(io_err)?.dev();
+        let staging_dev = std::fs::metadata(&staging).map_err(io_err)?.dev();
+        if root_dev != staging_dev {
+            return Err(BlobError::Io(format!(
+                "data root {} (dev {root_dev}) and staging directory {} (dev {staging_dev}) are on \
+                 different filesystems; atomic rename requires one filesystem (ARCH §2.4)",
+                root.display(),
+                staging.display(),
+            )));
+        }
+        Ok(())
+    }
 }
 
 async fn fsync_dir(dir: &Path) -> Result<(), BlobError> {
     let d = tokio::fs::File::open(dir).await.map_err(io_err)?;
     d.sync_all().await.map_err(io_err)?;
+    Ok(())
+}
+
+/// Ensure a per-bucket directory exists, fsyncing `data_root` when the directory entry is newly
+/// created (F-1, ARCH §8.2 step 4). `create_dir_all` makes the directory durable only once its
+/// own parent records the new entry: a power loss after the rename but before `data_root` is
+/// fsynced can lose the bucket directory entry, orphaning the committed blob inside it. We detect
+/// newness by probing for existence first, so the extra parent fsync is paid only on the rare
+/// first write into a bucket rather than on every commit.
+async fn ensure_bucket_dir(data_root: &Path, bucket_dir: &Path) -> Result<(), BlobError> {
+    let existed = tokio::fs::try_exists(bucket_dir).await.map_err(io_err)?;
+    tokio::fs::create_dir_all(bucket_dir)
+        .await
+        .map_err(io_err)?;
+    if !existed {
+        // The bucket directory entry now lives in data_root; make that entry durable.
+        fsync_dir(data_root).await?;
+    }
     Ok(())
 }
 
@@ -258,9 +304,7 @@ impl BlobStore for LocalBlobStore {
         let file = writer.into_inner();
         // 1) fsync the staged file, 2) rename it in, 3) fsync the destination directory.
         file.sync_all().await.map_err(io_err)?;
-        tokio::fs::create_dir_all(&bucket_dir)
-            .await
-            .map_err(io_err)?;
+        ensure_bucket_dir(&self.data_root, &bucket_dir).await?;
         tokio::fs::rename(&staging, &final_path)
             .await
             .map_err(io_err)?;
@@ -460,9 +504,7 @@ impl BlobStore for LocalBlobStore {
         writer.flush().await.map_err(io_err)?;
         let file = writer.into_inner();
         file.sync_all().await.map_err(io_err)?;
-        tokio::fs::create_dir_all(&bucket_dir)
-            .await
-            .map_err(io_err)?;
+        ensure_bucket_dir(&self.data_root, &bucket_dir).await?;
         tokio::fs::rename(&staging, &final_path)
             .await
             .map_err(io_err)?;
@@ -499,43 +541,95 @@ impl BlobStore for LocalBlobStore {
         oracle: &dyn ReconcileOracle,
         opts: ReconcileOpts,
     ) -> Result<ReconcileReport, BlobError> {
-        let mut report = ReconcileReport::default();
-        let mut entries = tokio::fs::read_dir(&*self.data_root)
-            .await
-            .map_err(io_err)?;
-        while let Some(entry) = entries.next_entry().await.map_err(io_err)? {
-            let name = entry.file_name();
-            let name = name.to_string_lossy().to_string();
-            let ft = entry.file_type().await.map_err(io_err)?;
-            if !ft.is_dir() {
-                continue;
-            }
-            if name == STAGING {
-                reconcile_staging(&entry.path(), oracle, &mut report).await?;
-                continue;
-            }
-            // A per-bucket directory: reclaim blobs no metadata row references.
-            reconcile_bucket(
-                &entry.path(),
-                &name,
-                oracle,
-                opts.batch_size.max(1),
-                &mut report,
-            )
-            .await?;
-        }
-        Ok(report)
+        // The trait method is frozen, so `now` cannot be a parameter; obtain it once here from
+        // the system clock and thread it explicitly into the reconcile core so the staging
+        // safety-margin logic stays unit-testable with an injected `now`.
+        let now = system_now();
+        reconcile_inner(&self.data_root, oracle, opts, now).await
     }
 }
 
+/// The wall-clock now as a [`Timestamp`], saturating at the epoch for clocks set before 1970.
+fn system_now() -> Timestamp {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    Timestamp::from_secs(secs)
+}
+
+/// The reconcile core, taking an explicit `now` so the staging safety margin is testable. It
+/// walks the data root once, reconciles the staging area, and reconciles the per-bucket
+/// directories with bounded concurrency (`opts.parallelism`), pruning any directories it empties.
+async fn reconcile_inner(
+    data_root: &Path,
+    oracle: &dyn ReconcileOracle,
+    opts: ReconcileOpts,
+    now: Timestamp,
+) -> Result<ReconcileReport, BlobError> {
+    let mut report = ReconcileReport::default();
+    // Collect bucket directories first (names only — bounded by the bucket count, not the
+    // keyspace) so they can be reconciled concurrently while the staging area is handled inline.
+    let mut bucket_dirs: Vec<(PathBuf, String)> = Vec::new();
+    let mut entries = tokio::fs::read_dir(data_root).await.map_err(io_err)?;
+    while let Some(entry) = entries.next_entry().await.map_err(io_err)? {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !entry.file_type().await.map_err(io_err)?.is_dir() {
+            continue;
+        }
+        if name == STAGING {
+            reconcile_staging(&entry.path(), oracle, opts, now, &mut report).await?;
+            continue;
+        }
+        bucket_dirs.push((entry.path(), name));
+    }
+
+    // Reconcile buckets with bounded concurrency. The oracle is a borrowed `&dyn`, so the
+    // futures are not `'static` and cannot move into a detached `JoinSet`; a `FuturesUnordered`
+    // capped at `parallelism` gives the same bounded-concurrency, bounded-memory behaviour while
+    // keeping the borrow. Each bucket still batches its membership checks internally, so the live
+    // working set is at most `parallelism * batch_size` paths.
+    let parallelism = opts.parallelism.max(1);
+    let batch_size = opts.batch_size.max(1);
+    let mut inflight: futures_util::stream::FuturesUnordered<_> =
+        futures_util::stream::FuturesUnordered::new();
+    let mut iter = bucket_dirs.into_iter();
+    loop {
+        while inflight.len() < parallelism {
+            let Some((path, name)) = iter.next() else {
+                break;
+            };
+            inflight.push(reconcile_bucket(path, name, oracle, batch_size));
+        }
+        let Some(part) = inflight.next().await else {
+            break;
+        };
+        merge_report(&mut report, part?);
+    }
+    Ok(report)
+}
+
+/// Fold a per-bucket reconcile report into the running total. `ReconcileReport` is a frozen type
+/// in `cairn-types`, so the accumulation lives here rather than as a method on it.
+fn merge_report(into: &mut ReconcileReport, part: ReconcileReport) {
+    into.blobs_scanned += part.blobs_scanned;
+    into.orphans_reclaimed += part.orphans_reclaimed;
+    into.staging_cleaned += part.staging_cleaned;
+    into.sessions_cleaned += part.sessions_cleaned;
+    into.dirs_pruned += part.dirs_pruned;
+    into.errors += part.errors;
+}
+
+/// Reconcile one per-bucket directory, reclaiming blobs no metadata row references, then pruning
+/// the directory if reconciliation left it empty. Returns its own report so callers can run it
+/// concurrently and fold the counts. Memory stays bounded: at most `batch_size` paths are held.
 async fn reconcile_bucket(
-    dir: &Path,
-    bucket: &str,
+    dir: PathBuf,
+    bucket: String,
     oracle: &dyn ReconcileOracle,
     batch_size: u32,
-    report: &mut ReconcileReport,
-) -> Result<(), BlobError> {
-    let mut rd = tokio::fs::read_dir(dir).await.map_err(io_err)?;
+) -> Result<ReconcileReport, BlobError> {
+    let mut report = ReconcileReport::default();
+    let mut rd = tokio::fs::read_dir(&dir).await.map_err(io_err)?;
     let mut batch: Vec<(PathBuf, StoragePath)> = Vec::new();
     loop {
         let next = rd.next_entry().await.map_err(io_err)?;
@@ -568,12 +662,33 @@ async fn reconcile_bucket(
             break;
         }
     }
-    Ok(())
+    // Prune the bucket directory if reconciliation emptied it. `remove_dir` only succeeds on an
+    // empty directory, so a concurrent write that re-populated it is left untouched.
+    if prune_if_empty(&dir).await? {
+        report.dirs_pruned += 1;
+    }
+    Ok(report)
+}
+
+/// Remove `dir` if it is empty, reporting whether it was pruned. A non-empty directory, or one a
+/// race repopulated, is left in place; a missing directory counts as not pruned.
+async fn prune_if_empty(dir: &Path) -> Result<bool, BlobError> {
+    let mut rd = match tokio::fs::read_dir(dir).await {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(io_err(e)),
+    };
+    if rd.next_entry().await.map_err(io_err)?.is_some() {
+        return Ok(false);
+    }
+    Ok(tokio::fs::remove_dir(dir).await.is_ok())
 }
 
 async fn reconcile_staging(
     staging: &Path,
     oracle: &dyn ReconcileOracle,
+    opts: ReconcileOpts,
+    now: Timestamp,
     report: &mut ReconcileReport,
 ) -> Result<(), BlobError> {
     let mut rd = match tokio::fs::read_dir(staging).await {
@@ -584,9 +699,16 @@ async fn reconcile_staging(
         let name = entry.file_name().to_string_lossy().to_string();
         let ft = entry.file_type().await.map_err(io_err)?;
         if ft.is_file() {
-            // A leftover single-part staging artifact from a crash.
-            if tokio::fs::remove_file(entry.path()).await.is_ok() {
-                report.staging_cleaned += 1;
+            // A leftover single-part staging artifact, possibly from a crash — but possibly an
+            // in-flight write from a live process. Only reclaim it once it is older than the
+            // safety margin, so an out-of-band reconcile against a live data dir cannot delete a
+            // STAGING/{id}.tmp file that a concurrent write is still streaming into (ARCH §8.5).
+            if staging_artifact_expired(&entry, opts.staging_safety_margin_secs, now).await? {
+                if tokio::fs::remove_file(entry.path()).await.is_ok() {
+                    report.staging_cleaned += 1;
+                } else {
+                    report.errors += 1;
+                }
             }
         } else if ft.is_dir() && name == "multipart" {
             let mut sessions = tokio::fs::read_dir(entry.path()).await.map_err(io_err)?;
@@ -600,7 +722,152 @@ async fn reconcile_staging(
                     report.sessions_cleaned += 1;
                 }
             }
+            // Note: the `multipart` parent itself is left in place. It is recreated on every
+            // store open and on each `stage_part`, so pruning it would be pointless churn; only
+            // the per-session subdirectories are reclaimed (counted as `sessions_cleaned`).
         }
     }
     Ok(())
+}
+
+/// Whether a staging artifact is older than the safety margin and so safe to reclaim. The margin
+/// is compared against the file's mtime; an artifact whose mtime cannot be read (or sits in the
+/// future relative to `now`) is treated as fresh and preserved, erring toward never deleting a
+/// possibly-live in-flight write.
+async fn staging_artifact_expired(
+    entry: &tokio::fs::DirEntry,
+    margin_secs: i64,
+    now: Timestamp,
+) -> Result<bool, BlobError> {
+    let meta = entry.metadata().await.map_err(io_err)?;
+    let Ok(modified) = meta.modified() else {
+        return Ok(false);
+    };
+    let mtime_secs = match modified.duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_secs() as i64,
+        // mtime predates the epoch: unambiguously old, so it is past any non-negative margin.
+        Err(_) => return Ok(margin_secs >= 0),
+    };
+    let age_secs = now.as_secs() - mtime_secs;
+    Ok(age_secs >= margin_secs.max(0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cairn_types::testing::SetReconcileOracle;
+
+    /// The mtime of a freshly created file, as whole epoch seconds.
+    async fn file_mtime_secs(path: &Path) -> i64 {
+        let modified = tokio::fs::metadata(path).await.unwrap().modified().unwrap();
+        modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    }
+
+    /// A fresh `.staging` artifact (younger than the margin) is preserved while an old one is
+    /// reclaimed, so an out-of-band reconcile cannot delete an in-flight write (ARCH §8.5).
+    #[tokio::test]
+    async fn staging_safety_margin_preserves_fresh_reclaims_old() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalBlobStore::open(dir.path()).await.unwrap();
+        let staging = dir.path().join(STAGING);
+        let tmp = staging.join("inflight.tmp");
+        tokio::fs::write(&tmp, b"streaming...").await.unwrap();
+        let mtime = file_mtime_secs(&tmp).await;
+
+        let oracle = SetReconcileOracle::default();
+        let opts = ReconcileOpts {
+            staging_safety_margin_secs: 3600,
+            ..ReconcileOpts::default()
+        };
+
+        // `now` only one second past the file's mtime: the artifact is well inside the margin.
+        let now_fresh = Timestamp::from_secs(mtime + 1);
+        let report = reconcile_inner(&store.data_root, &oracle, opts, now_fresh)
+            .await
+            .unwrap();
+        assert_eq!(report.staging_cleaned, 0, "fresh staging file preserved");
+        assert!(tokio::fs::try_exists(&tmp).await.unwrap());
+
+        // `now` two hours past the mtime: the artifact is now older than the 1h margin.
+        let now_old = Timestamp::from_secs(mtime + 7200);
+        let report = reconcile_inner(&store.data_root, &oracle, opts, now_old)
+            .await
+            .unwrap();
+        assert_eq!(report.staging_cleaned, 1, "stale staging file reclaimed");
+        assert!(!tokio::fs::try_exists(&tmp).await.unwrap());
+    }
+
+    /// A zero margin reclaims even a brand-new artifact (the legacy unconditional behaviour, now
+    /// opt-in via the margin), confirming the comparison is inclusive at the boundary.
+    #[tokio::test]
+    async fn staging_zero_margin_reclaims_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalBlobStore::open(dir.path()).await.unwrap();
+        let tmp = dir.path().join(STAGING).join("orphan.tmp");
+        tokio::fs::write(&tmp, b"leftover").await.unwrap();
+        let mtime = file_mtime_secs(&tmp).await;
+
+        let opts = ReconcileOpts {
+            staging_safety_margin_secs: 0,
+            ..ReconcileOpts::default()
+        };
+        let report = reconcile_inner(
+            &store.data_root,
+            &SetReconcileOracle::default(),
+            opts,
+            Timestamp::from_secs(mtime),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.staging_cleaned, 1);
+    }
+
+    /// `ensure_bucket_dir` is a no-op-and-still-Ok on an existing directory and creates a missing
+    /// one; the durable parent fsync runs only on the create path (F-1, ARCH §8.2 step 4).
+    #[tokio::test]
+    async fn ensure_bucket_dir_creates_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let bucket = root.join("bkt");
+        assert!(!tokio::fs::try_exists(&bucket).await.unwrap());
+        // First call creates it (and fsyncs the parent for durability of the new entry).
+        ensure_bucket_dir(root, &bucket).await.unwrap();
+        assert!(tokio::fs::metadata(&bucket).await.unwrap().is_dir());
+        // Second call is a no-op that still succeeds.
+        ensure_bucket_dir(root, &bucket).await.unwrap();
+        assert!(tokio::fs::metadata(&bucket).await.unwrap().is_dir());
+    }
+
+    /// `prune_if_empty` removes only an empty directory, leaves a populated one, and treats a
+    /// missing directory as not pruned.
+    #[tokio::test]
+    async fn prune_if_empty_only_removes_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty = dir.path().join("empty");
+        tokio::fs::create_dir(&empty).await.unwrap();
+        assert!(prune_if_empty(&empty).await.unwrap());
+        assert!(!tokio::fs::try_exists(&empty).await.unwrap());
+
+        let full = dir.path().join("full");
+        tokio::fs::create_dir(&full).await.unwrap();
+        tokio::fs::write(full.join("f"), b"x").await.unwrap();
+        assert!(!prune_if_empty(&full).await.unwrap());
+        assert!(tokio::fs::try_exists(&full).await.unwrap());
+
+        let missing = dir.path().join("missing");
+        assert!(!prune_if_empty(&missing).await.unwrap());
+    }
+
+    /// The data root and its in-root staging directory share one filesystem, so the startup check
+    /// passes for a normal temp dir (ARCH §2.4, §9.2).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn single_filesystem_check_passes_for_same_fs() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalBlobStore::open(dir.path()).await.unwrap();
+        store.check_single_filesystem().unwrap();
+    }
 }

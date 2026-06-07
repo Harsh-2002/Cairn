@@ -811,3 +811,169 @@ async fn bucket_policy_roundtrip() {
     .await;
     assert_eq!(st, StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn put_object_acl_subresource_does_not_overwrite_body() {
+    let h = harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("aclb"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("aclb"),
+                Some("k"),
+                &[],
+                &[],
+                b"real-body".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+
+    // PUT ?acl must NOT fall through to put_object and overwrite the object with the ACL body.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("aclb"),
+                Some("k"),
+                &[("acl", "")],
+                &[],
+                b"<AccessControlPolicy/>".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::NOT_IMPLEMENTED,
+        "PUT key?acl must not be a body write"
+    );
+
+    // The object body is unchanged.
+    let (_, _, body) = drain(
+        send(
+            &h.svc,
+            req(Method::GET, Some("aclb"), Some("k"), &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(body, b"real-body");
+
+    // GET ?acl returns an AccessControlPolicy document.
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("aclb"),
+                Some("k"),
+                &[("acl", "")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(
+        String::from_utf8(body)
+            .unwrap()
+            .contains("AccessControlPolicy")
+    );
+}
+
+#[tokio::test]
+async fn unknown_subresource_is_not_implemented_not_misrouted() {
+    let h = harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("subb"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    // An unrecognized bucket subresource must be 501, never a list/create fall-through.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("subb"),
+                None,
+                &[("website", "")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_IMPLEMENTED);
+}
+
+#[tokio::test]
+async fn public_access_block_roundtrip() {
+    let h = harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("bpab"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    let cfg = b"<PublicAccessBlockConfiguration><BlockPublicAcls>true</BlockPublicAcls><IgnorePublicAcls>false</IgnorePublicAcls><BlockPublicPolicy>true</BlockPublicPolicy><RestrictPublicBuckets>false</RestrictPublicBuckets></PublicAccessBlockConfiguration>".to_vec();
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("bpab"),
+                None,
+                &[("publicAccessBlock", "")],
+                &[],
+                cfg,
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("bpab"),
+                None,
+                &[("publicAccessBlock", "")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let xml = String::from_utf8(body).unwrap();
+    assert!(
+        xml.contains("<BlockPublicAcls>true</BlockPublicAcls>"),
+        "bpa: {xml}"
+    );
+    assert!(xml.contains("<BlockPublicPolicy>true</BlockPublicPolicy>"));
+}

@@ -11,10 +11,11 @@ struct Migration {
     sql: &'static str,
 }
 
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "initial schema",
-    sql: r#"
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "initial schema",
+        sql: r#"
 CREATE TABLE users (
     id                      TEXT PRIMARY KEY,
     display_name            TEXT NOT NULL,
@@ -140,7 +141,31 @@ CREATE TABLE activity (
 );
 CREATE INDEX idx_activity_at ON activity (at);
 "#,
-}];
+    },
+    Migration {
+        version: 2,
+        name: "storage_path index, bucket quota, schema-name alignment (ARCH §8/§27.5/§34)",
+        sql: r#"
+-- F-8: a seek index over storage_path so reconcile's per-batch membership lookups and
+-- enumerate_storage_paths range-seek instead of full-scanning object_versions, and so the
+-- multipart parts table's paths are likewise seekable.
+CREATE INDEX idx_object_versions_storage_path ON object_versions (storage_path);
+CREATE INDEX idx_multipart_parts_storage_path ON multipart_parts (storage_path);
+
+-- The (bucket_name, key, version_id) UNIQUE constraint already materialises an auto-index that
+-- serves current-version lookup and version listing (ARCH §34.2), so this explicit duplicate is
+-- redundant dead weight; drop it.
+DROP INDEX idx_object_versions_bkv;
+
+-- §27.5/§28.2: an optional per-bucket byte quota enforced inside the commit transaction.
+-- NULL means unlimited.
+ALTER TABLE buckets ADD COLUMN quota_bytes INTEGER;
+
+-- §34.1/§34: the spec names this column compression_policy; the v1 column was compression.
+ALTER TABLE buckets RENAME COLUMN compression TO compression_policy;
+"#,
+    },
+];
 
 /// Run all pending migrations on the write connection, recording each as applied.
 pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
@@ -202,5 +227,52 @@ mod tests {
             )
             .unwrap();
         assert_eq!(n, 1);
+    }
+
+    fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
+        conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name=?2",
+            rusqlite::params![table, column],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+            > 0
+    }
+
+    fn index_exists(conn: &Connection, name: &str) -> bool {
+        conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?1",
+            rusqlite::params![name],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+            > 0
+    }
+
+    #[test]
+    fn migration_v2_renames_quota_and_index_changes() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+
+        // The compression column was renamed to the spec name (ARCH §34.1) and the quota column
+        // was added (ARCH §27.5).
+        assert!(column_exists(&conn, "buckets", "compression_policy"));
+        assert!(!column_exists(&conn, "buckets", "compression"));
+        assert!(column_exists(&conn, "buckets", "quota_bytes"));
+
+        // The storage_path seek indexes were created (F-8) and the redundant bkv index dropped.
+        assert!(index_exists(&conn, "idx_object_versions_storage_path"));
+        assert!(index_exists(&conn, "idx_multipart_parts_storage_path"));
+        assert!(!index_exists(&conn, "idx_object_versions_bkv"));
+        // The UNIQUE-constraint auto-index still serves bkv range seeks (ARCH §34.2).
+        let auto: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='index' AND tbl_name='object_versions' AND sql IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(auto >= 1, "the UNIQUE constraint's auto-index must remain");
     }
 }

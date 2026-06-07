@@ -31,8 +31,12 @@
 #![forbid(unsafe_code)]
 
 mod backoff;
+mod config;
+mod sink;
 
 pub use backoff::next_backoff;
+pub use config::{Destination, Filter, ReplicationConfig, ReplicationRule, parse_replication};
+pub use sink::{HttpS3Sink, S3SinkConfig};
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

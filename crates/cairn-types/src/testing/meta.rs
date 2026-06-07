@@ -389,6 +389,11 @@ impl MetadataStore for InMemoryMetadataStore {
                 }
                 Ok(MutationOutcome::Ack)
             }
+            Mutation::SetBucketQuota { .. } => {
+                // The in-memory double does not model quota enforcement (that lives in the SQLite
+                // writer's commit transaction); accept the mutation as a no-op.
+                Ok(MutationOutcome::Ack)
+            }
             Mutation::SetAccountPublicAccessBlock(bpa) => {
                 st.account_bpa = bpa;
                 Ok(MutationOutcome::Ack)

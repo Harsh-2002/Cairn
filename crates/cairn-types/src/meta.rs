@@ -132,6 +132,14 @@ pub enum Mutation {
         /// The new mode.
         mode: OwnershipMode,
     },
+    /// Set (or clear) a bucket's byte quota. The quota is enforced inside the commit transaction
+    /// of subsequent object writes (ARCH §27.5).
+    SetBucketQuota {
+        /// The bucket.
+        bucket: BucketName,
+        /// The new quota in bytes, or `None` to remove the limit.
+        quota_bytes: Option<u64>,
+    },
     /// Set the account-wide Block Public Access singleton.
     SetAccountPublicAccessBlock(PublicAccessBlock),
     /// Replace an object version's tags.

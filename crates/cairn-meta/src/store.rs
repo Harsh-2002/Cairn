@@ -4,7 +4,7 @@
 
 use crate::model::{self, engine_err};
 use crate::range::{prefix_upper_bound, successor};
-use crate::writer::Writer;
+use crate::writer::{WalCheckpointStats, Writer};
 use cairn_types::MetaError;
 use cairn_types::authz::PublicAccessBlock;
 use cairn_types::bucket::{Bucket, ConfigAspect, ConfigDoc};
@@ -28,6 +28,8 @@ const LIST_BATCH: usize = 1024;
 pub struct SqliteMetadataStore {
     pub(crate) writer: Writer,
     pub(crate) pool: Pool<SqliteConnectionManager>,
+    /// The on-disk database path, used to stat the `-wal` sidecar. `None` for in-memory stores.
+    pub(crate) db_path: Option<std::path::PathBuf>,
 }
 
 impl std::fmt::Debug for SqliteMetadataStore {
@@ -38,6 +40,41 @@ impl std::fmt::Debug for SqliteMetadataStore {
 }
 
 impl SqliteMetadataStore {
+    /// Run a truncating WAL checkpoint on the writer thread (ARCH §8.4/§11.2).
+    ///
+    /// The writer owns the only write connection, so the checkpoint is submitted to it as a
+    /// control message and runs serialized with mutations. Returns the checkpoint's frame
+    /// counts: whether it found the WAL `busy` with a reader, the total `log_frames`, and the
+    /// `checkpointed_frames` that were moved into the database file.
+    ///
+    /// # Errors
+    /// Returns a [`MetaError`] if the writer has shut down or the checkpoint PRAGMA fails.
+    pub async fn checkpoint(&self) -> Result<WalCheckpointStats, MetaError> {
+        self.writer.checkpoint().await
+    }
+
+    /// The current size in bytes of the write-ahead log (`-wal`) sidecar file.
+    ///
+    /// Returns `0` for an in-memory store, or when the `-wal` file is absent (e.g. just after a
+    /// truncating checkpoint, or before the first write). Stating the path is a fast `metadata`
+    /// call run off the writer thread.
+    ///
+    /// # Errors
+    /// Returns a [`MetaError`] if the `-wal` file exists but cannot be stat-ed.
+    pub async fn wal_size_bytes(&self) -> Result<u64, MetaError> {
+        let Some(db_path) = self.db_path.clone() else {
+            return Ok(0);
+        };
+        let wal_path = wal_sidecar_path(&db_path);
+        tokio::task::spawn_blocking(move || match std::fs::metadata(&wal_path) {
+            Ok(meta) => Ok(meta.len()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
+            Err(e) => Err(MetaError::Engine(e.to_string())),
+        })
+        .await
+        .map_err(|e| MetaError::Engine(e.to_string()))?
+    }
+
     /// Run a read closure on the blocking pool with a pooled read connection.
     pub(crate) async fn with_read<F, T>(&self, f: F) -> Result<T, MetaError>
     where
@@ -52,6 +89,13 @@ impl SqliteMetadataStore {
         .await
         .map_err(|e| MetaError::Engine(e.to_string()))?
     }
+}
+
+/// SQLite names the write-ahead log sidecar `<database>-wal`; build that path.
+fn wal_sidecar_path(db_path: &std::path::Path) -> std::path::PathBuf {
+    let mut name = db_path.as_os_str().to_owned();
+    name.push("-wal");
+    std::path::PathBuf::from(name)
 }
 
 /// The efficient listing implementation: half-open range seek with delimiter skip-scan. The

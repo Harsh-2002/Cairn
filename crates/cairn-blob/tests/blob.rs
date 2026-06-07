@@ -244,6 +244,82 @@ async fn reconcile_reclaims_orphans_only() {
 }
 
 #[tokio::test]
+async fn reconcile_prunes_emptied_bucket_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let b = BucketName::parse("doomed").unwrap();
+    // One bucket whose only blob is an orphan, and a second bucket whose blob is live.
+    store
+        .stage(&b, body(b"orphan".to_vec()), opts(None, "text/plain"))
+        .await
+        .unwrap();
+    let kb = BucketName::parse("kept").unwrap();
+    let keep = store
+        .stage(&kb, body(b"keep".to_vec()), opts(None, "text/plain"))
+        .await
+        .unwrap();
+
+    let mut live = std::collections::HashSet::new();
+    live.insert(keep.storage_path.as_str().to_owned());
+    let oracle = SetReconcileOracle {
+        live_paths: live,
+        live_uploads: Default::default(),
+    };
+
+    let report = store
+        .reconcile(&oracle, ReconcileOpts::default())
+        .await
+        .unwrap();
+    assert_eq!(report.orphans_reclaimed, 1);
+    // The emptied bucket directory is pruned; the populated one survives.
+    assert_eq!(report.dirs_pruned, 1, "emptied bucket dir is pruned");
+    assert!(
+        !tokio::fs::try_exists(dir.path().join("doomed"))
+            .await
+            .unwrap(),
+        "doomed bucket dir removed once empty"
+    );
+    assert!(
+        tokio::fs::try_exists(dir.path().join("kept"))
+            .await
+            .unwrap(),
+        "kept bucket dir preserved"
+    );
+}
+
+#[tokio::test]
+async fn reconcile_honours_parallelism_across_buckets() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    // Several buckets, each with a single orphan blob, reconciled with bounded concurrency.
+    for n in 0..6 {
+        let b = BucketName::parse(&format!("bucket-{n}")).unwrap();
+        store
+            .stage(&b, body(vec![n as u8; 8]), opts(None, "text/plain"))
+            .await
+            .unwrap();
+    }
+    let oracle = SetReconcileOracle::default(); // nothing is live
+    let opts = ReconcileOpts {
+        parallelism: 3,
+        ..ReconcileOpts::default()
+    };
+    let report = store.reconcile(&oracle, opts).await.unwrap();
+    assert_eq!(report.blobs_scanned, 6);
+    assert_eq!(report.orphans_reclaimed, 6);
+    assert_eq!(report.dirs_pruned, 6, "every emptied bucket dir is pruned");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn single_filesystem_check_passes() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    // Data root and its in-root staging dir share a filesystem, so the startup check is Ok.
+    store.check_single_filesystem().unwrap();
+}
+
+#[tokio::test]
 async fn delete_is_idempotent_and_paths_are_safe() {
     let dir = tempfile::tempdir().unwrap();
     let store = LocalBlobStore::open(dir.path()).await.unwrap();

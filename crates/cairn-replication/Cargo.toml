@@ -11,10 +11,21 @@ workspace = true
 
 [dependencies]
 cairn-types.workspace = true
+cairn-auth.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 futures-util = { workspace = true, features = ["std"] }
+hyper = { workspace = true, features = ["client", "http1"] }
+hyper-util = { workspace = true, features = ["client-legacy", "http1", "tokio"] }
+http.workspace = true
+http-body-util.workspace = true
+sha2.workspace = true
+hex.workspace = true
+quick-xml.workspace = true
 
 [dev-dependencies]
 cairn-types = { workspace = true, features = ["testing"] }
-tokio = { workspace = true, features = ["rt", "macros"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "net", "macros"] }
+hyper = { workspace = true, features = ["server", "http1"] }
+hyper-util = { workspace = true, features = ["server-auto", "tokio"] }
+http-body-util.workspace = true

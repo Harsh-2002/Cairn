@@ -315,6 +315,78 @@ async fn reconcile_oracle_reports_membership() {
 }
 
 #[tokio::test]
+async fn checkpoint_truncates_wal_and_reports_frames() {
+    // The checkpointer needs an on-disk database so a real -wal sidecar exists to stat/truncate.
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("meta.sqlite");
+    let store = cairn_meta::open(&db, &cairn_meta::OpenOptions::default()).unwrap();
+    let b = BucketName::parse("bkt").unwrap();
+
+    // Write enough versions to grow the WAL.
+    for i in 0..64 {
+        store
+            .submit(put(
+                row(&b, &format!("k{i:03}"), VersionId::null(), "e", true),
+                Precondition::default(),
+            ))
+            .await
+            .unwrap();
+    }
+
+    // The writes left frames in the -wal file.
+    let before = store.wal_size_bytes().await.unwrap();
+    assert!(before > 0, "writes should have grown the WAL");
+
+    // A truncating checkpoint runs on the writer thread without error and reports its frame
+    // counts. SQLite's implicit PASSIVE autocheckpoint may already have moved some frames into
+    // the database (without shrinking the file), so `log_frames` is the count still present at
+    // checkpoint time; what we require is that the run completes uncontended and the counts are
+    // internally consistent.
+    let stats = store.checkpoint().await.unwrap();
+    assert!(
+        !stats.busy,
+        "the single-writer design means the checkpoint is never blocked, got {stats:?}"
+    );
+    assert!(
+        stats.checkpointed_frames <= stats.log_frames,
+        "cannot checkpoint more frames than the WAL holds, got {stats:?}"
+    );
+
+    // TRUNCATE resets the -wal file (the F-3 fix: the file would otherwise grow unbounded), so
+    // it is now strictly smaller than before — typically zero.
+    let after = store.wal_size_bytes().await.unwrap();
+    assert!(
+        after < before,
+        "truncating checkpoint should shrink the WAL: before={before} after={after}"
+    );
+
+    // A second checkpoint immediately after a truncate finds an (almost) empty WAL and still
+    // reports frames cleanly, proving the control path stays responsive.
+    let again = store.checkpoint().await.unwrap();
+    assert!(!again.busy, "follow-up checkpoint is also uncontended");
+
+    // The store is still fully functional after the checkpoint.
+    store
+        .submit(put(
+            row(&b, "after", VersionId::null(), "e", true),
+            Precondition::default(),
+        ))
+        .await
+        .unwrap();
+    let counts = store.aggregate_counts().await.unwrap();
+    assert_eq!(counts.objects, 65);
+}
+
+#[tokio::test]
+async fn wal_size_is_zero_for_in_memory_store() {
+    let store = cairn_meta::open_in_memory().unwrap();
+    // An in-memory store has no -wal sidecar; the size is reported as zero rather than erroring.
+    assert_eq!(store.wal_size_bytes().await.unwrap(), 0);
+    // Checkpoint is still safe to call (it is a no-op against the in-memory journal).
+    store.checkpoint().await.unwrap();
+}
+
+#[tokio::test]
 async fn create_bucket_conflict() {
     let store = cairn_meta::open_in_memory().unwrap();
     let bucket = Bucket {

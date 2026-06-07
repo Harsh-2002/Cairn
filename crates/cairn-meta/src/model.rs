@@ -195,8 +195,9 @@ pub fn object_summary_from_row(row: &Row) -> rusqlite::Result<ObjectSummary> {
 }
 
 pub fn bucket_from_row(row: &Row) -> rusqlite::Result<Bucket> {
+    // The column is `compression_policy` per ARCH §34.1; the domain field stays `compression`.
     let compression: Option<CompressionPolicy> =
-        match row.get::<_, Option<String>>("compression")? {
+        match row.get::<_, Option<String>>("compression_policy")? {
             Some(s) => Some(json_col(&s)?),
             None => None,
         };

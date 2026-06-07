@@ -22,7 +22,7 @@ use std::time::Duration;
 
 pub use range::{prefix_upper_bound, successor};
 pub use store::SqliteMetadataStore;
-pub use writer::Writer;
+pub use writer::{WalCheckpointStats, Writer};
 
 /// Tuning knobs for opening the store (ARCH §28).
 #[derive(Debug, Clone)]
@@ -102,7 +102,11 @@ pub fn open(db_path: &Path, opts: &OpenOptions) -> Result<SqliteMetadataStore, M
         .build(manager)
         .map_err(|e| MetaError::Engine(e.to_string()))?;
 
-    Ok(SqliteMetadataStore { writer, pool })
+    Ok(SqliteMetadataStore {
+        writer,
+        pool,
+        db_path: Some(db_path.to_owned()),
+    })
 }
 
 /// Open an in-memory store (shared cache) for tests.
@@ -133,7 +137,11 @@ pub fn open_in_memory() -> Result<SqliteMetadataStore, MetaError> {
         .max_size(4)
         .build(manager)
         .map_err(|e| MetaError::Engine(e.to_string()))?;
-    Ok(SqliteMetadataStore { writer, pool })
+    Ok(SqliteMetadataStore {
+        writer,
+        pool,
+        db_path: None,
+    })
 }
 
 impl SqliteMetadataStore {

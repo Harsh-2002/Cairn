@@ -9,7 +9,8 @@ use crate::request::{S3Body, S3Request, S3Response};
 use base64::Engine;
 use cairn_types::auth::{Principal, RequesterClass, Role};
 use cairn_types::authz::{
-    Action, AuthzInput, Decision, PublicAccessBlock, RequestContext, Resource,
+    Acl, Action, AuthzInput, Decision, Grant, Grantee, OwnershipMode, Permission,
+    PublicAccessBlock, RequestContext, Resource,
 };
 use cairn_types::blob::{ByteRange, PartRef, StageOptions};
 use cairn_types::bucket::{Bucket, ConfigAspect, ConfigDoc, VersioningState};
@@ -170,6 +171,26 @@ impl S3Service {
                 self.clear_bucket_config(&req, ConfigAspect::Replication)
                     .await
             }
+            Method::GET if req.has_query("acl") => self.get_bucket_acl(&req).await,
+            Method::PUT if req.has_query("acl") => self.put_bucket_acl(&req).await,
+            Method::GET if req.has_query("publicAccessBlock") => {
+                self.get_public_access_block(&req).await
+            }
+            Method::PUT if req.has_query("publicAccessBlock") => {
+                self.put_public_access_block(req, body).await
+            }
+            Method::DELETE if req.has_query("publicAccessBlock") => {
+                self.clear_bucket_config(&req, ConfigAspect::PublicAccessBlock)
+                    .await
+            }
+            Method::GET if req.has_query("ownershipControls") => {
+                self.get_ownership_controls(&req).await
+            }
+            Method::PUT if req.has_query("ownershipControls") => {
+                self.put_ownership_controls(req, body).await
+            }
+            // An UNRECOGNIZED bucket subresource must not fall through to list/create/delete.
+            _ if unhandled_bucket_subresource(&req) => Err(Error::NotImplemented),
             Method::PUT => self.create_bucket(&req).await,
             Method::DELETE => self.delete_bucket(&req).await,
             Method::HEAD => self.head_bucket(&req).await,
@@ -195,6 +216,15 @@ impl S3Service {
         )
         .await?;
         match req.method {
+            // A copy-source part is UploadPartCopy, not a body upload; until that is implemented
+            // reject it rather than corrupt the part with the request body.
+            Method::PUT
+                if req.has_query("uploadId")
+                    && req.query("partNumber").is_some()
+                    && req.header("x-amz-copy-source").is_some() =>
+            {
+                Err(Error::NotImplemented)
+            }
             Method::PUT if req.has_query("uploadId") && req.query("partNumber").is_some() => {
                 self.upload_part(req, body).await
             }
@@ -204,6 +234,10 @@ impl S3Service {
             Method::PUT if req.has_query("tagging") => self.put_object_tagging(req, body).await,
             Method::GET if req.has_query("tagging") => self.get_object_tagging(&req).await,
             Method::DELETE if req.has_query("tagging") => self.delete_object_tagging(&req).await,
+            Method::GET if req.has_query("acl") => self.get_object_acl(&req).await,
+            // An UNRECOGNIZED object subresource must never fall through to a data-plane handler
+            // (a PUT object?acl must not overwrite the object body). Answer NotImplemented.
+            _ if unhandled_object_subresource(&req) => Err(Error::NotImplemented),
             Method::PUT => self.put_object(req, body).await,
             Method::POST if req.has_query("uploads") => self.create_multipart(&req).await,
             Method::POST if req.has_query("uploadId") => self.complete_multipart(req, body).await,
@@ -394,6 +428,13 @@ impl S3Service {
             VersionId::null()
         };
         let now = self.clock.now();
+        // Honor a canned x-amz-acl when the bucket's ownership mode keeps ACLs in force.
+        let acl = match req.header("x-amz-acl") {
+            Some(canned) if bucket.ownership_mode != OwnershipMode::BucketOwnerEnforced => {
+                cairn_authz::expand_canned_acl(canned, &bucket.owner_id)
+            }
+            _ => None,
+        };
         let row = ObjectVersionRow {
             id: uuid::Uuid::new_v4().simple().to_string(),
             bucket: bucket.name.clone(),
@@ -411,7 +452,7 @@ impl S3Service {
             cold_locator: None,
             owner_id: bucket.owner_id.clone(),
             user_metadata,
-            acl: None,
+            acl,
             checksums: staged.checksums.clone(),
             replication_status: None,
             created_at: now,
@@ -1140,6 +1181,126 @@ impl S3Service {
             .with_header("x-amz-request-id", &req.request_id))
     }
 
+    // --- ACL / Block Public Access / Object Ownership subresources ---
+
+    async fn get_bucket_acl(&self, req: &S3Request) -> Result<S3Response> {
+        let bucket = self.fetch_bucket(req).await?;
+        let acl = match self
+            .meta
+            .get_bucket_config(&bucket.name, ConfigAspect::Acl)
+            .await?
+        {
+            Some(doc) => serde_json::from_str(&doc.0)
+                .map_err(|_| Error::Internal("config (de)serialization failed".to_owned()))?,
+            None => default_owner_acl(&bucket.owner_id),
+        };
+        Ok(S3Response::xml(StatusCode::OK, acl_to_xml(&acl))
+            .with_header("x-amz-request-id", &req.request_id))
+    }
+
+    async fn put_bucket_acl(&self, req: &S3Request) -> Result<S3Response> {
+        let bucket = self.fetch_bucket(req).await?;
+        // ACLs are disabled under BucketOwnerEnforced (S3: AccessControlListNotSupported).
+        if bucket.ownership_mode == OwnershipMode::BucketOwnerEnforced {
+            return Err(Error::NotImplemented);
+        }
+        let canned = req.header("x-amz-acl").ok_or(Error::NotImplemented)?;
+        let acl = cairn_authz::expand_canned_acl(canned, &bucket.owner_id)
+            .ok_or_else(|| Error::InvalidArgument("invalid request body".to_owned()))?;
+        let doc = serde_json::to_string(&acl)
+            .map_err(|_| Error::Internal("config (de)serialization failed".to_owned()))?;
+        self.meta
+            .submit(Mutation::SetBucketConfig {
+                bucket: bucket.name,
+                aspect: ConfigAspect::Acl,
+                doc: Some(ConfigDoc(doc)),
+            })
+            .await?;
+        Ok(S3Response::status(StatusCode::OK).with_header("x-amz-request-id", &req.request_id))
+    }
+
+    async fn get_object_acl(&self, req: &S3Request) -> Result<S3Response> {
+        let (row, bucket) = self.resolve_object(req).await?;
+        let acl = row
+            .acl
+            .unwrap_or_else(|| default_owner_acl(&bucket.owner_id));
+        Ok(S3Response::xml(StatusCode::OK, acl_to_xml(&acl))
+            .with_header("x-amz-request-id", &req.request_id))
+    }
+
+    async fn get_public_access_block(&self, req: &S3Request) -> Result<S3Response> {
+        let bucket = self.fetch_bucket(req).await?;
+        match self
+            .meta
+            .get_bucket_config(&bucket.name, ConfigAspect::PublicAccessBlock)
+            .await?
+        {
+            Some(doc) => {
+                let bpa: PublicAccessBlock = serde_json::from_str(&doc.0)
+                    .map_err(|_| Error::Internal("config (de)serialization failed".to_owned()))?;
+                Ok(
+                    S3Response::xml(StatusCode::OK, public_access_block_to_xml(&bpa))
+                        .with_header("x-amz-request-id", &req.request_id),
+                )
+            }
+            None => Ok(S3Response::xml(
+                StatusCode::NOT_FOUND,
+                cairn_xml::error_document(
+                    "NoSuchPublicAccessBlockConfiguration",
+                    "The public access block configuration was not found",
+                    &resource_path(req),
+                    &req.request_id,
+                ),
+            )),
+        }
+    }
+
+    async fn put_public_access_block(
+        &self,
+        req: S3Request,
+        body: cairn_types::BodyStream,
+    ) -> Result<S3Response> {
+        let bucket = self.fetch_bucket(&req).await?;
+        let doc = drain_body(body, 64 * 1024).await?;
+        let bpa = parse_public_access_block(&doc);
+        let json = serde_json::to_string(&bpa)
+            .map_err(|_| Error::Internal("config (de)serialization failed".to_owned()))?;
+        self.meta
+            .submit(Mutation::SetBucketConfig {
+                bucket: bucket.name,
+                aspect: ConfigAspect::PublicAccessBlock,
+                doc: Some(ConfigDoc(json)),
+            })
+            .await?;
+        Ok(S3Response::status(StatusCode::OK).with_header("x-amz-request-id", &req.request_id))
+    }
+
+    async fn get_ownership_controls(&self, req: &S3Request) -> Result<S3Response> {
+        let bucket = self.fetch_bucket(req).await?;
+        Ok(
+            S3Response::xml(StatusCode::OK, ownership_to_xml(bucket.ownership_mode))
+                .with_header("x-amz-request-id", &req.request_id),
+        )
+    }
+
+    async fn put_ownership_controls(
+        &self,
+        req: S3Request,
+        body: cairn_types::BodyStream,
+    ) -> Result<S3Response> {
+        let bucket = self.fetch_bucket(&req).await?;
+        let doc = drain_body(body, 64 * 1024).await?;
+        let mode = parse_ownership(&doc)
+            .ok_or_else(|| Error::InvalidArgument("invalid request body".to_owned()))?;
+        self.meta
+            .submit(Mutation::SetOwnership {
+                bucket: bucket.name,
+                mode,
+            })
+            .await?;
+        Ok(S3Response::status(StatusCode::OK).with_header("x-amz-request-id", &req.request_id))
+    }
+
     // --- object tagging ---
 
     async fn get_object_tagging(&self, req: &S3Request) -> Result<S3Response> {
@@ -1236,12 +1397,16 @@ impl S3Service {
             None => RequesterClass::Anonymous,
         };
         let account_bpa = self.meta.get_account_public_access_block().await?;
+        // Corrupt security configs MUST fail closed (ARCH §15.3/§15.5): a BPA doc that does not
+        // parse must not silently open access, and an unparseable policy must not silently drop
+        // its (possibly Deny) statements.
         let bucket_bpa = match self
             .meta
             .get_bucket_config(&bucket.name, ConfigAspect::PublicAccessBlock)
             .await?
         {
-            Some(doc) => serde_json::from_str(&doc.0).unwrap_or_default(),
+            Some(doc) => serde_json::from_str(&doc.0)
+                .map_err(|_| Error::Internal("config (de)serialization failed".to_owned()))?,
             None => PublicAccessBlock::default(),
         };
         let policy = match self
@@ -1249,9 +1414,38 @@ impl S3Service {
             .get_bucket_config(&bucket.name, ConfigAspect::Policy)
             .await?
         {
-            Some(doc) => cairn_authz::parse_policy(&doc.0).ok(),
+            Some(doc) => Some(
+                cairn_authz::parse_policy(&doc.0)
+                    .map_err(|_| Error::Internal("config (de)serialization failed".to_owned()))?,
+            ),
             None => None,
         };
+        // Load ACLs only when ownership mode keeps them enabled; under BucketOwnerEnforced
+        // (the default) ACLs are disabled, so this stays a no-op on the hot path.
+        let (bucket_acl, object_acl) =
+            if bucket.ownership_mode == cairn_types::authz::OwnershipMode::BucketOwnerEnforced {
+                (None, None)
+            } else {
+                let bucket_acl = match self
+                    .meta
+                    .get_bucket_config(&bucket.name, ConfigAspect::Acl)
+                    .await?
+                {
+                    Some(doc) => Some(serde_json::from_str(&doc.0).map_err(|_| {
+                        Error::Internal("config (de)serialization failed".to_owned())
+                    })?),
+                    None => None,
+                };
+                let object_acl = match &resource {
+                    Resource::Object { key, .. } => self
+                        .meta
+                        .current_version(&bucket.name, key)
+                        .await?
+                        .and_then(|row| row.acl),
+                    _ => None,
+                };
+                (bucket_acl, object_acl)
+            };
         let input = AuthzInput {
             requester,
             action,
@@ -1260,8 +1454,8 @@ impl S3Service {
             account_bpa,
             bucket_bpa,
             policy,
-            bucket_acl: None,
-            object_acl: None,
+            bucket_acl,
+            object_acl,
             ownership_mode: bucket.ownership_mode,
             context: build_context(req, self.clock.now()),
         };
@@ -1323,6 +1517,145 @@ fn build_context(req: &S3Request, now: cairn_types::Timestamp) -> RequestContext
     }
 }
 
+/// Known S3 object subresource selectors that we do NOT serve via a handler; their presence must
+/// route to NotImplemented rather than fall through to a data-plane handler (which would let
+/// `PUT key?acl` overwrite the object body). `acl` GET is handled earlier; PUT/DELETE land here.
+const UNHANDLED_OBJECT_SUBRESOURCES: &[&str] = &[
+    "acl",
+    "retention",
+    "legal-hold",
+    "torrent",
+    "restore",
+    "select",
+    "attributes",
+];
+
+/// Known S3 bucket subresource selectors we do not serve (handled ones are matched earlier).
+const UNHANDLED_BUCKET_SUBRESOURCES: &[&str] = &[
+    "accelerate",
+    "analytics",
+    "encryption",
+    "intelligent-tiering",
+    "inventory",
+    "logging",
+    "metrics",
+    "notification",
+    "object-lock",
+    "policyStatus",
+    "requestPayment",
+    "website",
+];
+
+fn unhandled_object_subresource(req: &S3Request) -> bool {
+    UNHANDLED_OBJECT_SUBRESOURCES
+        .iter()
+        .any(|k| req.has_query(k))
+}
+
+fn unhandled_bucket_subresource(req: &S3Request) -> bool {
+    UNHANDLED_BUCKET_SUBRESOURCES
+        .iter()
+        .any(|k| req.has_query(k))
+}
+
+/// The default private ACL: the owner has full control.
+fn default_owner_acl(owner: &cairn_types::id::UserId) -> Acl {
+    Acl {
+        owner: owner.clone(),
+        grants: vec![Grant {
+            grantee: Grantee::User(owner.clone()),
+            permission: Permission::FullControl,
+        }],
+    }
+}
+
+/// Serialize an ACL to an S3 `AccessControlPolicy` document.
+fn acl_to_xml(acl: &Acl) -> String {
+    let mut grants = String::new();
+    for g in &acl.grants {
+        let (gtype, ident) = match &g.grantee {
+            Grantee::User(u) => ("CanonicalUser", format!("<ID>{}</ID>", u.0)),
+            Grantee::AllUsers => (
+                "Group",
+                "<URI>http://acs.amazonaws.com/groups/global/AllUsers</URI>".to_owned(),
+            ),
+            Grantee::AuthenticatedUsers => (
+                "Group",
+                "<URI>http://acs.amazonaws.com/groups/global/AuthenticatedUsers</URI>".to_owned(),
+            ),
+            Grantee::LogDelivery => (
+                "Group",
+                "<URI>http://acs.amazonaws.com/groups/s3/LogDelivery</URI>".to_owned(),
+            ),
+        };
+        let perm = match g.permission {
+            Permission::FullControl => "FULL_CONTROL",
+            Permission::Read => "READ",
+            Permission::Write => "WRITE",
+            Permission::ReadAcp => "READ_ACP",
+            Permission::WriteAcp => "WRITE_ACP",
+        };
+        grants.push_str(&format!(
+            "<Grant><Grantee xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"{gtype}\">{ident}</Grantee><Permission>{perm}</Permission></Grant>"
+        ));
+    }
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><AccessControlPolicy xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Owner><ID>{}</ID></Owner><AccessControlList>{grants}</AccessControlList></AccessControlPolicy>",
+        acl.owner.0
+    )
+}
+
+/// Parse the four toggles of a `PublicAccessBlockConfiguration` document (tolerant scan).
+fn parse_public_access_block(doc: &[u8]) -> PublicAccessBlock {
+    let s = String::from_utf8_lossy(doc);
+    let flag = |tag: &str| -> bool {
+        match s.find(&format!("<{tag}>")) {
+            Some(i) => s[i + tag.len() + 2..]
+                .trim_start()
+                .to_ascii_lowercase()
+                .starts_with("true"),
+            None => false,
+        }
+    };
+    PublicAccessBlock {
+        block_public_acls: flag("BlockPublicAcls"),
+        ignore_public_acls: flag("IgnorePublicAcls"),
+        block_public_policy: flag("BlockPublicPolicy"),
+        restrict_public_buckets: flag("RestrictPublicBuckets"),
+    }
+}
+
+fn public_access_block_to_xml(b: &PublicAccessBlock) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><PublicAccessBlockConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><BlockPublicAcls>{}</BlockPublicAcls><IgnorePublicAcls>{}</IgnorePublicAcls><BlockPublicPolicy>{}</BlockPublicPolicy><RestrictPublicBuckets>{}</RestrictPublicBuckets></PublicAccessBlockConfiguration>",
+        b.block_public_acls, b.ignore_public_acls, b.block_public_policy, b.restrict_public_buckets
+    )
+}
+
+fn ownership_to_xml(mode: OwnershipMode) -> String {
+    let m = match mode {
+        OwnershipMode::BucketOwnerEnforced => "BucketOwnerEnforced",
+        OwnershipMode::BucketOwnerPreferred => "BucketOwnerPreferred",
+        OwnershipMode::ObjectWriter => "ObjectWriter",
+    };
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><OwnershipControls xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Rule><ObjectOwnership>{m}</ObjectOwnership></Rule></OwnershipControls>"
+    )
+}
+
+fn parse_ownership(doc: &[u8]) -> Option<OwnershipMode> {
+    let s = String::from_utf8_lossy(doc);
+    if s.contains("BucketOwnerEnforced") {
+        Some(OwnershipMode::BucketOwnerEnforced)
+    } else if s.contains("BucketOwnerPreferred") {
+        Some(OwnershipMode::BucketOwnerPreferred)
+    } else if s.contains("ObjectWriter") {
+        Some(OwnershipMode::ObjectWriter)
+    } else {
+        None
+    }
+}
+
 /// Map a bucket-level request to the S3 action it requires.
 fn bucket_action(req: &S3Request) -> Result<Action> {
     use Action::*;
@@ -1334,12 +1667,16 @@ fn bucket_action(req: &S3Request) -> Result<Action> {
         Method::PUT if q("policy") => PutBucketPolicy,
         Method::PUT if q("lifecycle") => PutLifecycleConfiguration,
         Method::PUT if q("replication") => PutReplicationConfiguration,
+        Method::PUT if q("acl") => PutBucketAcl,
+        Method::PUT if q("publicAccessBlock") => PutBucketPublicAccessBlock,
+        Method::PUT if q("ownershipControls") => PutBucketOwnershipControls,
         Method::PUT => CreateBucket,
         Method::DELETE if q("tagging") => PutBucketTagging,
         Method::DELETE if q("cors") => PutBucketCors,
         Method::DELETE if q("policy") => PutBucketPolicy,
         Method::DELETE if q("lifecycle") => PutLifecycleConfiguration,
         Method::DELETE if q("replication") => PutReplicationConfiguration,
+        Method::DELETE if q("publicAccessBlock") => PutBucketPublicAccessBlock,
         Method::DELETE => DeleteBucket,
         Method::HEAD => ListBucket,
         Method::GET if q("location") => GetBucketLocation,
@@ -1351,6 +1688,9 @@ fn bucket_action(req: &S3Request) -> Result<Action> {
         Method::GET if q("policy") => GetBucketPolicy,
         Method::GET if q("lifecycle") => GetLifecycleConfiguration,
         Method::GET if q("replication") => GetReplicationConfiguration,
+        Method::GET if q("acl") => GetBucketAcl,
+        Method::GET if q("publicAccessBlock") => GetBucketPublicAccessBlock,
+        Method::GET if q("ownershipControls") => GetBucketOwnershipControls,
         Method::POST if q("delete") => DeleteObject,
         Method::GET => ListBucket,
         _ => return Err(Error::NotImplemented),
@@ -1365,6 +1705,8 @@ fn object_action(req: &S3Request) -> Result<Action> {
         Method::PUT if q("tagging") => PutObjectTagging,
         Method::GET if q("tagging") => GetObjectTagging,
         Method::DELETE if q("tagging") => DeleteObjectTagging,
+        Method::GET if q("acl") => GetObjectAcl,
+        Method::PUT if q("acl") => PutObjectAcl,
         Method::GET if q("uploadId") => ListMultipartUploadParts,
         Method::DELETE if q("uploadId") => AbortMultipartUpload,
         Method::PUT | Method::POST => PutObject,

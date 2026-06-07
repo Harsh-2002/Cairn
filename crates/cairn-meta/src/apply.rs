@@ -121,6 +121,7 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             let bucket = row.bucket.clone();
             let key = row.key.clone();
             check_precondition(conn, &bucket, &key, &precondition)?;
+            enforce_bucket_quota(conn, &row)?;
             let version_id = row.version_id.clone();
             let superseded = upsert_version(conn, *row)?;
             conn.execute(
@@ -145,8 +146,10 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             Ok(MutationOutcome::Ack)
         }
         Mutation::CreateBucket(b) => {
+            // `compression_policy` is the spec column name (ARCH §34.1); `quota_bytes` defaults to
+            // NULL (unlimited) since the frozen `Bucket` domain type carries no quota field.
             conn.execute(
-                "INSERT INTO buckets (name, owner_id, created_at, versioning_state, ownership_mode, region, compression)
+                "INSERT INTO buckets (name, owner_id, created_at, versioning_state, ownership_mode, region, compression_policy)
                  VALUES (?1,?2,?3,?4,?5,?6,?7)",
                 params![
                     b.name.as_str(),
@@ -202,6 +205,17 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             conn.execute(
                 "UPDATE buckets SET ownership_mode=?2 WHERE name=?1",
                 params![bucket.as_str(), model::ownership_str(mode)],
+            )
+            .map_err(engine_err)?;
+            Ok(MutationOutcome::Ack)
+        }
+        Mutation::SetBucketQuota {
+            bucket,
+            quota_bytes,
+        } => {
+            conn.execute(
+                "UPDATE buckets SET quota_bytes=?2 WHERE name=?1",
+                params![bucket.as_str(), quota_bytes.map(|q| q as i64)],
             )
             .map_err(engine_err)?;
             Ok(MutationOutcome::Ack)
@@ -358,6 +372,7 @@ fn put_version(
     replication: Option<OutboxEntry>,
 ) -> R<MutationOutcome> {
     check_precondition(conn, &row.bucket, &row.key, precondition)?;
+    enforce_bucket_quota(conn, &row)?;
     let version_id = row.version_id.clone();
     let superseded = upsert_version(conn, row)?;
     if let Some(e) = replication {
@@ -367,6 +382,47 @@ fn put_version(
         superseded,
         version_id,
     })
+}
+
+/// Enforce a bucket's optional byte quota inside the commit transaction (ARCH §27.5/§28.2).
+///
+/// If the target bucket has a non-NULL `quota_bytes`, this rejects the write — with
+/// [`MetaError::QuotaExceeded`], which rolls back only this mutation's savepoint — when the
+/// bucket's resulting logical bytes would exceed the quota. The existing row at the same
+/// (bucket, key, version_id), if any, is excluded from the current total because the upsert
+/// replaces it. Delete markers carry no logical bytes, so they never trip the quota.
+fn enforce_bucket_quota(conn: &Connection, row: &ObjectVersionRow) -> R<()> {
+    let quota: Option<i64> = conn
+        .query_row(
+            "SELECT quota_bytes FROM buckets WHERE name=?1",
+            params![row.bucket.as_str()],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(engine_err)?
+        .flatten();
+    let Some(quota) = quota else {
+        return Ok(());
+    };
+    // Current logical bytes in the bucket, excluding the row this upsert will replace.
+    let current: i64 = conn
+        .query_row(
+            "SELECT COALESCE(SUM(size_logical), 0) FROM object_versions
+             WHERE bucket_name=?1 AND NOT (key=?2 AND version_id=?3)",
+            params![
+                row.bucket.as_str(),
+                row.key.as_str(),
+                row.version_id.as_str()
+            ],
+            |r| r.get(0),
+        )
+        .map_err(engine_err)?;
+    // Saturating add in u128 so a pathological size can never wrap past the quota check.
+    let projected = u128::from(current.max(0) as u64) + u128::from(row.size_logical);
+    if projected > u128::from(quota.max(0) as u64) {
+        return Err(MetaError::QuotaExceeded);
+    }
+    Ok(())
 }
 
 /// Replace any existing row at (bucket,key,version_id) — capturing its blob for reclamation —
@@ -599,4 +655,168 @@ fn config_aspect_str(a: cairn_types::bucket::ConfigAspect) -> &'static str {
 /// The string form of a config aspect (shared with the read path).
 pub fn aspect_str(a: cairn_types::bucket::ConfigAspect) -> &'static str {
     config_aspect_str(a)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cairn_types::id::UserId;
+    use cairn_types::object::{CompressionDescriptor, StorageClass};
+    use cairn_types::time::Timestamp;
+
+    fn conn_with_schema() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::schema::run_migrations(&conn).unwrap();
+        conn
+    }
+
+    fn seed_bucket(conn: &Connection, name: &str, quota: Option<i64>) {
+        conn.execute(
+            "INSERT INTO buckets (name, owner_id, created_at, versioning_state, ownership_mode, region, quota_bytes)
+             VALUES (?1, 'owner', 0, 'enabled', 'BucketOwnerEnforced', 'us-east-1', ?2)",
+            params![name, quota],
+        )
+        .unwrap();
+    }
+
+    fn obj_row(bucket: &str, key: &str, version: &str, size: u64) -> ObjectVersionRow {
+        ObjectVersionRow {
+            id: uuid::Uuid::new_v4().simple().to_string(),
+            bucket: BucketName::parse(bucket).unwrap(),
+            key: ObjectKey::parse(key).unwrap(),
+            version_id: VersionId::from_string(version.to_owned()),
+            is_latest: true,
+            is_delete_marker: false,
+            size_logical: size,
+            size_physical: size,
+            etag: ETag::from_string("e".to_owned()),
+            content_type: "text/plain".to_owned(),
+            storage_path: Some(StoragePath::from_string(format!("{bucket}/{version}"))),
+            compression: CompressionDescriptor::Uncompressed,
+            storage_class: StorageClass::Standard,
+            cold_locator: None,
+            owner_id: UserId("owner".to_owned()),
+            user_metadata: Vec::new(),
+            acl: None,
+            checksums: Vec::new(),
+            replication_status: None,
+            created_at: Timestamp(1),
+            updated_at: Timestamp(1),
+        }
+    }
+
+    fn put(row: ObjectVersionRow) -> Mutation {
+        Mutation::PutObjectVersion {
+            row: Box::new(row),
+            precondition: Precondition::default(),
+            replication: None,
+        }
+    }
+
+    fn bucket_logical_bytes(conn: &Connection, bucket: &str) -> i64 {
+        conn.query_row(
+            "SELECT COALESCE(SUM(size_logical),0) FROM object_versions WHERE bucket_name=?1",
+            params![bucket],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Apply a mutation the way the writer does: inside a savepoint, rolling that savepoint back
+    /// on error so a rejected op commits nothing while the surrounding transaction survives.
+    fn apply_in_savepoint(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
+        conn.execute_batch("SAVEPOINT sp").unwrap();
+        match apply(conn, m) {
+            Ok(o) => {
+                conn.execute_batch("RELEASE sp").unwrap();
+                Ok(o)
+            }
+            Err(e) => {
+                conn.execute_batch("ROLLBACK TO sp; RELEASE sp").unwrap();
+                Err(e)
+            }
+        }
+    }
+
+    #[test]
+    fn put_under_quota_succeeds() {
+        let conn = conn_with_schema();
+        seed_bucket(&conn, "bkt", Some(100));
+        apply(&conn, put(obj_row("bkt", "k", "v1", 60))).unwrap();
+        assert_eq!(bucket_logical_bytes(&conn, "bkt"), 60);
+    }
+
+    #[test]
+    fn put_exceeding_quota_rejected_and_commits_nothing() {
+        let conn = conn_with_schema();
+        seed_bucket(&conn, "bkt", Some(100));
+        // First put fits: 60 <= 100.
+        apply_in_savepoint(&conn, put(obj_row("bkt", "k1", "v1", 60))).unwrap();
+        // Second put would push the bucket to 60 + 50 = 110 > 100: rejected, rolled back.
+        let err = apply_in_savepoint(&conn, put(obj_row("bkt", "k2", "v1", 50))).unwrap_err();
+        assert!(matches!(err, MetaError::QuotaExceeded));
+        // The rejected op left nothing behind: the bucket still holds exactly the first object.
+        assert_eq!(bucket_logical_bytes(&conn, "bkt"), 60);
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM object_versions WHERE bucket_name='bkt'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1);
+    }
+
+    #[test]
+    fn raising_quota_lets_the_put_through() {
+        let conn = conn_with_schema();
+        seed_bucket(&conn, "bkt", Some(100));
+        apply(&conn, put(obj_row("bkt", "k1", "v1", 60))).unwrap();
+        let err = apply_in_savepoint(&conn, put(obj_row("bkt", "k2", "v1", 50))).unwrap_err();
+        assert!(matches!(err, MetaError::QuotaExceeded));
+        // Operator raises the quota; the previously-rejected size now fits.
+        conn.execute("UPDATE buckets SET quota_bytes=200 WHERE name='bkt'", [])
+            .unwrap();
+        apply(&conn, put(obj_row("bkt", "k2", "v1", 50))).unwrap();
+        assert_eq!(bucket_logical_bytes(&conn, "bkt"), 110);
+    }
+
+    #[test]
+    fn null_quota_is_unlimited() {
+        let conn = conn_with_schema();
+        seed_bucket(&conn, "bkt", None);
+        apply(&conn, put(obj_row("bkt", "k", "v1", 1_000_000))).unwrap();
+        assert_eq!(bucket_logical_bytes(&conn, "bkt"), 1_000_000);
+    }
+
+    #[test]
+    fn overwriting_same_version_counts_only_the_new_size() {
+        let conn = conn_with_schema();
+        seed_bucket(&conn, "bkt", Some(100));
+        apply(&conn, put(obj_row("bkt", "k", "v1", 90))).unwrap();
+        // Overwriting the same (key, version) with a 95-byte body replaces the old 90 bytes,
+        // so the bucket total is 95 (not 185) and the quota of 100 is not exceeded.
+        apply(&conn, put(obj_row("bkt", "k", "v1", 95))).unwrap();
+        assert_eq!(bucket_logical_bytes(&conn, "bkt"), 95);
+    }
+
+    #[test]
+    fn delete_marker_ignores_quota() {
+        let conn = conn_with_schema();
+        seed_bucket(&conn, "bkt", Some(10));
+        // Fill to the quota, then a delete marker (no logical bytes) must still be allowed.
+        apply(&conn, put(obj_row("bkt", "k", "v1", 10))).unwrap();
+        apply(
+            &conn,
+            Mutation::CreateDeleteMarker {
+                bucket: BucketName::parse("bkt").unwrap(),
+                key: ObjectKey::parse("k").unwrap(),
+                version_id: VersionId::from_string("v2".to_owned()),
+                owner_id: UserId("owner".to_owned()),
+                now: Timestamp(2),
+                replication: None,
+            },
+        )
+        .unwrap();
+    }
 }
