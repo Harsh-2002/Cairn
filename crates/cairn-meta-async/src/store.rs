@@ -30,23 +30,27 @@ const LIST_BATCH: usize = 1024;
 /// A round-robin pool of read-only driver connections. WAL readers take consistent snapshots and
 /// never block the writer or each other, so concurrent reads simply pick the next connection.
 ///
-/// The libSQL [`Database`](libsql::Database) handle the connections were opened from is retained
-/// so it (and, for a shared-cache in-memory database, the underlying memory) outlives every
-/// connection.
+/// The underlying engine's `Database` handle the connections were opened from is retained behind
+/// an opaque keep-alive box so it (and, for a shared-cache in-memory database, the underlying
+/// memory) outlives every connection. The box is engine-agnostic so the same pool serves any
+/// [`AsyncSqlDriver`] backend (libSQL, Turso, …).
 pub(crate) struct ReadPool {
     conns: Vec<Arc<dyn AsyncSqlDriver>>,
     next: AtomicUsize,
-    // Held only to keep the database handle alive for the store's lifetime.
-    _db: libsql::Database,
+    // Held only to keep the engine's database handle alive for the store's lifetime.
+    _keepalive: Box<dyn std::any::Any + Send + Sync>,
 }
 
 impl ReadPool {
-    pub(crate) fn new_with_db(conns: Vec<Arc<dyn AsyncSqlDriver>>, db: libsql::Database) -> Self {
+    pub(crate) fn new_with_keepalive(
+        conns: Vec<Arc<dyn AsyncSqlDriver>>,
+        keepalive: Box<dyn std::any::Any + Send + Sync>,
+    ) -> Self {
         assert!(!conns.is_empty(), "read pool must have at least one conn");
         Self {
             conns,
             next: AtomicUsize::new(0),
-            _db: db,
+            _keepalive: keepalive,
         }
     }
 
@@ -56,21 +60,23 @@ impl ReadPool {
     }
 }
 
-/// The libSQL-backed metadata store.
+/// The async-driver-backed metadata store. Engine-agnostic: it drives writes through the async
+/// group-committing [`Writer`] and reads through the [`ReadPool`], both over the
+/// [`AsyncSqlDriver`] seam, so the same store type serves any backend (libSQL, Turso, …). The
+/// [`LibsqlMetadataStore`] alias is the libSQL incarnation.
 #[derive(Clone)]
-pub struct LibsqlMetadataStore {
+pub struct AsyncMetadataStore {
     pub(crate) writer: Writer,
     pub(crate) reads: Arc<ReadPool>,
 }
 
-impl std::fmt::Debug for LibsqlMetadataStore {
+impl std::fmt::Debug for AsyncMetadataStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LibsqlMetadataStore")
-            .finish_non_exhaustive()
+        f.debug_struct("AsyncMetadataStore").finish_non_exhaustive()
     }
 }
 
-impl LibsqlMetadataStore {
+impl AsyncMetadataStore {
     pub(crate) fn new(writer: Writer, reads: ReadPool) -> Self {
         Self {
             writer,
@@ -85,8 +91,8 @@ impl LibsqlMetadataStore {
 
     /// A reconciliation oracle backed by this store, for the blob store's `reconcile`.
     #[must_use]
-    pub fn reconcile_oracle(&self) -> LibsqlReconcileOracle {
-        LibsqlReconcileOracle {
+    pub fn reconcile_oracle(&self) -> AsyncReconcileOracle {
+        AsyncReconcileOracle {
             reads: self.reads.clone(),
         }
     }
@@ -205,7 +211,7 @@ async fn fetch_rows(
 }
 
 #[async_trait::async_trait]
-impl MetadataStore for LibsqlMetadataStore {
+impl MetadataStore for AsyncMetadataStore {
     async fn submit(&self, mutation: Mutation) -> Result<MutationOutcome, MetaError> {
         self.writer.submit(mutation).await
     }
@@ -644,21 +650,22 @@ impl MetadataStore for LibsqlMetadataStore {
 }
 
 /// A [`cairn_types::traits::ReconcileOracle`] answering membership questions against the live
-/// metadata, backed by the same read pool as the store.
+/// metadata, backed by the same read pool as the store. Engine-agnostic; [`LibsqlReconcileOracle`]
+/// is the libSQL alias.
 #[derive(Clone)]
-pub struct LibsqlReconcileOracle {
+pub struct AsyncReconcileOracle {
     reads: Arc<ReadPool>,
 }
 
-impl std::fmt::Debug for LibsqlReconcileOracle {
+impl std::fmt::Debug for AsyncReconcileOracle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LibsqlReconcileOracle")
+        f.debug_struct("AsyncReconcileOracle")
             .finish_non_exhaustive()
     }
 }
 
 #[async_trait::async_trait]
-impl cairn_types::traits::ReconcileOracle for LibsqlReconcileOracle {
+impl cairn_types::traits::ReconcileOracle for AsyncReconcileOracle {
     async fn live_blobs(&self, candidates: &[StoragePath]) -> Result<Vec<bool>, MetaError> {
         let driver = self.reads.pick();
         let mut out = Vec::with_capacity(candidates.len());

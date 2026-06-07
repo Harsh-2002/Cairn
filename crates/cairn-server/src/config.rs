@@ -31,6 +31,11 @@ pub struct Config {
     pub data_dir: PathBuf,
     /// Location of the SQLite metadata file.
     pub db_path: PathBuf,
+    /// Which metadata backend drives the store (`CAIRN_META_BACKEND`). One of `sqlite` (the
+    /// default rusqlite/bundled-C store), `libsql` (the async embedded libSQL driver), or `turso`
+    /// (the pure-Rust SQLite rewrite). The on-disk database file is the same SQLite format for all
+    /// three, so the choice is purely which engine drives it.
+    pub meta_backend: String,
     /// External base URL used when generating URLs behind ingress.
     pub public_base_url: Option<String>,
     /// TLS certificate path (enables built-in TLS when set together with the key).
@@ -90,6 +95,7 @@ impl Default for Config {
             listen_addr: "127.0.0.1:9000".parse().expect("valid default addr"),
             data_dir: PathBuf::from("./data"),
             db_path: PathBuf::from("./data/cairn.db"),
+            meta_backend: "sqlite".to_owned(),
             public_base_url: None,
             tls_cert_path: None,
             tls_key_path: None,
@@ -194,6 +200,12 @@ impl Config {
         }
         if self.db_path.as_os_str().is_empty() {
             return Err(ConfigError::Invalid("db_path must not be empty".into()));
+        }
+        if !matches!(self.meta_backend.as_str(), "sqlite" | "libsql" | "turso") {
+            return Err(ConfigError::Invalid(format!(
+                "meta_backend must be one of sqlite|libsql|turso, got {:?}",
+                self.meta_backend
+            )));
         }
         if let Some(url) = &self.public_base_url {
             if !(url.starts_with("http://") || url.starts_with("https://")) {
@@ -343,6 +355,35 @@ mod tests {
         c.multipart_upload_lifetime_secs = 7200;
         c.wal_checkpoint_interval_secs = 60;
         assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn meta_backend_defaults_to_sqlite_and_validates_choices() {
+        // Default is sqlite (the byte-identical, unchanged default path).
+        assert_eq!(base().meta_backend, "sqlite");
+        for ok in ["sqlite", "libsql", "turso"] {
+            let mut c = base();
+            c.meta_backend = ok.to_owned();
+            assert!(c.validate().is_ok(), "{ok} must be accepted");
+        }
+        // An unknown backend is rejected at load.
+        let mut c = base();
+        c.meta_backend = "postgres".to_owned();
+        assert!(c.validate().is_err());
+    }
+
+    /// `CAIRN_META_BACKEND` selects the backend from the environment; unset leaves the default.
+    #[test]
+    fn load_reads_meta_backend_from_env() {
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("CAIRN_META_BACKEND", "libsql");
+            assert_eq!(Config::load().expect("loads").meta_backend, "libsql");
+            Ok(())
+        });
+        figment::Jail::expect_with(|_jail| {
+            assert_eq!(Config::load().expect("loads").meta_backend, "sqlite");
+            Ok(())
+        });
     }
 
     #[test]

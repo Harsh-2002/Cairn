@@ -15,6 +15,7 @@ authors = ["The Cairn authors"]
 # --- internal crates (path deps filled in by each member) ---
 cairn-types = { path = "crates/cairn-types" }
 cairn-meta = { path = "crates/cairn-meta" }
+cairn-meta-async = { path = "crates/cairn-meta-async" }
 cairn-blob = { path = "crates/cairn-blob" }
 cairn-crypto = { path = "crates/cairn-crypto" }
 cairn-auth = { path = "crates/cairn-auth" }

@@ -16,6 +16,10 @@ async-trait.workspace = true
 # for a local embedded database; the default replication/remote/sync/tls features pull in a
 # large dependency tree we do not use, so they are disabled.
 libsql = { version = "0.10.0-pre.4", default-features = false, features = ["core"] }
+# Turso — the pure-Rust SQLite rewrite (beta engine). Default-features off to drop the `mimalloc`
+# global allocator (it must not be imposed on the whole binary) and the `fts` full-text indexing we
+# do not use; only the embedded local-database core is needed.
+turso = { version = "0.6.1", default-features = false }
 tokio = { workspace = true, features = ["rt", "sync", "macros", "time"] }
 serde.workspace = true
 serde_json.workspace = true

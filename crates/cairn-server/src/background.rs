@@ -33,7 +33,16 @@ pub fn spawn(stack: Arc<AppStack>, cfg: &Config) {
         multipart_lifetime_secs,
     ));
     tokio::spawn(lifecycle_loop(stack.clone(), lifecycle_interval));
-    tokio::spawn(checkpoint_loop(stack.clone(), checkpoint_interval));
+    // The WAL checkpointer drives inherent methods on the concrete `SqliteMetadataStore`, so it
+    // runs only for the `sqlite` backend (where `stack.store` is `Some`). The libSQL and Turso
+    // engines self-manage their WAL, so the loop is simply not spawned for them.
+    if stack.store.is_some() {
+        tokio::spawn(checkpoint_loop(stack.clone(), checkpoint_interval));
+    } else {
+        tracing::info!(
+            "WAL checkpointer disabled: the active metadata backend self-manages its WAL"
+        );
+    }
 
     // Replication worker. Two shapes, chosen by configuration:
     //
@@ -378,9 +387,13 @@ impl BucketRoutedSink for MultiTargetSink {
 /// contending), and a `busy` result means a reader pinned the log so the truncation was
 /// deferred — that is observable via `cairn_wal_checkpoints_busy_total`.
 async fn checkpoint_loop(stack: Arc<AppStack>, interval: Duration) {
+    // Only spawned when `store` is Some (the sqlite backend); bind the typed handle once.
+    let Some(store) = stack.store.clone() else {
+        return;
+    };
     loop {
         tokio::time::sleep(interval).await;
-        match stack.store.checkpoint().await {
+        match store.checkpoint().await {
             Ok(stats) => {
                 metrics::counter!("cairn_wal_checkpoints_total").increment(1);
                 if stats.busy {
@@ -397,7 +410,7 @@ async fn checkpoint_loop(stack: Arc<AppStack>, interval: Duration) {
             }
             Err(e) => tracing::warn!(error = %e, "wal checkpoint failed"),
         }
-        match stack.store.wal_size_bytes().await {
+        match store.wal_size_bytes().await {
             Ok(bytes) => metrics::gauge!("cairn_wal_bytes").set(bytes as f64),
             Err(e) => tracing::warn!(error = %e, "wal size probe failed"),
         }

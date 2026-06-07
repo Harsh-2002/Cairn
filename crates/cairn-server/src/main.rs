@@ -104,14 +104,15 @@ fn integrity(cfg: Config) -> ExitCode {
         }
     };
     rt.block_on(async {
-        let store = match cairn_meta::open(&cfg.db_path, &cairn_meta::OpenOptions::default()) {
-            Ok(s) => s,
+        // Open through the configured backend (CAIRN_META_BACKEND) so reconciliation consults the
+        // same engine the server serves from.
+        let (_meta, oracle) = match stack::open_meta_store(&cfg).await {
+            Ok(pair) => pair,
             Err(e) => {
                 eprintln!("failed to open metadata store: {e}");
                 return ExitCode::FAILURE;
             }
         };
-        let oracle = store.reconcile_oracle();
         let blob = match cairn_blob::LocalBlobStore::open(cfg.data_dir.clone()).await {
             Ok(b) => b,
             Err(e) => {
@@ -119,7 +120,7 @@ fn integrity(cfg: Config) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        match blob.reconcile(&oracle, ReconcileOpts::default()).await {
+        match blob.reconcile(oracle.as_ref(), ReconcileOpts::default()).await {
             Ok(r) => {
                 println!(
                     "reconciliation complete: scanned={} orphans_reclaimed={} staging_cleaned={} sessions_cleaned={} errors={}",
@@ -414,7 +415,7 @@ fn bootstrap(cfg: Config) -> ExitCode {
     use cairn_types::auth::Role;
     use cairn_types::id::UserId;
     use cairn_types::meta::{Mutation, User, UserRecord};
-    use cairn_types::traits::{Clock, Crypto, MetadataStore};
+    use cairn_types::traits::{Clock, Crypto};
 
     let rt = match runtime() {
         Ok(rt) => rt,
@@ -430,8 +431,10 @@ fn bootstrap(cfg: Config) -> ExitCode {
         }
         let _ = tokio::fs::create_dir_all(&cfg.data_dir).await;
 
-        let store = match cairn_meta::open(&cfg.db_path, &cairn_meta::OpenOptions::default()) {
-            Ok(s) => s,
+        // Open through the configured backend (CAIRN_META_BACKEND) so the first administrator is
+        // written into the same engine the server will later serve from.
+        let store = match stack::open_meta_store(&cfg).await {
+            Ok((meta, _oracle)) => meta,
             Err(e) => {
                 eprintln!("failed to open metadata store: {e}");
                 return ExitCode::FAILURE;

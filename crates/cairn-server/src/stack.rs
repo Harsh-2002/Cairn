@@ -6,11 +6,11 @@ use crate::config::Config;
 use cairn_auth::AuthChain;
 use cairn_blob::LocalBlobStore;
 use cairn_crypto::{SystemClock, SystemCrypto};
-use cairn_meta::{OpenOptions, SqliteMetadataStore, SqliteReconcileOracle};
+use cairn_meta::{OpenOptions, SqliteMetadataStore};
 use cairn_s3::S3Service;
 use cairn_types::blob::ReconcileOpts;
 use cairn_types::traits::{
-    Authenticator, AuthorizationEngine, BlobStore, Clock, Crypto, MetadataStore,
+    Authenticator, AuthorizationEngine, BlobStore, Clock, Crypto, MetadataStore, ReconcileOracle,
 };
 use std::sync::Arc;
 
@@ -23,19 +23,23 @@ pub struct AppStack {
     /// The authenticator chain.
     pub auth: Arc<dyn Authenticator>,
     /// The metadata store behind its trait object, used by request handlers, the readiness
-    /// probe, and the background subsystems (multipart sweeper, lifecycle scanner).
+    /// probe, and the background subsystems (multipart sweeper, lifecycle scanner). Backend-
+    /// agnostic: it is the sqlite, libSQL, or Turso store depending on `CAIRN_META_BACKEND`.
     pub meta: Arc<dyn MetadataStore>,
     /// The blob store. Held for the background subsystems (sweeper, periodic reconcile).
     #[allow(dead_code)]
     pub blob: Arc<dyn BlobStore>,
-    /// The reconciliation oracle. Held for periodic out-of-band reconcile.
+    /// The reconciliation oracle behind its trait object. Held for periodic out-of-band reconcile.
+    /// Boxed because the concrete oracle type differs per backend (sqlite vs the shared async one).
     #[allow(dead_code)]
-    pub oracle: SqliteReconcileOracle,
-    /// A typed handle to the concrete SQLite store. The WAL checkpointer's `checkpoint()` and
-    /// `wal_size_bytes()` are inherent methods on `SqliteMetadataStore`, not part of the
-    /// `MetadataStore` trait object, so the concrete store is threaded through here rather than
-    /// reached via `meta` (ARCH §8.4/§11.2).
-    pub store: Arc<SqliteMetadataStore>,
+    pub oracle: Box<dyn ReconcileOracle + Send + Sync>,
+    /// A typed handle to the concrete SQLite store, **only present for the `sqlite` backend**. The
+    /// WAL checkpointer's `checkpoint()` and `wal_size_bytes()` are inherent methods on
+    /// `SqliteMetadataStore`, not part of the `MetadataStore` trait object, so the concrete store
+    /// is threaded through here rather than reached via `meta` (ARCH §8.4/§11.2). The libSQL and
+    /// Turso engines self-manage their WAL, so this is `None` for them and the WAL-checkpointer
+    /// background loop does not run.
+    pub store: Option<Arc<SqliteMetadataStore>>,
 }
 
 impl std::fmt::Debug for AppStack {
@@ -57,6 +61,76 @@ pub(crate) fn build_crypto(cfg: &Config) -> Result<SystemCrypto, String> {
     }
 }
 
+/// Open the metadata store for the configured backend (ARCH §12.7). Returns the trait-object
+/// store, the boxed reconcile oracle, and — for the `sqlite` backend only — the typed
+/// `SqliteMetadataStore` handle the WAL checkpointer drives (the libSQL and Turso engines
+/// self-manage their WAL, so they return `None`). The on-disk database is the same SQLite file
+/// format for all three engines; the backend only changes which engine drives it.
+async fn open_meta(
+    cfg: &Config,
+) -> Result<
+    (
+        Arc<dyn MetadataStore>,
+        Box<dyn ReconcileOracle + Send + Sync>,
+        Option<Arc<SqliteMetadataStore>>,
+    ),
+    String,
+> {
+    match cfg.meta_backend.as_str() {
+        "sqlite" => {
+            // The default, byte-identical path: the rusqlite/bundled-C store. Migrations run
+            // inside `open`. A typed handle is kept for the WAL checkpointer.
+            let store = cairn_meta::open(&cfg.db_path, &OpenOptions::default())
+                .map_err(|e| format!("open metadata store (sqlite): {e}"))?;
+            let oracle = Box::new(store.reconcile_oracle());
+            let store = Arc::new(store);
+            let meta: Arc<dyn MetadataStore> = store.clone();
+            Ok((meta, oracle, Some(store)))
+        }
+        "libsql" => {
+            let store = cairn_meta_async::open_libsql(&cfg.db_path, &Default::default())
+                .await
+                .map_err(|e| format!("open metadata store (libsql): {e}"))?;
+            let oracle = Box::new(store.reconcile_oracle());
+            let meta: Arc<dyn MetadataStore> = Arc::new(store);
+            Ok((meta, oracle, None))
+        }
+        "turso" => {
+            let store = cairn_meta_async::open_turso(&cfg.db_path, &Default::default())
+                .await
+                .map_err(|e| format!("turso backend unavailable: {e}"))?;
+            let oracle = Box::new(store.reconcile_oracle());
+            let meta: Arc<dyn MetadataStore> = Arc::new(store);
+            Ok((meta, oracle, None))
+        }
+        // `Config::validate` already rejects any other value at load, so this is unreachable in
+        // practice; it is kept as a defensive clear error rather than a panic.
+        other => Err(format!(
+            "unknown meta_backend {other:?} (expected sqlite|libsql|turso)"
+        )),
+    }
+}
+
+/// Open just the metadata store (and its reconcile oracle) for the configured backend, for the
+/// node-local CLI commands (`bootstrap`, `integrity`). This honours `CAIRN_META_BACKEND` so an
+/// operator who selects libSQL or Turso bootstraps and reconciles through that same engine, rather
+/// than silently falling back to the rusqlite engine. Migrations run as part of opening.
+///
+/// # Errors
+/// Returns a message if the store cannot be opened for the configured backend.
+pub(crate) async fn open_meta_store(
+    cfg: &Config,
+) -> Result<
+    (
+        Arc<dyn MetadataStore>,
+        Box<dyn ReconcileOracle + Send + Sync>,
+    ),
+    String,
+> {
+    let (meta, oracle, _store) = open_meta(cfg).await?;
+    Ok((meta, oracle))
+}
+
 /// Open the stores, wire the stack, and run startup reconciliation.
 ///
 /// # Errors
@@ -66,14 +140,10 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
         .await
         .map_err(|e| format!("create data_dir: {e}"))?;
 
-    let store = cairn_meta::open(&cfg.db_path, &OpenOptions::default())
-        .map_err(|e| format!("open metadata store: {e}"))?;
-    let oracle = store.reconcile_oracle();
-    // Open + migrations already ran inside `open`; keep a typed handle for the WAL checkpointer
-    // (its `checkpoint()`/`wal_size_bytes()` are inherent methods, not on the trait object) and
-    // share the same store behind the trait object for everything else.
-    let store = Arc::new(store);
-    let meta: Arc<dyn MetadataStore> = store.clone();
+    // Open the configured metadata backend. `meta` is the trait-object store used everywhere;
+    // `oracle` is the boxed reconcile oracle; `store` is the typed sqlite handle for the WAL
+    // checkpointer (None for the self-WAL-managing libSQL/Turso engines).
+    let (meta, oracle, store) = open_meta(cfg).await?;
 
     let blob_impl = LocalBlobStore::open(cfg.data_dir.clone())
         .await
@@ -114,8 +184,12 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
         clock.clone(),
     );
 
-    // Startup reconciliation reclaims orphaned blobs from any crash window before serving.
-    match blob.reconcile(&oracle, ReconcileOpts::default()).await {
+    // Startup reconciliation reclaims orphaned blobs from any crash window before serving. The
+    // oracle is taken by `&dyn ReconcileOracle`, so the boxed oracle is borrowed via `as_ref`.
+    match blob
+        .reconcile(oracle.as_ref(), ReconcileOpts::default())
+        .await
+    {
         Ok(report) => tracing::info!(
             orphans = report.orphans_reclaimed,
             scanned = report.blobs_scanned,

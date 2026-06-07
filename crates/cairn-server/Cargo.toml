@@ -48,6 +48,12 @@ libc = { version = "0.2", optional = true }
 cairn-types.workspace = true
 cairn-s3.workspace = true
 cairn-meta.workspace = true
+# The async (libSQL + Turso) metadata backends, selectable at runtime via CAIRN_META_BACKEND.
+# Linking this alongside cairn-meta puts both rusqlite's and libSQL's bundled SQLite C libraries in
+# the `cairn` binary, which collide on the public `sqlite3_*` symbols; `build.rs` emits a
+# binary-scoped `--allow-multiple-definition` link arg so the binary links (see build.rs). Turso is
+# pure-Rust and adds no C SQLite, so it does not contribute to the collision.
+cairn-meta-async.workspace = true
 cairn-blob.workspace = true
 cairn-crypto.workspace = true
 cairn-auth.workspace = true
