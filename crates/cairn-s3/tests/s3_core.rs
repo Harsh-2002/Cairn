@@ -27,12 +27,15 @@ struct Harness {
 }
 
 async fn harness() -> Harness {
+    harness_with_authz(Arc::new(cairn_types::testing::AllowAll)).await
+}
+
+async fn harness_with_authz(authz: Arc<dyn cairn_types::traits::AuthorizationEngine>) -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let meta: Arc<dyn MetadataStore> = Arc::new(cairn_meta::open_in_memory().unwrap());
     let blob: Arc<dyn BlobStore> =
         Arc::new(cairn_blob::LocalBlobStore::open(dir.path()).await.unwrap());
     let clock = Arc::new(cairn_types::testing::TestClock::default());
-    let authz = Arc::new(cairn_types::testing::AllowAll);
     let svc = S3Service::new(
         meta,
         blob,
@@ -1487,4 +1490,545 @@ async fn public_access_block_roundtrip() {
         "bpa: {xml}"
     );
     assert!(xml.contains("<BlockPublicPolicy>true</BlockPublicPolicy>"));
+}
+
+/// Create a bucket and enable versioning on it.
+async fn versioned_bucket(h: &Harness, bucket: &str) {
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some(bucket), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    let vcfg =
+        b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>".to_vec();
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some(bucket),
+                None,
+                &[("versioning", "")],
+                &[],
+                vcfg,
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn versioning_delete_marker_signaling_and_405() {
+    let h = harness().await;
+    versioned_bucket(&h, "dmb").await;
+
+    // PUT a version.
+    drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("dmb"),
+                Some("k"),
+                &[],
+                &[],
+                b"v1".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+
+    // Plain DELETE in an Enabled bucket inserts a delete marker and signals its identity.
+    let (st, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(Method::DELETE, Some("dmb"), Some("k"), &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    assert_eq!(header(&hdrs, "x-amz-delete-marker"), Some("true"));
+    let marker_vid = header(&hdrs, "x-amz-version-id")
+        .expect("delete response carries the new marker version id")
+        .to_owned();
+
+    // A plain GET of the now-deleted key returns 404 with the marker signaled.
+    let (st, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(Method::GET, Some("dmb"), Some("k"), &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    assert_eq!(header(&hdrs, "x-amz-delete-marker"), Some("true"));
+    assert_eq!(header(&hdrs, "x-amz-version-id"), Some(marker_vid.as_str()));
+
+    // A plain HEAD behaves the same way.
+    let (st, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(Method::HEAD, Some("dmb"), Some("k"), &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    assert_eq!(header(&hdrs, "x-amz-delete-marker"), Some("true"));
+
+    // GET/HEAD naming the delete marker's OWN version id is 405 MethodNotAllowed, not 404.
+    let (st, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("dmb"),
+                Some("k"),
+                &[("versionId", marker_vid.as_str())],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(header(&hdrs, "x-amz-delete-marker"), Some("true"));
+
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::HEAD,
+                Some("dmb"),
+                Some("k"),
+                &[("versionId", marker_vid.as_str())],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::METHOD_NOT_ALLOWED);
+
+    // The original version is still retrievable by its own version id (not destroyed).
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("dmb"),
+                None,
+                &[("versions", "")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let xml = String::from_utf8(body).unwrap();
+    assert_eq!(xml.matches("<Version>").count(), 1, "v1 retained: {xml}");
+    assert_eq!(
+        xml.matches("<DeleteMarker>").count(),
+        1,
+        "delete marker listed: {xml}"
+    );
+}
+
+#[tokio::test]
+async fn suspended_delete_inserts_null_marker_no_data_loss() {
+    let h = harness().await;
+    versioned_bucket(&h, "susb").await;
+
+    // Write an identified version while Enabled.
+    drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("susb"),
+                Some("k"),
+                &[],
+                &[],
+                b"keep-me".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    // Capture the surviving identified version id from the versions listing.
+    let (_, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("susb"),
+                None,
+                &[("versions", "")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    let xml = String::from_utf8(body).unwrap();
+    let kept_vid = between(&xml, "<VersionId>", "</VersionId>");
+
+    // Suspend versioning.
+    let vcfg =
+        b"<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>".to_vec();
+    drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("susb"),
+                None,
+                &[("versioning", "")],
+                &[],
+                vcfg,
+            ),
+        )
+        .await,
+    )
+    .await;
+
+    // A plain DELETE in a Suspended bucket inserts a NULL-version delete marker rather than
+    // permanently removing data; the response signals a delete marker.
+    let (st, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(Method::DELETE, Some("susb"), Some("k"), &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    assert_eq!(header(&hdrs, "x-amz-delete-marker"), Some("true"));
+
+    // The current key now reads as deleted (a delete marker hides it).
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(Method::GET, Some("susb"), Some("k"), &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+
+    // But the earlier identified version is NOT lost: it is still retrievable by its version id.
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("susb"),
+                Some("k"),
+                &[("versionId", kept_vid.as_str())],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "suspended delete must not destroy data");
+    assert_eq!(body, b"keep-me");
+}
+
+#[tokio::test]
+async fn put_object_inline_tagging_header_is_persisted() {
+    let h = harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("tagb"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+
+    // PUT with an inline x-amz-tagging header (form-encoded tag set).
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("tagb"),
+                Some("k"),
+                &[],
+                &[("x-amz-tagging", "team=storage&env=prod")],
+                b"body".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    // GET ?tagging returns the persisted tags.
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("tagb"),
+                Some("k"),
+                &[("tagging", "")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let xml = String::from_utf8(body).unwrap();
+    assert!(
+        xml.contains("team") && xml.contains("storage"),
+        "tags: {xml}"
+    );
+    assert!(xml.contains("env") && xml.contains("prod"), "tags: {xml}");
+}
+
+/// An authorization engine that denies DELETE of one specific object key and allows everything
+/// else, used to exercise per-key authorization fidelity in bulk delete. (Reads of the key stay
+/// allowed so the test can verify the key survived.)
+#[derive(Debug)]
+struct DenyKey(&'static str);
+
+impl cairn_types::traits::AuthorizationEngine for DenyKey {
+    fn evaluate(&self, input: &cairn_types::authz::AuthzInput) -> cairn_types::authz::Decision {
+        use cairn_types::authz::{Action, Decision, DenyReason, Resource};
+        let is_delete = matches!(
+            input.action,
+            Action::DeleteObject | Action::DeleteObjectVersion
+        );
+        if is_delete {
+            if let Resource::Object { key, .. } = &input.resource {
+                if key.as_str() == self.0 {
+                    return Decision::Deny(DenyReason::DefaultDeny);
+                }
+            }
+        }
+        Decision::Allow
+    }
+}
+
+#[tokio::test]
+async fn bulk_delete_mixed_results_have_per_key_codes() {
+    // Deny "denied.txt"; everything else is allowed.
+    let h = harness_with_authz(Arc::new(DenyKey("denied.txt"))).await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("mxb"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    for k in ["allowed.txt", "denied.txt"] {
+        drain(
+            send(
+                &h.svc,
+                req(Method::PUT, Some("mxb"), Some(k), &[], &[], b"x".to_vec()),
+            )
+            .await,
+        )
+        .await;
+    }
+
+    let del = "<Delete>\
+        <Object><Key>allowed.txt</Key></Object>\
+        <Object><Key>denied.txt</Key></Object>\
+        <Object><Key>missing.txt</Key></Object>\
+        </Delete>";
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::POST,
+                Some("mxb"),
+                None,
+                &[("delete", "")],
+                &[],
+                del.as_bytes().to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let xml = String::from_utf8(body).unwrap();
+
+    // The denied key reports AccessDenied, NOT InternalError.
+    assert!(
+        xml.contains("<Key>denied.txt</Key>") && xml.contains("<Code>AccessDenied</Code>"),
+        "denied key must surface its true code: {xml}"
+    );
+    assert!(
+        !xml.contains("InternalError"),
+        "no failure should collapse to InternalError: {xml}"
+    );
+    // The allowed key is deleted.
+    assert!(xml.contains("<Deleted>") && xml.contains("allowed.txt"));
+
+    // allowed.txt is gone; denied.txt remains (its delete was rejected).
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("mxb"),
+                Some("allowed.txt"),
+                &[],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("mxb"),
+                Some("denied.txt"),
+                &[],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "denied key must NOT be deleted");
+}
+
+#[tokio::test]
+async fn cors_preflight_match_and_no_match() {
+    let h = harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("corsb"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+
+    // Configure a CORS rule allowing https://app.example for GET/PUT with any header.
+    let cors = b"<CORSConfiguration><CORSRule>\
+        <AllowedOrigin>https://app.example</AllowedOrigin>\
+        <AllowedMethod>GET</AllowedMethod>\
+        <AllowedMethod>PUT</AllowedMethod>\
+        <AllowedHeader>*</AllowedHeader>\
+        <ExposeHeader>ETag</ExposeHeader>\
+        <MaxAgeSeconds>3000</MaxAgeSeconds>\
+        </CORSRule></CORSConfiguration>"
+        .to_vec();
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("corsb"), None, &[("cors", "")], &[], cors),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+
+    // A matching preflight returns 200 with the Access-Control-Allow-* headers and Vary: Origin.
+    let (st, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::OPTIONS,
+                Some("corsb"),
+                None,
+                &[],
+                &[
+                    ("origin", "https://app.example"),
+                    ("access-control-request-method", "PUT"),
+                    (
+                        "access-control-request-headers",
+                        "x-amz-meta-foo, content-type",
+                    ),
+                ],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        header(&hdrs, "access-control-allow-origin"),
+        Some("https://app.example")
+    );
+    let methods = header(&hdrs, "access-control-allow-methods").unwrap();
+    assert!(methods.contains("PUT"), "methods echoed: {methods}");
+    assert_eq!(
+        header(&hdrs, "access-control-allow-headers"),
+        Some("x-amz-meta-foo, content-type")
+    );
+    assert_eq!(header(&hdrs, "access-control-max-age"), Some("3000"));
+    assert_eq!(header(&hdrs, "vary"), Some("Origin"));
+
+    // A preflight from a disallowed origin is rejected with 403.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::OPTIONS,
+                Some("corsb"),
+                None,
+                &[],
+                &[
+                    ("origin", "https://evil.example"),
+                    ("access-control-request-method", "PUT"),
+                ],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+
+    // A preflight for a disallowed METHOD is also rejected.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::OPTIONS,
+                Some("corsb"),
+                None,
+                &[],
+                &[
+                    ("origin", "https://app.example"),
+                    ("access-control-request-method", "DELETE"),
+                ],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
 }

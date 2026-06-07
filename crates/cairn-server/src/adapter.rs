@@ -1,7 +1,11 @@
 //! Adapts hyper's request/response to the library-neutral S3 request/response, performs
-//! authentication, and routes path-style addressing into the S3 service. Responses are
-//! buffered in this first wiring; streaming the response body straight from the blob store is a
-//! hardening-wave refinement.
+//! authentication, and routes path-style addressing into the S3 service.
+//!
+//! Object reads (`S3Body::Stream`) are forwarded to hyper as a streaming body so a large GET
+//! flows blob -> socket with bounded memory (ARCH §7.4/§7.6/§7.8): no whole-object buffer is ever
+//! materialised. Empty and in-memory (XML/error) bodies stay fully buffered, which is correct —
+//! they are already small and bounded. Request bodies for object PUT are streamed separately via
+//! [`incoming_to_stream`].
 
 use crate::stack::AppStack;
 use bytes::Bytes;
@@ -10,10 +14,25 @@ use cairn_types::auth::{AuthOutcome, RequestView};
 use cairn_types::error::{BodyError, Error};
 use cairn_types::id::{BucketName, ObjectKey};
 use futures_util::StreamExt;
-use http_body_util::{BodyExt, BodyStream, Full};
-use hyper::body::Incoming;
+use http_body_util::{BodyExt, BodyStream, Full, StreamBody};
+use hyper::body::{Frame, Incoming};
 use hyper::{Request, Response};
 use std::net::IpAddr;
+
+/// The unified HTTP response body: either a fully-buffered in-memory body (empty, XML, errors,
+/// UI assets, management JSON) or a blob stream forwarded frame-by-frame from the blob store.
+/// Boxing both into one type lets every response path return a single concrete `Body`. It is an
+/// `UnsyncBoxBody` rather than a `BoxBody` because the underlying blob stream is `Send` but not
+/// `Sync`; hyper only requires the body to be `Send`, so dropping the `Sync` bound is correct and
+/// avoids buffering the stream to satisfy it.
+pub type ResponseBody = http_body_util::combinators::UnsyncBoxBody<Bytes, BodyError>;
+
+/// Wrap a fully-buffered byte payload as a [`ResponseBody`].
+pub(crate) fn full_body(bytes: Bytes) -> ResponseBody {
+    Full::new(bytes)
+        .map_err(|e: std::convert::Infallible| match e {})
+        .boxed_unsync()
+}
 
 /// Handle an S3 (or anonymous) HTTP request end to end.
 pub async fn handle(
@@ -22,7 +41,7 @@ pub async fn handle(
     peer: IpAddr,
     secure: bool,
     request_id: String,
-) -> Response<Full<Bytes>> {
+) -> Response<ResponseBody> {
     let method = req.method().clone();
     let raw_path = req.uri().path().to_owned();
     let query_str = req.uri().query().unwrap_or("").to_owned();
@@ -58,7 +77,7 @@ pub async fn handle(
             AuthOutcome::NotApplicable => None,
             AuthOutcome::Denied(e) => {
                 let resource = raw_path.clone();
-                return collect(error_response(&Error::from(e), &resource, &request_id)).await;
+                return render(error_response(&Error::from(e), &resource, &request_id));
             }
         }
     };
@@ -77,8 +96,8 @@ pub async fn handle(
         return Response::builder()
             .status(resp.status)
             .header("content-type", "application/json")
-            .body(Full::new(Bytes::from(resp.body)))
-            .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())));
+            .body(full_body(Bytes::from(resp.body)))
+            .unwrap_or_else(|_| Response::new(full_body(Bytes::new())));
     }
     if raw_path == "/ui" || raw_path.starts_with("/ui/") {
         return serve_ui(&raw_path);
@@ -99,17 +118,17 @@ pub async fn handle(
         secure,
         request_id,
     };
-    collect(stack.s3.handle(s3req, body).await).await
+    render(stack.s3.handle(s3req, body).await)
 }
 
 /// Serve the embedded management UI under `/ui/`.
-fn serve_ui(path: &str) -> Response<Full<Bytes>> {
+fn serve_ui(path: &str) -> Response<ResponseBody> {
     if path == "/ui" {
         return Response::builder()
             .status(301)
             .header("location", "/ui/")
-            .body(Full::new(Bytes::new()))
-            .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())));
+            .body(full_body(Bytes::new()))
+            .unwrap_or_else(|_| Response::new(full_body(Bytes::new())));
     }
     let rel = path.strip_prefix("/ui/").unwrap_or("");
     let (content_type, bytes) = if rel.is_empty() {
@@ -120,8 +139,8 @@ fn serve_ui(path: &str) -> Response<Full<Bytes>> {
     Response::builder()
         .status(200)
         .header("content-type", content_type)
-        .body(Full::new(Bytes::from(bytes.into_owned())))
-        .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())))
+        .body(full_body(Bytes::from(bytes.into_owned())))
+        .unwrap_or_else(|_| Response::new(full_body(Bytes::new())))
 }
 
 /// Split a path-style request path into a bucket and key.
@@ -160,19 +179,23 @@ fn incoming_to_stream(body: Incoming) -> cairn_types::BodyStream {
     }))
 }
 
-async fn collect(resp: S3Response) -> Response<Full<Bytes>> {
-    let body = match resp.body {
-        S3Body::Empty => Bytes::new(),
-        S3Body::Bytes(b) => b,
-        S3Body::Stream { mut stream, .. } => {
-            let mut buf = Vec::new();
-            while let Some(chunk) = stream.next().await {
-                match chunk {
-                    Ok(b) => buf.extend_from_slice(&b),
-                    Err(_) => break,
-                }
-            }
-            Bytes::from(buf)
+/// Render an [`S3Response`] onto the wire. `Empty`/`Bytes` bodies are already bounded and stay
+/// buffered; a `Stream` body (object read) is forwarded to hyper as a `StreamBody` so bytes flow
+/// from the blob store to the socket in bounded chunks with backpressure, never materialising the
+/// whole object in memory (ARCH §7.4/§7.6/§7.8). The stream's `BlobError` is mapped onto the
+/// body's `BodyError`; a mid-stream blob failure terminates the body, which surfaces to the
+/// client as a truncated transfer (the status line is already sent by then).
+fn render(resp: S3Response) -> Response<ResponseBody> {
+    let body: ResponseBody = match resp.body {
+        S3Body::Empty => full_body(Bytes::new()),
+        S3Body::Bytes(b) => full_body(b),
+        S3Body::Stream { stream, .. } => {
+            let framed = stream.map(|chunk| {
+                chunk
+                    .map(Frame::data)
+                    .map_err(|e| BodyError::Transport(e.to_string()))
+            });
+            BodyExt::boxed_unsync(StreamBody::new(framed))
         }
     };
     let mut builder = Response::builder().status(resp.status);
@@ -180,8 +203,8 @@ async fn collect(resp: S3Response) -> Response<Full<Bytes>> {
         builder = builder.header(k, v);
     }
     builder
-        .body(Full::new(body))
-        .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())))
+        .body(body)
+        .unwrap_or_else(|_| Response::new(full_body(Bytes::new())))
 }
 
 /// Minimal percent-decoding for path/query segments.
@@ -209,5 +232,83 @@ fn hex_val(b: u8) -> Option<u8> {
         b'a'..=b'f' => Some(b - b'a' + 10),
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cairn_types::error::BlobError;
+    use futures_util::stream;
+    use http::StatusCode;
+
+    /// A `Stream` response body is forwarded frame-by-frame, not drained into one buffer: the
+    /// rendered body yields one HTTP data frame per source chunk and the bytes round-trip
+    /// unchanged (ARCH §7.4/§7.6/§7.8, High #4).
+    #[tokio::test]
+    async fn stream_response_is_forwarded_chunk_by_chunk() {
+        let chunks: Vec<Result<Bytes, BlobError>> = vec![
+            Ok(Bytes::from_static(b"hello ")),
+            Ok(Bytes::from_static(b"streamed ")),
+            Ok(Bytes::from_static(b"world")),
+        ];
+        let stream: cairn_types::BlobStream = Box::pin(stream::iter(chunks));
+        let resp = S3Response {
+            status: StatusCode::OK,
+            headers: vec![("content-length".to_owned(), "20".to_owned())],
+            body: S3Body::Stream { length: 20, stream },
+        };
+
+        let mut body = render(resp).into_body();
+        let mut frames = 0usize;
+        let mut collected = Vec::new();
+        while let Some(frame) = body.frame().await {
+            let frame = frame.expect("frame ok");
+            if let Ok(data) = frame.into_data() {
+                frames += 1;
+                collected.extend_from_slice(&data);
+            }
+        }
+        assert_eq!(collected, b"hello streamed world");
+        // Three source chunks must surface as three distinct data frames: proof the body streams
+        // rather than collecting everything into a single buffer first.
+        assert_eq!(frames, 3, "each source chunk must be its own frame");
+    }
+
+    /// A buffered (`Bytes`) response stays a single bounded body.
+    #[tokio::test]
+    async fn bytes_response_round_trips() {
+        let resp = S3Response {
+            status: StatusCode::OK,
+            headers: Vec::new(),
+            body: S3Body::Bytes(Bytes::from_static(b"<xml/>")),
+        };
+        let body = render(resp).into_body();
+        let collected = body.collect().await.expect("collect").to_bytes();
+        assert_eq!(&collected[..], b"<xml/>");
+    }
+
+    /// A mid-stream blob error terminates the body with a transport error rather than panicking
+    /// or silently truncating without signal.
+    #[tokio::test]
+    async fn stream_error_surfaces_as_body_error() {
+        let chunks: Vec<Result<Bytes, BlobError>> = vec![
+            Ok(Bytes::from_static(b"partial")),
+            Err(BlobError::Io("disk gone".to_owned())),
+        ];
+        let stream: cairn_types::BlobStream = Box::pin(stream::iter(chunks));
+        let resp = S3Response {
+            status: StatusCode::OK,
+            headers: Vec::new(),
+            body: S3Body::Stream { length: 7, stream },
+        };
+        let mut body = render(resp).into_body();
+        let first = body.frame().await.expect("first frame").expect("ok");
+        assert_eq!(
+            first.into_data().expect("data"),
+            Bytes::from_static(b"partial")
+        );
+        let second = body.frame().await.expect("second frame");
+        assert!(second.is_err(), "blob error must surface as a body error");
     }
 }

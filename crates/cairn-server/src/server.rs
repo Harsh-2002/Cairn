@@ -3,10 +3,10 @@
 //! management families here behind authentication and authorization.
 
 use crate::adapter;
+use crate::adapter::{ResponseBody, full_body};
 use crate::config::Config;
 use crate::stack::AppStack;
 use bytes::Bytes;
-use http_body_util::Full;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
@@ -66,13 +66,8 @@ pub async fn serve(
     // Migrations and startup reconciliation already ran while building the stack; ready now.
     state.ready.store(true, Ordering::SeqCst);
 
-    // Background subsystems: the multipart sweeper and the lifecycle scanner.
-    crate::background::spawn(
-        state.stack.clone(),
-        Duration::from_secs(3600),
-        86_400,
-        Duration::from_secs(3600),
-    );
+    // Background subsystems: multipart sweeper, lifecycle scanner, WAL checkpointer, metrics.
+    crate::background::spawn(state.stack.clone(), &config);
     tracing::info!(addr = %local, tls = tls.is_some(), "cairn listening");
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -157,7 +152,7 @@ async fn handle(
     peer: std::net::SocketAddr,
     secure: bool,
     req: Request<Incoming>,
-) -> Result<Response<Full<Bytes>>, Infallible> {
+) -> Result<Response<ResponseBody>, Infallible> {
     let request_id = uuid::Uuid::new_v4().simple().to_string();
     let method = req.method().clone();
     let path = req.uri().path().to_owned();
@@ -180,7 +175,7 @@ async fn handle(
         let start = Instant::now();
         let work = async {
             if infra {
-                route_infra(&state, &path)
+                route_infra(&state, &path).await
             } else {
                 adapter::handle(&state.stack, req, peer.ip(), secure, request_id.clone()).await
             }
@@ -217,11 +212,11 @@ async fn handle(
 
 /// Liveness, readiness, and metrics endpoints (the S3 and management families are dispatched
 /// through the adapter).
-fn route_infra(state: &AppState, path: &str) -> Response<Full<Bytes>> {
+async fn route_infra(state: &AppState, path: &str) -> Response<ResponseBody> {
     match path {
         "/healthz" => text(StatusCode::OK, "ok"),
         "/readyz" => {
-            if state.ready.load(Ordering::SeqCst) {
+            if is_ready(state).await {
                 text(StatusCode::OK, "ready")
             } else {
                 text(StatusCode::SERVICE_UNAVAILABLE, "not ready")
@@ -232,26 +227,38 @@ fn route_infra(state: &AppState, path: &str) -> Response<Full<Bytes>> {
             Response::builder()
                 .status(StatusCode::OK)
                 .header("content-type", "text/plain; version=0.0.4")
-                .body(Full::new(Bytes::from(body)))
+                .body(full_body(Bytes::from(body)))
                 .expect("valid metrics response")
         }
         _ => error_response(StatusCode::NOT_FOUND, "NotFound"),
     }
 }
 
-fn text(status: StatusCode, body: &'static str) -> Response<Full<Bytes>> {
+/// Readiness reflects real state (ARCH §6.4, §26.4): the process is ready only once startup
+/// migrations and reconciliation have completed (the `ready` gate) AND a cheap liveness probe of
+/// the metadata store succeeds. `/healthz` stays pure liveness; this probe must not falsely
+/// report ready when the store is wedged. The probe is a trivial indexed read
+/// (`list_buckets(None)`) on the read pool — it never touches the single writer.
+async fn is_ready(state: &AppState) -> bool {
+    if !state.ready.load(Ordering::SeqCst) {
+        return false;
+    }
+    state.stack.meta.list_buckets(None).await.is_ok()
+}
+
+fn text(status: StatusCode, body: &'static str) -> Response<ResponseBody> {
     Response::builder()
         .status(status)
         .header("content-type", "text/plain")
-        .body(Full::new(Bytes::from_static(body.as_bytes())))
+        .body(full_body(Bytes::from_static(body.as_bytes())))
         .expect("valid text response")
 }
 
-fn error_response(status: StatusCode, code: &str) -> Response<Full<Bytes>> {
+fn error_response(status: StatusCode, code: &str) -> Response<ResponseBody> {
     Response::builder()
         .status(status)
         .header("content-type", "text/plain")
-        .body(Full::new(Bytes::from(code.to_owned())))
+        .body(full_body(Bytes::from(code.to_owned())))
         .expect("valid error response")
 }
 

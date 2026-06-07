@@ -81,11 +81,56 @@ impl S3Service {
     }
 
     async fn dispatch(&self, req: S3Request, body: cairn_types::BodyStream) -> Result<S3Response> {
+        // A CORS preflight (OPTIONS) is evaluated against the bucket's stored CORS configuration
+        // before any authentication/authorization — a browser sends preflight without credentials
+        // (ARCH §18.2, Medium #3).
+        if req.method == Method::OPTIONS {
+            return self.cors_preflight(&req).await;
+        }
         match (&req.method, req.bucket.is_some(), req.key.is_some()) {
             (&Method::GET, false, _) => self.list_buckets(&req).await,
             (_, true, false) => self.bucket_op(req, body).await,
             (_, true, true) => self.object_op(req, body).await,
             _ => Err(Error::NotImplemented),
+        }
+    }
+
+    /// Handle a CORS preflight (`OPTIONS` with `Origin` + `Access-Control-Request-Method`):
+    /// evaluate the request against the bucket's stored CORS rules and, on a match, return 200
+    /// with the `Access-Control-Allow-*`/`Vary: Origin` headers; on no match return 403 (ARCH
+    /// §18.2, Medium #3).
+    async fn cors_preflight(&self, req: &S3Request) -> Result<S3Response> {
+        let Some(origin) = req.header("origin") else {
+            // A bare OPTIONS without an Origin is not a CORS preflight.
+            return Err(Error::AccessDenied);
+        };
+        let Some(method) = req.header("access-control-request-method") else {
+            return Err(Error::AccessDenied);
+        };
+        // The requested headers are a comma-separated list (may be absent).
+        let requested_headers: Vec<String> = req
+            .header("access-control-request-headers")
+            .map(|h| {
+                h.split(',')
+                    .map(|s| s.trim().to_ascii_lowercase())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let bucket = self.fetch_bucket(req).await?;
+        let rules = match self
+            .meta
+            .get_bucket_config(&bucket.name, ConfigAspect::Cors)
+            .await?
+        {
+            Some(doc) => cairn_xml::parse_cors_configuration(doc.0.as_bytes())?,
+            None => Vec::new(),
+        };
+
+        match cors_match(&rules, origin, method, &requested_headers) {
+            Some(resp) => Ok(resp.with_header("x-amz-request-id", &req.request_id)),
+            None => Err(Error::AccessDenied),
         }
     }
 
@@ -479,6 +524,21 @@ impl S3Service {
                 if let Some(old) = superseded {
                     let _ = self.blob.delete(&old).await;
                 }
+                // Persist the inline `x-amz-tagging` header as the object's initial tag set
+                // (ARCH §17.1, Medium #5). Tags are a separate mutation; commit them after the
+                // object version exists so they attach to the just-written version.
+                let initial_tags = parse_tagging_header(req.header("x-amz-tagging"));
+                if !initial_tags.is_empty() {
+                    let _ = self
+                        .meta
+                        .submit(Mutation::PutObjectTags {
+                            bucket: bucket.name.clone(),
+                            key: key.clone(),
+                            version_id: version_id.clone(),
+                            tags: initial_tags,
+                        })
+                        .await;
+                }
                 let mut resp = S3Response::status(StatusCode::OK)
                     .with_header("etag", quoted(&staged.etag))
                     .with_header("x-amz-request-id", &request_id);
@@ -499,7 +559,10 @@ impl S3Service {
     }
 
     async fn get_object(&self, req: &S3Request) -> Result<S3Response> {
-        let (row, _bucket) = self.resolve_object(req).await?;
+        let row = match self.resolve_read_target(req).await? {
+            ReadTarget::Object(row) => *row,
+            ReadTarget::DeleteMarker(resp) => return Ok(resp),
+        };
         if let Some(resp) = conditional_short_circuit(req, &row) {
             return Ok(resp.with_header("x-amz-request-id", &req.request_id));
         }
@@ -532,7 +595,10 @@ impl S3Service {
     }
 
     async fn head_object(&self, req: &S3Request) -> Result<S3Response> {
-        let (row, _bucket) = self.resolve_object(req).await?;
+        let row = match self.resolve_read_target(req).await? {
+            ReadTarget::Object(row) => *row,
+            ReadTarget::DeleteMarker(resp) => return Ok(resp),
+        };
         if let Some(resp) = conditional_short_circuit(req, &row) {
             // Conditional HEAD returns the bare 304/412 status (no body, per S3).
             return Ok(resp.with_header("x-amz-request-id", &req.request_id));
@@ -548,42 +614,99 @@ impl S3Service {
         let key = req.key.clone().expect("key present");
         let now = self.clock.now();
 
-        let outcome = if let Some(vid) = req.query("versionId") {
-            self.meta
+        // A versioned DELETE (?versionId) permanently removes that version (no delete marker). A
+        // plain DELETE in an Enabled bucket inserts a new identified delete marker; in a Suspended
+        // bucket it inserts a NULL-version delete marker that replaces the null version (avoiding
+        // the silent permanent removal of the null version — ARCH §16.1/§16.3, Medium #4); in an
+        // Unversioned bucket it removes the sentinel version.
+        if let Some(vid) = req.query("versionId") {
+            let outcome = self
+                .meta
                 .submit(Mutation::DeleteVersion {
                     bucket: bucket.name.clone(),
                     key,
                     version_id: VersionId::from_string(vid.to_owned()),
                 })
-                .await?
-        } else if bucket.versioning == VersioningState::Enabled {
-            self.meta
-                .submit(Mutation::CreateDeleteMarker {
-                    bucket: bucket.name.clone(),
-                    key,
-                    version_id: VersionId::generate(),
-                    owner_id: bucket.owner_id.clone(),
-                    now,
-                    replication: None,
-                })
-                .await?
-        } else {
-            self.meta
-                .submit(Mutation::DeleteVersion {
-                    bucket: bucket.name.clone(),
-                    key,
-                    version_id: VersionId::null(),
-                })
-                .await?
-        };
-        if let MutationOutcome::Deleted {
-            freed: Some(path), ..
-        } = outcome
-        {
-            let _ = self.blob.delete(&path).await;
+                .await?;
+            if let MutationOutcome::Deleted {
+                freed: Some(path), ..
+            } = outcome
+            {
+                let _ = self.blob.delete(&path).await;
+            }
+            return Ok(S3Response::status(StatusCode::NO_CONTENT)
+                .with_header("x-amz-request-id", &req.request_id));
         }
-        Ok(S3Response::status(StatusCode::NO_CONTENT)
-            .with_header("x-amz-request-id", &req.request_id))
+
+        match bucket.versioning {
+            VersioningState::Enabled => {
+                let marker_id = VersionId::generate();
+                self.meta
+                    .submit(Mutation::CreateDeleteMarker {
+                        bucket: bucket.name.clone(),
+                        key,
+                        version_id: marker_id.clone(),
+                        owner_id: bucket.owner_id.clone(),
+                        now,
+                        replication: None,
+                    })
+                    .await?;
+                // Signal the newly-created delete marker's identity to the client (Medium #4).
+                Ok(S3Response::status(StatusCode::NO_CONTENT)
+                    .with_header("x-amz-delete-marker", "true")
+                    .with_header("x-amz-version-id", marker_id.as_str())
+                    .with_header("x-amz-request-id", &req.request_id))
+            }
+            VersioningState::Suspended => {
+                // Replace any existing null version with a NULL-version delete marker. Removing the
+                // null version first keeps a single null entry per key without disturbing older
+                // identified versions, and avoids a unique-constraint conflict on the insert.
+                if let Ok(MutationOutcome::Deleted {
+                    freed: Some(path), ..
+                }) = self
+                    .meta
+                    .submit(Mutation::DeleteVersion {
+                        bucket: bucket.name.clone(),
+                        key: key.clone(),
+                        version_id: VersionId::null(),
+                    })
+                    .await
+                {
+                    let _ = self.blob.delete(&path).await;
+                }
+                self.meta
+                    .submit(Mutation::CreateDeleteMarker {
+                        bucket: bucket.name.clone(),
+                        key,
+                        version_id: VersionId::null(),
+                        owner_id: bucket.owner_id.clone(),
+                        now,
+                        replication: None,
+                    })
+                    .await?;
+                Ok(S3Response::status(StatusCode::NO_CONTENT)
+                    .with_header("x-amz-delete-marker", "true")
+                    .with_header("x-amz-request-id", &req.request_id))
+            }
+            VersioningState::Unversioned => {
+                let outcome = self
+                    .meta
+                    .submit(Mutation::DeleteVersion {
+                        bucket: bucket.name.clone(),
+                        key,
+                        version_id: VersionId::null(),
+                    })
+                    .await?;
+                if let MutationOutcome::Deleted {
+                    freed: Some(path), ..
+                } = outcome
+                {
+                    let _ = self.blob.delete(&path).await;
+                }
+                Ok(S3Response::status(StatusCode::NO_CONTENT)
+                    .with_header("x-amz-request-id", &req.request_id))
+            }
+        }
     }
 
     // --- multipart ---
@@ -981,9 +1104,15 @@ impl S3Service {
                 }
                 Ok(resp)
             }
-            Ok(_) | Err(_) => {
+            // Surface the commit's TRUE error (PreconditionFailed, InsufficientStorage, ...) rather
+            // than collapsing every failure to Internal(500) (Medium #7).
+            Ok(_) => {
                 let _ = self.blob.delete(&staged.storage_path).await;
-                Err(Error::Internal("copy commit failed".to_owned()))
+                Err(Error::Internal("unexpected copy outcome".to_owned()))
+            }
+            Err(e) => {
+                let _ = self.blob.delete(&staged.storage_path).await;
+                Err(e.into())
             }
         }
     }
@@ -1010,6 +1139,31 @@ impl S3Service {
                 ));
                 continue;
             };
+            // Authorize each key individually (Medium #7): a bulk delete is N independent
+            // DeleteObject (or DeleteObjectVersion, for a versioned entry) decisions, not one
+            // bucket-level grant. A per-key denial becomes a per-key error, not a whole-request
+            // failure, so the remaining keys still proceed.
+            let action = if version.is_some() {
+                Action::DeleteObjectVersion
+            } else {
+                Action::DeleteObject
+            };
+            if let Err(e) = self
+                .authorize(
+                    req,
+                    &bucket,
+                    action,
+                    Resource::Object {
+                        bucket: bucket.name.clone(),
+                        key: key.clone(),
+                    },
+                )
+                .await
+            {
+                let (_, code) = crate::error_map::map(&e);
+                errors.push((key_s, code.to_owned(), e.to_string()));
+                continue;
+            }
             let mutation = match (&version, versioned) {
                 (Some(v), _) => Mutation::DeleteVersion {
                     bucket: bucket.name.clone(),
@@ -1044,7 +1198,13 @@ impl S3Service {
                         deleted.push((key_s, version));
                     }
                 }
-                Err(e) => errors.push((key_s, "InternalError".to_owned(), e.to_string())),
+                // Map each per-key failure to its TRUE S3 code via the total error map, rather
+                // than collapsing every failure to InternalError (Medium #7).
+                Err(e) => {
+                    let err: Error = e.into();
+                    let (_, code) = crate::error_map::map(&err);
+                    errors.push((key_s, code.to_owned(), err.to_string()));
+                }
             }
         }
         let body = cairn_xml::delete_result(&deleted, &errors);
@@ -1449,6 +1609,27 @@ impl S3Service {
                 };
                 (bucket_acl, object_acl)
             };
+        // Load the existing object's tags and parse any request-supplied tags so policies
+        // conditioned on s3:ExistingObjectTag/aws:RequestTag evaluate correctly (ARCH §15.6,
+        // Medium #5). Existing tags are read only for object resources; the request tags come
+        // from the inline `x-amz-tagging` header (a `PutObject`/copy form-encoded tag set).
+        let existing_tags = match &resource {
+            Resource::Object { key, .. } => {
+                match self.meta.current_version(&bucket.name, key).await? {
+                    Some(row) => {
+                        self.meta
+                            .get_object_tags(&bucket.name, key, &row.version_id)
+                            .await?
+                    }
+                    None => Vec::new(),
+                }
+            }
+            Resource::Bucket(_) => Vec::new(),
+        };
+        let request_tags = parse_tagging_header(req.header("x-amz-tagging"));
+        let mut context = build_context(req, self.clock.now());
+        context.existing_tags = existing_tags;
+        context.request_tags = request_tags;
         let input = AuthzInput {
             requester,
             action,
@@ -1460,7 +1641,7 @@ impl S3Service {
             bucket_acl,
             object_acl,
             ownership_mode: bucket.ownership_mode,
-            context: build_context(req, self.clock.now()),
+            context,
         };
         match self.authz.evaluate(&input) {
             Decision::Allow => Ok(()),
@@ -1489,6 +1670,87 @@ impl S3Service {
         }
         Ok((row, bucket))
     }
+
+    /// Resolve a GET/HEAD read target with full delete-marker fidelity (ARCH §16, Medium #4).
+    ///
+    /// - A plain read (no `?versionId`) of a key whose latest version is a delete marker returns a
+    ///   404 carrying `x-amz-delete-marker: true` and the marker's `x-amz-version-id`.
+    /// - A read that names a delete marker's OWN `?versionId` returns 405 `MethodNotAllowed`
+    ///   (a delete marker has no retrievable content), not 404.
+    /// - Otherwise the live object version is returned.
+    async fn resolve_read_target(&self, req: &S3Request) -> Result<ReadTarget> {
+        let bucket = self.fetch_bucket(req).await?;
+        let key = req.key.clone().expect("key present");
+        match req.query("versionId") {
+            Some(vid) => {
+                let row = self
+                    .meta
+                    .get_version(&bucket.name, &key, &VersionId::from_string(vid.to_owned()))
+                    .await?
+                    .ok_or(Error::NoSuchVersion)?;
+                if row.is_delete_marker {
+                    // Naming a delete marker's own version is a 405, not a 404.
+                    return Ok(ReadTarget::DeleteMarker(method_not_allowed_marker(
+                        req, &row,
+                    )));
+                }
+                Ok(ReadTarget::Object(Box::new(row)))
+            }
+            None => {
+                let row = self
+                    .meta
+                    .current_version(&bucket.name, &key)
+                    .await?
+                    .ok_or(Error::NoSuchKey)?;
+                if row.is_delete_marker {
+                    return Ok(ReadTarget::DeleteMarker(not_found_marker(req, &row)));
+                }
+                Ok(ReadTarget::Object(Box::new(row)))
+            }
+        }
+    }
+}
+
+/// The outcome of resolving a GET/HEAD target: a live object version, or a delete-marker response
+/// (a 404 for a hidden current version, or a 405 for a directly-named marker version).
+enum ReadTarget {
+    Object(Box<ObjectVersionRow>),
+    DeleteMarker(S3Response),
+}
+
+/// The 404 returned when the latest version of a key is a delete marker: the marker's identity is
+/// signaled via `x-amz-delete-marker` and `x-amz-version-id` (ARCH §16.1, Medium #4).
+fn not_found_marker(req: &S3Request, marker: &ObjectVersionRow) -> S3Response {
+    let body = cairn_xml::error_document(
+        "NoSuchKey",
+        "The specified key does not exist.",
+        &resource_path(req),
+        &req.request_id,
+    );
+    let mut resp = S3Response::xml(StatusCode::NOT_FOUND, body)
+        .with_header("x-amz-delete-marker", "true")
+        .with_header("x-amz-request-id", &req.request_id);
+    if !marker.version_id.is_null() {
+        resp = resp.with_header("x-amz-version-id", marker.version_id.as_str());
+    }
+    resp
+}
+
+/// The 405 returned when a GET/HEAD names a delete marker's own version id (ARCH §16.1, Medium #4).
+fn method_not_allowed_marker(req: &S3Request, marker: &ObjectVersionRow) -> S3Response {
+    let body = cairn_xml::error_document(
+        "MethodNotAllowed",
+        "The specified method is not allowed against this resource.",
+        &resource_path(req),
+        &req.request_id,
+    );
+    let mut resp = S3Response::xml(StatusCode::METHOD_NOT_ALLOWED, body)
+        .with_header("x-amz-delete-marker", "true")
+        .with_header("x-amz-request-id", &req.request_id);
+    if !marker.version_id.is_null() {
+        resp = resp.with_header("x-amz-version-id", marker.version_id.as_str());
+    }
+    resp
 }
 
 fn resource_path(req: &S3Request) -> String {
@@ -1701,9 +1963,18 @@ fn bucket_action(req: &S3Request) -> Result<Action> {
 }
 
 /// Map an object-level request to the S3 action it requires.
+///
+/// A read or delete that names a `?versionId` maps to the version-scoped action
+/// (`GetObjectVersion`/`DeleteObjectVersion`) so a policy written against those distinct actions
+/// grants or denies as written (ARCH §34.4, Medium #9). The multipart lifecycle
+/// (create/complete/upload-part) has no distinct `Action` variant in `cairn_types::authz::Action`
+/// — only `AbortMultipartUpload` and `ListMultipartUploadParts` exist — so those stay mapped to
+/// the closest existing action (`PutObject`). NOTE: add `CreateMultipartUpload`/`UploadPart` etc.
+/// to the action catalogue if finer-grained multipart policy is required.
 fn object_action(req: &S3Request) -> Result<Action> {
     use Action::*;
     let q = |s: &str| req.has_query(s);
+    let versioned = req.query("versionId").is_some();
     Ok(match req.method {
         Method::PUT if q("tagging") => PutObjectTagging,
         Method::GET if q("tagging") => GetObjectTagging,
@@ -1712,8 +1983,12 @@ fn object_action(req: &S3Request) -> Result<Action> {
         Method::PUT if q("acl") => PutObjectAcl,
         Method::GET if q("uploadId") => ListMultipartUploadParts,
         Method::DELETE if q("uploadId") => AbortMultipartUpload,
+        // The multipart lifecycle (initiate/complete/upload-part) has no distinct action variant;
+        // it maps to PutObject, the closest catalogued action.
         Method::PUT | Method::POST => PutObject,
+        Method::GET | Method::HEAD if versioned => GetObjectVersion,
         Method::GET | Method::HEAD => GetObject,
+        Method::DELETE if versioned => DeleteObjectVersion,
         Method::DELETE => DeleteObject,
         _ => return Err(Error::NotImplemented),
     })
@@ -1966,6 +2241,94 @@ fn verify_client_checksums(req: &S3Request, computed: &[ChecksumValue]) -> Resul
     Ok(())
 }
 
+/// Evaluate a CORS preflight against the bucket's rules (ARCH §18.2). Returns the 200 preflight
+/// response (with `Access-Control-Allow-*` and `Vary: Origin`) for the first rule that allows the
+/// `origin` + `method` + every requested header, or `None` if no rule matches.
+fn cors_match(
+    rules: &[cairn_xml::CorsRule],
+    origin: &str,
+    method: &str,
+    requested_headers: &[String],
+) -> Option<S3Response> {
+    for rule in rules {
+        let Some(allow_origin) = rule
+            .allowed_origins
+            .iter()
+            .find_map(|pat| cors_origin_match(pat, origin))
+        else {
+            continue;
+        };
+        // Methods compare case-sensitively (S3 uses uppercase HTTP method tokens).
+        if !rule.allowed_methods.iter().any(|m| m == method) {
+            continue;
+        }
+        // Every requested header must be covered by an AllowedHeader pattern.
+        if !requested_headers.iter().all(|h| {
+            rule.allowed_headers
+                .iter()
+                .any(|pat| cors_header_match(pat, h))
+        }) {
+            continue;
+        }
+
+        let mut resp = S3Response::status(StatusCode::OK)
+            .with_header("access-control-allow-origin", allow_origin)
+            .with_header(
+                "access-control-allow-methods",
+                rule.allowed_methods.join(", "),
+            )
+            .with_header("vary", "Origin");
+        if !requested_headers.is_empty() {
+            resp = resp.with_header("access-control-allow-headers", requested_headers.join(", "));
+        }
+        if let Some(max_age) = rule.max_age_seconds {
+            resp = resp.with_header("access-control-max-age", max_age.to_string());
+        }
+        if !rule.expose_headers.is_empty() {
+            resp = resp.with_header(
+                "access-control-expose-headers",
+                rule.expose_headers.join(", "),
+            );
+        }
+        return Some(resp);
+    }
+    None
+}
+
+/// Match an `AllowedOrigin` pattern against the request `Origin`. A bare `*` allows any origin and
+/// echoes `*`; an exact match echoes the origin; a single embedded `*` is a wildcard segment. On a
+/// match the value to echo in `Access-Control-Allow-Origin` is returned.
+fn cors_origin_match(pattern: &str, origin: &str) -> Option<String> {
+    if pattern == "*" {
+        return Some("*".to_owned());
+    }
+    if pattern == origin {
+        return Some(origin.to_owned());
+    }
+    if let Some((prefix, suffix)) = pattern.split_once('*') {
+        if origin.len() >= prefix.len() + suffix.len()
+            && origin.starts_with(prefix)
+            && origin.ends_with(suffix)
+        {
+            return Some(origin.to_owned());
+        }
+    }
+    None
+}
+
+/// Match an `AllowedHeader` pattern (case-insensitive) against a requested header name. `*` allows
+/// any header; a trailing `*` is a prefix wildcard.
+fn cors_header_match(pattern: &str, header: &str) -> bool {
+    let pattern = pattern.to_ascii_lowercase();
+    if pattern == "*" {
+        return true;
+    }
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        return header.starts_with(prefix);
+    }
+    pattern == header
+}
+
 fn checksum_algo(name: &str) -> Option<ChecksumAlgorithm> {
     match name.to_ascii_lowercase().as_str() {
         "crc32" => Some(ChecksumAlgorithm::Crc32),
@@ -1984,6 +2347,54 @@ fn user_metadata(req: &S3Request) -> Vec<(String, String)> {
                 .map(|n| (n.to_owned(), v.clone()))
         })
         .collect()
+}
+
+/// Parse the inline `x-amz-tagging` header, a URL-encoded `Key=Value&Key2=Value2` tag set as used
+/// by `PutObject` and copy (ARCH §17.1, Medium #5). An empty/absent header yields no tags; a
+/// segment with no `=` is treated as a key with an empty value.
+fn parse_tagging_header(header: Option<&str>) -> Vec<(String, String)> {
+    let Some(raw) = header else {
+        return Vec::new();
+    };
+    raw.split('&')
+        .filter(|seg| !seg.is_empty())
+        .map(|seg| match seg.split_once('=') {
+            Some((k, v)) => (form_pct_decode(k), form_pct_decode(v)),
+            None => (form_pct_decode(seg), String::new()),
+        })
+        .collect()
+}
+
+/// Decode an `application/x-www-form-urlencoded` component: `+` becomes a space and `%XX`
+/// becomes its byte. Used for the inline `x-amz-tagging` tag set.
+fn form_pct_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < b.len() => {
+                let hi = (b[i + 1] as char).to_digit(16);
+                let lo = (b[i + 2] as char).to_digit(16);
+                if let (Some(h), Some(l)) = (hi, lo) {
+                    out.push((h * 16 + l) as u8);
+                    i += 3;
+                } else {
+                    out.push(b[i]);
+                    i += 1;
+                }
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn encode_token(cursor: &str) -> String {

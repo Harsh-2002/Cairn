@@ -52,6 +52,14 @@ pub struct Config {
     pub log_format: LogFormat,
     /// Enable the development authentication bypass (loopback only; debug builds).
     pub dev_auth: bool,
+    /// How often the lifecycle scanner applies each bucket's rules, in seconds.
+    pub lifecycle_interval_secs: u64,
+    /// How often the multipart sweeper reclaims stale upload sessions, in seconds.
+    pub multipart_sweep_interval_secs: u64,
+    /// How long an idle multipart upload session lives before the sweeper aborts it, in seconds.
+    pub multipart_upload_lifetime_secs: u64,
+    /// How often the WAL checkpointer runs a truncating checkpoint, in seconds.
+    pub wal_checkpoint_interval_secs: u64,
 }
 
 impl Default for Config {
@@ -71,6 +79,10 @@ impl Default for Config {
             log_level: "info".to_owned(),
             log_format: LogFormat::Text,
             dev_auth: false,
+            lifecycle_interval_secs: 3600,
+            multipart_sweep_interval_secs: 3600,
+            multipart_upload_lifetime_secs: 86_400,
+            wal_checkpoint_interval_secs: 300,
         }
     }
 }
@@ -147,6 +159,26 @@ impl Config {
                 "dev_auth is only permitted on a loopback listen_addr".into(),
             ));
         }
+        if self.lifecycle_interval_secs == 0 {
+            return Err(ConfigError::Invalid(
+                "lifecycle_interval_secs must be positive".into(),
+            ));
+        }
+        if self.multipart_sweep_interval_secs == 0 {
+            return Err(ConfigError::Invalid(
+                "multipart_sweep_interval_secs must be positive".into(),
+            ));
+        }
+        if self.multipart_upload_lifetime_secs == 0 {
+            return Err(ConfigError::Invalid(
+                "multipart_upload_lifetime_secs must be positive".into(),
+            ));
+        }
+        if self.wal_checkpoint_interval_secs == 0 {
+            return Err(ConfigError::Invalid(
+                "wal_checkpoint_interval_secs must be positive".into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -200,6 +232,30 @@ mod tests {
         c.public_base_url = Some("ftp://nope".into());
         assert!(c.validate().is_err());
         c.public_base_url = Some("https://ok.example".into());
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_zero_background_intervals() {
+        for mutate in [
+            (|c: &mut Config| c.lifecycle_interval_secs = 0) as fn(&mut Config),
+            |c: &mut Config| c.multipart_sweep_interval_secs = 0,
+            |c: &mut Config| c.multipart_upload_lifetime_secs = 0,
+            |c: &mut Config| c.wal_checkpoint_interval_secs = 0,
+        ] {
+            let mut c = base();
+            mutate(&mut c);
+            assert!(c.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn accepts_custom_background_intervals() {
+        let mut c = base();
+        c.lifecycle_interval_secs = 600;
+        c.multipart_sweep_interval_secs = 600;
+        c.multipart_upload_lifetime_secs = 7200;
+        c.wal_checkpoint_interval_secs = 60;
         assert!(c.validate().is_ok());
     }
 

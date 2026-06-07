@@ -10,6 +10,12 @@ default-run = "cairn"
 [lints]
 workspace = true
 
+[features]
+# Arms the fault-injection seams in the durable commit path (via cairn-blob) so a sibling
+# crash-harness/verification agent can build the server with the fail seams active. No
+# production code path depends on this; it only enables `cairn-blob`'s `failpoints` feature.
+failpoints = ["cairn-blob/failpoints"]
+
 [[bin]]
 name = "cairn"
 path = "src/main.rs"
@@ -42,6 +48,9 @@ figment.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
+# Used only by the node-local `migrate` CLI command to read the applied schema version after
+# `cairn_meta::open` has run migrations; the server proper never touches SQLite directly.
+rusqlite = { workspace = true }
 
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -50,3 +59,6 @@ metrics-exporter-prometheus.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
+tempfile.workspace = true
+futures-util.workspace = true
+cairn-types = { workspace = true, features = ["testing"] }
