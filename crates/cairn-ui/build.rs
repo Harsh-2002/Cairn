@@ -23,7 +23,9 @@ fn main() {
     let index = dist.join("index.html");
 
     if !index.exists() {
-        if let Err(e) = std::fs::create_dir_all(&dist).and_then(|()| std::fs::write(&index, PLACEHOLDER)) {
+        if let Err(e) =
+            std::fs::create_dir_all(&dist).and_then(|()| std::fs::write(&index, PLACEHOLDER))
+        {
             // Don't fail the build on a read-only tree; rust_embed will surface the real error.
             println!("cargo:warning=cairn-ui: could not scaffold placeholder ui/dist: {e}");
         }
