@@ -132,7 +132,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
-      - uses: taiki-e/install-action@cargo-fuzz
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
       # These fuzz targets live in crates that do not embed the UI, so no UI build is needed.
       - run: cargo fuzz run chunked_decoder -- -max_total_time=45
         working-directory: crates/cairn-s3
