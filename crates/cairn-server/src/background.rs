@@ -23,7 +23,29 @@ pub fn spawn(
         sweep_interval,
         multipart_lifetime_secs,
     ));
-    tokio::spawn(lifecycle_loop(stack, lifecycle_interval));
+    tokio::spawn(lifecycle_loop(stack.clone(), lifecycle_interval));
+    tokio::spawn(metrics_loop(stack));
+}
+
+/// Refresh the store gauges (object/bucket/byte counts and compression ratio) from the metadata
+/// aggregate on a short interval, so `/metrics` reflects live state.
+async fn metrics_loop(stack: Arc<AppStack>) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(15)).await;
+        if let Ok(c) = stack.meta.aggregate_counts().await {
+            metrics::gauge!("cairn_buckets").set(c.buckets as f64);
+            metrics::gauge!("cairn_objects").set(c.objects as f64);
+            metrics::gauge!("cairn_versions").set(c.versions as f64);
+            metrics::gauge!("cairn_logical_bytes").set(c.logical_bytes as f64);
+            metrics::gauge!("cairn_physical_bytes").set(c.physical_bytes as f64);
+            let ratio = if c.physical_bytes > 0 {
+                c.logical_bytes as f64 / c.physical_bytes as f64
+            } else {
+                1.0
+            };
+            metrics::gauge!("cairn_compression_ratio").set(ratio);
+        }
+    }
 }
 
 /// Periodically abort multipart sessions idle beyond their lifetime and reclaim their parts.
