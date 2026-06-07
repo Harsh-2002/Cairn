@@ -17,6 +17,7 @@
   let shared = $state(null); // { key, url } of the most recently minted share link
   let copied = $state(false);
   let previewing = $state(null); // { key, kind, url, text }
+  let encryptUploads = $state(false);
 
   async function loadDetail() {
     try {
@@ -60,7 +61,9 @@
     error = "";
     try {
       for (const f of files) {
-        await s3.putObject(name, (prefix || "") + f.name, f);
+        await s3.putObject(name, (prefix || "") + f.name, f, {
+          encrypt: encryptUploads,
+        });
       }
       await refresh();
     } catch (err) {
@@ -231,6 +234,14 @@
     >
   </form>
   <span class="spacer"></span>
+  <label class="row" style="gap:6px;font-size:0.88rem;color:var(--text-muted);">
+    <input
+      type="checkbox"
+      bind:checked={encryptUploads}
+      style="width:auto;"
+    />
+    Encrypt (SSE-S3)
+  </label>
   <input
     type="file"
     multiple
