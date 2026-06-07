@@ -17,3 +17,4 @@ fuzz/corpus
 *.png
 crates/cairn-s3/fuzz/corpus/
 crates/cairn-s3/fuzz/artifacts/
+target/
