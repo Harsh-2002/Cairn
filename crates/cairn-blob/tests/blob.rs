@@ -714,3 +714,72 @@ async fn uring_vs_epoll_staging_throughput() {
          tokio::fs={epoll_mibs:.1} MiB/s, delta={delta_pct:+.1}%"
     );
 }
+
+/// Concurrent staging throughput: io_uring's advantage shows when many writes overlap (it batches
+/// submissions to the kernel and overlaps fsync/rename), not on a serial loop. Run with multiple
+/// io_uring reactor threads: `CAIRN_URING_THREADS=4 cargo test -p cairn-blob --release --features
+/// io-uring -- --ignored --nocapture uring_vs_epoll_concurrent`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore]
+#[cfg(feature = "io-uring")]
+async fn uring_vs_epoll_concurrent_staging() {
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    async fn run(store: Arc<LocalBlobStore>, payload: Arc<Vec<u8>>, conc: usize, per: u32) -> f64 {
+        let b = BucketName::parse("bench").unwrap();
+        for _ in 0..4 {
+            store
+                .stage(
+                    &b,
+                    body(payload.to_vec()),
+                    opts(None, "application/octet-stream"),
+                )
+                .await
+                .unwrap();
+        }
+        let start = Instant::now();
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..conc {
+            let (s, p) = (store.clone(), payload.clone());
+            set.spawn(async move {
+                let b = BucketName::parse("bench").unwrap();
+                for _ in 0..per {
+                    s.stage(&b, body(p.to_vec()), opts(None, "application/octet-stream"))
+                        .await
+                        .unwrap();
+                }
+            });
+        }
+        while set.join_next().await.is_some() {}
+        let elapsed = start.elapsed().as_secs_f64();
+        let total = payload.len() as f64 * conc as f64 * per as f64;
+        (total / (1024.0 * 1024.0)) / elapsed
+    }
+
+    let payload = Arc::new(vec![0xABu8; 256 * 1024]); // 256 KiB
+    let (conc, per) = (32usize, 16u32);
+
+    let du = tempfile::tempdir().unwrap();
+    let uring = Arc::new(
+        LocalBlobStore::open(du.path())
+            .await
+            .unwrap()
+            .with_io_uring(true),
+    );
+    let de = tempfile::tempdir().unwrap();
+    let epoll = Arc::new(
+        LocalBlobStore::open(de.path())
+            .await
+            .unwrap()
+            .with_io_uring(false),
+    );
+
+    let u = run(uring, payload.clone(), conc, per).await;
+    let e = run(epoll, payload, conc, per).await;
+    println!(
+        "CONCURRENT staging ({conc} workers x {per} x 256KiB): io_uring={u:.1} MiB/s, \
+         tokio::fs={e:.1} MiB/s, delta={:+.1}%",
+        (u - e) / e * 100.0
+    );
+}

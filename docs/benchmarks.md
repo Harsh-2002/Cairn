@@ -277,3 +277,20 @@ Verdict: **PASS** — replication landed every sampled object byte-for-byte (0 m
 source's resident set stayed essentially flat across ~5k PUTs (the small rise is pool/cache warm-up,
 not a monotonic climb). At the CI default `DURATION=120` the PUT and verified counts roughly double
 while the RSS picture is unchanged.
+
+## io_uring blob path (`--features io-uring`, experimental, Linux-only)
+
+The staging write path can run through a dedicated `tokio-uring` reactor (off by default). Measured
+in release on this NVMe sandbox (`CAIRN_URING_THREADS=4`), staging 1 MiB / 256 KiB objects:
+
+| workload | io_uring | tokio::fs (epoll) | delta |
+|---|---:|---:|---:|
+| **concurrent** (32 workers × 16 × 256 KiB) | **398 MiB/s** | 382 MiB/s | **+4.2%** |
+| serial (200 × 1 MiB, fsync-bound loop) | 162 MiB/s | 282 MiB/s | **−42.5%** |
+
+**Interpretation (honest):** io_uring wins under concurrency (overlapped submission/fsync), which is
+the realistic server workload — but the current implementation bridges each file op to the reactor
+over a channel, and that per-op hop dominates a serial fsync-bound loop (the worst case), making it
+*slower* there. So the feature is appropriately experimental and off by default; a clear across-the-
+board win would require batching submissions and removing the per-chunk bridge hop. Both probes are
+`#[ignore]` tests in `crates/cairn-blob/tests/blob.rs` (`uring_vs_epoll_*`).
