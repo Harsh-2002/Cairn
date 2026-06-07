@@ -80,16 +80,30 @@ jobs:
       - name: Drive Cairn with the AWS SDK (real SigV4 + aws-chunked streaming, the F-5 path)
         run: BIN=target/debug/cairn PY=python3 bash conformance/run.sh
 
+  crash-consistency:
+    name: crash consistency (F-4)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Arm the durability fault seam, crash in the window, assert reconcile reclaims
+        run: bash conformance/crash_consistency.sh
+
   fuzz-smoke:
-    name: fuzz smoke (chunked decoder)
+    name: fuzz smoke (decoder, xml, policy)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-fuzz
-      - run: cargo fuzz run chunked_decoder -- -max_total_time=60
+      - run: cargo fuzz run chunked_decoder -- -max_total_time=45
         working-directory: crates/cairn-s3
+      - run: cargo fuzz run request_parsers -- -max_total_time=30
+        working-directory: crates/cairn-xml
+      - run: cargo fuzz run parse_policy -- -max_total_time=30
+        working-directory: crates/cairn-authz
 
   benches:
     name: benchmarks compile

@@ -2,7 +2,35 @@
 
 Multi-agent audit of the implementation against ARCH.md (10 domain reviewers + synthesis).
 
-**Overall verdict:** partially-satisfies — **~68% of spec**.
+**Original audit verdict:** partially-satisfies — **~68% of spec**.
+
+## Remediation status (post-audit)
+
+All three **critical** findings and the **high** findings have been remediated and verified:
+
+| Finding | Status |
+|---|---|
+| C1 — signed-streaming chunk verification (F-5) | ✅ fixed — `Principal.chunk_signing` → verified per-chunk chain; tamper test rejects |
+| C2 — subresource mis-routing (object-body corruption) | ✅ fixed — unknown subresources → 501; `?acl`/`?publicAccessBlock`/`?ownershipControls` routed |
+| C3 — replication non-functional | ✅ fixed — enqueue-on-write + worker + real SigV4 sink; **verified node→node** |
+| H — ACL/BPA/Ownership inert; corrupt config fails open | ✅ fixed — wired into authz; **fail closed** |
+| H — WAL checkpointer absent | ✅ fixed — truncating checkpoint task + `cairn_wal_*` metrics |
+| H — quotas unimplemented | ✅ fixed — settable + enforced in the commit transaction |
+| H — client checksums never compared | ✅ fixed — mismatch → `BadDigest` |
+| H — response-body buffering | ✅ fixed — streamed (`UnsyncBoxBody`, bounded memory) |
+| H — conditionals incomplete; faked readiness | ✅ fixed — `If-*-Since` + HEAD short-circuit; real `/readyz` |
+| H — mgmt API/CLI gaps | ✅ largely fixed — 8 config/user/replication endpoints; `backup`/`restore`/`migrate` CLI |
+| H — crash-consistency harness inert | ✅ fixed — **live F-4 test passes** (crash → orphan → reconcile reclaims) |
+| Medium — versioning fidelity, per-key errors, CORS preflight, tag context, one-fs check, storage_path index, data_root fsync | ✅ fixed |
+
+Remaining (lower priority / documented): per-bucket replication *destinations* (single configured
+target today), HTTPS replication connector (http:// works; needs `hyper-rustls`), `UploadPartCopy`
+and `GetObjectAttributes`, ACL *body* documents (canned `x-amz-acl` supported), cert hot-reload,
+and `warp` macro load profiles. The findings below are the original audit text, kept for reference.
+
+---
+
+**Original audit verdict:** partially-satisfies — **~68% of spec**.
 
 ## Executive summary
 

@@ -15,7 +15,7 @@ authorizes.
 | GetBucketCors / PutBucketCors / DeleteBucketCors | ✅ | Per-bucket config (validated). |
 | GetBucketTagging / PutBucketTagging / DeleteBucketTagging | ✅ | |
 | GetBucketLifecycleConfiguration / Put / Delete | ✅ | Expiration, noncurrent expiration, abort-incomplete, delete-marker removal; transition is a v1 no-op. |
-| GetBucketReplication / Put / Delete | ✅ (config) | Outbox + worker engine implemented; a remote sink is wired when configured. |
+| GetBucketReplication / Put / Delete | ✅ | Enqueue-on-write + worker drains the outbox to a configured remote via a real SigV4-signing sink (verified node→node); single configured target today. |
 | ListObjectsV2 / ListObjects (v1) | ✅ | Prefix, delimiter, pagination (opaque tokens), start-after / marker. |
 | ListObjectVersions | ✅ | Distinguishes versions from delete markers. |
 | ListMultipartUploads | ✅ | |

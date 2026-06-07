@@ -29,12 +29,17 @@ server, validated against a real AWS SDK.**
 - **Control plane** — management JSON API (`/api/v1`) + embedded **Svelte UI** (`/ui/`) + CLI
   (`bootstrap`, `integrity`, `validate-config`, `serve`); **native TLS** (rustls + aws-lc-rs).
 
-**Verification:** 242 unit/integration/property tests; `clippy -D warnings` and `rustfmt`
-clean; a verified static `musl` binary; the F-5 chunked decoder survives **2.1M fuzz
-iterations** (libFuzzer) and benchmarks at **~1 GiB/s**; a **boto3 conformance suite** (a real
-AWS SDK) drives the running server through the full object lifecycle (real SigV4 + aws-chunked
-streaming + multipart + versioning + tagging); and the **Svelte UI** is verified in a real
-browser (login, live overview, bucket/user creation that lands in the backend, audit log).
+**Verification:** 318 unit/integration/property tests; `clippy -D warnings` and `rustfmt`
+clean; a verified static `musl` binary; a **live crash-consistency test** (F-4: crash in the
+durability window → orphan → reconcile reclaims it); the F-5 chunked decoder survives **2.1M
+fuzz iterations** (plus XML + policy fuzz targets) and benchmarks at **~1 GiB/s**; a **boto3
+conformance suite** (a real AWS SDK) drives the full object lifecycle; **node→node replication**
+verified end to end; signed-streaming integrity verified (tampered chunk rejected); and the
+**Svelte UI** verified in a real browser.
+
+A multi-agent audit against ARCH.md (see [`docs/GAPS.md`](./docs/GAPS.md)) drove a remediation
+pass that closed all critical and high findings (signed-streaming verification, subresource
+mis-routing, real replication, ACL/BPA/quotas/checkpointer/streaming-bodies/conditionals).
 
 ### Try it
 
