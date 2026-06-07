@@ -8,11 +8,13 @@ use crate::httpdate::http_date;
 use crate::request::{S3Body, S3Request, S3Response};
 use base64::Engine;
 use cairn_types::auth::{Principal, Role};
-use cairn_types::blob::{ByteRange, StageOptions};
+use cairn_types::blob::{ByteRange, PartRef, StageOptions};
 use cairn_types::bucket::{Bucket, VersioningState};
 use cairn_types::error::Error;
-use cairn_types::id::VersionId;
-use cairn_types::meta::{IfNoneMatch, ListQuery, Mutation, MutationOutcome, Precondition};
+use cairn_types::id::{BucketName, ObjectKey, UploadId, VersionId};
+use cairn_types::meta::{
+    ClaimOutcome, IfNoneMatch, ListQuery, MultipartSession, Mutation, MutationOutcome, Precondition,
+};
 use cairn_types::object::{
     ChecksumAlgorithm, ChecksumSet, CompressionDescriptor, ETag, ObjectVersionRow, StorageClass,
 };
@@ -73,18 +75,20 @@ impl S3Service {
     async fn dispatch(&self, req: S3Request, body: cairn_types::BodyStream) -> Result<S3Response> {
         match (&req.method, req.bucket.is_some(), req.key.is_some()) {
             (&Method::GET, false, _) => self.list_buckets(&req).await,
-            (_, true, false) => self.bucket_op(req).await,
+            (_, true, false) => self.bucket_op(req, body).await,
             (_, true, true) => self.object_op(req, body).await,
             _ => Err(Error::NotImplemented),
         }
     }
 
-    async fn bucket_op(&self, req: S3Request) -> Result<S3Response> {
+    async fn bucket_op(&self, req: S3Request, body: cairn_types::BodyStream) -> Result<S3Response> {
         match req.method {
             Method::PUT => self.create_bucket(&req).await,
             Method::DELETE => self.delete_bucket(&req).await,
             Method::HEAD => self.head_bucket(&req).await,
             Method::GET if req.has_query("location") => self.get_bucket_location(&req).await,
+            Method::GET if req.has_query("uploads") => self.list_multipart_uploads(&req).await,
+            Method::POST if req.has_query("delete") => self.delete_objects(&req, body).await,
             Method::GET => self.list_objects(&req).await,
             _ => Err(Error::NotImplemented),
         }
@@ -92,9 +96,19 @@ impl S3Service {
 
     async fn object_op(&self, req: S3Request, body: cairn_types::BodyStream) -> Result<S3Response> {
         match req.method {
+            Method::PUT if req.has_query("uploadId") && req.query("partNumber").is_some() => {
+                self.upload_part(req, body).await
+            }
+            Method::PUT if req.header("x-amz-copy-source").is_some() => {
+                self.copy_object(&req).await
+            }
             Method::PUT => self.put_object(req, body).await,
+            Method::POST if req.has_query("uploads") => self.create_multipart(&req).await,
+            Method::POST if req.has_query("uploadId") => self.complete_multipart(req, body).await,
+            Method::GET if req.has_query("uploadId") => self.list_parts(&req).await,
             Method::GET => self.get_object(&req).await,
             Method::HEAD => self.head_object(&req).await,
+            Method::DELETE if req.has_query("uploadId") => self.abort_multipart(&req).await,
             Method::DELETE => self.delete_object(&req).await,
             _ => Err(Error::NotImplemented),
         }
@@ -421,6 +435,476 @@ impl S3Service {
             .with_header("x-amz-request-id", &req.request_id))
     }
 
+    // --- multipart ---
+
+    async fn create_multipart(&self, req: &S3Request) -> Result<S3Response> {
+        let bucket = self.authorized_bucket_owned(req).await?;
+        let key = req.key.clone().expect("key present");
+        let upload_id = UploadId::generate();
+        let now = self.clock.now();
+        let session = MultipartSession {
+            upload_id: upload_id.clone(),
+            bucket: bucket.name.clone(),
+            key: key.clone(),
+            content_type: req
+                .header("content-type")
+                .unwrap_or("application/octet-stream")
+                .to_owned(),
+            status: cairn_types::meta::MultipartStatus::Active,
+            owner_id: bucket.owner_id.clone(),
+            intended_acl: None,
+            user_metadata: user_metadata(req),
+            created_at: now,
+            updated_at: now,
+        };
+        self.meta
+            .submit(Mutation::CreateMultipart(Box::new(session)))
+            .await?;
+        let body = cairn_xml::initiate_multipart_result(
+            bucket.name.as_str(),
+            key.as_str(),
+            upload_id.as_str(),
+        );
+        Ok(S3Response::xml(StatusCode::OK, body).with_header("x-amz-request-id", &req.request_id))
+    }
+
+    async fn upload_part(
+        &self,
+        req: S3Request,
+        raw_body: cairn_types::BodyStream,
+    ) -> Result<S3Response> {
+        let _bucket = self.authorized_bucket_owned(&req).await?;
+        let upload_id = UploadId::from_string(req.query("uploadId").unwrap_or_default().to_owned());
+        let part_number: u16 = req
+            .query("partNumber")
+            .and_then(|s| s.parse().ok())
+            .filter(|n| (1..=10_000).contains(n))
+            .ok_or_else(|| Error::InvalidArgument("partNumber out of range".to_owned()))?;
+        if self.meta.get_multipart(&upload_id).await?.is_none() {
+            return Err(Error::NoSuchUpload);
+        }
+        let streaming = req
+            .header("x-amz-content-sha256")
+            .map(|v| v.starts_with("STREAMING"))
+            .unwrap_or(false);
+        let body = if streaming {
+            decode_stream(raw_body, ChunkDecoder::unsigned(self.max_object_size))
+        } else {
+            raw_body
+        };
+        let staged = self
+            .blob
+            .stage_part(&upload_id, part_number, body, self.max_object_size)
+            .await?;
+        let part = cairn_types::meta::PartRecord {
+            part_number,
+            size: staged.size,
+            etag: staged.md5_hex.clone(),
+            storage_path: staged.storage_path.clone(),
+            checksum: None,
+        };
+        if let MutationOutcome::PartRecorded {
+            superseded: Some(old),
+        } = self
+            .meta
+            .submit(Mutation::RecordPart { upload_id, part })
+            .await?
+        {
+            let _ = self.blob.delete(&old).await;
+        }
+        Ok(S3Response::status(StatusCode::OK)
+            .with_header("etag", format!("\"{}\"", staged.md5_hex))
+            .with_header("x-amz-request-id", &req.request_id))
+    }
+
+    async fn complete_multipart(
+        &self,
+        req: S3Request,
+        body: cairn_types::BodyStream,
+    ) -> Result<S3Response> {
+        let bucket = self.authorized_bucket_owned(&req).await?;
+        let key = req.key.clone().expect("key present");
+        let upload_id = UploadId::from_string(req.query("uploadId").unwrap_or_default().to_owned());
+        let xml = drain_body(body, 8 * 1024 * 1024).await?;
+        let requested = cairn_xml::parse_complete_multipart(&xml)?;
+        if requested.is_empty() {
+            return Err(Error::InvalidArgument("no parts specified".to_owned()));
+        }
+
+        let session = match self
+            .meta
+            .submit(Mutation::ClaimMultipart(upload_id.clone()))
+            .await?
+        {
+            MutationOutcome::MultipartClaim(ClaimOutcome::Claimed(s)) => *s,
+            _ => return Err(Error::NoSuchUpload),
+        };
+
+        let stored: std::collections::HashMap<u16, cairn_types::meta::PartRecord> = self
+            .meta
+            .list_parts(&upload_id, 0, 10_000)
+            .await?
+            .items
+            .into_iter()
+            .map(|p| (p.part_number, p))
+            .collect();
+
+        let mut refs = Vec::with_capacity(requested.len());
+        let mut part_md5s = Vec::with_capacity(requested.len());
+        let mut last_pn = 0u16;
+        for (i, (pn, etag)) in requested.iter().enumerate() {
+            if *pn <= last_pn {
+                return Err(Error::InvalidArgument(
+                    "parts not in ascending order".to_owned(),
+                ));
+            }
+            last_pn = *pn;
+            let rec = stored.get(pn).ok_or(Error::NoSuchUpload)?;
+            if strip_quotes(etag) != rec.etag {
+                return Err(Error::InvalidArgument(format!("part {pn} etag mismatch")));
+            }
+            if i + 1 < requested.len() && rec.size < 5 * 1024 * 1024 {
+                return Err(Error::InvalidArgument(format!(
+                    "part {pn} smaller than 5 MiB"
+                )));
+            }
+            refs.push(PartRef {
+                part_number: *pn,
+                storage_path: rec.storage_path.clone(),
+                size: rec.size,
+            });
+            part_md5s.push(rec.etag.clone());
+        }
+
+        let opts = StageOptions {
+            compression: bucket.compression,
+            extra_checksums: ChecksumSet::none(),
+            size_ceiling: self.max_object_size,
+            content_type: session.content_type.clone(),
+        };
+        let staged = self.blob.assemble(&bucket.name, &refs, opts).await?;
+        let etag = multipart_etag(&part_md5s);
+
+        let versioned = bucket.versioning == VersioningState::Enabled;
+        let version_id = if versioned {
+            VersionId::generate()
+        } else {
+            VersionId::null()
+        };
+        let now = self.clock.now();
+        let row = ObjectVersionRow {
+            id: uuid::Uuid::new_v4().simple().to_string(),
+            bucket: bucket.name.clone(),
+            key: key.clone(),
+            version_id: version_id.clone(),
+            is_latest: true,
+            is_delete_marker: false,
+            size_logical: staged.size_logical,
+            size_physical: staged.size_physical,
+            etag: etag.clone(),
+            content_type: session.content_type.clone(),
+            storage_path: Some(staged.storage_path.clone()),
+            compression: staged.compression.clone(),
+            storage_class: StorageClass::Standard,
+            cold_locator: None,
+            owner_id: bucket.owner_id.clone(),
+            user_metadata: session.user_metadata.clone(),
+            acl: None,
+            checksums: Vec::new(),
+            replication_status: None,
+            created_at: now,
+            updated_at: now,
+        };
+
+        match self
+            .meta
+            .submit(Mutation::CompleteMultipart {
+                upload_id: upload_id.clone(),
+                row: Box::new(row),
+                precondition: Precondition::default(),
+                replication: None,
+            })
+            .await
+        {
+            Ok(MutationOutcome::MultipartCompleted { superseded, .. }) => {
+                if let Some(old) = superseded {
+                    let _ = self.blob.delete(&old).await;
+                }
+                let _ = self.blob.delete_session(&upload_id).await;
+                let location = format!("/{}/{}", bucket.name.as_str(), key.as_str());
+                let body = cairn_xml::complete_multipart_result(
+                    &location,
+                    bucket.name.as_str(),
+                    key.as_str(),
+                    &etag,
+                );
+                let mut resp = S3Response::xml(StatusCode::OK, body)
+                    .with_header("x-amz-request-id", &req.request_id);
+                if versioned {
+                    resp = resp.with_header("x-amz-version-id", version_id.as_str());
+                }
+                Ok(resp)
+            }
+            Ok(_) => Err(Error::Internal("unexpected completion outcome".to_owned())),
+            Err(e) => {
+                let _ = self.blob.delete(&staged.storage_path).await;
+                Err(e.into())
+            }
+        }
+    }
+
+    async fn abort_multipart(&self, req: &S3Request) -> Result<S3Response> {
+        let _bucket = self.authorized_bucket_owned(req).await?;
+        let upload_id = UploadId::from_string(req.query("uploadId").unwrap_or_default().to_owned());
+        self.meta
+            .submit(Mutation::AbortMultipart(upload_id.clone()))
+            .await?;
+        let _ = self.blob.delete_session(&upload_id).await;
+        Ok(S3Response::status(StatusCode::NO_CONTENT)
+            .with_header("x-amz-request-id", &req.request_id))
+    }
+
+    async fn list_parts(&self, req: &S3Request) -> Result<S3Response> {
+        let (bucket, _) = self.authorized_bucket(req).await?;
+        let key = req.key.clone().expect("key present");
+        let upload_id = UploadId::from_string(req.query("uploadId").unwrap_or_default().to_owned());
+        if self.meta.get_multipart(&upload_id).await?.is_none() {
+            return Err(Error::NoSuchUpload);
+        }
+        let marker: u16 = req
+            .query("part-number-marker")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let max: u32 = req
+            .query("max-parts")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1000)
+            .min(1000);
+        let page = self.meta.list_parts(&upload_id, marker, max).await?;
+        let body = cairn_xml::list_parts_result(
+            bucket.name.as_str(),
+            key.as_str(),
+            upload_id.as_str(),
+            &page,
+            &bucket.owner_id.0,
+            marker,
+            max,
+        );
+        Ok(S3Response::xml(StatusCode::OK, body).with_header("x-amz-request-id", &req.request_id))
+    }
+
+    async fn list_multipart_uploads(&self, req: &S3Request) -> Result<S3Response> {
+        let (bucket, _) = self.authorized_bucket(req).await?;
+        let prefix = req.query("prefix").map(str::to_owned);
+        let max: u32 = req
+            .query("max-uploads")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1000)
+            .min(1000);
+        let query = ListQuery {
+            prefix: prefix.clone(),
+            limit: max,
+            ..Default::default()
+        };
+        let page = self
+            .meta
+            .list_multipart_uploads(&bucket.name, &query)
+            .await?;
+        let body = cairn_xml::list_multipart_uploads_result(
+            bucket.name.as_str(),
+            prefix.as_deref(),
+            None,
+            &page,
+            None,
+            None,
+            max,
+        );
+        Ok(S3Response::xml(StatusCode::OK, body).with_header("x-amz-request-id", &req.request_id))
+    }
+
+    // --- copy & bulk delete ---
+
+    async fn copy_object(&self, req: &S3Request) -> Result<S3Response> {
+        let dest_bucket = self.authorized_bucket_owned(req).await?;
+        let dest_key = req.key.clone().expect("key present");
+        let raw_source = req.header("x-amz-copy-source").unwrap_or_default();
+        let (src_bucket_s, src_key_s, src_version) = parse_copy_source(raw_source)
+            .ok_or_else(|| Error::InvalidArgument("bad copy source".to_owned()))?;
+        let src_bucket = BucketName::parse(&src_bucket_s)?;
+        let src_key = ObjectKey::parse(&src_key_s)?;
+
+        let src_row = match src_version {
+            Some(v) => self
+                .meta
+                .get_version(&src_bucket, &src_key, &VersionId::from_string(v))
+                .await?
+                .ok_or(Error::NoSuchVersion)?,
+            None => self
+                .meta
+                .current_version(&src_bucket, &src_key)
+                .await?
+                .ok_or(Error::NoSuchKey)?,
+        };
+        if src_row.is_delete_marker {
+            return Err(Error::NoSuchKey);
+        }
+        let src_path = src_row.storage_path.clone().ok_or(Error::NoSuchKey)?;
+
+        let replace = req
+            .header("x-amz-metadata-directive")
+            .map(|d| d.eq_ignore_ascii_case("REPLACE"))
+            .unwrap_or(false);
+        let content_type = if replace {
+            req.header("content-type")
+                .unwrap_or("application/octet-stream")
+                .to_owned()
+        } else {
+            src_row.content_type.clone()
+        };
+        let user_meta = if replace {
+            user_metadata(req)
+        } else {
+            src_row.user_metadata.clone()
+        };
+
+        let handle = self.blob.open(&src_path, None).await?;
+        // Re-tag the blob read errors as body errors so the source can feed `stage`.
+        let src_stream: cairn_types::BodyStream =
+            {
+                use futures_util::StreamExt;
+                Box::pin(handle.body.map(|r| {
+                    r.map_err(|e| cairn_types::error::BodyError::Transport(e.to_string()))
+                }))
+            };
+        let opts = StageOptions {
+            compression: dest_bucket.compression,
+            extra_checksums: ChecksumSet::none(),
+            size_ceiling: self.max_object_size,
+            content_type: content_type.clone(),
+        };
+        let staged = self.blob.stage(&dest_bucket.name, src_stream, opts).await?;
+
+        let versioned = dest_bucket.versioning == VersioningState::Enabled;
+        let version_id = if versioned {
+            VersionId::generate()
+        } else {
+            VersionId::null()
+        };
+        let now = self.clock.now();
+        let row = ObjectVersionRow {
+            id: uuid::Uuid::new_v4().simple().to_string(),
+            bucket: dest_bucket.name.clone(),
+            key: dest_key,
+            version_id: version_id.clone(),
+            is_latest: true,
+            is_delete_marker: false,
+            size_logical: staged.size_logical,
+            size_physical: staged.size_physical,
+            etag: staged.etag.clone(),
+            content_type,
+            storage_path: Some(staged.storage_path.clone()),
+            compression: staged.compression.clone(),
+            storage_class: StorageClass::Standard,
+            cold_locator: None,
+            owner_id: dest_bucket.owner_id.clone(),
+            user_metadata: user_meta,
+            acl: None,
+            checksums: staged.checksums.clone(),
+            replication_status: None,
+            created_at: now,
+            updated_at: now,
+        };
+        match self
+            .meta
+            .submit(Mutation::PutObjectVersion {
+                row: Box::new(row),
+                precondition: Precondition::default(),
+                replication: None,
+            })
+            .await
+        {
+            Ok(MutationOutcome::Put { superseded, .. }) => {
+                if let Some(old) = superseded {
+                    let _ = self.blob.delete(&old).await;
+                }
+                let body = cairn_xml::copy_object_result(&staged.etag, now);
+                let mut resp = S3Response::xml(StatusCode::OK, body)
+                    .with_header("x-amz-request-id", &req.request_id);
+                if versioned {
+                    resp = resp.with_header("x-amz-version-id", version_id.as_str());
+                }
+                Ok(resp)
+            }
+            Ok(_) | Err(_) => {
+                let _ = self.blob.delete(&staged.storage_path).await;
+                Err(Error::Internal("copy commit failed".to_owned()))
+            }
+        }
+    }
+
+    async fn delete_objects(
+        &self,
+        req: &S3Request,
+        body: cairn_types::BodyStream,
+    ) -> Result<S3Response> {
+        let bucket = self.authorized_bucket_owned(req).await?;
+        let xml = drain_body(body, 8 * 1024 * 1024).await?;
+        let (quiet, keys) = cairn_xml::parse_delete(&xml)?;
+        let versioned = bucket.versioning == VersioningState::Enabled;
+        let now = self.clock.now();
+
+        let mut deleted: Vec<(String, Option<String>)> = Vec::new();
+        let mut errors: Vec<(String, String, String)> = Vec::new();
+        for (key_s, version) in keys {
+            let Ok(key) = ObjectKey::parse(&key_s) else {
+                errors.push((
+                    key_s,
+                    "InvalidArgument".to_owned(),
+                    "invalid key".to_owned(),
+                ));
+                continue;
+            };
+            let mutation = match (&version, versioned) {
+                (Some(v), _) => Mutation::DeleteVersion {
+                    bucket: bucket.name.clone(),
+                    key,
+                    version_id: VersionId::from_string(v.clone()),
+                },
+                (None, true) => Mutation::CreateDeleteMarker {
+                    bucket: bucket.name.clone(),
+                    key,
+                    version_id: VersionId::generate(),
+                    owner_id: bucket.owner_id.clone(),
+                    now,
+                    replication: None,
+                },
+                (None, false) => Mutation::DeleteVersion {
+                    bucket: bucket.name.clone(),
+                    key,
+                    version_id: VersionId::null(),
+                },
+            };
+            match self.meta.submit(mutation).await {
+                Ok(MutationOutcome::Deleted { freed, .. }) => {
+                    if let Some(p) = freed {
+                        let _ = self.blob.delete(&p).await;
+                    }
+                    if !quiet {
+                        deleted.push((key_s, version));
+                    }
+                }
+                Ok(_) => {
+                    if !quiet {
+                        deleted.push((key_s, version));
+                    }
+                }
+                Err(e) => errors.push((key_s, "InternalError".to_owned(), e.to_string())),
+            }
+        }
+        let body = cairn_xml::delete_result(&deleted, &errors);
+        Ok(S3Response::xml(StatusCode::OK, body).with_header("x-amz-request-id", &req.request_id))
+    }
+
     // --- helpers ---
 
     fn require_principal<'a>(&self, req: &'a S3Request) -> Result<&'a Principal> {
@@ -611,4 +1095,70 @@ fn decode_token(token: &str) -> Option<String> {
         .decode(token)
         .ok()
         .and_then(|b| String::from_utf8(b).ok())
+}
+
+/// Buffer a (small, XML) request body up to `limit` bytes.
+async fn drain_body(body: cairn_types::BodyStream, limit: usize) -> Result<Vec<u8>> {
+    use futures_util::StreamExt;
+    let mut body = body;
+    let mut buf = Vec::new();
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk.map_err(|e| Error::InvalidArgument(e.to_string()))?;
+        if buf.len() + chunk.len() > limit {
+            return Err(Error::EntityTooLarge);
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
+/// The multipart ETag: MD5 of the concatenated per-part binary MD5 digests, suffixed with the
+/// part count (ARCH §10.2).
+fn multipart_etag(part_md5_hexes: &[String]) -> ETag {
+    use md5::{Digest, Md5};
+    let mut h = Md5::new();
+    for hex_md5 in part_md5_hexes {
+        if let Ok(bytes) = hex::decode(hex_md5) {
+            h.update(&bytes);
+        }
+    }
+    ETag::multipart(hex::encode(h.finalize()), part_md5_hexes.len())
+}
+
+fn strip_quotes(s: &str) -> &str {
+    s.trim().trim_matches('"')
+}
+
+/// Parse `x-amz-copy-source`: `/bucket/key` or `bucket/key`, optionally `?versionId=...`.
+fn parse_copy_source(raw: &str) -> Option<(String, String, Option<String>)> {
+    let s = raw.strip_prefix('/').unwrap_or(raw);
+    let (path, version) = match s.split_once("?versionId=") {
+        Some((p, v)) => (p, Some(copy_pct_decode(v))),
+        None => (s, None),
+    };
+    let (bucket, key) = path.split_once('/')?;
+    if bucket.is_empty() || key.is_empty() {
+        return None;
+    }
+    Some((copy_pct_decode(bucket), copy_pct_decode(key), version))
+}
+
+fn copy_pct_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            let hi = (b[i + 1] as char).to_digit(16);
+            let lo = (b[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }

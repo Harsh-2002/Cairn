@@ -335,3 +335,238 @@ fn md5_hex(data: &[u8]) -> String {
     h.update(data);
     hex::encode(h.finalize())
 }
+
+fn between(s: &str, start: &str, end: &str) -> String {
+    let i = s.find(start).expect("start tag") + start.len();
+    let j = s[i..].find(end).expect("end tag") + i;
+    s[i..j].to_owned()
+}
+
+#[tokio::test]
+async fn multipart_lifecycle() {
+    let h = harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("mpb"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+
+    // Initiate.
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::POST,
+                Some("mpb"),
+                Some("big.bin"),
+                &[("uploads", "")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let upload_id = between(
+        &String::from_utf8(body).unwrap(),
+        "<UploadId>",
+        "</UploadId>",
+    );
+
+    // Part 1 must be >= 5 MiB; part 2 is the small tail.
+    let part1 = vec![b'a'; 5 * 1024 * 1024];
+    let part2 = b"the-tail".to_vec();
+    let (st, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("mpb"),
+                Some("big.bin"),
+                &[("uploadId", upload_id.as_str()), ("partNumber", "1")],
+                &[],
+                part1.clone(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let etag1 = header(&hdrs, "etag").unwrap().to_owned();
+    let (_, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("mpb"),
+                Some("big.bin"),
+                &[("uploadId", upload_id.as_str()), ("partNumber", "2")],
+                &[],
+                part2.clone(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    let etag2 = header(&hdrs, "etag").unwrap().to_owned();
+
+    // Complete.
+    let complete = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag1}</ETag></Part>\
+         <Part><PartNumber>2</PartNumber><ETag>{etag2}</ETag></Part></CompleteMultipartUpload>"
+    );
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::POST,
+                Some("mpb"),
+                Some("big.bin"),
+                &[("uploadId", upload_id.as_str())],
+                &[],
+                complete.into_bytes(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(
+        String::from_utf8(body).unwrap().contains("-2"),
+        "multipart ETag has part-count suffix"
+    );
+
+    // The assembled object is the concatenation of the parts.
+    let (st, _, got) = drain(
+        send(
+            &h.svc,
+            req(Method::GET, Some("mpb"), Some("big.bin"), &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let mut expected = part1.clone();
+    expected.extend_from_slice(&part2);
+    assert_eq!(got.len(), expected.len());
+    assert_eq!(got, expected);
+}
+
+#[tokio::test]
+async fn copy_object_works() {
+    let h = harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("cpb"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("cpb"),
+                Some("src.txt"),
+                &[],
+                &[("content-type", "text/plain")],
+                b"original".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("cpb"),
+                Some("dst.txt"),
+                &[],
+                &[("x-amz-copy-source", "/cpb/src.txt")],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(Method::GET, Some("cpb"), Some("dst.txt"), &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(body, b"original");
+}
+
+#[tokio::test]
+async fn bulk_delete_works() {
+    let h = harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("bdb"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    for k in ["a.txt", "b.txt", "c.txt"] {
+        drain(
+            send(
+                &h.svc,
+                req(Method::PUT, Some("bdb"), Some(k), &[], &[], b"x".to_vec()),
+            )
+            .await,
+        )
+        .await;
+    }
+    let del = "<Delete><Object><Key>a.txt</Key></Object><Object><Key>b.txt</Key></Object></Delete>";
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::POST,
+                Some("bdb"),
+                None,
+                &[("delete", "")],
+                &[],
+                del.as_bytes().to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let xml = String::from_utf8(body).unwrap();
+    assert!(xml.contains("<Deleted>") && xml.contains("a.txt"));
+    // a and b are gone, c remains.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(Method::GET, Some("bdb"), Some("a.txt"), &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(Method::GET, Some("bdb"), Some("c.txt"), &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+}
