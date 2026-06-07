@@ -129,6 +129,12 @@ jobs:
   fuzz-smoke:
     name: fuzz smoke (decoder, xml, policy)
     runs-on: ubuntu-latest
+    # The repo's rust-toolchain.toml pins stable, which would override the nightly install and break
+    # cargo-fuzz's -Z sanitizer flags ("only accepted on nightly"). RUSTUP_TOOLCHAIN takes precedence
+    # over the toolchain file, so every cargo invocation here (incl. cargo-fuzz's nested build) uses
+    # nightly.
+    env:
+      RUSTUP_TOOLCHAIN: nightly
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
