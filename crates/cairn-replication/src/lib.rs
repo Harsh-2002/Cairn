@@ -388,6 +388,13 @@ impl ReplicationEngine {
     where
         M: MetadataStore + ?Sized,
     {
+        tracing::warn!(
+            bucket = %entry.bucket.as_str(),
+            key = %entry.key.as_str(),
+            terminal = next_attempt_at.is_none(),
+            error,
+            "replication delivery failed"
+        );
         meta.submit(Mutation::MarkReplicationFailed {
             id: entry.id.clone(),
             error: error.to_owned(),
