@@ -11,3 +11,9 @@
 *.db-shm
 fuzz/target
 fuzz/corpus
+
+# verification artifacts
+.playwright-mcp/
+*.png
+crates/cairn-s3/fuzz/corpus/
+crates/cairn-s3/fuzz/artifacts/

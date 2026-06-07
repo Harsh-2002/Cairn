@@ -29,10 +29,12 @@ server, validated against a real AWS SDK.**
 - **Control plane** — management JSON API (`/api/v1`) + embedded **Svelte UI** (`/ui/`) + CLI
   (`bootstrap`, `integrity`, `validate-config`, `serve`); **native TLS** (rustls + aws-lc-rs).
 
-**Verification:** 242 unit/integration/property tests + a doctest suite; `clippy -D warnings`
-and `rustfmt` clean; a verified static `musl` binary; the chunked decoder benchmarks at
-**~1 GiB/s**; and a **boto3 conformance suite** drives the running server through the full object
-lifecycle (incl. real SigV4 + aws-chunked streaming + multipart + versioning + tagging).
+**Verification:** 242 unit/integration/property tests; `clippy -D warnings` and `rustfmt`
+clean; a verified static `musl` binary; the F-5 chunked decoder survives **2.1M fuzz
+iterations** (libFuzzer) and benchmarks at **~1 GiB/s**; a **boto3 conformance suite** (a real
+AWS SDK) drives the running server through the full object lifecycle (real SigV4 + aws-chunked
+streaming + multipart + versioning + tagging); and the **Svelte UI** is verified in a real
+browser (login, live overview, bucket/user creation that lands in the backend, audit log).
 
 ### Try it
 
