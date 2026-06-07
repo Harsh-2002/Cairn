@@ -14,6 +14,8 @@
   let prefix = $state("");
   let busy = $state(false);
   let fileInput;
+  let shared = $state(null); // { key, url } of the most recently minted share link
+  let copied = $state(false);
 
   async function loadDetail() {
     try {
@@ -96,6 +98,26 @@
       error = err.message || "Delete failed.";
     } finally {
       busy = false;
+    }
+  }
+
+  async function share(key) {
+    error = "";
+    copied = false;
+    try {
+      const res = await api.shareObject(name, key, 3600);
+      shared = { key, url: window.location.origin + res.url };
+    } catch (err) {
+      error = err.message || "Could not create share link.";
+    }
+  }
+
+  async function copyShare() {
+    try {
+      await navigator.clipboard.writeText(shared.url);
+      copied = true;
+    } catch {
+      copied = false;
     }
   }
 
@@ -199,6 +221,23 @@
   </p>
 {/if}
 
+{#if shared}
+  <div class="panel" style="margin-bottom:14px;">
+    <div class="label-sm">
+      Public share link for <span class="mono">{shared.key}</span> — valid for 1 hour,
+      no sign-in required
+    </div>
+    <div class="secret-box">{shared.url}</div>
+    <div class="actions">
+      <button class="sm primary" onclick={copyShare}>
+        {copied ? "Copied!" : "Copy link"}
+      </button>
+      <a class="btn sm" href={shared.url} target="_blank" rel="noopener">Open</a>
+      <button class="sm" onclick={() => (shared = null)}>Dismiss</button>
+    </div>
+  </div>
+{/if}
+
 {#if loading}
   <p class="muted">Loading…</p>
 {:else if objects.length === 0}
@@ -227,6 +266,7 @@
                 <button class="sm" onclick={() => download(o.key)}>
                   Download
                 </button>
+                <button class="sm" onclick={() => share(o.key)}>Share</button>
                 <button class="sm danger" disabled={busy} onclick={() => remove(o.key)}>
                   Delete
                 </button>

@@ -146,6 +146,14 @@ export const api = {
     );
   },
 
+  // Mint a signed, time-limited public-read ("share") URL for an object. Returns { url,
+  // expires_at_ms }; `url` is a path (/p/...) the caller turns into an absolute link.
+  shareObject: (name, key, expires_in_secs = 3600) =>
+    request("POST", `/buckets/${encodeURIComponent(name)}/objects/share`, {
+      key,
+      expires_in_secs,
+    }),
+
   // Bucket configuration (ARCH §22.2).
   getBucketConfig: (name) =>
     request("GET", `/buckets/${encodeURIComponent(name)}/config`),

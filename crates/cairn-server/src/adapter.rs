@@ -9,14 +9,18 @@
 
 use crate::stack::AppStack;
 use bytes::Bytes;
+use cairn_crypto::SystemClock;
 use cairn_s3::{S3Body, S3Request, S3Response, error_response};
-use cairn_types::auth::{AuthOutcome, RequestView};
+use cairn_types::auth::{AuthMethod, AuthOutcome, Principal, RequestView, Role};
+use cairn_types::crypto::Signature;
 use cairn_types::error::{BodyError, Error};
-use cairn_types::id::{BucketName, ObjectKey};
+use cairn_types::id::{BucketName, ObjectKey, UserId};
+use cairn_types::time::Timestamp;
+use cairn_types::traits::Clock;
 use futures_util::StreamExt;
 use http_body_util::{BodyExt, BodyStream, Full, StreamBody};
 use hyper::body::{Frame, Incoming};
-use hyper::{Request, Response};
+use hyper::{Method, Request, Response};
 use std::net::IpAddr;
 
 /// The unified HTTP response body: either a fully-buffered in-memory body (empty, XML, errors,
@@ -89,6 +93,16 @@ pub async fn handle(
             Ok(c) => c.to_bytes(),
             Err(_) => Bytes::new(),
         };
+        // Signing a public-read ("share") URL is handled here, not in cairn-control, because the
+        // signer lives in the server stack: POST /api/v1/buckets/{bucket}/objects/share.
+        if method == Method::POST {
+            if let Some(bucket) = subpath
+                .strip_prefix("/buckets/")
+                .and_then(|r| r.strip_suffix("/objects/share"))
+            {
+                return sign_share(stack, bucket, &body_bytes, principal.as_ref());
+            }
+        }
         let resp = stack
             .control
             .handle(&method, subpath, &query, principal.as_ref(), body_bytes)
@@ -107,6 +121,13 @@ pub async fn handle(
     if raw_path == "/ui" || raw_path.starts_with("/ui/") {
         let target = raw_path.replacen("/ui", "/web", 1);
         return redirect(&target);
+    }
+
+    // Signed public-read ("share") URLs: GET /p/{bucket}/{key}?expires=..&sig=.. — unauthenticated,
+    // authorized solely by the HMAC signature over the path + expiry.
+    if method == Method::GET && (raw_path.starts_with("/p/")) {
+        let escaped = &raw_path[2..]; // keep the leading '/', drop the "/p" prefix
+        return serve_public(stack, escaped, &query_str, peer, secure, request_id).await;
     }
 
     let (bucket, key) = route_path(&raw_path);
@@ -157,6 +178,128 @@ fn redirect(location: &str) -> Response<ResponseBody> {
         .header("location", location)
         .body(full_body(Bytes::new()))
         .unwrap_or_else(|_| Response::new(full_body(Bytes::new())))
+}
+
+/// Build a JSON response with the given status.
+fn json_status(status: u16, body: &str) -> Response<ResponseBody> {
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .body(full_body(Bytes::from(body.to_owned())))
+        .unwrap_or_else(|_| Response::new(full_body(Bytes::new())))
+}
+
+/// Percent-encode a key for the wire, keeping the unreserved set and `/` (path separators).
+fn pct_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Sign a public-read ("share") URL for an object. Admin-only. The signature covers the decoded
+/// canonical path (`/{bucket}/{key}`) and the expiry; the returned URL percent-encodes the key for
+/// the wire. Body: `{"key": "...", "expires_in_secs": 3600}`.
+fn sign_share(
+    stack: &AppStack,
+    bucket: &str,
+    body: &Bytes,
+    principal: Option<&Principal>,
+) -> Response<ResponseBody> {
+    if principal.map(|p| p.role) != Some(Role::Administrator) {
+        return json_status(403, r#"{"error":"forbidden"}"#);
+    }
+    #[derive(serde::Deserialize)]
+    struct ShareReq {
+        key: String,
+        #[serde(default)]
+        expires_in_secs: Option<u64>,
+    }
+    let req: ShareReq = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(_) => return json_status(400, r#"{"error":"invalid request body"}"#),
+    };
+    if req.key.is_empty() {
+        return json_status(400, r#"{"error":"key is required"}"#);
+    }
+    let ttl = req.expires_in_secs.unwrap_or(3600).clamp(1, 7 * 24 * 3600);
+    let expiry = Timestamp(SystemClock::new().now().as_millis() + (ttl as i64) * 1000);
+    let canonical = format!("/{bucket}/{}", req.key);
+    let sig = stack.public_url.sign("GET", &canonical, expiry);
+    let url = format!(
+        "/p/{bucket}/{}?expires={}&sig={}",
+        pct_encode(&req.key),
+        expiry.as_millis(),
+        sig.0
+    );
+    json_status(
+        200,
+        &format!(
+            r#"{{"url":"{url}","expires_at_ms":{}}}"#,
+            expiry.as_millis()
+        ),
+    )
+}
+
+/// Serve a signed public-read URL: verify the signature + expiry, then serve the object through the
+/// normal S3 GET path with a synthetic administrator principal (the signature is the authorization;
+/// an administrator short-circuits bucket authz — ARCH §15.3). `escaped` is the path after `/p`.
+async fn serve_public(
+    stack: &AppStack,
+    escaped: &str,
+    query_str: &str,
+    peer: IpAddr,
+    secure: bool,
+    request_id: String,
+) -> Response<ResponseBody> {
+    let q = parse_query(query_str);
+    let expires = q
+        .iter()
+        .find(|(k, _)| k == "expires")
+        .and_then(|(_, v)| v.parse::<i64>().ok());
+    let sig = q.iter().find(|(k, _)| k == "sig").map(|(_, v)| v.clone());
+    let (Some(expires), Some(sig)) = (expires, sig) else {
+        return json_status(403, r#"{"error":"invalid signed url"}"#);
+    };
+    let (bucket, key) = route_path(escaped);
+    let (Some(bucket), Some(key)) = (bucket, key) else {
+        return json_status(404, r#"{"error":"not found"}"#);
+    };
+    let canonical = format!("/{}/{}", bucket.as_str(), key.as_str());
+    let now = SystemClock::new().now();
+    if !stack
+        .public_url
+        .verify("GET", &canonical, Timestamp(expires), &Signature(sig), now)
+    {
+        return json_status(403, r#"{"error":"invalid or expired signed url"}"#);
+    }
+    let principal = Principal {
+        user_id: UserId::generate(),
+        display_name: "public-url".to_owned(),
+        access_key_id: "public-url".to_owned(),
+        role: Role::Administrator,
+        method: AuthMethod::Bearer,
+        chunk_signing: None,
+    };
+    let s3req = S3Request {
+        method: Method::GET,
+        bucket: Some(bucket),
+        key: Some(key),
+        query: Vec::new(),
+        headers: Vec::new(),
+        principal: Some(principal),
+        source: peer,
+        secure,
+        request_id,
+    };
+    let empty: cairn_types::BodyStream = Box::pin(futures_util::stream::empty());
+    render(stack.s3.handle(s3req, empty).await)
 }
 
 /// Split a path-style request path into a bucket and key.

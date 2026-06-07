@@ -5,12 +5,13 @@
 use crate::config::Config;
 use cairn_auth::AuthChain;
 use cairn_blob::LocalBlobStore;
-use cairn_crypto::{SystemClock, SystemCrypto};
+use cairn_crypto::{HmacPublicUrl, SystemClock, SystemCrypto};
 use cairn_meta::{OpenOptions, SqliteMetadataStore};
 use cairn_s3::S3Service;
 use cairn_types::blob::ReconcileOpts;
 use cairn_types::traits::{
-    Authenticator, AuthorizationEngine, BlobStore, Clock, Crypto, MetadataStore, ReconcileOracle,
+    Authenticator, AuthorizationEngine, BlobStore, Clock, Crypto, MetadataStore, PublicUrl,
+    ReconcileOracle,
 };
 use std::sync::Arc;
 
@@ -40,6 +41,9 @@ pub struct AppStack {
     /// Turso engines self-manage their WAL, so this is `None` for them and the WAL-checkpointer
     /// background loop does not run.
     pub store: Option<Arc<SqliteMetadataStore>>,
+    /// Signer/verifier for Cairn's signed public-read ("share") URLs (ARCH §14.5). Keyed off the
+    /// master key so links stay valid across restarts when `CAIRN_MASTER_KEY` is set.
+    pub public_url: Arc<dyn PublicUrl>,
 }
 
 impl std::fmt::Debug for AppStack {
@@ -199,6 +203,15 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
     // key + secret log into the web UI, authenticate the management API, and sign S3 requests.
     ensure_root_admin(&meta, &crypto, &clock, cfg).await?;
 
+    // The public-read ("share") URL signer is keyed off the master key (its hex string as the HMAC
+    // secret) so signed links survive restarts when CAIRN_MASTER_KEY is set; without it, a fixed
+    // dev key is used (links are valid only within a process lifetime, like the dev master key).
+    let pu_secret = cfg
+        .master_key
+        .clone()
+        .unwrap_or_else(|| "cairn-development-public-url-key".to_owned());
+    let public_url: Arc<dyn PublicUrl> = Arc::new(HmacPublicUrl::new(pu_secret.into_bytes()));
+
     // Startup reconciliation reclaims orphaned blobs from any crash window before serving. The
     // oracle is taken by `&dyn ReconcileOracle`, so the boxed oracle is borrowed via `as_ref`.
     match blob
@@ -221,6 +234,7 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
         blob,
         oracle,
         store,
+        public_url,
     })
 }
 
