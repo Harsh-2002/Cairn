@@ -570,3 +570,242 @@ async fn bulk_delete_works() {
     .await;
     assert_eq!(st, StatusCode::OK);
 }
+
+#[tokio::test]
+async fn versioning_and_object_tagging() {
+    let h = harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("verb"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+
+    // Enable versioning.
+    let vcfg =
+        b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>".to_vec();
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("verb"),
+                None,
+                &[("versioning", "")],
+                &[],
+                vcfg,
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    // Two puts create two versions.
+    drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("verb"),
+                Some("k"),
+                &[],
+                &[],
+                b"v1".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("verb"),
+                Some("k"),
+                &[],
+                &[],
+                b"v2-newer".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("verb"),
+                None,
+                &[("versions", "")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let xml = String::from_utf8(body).unwrap();
+    assert_eq!(
+        xml.matches("<Version>").count(),
+        2,
+        "two versions listed: {xml}"
+    );
+
+    // Latest GET returns the newer object.
+    let (_, _, body) = drain(
+        send(
+            &h.svc,
+            req(Method::GET, Some("verb"), Some("k"), &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(body, b"v2-newer");
+
+    // Object tagging round-trip.
+    let tags = b"<Tagging><TagSet><Tag><Key>env</Key><Value>prod</Value></Tag></TagSet></Tagging>"
+        .to_vec();
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("verb"),
+                Some("k"),
+                &[("tagging", "")],
+                &[],
+                tags,
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (_, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("verb"),
+                Some("k"),
+                &[("tagging", "")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    let xml = String::from_utf8(body).unwrap();
+    assert!(
+        xml.contains("env") && xml.contains("prod"),
+        "tags returned: {xml}"
+    );
+}
+
+#[tokio::test]
+async fn bucket_policy_roundtrip() {
+    let h = harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("polb"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+
+    let policy = br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::polb/*"}]}"#.to_vec();
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("polb"),
+                None,
+                &[("policy", "")],
+                &[],
+                policy,
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("polb"),
+                None,
+                &[("policy", "")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(String::from_utf8(body).unwrap().contains("s3:GetObject"));
+
+    // Malformed policy is rejected.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("polb"),
+                None,
+                &[("policy", "")],
+                &[],
+                b"not json".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+
+    // Delete then 404.
+    drain(
+        send(
+            &h.svc,
+            req(
+                Method::DELETE,
+                Some("polb"),
+                None,
+                &[("policy", "")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("polb"),
+                None,
+                &[("policy", "")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+}

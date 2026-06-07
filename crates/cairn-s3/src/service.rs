@@ -9,7 +9,7 @@ use crate::request::{S3Body, S3Request, S3Response};
 use base64::Engine;
 use cairn_types::auth::{Principal, Role};
 use cairn_types::blob::{ByteRange, PartRef, StageOptions};
-use cairn_types::bucket::{Bucket, VersioningState};
+use cairn_types::bucket::{Bucket, ConfigAspect, ConfigDoc, VersioningState};
 use cairn_types::error::Error;
 use cairn_types::id::{BucketName, ObjectKey, UploadId, VersionId};
 use cairn_types::meta::{
@@ -83,11 +83,49 @@ impl S3Service {
 
     async fn bucket_op(&self, req: S3Request, body: cairn_types::BodyStream) -> Result<S3Response> {
         match req.method {
+            // Subresources first (they share the bucket path with the plain operations).
+            Method::GET if req.has_query("location") => self.get_bucket_location(&req).await,
+            Method::GET if req.has_query("uploads") => self.list_multipart_uploads(&req).await,
+            Method::GET if req.has_query("versions") => self.list_object_versions(&req).await,
+            Method::GET if req.has_query("versioning") => self.get_bucket_versioning(&req).await,
+            Method::PUT if req.has_query("versioning") => {
+                self.put_bucket_versioning(req, body).await
+            }
+            Method::GET if req.has_query("tagging") => {
+                self.get_bucket_doc(&req, ConfigAspect::Tagging, "NoSuchTagSet")
+                    .await
+            }
+            Method::PUT if req.has_query("tagging") => {
+                self.put_bucket_config(req, body, ConfigAspect::Tagging)
+                    .await
+            }
+            Method::DELETE if req.has_query("tagging") => {
+                self.clear_bucket_config(&req, ConfigAspect::Tagging).await
+            }
+            Method::GET if req.has_query("cors") => {
+                self.get_bucket_doc(&req, ConfigAspect::Cors, "NoSuchCORSConfiguration")
+                    .await
+            }
+            Method::PUT if req.has_query("cors") => {
+                self.put_bucket_config(req, body, ConfigAspect::Cors).await
+            }
+            Method::DELETE if req.has_query("cors") => {
+                self.clear_bucket_config(&req, ConfigAspect::Cors).await
+            }
+            Method::GET if req.has_query("policy") => {
+                self.get_bucket_doc(&req, ConfigAspect::Policy, "NoSuchBucketPolicy")
+                    .await
+            }
+            Method::PUT if req.has_query("policy") => {
+                self.put_bucket_config(req, body, ConfigAspect::Policy)
+                    .await
+            }
+            Method::DELETE if req.has_query("policy") => {
+                self.clear_bucket_config(&req, ConfigAspect::Policy).await
+            }
             Method::PUT => self.create_bucket(&req).await,
             Method::DELETE => self.delete_bucket(&req).await,
             Method::HEAD => self.head_bucket(&req).await,
-            Method::GET if req.has_query("location") => self.get_bucket_location(&req).await,
-            Method::GET if req.has_query("uploads") => self.list_multipart_uploads(&req).await,
             Method::POST if req.has_query("delete") => self.delete_objects(&req, body).await,
             Method::GET => self.list_objects(&req).await,
             _ => Err(Error::NotImplemented),
@@ -102,6 +140,9 @@ impl S3Service {
             Method::PUT if req.header("x-amz-copy-source").is_some() => {
                 self.copy_object(&req).await
             }
+            Method::PUT if req.has_query("tagging") => self.put_object_tagging(req, body).await,
+            Method::GET if req.has_query("tagging") => self.get_object_tagging(&req).await,
+            Method::DELETE if req.has_query("tagging") => self.delete_object_tagging(&req).await,
             Method::PUT => self.put_object(req, body).await,
             Method::POST if req.has_query("uploads") => self.create_multipart(&req).await,
             Method::POST if req.has_query("uploadId") => self.complete_multipart(req, body).await,
@@ -903,6 +944,201 @@ impl S3Service {
         }
         let body = cairn_xml::delete_result(&deleted, &errors);
         Ok(S3Response::xml(StatusCode::OK, body).with_header("x-amz-request-id", &req.request_id))
+    }
+
+    // --- versioning ---
+
+    async fn get_bucket_versioning(&self, req: &S3Request) -> Result<S3Response> {
+        let (bucket, _) = self.authorized_bucket(req).await?;
+        Ok(S3Response::xml(
+            StatusCode::OK,
+            cairn_xml::versioning_configuration(bucket.versioning),
+        )
+        .with_header("x-amz-request-id", &req.request_id))
+    }
+
+    async fn put_bucket_versioning(
+        &self,
+        req: S3Request,
+        body: cairn_types::BodyStream,
+    ) -> Result<S3Response> {
+        let bucket = self.authorized_bucket_owned(&req).await?;
+        let doc = drain_body(body, 64 * 1024).await?;
+        let state = cairn_xml::parse_versioning_configuration(&doc)?;
+        self.meta
+            .submit(Mutation::SetVersioning {
+                bucket: bucket.name,
+                state,
+            })
+            .await?;
+        Ok(S3Response::status(StatusCode::OK).with_header("x-amz-request-id", &req.request_id))
+    }
+
+    async fn list_object_versions(&self, req: &S3Request) -> Result<S3Response> {
+        let (bucket, _) = self.authorized_bucket(req).await?;
+        let prefix = req.query("prefix").map(str::to_owned);
+        let delimiter = req.query("delimiter").map(str::to_owned);
+        let max = req
+            .query("max-keys")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1000u32)
+            .min(1000);
+        let cursor = req.query("key-marker").and_then(decode_token);
+        let query = ListQuery {
+            prefix: prefix.clone(),
+            delimiter: delimiter.clone(),
+            cursor,
+            start_after: None,
+            limit: max,
+        };
+        let mut page = self.meta.list_versions(&bucket.name, &query).await?;
+        page.next_cursor = page.next_cursor.map(|c| encode_token(&c));
+        let body = cairn_xml::list_object_versions(
+            bucket.name.as_str(),
+            prefix.as_deref(),
+            delimiter.as_deref(),
+            max,
+            &page,
+            req.query("key-marker"),
+            req.query("version-id-marker"),
+        );
+        Ok(S3Response::xml(StatusCode::OK, body).with_header("x-amz-request-id", &req.request_id))
+    }
+
+    // --- bucket configuration documents (tagging, cors, policy) ---
+
+    async fn get_bucket_doc(
+        &self,
+        req: &S3Request,
+        aspect: ConfigAspect,
+        not_found_code: &str,
+    ) -> Result<S3Response> {
+        let (bucket, _) = self.authorized_bucket(req).await?;
+        match self.meta.get_bucket_config(&bucket.name, aspect).await? {
+            Some(doc) => Ok(S3Response::xml(StatusCode::OK, doc.0)
+                .with_header("x-amz-request-id", &req.request_id)),
+            None => Ok(S3Response::xml(
+                StatusCode::NOT_FOUND,
+                cairn_xml::error_document(
+                    not_found_code,
+                    "The requested configuration does not exist",
+                    &resource_path(req),
+                    &req.request_id,
+                ),
+            )),
+        }
+    }
+
+    async fn put_bucket_config(
+        &self,
+        req: S3Request,
+        body: cairn_types::BodyStream,
+        aspect: ConfigAspect,
+    ) -> Result<S3Response> {
+        let bucket = self.authorized_bucket_owned(&req).await?;
+        let doc = drain_body(body, 1024 * 1024).await?;
+        let text = String::from_utf8_lossy(&doc).into_owned();
+        // Validate per aspect before storing.
+        match aspect {
+            ConfigAspect::Policy => {
+                cairn_authz::parse_policy(&text)?;
+            }
+            ConfigAspect::Cors => {
+                cairn_xml::parse_cors_configuration(&doc)?;
+            }
+            ConfigAspect::Tagging => {
+                cairn_xml::parse_tagging(&doc)?;
+            }
+            _ => {}
+        }
+        self.meta
+            .submit(Mutation::SetBucketConfig {
+                bucket: bucket.name,
+                aspect,
+                doc: Some(ConfigDoc(text)),
+            })
+            .await?;
+        Ok(S3Response::status(StatusCode::NO_CONTENT)
+            .with_header("x-amz-request-id", &req.request_id))
+    }
+
+    async fn clear_bucket_config(
+        &self,
+        req: &S3Request,
+        aspect: ConfigAspect,
+    ) -> Result<S3Response> {
+        let bucket = self.authorized_bucket_owned(req).await?;
+        self.meta
+            .submit(Mutation::SetBucketConfig {
+                bucket: bucket.name,
+                aspect,
+                doc: None,
+            })
+            .await?;
+        Ok(S3Response::status(StatusCode::NO_CONTENT)
+            .with_header("x-amz-request-id", &req.request_id))
+    }
+
+    // --- object tagging ---
+
+    async fn get_object_tagging(&self, req: &S3Request) -> Result<S3Response> {
+        let (bucket, _) = self.authorized_bucket(req).await?;
+        let key = req.key.clone().expect("key present");
+        let row = self
+            .meta
+            .current_version(&bucket.name, &key)
+            .await?
+            .ok_or(Error::NoSuchKey)?;
+        let tags = self
+            .meta
+            .get_object_tags(&bucket.name, &key, &row.version_id)
+            .await?;
+        Ok(S3Response::xml(StatusCode::OK, cairn_xml::tagging(&tags))
+            .with_header("x-amz-request-id", &req.request_id))
+    }
+
+    async fn put_object_tagging(
+        &self,
+        req: S3Request,
+        body: cairn_types::BodyStream,
+    ) -> Result<S3Response> {
+        let bucket = self.authorized_bucket_owned(&req).await?;
+        let key = req.key.clone().expect("key present");
+        let row = self
+            .meta
+            .current_version(&bucket.name, &key)
+            .await?
+            .ok_or(Error::NoSuchKey)?;
+        let doc = drain_body(body, 64 * 1024).await?;
+        let tags = cairn_xml::parse_tagging(&doc)?;
+        self.meta
+            .submit(Mutation::PutObjectTags {
+                bucket: bucket.name,
+                key,
+                version_id: row.version_id,
+                tags,
+            })
+            .await?;
+        Ok(S3Response::status(StatusCode::OK).with_header("x-amz-request-id", &req.request_id))
+    }
+
+    async fn delete_object_tagging(&self, req: &S3Request) -> Result<S3Response> {
+        let bucket = self.authorized_bucket_owned(req).await?;
+        let key = req.key.clone().expect("key present");
+        let row = self
+            .meta
+            .current_version(&bucket.name, &key)
+            .await?
+            .ok_or(Error::NoSuchKey)?;
+        self.meta
+            .submit(Mutation::DeleteObjectTags {
+                bucket: bucket.name,
+                key,
+                version_id: row.version_id,
+            })
+            .await?;
+        Ok(S3Response::status(StatusCode::NO_CONTENT)
+            .with_header("x-amz-request-id", &req.request_id))
     }
 
     // --- helpers ---

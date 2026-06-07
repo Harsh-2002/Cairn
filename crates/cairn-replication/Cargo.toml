@@ -1,0 +1,20 @@
+[package]
+name = "cairn-replication"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Outbox-driven asynchronous bucket replication engine for Cairn (ARCH §20)."
+
+[lints]
+workspace = true
+
+[dependencies]
+cairn-types.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+futures-util = { workspace = true, features = ["std"] }
+
+[dev-dependencies]
+cairn-types = { workspace = true, features = ["testing"] }
+tokio = { workspace = true, features = ["rt", "macros"] }

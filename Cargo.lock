@@ -262,6 +262,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "cairn-lifecycle"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "cairn-types",
+ "futures-util",
+ "quick-xml",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "cairn-meta"
 version = "0.1.0"
 dependencies = [
@@ -277,6 +289,17 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "cairn-replication"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "cairn-types",
+ "futures-util",
+ "tokio",
 ]
 
 [[package]]
