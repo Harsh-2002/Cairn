@@ -29,7 +29,71 @@ pub fn spawn(stack: Arc<AppStack>, cfg: &Config) {
     ));
     tokio::spawn(lifecycle_loop(stack.clone(), lifecycle_interval));
     tokio::spawn(checkpoint_loop(stack.clone(), checkpoint_interval));
+
+    // Replication worker: only active when a destination endpoint is configured (otherwise outbox
+    // entries accumulate and are observable, never silently dropped — ARCH §20).
+    if let (Some(endpoint), Some(dest_bucket), Some(access), Some(secret)) = (
+        cfg.replication_endpoint.clone(),
+        cfg.replication_dest_bucket.clone(),
+        cfg.replication_access_key.clone(),
+        cfg.replication_secret.clone(),
+    ) {
+        let sink_cfg = cairn_replication::S3SinkConfig {
+            endpoint,
+            dest_bucket,
+            region: cfg
+                .replication_region
+                .clone()
+                .unwrap_or_else(|| cfg.region.clone()),
+            access_key_id: access,
+            secret_access_key: secret,
+        };
+        tokio::spawn(replication_loop(
+            stack.clone(),
+            sink_cfg,
+            Duration::from_secs(cfg.replication_interval_secs),
+        ));
+        tracing::info!("replication worker enabled");
+    }
     tokio::spawn(metrics_loop(stack));
+}
+
+/// Drain the replication outbox to the configured remote sink on an interval (ARCH §20).
+async fn replication_loop(
+    stack: Arc<AppStack>,
+    sink_cfg: cairn_replication::S3SinkConfig,
+    interval: Duration,
+) {
+    let sink = match cairn_replication::HttpS3Sink::new(sink_cfg) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(error = %e, "replication sink construction failed; worker disabled");
+            return;
+        }
+    };
+    let engine =
+        cairn_replication::ReplicationEngine::new(cairn_replication::ReplicationOpts::default());
+    let clock = SystemClock::new();
+    loop {
+        tokio::time::sleep(interval).await;
+        match engine
+            .run_until_idle(&*stack.meta, &sink, &stack.blob, &clock, 50)
+            .await
+        {
+            Ok(report) if !report.is_idle() => {
+                metrics::counter!("cairn_replication_completed_total")
+                    .increment(report.completed as u64);
+                metrics::counter!("cairn_replication_failed_total").increment(report.failed as u64);
+                tracing::info!(
+                    completed = report.completed,
+                    failed = report.failed,
+                    "replication progressed"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "replication run failed"),
+        }
+    }
 }
 
 /// Periodically run a truncating WAL checkpoint on the metadata store and publish the WAL size

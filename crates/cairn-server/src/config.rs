@@ -60,6 +60,19 @@ pub struct Config {
     pub multipart_upload_lifetime_secs: u64,
     /// How often the WAL checkpointer runs a truncating checkpoint, in seconds.
     pub wal_checkpoint_interval_secs: u64,
+    /// Replication destination endpoint (e.g. `http://backup-host:9000`). When set, the
+    /// replication worker ships outbox entries to this S3-compatible target (ARCH §20).
+    pub replication_endpoint: Option<String>,
+    /// Destination bucket at the replication endpoint (path-style).
+    pub replication_dest_bucket: Option<String>,
+    /// Destination access-key id.
+    pub replication_access_key: Option<String>,
+    /// Destination secret access key.
+    pub replication_secret: Option<String>,
+    /// Destination signing region (defaults to `region` when unset).
+    pub replication_region: Option<String>,
+    /// How often the replication worker drains the outbox, in seconds.
+    pub replication_interval_secs: u64,
 }
 
 impl Default for Config {
@@ -83,6 +96,12 @@ impl Default for Config {
             multipart_sweep_interval_secs: 3600,
             multipart_upload_lifetime_secs: 86_400,
             wal_checkpoint_interval_secs: 300,
+            replication_endpoint: None,
+            replication_dest_bucket: None,
+            replication_access_key: None,
+            replication_secret: None,
+            replication_region: None,
+            replication_interval_secs: 30,
         }
     }
 }

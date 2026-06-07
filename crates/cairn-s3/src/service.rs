@@ -17,7 +17,8 @@ use cairn_types::bucket::{Bucket, ConfigAspect, ConfigDoc, VersioningState};
 use cairn_types::error::Error;
 use cairn_types::id::{BucketName, ObjectKey, UploadId, VersionId};
 use cairn_types::meta::{
-    ClaimOutcome, IfNoneMatch, ListQuery, MultipartSession, Mutation, MutationOutcome, Precondition,
+    ClaimOutcome, IfNoneMatch, ListQuery, MultipartSession, Mutation, MutationOutcome, OutboxEntry,
+    Precondition, ReplicationOp,
 };
 use cairn_types::object::{
     ChecksumAlgorithm, ChecksumSet, ChecksumValue, CompressionDescriptor, ETag, ObjectVersionRow,
@@ -508,12 +509,15 @@ impl S3Service {
             updated_at: now,
         };
 
+        let replication = self
+            .replication_outbox(&bucket, &key, &version_id, ReplicationOp::ObjectCreate)
+            .await;
         match self
             .meta
             .submit(Mutation::PutObjectVersion {
                 row: Box::new(row),
                 precondition: precond,
-                replication: None,
+                replication,
             })
             .await
         {
@@ -1647,6 +1651,40 @@ impl S3Service {
             Decision::Allow => Ok(()),
             Decision::Deny(_) => Err(Error::AccessDenied),
         }
+    }
+
+    /// Build a replication outbox entry for a write when the bucket has an enabled replication
+    /// rule whose prefix matches the key (ARCH §20). Replication requires versioning. The entry
+    /// rides the same commit transaction as the write, so enqueue is atomic with the version.
+    async fn replication_outbox(
+        &self,
+        bucket: &Bucket,
+        key: &ObjectKey,
+        version_id: &VersionId,
+        op: ReplicationOp,
+    ) -> Option<OutboxEntry> {
+        if bucket.versioning != VersioningState::Enabled {
+            return None;
+        }
+        let doc = self
+            .meta
+            .get_bucket_config(&bucket.name, ConfigAspect::Replication)
+            .await
+            .ok()??;
+        let cfg = cairn_replication::parse_replication(doc.0.as_bytes()).ok()?;
+        let rule = cfg
+            .rules
+            .iter()
+            .find(|r| r.enabled && r.filter.matches(key.as_str()))?;
+        Some(cairn_replication::outbox_entry_for(
+            uuid::Uuid::new_v4().simple().to_string(),
+            bucket.name.clone(),
+            key.clone(),
+            version_id.clone(),
+            op,
+            rule.id.clone(),
+            self.clock.now(),
+        ))
     }
 
     /// Resolve the current (or hidden-by-delete-marker) object version for a read.
