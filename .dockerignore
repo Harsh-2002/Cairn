@@ -1,0 +1,13 @@
+# Keep the build context small and reproducible: the Dockerfile builds the UI and the binary from
+# source itself, so exclude all build outputs and local-only dirs.
+target
+**/target
+ui/node_modules
+ui/dist
+.git
+.github
+reference
+*.md
+docs
+conformance
+**/*.profraw

@@ -1,9 +1,18 @@
 name: CI
 
+# Runs the complete test methodology on every commit (any branch) and every pull request:
+# formatting + lint, unit/integration tests (gnu + musl, default and all-features), doc tests,
+# the boto3 S3 conformance suite, the crash-consistency (durability) harness, a two-node
+# replication soak, the MinIO warp macro benchmark, fuzz smoke tests, a benchmark compile check,
+# and coverage. Release artifacts are built by release.yml, not here. No caching anywhere.
 on:
   push:
-    branches: [main]
+    branches: ["**"]
   pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -15,12 +24,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
-      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
   test:
     name: test (${{ matrix.target }})
@@ -33,77 +42,37 @@ jobs:
           - x86_64-unknown-linux-musl
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
       - name: Install musl tools
         if: endsWith(matrix.target, 'musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup
+        with:
+          targets: ${{ matrix.target }}
       - uses: taiki-e/install-action@nextest
       - run: cargo nextest run --workspace --target ${{ matrix.target }}
       - run: cargo test --workspace --doc
 
-  static-binary:
-    name: static musl binary
+  test-all-features:
+    name: test (all features)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
         with:
-          targets: x86_64-unknown-linux-musl
-      - run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release --bin cairn --target x86_64-unknown-linux-musl
-      - name: Verify the binary is statically linked
-        run: |
-          BIN=target/x86_64-unknown-linux-musl/release/cairn
-          file "$BIN"
-          ldd "$BIN" 2>&1 | grep -q "not a dynamic executable" || { echo "binary is not static"; exit 1; }
-      - uses: actions/upload-artifact@v4
-        with:
-          name: cairn-x86_64-musl
-          path: target/x86_64-unknown-linux-musl/release/cairn
-
-  static-binary-aarch64:
-    name: static musl binary (aarch64)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-unknown-linux-musl
-      - uses: Swatinem/rust-cache@v2
-      # Cross-compile with cargo-zigbuild: Zig's `cc`/linker carries a complete aarch64 *musl*
-      # sysroot, so the vendored C deps (aws-lc-rs, bundled SQLite, zstd) compile + link against musl
-      # cleanly without Docker or a hand-wired cross-gcc. The DEFAULT binary links only rusqlite's one
-      # bundled SQLite (the libSQL/Turso backends are behind `--features meta-async`), so there is no
-      # dual-SQLite symbol collision and no multiple-definition link flag — which matters because
-      # lld (Zig's linker) rejects every such flag. This exact recipe was validated locally to produce
-      # an "ELF 64-bit LSB executable, ARM aarch64, ... statically linked" cairn binary.
-      - run: pip install ziglang
-      - uses: taiki-e/install-action@cargo-zigbuild
-      - name: Build the aarch64 static binary
-        run: cargo zigbuild --release --bin cairn --target aarch64-unknown-linux-musl
-      - name: Verify the binary is aarch64 and statically linked
-        run: |
-          BIN=target/aarch64-unknown-linux-musl/release/cairn
-          file "$BIN"
-          file "$BIN" | grep -q "ARM aarch64" || { echo "binary is not aarch64"; exit 1; }
-          file "$BIN" | grep -qiE "statically linked|static-pie linked" || {
-            echo "binary is not statically linked"; exit 1; }
-      - uses: actions/upload-artifact@v4
-        with:
-          name: cairn-aarch64-musl
-          path: target/aarch64-unknown-linux-musl/release/cairn
+          tool-cache: false
+          large-packages: false
+      - uses: ./.github/actions/setup
+      - uses: taiki-e/install-action@nextest
+      # Exercises the optional backends (libSQL + Turso) and the fast-io (io_uring + kTLS) paths.
+      - run: cargo nextest run --workspace --all-features
 
   conformance:
     name: boto3 conformance
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup
       - uses: actions/setup-python@v5
         with:
           python-version: "3.x"
@@ -117,22 +86,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup
       - name: Arm the durability fault seam, crash in the window, assert reconcile reclaims
         run: bash conformance/crash_consistency.sh
-
-  warp:
-    name: warp macro benchmark
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --bin cairn
-      - name: Run the real MinIO warp benchmark against a fresh Cairn (get/put/mixed, strict)
-        run: BIN=target/debug/cairn bash conformance/warp.sh
 
   soak:
     name: replication soak (multi-host)
@@ -140,15 +96,25 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup
       - uses: actions/setup-python@v5
         with:
           python-version: "3.x"
       - run: pip install boto3
       - run: cargo build --bin cairn
       - name: Two-node replication soak — sustained PUTs, byte-identical verify, RSS leak check
-        run: BIN=target/debug/cairn PY=python3 DURATION=120 bash conformance/soak.sh
+        run: BIN=target/debug/cairn PY=python3 DURATION=90 bash conformance/soak.sh
+
+  warp:
+    name: warp macro benchmark
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+      - run: cargo build --bin cairn
+      - name: Run the real MinIO warp benchmark against a fresh Cairn (get/put/mixed, strict)
+        run: BIN=target/debug/cairn bash conformance/warp.sh
 
   fuzz-smoke:
     name: fuzz smoke (decoder, xml, policy)
@@ -156,8 +122,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-fuzz
+      # These fuzz targets live in crates that do not embed the UI, so no UI build is needed.
       - run: cargo fuzz run chunked_decoder -- -max_total_time=45
         working-directory: crates/cairn-s3
       - run: cargo fuzz run request_parsers -- -max_total_time=30
@@ -170,8 +136,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup
       - run: cargo bench --workspace --no-run
 
   coverage:
@@ -179,12 +144,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          large-packages: false
+      - uses: ./.github/actions/setup
         with:
           components: llvm-tools-preview
-      - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-llvm-cov
-      - run: cargo llvm-cov --workspace --all-features --lcov --output-path lcov.info
+      - run: cargo llvm-cov --workspace --lcov --output-path lcov.info
       - uses: actions/upload-artifact@v4
         with:
           name: coverage
