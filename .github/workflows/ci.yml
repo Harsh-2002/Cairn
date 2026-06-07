@@ -131,14 +131,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --bin cairn
-      # WARP_ALLOW_KEY_ENCODING_BUG downgrades the known SigV4 key-encoding blocker (warp object
-      # names contain '(' / ')', which Cairn's canonical-URI double-encoding rejects) from a hard
-      # failure to a warning, so CI stays green on the *benchmark* while still printing the real
-      # `warp put` throughput and the error count. Drop the env var once that crate-level defect is
-      # fixed; the run will then be a clean, error-free get/put/mixed sweep. See docs/benchmarks.md.
-      - name: Run the real MinIO warp benchmark against a fresh Cairn
-        env:
-          WARP_ALLOW_KEY_ENCODING_BUG: "1"
+      - name: Run the real MinIO warp benchmark against a fresh Cairn (get/put/mixed, strict)
         run: BIN=target/debug/cairn bash conformance/warp.sh
 
   soak:

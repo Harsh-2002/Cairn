@@ -16,21 +16,10 @@
 # infrastructure failure (binary missing, server failed to start, warp download failed) OR if warp
 # reported operation errors. See the "Known blocker" note below and docs/benchmarks.md.
 #
-# ---------------------------------------------------------------------------------------------
-# KNOWN BLOCKER (recorded by this harness on commit 8859a5d; see docs/benchmarks.md "warp"):
-#   `warp`'s object-name generator draws from the alphabet
-#       abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890()
-#   i.e. it deliberately puts '(' and ')' in keys to stress URL-encoding. Cairn's SigV4 canonical
-#   request double-encodes an already-percent-encoded request path (it re-runs uri_encode over
-#   `req.uri().path()`, turning `%28` into `%2528`), so every key containing a reserved sub-delim
-#   ('(', ')', space, ...) fails with SignatureDoesNotMatch. `warp put` survives this (it records
-#   per-object errors and still reports throughput for the keys that signed cleanly), but
-#   `warp get`/`warp mixed` abort during prepare. The same defect reproduces with plain boto3:
-#       client.put_object(Bucket=b, Key='a(1).rnd', Body=b'x')  ->  SignatureDoesNotMatch
-#   Fix lives in crate source (cairn-server adapter / cairn-auth sigv4 canonical URI) and is out of
-#   this harness's scope. Until it lands, this script exits non-zero on the operation errors so CI
-#   keeps flagging it; set WARP_ALLOW_KEY_ENCODING_BUG=1 to downgrade that to a warning.
-# ---------------------------------------------------------------------------------------------
+# `warp`'s object-name generator deliberately puts '(' and ')' in keys to stress URL-encoding. The
+# SigV4 canonical-URI double-encoding bug this once surfaced (keys with '(' ')' space failing
+# SignatureDoesNotMatch) is FIXED (cairn-auth sigv4: uri_encode(percent_decode(path))), so the script
+# runs get/put/mixed strict and any operation error fails the run.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -168,11 +157,4 @@ if [ "$total_errors" -eq 0 ]; then
   exit 0
 fi
 printf 'WARP REPORTED %s OPERATION ERROR(S).\n' "$total_errors" >&2
-printf 'This is the known SigV4 key-encoding blocker (keys with %s fail SignatureDoesNotMatch).\n' \
-  "'(' / ')' / space" >&2
-printf 'See the KNOWN BLOCKER note at the top of this script and docs/benchmarks.md.\n' >&2
-if [ "${WARP_ALLOW_KEY_ENCODING_BUG:-0}" = "1" ]; then
-  printf '(WARP_ALLOW_KEY_ENCODING_BUG=1 set -> downgraded to a warning, exiting 0)\n' >&2
-  exit 0
-fi
 exit 1

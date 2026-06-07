@@ -196,55 +196,29 @@ tarball actually hosted on the GitHub releases page and gives a stable, scriptab
 v1.0.0 auto-detects path-style addressing for an `IP:port` `--host`, so no `--path-style`/`--lookup`
 flag is needed (and v1.0.0 does not accept one; newer warp would take `--lookup path`).
 
-### Important caveat — a SigV4 key-encoding defect that `warp` surfaces
+### How `warp` surfaced (and we fixed) a real SigV4 bug
 
-Running `warp` against Cairn **uncovered a real server bug** (commit `8859a5d`). `warp`'s object
-name generator draws from the alphabet
+Running `warp` **uncovered a real server bug** and then verified its fix. `warp`'s object-name
+generator deliberately puts `(` and `)` in keys (alphabet `…1234567890()`) to stress URL-encoding.
+Cairn's SigV4 canonical request was **double-encoding** an already-percent-encoded request path: the
+server canonicalized `req.uri().path()` (already `…/with%28paren%29`) by running `uri_encode` over it
+again, turning `%28` into `%2528`, so **every key with a reserved sub-delim** (`(`, `)`, space, …)
+failed `SignatureDoesNotMatch` — reproducible with plain boto3 (`Key="a(1).rnd"` → fail). **Fixed**
+in `cairn-auth` (`sigv4.rs`): the canonical URI now decodes the wire path and encodes exactly once,
+`uri_encode(percent_decode(path))` (regression test in `crypto_util.rs`; verified via boto3 across
+`()`, spaces, `+`, and unicode keys). `warp.sh` now runs get/put/mixed **strict** — any operation
+error fails the run.
 
-```
-abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890()
-```
+### Observed results (this host, all phases error-free)
 
-i.e. it deliberately puts `(` and `)` in keys to stress URL-encoding. Cairn's SigV4 canonical
-request **double-encodes** an already-percent-encoded request path: the server canonicalizes
-`req.uri().path()` (which is already `…/with%28paren%29`) by running `uri_encode` over it again,
-turning `%28` into `%2528`. The recomputed signature then never matches, so **every key containing
-a reserved sub-delim** (`(`, `)`, space, …) fails with `SignatureDoesNotMatch`. The same defect
-reproduces with plain boto3, no warp involved:
+1 MiB objects, concurrency 4, 8s (CI uses 20s):
 
-```python
-client.put_object(Bucket=b, Key="a(1).rnd", Body=b"x")   # -> SignatureDoesNotMatch
-client.put_object(Bucket=b, Key="plain-key", Body=b"x")  # -> OK
-```
-
-Consequences for the warp run:
-
-- **`warp put` survives it** — it records per-object errors and still reports throughput for the
-  ~86% of keys that sign cleanly, so we get real numbers plus an error count.
-- **`warp get` and `warp mixed` abort during prepare** — their prepare step PUTs objects and
-  bails on the first failure, so they cannot produce numbers until the bug is fixed.
-
-`warp.sh` therefore exits non-zero by default (so CI keeps flagging the defect); set
-`WARP_ALLOW_KEY_ENCODING_BUG=1` to downgrade that to a warning. The fix lives in crate source
-(the `cairn-server` adapter feeding `cairn-auth`'s canonical-URI step — canonicalize the **decoded**
-key once, or pass the raw path through without re-encoding) and is out of the benchmark harness's
-scope. Once it lands, drop `WARP_ALLOW_KEY_ENCODING_BUG` and the full get/put/mixed sweep runs
-clean.
-
-### Observed results (this host)
-
-`warp put`, 1 MiB objects, concurrency 4, 8s (the CI run uses 20s):
-
-| metric | value |
-|--------|------:|
-| average | **35.5 MiB/s** (35.5 obj/s) |
-| fastest 1s block | 39.5 MiB/s |
-| median 1s block | 37.1 MiB/s |
-| slowest 1s block | 26.1 MiB/s |
-| errors (key-encoding bug) | ~170-200 over the run |
-
-`warp get` / `warp mixed`: **could not benchmark** — prepare aborted on the key-encoding defect
-above (no throughput figure until the SigV4 fix lands).
+| phase | average throughput |
+|-------|------:|
+| `warp put` | **~38 MiB/s** (38 obj/s) |
+| `warp get` | **~450 MiB/s** (read path, cached) |
+| `warp mixed` | **~98 MiB/s** total (163 obj/s) |
+| errors | **0** |
 
 These `warp put` figures sit in the same band as the boto3 §2(a) large-object PUT path once you
 account for object size and concurrency — both are bounded by the durable-commit write cost, not
@@ -270,8 +244,8 @@ The boto3 driver (`conformance/soak.py`, run with the `/tmp/cairnvenv` python) e
 + an enabled replication rule on the source bucket (replication requires both, ARCH §20), then for
 `DURATION` seconds:
 
-- runs a continuous multi-worker PUT workload against the **source** (URL-safe keys only, so the
-  soak exercises replication and durability rather than the §3 key-encoding defect);
+- runs a continuous multi-worker PUT workload against the **source** (the soak focuses on
+  replication and durability under sustained load);
 - every few seconds reads a random sample of already-PUT objects back from the **target** and
   compares them **byte-for-byte** against what was written — any mismatch (or non-arrival past a
   grace window) is counted;
