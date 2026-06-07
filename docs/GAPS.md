@@ -23,9 +23,15 @@ All three **critical** findings and the **high** findings have been remediated a
 | H — crash-consistency harness inert | ✅ fixed — **live F-4 test passes** (crash → orphan → reconcile reclaims) |
 | Medium — versioning fidelity, per-key errors, CORS preflight, tag context, one-fs check, storage_path index, data_root fsync | ✅ fixed |
 
-Remaining (lower priority / documented): `UploadPartCopy` and `GetObjectAttributes`, ACL *body*
-documents (canned `x-amz-acl` supported), and `warp` macro load profiles. The findings below are
-the original audit text, kept for reference.
+**All audit findings — critical, high, medium, and the documented lower-priority items — are now
+remediated.** The remaining-items pass added: `UploadPartCopy`, `GetObjectAttributes`, ACL *body*
+documents (`AccessControlPolicy` parsing in addition to canned `x-amz-acl`), `list_failed_replication`
++ `get_bucket_quota` readers wired into the management API, HTTPS replication (`hyper-rustls`),
+per-rule replication destinations, TLS cert hot-reload (SIGHUP), the management UI views
+(bucket-config editor, user deactivate/role/rotate, replication status), and a boto3 macro
+load-profile harness ([`benchmarks.md`](./benchmarks.md)) standing in for `warp`.
+
+The findings below are the original audit text, kept for reference.
 
 Recently completed:
 - **HTTPS replication connector** — `HttpS3Sink` now uses a `hyper-rustls` `HttpsConnector`
