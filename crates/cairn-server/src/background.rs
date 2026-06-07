@@ -35,15 +35,16 @@ pub fn spawn(stack: Arc<AppStack>, cfg: &Config) {
     // `replication_dest_bucket` is the *default* destination; the actual destination per source
     // bucket is resolved each drain from that bucket's stored replication rule (see
     // `replication_loop`).
-    if let (Some(endpoint), Some(dest_bucket), Some(access), Some(secret)) = (
+    // The endpoint + credentials are required; the default `dest_bucket` is OPTIONAL because the
+    // per-source destination is normally resolved from each bucket's replication rule each drain.
+    if let (Some(endpoint), Some(access), Some(secret)) = (
         cfg.replication_endpoint.clone(),
-        cfg.replication_dest_bucket.clone(),
         cfg.replication_access_key.clone(),
         cfg.replication_secret.clone(),
     ) {
         let sink_cfg = cairn_replication::S3SinkConfig {
             endpoint,
-            dest_bucket,
+            dest_bucket: cfg.replication_dest_bucket.clone().unwrap_or_default(),
             // Populated per drain from each source bucket's replication rule.
             dest_buckets: std::collections::HashMap::new(),
             region: cfg
