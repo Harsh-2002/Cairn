@@ -1,0 +1,686 @@
+//! [`LibsqlMetadataStore`]: writes go through the single async group-committing [`Writer`];
+//! reads run async queries directly against a small pool of read-only driver connections, never
+//! contending with the writer. Listing is a half-open range seek with an efficient delimiter
+//! skip-scan — the same algorithm as `cairn-meta/src/store.rs`, ported to the async driver.
+
+use crate::driver::{AsyncSqlDriver, Row, Value, query_one};
+use crate::model::{
+    self, ACTIVITY_COLS, BUCKET_COLS, MULTIPART_COLS, OBJECT_VERSION_COLS, OUTBOX_COLS, PART_COLS,
+    SUMMARY_COLS, USER_COLS,
+};
+use crate::range::{prefix_upper_bound, successor};
+use crate::writer::Writer;
+use cairn_types::MetaError;
+use cairn_types::authz::PublicAccessBlock;
+use cairn_types::bucket::{Bucket, ConfigAspect, ConfigDoc};
+use cairn_types::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
+use cairn_types::meta::{
+    ActivityEntry, ListPage, ListQuery, MultipartSession, Mutation, MutationOutcome, ObjectSummary,
+    OutboxEntry, PartRecord, ReplicationStatus, StoreCounts, User, UserSigV4Credentials,
+    UserWithBearerHash,
+};
+use cairn_types::object::ObjectVersionRow;
+use cairn_types::time::Timestamp;
+use cairn_types::traits::MetadataStore;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+const LIST_BATCH: usize = 1024;
+
+/// A round-robin pool of read-only driver connections. WAL readers take consistent snapshots and
+/// never block the writer or each other, so concurrent reads simply pick the next connection.
+///
+/// The libSQL [`Database`](libsql::Database) handle the connections were opened from is retained
+/// so it (and, for a shared-cache in-memory database, the underlying memory) outlives every
+/// connection.
+pub(crate) struct ReadPool {
+    conns: Vec<Arc<dyn AsyncSqlDriver>>,
+    next: AtomicUsize,
+    // Held only to keep the database handle alive for the store's lifetime.
+    _db: libsql::Database,
+}
+
+impl ReadPool {
+    pub(crate) fn new_with_db(conns: Vec<Arc<dyn AsyncSqlDriver>>, db: libsql::Database) -> Self {
+        assert!(!conns.is_empty(), "read pool must have at least one conn");
+        Self {
+            conns,
+            next: AtomicUsize::new(0),
+            _db: db,
+        }
+    }
+
+    fn pick(&self) -> &dyn AsyncSqlDriver {
+        let i = self.next.fetch_add(1, Ordering::Relaxed) % self.conns.len();
+        self.conns[i].as_ref()
+    }
+}
+
+/// The libSQL-backed metadata store.
+#[derive(Clone)]
+pub struct LibsqlMetadataStore {
+    pub(crate) writer: Writer,
+    pub(crate) reads: Arc<ReadPool>,
+}
+
+impl std::fmt::Debug for LibsqlMetadataStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LibsqlMetadataStore")
+            .finish_non_exhaustive()
+    }
+}
+
+impl LibsqlMetadataStore {
+    pub(crate) fn new(writer: Writer, reads: ReadPool) -> Self {
+        Self {
+            writer,
+            reads: Arc::new(reads),
+        }
+    }
+
+    /// A read-only driver connection from the pool.
+    fn reader(&self) -> &dyn AsyncSqlDriver {
+        self.reads.pick()
+    }
+
+    /// A reconciliation oracle backed by this store, for the blob store's `reconcile`.
+    #[must_use]
+    pub fn reconcile_oracle(&self) -> LibsqlReconcileOracle {
+        LibsqlReconcileOracle {
+            reads: self.reads.clone(),
+        }
+    }
+}
+
+/// The efficient listing implementation: half-open range seek with delimiter skip-scan. The
+/// continuation cursor is an inclusive lower bound (the first key NOT yet returned). Ported from
+/// `cairn-meta/src/store.rs::list_impl`.
+async fn list_impl(
+    driver: &dyn AsyncSqlDriver,
+    bucket: &str,
+    query: &ListQuery,
+    latest_only: bool,
+) -> Result<ListPage<ObjectSummary>, MetaError> {
+    let prefix = query.prefix.clone().unwrap_or_default();
+    let upper = prefix_upper_bound(&prefix);
+    let limit = query.limit.max(1) as usize;
+
+    // Inclusive lower bound = max(prefix, cursor, successor(start_after)).
+    let mut seek = prefix.clone();
+    if let Some(c) = &query.cursor {
+        if c.as_str() > seek.as_str() {
+            seek = c.clone();
+        }
+    }
+    if let Some(sa) = &query.start_after {
+        let s = successor(sa);
+        if s > seek {
+            seek = s;
+        }
+    }
+
+    let mut page = ListPage::default();
+    let mut seen_cp = std::collections::HashSet::new();
+
+    'outer: loop {
+        let rows = fetch_rows(
+            driver,
+            bucket,
+            &seek,
+            upper.as_deref(),
+            latest_only,
+            LIST_BATCH + 1,
+        )
+        .await?;
+        if rows.is_empty() {
+            break;
+        }
+        let exhausted = rows.len() <= LIST_BATCH;
+        for summary in rows.into_iter().take(LIST_BATCH) {
+            if page.items.len() + page.common_prefixes.len() >= limit {
+                page.truncated = true;
+                page.next_cursor = Some(summary.key.as_str().to_owned());
+                break 'outer;
+            }
+            let key = summary.key.as_str().to_owned();
+            if let Some(delim) = query.delimiter.as_deref() {
+                let rest = &key[prefix.len()..];
+                if let Some(idx) = rest.find(delim) {
+                    let cp = format!("{}{}{}", prefix, &rest[..idx], delim);
+                    if seen_cp.insert(cp.clone()) {
+                        page.common_prefixes.push(cp.clone());
+                    }
+                    // Skip every key under this common prefix.
+                    match prefix_upper_bound(&cp) {
+                        Some(next) => {
+                            seek = next;
+                            continue 'outer;
+                        }
+                        None => break 'outer,
+                    }
+                }
+            }
+            seek = successor(&key);
+            page.items.push(summary);
+        }
+        if exhausted {
+            break;
+        }
+    }
+    Ok(page)
+}
+
+async fn fetch_rows(
+    driver: &dyn AsyncSqlDriver,
+    bucket: &str,
+    seek: &str,
+    upper: Option<&str>,
+    latest_only: bool,
+    limit: usize,
+) -> Result<Vec<ObjectSummary>, MetaError> {
+    let mut sql =
+        format!("SELECT {SUMMARY_COLS} FROM object_versions WHERE bucket_name = ?1 AND key >= ?2");
+    if latest_only {
+        sql.push_str(" AND is_latest = 1 AND is_delete_marker = 0");
+    }
+    if upper.is_some() {
+        sql.push_str(" AND key < ?3");
+    }
+    if latest_only {
+        sql.push_str(" ORDER BY key ASC");
+    } else {
+        sql.push_str(" ORDER BY key ASC, version_id DESC");
+    }
+    sql.push_str(" LIMIT ?4");
+
+    let limit = limit as i64;
+    let params = vec![
+        Value::Text(bucket.to_owned()),
+        Value::Text(seek.to_owned()),
+        upper.map_or(Value::Null, |u| Value::Text(u.to_owned())),
+        Value::Int(limit),
+    ];
+    let rows = driver.query(&sql, params).await?;
+    rows.iter().map(model::object_summary_from_row).collect()
+}
+
+#[async_trait::async_trait]
+impl MetadataStore for LibsqlMetadataStore {
+    async fn submit(&self, mutation: Mutation) -> Result<MutationOutcome, MetaError> {
+        self.writer.submit(mutation).await
+    }
+
+    async fn get_bucket(&self, name: &BucketName) -> Result<Option<Bucket>, MetaError> {
+        let row = query_one(
+            self.reader(),
+            &format!("SELECT {BUCKET_COLS} FROM buckets WHERE name=?1"),
+            vec![Value::Text(name.as_str().to_owned())],
+        )
+        .await?;
+        row.as_ref().map(model::bucket_from_row).transpose()
+    }
+
+    async fn list_buckets(&self, owner: Option<&UserId>) -> Result<Vec<Bucket>, MetaError> {
+        let (sql, params) = match owner {
+            Some(o) => (
+                format!("SELECT {BUCKET_COLS} FROM buckets WHERE owner_id=?1 ORDER BY name"),
+                vec![Value::Text(o.0.clone())],
+            ),
+            None => (
+                format!("SELECT {BUCKET_COLS} FROM buckets ORDER BY name"),
+                vec![],
+            ),
+        };
+        let rows = self.reader().query(&sql, params).await?;
+        rows.iter().map(model::bucket_from_row).collect()
+    }
+
+    async fn get_bucket_config(
+        &self,
+        name: &BucketName,
+        aspect: ConfigAspect,
+    ) -> Result<Option<ConfigDoc>, MetaError> {
+        let aspect = crate::apply::aspect_str(aspect);
+        let row = query_one(
+            self.reader(),
+            "SELECT doc FROM bucket_config WHERE bucket_name=?1 AND aspect=?2",
+            vec![
+                Value::Text(name.as_str().to_owned()),
+                Value::Text(aspect.to_owned()),
+            ],
+        )
+        .await?;
+        Ok(row.and_then(|r| r.get_opt_text(0)).map(ConfigDoc))
+    }
+
+    async fn get_account_public_access_block(&self) -> Result<PublicAccessBlock, MetaError> {
+        let row = query_one(
+            self.reader(),
+            "SELECT v FROM account_config WHERE k='public_access_block'",
+            vec![],
+        )
+        .await?;
+        let v = row.and_then(|r| r.get_opt_text(0));
+        Ok(v.and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default())
+    }
+
+    async fn get_bucket_quota(&self, bucket: &BucketName) -> Result<Option<u64>, MetaError> {
+        // The query returns no row for "no such bucket"; a NULL cell for "no quota set". Both
+        // present to the reader as "no quota". A stored negative is clamped to 0 defensively.
+        let row = query_one(
+            self.reader(),
+            "SELECT quota_bytes FROM buckets WHERE name=?1",
+            vec![Value::Text(bucket.as_str().to_owned())],
+        )
+        .await?;
+        Ok(row.and_then(|r| r.get_opt_i64(0)).map(|q| q.max(0) as u64))
+    }
+
+    async fn is_bucket_empty(&self, name: &BucketName) -> Result<bool, MetaError> {
+        let row = query_one(
+            self.reader(),
+            "SELECT EXISTS(SELECT 1 FROM object_versions WHERE bucket_name=?1 AND is_latest=1 AND is_delete_marker=0)",
+            vec![Value::Text(name.as_str().to_owned())],
+        )
+        .await?;
+        Ok(row.is_none_or(|r| r.get_i64(0) == 0))
+    }
+
+    async fn current_version(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<Option<ObjectVersionRow>, MetaError> {
+        let row = query_one(
+            self.reader(),
+            &format!(
+                "SELECT {OBJECT_VERSION_COLS} FROM object_versions WHERE bucket_name=?1 AND key=?2 AND is_latest=1"
+            ),
+            vec![
+                Value::Text(bucket.as_str().to_owned()),
+                Value::Text(key.as_str().to_owned()),
+            ],
+        )
+        .await?;
+        row.as_ref().map(model::object_version_from_row).transpose()
+    }
+
+    async fn get_version(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version: &VersionId,
+    ) -> Result<Option<ObjectVersionRow>, MetaError> {
+        let row = query_one(
+            self.reader(),
+            &format!(
+                "SELECT {OBJECT_VERSION_COLS} FROM object_versions WHERE bucket_name=?1 AND key=?2 AND version_id=?3"
+            ),
+            vec![
+                Value::Text(bucket.as_str().to_owned()),
+                Value::Text(key.as_str().to_owned()),
+                Value::Text(version.as_str().to_owned()),
+            ],
+        )
+        .await?;
+        row.as_ref().map(model::object_version_from_row).transpose()
+    }
+
+    async fn list_current(
+        &self,
+        bucket: &BucketName,
+        query: &ListQuery,
+    ) -> Result<ListPage<ObjectSummary>, MetaError> {
+        list_impl(self.reader(), bucket.as_str(), query, true).await
+    }
+
+    async fn list_versions(
+        &self,
+        bucket: &BucketName,
+        query: &ListQuery,
+    ) -> Result<ListPage<ObjectSummary>, MetaError> {
+        list_impl(self.reader(), bucket.as_str(), query, false).await
+    }
+
+    async fn enumerate_storage_paths(
+        &self,
+        bucket: &BucketName,
+        cursor: Option<&str>,
+        batch: u32,
+    ) -> Result<ListPage<StoragePath>, MetaError> {
+        let rows = self
+            .reader()
+            .query(
+                "SELECT storage_path FROM object_versions
+                 WHERE bucket_name=?1 AND storage_path IS NOT NULL AND storage_path > ?2
+                 ORDER BY storage_path LIMIT ?3",
+                vec![
+                    Value::Text(bucket.as_str().to_owned()),
+                    Value::Text(cursor.unwrap_or("").to_owned()),
+                    Value::Int(i64::from(batch) + 1),
+                ],
+            )
+            .await?;
+        let mut items: Vec<String> = rows.iter().map(|r| r.get_text(0)).collect();
+        let truncated = items.len() > batch as usize;
+        items.truncate(batch as usize);
+        let next_cursor = if truncated {
+            items.last().cloned()
+        } else {
+            None
+        };
+        Ok(ListPage {
+            items: items.into_iter().map(StoragePath::from_string).collect(),
+            common_prefixes: Vec::new(),
+            next_cursor,
+            truncated,
+        })
+    }
+
+    async fn get_object_tags(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version: &VersionId,
+    ) -> Result<Vec<(String, String)>, MetaError> {
+        let rows = self
+            .reader()
+            .query(
+                "SELECT tag_key, tag_value FROM object_tags WHERE bucket_name=?1 AND key=?2 AND version_id=?3 ORDER BY tag_key",
+                vec![
+                    Value::Text(bucket.as_str().to_owned()),
+                    Value::Text(key.as_str().to_owned()),
+                    Value::Text(version.as_str().to_owned()),
+                ],
+            )
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|r| (r.get_text(0), r.get_text(1)))
+            .collect())
+    }
+
+    async fn get_multipart(
+        &self,
+        upload: &UploadId,
+    ) -> Result<Option<MultipartSession>, MetaError> {
+        let row = query_one(
+            self.reader(),
+            &format!("SELECT {MULTIPART_COLS} FROM multipart_uploads WHERE id=?1"),
+            vec![Value::Text(upload.as_str().to_owned())],
+        )
+        .await?;
+        row.as_ref().map(model::multipart_from_row).transpose()
+    }
+
+    async fn list_parts(
+        &self,
+        upload: &UploadId,
+        part_number_marker: u16,
+        limit: u32,
+    ) -> Result<ListPage<PartRecord>, MetaError> {
+        let rows = self
+            .reader()
+            .query(
+                &format!(
+                    "SELECT {PART_COLS} FROM multipart_parts WHERE upload_id=?1 AND part_number>?2 ORDER BY part_number LIMIT ?3"
+                ),
+                vec![
+                    Value::Text(upload.as_str().to_owned()),
+                    Value::Int(i64::from(part_number_marker)),
+                    Value::Int(i64::from(limit) + 1),
+                ],
+            )
+            .await?;
+        let mut items: Vec<PartRecord> = rows
+            .iter()
+            .map(model::part_from_row)
+            .collect::<Result<_, _>>()?;
+        let truncated = items.len() > limit as usize;
+        items.truncate(limit as usize);
+        let next_cursor = if truncated {
+            items.last().map(|p| p.part_number.to_string())
+        } else {
+            None
+        };
+        Ok(ListPage {
+            items,
+            common_prefixes: Vec::new(),
+            next_cursor,
+            truncated,
+        })
+    }
+
+    async fn list_multipart_uploads(
+        &self,
+        bucket: &BucketName,
+        query: &ListQuery,
+    ) -> Result<ListPage<MultipartSession>, MetaError> {
+        let prefix = query.prefix.clone().unwrap_or_default();
+        let rows = self
+            .reader()
+            .query(
+                &format!(
+                    "SELECT {MULTIPART_COLS} FROM multipart_uploads WHERE bucket_name=?1 AND status='active' AND key>=?2 ORDER BY key, id"
+                ),
+                vec![
+                    Value::Text(bucket.as_str().to_owned()),
+                    Value::Text(prefix.clone()),
+                ],
+            )
+            .await?;
+        let mut items: Vec<MultipartSession> = rows
+            .iter()
+            .map(model::multipart_from_row)
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|s| s.key.as_str().starts_with(&prefix))
+            .collect();
+        let truncated = items.len() > query.limit.max(1) as usize;
+        items.truncate(query.limit.max(1) as usize);
+        Ok(ListPage {
+            items,
+            common_prefixes: Vec::new(),
+            next_cursor: None,
+            truncated,
+        })
+    }
+
+    async fn enumerate_stale_sessions(
+        &self,
+        older_than: Timestamp,
+        batch: u32,
+    ) -> Result<Vec<MultipartSession>, MetaError> {
+        let rows = self
+            .reader()
+            .query(
+                &format!(
+                    "SELECT {MULTIPART_COLS} FROM multipart_uploads WHERE updated_at < ?1 LIMIT ?2"
+                ),
+                vec![Value::Int(older_than.0), Value::Int(i64::from(batch))],
+            )
+            .await?;
+        rows.iter().map(model::multipart_from_row).collect()
+    }
+
+    async fn object_replication_status(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version: &VersionId,
+    ) -> Result<Option<ReplicationStatus>, MetaError> {
+        let row = query_one(
+            self.reader(),
+            "SELECT replication_status FROM object_versions WHERE bucket_name=?1 AND key=?2 AND version_id=?3",
+            vec![
+                Value::Text(bucket.as_str().to_owned()),
+                Value::Text(key.as_str().to_owned()),
+                Value::Text(version.as_str().to_owned()),
+            ],
+        )
+        .await?;
+        Ok(row
+            .and_then(|r| r.get_opt_text(0))
+            .map(|s| model::repl_status_from(&s)))
+    }
+
+    async fn claim_replication_batch(
+        &self,
+        limit: u32,
+        now: Timestamp,
+    ) -> Result<Vec<OutboxEntry>, MetaError> {
+        let rows = self
+            .reader()
+            .query(
+                &format!(
+                    "SELECT {OUTBOX_COLS} FROM replication_outbox WHERE status='pending' AND next_attempt_at<=?1 ORDER BY next_attempt_at LIMIT ?2"
+                ),
+                vec![Value::Int(now.0), Value::Int(i64::from(limit))],
+            )
+            .await?;
+        rows.iter().map(model::outbox_from_row).collect()
+    }
+
+    async fn list_failed_replication(&self, limit: u32) -> Result<Vec<OutboxEntry>, MetaError> {
+        let rows = self
+            .reader()
+            .query(
+                &format!(
+                    "SELECT {OUTBOX_COLS} FROM replication_outbox WHERE status='failed' ORDER BY next_attempt_at DESC LIMIT ?1"
+                ),
+                vec![Value::Int(i64::from(limit))],
+            )
+            .await?;
+        rows.iter().map(model::outbox_from_row).collect()
+    }
+
+    async fn user_by_bearer_key(
+        &self,
+        access_key_id: &str,
+    ) -> Result<Option<UserWithBearerHash>, MetaError> {
+        let row = query_one(
+            self.reader(),
+            &format!("SELECT {USER_COLS} FROM users WHERE access_key_id=?1"),
+            vec![Value::Text(access_key_id.to_owned())],
+        )
+        .await?;
+        row.as_ref()
+            .map(model::user_with_bearer_from_row)
+            .transpose()
+    }
+
+    async fn user_by_sigv4_key(
+        &self,
+        access_key_id: &str,
+    ) -> Result<Option<UserSigV4Credentials>, MetaError> {
+        let row = query_one(
+            self.reader(),
+            &format!("SELECT {USER_COLS} FROM users WHERE sigv4_access_key_id=?1"),
+            vec![Value::Text(access_key_id.to_owned())],
+        )
+        .await?;
+        match row {
+            Some(r) => model::user_sigv4_from_row(&r),
+            None => Ok(None),
+        }
+    }
+
+    async fn count_users(&self) -> Result<u64, MetaError> {
+        let row = query_one(self.reader(), "SELECT COUNT(*) FROM users", vec![]).await?;
+        Ok(row.map_or(0, |r| r.get_i64(0)) as u64)
+    }
+
+    async fn list_users(&self) -> Result<Vec<User>, MetaError> {
+        let rows = self
+            .reader()
+            .query(
+                &format!("SELECT {USER_COLS} FROM users ORDER BY created_at"),
+                vec![],
+            )
+            .await?;
+        rows.iter().map(model::user_from_row).collect()
+    }
+
+    async fn list_activity(&self, limit: u32) -> Result<Vec<ActivityEntry>, MetaError> {
+        let rows = self
+            .reader()
+            .query(
+                &format!("SELECT {ACTIVITY_COLS} FROM activity ORDER BY at DESC LIMIT ?1"),
+                vec![Value::Int(i64::from(limit))],
+            )
+            .await?;
+        rows.iter().map(model::activity_from_row).collect()
+    }
+
+    async fn aggregate_counts(&self) -> Result<StoreCounts, MetaError> {
+        let driver = self.reader();
+        let buckets = query_one(driver, "SELECT COUNT(*) FROM buckets", vec![])
+            .await?
+            .map_or(0, |r| r.get_i64(0));
+        let agg = query_one(
+            driver,
+            "SELECT
+                COALESCE(SUM(CASE WHEN is_latest=1 AND is_delete_marker=0 THEN 1 ELSE 0 END),0),
+                COALESCE(SUM(size_logical),0),
+                COALESCE(SUM(size_physical),0)
+             FROM object_versions",
+            vec![],
+        )
+        .await?
+        .unwrap_or_default();
+        let (objects, logical, physical) = (agg.get_i64(0), agg.get_i64(1), agg.get_i64(2));
+        let versions = query_one(driver, "SELECT COUNT(*) FROM object_versions", vec![])
+            .await?
+            .map_or(0, |r| r.get_i64(0));
+        Ok(StoreCounts {
+            buckets: buckets as u64,
+            objects: objects as u64,
+            versions: versions as u64,
+            logical_bytes: logical as u64,
+            physical_bytes: physical as u64,
+        })
+    }
+}
+
+/// A [`cairn_types::traits::ReconcileOracle`] answering membership questions against the live
+/// metadata, backed by the same read pool as the store.
+#[derive(Clone)]
+pub struct LibsqlReconcileOracle {
+    reads: Arc<ReadPool>,
+}
+
+impl std::fmt::Debug for LibsqlReconcileOracle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LibsqlReconcileOracle")
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait::async_trait]
+impl cairn_types::traits::ReconcileOracle for LibsqlReconcileOracle {
+    async fn live_blobs(&self, candidates: &[StoragePath]) -> Result<Vec<bool>, MetaError> {
+        let driver = self.reads.pick();
+        let mut out = Vec::with_capacity(candidates.len());
+        for p in candidates {
+            let row: Option<Row> = query_one(
+                driver,
+                "SELECT EXISTS(SELECT 1 FROM object_versions WHERE storage_path=?1)",
+                vec![Value::Text(p.as_str().to_owned())],
+            )
+            .await?;
+            out.push(row.is_some_and(|r| r.get_i64(0) != 0));
+        }
+        Ok(out)
+    }
+
+    async fn live_session(&self, upload: &UploadId) -> Result<bool, MetaError> {
+        let row = query_one(
+            self.reads.pick(),
+            "SELECT EXISTS(SELECT 1 FROM multipart_uploads WHERE id=?1)",
+            vec![Value::Text(upload.as_str().to_owned())],
+        )
+        .await?;
+        Ok(row.is_some_and(|r| r.get_i64(0) != 0))
+    }
+}

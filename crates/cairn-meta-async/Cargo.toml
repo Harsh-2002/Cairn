@@ -1,0 +1,29 @@
+[package]
+name = "cairn-meta-async"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Async libSQL metadata store for Cairn: an async group-committing writer + async reads, behaviour-identical to cairn-meta."
+
+[lints]
+workspace = true
+
+[dependencies]
+cairn-types.workspace = true
+async-trait.workspace = true
+# libSQL embedded Rust driver (the SQLite-compatible fork). Only the `core` feature is needed
+# for a local embedded database; the default replication/remote/sync/tls features pull in a
+# large dependency tree we do not use, so they are disabled.
+libsql = { version = "0.10.0-pre.4", default-features = false, features = ["core"] }
+tokio = { workspace = true, features = ["rt", "sync", "macros", "time"] }
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+cairn-types = { workspace = true, features = ["testing"] }
+cairn-meta.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+tempfile.workspace = true

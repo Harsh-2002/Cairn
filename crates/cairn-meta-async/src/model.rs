@@ -1,0 +1,366 @@
+//! Conversions between driver [`Row`]s and domain types, and the enum<->text mappings, ported
+//! from `cairn-meta/src/model.rs`. The rusqlite store maps rows by column name; the async
+//! driver yields positional cells, so reads select an explicit, fixed column list (the `*_COLS`
+//! constants below) and the mappers index those positions. The JSON column encoding, the
+//! enum<->text strings, and the resulting domain values are identical to the rusqlite store.
+
+use crate::driver::{Row, Value};
+use cairn_types::MetaError;
+use cairn_types::auth::Role;
+use cairn_types::authz::{Acl, OwnershipMode};
+use cairn_types::bucket::{Bucket, CompressionPolicy, VersioningState};
+use cairn_types::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
+use cairn_types::meta::{
+    ActivityEntry, MultipartSession, MultipartStatus, ObjectSummary, OutboxEntry, PartRecord,
+    ReplicationOp, ReplicationStatus, User, UserRecord, UserSigV4Credentials, UserWithBearerHash,
+};
+use cairn_types::object::{
+    ChecksumValue, CompressionDescriptor, ETag, ObjectVersionRow, StorageClass, UserMetadata,
+};
+use cairn_types::time::Timestamp;
+
+// --- canonical column lists (fix the positional order the mappers index) ---
+
+/// `object_versions` columns in mapper order.
+pub const OBJECT_VERSION_COLS: &str = "id, bucket_name, key, version_id, is_latest, \
+     is_delete_marker, size_logical, size_physical, etag, content_type, storage_path, \
+     compression, storage_class, cold_locator, owner_id, user_metadata, acl, checksums, \
+     sse_descriptor, replication_status, created_at, updated_at";
+
+/// `buckets` columns in mapper order.
+pub const BUCKET_COLS: &str =
+    "name, owner_id, created_at, versioning_state, ownership_mode, region, compression_policy";
+
+/// `multipart_uploads` columns in mapper order.
+pub const MULTIPART_COLS: &str = "id, bucket_name, key, content_type, status, owner_id, \
+     intended_acl, user_metadata, created_at, updated_at";
+
+/// `multipart_parts` columns in mapper order.
+pub const PART_COLS: &str = "part_number, size, etag, storage_path, checksum";
+
+/// `users` columns in mapper order (with the secret hash for the bearer mapper).
+pub const USER_COLS: &str = "id, display_name, access_key_id, secret_hash, sigv4_access_key_id, \
+     sigv4_secret_ciphertext, sigv4_secret_nonce, role, is_active, created_at, updated_at";
+
+/// `replication_outbox` columns in mapper order.
+pub const OUTBOX_COLS: &str = "id, bucket_name, key, version_id, operation, rule_id, attempts, \
+     next_attempt_at, status, last_error";
+
+/// `activity` columns in mapper order.
+pub const ACTIVITY_COLS: &str = "id, action, bucket, key, size, etag, actor, at";
+
+/// `object_summary` listing columns in mapper order.
+pub const SUMMARY_COLS: &str = "key, version_id, is_latest, is_delete_marker, etag, size_logical, \
+     updated_at, storage_class, owner_id";
+
+fn json_col<T: serde::de::DeserializeOwned>(s: &str) -> Result<T, MetaError> {
+    serde_json::from_str(s).map_err(|e| MetaError::Engine(format!("json column decode: {e}")))
+}
+
+/// Serialize a value to a JSON column string.
+pub fn to_json<T: serde::Serialize>(v: &T) -> String {
+    serde_json::to_string(v).expect("domain types serialize cleanly")
+}
+
+// --- enum <-> text (verbatim from cairn-meta/src/model.rs) ---
+
+pub fn role_str(r: Role) -> &'static str {
+    match r {
+        Role::Administrator => "administrator",
+        Role::Member => "member",
+    }
+}
+pub fn role_from(s: &str) -> Role {
+    match s {
+        "administrator" => Role::Administrator,
+        _ => Role::Member,
+    }
+}
+
+pub fn versioning_str(v: VersioningState) -> &'static str {
+    match v {
+        VersioningState::Unversioned => "unversioned",
+        VersioningState::Enabled => "enabled",
+        VersioningState::Suspended => "suspended",
+    }
+}
+
+pub fn versioning_from(s: &str) -> VersioningState {
+    match s {
+        "enabled" => VersioningState::Enabled,
+        "suspended" => VersioningState::Suspended,
+        _ => VersioningState::Unversioned,
+    }
+}
+
+pub fn ownership_str(o: OwnershipMode) -> &'static str {
+    match o {
+        OwnershipMode::BucketOwnerEnforced => "BucketOwnerEnforced",
+        OwnershipMode::BucketOwnerPreferred => "BucketOwnerPreferred",
+        OwnershipMode::ObjectWriter => "ObjectWriter",
+    }
+}
+pub fn ownership_from(s: &str) -> OwnershipMode {
+    match s {
+        "BucketOwnerPreferred" => OwnershipMode::BucketOwnerPreferred,
+        "ObjectWriter" => OwnershipMode::ObjectWriter,
+        _ => OwnershipMode::BucketOwnerEnforced,
+    }
+}
+
+pub fn mp_status_str(s: MultipartStatus) -> &'static str {
+    match s {
+        MultipartStatus::Active => "active",
+        MultipartStatus::Completing => "completing",
+        MultipartStatus::Aborted => "aborted",
+    }
+}
+pub fn mp_status_from(s: &str) -> MultipartStatus {
+    match s {
+        "completing" => MultipartStatus::Completing,
+        "aborted" => MultipartStatus::Aborted,
+        _ => MultipartStatus::Active,
+    }
+}
+
+pub fn repl_status_str(s: ReplicationStatus) -> &'static str {
+    match s {
+        ReplicationStatus::Pending => "pending",
+        ReplicationStatus::Completed => "completed",
+        ReplicationStatus::Failed => "failed",
+        ReplicationStatus::Replica => "replica",
+    }
+}
+pub fn repl_status_from(s: &str) -> ReplicationStatus {
+    match s {
+        "completed" => ReplicationStatus::Completed,
+        "failed" => ReplicationStatus::Failed,
+        "replica" => ReplicationStatus::Replica,
+        _ => ReplicationStatus::Pending,
+    }
+}
+
+pub fn repl_op_str(o: ReplicationOp) -> &'static str {
+    match o {
+        ReplicationOp::ObjectCreate => "object_create",
+        ReplicationOp::DeleteMarker => "delete_marker",
+    }
+}
+pub fn repl_op_from(s: &str) -> ReplicationOp {
+    match s {
+        "delete_marker" => ReplicationOp::DeleteMarker,
+        _ => ReplicationOp::ObjectCreate,
+    }
+}
+
+pub fn storage_class_str(c: StorageClass) -> &'static str {
+    match c {
+        StorageClass::Standard => "standard",
+        StorageClass::ColdTier => "cold_tier",
+    }
+}
+pub fn storage_class_from(s: &str) -> StorageClass {
+    match s {
+        "cold_tier" => StorageClass::ColdTier,
+        _ => StorageClass::Standard,
+    }
+}
+
+// --- row -> domain (positional, per the *_COLS lists) ---
+
+pub fn object_version_from_row(row: &Row) -> Result<ObjectVersionRow, MetaError> {
+    let compression: CompressionDescriptor = json_col(&row.get_text(11))?;
+    let user_metadata: UserMetadata = json_col(&row.get_text(15))?;
+    let acl: Option<Acl> = match row.get_opt_text(16) {
+        Some(s) => Some(json_col(&s)?),
+        None => None,
+    };
+    let checksums: Vec<ChecksumValue> = json_col(&row.get_text(17))?;
+    Ok(ObjectVersionRow {
+        id: row.get_text(0),
+        bucket: BucketName::parse(&row.get_text(1)).unwrap_or_else(|_| unreachable_bucket()),
+        key: ObjectKey::parse(&row.get_text(2)).unwrap_or_else(|_| unreachable_key()),
+        version_id: VersionId::from_string(row.get_text(3)),
+        is_latest: row.get_i64(4) != 0,
+        is_delete_marker: row.get_i64(5) != 0,
+        size_logical: row.get_i64(6) as u64,
+        size_physical: row.get_i64(7) as u64,
+        etag: ETag::from_string(row.get_text(8)),
+        content_type: row.get_text(9),
+        storage_path: row.get_opt_text(10).map(StoragePath::from_string),
+        compression,
+        storage_class: storage_class_from(&row.get_text(12)),
+        cold_locator: row.get_opt_text(13),
+        owner_id: UserId(row.get_text(14)),
+        user_metadata,
+        acl,
+        checksums,
+        sse_descriptor: row.get_opt_text(18),
+        replication_status: row.get_opt_text(19).map(|s| repl_status_from(&s)),
+        created_at: Timestamp(row.get_i64(20)),
+        updated_at: Timestamp(row.get_i64(21)),
+    })
+}
+
+pub fn object_summary_from_row(row: &Row) -> Result<ObjectSummary, MetaError> {
+    Ok(ObjectSummary {
+        key: ObjectKey::parse(&row.get_text(0)).unwrap_or_else(|_| unreachable_key()),
+        version_id: VersionId::from_string(row.get_text(1)),
+        is_latest: row.get_i64(2) != 0,
+        is_delete_marker: row.get_i64(3) != 0,
+        etag: ETag::from_string(row.get_text(4)),
+        size: row.get_i64(5) as u64,
+        last_modified: Timestamp(row.get_i64(6)),
+        storage_class: storage_class_from(&row.get_text(7)),
+        owner_id: UserId(row.get_text(8)),
+    })
+}
+
+pub fn bucket_from_row(row: &Row) -> Result<Bucket, MetaError> {
+    // The column is `compression_policy` per ARCH §34.1; the domain field stays `compression`.
+    let compression: Option<CompressionPolicy> = match row.get_opt_text(6) {
+        Some(s) => Some(json_col(&s)?),
+        None => None,
+    };
+    Ok(Bucket {
+        name: BucketName::parse(&row.get_text(0)).unwrap_or_else(|_| unreachable_bucket()),
+        owner_id: UserId(row.get_text(1)),
+        created_at: Timestamp(row.get_i64(2)),
+        versioning: versioning_from(&row.get_text(3)),
+        ownership_mode: ownership_from(&row.get_text(4)),
+        region: row.get_text(5),
+        compression,
+    })
+}
+
+pub fn multipart_from_row(row: &Row) -> Result<MultipartSession, MetaError> {
+    let intended_acl: Option<Acl> = match row.get_opt_text(6) {
+        Some(s) => Some(json_col(&s)?),
+        None => None,
+    };
+    let user_metadata: UserMetadata = json_col(&row.get_text(7))?;
+    Ok(MultipartSession {
+        upload_id: UploadId::from_string(row.get_text(0)),
+        bucket: BucketName::parse(&row.get_text(1)).unwrap_or_else(|_| unreachable_bucket()),
+        key: ObjectKey::parse(&row.get_text(2)).unwrap_or_else(|_| unreachable_key()),
+        content_type: row.get_text(3),
+        status: mp_status_from(&row.get_text(4)),
+        owner_id: UserId(row.get_text(5)),
+        intended_acl,
+        user_metadata,
+        created_at: Timestamp(row.get_i64(8)),
+        updated_at: Timestamp(row.get_i64(9)),
+    })
+}
+
+pub fn part_from_row(row: &Row) -> Result<PartRecord, MetaError> {
+    let checksum: Option<ChecksumValue> = match row.get_opt_text(4) {
+        Some(s) => Some(json_col(&s)?),
+        None => None,
+    };
+    Ok(PartRecord {
+        part_number: row.get_i64(0) as u16,
+        size: row.get_i64(1) as u64,
+        etag: row.get_text(2),
+        storage_path: StoragePath::from_string(row.get_text(3)),
+        checksum,
+    })
+}
+
+pub fn user_from_row(row: &Row) -> Result<User, MetaError> {
+    Ok(User {
+        id: UserId(row.get_text(0)),
+        display_name: row.get_text(1),
+        access_key_id: row.get_text(2),
+        sigv4_access_key_id: row.get_opt_text(4),
+        role: role_from(&row.get_text(7)),
+        is_active: row.get_i64(8) != 0,
+        created_at: Timestamp(row.get_i64(9)),
+        updated_at: Timestamp(row.get_i64(10)),
+    })
+}
+
+pub fn user_with_bearer_from_row(row: &Row) -> Result<UserWithBearerHash, MetaError> {
+    Ok(UserWithBearerHash {
+        user: user_from_row(row)?,
+        secret_hash: row.get_text(3),
+    })
+}
+
+pub fn user_sigv4_from_row(row: &Row) -> Result<Option<UserSigV4Credentials>, MetaError> {
+    let ct = row.get_opt_blob(5);
+    let nonce = row.get_opt_blob(6);
+    match (ct, nonce) {
+        (Some(secret_ciphertext), Some(secret_nonce)) => Ok(Some(UserSigV4Credentials {
+            user: user_from_row(row)?,
+            secret_ciphertext,
+            secret_nonce,
+        })),
+        _ => Ok(None),
+    }
+}
+
+pub fn outbox_from_row(row: &Row) -> Result<OutboxEntry, MetaError> {
+    Ok(OutboxEntry {
+        id: row.get_text(0),
+        bucket: BucketName::parse(&row.get_text(1)).unwrap_or_else(|_| unreachable_bucket()),
+        key: ObjectKey::parse(&row.get_text(2)).unwrap_or_else(|_| unreachable_key()),
+        version_id: VersionId::from_string(row.get_text(3)),
+        operation: repl_op_from(&row.get_text(4)),
+        rule_id: row.get_text(5),
+        attempts: row.get_i64(6) as u32,
+        next_attempt_at: Timestamp(row.get_i64(7)),
+        status: repl_status_from(&row.get_text(8)),
+        last_error: row.get_opt_text(9),
+    })
+}
+
+pub fn activity_from_row(row: &Row) -> Result<ActivityEntry, MetaError> {
+    Ok(ActivityEntry {
+        id: row.get_text(0),
+        action: row.get_text(1),
+        bucket: row.get_opt_text(2),
+        key: row.get_opt_text(3),
+        size: row.get_opt_i64(4).map(|s| s as u64),
+        etag: row.get_opt_text(5),
+        actor: row.get_opt_text(6),
+        at: Timestamp(row.get_i64(7)),
+    })
+}
+
+/// Build the full credential column values for inserts/updates, as bound [`Value`]s in the
+/// `users` insert order.
+pub fn user_record_values(rec: &UserRecord) -> Vec<Value> {
+    vec![
+        Value::Text(rec.user.id.0.clone()),
+        Value::Text(rec.user.display_name.clone()),
+        Value::Text(rec.user.access_key_id.clone()),
+        Value::Text(rec.bearer_secret_hash.clone()),
+        opt_text(rec.user.sigv4_access_key_id.clone()),
+        opt_blob(rec.sigv4_secret_ciphertext.clone()),
+        opt_blob(rec.sigv4_secret_nonce.clone()),
+        Value::Text(role_str(rec.user.role).to_owned()),
+        Value::Int(i64::from(rec.user.is_active)),
+        Value::Int(rec.user.created_at.0),
+        Value::Int(rec.user.updated_at.0),
+    ]
+}
+
+/// `Some(text)` -> text value, `None` -> NULL.
+pub fn opt_text(s: Option<String>) -> Value {
+    s.map_or(Value::Null, Value::Text)
+}
+
+/// `Some(bytes)` -> blob value, `None` -> NULL.
+pub fn opt_blob(b: Option<Vec<u8>>) -> Value {
+    b.map_or(Value::Null, Value::Blob)
+}
+
+// These two are only reached if the database somehow holds an invalid name/key, which our own
+// writes never produce; we keep listing/reads infallible rather than poisoning a page.
+fn unreachable_bucket() -> BucketName {
+    BucketName::parse("invalid-bucket").expect("placeholder is valid")
+}
+fn unreachable_key() -> ObjectKey {
+    ObjectKey::parse("invalid-key").expect("placeholder is valid")
+}

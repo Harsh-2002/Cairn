@@ -9,9 +9,16 @@
 
 mod compress;
 mod hash;
+#[cfg(feature = "io-uring")]
+mod uring;
+// The staging sink abstracts the durable-write file ops so the default `tokio::fs` path and the
+// optional io_uring path are interchangeable (ARCH §8.2). Each backend implements create →
+// streamed writes → commit (fsync file → rename → fsync dir) / abort with the same ordering.
+mod staging;
 
 use crate::compress::{BlockEncoder, CompressedReader, is_precompressed};
 use crate::hash::Hashers;
+use crate::staging::Staging;
 use async_trait::async_trait;
 use bytes::Bytes;
 use cairn_types::blob::{
@@ -27,7 +34,6 @@ use cairn_types::traits::{BlobStore, ReconcileOracle};
 use futures_util::StreamExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use tokio::io::{AsyncWriteExt, BufWriter};
 
 const STAGING: &str = ".staging";
 const READ_CHUNK: usize = 64 * 1024;
@@ -36,7 +42,7 @@ const READ_CHUNK: usize = 64 * 1024;
 /// 65536) while bounding the amount decrypted for a small ranged read.
 const DEFAULT_ENCRYPTED_BLOCK_SIZE: u32 = 64 * 1024;
 
-fn io_err(e: std::io::Error) -> BlobError {
+pub(crate) fn io_err(e: std::io::Error) -> BlobError {
     if e.kind() == std::io::ErrorKind::StorageFull || e.raw_os_error() == Some(28) {
         BlobError::OutOfSpace
     } else {
@@ -49,10 +55,20 @@ fn io_err(e: std::io::Error) -> BlobError {
 #[derive(Debug, Clone)]
 pub struct LocalBlobStore {
     data_root: Arc<PathBuf>,
+    /// Whether the durable single-object staging write path runs through the io_uring executor.
+    /// Always `false` unless the `io-uring` feature is compiled in; the field exists
+    /// unconditionally so the struct shape is feature-independent, but it can only be set `true`
+    /// under the feature (see [`LocalBlobStore::with_io_uring`]).
+    use_uring: bool,
 }
 
 impl LocalBlobStore {
     /// Open (creating the staging area) a blob store rooted at `data_root`.
+    ///
+    /// When built with the `io-uring` feature, the durable single-object staging write path
+    /// (create tmp → write → fsync → rename → fsync dir) runs on the io_uring executor by
+    /// default; without the feature it always uses `tokio::fs`. Use [`Self::with_io_uring`] to
+    /// override the choice explicitly (e.g. to compare backends in a benchmark).
     ///
     /// # Errors
     /// Returns a [`BlobError`] if the staging directory cannot be created.
@@ -63,7 +79,18 @@ impl LocalBlobStore {
             .map_err(io_err)?;
         Ok(Self {
             data_root: Arc::new(data_root),
+            use_uring: cfg!(feature = "io-uring"),
         })
+    }
+
+    /// Override whether the io_uring staging write path is used. Has effect only when the
+    /// `io-uring` feature is compiled in; without it the store always uses `tokio::fs` and this
+    /// returns the store unchanged. Primarily for benchmarks and tests that want to exercise a
+    /// specific backend deterministically.
+    #[must_use]
+    pub fn with_io_uring(mut self, enabled: bool) -> Self {
+        self.use_uring = enabled && cfg!(feature = "io-uring");
+        self
     }
 
     fn resolve(&self, sp: &StoragePath) -> Result<PathBuf, BlobError> {
@@ -109,7 +136,7 @@ impl LocalBlobStore {
     }
 }
 
-async fn fsync_dir(dir: &Path) -> Result<(), BlobError> {
+pub(crate) async fn fsync_dir(dir: &Path) -> Result<(), BlobError> {
     let d = tokio::fs::File::open(dir).await.map_err(io_err)?;
     d.sync_all().await.map_err(io_err)?;
     Ok(())
@@ -152,9 +179,11 @@ async fn is_compressed_blob(path: &Path) -> Result<bool, BlobError> {
     .map_err(|e| BlobError::Io(e.to_string()))?
 }
 
-/// Stream a body into a staging file, applying compression and hashing in one pass.
+/// Stream a body into a staging file, applying compression and hashing in one pass. The staging
+/// sink abstracts the file backend (default `tokio::fs`, or io_uring under the feature), so this
+/// transform is identical on both paths.
 async fn write_staged(
-    file: &mut BufWriter<tokio::fs::File>,
+    file: &mut Staging,
     mut body: cairn_types::BodyStream,
     opts: &StageOptions,
 ) -> Result<
@@ -200,11 +229,11 @@ async fn write_staged(
             }
             hashers.update(&chunk);
             let phys = enc.feed(&chunk);
-            file.write_all(&phys).await.map_err(io_err)?;
+            file.write_all(&phys).await?;
             physical += phys.len() as u64;
         }
         let tail = enc.finish()?;
-        file.write_all(&tail).await.map_err(io_err)?;
+        file.write_all(&tail).await?;
         physical += tail.len() as u64;
         let (md5, checks) = hashers.finalize();
         // The descriptor records the logical compression of the object. Encryption is recorded on
@@ -226,7 +255,7 @@ async fn write_staged(
                 return Err(BlobError::SizeExceeded);
             }
             hashers.update(&chunk);
-            file.write_all(&chunk).await.map_err(io_err)?;
+            file.write_all(&chunk).await?;
             physical += chunk.len() as u64;
         }
         let (md5, checks) = hashers.finalize();
@@ -304,6 +333,52 @@ fn read_stream(
     }))
 }
 
+impl LocalBlobStore {
+    /// Read each part in order, hashing the plaintext, applying the (optional) block
+    /// encoder/encrypter, and streaming the physical bytes into the staging sink. Factored out of
+    /// `assemble` so the caller can `abort` the sink on any error without duplicating the unlink.
+    #[allow(clippy::too_many_arguments)]
+    async fn assemble_into(
+        &self,
+        sink: &mut Staging,
+        parts: &[PartRef],
+        hasher: &mut md5::Md5,
+        enc: &mut Option<BlockEncoder>,
+        logical: &mut u64,
+        physical: &mut u64,
+    ) -> Result<(), BlobError> {
+        use md5::Digest;
+        use tokio::io::AsyncReadExt;
+        for part in parts {
+            let part_path = self.resolve(&part.storage_path)?;
+            let mut f = tokio::fs::File::open(&part_path)
+                .await
+                .map_err(|_| BlobError::NotFound)?;
+            let mut buf = vec![0u8; READ_CHUNK];
+            loop {
+                let n = f.read(&mut buf).await.map_err(io_err)?;
+                if n == 0 {
+                    break;
+                }
+                *logical += n as u64;
+                hasher.update(&buf[..n]);
+                match enc {
+                    Some(e) => {
+                        let phys = e.feed(&buf[..n]);
+                        sink.write_all(&phys).await?;
+                        *physical += phys.len() as u64;
+                    }
+                    None => {
+                        sink.write_all(&buf[..n]).await?;
+                        *physical += n as u64;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl BlobStore for LocalBlobStore {
     async fn stage(
@@ -318,25 +393,20 @@ impl BlobStore for LocalBlobStore {
         let final_path = bucket_dir.join(&id);
         let storage_path = StoragePath::from_string(format!("{}/{}", bucket.as_str(), id));
 
-        let file = tokio::fs::File::create(&staging).await.map_err(io_err)?;
-        let mut writer = BufWriter::new(file);
-        let outcome = write_staged(&mut writer, body, &opts).await;
+        let mut sink = Staging::create(staging, self.use_uring).await?;
+        let outcome = write_staged(&mut sink, body, &opts).await;
         let (logical, physical, md5, checksums, descriptor) = match outcome {
             Ok(v) => v,
             Err(e) => {
-                let _ = tokio::fs::remove_file(&staging).await;
+                sink.abort().await;
                 return Err(e);
             }
         };
-        writer.flush().await.map_err(io_err)?;
-        let file = writer.into_inner();
-        // 1) fsync the staged file, 2) rename it in, 3) fsync the destination directory.
-        file.sync_all().await.map_err(io_err)?;
+        // Create (and fsync the parent of) the bucket directory *before* the rename, so the
+        // commit can rename into an already-durable directory entry (F-1, ARCH §8.2 step 4). The
+        // commit itself performs: fsync the staged file → rename → fsync the destination dir.
         ensure_bucket_dir(&self.data_root, &bucket_dir).await?;
-        tokio::fs::rename(&staging, &final_path)
-            .await
-            .map_err(io_err)?;
-        fsync_dir(&bucket_dir).await?;
+        sink.commit(&final_path, &bucket_dir).await?;
         // The crash window the durability ordering protects: the blob is now durable but no
         // metadata row references it yet. A crash here leaves an orphan that reconcile reclaims.
         fail::fail_point!("blob_after_durable");
@@ -445,18 +515,16 @@ impl BlobStore for LocalBlobStore {
             content_type: String::new(),
             ..StageOptions::default()
         };
-        let file = tokio::fs::File::create(&path).await.map_err(io_err)?;
-        let mut writer = BufWriter::new(file);
-        let (logical, _phys, md5, _checks, _desc) =
-            match write_staged(&mut writer, body, &opts).await {
-                Ok(v) => v,
-                Err(e) => {
-                    let _ = tokio::fs::remove_file(&path).await;
-                    return Err(e);
-                }
-            };
-        writer.flush().await.map_err(io_err)?;
-        writer.into_inner().sync_all().await.map_err(io_err)?;
+        let mut sink = Staging::create(path, self.use_uring).await?;
+        let (logical, _phys, md5, _checks, _desc) = match write_staged(&mut sink, body, &opts).await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                sink.abort().await;
+                return Err(e);
+            }
+        };
+        sink.fsync_in_place().await?;
         Ok(StagedPart {
             storage_path: StoragePath::from_string(format!(
                 "{}/multipart/{}/{}",
@@ -495,8 +563,7 @@ impl BlobStore for LocalBlobStore {
                 block_size: DEFAULT_ENCRYPTED_BLOCK_SIZE,
             })
         });
-        let file = tokio::fs::File::create(&staging).await.map_err(io_err)?;
-        let mut writer = BufWriter::new(file);
+        let mut sink = Staging::create(staging, self.use_uring).await?;
         use md5::Digest;
         let mut hasher = md5::Md5::new();
         let mut logical: u64 = 0;
@@ -506,36 +573,29 @@ impl BlobStore for LocalBlobStore {
             None => BlockEncoder::new(p.algorithm, p.block_size),
         });
 
-        for part in parts {
-            let part_path = self.resolve(&part.storage_path)?;
-            let mut f = tokio::fs::File::open(&part_path)
-                .await
-                .map_err(|_| BlobError::NotFound)?;
-            let mut buf = vec![0u8; READ_CHUNK];
-            use tokio::io::AsyncReadExt;
-            loop {
-                let n = f.read(&mut buf).await.map_err(io_err)?;
-                if n == 0 {
-                    break;
-                }
-                logical += n as u64;
-                hasher.update(&buf[..n]);
-                match &mut enc {
-                    Some(e) => {
-                        let phys = e.feed(&buf[..n]);
-                        writer.write_all(&phys).await.map_err(io_err)?;
-                        physical += phys.len() as u64;
-                    }
-                    None => {
-                        writer.write_all(&buf[..n]).await.map_err(io_err)?;
-                        physical += n as u64;
-                    }
-                }
-            }
+        // The assemble write path mirrors `stage`: on any error before commit, unlink the staged
+        // tmp via the same backend that created it, then propagate. A small closure keeps the
+        // sink's `abort` reachable from each fallible step without a flag dance.
+        let assembled = self
+            .assemble_into(
+                &mut sink,
+                parts,
+                &mut hasher,
+                &mut enc,
+                &mut logical,
+                &mut physical,
+            )
+            .await;
+        if let Err(e) = assembled {
+            sink.abort().await;
+            return Err(e);
         }
         let descriptor = if let Some(e) = enc {
             let tail = e.finish()?;
-            writer.write_all(&tail).await.map_err(io_err)?;
+            if let Err(err) = sink.write_all(&tail).await {
+                sink.abort().await;
+                return Err(err);
+            }
             physical += tail.len() as u64;
             // Record `Compressed` only when a compression policy was actually in force; an
             // encryption-only block container leaves the logical compression as `Uncompressed`.
@@ -550,14 +610,8 @@ impl BlobStore for LocalBlobStore {
             CompressionDescriptor::Uncompressed
         };
 
-        writer.flush().await.map_err(io_err)?;
-        let file = writer.into_inner();
-        file.sync_all().await.map_err(io_err)?;
         ensure_bucket_dir(&self.data_root, &bucket_dir).await?;
-        tokio::fs::rename(&staging, &final_path)
-            .await
-            .map_err(io_err)?;
-        fsync_dir(&bucket_dir).await?;
+        sink.commit(&final_path, &bucket_dir).await?;
         fail::fail_point!("blob_after_assemble");
 
         let md5_hex = hex::encode(hasher.finalize());

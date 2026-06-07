@@ -512,3 +512,205 @@ async fn delete_is_idempotent_and_paths_are_safe() {
     let evil = StoragePath::from_string("../../../etc/passwd".to_owned());
     assert!(store.open(&evil, None).await.is_err());
 }
+
+/// An object staged through the io_uring write path reads back byte-for-byte identically and with
+/// the same ETag as the same bytes staged through the default `tokio::fs` path. This exercises the
+/// dedicated io_uring executor end to end: create the staging tmp, stream the payload, fsync,
+/// rename, fsync the bucket dir (the F-1 ordering), then read the committed blob back. Multi-chunk
+/// and large bodies confirm the running-offset positional writes reassemble correctly.
+#[cfg(feature = "io-uring")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn io_uring_staged_object_reads_back_identically() {
+    let dir = tempfile::tempdir().unwrap();
+    // Two stores over the same root: one forced onto the io_uring path, one onto tokio::fs.
+    let uring = LocalBlobStore::open(dir.path())
+        .await
+        .unwrap()
+        .with_io_uring(true);
+    let epoll = LocalBlobStore::open(dir.path())
+        .await
+        .unwrap()
+        .with_io_uring(false);
+    let b = BucketName::parse("bkt").unwrap();
+
+    // A payload large enough to span many write chunks, delivered in small chunks.
+    let data: Vec<u8> = (0..(1u32 << 18))
+        .map(|i| i.wrapping_mul(2_654_435_761) as u8)
+        .collect();
+
+    let via_uring = uring
+        .stage(
+            &b,
+            chunked_body(data.clone(), 7000),
+            opts(None, "application/octet-stream"),
+        )
+        .await
+        .unwrap();
+    let via_epoll = epoll
+        .stage(
+            &b,
+            chunked_body(data.clone(), 7000),
+            opts(None, "application/octet-stream"),
+        )
+        .await
+        .unwrap();
+
+    // Same plaintext MD5/ETag and size from both backends.
+    assert_eq!(via_uring.etag.as_str(), via_epoll.etag.as_str());
+    assert_eq!(via_uring.size_logical, data.len() as u64);
+    assert_eq!(via_uring.size_physical, via_epoll.size_physical);
+
+    // The blob committed by the io_uring path reads back byte-for-byte.
+    assert_eq!(read_all(&uring, &via_uring.storage_path, None).await, data);
+    // And it is fully readable through a store using the default backend, too — the on-disk
+    // artifact is identical regardless of which path wrote it.
+    assert_eq!(read_all(&epoll, &via_uring.storage_path, None).await, data);
+
+    // A ranged read of the io_uring-staged blob returns the matching slice.
+    let range = ByteRange {
+        offset: 100_000,
+        length: 4096,
+    };
+    assert_eq!(
+        read_all(&uring, &via_uring.storage_path, Some(range)).await,
+        &data[100_000..104_096]
+    );
+}
+
+/// The io_uring path honours the durable-commit ordering across compression, encryption, and
+/// multipart assembly: each variant staged through io_uring round-trips to the original bytes.
+#[cfg(feature = "io-uring")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn io_uring_compressed_encrypted_and_multipart_roundtrip() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(dir.path())
+        .await
+        .unwrap()
+        .with_io_uring(true);
+    let b = BucketName::parse("bkt").unwrap();
+    let data: Vec<u8> = b"the quick brown fox "
+        .iter()
+        .copied()
+        .cycle()
+        .take(40_000)
+        .collect();
+    let policy = CompressionPolicy {
+        algorithm: CompressionAlgorithm::Zstd,
+        block_size: 4096,
+    };
+    let dek = [0x5au8; 32];
+
+    // Compressed + encrypted single-shot stage via io_uring.
+    let enc = store
+        .stage(
+            &b,
+            chunked_body(data.clone(), 1234),
+            opts_encrypted(Some(policy), "text/plain", dek),
+        )
+        .await
+        .unwrap();
+    assert!(enc.size_physical < enc.size_logical, "compressed on disk");
+    assert_eq!(
+        read_all_dek(&store, &enc.storage_path, None, Some(dek))
+            .await
+            .unwrap(),
+        data
+    );
+
+    // Multipart parts staged + assembled via io_uring.
+    let upload = UploadId::generate();
+    let p1 = store
+        .stage_part(&upload, 1, body(b"uring-part-one-".to_vec()), 1 << 20)
+        .await
+        .unwrap();
+    let p2 = store
+        .stage_part(&upload, 2, body(b"uring-part-two".to_vec()), 1 << 20)
+        .await
+        .unwrap();
+    let refs = vec![
+        PartRef {
+            part_number: 1,
+            storage_path: p1.storage_path.clone(),
+            size: p1.size,
+        },
+        PartRef {
+            part_number: 2,
+            storage_path: p2.storage_path.clone(),
+            size: p2.size,
+        },
+    ];
+    let assembled = store
+        .assemble(&b, &refs, opts(None, "text/plain"))
+        .await
+        .unwrap();
+    assert_eq!(
+        read_all(&store, &assembled.storage_path, None).await,
+        b"uring-part-one-uring-part-two"
+    );
+    store.delete_session(&upload).await.unwrap();
+}
+
+/// A lightweight, opt-in throughput probe comparing the io_uring staging-write backend against the
+/// default `tokio::fs` backend over the same data root. It is `#[ignore]`d so it never runs in the
+/// normal gate (it does real fsyncs and depends on the host's storage), but can be invoked with
+/// `cargo test -p cairn-blob --features io-uring -- --ignored --nocapture uring_vs_epoll`.
+/// Reports MB/s for each backend and the relative delta. Not an assertion of a performance target;
+/// io_uring's win is workload- and kernel-dependent (it shines most under high concurrency, which
+/// a single-threaded loop understates).
+#[cfg(feature = "io-uring")]
+#[ignore = "benchmark: run explicitly with --ignored"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn uring_vs_epoll_staging_throughput() {
+    use std::time::Instant;
+
+    async fn run(store: &LocalBlobStore, payload: &[u8], iters: u32) -> f64 {
+        let b = BucketName::parse("bench").unwrap();
+        // Warm up so directory-creation and first-touch costs don't skew the timed loop.
+        for _ in 0..4 {
+            store
+                .stage(
+                    &b,
+                    body(payload.to_vec()),
+                    opts(None, "application/octet-stream"),
+                )
+                .await
+                .unwrap();
+        }
+        let start = Instant::now();
+        for _ in 0..iters {
+            store
+                .stage(
+                    &b,
+                    body(payload.to_vec()),
+                    opts(None, "application/octet-stream"),
+                )
+                .await
+                .unwrap();
+        }
+        let elapsed = start.elapsed().as_secs_f64();
+        let total_bytes = (payload.len() as f64) * (iters as f64);
+        (total_bytes / (1024.0 * 1024.0)) / elapsed
+    }
+
+    let payload = vec![0xABu8; 1 << 20]; // 1 MiB objects
+    let iters = 200u32;
+
+    let dir_u = tempfile::tempdir().unwrap();
+    let uring = LocalBlobStore::open(dir_u.path())
+        .await
+        .unwrap()
+        .with_io_uring(true);
+    let dir_e = tempfile::tempdir().unwrap();
+    let epoll = LocalBlobStore::open(dir_e.path())
+        .await
+        .unwrap()
+        .with_io_uring(false);
+
+    let uring_mibs = run(&uring, &payload, iters).await;
+    let epoll_mibs = run(&epoll, &payload, iters).await;
+    let delta_pct = (uring_mibs - epoll_mibs) / epoll_mibs * 100.0;
+    println!(
+        "staging throughput ({iters}x1MiB): io_uring={uring_mibs:.1} MiB/s, \
+         tokio::fs={epoll_mibs:.1} MiB/s, delta={delta_pct:+.1}%"
+    );
+}

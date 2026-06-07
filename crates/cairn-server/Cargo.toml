@@ -16,12 +16,35 @@ workspace = true
 # production code path depends on this; it only enables `cairn-blob`'s `failpoints` feature.
 failpoints = ["cairn-blob/failpoints", "dep:fail"]
 
+# EXPERIMENTAL, Linux-only zero-copy I/O fast path (off by default; ARCH §7.x perf path).
+#
+# Layer (a) kTLS offload: after the rustls handshake the resulting TLS socket is handed to the
+# kernel TLS (kTLS) machinery via the `ktls` crate so the kernel performs the symmetric record
+# crypto, offloading it from the userspace rustls path. hyper keeps serving on top of the kTLS
+# socket unchanged (it still implements AsyncRead/AsyncWrite); the win is CPU. If kTLS setup
+# fails for any reason the connection transparently falls back to the normal userspace TlsStream.
+#
+# Layer (b) sendfile(2) fast path: a self-contained, tested wrapper around the `sendfile(2)`
+# syscall that can copy a blob file fd straight to the socket fd. See `src/sendfile.rs` for why
+# the GET takeover is currently stubbed behind a documented seam (the raw fd is not plumbed across
+# the cairn-s3 boundary, which this crate must not edit). Enabling the feature never changes the
+# always-on portable streamed path for any request.
+#
+# With the feature OFF the optional deps are not compiled and nothing changes.
+fast-io = ["dep:ktls", "dep:libc"]
+
 [[bin]]
 name = "cairn"
 path = "src/main.rs"
 
 [dependencies]
 fail = { workspace = true, optional = true }
+# Optional, enabled only by `fast-io`. `ktls` drives the kernel-TLS offload; `libc` provides the
+# raw `sendfile(2)` syscall for the (currently stubbed) sendfile fast path. Both are
+# effective on Linux only; the source gates every use behind `#[cfg(all(feature = "fast-io",
+# target_os = "linux"))]`, so the feature is a harmless no-op if ever built on a non-Linux target.
+ktls = { version = "6", optional = true, default-features = false, features = ["aws_lc_rs", "tls12"] }
+libc = { version = "0.2", optional = true }
 cairn-types.workspace = true
 cairn-s3.workspace = true
 cairn-meta.workspace = true

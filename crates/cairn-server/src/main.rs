@@ -5,13 +5,24 @@
 //! report the schema version), and `backup`/`restore` (the ARCH §31.4 consistent snapshot and its
 //! inverse). The full remote-admin CLI ships as `cairn-cli` in a later wave.
 
-#![forbid(unsafe_code)]
+// The default (and every non-`fast-io`) build keeps the strongest posture: `forbid(unsafe_code)`
+// makes it impossible to introduce `unsafe` anywhere in the crate. The experimental, Linux-only
+// `fast-io` performance path needs a few raw syscalls (kTLS setsockopt probe, `sendfile(2)`), so
+// under that feature we relax to `deny(unsafe_code)` — still rejecting every `unsafe` block by
+// default, but allowing the individually reviewed, SAFETY-commented blocks in `sendfile.rs` to
+// opt in with `#[allow(unsafe_code)]`. `forbid` cannot be locally overridden; `deny` can.
+#![cfg_attr(not(feature = "fast-io"), forbid(unsafe_code))]
+#![cfg_attr(feature = "fast-io", deny(unsafe_code))]
 
 mod adapter;
 mod background;
 mod config;
 mod observability;
 mod server;
+// Linux-only zero-copy syscall helpers for the `fast-io` perf path (kTLS probe + sendfile(2)).
+// Gated to the feature *and* Linux so it is absent (and cannot warn) in every other build.
+#[cfg(all(feature = "fast-io", target_os = "linux"))]
+mod sendfile;
 mod stack;
 mod tls;
 

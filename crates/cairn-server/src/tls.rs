@@ -27,10 +27,21 @@ pub fn load_server_config(cert_path: &Path, key_path: &Path) -> Result<Arc<Serve
 
     let certs = load_certs(cert_path)?;
     let key = load_key(key_path)?;
-    let config = ServerConfig::builder()
+    #[cfg_attr(not(feature = "fast-io"), allow(unused_mut))]
+    let mut config = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .map_err(|e| format!("invalid certificate/key: {e}"))?;
+    // kTLS offload (feature `fast-io`): the kernel can only perform the record crypto if rustls is
+    // allowed to hand out the negotiated traffic secrets after the handshake, so opt in to secret
+    // extraction here. This is the *only* TLS-config difference the feature introduces; with the
+    // feature off the config is byte-for-byte the original (the field defaults to false), so the
+    // userspace TLS path and its tests are unchanged. Extraction only exposes the secrets to our
+    // own process for the `setsockopt(TLS_TX/TLS_RX)` calls; it is not transmitted anywhere.
+    #[cfg(feature = "fast-io")]
+    {
+        config.enable_secret_extraction = true;
+    }
     Ok(Arc::new(config))
 }
 
@@ -104,6 +115,27 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (cert, key) = write_pair(dir.path(), "a", CERT_A, KEY_A);
         assert!(load_server_config(&cert, &key).is_ok());
+    }
+
+    /// The `fast-io` feature must, and must *only*, flip on rustls secret extraction — kTLS cannot
+    /// install the negotiated keys on the socket otherwise. With the feature off the field stays at
+    /// its `false` default, so the userspace TLS path is byte-for-byte unchanged.
+    #[test]
+    fn fast_io_enables_secret_extraction_exactly_when_featured() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert, key) = write_pair(dir.path(), "a", CERT_A, KEY_A);
+        let cfg = load_server_config(&cert, &key).unwrap();
+        if cfg!(feature = "fast-io") {
+            assert!(
+                cfg.enable_secret_extraction,
+                "fast-io must enable secret extraction for kTLS"
+            );
+        } else {
+            assert!(
+                !cfg.enable_secret_extraction,
+                "without fast-io the TLS config must be unchanged"
+            );
+        }
     }
 
     #[test]

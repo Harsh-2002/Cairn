@@ -29,10 +29,17 @@ zstd.workspace = true
 lz4_flex.workspace = true
 fail.workspace = true
 tracing.workspace = true
+# EXPERIMENTAL, Linux-only: the io_uring staging-write backend. Optional and pulled in only by the
+# `io-uring` feature; with the feature off this dependency is not compiled at all.
+tokio-uring = { version = "0.5", optional = true }
 
 [features]
 # Arms the test-only fault-injection seam in the durable commit path.
 failpoints = ["fail/failpoints"]
+# EXPERIMENTAL, Linux-only: route the durable staging write path (create tmp -> write -> fsync ->
+# rename -> fsync dir) through a dedicated tokio-uring executor. Off by default; when off the store
+# uses the unchanged `tokio::fs` path. See `src/uring.rs`.
+io-uring = ["dep:tokio-uring"]
 
 [dev-dependencies]
 cairn-types = { workspace = true, features = ["testing"] }
