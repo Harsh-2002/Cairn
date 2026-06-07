@@ -25,6 +25,9 @@ cairn-authz.workspace = true
 cairn-lifecycle.workspace = true
 
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "signal", "macros", "time", "sync", "io-util"] }
+rustls = { workspace = true, features = ["aws_lc_rs", "tls12"] }
+tokio-rustls = { workspace = true, features = ["aws_lc_rs", "tls12"] }
+rustls-pemfile.workspace = true
 hyper = { workspace = true, features = ["server", "http1", "http2"] }
 hyper-util = { workspace = true, features = ["tokio", "server-auto", "service"] }
 http.workspace = true

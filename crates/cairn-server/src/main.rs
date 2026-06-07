@@ -11,6 +11,7 @@ mod config;
 mod observability;
 mod server;
 mod stack;
+mod tls;
 
 use clap::{Parser, Subcommand};
 use config::Config;

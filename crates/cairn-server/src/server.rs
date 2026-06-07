@@ -54,6 +54,16 @@ pub async fn serve(
         stack,
     });
 
+    // Optional native TLS.
+    let tls = match (&config.tls_cert_path, &config.tls_key_path) {
+        (Some(cert), Some(key)) => {
+            let cfg = crate::tls::load_server_config(cert, key)
+                .map_err(|e| std::io::Error::other(e))?;
+            Some(cfg)
+        }
+        _ => None,
+    };
+
     // Migrations and startup reconciliation already ran while building the stack; ready now.
     state.ready.store(true, Ordering::SeqCst);
 
@@ -64,7 +74,7 @@ pub async fn serve(
         86_400,
         Duration::from_secs(3600),
     );
-    tracing::info!(addr = %local, "cairn listening");
+    tracing::info!(addr = %local, tls = tls.is_some(), "cairn listening");
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     tokio::spawn(wait_for_signal(shutdown_tx));
@@ -79,21 +89,18 @@ pub async fn serve(
                     Err(e) => { tracing::warn!(error = %e, "accept failed"); continue; }
                 };
                 let st = state.clone();
-                let mut conn_shutdown = shutdown_rx.clone();
+                let conn_shutdown = shutdown_rx.clone();
+                let tls = tls.clone();
                 conns.spawn(async move {
-                    let io = TokioIo::new(stream);
-                    let svc = service_fn(move |req| handle(st.clone(), peer, req));
-                    let builder = auto::Builder::new(TokioExecutor::new());
-                    let conn = builder.serve_connection(io, svc);
-                    tokio::pin!(conn);
-                    tokio::select! {
-                        res = conn.as_mut() => {
-                            if let Err(e) = res { tracing::debug!(error = %e, "connection ended"); }
+                    match tls {
+                        Some(cfg) => {
+                            let acceptor = tokio_rustls::TlsAcceptor::from(cfg);
+                            match acceptor.accept(stream).await {
+                                Ok(s) => serve_io(s, st, peer, true, conn_shutdown).await,
+                                Err(e) => tracing::debug!(error = %e, "TLS handshake failed"),
+                            }
                         }
-                        _ = conn_shutdown.changed() => {
-                            conn.as_mut().graceful_shutdown();
-                            let _ = conn.await;
-                        }
+                        None => serve_io(stream, st, peer, false, conn_shutdown).await,
                     }
                 });
             }
@@ -118,11 +125,38 @@ pub async fn serve(
     Ok(())
 }
 
+/// Serve one accepted connection (plaintext or TLS) with graceful shutdown.
+async fn serve_io<S>(
+    stream: S,
+    state: Arc<AppState>,
+    peer: std::net::SocketAddr,
+    secure: bool,
+    mut conn_shutdown: watch::Receiver<bool>,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let io = TokioIo::new(stream);
+    let svc = service_fn(move |req| handle(state.clone(), peer, secure, req));
+    let builder = auto::Builder::new(TokioExecutor::new());
+    let conn = builder.serve_connection(io, svc);
+    tokio::pin!(conn);
+    tokio::select! {
+        res = conn.as_mut() => {
+            if let Err(e) = res { tracing::debug!(error = %e, "connection ended"); }
+        }
+        _ = conn_shutdown.changed() => {
+            conn.as_mut().graceful_shutdown();
+            let _ = conn.await;
+        }
+    }
+}
+
 /// The outer middleware: request id, tracing span, concurrency limit, timeout, and the
 /// request/latency metrics, wrapping the router.
 async fn handle(
     state: Arc<AppState>,
     peer: std::net::SocketAddr,
+    secure: bool,
     req: Request<Incoming>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     let request_id = uuid::Uuid::new_v4().simple().to_string();
@@ -149,7 +183,7 @@ async fn handle(
             if infra {
                 route_infra(&state, &path)
             } else {
-                adapter::handle(&state.stack, req, peer.ip(), false, request_id.clone()).await
+                adapter::handle(&state.stack, req, peer.ip(), secure, request_id.clone()).await
             }
         };
         let mut resp = match tokio::time::timeout(state.request_timeout, work).await {

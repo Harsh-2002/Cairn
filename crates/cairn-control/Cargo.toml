@@ -1,0 +1,24 @@
+[package]
+name = "cairn-control"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The JSON management API for Cairn: overview, buckets, objects, users, and activity."
+
+[lints]
+workspace = true
+
+[dependencies]
+cairn-types.workspace = true
+cairn-auth.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+http.workspace = true
+bytes.workspace = true
+uuid.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+cairn-types = { workspace = true, features = ["testing"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
