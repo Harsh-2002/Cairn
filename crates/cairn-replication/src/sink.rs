@@ -21,24 +21,37 @@
 //! failure into a backed-off re-attempt and a terminal one into operator-visible failure.
 //!
 //! ## Transport
-//! The sink uses a `hyper-util` legacy client over a plain-HTTP connector, so `http://`
-//! endpoints work out of the box. `https://` requires a TLS connector (`hyper-rustls` or a
-//! hand-rolled `tokio-rustls` connector); that dependency is **not** declared in the workspace,
-//! so an `https://` endpoint is rejected at construction with a clear error rather than failing
-//! opaquely at connect time. See the crate README / remediation note.
+//! The sink uses a `hyper-util` legacy client over a `hyper-rustls` [`HttpsConnector`] built with
+//! `.https_or_http()`, so the **same** client serves both `http://` and `https://` endpoints:
+//! plaintext endpoints connect directly, TLS endpoints negotiate rustls (aws-lc-rs provider,
+//! webpki root anchors) and verify the server certificate. There is no longer an https-rejection
+//! at construction (ARCH §20.2).
+//!
+//! ## Per-source destination routing
+//! A single sink can replicate many source buckets to many destination buckets. [`S3SinkConfig`]
+//! carries a `source -> dest` [`HashMap`](std::collections::HashMap) plus a `dest_bucket` default;
+//! [`HttpS3Sink::dest_for`] resolves the destination bucket for a given source bucket, falling
+//! back to the default when the source has no explicit mapping. The [`BucketRoutedSink`] entry
+//! points carry the source bucket so the destination is chosen per request. Constructing a sink
+//! with an empty map and a single `dest_bucket` reproduces the original node->node behaviour.
+//!
+//! [`HttpsConnector`]: hyper_rustls::HttpsConnector
+//! [`BucketRoutedSink`]: crate::BucketRoutedSink
 
 use cairn_auth::{canonical_request, compute_signature, sha256_hex, signing_key, string_to_sign};
 use cairn_types::error::ReplicationError;
-use cairn_types::id::{ObjectKey, VersionId};
+use cairn_types::id::{BucketName, ObjectKey, VersionId};
 use cairn_types::replication::ReplicatedObject;
 use cairn_types::time::Timestamp;
-use cairn_types::traits::{Clock, ReplicationSink};
+use cairn_types::traits::Clock;
 use futures_util::StreamExt;
 use http::{Method, Request, Uri};
 use http_body_util::{BodyExt, Full};
+use hyper_rustls::HttpsConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// The S3 service name in the SigV4 credential scope.
@@ -49,11 +62,18 @@ const REPLICA_MARKER_KEY: &str = "cairn-replica";
 /// Connection parameters for a remote S3-compatible replication destination.
 #[derive(Debug, Clone)]
 pub struct S3SinkConfig {
-    /// The endpoint base URL, e.g. `http://s3.us-east-1.example.com:9000`. Path-style addressing
-    /// is used: requests target `{endpoint}/{dest_bucket}/{key}`.
+    /// The endpoint base URL, e.g. `http://s3.us-east-1.example.com:9000` or
+    /// `https://s3.example.com`. Path-style addressing is used: requests target
+    /// `{endpoint}/{dest_bucket}/{key}`. Both `http://` and `https://` are supported.
     pub endpoint: String,
-    /// The destination bucket name (path-style).
+    /// The default destination bucket (path-style), used for any source bucket not present in
+    /// [`dest_buckets`](Self::dest_buckets). With an empty map this is the single fixed
+    /// destination (the original node->node behaviour).
     pub dest_bucket: String,
+    /// Per-source-bucket destination overrides (`source bucket name -> dest bucket name`),
+    /// resolved from each bucket's stored replication rule. A source bucket absent from the map
+    /// replicates to [`dest_bucket`](Self::dest_bucket).
+    pub dest_buckets: HashMap<String, String>,
     /// The SigV4 signing region.
     pub region: String,
     /// The destination access-key id.
@@ -62,13 +82,18 @@ pub struct S3SinkConfig {
     pub secret_access_key: String,
 }
 
-/// A production [`ReplicationSink`] issuing SigV4-signed S3 requests to a remote endpoint.
+/// A production replication sink issuing SigV4-signed S3 requests to a remote endpoint over
+/// HTTP or HTTPS. Implements [`BucketRoutedSink`](crate::BucketRoutedSink), choosing the
+/// destination bucket per request from the source bucket.
 pub struct HttpS3Sink {
     config: S3SinkConfig,
+    /// The scheme of the endpoint (`http` or `https`), parsed once at construction. Reused when
+    /// building each request URI so the connector dials the right transport.
+    scheme: String,
     /// The scheme/authority of the endpoint, parsed once at construction (e.g. `s3.example.com:9000`).
     authority: String,
-    /// The HTTP client. Plain HTTP only; see the module note on HTTPS.
-    client: Client<HttpConnector, Full<bytes::Bytes>>,
+    /// The HTTP(S) client. The TLS-or-plaintext connector serves both schemes.
+    client: Client<HttpsConnector<HttpConnector>, Full<bytes::Bytes>>,
     /// The clock supplying the SigV4 request time; injected so signing is deterministic in tests.
     clock: Arc<dyn Clock>,
 }
@@ -78,6 +103,7 @@ impl std::fmt::Debug for HttpS3Sink {
         f.debug_struct("HttpS3Sink")
             .field("endpoint", &self.config.endpoint)
             .field("dest_bucket", &self.config.dest_bucket)
+            .field("dest_buckets", &self.config.dest_buckets)
             .field("region", &self.config.region)
             .field("access_key_id", &self.config.access_key_id)
             .finish_non_exhaustive()
@@ -89,10 +115,9 @@ impl HttpS3Sink {
     /// wall clock for request signing.
     ///
     /// # Errors
-    /// Returns [`ReplicationError::Terminal`] if the endpoint URL is malformed, or if it uses
-    /// `https://` (which needs a TLS connector not available in this build — see the module
-    /// note); a misconfiguration is a permanent, operator-actionable problem, not a transient
-    /// one.
+    /// Returns [`ReplicationError::Terminal`] if the endpoint URL is malformed or names a scheme
+    /// other than `http`/`https`; a misconfiguration is a permanent, operator-actionable problem,
+    /// not a transient one.
     pub fn new(config: S3SinkConfig) -> Result<Self, ReplicationError> {
         Self::with_clock(config, Arc::new(SystemClock))
     }
@@ -110,50 +135,64 @@ impl HttpS3Sink {
             .endpoint
             .parse()
             .map_err(|e| ReplicationError::Terminal(format!("invalid endpoint URL: {e}")))?;
-        match uri.scheme_str() {
-            Some("http") => {}
-            Some("https") => {
-                return Err(ReplicationError::Terminal(
-                    "https replication endpoints require a TLS connector not built into this \
-                     crate (hyper-rustls is not a declared workspace dependency); use an http:// \
-                     endpoint or add the connector"
-                        .to_owned(),
-                ));
-            }
+        let scheme = match uri.scheme_str() {
+            // Both schemes are served by the same TLS-or-plaintext connector below.
+            Some(s @ ("http" | "https")) => s.to_owned(),
             other => {
                 return Err(ReplicationError::Terminal(format!(
                     "unsupported endpoint scheme: {other:?}"
                 )));
             }
-        }
+        };
         let authority = uri
             .authority()
             .map(ToString::to_string)
             .ok_or_else(|| ReplicationError::Terminal("endpoint URL has no host".to_owned()))?;
 
-        let client = Client::builder(TokioExecutor::new()).build(HttpConnector::new());
+        // One connector serves both transports: `.https_or_http()` dials plaintext for `http://`
+        // and negotiates rustls (aws-lc-rs, webpki roots, server-cert verification) for
+        // `https://`. `enable_http1()` matches the HTTP/1.1 protocol the legacy client speaks.
+        let https = hyper_rustls::HttpsConnectorBuilder::new()
+            .with_webpki_roots()
+            .https_or_http()
+            .enable_http1()
+            .build();
+        let client = Client::builder(TokioExecutor::new()).build(https);
 
         Ok(Self {
             config,
+            scheme,
             authority,
             client,
             clock,
         })
     }
 
+    /// Resolve the destination bucket for a source bucket: the per-source override if one is
+    /// configured, otherwise the default [`dest_bucket`](S3SinkConfig::dest_bucket).
+    #[must_use]
+    pub fn dest_for(&self, source_bucket: &str) -> &str {
+        self.config
+            .dest_buckets
+            .get(source_bucket)
+            .map_or(self.config.dest_bucket.as_str(), String::as_str)
+    }
+
     /// Build the canonical, percent-encoded request path `/{dest_bucket}/{key}` (S3 path-style).
-    fn request_path(&self, key: &str) -> String {
+    fn request_path(&self, dest_bucket: &str, key: &str) -> String {
         let mut path = String::from("/");
-        path.push_str(&uri_encode_path(&self.config.dest_bucket));
+        path.push_str(&uri_encode_path(dest_bucket));
         path.push('/');
         path.push_str(&uri_encode_path(key));
         path
     }
 
-    /// Sign and send one request, classifying the outcome into the sink error taxonomy.
+    /// Sign and send one request to `dest_bucket`, classifying the outcome into the sink error
+    /// taxonomy.
     async fn send_signed(
         &self,
         method: &Method,
+        dest_bucket: &str,
         key: &str,
         body: bytes::Bytes,
         content_type: Option<&str>,
@@ -163,7 +202,7 @@ impl HttpS3Sink {
         let amz_date = format_amz_datetime(now);
         let scope_date = &amz_date[..8];
         let payload_hash = sha256_hex(&body);
-        let path = self.request_path(key);
+        let path = self.request_path(dest_bucket, key);
 
         // Assemble the headers that participate in (and accompany) the request. `host`,
         // `x-amz-content-sha256`, and `x-amz-date` are always signed; the content type and any
@@ -210,8 +249,9 @@ impl HttpS3Sink {
             self.config.access_key_id
         );
 
-        // Build the wire request. The endpoint authority is reused; only the path varies.
-        let uri = format!("http://{}{path}", self.authority);
+        // Build the wire request. The endpoint scheme and authority are reused; only the path
+        // varies. The scheme (`http`/`https`) selects the transport the connector dials.
+        let uri = format!("{}://{}{path}", self.scheme, self.authority);
         let mut builder = Request::builder()
             .method(method.clone())
             .uri(&uri)
@@ -268,9 +308,15 @@ fn classify_status(code: u16, detail: &str) -> ReplicationError {
     }
 }
 
-#[async_trait::async_trait]
-impl ReplicationSink for HttpS3Sink {
-    async fn put_object(&self, object: ReplicatedObject) -> Result<(), ReplicationError> {
+impl HttpS3Sink {
+    /// PUT a replicated object into the destination bucket resolved for `source_bucket`.
+    async fn put_object_routed(
+        &self,
+        source_bucket: &str,
+        object: ReplicatedObject,
+    ) -> Result<(), ReplicationError> {
+        let dest_bucket = self.dest_for(source_bucket).to_owned();
+
         // Buffer the logical body so the payload can be hashed for the signed-payload PUT.
         let body = collect_body(object.body).await?;
 
@@ -288,6 +334,7 @@ impl ReplicationSink for HttpS3Sink {
 
         self.send_signed(
             &Method::PUT,
+            &dest_bucket,
             object.key.as_str(),
             body,
             Some(&object.content_type),
@@ -296,19 +343,42 @@ impl ReplicationSink for HttpS3Sink {
         .await
     }
 
-    async fn delete_marker(
+    /// DELETE a key in the destination bucket resolved for `source_bucket`.
+    async fn delete_marker_routed(
         &self,
+        source_bucket: &str,
         key: &ObjectKey,
-        _version: &VersionId,
     ) -> Result<(), ReplicationError> {
+        let dest_bucket = self.dest_for(source_bucket).to_owned();
         self.send_signed(
             &Method::DELETE,
+            &dest_bucket,
             key.as_str(),
             bytes::Bytes::new(),
             None,
             &[],
         )
         .await
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::route::BucketRoutedSink for HttpS3Sink {
+    async fn put_object(
+        &self,
+        source_bucket: &BucketName,
+        object: ReplicatedObject,
+    ) -> Result<(), ReplicationError> {
+        self.put_object_routed(source_bucket.as_str(), object).await
+    }
+
+    async fn delete_marker(
+        &self,
+        source_bucket: &BucketName,
+        key: &ObjectKey,
+        _version: &VersionId,
+    ) -> Result<(), ReplicationError> {
+        self.delete_marker_routed(source_bucket.as_str(), key).await
     }
 }
 
@@ -458,28 +528,70 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn rejects_https_endpoint_with_terminal_error() {
-        let cfg = S3SinkConfig {
-            endpoint: "https://s3.example.com".to_owned(),
+    fn cfg_for(endpoint: &str) -> S3SinkConfig {
+        S3SinkConfig {
+            endpoint: endpoint.to_owned(),
             dest_bucket: "dest".to_owned(),
+            dest_buckets: HashMap::new(),
             region: "us-east-1".to_owned(),
             access_key_id: "AKID".to_owned(),
             secret_access_key: "secret".to_owned(),
-        };
-        let err = HttpS3Sink::new(cfg).unwrap_err();
-        assert!(matches!(err, ReplicationError::Terminal(_)));
+        }
+    }
+
+    #[test]
+    fn builds_for_https_endpoint() {
+        // An https:// endpoint must construct cleanly now that the TLS connector is wired in
+        // (the former terminal https-rejection is gone).
+        let sink = HttpS3Sink::new(cfg_for("https://s3.example.com")).expect("https sink builds");
+        assert_eq!(sink.scheme, "https");
+        assert_eq!(sink.authority, "s3.example.com");
+    }
+
+    #[test]
+    fn builds_for_http_endpoint() {
+        // The same connector still serves plaintext http:// endpoints.
+        let sink =
+            HttpS3Sink::new(cfg_for("http://s3.example.com:9000")).expect("http sink builds");
+        assert_eq!(sink.scheme, "http");
+        assert_eq!(sink.authority, "s3.example.com:9000");
     }
 
     #[test]
     fn rejects_malformed_endpoint() {
+        assert!(HttpS3Sink::new(cfg_for("not a url")).is_err());
+    }
+
+    #[test]
+    fn rejects_unsupported_scheme() {
+        let err = HttpS3Sink::new(cfg_for("ftp://s3.example.com")).unwrap_err();
+        assert!(matches!(err, ReplicationError::Terminal(_)));
+    }
+
+    #[test]
+    fn dest_for_resolves_per_source_with_default_fallback() {
+        let mut dest_buckets = HashMap::new();
+        dest_buckets.insert("logs-src".to_owned(), "logs-dst".to_owned());
+        dest_buckets.insert("media-src".to_owned(), "media-dst".to_owned());
         let cfg = S3SinkConfig {
-            endpoint: "not a url".to_owned(),
-            dest_bucket: "dest".to_owned(),
+            endpoint: "http://s3.example.com".to_owned(),
+            dest_bucket: "fallback-dst".to_owned(),
+            dest_buckets,
             region: "us-east-1".to_owned(),
             access_key_id: "AKID".to_owned(),
             secret_access_key: "secret".to_owned(),
         };
-        assert!(HttpS3Sink::new(cfg).is_err());
+        let sink = HttpS3Sink::new(cfg).unwrap();
+        // Mapped sources resolve to their explicit destinations.
+        assert_eq!(sink.dest_for("logs-src"), "logs-dst");
+        assert_eq!(sink.dest_for("media-src"), "media-dst");
+        // An unmapped source falls back to the default destination bucket.
+        assert_eq!(sink.dest_for("other-src"), "fallback-dst");
+    }
+
+    #[test]
+    fn request_path_uses_resolved_dest_bucket() {
+        let sink = HttpS3Sink::new(cfg_for("http://s3.example.com")).unwrap();
+        assert_eq!(sink.request_path("dst", "a/b c"), "/dst/a/b%20c");
     }
 }

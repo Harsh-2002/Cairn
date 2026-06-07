@@ -6,6 +6,7 @@
   import Buckets from "./views/Buckets.svelte";
   import BucketObjects from "./views/BucketObjects.svelte";
   import Users from "./views/Users.svelte";
+  import Replication from "./views/Replication.svelte";
   import Activity from "./views/Activity.svelte";
 
   let authed = $state(hasToken());
@@ -30,6 +31,7 @@
     { view: "overview", label: "Overview" },
     { view: "buckets", label: "Buckets" },
     { view: "users", label: "Users" },
+    { view: "replication", label: "Replication" },
     { view: "activity", label: "Activity" },
   ];
 
@@ -74,6 +76,8 @@
         {/if}
       {:else if current.view === "users"}
         <Users />
+      {:else if current.view === "replication"}
+        <Replication />
       {:else if current.view === "activity"}
         <Activity />
       {:else}

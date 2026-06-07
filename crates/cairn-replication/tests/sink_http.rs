@@ -7,13 +7,13 @@ use std::sync::Mutex;
 
 use bytes::Bytes;
 use cairn_types::error::BlobError;
-use cairn_types::id::{ObjectKey, VersionId};
+use cairn_types::id::{BucketName, ObjectKey, VersionId};
 use cairn_types::object::ETag;
 use cairn_types::replication::ReplicatedObject;
 use cairn_types::time::Timestamp;
-use cairn_types::traits::{Clock, ReplicationSink};
+use cairn_types::traits::Clock;
 
-use cairn_replication::{HttpS3Sink, S3SinkConfig};
+use cairn_replication::{BucketRoutedSink, HttpS3Sink, S3SinkConfig};
 
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
@@ -119,6 +119,7 @@ fn sink_for(authority: &str, clock_secs: i64) -> HttpS3Sink {
         S3SinkConfig {
             endpoint: format!("http://{authority}"),
             dest_bucket: "dest-bucket".to_owned(),
+            dest_buckets: std::collections::HashMap::new(),
             region: "us-east-1".to_owned(),
             access_key_id: "AKIDEXAMPLE".to_owned(),
             secret_access_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_owned(),
@@ -126,6 +127,12 @@ fn sink_for(authority: &str, clock_secs: i64) -> HttpS3Sink {
         Arc::new(FixedClock(clock_secs)),
     )
     .unwrap()
+}
+
+/// The source bucket each call replicates *from*. With the default (empty) map, `sink_for`
+/// routes every source to `dest-bucket`, so the wire path is unaffected by the source name.
+fn src() -> BucketName {
+    BucketName::parse("source-bucket").unwrap()
 }
 
 #[tokio::test]
@@ -148,7 +155,7 @@ async fn put_object_issues_well_formed_signed_request() {
         body: body_stream(b"hello"),
     };
 
-    sink.put_object(object).await.unwrap();
+    sink.put_object(&src(), object).await.unwrap();
 
     let reqs = captured.lock().unwrap().clone();
     assert_eq!(reqs.len(), 1);
@@ -232,8 +239,8 @@ async fn put_object_recomputes_signature_when_a_header_changes() {
         body: body_stream(b"hello"),
     };
 
-    sink.put_object(make("a")).await.unwrap();
-    sink.put_object(make("b")).await.unwrap();
+    sink.put_object(&src(), make("a")).await.unwrap();
+    sink.put_object(&src(), make("b")).await.unwrap();
 
     let reqs = captured.lock().unwrap().clone();
     let sig = |r: &Captured| {
@@ -254,6 +261,7 @@ async fn delete_marker_issues_signed_delete() {
     let sink = sink_for(&authority, 1_440_938_160);
 
     sink.delete_marker(
+        &src(),
         &ObjectKey::parse("logs/app.log").unwrap(),
         &VersionId::from_string("v9".to_owned()),
     )
@@ -285,7 +293,7 @@ async fn server_5xx_is_retryable() {
         acl: None,
         body: body_stream(b"x"),
     };
-    let err = sink.put_object(object).await.unwrap_err();
+    let err = sink.put_object(&src(), object).await.unwrap_err();
     assert!(
         matches!(err, cairn_types::error::ReplicationError::Retryable(_)),
         "503 should be retryable, got {err:?}"
@@ -300,6 +308,7 @@ async fn server_4xx_is_terminal() {
 
     let err = sink
         .delete_marker(
+            &src(),
             &ObjectKey::parse("k").unwrap(),
             &VersionId::from_string("v1".to_owned()),
         )
@@ -308,5 +317,131 @@ async fn server_4xx_is_terminal() {
     assert!(
         matches!(err, cairn_types::error::ReplicationError::Terminal(_)),
         "403 should be terminal, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn put_object_routes_to_per_source_destination_bucket() {
+    // A sink configured with a source -> dest map must address the request to the destination
+    // bucket resolved from the *source* bucket, and fall back to the default for unmapped
+    // sources. The wire path is /{dest-bucket}/{key}.
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let authority = spawn_server(captured.clone(), Reply { status: 200 }).await;
+
+    let mut dest_buckets = std::collections::HashMap::new();
+    dest_buckets.insert("alpha-src".to_owned(), "alpha-dst".to_owned());
+    let sink = HttpS3Sink::with_clock(
+        S3SinkConfig {
+            endpoint: format!("http://{authority}"),
+            dest_bucket: "fallback-dst".to_owned(),
+            dest_buckets,
+            region: "us-east-1".to_owned(),
+            access_key_id: "AKIDEXAMPLE".to_owned(),
+            secret_access_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_owned(),
+        },
+        Arc::new(FixedClock(1_440_938_160)),
+    )
+    .unwrap();
+
+    let make = |key: &'static str| ReplicatedObject {
+        key: ObjectKey::parse(key).unwrap(),
+        version_id: VersionId::from_string("v1".to_owned()),
+        content_type: "text/plain".to_owned(),
+        user_metadata: Vec::new(),
+        etag: ETag::from_string("\"e\"".to_owned()),
+        size: 1,
+        tags: Vec::new(),
+        acl: None,
+        body: body_stream(b"x"),
+    };
+
+    // Mapped source routes to its destination bucket.
+    sink.put_object(&BucketName::parse("alpha-src").unwrap(), make("k1"))
+        .await
+        .unwrap();
+    // Unmapped source falls back to the default destination bucket.
+    sink.put_object(&BucketName::parse("beta-src").unwrap(), make("k2"))
+        .await
+        .unwrap();
+    // A delete marker from a mapped source also routes per source.
+    sink.delete_marker(
+        &BucketName::parse("alpha-src").unwrap(),
+        &ObjectKey::parse("k3").unwrap(),
+        &VersionId::from_string("v2".to_owned()),
+    )
+    .await
+    .unwrap();
+
+    let reqs = captured.lock().unwrap().clone();
+    assert_eq!(reqs.len(), 3);
+    assert_eq!(reqs[0].path, "/alpha-dst/k1");
+    assert_eq!(reqs[1].path, "/fallback-dst/k2");
+    assert_eq!(reqs[2].method, "DELETE");
+    assert_eq!(reqs[2].path, "/alpha-dst/k3");
+}
+
+#[tokio::test]
+async fn https_endpoint_negotiates_tls_not_plaintext() {
+    // An https:// sink must drive the request over TLS through the wired hyper-rustls connector.
+    // We point it at a plain-TCP listener that, on accept, immediately reads a few bytes and
+    // closes: a TLS client opens with a ClientHello (the TLS record type byte 0x16), whereas a
+    // plaintext HTTP client would send ASCII (`PUT ...`). Capturing the first byte proves the
+    // connector actually negotiated TLS for the https scheme rather than falling back to
+    // plaintext. The handshake then fails (no server cert), surfacing a Retryable transport
+    // error — which also confirms the request was attempted, not rejected at construction.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let authority = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let first_byte = Arc::new(Mutex::new(None::<u8>));
+
+    let fb = first_byte.clone();
+    tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        if let Ok((mut stream, _)) = listener.accept().await {
+            let mut buf = [0u8; 1];
+            if stream.read_exact(&mut buf).await.is_ok() {
+                *fb.lock().unwrap() = Some(buf[0]);
+            }
+            // Drop the connection so the client's handshake fails fast.
+        }
+    });
+
+    let sink = HttpS3Sink::with_clock(
+        S3SinkConfig {
+            endpoint: format!("https://{authority}"),
+            dest_bucket: "dest-bucket".to_owned(),
+            dest_buckets: std::collections::HashMap::new(),
+            region: "us-east-1".to_owned(),
+            access_key_id: "AKIDEXAMPLE".to_owned(),
+            secret_access_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_owned(),
+        },
+        Arc::new(FixedClock(1_440_938_160)),
+    )
+    .unwrap();
+
+    let object = ReplicatedObject {
+        key: ObjectKey::parse("k").unwrap(),
+        version_id: VersionId::from_string("v1".to_owned()),
+        content_type: "text/plain".to_owned(),
+        user_metadata: Vec::new(),
+        etag: ETag::from_string("\"e\"".to_owned()),
+        size: 1,
+        tags: Vec::new(),
+        acl: None,
+        body: body_stream(b"x"),
+    };
+    // The handshake fails (server presents no certificate), so the call errors retryably.
+    let err = sink.put_object(&src(), object).await.unwrap_err();
+    assert!(
+        matches!(err, cairn_types::error::ReplicationError::Retryable(_)),
+        "a failed TLS handshake is a transport error (retryable), got {err:?}"
+    );
+
+    // The byte the client first put on the wire is a TLS handshake record (0x16), proving the
+    // connector negotiated TLS for the https scheme rather than speaking plaintext HTTP.
+    let observed = *first_byte.lock().unwrap();
+    assert_eq!(
+        observed,
+        Some(0x16),
+        "https endpoint must open with a TLS ClientHello (0x16), got {observed:?}"
     );
 }

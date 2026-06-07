@@ -31,7 +31,10 @@ pub fn spawn(stack: Arc<AppStack>, cfg: &Config) {
     tokio::spawn(checkpoint_loop(stack.clone(), checkpoint_interval));
 
     // Replication worker: only active when a destination endpoint is configured (otherwise outbox
-    // entries accumulate and are observable, never silently dropped — ARCH §20).
+    // entries accumulate and are observable, never silently dropped — ARCH §20). The configured
+    // `replication_dest_bucket` is the *default* destination; the actual destination per source
+    // bucket is resolved each drain from that bucket's stored replication rule (see
+    // `replication_loop`).
     if let (Some(endpoint), Some(dest_bucket), Some(access), Some(secret)) = (
         cfg.replication_endpoint.clone(),
         cfg.replication_dest_bucket.clone(),
@@ -41,6 +44,8 @@ pub fn spawn(stack: Arc<AppStack>, cfg: &Config) {
         let sink_cfg = cairn_replication::S3SinkConfig {
             endpoint,
             dest_bucket,
+            // Populated per drain from each source bucket's replication rule.
+            dest_buckets: std::collections::HashMap::new(),
             region: cfg
                 .replication_region
                 .clone()
@@ -59,23 +64,38 @@ pub fn spawn(stack: Arc<AppStack>, cfg: &Config) {
 }
 
 /// Drain the replication outbox to the configured remote sink on an interval (ARCH §20).
+///
+/// `base_cfg` carries the endpoint, credentials, region, and the *default* destination bucket.
+/// Before each drain the per-source-bucket destination map is rebuilt from every bucket's stored
+/// replication rule (`ConfigAspect::Replication` → [`parse_replication`] → the rule's
+/// `<Destination><Bucket>` with the `arn:aws:s3:::` prefix stripped), so each source bucket's
+/// objects ship to the destination its own rule names; a bucket with no explicit destination
+/// falls back to `replication_dest_bucket`. The sink is rebuilt per drain with the fresh map
+/// (its connector is cheap to construct), keeping the node→node single-destination path working
+/// when no per-bucket rule is present.
 async fn replication_loop(
     stack: Arc<AppStack>,
-    sink_cfg: cairn_replication::S3SinkConfig,
+    base_cfg: cairn_replication::S3SinkConfig,
     interval: Duration,
 ) {
-    let sink = match cairn_replication::HttpS3Sink::new(sink_cfg) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!(error = %e, "replication sink construction failed; worker disabled");
-            return;
-        }
-    };
     let engine =
         cairn_replication::ReplicationEngine::new(cairn_replication::ReplicationOpts::default());
     let clock = SystemClock::new();
     loop {
         tokio::time::sleep(interval).await;
+
+        // Resolve the per-source destination map from each bucket's replication rule.
+        let dest_buckets = resolve_dest_buckets(&stack).await;
+        let mut sink_cfg = base_cfg.clone();
+        sink_cfg.dest_buckets = dest_buckets;
+        let sink = match cairn_replication::HttpS3Sink::new(sink_cfg) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(error = %e, "replication sink construction failed; skipping drain");
+                continue;
+            }
+        };
+
         match engine
             .run_until_idle(&*stack.meta, &sink, &stack.blob, &clock, 50)
             .await
@@ -94,6 +114,43 @@ async fn replication_loop(
             Err(e) => tracing::warn!(error = %e, "replication run failed"),
         }
     }
+}
+
+/// Build the `source bucket name -> destination bucket name` map by reading each bucket's stored
+/// `ConfigAspect::Replication` document and taking the first enabled rule's destination bucket
+/// (ARN prefix stripped). Buckets with no replication config, an unparseable document, or no
+/// destination are simply omitted, so they fall back to the sink's default destination.
+async fn resolve_dest_buckets(stack: &Arc<AppStack>) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    let buckets = match stack.meta.list_buckets(None).await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "replication: listing buckets for dest resolution failed");
+            return map;
+        }
+    };
+    for b in buckets {
+        let Ok(Some(doc)) = stack
+            .meta
+            .get_bucket_config(&b.name, ConfigAspect::Replication)
+            .await
+        else {
+            continue;
+        };
+        let Ok(cfg) = cairn_replication::parse_replication(doc.0.as_bytes()) else {
+            continue;
+        };
+        // The first enabled rule that names a destination determines this bucket's target.
+        if let Some(dest) = cfg
+            .rules
+            .iter()
+            .find(|r| r.enabled)
+            .and_then(|r| r.destination.bucket())
+        {
+            map.insert(b.name.as_str().to_owned(), dest.to_owned());
+        }
+    }
+    map
 }
 
 /// Periodically run a truncating WAL checkpoint on the metadata store and publish the WAL size

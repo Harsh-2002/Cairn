@@ -1,5 +1,13 @@
 //! Native TLS termination using rustls with the aws-lc-rs provider (ARCH §7.7, §27.2). The
 //! server can terminate TLS itself or run behind a terminating proxy on a trusted interface.
+//!
+//! ## Hot reload (ARCH §27.2)
+//! The served configuration lives behind a [`tokio::sync::watch`] channel so the certificate and
+//! key can be rotated without dropping the listener. The accept loop reads the *current*
+//! [`ServerConfig`] from its watch receiver per connection; a `SIGHUP` handler reloads the
+//! cert/key from the same paths and publishes the new config with [`reload_into`]. A bad new
+//! cert is logged and the previous config is retained (the channel is not updated), so a rotation
+//! mistake never takes the listener down.
 
 use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -7,6 +15,7 @@ use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
 use std::sync::Arc;
+use tokio::sync::watch;
 
 /// Load a rustls server configuration from PEM certificate and key files.
 ///
@@ -39,4 +48,101 @@ fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>, String> {
     rustls_pemfile::private_key(&mut reader)
         .map_err(|e| format!("parse key: {e}"))?
         .ok_or_else(|| format!("no private key found in {}", path.display()))
+}
+
+/// Reload the certificate and key from `cert_path`/`key_path` and atomically publish the new
+/// [`ServerConfig`] into the watch channel. On success the served config is swapped so subsequent
+/// accepts use the rotated certificate; on failure the channel is left untouched so the listener
+/// keeps serving the previous config.
+///
+/// Returns the loaded config on success (the same `Arc` now published) so callers/tests can
+/// confirm what was installed.
+///
+/// # Errors
+/// Returns the load/parse error message if the new cert/key cannot be read or assembled. The
+/// channel is not updated in that case.
+pub fn reload_into(
+    tx: &watch::Sender<Arc<ServerConfig>>,
+    cert_path: &Path,
+    key_path: &Path,
+) -> Result<Arc<ServerConfig>, String> {
+    let cfg = load_server_config(cert_path, key_path)?;
+    // `send` only fails when every receiver has dropped; the accept loop holds one for the
+    // server's lifetime, so treat a send failure as benign (shutting down).
+    let _ = tx.send(cfg.clone());
+    Ok(cfg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Two distinct self-signed cert/key pairs (generated offline with openssl) so the reload
+    // test can rotate from one identity to another and observe the served config change. Using
+    // embedded PEM keeps the tests dependency-free (no cert-generation crate).
+    const CERT_A: &str = include_str!("../testdata/tls_a.crt");
+    const KEY_A: &str = include_str!("../testdata/tls_a.key");
+    const CERT_B: &str = include_str!("../testdata/tls_b.crt");
+    const KEY_B: &str = include_str!("../testdata/tls_b.key");
+
+    /// Write a cert/key pair into `dir` under `stem`, returning their paths.
+    fn write_pair(
+        dir: &Path,
+        stem: &str,
+        cert: &str,
+        key: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        let cert_path = dir.join(format!("{stem}.crt"));
+        let key_path = dir.join(format!("{stem}.key"));
+        std::fs::write(&cert_path, cert).unwrap();
+        std::fs::write(&key_path, key).unwrap();
+        (cert_path, key_path)
+    }
+
+    #[test]
+    fn load_server_config_reads_pem_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert, key) = write_pair(dir.path(), "a", CERT_A, KEY_A);
+        assert!(load_server_config(&cert, &key).is_ok());
+    }
+
+    #[test]
+    fn reload_loads_swaps_and_serves_new_config() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // The server reads cert/key from fixed paths; start by serving identity A.
+        let (cert, key) = write_pair(dir.path(), "live", CERT_A, KEY_A);
+        let initial = load_server_config(&cert, &key).unwrap();
+        let (tx, rx) = watch::channel(initial.clone());
+        // The receiver starts holding the initial config.
+        assert!(Arc::ptr_eq(&rx.borrow(), &initial));
+
+        // Rotate the on-disk cert/key to identity B (same paths) and reload.
+        std::fs::write(&cert, CERT_B).unwrap();
+        std::fs::write(&key, KEY_B).unwrap();
+        let reloaded = reload_into(&tx, &cert, &key).expect("reload succeeds");
+
+        // The channel now serves the new config (a distinct allocation), so the next accept
+        // picks it up without the listener being touched.
+        assert!(!Arc::ptr_eq(&reloaded, &initial));
+        assert!(Arc::ptr_eq(&rx.borrow(), &reloaded));
+    }
+
+    #[test]
+    fn reload_keeps_old_config_on_bad_cert() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let (cert, key) = write_pair(dir.path(), "live", CERT_A, KEY_A);
+        let initial = load_server_config(&cert, &key).unwrap();
+        let (tx, rx) = watch::channel(initial.clone());
+
+        // Replace the cert on disk with garbage: the reload must fail and leave the channel
+        // untouched so the listener keeps serving the previous, valid config.
+        std::fs::write(&cert, b"not a certificate").unwrap();
+        let err = reload_into(&tx, &cert, &key).unwrap_err();
+        assert!(!err.is_empty());
+
+        // The previously-served config is retained.
+        assert!(Arc::ptr_eq(&rx.borrow(), &initial));
+    }
 }

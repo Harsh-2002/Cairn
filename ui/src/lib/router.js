@@ -5,8 +5,9 @@
 // Routes:
 //   #/overview
 //   #/buckets
-//   #/buckets/<name>           (object browser for a bucket)
+//   #/buckets/<name>           (object browser + config panel for a bucket)
 //   #/users
+//   #/replication
 //   #/activity
 
 import { readable } from "svelte/store";

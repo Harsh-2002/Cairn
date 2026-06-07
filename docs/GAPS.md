@@ -23,10 +23,24 @@ All three **critical** findings and the **high** findings have been remediated a
 | H — crash-consistency harness inert | ✅ fixed — **live F-4 test passes** (crash → orphan → reconcile reclaims) |
 | Medium — versioning fidelity, per-key errors, CORS preflight, tag context, one-fs check, storage_path index, data_root fsync | ✅ fixed |
 
-Remaining (lower priority / documented): per-bucket replication *destinations* (single configured
-target today), HTTPS replication connector (http:// works; needs `hyper-rustls`), `UploadPartCopy`
-and `GetObjectAttributes`, ACL *body* documents (canned `x-amz-acl` supported), cert hot-reload,
-and `warp` macro load profiles. The findings below are the original audit text, kept for reference.
+Remaining (lower priority / documented): `UploadPartCopy` and `GetObjectAttributes`, ACL *body*
+documents (canned `x-amz-acl` supported), and `warp` macro load profiles. The findings below are
+the original audit text, kept for reference.
+
+Recently completed:
+- **HTTPS replication connector** — `HttpS3Sink` now uses a `hyper-rustls` `HttpsConnector`
+  (`with_webpki_roots().https_or_http().enable_http1()`) so both `http://` and `https://`
+  destination endpoints work; the former https-rejection is gone (a TLS-negotiation integration
+  test asserts the connector sends a ClientHello for https).
+- **Per-rule replication destinations** — the destination bucket is resolved *per source bucket*
+  from that bucket's stored replication rule (`ConfigAspect::Replication` → `parse_replication` →
+  `<Destination><Bucket>`, ARN prefix stripped). `S3SinkConfig` carries a `source -> dest` map plus
+  a default; `cairn-server`'s `replication_loop` rebuilds the map before each drain and falls back
+  to `CAIRN_REPLICATION_DEST_BUCKET`. The single-destination node→node path still works.
+- **TLS cert hot-reload (§27.2)** — a `SIGHUP` handler reloads the cert/key from the same paths and
+  atomically swaps the served `ServerConfig` via a `tokio::sync::watch` channel consulted per
+  accept, without dropping the listener; a bad new cert is logged and the old config is kept. Every
+  successful reload is logged.
 
 ---
 

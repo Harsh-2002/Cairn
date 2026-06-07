@@ -32,10 +32,12 @@
 
 mod backoff;
 mod config;
+mod route;
 mod sink;
 
 pub use backoff::next_backoff;
 pub use config::{Destination, Filter, ReplicationConfig, ReplicationRule, parse_replication};
+pub use route::BucketRoutedSink;
 pub use sink::{HttpS3Sink, S3SinkConfig};
 
 use std::collections::BTreeMap;
@@ -48,7 +50,7 @@ use cairn_types::meta::{Mutation, OutboxEntry, ReplicationOp, ReplicationStatus}
 use cairn_types::object::ObjectVersionRow;
 use cairn_types::replication::ReplicatedObject;
 use cairn_types::time::Timestamp;
-use cairn_types::traits::{BlobStore, Clock, MetadataStore, ReplicationSink};
+use cairn_types::traits::{BlobStore, Clock, MetadataStore};
 
 /// Tunables governing a replication worker pass.
 #[derive(Debug, Clone, Copy)]
@@ -138,7 +140,7 @@ impl ReplicationEngine {
     ) -> Result<RunReport, MetaError>
     where
         M: MetadataStore + ?Sized,
-        S: ReplicationSink + ?Sized,
+        S: BucketRoutedSink + ?Sized,
         B: BlobStore + ?Sized,
         C: Clock + ?Sized,
     {
@@ -214,7 +216,7 @@ impl ReplicationEngine {
     ) -> Result<RunReport, MetaError>
     where
         M: MetadataStore + ?Sized,
-        S: ReplicationSink + ?Sized,
+        S: BucketRoutedSink + ?Sized,
         B: BlobStore + ?Sized,
         C: Clock + ?Sized,
     {
@@ -245,7 +247,7 @@ impl ReplicationEngine {
     ) -> Result<EntryOutcome, MetaError>
     where
         M: MetadataStore + ?Sized,
-        S: ReplicationSink + ?Sized,
+        S: BucketRoutedSink + ?Sized,
         B: BlobStore + ?Sized,
     {
         // Load the version this entry concerns.
@@ -272,10 +274,15 @@ impl ReplicationEngine {
             _ => {}
         }
 
-        // Drive the sink for this operation.
+        // Drive the sink for this operation. The source bucket (`entry.bucket`) is threaded
+        // through so the sink can resolve the destination bucket per source bucket (per-rule
+        // replication); a fixed single-destination sink ignores it.
         let sink_result = match entry.operation {
             ReplicationOp::ObjectCreate => self.put_object(sink, blobs, &row).await,
-            ReplicationOp::DeleteMarker => sink.delete_marker(&entry.key, &entry.version_id).await,
+            ReplicationOp::DeleteMarker => {
+                sink.delete_marker(&entry.bucket, &entry.key, &entry.version_id)
+                    .await
+            }
         };
 
         match sink_result {
@@ -315,7 +322,7 @@ impl ReplicationEngine {
         row: &ObjectVersionRow,
     ) -> Result<(), ReplicationError>
     where
-        S: ReplicationSink + ?Sized,
+        S: BucketRoutedSink + ?Sized,
         B: BlobStore + ?Sized,
     {
         let Some(path) = row.storage_path.as_ref() else {
@@ -347,7 +354,7 @@ impl ReplicationEngine {
             body: handle.body,
         };
 
-        sink.put_object(object).await
+        sink.put_object(&row.bucket, object).await
     }
 
     /// Mark the entry done and stamp the version [`ReplicationStatus::Completed`]. The

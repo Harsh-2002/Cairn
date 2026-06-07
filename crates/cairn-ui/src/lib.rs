@@ -109,4 +109,52 @@ mod tests {
     fn leading_slash_is_tolerated() {
         assert!(asset("/index.html").is_some());
     }
+
+    /// The shell must reference its hashed JS/CSS bundles, and every asset it
+    /// references must itself be embedded and resolve with a sensible
+    /// content-type. This guards the embed pipeline against a stale or empty
+    /// `ui/dist` (e.g. a forgotten `npm run build`): if Vite emitted an index
+    /// that points at bundles, those bundles have to be present too.
+    #[test]
+    fn index_referenced_bundles_are_embedded() {
+        let (_, body) = asset("index.html").expect("index.html is embedded");
+        let html = String::from_utf8_lossy(&body);
+
+        let mut referenced = 0usize;
+        for needle in ["src=\"", "href=\""] {
+            let mut rest = html.as_ref();
+            while let Some(start) = rest.find(needle) {
+                let after = &rest[start + needle.len()..];
+                let end = after.find('"').expect("attribute value is quoted");
+                let raw = &after[..end];
+                rest = &after[end..];
+
+                // Only follow local asset references the bundler emits.
+                if !raw.contains("assets/") {
+                    continue;
+                }
+                referenced += 1;
+                let (content_type, bytes) = asset(raw).unwrap_or_else(|| {
+                    panic!("index references {raw}, which is not embedded; rebuild ui/dist")
+                });
+                assert!(!bytes.is_empty(), "{raw} is embedded but empty");
+                if raw.ends_with(".js") {
+                    assert!(
+                        content_type.contains("javascript"),
+                        "unexpected content-type for {raw}: {content_type}"
+                    );
+                } else if raw.ends_with(".css") {
+                    assert!(
+                        content_type.starts_with("text/css"),
+                        "unexpected content-type for {raw}: {content_type}"
+                    );
+                }
+            }
+        }
+
+        assert!(
+            referenced >= 2,
+            "expected the shell to reference at least the JS and CSS bundles, found {referenced}"
+        );
+    }
 }

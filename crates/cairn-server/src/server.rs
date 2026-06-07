@@ -54,11 +54,16 @@ pub async fn serve(
         stack,
     });
 
-    // Optional native TLS.
-    let tls = match (&config.tls_cert_path, &config.tls_key_path) {
+    // Optional native TLS. The served config lives behind a watch channel so a SIGHUP can
+    // hot-reload the certificate/key from the same paths without dropping the listener
+    // (ARCH §27.2): the accept loop reads the current config per connection, and the reload
+    // handler atomically publishes a new one (a bad new cert is logged and the old config kept).
+    let tls_rx = match (&config.tls_cert_path, &config.tls_key_path) {
         (Some(cert), Some(key)) => {
             let cfg = crate::tls::load_server_config(cert, key).map_err(std::io::Error::other)?;
-            Some(cfg)
+            let (tx, rx) = watch::channel(cfg);
+            tokio::spawn(reload_tls_on_sighup(tx, cert.clone(), key.clone()));
+            Some(rx)
         }
         _ => None,
     };
@@ -68,7 +73,7 @@ pub async fn serve(
 
     // Background subsystems: multipart sweeper, lifecycle scanner, WAL checkpointer, metrics.
     crate::background::spawn(state.stack.clone(), &config);
-    tracing::info!(addr = %local, tls = tls.is_some(), "cairn listening");
+    tracing::info!(addr = %local, tls = tls_rx.is_some(), "cairn listening");
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     tokio::spawn(wait_for_signal(shutdown_tx));
@@ -84,7 +89,9 @@ pub async fn serve(
                 };
                 let st = state.clone();
                 let conn_shutdown = shutdown_rx.clone();
-                let tls = tls.clone();
+                // Snapshot the *current* TLS config for this connection; a concurrent reload
+                // affects only subsequently-accepted connections.
+                let tls = tls_rx.as_ref().map(|rx| rx.borrow().clone());
                 conns.spawn(async move {
                     match tls {
                         Some(cfg) => {
@@ -260,6 +267,53 @@ fn error_response(status: StatusCode, code: &str) -> Response<ResponseBody> {
         .header("content-type", "text/plain")
         .body(full_body(Bytes::from(code.to_owned())))
         .expect("valid error response")
+}
+
+/// Reload the TLS certificate/key on every `SIGHUP`, publishing the new config into `tls_tx` so
+/// subsequently-accepted connections use the rotated certificate (ARCH §27.2). A reload failure
+/// (e.g. a half-written or invalid new cert) is logged and the previously-served config is kept,
+/// so a rotation mistake never takes the listener down. Each successful reload is logged.
+///
+/// On platforms without `SIGHUP` (non-unix) this is a no-op task.
+#[cfg(unix)]
+async fn reload_tls_on_sighup(
+    tls_tx: watch::Sender<std::sync::Arc<rustls::ServerConfig>>,
+    cert_path: std::path::PathBuf,
+    key_path: std::path::PathBuf,
+) {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut hup = match signal(SignalKind::hangup()) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "cannot install SIGHUP handler; TLS hot-reload disabled");
+            return;
+        }
+    };
+    // Stop when every accept-side receiver is gone (the server is shutting down).
+    while hup.recv().await.is_some() {
+        if tls_tx.is_closed() {
+            return;
+        }
+        match crate::tls::reload_into(&tls_tx, &cert_path, &key_path) {
+            Ok(_) => tracing::info!(
+                cert = %cert_path.display(),
+                key = %key_path.display(),
+                "TLS certificate reloaded on SIGHUP"
+            ),
+            Err(e) => tracing::error!(
+                error = %e,
+                "TLS reload failed; keeping the previously-served certificate"
+            ),
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn reload_tls_on_sighup(
+    _tls_tx: watch::Sender<std::sync::Arc<rustls::ServerConfig>>,
+    _cert_path: std::path::PathBuf,
+    _key_path: std::path::PathBuf,
+) {
 }
 
 /// Resolve on the first of SIGINT or SIGTERM, broadcasting shutdown.

@@ -87,6 +87,45 @@ async function request(method, path, body) {
   return payload;
 }
 
+// Like `request`, but the body is sent verbatim as a string rather than being
+// JSON-encoded. Used by the bucket-policy endpoint, whose body is a raw policy
+// JSON document the server validates and stores as-is.
+async function requestRaw(method, path, rawBody) {
+  const headers = {
+    Accept: "application/json",
+    "Content-Type": "application/json",
+  };
+  const tok = loadToken();
+  if (tok) headers.Authorization = `Bearer ${tok}`;
+
+  let res;
+  try {
+    res = await fetch(BASE + path, { method, headers, body: rawBody });
+  } catch (e) {
+    throw new ApiError(`network error: ${e.message || e}`, 0);
+  }
+
+  if (res.status === 204) return null;
+
+  let payload = null;
+  const text = await res.text();
+  if (text) {
+    try {
+      payload = JSON.parse(text);
+    } catch {
+      payload = { raw: text };
+    }
+  }
+
+  if (!res.ok) {
+    const msg =
+      (payload && (payload.error || payload.message)) ||
+      `request failed (${res.status})`;
+    throw new ApiError(msg, res.status);
+  }
+  return payload;
+}
+
 export const api = {
   health: () => request("GET", "/health"),
   overview: () => request("GET", "/overview"),
@@ -107,9 +146,34 @@ export const api = {
     );
   },
 
+  // Bucket configuration (ARCH §22.2).
+  getBucketConfig: (name) =>
+    request("GET", `/buckets/${encodeURIComponent(name)}/config`),
+  setVersioning: (name, status) =>
+    request("PUT", `/buckets/${encodeURIComponent(name)}/versioning`, {
+      status,
+    }),
+  setQuota: (name, quota_bytes) =>
+    request("PUT", `/buckets/${encodeURIComponent(name)}/quota`, {
+      quota_bytes,
+    }),
+  // The policy body is a raw policy JSON document, not the usual {error}/{message}
+  // envelope; `rawBody` is sent verbatim as the request body.
+  setPolicy: (name, rawBody) =>
+    requestRaw("PUT", `/buckets/${encodeURIComponent(name)}/policy`, rawBody),
+  deletePolicy: (name) =>
+    request("DELETE", `/buckets/${encodeURIComponent(name)}/policy`),
+
   listUsers: () => request("GET", "/users"),
   createUser: (display_name, role) =>
     request("POST", "/users", { display_name, role }),
+  patchUser: (id, fields) =>
+    request("PATCH", `/users/${encodeURIComponent(id)}`, fields),
+  rotateCredentials: (id) =>
+    request("POST", `/users/${encodeURIComponent(id)}/rotate-credentials`),
+
+  failedReplication: (limit = 100) =>
+    request("GET", `/replication/failed?limit=${limit}`),
 
   activity: (limit = 50) => request("GET", `/activity?limit=${limit}`),
 };

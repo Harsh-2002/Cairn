@@ -8,9 +8,14 @@
   let displayName = $state("");
   let role = $state("member");
   let creating = $state(false);
+  let notice = $state("");
 
-  // The one-time bearer secret returned on creation. Shown once, then the
-  // server only retains a hash (ARCH §23.4).
+  // The id of the user a per-row action is currently in flight for (disables
+  // that row's buttons without blocking the whole table).
+  let busyId = $state(null);
+
+  // The one-time bearer secret returned on creation or rotation. Shown once,
+  // then the server only retains a hash (ARCH §23.4).
   let created = $state(null);
 
   async function load() {
@@ -29,6 +34,7 @@
   async function create(e) {
     e.preventDefault();
     error = "";
+    notice = "";
     const dn = displayName.trim();
     if (!dn) {
       error = "Display name is required.";
@@ -58,6 +64,66 @@
     }
   }
 
+  async function setActive(u, active) {
+    error = "";
+    notice = "";
+    busyId = u.id;
+    try {
+      await api.patchUser(u.id, { is_active: active });
+      notice = `${u.display_name} ${active ? "reactivated" : "deactivated"}.`;
+      await load();
+    } catch (err) {
+      error = err.message || "Failed to update user.";
+    } finally {
+      busyId = null;
+    }
+  }
+
+  async function setRole(u, newRole) {
+    if (newRole === u.role) return;
+    error = "";
+    notice = "";
+    busyId = u.id;
+    try {
+      await api.patchUser(u.id, { role: newRole });
+      notice = `${u.display_name} is now ${newRole}.`;
+      await load();
+    } catch (err) {
+      error = err.message || "Failed to change role.";
+    } finally {
+      busyId = null;
+    }
+  }
+
+  async function rotate(u) {
+    if (
+      !window.confirm(
+        `Rotate credentials for "${u.display_name}"? The current secret stops working immediately.`,
+      )
+    )
+      return;
+    error = "";
+    notice = "";
+    busyId = u.id;
+    try {
+      const res = await api.rotateCredentials(u.id);
+      const token =
+        res.bearer_access_key_id && res.bearer_secret
+          ? `${res.bearer_access_key_id}.${res.bearer_secret}`
+          : null;
+      created = {
+        id: u.id,
+        access_key_id: res.bearer_access_key_id,
+        secret: res.bearer_secret,
+        token,
+      };
+    } catch (err) {
+      error = err.message || "Failed to rotate credentials.";
+    } finally {
+      busyId = null;
+    }
+  }
+
   load();
 </script>
 
@@ -66,6 +132,9 @@
 
 {#if error}
   <div class="notice error">{error}</div>
+{/if}
+{#if notice}
+  <div class="notice success">{notice}</div>
 {/if}
 
 {#if created}
@@ -122,6 +191,7 @@
         <th>Access key</th>
         <th>Role</th>
         <th>Status</th>
+        <th style="text-align:right;">Actions</th>
       </tr>
     </thead>
     <tbody>
@@ -142,8 +212,44 @@
               <span class="badge off">inactive</span>
             {/if}
           </td>
+          <td class="actions">
+            <select
+              value={u.role}
+              disabled={busyId === u.id}
+              onchange={(e) => setRole(u, e.currentTarget.value)}
+              aria-label="Change role"
+            >
+              <option value="member">member</option>
+              <option value="administrator">administrator</option>
+            </select>
+            {#if u.is_active}
+              <button
+                disabled={busyId === u.id}
+                onclick={() => setActive(u, false)}>Deactivate</button
+              >
+            {:else}
+              <button
+                disabled={busyId === u.id}
+                onclick={() => setActive(u, true)}>Reactivate</button
+              >
+            {/if}
+            <button disabled={busyId === u.id} onclick={() => rotate(u)}
+              >Rotate</button
+            >
+          </td>
         </tr>
       {/each}
     </tbody>
   </table>
 {/if}
+
+<style>
+  .actions {
+    text-align: right;
+    white-space: nowrap;
+  }
+  .actions select,
+  .actions button {
+    margin-left: 0.4rem;
+  }
+</style>
