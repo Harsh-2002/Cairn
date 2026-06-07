@@ -195,6 +195,10 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
         clock.clone(),
     );
 
+    // Ensure the root administrator exists so the deployment is usable immediately: the same access
+    // key + secret log into the web UI, authenticate the management API, and sign S3 requests.
+    ensure_root_admin(&meta, &crypto, &clock, cfg).await?;
+
     // Startup reconciliation reclaims orphaned blobs from any crash window before serving. The
     // oracle is taken by `&dyn ReconcileOracle`, so the boxed oracle is borrowed via `as_ref`.
     match blob
@@ -218,4 +222,78 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
         oracle,
         store,
     })
+}
+
+/// Ensure an active administrator with the configured root access key exists, so the server is
+/// usable out of the box. The same `CAIRN_ROOT_ACCESS_KEY` / `CAIRN_ROOT_SECRET_KEY` pair is valid
+/// for the web UI login, the management API (as a Bearer token `access.secret`), and the S3 API
+/// (SigV4 — the access key is registered as the SigV4 key id too). Idempotent: created when absent,
+/// secret/role refreshed when the env changed, left untouched when already in sync.
+async fn ensure_root_admin(
+    meta: &Arc<dyn MetadataStore>,
+    crypto: &Arc<dyn Crypto>,
+    clock: &Arc<dyn Clock>,
+    cfg: &Config,
+) -> Result<(), String> {
+    use cairn_types::auth::Role;
+    use cairn_types::id::UserId;
+    use cairn_types::meta::{Mutation, User, UserRecord};
+
+    let akid = cfg.root_access_key.clone();
+    let want_hash = cairn_auth::hash_bearer_secret(&cfg.root_secret_key);
+
+    let existing = meta
+        .user_by_bearer_key(&akid)
+        .await
+        .map_err(|e| format!("root admin lookup: {e}"))?;
+
+    // Already present, active, admin, and the secret matches the env — nothing to do.
+    if let Some(ub) = &existing {
+        if ub.user.is_active && ub.user.role == Role::Administrator && ub.secret_hash == want_hash {
+            return Ok(());
+        }
+    }
+
+    let now = clock.now();
+    let sealed = crypto
+        .seal(cfg.root_secret_key.as_bytes())
+        .map_err(|e| format!("seal root secret: {e}"))?;
+    let id = existing
+        .as_ref()
+        .map(|u| u.user.id.clone())
+        .unwrap_or_else(UserId::generate);
+    let record = UserRecord {
+        user: User {
+            id,
+            display_name: "root".to_owned(),
+            access_key_id: akid.clone(),
+            sigv4_access_key_id: Some(akid.clone()),
+            role: Role::Administrator,
+            is_active: true,
+            created_at: now,
+            updated_at: now,
+        },
+        bearer_secret_hash: want_hash,
+        sigv4_secret_ciphertext: Some(sealed.ciphertext),
+        sigv4_secret_nonce: Some(sealed.nonce.0),
+    };
+    let mutation = if existing.is_some() {
+        Mutation::UpdateUser(Box::new(record))
+    } else {
+        Mutation::CreateUser(Box::new(record))
+    };
+    meta.submit(mutation)
+        .await
+        .map_err(|e| format!("seed root admin: {e}"))?;
+
+    if cfg.root_access_key == "cairn" && cfg.root_secret_key == "cairnadmin" {
+        tracing::warn!(
+            access_key = %akid,
+            "using DEFAULT root admin credentials (cairn / cairnadmin) — set CAIRN_ROOT_ACCESS_KEY \
+             and CAIRN_ROOT_SECRET_KEY to secure this deployment"
+        );
+    } else {
+        tracing::info!(access_key = %akid, "root administrator ensured");
+    }
+    Ok(())
 }

@@ -56,7 +56,7 @@ note() { printf '  %s\n' "$*"; }
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 
 [ -x "$BIN" ] || fail "binary not found or not executable: $BIN (build it: cargo build --bin cairn)"
-[ -x "$PY" ] || fail "python interpreter not found: $PY (expected boto3-enabled venv)"
+command -v "$PY" >/dev/null 2>&1 || fail "python interpreter not found: $PY (expected boto3-enabled venv)"
 "$PY" -c "import boto3" 2>/dev/null || fail "boto3 not importable by $PY"
 
 wait_healthy() {

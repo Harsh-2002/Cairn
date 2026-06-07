@@ -99,8 +99,14 @@ pub async fn handle(
             .body(full_body(Bytes::from(resp.body)))
             .unwrap_or_else(|_| Response::new(full_body(Bytes::new())));
     }
+    // The embedded management UI is served under `/web`. `/ui/*` (the former mount) redirects there
+    // so existing links keep working.
+    if raw_path == "/web" || raw_path.starts_with("/web/") {
+        return serve_ui(&raw_path, "/web");
+    }
     if raw_path == "/ui" || raw_path.starts_with("/ui/") {
-        return serve_ui(&raw_path);
+        let target = raw_path.replacen("/ui", "/web", 1);
+        return redirect(&target);
     }
 
     let (bucket, key) = route_path(&raw_path);
@@ -121,16 +127,17 @@ pub async fn handle(
     render(stack.s3.handle(s3req, body).await)
 }
 
-/// Serve the embedded management UI under `/ui/`.
-fn serve_ui(path: &str) -> Response<ResponseBody> {
-    if path == "/ui" {
-        return Response::builder()
-            .status(301)
-            .header("location", "/ui/")
-            .body(full_body(Bytes::new()))
-            .unwrap_or_else(|_| Response::new(full_body(Bytes::new())));
+/// Serve the embedded management UI mounted at `prefix` (e.g. `/web`). A bare prefix with no
+/// trailing slash redirects to `prefix/`; any path that isn't an embedded asset falls back to the
+/// SPA shell so client-side routing survives a reload.
+fn serve_ui(path: &str, prefix: &str) -> Response<ResponseBody> {
+    if path == prefix {
+        return redirect(&format!("{prefix}/"));
     }
-    let rel = path.strip_prefix("/ui/").unwrap_or("");
+    let rel = path
+        .strip_prefix(prefix)
+        .and_then(|p| p.strip_prefix('/'))
+        .unwrap_or("");
     let (content_type, bytes) = if rel.is_empty() {
         cairn_ui::spa_shell()
     } else {
@@ -140,6 +147,15 @@ fn serve_ui(path: &str) -> Response<ResponseBody> {
         .status(200)
         .header("content-type", content_type)
         .body(full_body(Bytes::from(bytes.into_owned())))
+        .unwrap_or_else(|_| Response::new(full_body(Bytes::new())))
+}
+
+/// A 301 redirect to `location`.
+fn redirect(location: &str) -> Response<ResponseBody> {
+    Response::builder()
+        .status(301)
+        .header("location", location)
+        .body(full_body(Bytes::new()))
         .unwrap_or_else(|_| Response::new(full_body(Bytes::new())))
 }
 

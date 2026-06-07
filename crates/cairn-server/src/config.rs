@@ -87,6 +87,15 @@ pub struct Config {
     /// target used for any source bucket that does not match a named target. Each element is a
     /// [`ReplicationTarget`]; parsed with `serde_json` on load.
     pub replication_targets: Option<String>,
+
+    /// The root administrator's access key (`CAIRN_ROOT_ACCESS_KEY`). On every startup an active
+    /// administrator with this access key is ensured in the store; the same access key + secret work
+    /// for the web UI login, the management API (as a Bearer token `access.secret`), and the S3 API
+    /// (SigV4). Defaults to a well-known value for out-of-the-box access — override in production.
+    pub root_access_key: String,
+    /// The root administrator's secret key (`CAIRN_ROOT_SECRET_KEY`). Paired with
+    /// [`root_access_key`](Self::root_access_key); see its docs.
+    pub root_secret_key: String,
 }
 
 impl Default for Config {
@@ -118,6 +127,8 @@ impl Default for Config {
             replication_region: None,
             replication_interval_secs: 30,
             replication_targets: None,
+            root_access_key: "cairn".to_owned(),
+            root_secret_key: "cairnadmin".to_owned(),
         }
     }
 }
