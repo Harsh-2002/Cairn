@@ -107,7 +107,9 @@ async fn open_meta(
         }
         // The libSQL/Turso backends are compiled in only with the `meta-async` cargo feature, so the
         // default release binary links only the rusqlite engine (no dual-bundled-SQLite collision —
-        // it builds cleanly on every linker, including the aarch64 cross path).
+        // it builds cleanly on every linker, including the aarch64 cross path). This arm exists only
+        // when the feature is OFF (otherwise the specific arms above match and this is unreachable).
+        #[cfg(not(feature = "meta-async"))]
         backend @ ("libsql" | "turso") => Err(format!(
             "meta_backend {backend:?} requires a binary built with --features meta-async \
              (the default binary supports only sqlite)"
