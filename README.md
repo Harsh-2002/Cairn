@@ -6,9 +6,8 @@ in an embedded SQLite database (the single source of truth). Cairn adds transpar
 block compression, native TLS, asynchronous bucket replication, an embedded Svelte management
 UI, and a CLI — shipped as **one static binary**.
 
-> The full engineering specification is in [`ARCH.md`](./ARCH.md). The build roadmap is in
-> [the plan](.). Cairn is a built from its own engineering specification
-> `the baseline`.
+> The full engineering specification is in [`ARCH.md`](./ARCH.md). Cairn is built from scratch
+> in Rust from that specification.
 
 ## Status
 

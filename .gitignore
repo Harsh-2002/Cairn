@@ -1,5 +1,4 @@
 /target
-/reference
 **/*.rs.bk
 *.profraw
 /ui/node_modules

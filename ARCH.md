@@ -4,12 +4,11 @@
 
 > **On the name.** This document uses the working codename **Cairn** for the new system. A cairn is a deliberate stack of stones that marks and endures; it suits a store whose job is to keep bytes safe on local disk. The name is a placeholder. Rename freely; nothing in the design depends on it.
 
-> **Relationship to the baseline.** Cairn is built from this specification. It carries a different and much larger feature set, targets production rather than a single homelab node, and is engineered around the properties Rust gives us for an I/O-bound, latency-sensitive, security-critical data plane. Where this document contrasts Cairn with a baseline implementation, it does so only to motivate a design decision.
+> **Design philosophy.** Cairn is built from scratch in Rust from this specification. It is engineered for production rather than a single homelab node, carries a large feature set, and is designed around the properties Rust gives us for an I/O-bound, latency-sensitive, security-critical data plane. Where this document contrasts Cairn with a "naive" or "baseline" implementation, it does so only to motivate a design decision, not to describe any specific other system.
 
 | | |
 |---|---|
 | Document status | Draft v2 |
-| Reference system | `the baseline storage design` (Go), internal |
 | Target system | Cairn (Rust) |
 | Audience | The Rust engineers who will build Cairn from scratch |
 | Form | Technical specification in prose and tables. By request, this document contains no source-code listings; interfaces, schemas, and algorithms are specified in precise English and tabular form so that an engineer can implement them in whatever shape the language idioms of the day favour. |
@@ -21,7 +20,7 @@
 
 The document is organised in seven parts.
 
-Part I (Sections 1 to 5) sets context: what Cairn is, what it deliberately is not, the concrete engineering reasons it is written in Rust, the baseline storage architecture and the catalogue of production gaps together with the delta Cairn introduces.
+Part I (Sections 1 to 5) sets context: what Cairn is, what it deliberately is not, the concrete engineering reasons it is written in Rust, the baseline storage architecture it builds on, and the catalogue of production gaps a naive implementation has together with the delta Cairn introduces.
 
 Part II (Sections 6 to 10) is the core data-plane architecture: the node model, the concurrency and I/O model, the durability and crash-consistency model, the on-disk storage layout, and transparent compression at rest.
 
@@ -41,7 +40,7 @@ If you intend to start building immediately, read Sections 5, 6, 7, 8, 12, and 3
 
 ## 1. Executive summary
 
-Cairn is a single-binary object storage server that speaks the Amazon S3 API with enough fidelity that unmodified S3 clients, SDKs, and tools work against it without special-casing. It stores object data as plain files on a local POSIX filesystem and keeps all metadata in an embedded SQLite database. Its defining principle, inherited from the baseline and preserved, is that the metadata database is the single source of truth and object bytes live under opaque identifiers on disk, so that a metadata commit is the one and only linearization point of any mutation. Everything else in the system is built outward from that principle.
+Cairn is a single-binary object storage server that speaks the Amazon S3 API with enough fidelity that unmodified S3 clients, SDKs, and tools work against it without special-casing. It stores object data as plain files on a local POSIX filesystem and keeps all metadata in an embedded SQLite database. Its defining principle is that the metadata database is the single source of truth and object bytes live under opaque identifiers on disk, so that a metadata commit is the one and only linearization point of any mutation. Everything else in the system is built outward from that principle.
 
 Cairn is intended for production. The design goal is that a team running a single-node MinIO, or any single-drive or single-host S3 endpoint, can replace it with Cairn and gain a simpler operational model, a smaller and safer binary, transparent compression, an embedded management UI, and asynchronous bucket replication for redundancy, without losing S3 compatibility. Cairn does not attempt to be a distributed, erasure-coded, multi-node cluster; that is an explicit non-goal (Section 2). Its redundancy and geo-distribution story is asynchronous bucket replication between independent Cairn deployments (or to any S3-compatible destination), in the spirit of S3 Cross-Region Replication, rather than synchronous clustering. Within a node, durability rests on correct fsync ordering plus the operator's choice of resilient storage underneath (RAID, ZFS, or a cloud block device with its own redundancy).
 
@@ -98,7 +97,7 @@ The following are all in scope and specified in this document. Several were out 
 
 ## 3. Why a Rust rewrite
 
-This section is the engineering justification, stated concretely rather than as a preference. The claim is narrow and defensible: for the specific workload of an I/O-bound, concurrency-heavy, latency-sensitive, network-facing storage data plane that parses untrusted input, Rust is the better tool, and the advantages compound at production scale. the baseline is a competent Go program and Go is an excellent language; the point is not that Go is bad but that Cairn's goals lean directly into Rust's strengths.
+This section is the engineering justification, stated concretely rather than as a preference. The claim is narrow and defensible: for the specific workload of an I/O-bound, concurrency-heavy, latency-sensitive, network-facing storage data plane that parses untrusted input, Rust is the better tool, and the advantages compound at production scale. Go is an excellent language; the point is not that Go is bad but that Cairn's goals lean directly into Rust's strengths.
 
 ### 3.1 Predictable tail latency without a garbage collector
 
@@ -136,7 +135,7 @@ This section records the reference system at the level of detail needed to desig
 
 ### 4.1 Shape
 
-the baseline is one process with one HTTP listener serving four route families: the S3 API at the root, a management JSON API under a management path prefix, a loopback-only first-start bootstrap endpoint, and unauthenticated signed public-read URLs under a public path prefix, plus liveness and readiness endpoints. It depends on a small set of libraries: a router, a CORS helper, a UUID generator, and a pure-Go SQLite. There is no external database or cache.
+The baseline storage design is one process with one HTTP listener serving four route families: the S3 API at the root, a management JSON API under a management path prefix, a loopback-only first-start bootstrap endpoint, and unauthenticated signed public-read URLs under a public path prefix, plus liveness and readiness endpoints. It depends on a small set of libraries: a router, a CORS helper, a UUID generator, and an embedded SQLite. There is no external database or cache.
 
 ### 4.2 The storage model (inherited wholesale)
 
@@ -154,11 +153,11 @@ Cairn preserves: the UUID-blob storage model and metadata-as-truth; the temp-the
 
 ## 5. Gap and flaw analysis, and the delta to Cairn
 
-This is the bridge from the reference to the new system. Each finding states the the baseline gap or the new production requirement, its impact, and the decision Cairn takes. Findings carried from the earlier analysis keep their identifiers (F-series); new findings introduced by the expanded production scope are added (the N-series).
+This is the bridge from the baseline to the production system. Each finding states a baseline gap or a new production requirement, its impact, and the decision Cairn takes. Durability/correctness findings use the F-series identifiers; findings introduced by the expanded production scope use the N-series.
 
 ### 5.1 Durability and crash consistency
 
-**F-1 [HIGH] No directory fsync after rename.** the baseline fsyncs the staged file but not the parent directory after renaming it in. On POSIX, the rename is only durable once the containing directory is fsynced, so a power loss can lose a blob whose metadata row already committed, producing a dangling reference that reconciliation does not repair. **Cairn:** fsync the destination directory after every rename into a final location, as a single mandatory step on every commit path.
+**F-1 [HIGH] No directory fsync after rename.** A naive temp-then-rename fsyncs the staged file but not the parent directory after renaming it in. On POSIX, the rename is only durable once the containing directory is fsynced, so a power loss can lose a blob whose metadata row already committed, producing a dangling reference that reconciliation does not repair. **Cairn:** fsync the destination directory after every rename into a final location, as a single mandatory step on every commit path.
 
 **F-2 [HIGH] Blob durability is not ordered before metadata visibility.** The safe invariant is that a committed row never references a non-durable blob. **Cairn:** fix the commit sequence so blob data and its directory entry are both fsynced before the metadata transaction begins (Section 8).
 
@@ -176,7 +175,7 @@ This is the bridge from the reference to the new system. Each finding states the
 
 **F-7 [LOW] Listing edge cases under delimiter are not exhaustively tested.** **Cairn:** property tests against a reference oracle (Section 29).
 
-**N-2 [HIGH] The full S3 control surface is required.** the baseline implements core object and bucket operations only. Cairn must additionally implement versioning, tagging, ACLs, bucket policies, Block Public Access, Object Ownership, CORS configuration, lifecycle, and bucket replication, each to a fidelity that passes conformance. **Cairn:** Sections 15 to 20 specify each subsystem; Section 13 catalogues the operations; Section 34 lists the full matrix.
+**N-2 [HIGH] The full S3 control surface is required.** A baseline implementation provides core object and bucket operations only. Cairn must additionally implement versioning, tagging, ACLs, bucket policies, Block Public Access, Object Ownership, CORS configuration, lifecycle, and bucket replication, each to a fidelity that passes conformance. **Cairn:** Sections 15 to 20 specify each subsystem; Section 13 catalogues the operations; Section 34 lists the full matrix.
 
 **N-3 [HIGH] Authorization must be a real engine, not a role check.** With bucket policies and ACLs in scope, request authorization becomes a multi-source decision (identity and role, bucket policy, object and bucket ACL, Block Public Access, Object Ownership) with a defined precedence. **Cairn:** a single authorization pipeline with an explicit evaluation order modelled on AWS semantics (Section 15).
 
@@ -232,7 +231,7 @@ This is the bridge from the reference to the new system. Each finding states the
 
 ### 5.8 Consolidated delta
 
-The net of the above: Cairn keeps the baseline's storage model and its correct instincts, fixes its durability and memory and concurrency weaknesses, adds the entire production S3 control surface (versioning, tagging, ACL, policy, BPA, ownership, CORS, lifecycle, replication), engineers the write path for throughput via group commit, engineers the read path for zero-copy, adds transparent compression, adds native TLS and a full security posture, adds metrics and audit and a tested backup story, and ships an embedded UI and a CLI. The subsequent parts specify each of these.
+The net of the above: Cairn keeps the baseline storage model and its correct instincts, fixes the durability and memory and concurrency weaknesses of a naive implementation, adds the entire production S3 control surface (versioning, tagging, ACL, policy, BPA, ownership, CORS, lifecycle, replication), engineers the write path for throughput via group commit, engineers the read path for zero-copy, adds transparent compression, adds native TLS and a full security posture, adds metrics and audit and a tested backup story, and ships an embedded UI and a CLI. The subsequent parts specify each of these.
 
 ---
 
@@ -300,7 +299,7 @@ Cairn serves HTTP/1.1 and HTTP/2. It can terminate TLS itself using a Rust TLS s
 
 ### 7.8 Backpressure, limits, and fairness
 
-A global concurrency limit caps the number of in-flight requests so that overload sheds cleanly rather than collapsing; excess requests wait briefly or are rejected with a retryable status. Per-request timeouts bound how long any single request can hold resources. The bounded blob pool and the streamed, backpressured transfers ensure that a small number of very large transfers cannot monopolise memory or threads. These mechanisms together give the server a defined behaviour at and beyond saturation, which is a production requirement that the baseline does not address.
+A global concurrency limit caps the number of in-flight requests so that overload sheds cleanly rather than collapsing; excess requests wait briefly or are rejected with a retryable status. Per-request timeouts bound how long any single request can hold resources. The bounded blob pool and the streamed, backpressured transfers ensure that a small number of very large transfers cannot monopolise memory or threads. These mechanisms together give the server a defined behaviour at and beyond saturation, which is a production requirement a naive single-node server does not address.
 
 ---
 
@@ -314,7 +313,7 @@ Cairn guarantees that after any crash, on restart it converges to a state in whi
 
 Every mutating operation follows one ordered sequence, and the order is the durability design.
 
-First, the object's bytes are streamed to a staging file in the staging directory, with hashes computed inline and, where compression is enabled, the framed compressed form and its index trailer produced during the same pass. Second, the staging file is fsynced, which makes its data and inode durable. Third, the staging file is renamed into its final per-bucket directory under its UUID name; rename is atomic within the filesystem, which is why the staging directory must share the filesystem with the data directory. Fourth, and this is the step the baseline omits, the destination directory is fsynced, which makes the rename itself durable; without this the directory entry can be lost on power failure even though the file data is safe. Fifth, the computed hashes are validated against any client-supplied checksums, and on mismatch the blob is deleted and the operation fails with no metadata written. Sixth, the metadata transaction is submitted to the writer and committed; this is the single linearization point, and for conditional writes the precondition is evaluated inside this transaction so the check and the upsert are inseparable. Only after this commit is the operation acknowledged to the client. Seventh, after the commit, any superseded blob is deleted on a best-effort basis and the activity and metrics are recorded.
+First, the object's bytes are streamed to a staging file in the staging directory, with hashes computed inline and, where compression is enabled, the framed compressed form and its index trailer produced during the same pass. Second, the staging file is fsynced, which makes its data and inode durable. Third, the staging file is renamed into its final per-bucket directory under its UUID name; rename is atomic within the filesystem, which is why the staging directory must share the filesystem with the data directory. Fourth, and this is the step a naive temp-then-rename omits, the destination directory is fsynced, which makes the rename itself durable; without this the directory entry can be lost on power failure even though the file data is safe. Fifth, the computed hashes are validated against any client-supplied checksums, and on mismatch the blob is deleted and the operation fails with no metadata written. Sixth, the metadata transaction is submitted to the writer and committed; this is the single linearization point, and for conditional writes the precondition is evaluated inside this transaction so the check and the upsert are inseparable. Only after this commit is the operation acknowledged to the client. Seventh, after the commit, any superseded blob is deleted on a best-effort basis and the activity and metrics are recorded.
 
 The invariant this produces is that a committed, visible row never references a blob that is not already durable, because blob durability (steps two through four) strictly precedes metadata commit (step six). A crash between step four and step six leaves a durable blob with no row, which is an orphan that reconciliation reclaims; a crash after step six leaves a consistent state. There is no ordering in which a visible row points at a blob that the filesystem has not promised to keep.
 
@@ -424,7 +423,7 @@ Two query patterns are performance-critical and are designed explicitly. Listing
 
 ### 11.5 The metadata cache
 
-A concurrent, sharded, size-bounded cache fronts the store for hot reads of object and bucket metadata and of the small configuration documents consulted on every request, such as a bucket's policy and ACL and CORS and public-access-block settings. The cache holds reference-counted values, so a hit returns a cheap shared handle rather than copying the record, which removes both the global-lock contention and the per-hit allocation churn of the the baseline cache (F-10). It is sized by an approximate byte budget and can be disabled. After any write transaction commits, the writer invalidates the specific entries the transaction affected, and bucket-configuration changes invalidate the relevant configuration entries so the next request sees the new policy or ACL immediately; because the cache holds only hot entries rather than the whole keyspace, even invalidating all object entries of a deleted bucket is bounded work. The cache is a decorator over the store interface, so it composes with any metadata backend and can be tested independently.
+A concurrent, sharded, size-bounded cache fronts the store for hot reads of object and bucket metadata and of the small configuration documents consulted on every request, such as a bucket's policy and ACL and CORS and public-access-block settings. The cache holds reference-counted values, so a hit returns a cheap shared handle rather than copying the record, which removes both the global-lock contention and the per-hit allocation churn of a naive global cache (F-10). It is sized by an approximate byte budget and can be disabled. After any write transaction commits, the writer invalidates the specific entries the transaction affected, and bucket-configuration changes invalidate the relevant configuration entries so the next request sees the new policy or ACL immediately; because the cache holds only hot entries rather than the whole keyspace, even invalidating all object entries of a deleted bucket is bounded work. The cache is a decorator over the store interface, so it composes with any metadata backend and can be tested independently.
 
 ### 11.6 Transactions, group commit, and conditional logic
 
@@ -462,7 +461,7 @@ A cryptography interface provides the envelope encryption and decryption of SigV
 
 ### 12.7 Why this layer is worth its cost
 
-The abstraction layer adds indirection, and indirection has a cost in ceremony and sometimes in a virtual call. The cost is justified three times over. It makes the entire engine unit-testable without a disk or a database, so the protocol, authorization, versioning, lifecycle, and replication logic are tested in milliseconds against in-memory doubles, which is the difference between a test suite engineers run constantly and one they avoid. It makes backends swappable, so the io_uring blob engine, the remote cold tier, and a future pure-Rust metadata engine are drop-in rather than rewrites. And it forces clean seams that keep the protocol layer free of storage detail, which is the discipline that let the baseline's good instincts be preserved while everything around them was rebuilt. These are the same reasons the boundary is the single most important structural improvement over the reference (F-21).
+The abstraction layer adds indirection, and indirection has a cost in ceremony and sometimes in a virtual call. The cost is justified three times over. It makes the entire engine unit-testable without a disk or a database, so the protocol, authorization, versioning, lifecycle, and replication logic are tested in milliseconds against in-memory doubles, which is the difference between a test suite engineers run constantly and one they avoid. It makes backends swappable, so the io_uring blob engine, the remote cold tier, and a future pure-Rust metadata engine are drop-in rather than rewrites. And it forces clean seams that keep the protocol layer free of storage detail, which is the discipline that keeps the storage model's good instincts intact while everything around them is purpose-built for production. These are the same reasons the boundary is the single most important structural decision in the design (F-21).
 
 ---
 
@@ -772,7 +771,7 @@ The request identifier appears in the error body, as a response header, and in t
 
 ### 26.1 Tracing and logging
 
-The system is instrumented with structured tracing throughout, with one span per request that carries the method, the route, the bucket and key, the principal, the request identifier, the resulting status, and the duration, and with structured logs that can be emitted as human-readable text or as machine-readable JSON depending on configuration, filtered by a configurable level. Errors are logged at the boundary with their request identifier so they correlate with the client-visible identifier and with the trace. This is the baseline of being able to see what the server is doing, which the baseline has in part and Cairn extends.
+The system is instrumented with structured tracing throughout, with one span per request that carries the method, the route, the bucket and key, the principal, the request identifier, the resulting status, and the duration, and with structured logs that can be emitted as human-readable text or as machine-readable JSON depending on configuration, filtered by a configurable level. Errors are logged at the boundary with their request identifier so they correlate with the client-visible identifier and with the trace. This is the baseline of being able to see what the server is doing, which Cairn provides in full.
 
 ### 26.2 Metrics
 
