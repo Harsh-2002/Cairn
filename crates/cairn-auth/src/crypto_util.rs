@@ -130,7 +130,11 @@ mod tests {
         // The request path arrives already percent-encoded; the SigV4 canonical URI must
         // decode-then-encode-once so it matches what the client signed — never double-encode
         // (the bug that turned %28 into %2528 and broke keys with '(' ')' or spaces).
-        for wire in ["/bkt/a%281%29.rnd", "/bkt/with%20space.txt", "/bkt/p%29%28q"] {
+        for wire in [
+            "/bkt/a%281%29.rnd",
+            "/bkt/with%20space.txt",
+            "/bkt/p%29%28q",
+        ] {
             assert_eq!(uri_encode(&percent_decode(wire), false), wire);
         }
     }
