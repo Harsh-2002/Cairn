@@ -31,9 +31,11 @@ async fn harness() -> Harness {
     let blob: Arc<dyn BlobStore> =
         Arc::new(cairn_blob::LocalBlobStore::open(dir.path()).await.unwrap());
     let clock = Arc::new(cairn_types::testing::TestClock::default());
+    let authz = Arc::new(cairn_types::testing::AllowAll);
     let svc = S3Service::new(
         meta,
         blob,
+        authz,
         clock,
         "us-east-1".to_owned(),
         5 * 1024 * 1024 * 1024,

@@ -16,7 +16,7 @@ use cairn_types::testing::{
     TestClock,
 };
 use cairn_types::time::Timestamp;
-use cairn_types::traits::{BlobStore, MetadataStore};
+use cairn_types::traits::{BlobStore, Clock, MetadataStore};
 
 use cairn_replication::{ReplicationEngine, ReplicationOpts, next_backoff, outbox_entry_for};
 

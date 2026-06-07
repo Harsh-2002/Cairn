@@ -7,7 +7,10 @@ use crate::error_map::error_response;
 use crate::httpdate::http_date;
 use crate::request::{S3Body, S3Request, S3Response};
 use base64::Engine;
-use cairn_types::auth::{Principal, Role};
+use cairn_types::auth::{Principal, RequesterClass, Role};
+use cairn_types::authz::{
+    Action, AuthzInput, Decision, PublicAccessBlock, RequestContext, Resource,
+};
 use cairn_types::blob::{ByteRange, PartRef, StageOptions};
 use cairn_types::bucket::{Bucket, ConfigAspect, ConfigDoc, VersioningState};
 use cairn_types::error::Error;
@@ -18,7 +21,7 @@ use cairn_types::meta::{
 use cairn_types::object::{
     ChecksumAlgorithm, ChecksumSet, CompressionDescriptor, ETag, ObjectVersionRow, StorageClass,
 };
-use cairn_types::traits::{BlobStore, Clock, MetadataStore};
+use cairn_types::traits::{AuthorizationEngine, BlobStore, Clock, MetadataStore};
 use http::{Method, StatusCode};
 use std::sync::Arc;
 
@@ -29,6 +32,7 @@ type Result<T> = std::result::Result<T, Error>;
 pub struct S3Service {
     meta: Arc<dyn MetadataStore>,
     blob: Arc<dyn BlobStore>,
+    authz: Arc<dyn AuthorizationEngine>,
     clock: Arc<dyn Clock>,
     region: String,
     max_object_size: u64,
@@ -47,6 +51,7 @@ impl S3Service {
     pub fn new(
         meta: Arc<dyn MetadataStore>,
         blob: Arc<dyn BlobStore>,
+        authz: Arc<dyn AuthorizationEngine>,
         clock: Arc<dyn Clock>,
         region: String,
         max_object_size: u64,
@@ -54,6 +59,7 @@ impl S3Service {
         Self {
             meta,
             blob,
+            authz,
             clock,
             region,
             max_object_size,
@@ -82,6 +88,15 @@ impl S3Service {
     }
 
     async fn bucket_op(&self, req: S3Request, body: cairn_types::BodyStream) -> Result<S3Response> {
+        // Authorize centrally: map the operation to an action, then evaluate the engine.
+        let action = bucket_action(&req)?;
+        if action == Action::CreateBucket {
+            self.require_principal(&req)?;
+        } else {
+            let bucket = self.fetch_bucket(&req).await?;
+            self.authorize(&req, &bucket, action, Resource::Bucket(bucket.name.clone()))
+                .await?;
+        }
         match req.method {
             // Subresources first (they share the bucket path with the plain operations).
             Method::GET if req.has_query("location") => self.get_bucket_location(&req).await,
@@ -133,6 +148,20 @@ impl S3Service {
     }
 
     async fn object_op(&self, req: S3Request, body: cairn_types::BodyStream) -> Result<S3Response> {
+        // Authorize centrally against the object resource.
+        let action = object_action(&req)?;
+        let bucket = self.fetch_bucket(&req).await?;
+        let key = req.key.clone().ok_or(Error::NoSuchKey)?;
+        self.authorize(
+            &req,
+            &bucket,
+            action,
+            Resource::Object {
+                bucket: bucket.name.clone(),
+                key,
+            },
+        )
+        .await?;
         match req.method {
             Method::PUT if req.has_query("uploadId") && req.query("partNumber").is_some() => {
                 self.upload_part(req, body).await
@@ -191,7 +220,7 @@ impl S3Service {
     }
 
     async fn delete_bucket(&self, req: &S3Request) -> Result<S3Response> {
-        let (bucket, _) = self.authorized_bucket(req).await?;
+        let bucket = self.fetch_bucket(req).await?;
         if !self.meta.is_bucket_empty(&bucket.name).await? {
             return Err(Error::BucketNotEmpty);
         }
@@ -203,12 +232,12 @@ impl S3Service {
     }
 
     async fn head_bucket(&self, req: &S3Request) -> Result<S3Response> {
-        let _ = self.authorized_bucket(req).await?;
+        let _ = self.fetch_bucket(req).await?;
         Ok(S3Response::status(StatusCode::OK).with_header("x-amz-request-id", &req.request_id))
     }
 
     async fn get_bucket_location(&self, req: &S3Request) -> Result<S3Response> {
-        let (bucket, _) = self.authorized_bucket(req).await?;
+        let bucket = self.fetch_bucket(req).await?;
         let body = format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<LocationConstraint xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">{}</LocationConstraint>",
             bucket.region
@@ -217,7 +246,7 @@ impl S3Service {
     }
 
     async fn list_objects(&self, req: &S3Request) -> Result<S3Response> {
-        let (bucket, _) = self.authorized_bucket(req).await?;
+        let bucket = self.fetch_bucket(req).await?;
         let v1 = req.query("list-type").map(|v| v != "2").unwrap_or(true);
         let prefix = req.query("prefix").map(str::to_owned);
         let delimiter = req.query("delimiter").map(str::to_owned);
@@ -275,7 +304,7 @@ impl S3Service {
         req: S3Request,
         raw_body: cairn_types::BodyStream,
     ) -> Result<S3Response> {
-        let bucket = self.authorized_bucket_owned(&req).await?;
+        let bucket = self.fetch_bucket(&req).await?;
         let key = req.key.clone().expect("key present");
 
         if let Some(cl) = req
@@ -434,7 +463,7 @@ impl S3Service {
     }
 
     async fn delete_object(&self, req: &S3Request) -> Result<S3Response> {
-        let bucket = self.authorized_bucket_owned(req).await?;
+        let bucket = self.fetch_bucket(req).await?;
         let key = req.key.clone().expect("key present");
         let now = self.clock.now();
 
@@ -479,7 +508,7 @@ impl S3Service {
     // --- multipart ---
 
     async fn create_multipart(&self, req: &S3Request) -> Result<S3Response> {
-        let bucket = self.authorized_bucket_owned(req).await?;
+        let bucket = self.fetch_bucket(req).await?;
         let key = req.key.clone().expect("key present");
         let upload_id = UploadId::generate();
         let now = self.clock.now();
@@ -514,7 +543,7 @@ impl S3Service {
         req: S3Request,
         raw_body: cairn_types::BodyStream,
     ) -> Result<S3Response> {
-        let _bucket = self.authorized_bucket_owned(&req).await?;
+        let _bucket = self.fetch_bucket(&req).await?;
         let upload_id = UploadId::from_string(req.query("uploadId").unwrap_or_default().to_owned());
         let part_number: u16 = req
             .query("partNumber")
@@ -563,7 +592,7 @@ impl S3Service {
         req: S3Request,
         body: cairn_types::BodyStream,
     ) -> Result<S3Response> {
-        let bucket = self.authorized_bucket_owned(&req).await?;
+        let bucket = self.fetch_bucket(&req).await?;
         let key = req.key.clone().expect("key present");
         let upload_id = UploadId::from_string(req.query("uploadId").unwrap_or_default().to_owned());
         let xml = drain_body(body, 8 * 1024 * 1024).await?;
@@ -695,7 +724,7 @@ impl S3Service {
     }
 
     async fn abort_multipart(&self, req: &S3Request) -> Result<S3Response> {
-        let _bucket = self.authorized_bucket_owned(req).await?;
+        let _bucket = self.fetch_bucket(req).await?;
         let upload_id = UploadId::from_string(req.query("uploadId").unwrap_or_default().to_owned());
         self.meta
             .submit(Mutation::AbortMultipart(upload_id.clone()))
@@ -706,7 +735,7 @@ impl S3Service {
     }
 
     async fn list_parts(&self, req: &S3Request) -> Result<S3Response> {
-        let (bucket, _) = self.authorized_bucket(req).await?;
+        let bucket = self.fetch_bucket(req).await?;
         let key = req.key.clone().expect("key present");
         let upload_id = UploadId::from_string(req.query("uploadId").unwrap_or_default().to_owned());
         if self.meta.get_multipart(&upload_id).await?.is_none() {
@@ -735,7 +764,7 @@ impl S3Service {
     }
 
     async fn list_multipart_uploads(&self, req: &S3Request) -> Result<S3Response> {
-        let (bucket, _) = self.authorized_bucket(req).await?;
+        let bucket = self.fetch_bucket(req).await?;
         let prefix = req.query("prefix").map(str::to_owned);
         let max: u32 = req
             .query("max-uploads")
@@ -766,7 +795,7 @@ impl S3Service {
     // --- copy & bulk delete ---
 
     async fn copy_object(&self, req: &S3Request) -> Result<S3Response> {
-        let dest_bucket = self.authorized_bucket_owned(req).await?;
+        let dest_bucket = self.fetch_bucket(req).await?;
         let dest_key = req.key.clone().expect("key present");
         let raw_source = req.header("x-amz-copy-source").unwrap_or_default();
         let (src_bucket_s, src_key_s, src_version) = parse_copy_source(raw_source)
@@ -888,7 +917,7 @@ impl S3Service {
         req: &S3Request,
         body: cairn_types::BodyStream,
     ) -> Result<S3Response> {
-        let bucket = self.authorized_bucket_owned(req).await?;
+        let bucket = self.fetch_bucket(req).await?;
         let xml = drain_body(body, 8 * 1024 * 1024).await?;
         let (quiet, keys) = cairn_xml::parse_delete(&xml)?;
         let versioned = bucket.versioning == VersioningState::Enabled;
@@ -949,7 +978,7 @@ impl S3Service {
     // --- versioning ---
 
     async fn get_bucket_versioning(&self, req: &S3Request) -> Result<S3Response> {
-        let (bucket, _) = self.authorized_bucket(req).await?;
+        let bucket = self.fetch_bucket(req).await?;
         Ok(S3Response::xml(
             StatusCode::OK,
             cairn_xml::versioning_configuration(bucket.versioning),
@@ -962,7 +991,7 @@ impl S3Service {
         req: S3Request,
         body: cairn_types::BodyStream,
     ) -> Result<S3Response> {
-        let bucket = self.authorized_bucket_owned(&req).await?;
+        let bucket = self.fetch_bucket(&req).await?;
         let doc = drain_body(body, 64 * 1024).await?;
         let state = cairn_xml::parse_versioning_configuration(&doc)?;
         self.meta
@@ -975,7 +1004,7 @@ impl S3Service {
     }
 
     async fn list_object_versions(&self, req: &S3Request) -> Result<S3Response> {
-        let (bucket, _) = self.authorized_bucket(req).await?;
+        let bucket = self.fetch_bucket(req).await?;
         let prefix = req.query("prefix").map(str::to_owned);
         let delimiter = req.query("delimiter").map(str::to_owned);
         let max = req
@@ -1013,7 +1042,7 @@ impl S3Service {
         aspect: ConfigAspect,
         not_found_code: &str,
     ) -> Result<S3Response> {
-        let (bucket, _) = self.authorized_bucket(req).await?;
+        let bucket = self.fetch_bucket(req).await?;
         match self.meta.get_bucket_config(&bucket.name, aspect).await? {
             Some(doc) => Ok(S3Response::xml(StatusCode::OK, doc.0)
                 .with_header("x-amz-request-id", &req.request_id)),
@@ -1035,7 +1064,7 @@ impl S3Service {
         body: cairn_types::BodyStream,
         aspect: ConfigAspect,
     ) -> Result<S3Response> {
-        let bucket = self.authorized_bucket_owned(&req).await?;
+        let bucket = self.fetch_bucket(&req).await?;
         let doc = drain_body(body, 1024 * 1024).await?;
         let text = String::from_utf8_lossy(&doc).into_owned();
         // Validate per aspect before storing.
@@ -1067,7 +1096,7 @@ impl S3Service {
         req: &S3Request,
         aspect: ConfigAspect,
     ) -> Result<S3Response> {
-        let bucket = self.authorized_bucket_owned(req).await?;
+        let bucket = self.fetch_bucket(req).await?;
         self.meta
             .submit(Mutation::SetBucketConfig {
                 bucket: bucket.name,
@@ -1082,7 +1111,7 @@ impl S3Service {
     // --- object tagging ---
 
     async fn get_object_tagging(&self, req: &S3Request) -> Result<S3Response> {
-        let (bucket, _) = self.authorized_bucket(req).await?;
+        let bucket = self.fetch_bucket(req).await?;
         let key = req.key.clone().expect("key present");
         let row = self
             .meta
@@ -1102,7 +1131,7 @@ impl S3Service {
         req: S3Request,
         body: cairn_types::BodyStream,
     ) -> Result<S3Response> {
-        let bucket = self.authorized_bucket_owned(&req).await?;
+        let bucket = self.fetch_bucket(&req).await?;
         let key = req.key.clone().expect("key present");
         let row = self
             .meta
@@ -1123,7 +1152,7 @@ impl S3Service {
     }
 
     async fn delete_object_tagging(&self, req: &S3Request) -> Result<S3Response> {
-        let bucket = self.authorized_bucket_owned(req).await?;
+        let bucket = self.fetch_bucket(req).await?;
         let key = req.key.clone().expect("key present");
         let row = self
             .meta
@@ -1147,28 +1176,72 @@ impl S3Service {
         req.principal.as_ref().ok_or(Error::AccessDenied)
     }
 
-    /// Fetch the bucket and apply the owner/admin authorization baseline.
-    async fn authorized_bucket(&self, req: &S3Request) -> Result<(Bucket, Principal)> {
-        let principal = self.require_principal(req)?.clone();
+    /// Fetch the target bucket (NoSuchBucket if absent). Authorization is applied centrally in
+    /// `bucket_op`/`object_op`, so handlers only fetch.
+    async fn fetch_bucket(&self, req: &S3Request) -> Result<Bucket> {
         let name = req.bucket.clone().expect("bucket present");
-        let bucket = self
-            .meta
+        self.meta
             .get_bucket(&name)
             .await?
-            .ok_or(Error::NoSuchBucket)?;
-        if principal.role != Role::Administrator && principal.user_id != bucket.owner_id {
-            return Err(Error::AccessDenied);
-        }
-        Ok((bucket, principal))
+            .ok_or(Error::NoSuchBucket)
     }
 
-    async fn authorized_bucket_owned(&self, req: &S3Request) -> Result<Bucket> {
-        Ok(self.authorized_bucket(req).await?.0)
+    /// Evaluate the full authorization decision (ARCH §15): assemble the requester class, the
+    /// account/bucket Block Public Access settings, the bucket policy, and the request context,
+    /// then run the pure policy engine.
+    async fn authorize(
+        &self,
+        req: &S3Request,
+        bucket: &Bucket,
+        action: Action,
+        resource: Resource,
+    ) -> Result<()> {
+        let requester = match req.principal.as_ref() {
+            Some(p) if p.role == Role::Administrator || p.user_id == bucket.owner_id => {
+                RequesterClass::OwnerOrAdmin
+            }
+            Some(p) => RequesterClass::AuthenticatedMember(p.user_id.clone()),
+            None => RequesterClass::Anonymous,
+        };
+        let account_bpa = self.meta.get_account_public_access_block().await?;
+        let bucket_bpa = match self
+            .meta
+            .get_bucket_config(&bucket.name, ConfigAspect::PublicAccessBlock)
+            .await?
+        {
+            Some(doc) => serde_json::from_str(&doc.0).unwrap_or_default(),
+            None => PublicAccessBlock::default(),
+        };
+        let policy = match self
+            .meta
+            .get_bucket_config(&bucket.name, ConfigAspect::Policy)
+            .await?
+        {
+            Some(doc) => cairn_authz::parse_policy(&doc.0).ok(),
+            None => None,
+        };
+        let input = AuthzInput {
+            requester,
+            action,
+            resource,
+            bucket_owner: bucket.owner_id.clone(),
+            account_bpa,
+            bucket_bpa,
+            policy,
+            bucket_acl: None,
+            object_acl: None,
+            ownership_mode: bucket.ownership_mode,
+            context: build_context(req, self.clock.now()),
+        };
+        match self.authz.evaluate(&input) {
+            Decision::Allow => Ok(()),
+            Decision::Deny(_) => Err(Error::AccessDenied),
+        }
     }
 
     /// Resolve the current (or hidden-by-delete-marker) object version for a read.
     async fn resolve_object(&self, req: &S3Request) -> Result<(ObjectVersionRow, Bucket)> {
-        let (bucket, _) = self.authorized_bucket(req).await?;
+        let bucket = self.fetch_bucket(req).await?;
         let key = req.key.clone().expect("key present");
         let row = match req.query("versionId") {
             Some(vid) => self
@@ -1195,6 +1268,72 @@ fn resource_path(req: &S3Request) -> String {
         (Some(b), None) => format!("/{}", b.as_str()),
         _ => "/".to_owned(),
     }
+}
+
+/// Assemble the authorization condition/request context from the request.
+fn build_context(req: &S3Request, now: cairn_types::Timestamp) -> RequestContext {
+    RequestContext {
+        source: req.source,
+        secure_transport: req.secure,
+        referer: req.header("referer").map(str::to_owned),
+        user_agent: req.header("user-agent").map(str::to_owned),
+        now,
+        prefix: req.query("prefix").map(str::to_owned),
+        delimiter: req.query("delimiter").map(str::to_owned),
+        max_keys: req.query("max-keys").and_then(|s| s.parse().ok()),
+        canned_acl: req.header("x-amz-acl").map(str::to_owned),
+        content_sha256: req.header("x-amz-content-sha256").map(str::to_owned),
+        version_id: req
+            .query("versionId")
+            .map(|v| VersionId::from_string(v.to_owned())),
+        existing_tags: Vec::new(),
+        request_tags: Vec::new(),
+    }
+}
+
+/// Map a bucket-level request to the S3 action it requires.
+fn bucket_action(req: &S3Request) -> Result<Action> {
+    use Action::*;
+    let q = |s: &str| req.has_query(s);
+    Ok(match req.method {
+        Method::PUT if q("versioning") => PutBucketVersioning,
+        Method::PUT if q("tagging") => PutBucketTagging,
+        Method::PUT if q("cors") => PutBucketCors,
+        Method::PUT if q("policy") => PutBucketPolicy,
+        Method::PUT => CreateBucket,
+        Method::DELETE if q("tagging") => PutBucketTagging,
+        Method::DELETE if q("cors") => PutBucketCors,
+        Method::DELETE if q("policy") => PutBucketPolicy,
+        Method::DELETE => DeleteBucket,
+        Method::HEAD => ListBucket,
+        Method::GET if q("location") => GetBucketLocation,
+        Method::GET if q("uploads") => ListBucketMultipartUploads,
+        Method::GET if q("versions") => ListBucketVersions,
+        Method::GET if q("versioning") => GetBucketVersioning,
+        Method::GET if q("tagging") => GetBucketTagging,
+        Method::GET if q("cors") => GetBucketCors,
+        Method::GET if q("policy") => GetBucketPolicy,
+        Method::POST if q("delete") => DeleteObject,
+        Method::GET => ListBucket,
+        _ => return Err(Error::NotImplemented),
+    })
+}
+
+/// Map an object-level request to the S3 action it requires.
+fn object_action(req: &S3Request) -> Result<Action> {
+    use Action::*;
+    let q = |s: &str| req.has_query(s);
+    Ok(match req.method {
+        Method::PUT if q("tagging") => PutObjectTagging,
+        Method::GET if q("tagging") => GetObjectTagging,
+        Method::DELETE if q("tagging") => DeleteObjectTagging,
+        Method::GET if q("uploadId") => ListMultipartUploadParts,
+        Method::DELETE if q("uploadId") => AbortMultipartUpload,
+        Method::PUT | Method::POST => PutObject,
+        Method::GET | Method::HEAD => GetObject,
+        Method::DELETE => DeleteObject,
+        _ => return Err(Error::NotImplemented),
+    })
 }
 
 fn quoted(etag: &ETag) -> String {

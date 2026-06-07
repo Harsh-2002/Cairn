@@ -9,7 +9,9 @@ use cairn_crypto::{SystemClock, SystemCrypto};
 use cairn_meta::{OpenOptions, SqliteReconcileOracle};
 use cairn_s3::S3Service;
 use cairn_types::blob::ReconcileOpts;
-use cairn_types::traits::{Authenticator, BlobStore, Clock, Crypto, MetadataStore};
+use cairn_types::traits::{
+    Authenticator, AuthorizationEngine, BlobStore, Clock, Crypto, MetadataStore,
+};
 use std::sync::Arc;
 
 /// The assembled runtime stack shared across requests.
@@ -75,9 +77,11 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
         clock.clone(),
         cfg.dev_auth,
     ));
+    let authz: Arc<dyn AuthorizationEngine> = Arc::new(cairn_authz::PolicyEngine);
     let s3 = S3Service::new(
         meta.clone(),
         blob.clone(),
+        authz,
         clock.clone(),
         cfg.region.clone(),
         cfg.max_object_size,

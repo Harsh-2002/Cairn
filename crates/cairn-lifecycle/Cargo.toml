@@ -21,3 +21,4 @@ tracing.workspace = true
 cairn-types = { workspace = true, features = ["testing"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 futures-util.workspace = true
+bytes.workspace = true

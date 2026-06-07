@@ -15,6 +15,7 @@ cairn-auth.workspace = true
 cairn-authz.workspace = true
 cairn-xml.workspace = true
 async-trait.workspace = true
+serde_json.workspace = true
 bytes.workspace = true
 futures-util = { workspace = true, features = ["std"] }
 http.workspace = true
