@@ -49,8 +49,18 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: taiki-e/install-action@nextest
-      - run: cargo nextest run --workspace --target ${{ matrix.target }}
-      - run: cargo test --workspace --doc
+      # The libSQL/Turso backends (cairn-meta-async) bundle C deps that are not static-musl-safe
+      # (they SIGSEGV under a fully static musl link). They are optional, glibc-only backends and are
+      # NOT part of the default static musl binary (which links only rusqlite), so exclude them from
+      # the musl run; the gnu and all-features jobs exercise them on glibc.
+      - name: Test
+        run: |
+          EXTRA=""
+          case "${{ matrix.target }}" in
+            *musl) EXTRA="--exclude cairn-meta-async" ;;
+          esac
+          cargo nextest run --workspace $EXTRA --target ${{ matrix.target }}
+          cargo test --workspace $EXTRA --doc
 
   test-all-features:
     name: test (all features)
