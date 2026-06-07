@@ -74,17 +74,17 @@ jobs:
         with:
           targets: aarch64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
-      # Cross-compile with `cross`, NOT a hand-wired apt cross-gcc. This crate has vendored C deps
-      # (aws-lc-rs, bundled SQLite, zstd) that must be compiled against a *musl* sysroot for an
-      # aarch64-musl target. Debian ships no `aarch64-linux-musl-gcc`; using the aarch64 *gnu*
-      # cross-gcc instead mixes glibc headers with musl libc and the final link fails on
-      # `__isoc23_sscanf` / `open64` / `stat64` (glibc-only symbols the C deps pull in but musl
-      # lacks). `cross` runs the build in a container carrying the correct aarch64 musl toolchain +
-      # sysroot, so the vendored C links cleanly. This recipe was validated locally: it produces an
-      # "ELF 64-bit LSB executable, ARM aarch64, ... statically linked" cairn binary.
-      - uses: taiki-e/install-action@cross
+      # Cross-compile with cargo-zigbuild: Zig's `cc`/linker carries a complete aarch64 *musl*
+      # sysroot, so the vendored C deps (aws-lc-rs, bundled SQLite, zstd) compile + link against musl
+      # cleanly without Docker or a hand-wired cross-gcc. The DEFAULT binary links only rusqlite's one
+      # bundled SQLite (the libSQL/Turso backends are behind `--features meta-async`), so there is no
+      # dual-SQLite symbol collision and no multiple-definition link flag — which matters because
+      # lld (Zig's linker) rejects every such flag. This exact recipe was validated locally to produce
+      # an "ELF 64-bit LSB executable, ARM aarch64, ... statically linked" cairn binary.
+      - run: pip install ziglang
+      - uses: taiki-e/install-action@cargo-zigbuild
       - name: Build the aarch64 static binary
-        run: cross build --release --bin cairn --target aarch64-unknown-linux-musl
+        run: cargo zigbuild --release --bin cairn --target aarch64-unknown-linux-musl
       - name: Verify the binary is aarch64 and statically linked
         run: |
           BIN=target/aarch64-unknown-linux-musl/release/cairn
