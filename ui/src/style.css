@@ -546,6 +546,54 @@ tbody tr:hover {
   gap: 14px;
 }
 
+/* ---- modal ---------------------------------------------------------------------------------- */
+.modal {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  background: rgba(20, 28, 45, 0.4);
+  display: grid;
+  place-items: center;
+  padding: 20px;
+}
+.modal-card {
+  background: var(--surface);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-lg);
+  width: 100%;
+  max-width: 760px;
+  max-height: 86vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.modal-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--border);
+}
+.modal-head .spacer {
+  flex: 1 1 auto;
+}
+.modal-body {
+  padding: 16px 18px;
+  overflow: auto;
+}
+.modal-body img {
+  max-width: 100%;
+  height: auto;
+  border-radius: var(--r-sm);
+}
+.modal-body pre {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 0.82rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 /* ---- login ---------------------------------------------------------------------------------- */
 .login {
   min-height: 100vh;

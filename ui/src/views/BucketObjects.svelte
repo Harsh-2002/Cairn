@@ -16,6 +16,7 @@
   let fileInput;
   let shared = $state(null); // { key, url } of the most recently minted share link
   let copied = $state(false);
+  let previewing = $state(null); // { key, kind, url, text }
 
   async function loadDetail() {
     try {
@@ -118,6 +119,36 @@
       copied = true;
     } catch {
       copied = false;
+    }
+  }
+
+  function closePreview() {
+    if (previewing?.url) URL.revokeObjectURL(previewing.url);
+    previewing = null;
+  }
+
+  async function preview(key) {
+    error = "";
+    closePreview();
+    try {
+      const blob = await s3.getObjectBlob(name, key);
+      const type = blob.type || "";
+      if (type.startsWith("image/")) {
+        previewing = { key, kind: "image", url: URL.createObjectURL(blob) };
+      } else if (
+        type.startsWith("text/") ||
+        type.includes("json") ||
+        type.includes("xml") ||
+        type.includes("javascript") ||
+        blob.size < 256 * 1024
+      ) {
+        const text = await blob.text();
+        previewing = { key, kind: "text", text };
+      } else {
+        previewing = { key, kind: "none" };
+      }
+    } catch (err) {
+      error = err.message || "Preview failed.";
     }
   }
 
@@ -263,6 +294,7 @@
             <td>{whenMs(o.last_modified_ms)}</td>
             <td>
               <div class="actions">
+                <button class="sm" onclick={() => preview(o.key)}>Preview</button>
                 <button class="sm" onclick={() => download(o.key)}>
                   Download
                 </button>
@@ -282,4 +314,31 @@
       More results available (next token: <span class="mono">{next}</span>).
     </p>
   {/if}
+{/if}
+
+{#if previewing}
+  <div
+    class="modal"
+    role="presentation"
+    onclick={closePreview}
+    onkeydown={(e) => e.key === "Escape" && closePreview()}
+  >
+    <div class="modal-card" role="dialog" onclick={(e) => e.stopPropagation()}>
+      <div class="modal-head">
+        <span class="mono">{previewing.key}</span>
+        <span class="spacer"></span>
+        <button class="sm" onclick={() => download(previewing.key)}>Download</button>
+        <button class="sm" onclick={closePreview}>Close</button>
+      </div>
+      <div class="modal-body">
+        {#if previewing.kind === "image"}
+          <img src={previewing.url} alt={previewing.key} />
+        {:else if previewing.kind === "text"}
+          <pre>{previewing.text}</pre>
+        {:else}
+          <p class="muted">No inline preview for this file type — use Download.</p>
+        {/if}
+      </div>
+    </div>
+  </div>
 {/if}
