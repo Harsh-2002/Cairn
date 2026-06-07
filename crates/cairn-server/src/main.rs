@@ -39,6 +39,8 @@ enum Command {
     ValidateConfig,
     /// Create the first administrator into an empty store and print its credentials once.
     Bootstrap,
+    /// Run reconciliation on demand (reclaim orphaned blobs); a node-local integrity check.
+    Integrity,
 }
 
 fn main() -> ExitCode {
@@ -57,8 +59,52 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Command::Bootstrap => bootstrap(cfg),
+        Command::Integrity => integrity(cfg),
         Command::Serve => run_server(cfg),
     }
+}
+
+fn integrity(cfg: Config) -> ExitCode {
+    use cairn_types::blob::ReconcileOpts;
+    use cairn_types::traits::BlobStore;
+
+    let rt = match runtime() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("failed to start runtime: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    rt.block_on(async {
+        let store = match cairn_meta::open(&cfg.db_path, &cairn_meta::OpenOptions::default()) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("failed to open metadata store: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let oracle = store.reconcile_oracle();
+        let blob = match cairn_blob::LocalBlobStore::open(cfg.data_dir.clone()).await {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("failed to open blob store: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        match blob.reconcile(&oracle, ReconcileOpts::default()).await {
+            Ok(r) => {
+                println!(
+                    "reconciliation complete: scanned={} orphans_reclaimed={} staging_cleaned={} sessions_cleaned={} errors={}",
+                    r.blobs_scanned, r.orphans_reclaimed, r.staging_cleaned, r.sessions_cleaned, r.errors
+                );
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("reconciliation failed: {e}");
+                ExitCode::FAILURE
+            }
+        }
+    })
 }
 
 fn runtime() -> std::io::Result<tokio::runtime::Runtime> {

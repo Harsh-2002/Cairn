@@ -10,7 +10,7 @@ use cairn_types::auth::{AuthOutcome, RequestView};
 use cairn_types::error::{BodyError, Error};
 use cairn_types::id::{BucketName, ObjectKey};
 use futures_util::StreamExt;
-use http_body_util::{BodyStream, Full};
+use http_body_util::{BodyExt, BodyStream, Full};
 use hyper::body::Incoming;
 use hyper::{Request, Response};
 use std::net::IpAddr;
@@ -63,6 +63,27 @@ pub async fn handle(
         }
     };
 
+    // The management JSON API and the embedded web UI share the listener with the S3 surface.
+    if let Some(subpath) = raw_path.strip_prefix("/api/v1") {
+        let query = parse_query(&query_str);
+        let body_bytes = match req.into_body().collect().await {
+            Ok(c) => c.to_bytes(),
+            Err(_) => Bytes::new(),
+        };
+        let resp = stack
+            .control
+            .handle(&method, subpath, &query, principal.as_ref(), body_bytes)
+            .await;
+        return Response::builder()
+            .status(resp.status)
+            .header("content-type", "application/json")
+            .body(Full::new(Bytes::from(resp.body)))
+            .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())));
+    }
+    if raw_path == "/ui" || raw_path.starts_with("/ui/") {
+        return serve_ui(&raw_path);
+    }
+
     let (bucket, key) = route_path(&raw_path);
     let query = parse_query(&query_str);
     let body = incoming_to_stream(req.into_body());
@@ -79,6 +100,28 @@ pub async fn handle(
         request_id,
     };
     collect(stack.s3.handle(s3req, body).await).await
+}
+
+/// Serve the embedded management UI under `/ui/`.
+fn serve_ui(path: &str) -> Response<Full<Bytes>> {
+    if path == "/ui" {
+        return Response::builder()
+            .status(301)
+            .header("location", "/ui/")
+            .body(Full::new(Bytes::new()))
+            .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())));
+    }
+    let rel = path.strip_prefix("/ui/").unwrap_or("");
+    let (content_type, bytes) = if rel.is_empty() {
+        cairn_ui::spa_shell()
+    } else {
+        cairn_ui::asset(rel).unwrap_or_else(cairn_ui::spa_shell)
+    };
+    Response::builder()
+        .status(200)
+        .header("content-type", content_type)
+        .body(Full::new(Bytes::from(bytes.into_owned())))
+        .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())))
 }
 
 /// Split a path-style request path into a bucket and key.

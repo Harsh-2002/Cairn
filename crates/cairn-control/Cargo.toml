@@ -22,3 +22,5 @@ rand.workspace = true
 [dev-dependencies]
 cairn-types = { workspace = true, features = ["testing"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+futures-util = { workspace = true, features = ["std"] }
+serde_json.workspace = true

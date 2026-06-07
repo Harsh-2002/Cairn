@@ -9,9 +9,7 @@ use bytes::Bytes;
 use cairn_types::auth::{Principal, Role};
 use cairn_types::bucket::{Bucket, VersioningState};
 use cairn_types::id::{BucketName, UserId};
-use cairn_types::meta::{
-    ListQuery, Mutation, MutationOutcome, StoreCounts, User, UserRecord,
-};
+use cairn_types::meta::{ListQuery, Mutation, MutationOutcome, StoreCounts, User, UserRecord};
 use cairn_types::traits::{BlobStore, Clock, Crypto, MetadataStore};
 use http::{Method, StatusCode};
 use serde::Serialize;
@@ -243,7 +241,8 @@ impl ControlService {
             Err(e) => return ControlResponse::error_internal(&e.to_string()),
         }
 
-        self.record_activity("CreateBucket", Some(name.as_str()), None).await;
+        self.record_activity("CreateBucket", Some(name.as_str()), None)
+            .await;
 
         ControlResponse::json(
             StatusCode::CREATED,
@@ -284,10 +283,7 @@ impl ControlService {
 
     /// Page the current objects of a bucket with a bounded loop, summing count and logical
     /// bytes. Bounded by [`MAX_PAGES`] iterations.
-    async fn bucket_current_totals(
-        &self,
-        bucket: &BucketName,
-    ) -> Result<(u64, u64), String> {
+    async fn bucket_current_totals(&self, bucket: &BucketName) -> Result<(u64, u64), String> {
         let mut object_count = 0u64;
         let mut logical_bytes = 0u64;
         let mut cursor: Option<String> = None;
@@ -377,7 +373,8 @@ impl ControlService {
             return ControlResponse::error_internal(&e.to_string());
         }
 
-        self.record_activity("DeleteBucket", Some(bucket_name.as_str()), None).await;
+        self.record_activity("DeleteBucket", Some(bucket_name.as_str()), None)
+            .await;
 
         ControlResponse {
             status: StatusCode::NO_CONTENT,
@@ -476,23 +473,41 @@ impl ControlService {
         let bearer_secret_hash = cairn_auth::hash_bearer_secret(&secret);
         let now = self.clock.now();
 
+        // Also provision a SigV4 access-key pair so the user can use the S3 surface. The
+        // SigV4 secret is envelope-encrypted at rest via the crypto facility (the SigV4
+        // authenticator decrypts it transiently); it is never returned over the wire.
+        let sigv4_access_key_id = format!(
+            "CAIRN{}",
+            uuid::Uuid::new_v4().simple().to_string().to_uppercase()
+        );
+        let sigv4_secret = generate_secret();
+        let (sigv4_secret_ciphertext, sigv4_secret_nonce) =
+            match self.crypto.seal(sigv4_secret.as_bytes()) {
+                Ok(sealed) => (Some(sealed.ciphertext), Some(sealed.nonce.0)),
+                Err(e) => return ControlResponse::error_internal(&e.to_string()),
+            };
+
         let record = UserRecord {
             user: User {
                 id: user_id.clone(),
                 display_name: req.display_name,
                 access_key_id: access_key_id.clone(),
-                sigv4_access_key_id: None,
+                sigv4_access_key_id: Some(sigv4_access_key_id),
                 role,
                 is_active: true,
                 created_at: now,
                 updated_at: now,
             },
             bearer_secret_hash,
-            sigv4_secret_ciphertext: None,
-            sigv4_secret_nonce: None,
+            sigv4_secret_ciphertext,
+            sigv4_secret_nonce,
         };
 
-        match self.meta.submit(Mutation::CreateUser(Box::new(record))).await {
+        match self
+            .meta
+            .submit(Mutation::CreateUser(Box::new(record)))
+            .await
+        {
             Ok(MutationOutcome::UserCreated(_)) | Ok(MutationOutcome::Ack) => {}
             Ok(_) => return ControlResponse::error_internal("unexpected create-user outcome"),
             Err(e) => return ControlResponse::error_internal(&e.to_string()),

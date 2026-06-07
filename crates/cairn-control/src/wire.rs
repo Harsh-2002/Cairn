@@ -3,8 +3,8 @@
 //! here so that the contract never drifts with internal representation changes.
 
 use cairn_types::auth::Role;
-use cairn_types::bucket::VersioningState;
 use cairn_types::authz::OwnershipMode;
+use cairn_types::bucket::VersioningState;
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------------------

@@ -57,8 +57,7 @@ pub async fn serve(
     // Optional native TLS.
     let tls = match (&config.tls_cert_path, &config.tls_key_path) {
         (Some(cert), Some(key)) => {
-            let cfg = crate::tls::load_server_config(cert, key)
-                .map_err(|e| std::io::Error::other(e))?;
+            let cfg = crate::tls::load_server_config(cert, key).map_err(std::io::Error::other)?;
             Some(cfg)
         }
         _ => None,

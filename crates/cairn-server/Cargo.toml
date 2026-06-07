@@ -23,6 +23,8 @@ cairn-crypto.workspace = true
 cairn-auth.workspace = true
 cairn-authz.workspace = true
 cairn-lifecycle.workspace = true
+cairn-control.workspace = true
+cairn-ui.workspace = true
 
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "signal", "macros", "time", "sync", "io-util"] }
 rustls = { workspace = true, features = ["aws_lc_rs", "tls12"] }

@@ -18,6 +18,8 @@ use std::sync::Arc;
 pub struct AppStack {
     /// The S3 protocol service.
     pub s3: S3Service,
+    /// The management JSON API service.
+    pub control: cairn_control::ControlService,
     /// The authenticator chain.
     pub auth: Arc<dyn Authenticator>,
     // Held for the background subsystems wired in later waves (WAL checkpointer, multipart
@@ -86,6 +88,12 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
         cfg.region.clone(),
         cfg.max_object_size,
     );
+    let control = cairn_control::ControlService::new(
+        meta.clone(),
+        blob.clone(),
+        crypto.clone(),
+        clock.clone(),
+    );
 
     // Startup reconciliation reclaims orphaned blobs from any crash window before serving.
     match blob.reconcile(&oracle, ReconcileOpts::default()).await {
@@ -99,6 +107,7 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
 
     Ok(AppStack {
         s3,
+        control,
         auth,
         meta,
         blob,
