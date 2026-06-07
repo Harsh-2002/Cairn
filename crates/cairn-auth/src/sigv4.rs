@@ -250,7 +250,7 @@ pub fn verify_header(
     let signed_names = sorted_names(&parsed.signed_headers);
     let cr = canonical_request(
         view.method,
-        &uri_encode(view.path, false),
+        &uri_encode(&percent_decode(view.path), false),
         &canonical_query(view.query, None),
         &signed,
         &signed_names,
@@ -305,7 +305,7 @@ pub fn verify_presigned(
     let signed_names = sorted_names(&parsed.signed_headers);
     let cr = canonical_request(
         view.method,
-        &uri_encode(view.path, false),
+        &uri_encode(&percent_decode(view.path), false),
         &canonical_query(view.query, Some("X-Amz-Signature")),
         &signed,
         &signed_names,
