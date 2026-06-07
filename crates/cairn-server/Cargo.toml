@@ -16,6 +16,12 @@ workspace = true
 # production code path depends on this; it only enables `cairn-blob`'s `failpoints` feature.
 failpoints = ["cairn-blob/failpoints", "dep:fail"]
 
+# Compiles in the async libSQL + Turso metadata backends so CAIRN_META_BACKEND=libsql|turso work.
+# OFF by default: the default release binary then links ONLY rusqlite's bundled SQLite, avoiding the
+# dual-bundled-SQLite symbol collision and the GNU-ld-only link workaround — so the default binary
+# builds on every linker, including the aarch64 cross path (cargo-zigbuild / lld).
+meta-async = ["dep:cairn-meta-async"]
+
 # EXPERIMENTAL, Linux-only zero-copy I/O fast path (off by default; ARCH §7.x perf path).
 #
 # Layer (a) kTLS offload: after the rustls handshake the resulting TLS socket is handed to the
@@ -49,11 +55,12 @@ cairn-types.workspace = true
 cairn-s3.workspace = true
 cairn-meta.workspace = true
 # The async (libSQL + Turso) metadata backends, selectable at runtime via CAIRN_META_BACKEND.
-# Linking this alongside cairn-meta puts both rusqlite's and libSQL's bundled SQLite C libraries in
-# the `cairn` binary, which collide on the public `sqlite3_*` symbols; `build.rs` emits a
-# binary-scoped `--allow-multiple-definition` link arg so the binary links (see build.rs). Turso is
-# pure-Rust and adds no C SQLite, so it does not contribute to the collision.
-cairn-meta-async.workspace = true
+# Optional, enabled by the `meta-async` feature. When enabled, linking this alongside cairn-meta puts
+# both rusqlite's and libSQL's bundled SQLite C libraries in the `cairn` binary, which collide on the
+# public `sqlite3_*` symbols; `build.rs` then emits a binary-scoped `-z muldefs` link arg (see
+# build.rs). Turso is pure-Rust and adds no C SQLite. With the feature OFF the default binary links
+# only rusqlite and needs no link workaround.
+cairn-meta-async = { workspace = true, optional = true }
 cairn-blob.workspace = true
 cairn-crypto.workspace = true
 cairn-auth.workspace = true

@@ -87,6 +87,7 @@ async fn open_meta(
             let meta: Arc<dyn MetadataStore> = store.clone();
             Ok((meta, oracle, Some(store)))
         }
+        #[cfg(feature = "meta-async")]
         "libsql" => {
             let store = cairn_meta_async::open_libsql(&cfg.db_path, &Default::default())
                 .await
@@ -95,6 +96,7 @@ async fn open_meta(
             let meta: Arc<dyn MetadataStore> = Arc::new(store);
             Ok((meta, oracle, None))
         }
+        #[cfg(feature = "meta-async")]
         "turso" => {
             let store = cairn_meta_async::open_turso(&cfg.db_path, &Default::default())
                 .await
@@ -103,6 +105,13 @@ async fn open_meta(
             let meta: Arc<dyn MetadataStore> = Arc::new(store);
             Ok((meta, oracle, None))
         }
+        // The libSQL/Turso backends are compiled in only with the `meta-async` cargo feature, so the
+        // default release binary links only the rusqlite engine (no dual-bundled-SQLite collision —
+        // it builds cleanly on every linker, including the aarch64 cross path).
+        backend @ ("libsql" | "turso") => Err(format!(
+            "meta_backend {backend:?} requires a binary built with --features meta-async \
+             (the default binary supports only sqlite)"
+        )),
         // `Config::validate` already rejects any other value at load, so this is unreachable in
         // practice; it is kept as a defensive clear error rather than a panic.
         other => Err(format!(

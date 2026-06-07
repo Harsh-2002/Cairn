@@ -16,7 +16,11 @@
 //! `cairn-meta-async`'s build script (which scopes the same flag to that crate's test binaries).
 
 fn main() {
-    // Only GNU-style linkers understand this flag; it is what the libSQL + rusqlite combination
-    // requires to co-reside in the single `cairn` binary.
-    println!("cargo:rustc-link-arg-bin=cairn=-Wl,--allow-multiple-definition");
+    // The dual-bundled-SQLite collision only exists when the libSQL backend is compiled in (the
+    // `meta-async` feature). Only then emit the `-z muldefs` link arg (first definition wins). The
+    // DEFAULT binary links only rusqlite, needs no workaround, and builds on every linker including
+    // the aarch64 cross path (cargo-zigbuild/lld rejects every multiple-definition flag).
+    if std::env::var_os("CARGO_FEATURE_META_ASYNC").is_some() {
+        println!("cargo:rustc-link-arg-bin=cairn=-Wl,-z,muldefs");
+    }
 }

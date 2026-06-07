@@ -13,7 +13,8 @@
 //! are entirely unaffected, so the rest of the workspace links exactly as before.
 
 fn main() {
-    // Only GNU-style linkers understand this flag; it is what the libSQL + rusqlite combination
-    // requires to co-reside in a single test binary.
-    println!("cargo:rustc-link-arg-tests=-Wl,--allow-multiple-definition");
+    // `-z muldefs` (first definition wins) resolves the duplicate `sqlite3_*` symbols and is
+    // accepted by both GNU `ld` and LLVM `lld` — unlike the GNU-only `--allow-multiple-definition`,
+    // which lld (e.g. via cargo-zigbuild) rejects.
+    println!("cargo:rustc-link-arg-tests=-Wl,-z,muldefs");
 }
