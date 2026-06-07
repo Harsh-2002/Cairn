@@ -39,6 +39,7 @@ fn row_from(
         user_metadata: Vec::new(),
         acl: None,
         checksums: Vec::new(),
+        sse_descriptor: None,
         replication_status: None,
         created_at: now,
         updated_at: now,
@@ -78,6 +79,7 @@ async fn put_get_list_delete_roundtrip() {
                     extra_checksums: ChecksumSet::none(),
                     size_ceiling: 1 << 20,
                     content_type: "text/plain".to_owned(),
+                    encryption: None,
                 },
             )
             .await
@@ -307,6 +309,7 @@ fn opts() -> StageOptions {
         extra_checksums: ChecksumSet::none(),
         size_ceiling: 1 << 20,
         content_type: "application/octet-stream".to_owned(),
+        encryption: None,
     }
 }
 
@@ -353,6 +356,7 @@ async fn plant_outbox_entry(
         user_metadata: Vec::new(),
         acl: None,
         checksums: Vec::new(),
+        sse_descriptor: None,
         replication_status: Some(cairn_types::meta::ReplicationStatus::Pending),
         created_at: Timestamp::EPOCH,
         updated_at: Timestamp::EPOCH,

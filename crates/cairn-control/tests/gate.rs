@@ -87,6 +87,7 @@ async fn put_object(h: &Harness, bucket: &str, key: &str, data: &'static [u8]) {
                 extra_checksums: ChecksumSet::none(),
                 size_ceiling: 1 << 30,
                 content_type: "application/octet-stream".to_owned(),
+                encryption: None,
             },
         )
         .await
@@ -111,6 +112,7 @@ async fn put_object(h: &Harness, bucket: &str, key: &str, data: &'static [u8]) {
         user_metadata: Vec::new(),
         acl: None,
         checksums: Vec::new(),
+        sse_descriptor: None,
         replication_status: None,
         created_at: now,
         updated_at: now,
@@ -1069,6 +1071,7 @@ async fn failed_replication_reflects_a_planted_terminal_entry() {
         user_metadata: Vec::new(),
         acl: None,
         checksums: Vec::new(),
+        sse_descriptor: None,
         replication_status: Some(cairn_types::meta::ReplicationStatus::Pending),
         created_at: now,
         updated_at: now,

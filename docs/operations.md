@@ -17,9 +17,10 @@ software/hardware RAID or a cloud block volume with provider redundancy are also
 
 ## 2. Configuration
 
-Configuration layers, highest precedence first: **command-line flags → environment variables
-(`CAIRN_*`) → optional TOML file (`--config`) → built-in defaults.** It is validated on load;
-an invalid configuration fails fast. Validate without starting: `cairn validate-config`.
+Configuration is **environment-only**: built-in defaults overlaid with `CAIRN_*` environment
+variables. There is no configuration file and no `--config` flag — a Cairn host or container is
+configured purely by env. It is validated on load; an invalid configuration fails fast. Validate
+without starting: `cairn validate-config`.
 
 | Setting | Env var | Default | Meaning |
 |---|---|---|---|
@@ -38,6 +39,35 @@ an invalid configuration fails fast. Validate without starting: `cairn validate-
 > **Master key.** SigV4 secrets and replication credentials are envelope-encrypted under this
 > key. Supply it out of band; **keep it out of the backup** that contains the database, so the
 > backup alone cannot disclose secrets. Without it, a fixed insecure development key is used.
+
+### Replication targets
+
+The replication worker ships outbox entries to one or more S3-compatible destinations (§20).
+
+* **Single target** (node→node) — set `CAIRN_REPLICATION_ENDPOINT`, `CAIRN_REPLICATION_ACCESS_KEY`,
+  and `CAIRN_REPLICATION_SECRET` (optionally `CAIRN_REPLICATION_DEST_BUCKET`,
+  `CAIRN_REPLICATION_REGION`). Each source bucket's *destination bucket* is resolved from its own
+  replication rule; the endpoint and credentials are shared.
+
+* **Multiple targets** — set `CAIRN_REPLICATION_TARGETS` to a JSON array of named destinations,
+  each with its own endpoint, credentials, and TLS trust. Each source bucket routes to the target
+  whose `dest_bucket` (or `name`) matches its replication rule; a bucket matching no target falls
+  back to the single-target keys above when present.
+
+  ```json
+  [
+    { "name": "west", "endpoint": "https://s3.west.example", "region": "us-west-2",
+      "dest_bucket": "mirror-west", "access_key": "AK...", "secret": "...",
+      "ca_path": "/etc/cairn/west-ca.pem" },
+    { "name": "lab", "endpoint": "https://s3.lab.internal", "region": "us-east-1",
+      "dest_bucket": "mirror-lab", "access_key": "AK...", "secret": "...",
+      "insecure_skip_verify": true }
+  ]
+  ```
+
+  Per-target TLS trust for an `https://` endpoint: `ca_path` trusts a private CA's PEM bundle
+  instead of the public webpki roots; `insecure_skip_verify` disables certificate verification
+  entirely (**dangerous** — testing only, and logged loudly). The two are mutually exclusive.
 
 ## 3. Bootstrapping
 

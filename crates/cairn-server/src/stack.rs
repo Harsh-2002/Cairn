@@ -103,6 +103,7 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
         blob.clone(),
         authz,
         clock.clone(),
+        crypto.clone(),
         cfg.region.clone(),
         cfg.max_object_size,
     );

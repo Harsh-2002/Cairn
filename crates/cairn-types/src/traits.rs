@@ -46,10 +46,29 @@ pub trait BlobStore: Send + Sync {
 
     /// Open a committed blob for reading, transparently decompressing, optionally for a range
     /// expressed in logical (plaintext) coordinates.
+    ///
+    /// This is the default reader for unencrypted (SSE-S3-disabled) objects; it delegates to
+    /// [`open_with_dek`](BlobStore::open_with_dek) with no data-encryption key, so a single
+    /// implementation of `open_with_dek` serves both paths and existing callers of `open`
+    /// (cairn-server, cairn-replication) keep compiling unchanged.
     async fn open(
         &self,
         path: &StoragePath,
         range: Option<ByteRange>,
+    ) -> Result<BlobReadHandle, BlobError> {
+        self.open_with_dek(path, range, None).await
+    }
+
+    /// Open a committed blob for reading, transparently decompressing and — when `dek` is
+    /// `Some` — transparently decrypting each AES-256-GCM block with the supplied raw 32-byte
+    /// data-encryption key, optionally for a range expressed in logical (plaintext) coordinates.
+    /// An encrypted blob opened with the wrong (or no) DEK fails with [`BlobError::Corruption`]
+    /// rather than yielding plaintext (ARCH §27, SSE-S3).
+    async fn open_with_dek(
+        &self,
+        path: &StoragePath,
+        range: Option<ByteRange>,
+        dek: Option<[u8; 32]>,
     ) -> Result<BlobReadHandle, BlobError>;
 
     /// Idempotently delete a committed blob (absence is success).

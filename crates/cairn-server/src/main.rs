@@ -21,13 +21,11 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-/// Cairn — a production-grade, S3-compatible object storage server.
+/// Cairn — a production-grade, S3-compatible object storage server. Configuration is
+/// environment-only: set `CAIRN_*` variables (there is no configuration file).
 #[derive(Debug, Parser)]
 #[command(name = "cairn", version, about)]
 struct Cli {
-    /// Path to an optional TOML configuration file.
-    #[arg(long, global = true, env = "CAIRN_CONFIG")]
-    config: Option<PathBuf>,
     /// The subcommand to run (defaults to `serve`).
     #[command(subcommand)]
     command: Option<Command>,
@@ -61,7 +59,7 @@ enum Command {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let cfg = match Config::load(cli.config.as_ref()) {
+    let cfg = match Config::load() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("configuration error: {e}");

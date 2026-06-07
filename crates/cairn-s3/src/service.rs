@@ -14,6 +14,7 @@ use cairn_types::authz::{
 };
 use cairn_types::blob::{ByteRange, PartRef, StageOptions};
 use cairn_types::bucket::{Bucket, ConfigAspect, ConfigDoc, VersioningState};
+use cairn_types::crypto::Nonce;
 use cairn_types::error::Error;
 use cairn_types::id::{BucketName, ObjectKey, UploadId, VersionId};
 use cairn_types::meta::{
@@ -24,7 +25,7 @@ use cairn_types::object::{
     ChecksumAlgorithm, ChecksumSet, ChecksumValue, CompressionDescriptor, ETag, ObjectVersionRow,
     StorageClass,
 };
-use cairn_types::traits::{AuthorizationEngine, BlobStore, Clock, MetadataStore};
+use cairn_types::traits::{AuthorizationEngine, BlobStore, Clock, Crypto, MetadataStore};
 use http::{Method, StatusCode};
 use std::sync::Arc;
 
@@ -37,6 +38,9 @@ pub struct S3Service {
     blob: Arc<dyn BlobStore>,
     authz: Arc<dyn AuthorizationEngine>,
     clock: Arc<dyn Clock>,
+    /// The cryptography facility, used to wrap (seal) and unwrap (open) per-object SSE-S3
+    /// data-encryption keys under the master key (ARCH §27).
+    crypto: Arc<dyn Crypto>,
     region: String,
     max_object_size: u64,
 }
@@ -56,6 +60,7 @@ impl S3Service {
         blob: Arc<dyn BlobStore>,
         authz: Arc<dyn AuthorizationEngine>,
         clock: Arc<dyn Clock>,
+        crypto: Arc<dyn Crypto>,
         region: String,
         max_object_size: u64,
     ) -> Self {
@@ -64,6 +69,7 @@ impl S3Service {
             blob,
             authz,
             clock,
+            crypto,
             region,
             max_object_size,
         }
@@ -444,11 +450,25 @@ impl S3Service {
         let request_id = req.request_id.clone();
         let body = streaming_body(&req, raw_body, self.max_object_size)?;
 
+        // SSE-S3 (ARCH §27): when the client requests AES256 server-side encryption, mint a fresh
+        // random DEK, hand it to the blob store (which compress-then-encrypts each block), and seal
+        // it under the master key for the metadata row. The plaintext-MD5 ETag is unaffected
+        // because the blob store hashes the plaintext before any transform.
+        let (sse_dek, sse_descriptor) = match requested_sse(&req) {
+            Some(Ok(())) => {
+                let (dek, descriptor) = self.new_sse_dek()?;
+                (Some(dek), Some(descriptor))
+            }
+            Some(Err(e)) => return Err(e),
+            None => (None, None),
+        };
+
         let opts = StageOptions {
             compression: bucket.compression,
             extra_checksums: extra,
             size_ceiling: self.max_object_size,
             content_type: content_type.clone(),
+            encryption: sse_dek,
         };
         let staged = self
             .blob
@@ -506,6 +526,7 @@ impl S3Service {
             user_metadata,
             acl,
             checksums: staged.checksums.clone(),
+            sse_descriptor: sse_descriptor.clone(),
             replication_status: None,
             created_at: now,
             updated_at: now,
@@ -551,6 +572,10 @@ impl S3Service {
                 if versioned {
                     resp = resp.with_header("x-amz-version-id", version_id.as_str());
                 }
+                // Echo the SSE algorithm on the PUT response for an encrypted object (ARCH §27).
+                if sse_descriptor.is_some() {
+                    resp = resp.with_header("x-amz-server-side-encryption", SSE_AES256);
+                }
                 Ok(resp)
             }
             Ok(_) => {
@@ -574,7 +599,13 @@ impl S3Service {
         }
         let range = parse_range(req.header("range"), row.size_logical)?;
         let storage = row.storage_path.clone().ok_or(Error::NoSuchKey)?;
-        let handle = self.blob.open(&storage, range).await?;
+        // SSE-S3 (ARCH §27): if the version is encrypted, unwrap its DEK under the master key and
+        // decrypt transparently while reading. An unencrypted version passes `None`.
+        let dek = match row.sse_descriptor.as_deref() {
+            Some(d) => Some(self.open_sse_dek(d)?),
+            None => None,
+        };
+        let handle = self.blob.open_with_dek(&storage, range, dek).await?;
         let status = if handle.content_range.is_some() {
             StatusCode::PARTIAL_CONTENT
         } else {
@@ -838,8 +869,13 @@ impl S3Service {
             parse_copy_source_range(req.header("x-amz-copy-source-range"), src_row.size_logical)?;
 
         // Open the source range and feed its logical bytes into the part stager, re-tagging blob
-        // read errors as body errors so the source can drive `stage_part`.
-        let handle = self.blob.open(&src_path, range).await?;
+        // read errors as body errors so the source can drive `stage_part`. An SSE-encrypted source
+        // is decrypted transparently via its unwrapped DEK (ARCH §27).
+        let src_dek = match src_row.sse_descriptor.as_deref() {
+            Some(d) => Some(self.open_sse_dek(d)?),
+            None => None,
+        };
+        let handle = self.blob.open_with_dek(&src_path, range, src_dek).await?;
         let src_stream: cairn_types::BodyStream =
             {
                 use futures_util::StreamExt;
@@ -944,6 +980,7 @@ impl S3Service {
             extra_checksums: ChecksumSet::none(),
             size_ceiling: self.max_object_size,
             content_type: session.content_type.clone(),
+            encryption: None,
         };
         let staged = self.blob.assemble(&bucket.name, &refs, opts).await?;
         let etag = multipart_etag(&part_md5s);
@@ -974,6 +1011,8 @@ impl S3Service {
             user_metadata: session.user_metadata.clone(),
             acl: None,
             checksums: Vec::new(),
+            // SSE-S3 is applied to single-part PUTs; multipart assembly stores plaintext for now.
+            sse_descriptor: None,
             replication_status: None,
             created_at: now,
             updated_at: now,
@@ -1132,7 +1171,12 @@ impl S3Service {
             src_row.user_metadata.clone()
         };
 
-        let handle = self.blob.open(&src_path, None).await?;
+        // An SSE-encrypted source is decrypted transparently via its unwrapped DEK (ARCH §27).
+        let src_dek = match src_row.sse_descriptor.as_deref() {
+            Some(d) => Some(self.open_sse_dek(d)?),
+            None => None,
+        };
+        let handle = self.blob.open_with_dek(&src_path, None, src_dek).await?;
         // Re-tag the blob read errors as body errors so the source can feed `stage`.
         let src_stream: cairn_types::BodyStream =
             {
@@ -1146,6 +1190,7 @@ impl S3Service {
             extra_checksums: ChecksumSet::none(),
             size_ceiling: self.max_object_size,
             content_type: content_type.clone(),
+            encryption: None,
         };
         let staged = self.blob.stage(&dest_bucket.name, src_stream, opts).await?;
 
@@ -1175,6 +1220,8 @@ impl S3Service {
             user_metadata: user_meta,
             acl: None,
             checksums: staged.checksums.clone(),
+            // The copy destination is stored unencrypted (SSE on copy is out of scope here).
+            sse_descriptor: None,
             replication_status: None,
             created_at: now,
             updated_at: now,
@@ -2205,6 +2252,71 @@ fn quoted(etag: &ETag) -> String {
     format!("\"{}\"", etag.as_str())
 }
 
+/// The S3 algorithm token for SSE-S3 (the only server-side-encryption mode Cairn implements).
+const SSE_AES256: &str = "AES256";
+/// The algorithm recorded in the per-object SSE descriptor.
+const SSE_DESCRIPTOR_ALG: &str = "AES256-GCM";
+
+/// The JSON `sse_descriptor` persisted on an encrypted object version: the algorithm, the
+/// data-encryption key sealed under the master key (base64), and the wrapping nonce (base64). The
+/// raw DEK is never stored — only this wrapped form (ARCH §27, SSE-S3).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SseDescriptor {
+    alg: String,
+    wrapped_dek_b64: String,
+    nonce_b64: String,
+}
+
+/// Whether the request asks for SSE-S3 via `x-amz-server-side-encryption: AES256`. Any other value
+/// (e.g. `aws:kms`) is rejected as unsupported by the caller.
+fn requested_sse(req: &S3Request) -> Option<Result<()>> {
+    req.header("x-amz-server-side-encryption").map(|v| {
+        if v.eq_ignore_ascii_case(SSE_AES256) {
+            Ok(())
+        } else {
+            Err(Error::InvalidArgument(format!(
+                "unsupported server-side encryption: {v}"
+            )))
+        }
+    })
+}
+
+impl S3Service {
+    /// Generate a fresh random 32-byte DEK, seal it under the master key, and return both the raw
+    /// DEK (for staging) and the JSON descriptor string (for the metadata row).
+    fn new_sse_dek(&self) -> Result<([u8; 32], String)> {
+        use rand::RngCore;
+        let mut dek = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut dek);
+        let sealed = self.crypto.seal(&dek)?;
+        let descriptor = SseDescriptor {
+            alg: SSE_DESCRIPTOR_ALG.to_owned(),
+            wrapped_dek_b64: base64::engine::general_purpose::STANDARD.encode(&sealed.ciphertext),
+            nonce_b64: base64::engine::general_purpose::STANDARD.encode(&sealed.nonce.0),
+        };
+        let json = serde_json::to_string(&descriptor)
+            .map_err(|e| Error::Internal(format!("serialize sse descriptor: {e}")))?;
+        Ok((dek, json))
+    }
+
+    /// Unwrap the raw 32-byte DEK from a stored `sse_descriptor` JSON document by opening the
+    /// sealed key under the master key.
+    fn open_sse_dek(&self, descriptor_json: &str) -> Result<[u8; 32]> {
+        let d: SseDescriptor = serde_json::from_str(descriptor_json)
+            .map_err(|e| Error::Internal(format!("parse sse descriptor: {e}")))?;
+        let ciphertext = base64::engine::general_purpose::STANDARD
+            .decode(d.wrapped_dek_b64.as_bytes())
+            .map_err(|_| Error::Internal("sse descriptor: bad wrapped key base64".to_owned()))?;
+        let nonce_bytes = base64::engine::general_purpose::STANDARD
+            .decode(d.nonce_b64.as_bytes())
+            .map_err(|_| Error::Internal("sse descriptor: bad nonce base64".to_owned()))?;
+        let raw = self.crypto.open(&ciphertext, &Nonce(nonce_bytes))?;
+        raw.as_slice().try_into().map_err(|_| {
+            Error::Internal("sse descriptor: unwrapped key is not 32 bytes".to_owned())
+        })
+    }
+}
+
 fn object_headers(resp: S3Response, row: &ObjectVersionRow) -> S3Response {
     let mut resp = resp
         .with_header("etag", quoted(&row.etag))
@@ -2213,6 +2325,10 @@ fn object_headers(resp: S3Response, row: &ObjectVersionRow) -> S3Response {
         .with_header("accept-ranges", "bytes");
     if !row.version_id.is_null() {
         resp = resp.with_header("x-amz-version-id", row.version_id.as_str());
+    }
+    // Echo the SSE algorithm on GET/HEAD for a server-side-encrypted object (ARCH §27).
+    if row.sse_descriptor.is_some() {
+        resp = resp.with_header("x-amz-server-side-encryption", SSE_AES256);
     }
     if let CompressionDescriptor::Compressed { .. } = row.compression {
         // The physical form is hidden from clients; nothing leaks here.

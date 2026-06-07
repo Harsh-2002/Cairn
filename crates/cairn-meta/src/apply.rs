@@ -47,6 +47,7 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
                 user_metadata: Vec::new(),
                 acl: None,
                 checksums: Vec::new(),
+                sse_descriptor: None,
                 replication_status: None,
                 created_at: now,
                 updated_at: now,
@@ -484,8 +485,8 @@ fn insert_version(conn: &Connection, row: &ObjectVersionRow) -> R<()> {
         "INSERT INTO object_versions
          (id, bucket_name, key, version_id, is_latest, is_delete_marker, size_logical, size_physical,
           etag, content_type, storage_path, compression, storage_class, cold_locator, owner_id,
-          user_metadata, acl, checksums, replication_status, created_at, updated_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
+          user_metadata, acl, checksums, sse_descriptor, replication_status, created_at, updated_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)",
         params![
             row.id,
             row.bucket.as_str(),
@@ -505,6 +506,7 @@ fn insert_version(conn: &Connection, row: &ObjectVersionRow) -> R<()> {
             to_json(&row.user_metadata),
             row.acl.as_ref().map(to_json),
             to_json(&row.checksums),
+            row.sse_descriptor,
             row.replication_status.map(repl_status_str),
             row.created_at.0,
             row.updated_at.0,
@@ -718,6 +720,7 @@ mod tests {
             user_metadata: Vec::new(),
             acl: None,
             checksums: Vec::new(),
+            sse_descriptor: None,
             replication_status: None,
             created_at: Timestamp(1),
             updated_at: Timestamp(1),

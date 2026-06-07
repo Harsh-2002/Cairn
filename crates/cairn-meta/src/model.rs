@@ -172,6 +172,7 @@ pub fn object_version_from_row(row: &Row) -> rusqlite::Result<ObjectVersionRow> 
         user_metadata,
         acl,
         checksums,
+        sse_descriptor: row.get::<_, Option<String>>("sse_descriptor")?,
         replication_status: row
             .get::<_, Option<String>>("replication_status")?
             .map(|s| repl_status_from(&s)),

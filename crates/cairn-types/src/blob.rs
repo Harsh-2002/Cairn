@@ -17,6 +17,27 @@ pub struct StageOptions {
     pub size_ceiling: u64,
     /// The content type, used only by the incompressibility heuristic.
     pub content_type: String,
+    /// The raw 32-byte data-encryption key (DEK) for SSE-S3. When `Some`, the blob store
+    /// encrypts each physical block with AES-256-GCM *after* compression (compress-then-encrypt),
+    /// so ciphertext incompressibility never inflates a compressed block. `None` stores plaintext
+    /// blocks as before; the field is additive and defaults to `None` so existing callers are
+    /// unaffected (ARCH §27, SSE-S3).
+    pub encryption: Option<[u8; 32]>,
+}
+
+impl Default for StageOptions {
+    /// Uncompressed, unencrypted, no supplementary checksums, a 5 GiB ceiling, and an
+    /// octet-stream content type. Callers override only the fields they care about via the
+    /// struct-update syntax, which keeps the SSE/compression additions backward-compatible.
+    fn default() -> Self {
+        Self {
+            compression: None,
+            extra_checksums: ChecksumSet::none(),
+            size_ceiling: 5 * 1024 * 1024 * 1024,
+            content_type: "application/octet-stream".to_owned(),
+            encryption: None,
+        }
+    }
 }
 
 /// The result of staging a durable blob. The caller validates the computed hashes against

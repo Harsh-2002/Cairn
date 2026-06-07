@@ -18,11 +18,14 @@ futures-util = { workspace = true, features = ["std"] }
 hyper = { workspace = true, features = ["client", "http1"] }
 hyper-util = { workspace = true, features = ["client-legacy", "http1", "tokio"] }
 hyper-rustls = { workspace = true }
+rustls = { workspace = true, features = ["aws_lc_rs", "tls12"] }
+rustls-pemfile.workspace = true
 http.workspace = true
 http-body-util.workspace = true
 sha2.workspace = true
 hex.workspace = true
 quick-xml.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 cairn-types = { workspace = true, features = ["testing"] }
@@ -30,3 +33,4 @@ tokio = { workspace = true, features = ["rt", "rt-multi-thread", "net", "macros"
 hyper = { workspace = true, features = ["server", "http1"] }
 hyper-util = { workspace = true, features = ["server-auto", "tokio"] }
 http-body-util.workspace = true
+tempfile.workspace = true

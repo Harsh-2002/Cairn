@@ -123,6 +123,8 @@ fn sink_for(authority: &str, clock_secs: i64) -> HttpS3Sink {
             region: "us-east-1".to_owned(),
             access_key_id: "AKIDEXAMPLE".to_owned(),
             secret_access_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_owned(),
+            ca_cert_path: None,
+            insecure_skip_verify: false,
         },
         Arc::new(FixedClock(clock_secs)),
     )
@@ -338,6 +340,8 @@ async fn put_object_routes_to_per_source_destination_bucket() {
             region: "us-east-1".to_owned(),
             access_key_id: "AKIDEXAMPLE".to_owned(),
             secret_access_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_owned(),
+            ca_cert_path: None,
+            insecure_skip_verify: false,
         },
         Arc::new(FixedClock(1_440_938_160)),
     )
@@ -413,6 +417,8 @@ async fn https_endpoint_negotiates_tls_not_plaintext() {
             region: "us-east-1".to_owned(),
             access_key_id: "AKIDEXAMPLE".to_owned(),
             secret_access_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_owned(),
+            ca_cert_path: None,
+            insecure_skip_verify: false,
         },
         Arc::new(FixedClock(1_440_938_160)),
     )

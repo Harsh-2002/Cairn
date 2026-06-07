@@ -26,9 +26,24 @@ fn chunked_body(data: Vec<u8>, chunk: usize) -> BodyStream {
 fn opts(compression: Option<CompressionPolicy>, content_type: &str) -> StageOptions {
     StageOptions {
         compression,
-        extra_checksums: ChecksumSet::none(),
         size_ceiling: 100 * 1024 * 1024,
         content_type: content_type.to_owned(),
+        ..StageOptions::default()
+    }
+}
+
+/// Stage options that compress *and* encrypt under the given DEK (SSE-S3 over the block format).
+fn opts_encrypted(
+    compression: Option<CompressionPolicy>,
+    content_type: &str,
+    dek: [u8; 32],
+) -> StageOptions {
+    StageOptions {
+        compression,
+        size_ceiling: 100 * 1024 * 1024,
+        content_type: content_type.to_owned(),
+        encryption: Some(dek),
+        ..StageOptions::default()
     }
 }
 
@@ -125,6 +140,168 @@ async fn compression_is_transparent_and_etag_invariant() {
             .unwrap()
             .zero_copy
             .is_none()
+    );
+}
+
+async fn read_all_dek(
+    store: &LocalBlobStore,
+    path: &StoragePath,
+    range: Option<ByteRange>,
+    dek: Option<[u8; 32]>,
+) -> Result<Vec<u8>, cairn_types::error::BlobError> {
+    use futures_util::StreamExt;
+    let handle = store.open_with_dek(path, range, dek).await?;
+    let mut out = Vec::new();
+    let mut body = handle.body;
+    while let Some(c) = body.next().await {
+        out.extend_from_slice(&c?);
+    }
+    Ok(out)
+}
+
+/// SSE-S3 over the real store: an encrypted+compressed object round-trips when read back with the
+/// same DEK, its ETag equals the plaintext MD5 (encryption is transparent to the ETag), and a
+/// ranged read of the encrypted blob returns the matching plaintext slice.
+#[tokio::test]
+async fn encrypted_roundtrip_etag_invariant_and_ranged() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let b = BucketName::parse("bkt").unwrap();
+    let data: Vec<u8> = b"the quick brown fox "
+        .iter()
+        .copied()
+        .cycle()
+        .take(10_000)
+        .collect();
+    let policy = CompressionPolicy {
+        algorithm: CompressionAlgorithm::Zstd,
+        block_size: 1024,
+    };
+    let dek = [0x11u8; 32];
+
+    // The same plaintext, staged plain and staged encrypted, must share the plaintext-MD5 ETag.
+    let plain = store
+        .stage(&b, body(data.clone()), opts(None, "text/plain"))
+        .await
+        .unwrap();
+    let enc = store
+        .stage(
+            &b,
+            chunked_body(data.clone(), 333),
+            opts_encrypted(Some(policy), "text/plain", dek),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        plain.etag.as_str(),
+        enc.etag.as_str(),
+        "ETag is plaintext MD5"
+    );
+    assert_eq!(enc.size_logical, data.len() as u64);
+
+    // Full read with the correct DEK returns the original bytes.
+    assert_eq!(
+        read_all_dek(&store, &enc.storage_path, None, Some(dek))
+            .await
+            .unwrap(),
+        data
+    );
+    // A ranged read decrypts only the overlapping blocks.
+    let range = ByteRange {
+        offset: 5000,
+        length: 1234,
+    };
+    assert_eq!(
+        read_all_dek(&store, &enc.storage_path, Some(range), Some(dek))
+            .await
+            .unwrap(),
+        &data[5000..6234]
+    );
+    // An encrypted blob never offers a zero-copy hint (the kernel cannot decrypt).
+    assert!(
+        store
+            .open_with_dek(&enc.storage_path, None, Some(dek))
+            .await
+            .unwrap()
+            .zero_copy
+            .is_none()
+    );
+}
+
+/// An encrypted object encrypts even when the bucket has no compression policy: SSE flows through
+/// the block container with `CompressionAlgorithm::None`, and the wrong DEK (or no DEK) fails to
+/// decrypt rather than leaking plaintext.
+#[tokio::test]
+async fn encrypted_without_compression_and_wrong_dek_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let b = BucketName::parse("bkt").unwrap();
+    let data: Vec<u8> = (0..20_000u32).map(|i| (i % 256) as u8).collect();
+    let dek = [0x22u8; 32];
+
+    let enc = store
+        .stage(
+            &b,
+            chunked_body(data.clone(), 4096),
+            opts_encrypted(None, "application/octet-stream", dek),
+        )
+        .await
+        .unwrap();
+    // Even with no compression policy, the object is stored encrypted (uncompressed descriptor).
+    assert!(matches!(
+        enc.compression,
+        CompressionDescriptor::Uncompressed
+    ));
+
+    // Correct DEK reads the original bytes.
+    assert_eq!(
+        read_all_dek(&store, &enc.storage_path, None, Some(dek))
+            .await
+            .unwrap(),
+        data
+    );
+    // The wrong DEK fails authentication.
+    let wrong = read_all_dek(&store, &enc.storage_path, None, Some([0x23u8; 32])).await;
+    assert!(matches!(
+        wrong,
+        Err(cairn_types::error::BlobError::Corruption(_))
+    ));
+    // Opening an encrypted blob with no DEK at all fails fast.
+    let none = store.open_with_dek(&enc.storage_path, None, None).await;
+    assert!(matches!(
+        none,
+        Err(cairn_types::error::BlobError::Corruption(_))
+    ));
+}
+
+/// An old-format (unencrypted) blob still reads unchanged through both `open` and `open_with_dek`
+/// after the format gained encryption, confirming the version gate keeps backward compatibility.
+#[tokio::test]
+async fn old_unencrypted_blob_reads_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let b = BucketName::parse("bkt").unwrap();
+    let data: Vec<u8> = b"plaintext payload that compresses "
+        .iter()
+        .copied()
+        .cycle()
+        .take(8000)
+        .collect();
+    let policy = CompressionPolicy {
+        algorithm: CompressionAlgorithm::Zstd,
+        block_size: 512,
+    };
+    let staged = store
+        .stage(&b, body(data.clone()), opts(Some(policy), "text/plain"))
+        .await
+        .unwrap();
+    // Reads via the legacy `open` and via `open_with_dek(None)` both succeed and match.
+    assert_eq!(read_all(&store, &staged.storage_path, None).await, data);
+    assert_eq!(
+        read_all_dek(&store, &staged.storage_path, None, None)
+            .await
+            .unwrap(),
+        data
     );
 }
 

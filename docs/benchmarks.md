@@ -1,16 +1,20 @@
 # Benchmarks and macro load profiles
 
-This document covers Cairn's two layers of performance verification:
+This document covers Cairn's layers of performance verification:
 
 1. a **criterion micro-benchmark** of the SigV4 streaming chunked decoder (the hottest pure-CPU
-   stage on the ingest path), and
-2. a **macro load harness** that drives a real `cairn` binary with concurrent boto3 clients to
-   characterize large-object bandwidth, small-object rate, and — the point of ARCH §30.2 — the
-   **single-writer ceiling**.
+   stage on the ingest path) — §1;
+2. a **boto3 macro load harness** (`conformance/load_profile.py`) that drives a real `cairn`
+   binary with concurrent clients to characterize large-object bandwidth, small-object rate, and
+   — the point of ARCH §30.2 — the **single-writer ceiling** — §2;
+3. the **real MinIO `warp` macro benchmark** (`conformance/warp.sh`), the industry-standard S3
+   load tool, run against a fresh Cairn — §3; and
+4. a **multi-host replication soak** (`conformance/soak.sh`): two Cairn nodes, a sustained PUT
+   workload, byte-for-byte replication verification, and a source-RSS leak check — §4.
 
-MinIO's `warp` is the usual tool for the macro layer; it is unavailable in this environment, so
-`conformance/load_profile.py` is an equivalent concurrent generator built on the same boto3 client
-path the conformance suite drives (real SigV4 signing, real HTTP).
+The boto3 harness (§2) and `warp` (§3) overlap deliberately: §2 is the always-available,
+dependency-free generator that the single-writer-ceiling analysis is built on; §3 is the external
+ground-truth tool. Where `warp` can run, it corroborates §2; see §3 for an important caveat.
 
 All numbers below were recorded on this host; they are illustrative of *shape*, not a hardware
 spec sheet. Re-run on the target hardware for absolute figures.
@@ -165,3 +169,137 @@ be able to see.
   1.0 in the gauges).
 - `--quick` / `QUICK=1` shrinks the profile for a fast smoke check; use the default profile for a
   representative ceiling curve.
+
+---
+
+## 3. Real MinIO `warp` macro benchmark
+
+`conformance/warp.sh` downloads the upstream MinIO **`warp`** binary (the canonical S3 macro
+benchmark) from `github.com/minio/warp/releases`, bootstraps a throwaway Cairn the same env-only
+way `conformance/run.sh` does, creates a bucket, and runs `warp put`, `warp get`, and `warp mixed`
+against it with path-style addressing, then tears everything down. It finishes in ~2-3 minutes at
+the default (modest) size/duration.
+
+### How to run
+
+```sh
+# default: 1 MiB objects, concurrency 4, 20s per phase
+BIN=target/debug/cairn conformance/warp.sh
+
+# tune the load; reuse an installed warp instead of downloading
+WARP=/usr/local/bin/warp DURATION=30s OBJ_SIZE=512KiB CONCURRENT=8 conformance/warp.sh
+```
+
+The script pins **warp v1.0.0** — the GitHub releases assets use un-versioned names
+(`warp_Linux_x86_64.tar.gz`), and v1.5.0+ ship only on `dl.min.io`, so v1.0.0 is the newest
+tarball actually hosted on the GitHub releases page and gives a stable, scriptable URL. warp
+v1.0.0 auto-detects path-style addressing for an `IP:port` `--host`, so no `--path-style`/`--lookup`
+flag is needed (and v1.0.0 does not accept one; newer warp would take `--lookup path`).
+
+### Important caveat — a SigV4 key-encoding defect that `warp` surfaces
+
+Running `warp` against Cairn **uncovered a real server bug** (commit `8859a5d`). `warp`'s object
+name generator draws from the alphabet
+
+```
+abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890()
+```
+
+i.e. it deliberately puts `(` and `)` in keys to stress URL-encoding. Cairn's SigV4 canonical
+request **double-encodes** an already-percent-encoded request path: the server canonicalizes
+`req.uri().path()` (which is already `…/with%28paren%29`) by running `uri_encode` over it again,
+turning `%28` into `%2528`. The recomputed signature then never matches, so **every key containing
+a reserved sub-delim** (`(`, `)`, space, …) fails with `SignatureDoesNotMatch`. The same defect
+reproduces with plain boto3, no warp involved:
+
+```python
+client.put_object(Bucket=b, Key="a(1).rnd", Body=b"x")   # -> SignatureDoesNotMatch
+client.put_object(Bucket=b, Key="plain-key", Body=b"x")  # -> OK
+```
+
+Consequences for the warp run:
+
+- **`warp put` survives it** — it records per-object errors and still reports throughput for the
+  ~86% of keys that sign cleanly, so we get real numbers plus an error count.
+- **`warp get` and `warp mixed` abort during prepare** — their prepare step PUTs objects and
+  bails on the first failure, so they cannot produce numbers until the bug is fixed.
+
+`warp.sh` therefore exits non-zero by default (so CI keeps flagging the defect); set
+`WARP_ALLOW_KEY_ENCODING_BUG=1` to downgrade that to a warning. The fix lives in crate source
+(the `cairn-server` adapter feeding `cairn-auth`'s canonical-URI step — canonicalize the **decoded**
+key once, or pass the raw path through without re-encoding) and is out of the benchmark harness's
+scope. Once it lands, drop `WARP_ALLOW_KEY_ENCODING_BUG` and the full get/put/mixed sweep runs
+clean.
+
+### Observed results (this host)
+
+`warp put`, 1 MiB objects, concurrency 4, 8s (the CI run uses 20s):
+
+| metric | value |
+|--------|------:|
+| average | **35.5 MiB/s** (35.5 obj/s) |
+| fastest 1s block | 39.5 MiB/s |
+| median 1s block | 37.1 MiB/s |
+| slowest 1s block | 26.1 MiB/s |
+| errors (key-encoding bug) | ~170-200 over the run |
+
+`warp get` / `warp mixed`: **could not benchmark** — prepare aborted on the key-encoding defect
+above (no throughput figure until the SigV4 fix lands).
+
+These `warp put` figures sit in the same band as the boto3 §2(a) large-object PUT path once you
+account for object size and concurrency — both are bounded by the durable-commit write cost, not
+by client framing — so `warp` corroborates the boto3 harness where it can run.
+
+---
+
+## 4. Multi-host replication soak
+
+`conformance/soak.sh` stands up **two** Cairn nodes and exercises asynchronous bucket replication
+(ARCH §20) under sustained load while watching for two failure modes the spec cares about:
+replication *correctness* (every replicated object is byte-identical) and a *memory leak* on the
+busy source.
+
+Topology (the single-target node→node shape from `docs/operations.md` §2):
+
+- **node-1 = replication TARGET** — a plain Cairn mirror.
+- **node-2 = SOURCE** — started with `CAIRN_REPLICATION_ENDPOINT` pointed at node-1, so its
+  replication worker ships the source bucket's versions to node-1. (Each node's `bootstrap` and
+  `serve` share one master key, or the sealed SigV4 secret cannot be unsealed at serve time.)
+
+The boto3 driver (`conformance/soak.py`, run with the `/tmp/cairnvenv` python) enables versioning
++ an enabled replication rule on the source bucket (replication requires both, ARCH §20), then for
+`DURATION` seconds:
+
+- runs a continuous multi-worker PUT workload against the **source** (URL-safe keys only, so the
+  soak exercises replication and durability rather than the §3 key-encoding defect);
+- every few seconds reads a random sample of already-PUT objects back from the **target** and
+  compares them **byte-for-byte** against what was written — any mismatch (or non-arrival past a
+  grace window) is counted;
+- samples the **source** process RSS (`/proc/<pid>/status` `VmRSS`) throughout and, after dropping
+  the warm-up window, checks steady-state RSS did not grow past a threshold (default 50%).
+
+It exits non-zero unless replication mismatches are **0** and the source RSS stayed flat.
+
+### How to run
+
+```sh
+# default DURATION=120 (the CI value)
+BIN=target/debug/cairn PY=/tmp/cairnvenv/bin/python conformance/soak.sh
+
+# shorter local run
+DURATION=60 BIN=target/debug/cairn PY=/tmp/cairnvenv/bin/python conformance/soak.sh
+```
+
+### Observed results (this host, `DURATION=60`)
+
+| metric | value |
+|--------|------:|
+| source PUTs (60s) | **5023** (0 errors) |
+| objects verified byte-identical on the target | **93** |
+| replication mismatches | **0** |
+| source RSS (steady state) | **23.8 MiB → 26.3 MiB (+10.6%)**, under the 50% leak threshold |
+
+Verdict: **PASS** — replication landed every sampled object byte-for-byte (0 mismatches), and the
+source's resident set stayed essentially flat across ~5k PUTs (the small rise is pool/cache warm-up,
+not a monotonic climb). At the CI default `DURATION=120` the PUT and verified counts roughly double
+while the RSS picture is unchanged.

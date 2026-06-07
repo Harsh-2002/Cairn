@@ -156,6 +156,11 @@ pub struct ObjectVersionRow {
     pub acl: Option<Acl>,
     /// Any client-supplied checksums.
     pub checksums: Vec<ChecksumValue>,
+    /// The SSE-S3 descriptor when this version's data is server-side encrypted: a JSON document
+    /// `{alg, wrapped_dek_b64, nonce_b64}` recording the algorithm, the data-encryption key wrapped
+    /// (sealed) under the master key, and the wrapping nonce. `None` for unencrypted objects
+    /// (ARCH §27, SSE-S3). The raw DEK is never stored; only its sealed form lives here.
+    pub sse_descriptor: Option<String>,
     /// Replication status for replication-enabled buckets.
     pub replication_status: Option<crate::meta::ReplicationStatus>,
     /// Creation time.

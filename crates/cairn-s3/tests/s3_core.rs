@@ -36,11 +36,14 @@ async fn harness_with_authz(authz: Arc<dyn cairn_types::traits::AuthorizationEng
     let blob: Arc<dyn BlobStore> =
         Arc::new(cairn_blob::LocalBlobStore::open(dir.path()).await.unwrap());
     let clock = Arc::new(cairn_types::testing::TestClock::default());
+    let crypto: Arc<dyn cairn_types::traits::Crypto> =
+        Arc::new(cairn_crypto::SystemCrypto::new([7u8; 32]));
     let svc = S3Service::new(
         meta,
         blob,
         authz,
         clock,
+        crypto,
         "us-east-1".to_owned(),
         5 * 1024 * 1024 * 1024,
     );
@@ -2543,4 +2546,199 @@ async fn put_bucket_acl_accepts_body_document() {
     let xml = String::from_utf8(body).unwrap();
     assert!(xml.contains("AllUsers"), "bucket ACL body persisted: {xml}");
     assert!(xml.contains("<Permission>READ</Permission>"));
+}
+
+/// SSE-S3 end to end against the real backends: a PUT carrying
+/// `x-amz-server-side-encryption: AES256` stores the object encrypted, echoes the SSE header on the
+/// PUT/GET/HEAD responses, returns byte-identical content on GET (including a ranged read), and the
+/// ETag equals the plaintext MD5 — proving encryption is transparent to the entity tag (ARCH §27).
+#[tokio::test]
+async fn sse_s3_put_get_roundtrip_and_etag() {
+    let h = harness().await;
+
+    // Create the bucket.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("enc"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    // A multi-block payload so the ranged read crosses encrypted block boundaries.
+    let payload: Vec<u8> = (0..40_000u32).map(|i| (i % 256) as u8).collect();
+    let want_etag = format!("\"{}\"", md5_hex(&payload));
+
+    // PUT with the SSE-S3 header.
+    let put = req(
+        Method::PUT,
+        Some("enc"),
+        Some("secret.bin"),
+        &[],
+        &[
+            ("content-type", "application/octet-stream"),
+            ("x-amz-server-side-encryption", "AES256"),
+        ],
+        payload.clone(),
+    );
+    let (st, hdrs, _) = drain(send(&h.svc, put).await).await;
+    assert_eq!(st, StatusCode::OK);
+    // The ETag is the plaintext MD5 (byte-identical to the unencrypted case).
+    assert_eq!(header(&hdrs, "etag"), Some(want_etag.as_str()));
+    // The SSE algorithm is echoed on the PUT response.
+    assert_eq!(
+        header(&hdrs, "x-amz-server-side-encryption"),
+        Some("AES256")
+    );
+
+    // GET returns the identical bytes plus the SSE response header.
+    let (st, hdrs, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("enc"),
+                Some("secret.bin"),
+                &[],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(body, payload);
+    assert_eq!(header(&hdrs, "etag"), Some(want_etag.as_str()));
+    assert_eq!(
+        header(&hdrs, "x-amz-server-side-encryption"),
+        Some("AES256")
+    );
+
+    // HEAD also echoes the SSE header and carries no body.
+    let (st, hdrs, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::HEAD,
+                Some("enc"),
+                Some("secret.bin"),
+                &[],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(body.is_empty());
+    assert_eq!(
+        header(&hdrs, "x-amz-server-side-encryption"),
+        Some("AES256")
+    );
+
+    // A ranged GET decrypts only the overlapping blocks and returns the matching slice.
+    let (st, hdrs, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("enc"),
+                Some("secret.bin"),
+                &[],
+                &[("range", "bytes=10000-19999")],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(body, &payload[10000..20000]);
+    assert_eq!(
+        header(&hdrs, "content-range"),
+        Some("bytes 10000-19999/40000")
+    );
+}
+
+/// An object PUT without the SSE header is stored unencrypted and never echoes the SSE response
+/// header on GET, confirming the feature is opt-in.
+#[tokio::test]
+async fn put_without_sse_header_is_plaintext_and_no_header() {
+    let h = harness().await;
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("pln"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let (st, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("pln"),
+                Some("a.txt"),
+                &[],
+                &[("content-type", "text/plain")],
+                b"hello world".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(header(&hdrs, "x-amz-server-side-encryption").is_none());
+
+    let (st, hdrs, body) = drain(
+        send(
+            &h.svc,
+            req(Method::GET, Some("pln"), Some("a.txt"), &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(body, b"hello world");
+    assert!(header(&hdrs, "x-amz-server-side-encryption").is_none());
+}
+
+/// An unsupported server-side-encryption mode (e.g. `aws:kms`) is rejected rather than silently
+/// stored unencrypted.
+#[tokio::test]
+async fn put_with_unsupported_sse_mode_is_rejected() {
+    let h = harness().await;
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("kms"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("kms"),
+                Some("a.txt"),
+                &[],
+                &[("x-amz-server-side-encryption", "aws:kms")],
+                b"data".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
 }

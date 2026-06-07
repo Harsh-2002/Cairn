@@ -18,6 +18,7 @@ use cairn_types::blob::{
     BlobReadHandle, ByteRange, ContentRange, PartRef, ReconcileOpts, ReconcileReport, StageOptions,
     StagedBlob, StagedPart, ZeroCopyRead,
 };
+use cairn_types::bucket::{CompressionAlgorithm, CompressionPolicy};
 use cairn_types::error::BlobError;
 use cairn_types::id::{BucketName, StoragePath, UploadId};
 use cairn_types::object::{CompressionDescriptor, ETag};
@@ -30,6 +31,10 @@ use tokio::io::{AsyncWriteExt, BufWriter};
 
 const STAGING: &str = ".staging";
 const READ_CHUNK: usize = 64 * 1024;
+/// The logical block size for an encrypted-but-uncompressed object (no bucket policy supplies a
+/// block size in that case). 64 KiB keeps the per-block GCM-tag overhead negligible (16 bytes per
+/// 65536) while bounding the amount decrypted for a small ranged read.
+const DEFAULT_ENCRYPTED_BLOCK_SIZE: u32 = 64 * 1024;
 
 fn io_err(e: std::io::Error) -> BlobError {
     if e.kind() == std::io::ErrorKind::StorageFull || e.raw_os_error() == Some(28) {
@@ -170,8 +175,23 @@ async fn write_staged(
     let mut logical: u64 = 0;
     let mut physical: u64 = 0;
 
-    if let Some(pol) = compress {
-        let mut enc = BlockEncoder::new(pol.algorithm, pol.block_size);
+    // The self-describing CRNB block container is needed whenever we compress OR encrypt: SSE-S3
+    // encrypts each physical block after compression, so an encrypted-but-uncompressed object still
+    // flows through the block encoder with `CompressionAlgorithm::None`. The MD5/ETag is computed
+    // over the plaintext (here, via `hashers`) before any transform, so it is identical with or
+    // without compression/encryption (ARCH §21.1, §27).
+    let block_pol = compress.or_else(|| {
+        opts.encryption.map(|_| CompressionPolicy {
+            algorithm: CompressionAlgorithm::None,
+            block_size: DEFAULT_ENCRYPTED_BLOCK_SIZE,
+        })
+    });
+
+    if let Some(pol) = block_pol {
+        let mut enc = match opts.encryption {
+            Some(dek) => BlockEncoder::new_encrypted(pol.algorithm, pol.block_size, dek),
+            None => BlockEncoder::new(pol.algorithm, pol.block_size),
+        };
         while let Some(chunk) = body.next().await {
             let chunk = chunk?;
             logical += chunk.len() as u64;
@@ -183,20 +203,21 @@ async fn write_staged(
             file.write_all(&phys).await.map_err(io_err)?;
             physical += phys.len() as u64;
         }
-        let tail = enc.finish();
+        let tail = enc.finish()?;
         file.write_all(&tail).await.map_err(io_err)?;
         physical += tail.len() as u64;
         let (md5, checks) = hashers.finalize();
-        Ok((
-            logical,
-            physical,
-            md5,
-            checks,
-            CompressionDescriptor::Compressed {
+        // The descriptor records the logical compression of the object. Encryption is recorded on
+        // the metadata row's sse_descriptor, not here, so an uncompressed-but-encrypted object is
+        // still `Uncompressed` to readers that only care about the compression algorithm.
+        let descriptor = match compress {
+            Some(_) => CompressionDescriptor::Compressed {
                 algorithm: pol.algorithm,
                 block_size: pol.block_size,
             },
-        ))
+            None => CompressionDescriptor::Uncompressed,
+        };
+        Ok((logical, physical, md5, checks, descriptor))
     } else {
         while let Some(chunk) = body.next().await {
             let chunk = chunk?;
@@ -219,16 +240,23 @@ async fn write_staged(
     }
 }
 
-/// Stream a read of `[offset, offset+len)` logical bytes from a blob file, decompressing only
-/// the overlapping blocks. Runs the blocking file work off the reactor and yields chunks.
-fn read_stream(path: PathBuf, compressed: bool, offset: u64, len: u64) -> cairn_types::BlobStream {
+/// Stream a read of `[offset, offset+len)` logical bytes from a blob file, decompressing (and,
+/// when `dek` is supplied, decrypting) only the overlapping blocks. Runs the blocking file work off
+/// the reactor and yields chunks.
+fn read_stream(
+    path: PathBuf,
+    compressed: bool,
+    dek: Option<[u8; 32]>,
+    offset: u64,
+    len: u64,
+) -> cairn_types::BlobStream {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, BlobError>>(4);
     tokio::task::spawn_blocking(move || {
         let result = (|| -> Result<(), BlobError> {
             use std::io::{Read, Seek, SeekFrom};
             if compressed {
                 let f = std::fs::File::open(&path).map_err(io_err)?;
-                let mut reader = CompressedReader::open(f)?;
+                let mut reader = CompressedReader::open_with_dek(f, dek)?;
                 let bs = reader.block_size();
                 let end = offset.saturating_add(len).min(reader.logical_len());
                 if bs == 0 || offset >= end {
@@ -324,10 +352,11 @@ impl BlobStore for LocalBlobStore {
         })
     }
 
-    async fn open(
+    async fn open_with_dek(
         &self,
         path: &StoragePath,
         range: Option<ByteRange>,
+        dek: Option<[u8; 32]>,
     ) -> Result<BlobReadHandle, BlobError> {
         let file_path = self.resolve(path)?;
         if !tokio::fs::try_exists(&file_path).await.map_err(io_err)? {
@@ -338,7 +367,7 @@ impl BlobStore for LocalBlobStore {
             let p = file_path.clone();
             tokio::task::spawn_blocking(move || {
                 let f = std::fs::File::open(&p).map_err(io_err)?;
-                CompressedReader::open(f).map(|r| r.logical_len())
+                CompressedReader::open_with_dek(f, dek).map(|r| r.logical_len())
             })
             .await
             .map_err(|e| BlobError::Io(e.to_string()))??
@@ -360,8 +389,10 @@ impl BlobStore for LocalBlobStore {
             None => (0, logical_len, None),
         };
 
-        let body = read_stream(file_path.clone(), compressed, offset, len);
-        // Uncompressed, plaintext blobs may take the kernel file-to-socket fast path.
+        let body = read_stream(file_path.clone(), compressed, dek, offset, len);
+        // Uncompressed, plaintext blobs may take the kernel file-to-socket fast path. Encrypted
+        // blobs are always block-formatted (so `compressed` is true) and therefore never reach this
+        // branch — the kernel cannot decrypt, so a DEK-bearing read must go through `read_stream`.
         let zero_copy = if compressed {
             None
         } else {
@@ -407,11 +438,12 @@ impl BlobStore for LocalBlobStore {
         tokio::fs::create_dir_all(&dir).await.map_err(io_err)?;
         let id = format!("{part_number:05}-{}", uuid::Uuid::new_v4().simple());
         let path = dir.join(&id);
+        // Parts are staged unencrypted intermediate artifacts; SSE-S3 is applied to the assembled
+        // object, not to individual parts (matching how compression is deferred to `assemble`).
         let opts = StageOptions {
-            compression: None,
-            extra_checksums: cairn_types::object::ChecksumSet::none(),
             size_ceiling,
             content_type: String::new(),
+            ..StageOptions::default()
         };
         let file = tokio::fs::File::create(&path).await.map_err(io_err)?;
         let mut writer = BufWriter::new(file);
@@ -453,13 +485,26 @@ impl BlobStore for LocalBlobStore {
             Some(pol) if !is_precompressed(&opts.content_type) => Some(pol),
             _ => None,
         };
+        // As in `write_staged`, the CRNB block container is used when we compress OR encrypt; an
+        // encrypted-but-uncompressed assembly uses `CompressionAlgorithm::None` with a default block
+        // size. The multipart ETag is computed from the part MD5s by the caller, not from `hasher`,
+        // but the plaintext MD5 here is still computed before any transform.
+        let block_pol = compress.or_else(|| {
+            opts.encryption.map(|_| CompressionPolicy {
+                algorithm: CompressionAlgorithm::None,
+                block_size: DEFAULT_ENCRYPTED_BLOCK_SIZE,
+            })
+        });
         let file = tokio::fs::File::create(&staging).await.map_err(io_err)?;
         let mut writer = BufWriter::new(file);
         use md5::Digest;
         let mut hasher = md5::Md5::new();
         let mut logical: u64 = 0;
         let mut physical: u64 = 0;
-        let mut enc = compress.map(|p| BlockEncoder::new(p.algorithm, p.block_size));
+        let mut enc = block_pol.map(|p| match opts.encryption {
+            Some(dek) => BlockEncoder::new_encrypted(p.algorithm, p.block_size, dek),
+            None => BlockEncoder::new(p.algorithm, p.block_size),
+        });
 
         for part in parts {
             let part_path = self.resolve(&part.storage_path)?;
@@ -489,13 +534,17 @@ impl BlobStore for LocalBlobStore {
             }
         }
         let descriptor = if let Some(e) = enc {
-            let tail = e.finish();
+            let tail = e.finish()?;
             writer.write_all(&tail).await.map_err(io_err)?;
             physical += tail.len() as u64;
-            let pol = compress.expect("encoder implies a policy");
-            CompressionDescriptor::Compressed {
-                algorithm: pol.algorithm,
-                block_size: pol.block_size,
+            // Record `Compressed` only when a compression policy was actually in force; an
+            // encryption-only block container leaves the logical compression as `Uncompressed`.
+            match compress {
+                Some(pol) => CompressionDescriptor::Compressed {
+                    algorithm: pol.algorithm,
+                    block_size: pol.block_size,
+                },
+                None => CompressionDescriptor::Uncompressed,
             }
         } else {
             CompressionDescriptor::Uncompressed

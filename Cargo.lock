@@ -255,6 +255,7 @@ dependencies = [
 name = "cairn-blob"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "async-trait",
  "base64",
  "bytes",
@@ -264,6 +265,7 @@ dependencies = [
  "fail",
  "futures-util",
  "hex",
+ "hmac",
  "lz4_flex",
  "md-5",
  "sha1",
@@ -353,8 +355,12 @@ dependencies = [
  "hyper-rustls",
  "hyper-util",
  "quick-xml",
+ "rustls",
+ "rustls-pemfile",
  "sha2",
+ "tempfile",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -367,6 +373,7 @@ dependencies = [
  "cairn-auth",
  "cairn-authz",
  "cairn-blob",
+ "cairn-crypto",
  "cairn-meta",
  "cairn-replication",
  "cairn-types",
@@ -378,6 +385,8 @@ dependencies = [
  "hyper",
  "md-5",
  "proptest",
+ "rand 0.8.6",
+ "serde",
  "serde_json",
  "sha2",
  "subtle",
@@ -392,6 +401,7 @@ dependencies = [
 name = "cairn-server"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bytes",
  "cairn-auth",
  "cairn-authz",
@@ -418,6 +428,7 @@ dependencies = [
  "rustls",
  "rustls-pemfile",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -786,8 +797,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8cb01cd46b0cf372153850f4c6c272d9cbea2da513e07538405148f95bd789f3"
 dependencies = [
  "atomic",
+ "parking_lot",
  "pear",
  "serde",
+ "tempfile",
  "toml",
  "uncased",
  "version_check",

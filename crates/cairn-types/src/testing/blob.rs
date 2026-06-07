@@ -22,7 +22,16 @@ fn md5_hex(data: &[u8]) -> String {
     hex::encode(h.finalize())
 }
 
-type BlobMap = HashMap<String, Arc<Vec<u8>>>;
+/// A stored blob: its plaintext bytes and the optional data-encryption key it was staged under.
+/// The double models SSE-S3 semantics without real cryptography: a blob staged with a DEK can
+/// only be reopened with the *same* DEK, so the wrong-key-fails property is faithful.
+#[derive(Debug)]
+struct StoredBlob {
+    bytes: Arc<Vec<u8>>,
+    dek: Option<[u8; 32]>,
+}
+
+type BlobMap = HashMap<String, StoredBlob>;
 type PartMap = HashMap<(String, u16), Arc<Vec<u8>>>;
 
 /// An in-memory blob store.
@@ -45,14 +54,14 @@ impl InMemoryBlobStore {
         self.blobs.lock().unwrap().len()
     }
 
-    /// Directly read a committed blob's bytes (test introspection).
+    /// Directly read a committed blob's (plaintext) bytes (test introspection).
     #[must_use]
     pub fn get_bytes(&self, path: &StoragePath) -> Option<Vec<u8>> {
         self.blobs
             .lock()
             .unwrap()
             .get(path.as_str())
-            .map(|b| b.as_ref().clone())
+            .map(|b| b.bytes.as_ref().clone())
     }
 
     async fn drain(mut body: crate::BodyStream, ceiling: u64) -> Result<Vec<u8>, BlobError> {
@@ -77,13 +86,19 @@ impl BlobStore for InMemoryBlobStore {
         opts: StageOptions,
     ) -> Result<StagedBlob, BlobError> {
         let buf = Self::drain(body, opts.size_ceiling).await?;
+        // The MD5/ETag is computed over the plaintext, before any (modelled) encryption — exactly
+        // as the real store computes it pre-transform — so the ETag is identical with or without a
+        // DEK (ARCH §21.1, SSE-S3).
         let md5 = md5_hex(&buf);
         let path = StoragePath::generate(bucket);
         let len = buf.len() as u64;
-        self.blobs
-            .lock()
-            .unwrap()
-            .insert(path.as_str().to_owned(), Arc::new(buf));
+        self.blobs.lock().unwrap().insert(
+            path.as_str().to_owned(),
+            StoredBlob {
+                bytes: Arc::new(buf),
+                dek: opts.encryption,
+            },
+        );
         Ok(StagedBlob {
             storage_path: path,
             size_logical: len,
@@ -95,14 +110,23 @@ impl BlobStore for InMemoryBlobStore {
         })
     }
 
-    async fn open(
+    async fn open_with_dek(
         &self,
         path: &StoragePath,
         range: Option<ByteRange>,
+        dek: Option<[u8; 32]>,
     ) -> Result<BlobReadHandle, BlobError> {
         let data = {
             let blobs = self.blobs.lock().unwrap();
-            blobs.get(path.as_str()).ok_or(BlobError::NotFound)?.clone()
+            let stored = blobs.get(path.as_str()).ok_or(BlobError::NotFound)?;
+            // Model SSE-S3: a blob staged under a DEK is readable only with the same DEK, and a
+            // blob staged in the clear ignores any supplied DEK.
+            if stored.dek != dek && stored.dek.is_some() {
+                return Err(BlobError::Corruption(
+                    "blob is encrypted; wrong or missing data-encryption key".into(),
+                ));
+            }
+            stored.bytes.clone()
         };
         let total = data.len() as u64;
         let (slice, content_range, logical_len) = match range {
@@ -182,10 +206,13 @@ impl BlobStore for InMemoryBlobStore {
         let md5 = md5_hex(&buf);
         let path = StoragePath::generate(bucket);
         let len = buf.len() as u64;
-        self.blobs
-            .lock()
-            .unwrap()
-            .insert(path.as_str().to_owned(), Arc::new(buf));
+        self.blobs.lock().unwrap().insert(
+            path.as_str().to_owned(),
+            StoredBlob {
+                bytes: Arc::new(buf),
+                dek: _opts.encryption,
+            },
+        );
         Ok(StagedBlob {
             storage_path: path,
             size_logical: len,

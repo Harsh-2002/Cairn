@@ -23,9 +23,21 @@
 //! ## Transport
 //! The sink uses a `hyper-util` legacy client over a `hyper-rustls` [`HttpsConnector`] built with
 //! `.https_or_http()`, so the **same** client serves both `http://` and `https://` endpoints:
-//! plaintext endpoints connect directly, TLS endpoints negotiate rustls (aws-lc-rs provider,
-//! webpki root anchors) and verify the server certificate. There is no longer an https-rejection
-//! at construction (ARCH §20.2).
+//! plaintext endpoints connect directly, TLS endpoints negotiate rustls (aws-lc-rs provider).
+//! There is no longer an https-rejection at construction (ARCH §20.2).
+//!
+//! ## TLS trust
+//! Which root anchors a `https://` endpoint is verified against is per-target
+//! ([`S3SinkConfig::ca_cert_path`] and [`S3SinkConfig::insecure_skip_verify`]):
+//! * a custom **CA path** builds a [`RootCertStore`](rustls::RootCertStore) from that PEM bundle
+//!   and trusts exactly those anchors — the way to replicate to a peer with a private CA;
+//! * **`insecure_skip_verify`** installs a no-op [`ServerCertVerifier`] that accepts any
+//!   certificate and logs a loud warning — for testing against a self-signed endpoint only;
+//! * otherwise the built-in **webpki roots** are used, as before.
+//!
+//! `hyper-rustls` has no `.dangerous()` shortcut, so both non-default cases go through
+//! [`HttpsConnectorBuilder::with_tls_config`](hyper_rustls::HttpsConnectorBuilder::with_tls_config)
+//! with a hand-built [`ClientConfig`](rustls::ClientConfig).
 //!
 //! ## Per-source destination routing
 //! A single sink can replicate many source buckets to many destination buckets. [`S3SinkConfig`]
@@ -51,7 +63,13 @@ use hyper_rustls::HttpsConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::crypto::aws_lc_rs;
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
 use std::collections::HashMap;
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// The S3 service name in the SigV4 credential scope.
@@ -80,6 +98,15 @@ pub struct S3SinkConfig {
     pub access_key_id: String,
     /// The destination secret access key.
     pub secret_access_key: String,
+    /// An optional PEM bundle of CA certificates to trust for a `https://` endpoint, instead of
+    /// the built-in webpki roots. Use this to replicate to a peer that presents a certificate
+    /// signed by a private CA. Ignored for `http://` endpoints. Mutually exclusive with
+    /// [`insecure_skip_verify`](Self::insecure_skip_verify).
+    pub ca_cert_path: Option<PathBuf>,
+    /// When true, the server certificate of a `https://` endpoint is **not** verified: any
+    /// certificate is accepted. This is dangerous and defeats TLS authentication; it exists only
+    /// for testing against a self-signed endpoint and emits a loud warning when used.
+    pub insecure_skip_verify: bool,
 }
 
 /// A production replication sink issuing SigV4-signed S3 requests to a remote endpoint over
@@ -150,13 +177,11 @@ impl HttpS3Sink {
             .ok_or_else(|| ReplicationError::Terminal("endpoint URL has no host".to_owned()))?;
 
         // One connector serves both transports: `.https_or_http()` dials plaintext for `http://`
-        // and negotiates rustls (aws-lc-rs, webpki roots, server-cert verification) for
-        // `https://`. `enable_http1()` matches the HTTP/1.1 protocol the legacy client speaks.
-        let https = hyper_rustls::HttpsConnectorBuilder::new()
-            .with_webpki_roots()
-            .https_or_http()
-            .enable_http1()
-            .build();
+        // and negotiates rustls for `https://`. `enable_http1()` matches the HTTP/1.1 protocol the
+        // legacy client speaks. The TLS trust source is per-target (CA path / skip-verify /
+        // webpki); see `build_tls_connector`.
+        let builder = build_tls_connector_builder(&config)?;
+        let https = builder.https_or_http().enable_http1().build();
         let client = Client::builder(TokioExecutor::new()).build(https);
 
         Ok(Self {
@@ -290,6 +315,136 @@ impl HttpS3Sink {
             .map(|b| String::from_utf8_lossy(&b.to_bytes()).into_owned())
             .unwrap_or_default();
         Err(classify_status(status.as_u16(), &detail))
+    }
+}
+
+/// Build the `hyper-rustls` connector builder for a sink, selecting the TLS trust source from the
+/// per-target knobs (ARCH §20.2):
+///
+/// * [`ca_cert_path`](S3SinkConfig::ca_cert_path) — trust exactly the CA anchors in that PEM file;
+/// * [`insecure_skip_verify`](S3SinkConfig::insecure_skip_verify) — accept any certificate (logs a
+///   loud warning);
+/// * otherwise — the built-in webpki roots, the safe default.
+///
+/// The two non-default cases go through `with_tls_config` because `hyper-rustls` exposes no
+/// `.dangerous()` shortcut. The returned builder is in the `WantsSchemes` state, identical to what
+/// `with_webpki_roots()` produces, so the caller finishes it the same way for every variant.
+fn build_tls_connector_builder(
+    config: &S3SinkConfig,
+) -> Result<
+    hyper_rustls::HttpsConnectorBuilder<hyper_rustls::builderstates::WantsSchemes>,
+    ReplicationError,
+> {
+    let base = hyper_rustls::HttpsConnectorBuilder::new();
+    match (&config.ca_cert_path, config.insecure_skip_verify) {
+        (Some(_), true) => Err(ReplicationError::Terminal(
+            "ca_cert_path and insecure_skip_verify are mutually exclusive".to_owned(),
+        )),
+        (Some(ca_path), false) => {
+            let roots = load_root_store(ca_path)?;
+            let tls = ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            Ok(base.with_tls_config(tls))
+        }
+        (None, true) => {
+            // A loud, operator-visible warning: skip-verify defeats TLS authentication entirely.
+            tracing::warn!(
+                endpoint = %config.endpoint,
+                "replication TLS certificate verification DISABLED (insecure_skip_verify); the \
+                 destination's identity is NOT authenticated — use only for testing"
+            );
+            let verifier = Arc::new(NoVerification::new());
+            let tls = ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(verifier)
+                .with_no_client_auth();
+            Ok(base.with_tls_config(tls))
+        }
+        (None, false) => Ok(base.with_webpki_roots()),
+    }
+}
+
+/// Read a PEM bundle of CA certificates from `path` into a fresh [`RootCertStore`]. A missing or
+/// unreadable file, or a bundle that yields no usable certificates, is a permanent misconfiguration
+/// (terminal), not a transient failure.
+fn load_root_store(path: &Path) -> Result<RootCertStore, ReplicationError> {
+    let pem = std::fs::read(path).map_err(|e| {
+        ReplicationError::Terminal(format!("reading CA bundle {}: {e}", path.display()))
+    })?;
+    let mut reader = std::io::BufReader::new(pem.as_slice());
+    let mut roots = RootCertStore::empty();
+    let mut added = 0usize;
+    for cert in rustls_pemfile::certs(&mut reader) {
+        let cert = cert.map_err(|e| {
+            ReplicationError::Terminal(format!("parsing CA bundle {}: {e}", path.display()))
+        })?;
+        roots.add(cert).map_err(|e| {
+            ReplicationError::Terminal(format!("adding CA from {}: {e}", path.display()))
+        })?;
+        added += 1;
+    }
+    if added == 0 {
+        return Err(ReplicationError::Terminal(format!(
+            "CA bundle {} contained no certificates",
+            path.display()
+        )));
+    }
+    Ok(roots)
+}
+
+/// A [`ServerCertVerifier`] that accepts every certificate and signature without checking
+/// anything. It backs [`insecure_skip_verify`](S3SinkConfig::insecure_skip_verify); installing it
+/// is what makes TLS authentication a no-op, so it is constructed only on that explicit, warned
+/// opt-in. Signature schemes are delegated to the aws-lc-rs provider (the one the sink's
+/// `ClientConfig::builder()` uses) so the handshake still advertises a real, accepted set.
+#[derive(Debug)]
+struct NoVerification {
+    schemes: Vec<SignatureScheme>,
+}
+
+impl NoVerification {
+    fn new() -> Self {
+        Self {
+            schemes: aws_lc_rs::default_provider()
+                .signature_verification_algorithms
+                .supported_schemes(),
+        }
+    }
+}
+
+impl ServerCertVerifier for NoVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.schemes.clone()
     }
 }
 
@@ -536,6 +691,8 @@ mod tests {
             region: "us-east-1".to_owned(),
             access_key_id: "AKID".to_owned(),
             secret_access_key: "secret".to_owned(),
+            ca_cert_path: None,
+            insecure_skip_verify: false,
         }
     }
 
@@ -580,6 +737,8 @@ mod tests {
             region: "us-east-1".to_owned(),
             access_key_id: "AKID".to_owned(),
             secret_access_key: "secret".to_owned(),
+            ca_cert_path: None,
+            insecure_skip_verify: false,
         };
         let sink = HttpS3Sink::new(cfg).unwrap();
         // Mapped sources resolve to their explicit destinations.
@@ -593,5 +752,117 @@ mod tests {
     fn request_path_uses_resolved_dest_bucket() {
         let sink = HttpS3Sink::new(cfg_for("http://s3.example.com")).unwrap();
         assert_eq!(sink.request_path("dst", "a/b c"), "/dst/a/b%20c");
+    }
+
+    /// A self-signed CA certificate (PEM), used to exercise the custom-CA trust path. Generated
+    /// once with `openssl req -x509` (CN=cairn-test-ca, 100-year validity) so the test is
+    /// hermetic and needs no tooling at run time.
+    const TEST_CA_PEM: &str = "-----BEGIN CERTIFICATE-----\n\
+MIIDEzCCAfugAwIBAgIUe4M5AXhgFTWt7qnOtCOt72yDEfMwDQYJKoZIhvcNAQEL\n\
+BQAwGDEWMBQGA1UEAwwNY2Fpcm4tdGVzdC1jYTAgFw0yNjA2MDcxMTMyMjVaGA8y\n\
+MTI2MDUxNDExMzIyNVowGDEWMBQGA1UEAwwNY2Fpcm4tdGVzdC1jYTCCASIwDQYJ\n\
+KoZIhvcNAQEBBQADggEPADCCAQoCggEBAM8wfaaCovY1pSPYotW+aXm4JvDQauQv\n\
+UkwLZTNkyuG3/7N+jzSZIC1BS+tPej+ekQjm8us3zp0f4FDTEBsxc1pX144arIAT\n\
+coJn1mH1mKNgGF/Nj+y35mWWIH7DRFja1Wf4rl12P4qRo705n406k6mRtwp6o++m\n\
+kkW4VuO0X5GfSsx0ZGkZ2MAo2wTSyBKHgxv7tqzHNYrZdFmUNFs1K1eDP1kW61+Q\n\
+Vj5eRHbOMOsKaDRyXmFs+6I1jMJa+4XlYxJ8BMFhIruX5PYcRyOjSUaPGI3y/Twm\n\
+GJb6l3R0TTD82AP+TOdkAB1O/ivPZuaL/5tlpxb3R4EN5im28q4jZh0CAwEAAaNT\n\
+MFEwHQYDVR0OBBYEFMALcto1SS3baEY/CfRjatZ5eIX4MB8GA1UdIwQYMBaAFMAL\n\
+cto1SS3baEY/CfRjatZ5eIX4MA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQEL\n\
+BQADggEBALXMpLBStTKTWhAD8cbLWazTknzSkPAblHLpg6i11lqXl/F/KZ6kFXlw\n\
+YsOAWDXJ/sRVjIYHw6383+wv2fDe5HFmZfiRAVrCgGciN6nEuj7uMIBBMWushgwB\n\
+lKW7AYk2V0jamYhThbAyqUmu4JEvfJY7jQfv3S6kjVPLQtPe8N5qSMML44oC+bi2\n\
+V+IAp6sZrU2TNVgeOnP18BtJWFoKmHXgSs5eJtDcmw41llD1CCUnVjSfUGPmHNSb\n\
+hO1QwFPernIBHXfT8PObpNX2wryLTH1rMSJwHt50++2EPnR0Npi85smSQ4GglyTw\n\
++/7AJl5aMXyWTz4YhkL9aoTvLfbWrz8=\n\
+-----END CERTIFICATE-----\n";
+
+    /// An https endpoint with `insecure_skip_verify` builds: the connector is constructed through
+    /// the `with_tls_config` path with the no-op verifier installed (no `.dangerous()` shortcut on
+    /// hyper-rustls), so a sink against a self-signed endpoint comes up.
+    #[test]
+    fn builds_https_with_insecure_skip_verify() {
+        let mut cfg = cfg_for("https://self-signed.example.com");
+        cfg.insecure_skip_verify = true;
+        let sink = HttpS3Sink::new(cfg).expect("insecure-skip-verify https sink builds");
+        assert_eq!(sink.scheme, "https");
+        assert_eq!(sink.authority, "self-signed.example.com");
+    }
+
+    /// A custom CA path is honoured: the PEM bundle is read and a sink built against it. A bundle
+    /// that contains no certificates is rejected, and a path that conflicts with skip-verify is
+    /// rejected, so the trust source is unambiguous.
+    #[test]
+    fn builds_https_with_custom_ca_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = dir.path().join("ca.pem");
+        std::fs::write(&ca, TEST_CA_PEM).unwrap();
+
+        // The bundle parses into a non-empty root store.
+        let roots = load_root_store(&ca).expect("CA bundle loads");
+        assert_eq!(roots.len(), 1, "exactly the one test CA is trusted");
+
+        // And a sink against an https endpoint with that CA constructs.
+        let mut cfg = cfg_for("https://peer.example.com");
+        cfg.ca_cert_path = Some(ca);
+        let sink = HttpS3Sink::new(cfg).expect("custom-CA https sink builds");
+        assert_eq!(sink.scheme, "https");
+    }
+
+    /// A CA bundle with no certificates in it is a misconfiguration, not a transient failure.
+    #[test]
+    fn empty_ca_bundle_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = dir.path().join("empty.pem");
+        std::fs::write(&ca, "not a certificate\n").unwrap();
+        let err = load_root_store(&ca).unwrap_err();
+        assert!(matches!(err, ReplicationError::Terminal(_)));
+    }
+
+    /// A missing CA file is terminal (the path is wrong; retrying will not fix it).
+    #[test]
+    fn missing_ca_file_is_rejected() {
+        let err = load_root_store(Path::new("/no/such/ca.pem")).unwrap_err();
+        assert!(matches!(err, ReplicationError::Terminal(_)));
+        // ...and surfaces through sink construction too.
+        let mut cfg = cfg_for("https://peer.example.com");
+        cfg.ca_cert_path = Some(PathBuf::from("/no/such/ca.pem"));
+        assert!(HttpS3Sink::new(cfg).is_err());
+    }
+
+    /// Setting both a CA path and skip-verify is contradictory and rejected at construction.
+    #[test]
+    fn ca_path_and_skip_verify_conflict_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = dir.path().join("ca.pem");
+        std::fs::write(&ca, TEST_CA_PEM).unwrap();
+        let mut cfg = cfg_for("https://peer.example.com");
+        cfg.ca_cert_path = Some(ca);
+        cfg.insecure_skip_verify = true;
+        let err = HttpS3Sink::new(cfg).unwrap_err();
+        assert!(matches!(err, ReplicationError::Terminal(_)));
+    }
+
+    /// The no-op verifier accepts any certificate and signature, and advertises a non-empty,
+    /// provider-backed scheme set (so the handshake offers a real list).
+    #[test]
+    fn no_verification_accepts_everything() {
+        let v = NoVerification::new();
+        assert!(!v.supported_verify_schemes().is_empty());
+        // verify_server_cert returns Ok for an arbitrary (here empty) certificate.
+        let cert = CertificateDer::from(vec![0u8; 4]);
+        let name = ServerName::try_from("example.com").unwrap();
+        assert!(
+            v.verify_server_cert(&cert, &[], &name, &[], UnixTime::now())
+                .is_ok()
+        );
+    }
+
+    /// The plaintext `http://` path is unaffected by the trust knobs (they apply only to TLS), so
+    /// the default single-target node->node path keeps building exactly as before.
+    #[test]
+    fn http_endpoint_unaffected_by_trust_defaults() {
+        let sink = HttpS3Sink::new(cfg_for("http://s3.example.com:9000")).expect("http builds");
+        assert_eq!(sink.scheme, "http");
     }
 }

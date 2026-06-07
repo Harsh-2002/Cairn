@@ -1,9 +1,11 @@
-//! The configuration surface (ARCH §28). Values layer flags > env > file > default, and the
-//! whole config is validated on load so an invalid configuration fails fast with a clear
-//! message rather than at first use.
+//! The configuration surface (ARCH §28). Configuration is **environment-only**: the whole config
+//! is `Config::default()` overlaid with `CAIRN_*` environment variables, so the binary runs on a
+//! bare host or inside a container configured purely by env with no file to mount. The config is
+//! validated on load so an invalid configuration fails fast with a clear message rather than at
+//! first use.
 
 use figment::Figment;
-use figment::providers::{Env, Format, Serialized, Toml};
+use figment::providers::{Env, Serialized};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -73,6 +75,13 @@ pub struct Config {
     pub replication_region: Option<String>,
     /// How often the replication worker drains the outbox, in seconds.
     pub replication_interval_secs: u64,
+    /// A JSON array of named replication targets (`CAIRN_REPLICATION_TARGETS`). When present each
+    /// source bucket's destination is resolved to the matching named target (by the target's
+    /// `dest_bucket` or `name`) and shipped with that target's own endpoint, credentials, and TLS
+    /// trust (ARCH §20). The single-target `CAIRN_REPLICATION_*` keys above remain as the default
+    /// target used for any source bucket that does not match a named target. Each element is a
+    /// [`ReplicationTarget`]; parsed with `serde_json` on load.
+    pub replication_targets: Option<String>,
 }
 
 impl Default for Config {
@@ -102,23 +111,66 @@ impl Default for Config {
             replication_secret: None,
             replication_region: None,
             replication_interval_secs: 30,
+            replication_targets: None,
+        }
+    }
+}
+
+/// One entry of the `CAIRN_REPLICATION_TARGETS` JSON array: a named replication destination with
+/// its own endpoint, credentials, and TLS trust knobs (ARCH §20). A source bucket is routed to the
+/// target whose `dest_bucket` (or, failing that, `name`) matches the bucket's replication rule.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplicationTarget {
+    /// A stable name for the target, used to match a source bucket's replication rule when the
+    /// rule names the target rather than a destination bucket.
+    pub name: String,
+    /// The endpoint base URL, e.g. `https://s3.us-west-2.example.com`.
+    pub endpoint: String,
+    /// The SigV4 signing region for this target.
+    pub region: String,
+    /// The destination bucket (path-style) at this target.
+    pub dest_bucket: String,
+    /// The destination access-key id.
+    pub access_key: String,
+    /// The destination secret access key.
+    pub secret: String,
+    /// An optional path to a PEM file of CA certificates to trust for this target's TLS endpoint,
+    /// instead of the built-in webpki roots. Honoured only for `https://` endpoints.
+    #[serde(default)]
+    pub ca_path: Option<PathBuf>,
+    /// When true, the target's TLS server certificate is **not** verified. Dangerous; intended
+    /// only for testing against a self-signed endpoint, and logged loudly when used.
+    #[serde(default)]
+    pub insecure_skip_verify: bool,
+}
+
+impl Config {
+    /// Parse the `replication_targets` JSON document into the typed target list. Returns an empty
+    /// vector when no targets are configured.
+    ///
+    /// # Errors
+    /// Returns a [`ConfigError::Parse`] if the JSON is malformed or does not match the
+    /// [`ReplicationTarget`] shape.
+    pub fn parse_replication_targets(&self) -> Result<Vec<ReplicationTarget>, ConfigError> {
+        match &self.replication_targets {
+            None => Ok(Vec::new()),
+            Some(json) => serde_json::from_str(json).map_err(|e| {
+                ConfigError::Parse(format!("invalid CAIRN_REPLICATION_TARGETS JSON: {e}"))
+            }),
         }
     }
 }
 
 impl Config {
-    /// Load configuration, layering an optional TOML file under environment variables
-    /// (prefixed `CAIRN_`) over the built-in defaults, then validate.
+    /// Load configuration from the environment only: the built-in [`Config::default`] overlaid
+    /// with `CAIRN_*` environment variables, then validated. There is no configuration file — a
+    /// Cairn host or container is configured purely by env (ARCH §28).
     ///
     /// # Errors
-    /// Returns a [`ConfigError`] if a layer fails to parse or validation fails.
-    pub fn load(file: Option<&PathBuf>) -> Result<Self, ConfigError> {
-        let mut fig = Figment::from(Serialized::defaults(Config::default()));
-        if let Some(path) = file {
-            fig = fig.merge(Toml::file(path));
-        }
-        fig = fig.merge(Env::prefixed("CAIRN_"));
-        let cfg: Config = fig
+    /// Returns a [`ConfigError`] if the environment fails to parse or validation fails.
+    pub fn load() -> Result<Self, ConfigError> {
+        let cfg: Config = Figment::from(Serialized::defaults(Config::default()))
+            .merge(Env::prefixed("CAIRN_"))
             .extract()
             .map_err(|e| ConfigError::Parse(e.to_string()))?;
         cfg.validate()?;
@@ -198,6 +250,17 @@ impl Config {
                 "wal_checkpoint_interval_secs must be positive".into(),
             ));
         }
+        // A malformed replication-targets document is an operator error that must surface at load,
+        // not when the first drain tries to route an object. Reject targets that set both a CA
+        // path and skip-verify, since the two trust knobs are mutually exclusive.
+        for target in self.parse_replication_targets()? {
+            if target.ca_path.is_some() && target.insecure_skip_verify {
+                return Err(ConfigError::Invalid(format!(
+                    "replication target {:?} sets both ca_path and insecure_skip_verify",
+                    target.name
+                )));
+            }
+        }
         Ok(())
     }
 }
@@ -214,6 +277,10 @@ pub enum ConfigError {
 }
 
 #[cfg(test)]
+// `figment::Jail::expect_with` takes a closure returning `figment::Result<()>`, whose `Err`
+// variant (`figment::Error`) is large; the type is dictated by figment's API, not ours, so the
+// `result_large_err` lint is not actionable for these env-isolation tests.
+#[allow(clippy::result_large_err)]
 mod tests {
     use super::*;
 
@@ -286,5 +353,127 @@ mod tests {
         assert!(c.validate().is_err());
         c.listen_addr = "127.0.0.1:9000".parse().unwrap();
         assert!(c.validate().is_ok());
+    }
+
+    /// Environment-only loading: with no `CAIRN_*` set, `load` returns the validated defaults.
+    /// `Jail` clears the ambient environment, so this also proves the loader needs no config file.
+    #[test]
+    fn load_env_only_returns_defaults_when_unset() {
+        figment::Jail::expect_with(|_jail| {
+            let cfg = Config::load().expect("defaults load and validate");
+            assert_eq!(cfg.listen_addr, Config::default().listen_addr);
+            assert_eq!(cfg.region, "us-east-1");
+            assert!(cfg.replication_targets.is_none());
+            Ok(())
+        });
+    }
+
+    /// Environment variables override the defaults — the only configuration source there is.
+    /// There is no longer a TOML layer: `load` takes no path and reads `CAIRN_*` exclusively.
+    #[test]
+    fn load_env_only_applies_overrides() {
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("CAIRN_REGION", "eu-west-1");
+            jail.set_env("CAIRN_LISTEN_ADDR", "0.0.0.0:8080");
+            jail.set_env("CAIRN_LOG_FORMAT", "json");
+            jail.set_env("CAIRN_REPLICATION_INTERVAL_SECS", "7");
+            let cfg = Config::load().expect("env overrides load and validate");
+            assert_eq!(cfg.region, "eu-west-1");
+            assert_eq!(cfg.listen_addr, "0.0.0.0:8080".parse().unwrap());
+            assert_eq!(cfg.log_format, LogFormat::Json);
+            assert_eq!(cfg.replication_interval_secs, 7);
+            Ok(())
+        });
+    }
+
+    /// A TOML file present on disk is ignored: configuration comes only from env (and defaults),
+    /// proving the file-merge support is gone. The file would have changed `region` if honoured.
+    #[test]
+    fn load_ignores_any_toml_file() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file("Cairn.toml", "region = \"from-toml\"\n")?;
+            let cfg = Config::load().expect("loads without consulting the file");
+            assert_eq!(cfg.region, "us-east-1", "the TOML file must not be read");
+            Ok(())
+        });
+    }
+
+    /// The single-target `CAIRN_REPLICATION_*` keys still load (the fallback/default target).
+    #[test]
+    fn load_keeps_single_target_replication_keys() {
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("CAIRN_REPLICATION_ENDPOINT", "http://backup:9000");
+            jail.set_env("CAIRN_REPLICATION_DEST_BUCKET", "mirror");
+            jail.set_env("CAIRN_REPLICATION_ACCESS_KEY", "AKID");
+            jail.set_env("CAIRN_REPLICATION_SECRET", "shh");
+            let cfg = Config::load().expect("single-target keys load");
+            assert_eq!(
+                cfg.replication_endpoint.as_deref(),
+                Some("http://backup:9000")
+            );
+            assert_eq!(cfg.replication_dest_bucket.as_deref(), Some("mirror"));
+            assert_eq!(cfg.replication_access_key.as_deref(), Some("AKID"));
+            assert_eq!(cfg.replication_secret.as_deref(), Some("shh"));
+            Ok(())
+        });
+    }
+
+    /// `CAIRN_REPLICATION_TARGETS` carries a JSON array of named targets parsed with `serde_json`.
+    #[test]
+    fn load_parses_replication_targets_json() {
+        figment::Jail::expect_with(|jail| {
+            jail.set_env(
+                "CAIRN_REPLICATION_TARGETS",
+                r#"[
+                    {"name":"west","endpoint":"https://s3.west.example","region":"us-west-2",
+                     "dest_bucket":"mirror-west","access_key":"AKW","secret":"sw","ca_path":"/etc/ca.pem"},
+                    {"name":"east","endpoint":"http://s3.east.example:9000","region":"us-east-1",
+                     "dest_bucket":"mirror-east","access_key":"AKE","secret":"se",
+                     "insecure_skip_verify":true}
+                ]"#,
+            );
+            let cfg = Config::load().expect("targets JSON loads and validates");
+            let targets = cfg.parse_replication_targets().expect("targets parse");
+            assert_eq!(targets.len(), 2);
+            assert_eq!(targets[0].name, "west");
+            assert_eq!(targets[0].dest_bucket, "mirror-west");
+            assert_eq!(targets[0].ca_path, Some(PathBuf::from("/etc/ca.pem")));
+            assert!(!targets[0].insecure_skip_verify);
+            assert_eq!(targets[1].name, "east");
+            assert!(targets[1].insecure_skip_verify);
+            assert!(targets[1].ca_path.is_none());
+            Ok(())
+        });
+    }
+
+    /// A malformed `CAIRN_REPLICATION_TARGETS` document fails fast at load.
+    #[test]
+    fn load_rejects_malformed_replication_targets() {
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("CAIRN_REPLICATION_TARGETS", "{ not an array");
+            assert!(
+                Config::load().is_err(),
+                "malformed targets JSON must be rejected"
+            );
+            Ok(())
+        });
+    }
+
+    /// A target may not request both a custom CA and skip-verify; the two trust knobs conflict.
+    #[test]
+    fn rejects_target_with_conflicting_trust_knobs() {
+        let mut c = base();
+        c.replication_targets = Some(
+            r#"[{"name":"x","endpoint":"https://e","region":"r","dest_bucket":"d",
+                 "access_key":"a","secret":"s","ca_path":"/ca.pem","insecure_skip_verify":true}]"#
+                .to_owned(),
+        );
+        assert!(c.validate().is_err());
+    }
+
+    /// `parse_replication_targets` yields an empty list when unset.
+    #[test]
+    fn parse_targets_empty_when_unset() {
+        assert!(base().parse_replication_targets().unwrap().is_empty());
     }
 }

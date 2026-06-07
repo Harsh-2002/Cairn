@@ -165,6 +165,17 @@ ALTER TABLE buckets ADD COLUMN quota_bytes INTEGER;
 ALTER TABLE buckets RENAME COLUMN compression TO compression_policy;
 "#,
     },
+    Migration {
+        version: 3,
+        name: "SSE-S3 object encryption descriptor (ARCH §27)",
+        sql: r#"
+-- §27 SSE-S3: a nullable per-version descriptor for server-side-encrypted object data. The JSON
+-- document is {alg, wrapped_dek_b64, nonce_b64}: the algorithm, the data-encryption key sealed
+-- under the master key (base64), and the wrapping nonce (base64). NULL means the object's data is
+-- stored unencrypted. The raw DEK is never persisted; only its wrapped form lives here.
+ALTER TABLE object_versions ADD COLUMN sse_descriptor TEXT;
+"#,
+    },
 ];
 
 /// Run all pending migrations on the write connection, recording each as applied.
@@ -274,5 +285,31 @@ mod tests {
             )
             .unwrap();
         assert!(auto >= 1, "the UNIQUE constraint's auto-index must remain");
+    }
+
+    #[test]
+    fn migration_v3_adds_sse_descriptor_column() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        // The SSE-S3 descriptor column exists and is nullable (ARCH §27).
+        assert!(column_exists(&conn, "object_versions", "sse_descriptor"));
+        // It defaults to NULL when not supplied on insert.
+        conn.execute_batch(
+            "INSERT INTO object_versions
+             (id, bucket_name, key, version_id, is_latest, is_delete_marker, size_logical,
+              size_physical, etag, content_type, compression, storage_class, owner_id,
+              user_metadata, checksums, created_at, updated_at)
+             VALUES ('i','b','k','null',1,0,0,0,'e','text/plain','\"Uncompressed\"','Standard',
+                     'o','[]','[]',0,0);",
+        )
+        .unwrap();
+        let sse: Option<String> = conn
+            .query_row(
+                "SELECT sse_descriptor FROM object_versions WHERE id='i'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(sse.is_none());
     }
 }

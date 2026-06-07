@@ -61,6 +61,7 @@ async fn put_object(
                 extra_checksums: cairn_types::ChecksumSet::none(),
                 size_ceiling: 1 << 30,
                 content_type: "application/octet-stream".to_owned(),
+                encryption: None,
             },
         )
         .await
@@ -85,6 +86,7 @@ async fn put_object(
         user_metadata: Vec::new(),
         acl: None,
         checksums: Vec::new(),
+        sse_descriptor: None,
         replication_status: None,
         created_at: ts,
         updated_at: ts,

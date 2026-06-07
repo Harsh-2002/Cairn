@@ -43,6 +43,7 @@ async fn stage_blob(blobs: &InMemoryBlobStore, data: &'static [u8]) -> (StorageP
                 extra_checksums: ChecksumSet::none(),
                 size_ceiling: 1 << 30,
                 content_type: "text/plain".to_owned(),
+                encryption: None,
             },
         )
         .await
@@ -80,6 +81,7 @@ fn version_row(
         user_metadata: vec![("k".to_owned(), "v".to_owned())],
         acl: None,
         checksums: Vec::new(),
+        sse_descriptor: None,
         replication_status: Some(status),
         created_at: now,
         updated_at: now,
