@@ -129,24 +129,23 @@ jobs:
   fuzz-smoke:
     name: fuzz smoke (decoder, xml, policy)
     runs-on: ubuntu-latest
-    # The repo's rust-toolchain.toml pins stable, which would override the nightly install and break
-    # cargo-fuzz's -Z sanitizer flags ("only accepted on nightly"). RUSTUP_TOOLCHAIN takes precedence
-    # over the toolchain file, so every cargo invocation here (incl. cargo-fuzz's nested build) uses
-    # nightly.
-    env:
-      RUSTUP_TOOLCHAIN: nightly
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
+      # Build cargo-fuzz with the default (stable) toolchain from rust-toolchain.toml — its deps
+      # (rustix) don't compile on the very latest nightly. The fuzz RUN below then uses nightly via
+      # RUSTUP_TOOLCHAIN (which overrides the stable toolchain file) for the -Z sanitizer build, and
+      # that env propagates to cargo-fuzz's nested `cargo build`.
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
       # These fuzz targets live in crates that do not embed the UI, so no UI build is needed.
-      - run: cargo fuzz run chunked_decoder -- -max_total_time=45
-        working-directory: crates/cairn-s3
-      - run: cargo fuzz run request_parsers -- -max_total_time=30
-        working-directory: crates/cairn-xml
-      - run: cargo fuzz run parse_policy -- -max_total_time=30
-        working-directory: crates/cairn-authz
+      - name: Fuzz smoke (nightly build)
+        env:
+          RUSTUP_TOOLCHAIN: nightly
+        run: |
+          (cd crates/cairn-s3   && cargo fuzz run chunked_decoder  -- -max_total_time=45)
+          (cd crates/cairn-xml  && cargo fuzz run request_parsers  -- -max_total_time=30)
+          (cd crates/cairn-authz && cargo fuzz run parse_policy    -- -max_total_time=30)
 
   benches:
     name: benchmarks compile
