@@ -147,6 +147,8 @@ pub struct BucketDetailResp {
     pub object_count: u64,
     /// The logical bytes of current objects.
     pub logical_bytes: u64,
+    /// The active compression algorithm (`"zstd"`/`"lz4"`), or `null` when compression is disabled.
+    pub compression: Option<String>,
 }
 
 // ---------------------------------------------------------------------------------------

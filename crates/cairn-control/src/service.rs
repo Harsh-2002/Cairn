@@ -7,7 +7,9 @@
 use crate::wire;
 use bytes::Bytes;
 use cairn_types::auth::{Principal, Role};
-use cairn_types::bucket::{Bucket, ConfigAspect, ConfigDoc, VersioningState};
+use cairn_types::bucket::{
+    Bucket, CompressionAlgorithm, CompressionPolicy, ConfigAspect, ConfigDoc, VersioningState,
+};
 use cairn_types::id::{BucketName, UserId};
 use cairn_types::meta::{ListQuery, Mutation, MutationOutcome, StoreCounts, User, UserRecord};
 use cairn_types::traits::{BlobStore, Clock, Crypto, MetadataStore};
@@ -149,6 +151,9 @@ impl ControlService {
                 self.set_versioning(name, &body).await
             }
             (&Method::PUT, ["buckets", name, "quota"]) => self.set_quota(name, &body).await,
+            (&Method::PUT, ["buckets", name, "compression"]) => {
+                self.set_compression(name, &body).await
+            }
             (&Method::PUT, ["buckets", name, "policy"]) => self.set_policy(name, &body).await,
             (&Method::DELETE, ["buckets", name, "policy"]) => self.delete_policy(name).await,
 
@@ -299,6 +304,14 @@ impl ControlService {
                 region: bucket.region,
                 object_count,
                 logical_bytes,
+                compression: bucket.compression.as_ref().map(|p| {
+                    match p.algorithm {
+                        CompressionAlgorithm::Zstd => "zstd",
+                        CompressionAlgorithm::Lz4 => "lz4",
+                        CompressionAlgorithm::None => "none",
+                    }
+                    .to_owned()
+                }),
             },
         )
     }
@@ -590,6 +603,60 @@ impl ControlService {
         }
 
         self.record_activity("SetBucketQuota", Some(bucket_name.as_str()), None)
+            .await;
+        ControlResponse::no_content()
+    }
+
+    /// `PUT /buckets/{name}/compression`: set or disable the bucket's compression policy, applied to
+    /// subsequent object writes. Body: `{"algorithm": "zstd"|"lz4"|"none", "block_size": 65536}`.
+    async fn set_compression(&self, name: &str, body: &Bytes) -> ControlResponse {
+        let bucket_name = match self.require_bucket(name).await {
+            Ok(n) => n,
+            Err(resp) => return resp,
+        };
+        #[derive(serde::Deserialize)]
+        struct Req {
+            algorithm: String,
+            #[serde(default)]
+            block_size: Option<u32>,
+        }
+        let req: Req = match serde_json::from_slice(body) {
+            Ok(r) => r,
+            Err(e) => return ControlResponse::bad_request(&e.to_string()),
+        };
+        let block_size = req.block_size.unwrap_or(65_536);
+        let policy = match req.algorithm.to_ascii_lowercase().as_str() {
+            "none" | "off" | "" => None,
+            "zstd" => Some(CompressionPolicy {
+                algorithm: CompressionAlgorithm::Zstd,
+                block_size,
+            }),
+            "lz4" => Some(CompressionPolicy {
+                algorithm: CompressionAlgorithm::Lz4,
+                block_size,
+            }),
+            other => {
+                return ControlResponse::bad_request(&format!(
+                    "unknown algorithm {other:?} (expected zstd|lz4|none)"
+                ));
+            }
+        };
+        if policy.is_some() && !(1024..=16 * 1024 * 1024).contains(&block_size) {
+            return ControlResponse::bad_request("block_size must be between 1 KiB and 16 MiB");
+        }
+
+        if let Err(e) = self
+            .meta
+            .submit(Mutation::SetBucketCompression {
+                bucket: bucket_name.clone(),
+                policy,
+            })
+            .await
+        {
+            return ControlResponse::error_internal(&e.to_string());
+        }
+
+        self.record_activity("SetBucketCompression", Some(bucket_name.as_str()), None)
             .await;
         ControlResponse::no_content()
     }

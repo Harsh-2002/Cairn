@@ -410,6 +410,12 @@ impl MetadataStore for InMemoryMetadataStore {
                 }
                 Ok(MutationOutcome::Ack)
             }
+            Mutation::SetBucketCompression { bucket, policy } => {
+                if let Some(b) = st.buckets.get_mut(bucket.as_str()) {
+                    b.compression = policy;
+                }
+                Ok(MutationOutcome::Ack)
+            }
             Mutation::SetAccountPublicAccessBlock(bpa) => {
                 st.account_bpa = bpa;
                 Ok(MutationOutcome::Ack)

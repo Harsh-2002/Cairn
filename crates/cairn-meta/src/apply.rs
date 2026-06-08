@@ -221,6 +221,14 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             .map_err(engine_err)?;
             Ok(MutationOutcome::Ack)
         }
+        Mutation::SetBucketCompression { bucket, policy } => {
+            conn.execute(
+                "UPDATE buckets SET compression_policy=?2 WHERE name=?1",
+                params![bucket.as_str(), policy.as_ref().map(to_json)],
+            )
+            .map_err(engine_err)?;
+            Ok(MutationOutcome::Ack)
+        }
         Mutation::SetAccountPublicAccessBlock(bpa) => {
             conn.execute(
                 "INSERT OR REPLACE INTO account_config (k, v) VALUES ('public_access_block', ?1)",

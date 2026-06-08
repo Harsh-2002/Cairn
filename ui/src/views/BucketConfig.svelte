@@ -22,6 +22,10 @@
   let savingPolicy = $state(false);
   let deletingPolicy = $state(false);
 
+  // Compression control ("zstd" | "lz4" | "none"); read from the bucket detail.
+  let compression = $state("none");
+  let savingCompression = $state(false);
+
   // Map the server's lowercase versioning string to the capitalized form the
   // PUT /versioning endpoint expects.
   function statusFromState(s) {
@@ -51,6 +55,12 @@
           ? ""
           : String(res.quota_bytes);
       policyText = res.policy ? JSON.stringify(res.policy, null, 2) : "";
+      try {
+        const detail = await api.getBucket(name);
+        compression = detail.compression || "none";
+      } catch {
+        compression = "none";
+      }
     } catch (err) {
       error = err.message || "Failed to load bucket configuration.";
       config = null;
@@ -105,6 +115,24 @@
   function clearQuota() {
     quotaInput = "";
     saveQuota();
+  }
+
+  async function saveCompression() {
+    error = "";
+    notice = "";
+    savingCompression = true;
+    try {
+      await api.setCompression(name, compression);
+      notice =
+        compression === "none"
+          ? "Compression disabled."
+          : `Compression set to ${compression}.`;
+      await load();
+    } catch (err) {
+      error = err.message || "Failed to update compression.";
+    } finally {
+      savingCompression = false;
+    }
   }
 
   async function savePolicy() {
@@ -230,6 +258,26 @@
       </button>
       <button type="button" onclick={clearQuota} disabled={savingQuota}>
         Clear quota
+      </button>
+    </form>
+  </div>
+
+  <div class="panel">
+    <div class="muted label-sm">Compression (applied to new uploads)</div>
+    <form
+      class="row"
+      onsubmit={(e) => {
+        e.preventDefault();
+        saveCompression();
+      }}
+    >
+      <select bind:value={compression} aria-label="Compression algorithm">
+        <option value="zstd">Zstandard (zstd)</option>
+        <option value="lz4">LZ4</option>
+        <option value="none">Off</option>
+      </select>
+      <button class="primary" type="submit" disabled={savingCompression}>
+        {savingCompression ? "Saving…" : "Apply"}
       </button>
     </form>
   </div>

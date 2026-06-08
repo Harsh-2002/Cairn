@@ -165,6 +165,12 @@ export const api = {
     request("PUT", `/buckets/${encodeURIComponent(name)}/quota`, {
       quota_bytes,
     }),
+  // Set/disable the bucket compression policy. algorithm: "zstd" | "lz4" | "none".
+  setCompression: (name, algorithm, block_size = 65536) =>
+    request("PUT", `/buckets/${encodeURIComponent(name)}/compression`, {
+      algorithm,
+      block_size,
+    }),
   // The policy body is a raw policy JSON document, not the usual {error}/{message}
   // envelope; `rawBody` is sent verbatim as the request body.
   setPolicy: (name, rawBody) =>

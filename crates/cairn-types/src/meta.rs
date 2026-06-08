@@ -3,7 +3,7 @@
 //! and user/credential records.
 
 use crate::authz::{Acl, OwnershipMode, PublicAccessBlock};
-use crate::bucket::{Bucket, ConfigAspect, ConfigDoc, VersioningState};
+use crate::bucket::{Bucket, CompressionPolicy, ConfigAspect, ConfigDoc, VersioningState};
 use crate::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
 use crate::object::{ChecksumValue, ETag, ObjectVersionRow, StorageClass, UserMetadata};
 use crate::time::Timestamp;
@@ -139,6 +139,13 @@ pub enum Mutation {
         bucket: BucketName,
         /// The new quota in bytes, or `None` to remove the limit.
         quota_bytes: Option<u64>,
+    },
+    /// Set (or clear) a bucket's compression policy, applied to subsequent object writes.
+    SetBucketCompression {
+        /// The bucket.
+        bucket: BucketName,
+        /// The new compression policy, or `None` to disable compression.
+        policy: Option<CompressionPolicy>,
     },
     /// Set the account-wide Block Public Access singleton.
     SetAccountPublicAccessBlock(PublicAccessBlock),

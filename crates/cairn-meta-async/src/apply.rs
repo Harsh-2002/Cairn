@@ -261,6 +261,20 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
                 .await?;
             Ok(MutationOutcome::Ack)
         }
+        Mutation::SetBucketCompression { bucket, policy } => {
+            driver
+                .execute(
+                    "UPDATE buckets SET compression_policy=?2 WHERE name=?1",
+                    vec![
+                        Value::Text(bucket.as_str().to_owned()),
+                        policy
+                            .as_ref()
+                            .map_or(Value::Null, |p| Value::Text(to_json(p))),
+                    ],
+                )
+                .await?;
+            Ok(MutationOutcome::Ack)
+        }
         Mutation::SetAccountPublicAccessBlock(bpa) => {
             driver
                 .execute(
