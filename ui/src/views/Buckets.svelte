@@ -114,10 +114,10 @@
         <tr>
           <td class="mono">
             <a
-              href={`#/buckets/${encodeURIComponent(b.name)}`}
+              href={`#/buckets/${encodeURIComponent(b.name)}/browser`}
               onclick={(e) => {
                 e.preventDefault();
-                navigate(`/buckets/${encodeURIComponent(b.name)}`);
+                navigate(`/buckets/${encodeURIComponent(b.name)}/browser`);
               }}>{b.name}</a
             >
           </td>

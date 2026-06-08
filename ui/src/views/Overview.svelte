@@ -39,6 +39,17 @@
   const saved = $derived(
     data ? Math.max(0, data.logical_bytes - data.physical_bytes) : 0,
   );
+  // Stored fraction of original (0..1), for the compression bar.
+  const storedFrac = $derived(
+    data && data.logical_bytes > 0
+      ? Math.min(1, data.physical_bytes / data.logical_bytes)
+      : 1,
+  );
+  const savedPct = $derived(
+    data && data.logical_bytes > 0
+      ? Math.round((saved / data.logical_bytes) * 100)
+      : 0,
+  );
 </script>
 
 <h1>Overview</h1>
@@ -82,6 +93,21 @@
     </div>
   </div>
 
+  <div class="card" style="margin-top:18px">
+    <div class="row" style="justify-content:space-between; align-items:baseline;">
+      <h2 style="margin:0;">Compression</h2>
+      <span class="muted">{savedPct}% smaller · {ratio(data.compression_ratio)} ratio</span>
+    </div>
+    <div class="comp-bar" title={`Stored ${bytes(data.physical_bytes)} of ${bytes(data.logical_bytes)} original`}>
+      <div class="comp-stored" style={`width:${Math.round(storedFrac * 100)}%`}></div>
+    </div>
+    <div class="row comp-legend">
+      <span><i class="swatch stored"></i> Stored {bytes(data.physical_bytes)}</span>
+      <span><i class="swatch saved"></i> Saved {bytes(saved)}</span>
+      <span class="muted">Original {bytes(data.logical_bytes)}</span>
+    </div>
+  </div>
+
   <div class="toolbar">
     <h2 style="margin:0;">Storage by bucket</h2>
     <span class="spacer"></span>
@@ -107,11 +133,11 @@
               <tr>
                 <td>
                   <a
-                    href={`#/buckets/${b.name}`}
+                    href={`#/buckets/${b.name}/browser`}
                     class="mono"
                     onclick={(e) => {
                       e.preventDefault();
-                      navigate(`/buckets/${b.name}`);
+                      navigate(`/buckets/${b.name}/browser`);
                     }}>{b.name}</a
                   >
                 </td>
@@ -134,3 +160,39 @@
     </div>
   {/if}
 {/if}
+
+<style>
+  .comp-bar {
+    height: 14px;
+    border-radius: 999px;
+    background: var(--success-tint);
+    overflow: hidden;
+    margin: 12px 0 10px;
+  }
+  .comp-stored {
+    height: 100%;
+    background: var(--primary);
+    border-radius: 999px;
+  }
+  .comp-legend {
+    gap: 18px;
+    font-size: 0.85rem;
+    flex-wrap: wrap;
+  }
+  .swatch {
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    border-radius: 3px;
+    margin-right: 5px;
+    vertical-align: middle;
+  }
+  .swatch.stored {
+    background: var(--primary);
+  }
+  .swatch.saved {
+    background: var(--success-tint);
+    border: 1px solid var(--success);
+  }
+</style>
+

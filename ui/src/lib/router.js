@@ -1,27 +1,55 @@
-// Minimal hash-based router. Hash routing keeps reloads working without any
-// server-side rewrite (ARCH §23.3 — the SPA shell is returned for client-side
-// routes; with hash routing the shell is always index.html).
+// Hash-based router with nested routes + named params. Hash routing keeps reloads and deep links
+// working without any server rewrite — the SPA shell is served only for `/`, so every in-app route
+// lives in the fragment. Add a section by adding one line to ROUTES.
 //
-// Routes:
 //   #/overview
-//   #/buckets
-//   #/buckets/<name>           (object browser + config panel for a bucket)
-//   #/users
-//   #/replication
-//   #/activity
+//   #/buckets                       #/buckets/<name>/browser   #/buckets/<name>/settings
+//   #/users                         #/users/<id>
+//   #/activity                      #/replication
 
 import { readable } from "svelte/store";
 
-function parse() {
-  const raw = (window.location.hash || "#/overview").replace(/^#/, "");
-  const parts = raw.split("/").filter(Boolean);
-  // parts[0] = view, parts[1..] = params
-  const view = parts[0] || "overview";
-  return { view, params: parts.slice(1).map(decodeURIComponent), raw };
+// Patterns are length-discriminated, so `/users` and `/users/:id` never collide.
+const ROUTES = [
+  { name: "overview", pattern: "/overview" },
+  { name: "buckets", pattern: "/buckets" },
+  { name: "bucket.browser", pattern: "/buckets/:name/browser" },
+  { name: "bucket.settings", pattern: "/buckets/:name/settings" },
+  { name: "users", pattern: "/users" },
+  { name: "user", pattern: "/users/:id" },
+  { name: "activity", pattern: "/activity" },
+  { name: "replication", pattern: "/replication" },
+];
+
+// Match a raw hash path (no leading '#') against the table → { name, params, raw }. Unknown paths
+// fall back to the overview.
+export function match(raw) {
+  const path = raw.split("?")[0];
+  const segs = path.split("/").filter(Boolean);
+  for (const r of ROUTES) {
+    const pat = r.pattern.split("/").filter(Boolean);
+    if (pat.length !== segs.length) continue;
+    const params = {};
+    let ok = true;
+    for (let i = 0; i < pat.length; i++) {
+      if (pat[i].startsWith(":")) params[pat[i].slice(1)] = decodeURIComponent(segs[i]);
+      else if (pat[i] !== segs[i]) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) return { name: r.name, params, raw };
+  }
+  return { name: "overview", params: {}, raw };
 }
 
-export const route = readable(parse(), (set) => {
-  const handler = () => set(parse());
+function current() {
+  const raw = (window.location.hash || "#/overview").replace(/^#/, "");
+  return match(raw);
+}
+
+export const route = readable(current(), (set) => {
+  const handler = () => set(current());
   window.addEventListener("hashchange", handler);
   return () => window.removeEventListener("hashchange", handler);
 });

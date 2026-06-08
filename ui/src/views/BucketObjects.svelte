@@ -2,7 +2,6 @@
   import { api, s3 } from "../lib/api.js";
   import { bytes, count, whenMs } from "../lib/format.js";
   import { navigate } from "../lib/router.js";
-  import BucketConfig from "./BucketConfig.svelte";
 
   let { name } = $props();
 
@@ -215,10 +214,6 @@
     </div>
   </div>
 {/if}
-
-{#key name}
-  <BucketConfig {name} />
-{/key}
 
 <h2>Objects</h2>
 <div class="toolbar">

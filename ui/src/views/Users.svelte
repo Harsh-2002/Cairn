@@ -1,255 +1,159 @@
 <script>
+  // Users are S3-API-only credentials scoped by an access policy. The root admin is the sole admin,
+  // so there is no role selector here. Create mints an S3 (SigV4) key/secret shown exactly once and
+  // attaches the policy built with the PermissionBuilder.
   import { api } from "../lib/api.js";
+  import { navigate } from "../lib/router.js";
+  import { ok, err } from "../lib/toast.js";
+  import PermissionBuilder from "../components/PermissionBuilder.svelte";
+  import CopyField from "../components/CopyField.svelte";
 
   let users = $state([]);
-  let error = $state("");
+  let buckets = $state([]);
   let loading = $state(true);
 
+  let showCreate = $state(false);
   let displayName = $state("");
-  let role = $state("member");
+  let pendingPolicy = $state(undefined); // doc from the builder; null = invalid
   let creating = $state(false);
-  let notice = $state("");
-
-  // The id of the user a per-row action is currently in flight for (disables
-  // that row's buttons without blocking the whole table).
-  let busyId = $state(null);
-
-  // The one-time bearer secret returned on creation or rotation. Shown once,
-  // then the server only retains a hash (ARCH §23.4).
-  let created = $state(null);
+  let created = $state(null); // one-time credentials
 
   async function load() {
     loading = true;
-    error = "";
     try {
       const res = await api.listUsers();
       users = (res && res.users) || [];
-    } catch (err) {
-      error = err.message || "Failed to load users.";
-    } finally {
-      loading = false;
+      const b = await api.listBuckets();
+      buckets = (b.buckets || []).map((x) => x.name);
+    } catch (e) {
+      err(e.message);
     }
+    loading = false;
   }
+  load();
 
-  async function create(e) {
-    e.preventDefault();
-    error = "";
-    notice = "";
+  const onPolicy = (doc) => (pendingPolicy = doc);
+
+  async function create() {
     const dn = displayName.trim();
-    if (!dn) {
-      error = "Display name is required.";
-      return;
-    }
+    if (!dn) return err("Display name is required");
+    if (pendingPolicy === null) return err("Fix the policy JSON before creating");
     creating = true;
     try {
-      const res = await api.createUser(dn, role);
-      // Assemble the full Bearer token the user will sign in with.
-      const token =
-        res.bearer_access_key_id && res.bearer_secret
-          ? `${res.bearer_access_key_id}.${res.bearer_secret}`
-          : null;
-      created = {
-        id: res.id,
-        access_key_id: res.bearer_access_key_id,
-        secret: res.bearer_secret,
-        token,
-      };
+      const res = await api.createUser(dn); // member; S3-only
+      if (pendingPolicy) await api.setUserPolicy(res.id, JSON.stringify(pendingPolicy));
+      created = res;
+      ok(`Created ${dn}`);
+      showCreate = false;
       displayName = "";
-      role = "member";
       await load();
-    } catch (err) {
-      error = err.message || "Failed to create user.";
-    } finally {
-      creating = false;
+    } catch (e) {
+      err(e.message);
     }
+    creating = false;
   }
-
-  async function setActive(u, active) {
-    error = "";
-    notice = "";
-    busyId = u.id;
-    try {
-      await api.patchUser(u.id, { is_active: active });
-      notice = `${u.display_name} ${active ? "reactivated" : "deactivated"}.`;
-      await load();
-    } catch (err) {
-      error = err.message || "Failed to update user.";
-    } finally {
-      busyId = null;
-    }
-  }
-
-  async function setRole(u, newRole) {
-    if (newRole === u.role) return;
-    error = "";
-    notice = "";
-    busyId = u.id;
-    try {
-      await api.patchUser(u.id, { role: newRole });
-      notice = `${u.display_name} is now ${newRole}.`;
-      await load();
-    } catch (err) {
-      error = err.message || "Failed to change role.";
-    } finally {
-      busyId = null;
-    }
-  }
-
-  async function rotate(u) {
-    if (
-      !window.confirm(
-        `Rotate credentials for "${u.display_name}"? The current secret stops working immediately.`,
-      )
-    )
-      return;
-    error = "";
-    notice = "";
-    busyId = u.id;
-    try {
-      const res = await api.rotateCredentials(u.id);
-      const token =
-        res.bearer_access_key_id && res.bearer_secret
-          ? `${res.bearer_access_key_id}.${res.bearer_secret}`
-          : null;
-      created = {
-        id: u.id,
-        access_key_id: res.bearer_access_key_id,
-        secret: res.bearer_secret,
-        token,
-      };
-    } catch (err) {
-      error = err.message || "Failed to rotate credentials.";
-    } finally {
-      busyId = null;
-    }
-  }
-
-  load();
 </script>
 
-<h1>Users</h1>
-<p class="subtitle">Manage administrators and members.</p>
-
-{#if error}
-  <div class="notice error">{error}</div>
-{/if}
-{#if notice}
-  <div class="notice success">{notice}</div>
-{/if}
+<div class="row" style="justify-content:space-between; align-items:center;">
+  <div>
+    <h1 style="margin-bottom:2px">Users</h1>
+    <p class="subtitle" style="margin:0">S3-API access keys, each scoped by an access policy.</p>
+  </div>
+  <button class="btn primary" onclick={() => (showCreate = !showCreate)}>
+    {showCreate ? "Cancel" : "New user"}
+  </button>
+</div>
 
 {#if created}
-  <div class="notice warn">
+  <div class="card" style="margin-top:16px; border-color: var(--warning);">
     <strong>Save these credentials now — the secret is shown only once.</strong>
-    <div style="margin-top:0.5rem;">
-      <div class="muted">User ID</div>
-      <div class="secret-box">{created.id}</div>
-      <div class="muted">Access key ID</div>
-      <div class="secret-box">{created.access_key_id}</div>
-      <div class="muted">Secret</div>
-      <div class="secret-box">{created.secret}</div>
-      {#if created.token}
-        <div class="muted">Bearer token (use this to sign in)</div>
-        <div class="secret-box">{created.token}</div>
-      {/if}
-    </div>
-    <button
-      style="margin-top:0.6rem;"
-      onclick={() => {
-        created = null;
-      }}>Dismiss</button
-    >
+    <p class="muted" style="margin:4px 0 12px">
+      These are S3 credentials: use them in any S3 client (boto3, aws-cli, …) against this server.
+    </p>
+    <CopyField label="S3 access key id" value={created.s3_access_key_id} secret={true} />
+    <CopyField label="S3 secret key" value={created.s3_secret_key} secret={true} />
+    <details>
+      <summary class="muted" style="cursor:pointer; font-size:0.85rem;">
+        Bearer token (alternative auth)
+      </summary>
+      <div style="margin-top:8px">
+        <CopyField
+          label="Bearer token"
+          value={`${created.bearer_access_key_id}.${created.bearer_secret}`}
+          secret={true} />
+      </div>
+    </details>
+    <button class="btn" style="margin-top:10px" onclick={() => (created = null)}>Dismiss</button>
   </div>
 {/if}
 
-<div class="panel">
-  <form class="row" onsubmit={create}>
-    <input
-      placeholder="Display name"
-      bind:value={displayName}
-      autocomplete="off"
-    />
-    <select bind:value={role}>
-      <option value="member">member</option>
-      <option value="administrator">administrator</option>
-    </select>
-    <button class="primary" type="submit" disabled={creating}>
-      {creating ? "Creating…" : "Create user"}
-    </button>
-  </form>
-</div>
+{#if showCreate}
+  <div class="card" style="margin-top:16px">
+    <h2 style="margin-top:0">New user</h2>
+    <div class="field">
+      <label for="dn">Display name</label>
+      <input id="dn" placeholder="e.g. backup-bot" bind:value={displayName} autocomplete="off" />
+    </div>
+    <div class="label-sm" style="margin-top:14px">Access policy</div>
+    <p class="muted" style="margin-top:2px">
+      Choose what this user's S3 credentials can do. Unfamiliar with policy JSON? Use the split view.
+    </p>
+    <PermissionBuilder {buckets} onchange={onPolicy} />
+    <div class="row" style="gap:8px; margin-top:14px;">
+      <button class="btn primary" onclick={create} disabled={creating}>
+        {creating ? "Creating…" : "Create user"}
+      </button>
+      <button class="btn" onclick={() => (showCreate = false)}>Cancel</button>
+    </div>
+  </div>
+{/if}
 
 {#if loading}
-  <p class="muted">Loading…</p>
+  <p class="muted" style="margin-top:16px">Loading…</p>
 {:else if users.length === 0}
-  <div class="empty">No users yet.</div>
+  <div class="empty" style="margin-top:16px">No users yet.</div>
 {:else}
-  <table>
-    <thead>
-      <tr>
-        <th>Display name</th>
-        <th>ID</th>
-        <th>Access key</th>
-        <th>Role</th>
-        <th>Status</th>
-        <th style="text-align:right;">Actions</th>
-      </tr>
-    </thead>
-    <tbody>
-      {#each users as u (u.id)}
+  <div class="table-wrap" style="margin-top:16px">
+    <table>
+      <thead>
         <tr>
-          <td>{u.display_name}</td>
-          <td class="mono">{u.id}</td>
-          <td class="mono">{u.access_key_id}</td>
-          <td>
-            <span class="badge {u.role === 'administrator' ? 'admin' : ''}"
-              >{u.role}</span
-            >
-          </td>
-          <td>
-            {#if u.is_active}
-              <span class="badge ok">active</span>
-            {:else}
-              <span class="badge off">inactive</span>
-            {/if}
-          </td>
-          <td class="actions">
-            <select
-              value={u.role}
-              disabled={busyId === u.id}
-              onchange={(e) => setRole(u, e.currentTarget.value)}
-              aria-label="Change role"
-            >
-              <option value="member">member</option>
-              <option value="administrator">administrator</option>
-            </select>
-            {#if u.is_active}
-              <button
-                disabled={busyId === u.id}
-                onclick={() => setActive(u, false)}>Deactivate</button
-              >
-            {:else}
-              <button
-                disabled={busyId === u.id}
-                onclick={() => setActive(u, true)}>Reactivate</button
-              >
-            {/if}
-            <button disabled={busyId === u.id} onclick={() => rotate(u)}
-              >Rotate</button
-            >
-          </td>
+          <th>Display name</th>
+          <th>S3 access key</th>
+          <th>Status</th>
+          <th style="text-align:right;"></th>
         </tr>
-      {/each}
-    </tbody>
-  </table>
+      </thead>
+      <tbody>
+        {#each users as u (u.id)}
+          <tr>
+            <td>
+              <a
+                href={`#/users/${encodeURIComponent(u.id)}`}
+                onclick={(e) => {
+                  e.preventDefault();
+                  navigate(`/users/${encodeURIComponent(u.id)}`);
+                }}>{u.display_name}</a>
+            </td>
+            <td class="mono">{u.access_key_id}</td>
+            <td>
+              <span class="badge" class:ok-badge={u.is_active}
+                >{u.is_active ? "active" : "inactive"}</span>
+            </td>
+            <td style="text-align:right;">
+              <button class="btn" onclick={() => navigate(`/users/${encodeURIComponent(u.id)}`)}>
+                Manage
+              </button>
+            </td>
+          </tr>
+        {/each}
+      </tbody>
+    </table>
+  </div>
 {/if}
 
 <style>
-  .actions {
-    text-align: right;
-    white-space: nowrap;
-  }
-  .actions select,
-  .actions button {
-    margin-left: 0.4rem;
+  .ok-badge {
+    background: var(--success-tint);
+    color: var(--success);
   }
 </style>

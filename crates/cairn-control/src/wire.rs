@@ -212,7 +212,7 @@ pub struct CreateUserReq {
     pub role: String,
 }
 
-/// `POST /users` response body. The Bearer secret is shown exactly once.
+/// `POST /users` response body. The secrets are shown exactly once.
 #[derive(Debug, Serialize)]
 pub struct CreateUserResp {
     /// The new user id.
@@ -221,6 +221,10 @@ pub struct CreateUserResp {
     pub bearer_access_key_id: String,
     /// The Bearer secret (shown once; only its hash is retained server-side).
     pub bearer_secret: String,
+    /// The SigV4 access-key id — the "S3 access key" a standard S3 client (boto3, aws-cli) uses.
+    pub s3_access_key_id: String,
+    /// The SigV4 secret — the "S3 secret key", shown exactly once (sealed at rest server-side).
+    pub s3_secret_key: String,
 }
 
 /// `GET /users/{id}` response: the public user view plus its attached identity policy.

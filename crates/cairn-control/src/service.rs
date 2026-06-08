@@ -797,7 +797,7 @@ impl ControlService {
                 id: user_id.clone(),
                 display_name: req.display_name,
                 access_key_id: access_key_id.clone(),
-                sigv4_access_key_id: Some(sigv4_access_key_id),
+                sigv4_access_key_id: Some(sigv4_access_key_id.clone()),
                 role,
                 is_active: true,
                 created_at: now,
@@ -826,6 +826,8 @@ impl ControlService {
                 id: user_id.to_string(),
                 bearer_access_key_id: access_key_id,
                 bearer_secret: secret,
+                s3_access_key_id: sigv4_access_key_id,
+                s3_secret_key: sigv4_secret,
             },
         )
     }

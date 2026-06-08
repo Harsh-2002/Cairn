@@ -179,12 +179,20 @@ export const api = {
     request("DELETE", `/buckets/${encodeURIComponent(name)}/policy`),
 
   listUsers: () => request("GET", "/users"),
-  createUser: (display_name, role) =>
+  // Created users are S3-API-only: the response carries their S3 (SigV4) access key + secret,
+  // shown exactly once. `role` is always "member" from the console (the root admin is the sole admin).
+  createUser: (display_name, role = "member") =>
     request("POST", "/users", { display_name, role }),
+  getUser: (id) => request("GET", `/users/${encodeURIComponent(id)}`),
   patchUser: (id, fields) =>
     request("PATCH", `/users/${encodeURIComponent(id)}`, fields),
   rotateCredentials: (id) =>
     request("POST", `/users/${encodeURIComponent(id)}/rotate-credentials`),
+  // Identity (per-user) policy. The body is a raw policy JSON document sent verbatim.
+  setUserPolicy: (id, rawBody) =>
+    requestRaw("PUT", `/users/${encodeURIComponent(id)}/policy`, rawBody),
+  deleteUserPolicy: (id) =>
+    request("DELETE", `/users/${encodeURIComponent(id)}/policy`),
 
   failedReplication: (limit = 100) =>
     request("GET", `/replication/failed?limit=${limit}`),
