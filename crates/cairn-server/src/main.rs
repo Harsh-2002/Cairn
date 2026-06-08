@@ -23,6 +23,9 @@ mod server;
 // Gated to the feature *and* Linux so it is absent (and cannot warn) in every other build.
 #[cfg(all(feature = "fast-io", target_os = "linux"))]
 mod sendfile;
+// The plaintext HTTP/1.1 sendfile fast path for object GETs; same gate as `sendfile`.
+#[cfg(all(feature = "fast-io", target_os = "linux"))]
+mod fast_get;
 mod stack;
 mod tls;
 

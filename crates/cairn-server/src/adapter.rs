@@ -303,7 +303,7 @@ async fn serve_public(
 }
 
 /// Split a path-style request path into a bucket and key.
-fn route_path(raw_path: &str) -> (Option<BucketName>, Option<ObjectKey>) {
+pub(crate) fn route_path(raw_path: &str) -> (Option<BucketName>, Option<ObjectKey>) {
     let p = raw_path.strip_prefix('/').unwrap_or(raw_path);
     if p.is_empty() {
         return (None, None);

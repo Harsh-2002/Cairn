@@ -104,7 +104,7 @@ pub async fn serve(
                 conns.spawn(async move {
                     match tls {
                         Some(cfg) => serve_tls(stream, cfg, ktls_ready, st, peer, conn_shutdown).await,
-                        None => serve_io(stream, st, peer, false, conn_shutdown).await,
+                        None => serve_plaintext(stream, st, peer, conn_shutdown).await,
                     }
                 });
             }
@@ -207,6 +207,29 @@ fn ktls_available() -> bool {
 }
 
 /// Serve one accepted connection (plaintext or TLS) with graceful shutdown.
+/// Serve a plaintext (non-TLS) connection. With `fast-io` on Linux, the first request is offered to
+/// the `sendfile` fast path ([`crate::fast_get`]): a qualifying object GET is served file→socket with
+/// no userspace copy and the connection closes; anything else is replayed to hyper unchanged. With
+/// `fast-io` off (the default) this is exactly the original path — hyper serves the raw socket.
+async fn serve_plaintext(
+    stream: tokio::net::TcpStream,
+    state: Arc<AppState>,
+    peer: std::net::SocketAddr,
+    conn_shutdown: watch::Receiver<bool>,
+) {
+    #[cfg(all(feature = "fast-io", target_os = "linux"))]
+    {
+        match crate::fast_get::try_sendfile_get(stream, state.stack.as_ref(), peer).await {
+            crate::fast_get::Fast::Handled => {}
+            crate::fast_get::Fast::Fallback { stream } => {
+                serve_io(stream, state, peer, false, conn_shutdown).await;
+            }
+        }
+    }
+    #[cfg(not(all(feature = "fast-io", target_os = "linux")))]
+    serve_io(stream, state, peer, false, conn_shutdown).await;
+}
+
 async fn serve_io<S>(
     stream: S,
     state: Arc<AppState>,
