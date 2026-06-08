@@ -1,5 +1,5 @@
 <script>
-  import { api, ApiError } from "../lib/api.js";
+  import { api, s3, ApiError } from "../lib/api.js";
   import { bytes } from "../lib/format.js";
 
   let { name } = $props();
@@ -25,6 +25,12 @@
   // Compression control ("zstd" | "lz4" | "none"); read from the bucket detail.
   let compression = $state("none");
   let savingCompression = $state(false);
+
+  // Replication rule (via the S3 ?replication subresource).
+  let replDest = $state("");
+  let replPrefix = $state("");
+  let replActive = $state(false);
+  let savingRepl = $state(false);
 
   // Map the server's lowercase versioning string to the capitalized form the
   // PUT /versioning endpoint expects.
@@ -60,6 +66,14 @@
         compression = detail.compression || "none";
       } catch {
         compression = "none";
+      }
+      try {
+        const repl = await s3.getReplication(name);
+        replActive = !!repl;
+        replDest = repl ? repl.dest_bucket : "";
+        replPrefix = repl ? repl.prefix : "";
+      } catch {
+        replActive = false;
       }
     } catch (err) {
       error = err.message || "Failed to load bucket configuration.";
@@ -132,6 +146,44 @@
       error = err.message || "Failed to update compression.";
     } finally {
       savingCompression = false;
+    }
+  }
+
+  async function saveReplication() {
+    error = "";
+    notice = "";
+    if (!replDest.trim()) {
+      error = "Enter a destination bucket for replication.";
+      return;
+    }
+    savingRepl = true;
+    try {
+      await s3.putReplication(name, replDest.trim(), replPrefix.trim());
+      notice = `Replicating to "${replDest.trim()}".`;
+      await load();
+    } catch (err) {
+      error =
+        (err.message || "Failed to set replication.") +
+        " (replication requires versioning enabled and a matching CAIRN_REPLICATION target).";
+    } finally {
+      savingRepl = false;
+    }
+  }
+
+  async function clearReplication() {
+    error = "";
+    notice = "";
+    savingRepl = true;
+    try {
+      await s3.deleteReplication(name);
+      notice = "Replication rule removed.";
+      replDest = "";
+      replPrefix = "";
+      await load();
+    } catch (err) {
+      error = err.message || "Failed to clear replication.";
+    } finally {
+      savingRepl = false;
     }
   }
 
@@ -279,6 +331,43 @@
       <button class="primary" type="submit" disabled={savingCompression}>
         {savingCompression ? "Saving…" : "Apply"}
       </button>
+    </form>
+  </div>
+
+  <div class="panel">
+    <div class="muted label-sm">
+      Replication {replActive ? "· active" : "· not configured"}
+    </div>
+    <form
+      class="row"
+      style="flex-wrap:wrap;"
+      onsubmit={(e) => {
+        e.preventDefault();
+        saveReplication();
+      }}
+    >
+      <input
+        placeholder="destination bucket"
+        bind:value={replDest}
+        autocomplete="off"
+        aria-label="Replication destination bucket"
+        style="max-width:220px;"
+      />
+      <input
+        placeholder="prefix (optional)"
+        bind:value={replPrefix}
+        autocomplete="off"
+        aria-label="Replication prefix"
+        style="max-width:180px;"
+      />
+      <button class="primary" type="submit" disabled={savingRepl}>
+        {savingRepl ? "Saving…" : "Apply"}
+      </button>
+      {#if replActive}
+        <button type="button" onclick={clearReplication} disabled={savingRepl}>
+          Remove
+        </button>
+      {/if}
     </form>
   </div>
 

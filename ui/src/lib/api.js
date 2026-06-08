@@ -237,4 +237,41 @@ export const s3 = {
     if (!res.ok && res.status !== 204)
       throw new ApiError(`delete failed (${res.status})`, res.status);
   },
+
+  // Per-bucket replication rule via the S3 subresource (?replication). Returns the rule's
+  // destination bucket + prefix (or null when no rule is configured).
+  async getReplication(bucket) {
+    const res = await fetch(`/${encodeURIComponent(bucket)}?replication`, {
+      headers: s3headers(),
+    });
+    if (res.status === 404) return null;
+    if (!res.ok)
+      throw new ApiError(`load replication failed (${res.status})`, res.status);
+    const xml = await res.text();
+    const dest = /<Bucket>(?:arn:aws:s3:::)?([^<]+)<\/Bucket>/.exec(xml);
+    const prefix = /<Prefix>([^<]*)<\/Prefix>/.exec(xml);
+    return { dest_bucket: dest ? dest[1] : "", prefix: prefix ? prefix[1] : "" };
+  },
+  async putReplication(bucket, destBucket, prefix = "") {
+    const xml =
+      `<ReplicationConfiguration><Role>cairn</Role><Rule><ID>cairn-ui</ID>` +
+      `<Status>Enabled</Status><Filter><Prefix>${prefix}</Prefix></Filter>` +
+      `<Destination><Bucket>arn:aws:s3:::${destBucket}</Bucket></Destination></Rule>` +
+      `</ReplicationConfiguration>`;
+    const res = await fetch(`/${encodeURIComponent(bucket)}?replication`, {
+      method: "PUT",
+      headers: { ...s3headers(), "Content-Type": "application/xml" },
+      body: xml,
+    });
+    if (!res.ok && res.status !== 204)
+      throw new ApiError(`set replication failed (${res.status})`, res.status);
+  },
+  async deleteReplication(bucket) {
+    const res = await fetch(`/${encodeURIComponent(bucket)}?replication`, {
+      method: "DELETE",
+      headers: s3headers(),
+    });
+    if (!res.ok && res.status !== 204)
+      throw new ApiError(`clear replication failed (${res.status})`, res.status);
+  },
 };
