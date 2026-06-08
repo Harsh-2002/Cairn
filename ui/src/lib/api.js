@@ -135,10 +135,12 @@ export const api = {
   getBucket: (name) => request("GET", `/buckets/${encodeURIComponent(name)}`),
   deleteBucket: (name) =>
     request("DELETE", `/buckets/${encodeURIComponent(name)}`),
-  listObjects: (name, { prefix = "", limit = 100 } = {}) => {
+  listObjects: (name, { prefix = "", limit = 100, cursor = "" } = {}) => {
     const q = new URLSearchParams();
     if (prefix) q.set("prefix", prefix);
     if (limit) q.set("limit", String(limit));
+    // Continuation cursor returned as `next` by a prior page; omitted on the first page.
+    if (cursor) q.set("cursor", cursor);
     const qs = q.toString();
     return request(
       "GET",

@@ -1,20 +1,34 @@
 <script>
   // A horizontal tab bar. `tabs` = [{ id, label }]; `active` is the current id; `onselect(id)` fires
-  // on click. Collapses to a <select> on narrow screens.
-  let { tabs = [], active = "", onselect = () => {} } = $props();
+  // on click. Collapses to a labelled <select> on narrow screens. `label` names the tab group for
+  // assistive tech and the mobile select (default "Section").
+  let { tabs = [], active = "", onselect = () => {}, label = "Section" } = $props();
+  const selectId = `tabselect-${Math.random().toString(36).slice(2, 8)}`;
 </script>
 
 <div class="tabs">
-  <div class="tabbar">
+  <div class="tabbar" role="tablist" aria-label={label}>
     {#each tabs as t}
-      <button class="tab" class:active={t.id === active} onclick={() => onselect(t.id)}>
+      <button
+        class="tab"
+        class:active={t.id === active}
+        role="tab"
+        aria-selected={t.id === active}
+        onclick={() => onselect(t.id)}>
         {t.label}
       </button>
     {/each}
   </div>
-  <select class="tabselect" value={active} onchange={(e) => onselect(e.target.value)}>
-    {#each tabs as t}<option value={t.id}>{t.label}</option>{/each}
-  </select>
+  <div class="tabselect-wrap">
+    <label class="label-sm" for={selectId}>{label}</label>
+    <select
+      id={selectId}
+      class="tabselect"
+      value={active}
+      onchange={(e) => onselect(e.target.value)}>
+      {#each tabs as t}<option value={t.id}>{t.label}</option>{/each}
+    </select>
+  </div>
 </div>
 
 <style>
@@ -41,16 +55,22 @@
     color: var(--primary-hover);
     border-bottom-color: var(--primary);
   }
-  .tabselect {
+  .tabselect-wrap {
     display: none;
-    width: 100%;
     margin-bottom: 18px;
+  }
+  .tabselect-wrap .label-sm {
+    display: block;
+    margin-bottom: 5px;
+  }
+  .tabselect {
+    width: 100%;
   }
   @media (max-width: 560px) {
     .tabbar {
       display: none;
     }
-    .tabselect {
+    .tabselect-wrap {
       display: block;
     }
   }

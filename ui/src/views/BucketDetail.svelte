@@ -26,7 +26,7 @@
   <span class="mono">{name}</span>
 </div>
 
-<Tabs {tabs} active={tab} onselect={select} />
+<Tabs {tabs} active={tab} onselect={select} label="Bucket sections" />
 
 {#if tab === "settings"}
   <BucketConfig {name} />

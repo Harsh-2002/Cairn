@@ -5,33 +5,46 @@
  * the binary with no external font fetch). Fully responsive: the sidebar collapses to an off-canvas
  * drawer below 880px. A tasteful dark variant follows the OS preference. */
 
+/* ---- design tokens --------------------------------------------------------------------------
+ * Contrast: every text/on-tint pair below is computed against its real backdrop and meets WCAG AAA
+ * (>=7:1) where feasible and AA (>=4.5:1) as the hard floor. Control borders (--border-strong) clear
+ * the 3:1 non-text floor; --border is decorative (dividers/card edges) and stays soft.
+ * Standard breakpoints: 560px (stack tabs/compact), 880px (sidebar -> drawer). Document any others. */
 :root {
   /* surfaces */
   --bg: #f4f6fa;
   --surface: #ffffff;
   --surface-2: #f9fafc;
   --surface-3: #f1f4f9;
-  --border: #e6eaf1;
-  --border-strong: #d7dde8;
+  --border: #dde3ec; /* decorative dividers / card edges */
+  --border-strong: #8693ad; /* control borders (>=3:1 on surface) */
 
-  /* text */
+  /* text — muted 7.05:1, faint 5.19:1 on --bg */
   --text: #2a3342;
-  --text-muted: #6c7686;
-  --text-faint: #99a2b2;
+  --text-muted: #50596a;
+  --text-faint: #5f6878;
 
-  /* soft indigo accent */
+  /* soft indigo accent — identity colour kept for tints/accents/borders */
   --primary: #6b6fe0;
   --primary-hover: #585cd2;
+  --primary-strong: #5256cf; /* solid fill behind white text (5.85:1) */
   --primary-tint: #eeeffb;
+  --primary-ink: #4448bf; /* primary text on --primary-tint (6.28:1) */
+  --link: #5256cf; /* link text, AA on bg + surfaces (5.41:1 on --bg) */
   --on-primary: #ffffff;
 
-  /* semantic, all soft */
+  /* semantic — `*-ink` is the dark hue used for text on its tint (all >=6:1) */
   --success: #3aa57a;
   --success-tint: #e7f5ee;
+  --success-ink: #15673f;
   --warning: #cf9438;
   --warning-tint: #f9f0dd;
+  --warning-ink: #6f4d0e;
   --danger: #dd6679;
+  --danger-strong: #c33b53; /* solid danger fill / outline at strength */
   --danger-tint: #fbe9ed;
+  --danger-ink: #9e1d34;
+  --on-danger: #ffffff; /* text on a solid --danger-strong fill (5.16:1) */
 
   /* effects */
   --shadow-sm: 0 1px 2px rgba(20, 28, 45, 0.05);
@@ -41,6 +54,11 @@
   --r: 10px;
   --r-lg: 14px;
   --ring: 0 0 0 3px var(--primary-tint);
+  --ring-color: var(--primary);
+
+  /* breakpoints (reference values; @media must use literals) */
+  --bp-compact: 560px;
+  --bp-drawer: 880px;
 
   --sidebar-w: 248px;
   --font:
@@ -58,22 +76,43 @@
     --surface-2: #20242d;
     --surface-3: #262b35;
     --border: #2c313c;
-    --border-strong: #3a4150;
+    --border-strong: #687389; /* control borders (3.45:1 on surface) */
     --text: #e7eaf0;
-    --text-muted: #9aa3b2;
-    --text-faint: #6b7484;
+    --text-muted: #a3acba; /* 7.19:1 on surface */
+    --text-faint: #868fa1; /* 5.07:1 on surface */
     --primary: #8a8ef0;
     --primary-hover: #9b9ef3;
+    --primary-strong: #888cee; /* lighter in dark mode so dark on-primary text hits 6.0:1 */
     --primary-tint: #262a3f;
+    --primary-ink: #a8abf5; /* on --primary-tint (6.60:1) */
+    --link: #8a8ef0; /* link text, AA on dark bg + surfaces (5.65:1 on surface) */
+    --on-primary: #15171d; /* dark text on light-indigo fill (6.15:1) */
     --success: #5cc596;
     --success-tint: #1d2a25;
+    --success-ink: #74d3a8;
     --warning: #e0ad5c;
     --warning-tint: #2b2519;
+    --warning-ink: #edbf78;
     --danger: #ea8295;
+    --danger-strong: #f2a0ae;
     --danger-tint: #2c1f24;
+    --danger-ink: #f2a0ae;
+    --on-danger: #15171d; /* dark text on light danger fill (8.89:1) */
     --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
     --shadow: 0 2px 10px rgba(0, 0, 0, 0.35);
     --shadow-lg: 0 16px 44px rgba(0, 0, 0, 0.5);
+  }
+}
+
+/* ---- motion: honour reduced-motion everywhere ----------------------------------------------- */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
   }
 }
 
@@ -101,21 +140,24 @@ h1,
 h2,
 h3 {
   margin: 0 0 0.4em;
-  font-weight: 600;
+  font-weight: 650;
   letter-spacing: -0.01em;
+  line-height: 1.25;
   color: var(--text);
 }
+/* Fixed product type scale, ~1.25 ratio per step (body 14px = 1rem). */
 h1 {
-  font-size: 1.5rem;
+  font-size: 1.75rem;
+  letter-spacing: -0.02em;
 }
 h2 {
-  font-size: 1.15rem;
+  font-size: 1.375rem;
 }
 h3 {
-  font-size: 1rem;
+  font-size: 1.1rem;
 }
 a {
-  color: var(--primary);
+  color: var(--link);
   text-decoration: none;
 }
 a:hover {
@@ -135,6 +177,41 @@ a:hover {
 }
 .num {
   font-variant-numeric: tabular-nums;
+}
+
+/* ---- accessibility helpers ------------------------------------------------------------------ */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+/* Skip link: hidden until focused, then anchored top-left over the shell. */
+.skip-link {
+  position: fixed;
+  top: 8px;
+  left: 8px;
+  z-index: 100;
+  padding: 10px 16px;
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border-strong);
+  box-shadow: var(--shadow-lg);
+  transform: translateY(-150%);
+  transition: transform 0.16s ease;
+}
+.skip-link:focus-visible,
+.skip-link:focus {
+  transform: translateY(0);
+  outline: 3px solid var(--ring-color);
+  outline-offset: 2px;
+  text-decoration: none;
 }
 
 /* ---- layout: sidebar + main ----------------------------------------------------------------- */
@@ -170,7 +247,7 @@ a:hover {
   width: 12px;
   height: 12px;
   border-radius: 50%;
-  background: linear-gradient(135deg, var(--primary), #9a8cf0);
+  background: var(--primary);
   box-shadow: 0 0 0 4px var(--primary-tint);
 }
 
@@ -178,6 +255,7 @@ a:hover {
   display: flex;
   align-items: center;
   gap: 9px;
+  min-height: 40px;
   padding: 9px 12px;
   border-radius: var(--r-sm);
   color: var(--text-muted);
@@ -191,9 +269,15 @@ a:hover {
   color: var(--text);
   text-decoration: none;
 }
-.nav-link.active {
+.nav-link.active,
+.nav-link[aria-current="page"] {
   background: var(--primary-tint);
-  color: var(--primary);
+  color: var(--primary-ink);
+  font-weight: 600;
+}
+.nav-link:focus-visible {
+  outline: 3px solid var(--ring-color);
+  outline-offset: 2px;
 }
 
 .sidebar-footer {
@@ -214,6 +298,10 @@ a:hover {
   width: 100%;
   max-width: 1180px;
 }
+/* Programmatic focus target (skip-link lands here); no ring on the container itself. */
+.main:focus {
+  outline: none;
+}
 
 /* topbar shows only on small screens (mobile drawer toggle) */
 .topbar {
@@ -230,12 +318,20 @@ a:hover {
 .hamburger {
   display: inline-flex;
   flex-direction: column;
+  justify-content: center;
   gap: 4px;
+  min-width: 40px;
+  min-height: 40px;
   padding: 8px;
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-strong);
   border-radius: var(--r-sm);
   background: var(--surface);
   cursor: pointer;
+}
+.hamburger:focus-visible {
+  outline: 3px solid var(--ring-color);
+  outline-offset: 2px;
+  border-color: var(--primary);
 }
 .hamburger span {
   width: 18px;
@@ -296,13 +392,15 @@ a:hover {
 .card {
   padding: 16px 18px;
 }
+/* Card + small labels: sentence-case, no eyebrow tracking. One label vocabulary. */
 .card .label,
-.label-sm {
+.label-sm,
+.label {
   color: var(--text-muted);
-  font-size: 0.78rem;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  font-weight: 600;
+  font-size: 0.9rem;
+  font-weight: 550;
+  text-transform: none;
+  letter-spacing: 0;
 }
 .card .value,
 .value {
@@ -312,16 +410,13 @@ a:hover {
   font-variant-numeric: tabular-nums;
   margin-top: 2px;
 }
-.label {
-  color: var(--text-muted);
-  font-size: 0.85rem;
-}
 
 /* ---- buttons -------------------------------------------------------------------------------- */
 button,
 .btn {
   font: inherit;
   font-weight: 550;
+  min-height: 40px;
   padding: 8px 15px;
   border-radius: var(--r-sm);
   border: 1px solid var(--border-strong);
@@ -341,19 +436,28 @@ button:hover,
 button:active {
   transform: translateY(1px);
 }
+/* Visible focus ring on every interactive element. */
 button:focus-visible,
 .btn:focus-visible,
 input:focus-visible,
 select:focus-visible,
-textarea:focus-visible {
-  outline: none;
-  box-shadow: var(--ring);
+textarea:focus-visible,
+a:focus-visible,
+[tabindex]:focus-visible,
+summary:focus-visible {
+  outline: 3px solid var(--ring-color);
+  outline-offset: 2px;
   border-color: var(--primary);
+}
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+  outline-offset: 0;
 }
 button.primary,
 .btn.primary {
-  background: var(--primary);
-  border-color: var(--primary);
+  background: var(--primary-strong);
+  border-color: var(--primary-strong);
   color: var(--on-primary);
 }
 button.primary:hover {
@@ -361,11 +465,24 @@ button.primary:hover {
   border-color: var(--primary-hover);
 }
 button.danger {
-  color: var(--danger);
-  border-color: color-mix(in srgb, var(--danger) 40%, var(--border));
+  color: var(--danger-ink);
+  border-color: var(--danger-strong);
 }
 button.danger:hover {
   background: var(--danger-tint);
+}
+button.danger.primary,
+.btn.danger.primary {
+  background: var(--danger-strong);
+  border-color: var(--danger-strong);
+  color: var(--on-danger);
+}
+button.danger.primary:hover {
+  filter: brightness(0.96);
+  background: var(--danger-strong);
+}
+button.danger.primary:focus-visible {
+  outline-color: var(--danger-strong);
 }
 button.full,
 .full {
@@ -376,6 +493,7 @@ button:disabled {
   cursor: not-allowed;
 }
 button.sm {
+  min-height: 32px;
   padding: 5px 10px;
   font-size: 0.85rem;
 }
@@ -386,14 +504,45 @@ select,
 textarea {
   font: inherit;
   width: 100%;
+  min-height: 40px;
   padding: 9px 12px;
   border: 1px solid var(--border-strong);
   border-radius: var(--r-sm);
   background: var(--surface);
   color: var(--text);
 }
+input::placeholder,
+textarea::placeholder {
+  color: var(--text-faint);
+}
 textarea {
+  min-height: auto;
   resize: vertical;
+}
+input:disabled,
+select:disabled,
+textarea:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+  background: var(--surface-2);
+}
+/* Invalid state — set aria-invalid="true" or add .invalid alongside .field-error. */
+input.invalid,
+select.invalid,
+textarea.invalid,
+input[aria-invalid="true"],
+select[aria-invalid="true"],
+textarea[aria-invalid="true"] {
+  border-color: var(--danger-strong);
+}
+input.invalid:focus-visible,
+textarea.invalid:focus-visible,
+select.invalid:focus-visible,
+input[aria-invalid="true"]:focus-visible,
+textarea[aria-invalid="true"]:focus-visible,
+select[aria-invalid="true"]:focus-visible {
+  outline-color: var(--danger-strong);
+  border-color: var(--danger-strong);
 }
 .field {
   margin-bottom: 14px;
@@ -405,6 +554,14 @@ textarea {
   font-weight: 550;
   font-size: 0.9rem;
 }
+/* Inline validation message, paired with an invalid input. */
+.field-error {
+  display: block;
+  margin-top: 5px;
+  color: var(--danger-ink);
+  font-size: 0.85rem;
+  font-weight: 500;
+}
 
 /* ---- tables --------------------------------------------------------------------------------- */
 table {
@@ -413,9 +570,9 @@ table {
 }
 thead th {
   text-align: left;
-  font-size: 0.76rem;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
+  font-size: 0.85rem;
+  text-transform: none;
+  letter-spacing: 0;
   color: var(--text-muted);
   font-weight: 600;
   padding: 10px 12px;
@@ -481,19 +638,19 @@ tbody tr:hover {
 .badge.ok,
 .badge.success {
   background: var(--success-tint);
-  color: var(--success);
+  color: var(--success-ink);
 }
 .badge.off {
   background: var(--surface-3);
-  color: var(--text-faint);
+  color: var(--text-muted);
 }
 .badge.warn {
   background: var(--warning-tint);
-  color: var(--warning);
+  color: var(--warning-ink);
 }
 .badge.danger {
   background: var(--danger-tint);
-  color: var(--danger);
+  color: var(--danger-ink);
 }
 
 .notice {
@@ -506,22 +663,27 @@ tbody tr:hover {
 }
 .notice.success {
   background: var(--success-tint);
-  color: var(--success);
+  color: var(--success-ink);
   border-color: transparent;
 }
 .notice.warn {
   background: var(--warning-tint);
-  color: var(--warning);
+  color: var(--warning-ink);
+  border-color: transparent;
+}
+.notice.danger {
+  background: var(--danger-tint);
+  color: var(--danger-ink);
   border-color: transparent;
 }
 .error,
 .err {
-  color: var(--danger);
+  color: var(--danger-ink);
   font-size: 0.9rem;
 }
 .empty {
   text-align: center;
-  color: var(--text-faint);
+  color: var(--text-muted);
   padding: 40px 20px;
 }
 
@@ -592,6 +754,61 @@ tbody tr:hover {
   font-size: 0.82rem;
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+/* ---- skeleton (layout-preserving loading) --------------------------------------------------- */
+.skeleton {
+  position: relative;
+  overflow: hidden;
+  background: var(--surface-3);
+  border-radius: var(--r-sm);
+}
+.skeleton::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  transform: translateX(-100%);
+  background: linear-gradient(
+    90deg,
+    transparent,
+    color-mix(in srgb, var(--surface) 60%, transparent),
+    transparent
+  );
+  animation: skeleton-shimmer 1.3s ease-in-out infinite;
+}
+.skeleton-line {
+  height: 0.85em;
+  margin: 0.45em 0;
+  border-radius: var(--r-sm);
+}
+.skeleton-line:last-child {
+  width: 70%;
+}
+@keyframes skeleton-shimmer {
+  100% {
+    transform: translateX(100%);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .skeleton::after {
+    animation: none;
+    display: none;
+  }
+}
+
+/* ---- confirm dialog (ConfirmDialog.svelte) -------------------------------------------------- */
+dialog.confirm-dialog {
+  width: 100%;
+  max-width: 440px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: var(--shadow-lg);
+}
+dialog.confirm-dialog::backdrop {
+  background: rgba(20, 28, 45, 0.42);
 }
 
 /* ---- login ---------------------------------------------------------------------------------- */
