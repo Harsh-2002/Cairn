@@ -25,8 +25,15 @@ pub enum LogFormat {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
-    /// Where the server binds.
+    /// Where the **S3 API** listener binds (`CAIRN_LISTEN_ADDR`): the S3 protocol, the signed
+    /// public-read share URLs (`/p/…`), and the liveness/readiness/metrics endpoints. This is the
+    /// data-plane port you expose to S3 clients. Default `0.0.0.0:7373`.
     pub listen_addr: SocketAddr,
+    /// Where the **web UI** listener binds (`CAIRN_UI_ADDR`): the management console served at the
+    /// root path, the management API (`/api/v1`), and the S3 data plane the console drives. This is
+    /// the control-plane port you can firewall off from the internet. Default `0.0.0.0:7374`.
+    /// Set it empty (or `off`/`none`/`disabled`) to run headless with no UI listener.
+    pub ui_addr: String,
     /// Root of the staging and per-bucket blob directories.
     pub data_dir: PathBuf,
     /// Location of the SQLite metadata file.
@@ -101,7 +108,8 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            listen_addr: "127.0.0.1:9000".parse().expect("valid default addr"),
+            listen_addr: "0.0.0.0:7373".parse().expect("valid default addr"),
+            ui_addr: "0.0.0.0:7374".to_owned(),
             data_dir: PathBuf::from("./data"),
             db_path: PathBuf::from("./data/cairn.db"),
             meta_backend: "sqlite".to_owned(),
@@ -168,6 +176,21 @@ impl Config {
     /// # Errors
     /// Returns a [`ConfigError::Parse`] if the JSON is malformed or does not match the
     /// [`ReplicationTarget`] shape.
+    /// Resolve the web-UI listener address from [`ui_addr`](Self::ui_addr): `Some(addr)` to bind a
+    /// UI listener, or `None` for headless mode (empty / `off` / `none` / `disabled`).
+    ///
+    /// # Errors
+    /// Returns a [`ConfigError::Invalid`] if a non-empty value does not parse as `host:port`.
+    pub fn ui_listen_addr(&self) -> Result<Option<SocketAddr>, ConfigError> {
+        let v = self.ui_addr.trim();
+        if v.is_empty() || matches!(v.to_ascii_lowercase().as_str(), "off" | "none" | "disabled") {
+            return Ok(None);
+        }
+        v.parse::<SocketAddr>().map(Some).map_err(|e| {
+            ConfigError::Invalid(format!("CAIRN_UI_ADDR {v:?} is not a valid host:port: {e}"))
+        })
+    }
+
     pub fn parse_replication_targets(&self) -> Result<Vec<ReplicationTarget>, ConfigError> {
         match &self.replication_targets {
             None => Ok(Vec::new()),
@@ -282,6 +305,15 @@ impl Config {
                     "replication target {:?} sets both ca_path and insecure_skip_verify",
                     target.name
                 )));
+            }
+        }
+        // Validate (but don't bind) the UI listener address.
+        let ui = self.ui_listen_addr()?;
+        if let Some(ui) = ui {
+            if ui == self.listen_addr {
+                return Err(ConfigError::Invalid(
+                    "CAIRN_UI_ADDR must differ from the S3 API listener (CAIRN_LISTEN_ADDR)".into(),
+                ));
             }
         }
         Ok(())

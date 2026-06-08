@@ -44,6 +44,7 @@ pub async fn handle(
     req: Request<Incoming>,
     peer: IpAddr,
     secure: bool,
+    serve_ui: bool,
     request_id: String,
 ) -> Response<ResponseBody> {
     let method = req.method().clone();
@@ -113,14 +114,28 @@ pub async fn handle(
             .body(full_body(Bytes::from(resp.body)))
             .unwrap_or_else(|_| Response::new(full_body(Bytes::new())));
     }
-    // The embedded management UI is served under `/web`. `/ui/*` (the former mount) redirects there
-    // so existing links keep working.
-    if raw_path == "/web" || raw_path.starts_with("/web/") {
-        return serve_ui(&raw_path, "/web");
-    }
-    if raw_path == "/ui" || raw_path.starts_with("/ui/") {
-        let target = raw_path.replacen("/ui", "/web", 1);
-        return redirect(&target);
+    // On the web-UI listener only, serve the management console at the ROOT path and its embedded
+    // assets BEFORE S3 routing (so `/assets/...` can never be shadowed by a bucket named `assets`).
+    // Any path that is not the root or a known embedded asset falls through to the S3/data routing,
+    // which is what the console's own object operations and the API listener rely on. The former
+    // `/web` and `/ui` mounts redirect to the root for back-compat.
+    if serve_ui && method == Method::GET {
+        if raw_path == "/" {
+            let (content_type, bytes) = cairn_ui::spa_shell();
+            return ui_asset_response(content_type, bytes.into_owned());
+        }
+        if raw_path == "/web"
+            || raw_path.starts_with("/web/")
+            || raw_path == "/ui"
+            || raw_path.starts_with("/ui/")
+        {
+            return redirect("/");
+        }
+        if let Some(rel) = raw_path.strip_prefix('/').filter(|r| !r.is_empty()) {
+            if let Some((content_type, bytes)) = cairn_ui::asset(rel) {
+                return ui_asset_response(content_type, bytes.into_owned());
+            }
+        }
     }
 
     // Signed public-read ("share") URLs: GET /p/{bucket}/{key}?expires=..&sig=.. — unauthenticated,
@@ -148,26 +163,12 @@ pub async fn handle(
     render(stack.s3.handle(s3req, body).await)
 }
 
-/// Serve the embedded management UI mounted at `prefix` (e.g. `/web`). A bare prefix with no
-/// trailing slash redirects to `prefix/`; any path that isn't an embedded asset falls back to the
-/// SPA shell so client-side routing survives a reload.
-fn serve_ui(path: &str, prefix: &str) -> Response<ResponseBody> {
-    if path == prefix {
-        return redirect(&format!("{prefix}/"));
-    }
-    let rel = path
-        .strip_prefix(prefix)
-        .and_then(|p| p.strip_prefix('/'))
-        .unwrap_or("");
-    let (content_type, bytes) = if rel.is_empty() {
-        cairn_ui::spa_shell()
-    } else {
-        cairn_ui::asset(rel).unwrap_or_else(cairn_ui::spa_shell)
-    };
+/// Build a 200 response for an embedded UI asset with its content type.
+fn ui_asset_response(content_type: String, bytes: Vec<u8>) -> Response<ResponseBody> {
     Response::builder()
         .status(200)
         .header("content-type", content_type)
-        .body(full_body(Bytes::from(bytes.into_owned())))
+        .body(full_body(Bytes::from(bytes)))
         .unwrap_or_else(|_| Response::new(full_body(Bytes::new())))
 }
 

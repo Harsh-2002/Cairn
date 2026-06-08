@@ -46,6 +46,14 @@ pub async fn serve(
 ) -> std::io::Result<()> {
     let listener = TcpListener::bind(config.listen_addr).await?;
     let local = listener.local_addr()?;
+    // The web-UI listener is a second, optional socket. It serves the same stack but additionally
+    // serves the management console at the root path, so an operator can firewall it off from the
+    // S3 data-plane port. `None` (CAIRN_UI_ADDR empty/off) runs headless with only the S3 listener.
+    let ui_listener = match config.ui_listen_addr().ok().flatten() {
+        Some(addr) => Some(TcpListener::bind(addr).await?),
+        None => None,
+    };
+    let ui_local = ui_listener.as_ref().and_then(|l| l.local_addr().ok());
     let state = Arc::new(AppState {
         ready: AtomicBool::new(false),
         concurrency: Semaphore::new(config.concurrency_limit),
@@ -82,11 +90,44 @@ pub async fn serve(
 
     // Background subsystems: multipart sweeper, lifecycle scanner, WAL checkpointer, metrics.
     crate::background::spawn(state.stack.clone(), &config);
-    tracing::info!(addr = %local, tls = tls_rx.is_some(), "cairn listening");
+    tracing::info!(s3_api = %local, web_ui = ?ui_local, tls = tls_rx.is_some(), "cairn listening");
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     tokio::spawn(wait_for_signal(shutdown_tx));
 
+    // Run the S3-API accept loop and (optionally) the web-UI accept loop concurrently. The UI loop
+    // sets `serve_ui = true`, which makes its connections serve the console at the root path.
+    let api = accept_loop(
+        listener,
+        state.clone(),
+        tls_rx.clone(),
+        ktls_ready,
+        false,
+        shutdown_rx.clone(),
+    );
+    match ui_listener {
+        Some(ui) => {
+            let web = accept_loop(ui, state.clone(), tls_rx, ktls_ready, true, shutdown_rx);
+            tokio::join!(api, web);
+        }
+        None => api.await,
+    }
+    state.ready.store(false, Ordering::SeqCst);
+    tracing::info!("shutdown complete");
+    Ok(())
+}
+
+/// Accept and serve connections on one listener until shutdown, then drain in-flight connections
+/// within a bounded grace period. `serve_ui` selects the listener's role: `true` adds the web
+/// console at the root path; `false` is the pure S3 data-plane listener.
+async fn accept_loop(
+    listener: TcpListener,
+    state: Arc<AppState>,
+    tls_rx: Option<watch::Receiver<Arc<rustls::ServerConfig>>>,
+    ktls_ready: bool,
+    serve_ui: bool,
+    shutdown_rx: watch::Receiver<bool>,
+) {
     let mut conns = tokio::task::JoinSet::new();
     let mut shutdown = shutdown_rx.clone();
     loop {
@@ -103,30 +144,22 @@ pub async fn serve(
                 let tls = tls_rx.as_ref().map(|rx| rx.borrow().clone());
                 conns.spawn(async move {
                     match tls {
-                        Some(cfg) => serve_tls(stream, cfg, ktls_ready, st, peer, conn_shutdown).await,
-                        None => serve_plaintext(stream, st, peer, conn_shutdown).await,
+                        Some(cfg) => serve_tls(stream, cfg, ktls_ready, st, peer, serve_ui, conn_shutdown).await,
+                        None => serve_plaintext(stream, st, peer, serve_ui, conn_shutdown).await,
                     }
                 });
             }
-            _ = shutdown.changed() => {
-                tracing::info!("shutdown signal received; draining connections");
-                state.ready.store(false, Ordering::SeqCst);
-                break;
-            }
+            _ = shutdown.changed() => break,
         }
     }
 
-    // Drain in-flight connections within a bounded grace period.
     let drain = async { while conns.join_next().await.is_some() {} };
     if tokio::time::timeout(Duration::from_secs(30), drain)
         .await
         .is_err()
     {
-        tracing::warn!("drain timed out; aborting remaining connections");
         conns.shutdown().await;
     }
-    tracing::info!("shutdown complete");
-    Ok(())
 }
 
 /// Perform the TLS handshake for one accepted connection and serve it.
@@ -155,6 +188,7 @@ async fn serve_tls(
     ktls_ready: bool,
     state: Arc<AppState>,
     peer: std::net::SocketAddr,
+    serve_ui: bool,
     conn_shutdown: watch::Receiver<bool>,
 ) {
     let acceptor = tokio_rustls::TlsAcceptor::from(cfg);
@@ -167,7 +201,7 @@ async fn serve_tls(
                 Ok(ktls_stream) => {
                     metrics::counter!("cairn_ktls_offload_total", "result" => "ok").increment(1);
                     tracing::debug!(%peer, "kTLS offload engaged");
-                    serve_io(ktls_stream, state, peer, true, conn_shutdown).await;
+                    serve_io(ktls_stream, state, peer, true, serve_ui, conn_shutdown).await;
                 }
                 Err(e) => {
                     metrics::counter!("cairn_ktls_offload_total", "result" => "error").increment(1);
@@ -182,7 +216,7 @@ async fn serve_tls(
     // Userspace path (feature off, non-Linux, or kTLS unavailable): the original behaviour.
     let _ = ktls_ready;
     match acceptor.accept(stream).await {
-        Ok(tls) => serve_io(tls, state, peer, true, conn_shutdown).await,
+        Ok(tls) => serve_io(tls, state, peer, true, serve_ui, conn_shutdown).await,
         Err(e) => tracing::debug!(error = %e, "TLS handshake failed"),
     }
 }
@@ -215,19 +249,22 @@ async fn serve_plaintext(
     stream: tokio::net::TcpStream,
     state: Arc<AppState>,
     peer: std::net::SocketAddr,
+    serve_ui: bool,
     conn_shutdown: watch::Receiver<bool>,
 ) {
+    // The sendfile fast path runs only on the S3 data-plane listener: the UI listener serves console
+    // assets at paths that must be matched before S3 routing, so it always goes straight to hyper.
     #[cfg(all(feature = "fast-io", target_os = "linux"))]
-    {
+    if !serve_ui {
         match crate::fast_get::try_sendfile_get(stream, state.stack.as_ref(), peer).await {
             crate::fast_get::Fast::Handled => {}
             crate::fast_get::Fast::Fallback { stream } => {
-                serve_io(stream, state, peer, false, conn_shutdown).await;
+                serve_io(stream, state, peer, false, serve_ui, conn_shutdown).await;
             }
         }
+        return;
     }
-    #[cfg(not(all(feature = "fast-io", target_os = "linux")))]
-    serve_io(stream, state, peer, false, conn_shutdown).await;
+    serve_io(stream, state, peer, false, serve_ui, conn_shutdown).await;
 }
 
 async fn serve_io<S>(
@@ -235,12 +272,13 @@ async fn serve_io<S>(
     state: Arc<AppState>,
     peer: std::net::SocketAddr,
     secure: bool,
+    serve_ui: bool,
     mut conn_shutdown: watch::Receiver<bool>,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let io = TokioIo::new(stream);
-    let svc = service_fn(move |req| handle(state.clone(), peer, secure, req));
+    let svc = service_fn(move |req| handle(state.clone(), peer, secure, serve_ui, req));
     let builder = auto::Builder::new(TokioExecutor::new());
     let conn = builder.serve_connection(io, svc);
     tokio::pin!(conn);
@@ -261,6 +299,7 @@ async fn handle(
     state: Arc<AppState>,
     peer: std::net::SocketAddr,
     secure: bool,
+    serve_ui: bool,
     req: Request<Incoming>,
 ) -> Result<Response<ResponseBody>, Infallible> {
     let request_id = uuid::Uuid::new_v4().simple().to_string();
@@ -287,7 +326,15 @@ async fn handle(
             if infra {
                 route_infra(&state, &path).await
             } else {
-                adapter::handle(&state.stack, req, peer.ip(), secure, request_id.clone()).await
+                adapter::handle(
+                    &state.stack,
+                    req,
+                    peer.ip(),
+                    secure,
+                    serve_ui,
+                    request_id.clone(),
+                )
+                .await
             }
         };
         let mut resp = match tokio::time::timeout(state.request_timeout, work).await {
