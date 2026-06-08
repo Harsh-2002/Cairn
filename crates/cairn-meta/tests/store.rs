@@ -48,6 +48,56 @@ fn put(row: ObjectVersionRow, pc: Precondition) -> Mutation {
 }
 
 #[tokio::test]
+async fn user_policy_round_trips() {
+    let store = cairn_meta::open_in_memory().unwrap();
+    let id = UserId::generate();
+    store
+        .submit(Mutation::CreateUser(Box::new(UserRecord {
+            user: User {
+                id: id.clone(),
+                display_name: "alice".to_owned(),
+                access_key_id: "cairn_alice".to_owned(),
+                sigv4_access_key_id: None,
+                role: Role::Member,
+                is_active: true,
+                created_at: Timestamp(1),
+                updated_at: Timestamp(1),
+            },
+            bearer_secret_hash: "h".to_owned(),
+            sigv4_secret_ciphertext: None,
+            sigv4_secret_nonce: None,
+        })))
+        .await
+        .unwrap();
+    // No policy initially.
+    assert_eq!(store.get_user_policy(&id).await.unwrap(), None);
+    // Set → read back the exact stored JSON.
+    let doc = r#"{"Version":"2012-10-17","Statement":[]}"#.to_owned();
+    store
+        .submit(Mutation::SetUserPolicy {
+            user_id: id.clone(),
+            policy: Some(doc.clone()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(store.get_user_policy(&id).await.unwrap(), Some(doc));
+    // Clear → back to None.
+    store
+        .submit(Mutation::SetUserPolicy {
+            user_id: id.clone(),
+            policy: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(store.get_user_policy(&id).await.unwrap(), None);
+    // An unknown user has no policy.
+    assert_eq!(
+        store.get_user_policy(&UserId::generate()).await.unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
 async fn put_is_visible_only_after_commit() {
     let store = cairn_meta::open_in_memory().unwrap();
     let b = BucketName::parse("bkt").unwrap();

@@ -287,6 +287,7 @@ async fn serve_public(
         role: Role::Administrator,
         method: AuthMethod::Bearer,
         chunk_signing: None,
+        user_policy: None,
     };
     let s3req = S3Request {
         method: Method::GET,

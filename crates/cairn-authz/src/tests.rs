@@ -49,6 +49,7 @@ fn base_input() -> AuthzInput {
         account_bpa: PublicAccessBlock::default(),
         bucket_bpa: PublicAccessBlock::default(),
         policy: None,
+        user_policy: None,
         bucket_acl: None,
         object_acl: None,
         ownership_mode: OwnershipMode::ObjectWriter,
@@ -109,6 +110,132 @@ fn string_equals(key: &str, val: &str) -> Condition {
         values: vec![val.to_owned()],
         if_exists: false,
     }
+}
+
+/// An identity (per-user) policy statement: Principal-less (the engine ignores its principal), with
+/// `effect` over a single exact `action` on `my-bucket/*`.
+fn user_stmt(effect: Effect, action: &str) -> Statement {
+    Statement {
+        sid: None,
+        effect,
+        principals: PrincipalSpec::Any,
+        actions: vec![ActionPattern::Exact(action.to_owned())],
+        resources: vec!["arn:aws:s3:::my-bucket/*".to_owned()],
+        conditions: vec![],
+    }
+}
+
+// --- Identity (per-user) policy: ARCH §15 / user-centric authz --------------------------
+
+#[test]
+fn user_policy_grants_member_scoped_get_not_put() {
+    let mut input = base_input();
+    input.requester = RequesterClass::AuthenticatedMember(uid("alice"));
+    input.user_policy = Some(policy(vec![user_stmt(Effect::Allow, "s3:GetObject")]));
+    // The identity policy grants GetObject...
+    input.action = Action::GetObject;
+    assert_eq!(evaluate(&input), Decision::Allow);
+    // ...but nothing grants PutObject → default deny.
+    input.action = Action::PutObject;
+    assert_eq!(evaluate(&input), Decision::Deny(DenyReason::DefaultDeny));
+}
+
+#[test]
+fn user_policy_deny_overrides_bucket_allow() {
+    let mut input = base_input();
+    input.requester = RequesterClass::AuthenticatedMember(uid("alice"));
+    // The bucket (resource) policy allows GetObject for alice...
+    input.policy = Some(policy(vec![allow_get_statement(
+        PrincipalSpec::Users(vec![uid("alice")]),
+        vec![],
+    )]));
+    // ...but the user's identity policy explicitly Denies it — explicit Deny wins.
+    input.user_policy = Some(policy(vec![user_stmt(Effect::Deny, "s3:GetObject")]));
+    input.action = Action::GetObject;
+    assert_eq!(
+        evaluate(&input),
+        Decision::Deny(DenyReason::ExplicitPolicyDeny)
+    );
+}
+
+#[test]
+fn admin_full_access_without_user_policy() {
+    let mut input = base_input();
+    input.requester = RequesterClass::OwnerOrAdmin;
+    input.user_policy = None;
+    input.action = Action::PutObject;
+    assert_eq!(evaluate(&input), Decision::Allow);
+}
+
+#[test]
+fn user_policy_deny_binds_owner() {
+    // An identity Deny binds even an owner/admin acting as themselves (AWS semantics).
+    let mut input = base_input();
+    input.requester = RequesterClass::OwnerOrAdmin;
+    input.user_policy = Some(policy(vec![user_stmt(Effect::Deny, "s3:GetObject")]));
+    input.action = Action::GetObject;
+    assert_eq!(
+        evaluate(&input),
+        Decision::Deny(DenyReason::ExplicitPolicyDeny)
+    );
+}
+
+#[test]
+fn union_of_bucket_and_identity_grants() {
+    let mut input = base_input();
+    input.requester = RequesterClass::AuthenticatedMember(uid("alice"));
+    // Bucket (resource) policy grants GetObject to alice; identity policy grants PutObject.
+    input.policy = Some(policy(vec![allow_get_statement(
+        PrincipalSpec::Users(vec![uid("alice")]),
+        vec![],
+    )]));
+    input.user_policy = Some(policy(vec![user_stmt(Effect::Allow, "s3:PutObject")]));
+    // The union grants both; an action neither grants is denied.
+    input.action = Action::GetObject;
+    assert_eq!(evaluate(&input), Decision::Allow);
+    input.action = Action::PutObject;
+    assert_eq!(evaluate(&input), Decision::Allow);
+    input.action = Action::DeleteObject;
+    assert_eq!(evaluate(&input), Decision::Deny(DenyReason::DefaultDeny));
+}
+
+#[test]
+fn user_policy_grant_survives_block_public_access() {
+    let mut input = base_input();
+    input.requester = RequesterClass::AuthenticatedMember(uid("alice"));
+    // A public bucket-policy grant that BPA suppresses.
+    input.policy = Some(policy(vec![allow_get_statement(
+        PrincipalSpec::Any,
+        vec![],
+    )]));
+    input.account_bpa = PublicAccessBlock {
+        block_public_policy: true,
+        restrict_public_buckets: true,
+        ..PublicAccessBlock::default()
+    };
+    input.action = Action::GetObject;
+    // Without an identity policy, the sole (public) grant is BPA-suppressed → deny.
+    assert_eq!(
+        evaluate(&input),
+        Decision::Deny(DenyReason::BlockPublicAccess)
+    );
+    // An identity grant is never public, so it survives BPA → allow.
+    input.user_policy = Some(policy(vec![user_stmt(Effect::Allow, "s3:GetObject")]));
+    assert_eq!(evaluate(&input), Decision::Allow);
+}
+
+#[test]
+fn parse_user_policy_allows_missing_principal() {
+    // An identity policy may omit Principal (the principal is the attached user).
+    let doc = r#"{"Version":"2012-10-17","Statement":[
+        {"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*"}]}"#;
+    let p = crate::parse_user_policy(doc).expect("identity policy parses without Principal");
+    assert_eq!(p.statements.len(), 1);
+    assert_eq!(p.statements[0].effect, Effect::Allow);
+    // The same document via parse_policy (which requires Principal) is rejected.
+    assert!(crate::parse_policy(doc).is_err());
+    // Malformed JSON is still rejected.
+    assert!(crate::parse_user_policy("{ not json").is_err());
 }
 
 // --- The gate test matrix --------------------------------------------------------------
@@ -474,6 +601,7 @@ mod props {
                     account_bpa,
                     bucket_bpa,
                     policy,
+                    user_policy: None,
                     bucket_acl: None,
                     object_acl: Some(public_read_object_acl()),
                     ownership_mode,

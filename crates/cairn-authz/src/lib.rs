@@ -17,7 +17,7 @@ mod parse;
 
 pub use acl::{expand_canned_acl, permission_satisfies};
 pub use matching::{resource_arn, resource_matches, wildcard_match};
-pub use parse::parse_policy;
+pub use parse::{parse_policy, parse_user_policy};
 
 use cairn_types::authz::{ActionPattern, PrincipalSpec};
 use cairn_types::{
@@ -41,9 +41,11 @@ impl AuthorizationEngine for PolicyEngine {
 /// object. Identical to [`PolicyEngine::evaluate`].
 #[must_use]
 pub fn evaluate(input: &AuthzInput) -> Decision {
-    // (a) Owner / admin: permitted unless an explicit Deny in the bucket policy matches.
+    // (a) Owner / admin: permitted unless an explicit Deny matches — in the bucket policy OR the
+    //     requester's own identity policy (an identity Deny binds the principal, even an owner,
+    //     matching AWS).
     if matches!(input.requester, RequesterClass::OwnerOrAdmin) {
-        if explicit_deny_matches(input) {
+        if explicit_deny_matches(input) || user_policy_deny_matches(input) {
             return Decision::Deny(DenyReason::ExplicitPolicyDeny);
         }
         return Decision::Allow;
@@ -55,13 +57,18 @@ pub fn evaluate(input: &AuthzInput) -> Decision {
         return Decision::Deny(DenyReason::BlockPublicAccess);
     }
 
-    // (c) Explicit Deny anywhere in the policy denies unconditionally.
-    if explicit_deny_matches(input) {
+    // (c) Explicit Deny anywhere (bucket policy or the requester's identity policy) denies
+    //     unconditionally.
+    if explicit_deny_matches(input) || user_policy_deny_matches(input) {
         return Decision::Deny(DenyReason::ExplicitPolicyDeny);
     }
 
-    // (d) Any Allow: a matching policy Allow, or (ACLs in force) a matching ACL grant.
-    if policy_allow_matches_scoped(input, true, true) || acl_allows_scoped(input, true) {
+    // (d) Any Allow: a matching bucket-policy Allow, a matching identity-policy Allow, or (ACLs in
+    //     force) a matching ACL grant. This is the AWS union of resource- and identity-based grants.
+    if policy_allow_matches_scoped(input, true, true)
+        || user_policy_allow_matches(input)
+        || acl_allows_scoped(input, true)
+    {
         return Decision::Allow;
     }
 
@@ -102,15 +109,17 @@ fn block_public_access_denies(input: &AuthzInput) -> bool {
         return false;
     }
 
-    // Does anything still grant it once the suppressed public grants are removed?
+    // Does anything still grant it once the suppressed public grants are removed? Identity (per-user)
+    // policy grants are never public, so they always count here — a user-policy grant survives BPA.
     let granted_without_public = policy_allow_matches_scoped(
         input,
         /* allow_public_principal = */ !suppress_public_policy,
         /* allow_user_principal = */ true,
-    ) || acl_allows_scoped(
-        input,
-        /* allow_public_grantees = */ !suppress_public_acls,
-    );
+    ) || user_policy_allow_matches(input)
+        || acl_allows_scoped(
+            input,
+            /* allow_public_grantees = */ !suppress_public_acls,
+        );
 
     // Public was the sole grant => BPA denies.
     !granted_without_public
@@ -155,6 +164,49 @@ fn policy_allow_matches_scoped(
         .iter()
         .filter(|s| s.effect == Effect::Allow)
         .any(|s| statement_matches(s, input, allow_public_principal, allow_user_principal))
+}
+
+/// Whether any `Deny` statement in the requester's attached identity (per-user) policy matches.
+fn user_policy_deny_matches(input: &AuthzInput) -> bool {
+    user_policy_matches(input, Effect::Deny)
+}
+
+/// Whether any `Allow` statement in the requester's attached identity (per-user) policy matches.
+fn user_policy_allow_matches(input: &AuthzInput) -> bool {
+    user_policy_matches(input, Effect::Allow)
+}
+
+/// Whether any statement of `effect` in the identity policy matches. Identity-policy statements are
+/// matched WITHOUT a principal check — the requester is implicitly the principal.
+fn user_policy_matches(input: &AuthzInput, effect: Effect) -> bool {
+    let Some(policy) = &input.user_policy else {
+        return false;
+    };
+    policy
+        .statements
+        .iter()
+        .filter(|s| s.effect == effect)
+        .any(|s| statement_matches_no_principal(s, input))
+}
+
+/// Like [`statement_matches`] but skips the principal gate, for identity (per-user) policy
+/// statements where the requester is implicitly the principal.
+fn statement_matches_no_principal(s: &Statement, input: &AuthzInput) -> bool {
+    if !s
+        .actions
+        .iter()
+        .any(|a| action_pattern_matches(a, input.action))
+    {
+        return false;
+    }
+    if !s
+        .resources
+        .iter()
+        .any(|r| matching::resource_matches(r, &input.resource))
+    {
+        return false;
+    }
+    conditions_match(&s.conditions, &input.context, &input.requester)
 }
 
 /// Whether a single statement matches the request: principal, action, resource, conditions.

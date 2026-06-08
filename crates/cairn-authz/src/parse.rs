@@ -18,6 +18,23 @@ use serde_json::Value;
 /// Returns [`Error::MalformedPolicy`] for any structural problem (bad JSON, missing required
 /// fields, wrong shapes, unknown effect, or an unknown condition operator).
 pub fn parse_policy(json: &str) -> Result<Policy, Error> {
+    parse_policy_inner(json, true)
+}
+
+/// Parse a Principal-less **identity** (per-user) policy (ARCH §15 / user-centric authz).
+///
+/// Identical to [`parse_policy`], except a statement may omit `Principal`: the principal is
+/// implicitly the user the policy is attached to. An omitted `Principal` parses to
+/// [`PrincipalSpec::Any`] as a parse-time default; the engine evaluates user-policy statements on a
+/// dedicated path that never consults the principal, so the stored value is irrelevant.
+///
+/// # Errors
+/// Returns [`Error::MalformedPolicy`] for any structural problem (as [`parse_policy`]).
+pub fn parse_user_policy(json: &str) -> Result<Policy, Error> {
+    parse_policy_inner(json, false)
+}
+
+fn parse_policy_inner(json: &str, require_principal: bool) -> Result<Policy, Error> {
     let root: Value = serde_json::from_str(json).map_err(|_| Error::MalformedPolicy)?;
     let obj = root.as_object().ok_or(Error::MalformedPolicy)?;
 
@@ -35,8 +52,11 @@ pub fn parse_policy(json: &str) -> Result<Policy, Error> {
 
     let raw_statements = obj.get("Statement").ok_or(Error::MalformedPolicy)?;
     let statements = match raw_statements {
-        Value::Array(arr) => arr.iter().map(parse_statement).collect::<Result<_, _>>()?,
-        Value::Object(_) => vec![parse_statement(raw_statements)?],
+        Value::Array(arr) => arr
+            .iter()
+            .map(|s| parse_statement(s, require_principal))
+            .collect::<Result<_, _>>()?,
+        Value::Object(_) => vec![parse_statement(raw_statements, require_principal)?],
         _ => return Err(Error::MalformedPolicy),
     };
 
@@ -47,7 +67,7 @@ pub fn parse_policy(json: &str) -> Result<Policy, Error> {
     })
 }
 
-fn parse_statement(v: &Value) -> Result<Statement, Error> {
+fn parse_statement(v: &Value, require_principal: bool) -> Result<Statement, Error> {
     let obj = v.as_object().ok_or(Error::MalformedPolicy)?;
 
     let sid = match obj.get("Sid") {
@@ -62,7 +82,12 @@ fn parse_statement(v: &Value) -> Result<Statement, Error> {
         _ => return Err(Error::MalformedPolicy),
     };
 
-    let principals = parse_principal(obj.get("Principal").ok_or(Error::MalformedPolicy)?)?;
+    let principals = match obj.get("Principal") {
+        Some(p) => parse_principal(p)?,
+        None if require_principal => return Err(Error::MalformedPolicy),
+        // Identity (per-user) policy: the principal is the attached user; default to `Any`.
+        None => PrincipalSpec::Any,
+    };
     let actions = parse_actions(obj.get("Action").ok_or(Error::MalformedPolicy)?)?;
     let resources = parse_resources(obj.get("Resource").ok_or(Error::MalformedPolicy)?)?;
     let conditions = match obj.get("Condition") {

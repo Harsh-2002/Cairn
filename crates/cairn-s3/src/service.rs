@@ -1862,6 +1862,12 @@ impl S3Service {
         let mut context = build_context(req, self.clock.now());
         context.existing_tags = existing_tags;
         context.request_tags = request_tags;
+        // The requester's attached identity policy (loaded at auth time), evaluated in union with
+        // the bucket policy. `None` for anonymous requesters and users without one.
+        let user_policy = req
+            .principal
+            .as_ref()
+            .and_then(|p| p.user_policy.as_deref().cloned());
         let input = AuthzInput {
             requester,
             action,
@@ -1870,6 +1876,7 @@ impl S3Service {
             account_bpa,
             bucket_bpa,
             policy,
+            user_policy,
             bucket_acl,
             object_acl,
             ownership_mode: bucket.ownership_mode,

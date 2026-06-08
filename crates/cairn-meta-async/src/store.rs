@@ -608,6 +608,16 @@ impl MetadataStore for AsyncMetadataStore {
         rows.iter().map(model::user_from_row).collect()
     }
 
+    async fn get_user_policy(&self, user_id: &UserId) -> Result<Option<String>, MetaError> {
+        let row = query_one(
+            self.reader(),
+            "SELECT policy FROM users WHERE id=?1",
+            vec![Value::Text(user_id.0.as_str().to_owned())],
+        )
+        .await?;
+        Ok(row.and_then(|r| r.get_opt_text(0)))
+    }
+
     async fn list_activity(&self, limit: u32) -> Result<Vec<ActivityEntry>, MetaError> {
         let rows = self
             .reader()

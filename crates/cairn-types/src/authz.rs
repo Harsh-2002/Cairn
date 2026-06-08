@@ -353,6 +353,11 @@ pub struct AuthzInput {
     pub bucket_bpa: PublicAccessBlock,
     /// The bucket policy, if any.
     pub policy: Option<Policy>,
+    /// The requester's attached identity (per-user) policy, if any (ARCH §15 / user-centric authz).
+    /// Evaluated in union with the bucket policy; its statements have no principal (the requester is
+    /// implicitly the principal), and its grants are never public, so they survive Block Public
+    /// Access. `None` for anonymous requesters and users without an attached policy.
+    pub user_policy: Option<Policy>,
     /// The bucket ACL.
     pub bucket_acl: Option<Acl>,
     /// The object ACL (for object actions).

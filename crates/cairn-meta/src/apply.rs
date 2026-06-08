@@ -229,6 +229,14 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             .map_err(engine_err)?;
             Ok(MutationOutcome::Ack)
         }
+        Mutation::SetUserPolicy { user_id, policy } => {
+            conn.execute(
+                "UPDATE users SET policy=?2 WHERE id=?1",
+                params![user_id.0.as_str(), policy],
+            )
+            .map_err(engine_err)?;
+            Ok(MutationOutcome::Ack)
+        }
         Mutation::SetAccountPublicAccessBlock(bpa) => {
             conn.execute(
                 "INSERT OR REPLACE INTO account_config (k, v) VALUES ('public_access_block', ?1)",

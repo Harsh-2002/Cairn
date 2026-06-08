@@ -159,10 +159,14 @@ impl ControlService {
 
             (&Method::GET, ["users"]) => self.list_users().await,
             (&Method::POST, ["users"]) => self.create_user(&body).await,
+            (&Method::GET, ["users", id]) => self.user_detail(id).await,
             (&Method::PATCH, ["users", id]) => self.patch_user(id, &body).await,
             (&Method::POST, ["users", id, "rotate-credentials"]) => {
                 self.rotate_credentials(id).await
             }
+            (&Method::GET, ["users", id, "policy"]) => self.get_user_policy(id).await,
+            (&Method::PUT, ["users", id, "policy"]) => self.set_user_policy(id, &body).await,
+            (&Method::DELETE, ["users", id, "policy"]) => self.delete_user_policy(id).await,
 
             (&Method::GET, ["replication", "failed"]) => self.failed_replication(query).await,
 
@@ -977,6 +981,113 @@ impl ControlService {
             sigv4_secret_ciphertext,
             sigv4_secret_nonce,
         }))
+    }
+
+    /// `GET /users/{id}`: the public user view plus its attached identity (per-user) policy.
+    async fn user_detail(&self, id: &str) -> ControlResponse {
+        let user_id = UserId(id.to_owned());
+        let record = match self.load_user_record(&user_id).await {
+            Ok(Some(r)) => r,
+            Ok(None) => return ControlResponse::not_found(),
+            Err(resp) => return resp,
+        };
+        let policy = match self.load_user_policy_value(&user_id).await {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
+        ControlResponse::json(
+            StatusCode::OK,
+            &wire::UserDetailResp {
+                id: record.user.id.to_string(),
+                display_name: record.user.display_name,
+                access_key_id: record.user.access_key_id,
+                sigv4_access_key_id: record.user.sigv4_access_key_id,
+                role: wire::role_str(record.user.role),
+                is_active: record.user.is_active,
+                policy,
+            },
+        )
+    }
+
+    /// `GET /users/{id}/policy`: the attached identity policy document (or null).
+    async fn get_user_policy(&self, id: &str) -> ControlResponse {
+        let user_id = UserId(id.to_owned());
+        // Confirm the user exists so a missing user is a 404, not a null policy.
+        match self.load_user_record(&user_id).await {
+            Ok(Some(_)) => {}
+            Ok(None) => return ControlResponse::not_found(),
+            Err(resp) => return resp,
+        }
+        let policy = match self.load_user_policy_value(&user_id).await {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
+        ControlResponse::json(StatusCode::OK, &wire::UserPolicyResp { policy })
+    }
+
+    /// `PUT /users/{id}/policy`: validate the raw identity-policy JSON via `parse_user_policy`
+    /// (Principal-less; the principal is this user) and attach it. Rejected at the edge if malformed.
+    async fn set_user_policy(&self, id: &str, body: &Bytes) -> ControlResponse {
+        let user_id = UserId(id.to_owned());
+        match self.load_user_record(&user_id).await {
+            Ok(Some(_)) => {}
+            Ok(None) => return ControlResponse::not_found(),
+            Err(resp) => return resp,
+        }
+        let policy_json = match std::str::from_utf8(body) {
+            Ok(s) => s,
+            Err(_) => return ControlResponse::bad_request("policy must be valid UTF-8 JSON"),
+        };
+        if let Err(e) = cairn_authz::parse_user_policy(policy_json) {
+            return ControlResponse::bad_request(&format!("invalid policy: {e}"));
+        }
+        if let Err(e) = self
+            .meta
+            .submit(Mutation::SetUserPolicy {
+                user_id,
+                policy: Some(policy_json.to_owned()),
+            })
+            .await
+        {
+            return ControlResponse::error_internal(&e.to_string());
+        }
+        self.record_activity("SetUserPolicy", None, None).await;
+        ControlResponse::no_content()
+    }
+
+    /// `DELETE /users/{id}/policy`: detach the user's identity policy.
+    async fn delete_user_policy(&self, id: &str) -> ControlResponse {
+        let user_id = UserId(id.to_owned());
+        match self.load_user_record(&user_id).await {
+            Ok(Some(_)) => {}
+            Ok(None) => return ControlResponse::not_found(),
+            Err(resp) => return resp,
+        }
+        if let Err(e) = self
+            .meta
+            .submit(Mutation::SetUserPolicy {
+                user_id,
+                policy: None,
+            })
+            .await
+        {
+            return ControlResponse::error_internal(&e.to_string());
+        }
+        self.record_activity("DeleteUserPolicy", None, None).await;
+        ControlResponse::no_content()
+    }
+
+    /// Load a user's attached identity policy as a parsed JSON value (or null), failing closed on a
+    /// store error. A stored doc is JSON (validated on write), so a parse miss surfaces as null.
+    async fn load_user_policy_value(
+        &self,
+        id: &UserId,
+    ) -> Result<Option<serde_json::Value>, ControlResponse> {
+        match self.meta.get_user_policy(id).await {
+            Ok(Some(raw)) => Ok(serde_json::from_str(&raw).ok()),
+            Ok(None) => Ok(None),
+            Err(e) => Err(ControlResponse::error_internal(&e.to_string())),
+        }
     }
 
     // -----------------------------------------------------------------------------------

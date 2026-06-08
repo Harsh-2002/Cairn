@@ -179,6 +179,16 @@ ALTER TABLE buckets RENAME COLUMN compression TO compression_policy;
 ALTER TABLE object_versions ADD COLUMN sse_descriptor TEXT;
 "#,
     },
+    Migration {
+        version: 4,
+        name: "per-user identity policy (ARCH §15 / user-centric authz)",
+        sql: r#"
+-- An AWS-IAM-style identity policy attached to a user, evaluated for that user's S3 requests in
+-- union with bucket policy/ACL. The JSON document is a Principal-less policy (the principal IS this
+-- user). NULL means the user has no identity policy.
+ALTER TABLE users ADD COLUMN policy TEXT;
+"#,
+    },
 ];
 
 /// Run all pending migrations on the write driver, recording each as applied. Each migration is

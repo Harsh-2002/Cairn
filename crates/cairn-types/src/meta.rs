@@ -147,6 +147,14 @@ pub enum Mutation {
         /// The new compression policy, or `None` to disable compression.
         policy: Option<CompressionPolicy>,
     },
+    /// Set (or clear) a user's attached identity policy (ARCH §15 / user-centric authz). The value
+    /// is the validated policy JSON document, or `None` to detach.
+    SetUserPolicy {
+        /// The user.
+        user_id: UserId,
+        /// The validated policy JSON, or `None` to clear.
+        policy: Option<String>,
+    },
     /// Set the account-wide Block Public Access singleton.
     SetAccountPublicAccessBlock(PublicAccessBlock),
     /// Replace an object version's tags.

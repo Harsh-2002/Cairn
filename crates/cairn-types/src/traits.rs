@@ -247,6 +247,9 @@ pub trait MetadataStore: Send + Sync {
     async fn count_users(&self) -> Result<u64, MetaError>;
     /// List all users.
     async fn list_users(&self) -> Result<Vec<User>, MetaError>;
+    /// Fetch a user's attached identity-policy JSON document, or `None` if the user has none (or
+    /// does not exist). The raw stored JSON is returned; the caller parses/validates it.
+    async fn get_user_policy(&self, user_id: &UserId) -> Result<Option<String>, MetaError>;
 
     // --- audit & aggregates ---
     /// List recent activity (most recent first), up to `limit`.

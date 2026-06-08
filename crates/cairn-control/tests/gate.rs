@@ -22,6 +22,7 @@ fn admin() -> Principal {
         role: Role::Administrator,
         method: AuthMethod::Bearer,
         chunk_signing: None,
+        user_policy: None,
     }
 }
 
@@ -33,6 +34,7 @@ fn member() -> Principal {
         role: Role::Member,
         method: AuthMethod::Bearer,
         chunk_signing: None,
+        user_policy: None,
     }
 }
 
@@ -1222,4 +1224,142 @@ fn versioning_variants_exist() {
         VersioningState::Enabled,
         VersioningState::Suspended,
     );
+}
+
+#[tokio::test]
+async fn user_policy_routes_validate_store_and_surface() {
+    let h = harness();
+    let a = admin();
+
+    // Create a member, capture its id.
+    let resp = h
+        .svc
+        .handle(
+            &Method::POST,
+            "/users",
+            &[],
+            Some(&a),
+            Bytes::from_static(br#"{"display_name":"Bob","role":"member"}"#),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::CREATED);
+    let id = json(&resp)["id"].as_str().unwrap().to_owned();
+
+    // No policy initially: detail surfaces null.
+    let resp = h
+        .svc
+        .handle(
+            &Method::GET,
+            &format!("/users/{id}"),
+            &[],
+            Some(&a),
+            Bytes::new(),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::OK);
+    assert!(json(&resp)["policy"].is_null());
+
+    // Malformed policy JSON is rejected at the edge.
+    let resp = h
+        .svc
+        .handle(
+            &Method::PUT,
+            &format!("/users/{id}/policy"),
+            &[],
+            Some(&a),
+            Bytes::from_static(b"{ not json"),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::BAD_REQUEST);
+
+    // A valid Principal-less identity policy is stored and surfaced.
+    let doc = br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*"}]}"#;
+    let resp = h
+        .svc
+        .handle(
+            &Method::PUT,
+            &format!("/users/{id}/policy"),
+            &[],
+            Some(&a),
+            Bytes::from_static(doc),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::NO_CONTENT);
+
+    let resp = h
+        .svc
+        .handle(
+            &Method::GET,
+            &format!("/users/{id}/policy"),
+            &[],
+            Some(&a),
+            Bytes::new(),
+        )
+        .await;
+    assert_eq!(
+        json(&resp)["policy"]["Statement"][0]["Action"],
+        "s3:GetObject"
+    );
+    let resp = h
+        .svc
+        .handle(
+            &Method::GET,
+            &format!("/users/{id}"),
+            &[],
+            Some(&a),
+            Bytes::new(),
+        )
+        .await;
+    assert_eq!(json(&resp)["policy"]["Statement"][0]["Effect"], "Allow");
+
+    // Detaching clears it.
+    let resp = h
+        .svc
+        .handle(
+            &Method::DELETE,
+            &format!("/users/{id}/policy"),
+            &[],
+            Some(&a),
+            Bytes::new(),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::NO_CONTENT);
+    let resp = h
+        .svc
+        .handle(
+            &Method::GET,
+            &format!("/users/{id}/policy"),
+            &[],
+            Some(&a),
+            Bytes::new(),
+        )
+        .await;
+    assert!(json(&resp)["policy"].is_null());
+
+    // A non-admin (member) is forbidden from the policy routes.
+    let m = member();
+    let resp = h
+        .svc
+        .handle(
+            &Method::GET,
+            &format!("/users/{id}/policy"),
+            &[],
+            Some(&m),
+            Bytes::new(),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::FORBIDDEN);
+
+    // An unknown user is a 404.
+    let resp = h
+        .svc
+        .handle(
+            &Method::PUT,
+            "/users/nope/policy",
+            &[],
+            Some(&a),
+            Bytes::from_static(doc),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::NOT_FOUND);
 }

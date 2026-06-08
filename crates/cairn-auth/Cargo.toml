@@ -16,7 +16,9 @@ dev-auth = []
 
 [dependencies]
 cairn-types.workspace = true
+cairn-authz.workspace = true
 async-trait.workspace = true
+tracing.workspace = true
 sha2.workspace = true
 sha1.workspace = true
 hmac.workspace = true

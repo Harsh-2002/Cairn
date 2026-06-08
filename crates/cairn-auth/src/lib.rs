@@ -139,6 +139,8 @@ impl AuthChain {
                         method: AuthMethod::Bearer,
                         // Bearer auth has no SigV4 streaming chain.
                         chunk_signing: None,
+                        // Filled in by `attach_policy` at the authenticate() chokepoint.
+                        user_policy: None,
                     })
                 } else {
                     AuthOutcome::Denied(AuthError::SignatureMismatch)
@@ -153,6 +155,21 @@ impl AuthChain {
 #[async_trait]
 impl Authenticator for AuthChain {
     async fn authenticate(&self, view: &RequestView<'_>) -> AuthOutcome {
+        // Every successful authentication is funnelled through one chokepoint that loads the user's
+        // identity policy, so each auth method (bearer, SigV4 header/presigned, dev) gets it.
+        match self.classify(view).await {
+            AuthOutcome::Authenticated(p) => {
+                AuthOutcome::Authenticated(self.attach_policy(p).await)
+            }
+            other => other,
+        }
+    }
+}
+
+impl AuthChain {
+    /// Decide the auth outcome by method, without loading the identity policy (that is done once by
+    /// [`Authenticator::authenticate`]). Preserves the original dispatch precedence.
+    async fn classify(&self, view: &RequestView<'_>) -> AuthOutcome {
         if let Some(header) = view.header("authorization") {
             if header.starts_with("AWS4-HMAC-SHA256") {
                 return self.verify_sigv4_header(view, header).await;
@@ -170,6 +187,27 @@ impl Authenticator for AuthChain {
         }
         AuthOutcome::NotApplicable
     }
+
+    /// Load and attach the user's identity (per-user) policy (ARCH §15 / user-centric authz). A
+    /// malformed stored policy, or a load error, fails closed — the principal proceeds with no
+    /// identity policy (no grant), never a silently widened one.
+    async fn attach_policy(&self, mut principal: Principal) -> Principal {
+        match self.meta.get_user_policy(&principal.user_id).await {
+            Ok(Some(raw)) => match cairn_authz::parse_user_policy(&raw) {
+                Ok(policy) => principal.user_policy = Some(Box::new(policy)),
+                Err(_) => tracing::warn!(
+                    user_id = %principal.user_id,
+                    "ignoring malformed stored user policy (fail-closed)"
+                ),
+            },
+            Ok(None) => {}
+            Err(e) => tracing::warn!(
+                user_id = %principal.user_id, error = ?e,
+                "failed to load user policy; proceeding with none"
+            ),
+        }
+        principal
+    }
 }
 
 fn dev_principal() -> Principal {
@@ -180,5 +218,6 @@ fn dev_principal() -> Principal {
         role: Role::Administrator,
         method: AuthMethod::Development,
         chunk_signing: None,
+        user_policy: None,
     }
 }

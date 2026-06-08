@@ -368,6 +368,8 @@ pub fn principal(
         role,
         method,
         chunk_signing,
+        // Filled in by `AuthChain::attach_policy` at the authenticate() chokepoint.
+        user_policy: None,
     }
 }
 

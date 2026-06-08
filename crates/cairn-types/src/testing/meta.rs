@@ -36,6 +36,10 @@ struct State {
     parts: BTreeMap<(String, u16), PartRecord>,
     outbox: Vec<OutboxEntry>,
     users: BTreeMap<String, UserRecord>,
+    /// Per-user identity policy JSON (`users.policy`), keyed by user id. Absent when the user has no
+    /// attached policy; mirrors the real stores' nullable `policy` column without touching the
+    /// shared `UserRecord` type.
+    user_policies: BTreeMap<String, String>,
     activity: Vec<ActivityEntry>,
 }
 
@@ -414,6 +418,13 @@ impl MetadataStore for InMemoryMetadataStore {
                 if let Some(b) = st.buckets.get_mut(bucket.as_str()) {
                     b.compression = policy;
                 }
+                Ok(MutationOutcome::Ack)
+            }
+            Mutation::SetUserPolicy { user_id, policy } => {
+                match policy {
+                    Some(doc) => st.user_policies.insert(user_id.0.as_str().to_owned(), doc),
+                    None => st.user_policies.remove(user_id.0.as_str()),
+                };
                 Ok(MutationOutcome::Ack)
             }
             Mutation::SetAccountPublicAccessBlock(bpa) => {
@@ -850,6 +861,16 @@ impl MetadataStore for InMemoryMetadataStore {
             .values()
             .map(|r| r.user.clone())
             .collect())
+    }
+
+    async fn get_user_policy(&self, user_id: &UserId) -> Result<Option<String>, MetaError> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .user_policies
+            .get(user_id.0.as_str())
+            .cloned())
     }
 
     async fn list_activity(&self, limit: u32) -> Result<Vec<ActivityEntry>, MetaError> {

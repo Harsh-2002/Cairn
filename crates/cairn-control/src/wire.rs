@@ -223,6 +223,33 @@ pub struct CreateUserResp {
     pub bearer_secret: String,
 }
 
+/// `GET /users/{id}` response: the public user view plus its attached identity policy.
+#[derive(Debug, Serialize)]
+pub struct UserDetailResp {
+    /// The user id.
+    pub id: String,
+    /// The display name.
+    pub display_name: String,
+    /// The Bearer access-key id.
+    pub access_key_id: String,
+    /// The SigV4 access-key id used by S3 clients (public; the secret is never returned after
+    /// creation).
+    pub sigv4_access_key_id: Option<String>,
+    /// The role.
+    pub role: &'static str,
+    /// Whether the user is active.
+    pub is_active: bool,
+    /// The attached identity (per-user) policy document, or null if none.
+    pub policy: Option<Value>,
+}
+
+/// `GET /users/{id}/policy` response.
+#[derive(Debug, Serialize)]
+pub struct UserPolicyResp {
+    /// The attached identity (per-user) policy document, or null if none.
+    pub policy: Option<Value>,
+}
+
 // ---------------------------------------------------------------------------------------
 // Activity
 // ---------------------------------------------------------------------------------------

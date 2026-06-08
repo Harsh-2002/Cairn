@@ -275,6 +275,18 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
                 .await?;
             Ok(MutationOutcome::Ack)
         }
+        Mutation::SetUserPolicy { user_id, policy } => {
+            driver
+                .execute(
+                    "UPDATE users SET policy=?2 WHERE id=?1",
+                    vec![
+                        Value::Text(user_id.0.as_str().to_owned()),
+                        policy.map_or(Value::Null, Value::Text),
+                    ],
+                )
+                .await?;
+            Ok(MutationOutcome::Ack)
+        }
         Mutation::SetAccountPublicAccessBlock(bpa) => {
             driver
                 .execute(

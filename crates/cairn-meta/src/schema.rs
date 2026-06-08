@@ -176,6 +176,16 @@ ALTER TABLE buckets RENAME COLUMN compression TO compression_policy;
 ALTER TABLE object_versions ADD COLUMN sse_descriptor TEXT;
 "#,
     },
+    Migration {
+        version: 4,
+        name: "per-user identity policy (ARCH §15 / user-centric authz)",
+        sql: r#"
+-- An AWS-IAM-style identity policy attached to a user, evaluated for that user's S3 requests in
+-- union with bucket policy/ACL. The JSON document is a Principal-less policy (the principal IS this
+-- user). NULL means the user has no identity policy (a non-admin then has no granted S3 access).
+ALTER TABLE users ADD COLUMN policy TEXT;
+"#,
+    },
 ];
 
 /// Run all pending migrations on the write connection, recording each as applied.
@@ -311,5 +321,23 @@ mod tests {
             )
             .unwrap();
         assert!(sse.is_none());
+    }
+
+    #[test]
+    fn migration_v4_adds_user_policy_column() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        // The nullable per-user identity policy column exists (ARCH §15 / user-centric authz).
+        assert!(column_exists(&conn, "users", "policy"));
+        conn.execute_batch(
+            "INSERT INTO users
+             (id, display_name, access_key_id, secret_hash, role, is_active, created_at, updated_at)
+             VALUES ('u','n','ak','h','member',1,0,0);",
+        )
+        .unwrap();
+        let policy: Option<String> = conn
+            .query_row("SELECT policy FROM users WHERE id='u'", [], |r| r.get(0))
+            .unwrap();
+        assert!(policy.is_none());
     }
 }

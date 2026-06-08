@@ -663,6 +663,19 @@ impl MetadataStore for SqliteMetadataStore {
         .await
     }
 
+    async fn get_user_policy(&self, user_id: &UserId) -> Result<Option<String>, MetaError> {
+        let id = user_id.0.as_str().to_owned();
+        self.with_read(move |conn| {
+            conn.query_row("SELECT policy FROM users WHERE id=?1", params![id], |r| {
+                r.get::<_, Option<String>>(0)
+            })
+            .optional()
+            .map(Option::flatten)
+            .map_err(engine_err)
+        })
+        .await
+    }
+
     async fn list_activity(&self, limit: u32) -> Result<Vec<ActivityEntry>, MetaError> {
         self.with_read(move |conn| {
             let mut stmt = conn
