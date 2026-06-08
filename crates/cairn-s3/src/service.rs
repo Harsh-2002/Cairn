@@ -612,17 +612,30 @@ impl S3Service {
             StatusCode::OK
         };
 
-        let mut resp = S3Response {
-            status,
-            headers: Vec::new(),
-            body: S3Body::Stream {
-                length: handle.logical_len,
+        let logical_len = handle.logical_len;
+        let content_range = handle.content_range;
+        // A full GET of an uncompressed, unencrypted blob carries the zero-copy hint up so the
+        // connection layer can `sendfile` it on the fast path; it still carries the portable stream,
+        // so every other path serves it identically. Ranged reads use the normal stream.
+        let body = match handle.zero_copy {
+            Some(zc) if content_range.is_none() => S3Body::ZeroCopy {
+                length: logical_len,
+                zero_copy: zc,
+                stream: handle.body,
+            },
+            _ => S3Body::Stream {
+                length: logical_len,
                 stream: handle.body,
             },
         };
-        resp = object_headers(resp, &row)
-            .with_header("content-length", handle.logical_len.to_string());
-        if let Some(cr) = handle.content_range {
+
+        let mut resp = S3Response {
+            status,
+            headers: Vec::new(),
+            body,
+        };
+        resp = object_headers(resp, &row).with_header("content-length", logical_len.to_string());
+        if let Some(cr) = content_range {
             resp = resp.with_header(
                 "content-range",
                 format!("bytes {}-{}/{}", cr.start, cr.end, cr.total),

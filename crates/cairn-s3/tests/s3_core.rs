@@ -103,7 +103,7 @@ async fn drain(resp: S3Response) -> (StatusCode, Vec<(String, String)>, Vec<u8>)
     let body = match resp.body {
         S3Body::Empty => Vec::new(),
         S3Body::Bytes(b) => b.to_vec(),
-        S3Body::Stream { mut stream, .. } => {
+        S3Body::Stream { mut stream, .. } | S3Body::ZeroCopy { mut stream, .. } => {
             let mut out = Vec::new();
             while let Some(c) = stream.next().await {
                 out.extend_from_slice(&c.unwrap());

@@ -348,7 +348,10 @@ fn render(resp: S3Response) -> Response<ResponseBody> {
     let body: ResponseBody = match resp.body {
         S3Body::Empty => full_body(Bytes::new()),
         S3Body::Bytes(b) => full_body(b),
-        S3Body::Stream { stream, .. } => {
+        // ZeroCopy bodies fall back to their portable stream here: the fast `sendfile` path is taken
+        // (when enabled) before hyper renders the response, so reaching `render` means this response
+        // is being served the normal streamed way (TLS, default build, or a non-eligible connection).
+        S3Body::Stream { stream, .. } | S3Body::ZeroCopy { stream, .. } => {
             let framed = stream.map(|chunk| {
                 chunk
                     .map(Frame::data)

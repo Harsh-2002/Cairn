@@ -79,6 +79,18 @@ pub enum S3Body {
         /// The byte stream.
         stream: cairn_types::BlobStream,
     },
+    /// A zero-copy-eligible object read: an uncompressed, unencrypted committed blob that the
+    /// connection layer MAY transfer file->socket via `sendfile(2)` on the `fast-io` fast path. It
+    /// always carries the portable `stream` as well, so any path that cannot zero-copy (TLS, the
+    /// default build, a non-plaintext socket) serves it byte-for-byte identically to `Stream`.
+    ZeroCopy {
+        /// The content length in bytes.
+        length: u64,
+        /// The opened blob file plus the offset and byte count for the kernel transfer.
+        zero_copy: cairn_types::blob::ZeroCopyRead,
+        /// The portable fallback stream (identical bytes), used by every non-fast path.
+        stream: cairn_types::BlobStream,
+    },
 }
 
 impl std::fmt::Debug for S3Body {
@@ -88,6 +100,10 @@ impl std::fmt::Debug for S3Body {
             S3Body::Bytes(b) => f.debug_tuple("Bytes").field(&b.len()).finish(),
             S3Body::Stream { length, .. } => f
                 .debug_struct("Stream")
+                .field("length", length)
+                .finish_non_exhaustive(),
+            S3Body::ZeroCopy { length, .. } => f
+                .debug_struct("ZeroCopy")
                 .field("length", length)
                 .finish_non_exhaustive(),
         }
