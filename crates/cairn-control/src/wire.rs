@@ -94,6 +94,47 @@ pub struct OverviewResp {
     pub compression_ratio: f64,
 }
 
+/// `GET /system` response: node identity for the console's node card.
+#[derive(Debug, Serialize)]
+pub struct SystemResp {
+    /// The server version (workspace `CARGO_PKG_VERSION`).
+    pub version: String,
+    /// Seconds since this process started.
+    pub uptime_secs: u64,
+    /// The S3 API listener address as configured.
+    pub s3_addr: String,
+    /// The web-UI listener address as configured (may be `off`).
+    pub ui_addr: String,
+    /// Whether TLS is enabled on the S3 listener.
+    pub tls: bool,
+    /// The data directory path.
+    pub data_dir: String,
+    /// Total bytes of the filesystem holding the data directory (`null` when unavailable).
+    pub disk_total_bytes: Option<u64>,
+    /// Bytes available to unprivileged writers on that filesystem (`null` when unavailable).
+    pub disk_free_bytes: Option<u64>,
+}
+
+/// One entry in the `GET /overview/buckets` breakdown.
+#[derive(Debug, Serialize)]
+pub struct BucketUsageEntry {
+    /// The bucket name.
+    pub name: String,
+    /// Number of current objects.
+    pub objects: u64,
+    /// Total logical bytes across all versions.
+    pub logical_bytes: u64,
+    /// Total physical bytes across all versions.
+    pub physical_bytes: u64,
+}
+
+/// `GET /overview/buckets` response. Entries sum to the `GET /overview` totals.
+#[derive(Debug, Serialize)]
+pub struct OverviewBucketsResp {
+    /// Per-bucket usage, sorted by name; empty buckets appear with zeros.
+    pub buckets: Vec<BucketUsageEntry>,
+}
+
 // ---------------------------------------------------------------------------------------
 // Buckets
 // ---------------------------------------------------------------------------------------

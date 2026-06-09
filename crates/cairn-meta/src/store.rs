@@ -10,9 +10,9 @@ use cairn_types::authz::PublicAccessBlock;
 use cairn_types::bucket::{Bucket, ConfigAspect, ConfigDoc};
 use cairn_types::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
 use cairn_types::meta::{
-    ActivityEntry, ListPage, ListQuery, MultipartSession, Mutation, MutationOutcome, ObjectSummary,
-    OutboxEntry, PartRecord, ReplicationStatus, StoreCounts, User, UserSigV4Credentials,
-    UserWithBearerHash,
+    ActivityEntry, BucketCounts, ListPage, ListQuery, MultipartSession, Mutation, MutationOutcome,
+    ObjectSummary, OutboxEntry, PartRecord, ReplicationStatus, StoreCounts, User,
+    UserSigV4Credentials, UserWithBearerHash,
 };
 use cairn_types::object::ObjectVersionRow;
 use cairn_types::time::Timestamp;
@@ -714,6 +714,36 @@ impl MetadataStore for SqliteMetadataStore {
                 logical_bytes: logical as u64,
                 physical_bytes: physical as u64,
             })
+        })
+        .await
+    }
+
+    async fn bucket_counts(&self) -> Result<Vec<BucketCounts>, MetaError> {
+        self.with_read(move |conn| {
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT b.name,
+                        COALESCE(SUM(CASE WHEN ov.is_latest=1 AND ov.is_delete_marker=0 THEN 1 ELSE 0 END),0),
+                        COALESCE(SUM(ov.size_logical),0),
+                        COALESCE(SUM(ov.size_physical),0)
+                     FROM buckets b
+                     LEFT JOIN object_versions ov ON ov.bucket_name = b.name
+                     GROUP BY b.name ORDER BY b.name",
+                )
+                .map_err(engine_err)?;
+            stmt.query_map([], |r| {
+                let (objects, logical, physical): (i64, i64, i64) =
+                    (r.get(1)?, r.get(2)?, r.get(3)?);
+                Ok(BucketCounts {
+                    bucket: r.get(0)?,
+                    objects: objects as u64,
+                    logical_bytes: logical as u64,
+                    physical_bytes: physical as u64,
+                })
+            })
+            .map_err(engine_err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(engine_err)
         })
         .await
     }

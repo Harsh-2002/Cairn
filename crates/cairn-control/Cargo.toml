@@ -20,6 +20,10 @@ bytes.workspace = true
 uuid.workspace = true
 rand.workspace = true
 
+# Safe statvfs for the /system disk figures (the crate forbids unsafe, so no raw libc).
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs"] }
+
 [dev-dependencies]
 cairn-types = { workspace = true, features = ["testing"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

@@ -1,7 +1,7 @@
 //! Gate tests for the management API, exercised against the in-memory trait doubles.
 
 use bytes::Bytes;
-use cairn_control::{ControlResponse, ControlService};
+use cairn_control::{ControlResponse, ControlService, SystemInfo};
 use cairn_types::auth::{AuthMethod, Principal, Role};
 use cairn_types::blob::StageOptions;
 use cairn_types::bucket::VersioningState;
@@ -55,6 +55,14 @@ fn harness() -> Harness {
         blob.clone() as Arc<dyn BlobStore>,
         crypto as Arc<dyn Crypto>,
         clock.clone() as Arc<dyn Clock>,
+        SystemInfo {
+            version: "test".to_owned(),
+            s3_addr: "127.0.0.1:7373".to_owned(),
+            ui_addr: "127.0.0.1:7374".to_owned(),
+            tls: false,
+            data_dir: std::env::temp_dir(),
+            started_at: std::time::Instant::now(),
+        },
     );
     Harness {
         svc,
@@ -404,6 +412,115 @@ async fn overview_reflects_counts_after_put() {
     let v = json(&resp);
     assert_eq!(v["object_count"], 2);
     assert_eq!(v["logical_bytes"], 8);
+}
+
+#[tokio::test]
+async fn overview_buckets_breakdown_sums_to_totals() {
+    let h = harness();
+    let a = admin();
+    for name in [r#"{"name":"vault"}"#, r#"{"name":"empty"}"#] {
+        h.svc
+            .handle(
+                &Method::POST,
+                "/buckets",
+                &[],
+                Some(&a),
+                Bytes::from(name.as_bytes().to_vec()),
+            )
+            .await;
+    }
+    put_object(&h, "vault", "k1", b"12345").await; // 5 bytes
+    put_object(&h, "vault", "k2", b"678").await; // 3 bytes
+
+    let resp = h
+        .svc
+        .handle(
+            &Method::GET,
+            "/overview/buckets",
+            &[],
+            Some(&a),
+            Bytes::new(),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::OK);
+    let v = json(&resp);
+    let buckets = v["buckets"].as_array().unwrap();
+    // Sorted by name; the empty bucket is present with zeros.
+    assert_eq!(buckets.len(), 2);
+    assert_eq!(buckets[0]["name"], "empty");
+    assert_eq!(buckets[0]["objects"], 0);
+    assert_eq!(buckets[0]["logical_bytes"], 0);
+    assert_eq!(buckets[1]["name"], "vault");
+    assert_eq!(buckets[1]["objects"], 2);
+    assert_eq!(buckets[1]["logical_bytes"], 8);
+
+    // The breakdown sums to the /overview totals.
+    let resp = h
+        .svc
+        .handle(&Method::GET, "/overview", &[], Some(&a), Bytes::new())
+        .await;
+    let totals = json(&resp);
+    let sum: u64 = buckets
+        .iter()
+        .map(|b| b["logical_bytes"].as_u64().unwrap())
+        .sum();
+    assert_eq!(totals["logical_bytes"].as_u64().unwrap(), sum);
+}
+
+#[tokio::test]
+async fn overview_buckets_requires_admin() {
+    let h = harness();
+    let m = member();
+    let resp = h
+        .svc
+        .handle(
+            &Method::GET,
+            "/overview/buckets",
+            &[],
+            Some(&m),
+            Bytes::new(),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn system_requires_admin() {
+    let h = harness();
+    let m = member();
+    for principal in [Some(&m), None] {
+        let resp = h
+            .svc
+            .handle(&Method::GET, "/system", &[], principal, Bytes::new())
+            .await;
+        assert_eq!(resp.status, StatusCode::FORBIDDEN);
+        assert_eq!(json(&resp)["error"], "forbidden");
+    }
+}
+
+#[tokio::test]
+async fn system_reports_identity_and_disk() {
+    let h = harness();
+    let a = admin();
+    let resp = h
+        .svc
+        .handle(&Method::GET, "/system", &[], Some(&a), Bytes::new())
+        .await;
+    assert_eq!(resp.status, StatusCode::OK);
+    let v = json(&resp);
+    assert_eq!(v["version"], "test");
+    assert_eq!(v["s3_addr"], "127.0.0.1:7373");
+    assert_eq!(v["ui_addr"], "127.0.0.1:7374");
+    assert_eq!(v["tls"], false);
+    assert!(!v["data_dir"].as_str().unwrap().is_empty());
+    assert!(v["uptime_secs"].as_u64().is_some());
+    #[cfg(unix)]
+    {
+        let total = v["disk_total_bytes"].as_u64().expect("disk total on unix");
+        let free = v["disk_free_bytes"].as_u64().expect("disk free on unix");
+        assert!(total > 0);
+        assert!(free <= total);
+    }
 }
 
 #[tokio::test]

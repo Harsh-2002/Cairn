@@ -537,3 +537,19 @@ pub struct StoreCounts {
     /// Total physical bytes.
     pub physical_bytes: u64,
 }
+
+/// Per-bucket aggregate counts for the overview's storage breakdown. Semantics mirror
+/// [`StoreCounts`] sliced by bucket — `objects` counts latest non-delete-marker versions and the
+/// byte totals sum over *all* versions — so the per-bucket rows add up to the store totals.
+/// Buckets with no objects are included with zeros.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BucketCounts {
+    /// The bucket name.
+    pub bucket: String,
+    /// Number of current objects.
+    pub objects: u64,
+    /// Total logical bytes across all versions.
+    pub logical_bytes: u64,
+    /// Total physical bytes across all versions.
+    pub physical_bytes: u64,
+}

@@ -15,9 +15,9 @@ use cairn_types::authz::PublicAccessBlock;
 use cairn_types::bucket::{Bucket, ConfigAspect, ConfigDoc};
 use cairn_types::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
 use cairn_types::meta::{
-    ActivityEntry, ListPage, ListQuery, MultipartSession, Mutation, MutationOutcome, ObjectSummary,
-    OutboxEntry, PartRecord, ReplicationStatus, StoreCounts, User, UserSigV4Credentials,
-    UserWithBearerHash,
+    ActivityEntry, BucketCounts, ListPage, ListQuery, MultipartSession, Mutation, MutationOutcome,
+    ObjectSummary, OutboxEntry, PartRecord, ReplicationStatus, StoreCounts, User,
+    UserSigV4Credentials, UserWithBearerHash,
 };
 use cairn_types::object::ObjectVersionRow;
 use cairn_types::time::Timestamp;
@@ -656,6 +656,31 @@ impl MetadataStore for AsyncMetadataStore {
             logical_bytes: logical as u64,
             physical_bytes: physical as u64,
         })
+    }
+
+    async fn bucket_counts(&self) -> Result<Vec<BucketCounts>, MetaError> {
+        let rows = self
+            .reader()
+            .query(
+                "SELECT b.name,
+                    COALESCE(SUM(CASE WHEN ov.is_latest=1 AND ov.is_delete_marker=0 THEN 1 ELSE 0 END),0),
+                    COALESCE(SUM(ov.size_logical),0),
+                    COALESCE(SUM(ov.size_physical),0)
+                 FROM buckets b
+                 LEFT JOIN object_versions ov ON ov.bucket_name = b.name
+                 GROUP BY b.name ORDER BY b.name",
+                vec![],
+            )
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|r| BucketCounts {
+                bucket: r.get_text(0),
+                objects: r.get_i64(1) as u64,
+                logical_bytes: r.get_i64(2) as u64,
+                physical_bytes: r.get_i64(3) as u64,
+            })
+            .collect())
     }
 }
 

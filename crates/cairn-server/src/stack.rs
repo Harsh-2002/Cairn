@@ -197,6 +197,14 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
         blob.clone(),
         crypto.clone(),
         clock.clone(),
+        cairn_control::SystemInfo {
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            s3_addr: cfg.listen_addr.to_string(),
+            ui_addr: cfg.ui_addr.clone(),
+            tls: cfg.tls_enabled(),
+            data_dir: cfg.data_dir.clone(),
+            started_at: std::time::Instant::now(),
+        },
     );
 
     // Ensure the root administrator exists so the deployment is usable immediately: the same access

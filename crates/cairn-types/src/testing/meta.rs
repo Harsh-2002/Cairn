@@ -8,7 +8,7 @@ use crate::bucket::{Bucket, ConfigAspect, ConfigDoc};
 use crate::error::MetaError;
 use crate::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
 use crate::meta::{
-    ActivityEntry, ClaimOutcome, IfNoneMatch, ListPage, ListQuery, MultipartSession,
+    ActivityEntry, BucketCounts, ClaimOutcome, IfNoneMatch, ListPage, ListQuery, MultipartSession,
     MultipartStatus, Mutation, MutationOutcome, ObjectSummary, OutboxEntry, PartRecord,
     Precondition, ReplicationStatus, StoreCounts, User, UserRecord, UserSigV4Credentials,
     UserWithBearerHash,
@@ -899,6 +899,36 @@ impl MetadataStore for InMemoryMetadataStore {
             c.physical_bytes += r.size_physical;
         }
         Ok(c)
+    }
+
+    async fn bucket_counts(&self) -> Result<Vec<BucketCounts>, MetaError> {
+        let st = self.state.lock().unwrap();
+        // `st.buckets` is a BTreeMap, so the seed map is already name-ordered with empty
+        // buckets present at zero — matching the SQL LEFT JOIN ... GROUP BY semantics.
+        let mut by_bucket: BTreeMap<String, BucketCounts> = st
+            .buckets
+            .keys()
+            .map(|name| {
+                (
+                    name.clone(),
+                    BucketCounts {
+                        bucket: name.clone(),
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
+        for r in st.versions.values() {
+            let Some(c) = by_bucket.get_mut(r.bucket.as_str()) else {
+                continue;
+            };
+            if r.is_latest && !r.is_delete_marker {
+                c.objects += 1;
+            }
+            c.logical_bytes += r.size_logical;
+            c.physical_bytes += r.size_physical;
+        }
+        Ok(by_bucket.into_values().collect())
     }
 }
 

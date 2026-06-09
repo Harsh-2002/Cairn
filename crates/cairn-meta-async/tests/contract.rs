@@ -933,6 +933,44 @@ async fn aggregate_counts_parity() {
 }
 
 #[tokio::test]
+async fn bucket_counts_parity() {
+    let (a, b) = both().await;
+    for s in [&a as &dyn MetadataStore, &b as &dyn MetadataStore] {
+        for name in ["bkt", "empty"] {
+            s.submit(Mutation::CreateBucket(Box::new(bucket(
+                name,
+                VersioningState::Enabled,
+            ))))
+            .await
+            .unwrap();
+        }
+        let bk = BucketName::parse("bkt").unwrap();
+        s.submit(put(
+            row(&bk, "k1", VersionId::from_string("v1".into()), "e", 10),
+            Precondition::default(),
+        ))
+        .await
+        .unwrap();
+        s.submit(put(
+            row(&bk, "k1", VersionId::from_string("v2".into()), "e", 20),
+            Precondition::default(),
+        ))
+        .await
+        .unwrap();
+
+        let counts = s.bucket_counts().await.unwrap();
+        // Sorted by name; the empty bucket appears with zeros.
+        assert_eq!(counts.len(), 2);
+        assert_eq!(counts[0].bucket, "bkt");
+        assert_eq!(counts[0].objects, 1); // one current key
+        assert_eq!(counts[0].logical_bytes, 30); // both versions counted
+        assert_eq!(counts[1].bucket, "empty");
+        assert_eq!(counts[1].objects, 0);
+        assert_eq!(counts[1].logical_bytes, 0);
+    }
+}
+
+#[tokio::test]
 async fn reconcile_oracle_parity() {
     let (a, b) = both().await;
     let bk = BucketName::parse("bkt").unwrap();

@@ -79,6 +79,24 @@ impl ControlResponse {
     }
 }
 
+/// Static facts about the running node, surfaced by `GET /system` for the console's node card.
+/// Assembled once at startup from the server config; the service never re-reads config.
+#[derive(Debug, Clone)]
+pub struct SystemInfo {
+    /// The server version (workspace `CARGO_PKG_VERSION`).
+    pub version: String,
+    /// The S3 API listener address as configured.
+    pub s3_addr: String,
+    /// The web-UI listener address as configured (may be `off`).
+    pub ui_addr: String,
+    /// Whether TLS is enabled on the S3 listener.
+    pub tls: bool,
+    /// The data directory (also the statvfs target for disk figures).
+    pub data_dir: std::path::PathBuf,
+    /// Process start instant, for uptime.
+    pub started_at: std::time::Instant,
+}
+
 /// The JSON management API service. It owns shared handles to the trait spine and is otherwise
 /// stateless; clone the `Arc`s freely.
 #[derive(Clone)]
@@ -87,6 +105,7 @@ pub struct ControlService {
     blob: Arc<dyn BlobStore>,
     crypto: Arc<dyn Crypto>,
     clock: Arc<dyn Clock>,
+    system: Arc<SystemInfo>,
 }
 
 impl std::fmt::Debug for ControlService {
@@ -103,12 +122,14 @@ impl ControlService {
         blob: Arc<dyn BlobStore>,
         crypto: Arc<dyn Crypto>,
         clock: Arc<dyn Clock>,
+        system: SystemInfo,
     ) -> Self {
         Self {
             meta,
             blob,
             crypto,
             clock,
+            system: Arc::new(system),
         }
     }
 
@@ -139,6 +160,8 @@ impl ControlService {
 
         match (method, segments.as_slice()) {
             (&Method::GET, ["overview"]) => self.overview().await,
+            (&Method::GET, ["overview", "buckets"]) => self.overview_buckets().await,
+            (&Method::GET, ["system"]) => self.system(),
 
             (&Method::GET, ["buckets"]) => self.list_buckets().await,
             (&Method::POST, ["buckets"]) => self.create_bucket(&body).await,
@@ -207,6 +230,47 @@ impl ControlService {
                 logical_bytes: counts.logical_bytes,
                 physical_bytes: counts.physical_bytes,
                 compression_ratio: compression_ratio(&counts),
+            },
+        )
+    }
+
+    async fn overview_buckets(&self) -> ControlResponse {
+        let counts = match self.meta.bucket_counts().await {
+            Ok(c) => c,
+            Err(e) => return ControlResponse::error_internal(&e.to_string()),
+        };
+        ControlResponse::json(
+            StatusCode::OK,
+            &wire::OverviewBucketsResp {
+                buckets: counts
+                    .into_iter()
+                    .map(|c| wire::BucketUsageEntry {
+                        name: c.bucket,
+                        objects: c.objects,
+                        logical_bytes: c.logical_bytes,
+                        physical_bytes: c.physical_bytes,
+                    })
+                    .collect(),
+            },
+        )
+    }
+
+    fn system(&self) -> ControlResponse {
+        let (disk_total_bytes, disk_free_bytes) = match disk_stats(&self.system.data_dir) {
+            Some((total, free)) => (Some(total), Some(free)),
+            None => (None, None),
+        };
+        ControlResponse::json(
+            StatusCode::OK,
+            &wire::SystemResp {
+                version: self.system.version.clone(),
+                uptime_secs: self.system.started_at.elapsed().as_secs(),
+                s3_addr: self.system.s3_addr.clone(),
+                ui_addr: self.system.ui_addr.clone(),
+                tls: self.system.tls,
+                data_dir: self.system.data_dir.display().to_string(),
+                disk_total_bytes,
+                disk_free_bytes,
             },
         )
     }
@@ -1185,6 +1249,25 @@ fn find_query<'a>(query: &'a [(String, String)], name: &str) -> Option<&'a str> 
         .iter()
         .find(|(k, _)| k == name)
         .map(|(_, v)| v.as_str())
+}
+
+/// Total and unprivileged-available bytes of the filesystem holding `path`, or `None` when the
+/// platform or the syscall cannot answer. `f_frsize` is the fragment size the totals are counted
+/// in; some filesystems report it as zero, in which case `f_bsize` applies.
+#[cfg(unix)]
+fn disk_stats(path: &std::path::Path) -> Option<(u64, u64)> {
+    let v = rustix::fs::statvfs(path).ok()?;
+    let frsize = if v.f_frsize > 0 {
+        v.f_frsize
+    } else {
+        v.f_bsize
+    };
+    Some((v.f_blocks * frsize, v.f_bavail * frsize))
+}
+
+#[cfg(not(unix))]
+fn disk_stats(_path: &std::path::Path) -> Option<(u64, u64)> {
+    None
 }
 
 /// The logical/physical compression ratio, defined as `1.0` when nothing is stored.

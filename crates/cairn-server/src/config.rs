@@ -219,7 +219,6 @@ impl Config {
 
     /// Whether built-in TLS is configured.
     #[must_use]
-    #[allow(dead_code)] // wired into the listener in the TLS hardening wave
     pub fn tls_enabled(&self) -> bool {
         self.tls_cert_path.is_some() && self.tls_key_path.is_some()
     }

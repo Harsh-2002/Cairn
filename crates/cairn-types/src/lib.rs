@@ -56,7 +56,7 @@ pub use error::{
 };
 pub use id::{BucketName, InvalidName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
 pub use meta::{
-    ActivityEntry, ClaimOutcome, IfNoneMatch, ListPage, ListQuery, MultipartSession,
+    ActivityEntry, BucketCounts, ClaimOutcome, IfNoneMatch, ListPage, ListQuery, MultipartSession,
     MultipartStatus, Mutation, MutationOutcome, ObjectSummary, OutboxEntry, PartRecord,
     Precondition, ReplicationOp, ReplicationStatus, StoreCounts, User, UserRecord,
     UserSigV4Credentials, UserWithBearerHash,

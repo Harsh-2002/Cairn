@@ -19,9 +19,9 @@ use crate::crypto::{Nonce, Sealed, Signature};
 use crate::error::{BlobError, CryptoError, MetaError, ReplicationError};
 use crate::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
 use crate::meta::{
-    ActivityEntry, ListPage, ListQuery, MultipartSession, Mutation, MutationOutcome, ObjectSummary,
-    OutboxEntry, PartRecord, ReplicationStatus, StoreCounts, User, UserSigV4Credentials,
-    UserWithBearerHash,
+    ActivityEntry, BucketCounts, ListPage, ListQuery, MultipartSession, Mutation, MutationOutcome,
+    ObjectSummary, OutboxEntry, PartRecord, ReplicationStatus, StoreCounts, User,
+    UserSigV4Credentials, UserWithBearerHash,
 };
 use crate::object::ObjectVersionRow;
 use crate::replication::ReplicatedObject;
@@ -256,6 +256,8 @@ pub trait MetadataStore: Send + Sync {
     async fn list_activity(&self, limit: u32) -> Result<Vec<ActivityEntry>, MetaError>;
     /// Aggregate store counts.
     async fn aggregate_counts(&self) -> Result<StoreCounts, MetaError>;
+    /// Per-bucket aggregate counts (sorted by bucket name); empty buckets appear with zeros.
+    async fn bucket_counts(&self) -> Result<Vec<BucketCounts>, MetaError>;
 }
 
 /// An authenticator examines a library-neutral request view and yields one of three
