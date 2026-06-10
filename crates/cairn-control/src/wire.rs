@@ -214,6 +214,8 @@ pub struct ObjectEntry {
 pub struct ObjectListResp {
     /// The objects in this page.
     pub objects: Vec<ObjectEntry>,
+    /// Key groups folded at the requested `delimiter` (empty without one) — the "folders".
+    pub common_prefixes: Vec<String>,
     /// The continuation cursor, or `null` if this is the last page.
     pub next: Option<String>,
 }
@@ -346,6 +348,16 @@ pub struct BucketConfigResp {
     pub acl: Option<Value>,
     /// The bucket-level public-access-block document, or `null`.
     pub public_access_block: Option<Value>,
+    /// The default server-side-encryption document (`{"algorithm":"AES256"}`), or `null` when
+    /// new uploads are stored unencrypted by default.
+    pub encryption: Option<Value>,
+}
+
+/// `PUT /buckets/{name}/encryption` request body.
+#[derive(Debug, Deserialize)]
+pub struct SetEncryptionReq {
+    /// `"AES256"` to encrypt new uploads by default (SSE-S3), `"none"` to turn the default off.
+    pub algorithm: String,
 }
 
 /// `PUT /buckets/{name}/versioning` request body.

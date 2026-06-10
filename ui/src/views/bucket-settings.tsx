@@ -101,6 +101,7 @@ export function BucketSettings() {
   const [quotaInput, setQuotaInput] = useState("");
   const [quotaError, setQuotaError] = useState("");
   const [compression, setCompression] = useState("none");
+  const [encryption, setEncryption] = useState("none");
   const [policyText, setPolicyText] = useState("");
   const [policyError, setPolicyError] = useState("");
   const [replDest, setReplDest] = useState("");
@@ -117,6 +118,9 @@ export function BucketSettings() {
     setQuotaInput(d.config.quota_bytes == null ? "" : String(d.config.quota_bytes));
     setPolicyText(d.config.policy ? JSON.stringify(d.config.policy, null, 2) : "");
     setCompression(d.compression);
+    setEncryption(
+      d.config.encryption?.algorithm?.toUpperCase() === "AES256" ? "AES256" : "none",
+    );
     setReplDest(d.repl?.dest_bucket ?? "");
     setReplPrefix(d.repl?.prefix ?? "");
     setQuotaError("");
@@ -181,6 +185,17 @@ export function BucketSettings() {
         compression === "none"
           ? "Compression turned off."
           : `Compression set to ${compression}.`,
+      );
+    });
+  }
+
+  function saveEncryption() {
+    void run("encryption", async () => {
+      await api.setEncryption(name, encryption);
+      toast.success(
+        encryption === "none"
+          ? "New uploads are stored unencrypted."
+          : "New uploads will be encrypted (AES-256).",
       );
     });
   }
@@ -470,25 +485,41 @@ export function BucketSettings() {
         </CardFooter>
       </Card>
 
-      {/* ---- Encryption (informational) ---- */}
+      {/* ---- Encryption at rest ---- */}
       <Card className="gap-4 rounded-lg shadow-none">
         <CardHeader>
           <CardTitle className="flex items-center gap-2 text-base">
             Encryption at rest
-            <Badge variant="outline" className="text-muted-foreground">
-              Per upload
-            </Badge>
+            {res.data.config.encryption ? (
+              <Badge variant="outline">AES-256</Badge>
+            ) : (
+              <Badge variant="outline" className="text-muted-foreground">
+                Off
+              </Badge>
+            )}
           </CardTitle>
           <CardDescription>
-            New uploads are encrypted with a server-managed key (SSE-S3) when
-            requested. Set it per file from the Browser tab with the “Encrypt at
-            rest” option, or send the
-            <code className="mx-1 font-mono text-[12px]">
-              x-amz-server-side-encryption
-            </code>
-            header from any S3 client.
+            Encrypt every new upload with a server-managed key (SSE-S3,
+            AES-256). The key never leaves the server and downloads are
+            transparent. Existing objects are not rewritten.
           </CardDescription>
         </CardHeader>
+        <CardContent>
+          <Select value={encryption} onValueChange={setEncryption}>
+            <SelectTrigger className="w-56" aria-label="Default encryption">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="AES256">AES-256 (SSE-S3)</SelectItem>
+              <SelectItem value="none">Off</SelectItem>
+            </SelectContent>
+          </Select>
+        </CardContent>
+        <CardFooter className="justify-end border-t pt-4!">
+          <Button onClick={saveEncryption} disabled={busy === "encryption"}>
+            {busy === "encryption" ? "Saving…" : "Save"}
+          </Button>
+        </CardFooter>
       </Card>
 
       {/* ---- Bucket policy ---- */}

@@ -135,7 +135,7 @@ export function Users() {
 
       <Dialog open={open} onOpenChange={onOpenChange}>
         <DialogContent
-          className="max-h-[85vh] overflow-y-auto sm:max-w-2xl"
+          className="max-h-[85vh] overflow-y-auto sm:max-w-3xl lg:max-w-5xl"
           showCloseButton={!created}
           onInteractOutside={(e) => {
             if (created) e.preventDefault();

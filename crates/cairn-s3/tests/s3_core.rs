@@ -24,6 +24,7 @@ fn admin() -> Principal {
 
 struct Harness {
     svc: S3Service,
+    meta: Arc<dyn MetadataStore>,
     _dir: tempfile::TempDir,
 }
 
@@ -40,7 +41,7 @@ async fn harness_with_authz(authz: Arc<dyn cairn_types::traits::AuthorizationEng
     let crypto: Arc<dyn cairn_types::traits::Crypto> =
         Arc::new(cairn_crypto::SystemCrypto::new([7u8; 32]));
     let svc = S3Service::new(
-        meta,
+        meta.clone(),
         blob,
         authz,
         clock,
@@ -48,7 +49,11 @@ async fn harness_with_authz(authz: Arc<dyn cairn_types::traits::AuthorizationEng
         "us-east-1".to_owned(),
         5 * 1024 * 1024 * 1024,
     );
-    Harness { svc, _dir: dir }
+    Harness {
+        svc,
+        meta,
+        _dir: dir,
+    }
 }
 
 fn req(
@@ -2742,4 +2747,78 @@ async fn put_with_unsupported_sse_mode_is_rejected() {
     )
     .await;
     assert_eq!(st, StatusCode::BAD_REQUEST);
+}
+
+/// Bucket default encryption (the `encryption` config aspect): a plain PUT with NO SSE header into
+/// a bucket whose default is AES256 stores the object encrypted — the SSE header is echoed on the
+/// PUT and GET responses and the bytes round-trip. A sibling bucket without the default stays
+/// unencrypted, proving the setting is per-bucket.
+#[tokio::test]
+async fn bucket_default_encryption_applies_to_plain_puts() {
+    use cairn_types::bucket::{ConfigAspect, ConfigDoc};
+    use cairn_types::meta::Mutation;
+
+    let h = harness().await;
+    for b in ["encdef", "plain"] {
+        let (st, _, _) =
+            drain(send(&h.svc, req(Method::PUT, Some(b), None, &[], &[], vec![])).await).await;
+        assert_eq!(st, StatusCode::OK);
+    }
+
+    // Configure the default the way the management API stores it.
+    h.meta
+        .submit(Mutation::SetBucketConfig {
+            bucket: BucketName::parse("encdef").unwrap(),
+            aspect: ConfigAspect::Encryption,
+            doc: Some(ConfigDoc(r#"{"algorithm":"AES256"}"#.to_owned())),
+        })
+        .await
+        .unwrap();
+
+    let payload = b"default-encrypted bytes".to_vec();
+
+    // No SSE header on the PUT — the bucket default applies.
+    let put = req(
+        Method::PUT,
+        Some("encdef"),
+        Some("k"),
+        &[],
+        &[("content-type", "application/octet-stream")],
+        payload.clone(),
+    );
+    let (st, hdrs, _) = drain(send(&h.svc, put).await).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        header(&hdrs, "x-amz-server-side-encryption"),
+        Some("AES256"),
+        "bucket default encryption must apply to header-less PUTs"
+    );
+
+    let (st, hdrs, body) = drain(
+        send(
+            &h.svc,
+            req(Method::GET, Some("encdef"), Some("k"), &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(body, payload);
+    assert_eq!(
+        header(&hdrs, "x-amz-server-side-encryption"),
+        Some("AES256")
+    );
+
+    // The sibling bucket without the default stays unencrypted.
+    let put = req(
+        Method::PUT,
+        Some("plain"),
+        Some("k"),
+        &[],
+        &[("content-type", "application/octet-stream")],
+        payload.clone(),
+    );
+    let (st, hdrs, _) = drain(send(&h.svc, put).await).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(header(&hdrs, "x-amz-server-side-encryption"), None);
 }

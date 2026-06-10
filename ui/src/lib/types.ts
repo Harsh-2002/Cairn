@@ -63,6 +63,8 @@ export interface ObjectEntry {
 
 export interface ListObjectsResp {
   objects: ObjectEntry[];
+  /** Key groups folded at the requested delimiter (the "folders"). */
+  common_prefixes: string[];
   next: string | null;
 }
 
@@ -82,6 +84,8 @@ export interface BucketConfigResp {
   lifecycle: unknown | null;
   acl: unknown | null;
   public_access_block: unknown | null;
+  /** Default SSE document ({"algorithm":"AES256"}) or null when off. */
+  encryption: { algorithm?: string } | null;
 }
 
 export interface UserSummary {

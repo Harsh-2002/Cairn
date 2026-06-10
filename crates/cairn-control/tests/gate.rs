@@ -1480,3 +1480,151 @@ async fn user_policy_routes_validate_store_and_surface() {
         .await;
     assert_eq!(resp.status, StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn bucket_encryption_default_round_trips() {
+    let h = harness();
+    let a = admin();
+    h.svc
+        .handle(
+            &Method::POST,
+            "/buckets",
+            &[],
+            Some(&a),
+            Bytes::from_static(br#"{"name":"enc"}"#),
+        )
+        .await;
+
+    // Turn the default on.
+    let resp = h
+        .svc
+        .handle(
+            &Method::PUT,
+            "/buckets/enc/encryption",
+            &[],
+            Some(&a),
+            Bytes::from_static(br#"{"algorithm":"AES256"}"#),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::NO_CONTENT);
+
+    let resp = h
+        .svc
+        .handle(
+            &Method::GET,
+            "/buckets/enc/config",
+            &[],
+            Some(&a),
+            Bytes::new(),
+        )
+        .await;
+    let v = json(&resp);
+    assert_eq!(v["encryption"]["algorithm"], "AES256");
+
+    // Unknown algorithm -> 400.
+    let resp = h
+        .svc
+        .handle(
+            &Method::PUT,
+            "/buckets/enc/encryption",
+            &[],
+            Some(&a),
+            Bytes::from_static(br#"{"algorithm":"ROT13"}"#),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::BAD_REQUEST);
+
+    // Turn it off again.
+    let resp = h
+        .svc
+        .handle(
+            &Method::PUT,
+            "/buckets/enc/encryption",
+            &[],
+            Some(&a),
+            Bytes::from_static(br#"{"algorithm":"none"}"#),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::NO_CONTENT);
+    let resp = h
+        .svc
+        .handle(
+            &Method::GET,
+            "/buckets/enc/config",
+            &[],
+            Some(&a),
+            Bytes::new(),
+        )
+        .await;
+    assert!(json(&resp)["encryption"].is_null());
+}
+
+#[tokio::test]
+async fn list_objects_with_delimiter_folds_folders() {
+    let h = harness();
+    let a = admin();
+    h.svc
+        .handle(
+            &Method::POST,
+            "/buckets",
+            &[],
+            Some(&a),
+            Bytes::from_static(br#"{"name":"tree"}"#),
+        )
+        .await;
+    put_object(&h, "tree", "docs/a.txt", b"a").await;
+    put_object(&h, "tree", "docs/b.txt", b"b").await;
+    put_object(&h, "tree", "img/c.png", b"c").await;
+    put_object(&h, "tree", "root.txt", b"r").await;
+
+    let resp = h
+        .svc
+        .handle(
+            &Method::GET,
+            "/buckets/tree/objects",
+            &[("delimiter".to_owned(), "/".to_owned())],
+            Some(&a),
+            Bytes::new(),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::OK);
+    let v = json(&resp);
+    let prefixes: Vec<&str> = v["common_prefixes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p.as_str().unwrap())
+        .collect();
+    assert_eq!(prefixes, vec!["docs/", "img/"]);
+    let keys: Vec<&str> = v["objects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["key"].as_str().unwrap())
+        .collect();
+    assert_eq!(keys, vec!["root.txt"]);
+
+    // Drilling into a folder: prefix + delimiter lists only that level.
+    let resp = h
+        .svc
+        .handle(
+            &Method::GET,
+            "/buckets/tree/objects",
+            &[
+                ("prefix".to_owned(), "docs/".to_owned()),
+                ("delimiter".to_owned(), "/".to_owned()),
+            ],
+            Some(&a),
+            Bytes::new(),
+        )
+        .await;
+    let v = json(&resp);
+    let keys: Vec<&str> = v["objects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["key"].as_str().unwrap())
+        .collect();
+    assert_eq!(keys, vec!["docs/a.txt", "docs/b.txt"]);
+    assert!(v["common_prefixes"].as_array().unwrap().is_empty());
+}

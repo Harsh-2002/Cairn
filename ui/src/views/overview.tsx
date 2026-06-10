@@ -6,7 +6,7 @@ import { useMemo } from "react";
 import { NavLink, useNavigate } from "react-router";
 import { Database, RotateCw } from "lucide-react";
 import { api } from "@/lib/api";
-import { bytes, count, duration, ratio } from "@/lib/format";
+import { bytes, count, duration, ratio, whenMs } from "@/lib/format";
 import { useResource } from "@/lib/use-resource";
 import { EmptyState } from "@/components/empty-state";
 import { Page, PageHeader } from "@/components/page-header";
@@ -29,13 +29,18 @@ export function Overview() {
 
   const { data, error, loading, refreshing, refresh } = useResource(
     () =>
-      Promise.all([api.overview(), api.overviewBuckets(), api.system()]).then(
-        ([overview, perBucket, system]) => ({
-          overview,
-          perBucket: perBucket.buckets,
-          system,
-        }),
-      ),
+      Promise.all([
+        api.overview(),
+        api.overviewBuckets(),
+        api.system(),
+        // The activity teaser is decoration — its failure never fails the page.
+        api.activity(6).catch(() => null),
+      ]).then(([overview, perBucket, system, activity]) => ({
+        overview,
+        perBucket: perBucket.buckets,
+        system,
+        activity: activity?.entries ?? [],
+      })),
     [],
   );
 
@@ -321,6 +326,58 @@ export function Overview() {
               )}
             </CardContent>
           </Card>
+
+          {/* Recent activity teaser: the latest administrative changes, with
+              the full log one click away. */}
+          {data && data.activity.length > 0 ? (
+            <Card className="gap-3 rounded-lg shadow-none">
+              <CardHeader className="flex-row items-baseline justify-between">
+                <div>
+                  <CardTitle>Recent activity</CardTitle>
+                  <CardDescription className="mt-1">
+                    The latest administrative changes on this node.
+                  </CardDescription>
+                </div>
+                <NavLink
+                  to="/activity"
+                  className="shrink-0 text-[13px] text-link hover:underline underline-offset-4"
+                >
+                  View all
+                </NavLink>
+              </CardHeader>
+              <CardContent>
+                <ul className="divide-y">
+                  {data.activity.map((e, i) => (
+                    <li
+                      key={`${e.at_ms}:${e.action}:${i}`}
+                      className="flex flex-wrap items-baseline gap-x-3 gap-y-0.5 py-2 first:pt-0 last:pb-0"
+                    >
+                      <span className="text-sm font-medium">{e.action}</span>
+                      {e.bucket ? (
+                        <NavLink
+                          to={`/buckets/${encodeURIComponent(e.bucket)}/browser`}
+                          className="font-mono text-[13px] text-link hover:underline underline-offset-4"
+                        >
+                          {e.bucket}
+                        </NavLink>
+                      ) : null}
+                      {e.key ? (
+                        <span
+                          className="max-w-[24ch] truncate font-mono text-[13px] text-muted-foreground"
+                          title={e.key}
+                        >
+                          {e.key}
+                        </span>
+                      ) : null}
+                      <span className="ms-auto text-[13px] text-muted-foreground tabular-nums">
+                        {whenMs(e.at_ms)}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              </CardContent>
+            </Card>
+          ) : null}
         </div>
       ) : null}
     </Page>

@@ -35,7 +35,7 @@ import { EmptyState } from "@/components/empty-state";
 import { Page, PageHeader } from "@/components/page-header";
 import { TypedConfirmDialog } from "@/components/typed-confirm-dialog";
 import { api, ApiError, errorMessage } from "@/lib/api";
-import { whenMs } from "@/lib/format";
+import { bytes, count, whenMs } from "@/lib/format";
 import { useResource } from "@/lib/use-resource";
 
 const NAME_RULE =
@@ -54,7 +54,18 @@ function nameIssue(name: string): string | null {
 
 export function Buckets() {
   const navigate = useNavigate();
-  const list = useResource(() => api.listBuckets(), []);
+  // The list plus per-bucket usage (objects + bytes) in one refreshable unit;
+  // usage failing alone degrades to em-dashes rather than failing the page.
+  const list = useResource(async () => {
+    const [l, usage] = await Promise.all([
+      api.listBuckets(),
+      api.overviewBuckets().catch(() => null),
+    ]);
+    return {
+      buckets: l.buckets,
+      usage: new Map((usage?.buckets ?? []).map((u) => [u.name, u])),
+    };
+  }, []);
   const buckets = list.data?.buckets ?? [];
 
   // ---- create dialog -------------------------------------------------------
@@ -141,10 +152,16 @@ export function Buckets() {
 
       {list.loading ? (
         <div className="overflow-x-auto rounded-lg border">
-          <Table className="min-w-[560px]">
+          <Table className="min-w-[720px]">
             <TableHeader>
               <TableRow>
                 <TableHead className="text-xs text-muted-foreground">Name</TableHead>
+                <TableHead className="text-right text-xs text-muted-foreground">
+                  Objects
+                </TableHead>
+                <TableHead className="text-right text-xs text-muted-foreground">
+                  Size
+                </TableHead>
                 <TableHead className="text-xs text-muted-foreground">Versioning</TableHead>
                 <TableHead className="text-xs text-muted-foreground">Created</TableHead>
                 <TableHead>
@@ -157,6 +174,12 @@ export function Buckets() {
                 <TableRow key={i}>
                   <TableCell>
                     <Skeleton className="h-4 w-32" />
+                  </TableCell>
+                  <TableCell>
+                    <Skeleton className="ml-auto h-4 w-10" />
+                  </TableCell>
+                  <TableCell>
+                    <Skeleton className="ml-auto h-4 w-16" />
                   </TableCell>
                   <TableCell>
                     <Skeleton className="h-4 w-20" />
@@ -181,10 +204,16 @@ export function Buckets() {
         />
       ) : (
         <div className="overflow-x-auto rounded-lg border">
-          <Table className="min-w-[560px]">
+          <Table className="min-w-[720px]">
             <TableHeader>
               <TableRow>
                 <TableHead className="text-xs text-muted-foreground">Name</TableHead>
+                <TableHead className="text-right text-xs text-muted-foreground">
+                  Objects
+                </TableHead>
+                <TableHead className="text-right text-xs text-muted-foreground">
+                  Size
+                </TableHead>
                 <TableHead className="text-xs text-muted-foreground">Versioning</TableHead>
                 <TableHead className="text-xs text-muted-foreground">Created</TableHead>
                 <TableHead>
@@ -202,6 +231,12 @@ export function Buckets() {
                     >
                       {b.name}
                     </NavLink>
+                  </TableCell>
+                  <TableCell className="text-right text-[13px] tabular-nums">
+                    {count(list.data?.usage.get(b.name)?.objects ?? null)}
+                  </TableCell>
+                  <TableCell className="text-right text-[13px] tabular-nums">
+                    {bytes(list.data?.usage.get(b.name)?.logical_bytes ?? null)}
                   </TableCell>
                   <TableCell>
                     <Badge variant="outline">{b.versioning}</Badge>

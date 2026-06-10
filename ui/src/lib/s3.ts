@@ -21,13 +21,12 @@ export async function putObject(
   bucket: string,
   key: string,
   file: File,
-  { encrypt = false }: { encrypt?: boolean } = {},
 ): Promise<void> {
+  // Encryption is a bucket setting, not an upload option: the server applies
+  // the bucket's default SSE-S3 configuration to every header-less upload.
   const headers = s3headers({
     "Content-Type": file.type || "application/octet-stream",
   });
-  // Server-side encryption (SSE-S3): the server generates and manages the key.
-  if (encrypt) headers["x-amz-server-side-encryption"] = "AES256";
   const res = await fetch(objectPath(bucket, key), {
     method: "PUT",
     headers,

@@ -52,6 +52,9 @@ pub enum ConfigAspect {
     Tagging,
     /// The bucket-level Block Public Access settings.
     PublicAccessBlock,
+    /// The default server-side-encryption setting (SSE-S3 applied to new uploads
+    /// that do not carry their own `x-amz-server-side-encryption` header).
+    Encryption,
 }
 
 /// An opaque validated configuration document (stored as text/JSON). The typed parse lives

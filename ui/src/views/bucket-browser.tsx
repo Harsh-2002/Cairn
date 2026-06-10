@@ -5,12 +5,14 @@ import {
   useRef,
   useState,
   type ChangeEvent,
+  type DragEvent,
 } from "react";
 import { useParams } from "react-router";
 import {
   Check,
   CircleAlert,
   FileBox,
+  Folder,
   Loader2,
   MoreHorizontal,
   RotateCw,
@@ -20,7 +22,6 @@ import {
 import { toast } from "sonner";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
-import { Checkbox } from "@/components/ui/checkbox";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -64,47 +65,59 @@ export function BucketBrowser() {
   // :name comes from the parent /buckets/:name layout route.
   const { name = "" } = useParams<{ name: string }>();
 
-  const prefixId = useId();
-  const encryptId = useId();
-  const encryptHelpId = useId();
+  const filterId = useId();
 
-  // ---- listing (manual state: pages accumulate, refresh keeps stale rows) ----
-  const [prefixInput, setPrefixInput] = useState("");
-  const [prefix, setPrefix] = useState("");
+  // ---- listing -----------------------------------------------------------------
+  // `path` is the current folder ("" at the root, always "/"-terminated below);
+  // `filter` narrows within it. The effective listing prefix is path + filter,
+  // always folded at "/" so key groups render as folders.
+  const [path, setPath] = useState("");
+  const [filterInput, setFilterInput] = useState("");
+  const [filter, setFilter] = useState("");
   const [objects, setObjects] = useState<ObjectEntry[] | null>(null);
+  const [folders, setFolders] = useState<string[]>([]);
   const [next, setNext] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Stale-response guard: any new load (or a bucket/prefix change) bumps the
+  // Stale-response guard: any new load (or a bucket/path change) bumps the
   // ticket so an older in-flight response can't clobber newer state.
   const seqRef = useRef(0);
 
   // Switching buckets resets the whole browser.
   useEffect(() => {
-    setPrefixInput("");
-    setPrefix("");
+    setPath("");
+    setFilterInput("");
+    setFilter("");
     setObjects(null);
+    setFolders([]);
     setNext(null);
     setError(null);
     setUploads([]);
   }, [name]);
 
-  // Debounce the prefix filter; changing it resets paging via load().
+  // Debounce the filter; changing it resets paging via load().
   useEffect(() => {
-    const t = setTimeout(() => setPrefix(prefixInput), 300);
+    const t = setTimeout(() => setFilter(filterInput), 300);
     return () => clearTimeout(t);
-  }, [prefixInput]);
+  }, [filterInput]);
+
+  const listPrefix = path + filter;
 
   const load = useCallback(async () => {
     const ticket = ++seqRef.current;
     setError(null);
     setRefreshing(true);
     try {
-      const res = await api.listObjects(name, { prefix, limit: 100 });
+      const res = await api.listObjects(name, {
+        prefix: listPrefix,
+        delimiter: "/",
+        limit: 100,
+      });
       if (ticket !== seqRef.current) return;
       setObjects(res.objects ?? []);
+      setFolders(res.common_prefixes ?? []);
       setNext(res.next ?? null);
     } catch (e) {
       if (ticket !== seqRef.current) return;
@@ -112,7 +125,7 @@ export function BucketBrowser() {
     } finally {
       if (ticket === seqRef.current) setRefreshing(false);
     }
-  }, [name, prefix]);
+  }, [name, listPrefix]);
 
   useEffect(() => {
     void load();
@@ -124,9 +137,15 @@ export function BucketBrowser() {
     setLoadingMore(true);
     setError(null);
     try {
-      const res = await api.listObjects(name, { prefix, limit: 100, cursor: next });
+      const res = await api.listObjects(name, {
+        prefix: listPrefix,
+        delimiter: "/",
+        limit: 100,
+        cursor: next,
+      });
       if (ticket !== seqRef.current) return;
       setObjects((cur) => [...(cur ?? []), ...(res.objects ?? [])]);
+      setFolders((cur) => [...new Set([...cur, ...(res.common_prefixes ?? [])])]);
       setNext(res.next ?? null);
     } catch (e) {
       if (ticket === seqRef.current)
@@ -136,48 +155,77 @@ export function BucketBrowser() {
     }
   }
 
-  // ---- uploads ---------------------------------------------------------------
-  const fileInputRef = useRef<HTMLInputElement>(null);
-  const [encrypt, setEncrypt] = useState(false);
-  const [uploads, setUploads] = useState<UploadItem[]>([]);
-  const [uploading, setUploading] = useState(false);
-
-  async function onFilesPicked(e: ChangeEvent<HTMLInputElement>) {
-    const files = Array.from(e.target.files ?? []);
-    e.target.value = ""; // allow re-picking the same file later
-    if (files.length === 0) return;
-    setUploading(true);
-    setUploads(files.map((f) => ({ name: f.name, status: "uploading" as const })));
-    let okCount = 0;
-    for (const [i, f] of files.entries()) {
-      try {
-        await putObject(name, f.name, f, { encrypt });
-        okCount++;
-        setUploads((u) =>
-          u.map((x, j) => (j === i ? { ...x, status: "done" as const } : x)),
-        );
-      } catch (err) {
-        setUploads((u) =>
-          u.map((x, j) =>
-            j === i
-              ? {
-                  ...x,
-                  status: "failed" as const,
-                  message: errorMessage(err, "Upload failed."),
-                }
-              : x,
-          ),
-        );
-      }
-    }
-    setUploading(false);
-    if (okCount > 0) {
-      toast.success(`${okCount} file(s) uploaded`);
-      void load();
-    }
+  function enterFolder(prefix: string) {
+    setPath(prefix);
+    setFilterInput("");
+    setFilter("");
   }
 
-  // ---- per-object actions ------------------------------------------------------
+  // Breadcrumb segments for the current path ("docs/sub/" → ["docs", "sub"]).
+  const segments = path.split("/").filter(Boolean);
+
+  // ---- uploads -------------------------------------------------------------------
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [uploads, setUploads] = useState<UploadItem[]>([]);
+  const [uploading, setUploading] = useState(false);
+  const [dragOver, setDragOver] = useState(false);
+  // Counter-based drag tracking: child enter/leave events would flicker a boolean.
+  const dragDepth = useRef(0);
+
+  const uploadFiles = useCallback(
+    async (files: File[]) => {
+      if (files.length === 0 || uploading) return;
+      setUploading(true);
+      setUploads(
+        files.map((f) => ({ name: path + f.name, status: "uploading" as const })),
+      );
+      let okCount = 0;
+      for (const [i, f] of files.entries()) {
+        try {
+          // Uploads land in the folder being viewed. Encryption is the
+          // bucket's default-SSE setting — no per-upload choice.
+          await putObject(name, path + f.name, f);
+          okCount++;
+          setUploads((u) =>
+            u.map((x, j) => (j === i ? { ...x, status: "done" as const } : x)),
+          );
+        } catch (err) {
+          setUploads((u) =>
+            u.map((x, j) =>
+              j === i
+                ? {
+                    ...x,
+                    status: "failed" as const,
+                    message: errorMessage(err, "Upload failed."),
+                  }
+                : x,
+            ),
+          );
+        }
+      }
+      setUploading(false);
+      if (okCount > 0) {
+        toast.success(`${okCount} file${okCount === 1 ? "" : "s"} uploaded`);
+        void load();
+      }
+    },
+    [name, path, uploading, load],
+  );
+
+  function onFilesPicked(e: ChangeEvent<HTMLInputElement>) {
+    const files = Array.from(e.target.files ?? []);
+    e.target.value = ""; // allow re-picking the same file later
+    void uploadFiles(files);
+  }
+
+  function onDrop(e: DragEvent) {
+    e.preventDefault();
+    dragDepth.current = 0;
+    setDragOver(false);
+    void uploadFiles(Array.from(e.dataTransfer.files ?? []));
+  }
+
+  // ---- per-object actions ----------------------------------------------------------
   const [previewKey, setPreviewKey] = useState<string | null>(null);
   const [shareKey, setShareKey] = useState<string | null>(null);
   const [pendingDelete, setPendingDelete] = useState<string | null>(null);
@@ -216,28 +264,45 @@ export function BucketBrowser() {
   }
 
   const showSkeleton = objects === null && !error;
-  const showEmpty = objects !== null && objects.length === 0;
+  const showEmpty =
+    objects !== null && objects.length === 0 && folders.length === 0;
 
   return (
-    <div className="space-y-4">
-      {/* Toolbar: filter + refresh on the left, upload controls on the right. */}
+    <div
+      className="space-y-4"
+      onDragEnter={(e) => {
+        if (!e.dataTransfer.types.includes("Files")) return;
+        e.preventDefault();
+        dragDepth.current++;
+        setDragOver(true);
+      }}
+      onDragOver={(e) => {
+        if (e.dataTransfer.types.includes("Files")) e.preventDefault();
+      }}
+      onDragLeave={() => {
+        dragDepth.current = Math.max(0, dragDepth.current - 1);
+        if (dragDepth.current === 0) setDragOver(false);
+      }}
+      onDrop={onDrop}
+    >
+      {/* Toolbar: filter + refresh on the left, upload on the right. */}
       <div className="flex flex-wrap items-center gap-x-3 gap-y-3">
         <div className="relative">
           <Search
             aria-hidden="true"
             className="pointer-events-none absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground"
           />
-          <label className="visually-hidden" htmlFor={prefixId}>
-            Filter objects by key prefix
+          <label className="visually-hidden" htmlFor={filterId}>
+            Filter this folder by name prefix
           </label>
           <Input
-            id={prefixId}
-            value={prefixInput}
-            placeholder="Filter by prefix"
+            id={filterId}
+            value={filterInput}
+            placeholder="Filter this folder"
             autoComplete="off"
             spellCheck={false}
             className="w-56 pl-8 font-mono text-[13px]"
-            onChange={(e) => setPrefixInput(e.target.value)}
+            onChange={(e) => setFilterInput(e.target.value)}
           />
         </div>
         <Button
@@ -250,24 +315,10 @@ export function BucketBrowser() {
           Refresh
         </Button>
 
-        <div className="ms-auto flex flex-wrap items-center gap-x-4 gap-y-2">
-          <div className="flex items-start gap-2">
-            <Checkbox
-              id={encryptId}
-              checked={encrypt}
-              aria-describedby={encryptHelpId}
-              className="mt-0.5"
-              onCheckedChange={(v) => setEncrypt(v === true)}
-            />
-            <div className="leading-tight">
-              <label htmlFor={encryptId} className="text-sm font-medium">
-                Encrypt at rest (SSE-S3)
-              </label>
-              <p id={encryptHelpId} className="text-[13px] text-muted-foreground">
-                AES-256, managed by the server
-              </p>
-            </div>
-          </div>
+        <div className="ms-auto flex items-center gap-3">
+          <p className="hidden text-[13px] text-muted-foreground sm:block">
+            or drag files anywhere here
+          </p>
           <input
             ref={fileInputRef}
             type="file"
@@ -275,7 +326,7 @@ export function BucketBrowser() {
             className="hidden"
             tabIndex={-1}
             aria-hidden="true"
-            onChange={(e) => void onFilesPicked(e)}
+            onChange={onFilesPicked}
           />
           <Button
             type="button"
@@ -287,6 +338,47 @@ export function BucketBrowser() {
           </Button>
         </div>
       </div>
+
+      {/* Folder breadcrumb: the bucket root plus each path segment. */}
+      <nav aria-label="Folder path" className="flex flex-wrap items-center gap-1 text-[13px]">
+        <button
+          type="button"
+          onClick={() => enterFolder("")}
+          className={cn(
+            "rounded px-1.5 py-0.5 font-mono",
+            path === ""
+              ? "font-medium text-foreground"
+              : "text-link hover:underline underline-offset-4",
+          )}
+          aria-current={path === "" ? "location" : undefined}
+        >
+          {name}
+        </button>
+        {segments.map((seg, i) => {
+          const target = `${segments.slice(0, i + 1).join("/")}/`;
+          const isLast = i === segments.length - 1;
+          return (
+            <span key={target} className="flex items-center gap-1">
+              <span aria-hidden="true" className="text-muted-foreground">
+                /
+              </span>
+              <button
+                type="button"
+                onClick={() => enterFolder(target)}
+                className={cn(
+                  "rounded px-1 py-0.5 font-mono",
+                  isLast
+                    ? "font-medium text-foreground"
+                    : "text-link hover:underline underline-offset-4",
+                )}
+                aria-current={isLast ? "location" : undefined}
+              >
+                {seg}
+              </button>
+            </span>
+          );
+        })}
+      </nav>
 
       {/* Per-file upload progress for the current batch. */}
       {uploads.length > 0 ? (
@@ -344,7 +436,7 @@ export function BucketBrowser() {
           <Table className="min-w-[640px]">
             <TableHeader>
               <TableRow>
-                <TableHead className="text-xs text-muted-foreground">Key</TableHead>
+                <TableHead className="text-xs text-muted-foreground">Name</TableHead>
                 <TableHead className="text-right text-xs text-muted-foreground">Size</TableHead>
                 <TableHead className="text-xs text-muted-foreground">Modified</TableHead>
                 <TableHead>
@@ -373,26 +465,31 @@ export function BucketBrowser() {
           </Table>
         </div>
       ) : showEmpty ? (
-        prefix ? (
+        filter ? (
           <EmptyState
             icon={Search}
-            title="No objects match this prefix"
-            body="Clear the filter to see everything in this bucket."
+            title="Nothing matches this filter"
+            body="Clear the filter to see everything in this folder."
           />
         ) : (
           <EmptyState
             icon={FileBox}
-            title="No objects yet"
-            body="Upload your first files to this bucket."
+            title={path ? "This folder is empty" : "No objects yet"}
+            body="Upload files with the button above, or drop them anywhere on this page."
           />
         )
       ) : objects !== null ? (
         <>
-          <div className="overflow-x-auto rounded-lg border">
+          <div
+            className={cn(
+              "overflow-x-auto rounded-lg border transition-colors",
+              dragOver && "border-ring bg-muted/60",
+            )}
+          >
             <Table className="min-w-[640px]">
               <TableHeader>
                 <TableRow>
-                  <TableHead className="text-xs text-muted-foreground">Key</TableHead>
+                  <TableHead className="text-xs text-muted-foreground">Name</TableHead>
                   <TableHead className="text-right text-xs text-muted-foreground">Size</TableHead>
                   <TableHead className="text-xs text-muted-foreground">Modified</TableHead>
                   <TableHead>
@@ -401,6 +498,24 @@ export function BucketBrowser() {
                 </TableRow>
               </TableHeader>
               <TableBody>
+                {folders.map((f) => (
+                  <TableRow key={f}>
+                    <TableCell colSpan={3}>
+                      <button
+                        type="button"
+                        onClick={() => enterFolder(f)}
+                        className="flex items-center gap-2 font-mono text-[13px] text-foreground hover:underline underline-offset-4"
+                      >
+                        <Folder
+                          aria-hidden="true"
+                          className="size-4 shrink-0 text-muted-foreground"
+                        />
+                        {f.slice(path.length)}
+                      </button>
+                    </TableCell>
+                    <TableCell />
+                  </TableRow>
+                ))}
                 {objects.map((o) => (
                   <TableRow key={o.key}>
                     <TableCell className="max-w-[28rem]">
@@ -408,7 +523,7 @@ export function BucketBrowser() {
                         className="block truncate font-mono text-[13px]"
                         title={o.key}
                       >
-                        {o.key}
+                        {o.key.slice(path.length) || o.key}
                       </span>
                     </TableCell>
                     <TableCell className="text-right text-[13px] tabular-nums">

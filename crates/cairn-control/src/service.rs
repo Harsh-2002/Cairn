@@ -177,6 +177,9 @@ impl ControlService {
             (&Method::PUT, ["buckets", name, "compression"]) => {
                 self.set_compression(name, &body).await
             }
+            (&Method::PUT, ["buckets", name, "encryption"]) => {
+                self.set_encryption(name, &body).await
+            }
             (&Method::PUT, ["buckets", name, "policy"]) => self.set_policy(name, &body).await,
             (&Method::DELETE, ["buckets", name, "policy"]) => self.delete_policy(name).await,
 
@@ -498,9 +501,14 @@ impl ControlService {
             .and_then(|v| v.parse::<u32>().ok())
             .map_or(PAGE_LIMIT, |v| v.clamp(1, PAGE_LIMIT));
         let cursor = find_query(query, "cursor").map(str::to_owned);
+        // A delimiter folds keys into common prefixes ("folders"), exactly like S3 listing.
+        let delimiter = find_query(query, "delimiter")
+            .filter(|d| !d.is_empty())
+            .map(str::to_owned);
 
         let list_query = ListQuery {
             prefix,
+            delimiter,
             cursor,
             limit,
             ..Default::default()
@@ -525,6 +533,7 @@ impl ControlService {
             StatusCode::OK,
             &wire::ObjectListResp {
                 objects,
+                common_prefixes: page.common_prefixes,
                 next: page.next_cursor,
             },
         )
@@ -549,7 +558,7 @@ impl ControlService {
 
         // Each aspect is an opaque stored document; surface it as parsed JSON so the UI can
         // render it, falling back to a JSON string if it is not itself JSON.
-        let (policy, cors, tagging, lifecycle, acl, public_access_block) =
+        let (policy, cors, tagging, lifecycle, acl, public_access_block, encryption) =
             match self.read_aspects(&bucket_name).await {
                 Ok(aspects) => aspects,
                 Err(e) => return ControlResponse::error_internal(&e),
@@ -574,11 +583,12 @@ impl ControlService {
                 lifecycle,
                 acl,
                 public_access_block,
+                encryption,
             },
         )
     }
 
-    /// Read the six exposed config aspects of a bucket, each rendered as JSON (or `None` when
+    /// Read the seven exposed config aspects of a bucket, each rendered as JSON (or `None` when
     /// unset). Returns the documents in the response's declared order, or an error string on a
     /// store failure.
     #[allow(clippy::type_complexity)]
@@ -587,6 +597,7 @@ impl ControlService {
         bucket: &BucketName,
     ) -> Result<
         (
+            Option<serde_json::Value>,
             Option<serde_json::Value>,
             Option<serde_json::Value>,
             Option<serde_json::Value>,
@@ -610,6 +621,7 @@ impl ControlService {
             read(ConfigAspect::Lifecycle).await?,
             read(ConfigAspect::Acl).await?,
             read(ConfigAspect::PublicAccessBlock).await?,
+            read(ConfigAspect::Encryption).await?,
         ))
     }
 
@@ -725,6 +737,46 @@ impl ControlService {
         }
 
         self.record_activity("SetBucketCompression", Some(bucket_name.as_str()), None)
+            .await;
+        ControlResponse::no_content()
+    }
+
+    /// `PUT /buckets/{name}/encryption`: set or clear the bucket's default server-side encryption.
+    /// `"AES256"` makes every new upload SSE-S3-encrypted (unless the request carries its own
+    /// `x-amz-server-side-encryption` header); `"none"` returns to unencrypted-by-default.
+    /// Existing objects are never rewritten.
+    async fn set_encryption(&self, name: &str, body: &Bytes) -> ControlResponse {
+        let bucket_name = match self.require_bucket(name).await {
+            Ok(n) => n,
+            Err(resp) => return resp,
+        };
+        let req: wire::SetEncryptionReq = match serde_json::from_slice(body) {
+            Ok(r) => r,
+            Err(e) => return ControlResponse::bad_request(&e.to_string()),
+        };
+        let doc = match req.algorithm.to_ascii_uppercase().as_str() {
+            "NONE" | "OFF" | "" => None,
+            "AES256" => Some(ConfigDoc(r#"{"algorithm":"AES256"}"#.to_owned())),
+            other => {
+                return ControlResponse::bad_request(&format!(
+                    "unknown algorithm {other:?} (expected AES256|none)"
+                ));
+            }
+        };
+
+        if let Err(e) = self
+            .meta
+            .submit(Mutation::SetBucketConfig {
+                bucket: bucket_name.clone(),
+                aspect: ConfigAspect::Encryption,
+                doc,
+            })
+            .await
+        {
+            return ControlResponse::error_internal(&e.to_string());
+        }
+
+        self.record_activity("SetBucketEncryption", Some(bucket_name.as_str()), None)
             .await;
         ControlResponse::no_content()
     }

@@ -173,12 +173,20 @@ export const api = {
     name: string,
     {
       prefix = "",
+      delimiter = "",
       limit = 100,
       cursor = "",
-    }: { prefix?: string; limit?: number; cursor?: string } = {},
+    }: {
+      prefix?: string;
+      delimiter?: string;
+      limit?: number;
+      cursor?: string;
+    } = {},
   ) => {
     const q = new URLSearchParams();
     if (prefix) q.set("prefix", prefix);
+    // A delimiter folds keys into common prefixes ("folders"), like S3 listing.
+    if (delimiter) q.set("delimiter", delimiter);
     if (limit) q.set("limit", String(limit));
     // Continuation cursor returned as `next` by a prior page; omitted on the first page.
     if (cursor) q.set("cursor", cursor);
@@ -210,6 +218,9 @@ export const api = {
       algorithm,
       block_size,
     }),
+  // Default server-side encryption for new uploads. algorithm: "AES256" | "none".
+  setEncryption: (name: string, algorithm: string) =>
+    request<null>("PUT", `/buckets/${enc(name)}/encryption`, { algorithm }),
   // The policy body is a raw policy JSON document sent verbatim.
   setPolicy: (name: string, rawBody: string) =>
     requestRaw<null>("PUT", `/buckets/${enc(name)}/policy`, rawBody),

@@ -794,6 +794,7 @@ fn config_aspect_str(a: cairn_types::bucket::ConfigAspect) -> &'static str {
         Replication => "replication",
         Tagging => "tagging",
         PublicAccessBlock => "public_access_block",
+        Encryption => "encryption",
     }
 }
 

@@ -40,21 +40,21 @@ export function BucketDetail() {
 
       <h1 className="mb-5 font-mono text-xl font-semibold tracking-tight">{name}</h1>
 
+      {/* The component's "line" variant IS the underline style — it carries the
+          active-tab indicator and the dark-mode handling, so no per-trigger
+          border overrides (which fought the pill variant and left stray boxes). */}
       <Tabs
         value={tab}
         onValueChange={(v) => navigate(`/buckets/${encodeURIComponent(name)}/${v}`)}
       >
-        <TabsList className="h-auto! w-full justify-start gap-4 rounded-none border-b bg-transparent p-0">
-          <TabsTrigger
-            value="browser"
-            className="flex-none rounded-none border-b-2 border-transparent px-1 pb-2.5 pt-1 text-sm data-[state=active]:border-foreground data-[state=active]:bg-transparent data-[state=active]:shadow-none"
-          >
+        <TabsList
+          variant="line"
+          className="h-auto! w-full justify-start border-b p-0 pb-1"
+        >
+          <TabsTrigger value="browser" className="flex-none px-2.5 py-1.5">
             Browser
           </TabsTrigger>
-          <TabsTrigger
-            value="settings"
-            className="flex-none rounded-none border-b-2 border-transparent px-1 pb-2.5 pt-1 text-sm data-[state=active]:border-foreground data-[state=active]:bg-transparent data-[state=active]:shadow-none"
-          >
+          <TabsTrigger value="settings" className="flex-none px-2.5 py-1.5">
             Settings
           </TabsTrigger>
         </TabsList>

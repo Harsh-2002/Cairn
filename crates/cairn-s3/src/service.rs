@@ -453,14 +453,18 @@ impl S3Service {
         // SSE-S3 (ARCH §27): when the client requests AES256 server-side encryption, mint a fresh
         // random DEK, hand it to the blob store (which compress-then-encrypts each block), and seal
         // it under the master key for the metadata row. The plaintext-MD5 ETag is unaffected
-        // because the blob store hashes the plaintext before any transform.
-        let (sse_dek, sse_descriptor) = match requested_sse(&req) {
-            Some(Ok(())) => {
-                let (dek, descriptor) = self.new_sse_dek()?;
-                (Some(dek), Some(descriptor))
-            }
+        // because the blob store hashes the plaintext before any transform. Without a header, the
+        // bucket's default-encryption setting (the `encryption` config aspect) decides.
+        let want_sse = match requested_sse(&req) {
+            Some(Ok(())) => true,
             Some(Err(e)) => return Err(e),
-            None => (None, None),
+            None => self.bucket_default_sse(&bucket.name).await?,
+        };
+        let (sse_dek, sse_descriptor) = if want_sse {
+            let (dek, descriptor) = self.new_sse_dek()?;
+            (Some(dek), Some(descriptor))
+        } else {
+            (None, None)
         };
 
         let opts = StageOptions {
@@ -2302,6 +2306,26 @@ fn requested_sse(req: &S3Request) -> Option<Result<()>> {
 }
 
 impl S3Service {
+    /// Whether the bucket has default server-side encryption configured (the `encryption` config
+    /// aspect with algorithm AES256). A malformed stored document counts as "off" rather than
+    /// failing the upload — the setting is operator-managed and validated on write.
+    async fn bucket_default_sse(&self, bucket: &BucketName) -> Result<bool> {
+        let doc = self
+            .meta
+            .get_bucket_config(bucket, ConfigAspect::Encryption)
+            .await?;
+        Ok(doc.is_some_and(|d| {
+            serde_json::from_str::<serde_json::Value>(&d.0)
+                .ok()
+                .and_then(|v| {
+                    v.get("algorithm")
+                        .and_then(|a| a.as_str())
+                        .map(|a| a.eq_ignore_ascii_case(SSE_AES256))
+                })
+                .unwrap_or(false)
+        }))
+    }
+
     /// Generate a fresh random 32-byte DEK, seal it under the master key, and return both the raw
     /// DEK (for staging) and the JSON descriptor string (for the metadata row).
     fn new_sse_dek(&self) -> Result<([u8; 32], String)> {
