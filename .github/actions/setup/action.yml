@@ -1,5 +1,5 @@
 name: setup
-description: Build the embedded Svelte UI (ui/dist) and set up the Rust toolchain. No caching.
+description: Build the embedded React UI (ui/dist) and set up the Rust toolchain. No caching.
 
 inputs:
   targets:
@@ -17,7 +17,8 @@ runs:
     - name: Set up Node
       uses: actions/setup-node@v4
       with:
-        node-version: "20"
+        # Vite 8 requires Node >= 20.19; 22 LTS gives headroom.
+        node-version: "22"
     # The server binary embeds ui/dist via rust-embed, so the real UI must be built before any Rust
     # compile. (A build.rs scaffolds a placeholder so `cargo build` never *fails* without this, but
     # the UI tests and shipped binaries need the real bundle.)

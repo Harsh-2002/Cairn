@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <!-- The Cairn mark: a quiet stack of three stones, monochrome in both themes. -->
+  <style>
+    rect { fill: #0a0a0a; }
+    @media (prefers-color-scheme: dark) { rect { fill: #ededed; } }
+  </style>
+  <rect x="11" y="4" width="10" height="7" rx="2" />
+  <rect x="8" y="13" width="16" height="7" rx="2" />
+  <rect x="5" y="22" width="22" height="7" rx="2" />
+</svg>

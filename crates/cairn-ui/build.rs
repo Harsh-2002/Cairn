@@ -1,5 +1,5 @@
 //! Guarantees the `rust_embed` folder (`ui/dist`) exists so the crate always *compiles*, even on a
-//! fresh checkout where the Svelte UI has not been built yet (`#[derive(RustEmbed)]` is a hard error
+//! fresh checkout where the web UI has not been built yet (`#[derive(RustEmbed)]` is a hard error
 //! if its `#[folder]` is missing — that is what broke every CI compile job).
 //!
 //! Behaviour:

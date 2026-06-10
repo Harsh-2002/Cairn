@@ -28,7 +28,7 @@ Part III (Sections 11 to 12) covers the metadata store and the internal abstract
 
 Part IV (Sections 13 to 21) is the S3 surface in full: the operation catalogue, authentication, the authorization model (bucket policy, ACL, Block Public Access, Object Ownership), versioning, tagging, CORS, lifecycle, bucket replication, and the end-to-end server-side request lifecycles that tie them together.
 
-Part V (Sections 22 to 24) is the control plane: the management API, the embedded Svelte web UI compiled into the binary, and the command-line interface.
+Part V (Sections 22 to 24) is the control plane: the management API, the embedded React web UI compiled into the binary, and the command-line interface.
 
 Part VI (Sections 25 to 28) covers cross-cutting concerns: the error model, observability and audit, the security and threat model, and the full configuration surface.
 
@@ -44,7 +44,7 @@ Cairn is a single-binary object storage server that speaks the Amazon S3 API wit
 
 Cairn is intended for production. The design goal is that a team running a single-node MinIO, or any single-drive or single-host S3 endpoint, can replace it with Cairn and gain a simpler operational model, a smaller and safer binary, transparent compression, an embedded management UI, and asynchronous bucket replication for redundancy, without losing S3 compatibility. Cairn does not attempt to be a distributed, erasure-coded, multi-node cluster; that is an explicit non-goal (Section 2). Its redundancy and geo-distribution story is asynchronous bucket replication between independent Cairn deployments (or to any S3-compatible destination), in the spirit of S3 Cross-Region Replication, rather than synchronous clustering. Within a node, durability rests on correct fsync ordering plus the operator's choice of resilient storage underneath (RAID, ZFS, or a cloud block device with its own redundancy).
 
-The feature surface is the full practical S3 control set: object operations (including multipart and ranged, conditional reads and writes, copy, and bulk delete), object versioning with delete markers, object and bucket tagging, per-bucket ACLs and bucket policies with a real policy-evaluation engine, Block Public Access and Object Ownership, per-bucket CORS configuration, per-bucket lifecycle rules with expiration and incomplete-multipart cleanup and optional transition to a remote cold tier, and per-bucket asynchronous replication. Control happens through a JSON management API that is consumed both by an embedded Svelte single-page application compiled directly into the server binary and by a first-class command-line interface, so an operator manages Cairn from a browser or a terminal with the same capabilities.
+The feature surface is the full practical S3 control set: object operations (including multipart and ranged, conditional reads and writes, copy, and bulk delete), object versioning with delete markers, object and bucket tagging, per-bucket ACLs and bucket policies with a real policy-evaluation engine, Block Public Access and Object Ownership, per-bucket CORS configuration, per-bucket lifecycle rules with expiration and incomplete-multipart cleanup and optional transition to a remote cold tier, and per-bucket asynchronous replication. Control happens through a JSON management API that is consumed both by an embedded React single-page application compiled directly into the server binary and by a first-class command-line interface, so an operator manages Cairn from a browser or a terminal with the same capabilities.
 
 The rewrite is in Rust for specific, defensible engineering reasons elaborated in Section 3: a storage data plane is dominated by disk and network I/O and by tail latency under concurrency, and Rust gives predictable, garbage-collector-free latency, precise control over buffers and copies, safe fearless concurrency for the read, replication, and lifecycle workers, and direct ergonomic access to the fastest kernel I/O primitives (io_uring, sendfile, splice, O_DIRECT, fallocate, fadvise). It is also a network-facing service that parses untrusted input (the SigV4 chunked-upload framing, S3 XML, policy JSON), where Rust's memory safety removes an entire category of remotely-triggerable vulnerabilities at no runtime cost.
 
@@ -74,7 +74,7 @@ The following are all in scope and specified in this document. Several were out 
 - **Lifecycle**: per-bucket rules for object expiration, noncurrent-version expiration, aborting incomplete multipart uploads, and optional transition of cold objects to a remote S3 tier.
 - **Bucket replication**: per-bucket asynchronous replication rules with prefix and tag filters, delete-marker replication, status tracking, and retries.
 - **Transparent compression at rest**: optional, per-bucket, range-friendly block compression that preserves S3 ETag semantics.
-- **Embedded Svelte management UI** and a **management CLI**, both over a common management API.
+- **Embedded React management UI** and a **management CLI**, both over a common management API.
 - **Native TLS** (in addition to running behind a terminating proxy), production observability (metrics, tracing, audit log), and a specified backup and restore procedure.
 
 ### 2.3 Non-goals (explicitly out)
@@ -219,7 +219,7 @@ This is the bridge from the baseline to the production system. Each finding stat
 
 **F-20 [LOW] Shutdown does not drain or checkpoint deterministically.** **Cairn:** ordered graceful shutdown that drains in-flight work, flushes the writer, checkpoints, and stops background tasks (Section 11, Section 31).
 
-**N-7 [MED] An embedded management UI and a CLI are required.** **Cairn:** a Svelte single-page application built and embedded into the binary at compile time and served by the server, plus a CLI, both over one management API (Sections 22 to 24).
+**N-7 [MED] An embedded management UI and a CLI are required.** **Cairn:** a React single-page application built and embedded into the binary at compile time and served by the server, plus a CLI, both over one management API (Sections 22 to 24).
 
 **N-8 [MED] Transparent compression at rest is required, without breaking S3 semantics or ranges.** **Cairn:** optional per-bucket block compression with a stored block index that keeps range reads efficient and preserves the plaintext-based ETag (Section 10).
 
@@ -699,11 +699,11 @@ The management API authenticates with the same credential mechanisms as the rest
 
 ### 23.1 What it is and how it ships
 
-The management UI is a single-page application built with the Svelte framework and its standard build toolchain, and it is compiled into the Cairn binary at build time so that a Cairn deployment is one binary that already contains its own management interface, with no separate UI service to deploy, host, or version-match. The built static assets, the markup, the script bundles, and the styles produced by the Svelte build are embedded into the binary through a compile-time asset-embedding mechanism that bakes the asset directory into the executable, and the server serves them from memory. This is the operator's stated requirement that the UI be installed and compiled into the binary itself and that management be possible through either the UI or the CLI, and it is satisfied by making the UI a build-time artifact of the same binary.
+The management UI is a single-page application built with the React framework and its standard build toolchain, and it is compiled into the Cairn binary at build time so that a Cairn deployment is one binary that already contains its own management interface, with no separate UI service to deploy, host, or version-match. The built static assets, the markup, the script bundles, and the styles produced by the UI build are embedded into the binary through a compile-time asset-embedding mechanism that bakes the asset directory into the executable, and the server serves them from memory. This is the operator's stated requirement that the UI be installed and compiled into the binary itself and that management be possible through either the UI or the CLI, and it is satisfied by making the UI a build-time artifact of the same binary.
 
 ### 23.2 The build pipeline
 
-Building Cairn with its UI is a two-stage process that the workspace orchestrates so that a normal release build produces a UI-containing binary. The first stage runs the Svelte toolchain to produce the optimised static asset bundle from the UI source. The second stage compiles the Rust binary with the asset-embedding step pulling that bundle into the executable. The orchestration caches the asset build so that Rust-only changes do not rebuild the UI and UI-only changes do not needlessly recompile unrelated Rust, which keeps the developer loop fast, and a build feature allows producing a binary without the embedded UI for cases that want a smaller artifact or a faster build, in which case the UI routes are simply absent. The result is reproducible: the same sources produce the same binary with the same embedded UI.
+Building Cairn with its UI is a two-stage process that the workspace orchestrates so that a normal release build produces a UI-containing binary. The first stage runs the Node toolchain to produce the optimised static asset bundle from the UI source. The second stage compiles the Rust binary with the asset-embedding step pulling that bundle into the executable. The orchestration caches the asset build so that Rust-only changes do not rebuild the UI and UI-only changes do not needlessly recompile unrelated Rust, which keeps the developer loop fast, and a build feature allows producing a binary without the embedded UI for cases that want a smaller artifact or a faster build, in which case the UI routes are simply absent. The result is reproducible: the same sources produce the same binary with the same embedded UI.
 
 ### 23.3 Serving and behaviour
 
@@ -955,7 +955,7 @@ Build in this order. Each phase lists its deliverable and the acceptance criteri
 
 **Phase 11, compression.** The per-bucket block compression with the self-describing blob format and the block index, range-friendly reads, the incompressibility heuristic, ETag invariance, and the logical-versus-physical accounting. Accepts when compressed round-trips are faithful, ranged reads against compressed blobs are correct, the heuristic avoids enlarging incompressible data, and the ETag is invariant to compression.
 
-**Phase 12, control plane.** The management API, the embedded Svelte UI built and compiled into the binary, and the CLI with its remote and node-local commands. Accepts when each management endpoint behaves to its contract and is administrator-gated, the binary serves the embedded UI and the UI performs the documented operations, and the CLI performs both remote administration and the local bootstrap, integrity, and backup operations.
+**Phase 12, control plane.** The management API, the embedded React UI built and compiled into the binary, and the CLI with its remote and node-local commands. Accepts when each management endpoint behaves to its contract and is administrator-gated, the binary serves the embedded UI and the UI performs the documented operations, and the CLI performs both remote administration and the local bootstrap, integrity, and backup operations.
 
 **Phase 13, hardening and observability completion.** The full metric set wired across the request path and the background subsystems, quotas, native TLS, the concurrency limit and timeouts, and the final security review against the threat model. Accepts when the metrics move correctly under load, quotas reject over-limit writes with the right error, native TLS serves correctly, and a soak test shows stable memory and no thread growth under sustained large-transfer concurrency.
 
@@ -981,7 +981,7 @@ Build in this order. Each phase lists its deliverable and the acceptance criteri
 | Object ownership | Recommend the ACLs-disabled enforced mode as the default for new buckets. | Removes the most common accidental-exposure vector. |
 | Replication | Asynchronous, outbox-driven, at-least-once with idempotent application, requiring versioning on the source. | Cross-host redundancy without clustering, well-defined and idempotent through stable version identity. |
 | Versioning | Designed in as a substrate that lifecycle and replication build on, with three states matching S3. | Cheap under the blob model and required by the features that depend on it. |
-| Control plane | One JSON management API consumed by both an embedded Svelte UI compiled into the binary and a CLI. | A single artifact to deploy and parity between browser and terminal administration. |
+| Control plane | One JSON management API consumed by both an embedded React UI compiled into the binary and a CLI. | A single artifact to deploy and parity between browser and terminal administration. |
 | Transport | Optional native TLS in addition to running behind a terminating proxy. | A standalone secure endpoint without mandating a proxy. |
 | Secrets at rest | Envelope-encrypt SigV4 and replication secrets under an out-of-band master key; hash Bearer secrets. | Database disclosure must not yield usable secrets; high-entropy tokens need only a fast hash. |
 

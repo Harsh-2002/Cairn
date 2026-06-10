@@ -3,7 +3,7 @@
 # Self-contained, multi-stage, multi-arch build of the single Cairn binary, ending on a distroless
 # image for a minimal, hardened runtime (CA certificates for outbound TLS, a nonroot user, no shell
 # or package manager). Best-practice notes:
-#   * Three stages: build the embedded Svelte UI, cross-compile the static musl binary, ship it.
+#   * Three stages: build the embedded React UI, cross-compile the static musl binary, ship it.
 #   * The build stage is pinned to $BUILDPLATFORM and cross-compiles to $TARGETARCH with Zig
 #     (cargo-zigbuild) — so an arm64 image is cross-built on the native amd64 host, NOT emulated
 #     under slow QEMU. Zig carries a complete musl sysroot for both arches, so the vendored C deps
@@ -13,8 +13,8 @@
 # Build (multi-arch):
 #   docker buildx build --platform linux/amd64,linux/arm64 -t cairn:latest .
 
-# ---- Stage 1: build the embedded Svelte management UI (ui/dist) ----
-FROM --platform=$BUILDPLATFORM node:20-bookworm-slim AS ui
+# ---- Stage 1: build the embedded React management UI (ui/dist) ----
+FROM --platform=$BUILDPLATFORM node:22-bookworm-slim AS ui
 WORKDIR /ui
 COPY ui/package.json ui/package-lock.json ./
 RUN npm ci

@@ -3,7 +3,7 @@
 A production-grade, fully **S3-compatible object storage server** written from scratch in
 pure Rust. Object bytes live as plain files on a local POSIX filesystem; all metadata lives
 in an embedded SQLite database (the single source of truth). Cairn adds transparent per-bucket
-block compression, native TLS, asynchronous bucket replication, an embedded Svelte management
+block compression, native TLS, asynchronous bucket replication, an embedded React management
 UI, and a CLI — shipped as **one static binary**.
 
 > The full engineering specification is in [`ARCH.md`](./ARCH.md). Cairn is built from scratch
@@ -25,7 +25,7 @@ server, validated against a real AWS SDK.**
   replication subresources; the full authorization pipeline.
 - **Engines** — lifecycle scanner + multipart sweeper + metrics refresher run in the background;
   outbox-driven replication engine.
-- **Control plane** — management JSON API (`/api/v1`) + embedded **Svelte UI** (`/ui/`) + CLI
+- **Control plane** — management JSON API (`/api/v1`) + embedded **React console** (its own listener, port 7374) + CLI
   (`bootstrap`, `integrity`, `validate-config`, `serve`); **native TLS** (rustls + aws-lc-rs).
 
 **Verification:** 318 unit/integration/property tests; `clippy -D warnings` and `rustfmt`
@@ -34,7 +34,7 @@ durability window → orphan → reconcile reclaims it); the F-5 chunked decoder
 fuzz iterations** (plus XML + policy fuzz targets) and benchmarks at **~1 GiB/s**; a **boto3
 conformance suite** (a real AWS SDK) drives the full object lifecycle; **node→node replication**
 verified end to end; signed-streaming integrity verified (tampered chunk rejected); and the
-**Svelte UI** verified in a real browser.
+**web console** (React + shadcn/ui) verified in a real browser.
 
 A multi-agent audit against ARCH.md (see [`docs/GAPS.md`](./docs/GAPS.md)) drove a remediation
 pass that closed all critical and high findings (signed-streaming verification, subresource
@@ -72,7 +72,7 @@ support matrix.
 | `cairn-xml` | quick-xml S3 request/response codec. *(Wave 1)* |
 | `cairn-s3` | S3 handlers, the 7 request lifecycles, the streaming chunked decoder. *(Wave 2)* |
 | `cairn-replication` / `cairn-lifecycle` | Replication engine; lifecycle scanner. *(Wave 3)* |
-| `cairn-control` / `cairn-ui` / `cairn-cli` | Management API; embedded Svelte UI; CLI. *(Wave 4)* |
+| `cairn-control` / `cairn-ui` / `cairn-cli` | Management API; embedded React console; CLI. *(Wave 4)* |
 | `cairn-server` | The binary: wires concrete impls, the hyper/rustls stack, middleware, shutdown. |
 
 ## Building

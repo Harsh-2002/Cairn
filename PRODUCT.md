@@ -29,6 +29,15 @@ storage. Approachable through clarity, plain language, and breathing room, never
 no mascots, no bounce, no cuteness. The feeling is a calm, competent operator's tool that explains
 itself, not a toy and not a wall of widgets. Quiet confidence over flourish.
 
+## Visual Direction
+
+Vercel/Geist minimalism, executed with React + shadcn/ui and the Geist Sans/Mono faces. Light mode is
+pure white with hairline `#e5e5e5` borders and near-black ink; dark mode is near-black (`#0a0a0a`)
+with `#2e2e2e` borders. Depth comes from 1px borders, not shadows (only floating layers — menus,
+dialogs — cast one). The primary button is neutral (black on light, white on dark); blue is reserved
+for links and the focus ring; semantic color (green/amber/red) appears only when it means something.
+Identifiers, sizes, and addresses set in Geist Mono with tabular numerals.
+
 ## Anti-references
 
 - **Consumer-cute / toy-like.** Rounded mascots, playful illustrations, bouncy or elastic motion,

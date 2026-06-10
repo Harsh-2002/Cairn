@@ -1,0 +1,322 @@
+import { useId, useState, type FormEvent } from "react";
+import { NavLink, useNavigate } from "react-router";
+import { Database, MoreHorizontal } from "lucide-react";
+import { toast } from "sonner";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Skeleton } from "@/components/ui/skeleton";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
+import { EmptyState } from "@/components/empty-state";
+import { Page, PageHeader } from "@/components/page-header";
+import { TypedConfirmDialog } from "@/components/typed-confirm-dialog";
+import { api, ApiError, errorMessage } from "@/lib/api";
+import { whenMs } from "@/lib/format";
+import { useResource } from "@/lib/use-resource";
+
+const NAME_RULE =
+  "3–63 characters: lowercase letters, digits, hyphens, and dots; must start and end with a letter or digit.";
+
+/** S3-style bucket-name check; returns a specific problem or null when valid. */
+function nameIssue(name: string): string | null {
+  if (name.length < 3 || name.length > 63)
+    return "Bucket names must be 3–63 characters long.";
+  if (!/^[a-z0-9.-]+$/.test(name))
+    return "Only lowercase letters, digits, hyphens, and dots are allowed.";
+  if (!/^[a-z0-9]/.test(name) || !/[a-z0-9]$/.test(name))
+    return "Names must start and end with a letter or digit.";
+  return null;
+}
+
+export function Buckets() {
+  const navigate = useNavigate();
+  const list = useResource(() => api.listBuckets(), []);
+  const buckets = list.data?.buckets ?? [];
+
+  // ---- create dialog -------------------------------------------------------
+  const nameId = useId();
+  const helpId = useId();
+  const errId = useId();
+  const [createOpen, setCreateOpen] = useState(false);
+  const [name, setName] = useState("");
+  const [creating, setCreating] = useState(false);
+  // Server-side failure (409 duplicate, etc.) shown on the name field.
+  const [serverError, setServerError] = useState<string | null>(null);
+
+  const clientIssue = name ? nameIssue(name) : null;
+  const fieldError = serverError ?? clientIssue;
+  const canCreate = !!name && !clientIssue && !creating;
+
+  function openCreate(open: boolean) {
+    setCreateOpen(open);
+    if (open) {
+      setName("");
+      setServerError(null);
+    }
+  }
+
+  async function create(e: FormEvent) {
+    e.preventDefault();
+    if (!canCreate) return;
+    setCreating(true);
+    setServerError(null);
+    try {
+      await api.createBucket(name);
+      toast.success(`Bucket "${name}" created.`);
+      setCreateOpen(false);
+      list.refresh();
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 409) {
+        setServerError(`A bucket named "${name}" already exists.`);
+      } else {
+        setServerError(errorMessage(err, "Failed to create bucket."));
+      }
+    } finally {
+      setCreating(false);
+    }
+  }
+
+  // ---- delete flow ---------------------------------------------------------
+  const [pendingDelete, setPendingDelete] = useState<string | null>(null);
+  const [deleting, setDeleting] = useState(false);
+
+  async function confirmDelete() {
+    const target = pendingDelete;
+    if (!target || deleting) return;
+    setDeleting(true);
+    try {
+      await api.deleteBucket(target);
+      toast.success(`Bucket "${target}" deleted.`);
+      setPendingDelete(null);
+      list.refresh();
+    } catch (err) {
+      toast.error(errorMessage(err, "Failed to delete bucket."));
+    } finally {
+      setDeleting(false);
+    }
+  }
+
+  const createButton = (
+    <Button onClick={() => openCreate(true)}>Create bucket</Button>
+  );
+
+  return (
+    <Page>
+      <PageHeader
+        title="Buckets"
+        description="Top-level containers for your objects."
+        actions={createButton}
+      />
+
+      {list.error ? (
+        <Alert variant="destructive" role="alert" className="mb-4">
+          <AlertTitle>Couldn&apos;t load buckets</AlertTitle>
+          <AlertDescription>{list.error}</AlertDescription>
+        </Alert>
+      ) : null}
+
+      {list.loading ? (
+        <div className="overflow-x-auto rounded-lg border">
+          <Table className="min-w-[560px]">
+            <TableHeader>
+              <TableRow>
+                <TableHead className="text-xs text-muted-foreground">Name</TableHead>
+                <TableHead className="text-xs text-muted-foreground">Versioning</TableHead>
+                <TableHead className="text-xs text-muted-foreground">Created</TableHead>
+                <TableHead>
+                  <span className="visually-hidden">Actions</span>
+                </TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {Array.from({ length: 3 }, (_, i) => (
+                <TableRow key={i}>
+                  <TableCell>
+                    <Skeleton className="h-4 w-32" />
+                  </TableCell>
+                  <TableCell>
+                    <Skeleton className="h-4 w-20" />
+                  </TableCell>
+                  <TableCell>
+                    <Skeleton className="h-4 w-36" />
+                  </TableCell>
+                  <TableCell>
+                    <Skeleton className="ml-auto size-8" />
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </div>
+      ) : buckets.length === 0 && !list.error ? (
+        <EmptyState
+          icon={Database}
+          title="No buckets yet"
+          body="A bucket is a top-level container that holds your files as objects."
+          action={createButton}
+        />
+      ) : (
+        <div className="overflow-x-auto rounded-lg border">
+          <Table className="min-w-[560px]">
+            <TableHeader>
+              <TableRow>
+                <TableHead className="text-xs text-muted-foreground">Name</TableHead>
+                <TableHead className="text-xs text-muted-foreground">Versioning</TableHead>
+                <TableHead className="text-xs text-muted-foreground">Created</TableHead>
+                <TableHead>
+                  <span className="visually-hidden">Actions</span>
+                </TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {buckets.map((b) => (
+                <TableRow key={b.name}>
+                  <TableCell>
+                    <NavLink
+                      to={`/buckets/${encodeURIComponent(b.name)}/browser`}
+                      className="font-mono text-[13px] text-link hover:underline underline-offset-4"
+                    >
+                      {b.name}
+                    </NavLink>
+                  </TableCell>
+                  <TableCell>
+                    <Badge variant="outline">{b.versioning}</Badge>
+                  </TableCell>
+                  <TableCell className="text-[13px] text-muted-foreground tabular-nums">
+                    {whenMs(b.created_at_ms)}
+                  </TableCell>
+                  <TableCell className="text-right">
+                    <DropdownMenu>
+                      <DropdownMenuTrigger asChild>
+                        <Button
+                          variant="ghost"
+                          size="icon-sm"
+                          aria-label={`Actions for ${b.name}`}
+                        >
+                          <MoreHorizontal aria-hidden="true" />
+                        </Button>
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="end">
+                        <DropdownMenuItem
+                          onSelect={() =>
+                            navigate(`/buckets/${encodeURIComponent(b.name)}/browser`)
+                          }
+                        >
+                          Browse
+                        </DropdownMenuItem>
+                        <DropdownMenuItem
+                          onSelect={() =>
+                            navigate(`/buckets/${encodeURIComponent(b.name)}/settings`)
+                          }
+                        >
+                          Settings
+                        </DropdownMenuItem>
+                        <DropdownMenuSeparator />
+                        <DropdownMenuItem
+                          variant="destructive"
+                          className="text-destructive"
+                          onSelect={() => setPendingDelete(b.name)}
+                        >
+                          Delete
+                        </DropdownMenuItem>
+                      </DropdownMenuContent>
+                    </DropdownMenu>
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </div>
+      )}
+
+      <Dialog open={createOpen} onOpenChange={creating ? undefined : openCreate}>
+        <DialogContent className="sm:max-w-md">
+          <form onSubmit={create} noValidate>
+            <DialogHeader>
+              <DialogTitle>Create bucket</DialogTitle>
+              <DialogDescription>
+                Bucket names are permanent — they can&apos;t be renamed later.
+              </DialogDescription>
+            </DialogHeader>
+            <div className="space-y-1.5 py-4">
+              <Label htmlFor={nameId}>Bucket name</Label>
+              <Input
+                id={nameId}
+                value={name}
+                placeholder="photos"
+                autoComplete="off"
+                spellCheck={false}
+                className="font-mono"
+                aria-invalid={fieldError ? true : undefined}
+                aria-describedby={fieldError ? `${helpId} ${errId}` : helpId}
+                onChange={(e) => {
+                  setName(e.target.value);
+                  setServerError(null);
+                }}
+              />
+              <p id={helpId} className="text-[13px] text-muted-foreground">
+                {NAME_RULE}
+              </p>
+              {fieldError ? (
+                <p id={errId} className="text-[13px] text-destructive" role="alert">
+                  {fieldError}
+                </p>
+              ) : null}
+            </div>
+            <DialogFooter>
+              <Button
+                type="button"
+                variant="outline"
+                disabled={creating}
+                onClick={() => setCreateOpen(false)}
+              >
+                Cancel
+              </Button>
+              <Button type="submit" disabled={!canCreate}>
+                {creating ? "Creating…" : "Create bucket"}
+              </Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
+
+      <TypedConfirmDialog
+        open={pendingDelete !== null}
+        onOpenChange={(open) => {
+          if (!open) setPendingDelete(null);
+        }}
+        title="Delete bucket"
+        description="This permanently deletes the bucket and every object and version in it. This cannot be undone."
+        requireText={pendingDelete ?? ""}
+        confirmLabel={deleting ? "Deleting…" : "Delete bucket"}
+        cancelLabel="Keep bucket"
+        busy={deleting}
+        onConfirm={() => void confirmDelete()}
+      />
+    </Page>
+  );
+}

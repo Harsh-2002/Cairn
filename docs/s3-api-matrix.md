@@ -31,6 +31,6 @@ authorizes.
 | UploadPartCopy, GetObjectAttributes | ◐ | Planned. |
 | Object Lock / retention, SSE config, website / accelerate / analytics / inventory / requester-pays | ✖ | Out of scope; answered as NotImplemented. |
 
-**Management API** (`/api/v1`, admin-gated JSON) and the **embedded Svelte UI** (`/ui/`) provide
+**Management API** (`/api/v1`, admin-gated JSON) and the **embedded React console** (its own listener, port 7374) provide
 control-plane operations (overview, bucket/user/activity management) consumed by both the web UI
 and the CLI.

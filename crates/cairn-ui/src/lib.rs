@@ -1,6 +1,6 @@
-//! `cairn-ui` — the embedded Svelte management single-page application (ARCH §23).
+//! `cairn-ui` — the embedded React management single-page application (ARCH §23).
 //!
-//! The management UI is a Svelte SPA built by Vite into `ui/dist`. That bundle is
+//! The management UI is a React SPA built by Vite into `ui/dist`. That bundle is
 //! baked into the Cairn server binary at compile time via [`rust_embed`], so a Cairn
 //! deployment is a single binary that already contains its own management interface
 //! with no separate UI service to deploy or version-match (ARCH §23.1).

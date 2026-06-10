@@ -1,0 +1,154 @@
+// TypeScript mirrors of the management-API DTOs (crates/cairn-control/src/wire.rs).
+
+import type { PolicyDoc } from "./policy";
+
+export interface OverviewResp {
+  buckets: number;
+  objects: number;
+  versions: number;
+  logical_bytes: number;
+  physical_bytes: number;
+  compression_ratio: number;
+}
+
+export interface SystemResp {
+  version: string;
+  uptime_secs: number;
+  s3_addr: string;
+  ui_addr: string;
+  tls: boolean;
+  data_dir: string;
+  disk_total_bytes: number | null;
+  disk_free_bytes: number | null;
+}
+
+export interface BucketUsageEntry {
+  name: string;
+  objects: number;
+  logical_bytes: number;
+  physical_bytes: number;
+}
+
+export interface OverviewBucketsResp {
+  buckets: BucketUsageEntry[];
+}
+
+export interface BucketListEntry {
+  name: string;
+  owner_id: string;
+  created_at_ms: number;
+  versioning: string;
+}
+
+export interface BucketListResp {
+  buckets: BucketListEntry[];
+}
+
+export interface BucketDetailResp {
+  name: string;
+  versioning: string;
+  ownership_mode: string;
+  region: string;
+  object_count: number;
+  logical_bytes: number;
+  compression: unknown;
+}
+
+export interface ObjectEntry {
+  key: string;
+  size: number;
+  etag: string;
+  last_modified_ms: number;
+}
+
+export interface ListObjectsResp {
+  objects: ObjectEntry[];
+  next: string | null;
+}
+
+export interface ShareResp {
+  /** A path (`/p/...`) the caller turns into an absolute link. */
+  url: string;
+  expires_at_ms: number;
+}
+
+export interface BucketConfigResp {
+  versioning: string;
+  ownership_mode: string;
+  quota_bytes: number | null;
+  policy: unknown | null;
+  cors: unknown | null;
+  tagging: unknown | null;
+  lifecycle: unknown | null;
+  acl: unknown | null;
+  public_access_block: unknown | null;
+}
+
+export interface UserSummary {
+  id: string;
+  display_name: string;
+  access_key_id: string;
+  role: string;
+  is_active: boolean;
+}
+
+export interface UserListResp {
+  users: UserSummary[];
+}
+
+/** One-time credentials returned by user creation; never shown again. */
+export interface CreateUserResp {
+  id: string;
+  bearer_access_key_id: string;
+  bearer_secret: string;
+  s3_access_key_id: string;
+  s3_secret_key: string;
+}
+
+export interface UserDetailResp {
+  id: string;
+  display_name: string;
+  access_key_id: string;
+  sigv4_access_key_id: string | null;
+  role: string;
+  is_active: boolean;
+  policy: PolicyDoc | null;
+}
+
+export interface RotateCredentialsResp {
+  bearer_access_key_id: string;
+  bearer_secret: string;
+}
+
+export interface UserPolicyResp {
+  policy: PolicyDoc | null;
+}
+
+export interface ActivityEntry {
+  action: string;
+  bucket: string | null;
+  key: string | null;
+  at_ms: number;
+}
+
+export interface ActivityResp {
+  entries: ActivityEntry[];
+}
+
+export interface FailedReplicationEntry {
+  bucket: string;
+  key: string;
+  version_id: string;
+  error: string;
+  attempts: number;
+  next_attempt_at_ms: number;
+}
+
+export interface FailedReplicationResp {
+  entries: FailedReplicationEntry[];
+}
+
+export interface ReplicationRule {
+  dest_bucket: string;
+  prefix: string;
+}
