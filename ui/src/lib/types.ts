@@ -157,3 +157,47 @@ export interface ReplicationRule {
   dest_bucket: string;
   prefix: string;
 }
+
+/** A per-bucket remote replication target (the secret is never returned). */
+export interface ReplicationTarget {
+  arn: string;
+  endpoint: string;
+  region: string;
+  dest_bucket: string;
+  access_key_id: string;
+}
+
+export interface ReplicationTargetListResp {
+  targets: ReplicationTarget[];
+}
+
+/** Body for registering a remote target; the secret is sealed server-side. */
+export interface CreateReplicationTargetReq {
+  endpoint: string;
+  region: string;
+  dest_bucket: string;
+  access_key: string;
+  secret: string;
+}
+
+export interface ReplicationStatusError {
+  key: string;
+  version_id: string;
+  error: string;
+}
+
+export interface ReplicationStatusResp {
+  bucket: string;
+  pending: number;
+  failed: number;
+  recent_errors: ReplicationStatusError[];
+}
+
+export interface ReplicationRetryResp {
+  requeued: boolean;
+  failed_observed: number;
+}
+
+export interface ReplicationResyncResp {
+  started: boolean;
+}

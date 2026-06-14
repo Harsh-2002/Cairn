@@ -5,9 +5,8 @@
 
 import { useEffect, useId, useState } from "react";
 import { useParams } from "react-router";
-import { CircleAlert } from "lucide-react";
+import { Trash2 } from "lucide-react";
 import { toast } from "sonner";
-import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -29,13 +28,20 @@ import {
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
 import { ConfirmDialog } from "@/components/confirm-dialog";
+import { ErrorAlert } from "@/components/error-alert";
 import { JsonEditor } from "@/components/json-editor";
+import { StatusBadge } from "@/components/status-badge";
 import { ApiError, api, errorMessage } from "@/lib/api";
-import { bytes } from "@/lib/format";
+import { bytes, count } from "@/lib/format";
 import { pretty, validate } from "@/lib/policy";
 import * as s3 from "@/lib/s3";
 import { useResource } from "@/lib/use-resource";
-import type { ReplicationRule } from "@/lib/types";
+import type {
+  CreateReplicationTargetReq,
+  ReplicationRule,
+  ReplicationStatusResp,
+  ReplicationTarget,
+} from "@/lib/types";
 
 const EXAMPLE_POLICY = pretty({
   Version: "2012-10-17",
@@ -93,7 +99,19 @@ export function BucketSettings() {
     } catch {
       /* treated as no rule */
     }
-    return { config, compression, repl };
+    let targets: ReplicationTarget[] = [];
+    try {
+      targets = (await api.listReplicationTargets(name)).targets;
+    } catch {
+      /* no targets / endpoint unavailable */
+    }
+    let replStatus: ReplicationStatusResp | null = null;
+    try {
+      replStatus = await api.replicationStatus(name);
+    } catch {
+      /* status unavailable */
+    }
+    return { config, compression, repl, targets, replStatus };
   }, [name]);
 
   // Per-card editable state, seeded from the loaded snapshot.
@@ -110,6 +128,20 @@ export function BucketSettings() {
   const [busy, setBusy] = useState<string | null>(null); // which card is saving
   const [confirmDeletePolicy, setConfirmDeletePolicy] = useState(false);
   const [confirmClearRepl, setConfirmClearRepl] = useState(false);
+
+  // Remote replication targets (endpoint + sealed credentials) and the add form.
+  const blankTarget: CreateReplicationTargetReq = {
+    endpoint: "",
+    region: "us-east-1",
+    dest_bucket: "",
+    access_key: "",
+    secret: "",
+  };
+  const [targetForm, setTargetForm] = useState(blankTarget);
+  const [addingTarget, setAddingTarget] = useState(false);
+  const [confirmDeleteTarget, setConfirmDeleteTarget] = useState<string | null>(
+    null,
+  );
 
   useEffect(() => {
     const d = res.data;
@@ -267,6 +299,65 @@ export function BucketSettings() {
     });
   }
 
+  async function addTarget() {
+    const f = targetForm;
+    if (
+      !f.endpoint.trim() ||
+      !f.region.trim() ||
+      !f.dest_bucket.trim() ||
+      !f.access_key.trim() ||
+      !f.secret
+    ) {
+      toast.error(
+        "Endpoint, region, destination bucket, access key, and secret are all required.",
+      );
+      return;
+    }
+    setAddingTarget(true);
+    try {
+      await api.addReplicationTarget(name, {
+        endpoint: f.endpoint.trim(),
+        region: f.region.trim(),
+        dest_bucket: f.dest_bucket.trim(),
+        access_key: f.access_key.trim(),
+        secret: f.secret,
+      });
+      toast.success("Remote target added");
+      setTargetForm(blankTarget);
+      res.refresh();
+    } catch (e) {
+      toast.error(errorMessage(e, "Failed to add the target."));
+    } finally {
+      setAddingTarget(false);
+    }
+  }
+
+  function deleteTarget(arn: string) {
+    setConfirmDeleteTarget(null);
+    void run("target", async () => {
+      await api.deleteReplicationTarget(name, arn);
+      toast.success("Remote target removed");
+    });
+  }
+
+  function retryReplication() {
+    void run("retry", async () => {
+      const r = await api.retryReplication(name);
+      toast.success(
+        r.failed_observed > 0
+          ? `Requeued ${count(r.failed_observed)} failed object${r.failed_observed === 1 ? "" : "s"}.`
+          : "No failed objects to retry.",
+      );
+    });
+  }
+
+  function resyncReplication() {
+    void run("resync", async () => {
+      await api.resyncReplication(name);
+      toast.success("Backfill started for existing objects.");
+    });
+  }
+
   if (res.loading) {
     return (
       <div className="space-y-4" aria-busy="true">
@@ -274,7 +365,7 @@ export function BucketSettings() {
           Loading bucket settings…
         </span>
         {[0, 1, 2].map((i) => (
-          <Card key={i} className="rounded-lg p-5 shadow-none">
+          <Card key={i} className="p-5">
             <Skeleton className="mb-3 h-5 w-36" />
             <Skeleton className="mb-2 h-4 w-2/3" />
             <Skeleton className="h-9 w-64" />
@@ -286,27 +377,22 @@ export function BucketSettings() {
 
   if (res.error || !res.data) {
     return (
-      <Alert variant="destructive" role="alert">
-        <CircleAlert aria-hidden="true" />
-        <AlertTitle>Could not load bucket settings</AlertTitle>
-        <AlertDescription>
-          {res.error ?? "Unknown error."}
-          <Button variant="outline" size="sm" onClick={res.refresh} className="mt-2">
-            Try again
-          </Button>
-        </AlertDescription>
-      </Alert>
+      <ErrorAlert
+        title="Could not load bucket settings"
+        message={res.error ?? "Unknown error."}
+        onRetry={res.refresh}
+      />
     );
   }
 
-  const { config, repl } = res.data;
+  const { config, repl, targets, replStatus } = res.data;
 
   return (
     <div className="space-y-4">
       <h2 className="visually-hidden">Settings for {name}</h2>
 
       {/* ---- Versioning ---- */}
-      <Card className="gap-4 rounded-lg shadow-none">
+      <Card className="gap-4">
         <CardHeader>
           <CardTitle className="text-base">Versioning</CardTitle>
           <CardDescription>
@@ -316,7 +402,7 @@ export function BucketSettings() {
         </CardHeader>
         <CardContent>
           <Select value={versioning} onValueChange={setVersioning}>
-            <SelectTrigger className="w-56" aria-label="Versioning state">
+            <SelectTrigger className="w-full sm:w-56" aria-label="Versioning state">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
@@ -334,7 +420,7 @@ export function BucketSettings() {
       </Card>
 
       {/* ---- Quota ---- */}
-      <Card className="gap-4 rounded-lg shadow-none">
+      <Card className="gap-4">
         <CardHeader>
           <CardTitle className="text-base">Storage quota</CardTitle>
           <CardDescription>
@@ -355,7 +441,7 @@ export function BucketSettings() {
             placeholder="No limit"
             inputMode="numeric"
             autoComplete="off"
-            className="w-56 font-mono"
+            className="w-full font-mono sm:w-56"
             onChange={(e) => {
               setQuotaInput(e.target.value);
               setQuotaError("");
@@ -392,7 +478,7 @@ export function BucketSettings() {
       </Card>
 
       {/* ---- Compression ---- */}
-      <Card className="gap-4 rounded-lg shadow-none">
+      <Card className="gap-4">
         <CardHeader>
           <CardTitle className="text-base">Compression</CardTitle>
           <CardDescription>
@@ -402,7 +488,7 @@ export function BucketSettings() {
         </CardHeader>
         <CardContent>
           <Select value={compression} onValueChange={setCompression}>
-            <SelectTrigger className="w-56" aria-label="Compression algorithm">
+            <SelectTrigger className="w-full sm:w-56" aria-label="Compression algorithm">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
@@ -420,25 +506,39 @@ export function BucketSettings() {
       </Card>
 
       {/* ---- Replication ---- */}
-      <Card className="gap-4 rounded-lg shadow-none">
+      <Card className="gap-4">
         <CardHeader>
           <CardTitle className="flex items-center gap-2 text-base">
             Replication
-            {repl ? (
-              <Badge variant="outline">Active</Badge>
-            ) : (
-              <Badge variant="outline" className="text-muted-foreground">
-                Off
-              </Badge>
-            )}
+            <StatusBadge tone={repl ? "positive" : "neutral"}>
+              {repl ? "Active" : "Off"}
+            </StatusBadge>
           </CardTitle>
           <CardDescription>
             Continuously copy new objects to another bucket. Needs versioning
-            enabled and a matching destination configured on the server.
+            enabled and a remote target (below) for the destination.
             {repl
               ? ` Currently replicating to "${repl.dest_bucket}"${repl.prefix ? ` (prefix "${repl.prefix}")` : ""}.`
               : ""}
           </CardDescription>
+          {replStatus && (replStatus.pending > 0 || replStatus.failed > 0) ? (
+            <p className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[13px]">
+              <span className="text-muted-foreground">
+                Pending:{" "}
+                <span className="tabular-nums text-foreground">
+                  {count(replStatus.pending)}
+                </span>
+              </span>
+              {replStatus.failed > 0 ? (
+                <span className="text-destructive">
+                  Failed:{" "}
+                  <span className="tabular-nums">
+                    {count(replStatus.failed)}
+                  </span>
+                </span>
+              ) : null}
+            </p>
+          ) : null}
         </CardHeader>
         <CardContent className="space-y-1.5">
           <div className="flex flex-wrap gap-2">
@@ -448,7 +548,7 @@ export function BucketSettings() {
               autoComplete="off"
               aria-label="Replication destination bucket"
               aria-invalid={replError ? true : undefined}
-              className="w-56 font-mono"
+              className="w-full font-mono sm:w-56"
               onChange={(e) => {
                 setReplDest(e.target.value);
                 setReplError("");
@@ -459,7 +559,7 @@ export function BucketSettings() {
               placeholder="Prefix (optional)"
               autoComplete="off"
               aria-label="Replication prefix"
-              className="w-44 font-mono"
+              className="w-full font-mono sm:w-44"
               onChange={(e) => setReplPrefix(e.target.value)}
             />
           </div>
@@ -469,7 +569,26 @@ export function BucketSettings() {
             </p>
           ) : null}
         </CardContent>
-        <CardFooter className="justify-end gap-2 border-t pt-4!">
+        <CardFooter className="flex-wrap justify-end gap-2 border-t pt-4!">
+          {replStatus && replStatus.failed > 0 ? (
+            <Button
+              variant="outline"
+              onClick={retryReplication}
+              disabled={busy === "retry"}
+              aria-busy={busy === "retry" || undefined}
+            >
+              {busy === "retry" ? "Retrying…" : "Retry failed"}
+            </Button>
+          ) : null}
+          <Button
+            variant="outline"
+            onClick={resyncReplication}
+            disabled={busy === "resync"}
+            aria-busy={busy === "resync" || undefined}
+            title="Enqueue existing objects for replication (needs ExistingObjectReplication enabled)"
+          >
+            {busy === "resync" ? "Starting…" : "Resync existing"}
+          </Button>
           {repl ? (
             <Button
               variant="outline"
@@ -485,18 +604,133 @@ export function BucketSettings() {
         </CardFooter>
       </Card>
 
+      {/* ---- Replication targets (remote endpoints + sealed credentials) ---- */}
+      <Card className="gap-4">
+        <CardHeader>
+          <CardTitle className="text-base">Replication targets</CardTitle>
+          <CardDescription>
+            Remote destinations this bucket can replicate into. Each holds the
+            endpoint and credentials of a bucket on another Cairn (or S3) node;
+            the secret is sealed on the server and never shown again.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          {targets.length > 0 ? (
+            <ul className="divide-y rounded-lg border">
+              {targets.map((t) => (
+                <li
+                  key={t.arn}
+                  className="flex flex-wrap items-center justify-between gap-2 px-3 py-2.5"
+                >
+                  <div className="min-w-0">
+                    <p className="truncate font-mono text-[13px]" title={t.arn}>
+                      {t.dest_bucket}{" "}
+                      <span className="text-muted-foreground">@ {t.endpoint}</span>
+                    </p>
+                    <p className="text-xs text-muted-foreground">
+                      {t.region} · key {t.access_key_id}
+                    </p>
+                  </div>
+                  <Button
+                    variant="outline"
+                    size="icon"
+                    className="text-destructive"
+                    aria-label={`Remove target ${t.dest_bucket}`}
+                    disabled={busy === "target"}
+                    onClick={() => setConfirmDeleteTarget(t.arn)}
+                  >
+                    <Trash2 aria-hidden="true" />
+                  </Button>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="text-[13px] text-muted-foreground">
+              No remote targets yet. Add one below, then set the replication rule
+              above to its destination bucket.
+            </p>
+          )}
+
+          <div className="grid gap-3 rounded-lg border p-3 sm:grid-cols-2">
+            <div className="grid gap-1.5 sm:col-span-2">
+              <Label htmlFor={`${quotaId}-ep`}>Endpoint</Label>
+              <Input
+                id={`${quotaId}-ep`}
+                value={targetForm.endpoint}
+                placeholder="https://s3.peer.example.com:7373"
+                autoComplete="off"
+                className="font-mono"
+                onChange={(e) =>
+                  setTargetForm({ ...targetForm, endpoint: e.target.value })
+                }
+              />
+            </div>
+            <div className="grid gap-1.5">
+              <Label htmlFor={`${quotaId}-region`}>Region</Label>
+              <Input
+                id={`${quotaId}-region`}
+                value={targetForm.region}
+                autoComplete="off"
+                className="font-mono"
+                onChange={(e) =>
+                  setTargetForm({ ...targetForm, region: e.target.value })
+                }
+              />
+            </div>
+            <div className="grid gap-1.5">
+              <Label htmlFor={`${quotaId}-db`}>Destination bucket</Label>
+              <Input
+                id={`${quotaId}-db`}
+                value={targetForm.dest_bucket}
+                autoComplete="off"
+                className="font-mono"
+                onChange={(e) =>
+                  setTargetForm({ ...targetForm, dest_bucket: e.target.value })
+                }
+              />
+            </div>
+            <div className="grid gap-1.5">
+              <Label htmlFor={`${quotaId}-ak`}>Access key</Label>
+              <Input
+                id={`${quotaId}-ak`}
+                value={targetForm.access_key}
+                autoComplete="off"
+                className="font-mono"
+                onChange={(e) =>
+                  setTargetForm({ ...targetForm, access_key: e.target.value })
+                }
+              />
+            </div>
+            <div className="grid gap-1.5">
+              <Label htmlFor={`${quotaId}-sk`}>Secret key</Label>
+              <Input
+                id={`${quotaId}-sk`}
+                type="password"
+                value={targetForm.secret}
+                autoComplete="off"
+                className="font-mono"
+                onChange={(e) =>
+                  setTargetForm({ ...targetForm, secret: e.target.value })
+                }
+              />
+            </div>
+          </div>
+        </CardContent>
+        <CardFooter className="justify-end border-t pt-4!">
+          <Button onClick={addTarget} disabled={addingTarget}>
+            {addingTarget ? "Adding…" : "Add target"}
+          </Button>
+        </CardFooter>
+      </Card>
+
       {/* ---- Encryption at rest ---- */}
-      <Card className="gap-4 rounded-lg shadow-none">
+      <Card className="gap-4">
         <CardHeader>
           <CardTitle className="flex items-center gap-2 text-base">
             Encryption at rest
-            {res.data.config.encryption ? (
-              <Badge variant="outline">AES-256</Badge>
-            ) : (
-              <Badge variant="outline" className="text-muted-foreground">
-                Off
-              </Badge>
-            )}
+            <StatusBadge tone={config.encryption ? "positive" : "neutral"}>
+              {config.encryption ? "AES-256" : "Off"}
+            </StatusBadge>
           </CardTitle>
           <CardDescription>
             Encrypt every new upload with a server-managed key (SSE-S3,
@@ -506,7 +740,7 @@ export function BucketSettings() {
         </CardHeader>
         <CardContent>
           <Select value={encryption} onValueChange={setEncryption}>
-            <SelectTrigger className="w-56" aria-label="Default encryption">
+            <SelectTrigger className="w-full sm:w-56" aria-label="Default encryption">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
@@ -523,7 +757,7 @@ export function BucketSettings() {
       </Card>
 
       {/* ---- Bucket policy ---- */}
-      <Card className="gap-4 rounded-lg shadow-none">
+      <Card className="gap-4">
         <CardHeader>
           <CardTitle className="text-base">Bucket policy</CardTitle>
           <CardDescription>
@@ -588,7 +822,7 @@ export function BucketSettings() {
       </Card>
 
       {/* ---- Configured aspects (read-only) ---- */}
-      <Card className="gap-4 rounded-lg shadow-none">
+      <Card className="gap-4">
         <CardHeader>
           <CardTitle className="text-base">Other S3 aspects</CardTitle>
           <CardDescription>
@@ -638,6 +872,19 @@ export function BucketSettings() {
         confirmLabel="Remove rule"
         cancelLabel="Keep replicating"
         onConfirm={clearReplication}
+      />
+      <ConfirmDialog
+        open={confirmDeleteTarget !== null}
+        onOpenChange={(o) => !o && setConfirmDeleteTarget(null)}
+        destructive
+        busy={busy === "target"}
+        title="Remove this replication target"
+        description="Rules pointing at this destination will stop replicating. The destination bucket and its data are not touched."
+        confirmLabel="Remove target"
+        cancelLabel="Keep target"
+        onConfirm={() =>
+          confirmDeleteTarget && deleteTarget(confirmDeleteTarget)
+        }
       />
     </div>
   );

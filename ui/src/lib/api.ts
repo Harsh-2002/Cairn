@@ -10,11 +10,16 @@ import type {
   BucketConfigResp,
   BucketDetailResp,
   BucketListResp,
+  CreateReplicationTargetReq,
   CreateUserResp,
   FailedReplicationResp,
   ListObjectsResp,
   OverviewBucketsResp,
   OverviewResp,
+  ReplicationResyncResp,
+  ReplicationRetryResp,
+  ReplicationStatusResp,
+  ReplicationTargetListResp,
   RotateCredentialsResp,
   ShareResp,
   SystemResp,
@@ -251,6 +256,44 @@ export const api = {
     requestRaw<null>("PUT", `/users/${enc(id)}/policy`, rawBody),
   deleteUserPolicy: (id: string) =>
     request<null>("DELETE", `/users/${enc(id)}/policy`),
+
+  // Per-bucket replication management (ARCH §20). Remote targets hold the
+  // destination endpoint + credentials (secret sealed server-side) and mint the
+  // ARN that replication rules reference.
+  listReplicationTargets: (name: string) =>
+    request<ReplicationTargetListResp>(
+      "GET",
+      `/buckets/${enc(name)}/replication/targets`,
+    ),
+  addReplicationTarget: (name: string, body: CreateReplicationTargetReq) =>
+    request<{ arn: string }>(
+      "POST",
+      `/buckets/${enc(name)}/replication/targets`,
+      body,
+    ),
+  deleteReplicationTarget: (name: string, arn: string) =>
+    request<null>(
+      "DELETE",
+      `/buckets/${enc(name)}/replication/targets/${enc(arn)}`,
+    ),
+  // Requeue this bucket's terminally-failed replication entries.
+  retryReplication: (name: string) =>
+    request<ReplicationRetryResp>(
+      "POST",
+      `/buckets/${enc(name)}/replication/retry`,
+    ),
+  // Backfill: enqueue current versions for replication (needs an enabled rule
+  // with existing-object replication).
+  resyncReplication: (name: string) =>
+    request<ReplicationResyncResp>(
+      "POST",
+      `/buckets/${enc(name)}/replication/resync`,
+    ),
+  replicationStatus: (name: string) =>
+    request<ReplicationStatusResp>(
+      "GET",
+      `/buckets/${enc(name)}/replication/status`,
+    ),
 
   failedReplication: (limit = 100) =>
     request<FailedReplicationResp>("GET", `/replication/failed?limit=${limit}`),
