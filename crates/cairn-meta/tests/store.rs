@@ -65,6 +65,7 @@ async fn user_policy_round_trips() {
                 sigv4_access_key_id: None,
                 role: Role::Member,
                 is_active: true,
+                quota_bytes: None,
                 created_at: Timestamp(1),
                 updated_at: Timestamp(1),
             },

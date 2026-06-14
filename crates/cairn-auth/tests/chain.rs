@@ -27,6 +27,7 @@ async fn setup() -> (AuthChain, Arc<InMemoryMetadataStore>) {
         sigv4_access_key_id: Some(AKID.to_owned()),
         role: Role::Member,
         is_active: true,
+        quota_bytes: None,
         created_at: Timestamp(0),
         updated_at: Timestamp(0),
     };

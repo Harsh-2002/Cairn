@@ -516,6 +516,8 @@ pub struct User {
     pub role: crate::auth::Role,
     /// Whether active.
     pub is_active: bool,
+    /// The per-user byte quota (`users.quota_bytes`, ARCH §27.5), or `None` when unset (no limit).
+    pub quota_bytes: Option<u64>,
     /// Creation time.
     pub created_at: Timestamp,
     /// Last-update time.

@@ -1085,6 +1085,7 @@ impl ControlService {
                 sigv4_access_key_id: Some(sigv4_access_key_id.clone()),
                 role,
                 is_active: true,
+                quota_bytes: None,
                 created_at: now,
                 updated_at: now,
             },
@@ -1315,6 +1316,7 @@ impl ControlService {
                 sigv4_access_key_id: record.user.sigv4_access_key_id,
                 role: wire::role_str(record.user.role),
                 is_active: record.user.is_active,
+                quota_bytes: record.user.quota_bytes,
                 policy,
             },
         )

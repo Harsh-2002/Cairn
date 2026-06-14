@@ -264,6 +264,7 @@ pub fn user_from_row(row: &Row) -> rusqlite::Result<User> {
         sigv4_access_key_id: row.get("sigv4_access_key_id")?,
         role: role_from(&row.get::<_, String>("role")?),
         is_active: row.get::<_, i64>("is_active")? != 0,
+        quota_bytes: row.get::<_, Option<i64>>("quota_bytes")?.map(|q| q as u64),
         created_at: Timestamp(row.get("created_at")?),
         updated_at: Timestamp(row.get("updated_at")?),
     })

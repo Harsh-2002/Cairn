@@ -41,7 +41,8 @@ pub const PART_COLS: &str = "part_number, size, etag, storage_path, checksum";
 
 /// `users` columns in mapper order (with the secret hash for the bearer mapper).
 pub const USER_COLS: &str = "id, display_name, access_key_id, secret_hash, sigv4_access_key_id, \
-     sigv4_secret_ciphertext, sigv4_secret_nonce, role, is_active, created_at, updated_at";
+     sigv4_secret_ciphertext, sigv4_secret_nonce, role, is_active, created_at, updated_at, \
+     quota_bytes";
 
 /// `replication_outbox` columns in mapper order.
 pub const OUTBOX_COLS: &str = "id, bucket_name, key, version_id, operation, rule_id, target_arn, \
@@ -285,6 +286,7 @@ pub fn user_from_row(row: &Row) -> Result<User, MetaError> {
         is_active: row.get_i64(8) != 0,
         created_at: Timestamp(row.get_i64(9)),
         updated_at: Timestamp(row.get_i64(10)),
+        quota_bytes: row.get_opt_i64(11).map(|q| q as u64),
     })
 }
 

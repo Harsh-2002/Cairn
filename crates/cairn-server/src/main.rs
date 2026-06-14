@@ -696,6 +696,7 @@ fn bootstrap(cfg: Config) -> ExitCode {
                 sigv4_access_key_id: Some(sigv4_akid.clone()),
                 role: Role::Administrator,
                 is_active: true,
+                quota_bytes: None,
                 created_at: now,
                 updated_at: now,
             },

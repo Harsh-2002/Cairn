@@ -90,6 +90,7 @@ fn user_record(id: &str, akid: &str) -> UserRecord {
             sigv4_access_key_id: Some(format!("SIG-{akid}")),
             role: cairn_types::auth::Role::Member,
             is_active: true,
+            quota_bytes: None,
             created_at: Timestamp(1),
             updated_at: Timestamp(1),
         },

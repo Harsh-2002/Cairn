@@ -319,6 +319,7 @@ async fn ensure_root_admin(
             sigv4_access_key_id: Some(akid.clone()),
             role: Role::Administrator,
             is_active: true,
+            quota_bytes: None,
             created_at: now,
             updated_at: now,
         },

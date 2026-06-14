@@ -293,6 +293,8 @@ pub struct UserDetailResp {
     pub role: &'static str,
     /// Whether the user is active.
     pub is_active: bool,
+    /// The per-user byte quota (ARCH §27.5), or null when unset (no limit).
+    pub quota_bytes: Option<u64>,
     /// The attached identity (per-user) policy document, or null if none.
     pub policy: Option<Value>,
 }
