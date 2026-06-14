@@ -223,7 +223,7 @@ export function PermissionBuilder({
       <div
         role="group"
         aria-label="Policy editor view"
-        className="mb-4 inline-flex rounded-lg bg-muted p-1"
+        className="mb-4 flex w-full rounded-lg bg-muted p-1 sm:inline-flex sm:w-auto"
       >
         {(
           [
@@ -238,7 +238,7 @@ export function PermissionBuilder({
             aria-pressed={mode === m}
             onClick={() => switchMode(m)}
             className={cn(
-              "rounded-md px-3.5 py-1.5 text-sm font-medium transition-colors",
+              "flex-1 rounded-md px-3.5 py-1.5 text-sm font-medium transition-colors sm:flex-none",
               mode === m
                 ? "border bg-background text-foreground"
                 : "text-muted-foreground hover:text-foreground",

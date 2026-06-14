@@ -138,7 +138,7 @@ export function Login() {
                   type="button"
                   variant="ghost"
                   size="icon-sm"
-                  className="absolute top-1/2 right-1 size-7 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                  className="absolute top-1/2 right-1 size-8 -translate-y-1/2 text-muted-foreground hover:text-foreground"
                   aria-pressed={showSecret}
                   aria-label={
                     showSecret ? "Hide secret key" : "Show secret key"
