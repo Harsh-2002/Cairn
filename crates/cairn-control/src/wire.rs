@@ -332,6 +332,38 @@ pub struct ActivityListResp {
     pub entries: Vec<ActivityListEntry>,
 }
 
+/// A persistent object-share, as returned by the management API (ARCH §15.8).
+#[derive(Debug, Serialize)]
+pub struct ShareRecord {
+    /// The opaque token; also the `/p/{token}` path tail.
+    pub token: String,
+    /// The shared object's bucket.
+    pub bucket: String,
+    /// The shared object's key.
+    pub key: String,
+    /// A pinned version id, or null to follow the current version.
+    pub version_id: Option<String>,
+    /// Expiry in epoch ms, or null for a forever share.
+    pub expires_at_ms: Option<i64>,
+    /// When the share was minted, in epoch ms.
+    pub created_at_ms: i64,
+    /// The user id that minted it.
+    pub created_by: String,
+    /// `inline` or `attachment`.
+    pub disposition: String,
+    /// The download filename for `attachment`, or null.
+    pub filename: Option<String>,
+    /// Server-derived: `active`, `expired`, or `revoked`.
+    pub status: String,
+}
+
+/// `GET /buckets/{b}/objects/shares` response.
+#[derive(Debug, Serialize)]
+pub struct ShareListResp {
+    /// The shares, most recent first.
+    pub shares: Vec<ShareRecord>,
+}
+
 // ---------------------------------------------------------------------------------------
 // Bucket configuration
 // ---------------------------------------------------------------------------------------

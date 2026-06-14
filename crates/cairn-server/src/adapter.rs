@@ -12,11 +12,12 @@ use bytes::Bytes;
 use cairn_crypto::SystemClock;
 use cairn_protocol::{S3Body, S3Request, S3Response, error_response};
 use cairn_types::auth::{AuthMethod, AuthOutcome, Principal, RequestView, Role};
+use cairn_types::crypto::Nonce;
 use cairn_types::error::{BodyError, Error};
 use cairn_types::id::{BucketName, ObjectKey, UserId, VersionId};
 use cairn_types::meta::{ActivityEntry, Mutation, ShareDisposition, ShareRow};
 use cairn_types::time::Timestamp;
-use cairn_types::traits::Clock;
+use cairn_types::traits::{Clock, Crypto};
 use futures_util::StreamExt;
 use http_body_util::{BodyExt, BodyStream, Full, StreamBody};
 use hyper::body::{Frame, Incoming};
@@ -103,6 +104,22 @@ pub async fn handle(
                 .and_then(|r| r.strip_suffix("/objects/share"))
             {
                 return create_share(stack, bucket, &body_bytes, principal.as_ref()).await;
+            }
+            // Mint an interoperable S3 presigned URL (GET download / PUT upload). Lives here
+            // because it opens the requester's sealed SigV4 secret from the server stack.
+            if let Some(bucket) = subpath
+                .strip_prefix("/buckets/")
+                .and_then(|r| r.strip_suffix("/objects/presign"))
+            {
+                return presign(
+                    stack,
+                    bucket,
+                    &body_bytes,
+                    principal.as_ref(),
+                    &host,
+                    secure,
+                )
+                .await;
             }
         }
         let resp = stack
@@ -308,6 +325,179 @@ async fn create_share(
         200,
         &format!(r#"{{"token":"{token}","url":"/p/{token}","expires_at_ms":{expires_json}}}"#),
     )
+}
+
+/// Mint an interoperable S3 presigned URL (ARCH §14.2). Admin-only. Body: `{"key","method"?:
+/// "GET"|"PUT","expires_in_secs":1..=604800,"version_id"?,"response_content_disposition"?,
+/// "response_content_type"?,"content_type"?}`. Signs with the requester's own SigV4 secret.
+async fn presign(
+    stack: &AppStack,
+    bucket: &str,
+    body: &Bytes,
+    principal: Option<&Principal>,
+    host: &str,
+    secure: bool,
+) -> Response<ResponseBody> {
+    let p = match principal {
+        Some(p) if p.role == Role::Administrator => p,
+        _ => return json_status(403, r#"{"error":"forbidden"}"#),
+    };
+    if BucketName::parse(bucket).is_err() {
+        return json_status(404, r#"{"error":"no such bucket"}"#);
+    }
+    #[derive(serde::Deserialize)]
+    struct PresignReq {
+        key: String,
+        #[serde(default)]
+        method: Option<String>,
+        expires_in_secs: i64,
+        #[serde(default)]
+        version_id: Option<String>,
+        #[serde(default)]
+        response_content_disposition: Option<String>,
+        #[serde(default)]
+        response_content_type: Option<String>,
+        #[serde(default)]
+        content_type: Option<String>,
+    }
+    let req: PresignReq = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(_) => return json_status(400, r#"{"error":"invalid request body"}"#),
+    };
+    if req.key.is_empty() {
+        return json_status(400, r#"{"error":"key is required"}"#);
+    }
+    let http_method = req.method.as_deref().unwrap_or("GET").to_ascii_uppercase();
+    if http_method != "GET" && http_method != "PUT" {
+        return json_status(400, r#"{"error":"method must be GET or PUT"}"#);
+    }
+    // Reject over-cap at mint (vs the verifier's silent clamp) so the operator-visible expiry is
+    // the real one; "forever" is only available via persistent shares, never presigned.
+    if !(1..=604_800).contains(&req.expires_in_secs) {
+        return json_status(
+            400,
+            r#"{"error":"expires_in_secs must be between 1 and 604800 (7 days)"}"#,
+        );
+    }
+    // Open the requesting admin's own SigV4 secret transiently.
+    let users = match stack.meta.list_users().await {
+        Ok(u) => u,
+        Err(_) => return json_status(500, r#"{"error":"internal error"}"#),
+    };
+    let Some(user) = users.into_iter().find(|u| u.id == p.user_id) else {
+        return json_status(403, r#"{"error":"forbidden"}"#);
+    };
+    let Some(sigv4_key) = user.sigv4_access_key_id else {
+        return json_status(
+            400,
+            r#"{"error":"this user has no S3 (SigV4) credential to sign with"}"#,
+        );
+    };
+    let creds = match stack.meta.user_by_sigv4_key(&sigv4_key).await {
+        Ok(Some(c)) => c,
+        _ => return json_status(500, r#"{"error":"internal error"}"#),
+    };
+    let secret = match stack
+        .crypto
+        .open(&creds.secret_ciphertext, &Nonce(creds.secret_nonce.clone()))
+    {
+        Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+        Err(_) => return json_status(500, r#"{"error":"internal error"}"#),
+    };
+
+    let (scheme, signed_host) = base_scheme_host(stack.public_base_url.as_deref(), host, secure);
+    let mut extra_query: Vec<(String, String)> = Vec::new();
+    if let Some(v) = &req.version_id {
+        extra_query.push(("versionId".to_owned(), v.clone()));
+    }
+    if http_method == "GET" {
+        if let Some(d) = &req.response_content_disposition {
+            extra_query.push(("response-content-disposition".to_owned(), d.clone()));
+        }
+        if let Some(t) = &req.response_content_type {
+            extra_query.push(("response-content-type".to_owned(), t.clone()));
+        }
+    }
+    let mut extra_signed_headers: Vec<(String, String)> = Vec::new();
+    if http_method == "PUT" {
+        if let Some(ct) = &req.content_type {
+            extra_signed_headers.push(("content-type".to_owned(), ct.clone()));
+        }
+    }
+    let now = SystemClock::new().now();
+    let amz_date = format_amz_date(now);
+    let path_query = cairn_auth::mint_presigned(&cairn_auth::PresignRequest {
+        method: &http_method,
+        host: &signed_host,
+        bucket,
+        key: &req.key,
+        access_key_id: &sigv4_key,
+        secret: &secret,
+        region: &stack.region,
+        expires_secs: req.expires_in_secs,
+        amz_date: &amz_date,
+        extra_query,
+        extra_signed_headers,
+    });
+    let expires_at = now.as_millis() + req.expires_in_secs * 1000;
+    let url = format!("{scheme}://{signed_host}{path_query}");
+    json_status(
+        200,
+        &format!(r#"{{"url":"{url}","expires_at_ms":{expires_at},"absolute":true}}"#),
+    )
+}
+
+/// Resolve the `(scheme, host)` for an absolute share/presigned URL: the configured public base URL
+/// when set, else this request's transport + Host.
+fn base_scheme_host(
+    public_base_url: Option<&str>,
+    req_host: &str,
+    secure: bool,
+) -> (String, String) {
+    if let Some(base) = public_base_url {
+        if let Some(rest) = base.strip_prefix("https://") {
+            return (
+                "https".to_owned(),
+                rest.split('/').next().unwrap_or(rest).to_owned(),
+            );
+        }
+        if let Some(rest) = base.strip_prefix("http://") {
+            return (
+                "http".to_owned(),
+                rest.split('/').next().unwrap_or(rest).to_owned(),
+            );
+        }
+    }
+    (
+        if secure { "https" } else { "http" }.to_owned(),
+        req_host.to_owned(),
+    )
+}
+
+/// Format an instant as the SigV4 basic date `YYYYMMDDTHHMMSSZ`.
+fn format_amz_date(ts: Timestamp) -> String {
+    let ms = ts.as_millis();
+    let days = ms.div_euclid(86_400_000);
+    let ms_of_day = ms.rem_euclid(86_400_000);
+    let (y, m, d) = civil_from_days(days);
+    let hh = ms_of_day / 3_600_000;
+    let mm = (ms_of_day % 3_600_000) / 60_000;
+    let ss = (ms_of_day % 60_000) / 1_000;
+    format!("{y:04}{m:02}{d:02}T{hh:02}{mm:02}{ss:02}Z")
+}
+
+/// Civil (year, month, day) from a count of days since the Unix epoch (Howard Hinnant's algorithm).
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 /// Serve a persistent share by its token: look it up, reject revoked/expired (`410`) or unknown

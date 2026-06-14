@@ -13,8 +13,11 @@ use cairn_types::auth::{Principal, Role};
 use cairn_types::bucket::{
     Bucket, CompressionAlgorithm, CompressionPolicy, ConfigAspect, ConfigDoc, VersioningState,
 };
-use cairn_types::id::{BucketName, UserId};
-use cairn_types::meta::{ListQuery, Mutation, MutationOutcome, StoreCounts, User, UserRecord};
+use cairn_types::id::{BucketName, ObjectKey, UserId};
+use cairn_types::meta::{
+    ListQuery, Mutation, MutationOutcome, ShareDisposition, ShareRow, StoreCounts, User, UserRecord,
+};
+use cairn_types::time::Timestamp;
 use cairn_types::traits::{BlobStore, Clock, Crypto, MetadataStore};
 use http::{Method, StatusCode};
 use serde::Serialize;
@@ -239,6 +242,19 @@ impl ControlService {
             (&Method::GET, ["buckets", name]) => self.bucket_detail(name).await,
             (&Method::DELETE, ["buckets", name]) => self.delete_bucket(name, principal).await,
             (&Method::GET, ["buckets", name, "objects"]) => self.list_objects(name, query).await,
+
+            // Persistent object-share management (ARCH §15.8). Minting is handled in the server
+            // adapter (it streams object bytes on redemption); listing and revoking are pure
+            // metadata operations and live here.
+            (&Method::GET, ["buckets", name, "objects", "shares"]) => {
+                self.list_object_shares(name, query).await
+            }
+            (&Method::GET, ["buckets", name, "objects", "shares", token]) => {
+                self.get_object_share(name, token).await
+            }
+            (&Method::DELETE, ["buckets", name, "objects", "shares", token]) => {
+                self.revoke_object_share(name, token, principal).await
+            }
 
             (&Method::GET, ["buckets", name, "config"]) => self.bucket_config(name).await,
             (&Method::PUT, ["buckets", name, "versioning"]) => {
@@ -1856,6 +1872,62 @@ impl ControlService {
         ControlResponse::json(StatusCode::OK, &wire::ActivityListResp { entries: list })
     }
 
+    /// `GET /buckets/{name}/objects/shares[?key=]`: list a bucket's shares (or one key's).
+    async fn list_object_shares(&self, name: &str, query: &[(String, String)]) -> ControlResponse {
+        let bucket = match self.require_bucket(name).await {
+            Ok(n) => n,
+            Err(resp) => return resp,
+        };
+        let key = find_query(query, "key").and_then(|k| ObjectKey::parse(k).ok());
+        let shares = match self.meta.list_shares(&bucket, key.as_ref()).await {
+            Ok(s) => s,
+            Err(e) => return ControlResponse::error_internal(&e.to_string()),
+        };
+        let now = self.clock.now();
+        let records = shares.into_iter().map(|s| share_record(s, now)).collect();
+        ControlResponse::json(StatusCode::OK, &wire::ShareListResp { shares: records })
+    }
+
+    /// `GET /buckets/{name}/objects/shares/{token}`: one share by token.
+    async fn get_object_share(&self, name: &str, token: &str) -> ControlResponse {
+        if let Err(resp) = self.require_bucket(name).await {
+            return resp;
+        }
+        match self.meta.get_share(token).await {
+            Ok(Some(s)) => {
+                ControlResponse::json(StatusCode::OK, &share_record(s, self.clock.now()))
+            }
+            Ok(None) => ControlResponse::not_found(),
+            Err(e) => ControlResponse::error_internal(&e.to_string()),
+        }
+    }
+
+    /// `DELETE /buckets/{name}/objects/shares/{token}`: revoke a share. Idempotent.
+    async fn revoke_object_share(
+        &self,
+        name: &str,
+        token: &str,
+        principal: Option<&Principal>,
+    ) -> ControlResponse {
+        let bucket = match self.require_bucket(name).await {
+            Ok(n) => n,
+            Err(resp) => return resp,
+        };
+        if let Err(e) = self
+            .meta
+            .submit(Mutation::RevokeShare {
+                token: token.to_owned(),
+                now: self.clock.now(),
+            })
+            .await
+        {
+            return ControlResponse::error_internal(&e.to_string());
+        }
+        self.record_activity("RevokeShare", Some(bucket.as_str()), None, principal)
+            .await;
+        ControlResponse::no_content()
+    }
+
     // -----------------------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------------------
@@ -1905,6 +1977,33 @@ fn find_query<'a>(query: &'a [(String, String)], name: &str) -> Option<&'a str> 
         .iter()
         .find(|(k, _)| k == name)
         .map(|(_, v)| v.as_str())
+}
+
+/// Map a stored [`ShareRow`] to the wire view, deriving the `active`/`expired`/`revoked` status.
+fn share_record(s: ShareRow, now: Timestamp) -> wire::ShareRecord {
+    let status = if s.revoked_at.is_some() {
+        "revoked"
+    } else if s.expires_at.is_some_and(|e| now.as_millis() > e.0) {
+        "expired"
+    } else {
+        "active"
+    };
+    wire::ShareRecord {
+        token: s.token,
+        bucket: s.bucket.as_str().to_owned(),
+        key: s.key.as_str().to_owned(),
+        version_id: s.version_id.map(|v| v.as_str().to_owned()),
+        expires_at_ms: s.expires_at.map(|t| t.0),
+        created_at_ms: s.created_at.0,
+        created_by: s.created_by.0,
+        disposition: match s.disposition {
+            ShareDisposition::Attachment => "attachment",
+            ShareDisposition::Inline => "inline",
+        }
+        .to_owned(),
+        filename: s.filename,
+        status: status.to_owned(),
+    }
 }
 
 /// Percent-decode a single URL path segment (used for the replication-target ARN, which contains

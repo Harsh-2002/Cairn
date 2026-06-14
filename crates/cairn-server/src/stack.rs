@@ -52,6 +52,12 @@ pub struct AppStack {
     /// `s3.example.com`. When set, a request whose `Host` is `<bucket>.<s3_domain>` routes to that
     /// bucket with the whole path as the key; `None` leaves path-style addressing as the only form.
     pub s3_domain: Option<String>,
+    /// The SigV4 signing region (`CAIRN_REGION`), used when minting presigned URLs so the
+    /// credential scope matches what the verifier derives.
+    pub region: String,
+    /// The public base URL (`CAIRN_PUBLIC_BASE_URL`) shares/presigned links are built against; when
+    /// `None`, the minting request's own scheme + Host is used.
+    pub public_base_url: Option<String>,
 }
 
 impl std::fmt::Debug for AppStack {
@@ -256,6 +262,8 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
         oracle,
         store,
         s3_domain: cfg.s3_domain.clone(),
+        region: cfg.region.clone(),
+        public_base_url: cfg.public_base_url.clone(),
     })
 }
 
