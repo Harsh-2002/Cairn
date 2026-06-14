@@ -75,7 +75,10 @@ function CommandInput({
       <CommandPrimitive.Input
         data-slot="command-input"
         className={cn(
-          "flex h-10 w-full rounded-md bg-transparent py-3 text-sm outline-hidden placeholder:text-muted-foreground disabled:cursor-not-allowed disabled:opacity-50",
+          // The palette dialog is the focus context, so the input needs no ring
+          // of its own — the global 2px focus ring would be clipped by the
+          // dialog's overflow-hidden and read as a stray blue line.
+          "flex h-10 w-full rounded-md bg-transparent py-3 text-sm outline-none focus-visible:ring-0 focus-visible:ring-offset-0 placeholder:text-muted-foreground disabled:cursor-not-allowed disabled:opacity-50",
           className
         )}
         {...props}

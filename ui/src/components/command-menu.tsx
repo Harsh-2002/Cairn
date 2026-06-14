@@ -62,13 +62,13 @@ export function CommandMenu() {
     <>
       <Button
         variant="outline"
-        size="sm"
-        className="gap-2 text-muted-foreground"
         onClick={() => setOpen(true)}
+        aria-label="Search"
+        className="h-9 justify-start gap-2 px-3 font-normal text-muted-foreground hover:text-foreground sm:w-60"
       >
-        <Search aria-hidden="true" className="size-3.5" />
+        <Search aria-hidden="true" className="size-4 shrink-0" />
         <span className="hidden sm:inline">Search…</span>
-        <kbd className="pointer-events-none hidden rounded border bg-muted px-1.5 font-mono text-[10px] sm:inline">
+        <kbd className="pointer-events-none ml-auto hidden h-5 items-center rounded border bg-muted px-1.5 font-mono text-[11px] font-medium sm:inline-flex">
           ⌘K
         </kbd>
       </Button>
