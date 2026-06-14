@@ -288,31 +288,27 @@ async fn drain_with_router(
     }
 }
 
-/// Resolve the `source bucket name -> built sink` map from each bucket's stored remote replication
-/// targets (`ConfigAspect::ReplicationTargets`, ARCH §20.5). For every bucket whose stored
-/// replication rule names a remote-target ARN, the matching [`RemoteTarget`] is unsealed under the
-/// master key and built into an [`HttpS3Sink`]; that sink ships the bucket's objects to the
-/// destination the target names. Buckets with no stored targets (or whose rule names no ARN, or
-/// whose ARN does not resolve) are omitted, falling back to the env default/named sinks.
+/// Resolve the `target-ARN -> built sink` map from every bucket's stored remote replication targets
+/// (`ConfigAspect::ReplicationTargets`, ARCH §20.5). Each stored [`RemoteTarget`] is unsealed under
+/// the master key and built into an [`HttpS3Sink`] keyed by its ARN, so a drained outbox entry —
+/// which carries the ARN its matching rule named at enqueue — routes to exactly its destination.
+/// Keying by ARN (rather than by source bucket) is what lets one bucket fan out to several distinct
+/// targets by rule/priority/filter.
 ///
 /// Sinks are keyed and rebuilt per drain. Building a sink is cheap (the connector is the only real
-/// cost) and the stored-target set is small, so this keeps a fresh view of operator edits each pass
-/// without a long-lived cache to invalidate.
+/// cost) and the target set is small, so this keeps a fresh view of operator edits each pass without
+/// a long-lived cache to invalidate. An entry whose ARN resolves to no sink here is terminated by
+/// the engine (target removed), rather than silently misrouted.
 async fn resolve_stored_target_sinks(stack: &Arc<AppStack>) -> HashMap<String, Arc<HttpS3Sink>> {
-    let mut out: HashMap<String, Arc<HttpS3Sink>> = HashMap::new();
+    let mut by_arn: HashMap<String, Arc<HttpS3Sink>> = HashMap::new();
     let buckets = match stack.meta.list_buckets(None).await {
         Ok(b) => b,
         Err(e) => {
             tracing::warn!(error = %e, "replication: listing buckets for stored-target resolution failed");
-            return out;
+            return by_arn;
         }
     };
     for b in buckets {
-        // The bucket's replication rule names the target ARN to ship to.
-        let Some(arn) = bucket_rule_target_arn(stack, &b.name).await else {
-            continue;
-        };
-        // Load and parse this bucket's stored remote targets.
         let doc = match stack
             .meta
             .get_bucket_config(&b.name, ConfigAspect::ReplicationTargets)
@@ -334,61 +330,44 @@ async fn resolve_stored_target_sinks(stack: &Arc<AppStack>) -> HashMap<String, A
                 continue;
             }
         };
-        let Some(target) = cairn_replication::resolve_target(&targets, &arn) else {
-            tracing::warn!(bucket = %b.name.as_str(), %arn,
-                "replication: rule names a target ARN with no matching stored target");
-            continue;
-        };
-        // Unseal the target under the master key and build its dedicated sink.
-        let open = match cairn_replication::open_target(&stack.crypto, target) {
-            Ok(o) => o,
-            Err(e) => {
-                tracing::warn!(bucket = %b.name.as_str(), error = %e,
-                    "replication: unsealing stored target failed");
+        // Build a sink for every distinct target ARN (a bucket may name several).
+        for target in &targets {
+            if by_arn.contains_key(&target.arn) {
                 continue;
             }
-        };
-        match cairn_replication::sink_for_target(&open, None, false) {
-            Ok(sink) => {
-                out.insert(b.name.as_str().to_owned(), Arc::new(sink));
-            }
-            Err(e) => {
-                tracing::warn!(bucket = %b.name.as_str(), error = %e,
-                    "replication: building sink for stored target failed");
+            let open = match cairn_replication::open_target(&stack.crypto, target) {
+                Ok(o) => o,
+                Err(e) => {
+                    tracing::warn!(arn = %target.arn, error = %e,
+                        "replication: unsealing stored target failed");
+                    continue;
+                }
+            };
+            match cairn_replication::sink_for_target(&open, None, false) {
+                Ok(sink) => {
+                    by_arn.insert(target.arn.clone(), Arc::new(sink));
+                }
+                Err(e) => {
+                    tracing::warn!(arn = %target.arn, error = %e,
+                        "replication: building sink for stored target failed");
+                }
             }
         }
     }
-    out
+    by_arn
 }
 
 /// Read a single bucket's first enabled replication rule's remote-target ARN, or `None` when the
 /// bucket has no replication config, an unparseable document, or no enabled rule naming a target.
-async fn bucket_rule_target_arn(stack: &Arc<AppStack>, bucket: &BucketName) -> Option<String> {
-    let doc = stack
-        .meta
-        .get_bucket_config(bucket, ConfigAspect::Replication)
-        .await
-        .ok()??;
-    let cfg = cairn_replication::parse_replication(doc.0.as_bytes()).ok()?;
-    // The highest-priority enabled rule's target wins, consistent with the per-write rule selection
-    // (ARCH §20.2). Routing is per source bucket, so the single highest-priority target is used; a
-    // bucket fanning out to several distinct targets by priority/filter is a known limitation.
-    cfg.rules
-        .iter()
-        .filter(|r| r.enabled)
-        .reduce(|best, r| if r.priority > best.priority { r } else { best })
-        .and_then(|r| r.target_arn.clone())
-}
-
-/// Build the [`StoredTargetRouter`] for a drain from the stored per-bucket sinks plus the env
-/// default. The multi-target worker shape folds its env-named per-source routes in afterwards via
+/// Build the [`StoredTargetRouter`] for a drain from the stored per-ARN sinks plus the env default.
+/// The multi-target worker shape folds its env-named per-source routes in afterwards via
 /// [`StoredTargetRouter::with_env_routes`]; the single-target shape passes none.
 fn build_router(
     default: Option<Arc<HttpS3Sink>>,
-    stored: &HashMap<String, Arc<HttpS3Sink>>,
+    by_arn: &HashMap<String, Arc<HttpS3Sink>>,
 ) -> StoredTargetRouter {
     StoredTargetRouter {
-        stored: stored.clone(),
+        by_arn: by_arn.clone(),
         env_routes: HashMap::new(),
         default,
     }
@@ -469,38 +448,32 @@ fn match_target(
 ///  2. **env_routes** — the legacy `CAIRN_REPLICATION_TARGETS` named-target route for the bucket.
 ///  3. **default** — the single-target `CAIRN_REPLICATION_*` env sink.
 ///
-/// With no stored target, no env route, and no default, an entry's source bucket names a
-/// destination no configured target serves: a terminal failure surfaced for operator attention,
-/// never a silent drop (ARCH §20).
-///
-/// SIMPLIFICATION (noted per task brief): because the durable outbox entry does not carry the
-/// target ARN, routing keys off the **source bucket** rather than a per-entry ARN. This is correct
-/// for the current model (a bucket's enabled rule names one target) and preserves the existing
-/// env-driven behaviour and tests; if the entry later grows an explicit ARN field, `sink_for` can
-/// switch to keying on it.
+/// Routing precedence: an entry carrying a stored-target ARN routes directly to that target's sink
+/// (per-entry, so one bucket fans out to several distinct targets correctly). An entry with no ARN
+/// (the legacy env path) routes by source bucket through the env named route, then the env default.
+/// An entry whose ARN resolves to no sink, or a no-ARN entry with no env route/default, terminates
+/// for operator attention rather than silently dropping (ARCH §20).
 struct StoredTargetRouter {
-    /// `source bucket -> sink` resolved from each bucket's stored remote target (precedence 1).
-    stored: HashMap<String, Arc<HttpS3Sink>>,
-    /// `source bucket -> sink` resolved from the env named targets (precedence 2).
+    /// `target ARN -> sink` for the per-bucket stored remote targets — the primary path.
+    by_arn: HashMap<String, Arc<HttpS3Sink>>,
+    /// `source bucket -> sink` resolved from the env named targets (legacy path for ARN-less entries).
     env_routes: HashMap<String, Arc<HttpS3Sink>>,
-    /// The env single-target default sink (precedence 3).
+    /// The env single-target default sink (legacy fallback for ARN-less entries).
     default: Option<Arc<HttpS3Sink>>,
 }
 
 impl StoredTargetRouter {
-    /// Fold the env-named per-source routes in (used by the multi-target worker shape). Stored
-    /// targets still take precedence over these at dispatch time.
+    /// Fold the env-named per-source routes in (used by the multi-target worker shape).
     fn with_env_routes(mut self, routes: HashMap<String, Arc<HttpS3Sink>>) -> Self {
         self.env_routes = routes;
         self
     }
 
-    /// Resolve the sink for a source bucket in precedence order: stored, then env route, then the
-    /// env default.
+    /// Resolve the sink for an ARN-less (legacy/env) entry by its source bucket: env route, then
+    /// the env default.
     fn sink_for_bucket(&self, source_bucket: &str) -> Result<&Arc<HttpS3Sink>, ReplicationError> {
-        self.stored
+        self.env_routes
             .get(source_bucket)
-            .or_else(|| self.env_routes.get(source_bucket))
             .or(self.default.as_ref())
             .ok_or_else(|| {
                 ReplicationError::Terminal(format!(
@@ -511,9 +484,17 @@ impl StoredTargetRouter {
 }
 
 impl SinkRouter for StoredTargetRouter {
-    fn sink_for<'a>(&'a self, _target_arn: Option<&str>) -> Option<&'a dyn BucketRoutedSink> {
-        // The entry carries no explicit ARN; we route per source bucket inside `BucketRoutedSink`.
-        Some(self)
+    fn sink_for<'a>(&'a self, target_arn: Option<&str>) -> Option<&'a dyn BucketRoutedSink> {
+        match target_arn {
+            // The entry names a stored target: route straight to that target's sink. An ARN with no
+            // sink (target removed since enqueue) yields None → the engine terminates the entry.
+            Some(arn) => self
+                .by_arn
+                .get(arn)
+                .map(|s| s.as_ref() as &dyn BucketRoutedSink),
+            // No ARN (legacy/env entry): route by source bucket inside `BucketRoutedSink`.
+            None => Some(self),
+        }
     }
 }
 
@@ -650,9 +631,10 @@ async fn metrics_loop(stack: Arc<AppStack>) {
 
         // Metadata config-cache effectiveness (ARCH §11.5). The cache is not a `metrics` dependency,
         // so it exposes cumulative counters we mirror into the registry here.
+        // Cumulative monotonic totals: set the counters to their absolute values each tick.
         let (hits, misses) = stack.meta_cache.stats();
-        metrics::gauge!("cairn_meta_cache_hits_total").set(hits as f64);
-        metrics::gauge!("cairn_meta_cache_misses_total").set(misses as f64);
+        metrics::counter!("cairn_meta_cache_hits_total").absolute(hits);
+        metrics::counter!("cairn_meta_cache_misses_total").absolute(misses);
 
         // Replication queue depth + lag (ARCH §20/§26). `list_due_replication` is a read-only mirror
         // of the claim predicate; the oldest due entry's age is the replication lag.
@@ -835,7 +817,7 @@ mod tests {
         let mut routes = HashMap::new();
         routes.insert("logs".to_owned(), Arc::clone(&west));
         let sink = StoredTargetRouter {
-            stored: HashMap::new(),
+            by_arn: HashMap::new(),
             env_routes: routes,
             default: Some(default),
         };
@@ -852,7 +834,7 @@ mod tests {
 
         // With no default, an unrouted bucket is a terminal failure.
         let sink = StoredTargetRouter {
-            stored: HashMap::new(),
+            by_arn: HashMap::new(),
             env_routes: HashMap::new(),
             default: None,
         };
@@ -860,14 +842,11 @@ mod tests {
         assert!(matches!(err, ReplicationError::Terminal(_)));
     }
 
-    /// A stored per-bucket remote target takes precedence over both an env-named route and the env
-    /// default for the same source bucket (ARCH §20.5).
-    #[test]
-    fn stored_target_wins_over_env_route_and_default() {
-        let stored_sink = Arc::new(
+    fn test_sink(endpoint: &str, dest: &str) -> Arc<HttpS3Sink> {
+        Arc::new(
             HttpS3Sink::new(cairn_replication::S3SinkConfig {
-                endpoint: "https://stored.example:9000".to_owned(),
-                dest_bucket: "stored-dest".to_owned(),
+                endpoint: endpoint.to_owned(),
+                dest_bucket: dest.to_owned(),
                 dest_buckets: HashMap::new(),
                 region: "us-east-1".to_owned(),
                 access_key_id: "AKID".to_owned(),
@@ -876,56 +855,71 @@ mod tests {
                 insecure_skip_verify: false,
             })
             .unwrap(),
-        );
-        let env_sink = Arc::new(
-            HttpS3Sink::new(cairn_replication::S3SinkConfig {
-                endpoint: "https://env.example:9000".to_owned(),
-                dest_bucket: "env-dest".to_owned(),
-                dest_buckets: HashMap::new(),
-                region: "us-east-1".to_owned(),
-                access_key_id: "AKID".to_owned(),
-                secret_access_key: "secret".to_owned(),
-                ca_cert_path: None,
-                insecure_skip_verify: false,
-            })
-            .unwrap(),
-        );
-        let default_sink = Arc::new(
-            HttpS3Sink::new(cairn_replication::S3SinkConfig {
-                endpoint: "https://default.example:9000".to_owned(),
-                dest_bucket: "default-dest".to_owned(),
-                dest_buckets: HashMap::new(),
-                region: "us-east-1".to_owned(),
-                access_key_id: "AKID".to_owned(),
-                secret_access_key: "secret".to_owned(),
-                ca_cert_path: None,
-                insecure_skip_verify: false,
-            })
-            .unwrap(),
-        );
+        )
+    }
 
-        let mut stored = HashMap::new();
-        stored.insert("logs".to_owned(), Arc::clone(&stored_sink));
+    /// An entry routes to the sink for ITS target ARN (per-entry), so one source can fan out to
+    /// several distinct targets; an ARN with no sink terminates; an ARN-less (env) entry falls back
+    /// to the source-bucket route, then the env default (ARCH §20.4/§20.5).
+    #[test]
+    fn router_routes_per_entry_arn_then_falls_back_to_env() {
+        let target_a = test_sink("https://a.example:9000", "dest-a");
+        let target_b = test_sink("https://b.example:9000", "dest-b");
+        let env_sink = test_sink("https://env.example:9000", "env-dest");
+        let default_sink = test_sink("https://default.example:9000", "default-dest");
+
+        let mut by_arn = HashMap::new();
+        by_arn.insert(
+            "arn:cairn:replication:us-east-1:aaaa:dest-a".to_owned(),
+            Arc::clone(&target_a),
+        );
+        by_arn.insert(
+            "arn:cairn:replication:us-east-1:bbbb:dest-b".to_owned(),
+            Arc::clone(&target_b),
+        );
         let mut env_routes = HashMap::new();
-        env_routes.insert("logs".to_owned(), Arc::clone(&env_sink));
         env_routes.insert("metrics".to_owned(), Arc::clone(&env_sink));
         let router = StoredTargetRouter {
-            stored,
+            by_arn,
             env_routes,
             default: Some(Arc::clone(&default_sink)),
         };
 
-        // "logs" has a stored target -> stored wins over its env route.
-        assert_eq!(
-            router.sink_for_bucket("logs").unwrap().dest_for("x"),
-            "stored-dest"
+        // Two different ARNs resolve (so one source fans out to several distinct targets), each to
+        // its own correct destination. `sink_for` yields a trait object, so the destination is
+        // asserted on the concrete `by_arn` sinks; resolution itself is asserted via `sink_for`.
+        assert!(
+            router
+                .sink_for(Some("arn:cairn:replication:us-east-1:aaaa:dest-a"))
+                .is_some()
         );
-        // "metrics" has only an env route -> env route wins over default.
+        assert!(
+            router
+                .sink_for(Some("arn:cairn:replication:us-east-1:bbbb:dest-b"))
+                .is_some()
+        );
+        assert_eq!(
+            router.by_arn["arn:cairn:replication:us-east-1:aaaa:dest-a"].dest_for("x"),
+            "dest-a"
+        );
+        assert_eq!(
+            router.by_arn["arn:cairn:replication:us-east-1:bbbb:dest-b"].dest_for("x"),
+            "dest-b"
+        );
+
+        // An ARN with no built sink (target removed) does not resolve -> the engine terminates it.
+        assert!(
+            router
+                .sink_for(Some("arn:cairn:replication:us-east-1:zzzz:gone"))
+                .is_none()
+        );
+
+        // An ARN-less (legacy/env) entry routes by source bucket: env route, then the env default.
+        assert!(router.sink_for(None).is_some());
         assert_eq!(
             router.sink_for_bucket("metrics").unwrap().dest_for("x"),
             "env-dest"
         );
-        // "other" has neither -> the env default.
         assert_eq!(
             router.sink_for_bucket("other").unwrap().dest_for("x"),
             "default-dest"

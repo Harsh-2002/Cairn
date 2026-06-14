@@ -276,6 +276,50 @@ async fn current_expiration_versioned_inserts_delete_marker() {
 }
 
 #[tokio::test]
+async fn lifecycle_expiration_replicates_delete_marker() {
+    let meta = InMemoryMetadataStore::new();
+    let blob = InMemoryBlobStore::new();
+    let clock = TestClock::at_secs(0);
+    make_bucket(&meta, VersioningState::Enabled).await;
+
+    // A replication rule that replicates delete markers to a stored target.
+    let repl = r#"<ReplicationConfiguration><Role>arn:aws:iam::cairn:role/r</Role><Rule><ID>r1</ID><Status>Enabled</Status><DeleteMarkerReplication><Status>Enabled</Status></DeleteMarkerReplication><Filter><Prefix></Prefix></Filter><Destination><Bucket>arn:cairn:replication:us-east-1:t1:dest</Bucket></Destination></Rule></ReplicationConfiguration>"#;
+    meta.submit(Mutation::SetBucketConfig {
+        bucket: bucket_name(),
+        aspect: cairn_types::bucket::ConfigAspect::Replication,
+        doc: Some(cairn_types::bucket::ConfigDoc(repl.to_owned())),
+    })
+    .await
+    .unwrap();
+
+    put_object(&meta, &blob, "doc.txt", b"hello", 0, VersionId::generate()).await;
+
+    clock.set(Timestamp::from_secs(31 * DAY));
+    let scanner = LifecycleScanner::new();
+    let report = scanner
+        .run_once(&meta, &blob, &clock, &cfg(vec![expiration_rule(30)]))
+        .await
+        .unwrap();
+    assert_eq!(report.objects_expired, 1);
+
+    // The lifecycle-created delete marker was enqueued for replication to the rule's target —
+    // expirations propagate to the replica exactly like a client delete (ARCH §19.3/§20.3).
+    let due = meta
+        .list_due_replication(100, Timestamp::from_secs(31 * DAY))
+        .await
+        .unwrap();
+    assert_eq!(due.len(), 1, "delete-marker replication enqueued");
+    assert_eq!(
+        due[0].operation,
+        cairn_types::meta::ReplicationOp::DeleteMarker
+    );
+    assert_eq!(
+        due[0].target_arn.as_deref(),
+        Some("arn:cairn:replication:us-east-1:t1:dest")
+    );
+}
+
+#[tokio::test]
 async fn noncurrent_expiration_keeps_newest_and_deletes_old() {
     let meta = InMemoryMetadataStore::new();
     let blob = InMemoryBlobStore::new();

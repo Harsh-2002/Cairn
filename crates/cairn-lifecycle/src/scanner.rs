@@ -513,7 +513,8 @@ impl LifecycleScanner {
         })
     }
 
-    /// Insert a delete marker for the current object (versioned-bucket expiration).
+    /// Insert a delete marker for the current object (versioned-bucket expiration), propagating it
+    /// to replicas where the bucket's replication rule calls for it (ARCH §19.3/§20.3).
     async fn insert_delete_marker<M>(
         &self,
         meta: &M,
@@ -524,16 +525,60 @@ impl LifecycleScanner {
     where
         M: MetadataStore + ?Sized,
     {
+        let marker_id = VersionId::generate();
+        let replication = Self::marker_replication(meta, bucket, key, &marker_id, now).await;
         meta.submit(Mutation::CreateDeleteMarker {
             bucket: bucket.name.clone(),
             key: key.clone(),
-            version_id: VersionId::generate(),
+            version_id: marker_id,
             owner_id: bucket.owner_id.clone(),
             now,
-            replication: None,
+            replication,
         })
         .await
         .map(|_| ())
+    }
+
+    /// Build a replication-outbox entry for a lifecycle-created delete marker when the bucket has an
+    /// enabled replication rule (with delete-marker replication) whose prefix matches the key, so
+    /// expirations propagate to the replica the same way a client delete does (ARCH §20.3/§20.4).
+    /// Replication requires versioning-enabled, so a non-enabled bucket yields `None`.
+    async fn marker_replication<M>(
+        meta: &M,
+        bucket: &Bucket,
+        key: &ObjectKey,
+        marker_id: &VersionId,
+        now: Timestamp,
+    ) -> Option<cairn_types::meta::OutboxEntry>
+    where
+        M: MetadataStore + ?Sized,
+    {
+        if bucket.versioning != VersioningState::Enabled {
+            return None;
+        }
+        let doc = meta
+            .get_bucket_config(&bucket.name, cairn_types::bucket::ConfigAspect::Replication)
+            .await
+            .ok()??;
+        let cfg = cairn_replication::parse_replication(doc.0.as_bytes()).ok()?;
+        let rule = cfg
+            .rules
+            .iter()
+            .filter(|r| {
+                r.enabled && r.delete_marker_replication && r.filter.matches_prefix(key.as_str())
+            })
+            .reduce(|best, r| if r.priority > best.priority { r } else { best })?;
+        Some(cairn_replication::outbox_entry_for(
+            format!("dmrepl:{}", marker_id.as_str()),
+            bucket.name.clone(),
+            key.clone(),
+            marker_id.clone(),
+            cairn_types::meta::ReplicationOp::DeleteMarker,
+            rule.id.clone(),
+            rule.target_arn.clone(),
+            now,
+            rule.priority,
+        ))
     }
 
     /// Permanently delete a version and reclaim its freed blob (idempotent: a missing version

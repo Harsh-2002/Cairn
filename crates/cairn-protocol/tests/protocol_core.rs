@@ -3117,3 +3117,92 @@ async fn bulk_delete_reports_marker_and_rejects_oversize() {
     .await;
     assert_eq!(st, StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test]
+async fn bulk_delete_suspended_inserts_null_marker_not_permanent() {
+    let h = harness().await;
+    versioned_bucket(&h, "bdsus").await;
+    // Write an identified version while Enabled.
+    drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("bdsus"),
+                Some("k"),
+                &[],
+                &[],
+                b"keep".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    // Suspend versioning.
+    let vcfg =
+        b"<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>".to_vec();
+    drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("bdsus"),
+                None,
+                &[("versioning", "")],
+                &[],
+                vcfg,
+            ),
+        )
+        .await,
+    )
+    .await;
+
+    // A bulk delete in a Suspended bucket must insert a NULL-version delete marker — NOT permanently
+    // remove the object (the prior identified version must survive). Previously the bulk path
+    // collapsed Suspended to Unversioned and destroyed data.
+    let del = "<Delete><Object><Key>k</Key></Object></Delete>";
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::POST,
+                Some("bdsus"),
+                None,
+                &[("delete", "")],
+                &[],
+                del.as_bytes().to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let xml = String::from_utf8(body).unwrap();
+    assert!(
+        xml.contains("<DeleteMarker>true</DeleteMarker>"),
+        "suspended bulk delete inserts a marker: {xml}"
+    );
+
+    // The earlier identified version is retained (data not destroyed): a versions listing still
+    // shows a real <Version> entry alongside the new delete marker.
+    let (_, _, vbody) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("bdsus"),
+                None,
+                &[("versions", "")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    let vxml = String::from_utf8(vbody).unwrap();
+    assert!(
+        vxml.contains("<Version>"),
+        "identified version retained under Suspended bulk delete: {vxml}"
+    );
+}

@@ -208,6 +208,16 @@ ALTER TABLE replication_outbox ADD COLUMN lease_until INTEGER;
 ALTER TABLE users ADD COLUMN quota_bytes INTEGER;
 "#,
     },
+    Migration {
+        version: 6,
+        name: "replication outbox target ARN (per-entry routing)",
+        sql: r#"
+-- The remote-target ARN an outbox entry ships to, stamped at enqueue from the matching rule so
+-- drain-time routing is a pure per-entry lookup (multi-target buckets route correctly, and a later
+-- rule edit cannot misroute already-queued entries). NULL routes via the legacy env single target.
+ALTER TABLE replication_outbox ADD COLUMN target_arn TEXT;
+"#,
+    },
 ];
 
 /// Run all pending migrations on the write connection, recording each as applied.

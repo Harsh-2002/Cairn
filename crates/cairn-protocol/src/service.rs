@@ -692,6 +692,8 @@ impl S3Service {
         let resp = object_headers(S3Response::status(StatusCode::OK), &row)
             .with_header("content-length", row.size_logical.to_string())
             .with_header("x-amz-request-id", &req.request_id);
+        // S3 applies the `response-*` header overrides to HEAD as well as GET.
+        let resp = apply_response_overrides(resp, req);
         Ok(resp)
     }
 
@@ -1361,7 +1363,6 @@ impl S3Service {
         if keys.len() > 1000 {
             return Err(Error::MalformedXml);
         }
-        let versioned = bucket.versioning == VersioningState::Enabled;
         let now = self.clock.now();
 
         // Each entry is (key, version_id, is_delete_marker, delete_marker_version_id) so the
@@ -1402,39 +1403,81 @@ impl S3Service {
                 errors.push((key_s, code.to_owned(), e.to_string()));
                 continue;
             }
-            // A plain delete in a versioned bucket inserts a delete marker (whose id we capture for
-            // the result and for delete-marker replication); a versioned delete or an unversioned
-            // delete removes a version outright.
-            let marker_id = match (&version, versioned) {
-                (None, true) => Some(VersionId::generate()),
-                _ => None,
-            };
-            let mutation = match (&version, &marker_id) {
-                (Some(v), _) => Mutation::DeleteVersion {
-                    bucket: bucket.name.clone(),
-                    key,
-                    version_id: VersionId::from_string(v.clone()),
-                },
-                (None, Some(mid)) => {
-                    let replication = self
-                        .replication_outbox(&bucket, &key, mid, ReplicationOp::DeleteMarker, &[])
-                        .await;
-                    Mutation::CreateDeleteMarker {
+            // Per-key delete semantics by versioning state, mirroring the single-object DELETE:
+            //  - a versioned delete (?versionId) permanently removes that version;
+            //  - Enabled: insert a delete marker (replicated where the rule calls for it);
+            //  - Suspended: replace any existing null version with a null-version delete marker
+            //    (NOT a permanent removal — Medium #4 applied to the bulk path);
+            //  - Unversioned: remove the sentinel version outright.
+            let result = if let Some(v) = &version {
+                self.meta
+                    .submit(Mutation::DeleteVersion {
                         bucket: bucket.name.clone(),
                         key,
-                        version_id: mid.clone(),
-                        owner_id: bucket.owner_id.clone(),
-                        now,
-                        replication,
+                        version_id: VersionId::from_string(v.clone()),
+                    })
+                    .await
+            } else {
+                match bucket.versioning {
+                    VersioningState::Enabled => {
+                        let mid = VersionId::generate();
+                        let replication = self
+                            .replication_outbox(
+                                &bucket,
+                                &key,
+                                &mid,
+                                ReplicationOp::DeleteMarker,
+                                &[],
+                            )
+                            .await;
+                        self.meta
+                            .submit(Mutation::CreateDeleteMarker {
+                                bucket: bucket.name.clone(),
+                                key,
+                                version_id: mid,
+                                owner_id: bucket.owner_id.clone(),
+                                now,
+                                replication,
+                            })
+                            .await
+                    }
+                    VersioningState::Suspended => {
+                        // Remove any existing null version (reclaiming its blob), then insert a
+                        // null-version delete marker that replaces it.
+                        if let Ok(MutationOutcome::Deleted { freed: Some(p), .. }) = self
+                            .meta
+                            .submit(Mutation::DeleteVersion {
+                                bucket: bucket.name.clone(),
+                                key: key.clone(),
+                                version_id: VersionId::null(),
+                            })
+                            .await
+                        {
+                            let _ = self.blob.delete(&p).await;
+                        }
+                        self.meta
+                            .submit(Mutation::CreateDeleteMarker {
+                                bucket: bucket.name.clone(),
+                                key,
+                                version_id: VersionId::null(),
+                                owner_id: bucket.owner_id.clone(),
+                                now,
+                                replication: None,
+                            })
+                            .await
+                    }
+                    VersioningState::Unversioned => {
+                        self.meta
+                            .submit(Mutation::DeleteVersion {
+                                bucket: bucket.name.clone(),
+                                key,
+                                version_id: VersionId::null(),
+                            })
+                            .await
                     }
                 }
-                (None, None) => Mutation::DeleteVersion {
-                    bucket: bucket.name.clone(),
-                    key,
-                    version_id: VersionId::null(),
-                },
             };
-            match self.meta.submit(mutation).await {
+            match result {
                 Ok(MutationOutcome::Deleted { freed, .. }) => {
                     if let Some(p) = freed {
                         let _ = self.blob.delete(&p).await;
@@ -2037,6 +2080,7 @@ impl S3Service {
             version_id.clone(),
             op,
             rule.id.clone(),
+            rule.target_arn.clone(),
             self.clock.now(),
             rule.priority,
         ))
@@ -2380,10 +2424,13 @@ fn object_action(req: &S3Request) -> Result<Action> {
         // An inbound replica PUT (`x-amz-meta-cairn-replica: true`, ARCH §20.4) authorizes against
         // `s3:ReplicateObject`, so a dedicated replication user scoped to that action is allowed
         // (and a normal writer's `s3:PutObject` grant does not silently accept replica traffic).
+        // Only a genuine body PUT is reclassified — a copy (which carries `x-amz-copy-source`) stays
+        // a normal write so the replica marker cannot launder a copy past `s3:PutObject`.
         Method::PUT
-            if req
-                .header("x-amz-meta-cairn-replica")
-                .is_some_and(|v| v.eq_ignore_ascii_case("true")) =>
+            if req.header("x-amz-copy-source").is_none()
+                && req
+                    .header("x-amz-meta-cairn-replica")
+                    .is_some_and(|v| v.eq_ignore_ascii_case("true")) =>
         {
             ReplicateObject
         }

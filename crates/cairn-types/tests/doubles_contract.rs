@@ -333,6 +333,7 @@ async fn plant_outbox_entry(
         version_id: version.clone(),
         operation: cairn_types::meta::ReplicationOp::ObjectCreate,
         rule_id: "rule-1".to_owned(),
+        target_arn: None,
         attempts: 0,
         next_attempt_at: Timestamp::EPOCH,
         status: cairn_types::meta::ReplicationStatus::Pending,

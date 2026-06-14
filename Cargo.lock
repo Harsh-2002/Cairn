@@ -455,6 +455,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tracing",
  "uuid",
 ]
 
@@ -478,6 +479,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "cairn-replication",
  "cairn-types",
  "futures-util",
  "quick-xml",

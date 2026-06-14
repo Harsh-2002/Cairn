@@ -20,6 +20,10 @@ http.workspace = true
 bytes.workspace = true
 uuid.workspace = true
 rand.workspace = true
+tracing.workspace = true
+# `rt` provides `tokio::spawn` for the background replication backfill (resync); the server runs on
+# a multi-thread runtime, but this crate only needs the spawn handle.
+tokio = { workspace = true, features = ["rt"] }
 
 # Safe statvfs for the /system disk figures (the crate forbids unsafe, so no raw libc).
 [target.'cfg(unix)'.dependencies]

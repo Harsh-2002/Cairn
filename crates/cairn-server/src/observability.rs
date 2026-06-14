@@ -60,12 +60,12 @@ fn describe_metrics() {
         "Total response-body bytes sent (from declared content-length)"
     );
 
-    // Metadata config-cache effectiveness (ARCH §11.5).
-    describe_gauge!(
+    // Metadata config-cache effectiveness (ARCH §11.5). Monotonic cumulative counts.
+    describe_counter!(
         "cairn_meta_cache_hits_total",
         "Cumulative metadata config-cache hits"
     );
-    describe_gauge!(
+    describe_counter!(
         "cairn_meta_cache_misses_total",
         "Cumulative metadata config-cache misses"
     );

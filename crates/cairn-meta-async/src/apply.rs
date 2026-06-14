@@ -505,6 +505,32 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
             }
             Ok(MutationOutcome::Ack)
         }
+        Mutation::EnqueueReplication(e) => {
+            // Idempotent (INSERT OR IGNORE on the deterministic backfill id); see the sync store.
+            driver
+                .execute(
+                    "INSERT OR IGNORE INTO replication_outbox
+                     (id, bucket_name, key, version_id, operation, rule_id, target_arn, attempts, next_attempt_at, status, last_error, priority, lease_until)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                    vec![
+                        Value::Text(e.id.clone()),
+                        Value::Text(e.bucket.as_str().to_owned()),
+                        Value::Text(e.key.as_str().to_owned()),
+                        Value::Text(e.version_id.as_str().to_owned()),
+                        Value::Text(repl_op_str(e.operation).to_owned()),
+                        Value::Text(e.rule_id.clone()),
+                        opt_text(e.target_arn.clone()),
+                        Value::Int(e.attempts as i64),
+                        Value::Int(e.next_attempt_at.0),
+                        Value::Text(repl_status_str(e.status).to_owned()),
+                        opt_text(e.last_error.clone()),
+                        Value::Int(e.priority),
+                        e.lease_until.map_or(Value::Null, |t| Value::Int(t.0)),
+                    ],
+                )
+                .await?;
+            Ok(MutationOutcome::Ack)
+        }
         Mutation::RecordActivity(e) => {
             driver
                 .execute(
@@ -864,8 +890,8 @@ async fn enqueue(driver: &dyn AsyncSqlDriver, e: &OutboxEntry) -> R<()> {
     driver
         .execute(
             "INSERT INTO replication_outbox
-             (id, bucket_name, key, version_id, operation, rule_id, attempts, next_attempt_at, status, last_error, priority, lease_until)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+             (id, bucket_name, key, version_id, operation, rule_id, target_arn, attempts, next_attempt_at, status, last_error, priority, lease_until)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
             vec![
                 Value::Text(e.id.clone()),
                 Value::Text(e.bucket.as_str().to_owned()),
@@ -873,6 +899,7 @@ async fn enqueue(driver: &dyn AsyncSqlDriver, e: &OutboxEntry) -> R<()> {
                 Value::Text(e.version_id.as_str().to_owned()),
                 Value::Text(repl_op_str(e.operation).to_owned()),
                 Value::Text(e.rule_id.clone()),
+                opt_text(e.target_arn.clone()),
                 Value::Int(e.attempts as i64),
                 Value::Int(e.next_attempt_at.0),
                 Value::Text(repl_status_str(e.status).to_owned()),

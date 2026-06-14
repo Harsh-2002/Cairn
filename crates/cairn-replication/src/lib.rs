@@ -506,8 +506,8 @@ where
 /// the source bucket it already knows. Centralising it here keeps the routing seam in one place if
 /// the entry later grows an explicit target field.
 #[inline]
-fn entry_target_arn(_entry: &OutboxEntry) -> Option<&str> {
-    None
+fn entry_target_arn(entry: &OutboxEntry) -> Option<&str> {
+    entry.target_arn.as_deref()
 }
 
 /// Classify a blob-store error opening the source body: a missing blob is terminal (it will
@@ -533,6 +533,7 @@ pub fn outbox_entry_for(
     version_id: VersionId,
     operation: ReplicationOp,
     rule_id: impl Into<String>,
+    target_arn: Option<String>,
     due_at: Timestamp,
     priority: i64,
 ) -> OutboxEntry {
@@ -543,6 +544,7 @@ pub fn outbox_entry_for(
         version_id,
         operation,
         rule_id: rule_id.into(),
+        target_arn,
         attempts: 0,
         next_attempt_at: due_at,
         status: ReplicationStatus::Pending,
@@ -591,6 +593,7 @@ pub fn backfill_outbox_entries(
                 version.clone(),
                 ReplicationOp::ObjectCreate,
                 rule.id.clone(),
+                rule.target_arn.clone(),
                 Timestamp::from_secs(0),
                 rule.priority,
             )

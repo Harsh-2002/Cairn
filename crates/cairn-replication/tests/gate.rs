@@ -124,6 +124,7 @@ async fn put_with_outbox(
         version.clone(),
         ReplicationOp::ObjectCreate,
         "rule-0",
+        None,
         due_at,
         0,
     );
@@ -376,6 +377,7 @@ async fn delete_marker_entry_drives_sink_delete_marker() {
         version.clone(),
         ReplicationOp::DeleteMarker,
         "rule-0",
+        None,
         now,
         0,
     );
@@ -439,6 +441,7 @@ async fn replica_status_is_never_re_replicated() {
         version.clone(),
         ReplicationOp::ObjectCreate,
         "rule-0",
+        None,
         now,
         0,
     );
@@ -502,6 +505,7 @@ async fn redelivering_completed_version_is_idempotent() {
         version.clone(),
         ReplicationOp::ObjectCreate,
         "rule-0",
+        None,
         now,
         0,
     );
@@ -604,6 +608,7 @@ async fn run_until_idle_drains_independent_keys() {
             version,
             ReplicationOp::ObjectCreate,
             "rule-0",
+            None,
             now,
             0,
         );

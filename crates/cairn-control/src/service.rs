@@ -272,6 +272,9 @@ impl ControlService {
             (&Method::POST, ["buckets", name, "replication", "retry"]) => {
                 self.retry_replication(name, principal).await
             }
+            (&Method::POST, ["buckets", name, "replication", "resync"]) => {
+                self.resync_replication(name, principal).await
+            }
             (&Method::GET, ["buckets", name, "replication", "status"]) => {
                 self.replication_status(name).await
             }
@@ -1687,6 +1690,68 @@ impl ControlService {
         )
     }
 
+    /// `POST /buckets/{name}/replication/resync`: trigger existing-object backfill (ARCH §20.5).
+    /// Requires the bucket to have a replication configuration with at least one enabled rule whose
+    /// `ExistingObjectReplication` is enabled. The actual enumeration runs as a spawned background
+    /// task (a large bucket must not block the request); the entries it enqueues are idempotent, so
+    /// re-running a resync is safe and already-replicated versions are not re-shipped.
+    async fn resync_replication(
+        &self,
+        name: &str,
+        principal: Option<&Principal>,
+    ) -> ControlResponse {
+        let bucket_name = match self.require_bucket(name).await {
+            Ok(n) => n,
+            Err(resp) => return resp,
+        };
+        let doc = match self
+            .meta
+            .get_bucket_config(&bucket_name, ConfigAspect::Replication)
+            .await
+        {
+            Ok(Some(d)) => d,
+            Ok(None) => {
+                return ControlResponse::bad_request("bucket has no replication configuration");
+            }
+            Err(e) => return ControlResponse::error_internal(&e.to_string()),
+        };
+        let cfg = match cairn_replication::parse_replication(doc.0.as_bytes()) {
+            Ok(c) => c,
+            Err(e) => {
+                return ControlResponse::bad_request(&format!("invalid replication config: {e}"));
+            }
+        };
+        if !cfg
+            .rules
+            .iter()
+            .any(|r| r.enabled && r.existing_object_replication)
+        {
+            return ControlResponse::bad_request(
+                "no enabled rule has existing-object replication (set ExistingObjectReplication=Enabled)",
+            );
+        }
+
+        // Spawn the bounded backfill; the request returns immediately.
+        let meta = self.meta.clone();
+        let clock = self.clock.clone();
+        let bucket = bucket_name.clone();
+        tokio::spawn(async move {
+            backfill_replication(meta, clock, bucket, cfg).await;
+        });
+
+        self.record_activity(
+            "ResyncReplication",
+            Some(bucket_name.as_str()),
+            None,
+            principal,
+        )
+        .await;
+        ControlResponse::json(
+            StatusCode::ACCEPTED,
+            &wire::ReplicationResyncResp { started: true },
+        )
+    }
+
     /// `GET /buckets/{name}/replication/status`: per-bucket replication counters — `pending` (due
     /// entries filtered to this bucket) and `failed` (terminal entries filtered to this bucket) —
     /// plus the most recent failed entries' errors. Every figure is bounded by [`PAGE_LIMIT`].
@@ -1941,4 +2006,98 @@ fn generate_secret() -> String {
     let mut bytes = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut bytes);
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Page a bucket's current object versions and idempotently enqueue a replication-outbox entry for
+/// each one a backfill-enabled rule selects (existing-object replication / resync, ARCH §20.5).
+///
+/// The entry id is deterministic (`backfill:{rule}:{key}:{version}`) and the enqueue is
+/// `INSERT OR IGNORE`, so a repeated resync is a no-op for already-queued versions and an
+/// already-completed entry is never re-shipped. Enumeration is bounded paging (metadata-only — the
+/// byte transfer is the worker's job), run on a spawned task so a large bucket never blocks a
+/// request. Tag predicates are honoured by loading an object's tags only when the matched rule
+/// actually carries them.
+async fn backfill_replication(
+    meta: Arc<dyn MetadataStore>,
+    clock: Arc<dyn Clock>,
+    bucket: BucketName,
+    cfg: cairn_replication::ReplicationConfig,
+) {
+    let mut cursor: Option<String> = None;
+    let mut enqueued: u64 = 0;
+    loop {
+        let query = ListQuery {
+            prefix: None,
+            delimiter: None,
+            cursor: cursor.clone(),
+            version_id_marker: None,
+            start_after: None,
+            limit: PAGE_LIMIT,
+        };
+        let page = match meta.list_current(&bucket, &query).await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(bucket = %bucket.as_str(), error = %e,
+                    "replication backfill: listing current objects failed");
+                return;
+            }
+        };
+        for summary in &page.items {
+            let key = &summary.key;
+            // Highest-priority enabled backfill rule whose prefix matches this key.
+            let Some(rule) = cfg
+                .rules
+                .iter()
+                .filter(|r| {
+                    r.enabled
+                        && r.existing_object_replication
+                        && r.filter.matches_prefix(key.as_str())
+                })
+                .reduce(|best, r| if r.priority > best.priority { r } else { best })
+            else {
+                continue;
+            };
+            // Honour tag predicates, loading the object's tags only when the rule has any.
+            if !rule.filter.tags.is_empty() {
+                let tags = meta
+                    .get_object_tags(&bucket, key, &summary.version_id)
+                    .await
+                    .unwrap_or_default();
+                if !rule.filter.matches(key.as_str(), &tags) {
+                    continue;
+                }
+            }
+            let id = format!(
+                "backfill:{}:{}:{}",
+                rule.id,
+                key.as_str(),
+                summary.version_id.as_str()
+            );
+            let entry = cairn_replication::outbox_entry_for(
+                id,
+                bucket.clone(),
+                key.clone(),
+                summary.version_id.clone(),
+                cairn_types::meta::ReplicationOp::ObjectCreate,
+                rule.id.clone(),
+                rule.target_arn.clone(),
+                clock.now(),
+                rule.priority,
+            );
+            if let Err(e) = meta
+                .submit(Mutation::EnqueueReplication(Box::new(entry)))
+                .await
+            {
+                tracing::warn!(bucket = %bucket.as_str(), error = %e,
+                    "replication backfill: enqueue failed");
+                return;
+            }
+            enqueued += 1;
+        }
+        match page.next_cursor {
+            Some(c) => cursor = Some(c),
+            None => break,
+        }
+    }
+    tracing::info!(bucket = %bucket.as_str(), enqueued, "replication backfill complete");
 }

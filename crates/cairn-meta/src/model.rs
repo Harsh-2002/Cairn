@@ -298,6 +298,7 @@ pub fn outbox_from_row(row: &Row) -> rusqlite::Result<OutboxEntry> {
         version_id: VersionId::from_string(row.get("version_id")?),
         operation: repl_op_from(&row.get::<_, String>("operation")?),
         rule_id: row.get("rule_id")?,
+        target_arn: row.get("target_arn")?,
         attempts: row.get::<_, i64>("attempts")? as u32,
         next_attempt_at: Timestamp(row.get("next_attempt_at")?),
         status: repl_status_from(&row.get::<_, String>("status")?),

@@ -616,6 +616,13 @@ impl MetadataStore for InMemoryMetadataStore {
                 }
                 Ok(MutationOutcome::Ack)
             }
+            Mutation::EnqueueReplication(entry) => {
+                // Idempotent on the entry id (mirrors INSERT OR IGNORE in the SQLite stores).
+                if !st.outbox.iter().any(|e| e.id == entry.id) {
+                    st.outbox.push(*entry);
+                }
+                Ok(MutationOutcome::Ack)
+            }
             Mutation::RecordActivity(entry) => {
                 st.activity.push(*entry);
                 Ok(MutationOutcome::Ack)

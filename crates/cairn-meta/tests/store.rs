@@ -493,6 +493,7 @@ async fn plant_outbox(
         version_id: version.clone(),
         operation: ReplicationOp::ObjectCreate,
         rule_id: "rule-1".to_owned(),
+        target_arn: None,
         attempts: 0,
         next_attempt_at: Timestamp(0),
         status: ReplicationStatus::Pending,

@@ -349,6 +349,7 @@ impl CachedMetadataStore {
             | Mutation::MarkReplicationDone(_)
             | Mutation::MarkReplicationFailed { .. }
             | Mutation::RetryFailedReplication { .. }
+            | Mutation::EnqueueReplication(_)
             | Mutation::RecordActivity(_) => {}
         }
     }

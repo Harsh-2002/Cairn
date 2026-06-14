@@ -514,6 +514,14 @@ pub struct ReplicationRetryResp {
     pub failed_observed: u64,
 }
 
+/// `POST /buckets/{name}/replication/resync` response: the backfill has been accepted and runs as a
+/// background task (HTTP 202). Progress is observable via the replication-status endpoint/metrics.
+#[derive(Debug, Serialize)]
+pub struct ReplicationResyncResp {
+    /// Always `true` once the backfill task is spawned.
+    pub started: bool,
+}
+
 /// `GET /buckets/{name}/replication/status` response: per-bucket replication counters plus the
 /// most recent failed entries' errors. All figures are bounded by the standard page limit.
 #[derive(Debug, Serialize)]

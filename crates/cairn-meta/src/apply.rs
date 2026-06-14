@@ -421,6 +421,32 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             .map_err(engine_err)?;
             Ok(MutationOutcome::Ack)
         }
+        Mutation::EnqueueReplication(e) => {
+            // Idempotent: a repeated resync of the same (rule, key, version) — which produces the
+            // same deterministic entry id — is a no-op rather than a duplicate or a PK error.
+            conn.execute(
+                "INSERT OR IGNORE INTO replication_outbox
+                 (id, bucket_name, key, version_id, operation, rule_id, target_arn, attempts, next_attempt_at, status, last_error, priority, lease_until)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                params![
+                    e.id,
+                    e.bucket.as_str(),
+                    e.key.as_str(),
+                    e.version_id.as_str(),
+                    repl_op_str(e.operation),
+                    e.rule_id,
+                    e.target_arn,
+                    e.attempts as i64,
+                    e.next_attempt_at.0,
+                    repl_status_str(e.status),
+                    e.last_error,
+                    e.priority,
+                    e.lease_until.map(|t| t.0),
+                ],
+            )
+            .map_err(engine_err)?;
+            Ok(MutationOutcome::Ack)
+        }
         Mutation::RecordActivity(e) => {
             conn.execute(
                 "INSERT INTO activity (id, action, bucket, key, size, etag, actor, at)
@@ -749,8 +775,8 @@ fn check_precondition(
 fn enqueue(conn: &Connection, e: &OutboxEntry) -> R<()> {
     conn.execute(
         "INSERT INTO replication_outbox
-         (id, bucket_name, key, version_id, operation, rule_id, attempts, next_attempt_at, status, last_error, priority, lease_until)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+         (id, bucket_name, key, version_id, operation, rule_id, target_arn, attempts, next_attempt_at, status, last_error, priority, lease_until)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
         params![
             e.id,
             e.bucket.as_str(),
@@ -758,6 +784,7 @@ fn enqueue(conn: &Connection, e: &OutboxEntry) -> R<()> {
             e.version_id.as_str(),
             repl_op_str(e.operation),
             e.rule_id,
+            e.target_arn,
             e.attempts as i64,
             e.next_attempt_at.0,
             repl_status_str(e.status),

@@ -234,6 +234,11 @@ pub enum Mutation {
         /// The time to schedule the retry at (immediately due).
         now: Timestamp,
     },
+    /// Enqueue a single replication-outbox entry idempotently (INSERT OR IGNORE on the entry id),
+    /// used by existing-object backfill / resync (ARCH §20.5). Unlike the enqueue that rides a
+    /// `PutObjectVersion`, this stands alone for objects written before replication was configured;
+    /// the deterministic backfill id makes a repeated resync a no-op for already-queued versions.
+    EnqueueReplication(Box<OutboxEntry>),
     /// Append an audit/activity entry.
     RecordActivity(Box<ActivityEntry>),
 }
@@ -472,6 +477,11 @@ pub struct OutboxEntry {
     pub operation: ReplicationOp,
     /// The replication rule id this belongs to.
     pub rule_id: String,
+    /// The remote-target ARN this entry ships to, resolved from the matching rule at enqueue time
+    /// and stamped on the entry so routing is a pure per-entry lookup at drain time (a later rule
+    /// edit cannot misroute already-queued entries). `None` for entries enqueued before targets
+    /// were stamped or routed via the legacy env single-target path.
+    pub target_arn: Option<String>,
     /// Retry attempt count.
     pub attempts: u32,
     /// When the entry is next due.

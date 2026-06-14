@@ -44,8 +44,8 @@ pub const USER_COLS: &str = "id, display_name, access_key_id, secret_hash, sigv4
      sigv4_secret_ciphertext, sigv4_secret_nonce, role, is_active, created_at, updated_at";
 
 /// `replication_outbox` columns in mapper order.
-pub const OUTBOX_COLS: &str = "id, bucket_name, key, version_id, operation, rule_id, attempts, \
-     next_attempt_at, status, last_error, priority, lease_until";
+pub const OUTBOX_COLS: &str = "id, bucket_name, key, version_id, operation, rule_id, target_arn, \
+     attempts, next_attempt_at, status, last_error, priority, lease_until";
 
 /// `activity` columns in mapper order.
 pub const ACTIVITY_COLS: &str = "id, action, bucket, key, size, etag, actor, at";
@@ -316,12 +316,13 @@ pub fn outbox_from_row(row: &Row) -> Result<OutboxEntry, MetaError> {
         version_id: VersionId::from_string(row.get_text(3)),
         operation: repl_op_from(&row.get_text(4)),
         rule_id: row.get_text(5),
-        attempts: row.get_i64(6) as u32,
-        next_attempt_at: Timestamp(row.get_i64(7)),
-        status: repl_status_from(&row.get_text(8)),
-        last_error: row.get_opt_text(9),
-        priority: row.get_i64(10),
-        lease_until: row.get_opt_i64(11).map(Timestamp),
+        target_arn: row.get_opt_text(6),
+        attempts: row.get_i64(7) as u32,
+        next_attempt_at: Timestamp(row.get_i64(8)),
+        status: repl_status_from(&row.get_text(9)),
+        last_error: row.get_opt_text(10),
+        priority: row.get_i64(11),
+        lease_until: row.get_opt_i64(12).map(Timestamp),
     })
 }
 
