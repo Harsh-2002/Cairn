@@ -77,7 +77,7 @@ pub fn probe_tcp_ulp_tls() -> bool {
 /// `#[allow(dead_code)]`: this is the implemented, tested transfer primitive for layer (b) of the
 /// feature; it is exercised by the unit tests but not yet called from a live serving path (see
 /// [`sendfile_get_takeover`] for why the GET takeover is stubbed). Kept so the mechanism is ready
-/// for the follow-up that plumbs the blob fd across the `cairn-s3` boundary.
+/// for the follow-up that plumbs the blob fd across the `cairn-protocol` boundary.
 #[allow(dead_code)]
 pub fn sendfile_all(dst: RawFd, src: RawFd, offset: u64, len: u64) -> io::Result<u64> {
     let mut sent: u64 = 0;
@@ -157,19 +157,19 @@ impl Drop for FdGuard {
 /// len })` (see `cairn-blob`/`cairn-types`).
 ///
 /// The blocker is purely a crate boundary this task must not cross. The server never sees that
-/// `ZeroCopyRead`: `cairn-s3`'s `get_object` consumes the `BlobReadHandle` and returns its body as
+/// `ZeroCopyRead`: `cairn-protocol`'s `get_object` consumes the `BlobReadHandle` and returns its body as
 /// `S3Body::Stream { length, stream }` — an opaque `BlobStream` that carries the *bytes* but drops
 /// the raw fd. The adapter then renders that stream into hyper's body. To take over the connection
-/// with sendfile the server would need the fd, which means widening `S3Body` (in `cairn-s3`) to
+/// with sendfile the server would need the fd, which means widening `S3Body` (in `cairn-protocol`) to
 /// carry the `zero_copy` hint and threading it through `get_object` and the adapter. That edits
-/// `cairn-s3`/`cairn-types`, which are out of scope here, so the takeover is deferred.
+/// `cairn-protocol`/`cairn-types`, which are out of scope here, so the takeover is deferred.
 ///
 /// Crucially, *not* wiring this changes nothing about correctness: every GET — fast-path-eligible
 /// or not — continues to flow through the always-on portable streamed body. The mechanism this
 /// stub documents is the only missing piece, and it is implemented and tested above
-/// ([`sendfile_all`]); only the plumbing of the fd across the `cairn-s3` boundary remains.
+/// ([`sendfile_all`]); only the plumbing of the fd across the `cairn-protocol` boundary remains.
 ///
-/// ## Sketch of the intended integration (for the follow-up that owns `cairn-s3`)
+/// ## Sketch of the intended integration (for the follow-up that owns `cairn-protocol`)
 ///
 /// 1. Add a `ZeroCopy { file: Arc<File>, offset, len, length }` variant (or a side-channel field)
 ///    to `S3Body`, populated by `get_object` from `handle.zero_copy` when present and the object is

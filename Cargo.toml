@@ -21,7 +21,7 @@ cairn-crypto = { path = "crates/cairn-crypto" }
 cairn-auth = { path = "crates/cairn-auth" }
 cairn-authz = { path = "crates/cairn-authz" }
 cairn-xml = { path = "crates/cairn-xml" }
-cairn-s3 = { path = "crates/cairn-s3" }
+cairn-protocol = { path = "crates/cairn-protocol" }
 cairn-replication = { path = "crates/cairn-replication" }
 cairn-lifecycle = { path = "crates/cairn-lifecycle" }
 cairn-control = { path = "crates/cairn-control" }

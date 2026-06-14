@@ -48,6 +48,8 @@ pub enum ConfigAspect {
     Lifecycle,
     /// The replication configuration.
     Replication,
+    /// The stored replication remote-target descriptors (consumed by the replication engine).
+    ReplicationTargets,
     /// The tag set.
     Tagging,
     /// The bucket-level Block Public Access settings.

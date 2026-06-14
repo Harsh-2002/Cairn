@@ -8,6 +8,8 @@ use crate::apply::apply;
 use cairn_types::MetaError;
 use cairn_types::meta::{Mutation, MutationOutcome};
 use rusqlite::Connection;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
@@ -32,6 +34,9 @@ pub struct WalCheckpointStats {
 enum Control {
     /// Run a truncating WAL checkpoint and report its frame counts.
     Checkpoint(oneshot::Sender<Result<WalCheckpointStats, MetaError>>),
+    /// A liveness probe: the writer simply acks, proving its thread is draining the queue. Used by
+    /// the readiness check so `/readyz` reflects a responsive writer, not just a readable pool.
+    Probe(oneshot::Sender<()>),
 }
 
 /// One unit of work for the writer loop: either a batched mutation or a control message.
@@ -49,6 +54,12 @@ enum Job {
 #[derive(Clone, Debug)]
 pub struct Writer {
     tx: mpsc::Sender<Job>,
+    /// Number of mutations enqueued but not yet drained into a commit batch. Incremented on
+    /// `submit` and decremented as the writer loop pulls each job off the channel. Exposed via
+    /// [`Writer::queue_depth`] for the `cairn_writer_queue_depth` gauge (ARCH §26.2). This is the
+    /// inbound backlog signal — a sustained nonzero depth means writes are arriving faster than the
+    /// single writer can commit them.
+    queue_depth: Arc<AtomicUsize>,
 }
 
 impl Writer {
@@ -56,22 +67,49 @@ impl Writer {
     /// short window to enlarge batches under bursty load (group-commit linger).
     pub fn spawn(conn: Connection, linger: Option<Duration>) -> Writer {
         let (tx, rx) = mpsc::channel::<Job>(4096);
+        let queue_depth = Arc::new(AtomicUsize::new(0));
+        let loop_depth = queue_depth.clone();
         std::thread::Builder::new()
             .name("cairn-meta-writer".to_owned())
-            .spawn(move || writer_loop(conn, rx, linger))
+            .spawn(move || writer_loop(conn, rx, linger, &loop_depth))
             .expect("spawn writer thread");
-        Writer { tx }
+        Writer { tx, queue_depth }
+    }
+
+    /// The current inbound write-queue depth: mutations submitted but not yet pulled into a commit
+    /// batch by the writer loop. Published as the `cairn_writer_queue_depth` gauge.
+    #[must_use]
+    pub fn queue_depth(&self) -> usize {
+        self.queue_depth.load(Ordering::Relaxed)
     }
 
     /// Submit a mutation; the returned future resolves only after the batch containing it has
     /// been made durable.
     pub async fn submit(&self, mutation: Mutation) -> Result<MutationOutcome, MetaError> {
         let (ack_tx, ack_rx) = oneshot::channel();
+        // Count the job as queued before it is sent; the writer loop decrements as it drains.
+        self.queue_depth.fetch_add(1, Ordering::Relaxed);
+        if self.tx.send(Job::Write((mutation, ack_tx))).await.is_err() {
+            // The send failed (writer gone): the job will never be drained, so undo the increment.
+            self.queue_depth.fetch_sub(1, Ordering::Relaxed);
+            return Err(MetaError::WriterClosed);
+        }
+        ack_rx.await.map_err(|_| MetaError::WriterClosed)?
+    }
+
+    /// Probe that the writer thread is alive and draining its queue. Enqueues a control message and
+    /// awaits its ack; resolving proves the writer is responsive (the readiness check uses this so
+    /// `/readyz` does not report ready while the writer is wedged). Cheap: no database work.
+    ///
+    /// # Errors
+    /// Returns [`MetaError::WriterClosed`] if the writer has shut down.
+    pub async fn probe(&self) -> Result<(), MetaError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
-            .send(Job::Write((mutation, ack_tx)))
+            .send(Job::Control(Control::Probe(reply_tx)))
             .await
             .map_err(|_| MetaError::WriterClosed)?;
-        ack_rx.await.map_err(|_| MetaError::WriterClosed)?
+        reply_rx.await.map_err(|_| MetaError::WriterClosed)
     }
 
     /// Run a truncating WAL checkpoint on the writer thread — the only thread that owns the
@@ -87,7 +125,12 @@ impl Writer {
     }
 }
 
-fn writer_loop(conn: Connection, mut rx: mpsc::Receiver<Job>, linger: Option<Duration>) {
+fn writer_loop(
+    conn: Connection,
+    mut rx: mpsc::Receiver<Job>,
+    linger: Option<Duration>,
+    queue_depth: &AtomicUsize,
+) {
     loop {
         // Block for the first job; None means every handle dropped — shut down.
         let Some(first) = rx.blocking_recv() else {
@@ -99,7 +142,11 @@ fn writer_loop(conn: Connection, mut rx: mpsc::Receiver<Job>, linger: Option<Dur
                 run_control(&conn, ctl);
                 continue;
             }
-            Job::Write(req) => req,
+            // This write job is now drained off the inbound queue.
+            Job::Write(req) => {
+                queue_depth.fetch_sub(1, Ordering::Relaxed);
+                req
+            }
         };
 
         let mut batch: Vec<WriteRequest> = Vec::with_capacity(MAX_BATCH);
@@ -109,13 +156,13 @@ fn writer_loop(conn: Connection, mut rx: mpsc::Receiver<Job>, linger: Option<Dur
         let mut deferred: Vec<Control> = Vec::new();
 
         // Opportunistically drain everything already queued.
-        drain_available(&mut rx, &mut batch, &mut deferred);
+        drain_available(&mut rx, &mut batch, &mut deferred, queue_depth);
 
         // Optional linger to enlarge the batch under bursty load.
         if let Some(d) = linger {
             if batch.len() < MAX_BATCH {
                 std::thread::sleep(d);
-                drain_available(&mut rx, &mut batch, &mut deferred);
+                drain_available(&mut rx, &mut batch, &mut deferred, queue_depth);
             }
         }
 
@@ -130,10 +177,14 @@ fn drain_available(
     rx: &mut mpsc::Receiver<Job>,
     batch: &mut Vec<WriteRequest>,
     deferred: &mut Vec<Control>,
+    queue_depth: &AtomicUsize,
 ) {
     while batch.len() < MAX_BATCH {
         match rx.try_recv() {
-            Ok(Job::Write(req)) => batch.push(req),
+            Ok(Job::Write(req)) => {
+                queue_depth.fetch_sub(1, Ordering::Relaxed);
+                batch.push(req);
+            }
             Ok(Job::Control(ctl)) => deferred.push(ctl),
             Err(_) => break,
         }
@@ -145,6 +196,9 @@ fn run_control(conn: &Connection, ctl: Control) {
     match ctl {
         Control::Checkpoint(reply) => {
             let _ = reply.send(run_checkpoint(conn));
+        }
+        Control::Probe(reply) => {
+            let _ = reply.send(());
         }
     }
 }

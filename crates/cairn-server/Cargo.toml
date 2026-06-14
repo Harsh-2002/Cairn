@@ -33,7 +33,7 @@ meta-async = ["dep:cairn-meta-async"]
 # Layer (b) sendfile(2) fast path: a self-contained, tested wrapper around the `sendfile(2)`
 # syscall that can copy a blob file fd straight to the socket fd. See `src/sendfile.rs` for why
 # the GET takeover is currently stubbed behind a documented seam (the raw fd is not plumbed across
-# the cairn-s3 boundary, which this crate must not edit). Enabling the feature never changes the
+# the cairn-protocol boundary, which this crate must not edit). Enabling the feature never changes the
 # always-on portable streamed path for any request.
 #
 # With the feature OFF the optional deps are not compiled and nothing changes.
@@ -52,7 +52,7 @@ fail = { workspace = true, optional = true }
 ktls = { version = "6", optional = true, default-features = false, features = ["aws_lc_rs", "tls12"] }
 libc = { version = "0.2", optional = true }
 cairn-types.workspace = true
-cairn-s3.workspace = true
+cairn-protocol.workspace = true
 cairn-meta.workspace = true
 # The async (libSQL + Turso) metadata backends, selectable at runtime via CAIRN_META_BACKEND.
 # Optional, enabled by the `meta-async` feature. When enabled, linking this alongside cairn-meta puts
@@ -74,8 +74,13 @@ tokio = { workspace = true, features = ["rt-multi-thread", "net", "signal", "mac
 rustls = { workspace = true, features = ["aws_lc_rs", "tls12"] }
 tokio-rustls = { workspace = true, features = ["aws_lc_rs", "tls12"] }
 rustls-pemfile.workspace = true
-hyper = { workspace = true, features = ["server", "http1", "http2"] }
-hyper-util = { workspace = true, features = ["tokio", "server-auto", "service"] }
+hyper = { workspace = true, features = ["server", "http1", "http2", "client"] }
+hyper-util = { workspace = true, features = ["tokio", "server-auto", "service", "client-legacy", "http1"] }
+# The remote-administration CLI (`cli_remote.rs`, ARCH §24.2) is a thin HTTP client over a running
+# server's management API and S3 data plane. It reuses the same legacy hyper-util client + rustls
+# connector the replication sink uses, so the binary links no new HTTP stack: `hyper-rustls` dials
+# plaintext for `http://` endpoints and negotiates rustls for `https://`.
+hyper-rustls = { workspace = true }
 http.workspace = true
 http-body-util.workspace = true
 bytes.workspace = true

@@ -34,11 +34,16 @@ mod backoff;
 mod config;
 mod route;
 mod sink;
+mod target;
 
 pub use backoff::next_backoff;
 pub use config::{Destination, Filter, ReplicationConfig, ReplicationRule, parse_replication};
-pub use route::BucketRoutedSink;
-pub use sink::{HttpS3Sink, S3SinkConfig};
+pub use route::{BucketRoutedSink, SingleSink, SinkRouter};
+pub use sink::{HttpS3Sink, S3SinkConfig, sink_for_target};
+pub use target::{
+    OpenTarget, RemoteTarget, RemoteTargetInput, open_target, parse_targets, resolve_target,
+    seal_target, serialize_targets,
+};
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -91,6 +96,10 @@ pub struct RunReport {
     /// Entries skipped this pass to preserve per-key ordering (an earlier version of the
     /// same key did not complete).
     pub deferred: usize,
+    /// Total logical bytes shipped by successful object replications this pass (delete markers and
+    /// drained replica/duplicate entries contribute zero). Observability emits this as the
+    /// replicated-bytes counter.
+    pub bytes: u64,
 }
 
 impl RunReport {
@@ -131,16 +140,16 @@ impl ReplicationEngine {
     /// Returns a [`MetaError`] only if claiming the batch or submitting a status mutation to
     /// the metadata store fails; per-entry sink failures are recorded on the outbox (retried
     /// or failed) and never abort the pass.
-    pub async fn run_once<M, S, B, C>(
+    pub async fn run_once<M, R, B, C>(
         &self,
         meta: &M,
-        sink: &S,
+        router: &R,
         blobs: &Arc<B>,
         clock: &C,
     ) -> Result<RunReport, MetaError>
     where
         M: MetadataStore + ?Sized,
-        S: BucketRoutedSink + ?Sized,
+        R: SinkRouter + ?Sized,
         B: BlobStore + ?Sized,
         C: Clock + ?Sized,
     {
@@ -178,8 +187,11 @@ impl ReplicationEngine {
                     report.deferred += 1;
                     continue;
                 }
-                match self.process_entry(meta, sink, blobs, now, entry).await? {
-                    EntryOutcome::Completed => report.completed += 1,
+                match self.process_entry(meta, router, blobs, now, entry).await? {
+                    EntryOutcome::Completed { bytes } => {
+                        report.completed += 1;
+                        report.bytes += bytes;
+                    }
                     EntryOutcome::Retried => {
                         report.retried += 1;
                         blocked = true;
@@ -206,28 +218,29 @@ impl ReplicationEngine {
     ///
     /// # Errors
     /// Propagates any [`MetaError`] from an underlying pass.
-    pub async fn run_until_idle<M, S, B, C>(
+    pub async fn run_until_idle<M, R, B, C>(
         &self,
         meta: &M,
-        sink: &S,
+        router: &R,
         blobs: &Arc<B>,
         clock: &C,
         max_passes: u32,
     ) -> Result<RunReport, MetaError>
     where
         M: MetadataStore + ?Sized,
-        S: BucketRoutedSink + ?Sized,
+        R: SinkRouter + ?Sized,
         B: BlobStore + ?Sized,
         C: Clock + ?Sized,
     {
         let mut total = RunReport::default();
         for _ in 0..max_passes {
-            let pass = self.run_once(meta, sink, blobs, clock).await?;
+            let pass = self.run_once(meta, router, blobs, clock).await?;
             total.claimed += pass.claimed;
             total.completed += pass.completed;
             total.retried += pass.retried;
             total.failed += pass.failed;
             total.deferred += pass.deferred;
+            total.bytes += pass.bytes;
             if pass.is_idle() {
                 break;
             }
@@ -237,17 +250,17 @@ impl ReplicationEngine {
 
     /// Process exactly one outbox entry, contacting the sink and recording the result on the
     /// outbox. Returns how the entry resolved so the caller can preserve per-key ordering.
-    async fn process_entry<M, S, B>(
+    async fn process_entry<M, R, B>(
         &self,
         meta: &M,
-        sink: &S,
+        router: &R,
         blobs: &Arc<B>,
         now: Timestamp,
         entry: &OutboxEntry,
     ) -> Result<EntryOutcome, MetaError>
     where
         M: MetadataStore + ?Sized,
-        S: BucketRoutedSink + ?Sized,
+        R: SinkRouter + ?Sized,
         B: BlobStore + ?Sized,
     {
         // Load the version this entry concerns.
@@ -269,26 +282,59 @@ impl ReplicationEngine {
             Some(ReplicationStatus::Replica) | Some(ReplicationStatus::Completed) => {
                 meta.submit(Mutation::MarkReplicationDone(entry.id.clone()))
                     .await?;
-                return Ok(EntryOutcome::Completed);
+                return Ok(EntryOutcome::Completed { bytes: 0 });
             }
             _ => {}
         }
+
+        // Route this entry to the sink for its rule's remote target. The outbox entry's identity is
+        // the (bucket, key, version); the rule -> target binding is resolved by the router, which
+        // owns the per-bucket target table. An entry whose target is unknown to the router has
+        // nowhere to go: terminate it for operator attention rather than retrying forever against a
+        // destination that does not exist.
+        let target_arn = entry_target_arn(entry);
+        let Some(sink) = router.sink_for(target_arn) else {
+            self.mark_failed(meta, entry, "no replication sink for target", None)
+                .await?;
+            return Ok(EntryOutcome::Failed);
+        };
 
         // Drive the sink for this operation. The source bucket (`entry.bucket`) is threaded
         // through so the sink can resolve the destination bucket per source bucket (per-rule
         // replication); a fixed single-destination sink ignores it.
         let sink_result = match entry.operation {
-            ReplicationOp::ObjectCreate => self.put_object(sink, blobs, &row).await,
-            ReplicationOp::DeleteMarker => {
-                sink.delete_marker(&entry.bucket, &entry.key, &entry.version_id)
+            ReplicationOp::ObjectCreate => {
+                // Load the object's tags so the replicated copy carries the same tag set. Tag
+                // filtering selected this object *by* its tags, so shipping it untagged would
+                // silently drop them at the destination. The tags live in a separate table
+                // (`object_tags`), not on the version row, so we fetch them explicitly.
+                //
+                // Error handling: a tag-load failure is treated as **retryable** (returned, not
+                // swallowed) — the same backoff machinery the body read uses. Tags are part of
+                // the object's identity for a tag-filtered rule, so shipping a copy with the
+                // wrong (empty) tag set is worse than re-attempting once the store recovers; a
+                // transient metadata-store hiccup should not produce a permanently mis-tagged
+                // replica. (A genuinely empty tag set is a successful `Ok(vec![])`, not an error,
+                // and ships correctly as no tags.)
+                let tags = meta
+                    .get_object_tags(&entry.bucket, &entry.key, &entry.version_id)
                     .await
+                    .map_err(|e| ReplicationError::Retryable(format!("loading object tags: {e}")));
+                match tags {
+                    Ok(tags) => self.put_object(sink, blobs, &row, tags).await,
+                    Err(e) => Err(e),
+                }
             }
+            ReplicationOp::DeleteMarker => sink
+                .delete_marker(&entry.bucket, &entry.key, &entry.version_id)
+                .await
+                .map(|()| 0u64),
         };
 
         match sink_result {
-            Ok(()) => {
+            Ok(bytes) => {
                 self.mark_done(meta, entry, &row).await?;
-                Ok(EntryOutcome::Completed)
+                Ok(EntryOutcome::Completed { bytes })
             }
             Err(ReplicationError::Retryable(msg)) => {
                 // Exhausting the attempt budget turns a retryable failure terminal.
@@ -314,15 +360,19 @@ impl ReplicationEngine {
         }
     }
 
-    /// Open the source blob, assemble a [`ReplicatedObject`], and put it at the destination.
-    async fn put_object<S, B>(
+    /// Open the source blob, assemble a [`ReplicatedObject`] carrying the object's `tags`, put it
+    /// at the destination, and on success return the number of logical bytes shipped (for the
+    /// replicated-bytes metric). `tags` are loaded by the caller from the metadata store (they
+    /// live in a separate table, not on the version row) so the replica carries the same tag set
+    /// the source rule selected on.
+    async fn put_object<B>(
         &self,
-        sink: &S,
+        sink: &dyn BucketRoutedSink,
         blobs: &Arc<B>,
         row: &ObjectVersionRow,
-    ) -> Result<(), ReplicationError>
+        tags: Vec<(String, String)>,
+    ) -> Result<u64, ReplicationError>
     where
-        S: BucketRoutedSink + ?Sized,
         B: BlobStore + ?Sized,
     {
         let Some(path) = row.storage_path.as_ref() else {
@@ -342,19 +392,21 @@ impl ReplicationEngine {
         });
         let handle = blobs.open(path, range).await.map_err(map_blob_err)?;
 
+        let size = row.size_logical;
         let object = ReplicatedObject {
             key: row.key.clone(),
             version_id: row.version_id.clone(),
             content_type: row.content_type.clone(),
             user_metadata: row.user_metadata.clone(),
             etag: row.etag.clone(),
-            size: row.size_logical,
-            tags: Vec::new(),
+            size,
+            tags,
             acl: row.acl.clone(),
             body: handle.body,
         };
 
-        sink.put_object(&row.bucket, object).await
+        sink.put_object(&row.bucket, object).await?;
+        Ok(size)
     }
 
     /// Mark the entry done and stamp the version [`ReplicationStatus::Completed`]. The
@@ -413,9 +465,11 @@ impl ReplicationEngine {
     }
 }
 
-/// The disposition of a single processed entry, used to preserve per-key ordering.
+/// The disposition of a single processed entry, used to preserve per-key ordering. A completed
+/// object ship carries the logical byte count it shipped (zero for a drained replica/duplicate or a
+/// delete marker) so the pass can total replicated bytes.
 enum EntryOutcome {
-    Completed,
+    Completed { bytes: u64 },
     Retried,
     Failed,
 }
@@ -444,6 +498,18 @@ where
     Ok(())
 }
 
+/// The remote-target ARN to route an outbox entry by. The durable [`OutboxEntry`] keys on
+/// `(bucket, key, version)` and does not itself carry a target ARN; the rule -> target binding is
+/// owned by the [`SinkRouter`] (the per-bucket target table). This indirection point returns
+/// `None`, so the router resolves the target from the entry's bucket — a [`SingleSink`] router
+/// ignores the ARN entirely (the legacy fixed-destination path), and a multi-target router keys off
+/// the source bucket it already knows. Centralising it here keeps the routing seam in one place if
+/// the entry later grows an explicit target field.
+#[inline]
+fn entry_target_arn(_entry: &OutboxEntry) -> Option<&str> {
+    None
+}
+
 /// Classify a blob-store error opening the source body: a missing blob is terminal (it will
 /// never reappear), everything else is transient and worth retrying.
 fn map_blob_err(e: BlobError) -> ReplicationError {
@@ -456,8 +522,10 @@ fn map_blob_err(e: BlobError) -> ReplicationError {
 /// Build the replication outbox entry for a freshly-written version. A convenience for the
 /// write path (and the tests' setup): callers attach the returned entry to the
 /// [`Mutation::PutObjectVersion`] that commits the write, so the enqueue rides the same
-/// transaction.
+/// transaction. `priority` is taken from the matching rule and stamped on the entry so the outbox
+/// drains hot rules first.
 #[must_use]
+#[allow(clippy::too_many_arguments)]
 pub fn outbox_entry_for(
     id: impl Into<String>,
     bucket: BucketName,
@@ -466,6 +534,7 @@ pub fn outbox_entry_for(
     operation: ReplicationOp,
     rule_id: impl Into<String>,
     due_at: Timestamp,
+    priority: i64,
 ) -> OutboxEntry {
     OutboxEntry {
         id: id.into(),
@@ -478,5 +547,120 @@ pub fn outbox_entry_for(
         next_attempt_at: due_at,
         status: ReplicationStatus::Pending,
         last_error: None,
+        priority,
+        lease_until: None,
+    }
+}
+
+/// Build the backfill outbox entries for a rule's **existing-object replication**: one
+/// [`OutboxEntry`] per current `(key, version)` the caller enumerated from the store, for every key
+/// the rule's prefix selects. This is a pure builder — the caller owns enumerating the store and
+/// committing the returned entries; it lets a control-plane "replicate existing objects" action
+/// reuse the exact entry shape the write path produces.
+///
+/// Each entry is an [`ReplicationOp::ObjectCreate`] due immediately (`next_attempt_at = epoch`),
+/// carries the rule's [`priority`](ReplicationRule::priority), and is id'd
+/// `backfill:<rule>:<key>:<version>` so a re-run is idempotent against an outbox keyed by entry id.
+/// Tag predicates are not applied here (the caller does not pass per-object tags); the prefix is the
+/// selector, matching the existing-object backfill contract.
+///
+/// A [`ReplicationRule`] is not bound to a source bucket, so each returned entry's
+/// [`bucket`](OutboxEntry::bucket) is left as the reserved [`BACKFILL_PLACEHOLDER_BUCKET`] sentinel;
+/// the caller — which enumerated the store per bucket and therefore knows it — **must** set
+/// `entry.bucket` to the source bucket before committing. Returns an empty vector when the rule does
+/// not opt into existing-object replication.
+#[must_use]
+pub fn backfill_outbox_entries(
+    rule: &ReplicationRule,
+    current: &[(ObjectKey, VersionId)],
+) -> Vec<OutboxEntry> {
+    if !rule.existing_object_replication {
+        return Vec::new();
+    }
+    let placeholder = BucketName::parse(BACKFILL_PLACEHOLDER_BUCKET)
+        .expect("BACKFILL_PLACEHOLDER_BUCKET is a valid bucket name");
+    current
+        .iter()
+        .filter(|(key, _)| rule.filter.matches_prefix(key.as_str()))
+        .map(|(key, version)| {
+            let id = format!("backfill:{}:{}:{}", rule.id, key.as_str(), version.as_str());
+            outbox_entry_for(
+                id,
+                placeholder.clone(),
+                key.clone(),
+                version.clone(),
+                ReplicationOp::ObjectCreate,
+                rule.id.clone(),
+                Timestamp::from_secs(0),
+                rule.priority,
+            )
+        })
+        .collect()
+}
+
+/// The reserved source-bucket sentinel stamped on entries built by [`backfill_outbox_entries`]
+/// before the caller substitutes the real source bucket. It is a syntactically valid bucket name so
+/// the entry type-checks, but it is reserved (no real Cairn bucket may take it) so an unsubstituted
+/// entry is recognisable rather than silently shippable.
+pub const BACKFILL_PLACEHOLDER_BUCKET: &str = "cairn-backfill-placeholder";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cairn_types::id::{ObjectKey, VersionId};
+
+    fn rule(existing: bool, prefix: Option<&str>, priority: i64) -> ReplicationRule {
+        ReplicationRule {
+            id: "r1".to_owned(),
+            enabled: true,
+            filter: Filter {
+                prefix: prefix.map(str::to_owned),
+                tags: Vec::new(),
+            },
+            destination: Destination::default(),
+            priority,
+            target_arn: None,
+            delete_marker_replication: false,
+            existing_object_replication: existing,
+        }
+    }
+
+    fn kv() -> Vec<(ObjectKey, VersionId)> {
+        vec![
+            (ObjectKey::parse("data/a").unwrap(), VersionId::generate()),
+            (ObjectKey::parse("logs/b").unwrap(), VersionId::generate()),
+        ]
+    }
+
+    #[test]
+    fn backfill_disabled_rule_yields_nothing() {
+        assert!(backfill_outbox_entries(&rule(false, None, 0), &kv()).is_empty());
+    }
+
+    #[test]
+    fn backfill_builds_entries_for_prefix_matches_with_priority() {
+        let current = kv();
+        let entries = backfill_outbox_entries(&rule(true, Some("data/"), 7), &current);
+        assert_eq!(entries.len(), 1, "only the data/ key matches the prefix");
+        let e = &entries[0];
+        assert_eq!(e.key.as_str(), "data/a");
+        assert_eq!(e.operation, ReplicationOp::ObjectCreate);
+        assert_eq!(e.priority, 7);
+        assert_eq!(e.status, ReplicationStatus::Pending);
+        assert_eq!(e.bucket.as_str(), BACKFILL_PLACEHOLDER_BUCKET);
+        assert!(e.id.starts_with("backfill:r1:data/a:"));
+    }
+
+    #[test]
+    fn backfill_no_prefix_matches_all() {
+        let entries = backfill_outbox_entries(&rule(true, None, 0), &kv());
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn run_report_bytes_default_zero_and_idle() {
+        let r = RunReport::default();
+        assert_eq!(r.bytes, 0);
+        assert!(r.is_idle());
     }
 }

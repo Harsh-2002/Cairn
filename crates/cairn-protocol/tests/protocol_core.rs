@@ -2,7 +2,7 @@
 //! blob), exercising the core bucket/object lifecycle including a SigV4-streaming (chunked) PUT.
 
 use bytes::Bytes;
-use cairn_s3::{S3Body, S3Request, S3Response, S3Service};
+use cairn_protocol::{S3Body, S3Request, S3Response, S3Service};
 use cairn_types::auth::{AuthMethod, Principal, Role};
 use cairn_types::id::{BucketName, ObjectKey, UserId};
 use cairn_types::traits::{BlobStore, MetadataStore};
@@ -1378,9 +1378,11 @@ async fn put_object_acl_subresource_does_not_overwrite_body() {
         .await,
     )
     .await;
+    // Under BucketOwnerEnforced ownership ACLs are unsupported (400); the key point is that
+    // PUT key?acl is never a body write (the GET below still returns the original body).
     assert_eq!(
         st,
-        StatusCode::NOT_IMPLEMENTED,
+        StatusCode::BAD_REQUEST,
         "PUT key?acl must not be a body write"
     );
 
@@ -2499,8 +2501,8 @@ async fn put_object_acl_rejected_under_enforced_ownership() {
     .await;
     assert_eq!(
         st,
-        StatusCode::NOT_IMPLEMENTED,
-        "ACLs disabled under BucketOwnerEnforced"
+        StatusCode::BAD_REQUEST,
+        "ACLs disabled under BucketOwnerEnforced (AccessControlListNotSupported)"
     );
 }
 
@@ -2821,4 +2823,297 @@ async fn bucket_default_encryption_applies_to_plain_puts() {
     let (st, hdrs, _) = drain(send(&h.svc, put).await).await;
     assert_eq!(st, StatusCode::OK);
     assert_eq!(header(&hdrs, "x-amz-server-side-encryption"), None);
+}
+
+/// A replication configuration with one enabled rule scoped to `prefix`, optionally enabling
+/// delete-marker replication. The destination is a fixed remote bucket ARN.
+fn replication_config_xml(prefix: &str, delete_marker: bool) -> Vec<u8> {
+    let dmr = if delete_marker {
+        "<DeleteMarkerReplication><Status>Enabled</Status></DeleteMarkerReplication>"
+    } else {
+        ""
+    };
+    format!(
+        "<ReplicationConfiguration><Role>arn:aws:iam::1:role/r</Role>\
+         <Rule><ID>r1</ID><Status>Enabled</Status><Priority>1</Priority>\
+         <Filter><Prefix>{prefix}</Prefix></Filter>{dmr}\
+         <Destination><Bucket>arn:aws:s3:::dest</Bucket></Destination></Rule>\
+         </ReplicationConfiguration>"
+    )
+    .into_bytes()
+}
+
+async fn set_replication(h: &Harness, bucket: &str, prefix: &str, delete_marker: bool) {
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some(bucket),
+                None,
+                &[("replication", "")],
+                &[],
+                replication_config_xml(prefix, delete_marker),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn system_headers_round_trip_and_response_overrides() {
+    let h = harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("syshdr"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    // PUT with the five system headers (ARCH §13.4).
+    let put = req(
+        Method::PUT,
+        Some("syshdr"),
+        Some("k"),
+        &[],
+        &[
+            ("content-type", "text/plain"),
+            ("content-encoding", "gzip"),
+            ("cache-control", "max-age=99"),
+            ("content-disposition", "attachment; filename=a.txt"),
+            ("content-language", "en-US"),
+            ("expires", "Wed, 21 Oct 2026 07:28:00 GMT"),
+        ],
+        b"hello".to_vec(),
+    );
+    let (st, _, _) = drain(send(&h.svc, put).await).await;
+    assert_eq!(st, StatusCode::OK);
+
+    // GET echoes each stored system header.
+    let (st, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(Method::GET, Some("syshdr"), Some("k"), &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(header(&hdrs, "content-encoding"), Some("gzip"));
+    assert_eq!(header(&hdrs, "cache-control"), Some("max-age=99"));
+    assert_eq!(
+        header(&hdrs, "content-disposition"),
+        Some("attachment; filename=a.txt")
+    );
+    assert_eq!(header(&hdrs, "content-language"), Some("en-US"));
+    assert_eq!(
+        header(&hdrs, "expires"),
+        Some("Wed, 21 Oct 2026 07:28:00 GMT")
+    );
+
+    // HEAD echoes them too.
+    let (_, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(Method::HEAD, Some("syshdr"), Some("k"), &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(header(&hdrs, "content-encoding"), Some("gzip"));
+
+    // GET response-* overrides REPLACE the corresponding headers (ARCH §21.2), with no duplicate.
+    let (_, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("syshdr"),
+                Some("k"),
+                &[
+                    ("response-content-type", "application/xml"),
+                    ("response-cache-control", "no-store"),
+                    ("response-content-disposition", "inline"),
+                ],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(header(&hdrs, "content-type"), Some("application/xml"));
+    assert_eq!(header(&hdrs, "cache-control"), Some("no-store"));
+    assert_eq!(header(&hdrs, "content-disposition"), Some("inline"));
+    // Exactly one content-type header (override replaced, not appended).
+    assert_eq!(
+        hdrs.iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn inbound_replica_marks_status_and_skips_outbox() {
+    let h = harness().await;
+    versioned_bucket(&h, "repl").await;
+    set_replication(&h, "repl", "", false).await;
+
+    // A normal PUT enqueues a replication outbox entry.
+    let (st, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("repl"),
+                Some("a"),
+                &[],
+                &[],
+                b"x".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let _ = hdrs;
+    let now = cairn_types::Timestamp::from_secs(4_000_000_000);
+    let due = h.meta.list_due_replication(100, now).await.unwrap();
+    assert_eq!(due.len(), 1, "normal PUT enqueues replication");
+
+    // A replica PUT (x-amz-meta-cairn-replica: true) does NOT enqueue, and is marked Replica.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("repl"),
+                Some("b"),
+                &[],
+                &[("x-amz-meta-cairn-replica", "true")],
+                b"y".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let due = h.meta.list_due_replication(100, now).await.unwrap();
+    assert_eq!(due.len(), 1, "replica PUT must not enqueue replication");
+
+    let key_b = ObjectKey::parse("b").unwrap();
+    let row = h
+        .meta
+        .current_version(&BucketName::parse("repl").unwrap(), &key_b)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.replication_status,
+        Some(cairn_types::meta::ReplicationStatus::Replica)
+    );
+}
+
+#[tokio::test]
+async fn delete_marker_replication_enqueues_when_enabled() {
+    let h = harness().await;
+    versioned_bucket(&h, "dmr").await;
+    set_replication(&h, "dmr", "", true).await;
+    let now = cairn_types::Timestamp::from_secs(4_000_000_000);
+
+    // PUT then plain DELETE inserts a delete marker; with delete_marker_replication on, the
+    // marker is enqueued (one entry for the object create + one for the marker).
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("dmr"), Some("k"), &[], &[], b"x".to_vec()),
+        )
+        .await,
+    )
+    .await;
+    let after_put = h.meta.list_due_replication(100, now).await.unwrap().len();
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(Method::DELETE, Some("dmr"), Some("k"), &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    let after_delete = h.meta.list_due_replication(100, now).await.unwrap();
+    assert_eq!(
+        after_delete.len(),
+        after_put + 1,
+        "delete-marker replication enqueues an entry when enabled"
+    );
+    assert!(
+        after_delete
+            .iter()
+            .any(|e| e.operation == cairn_types::meta::ReplicationOp::DeleteMarker),
+        "a DeleteMarker outbox op is present"
+    );
+}
+
+#[tokio::test]
+async fn bulk_delete_reports_marker_and_rejects_oversize() {
+    let h = harness().await;
+    versioned_bucket(&h, "bdm").await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("bdm"), Some("k"), &[], &[], b"x".to_vec()),
+        )
+        .await,
+    )
+    .await;
+
+    // A plain bulk delete in a versioned bucket inserts a marker; the result reports it.
+    let del = "<Delete><Object><Key>k</Key></Object></Delete>";
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::POST,
+                Some("bdm"),
+                None,
+                &[("delete", "")],
+                &[],
+                del.as_bytes().to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let xml = String::from_utf8(body).unwrap();
+    assert!(xml.contains("<DeleteMarker>true</DeleteMarker>"), "{xml}");
+    assert!(xml.contains("<DeleteMarkerVersionId>"), "{xml}");
+
+    // A batch of >1000 keys is rejected as MalformedXML (400).
+    let mut big = String::from("<Delete>");
+    for i in 0..1001 {
+        big.push_str(&format!("<Object><Key>k{i}</Key></Object>"));
+    }
+    big.push_str("</Delete>");
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::POST,
+                Some("bdm"),
+                None,
+                &[("delete", "")],
+                &[],
+                big.into_bytes(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
 }

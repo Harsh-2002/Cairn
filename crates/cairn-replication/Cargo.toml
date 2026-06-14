@@ -12,7 +12,12 @@ workspace = true
 [dependencies]
 cairn-types.workspace = true
 cairn-auth.workspace = true
+cairn-crypto.workspace = true
 async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid = { workspace = true, features = ["v4"] }
+zeroize.workspace = true
 bytes.workspace = true
 futures-util = { workspace = true, features = ["std"] }
 hyper = { workspace = true, features = ["client", "http1"] }

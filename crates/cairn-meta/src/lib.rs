@@ -5,6 +5,7 @@
 #![forbid(unsafe_code)]
 
 mod apply;
+mod cache;
 mod model;
 mod range;
 mod schema;
@@ -20,6 +21,7 @@ use rusqlite::Connection;
 use std::path::Path;
 use std::time::Duration;
 
+pub use cache::CachedMetadataStore;
 pub use range::{prefix_upper_bound, successor};
 pub use store::SqliteMetadataStore;
 pub use writer::{WalCheckpointStats, Writer};

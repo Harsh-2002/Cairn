@@ -1,7 +1,7 @@
 //! `cairn-auth` — the authenticator chain (ARCH §14). It composes the Bearer, SigV4 header,
 //! SigV4 presigned, and (debug-only) development schemes into an ordered chain whose first
 //! applicable outcome decides. SigV4 and Bearer verification live here; the streaming
-//! chunk-signature primitives are consumed by the ingest decoder in `cairn-s3`.
+//! chunk-signature primitives are consumed by the ingest decoder in `cairn-protocol`.
 
 #![forbid(unsafe_code)]
 

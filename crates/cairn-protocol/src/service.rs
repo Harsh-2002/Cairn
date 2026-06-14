@@ -389,6 +389,7 @@ impl S3Service {
             prefix: prefix.clone(),
             delimiter: delimiter.clone(),
             cursor,
+            version_id_marker: None,
             start_after,
             limit: max_keys,
         };
@@ -511,6 +512,16 @@ impl S3Service {
             }
             _ => None,
         };
+        // An inbound replica is a PUT carrying `x-amz-meta-cairn-replica: true` (ARCH §20.4): mark
+        // the version a `Replica` so it is never re-replicated, and skip the outbox entirely (loop
+        // prevention). The marker is matched case-insensitively on the value.
+        let is_replica = req
+            .header("x-amz-meta-cairn-replica")
+            .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+        let replication_status =
+            is_replica.then_some(cairn_types::meta::ReplicationStatus::Replica);
+        // The system response headers (ARCH §13.4) are stored verbatim from the request.
+        let header_owned = |name: &str| req.header(name).map(str::to_owned);
         let row = ObjectVersionRow {
             id: uuid::Uuid::new_v4().simple().to_string(),
             bucket: bucket.name.clone(),
@@ -522,6 +533,11 @@ impl S3Service {
             size_physical: staged.size_physical,
             etag: staged.etag.clone(),
             content_type,
+            content_encoding: header_owned("content-encoding"),
+            cache_control: header_owned("cache-control"),
+            content_disposition: header_owned("content-disposition"),
+            content_language: header_owned("content-language"),
+            expires: header_owned("expires"),
             storage_path: Some(staged.storage_path.clone()),
             compression: staged.compression.clone(),
             storage_class: StorageClass::Standard,
@@ -531,14 +547,27 @@ impl S3Service {
             acl,
             checksums: staged.checksums.clone(),
             sse_descriptor: sse_descriptor.clone(),
-            replication_status: None,
+            replication_status,
             created_at: now,
             updated_at: now,
         };
 
-        let replication = self
-            .replication_outbox(&bucket, &key, &version_id, ReplicationOp::ObjectCreate)
-            .await;
+        // An inbound replica must NOT itself enqueue replication (loop prevention, ARCH §20.4);
+        // a normal create enqueues when an enabled rule matches the key and the object's inline
+        // tags (the `x-amz-tagging` header tag set, applied to this version below).
+        let replication = if is_replica {
+            None
+        } else {
+            let inline_tags = parse_tagging_header(req.header("x-amz-tagging"));
+            self.replication_outbox(
+                &bucket,
+                &key,
+                &version_id,
+                ReplicationOp::ObjectCreate,
+                &inline_tags,
+            )
+            .await
+        };
         match self
             .meta
             .submit(Mutation::PutObjectVersion {
@@ -639,6 +668,9 @@ impl S3Service {
             body,
         };
         resp = object_headers(resp, &row).with_header("content-length", logical_len.to_string());
+        // Response-header overrides (ARCH §21.2): the `response-*` query params override the
+        // corresponding response headers for this GET, applied after `object_headers` so they win.
+        resp = apply_response_overrides(resp, req);
         if let Some(cr) = content_range {
             resp = resp.with_header(
                 "content-range",
@@ -667,6 +699,12 @@ impl S3Service {
         let bucket = self.fetch_bucket(req).await?;
         let key = req.key.clone().expect("key present");
         let now = self.clock.now();
+        // An inbound replicated delete-marker propagation carries the loop-prevention marker; the
+        // marker it creates must NOT itself be re-enqueued for replication (ARCH §20.4), which
+        // matters for two-way replication where the destination bucket also has a rule.
+        let is_replica = req
+            .header("x-amz-meta-cairn-replica")
+            .is_some_and(|v| v.eq_ignore_ascii_case("true"));
 
         // A versioned DELETE (?versionId) permanently removes that version (no delete marker). A
         // plain DELETE in an Enabled bucket inserts a new identified delete marker; in a Suspended
@@ -695,6 +733,18 @@ impl S3Service {
         match bucket.versioning {
             VersioningState::Enabled => {
                 let marker_id = VersionId::generate();
+                let replication = if is_replica {
+                    None
+                } else {
+                    self.replication_outbox(
+                        &bucket,
+                        &key,
+                        &marker_id,
+                        ReplicationOp::DeleteMarker,
+                        &[],
+                    )
+                    .await
+                };
                 self.meta
                     .submit(Mutation::CreateDeleteMarker {
                         bucket: bucket.name.clone(),
@@ -702,7 +752,7 @@ impl S3Service {
                         version_id: marker_id.clone(),
                         owner_id: bucket.owner_id.clone(),
                         now,
-                        replication: None,
+                        replication,
                     })
                     .await?;
                 // Signal the newly-created delete marker's identity to the client (Medium #4).
@@ -728,6 +778,17 @@ impl S3Service {
                 {
                     let _ = self.blob.delete(&path).await;
                 }
+                // A Suspended bucket inserts a NULL-version marker; replication requires
+                // Enabled versioning, so `replication_outbox` returns None here by construction.
+                let replication = self
+                    .replication_outbox(
+                        &bucket,
+                        &key,
+                        &VersionId::null(),
+                        ReplicationOp::DeleteMarker,
+                        &[],
+                    )
+                    .await;
                 self.meta
                     .submit(Mutation::CreateDeleteMarker {
                         bucket: bucket.name.clone(),
@@ -735,7 +796,7 @@ impl S3Service {
                         version_id: VersionId::null(),
                         owner_id: bucket.owner_id.clone(),
                         now,
-                        replication: None,
+                        replication,
                     })
                     .await?;
                 Ok(S3Response::status(StatusCode::NO_CONTENT)
@@ -1020,6 +1081,11 @@ impl S3Service {
             size_physical: staged.size_physical,
             etag: etag.clone(),
             content_type: session.content_type.clone(),
+            content_encoding: None,
+            cache_control: None,
+            content_disposition: None,
+            content_language: None,
+            expires: None,
             storage_path: Some(staged.storage_path.clone()),
             compression: staged.compression.clone(),
             storage_class: StorageClass::Standard,
@@ -1229,6 +1295,11 @@ impl S3Service {
             size_physical: staged.size_physical,
             etag: staged.etag.clone(),
             content_type,
+            content_encoding: None,
+            cache_control: None,
+            content_disposition: None,
+            content_language: None,
+            expires: None,
             storage_path: Some(staged.storage_path.clone()),
             compression: staged.compression.clone(),
             storage_class: StorageClass::Standard,
@@ -1285,10 +1356,17 @@ impl S3Service {
         let bucket = self.fetch_bucket(req).await?;
         let xml = drain_body(body, 8 * 1024 * 1024).await?;
         let (quiet, keys) = cairn_xml::parse_delete(&xml)?;
+        // S3 caps a multi-object delete at 1000 keys per request (ARCH §21.5); reject a larger
+        // batch as a malformed request rather than processing it partially.
+        if keys.len() > 1000 {
+            return Err(Error::MalformedXml);
+        }
         let versioned = bucket.versioning == VersioningState::Enabled;
         let now = self.clock.now();
 
-        let mut deleted: Vec<(String, Option<String>)> = Vec::new();
+        // Each entry is (key, version_id, is_delete_marker, delete_marker_version_id) so the
+        // result can surface `<DeleteMarker>`/`<DeleteMarkerVersionId>` for a marker insert.
+        let mut deleted: Vec<(String, Option<String>, bool, Option<String>)> = Vec::new();
         let mut errors: Vec<(String, String, String)> = Vec::new();
         for (key_s, version) in keys {
             let Ok(key) = ObjectKey::parse(&key_s) else {
@@ -1324,21 +1402,33 @@ impl S3Service {
                 errors.push((key_s, code.to_owned(), e.to_string()));
                 continue;
             }
-            let mutation = match (&version, versioned) {
+            // A plain delete in a versioned bucket inserts a delete marker (whose id we capture for
+            // the result and for delete-marker replication); a versioned delete or an unversioned
+            // delete removes a version outright.
+            let marker_id = match (&version, versioned) {
+                (None, true) => Some(VersionId::generate()),
+                _ => None,
+            };
+            let mutation = match (&version, &marker_id) {
                 (Some(v), _) => Mutation::DeleteVersion {
                     bucket: bucket.name.clone(),
                     key,
                     version_id: VersionId::from_string(v.clone()),
                 },
-                (None, true) => Mutation::CreateDeleteMarker {
-                    bucket: bucket.name.clone(),
-                    key,
-                    version_id: VersionId::generate(),
-                    owner_id: bucket.owner_id.clone(),
-                    now,
-                    replication: None,
-                },
-                (None, false) => Mutation::DeleteVersion {
+                (None, Some(mid)) => {
+                    let replication = self
+                        .replication_outbox(&bucket, &key, mid, ReplicationOp::DeleteMarker, &[])
+                        .await;
+                    Mutation::CreateDeleteMarker {
+                        bucket: bucket.name.clone(),
+                        key,
+                        version_id: mid.clone(),
+                        owner_id: bucket.owner_id.clone(),
+                        now,
+                        replication,
+                    }
+                }
+                (None, None) => Mutation::DeleteVersion {
                     bucket: bucket.name.clone(),
                     key,
                     version_id: VersionId::null(),
@@ -1350,12 +1440,20 @@ impl S3Service {
                         let _ = self.blob.delete(&p).await;
                     }
                     if !quiet {
-                        deleted.push((key_s, version));
+                        deleted.push((key_s, version, false, None));
+                    }
+                }
+                Ok(MutationOutcome::DeleteMarker { version_id: mv }) => {
+                    if !quiet {
+                        // S3 surfaces a marker insert with DeleteMarker=true and the marker id in
+                        // DeleteMarkerVersionId; the request's VersionId field stays empty here.
+                        let dmv = (!mv.is_null()).then(|| mv.as_str().to_owned());
+                        deleted.push((key_s, None, true, dmv));
                     }
                 }
                 Ok(_) => {
                     if !quiet {
-                        deleted.push((key_s, version));
+                        deleted.push((key_s, version, false, None));
                     }
                 }
                 // Map each per-key failure to its TRUE S3 code via the total error map, rather
@@ -1409,10 +1507,12 @@ impl S3Service {
             .unwrap_or(1000u32)
             .min(1000);
         let cursor = req.query("key-marker").and_then(decode_token);
+        let version_id_marker = req.query("version-id-marker").map(str::to_owned);
         let query = ListQuery {
             prefix: prefix.clone(),
             delimiter: delimiter.clone(),
             cursor,
+            version_id_marker,
             start_after: None,
             limit: max,
         };
@@ -1530,9 +1630,9 @@ impl S3Service {
         body: cairn_types::BodyStream,
     ) -> Result<S3Response> {
         let bucket = self.fetch_bucket(&req).await?;
-        // ACLs are disabled under BucketOwnerEnforced (S3: AccessControlListNotSupported).
+        // ACLs are disabled under BucketOwnerEnforced (S3: AccessControlListNotSupported, 400).
         if bucket.ownership_mode == OwnershipMode::BucketOwnerEnforced {
-            return Err(Error::NotImplemented);
+            return Err(Error::AclNotSupported);
         }
         let acl = self.resolve_acl_input(&req, body, &bucket.owner_id).await?;
         let doc = serde_json::to_string(&acl)
@@ -1589,9 +1689,9 @@ impl S3Service {
     ) -> Result<S3Response> {
         let (row, bucket) = self.resolve_object(req).await?;
         // Under BucketOwnerEnforced ownership ACLs are disabled; reject with the
-        // AccessControlListNotSupported semantics (mapped to NotImplemented, as PutBucketAcl does).
+        // AccessControlListNotSupported semantics (400), as PutBucketAcl does.
         if bucket.ownership_mode == OwnershipMode::BucketOwnerEnforced {
-            return Err(Error::NotImplemented);
+            return Err(Error::AclNotSupported);
         }
         let acl = self.resolve_acl_input(req, body, &bucket.owner_id).await?;
         self.meta
@@ -1893,14 +1993,20 @@ impl S3Service {
     }
 
     /// Build a replication outbox entry for a write when the bucket has an enabled replication
-    /// rule whose prefix matches the key (ARCH §20). Replication requires versioning. The entry
-    /// rides the same commit transaction as the write, so enqueue is atomic with the version.
+    /// rule matching the key (ARCH §20). Replication requires versioning. The entry rides the same
+    /// commit transaction as the write, so enqueue is atomic with the version.
+    ///
+    /// For an object-create the rule must match the key AND the object's `tags` (the full
+    /// [`Filter::matches`] predicate, ARCH §20). For a [`ReplicationOp::DeleteMarker`] the rule
+    /// must additionally have `delete_marker_replication` enabled (ARCH §20.3/§21.5); delete
+    /// markers carry no tags, so an empty tag set is used for the prefix-only match.
     async fn replication_outbox(
         &self,
         bucket: &Bucket,
         key: &ObjectKey,
         version_id: &VersionId,
         op: ReplicationOp,
+        tags: &[(String, String)],
     ) -> Option<OutboxEntry> {
         if bucket.versioning != VersioningState::Enabled {
             return None;
@@ -1911,10 +2017,19 @@ impl S3Service {
             .await
             .ok()??;
         let cfg = cairn_replication::parse_replication(doc.0.as_bytes()).ok()?;
+        let is_marker = op == ReplicationOp::DeleteMarker;
+        // Among all rules whose filter matches, the highest-priority one wins (ties → document
+        // order), matching S3/MinIO rule-priority semantics; `find` would wrongly take the first
+        // document-order match regardless of `<Priority>` (ARCH §20.2).
         let rule = cfg
             .rules
             .iter()
-            .find(|r| r.enabled && r.filter.matches(key.as_str()))?;
+            .filter(|r| {
+                r.enabled
+                    && r.filter.matches(key.as_str(), tags)
+                    && (!is_marker || r.delete_marker_replication)
+            })
+            .reduce(|best, r| if r.priority > best.priority { r } else { best })?;
         Some(cairn_replication::outbox_entry_for(
             uuid::Uuid::new_v4().simple().to_string(),
             bucket.name.clone(),
@@ -1923,6 +2038,7 @@ impl S3Service {
             op,
             rule.id.clone(),
             self.clock.now(),
+            rule.priority,
         ))
     }
 
@@ -2261,11 +2377,32 @@ fn object_action(req: &S3Request) -> Result<Action> {
         Method::GET if q("attributes") => GetObjectAttributes,
         Method::GET if q("uploadId") => ListMultipartUploadParts,
         Method::DELETE if q("uploadId") => AbortMultipartUpload,
+        // An inbound replica PUT (`x-amz-meta-cairn-replica: true`, ARCH §20.4) authorizes against
+        // `s3:ReplicateObject`, so a dedicated replication user scoped to that action is allowed
+        // (and a normal writer's `s3:PutObject` grant does not silently accept replica traffic).
+        Method::PUT
+            if req
+                .header("x-amz-meta-cairn-replica")
+                .is_some_and(|v| v.eq_ignore_ascii_case("true")) =>
+        {
+            ReplicateObject
+        }
         // The multipart lifecycle (initiate/complete/upload-part) has no distinct action variant;
         // it maps to PutObject, the closest catalogued action.
         Method::PUT | Method::POST => PutObject,
         Method::GET | Method::HEAD if versioned => GetObjectVersion,
         Method::GET | Method::HEAD => GetObject,
+        // An inbound replicated delete-marker propagation (`x-amz-meta-cairn-replica: true`,
+        // ARCH §20.4) authorizes against `s3:ReplicateDelete`, matching the dedicated replication
+        // user's policy rather than requiring full `s3:DeleteObject`.
+        Method::DELETE
+            if !versioned
+                && req
+                    .header("x-amz-meta-cairn-replica")
+                    .is_some_and(|v| v.eq_ignore_ascii_case("true")) =>
+        {
+            ReplicateDelete
+        }
         Method::DELETE if versioned => DeleteObjectVersion,
         Method::DELETE => DeleteObject,
         _ => return Err(Error::NotImplemented),
@@ -2370,6 +2507,22 @@ fn object_headers(resp: S3Response, row: &ObjectVersionRow) -> S3Response {
     if !row.version_id.is_null() {
         resp = resp.with_header("x-amz-version-id", row.version_id.as_str());
     }
+    // Emit the stored system response headers when present (ARCH §13.4).
+    if let Some(v) = &row.content_encoding {
+        resp = resp.with_header("content-encoding", v.clone());
+    }
+    if let Some(v) = &row.cache_control {
+        resp = resp.with_header("cache-control", v.clone());
+    }
+    if let Some(v) = &row.content_disposition {
+        resp = resp.with_header("content-disposition", v.clone());
+    }
+    if let Some(v) = &row.content_language {
+        resp = resp.with_header("content-language", v.clone());
+    }
+    if let Some(v) = &row.expires {
+        resp = resp.with_header("expires", v.clone());
+    }
     // Echo the SSE algorithm on GET/HEAD for a server-side-encrypted object (ARCH §27).
     if row.sse_descriptor.is_some() {
         resp = resp.with_header("x-amz-server-side-encryption", SSE_AES256);
@@ -2379,6 +2532,30 @@ fn object_headers(resp: S3Response, row: &ObjectVersionRow) -> S3Response {
     }
     for (k, v) in &row.user_metadata {
         resp = resp.with_header(&format!("x-amz-meta-{k}"), v.clone());
+    }
+    resp
+}
+
+/// Apply the GET `response-*` query-parameter header overrides (ARCH §21.2): each present param
+/// REPLACES the corresponding response header (set rather than append, so no duplicate is emitted).
+/// Applied after `object_headers`, so a client override always wins over the stored value.
+fn apply_response_overrides(resp: S3Response, req: &S3Request) -> S3Response {
+    const OVERRIDES: &[(&str, &str)] = &[
+        ("response-content-type", "content-type"),
+        ("response-content-disposition", "content-disposition"),
+        ("response-content-encoding", "content-encoding"),
+        ("response-content-language", "content-language"),
+        ("response-cache-control", "cache-control"),
+        ("response-expires", "expires"),
+    ];
+    let mut resp = resp;
+    for (param, header) in OVERRIDES {
+        if let Some(v) = req.query(param) {
+            // Replace any existing value for this header, then set the override.
+            resp.headers
+                .retain(|(k, _)| !k.eq_ignore_ascii_case(header));
+            resp = resp.with_header(header, v.to_owned());
+        }
     }
     resp
 }

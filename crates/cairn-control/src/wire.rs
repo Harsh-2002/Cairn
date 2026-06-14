@@ -73,7 +73,8 @@ pub fn parse_versioning(s: &str) -> Option<VersioningState> {
 pub struct HealthResp {
     /// Liveness marker (always `"ok"`).
     pub status: &'static str,
-    /// Whether the store is ready to serve.
+    /// Whether the store is ready to serve. Reflects a real probe of the metadata store
+    /// (`list_buckets` succeeds), not a hardcoded constant (ARCH §26.4).
     pub ready: bool,
 }
 
@@ -253,6 +254,12 @@ pub struct CreateUserReq {
     pub display_name: String,
     /// The role (`"administrator"` or `"member"`).
     pub role: String,
+    /// When set, attach a canned **replication** identity policy to the new user scoped to this
+    /// destination bucket: it grants `s3:ReplicateObject`, `s3:ReplicateDelete`, `s3:GetObject`,
+    /// and `s3:PutObject` on `arn:aws:s3:::<bucket>/*`. This mints a dedicated destination
+    /// credential in one step (ARCH §20.5). Absent/null leaves the user with no attached policy.
+    #[serde(default)]
+    pub replication_policy_bucket: Option<String>,
 }
 
 /// `POST /users` response body. The secrets are shown exactly once.
@@ -414,6 +421,14 @@ pub struct RotateCredentialsResp {
     pub bearer_secret: String,
 }
 
+/// `PUT /users/{id}/quota` request body. The quota is enforced inside the writer's commit
+/// transaction (ARCH §27.5); this endpoint only sets the configured value.
+#[derive(Debug, Deserialize)]
+pub struct SetUserQuotaReq {
+    /// The new byte quota, or `null` to remove the limit.
+    pub quota_bytes: Option<u64>,
+}
+
 // ---------------------------------------------------------------------------------------
 // Replication operations
 // ---------------------------------------------------------------------------------------
@@ -442,13 +457,99 @@ pub struct FailedReplicationResp {
     pub entries: Vec<FailedReplicationEntry>,
 }
 
+/// `POST /buckets/{name}/replication/targets` request body. The `secret` is sealed under the
+/// master key before it is stored and is **never** echoed back in any response.
+#[derive(Debug, Deserialize)]
+pub struct CreateReplicationTargetReq {
+    /// The destination endpoint base URL, e.g. `https://s3.peer.example.com:9000`.
+    pub endpoint: String,
+    /// The SigV4 signing region for the destination.
+    pub region: String,
+    /// The destination bucket replicated into.
+    pub dest_bucket: String,
+    /// The destination access-key id (public; stored in the clear).
+    pub access_key: String,
+    /// The destination secret access key (plaintext; sealed at rest, never returned).
+    pub secret: String,
+}
+
+/// `POST /buckets/{name}/replication/targets` response body: just the minted ARN. The secret is
+/// never returned.
+#[derive(Debug, Serialize)]
+pub struct CreateReplicationTargetResp {
+    /// The stable target ARN that replication rules reference.
+    pub arn: String,
+}
+
+/// One entry in the replication-target listing. Deliberately omits the sealed secret material:
+/// only the public connection parameters and access-key id are surfaced.
+#[derive(Debug, Serialize)]
+pub struct ReplicationTargetEntry {
+    /// The stable target ARN.
+    pub arn: String,
+    /// The destination endpoint base URL.
+    pub endpoint: String,
+    /// The SigV4 signing region.
+    pub region: String,
+    /// The destination bucket.
+    pub dest_bucket: String,
+    /// The destination access-key id (the secret is never returned).
+    pub access_key_id: String,
+}
+
+/// `GET /buckets/{name}/replication/targets` response. Secrets are never included.
+#[derive(Debug, Serialize)]
+pub struct ReplicationTargetListResp {
+    /// The configured targets, without any secret material.
+    pub targets: Vec<ReplicationTargetEntry>,
+}
+
+/// `POST /buckets/{name}/replication/retry` response: an acknowledgement carrying the count of
+/// failed entries observed for the bucket just before the requeue was submitted.
+#[derive(Debug, Serialize)]
+pub struct ReplicationRetryResp {
+    /// Always `true` once the requeue mutation is accepted.
+    pub requeued: bool,
+    /// How many failed entries for this bucket were observed prior to the requeue.
+    pub failed_observed: u64,
+}
+
+/// `GET /buckets/{name}/replication/status` response: per-bucket replication counters plus the
+/// most recent failed entries' errors. All figures are bounded by the standard page limit.
+#[derive(Debug, Serialize)]
+pub struct ReplicationStatusResp {
+    /// The bucket the status pertains to.
+    pub bucket: String,
+    /// Count of entries currently due (pending and claimable) for this bucket, bounded.
+    pub pending: u64,
+    /// Count of terminally failed entries for this bucket, bounded.
+    pub failed: u64,
+    /// The most recent failed entries' errors for this bucket (bounded), newest first.
+    pub recent_errors: Vec<ReplicationStatusError>,
+}
+
+/// One recent failed-replication error in the per-bucket status view.
+#[derive(Debug, Serialize)]
+pub struct ReplicationStatusError {
+    /// The object key concerned.
+    pub key: String,
+    /// The version id concerned.
+    pub version_id: String,
+    /// The last error recorded, if any.
+    pub error: Option<String>,
+}
+
 // ---------------------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------------------
 
-/// The JSON error envelope used by every non-success response.
+/// The JSON error envelope used by every non-success response. The `request_id` mirrors the
+/// `x-amz-request-id` response header so an operator can correlate a failed call with logs
+/// (ARCH §25.1).
 #[derive(Debug, Serialize)]
 pub struct ErrorResp {
     /// A short, stable error message.
     pub error: String,
+    /// The per-request id, also emitted as the `x-amz-request-id` response header.
+    pub request_id: String,
 }

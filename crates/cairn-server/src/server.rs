@@ -305,6 +305,9 @@ async fn handle(
     let request_id = uuid::Uuid::new_v4().simple().to_string();
     let method = req.method().clone();
     let path = req.uri().path().to_owned();
+    // Approximate inbound payload size from the declared content-length (the body itself is streamed
+    // and never fully buffered here, so the header is the cheapest available proxy).
+    let req_bytes = content_length(req.headers());
     let span = tracing::info_span!(
         "request",
         request_id = %request_id,
@@ -343,14 +346,31 @@ async fn handle(
         };
         let status = resp.status();
         let elapsed = start.elapsed().as_secs_f64();
+        // A low-cardinality `route` label (ARCH §26): the request is bucketed into a small fixed set
+        // of route classes rather than the raw path, so the time series stay bounded.
+        let route = classify_route(&path);
         metrics::counter!(
             "cairn_requests_total",
             "method" => method.to_string(),
             "status" => status.as_u16().to_string(),
+            "route" => route,
         )
         .increment(1);
-        metrics::histogram!("cairn_request_duration_seconds", "method" => method.to_string())
-            .record(elapsed);
+        metrics::histogram!(
+            "cairn_request_duration_seconds",
+            "method" => method.to_string(),
+            "route" => route,
+        )
+        .record(elapsed);
+        // Throughput counters (ARCH §26). Sizes are taken from the content-length declarations, the
+        // only bounded-cost proxy at this layer (bodies stream past without being buffered).
+        if req_bytes > 0 {
+            metrics::counter!("cairn_bytes_received_total").increment(req_bytes);
+        }
+        let resp_bytes = content_length(resp.headers());
+        if resp_bytes > 0 {
+            metrics::counter!("cairn_bytes_sent_total").increment(resp_bytes);
+        }
         tracing::info!(
             status = status.as_u16(),
             elapsed_ms = elapsed * 1000.0,
@@ -365,6 +385,38 @@ async fn handle(
     .await;
 
     Ok(response)
+}
+
+/// Read a `content-length` header as a byte count, or `0` when absent/unparseable. Used as the
+/// bounded-cost proxy for the throughput counters (the bodies themselves stream past unbuffered).
+fn content_length(headers: &hyper::HeaderMap) -> u64 {
+    headers
+        .get(hyper::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+/// Bucket a request path into a small, fixed set of low-cardinality route classes for the metrics
+/// `route` label (ARCH §26). The raw path (which embeds bucket/key names) would explode the time
+/// series, so it is collapsed to a coarse family: the infra endpoints by name, the management API,
+/// the web console assets, the signed share path, and otherwise the S3 data plane.
+fn classify_route(path: &str) -> &'static str {
+    match path {
+        "/healthz" => "healthz",
+        "/readyz" => "readyz",
+        "/metrics" => "metrics",
+        "/" => "ui",
+        _ if path.starts_with("/api/v1") => "api",
+        _ if path.starts_with("/p/") => "share",
+        _ if path.starts_with("/assets/")
+            || path.starts_with("/web/")
+            || path.starts_with("/ui/") =>
+        {
+            "ui"
+        }
+        _ => "s3",
+    }
 }
 
 /// Liveness, readiness, and metrics endpoints (the S3 and management families are dispatched
@@ -392,15 +444,25 @@ async fn route_infra(state: &AppState, path: &str) -> Response<ResponseBody> {
 }
 
 /// Readiness reflects real state (ARCH §6.4, §26.4): the process is ready only once startup
-/// migrations and reconciliation have completed (the `ready` gate) AND a cheap liveness probe of
-/// the metadata store succeeds. `/healthz` stays pure liveness; this probe must not falsely
-/// report ready when the store is wedged. The probe is a trivial indexed read
-/// (`list_buckets(None)`) on the read pool — it never touches the single writer.
+/// migrations and reconciliation have completed (the `ready` gate) AND both halves of the store are
+/// responsive — a trivial indexed read on the read pool (`list_buckets(None)`) AND a cheap probe of
+/// the single writer (it must be draining its queue, not wedged). `/healthz` stays pure liveness;
+/// this probe must not falsely report ready when either the read pool or the writer is stuck. The
+/// writer probe is available only for the concrete sqlite backend; the libSQL/Turso engines
+/// self-manage their writer, so for them the read probe alone gates readiness.
 async fn is_ready(state: &AppState) -> bool {
     if !state.ready.load(Ordering::SeqCst) {
         return false;
     }
-    state.stack.meta.list_buckets(None).await.is_ok()
+    if state.stack.meta.list_buckets(None).await.is_err() {
+        return false;
+    }
+    if let Some(store) = state.stack.store.as_ref() {
+        if store.writer_probe().await.is_err() {
+            return false;
+        }
+    }
+    true
 }
 
 fn text(status: StatusCode, body: &'static str) -> Response<ResponseBody> {
@@ -488,7 +550,7 @@ async fn wait_for_signal(tx: watch::Sender<bool>) {
 }
 
 // The infra endpoints and S3 dispatch are exercised by the live smoke test and the
-// cairn-s3 real-stack integration tests.
+// cairn-protocol real-stack integration tests.
 
 /// End-to-end coverage of the `fast-io` kTLS path. These run only with the feature on and on Linux
 /// (the only platform where kTLS exists). They prove the exact serving logic of [`serve_tls`] —

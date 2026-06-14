@@ -46,6 +46,34 @@ pub trait BucketRoutedSink: Send + Sync {
     ) -> Result<(), ReplicationError>;
 }
 
+/// Chooses which [`BucketRoutedSink`] ships a given outbox entry, keyed by the entry's rule's
+/// remote-target ARN (ARCH §20.5).
+///
+/// Per-bucket remote targets mean different rules can ship to different destinations; the engine
+/// asks a router for the sink that serves a particular target ARN. A `None` ARN is the legacy
+/// fixed-destination form (a rule without a remote target). A router that does not recognise the
+/// ARN returns `None`, and the engine treats the entry as undeliverable (terminal: its target is
+/// unknown).
+pub trait SinkRouter: Send + Sync {
+    /// The sink that ships entries for `target_arn`, or `None` if no sink serves it.
+    fn sink_for<'a>(&'a self, target_arn: Option<&str>) -> Option<&'a dyn BucketRoutedSink>;
+}
+
+/// The trivial single-destination router: it returns its one wrapped sink for **any** target ARN
+/// (including `None`). This preserves the original single-sink engine seam — tests wrap their fake
+/// in `SingleSink(FakeReplicationSink)` and the engine routes every entry to it.
+#[derive(Debug, Clone)]
+pub struct SingleSink<S>(pub S);
+
+impl<S> SinkRouter for SingleSink<S>
+where
+    S: BucketRoutedSink,
+{
+    fn sink_for<'a>(&'a self, _target_arn: Option<&str>) -> Option<&'a dyn BucketRoutedSink> {
+        Some(&self.0)
+    }
+}
+
 /// Blanket adapter: any fixed-destination [`ReplicationSink`] is a [`BucketRoutedSink`] that
 /// ignores the source bucket. This keeps every existing sink (notably the in-memory test double)
 /// usable by the engine with no changes, and preserves the single-destination node->node path.

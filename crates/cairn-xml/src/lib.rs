@@ -229,6 +229,9 @@ pub fn list_object_versions(
                 if let Some(next) = &page.next_cursor {
                     leaf(w, "NextKeyMarker", next);
                 }
+                if let Some(nvid) = &page.next_version_id_marker {
+                    leaf(w, "NextVersionIdMarker", nvid);
+                }
             }
             for item in &page.items {
                 write_version_entry(w, item);
@@ -563,20 +566,31 @@ pub fn copy_part_result(etag: &ETag, last_modified: Timestamp) -> String {
 
 /// `DeleteResult` for the multi-object delete operation, carrying the deleted entries and
 /// any per-key errors.
+///
+/// Each deleted entry is `(key, version_id, is_delete_marker, delete_marker_version_id)`:
+/// `version_id` is the version named in (or affected by) the delete; when the delete inserted a
+/// delete marker, `is_delete_marker` is `true` and `delete_marker_version_id` carries the new
+/// marker's id, which S3 surfaces as `<DeleteMarker>`/`<DeleteMarkerVersionId>` (ARCH §21.5).
 #[must_use]
 pub fn delete_result(
-    deleted: &[(String, Option<String>)],
+    deleted: &[(String, Option<String>, bool, Option<String>)],
     errors: &[(String, String, String)],
 ) -> String {
     let mut w = new_doc();
     w.create_element("DeleteResult")
         .with_attribute(("xmlns", "http://s3.amazonaws.com/doc/2006-03-01/"))
         .write_inner_content(|w| {
-            for (key, version_id) in deleted {
+            for (key, version_id, is_delete_marker, delete_marker_version_id) in deleted {
                 w.create_element("Deleted").write_inner_content(|w| {
                     leaf(w, "Key", key);
                     if let Some(v) = version_id {
                         leaf(w, "VersionId", v);
+                    }
+                    if *is_delete_marker {
+                        leaf(w, "DeleteMarker", "true");
+                    }
+                    if let Some(dmv) = delete_marker_version_id {
+                        leaf(w, "DeleteMarkerVersionId", dmv);
                     }
                     Ok(())
                 })?;

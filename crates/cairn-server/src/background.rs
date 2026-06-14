@@ -7,7 +7,7 @@ use crate::config::{Config, ReplicationTarget};
 use crate::stack::AppStack;
 use cairn_crypto::SystemClock;
 use cairn_lifecycle::{BucketLifecycle, LifecycleScanner};
-use cairn_replication::{BucketRoutedSink, HttpS3Sink};
+use cairn_replication::{BucketRoutedSink, HttpS3Sink, SinkRouter};
 use cairn_types::bucket::ConfigAspect;
 use cairn_types::error::ReplicationError;
 use cairn_types::id::{BucketName, ObjectKey, VersionId};
@@ -37,7 +37,11 @@ pub fn spawn(stack: Arc<AppStack>, cfg: &Config) {
     // runs only for the `sqlite` backend (where `stack.store` is `Some`). The libSQL and Turso
     // engines self-manage their WAL, so the loop is simply not spawned for them.
     if stack.store.is_some() {
-        tokio::spawn(checkpoint_loop(stack.clone(), checkpoint_interval));
+        tokio::spawn(checkpoint_loop(
+            stack.clone(),
+            checkpoint_interval,
+            cfg.wal_checkpoint_size_bytes,
+        ));
     } else {
         tracing::info!(
             "WAL checkpointer disabled: the active metadata backend self-manages its WAL"
@@ -72,6 +76,17 @@ pub fn spawn(stack: Arc<AppStack>, cfg: &Config) {
     } else if let Some(sink_cfg) = single_target_sink_cfg(cfg) {
         tokio::spawn(replication_loop(stack.clone(), sink_cfg, interval));
         tracing::info!("replication worker enabled");
+    } else {
+        // No env-configured sink. The per-bucket STORED remote targets (the primary model, set
+        // through the API/UI/CLI and sealed at rest) are the real source of destinations now, and
+        // they are discovered fresh from bucket config on each drain — so the worker must still run.
+        tokio::spawn(multi_target_replication_loop(
+            stack.clone(),
+            Vec::new(),
+            None,
+            interval,
+        ));
+        tracing::info!("replication worker enabled (per-bucket stored targets)");
     }
     tokio::spawn(metrics_loop(stack));
 }
@@ -128,31 +143,20 @@ async fn replication_loop(
         let dest_buckets = resolve_dest_buckets(&stack).await;
         let mut sink_cfg = base_cfg.clone();
         sink_cfg.dest_buckets = dest_buckets;
-        let sink = match cairn_replication::HttpS3Sink::new(sink_cfg) {
-            Ok(s) => s,
+        let default_sink = match cairn_replication::HttpS3Sink::new(sink_cfg) {
+            Ok(s) => Some(Arc::new(s)),
             Err(e) => {
                 tracing::error!(error = %e, "replication sink construction failed; skipping drain");
                 continue;
             }
         };
 
-        match engine
-            .run_until_idle(&*stack.meta, &sink, &stack.blob, &clock, 50)
-            .await
-        {
-            Ok(report) if !report.is_idle() => {
-                metrics::counter!("cairn_replication_completed_total")
-                    .increment(report.completed as u64);
-                metrics::counter!("cairn_replication_failed_total").increment(report.failed as u64);
-                tracing::info!(
-                    completed = report.completed,
-                    failed = report.failed,
-                    "replication progressed"
-                );
-            }
-            Ok(_) => {}
-            Err(e) => tracing::warn!(error = %e, "replication run failed"),
-        }
+        // Build the router for this drain: stored per-bucket remote targets take precedence; any
+        // bucket without one falls back to this env-configured default sink (the unchanged
+        // node->node path).
+        let stored = resolve_stored_target_sinks(&stack).await;
+        let router = build_router(default_sink, &stored);
+        drain_with_router(&engine, &stack, &router, &clock).await;
     }
 }
 
@@ -237,37 +241,156 @@ async fn multi_target_replication_loop(
     };
 
     if target_sinks.is_empty() && default_sink.is_none() {
-        tracing::error!("no usable replication targets; replication worker idle");
-        return;
+        // No env sinks — this is the stored-targets-only shape. Do NOT bail: per-bucket stored
+        // remote targets are resolved from bucket config on every drain below (ARCH §20).
+        tracing::debug!("no env replication sinks; serving per-bucket stored targets only");
     }
 
     loop {
         tokio::time::sleep(interval).await;
 
-        // Resolve `source bucket -> target sink` from the current bucket rules each drain.
+        // Resolve `source bucket -> target sink` from the current bucket rules each drain. Stored
+        // per-bucket remote targets are layered on top and win over the env-named targets.
         let routes = resolve_target_routes(&stack, &target_sinks).await;
-        let sink = MultiTargetSink {
-            routes,
-            default: default_sink.clone(),
-        };
+        let stored = resolve_stored_target_sinks(&stack).await;
+        // `routes` are the env-named per-source routes; fold them in over the stored ones.
+        let router = build_router(default_sink.clone(), &stored).with_env_routes(routes);
+        drain_with_router(&engine, &stack, &router, &clock).await;
+    }
+}
 
-        match engine
-            .run_until_idle(&*stack.meta, &sink, &stack.blob, &clock, 50)
+/// Run one drain pass through the engine with the assembled router, publishing the replication
+/// progress + bytes metrics. Centralises the run/report handling shared by both worker shapes.
+async fn drain_with_router(
+    engine: &cairn_replication::ReplicationEngine,
+    stack: &Arc<AppStack>,
+    router: &StoredTargetRouter,
+    clock: &SystemClock,
+) {
+    match engine
+        .run_until_idle(&*stack.meta, router, &stack.blob, clock, 50)
+        .await
+    {
+        Ok(report) if !report.is_idle() => {
+            metrics::counter!("cairn_replication_completed_total")
+                .increment(report.completed as u64);
+            metrics::counter!("cairn_replication_failed_total").increment(report.failed as u64);
+            metrics::counter!("cairn_replication_bytes_total").increment(report.bytes);
+            tracing::info!(
+                completed = report.completed,
+                failed = report.failed,
+                bytes = report.bytes,
+                "replication progressed"
+            );
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "replication run failed"),
+    }
+}
+
+/// Resolve the `source bucket name -> built sink` map from each bucket's stored remote replication
+/// targets (`ConfigAspect::ReplicationTargets`, ARCH §20.5). For every bucket whose stored
+/// replication rule names a remote-target ARN, the matching [`RemoteTarget`] is unsealed under the
+/// master key and built into an [`HttpS3Sink`]; that sink ships the bucket's objects to the
+/// destination the target names. Buckets with no stored targets (or whose rule names no ARN, or
+/// whose ARN does not resolve) are omitted, falling back to the env default/named sinks.
+///
+/// Sinks are keyed and rebuilt per drain. Building a sink is cheap (the connector is the only real
+/// cost) and the stored-target set is small, so this keeps a fresh view of operator edits each pass
+/// without a long-lived cache to invalidate.
+async fn resolve_stored_target_sinks(stack: &Arc<AppStack>) -> HashMap<String, Arc<HttpS3Sink>> {
+    let mut out: HashMap<String, Arc<HttpS3Sink>> = HashMap::new();
+    let buckets = match stack.meta.list_buckets(None).await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "replication: listing buckets for stored-target resolution failed");
+            return out;
+        }
+    };
+    for b in buckets {
+        // The bucket's replication rule names the target ARN to ship to.
+        let Some(arn) = bucket_rule_target_arn(stack, &b.name).await else {
+            continue;
+        };
+        // Load and parse this bucket's stored remote targets.
+        let doc = match stack
+            .meta
+            .get_bucket_config(&b.name, ConfigAspect::ReplicationTargets)
             .await
         {
-            Ok(report) if !report.is_idle() => {
-                metrics::counter!("cairn_replication_completed_total")
-                    .increment(report.completed as u64);
-                metrics::counter!("cairn_replication_failed_total").increment(report.failed as u64);
-                tracing::info!(
-                    completed = report.completed,
-                    failed = report.failed,
-                    "replication progressed (multi-target)"
-                );
+            Ok(Some(doc)) => doc,
+            Ok(None) => continue,
+            Err(e) => {
+                tracing::warn!(bucket = %b.name.as_str(), error = %e,
+                    "replication: reading stored targets failed");
+                continue;
             }
-            Ok(_) => {}
-            Err(e) => tracing::warn!(error = %e, "replication run failed"),
+        };
+        let targets = match cairn_replication::parse_targets(doc.0.as_bytes()) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(bucket = %b.name.as_str(), error = %e,
+                    "replication: parsing stored targets failed");
+                continue;
+            }
+        };
+        let Some(target) = cairn_replication::resolve_target(&targets, &arn) else {
+            tracing::warn!(bucket = %b.name.as_str(), %arn,
+                "replication: rule names a target ARN with no matching stored target");
+            continue;
+        };
+        // Unseal the target under the master key and build its dedicated sink.
+        let open = match cairn_replication::open_target(&stack.crypto, target) {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::warn!(bucket = %b.name.as_str(), error = %e,
+                    "replication: unsealing stored target failed");
+                continue;
+            }
+        };
+        match cairn_replication::sink_for_target(&open, None, false) {
+            Ok(sink) => {
+                out.insert(b.name.as_str().to_owned(), Arc::new(sink));
+            }
+            Err(e) => {
+                tracing::warn!(bucket = %b.name.as_str(), error = %e,
+                    "replication: building sink for stored target failed");
+            }
         }
+    }
+    out
+}
+
+/// Read a single bucket's first enabled replication rule's remote-target ARN, or `None` when the
+/// bucket has no replication config, an unparseable document, or no enabled rule naming a target.
+async fn bucket_rule_target_arn(stack: &Arc<AppStack>, bucket: &BucketName) -> Option<String> {
+    let doc = stack
+        .meta
+        .get_bucket_config(bucket, ConfigAspect::Replication)
+        .await
+        .ok()??;
+    let cfg = cairn_replication::parse_replication(doc.0.as_bytes()).ok()?;
+    // The highest-priority enabled rule's target wins, consistent with the per-write rule selection
+    // (ARCH §20.2). Routing is per source bucket, so the single highest-priority target is used; a
+    // bucket fanning out to several distinct targets by priority/filter is a known limitation.
+    cfg.rules
+        .iter()
+        .filter(|r| r.enabled)
+        .reduce(|best, r| if r.priority > best.priority { r } else { best })
+        .and_then(|r| r.target_arn.clone())
+}
+
+/// Build the [`StoredTargetRouter`] for a drain from the stored per-bucket sinks plus the env
+/// default. The multi-target worker shape folds its env-named per-source routes in afterwards via
+/// [`StoredTargetRouter::with_env_routes`]; the single-target shape passes none.
+fn build_router(
+    default: Option<Arc<HttpS3Sink>>,
+    stored: &HashMap<String, Arc<HttpS3Sink>>,
+) -> StoredTargetRouter {
+    StoredTargetRouter {
+        stored: stored.clone(),
+        env_routes: HashMap::new(),
+        default,
     }
 }
 
@@ -332,21 +455,52 @@ fn match_target(
         .map(|(_, sink)| Arc::clone(sink))
 }
 
-/// A [`BucketRoutedSink`] over many per-target [`HttpS3Sink`]s plus an optional default. Each call
-/// dispatches on the source bucket: a routed bucket ships through its target's sink, an unrouted
-/// bucket through the default. With no route and no default the entry is a terminal failure (it
-/// names a destination no configured target serves), surfaced for operator attention rather than
-/// silently dropped.
-struct MultiTargetSink {
-    routes: HashMap<String, Arc<HttpS3Sink>>,
+/// The [`SinkRouter`] the engine drives, plus the [`BucketRoutedSink`] it routes every entry to.
+///
+/// The engine resolves an entry's rule->target binding through `sink_for(target_arn)`; the current
+/// outbox entry does not carry an explicit target ARN (`cairn_replication`'s `entry_target_arn`
+/// returns `None`), so this router returns **itself** for any ARN and performs the real routing per
+/// **source bucket** inside [`BucketRoutedSink`]. Each call dispatches on the source bucket in
+/// precedence order:
+///
+///  1. **stored** — a sink built from the bucket's stored per-bucket remote target
+///     (`ConfigAspect::ReplicationTargets`, unsealed under the master key). This is the MinIO-model
+///     per-bucket destination and takes precedence.
+///  2. **env_routes** — the legacy `CAIRN_REPLICATION_TARGETS` named-target route for the bucket.
+///  3. **default** — the single-target `CAIRN_REPLICATION_*` env sink.
+///
+/// With no stored target, no env route, and no default, an entry's source bucket names a
+/// destination no configured target serves: a terminal failure surfaced for operator attention,
+/// never a silent drop (ARCH §20).
+///
+/// SIMPLIFICATION (noted per task brief): because the durable outbox entry does not carry the
+/// target ARN, routing keys off the **source bucket** rather than a per-entry ARN. This is correct
+/// for the current model (a bucket's enabled rule names one target) and preserves the existing
+/// env-driven behaviour and tests; if the entry later grows an explicit ARN field, `sink_for` can
+/// switch to keying on it.
+struct StoredTargetRouter {
+    /// `source bucket -> sink` resolved from each bucket's stored remote target (precedence 1).
+    stored: HashMap<String, Arc<HttpS3Sink>>,
+    /// `source bucket -> sink` resolved from the env named targets (precedence 2).
+    env_routes: HashMap<String, Arc<HttpS3Sink>>,
+    /// The env single-target default sink (precedence 3).
     default: Option<Arc<HttpS3Sink>>,
 }
 
-impl MultiTargetSink {
-    /// Resolve the sink for a source bucket: its explicit route, else the default.
-    fn sink_for(&self, source_bucket: &str) -> Result<&Arc<HttpS3Sink>, ReplicationError> {
-        self.routes
+impl StoredTargetRouter {
+    /// Fold the env-named per-source routes in (used by the multi-target worker shape). Stored
+    /// targets still take precedence over these at dispatch time.
+    fn with_env_routes(mut self, routes: HashMap<String, Arc<HttpS3Sink>>) -> Self {
+        self.env_routes = routes;
+        self
+    }
+
+    /// Resolve the sink for a source bucket in precedence order: stored, then env route, then the
+    /// env default.
+    fn sink_for_bucket(&self, source_bucket: &str) -> Result<&Arc<HttpS3Sink>, ReplicationError> {
+        self.stored
             .get(source_bucket)
+            .or_else(|| self.env_routes.get(source_bucket))
             .or(self.default.as_ref())
             .ok_or_else(|| {
                 ReplicationError::Terminal(format!(
@@ -356,14 +510,21 @@ impl MultiTargetSink {
     }
 }
 
+impl SinkRouter for StoredTargetRouter {
+    fn sink_for<'a>(&'a self, _target_arn: Option<&str>) -> Option<&'a dyn BucketRoutedSink> {
+        // The entry carries no explicit ARN; we route per source bucket inside `BucketRoutedSink`.
+        Some(self)
+    }
+}
+
 #[async_trait::async_trait]
-impl BucketRoutedSink for MultiTargetSink {
+impl BucketRoutedSink for StoredTargetRouter {
     async fn put_object(
         &self,
         source_bucket: &BucketName,
         object: ReplicatedObject,
     ) -> Result<(), ReplicationError> {
-        self.sink_for(source_bucket.as_str())?
+        self.sink_for_bucket(source_bucket.as_str())?
             .put_object(source_bucket, object)
             .await
     }
@@ -374,7 +535,7 @@ impl BucketRoutedSink for MultiTargetSink {
         key: &ObjectKey,
         version: &VersionId,
     ) -> Result<(), ReplicationError> {
-        self.sink_for(source_bucket.as_str())?
+        self.sink_for_bucket(source_bucket.as_str())?
             .delete_marker(source_bucket, key, version)
             .await
     }
@@ -386,13 +547,55 @@ impl BucketRoutedSink for MultiTargetSink {
 /// latency. `checkpoint()` runs on the writer thread (serialized with mutations, never
 /// contending), and a `busy` result means a reader pinned the log so the truncation was
 /// deferred — that is observable via `cairn_wal_checkpoints_busy_total`.
-async fn checkpoint_loop(stack: Arc<AppStack>, interval: Duration) {
+async fn checkpoint_loop(stack: Arc<AppStack>, interval: Duration, size_threshold_bytes: u64) {
     // Only spawned when `store` is Some (the sqlite backend); bind the typed handle once.
     let Some(store) = stack.store.clone() else {
         return;
     };
+    // Poll on a cadence fine enough to react to the size threshold between interval ticks, but
+    // never longer than the interval itself. When the size trigger is disabled (threshold 0) the
+    // poll cadence is just the interval, preserving the original interval-only behaviour.
+    let poll = if size_threshold_bytes > 0 {
+        interval
+            .min(Duration::from_secs(10))
+            .max(Duration::from_secs(1))
+    } else {
+        interval
+    };
+    let mut elapsed = Duration::ZERO;
     loop {
-        tokio::time::sleep(interval).await;
+        tokio::time::sleep(poll).await;
+        elapsed += poll;
+
+        // Probe the WAL size every tick so the gauge stays live and the size trigger can fire.
+        let wal_bytes = match store.wal_size_bytes().await {
+            Ok(bytes) => {
+                metrics::gauge!("cairn_wal_bytes").set(bytes as f64);
+                bytes
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "wal size probe failed");
+                0
+            }
+        };
+
+        // Checkpoint when the interval has elapsed OR the WAL has grown past the configured size
+        // threshold (ARCH §8.4) — the latter bounds `-wal` growth under sustained writes with a
+        // long-lived reader rather than waiting out the whole interval.
+        let interval_due = elapsed >= interval;
+        let size_due = size_threshold_bytes > 0 && wal_bytes >= size_threshold_bytes;
+        if !interval_due && !size_due {
+            continue;
+        }
+        if size_due && !interval_due {
+            tracing::debug!(
+                wal_bytes,
+                threshold = size_threshold_bytes,
+                "wal size threshold exceeded; checkpointing early"
+            );
+        }
+        elapsed = Duration::ZERO;
+
         match store.checkpoint().await {
             Ok(stats) => {
                 metrics::counter!("cairn_wal_checkpoints_total").increment(1);
@@ -410,6 +613,7 @@ async fn checkpoint_loop(stack: Arc<AppStack>, interval: Duration) {
             }
             Err(e) => tracing::warn!(error = %e, "wal checkpoint failed"),
         }
+        // Refresh the gauge post-checkpoint so a truncating checkpoint's effect is visible.
         match store.wal_size_bytes().await {
             Ok(bytes) => metrics::gauge!("cairn_wal_bytes").set(bytes as f64),
             Err(e) => tracing::warn!(error = %e, "wal size probe failed"),
@@ -420,6 +624,7 @@ async fn checkpoint_loop(stack: Arc<AppStack>, interval: Duration) {
 /// Refresh the store gauges (object/bucket/byte counts and compression ratio) from the metadata
 /// aggregate on a short interval, so `/metrics` reflects live state.
 async fn metrics_loop(stack: Arc<AppStack>) {
+    let clock = SystemClock::new();
     loop {
         tokio::time::sleep(Duration::from_secs(15)).await;
         if let Ok(c) = stack.meta.aggregate_counts().await {
@@ -434,6 +639,38 @@ async fn metrics_loop(stack: Arc<AppStack>) {
                 1.0
             };
             metrics::gauge!("cairn_compression_ratio").set(ratio);
+        }
+
+        // Writer inbound queue depth (ARCH §26.2): the headline write-backpressure signal. Only the
+        // concrete sqlite store exposes the writer handle; libSQL/Turso self-manage and have no
+        // such gauge.
+        if let Some(store) = stack.store.as_ref() {
+            metrics::gauge!("cairn_writer_queue_depth").set(store.writer_queue_depth() as f64);
+        }
+
+        // Metadata config-cache effectiveness (ARCH §11.5). The cache is not a `metrics` dependency,
+        // so it exposes cumulative counters we mirror into the registry here.
+        let (hits, misses) = stack.meta_cache.stats();
+        metrics::gauge!("cairn_meta_cache_hits_total").set(hits as f64);
+        metrics::gauge!("cairn_meta_cache_misses_total").set(misses as f64);
+
+        // Replication queue depth + lag (ARCH §20/§26). `list_due_replication` is a read-only mirror
+        // of the claim predicate; the oldest due entry's age is the replication lag.
+        let now = clock.now();
+        match stack.meta.list_due_replication(10_000, now).await {
+            Ok(due) => {
+                metrics::gauge!("cairn_replication_queue_depth").set(due.len() as f64);
+                // The oldest *due* entry is the one whose `next_attempt_at` is furthest in the past;
+                // its age is the worst-case replication lag right now.
+                let oldest = due
+                    .iter()
+                    .map(|e| e.next_attempt_at.as_millis())
+                    .min()
+                    .unwrap_or_else(|| now.as_millis());
+                let lag_secs = ((now.as_millis() - oldest).max(0) as f64) / 1000.0;
+                metrics::gauge!("cairn_replication_lag_seconds").set(lag_secs);
+            }
+            Err(e) => tracing::debug!(error = %e, "replication lag probe failed"),
         }
     }
 }
@@ -597,22 +834,102 @@ mod tests {
 
         let mut routes = HashMap::new();
         routes.insert("logs".to_owned(), Arc::clone(&west));
-        let sink = MultiTargetSink {
-            routes,
+        let sink = StoredTargetRouter {
+            stored: HashMap::new(),
+            env_routes: routes,
             default: Some(default),
         };
 
         // Routed bucket -> its target sink; unrouted -> the default sink.
-        assert_eq!(sink.sink_for("logs").unwrap().dest_for("x"), "mirror-west");
-        assert_eq!(sink.sink_for("other").unwrap().dest_for("x"), "fallback");
+        assert_eq!(
+            sink.sink_for_bucket("logs").unwrap().dest_for("x"),
+            "mirror-west"
+        );
+        assert_eq!(
+            sink.sink_for_bucket("other").unwrap().dest_for("x"),
+            "fallback"
+        );
 
         // With no default, an unrouted bucket is a terminal failure.
-        let sink = MultiTargetSink {
-            routes: HashMap::new(),
+        let sink = StoredTargetRouter {
+            stored: HashMap::new(),
+            env_routes: HashMap::new(),
             default: None,
         };
-        let err = sink.sink_for("orphan").unwrap_err();
+        let err = sink.sink_for_bucket("orphan").unwrap_err();
         assert!(matches!(err, ReplicationError::Terminal(_)));
+    }
+
+    /// A stored per-bucket remote target takes precedence over both an env-named route and the env
+    /// default for the same source bucket (ARCH §20.5).
+    #[test]
+    fn stored_target_wins_over_env_route_and_default() {
+        let stored_sink = Arc::new(
+            HttpS3Sink::new(cairn_replication::S3SinkConfig {
+                endpoint: "https://stored.example:9000".to_owned(),
+                dest_bucket: "stored-dest".to_owned(),
+                dest_buckets: HashMap::new(),
+                region: "us-east-1".to_owned(),
+                access_key_id: "AKID".to_owned(),
+                secret_access_key: "secret".to_owned(),
+                ca_cert_path: None,
+                insecure_skip_verify: false,
+            })
+            .unwrap(),
+        );
+        let env_sink = Arc::new(
+            HttpS3Sink::new(cairn_replication::S3SinkConfig {
+                endpoint: "https://env.example:9000".to_owned(),
+                dest_bucket: "env-dest".to_owned(),
+                dest_buckets: HashMap::new(),
+                region: "us-east-1".to_owned(),
+                access_key_id: "AKID".to_owned(),
+                secret_access_key: "secret".to_owned(),
+                ca_cert_path: None,
+                insecure_skip_verify: false,
+            })
+            .unwrap(),
+        );
+        let default_sink = Arc::new(
+            HttpS3Sink::new(cairn_replication::S3SinkConfig {
+                endpoint: "https://default.example:9000".to_owned(),
+                dest_bucket: "default-dest".to_owned(),
+                dest_buckets: HashMap::new(),
+                region: "us-east-1".to_owned(),
+                access_key_id: "AKID".to_owned(),
+                secret_access_key: "secret".to_owned(),
+                ca_cert_path: None,
+                insecure_skip_verify: false,
+            })
+            .unwrap(),
+        );
+
+        let mut stored = HashMap::new();
+        stored.insert("logs".to_owned(), Arc::clone(&stored_sink));
+        let mut env_routes = HashMap::new();
+        env_routes.insert("logs".to_owned(), Arc::clone(&env_sink));
+        env_routes.insert("metrics".to_owned(), Arc::clone(&env_sink));
+        let router = StoredTargetRouter {
+            stored,
+            env_routes,
+            default: Some(Arc::clone(&default_sink)),
+        };
+
+        // "logs" has a stored target -> stored wins over its env route.
+        assert_eq!(
+            router.sink_for_bucket("logs").unwrap().dest_for("x"),
+            "stored-dest"
+        );
+        // "metrics" has only an env route -> env route wins over default.
+        assert_eq!(
+            router.sink_for_bucket("metrics").unwrap().dest_for("x"),
+            "env-dest"
+        );
+        // "other" has neither -> the env default.
+        assert_eq!(
+            router.sink_for_bucket("other").unwrap().dest_for("x"),
+            "default-dest"
+        );
     }
 
     /// `single_target_sink_cfg` yields `None` until the endpoint/credentials triple is complete,

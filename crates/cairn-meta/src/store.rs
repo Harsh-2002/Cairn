@@ -23,6 +23,10 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 const LIST_BATCH: usize = 1024;
 
+/// The claim-lease length for replication-outbox entries: a claimed entry whose lease elapses
+/// (a stalled worker) becomes eligible for re-claim after this many seconds.
+const REPLICATION_LEASE_SECS: i64 = 300;
+
 /// The SQLite-backed metadata store.
 #[derive(Clone)]
 pub struct SqliteMetadataStore {
@@ -75,6 +79,24 @@ impl SqliteMetadataStore {
         .map_err(|e| MetaError::Engine(e.to_string()))?
     }
 
+    /// The current inbound write-queue depth: mutations submitted to the single writer but not yet
+    /// pulled into a commit batch (ARCH §26.2). Published as `cairn_writer_queue_depth`; a sustained
+    /// nonzero value means writes are arriving faster than the writer can commit them.
+    #[must_use]
+    pub fn writer_queue_depth(&self) -> usize {
+        self.writer.queue_depth()
+    }
+
+    /// Probe that the single writer is responsive (its thread is draining the queue). Used by the
+    /// readiness check so `/readyz` does not report ready while the writer is wedged. Cheap: a
+    /// control message acked on the writer thread, no database work.
+    ///
+    /// # Errors
+    /// Returns a [`MetaError`] if the writer has shut down.
+    pub async fn writer_probe(&self) -> Result<(), MetaError> {
+        self.writer.probe().await
+    }
+
     /// Run a read closure on the blocking pool with a pooled read connection.
     pub(crate) async fn with_read<F, T>(&self, f: F) -> Result<T, MetaError>
     where
@@ -124,7 +146,20 @@ fn list_impl(
         }
     }
 
-    let mut page = ListPage::default();
+    // For version listings, a version-id marker resumes strictly after `(cursor_key, marker)`
+    // within the marker key. Versions sort `version_id DESC`, so entries already returned for that
+    // key have `version_id >= marker`; we skip exactly those on the first key.
+    let vid_marker = if latest_only {
+        None
+    } else {
+        query
+            .version_id_marker
+            .as_deref()
+            .zip(query.cursor.as_deref())
+            .map(|(vid, key)| (key.to_owned(), vid.to_owned()))
+    };
+
+    let mut page: ListPage<ObjectSummary> = ListPage::default();
     let mut seen_cp = std::collections::HashSet::new();
 
     'outer: loop {
@@ -141,9 +176,29 @@ fn list_impl(
         }
         let exhausted = rows.len() <= LIST_BATCH;
         for summary in rows.into_iter().take(LIST_BATCH) {
+            if let Some((mk, mv)) = &vid_marker {
+                if summary.key.as_str() == mk.as_str() && summary.version_id.as_str() >= mv.as_str()
+                {
+                    // Already returned on the previous page (or is the marker itself); skip it. The
+                    // skipped versions of the marker key are a bounded prefix that fits in one batch.
+                    continue;
+                }
+            }
             if page.items.len() + page.common_prefixes.len() >= limit {
                 page.truncated = true;
-                page.next_cursor = Some(summary.key.as_str().to_owned());
+                if latest_only {
+                    // Current-object listing (one row per key): resume at the first unreturned key.
+                    page.next_cursor = Some(summary.key.as_str().to_owned());
+                } else if let Some(last) = page.items.last() {
+                    // Version listing: resume at the LAST RETURNED (key, version_id). The next page
+                    // re-seeks that key and the version-id marker skips the versions already
+                    // returned (`version_id >= marker`), so paging within a multi-version key is
+                    // gap-free and duplicate-free.
+                    page.next_cursor = Some(last.key.as_str().to_owned());
+                    page.next_version_id_marker = Some(last.version_id.as_str().to_owned());
+                } else {
+                    page.next_cursor = Some(summary.key.as_str().to_owned());
+                }
                 break 'outer;
             }
             let key = summary.key.as_str().to_owned();
@@ -419,6 +474,7 @@ impl MetadataStore for SqliteMetadataStore {
                 items: items.into_iter().map(StoragePath::from_string).collect(),
                 common_prefixes: Vec::new(),
                 next_cursor,
+                next_version_id_marker: None,
                 truncated,
             })
         })
@@ -491,7 +547,7 @@ impl MetadataStore for SqliteMetadataStore {
             let mut items = rows;
             items.truncate(limit as usize);
             let next_cursor = if truncated { items.last().map(|p| p.part_number.to_string()) } else { None };
-            Ok(ListPage { items, common_prefixes: Vec::new(), next_cursor, truncated })
+            Ok(ListPage { items, common_prefixes: Vec::new(), next_cursor, next_version_id_marker: None, truncated })
         })
         .await
     }
@@ -504,21 +560,45 @@ impl MetadataStore for SqliteMetadataStore {
         let (b, q) = (bucket.as_str().to_owned(), query.clone());
         self.with_read(move |conn| {
             let prefix = q.prefix.clone().unwrap_or_default();
-            let mut stmt = conn
-                .prepare_cached(
-                    "SELECT * FROM multipart_uploads WHERE bucket_name=?1 AND status='active' AND key>=?2 ORDER BY key, id",
+            let upper = prefix_upper_bound(&prefix);
+            // Resume strictly after the cursor key when one is supplied; otherwise seek to the
+            // half-open prefix lower bound.
+            let seek = match &q.cursor {
+                Some(c) if c.as_str() > prefix.as_str() => c.clone(),
+                _ => prefix.clone(),
+            };
+            let limit = q.limit.max(1) as usize;
+            // Half-open `prefix_upper_bound` seek like the other listings, fetching one extra row to
+            // detect truncation.
+            let mut sql = String::from(
+                "SELECT * FROM multipart_uploads WHERE bucket_name=?1 AND status='active' AND key>=?2",
+            );
+            if upper.is_some() {
+                sql.push_str(" AND key<?3");
+            }
+            sql.push_str(" ORDER BY key, id LIMIT ?4");
+            let mut stmt = conn.prepare_cached(&sql).map_err(engine_err)?;
+            let batch = (limit + 1) as i64;
+            let rows = if let Some(ub) = &upper {
+                stmt.query_map(params![b, seek, ub, batch], model::multipart_from_row)
+            } else {
+                stmt.query_map(
+                    params![b, seek, rusqlite::types::Null, batch],
+                    model::multipart_from_row,
                 )
-                .map_err(engine_err)?;
-            let rows = stmt
-                .query_map(params![b, prefix], model::multipart_from_row)
-                .map_err(engine_err)?
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(engine_err)?;
-            let mut items: Vec<MultipartSession> =
-                rows.into_iter().filter(|s| s.key.as_str().starts_with(&prefix)).collect();
-            let truncated = items.len() > q.limit.max(1) as usize;
-            items.truncate(q.limit.max(1) as usize);
-            Ok(ListPage { items, common_prefixes: Vec::new(), next_cursor: None, truncated })
+            }
+            .map_err(engine_err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(engine_err)?;
+            let mut items: Vec<MultipartSession> = rows;
+            let truncated = items.len() > limit;
+            items.truncate(limit);
+            let next_cursor = if truncated {
+                items.last().map(|s| s.key.as_str().to_owned())
+            } else {
+                None
+            };
+            Ok(ListPage { items, common_prefixes: Vec::new(), next_cursor, next_version_id_marker: None, truncated })
         })
         .await
     }
@@ -574,10 +654,37 @@ impl MetadataStore for SqliteMetadataStore {
         limit: u32,
         now: Timestamp,
     ) -> Result<Vec<OutboxEntry>, MetaError> {
+        // Claiming is a write (it marks entries `claimed` with a lease), routed through the
+        // single writer so the select-and-mark is atomic against other workers.
+        let outcome = self
+            .submit(Mutation::ClaimReplicationBatch {
+                limit,
+                now,
+                lease_secs: REPLICATION_LEASE_SECS,
+            })
+            .await?;
+        match outcome {
+            MutationOutcome::ReplicationBatch(entries) => Ok(entries),
+            other => Err(MetaError::Engine(format!(
+                "unexpected outcome for ClaimReplicationBatch: {other:?}"
+            ))),
+        }
+    }
+
+    async fn list_due_replication(
+        &self,
+        limit: u32,
+        now: Timestamp,
+    ) -> Result<Vec<OutboxEntry>, MetaError> {
+        // Read-only mirror of the claim predicate (pending, or claimed with an expired lease, that
+        // has reached its next-attempt time), ordered as the claim orders. No mutation.
         self.with_read(move |conn| {
             let mut stmt = conn
                 .prepare_cached(
-                    "SELECT * FROM replication_outbox WHERE status='pending' AND next_attempt_at<=?1 ORDER BY next_attempt_at LIMIT ?2",
+                    "SELECT * FROM replication_outbox \
+                     WHERE next_attempt_at<=?1 \
+                       AND (status='pending' OR (status='claimed' AND lease_until<?1)) \
+                     ORDER BY priority DESC, next_attempt_at LIMIT ?2",
                 )
                 .map_err(engine_err)?;
             stmt.query_map(params![now.0, i64::from(limit)], model::outbox_from_row)

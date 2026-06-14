@@ -57,6 +57,9 @@ pub enum Action {
     PutReplicationConfiguration,
     PutBucketOwnershipControls,
     PutBucketPublicAccessBlock,
+    // replication (cross-bucket propagation)
+    ReplicateObject,
+    ReplicateDelete,
 }
 
 impl Action {
@@ -103,6 +106,8 @@ impl Action {
             PutReplicationConfiguration => "s3:PutReplicationConfiguration",
             PutBucketOwnershipControls => "s3:PutBucketOwnershipControls",
             PutBucketPublicAccessBlock => "s3:PutBucketPublicAccessBlock",
+            ReplicateObject => "s3:ReplicateObject",
+            ReplicateDelete => "s3:ReplicateDelete",
         }
     }
 }

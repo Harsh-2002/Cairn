@@ -10,7 +10,7 @@
 use crate::stack::AppStack;
 use bytes::Bytes;
 use cairn_crypto::SystemClock;
-use cairn_s3::{S3Body, S3Request, S3Response, error_response};
+use cairn_protocol::{S3Body, S3Request, S3Response, error_response};
 use cairn_types::auth::{AuthMethod, AuthOutcome, Principal, RequestView, Role};
 use cairn_types::crypto::Signature;
 use cairn_types::error::{BodyError, Error};
@@ -108,9 +108,15 @@ pub async fn handle(
             .control
             .handle(&method, subpath, &query, principal.as_ref(), body_bytes)
             .await;
-        return Response::builder()
+        // Emit the per-request id as `x-amz-request-id` on every control response, success or
+        // error, so an operator can correlate a call with logs and the error envelope (ARCH §25.1).
+        let mut builder = Response::builder()
             .status(resp.status)
-            .header("content-type", "application/json")
+            .header("content-type", "application/json");
+        if let Ok(v) = http::HeaderValue::from_str(&resp.request_id) {
+            builder = builder.header("x-amz-request-id", v);
+        }
+        return builder
             .body(full_body(Bytes::from(resp.body)))
             .unwrap_or_else(|_| Response::new(full_body(Bytes::new())));
     }
@@ -145,7 +151,10 @@ pub async fn handle(
         return serve_public(stack, escaped, &query_str, peer, secure, request_id).await;
     }
 
-    let (bucket, key) = route_path(&raw_path);
+    // Virtual-host-style addressing (ARCH §13.1): when `CAIRN_S3_DOMAIN` is configured and the
+    // request Host is `<bucket>.<s3_domain>`, the bucket is taken from the Host and the entire path
+    // is the key. Otherwise fall back to path-style routing (`/<bucket>/<key>`).
+    let (bucket, key) = route_request(stack.s3_domain.as_deref(), &host, &raw_path);
     let query = parse_query(&query_str);
     let body = incoming_to_stream(req.into_body());
 
@@ -304,6 +313,48 @@ async fn serve_public(
     render(stack.s3.handle(s3req, empty).await)
 }
 
+/// Route a request to a `(bucket, key)`, preferring virtual-host-style addressing when configured.
+///
+/// When `s3_domain` is `Some` and the request `Host` (port stripped) is `<bucket>.<s3_domain>`, the
+/// bucket is the leading Host label and the **entire** request path (sans the leading `/`) is the
+/// key (ARCH §13.1). Any other Host — including a bare `<s3_domain>` with no bucket label, or a Host
+/// that is not under the domain — falls through to path-style [`route_path`]. With `s3_domain`
+/// `None`, routing is always path-style.
+pub(crate) fn route_request(
+    s3_domain: Option<&str>,
+    host: &str,
+    raw_path: &str,
+) -> (Option<BucketName>, Option<ObjectKey>) {
+    if let Some(domain) = s3_domain {
+        if let Some(bucket) = vhost_bucket(host, domain) {
+            if let Ok(b) = BucketName::parse(&bucket) {
+                let key = raw_path.strip_prefix('/').unwrap_or(raw_path).to_owned();
+                let key = (!key.is_empty())
+                    .then(|| ObjectKey::parse(&pct_decode(&key)).ok())
+                    .flatten();
+                return (Some(b), key);
+            }
+        }
+    }
+    route_path(raw_path)
+}
+
+/// Extract the bucket label from a virtual-host `Host` of the form `<bucket>.<s3_domain>`, with any
+/// `:port` stripped and matching done case-insensitively. Returns `None` when the Host is not a
+/// strict `<label>.<domain>` (e.g. a bare domain, a mismatched domain, or an empty label).
+fn vhost_bucket(host: &str, domain: &str) -> Option<String> {
+    let host = host.split(':').next().unwrap_or(host);
+    let host_l = host.to_ascii_lowercase();
+    let domain_l = domain.to_ascii_lowercase();
+    let suffix = format!(".{domain_l}");
+    let bucket = host_l.strip_suffix(&suffix)?;
+    // A single leading label only — `a.b.<domain>` is not a Cairn virtual-host bucket.
+    if bucket.is_empty() || bucket.contains('.') {
+        return None;
+    }
+    Some(bucket.to_owned())
+}
+
 /// Split a path-style request path into a bucket and key.
 pub(crate) fn route_path(raw_path: &str) -> (Option<BucketName>, Option<ObjectKey>) {
     let p = raw_path.strip_prefix('/').unwrap_or(raw_path);
@@ -437,6 +488,55 @@ mod tests {
         // Three source chunks must surface as three distinct data frames: proof the body streams
         // rather than collecting everything into a single buffer first.
         assert_eq!(frames, 3, "each source chunk must be its own frame");
+    }
+
+    /// Virtual-host addressing: with `CAIRN_S3_DOMAIN` set and a `<bucket>.<domain>` Host, the
+    /// bucket comes from the Host and the entire path is the key (ARCH §13.1).
+    #[test]
+    fn route_request_virtual_host_takes_bucket_from_host() {
+        let (b, k) = route_request(
+            Some("s3.example.com"),
+            "photos.s3.example.com",
+            "/a/b/c.jpg",
+        );
+        assert_eq!(b.unwrap().as_str(), "photos");
+        assert_eq!(k.unwrap().as_str(), "a/b/c.jpg");
+
+        // Port on the Host is stripped; matching is case-insensitive.
+        let (b, _) = route_request(Some("s3.example.com"), "Photos.S3.Example.com:9000", "/x");
+        assert_eq!(b.unwrap().as_str(), "photos");
+
+        // A bucket-only request (path is just "/") yields the bucket with no key.
+        let (b, k) = route_request(Some("s3.example.com"), "logs.s3.example.com", "/");
+        assert_eq!(b.unwrap().as_str(), "logs");
+        assert!(k.is_none());
+    }
+
+    /// A bare domain Host (no bucket label) or a non-matching Host falls back to path-style routing,
+    /// and an unset domain is always path-style.
+    #[test]
+    fn route_request_falls_back_to_path_style() {
+        // Bare domain (no leading bucket label) -> path-style: `/bucket/key`.
+        let (b, k) = route_request(Some("s3.example.com"), "s3.example.com", "/mybucket/obj");
+        assert_eq!(b.unwrap().as_str(), "mybucket");
+        assert_eq!(k.unwrap().as_str(), "obj");
+
+        // Multi-label host under the domain is not a vhost bucket -> path-style.
+        let (b, _) = route_request(
+            Some("s3.example.com"),
+            "a.b.s3.example.com",
+            "/mybucket/obj",
+        );
+        assert_eq!(b.unwrap().as_str(), "mybucket");
+
+        // A Host not under the domain -> path-style.
+        let (b, _) = route_request(Some("s3.example.com"), "other.host.net", "/mybucket/obj");
+        assert_eq!(b.unwrap().as_str(), "mybucket");
+
+        // No domain configured -> always path-style even for a domain-shaped Host.
+        let (b, k) = route_request(None, "photos.s3.example.com", "/mybucket/obj");
+        assert_eq!(b.unwrap().as_str(), "mybucket");
+        assert_eq!(k.unwrap().as_str(), "obj");
     }
 
     /// A buffered (`Bytes`) response stays a single bounded body.

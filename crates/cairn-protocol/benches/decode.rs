@@ -1,7 +1,7 @@
 //! Micro-benchmark for the streaming chunked-upload decoder (ARCH §29.6): confirms the de-framer
 //! runs at many GiB/s and is not the bottleneck on the ingest path.
 
-use cairn_s3::ChunkDecoder;
+use cairn_protocol::ChunkDecoder;
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 
 fn build_unsigned_body(total: usize, chunk: usize) -> Vec<u8> {

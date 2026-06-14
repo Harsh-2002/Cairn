@@ -143,7 +143,7 @@ jobs:
         env:
           RUSTUP_TOOLCHAIN: nightly
         run: |
-          (cd crates/cairn-s3   && cargo fuzz run chunked_decoder  -- -max_total_time=45)
+          (cd crates/cairn-protocol   && cargo fuzz run chunked_decoder  -- -max_total_time=45)
           (cd crates/cairn-xml  && cargo fuzz run request_parsers  -- -max_total_time=30)
           (cd crates/cairn-authz && cargo fuzz run parse_policy    -- -max_total_time=30)
 

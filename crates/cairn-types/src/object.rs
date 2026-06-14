@@ -140,6 +140,16 @@ pub struct ObjectVersionRow {
     pub etag: ETag,
     /// The MIME content type.
     pub content_type: String,
+    /// The `Content-Encoding` header to echo on GET/HEAD (None if not supplied).
+    pub content_encoding: Option<String>,
+    /// The `Cache-Control` header to echo on GET/HEAD (None if not supplied).
+    pub cache_control: Option<String>,
+    /// The `Content-Disposition` header to echo on GET/HEAD (None if not supplied).
+    pub content_disposition: Option<String>,
+    /// The `Content-Language` header to echo on GET/HEAD (None if not supplied).
+    pub content_language: Option<String>,
+    /// The `Expires` header to echo on GET/HEAD (None if not supplied).
+    pub expires: Option<String>,
     /// The opaque blob path (None for delete markers).
     pub storage_path: Option<StoragePath>,
     /// How the blob is compressed.

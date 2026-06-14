@@ -25,7 +25,8 @@ use cairn_types::time::Timestamp;
 pub const OBJECT_VERSION_COLS: &str = "id, bucket_name, key, version_id, is_latest, \
      is_delete_marker, size_logical, size_physical, etag, content_type, storage_path, \
      compression, storage_class, cold_locator, owner_id, user_metadata, acl, checksums, \
-     sse_descriptor, replication_status, created_at, updated_at";
+     sse_descriptor, replication_status, created_at, updated_at, content_encoding, cache_control, \
+     content_disposition, content_language, expires";
 
 /// `buckets` columns in mapper order.
 pub const BUCKET_COLS: &str =
@@ -44,7 +45,7 @@ pub const USER_COLS: &str = "id, display_name, access_key_id, secret_hash, sigv4
 
 /// `replication_outbox` columns in mapper order.
 pub const OUTBOX_COLS: &str = "id, bucket_name, key, version_id, operation, rule_id, attempts, \
-     next_attempt_at, status, last_error";
+     next_attempt_at, status, last_error, priority, lease_until";
 
 /// `activity` columns in mapper order.
 pub const ACTIVITY_COLS: &str = "id, action, bucket, key, size, etag, actor, at";
@@ -126,6 +127,7 @@ pub fn mp_status_from(s: &str) -> MultipartStatus {
 pub fn repl_status_str(s: ReplicationStatus) -> &'static str {
     match s {
         ReplicationStatus::Pending => "pending",
+        ReplicationStatus::Claimed => "claimed",
         ReplicationStatus::Completed => "completed",
         ReplicationStatus::Failed => "failed",
         ReplicationStatus::Replica => "replica",
@@ -133,6 +135,7 @@ pub fn repl_status_str(s: ReplicationStatus) -> &'static str {
 }
 pub fn repl_status_from(s: &str) -> ReplicationStatus {
     match s {
+        "claimed" => ReplicationStatus::Claimed,
         "completed" => ReplicationStatus::Completed,
         "failed" => ReplicationStatus::Failed,
         "replica" => ReplicationStatus::Replica,
@@ -187,6 +190,11 @@ pub fn object_version_from_row(row: &Row) -> Result<ObjectVersionRow, MetaError>
         size_physical: row.get_i64(7) as u64,
         etag: ETag::from_string(row.get_text(8)),
         content_type: row.get_text(9),
+        content_encoding: row.get_opt_text(22),
+        cache_control: row.get_opt_text(23),
+        content_disposition: row.get_opt_text(24),
+        content_language: row.get_opt_text(25),
+        expires: row.get_opt_text(26),
         storage_path: row.get_opt_text(10).map(StoragePath::from_string),
         compression,
         storage_class: storage_class_from(&row.get_text(12)),
@@ -312,6 +320,8 @@ pub fn outbox_from_row(row: &Row) -> Result<OutboxEntry, MetaError> {
         next_attempt_at: Timestamp(row.get_i64(7)),
         status: repl_status_from(&row.get_text(8)),
         last_error: row.get_opt_text(9),
+        priority: row.get_i64(10),
+        lease_until: row.get_opt_i64(11).map(Timestamp),
     })
 }
 

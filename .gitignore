@@ -14,8 +14,8 @@ fuzz/corpus
 # verification artifacts
 .playwright-mcp/
 *.png
-crates/cairn-s3/fuzz/corpus/
-crates/cairn-s3/fuzz/artifacts/
+crates/cairn-protocol/fuzz/corpus/
+crates/cairn-protocol/fuzz/artifacts/
 crates/cairn-xml/fuzz/corpus/
 crates/cairn-xml/fuzz/artifacts/
 crates/cairn-authz/fuzz/corpus/

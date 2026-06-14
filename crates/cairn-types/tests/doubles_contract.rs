@@ -31,6 +31,11 @@ fn row_from(
         size_physical: staged.size_physical,
         etag: staged.etag.clone(),
         content_type: "application/octet-stream".to_owned(),
+        content_encoding: None,
+        cache_control: None,
+        content_disposition: None,
+        content_language: None,
+        expires: None,
         storage_path: Some(staged.storage_path.clone()),
         compression: CompressionDescriptor::Uncompressed,
         storage_class: StorageClass::Standard,
@@ -332,6 +337,8 @@ async fn plant_outbox_entry(
         next_attempt_at: Timestamp::EPOCH,
         status: cairn_types::meta::ReplicationStatus::Pending,
         last_error: None,
+        priority: 0,
+        lease_until: None,
     };
     let row = ObjectVersionRow {
         id: uuid::Uuid::new_v4().simple().to_string(),
@@ -344,6 +351,11 @@ async fn plant_outbox_entry(
         size_physical: 3,
         etag: cairn_types::object::ETag::from_string("e".to_owned()),
         content_type: "text/plain".to_owned(),
+        content_encoding: None,
+        cache_control: None,
+        content_disposition: None,
+        content_language: None,
+        expires: None,
         storage_path: Some(StoragePath::from_string(format!(
             "{}/{}",
             bucket.as_str(),

@@ -16,6 +16,7 @@
 
 mod adapter;
 mod background;
+mod cli_remote;
 mod config;
 mod observability;
 mod server;
@@ -54,7 +55,14 @@ enum Command {
     /// Create the first administrator into an empty store and print its credentials once.
     Bootstrap,
     /// Run reconciliation on demand (reclaim orphaned blobs); a node-local integrity check.
-    Integrity,
+    ///
+    /// With `--repair`, additionally run in repair mode (ARCH §24.3/§29.4): drop metadata rows
+    /// whose backing blob is missing on disk, so the store can re-serve the remaining keys cleanly.
+    Integrity {
+        /// Also drop metadata rows whose backing blob is missing (destructive repair).
+        #[arg(long)]
+        repair: bool,
+    },
     /// Open the store (running migrations) and report the applied schema version.
     Migrate,
     /// Take a consistent snapshot of the data dir into DIR (ARCH §31.4): checkpoint + copy the
@@ -69,10 +77,74 @@ enum Command {
         /// Source snapshot directory produced by `backup`.
         dir: PathBuf,
     },
+
+    // --- Remote administration (ARCH §24.2): a thin client over a running server's management API
+    //     and S3 data plane. These commands do not touch the local data dir or config; they are
+    //     dispatched before `Config::load()`. Connection + output options come from the flattened
+    //     `RemoteOpts` (flags or `CAIRN_*` env).
+    /// Bucket operations against a running server's management API.
+    Bucket {
+        #[command(flatten)]
+        opts: cli_remote::RemoteOpts,
+        #[command(subcommand)]
+        cmd: cli_remote::BucketCmd,
+    },
+    /// User operations against a running server's management API.
+    User {
+        #[command(flatten)]
+        opts: cli_remote::RemoteOpts,
+        #[command(subcommand)]
+        cmd: cli_remote::UserCmd,
+    },
+    /// Replication operations against a running server's management API.
+    Replication {
+        #[command(flatten)]
+        opts: cli_remote::RemoteOpts,
+        #[command(subcommand)]
+        cmd: cli_remote::ReplicationCmd,
+    },
+    /// Object operations over a running server's S3 data plane (same Bearer token).
+    Object {
+        #[command(flatten)]
+        opts: cli_remote::RemoteOpts,
+        #[command(subcommand)]
+        cmd: cli_remote::ObjectCmd,
+    },
+    /// Print a running server's store overview.
+    Overview {
+        #[command(flatten)]
+        opts: cli_remote::RemoteOpts,
+    },
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    let command = cli.command.unwrap_or(Command::Serve);
+
+    // Remote-administration commands are a thin client over a running server's HTTP surfaces and
+    // never read the local data dir or environment-only config; dispatch them before `Config::load`
+    // so they work without a configured node (only `--endpoint`/`--access-key`/`--secret-key` or the
+    // corresponding `CAIRN_*` vars matter).
+    match command {
+        Command::Bucket { opts, cmd } => {
+            return cli_remote::run(&opts, cli_remote::RemoteCommand::Bucket { cmd });
+        }
+        Command::User { opts, cmd } => {
+            return cli_remote::run(&opts, cli_remote::RemoteCommand::User { cmd });
+        }
+        Command::Replication { opts, cmd } => {
+            return cli_remote::run(&opts, cli_remote::RemoteCommand::Replication { cmd });
+        }
+        Command::Object { opts, cmd } => {
+            return cli_remote::run(&opts, cli_remote::RemoteCommand::Object { cmd });
+        }
+        Command::Overview { opts } => {
+            return cli_remote::run(&opts, cli_remote::RemoteCommand::Overview);
+        }
+        _ => {}
+    }
+
+    // Node-local commands need the environment-only config.
     let cfg = match Config::load() {
         Ok(c) => c,
         Err(e) => {
@@ -81,21 +153,27 @@ fn main() -> ExitCode {
         }
     };
 
-    match cli.command.unwrap_or(Command::Serve) {
+    match command {
         Command::ValidateConfig => {
             println!("configuration valid");
             ExitCode::SUCCESS
         }
         Command::Bootstrap => bootstrap(cfg),
-        Command::Integrity => integrity(cfg),
+        Command::Integrity { repair } => integrity(cfg, repair),
         Command::Migrate => migrate(cfg),
         Command::Backup { dir } => backup(cfg, &dir),
         Command::Restore { dir } => restore(cfg, &dir),
         Command::Serve => run_server(cfg),
+        // The remote-admin variants are handled and returned above.
+        Command::Bucket { .. }
+        | Command::User { .. }
+        | Command::Replication { .. }
+        | Command::Object { .. }
+        | Command::Overview { .. } => unreachable!("remote commands dispatched above"),
     }
 }
 
-fn integrity(cfg: Config) -> ExitCode {
+fn integrity(cfg: Config, repair: bool) -> ExitCode {
     use cairn_types::blob::ReconcileOpts;
     use cairn_types::traits::BlobStore;
 
@@ -108,8 +186,9 @@ fn integrity(cfg: Config) -> ExitCode {
     };
     rt.block_on(async {
         // Open through the configured backend (CAIRN_META_BACKEND) so reconciliation consults the
-        // same engine the server serves from.
-        let (_meta, oracle) = match stack::open_meta_store(&cfg).await {
+        // same engine the server serves from. Repair mode needs the metadata store itself (to drop
+        // dangling rows), so keep both halves.
+        let (meta, oracle) = match stack::open_meta_store(&cfg).await {
             Ok(pair) => pair,
             Err(e) => {
                 eprintln!("failed to open metadata store: {e}");
@@ -123,20 +202,140 @@ fn integrity(cfg: Config) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
+
+        // First, the always-on forward pass: reclaim orphaned blobs (blobs with no metadata row).
         match blob.reconcile(oracle.as_ref(), ReconcileOpts::default()).await {
             Ok(r) => {
                 println!(
                     "reconciliation complete: scanned={} orphans_reclaimed={} staging_cleaned={} sessions_cleaned={} errors={}",
                     r.blobs_scanned, r.orphans_reclaimed, r.staging_cleaned, r.sessions_cleaned, r.errors
                 );
-                ExitCode::SUCCESS
             }
             Err(e) => {
                 eprintln!("reconciliation failed: {e}");
-                ExitCode::FAILURE
+                return ExitCode::FAILURE;
             }
         }
+
+        // Then, in repair mode, the inverse pass: drop metadata rows whose backing blob is missing
+        // on disk (ARCH §24.3/§29.4). The forward reconcile cannot detect these — it only walks the
+        // blob tree — so repair walks the metadata instead, probes the blob store for each version's
+        // backing object, and deletes the row when the blob is gone.
+        if repair {
+            match repair_dangling_rows(meta.as_ref(), &blob).await {
+                Ok(dropped) => {
+                    println!("repair complete: dangling_rows_dropped={dropped}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("repair failed: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        } else {
+            ExitCode::SUCCESS
+        }
     })
+}
+
+/// The page size used when walking metadata in repair mode; bounds memory per round.
+const REPAIR_PAGE_LIMIT: u32 = 1000;
+/// Upper bound on paging iterations per bucket, so a hostile/corrupt cursor can never spin forever.
+const REPAIR_MAX_PAGES: u32 = 100_000;
+
+/// Repair-mode reconciliation (ARCH §24.3/§29.4): drop every metadata row whose backing blob is
+/// missing on disk. Walks each bucket's versions, resolves each non-delete-marker version's
+/// `storage_path`, probes the blob store for it, and submits a `DeleteVersion` mutation when the
+/// blob is absent. Returns the count of rows dropped.
+///
+/// This composes only the public store/blob primitives (no privileged internals): it is the
+/// node-local inverse of orphan reclamation and is deliberately destructive, so it runs only under
+/// the explicit `--repair` flag.
+async fn repair_dangling_rows(
+    meta: &dyn cairn_types::traits::MetadataStore,
+    blob: &cairn_blob::LocalBlobStore,
+) -> Result<u64, String> {
+    use cairn_types::error::BlobError;
+    use cairn_types::meta::{ListQuery, Mutation, MutationOutcome};
+    use cairn_types::traits::BlobStore;
+
+    let buckets = meta.list_buckets(None).await.map_err(|e| e.to_string())?;
+    let mut dropped = 0u64;
+
+    for bucket in &buckets {
+        let mut cursor: Option<String> = None;
+        for _ in 0..REPAIR_MAX_PAGES {
+            let query = ListQuery {
+                cursor: cursor.clone(),
+                limit: REPAIR_PAGE_LIMIT,
+                ..Default::default()
+            };
+            let page = meta
+                .list_versions(&bucket.name, &query)
+                .await
+                .map_err(|e| e.to_string())?;
+            if page.items.is_empty() {
+                break;
+            }
+
+            for item in &page.items {
+                // Delete markers carry no blob, so they are never dangling.
+                if item.is_delete_marker {
+                    continue;
+                }
+                // Resolve the version's backing storage path. A row that has gone missing between
+                // the listing and this read is simply skipped (nothing to repair).
+                let row = match meta
+                    .get_version(&bucket.name, &item.key, &item.version_id)
+                    .await
+                {
+                    Ok(Some(r)) => r,
+                    Ok(None) => continue,
+                    Err(e) => return Err(e.to_string()),
+                };
+                let Some(path) = row.storage_path.clone() else {
+                    continue;
+                };
+
+                // Probe the blob store. Opening a present blob succeeds (we read nothing); a
+                // missing blob yields `NotFound`, which is exactly the dangling case we repair. Any
+                // other error is surfaced rather than treated as "missing", so a transient I/O fault
+                // never deletes good metadata.
+                match blob.open(&path, None).await {
+                    Ok(_) => {}
+                    Err(BlobError::NotFound) => {
+                        match meta
+                            .submit(Mutation::DeleteVersion {
+                                bucket: bucket.name.clone(),
+                                key: item.key.clone(),
+                                version_id: item.version_id.clone(),
+                            })
+                            .await
+                        {
+                            Ok(MutationOutcome::Deleted { freed, .. }) => {
+                                // Best-effort, idempotent: the blob is already gone, but reclaim any
+                                // path the store reports freed so no surprise orphan remains.
+                                if let Some(freed) = freed {
+                                    let _ = blob.delete(&freed).await;
+                                }
+                                dropped += 1;
+                            }
+                            Ok(_) => {}
+                            Err(e) => return Err(e.to_string()),
+                        }
+                    }
+                    Err(e) => return Err(e.to_string()),
+                }
+            }
+
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+    }
+
+    Ok(dropped)
 }
 
 /// Open the metadata store (which runs any pending migrations) and report the resulting schema

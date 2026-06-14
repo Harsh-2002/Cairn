@@ -446,6 +446,7 @@ dependencies = [
  "bytes",
  "cairn-auth",
  "cairn-authz",
+ "cairn-replication",
  "cairn-types",
  "futures-util",
  "http",
@@ -520,31 +521,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "cairn-replication"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "bytes",
- "cairn-auth",
- "cairn-types",
- "futures-util",
- "hex",
- "http",
- "http-body-util",
- "hyper",
- "hyper-rustls",
- "hyper-util",
- "quick-xml",
- "rustls",
- "rustls-pemfile",
- "sha2",
- "tempfile",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "cairn-s3"
+name = "cairn-protocol"
 version = "0.1.0"
 dependencies = [
  "async-trait",
@@ -578,6 +555,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "cairn-replication"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "cairn-auth",
+ "cairn-crypto",
+ "cairn-types",
+ "futures-util",
+ "hex",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "quick-xml",
+ "rustls",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
 name = "cairn-server"
 version = "0.1.0"
 dependencies = [
@@ -591,8 +597,8 @@ dependencies = [
  "cairn-lifecycle",
  "cairn-meta",
  "cairn-meta-async",
+ "cairn-protocol",
  "cairn-replication",
- "cairn-s3",
  "cairn-types",
  "cairn-ui",
  "clap",
@@ -602,6 +608,7 @@ dependencies = [
  "http",
  "http-body-util",
  "hyper",
+ "hyper-rustls",
  "hyper-util",
  "ktls",
  "libc",

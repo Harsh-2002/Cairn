@@ -29,13 +29,34 @@ pub struct ReplicationConfig {
 }
 
 impl ReplicationConfig {
-    /// The first enabled rule whose prefix filter matches `key`, if any. Per S3, rules are
-    /// evaluated in order and the first match wins for a given key.
+    /// The enabled rule that applies to `key` by **prefix only**, if any. Among prefix matches the
+    /// highest [`priority`](ReplicationRule::priority) wins; ties fall back to document order (the
+    /// first such rule). This is the key-only fast path; use
+    /// [`matching_rule_for`](Self::matching_rule_for) when the object's tags are known so tag
+    /// predicates are honoured.
     #[must_use]
     pub fn matching_rule(&self, key: &str) -> Option<&ReplicationRule> {
+        // Highest priority wins; on a tie the earlier (document-order) rule is kept, so a strict
+        // `>` comparison never displaces an equal-priority earlier match.
         self.rules
             .iter()
-            .find(|r| r.enabled && r.filter.matches(key))
+            .filter(|r| r.enabled && r.filter.matches_prefix(key))
+            .reduce(|best, r| if r.priority > best.priority { r } else { best })
+    }
+
+    /// The enabled rule that applies to `key` carrying `tags`, honouring both the prefix and the
+    /// tag predicates. Among matches the highest [`priority`](ReplicationRule::priority) wins; ties
+    /// fall back to document order.
+    #[must_use]
+    pub fn matching_rule_for(
+        &self,
+        key: &str,
+        tags: &[(String, String)],
+    ) -> Option<&ReplicationRule> {
+        self.rules
+            .iter()
+            .filter(|r| r.enabled && r.filter.matches(key, tags))
+            .reduce(|best, r| if r.priority > best.priority { r } else { best })
     }
 
     /// Whether a write to `key` should enqueue a replication entry under this configuration: it
@@ -93,25 +114,57 @@ pub struct ReplicationRule {
     pub filter: Filter,
     /// The destination this rule replicates to.
     pub destination: Destination,
+    /// The rule's dispatch priority (`<Priority>`). When several rules match a key, the highest
+    /// priority wins; ties fall back to document order. Defaults to `0`. Carried onto each
+    /// enqueued [`OutboxEntry`](cairn_types::meta::OutboxEntry) so the outbox drains hot rules
+    /// first.
+    pub priority: i64,
+    /// The remote target ARN this rule ships to (`<Destination><Bucket>arn:cairn:…</Bucket>`),
+    /// when the destination names a [`RemoteTarget`](crate::RemoteTarget) ARN rather than a plain
+    /// S3 bucket ARN. `None` for the legacy fixed-destination form.
+    pub target_arn: Option<String>,
+    /// Whether delete markers are replicated (`<DeleteMarkerReplication><Status>Enabled`).
+    pub delete_marker_replication: bool,
+    /// Whether pre-existing objects are backfilled (`<ExistingObjectReplication><Status>Enabled`).
+    pub existing_object_replication: bool,
 }
 
 /// The selector that scopes a rule to a subset of a bucket's keys. An empty prefix matches
-/// every key. Cairn supports the prefix filter (S3's `<Prefix>` and `<Filter><Prefix>` forms);
-/// tag filters are accepted but not yet honoured.
+/// every key. Cairn supports both the prefix filter (S3's `<Prefix>` and `<Filter><Prefix>`
+/// forms) and tag predicates (S3's `<Filter><Tag>`/`<Filter><And><Tag>` forms): a key matches
+/// when it begins with the prefix **and** carries every required tag (key=value).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Filter {
     /// Restrict to keys beginning with this prefix. `None`/empty matches every key.
     pub prefix: Option<String>,
+    /// Required object tags, as `(key, value)` predicates. A key matches only if its tag set
+    /// contains every one of these pairs. An empty list imposes no tag constraint.
+    pub tags: Vec<(String, String)>,
 }
 
 impl Filter {
-    /// Whether a key matches this filter.
+    /// Whether a key matches this filter's **prefix only** (ignoring any tag predicates). This is
+    /// the entry point for callers that have only the key in hand (the enqueue-on-write fast path
+    /// where object tags are applied separately); use [`matches`](Self::matches) when the object's
+    /// tags are available.
     #[must_use]
-    pub fn matches(&self, key: &str) -> bool {
+    pub fn matches_prefix(&self, key: &str) -> bool {
         match &self.prefix {
             Some(p) => key.starts_with(p.as_str()),
             None => true,
         }
+    }
+
+    /// Whether a key with the given object tags matches this filter: the prefix matches **and**
+    /// every required tag predicate is satisfied by `tags`.
+    #[must_use]
+    pub fn matches(&self, key: &str, tags: &[(String, String)]) -> bool {
+        if !self.matches_prefix(key) {
+            return false;
+        }
+        self.tags
+            .iter()
+            .all(|(k, v)| tags.iter().any(|(tk, tv)| tk == k && tv == v))
     }
 }
 
@@ -152,6 +205,9 @@ pub fn parse_replication(body: &[u8]) -> Result<ReplicationConfig, Error> {
     // Per-rule accumulator state.
     let mut in_rule = false;
     let mut rule = ReplicationRule::default();
+    // The in-flight `<Tag>` being read inside a `<Filter>` (`<Key>`/`<Value>` pair).
+    let mut tag_key: Option<String> = None;
+    let mut tag_value: Option<String> = None;
 
     // A stack of currently-open element local names, so a parser can disambiguate where a text
     // leaf belongs (e.g. `Bucket` under `Destination` vs a stray element).
@@ -163,6 +219,9 @@ pub fn parse_replication(body: &[u8]) -> Result<ReplicationConfig, Error> {
                 if name.as_slice() == b"Rule" {
                     in_rule = true;
                     rule = ReplicationRule::default();
+                } else if name.as_slice() == b"Tag" {
+                    tag_key = None;
+                    tag_value = None;
                 }
                 stack.push(name);
             }
@@ -176,6 +235,24 @@ pub fn parse_replication(body: &[u8]) -> Result<ReplicationConfig, Error> {
                     b"Role" if !in_rule => config.role = text.trim().to_owned(),
                     _ if !in_rule => {}
                     b"ID" => rule.id = text.trim().to_owned(),
+                    // `<Status>` is overloaded: directly under `<Rule>` it is the rule's
+                    // enabled/disabled status, but the same element nested under
+                    // `<DeleteMarkerReplication>` / `<ExistingObjectReplication>` toggles those
+                    // sub-features. Disambiguate by the parent element.
+                    b"Status" if parent == Some(b"DeleteMarkerReplication") => {
+                        rule.delete_marker_replication = match text.trim() {
+                            "Enabled" => true,
+                            "Disabled" => false,
+                            _ => return Err(malformed()),
+                        };
+                    }
+                    b"Status" if parent == Some(b"ExistingObjectReplication") => {
+                        rule.existing_object_replication = match text.trim() {
+                            "Enabled" => true,
+                            "Disabled" => false,
+                            _ => return Err(malformed()),
+                        };
+                    }
                     b"Status" => {
                         rule.enabled = match text.trim() {
                             "Enabled" => true,
@@ -183,10 +260,20 @@ pub fn parse_replication(body: &[u8]) -> Result<ReplicationConfig, Error> {
                             _ => return Err(malformed()),
                         };
                     }
+                    b"Priority" => {
+                        rule.priority = text.trim().parse().map_err(|_| malformed())?;
+                    }
                     b"Prefix" => {
                         // `<Prefix>` may appear directly under `<Rule>` or nested in `<Filter>`
                         // / `<And>`; treat all positions as the rule prefix.
                         rule.filter.prefix = Some(text.into_owned());
+                    }
+                    // `<Key>`/`<Value>` inside a `<Tag>` accumulate one tag predicate.
+                    b"Key" if parent == Some(b"Tag") => {
+                        tag_key = Some(text.trim().to_owned());
+                    }
+                    b"Value" if parent == Some(b"Tag") => {
+                        tag_value = Some(text.trim().to_owned());
                     }
                     // `<Bucket>` is meaningful only inside `<Destination>`.
                     b"Bucket" if parent == Some(b"Destination") => {
@@ -198,9 +285,24 @@ pub fn parse_replication(body: &[u8]) -> Result<ReplicationConfig, Error> {
             Sax::Close(name) => {
                 let popped = stack.pop();
                 debug_assert!(popped.as_deref() == Some(name.as_slice()) || popped.is_none());
-                if name.as_slice() == b"Rule" && in_rule {
-                    config.rules.push(std::mem::take(&mut rule));
-                    in_rule = false;
+                match name.as_slice() {
+                    b"Tag" if in_rule => {
+                        // A complete `<Tag>` commits one (key, value) predicate; an incomplete tag
+                        // (missing key or value) is ignored rather than rejected.
+                        if let (Some(k), Some(v)) = (tag_key.take(), tag_value.take()) {
+                            rule.filter.tags.push((k, v));
+                        }
+                    }
+                    b"Rule" if in_rule => {
+                        // MinIO-style rules carry a remote-target ARN in `<Destination><Bucket>`;
+                        // surface it as `target_arn` while leaving the raw ARN on the destination.
+                        if let Some(arn) = target_arn_of(&rule.destination.bucket_arn) {
+                            rule.target_arn = Some(arn);
+                        }
+                        config.rules.push(std::mem::take(&mut rule));
+                        in_rule = false;
+                    }
+                    _ => {}
                 }
             }
         }
@@ -217,6 +319,18 @@ pub fn parse_replication(body: &[u8]) -> Result<ReplicationConfig, Error> {
 /// Map any quick-xml failure into the canonical malformed-XML error.
 fn malformed() -> Error {
     Error::MalformedXml
+}
+
+/// Recognise a MinIO-style remote-target ARN in a `<Destination><Bucket>` value: a Cairn
+/// replication-target ARN (`arn:cairn:replication:…`) is returned for use as the rule's
+/// `target_arn`; a plain S3 bucket ARN or bare name is not a target reference and yields `None`.
+fn target_arn_of(bucket_arn: &str) -> Option<String> {
+    let raw = bucket_arn.trim();
+    if raw.starts_with("arn:cairn:replication:") {
+        Some(raw.to_owned())
+    } else {
+        None
+    }
 }
 
 /// One decoded SAX event handed to the parser callback.
@@ -406,6 +520,7 @@ mod tests {
                 destination: Destination {
                     bucket_arn: "arn:aws:s3:::d".to_owned(),
                 },
+                ..ReplicationRule::default()
             }],
         };
         assert!(matches!(
@@ -431,12 +546,121 @@ mod tests {
                 enabled: true,
                 filter: Filter::default(),
                 destination: Destination::default(),
+                ..ReplicationRule::default()
             }],
         };
         assert!(matches!(
             no_dest.validate(VersioningState::Enabled),
             Err(Error::InvalidRequest(_))
         ));
+    }
+
+    const MINIO_STYLE: &[u8] = br#"<ReplicationConfiguration>
+      <Role></Role>
+      <Rule>
+        <ID>to-remote</ID>
+        <Status>Enabled</Status>
+        <Priority>5</Priority>
+        <DeleteMarkerReplication><Status>Enabled</Status></DeleteMarkerReplication>
+        <ExistingObjectReplication><Status>Enabled</Status></ExistingObjectReplication>
+        <Filter>
+          <And>
+            <Prefix>data/</Prefix>
+            <Tag><Key>replicate</Key><Value>yes</Value></Tag>
+            <Tag><Key>tier</Key><Value>gold</Value></Tag>
+          </And>
+        </Filter>
+        <Destination>
+          <Bucket>arn:cairn:replication:us-west-2:abc123:mirror</Bucket>
+        </Destination>
+      </Rule>
+    </ReplicationConfiguration>"#;
+
+    #[test]
+    fn parses_minio_style_rule_fields() {
+        let cfg = parse_replication(MINIO_STYLE).unwrap();
+        assert_eq!(cfg.rules.len(), 1);
+        let r = &cfg.rules[0];
+        assert_eq!(r.id, "to-remote");
+        assert!(r.enabled);
+        assert_eq!(r.priority, 5);
+        assert!(r.delete_marker_replication);
+        assert!(r.existing_object_replication);
+        assert_eq!(r.filter.prefix.as_deref(), Some("data/"));
+        assert_eq!(
+            r.filter.tags,
+            vec![
+                ("replicate".to_owned(), "yes".to_owned()),
+                ("tier".to_owned(), "gold".to_owned()),
+            ]
+        );
+        // The cairn replication ARN surfaces as the rule's target_arn.
+        assert_eq!(
+            r.target_arn.as_deref(),
+            Some("arn:cairn:replication:us-west-2:abc123:mirror")
+        );
+    }
+
+    #[test]
+    fn tag_filter_is_honoured_by_matches() {
+        let cfg = parse_replication(MINIO_STYLE).unwrap();
+        let f = &cfg.rules[0].filter;
+        // Prefix-only match ignores tags.
+        assert!(f.matches_prefix("data/x"));
+        // Full match requires the prefix AND every tag predicate.
+        let all_tags = [
+            ("replicate".to_owned(), "yes".to_owned()),
+            ("tier".to_owned(), "gold".to_owned()),
+            ("extra".to_owned(), "ok".to_owned()),
+        ];
+        assert!(f.matches("data/x", &all_tags));
+        // Missing a required tag -> no match.
+        let missing = [("replicate".to_owned(), "yes".to_owned())];
+        assert!(!f.matches("data/x", &missing));
+        // Wrong prefix -> no match even with all tags.
+        assert!(!f.matches("other/x", &all_tags));
+    }
+
+    #[test]
+    fn matching_rule_breaks_ties_by_priority() {
+        let xml = br#"<ReplicationConfiguration><Role>r</Role>
+          <Rule><ID>low</ID><Status>Enabled</Status><Priority>1</Priority>
+            <Destination><Bucket>arn:aws:s3:::a</Bucket></Destination></Rule>
+          <Rule><ID>high</ID><Status>Enabled</Status><Priority>9</Priority>
+            <Destination><Bucket>arn:aws:s3:::b</Bucket></Destination></Rule>
+        </ReplicationConfiguration>"#;
+        let cfg = parse_replication(xml).unwrap();
+        // Both match every key; the higher priority wins.
+        assert_eq!(cfg.matching_rule("k").map(|r| r.id.as_str()), Some("high"));
+    }
+
+    #[test]
+    fn equal_priority_keeps_document_order() {
+        // Default priority 0 for both: the first (document order) match wins.
+        let cfg = parse_replication(REPRESENTATIVE).unwrap();
+        assert_eq!(
+            cfg.matching_rule("logs/x").map(|r| r.id.as_str()),
+            Some("logs-rule")
+        );
+    }
+
+    #[test]
+    fn rejects_bad_priority() {
+        let xml = br#"<ReplicationConfiguration><Role>r</Role>
+          <Rule><Status>Enabled</Status><Priority>not-a-number</Priority>
+            <Destination><Bucket>arn:aws:s3:::d</Bucket></Destination></Rule>
+        </ReplicationConfiguration>"#;
+        assert!(matches!(
+            parse_replication(xml).unwrap_err(),
+            Error::MalformedXml
+        ));
+    }
+
+    #[test]
+    fn plain_s3_destination_has_no_target_arn() {
+        let cfg = parse_replication(REPRESENTATIVE).unwrap();
+        assert!(cfg.rules[0].target_arn.is_none());
+        assert_eq!(cfg.rules[0].destination.bucket(), Some("dest-bucket"));
     }
 
     #[test]

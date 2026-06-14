@@ -74,6 +74,20 @@ pub struct Config {
     pub multipart_upload_lifetime_secs: u64,
     /// How often the WAL checkpointer runs a truncating checkpoint, in seconds.
     pub wal_checkpoint_interval_secs: u64,
+    /// Size threshold, in bytes, above which a truncating WAL checkpoint is triggered between the
+    /// regular interval ticks (`CAIRN_WAL_CHECKPOINT_SIZE_BYTES`, ARCH §8.4). `0` disables the
+    /// size-based trigger, leaving only the interval. Default 64 MiB.
+    pub wal_checkpoint_size_bytes: u64,
+    /// The base domain for **virtual-host-style** S3 addressing (`CAIRN_S3_DOMAIN`), e.g.
+    /// `s3.example.com`. When set, a request whose `Host` is `<bucket>.<domain>` is routed to that
+    /// bucket with the whole path as the key; path-style addressing always remains supported. Unset
+    /// disables virtual-host routing (path-style only). (ARCH §13.1)
+    pub s3_domain: Option<String>,
+    /// Byte budget for the in-memory metadata/configuration cache (`CAIRN_META_CACHE_BYTES`, ARCH
+    /// §11.5). The cache fronts hot bucket-config reads (policy/ACL/CORS/public-access-block) so
+    /// authorization does not re-read SQLite on every request. `0` disables the cache. Default
+    /// 64 MiB.
+    pub meta_cache_bytes: u64,
     /// Replication destination endpoint (e.g. `http://backup-host:9000`). When set, the
     /// replication worker ships outbox entries to this S3-compatible target (ARCH §20).
     pub replication_endpoint: Option<String>,
@@ -128,6 +142,9 @@ impl Default for Config {
             multipart_sweep_interval_secs: 3600,
             multipart_upload_lifetime_secs: 86_400,
             wal_checkpoint_interval_secs: 300,
+            wal_checkpoint_size_bytes: 64 * 1024 * 1024,
+            s3_domain: None,
+            meta_cache_bytes: 64 * 1024 * 1024,
             replication_endpoint: None,
             replication_dest_bucket: None,
             replication_access_key: None,

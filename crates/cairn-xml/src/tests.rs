@@ -58,6 +58,7 @@ fn list_objects_v2_shape() {
         items: vec![summary("a/b.txt", "deadbeef", 17)],
         common_prefixes: vec!["a/".to_owned(), "c/".to_owned()],
         next_cursor: Some("a/b.txt".to_owned()),
+        next_version_id_marker: None,
         truncated: true,
     };
     let xml = list_objects_v2("mybucket", Some("a/"), Some("/"), 1000, &page, None);
@@ -85,6 +86,7 @@ fn list_objects_v1_marker_form() {
         items: vec![summary("k1", "aa", 1)],
         common_prefixes: vec![],
         next_cursor: Some("k1".to_owned()),
+        next_version_id_marker: None,
         truncated: true,
     };
     let xml = list_objects_v1("b", None, None, 100, &page, Some("k0"));
@@ -109,6 +111,7 @@ fn list_versions_distinguishes_markers() {
         items: vec![version, marker],
         common_prefixes: vec![],
         next_cursor: None,
+        next_version_id_marker: None,
         truncated: false,
     };
     let xml = list_object_versions("b", None, None, 1000, &page, None, None);
@@ -170,6 +173,7 @@ fn list_parts_shape() {
         }],
         common_prefixes: vec![],
         next_cursor: None,
+        next_version_id_marker: None,
         truncated: false,
     };
     let xml = list_parts_result("b", "k", "up", &page, "owner", 0, 1000);
@@ -197,6 +201,7 @@ fn list_multipart_uploads_shape() {
         items: vec![session],
         common_prefixes: vec!["pre/".to_owned()],
         next_cursor: None,
+        next_version_id_marker: None,
         truncated: false,
     };
     let xml =
@@ -265,13 +270,18 @@ fn get_object_attributes_with_checksum_and_parts() {
 #[test]
 fn delete_result_shape() {
     let deleted = vec![
-        ("a".to_owned(), None),
-        ("b".to_owned(), Some("v1".to_owned())),
+        ("a".to_owned(), None, false, None),
+        ("b".to_owned(), Some("v1".to_owned()), false, None),
+        // A versioned plain delete that inserted a marker: surfaces DeleteMarker + its id.
+        ("d".to_owned(), None, true, Some("dmv9".to_owned())),
     ];
     let errors = vec![("c".to_owned(), "AccessDenied".to_owned(), "no".to_owned())];
     let xml = delete_result(&deleted, &errors);
     assert!(xml.contains("<Deleted><Key>a</Key></Deleted>"));
     assert!(xml.contains("<Deleted><Key>b</Key><VersionId>v1</VersionId></Deleted>"));
+    assert!(xml.contains(
+        "<Deleted><Key>d</Key><DeleteMarker>true</DeleteMarker><DeleteMarkerVersionId>dmv9</DeleteMarkerVersionId></Deleted>"
+    ));
     assert!(
         xml.contains("<Error><Key>c</Key><Code>AccessDenied</Code><Message>no</Message></Error>")
     );

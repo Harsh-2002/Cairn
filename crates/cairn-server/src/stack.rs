@@ -6,8 +6,8 @@ use crate::config::Config;
 use cairn_auth::AuthChain;
 use cairn_blob::LocalBlobStore;
 use cairn_crypto::{HmacPublicUrl, SystemClock, SystemCrypto};
-use cairn_meta::{OpenOptions, SqliteMetadataStore};
-use cairn_s3::S3Service;
+use cairn_meta::{CachedMetadataStore, OpenOptions, SqliteMetadataStore};
+use cairn_protocol::S3Service;
 use cairn_types::blob::ReconcileOpts;
 use cairn_types::traits::{
     Authenticator, AuthorizationEngine, BlobStore, Clock, Crypto, MetadataStore, PublicUrl,
@@ -41,9 +41,21 @@ pub struct AppStack {
     /// Turso engines self-manage their WAL, so this is `None` for them and the WAL-checkpointer
     /// background loop does not run.
     pub store: Option<Arc<SqliteMetadataStore>>,
+    /// A typed handle to the read-through config cache wrapping `meta`, kept so the metrics loop can
+    /// scrape its `(hits, misses)` counters into `cairn_meta_cache_hits_total`/`_misses_total`
+    /// (ARCH §11.5). `meta` above is this same store behind the trait object; this handle exists
+    /// only for the inherent `stats()` accessor, which is not part of the `MetadataStore` trait.
+    pub meta_cache: Arc<CachedMetadataStore>,
+    /// The master-key crypto facility, threaded to the replication drain so it can unseal stored
+    /// per-bucket remote replication targets (`ConfigAspect::ReplicationTargets`, ARCH §20.5).
+    pub crypto: Arc<SystemCrypto>,
     /// Signer/verifier for Cairn's signed public-read ("share") URLs (ARCH §14.5). Keyed off the
     /// master key so links stay valid across restarts when `CAIRN_MASTER_KEY` is set.
     pub public_url: Arc<dyn PublicUrl>,
+    /// The base domain for virtual-host-style S3 addressing (`CAIRN_S3_DOMAIN`, ARCH §13.1), e.g.
+    /// `s3.example.com`. When set, a request whose `Host` is `<bucket>.<s3_domain>` routes to that
+    /// bucket with the whole path as the key; `None` leaves path-style addressing as the only form.
+    pub s3_domain: Option<String>,
 }
 
 impl std::fmt::Debug for AppStack {
@@ -155,10 +167,17 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
         .await
         .map_err(|e| format!("create data_dir: {e}"))?;
 
-    // Open the configured metadata backend. `meta` is the trait-object store used everywhere;
-    // `oracle` is the boxed reconcile oracle; `store` is the typed sqlite handle for the WAL
-    // checkpointer (None for the self-WAL-managing libSQL/Turso engines).
-    let (meta, oracle, store) = open_meta(cfg).await?;
+    // Open the configured metadata backend. `inner_meta` is the raw trait-object store; `oracle`
+    // is the boxed reconcile oracle; `store` is the typed sqlite handle for the WAL checkpointer
+    // (None for the self-WAL-managing libSQL/Turso engines).
+    let (inner_meta, oracle, store) = open_meta(cfg).await?;
+
+    // Front the store with the read-through config cache (ARCH §11.5) before handing it to the S3
+    // and control services, so the hot authorization config reads (policy/ACL/CORS/public-access)
+    // are memoised instead of re-reading SQLite per request. `meta_cache_bytes == 0` yields a pure
+    // pass-through. The typed `meta_cache` handle is kept so the metrics loop can scrape `stats()`.
+    let meta_cache = Arc::new(CachedMetadataStore::new(inner_meta, cfg.meta_cache_bytes));
+    let meta: Arc<dyn MetadataStore> = meta_cache.clone();
 
     let blob_impl = LocalBlobStore::open(cfg.data_dir.clone())
         .await
@@ -173,7 +192,11 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
 
     let blob: Arc<dyn BlobStore> = Arc::new(blob_impl);
 
-    let crypto: Arc<dyn Crypto> = Arc::new(build_crypto(cfg)?);
+    // Keep the concrete `SystemCrypto` (the replication target unsealing needs the concrete type,
+    // `seal_target`/`open_target` take `&SystemCrypto`) as well as the `dyn Crypto` view the rest
+    // of the stack uses.
+    let system_crypto = Arc::new(build_crypto(cfg)?);
+    let crypto: Arc<dyn Crypto> = system_crypto.clone();
     let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
 
     let auth: Arc<dyn Authenticator> = Arc::new(AuthChain::new(
@@ -239,10 +262,13 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
         control,
         auth,
         meta,
+        meta_cache,
+        crypto: system_crypto,
         blob,
         oracle,
         store,
         public_url,
+        s3_domain: cfg.s3_domain.clone(),
     })
 }
 

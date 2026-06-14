@@ -8,13 +8,13 @@
 //! unsure about — is handed back to hyper with the socket UNTOUCHED (peek consumed nothing), so
 //! hyper serves it exactly as if the fast path never ran.
 //!
-//! Security: the fast path authorizes through the SAME [`cairn_s3::S3Service::handle`] as the normal
+//! Security: the fast path authorizes through the SAME [`cairn_protocol::S3Service::handle`] as the normal
 //! path (same authenticator, same bucket policy/ACL evaluation), and only diverges in HOW the bytes
 //! of an already-authorized response are written. It never serves anything the normal path would not.
 
 use crate::adapter::route_path;
 use crate::stack::AppStack;
-use cairn_s3::{S3Body, S3Request};
+use cairn_protocol::{S3Body, S3Request};
 use cairn_types::auth::{AuthOutcome, RequestView};
 use std::net::SocketAddr;
 use std::os::fd::AsRawFd;

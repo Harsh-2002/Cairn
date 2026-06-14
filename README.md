@@ -70,7 +70,7 @@ support matrix.
 | `cairn-auth` | `Authenticator` chain: SigV4 + Bearer + chunked-signature primitives. *(Wave 1)* |
 | `cairn-authz` | `AuthorizationEngine`: pure policy/ACL/BPA/ownership evaluation. *(Wave 1)* |
 | `cairn-xml` | quick-xml S3 request/response codec. *(Wave 1)* |
-| `cairn-s3` | S3 handlers, the 7 request lifecycles, the streaming chunked decoder. *(Wave 2)* |
+| `cairn-protocol` | S3 handlers, the 7 request lifecycles, the streaming chunked decoder. *(Wave 2)* |
 | `cairn-replication` / `cairn-lifecycle` | Replication engine; lifecycle scanner. *(Wave 3)* |
 | `cairn-control` / `cairn-ui` / `cairn-cli` | Management API; embedded React console; CLI. *(Wave 4)* |
 | `cairn-server` | The binary: wires concrete impls, the hyper/rustls stack, middleware, shutdown. |

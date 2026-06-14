@@ -1,6 +1,6 @@
 //! The typed error tree. Each subsystem returns its own domain error from its trait
 //! methods; the protocol/control layers fold these into the canonical [`Error`], which a
-//! single translator (in `cairn-s3` / `cairn-control`) maps totally to an S3 XML or JSON
+//! single translator (in `cairn-protocol` / `cairn-control`) maps totally to an S3 XML or JSON
 //! response (ARCH §25). Keeping every wire-mappable condition in one enum is what makes
 //! that translator total and testable.
 
@@ -192,6 +192,9 @@ pub enum Error {
     /// The requested operation is not implemented.
     #[error("not implemented")]
     NotImplemented,
+    /// An ACL was supplied for a bucket whose Object Ownership disables ACLs.
+    #[error("The bucket does not allow ACLs")]
+    AclNotSupported,
     /// An unexpected internal failure.
     #[error("internal error: {0}")]
     Internal(String),

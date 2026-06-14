@@ -186,6 +186,28 @@ ALTER TABLE object_versions ADD COLUMN sse_descriptor TEXT;
 ALTER TABLE users ADD COLUMN policy TEXT;
 "#,
     },
+    Migration {
+        version: 5,
+        name: "object HTTP metadata, outbox priority/lease, user quota (Wave 1 spine)",
+        sql: r#"
+-- Standard S3 system-metadata headers persisted per object version, echoed back on GET/HEAD.
+-- All nullable: absent means the header was not supplied on the write.
+ALTER TABLE object_versions ADD COLUMN content_encoding TEXT;
+ALTER TABLE object_versions ADD COLUMN cache_control TEXT;
+ALTER TABLE object_versions ADD COLUMN content_disposition TEXT;
+ALTER TABLE object_versions ADD COLUMN content_language TEXT;
+ALTER TABLE object_versions ADD COLUMN expires TEXT;
+
+-- Replication-outbox scheduling: a priority (higher first) and a claim lease. The status column
+-- has no CHECK constraint, so an atomic claim can mark an entry 'claimed' with a lease_until that
+-- lets a stalled lease be reclaimed once it expires.
+ALTER TABLE replication_outbox ADD COLUMN priority INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE replication_outbox ADD COLUMN lease_until INTEGER;
+
+-- An optional per-user byte quota. NULL means unlimited.
+ALTER TABLE users ADD COLUMN quota_bytes INTEGER;
+"#,
+    },
 ];
 
 /// Run all pending migrations on the write connection, recording each as applied.

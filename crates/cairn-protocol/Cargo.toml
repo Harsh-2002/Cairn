@@ -1,5 +1,5 @@
 [package]
-name = "cairn-s3"
+name = "cairn-protocol"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -155,6 +155,14 @@ pub enum Mutation {
         /// The validated policy JSON, or `None` to clear.
         policy: Option<String>,
     },
+    /// Set (or clear) a user's byte quota. The quota is enforced inside the commit transaction of
+    /// subsequent object writes the user owns (ARCH §27.5), mirroring [`Mutation::SetBucketQuota`].
+    SetUserQuota {
+        /// The user.
+        user_id: UserId,
+        /// The new quota in bytes, or `None` to remove the limit.
+        quota_bytes: Option<u64>,
+    },
     /// Set the account-wide Block Public Access singleton.
     SetAccountPublicAccessBlock(PublicAccessBlock),
     /// Replace an object version's tags.
@@ -195,6 +203,17 @@ pub enum Mutation {
     UpdateUser(Box<UserRecord>),
     /// Deactivate a user.
     DeactivateUser(UserId),
+    /// Atomically claim a batch of due replication-outbox entries, routed through the writer so
+    /// the select-and-mark is one transaction (no two workers claim the same entry). Marks each
+    /// claimed entry `status='claimed'` with `lease_until = now + lease_secs`, and returns them.
+    ClaimReplicationBatch {
+        /// Maximum entries to claim.
+        limit: u32,
+        /// The current time (the due-by cutoff and the lease base).
+        now: Timestamp,
+        /// The claim lease length in seconds.
+        lease_secs: i64,
+    },
     /// Mark a replication outbox entry done and stamp the version replicated.
     MarkReplicationDone(String),
     /// Mark a replication outbox entry failed/retry with backoff.
@@ -205,6 +224,15 @@ pub enum Mutation {
         error: String,
         /// When to next attempt (None = give up / terminal).
         next_attempt_at: Option<Timestamp>,
+    },
+    /// Requeue terminal (`status='failed'`) replication-outbox entries for another attempt: flips
+    /// them back to `pending` with `next_attempt_at = now` so the worker picks them up on the next
+    /// drain (ARCH §20.5). Scoped to one bucket when `bucket` is `Some`, else all failed entries.
+    RetryFailedReplication {
+        /// Restrict to this source bucket, or `None` for every failed entry.
+        bucket: Option<BucketName>,
+        /// The time to schedule the retry at (immediately due).
+        now: Timestamp,
     },
     /// Append an audit/activity entry.
     RecordActivity(Box<ActivityEntry>),
@@ -269,6 +297,10 @@ pub struct ListQuery {
     pub delimiter: Option<String>,
     /// Continuation cursor (the last key returned).
     pub cursor: Option<String>,
+    /// Version-id marker for version listings: resume strictly after `(cursor, version_id_marker)`
+    /// so a key whose versions span a page boundary continues mid-key. Ignored unless `cursor` is
+    /// also set (the key it pairs with). `None` resumes at the key boundary.
+    pub version_id_marker: Option<String>,
     /// Start strictly after this key.
     pub start_after: Option<String>,
     /// Page size (clamped to the S3 ceiling by the caller).
@@ -282,8 +314,16 @@ pub struct ListPage<T> {
     pub items: Vec<T>,
     /// Common prefixes grouped by the delimiter.
     pub common_prefixes: Vec<String>,
-    /// The cursor to resume after, if truncated.
+    /// The cursor to resume after, if truncated. For version listings this is the boundary key
+    /// (paired with [`next_version_id_marker`](Self::next_version_id_marker)); for current-object
+    /// listings it is the last key returned.
     pub next_cursor: Option<String>,
+    /// The boundary version id to resume after, for a version listing truncated mid-key. Threads
+    /// back as the next request's [`ListQuery::version_id_marker`] (paired with `next_cursor` as the
+    /// key) so a key whose versions span a page boundary continues strictly after the last returned
+    /// version. `None` for current-object listings and for version listings truncated on a key
+    /// boundary (the next page resumes at the next key).
+    pub next_version_id_marker: Option<String>,
     /// Whether more pages remain.
     pub truncated: bool,
 }
@@ -294,6 +334,7 @@ impl<T> Default for ListPage<T> {
             items: Vec::new(),
             common_prefixes: Vec::new(),
             next_cursor: None,
+            next_version_id_marker: None,
             truncated: false,
         }
     }
@@ -397,6 +438,8 @@ pub enum ClaimOutcome {
 pub enum ReplicationStatus {
     /// Awaiting replication.
     Pending,
+    /// Claimed by a worker under a lease; eligible for re-claim once the lease expires.
+    Claimed,
     /// Replicated successfully.
     Completed,
     /// Replication failed after retries.
@@ -437,6 +480,11 @@ pub struct OutboxEntry {
     pub status: ReplicationStatus,
     /// The last error, if any.
     pub last_error: Option<String>,
+    /// Dispatch priority; higher is claimed first (default 0).
+    pub priority: i64,
+    /// When the current claim lease expires; `None` when the entry is not claimed. A claimed
+    /// entry whose lease has elapsed is eligible to be re-claimed.
+    pub lease_until: Option<Timestamp>,
 }
 
 // ---------------------------------------------------------------------------------------

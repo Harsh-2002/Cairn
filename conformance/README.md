@@ -64,7 +64,7 @@ Three `cargo-fuzz` projects, each detached from the workspace and built on night
 
 | crate | target | entry points |
 |-------|--------|--------------|
-| `crates/cairn-s3/fuzz`    | `chunked_decoder`  | the SigV4 streaming chunked decoder |
+| `crates/cairn-protocol/fuzz`    | `chunked_decoder`  | the SigV4 streaming chunked decoder |
 | `crates/cairn-xml/fuzz`   | `request_parsers`  | `parse_tagging` / `parse_cors_configuration` / `parse_delete` / `parse_complete_multipart` / `parse_versioning_configuration` |
 | `crates/cairn-authz/fuzz` | `parse_policy`     | `cairn_authz::parse_policy` |
 

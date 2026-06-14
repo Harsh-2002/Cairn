@@ -215,8 +215,17 @@ pub trait MetadataStore: Send + Sync {
         version: &VersionId,
     ) -> Result<Option<ReplicationStatus>, MetaError>;
     /// Claim a batch of due replication entries (a write; routed through the writer
-    /// internally by the implementation, exposed here for the worker pool).
+    /// internally by the implementation, exposed here for the worker pool). Claiming marks the
+    /// entries `Claimed` with a lease so a concurrent worker cannot also process them.
     async fn claim_replication_batch(
+        &self,
+        limit: u32,
+        now: Timestamp,
+    ) -> Result<Vec<OutboxEntry>, MetaError>;
+    /// Read-only peek of the replication entries that are due (claimable) as of `now`, without
+    /// claiming them. Used for observability — the per-bucket replication status view and tests —
+    /// where a non-mutating probe is required.
+    async fn list_due_replication(
         &self,
         limit: u32,
         now: Timestamp,

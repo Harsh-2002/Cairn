@@ -318,6 +318,31 @@ impl HttpS3Sink {
     }
 }
 
+/// Build an [`HttpS3Sink`] from an opened remote target (ARCH §20.5). The target supplies the
+/// endpoint, region, destination bucket, and the unsealed credentials; `ca_path` /
+/// `insecure_skip_verify` carry the per-target TLS-trust knobs. The resulting sink ships every
+/// source bucket to the target's single `dest_bucket` (no per-source override map).
+///
+/// # Errors
+/// Returns [`ReplicationError::Terminal`] if the endpoint URL is malformed or the TLS knobs
+/// conflict (see [`HttpS3Sink::new`]).
+pub fn sink_for_target(
+    open: &crate::OpenTarget,
+    ca_path: Option<&Path>,
+    insecure_skip_verify: bool,
+) -> Result<HttpS3Sink, ReplicationError> {
+    HttpS3Sink::new(S3SinkConfig {
+        endpoint: open.endpoint.clone(),
+        dest_bucket: open.dest_bucket.clone(),
+        dest_buckets: HashMap::new(),
+        region: open.region.clone(),
+        access_key_id: open.access_key_id.clone(),
+        secret_access_key: open.secret.as_str().to_owned(),
+        ca_cert_path: ca_path.map(Path::to_path_buf),
+        insecure_skip_verify,
+    })
+}
+
 /// Build the `hyper-rustls` connector builder for a sink, selecting the TLS trust source from the
 /// per-target knobs (ARCH §20.2):
 ///
@@ -487,6 +512,20 @@ impl HttpS3Sink {
             "true".to_owned(),
         ));
 
+        // Replicate the object's tag set via the standard `x-amz-tagging` header (form-urlencoded
+        // `k=v&k=v`), so the destination version carries the same tags the source rule filtered on.
+        // `uri_encode_path` percent-encodes the structural `&`/`=` which the destination's
+        // `form_pct_decode` reverses.
+        if !object.tags.is_empty() {
+            let tagging = object
+                .tags
+                .iter()
+                .map(|(k, v)| format!("{}={}", uri_encode_path(k), uri_encode_path(v)))
+                .collect::<Vec<_>>()
+                .join("&");
+            user_headers.push(("x-amz-tagging".to_owned(), tagging));
+        }
+
         self.send_signed(
             &Method::PUT,
             &dest_bucket,
@@ -505,13 +544,20 @@ impl HttpS3Sink {
         key: &ObjectKey,
     ) -> Result<(), ReplicationError> {
         let dest_bucket = self.dest_for(source_bucket).to_owned();
+        // Stamp the loop-prevention marker so the destination (a) authorizes this as a
+        // `ReplicateDelete` for a dedicated replication user and (b) records the propagated marker
+        // as a replica rather than re-replicating it (ARCH §20.4), mirroring the PUT path.
+        let headers = [(
+            format!("x-amz-meta-{REPLICA_MARKER_KEY}"),
+            "true".to_owned(),
+        )];
         self.send_signed(
             &Method::DELETE,
             &dest_bucket,
             key.as_str(),
             bytes::Bytes::new(),
             None,
-            &[],
+            &headers,
         )
         .await
     }

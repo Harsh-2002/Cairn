@@ -18,7 +18,9 @@ use cairn_types::testing::{
 use cairn_types::time::Timestamp;
 use cairn_types::traits::{BlobStore, Clock, MetadataStore};
 
-use cairn_replication::{ReplicationEngine, ReplicationOpts, next_backoff, outbox_entry_for};
+use cairn_replication::{
+    ReplicationEngine, ReplicationOpts, SingleSink, next_backoff, outbox_entry_for,
+};
 
 const BUCKET: &str = "repl-bucket";
 
@@ -73,6 +75,11 @@ fn version_row(
         size_physical: size,
         etag,
         content_type: "text/plain".to_owned(),
+        content_encoding: None,
+        cache_control: None,
+        content_disposition: None,
+        content_language: None,
+        expires: None,
         storage_path,
         compression: CompressionDescriptor::Uncompressed,
         storage_class: StorageClass::Standard,
@@ -118,6 +125,7 @@ async fn put_with_outbox(
         ReplicationOp::ObjectCreate,
         "rule-0",
         due_at,
+        0,
     );
     meta.submit(Mutation::PutObjectVersion {
         row: Box::new(row),
@@ -132,7 +140,9 @@ async fn put_with_outbox(
 /// How many due Pending entries the outbox would hand a worker at `now` (test introspection
 /// via the public trait surface).
 async fn due_entries(meta: &InMemoryMetadataStore, now: Timestamp) -> Vec<OutboxEntry> {
-    meta.claim_replication_batch(1000, now).await.unwrap()
+    // Read-only probe of what is due — must not claim, or it would steal entries from the engine
+    // run under test.
+    meta.list_due_replication(1000, now).await.unwrap()
 }
 
 async fn version_status(
@@ -161,13 +171,14 @@ async fn object_create_replicates_and_completes() {
     let meta = InMemoryMetadataStore::new();
     let blobs = Arc::new(InMemoryBlobStore::new());
     let sink = FakeReplicationSink::new();
+    let router = SingleSink(sink);
     let clock = TestClock::at_secs(1_000);
     let now = clock.now();
 
     let version = put_with_outbox(&meta, &blobs, "e1", "obj/a", b"hello world", now, now).await;
 
     let report = engine()
-        .run_once(&meta, &sink, &blobs, &clock)
+        .run_once(&meta, &router, &blobs, &clock)
         .await
         .unwrap();
 
@@ -177,7 +188,7 @@ async fn object_create_replicates_and_completes() {
     assert_eq!(report.failed, 0);
 
     // The fake sink recorded the Put intent with the right identity and size.
-    let intents = sink.intents();
+    let intents = router.0.intents();
     assert_eq!(intents.len(), 1);
     match &intents[0] {
         RecordedIntent::Put {
@@ -211,21 +222,22 @@ async fn retryable_failure_reschedules_then_succeeds_after_clock_advance() {
     let meta = InMemoryMetadataStore::new();
     let blobs = Arc::new(InMemoryBlobStore::new());
     let sink = FakeReplicationSink::new();
+    let router = SingleSink(sink);
     let clock = TestClock::at_secs(2_000);
     let now = clock.now();
 
     let version = put_with_outbox(&meta, &blobs, "e2", "obj/b", b"payload", now, now).await;
 
     // First pass: the sink fails retryably.
-    sink.set_behavior(SinkBehavior::Retryable);
+    router.0.set_behavior(SinkBehavior::Retryable);
     let report = engine()
-        .run_once(&meta, &sink, &blobs, &clock)
+        .run_once(&meta, &router, &blobs, &clock)
         .await
         .unwrap();
     assert_eq!(report.claimed, 1);
     assert_eq!(report.retried, 1);
     assert_eq!(report.completed, 0);
-    assert!(sink.intents().is_empty(), "no Put recorded on failure");
+    assert!(router.0.intents().is_empty(), "no Put recorded on failure");
 
     // The entry is no longer due *now* (backoff pushed next_attempt_at into the future) but
     // is still pending, with the attempt count incremented.
@@ -252,15 +264,15 @@ async fn retryable_failure_reschedules_then_succeeds_after_clock_advance() {
 
     // Advance the clock past the backoff and let the sink succeed: the retry replicates.
     clock.set(future);
-    sink.set_behavior(SinkBehavior::Succeed);
+    router.0.set_behavior(SinkBehavior::Succeed);
     let report = engine()
-        .run_once(&meta, &sink, &blobs, &clock)
+        .run_once(&meta, &router, &blobs, &clock)
         .await
         .unwrap();
     assert_eq!(report.claimed, 1);
     assert_eq!(report.completed, 1);
 
-    assert_eq!(sink.intents().len(), 1, "Put recorded on the retry");
+    assert_eq!(router.0.intents().len(), 1, "Put recorded on the retry");
     assert_eq!(
         version_status(&meta, "obj/b", &version).await,
         Some(ReplicationStatus::Completed)
@@ -277,23 +289,24 @@ async fn exceeding_max_attempts_marks_failed() {
     let meta = InMemoryMetadataStore::new();
     let blobs = Arc::new(InMemoryBlobStore::new());
     let sink = FakeReplicationSink::new();
+    let router = SingleSink(sink);
     let clock = TestClock::at_secs(3_000);
     let now = clock.now();
     let eng = engine(); // max_attempts = 3
 
     let version = put_with_outbox(&meta, &blobs, "e3", "obj/c", b"data", now, now).await;
-    sink.set_behavior(SinkBehavior::Retryable);
+    router.0.set_behavior(SinkBehavior::Retryable);
 
     // Attempt 1 -> retry (attempts becomes 1).
-    let r = eng.run_once(&meta, &sink, &blobs, &clock).await.unwrap();
+    let r = eng.run_once(&meta, &router, &blobs, &clock).await.unwrap();
     assert_eq!(r.retried, 1);
     // Advance past backoff, attempt 2 -> retry (attempts becomes 2).
     clock.advance_secs(10_000);
-    let r = eng.run_once(&meta, &sink, &blobs, &clock).await.unwrap();
+    let r = eng.run_once(&meta, &router, &blobs, &clock).await.unwrap();
     assert_eq!(r.retried, 1);
     // Advance past backoff, attempt 3 -> attempts would become 3 == max_attempts: terminal.
     clock.advance_secs(10_000);
-    let r = eng.run_once(&meta, &sink, &blobs, &clock).await.unwrap();
+    let r = eng.run_once(&meta, &router, &blobs, &clock).await.unwrap();
     assert_eq!(r.failed, 1);
     assert_eq!(r.retried, 0);
 
@@ -312,14 +325,15 @@ async fn terminal_failure_marks_failed_immediately() {
     let meta = InMemoryMetadataStore::new();
     let blobs = Arc::new(InMemoryBlobStore::new());
     let sink = FakeReplicationSink::new();
+    let router = SingleSink(sink);
     let clock = TestClock::at_secs(4_000);
     let now = clock.now();
 
     let version = put_with_outbox(&meta, &blobs, "e4", "obj/d", b"data", now, now).await;
-    sink.set_behavior(SinkBehavior::Terminal);
+    router.0.set_behavior(SinkBehavior::Terminal);
 
     let report = engine()
-        .run_once(&meta, &sink, &blobs, &clock)
+        .run_once(&meta, &router, &blobs, &clock)
         .await
         .unwrap();
     assert_eq!(report.failed, 1);
@@ -339,6 +353,7 @@ async fn delete_marker_entry_drives_sink_delete_marker() {
     let meta = InMemoryMetadataStore::new();
     let blobs = Arc::new(InMemoryBlobStore::new());
     let sink = FakeReplicationSink::new();
+    let router = SingleSink(sink);
     let clock = TestClock::at_secs(5_000);
     let now = clock.now();
 
@@ -362,6 +377,7 @@ async fn delete_marker_entry_drives_sink_delete_marker() {
         ReplicationOp::DeleteMarker,
         "rule-0",
         now,
+        0,
     );
     meta.submit(Mutation::PutObjectVersion {
         row: Box::new(row),
@@ -372,12 +388,12 @@ async fn delete_marker_entry_drives_sink_delete_marker() {
     .unwrap();
 
     let report = engine()
-        .run_once(&meta, &sink, &blobs, &clock)
+        .run_once(&meta, &router, &blobs, &clock)
         .await
         .unwrap();
     assert_eq!(report.completed, 1);
 
-    let intents = sink.intents();
+    let intents = router.0.intents();
     assert_eq!(intents.len(), 1);
     match &intents[0] {
         RecordedIntent::DeleteMarker { key, version_id } => {
@@ -398,6 +414,7 @@ async fn replica_status_is_never_re_replicated() {
     let meta = InMemoryMetadataStore::new();
     let blobs = Arc::new(InMemoryBlobStore::new());
     let sink = FakeReplicationSink::new();
+    let router = SingleSink(sink);
     let clock = TestClock::at_secs(6_000);
     let now = clock.now();
 
@@ -423,6 +440,7 @@ async fn replica_status_is_never_re_replicated() {
         ReplicationOp::ObjectCreate,
         "rule-0",
         now,
+        0,
     );
     meta.submit(Mutation::PutObjectVersion {
         row: Box::new(row),
@@ -433,13 +451,13 @@ async fn replica_status_is_never_re_replicated() {
     .unwrap();
 
     let report = engine()
-        .run_once(&meta, &sink, &blobs, &clock)
+        .run_once(&meta, &router, &blobs, &clock)
         .await
         .unwrap();
     assert_eq!(report.claimed, 1);
     assert_eq!(report.completed, 1, "the entry is drained...");
     // ...but the sink was never contacted: a replica is never re-replicated (loop prevention).
-    assert!(sink.intents().is_empty());
+    assert!(router.0.intents().is_empty());
 
     // The version stays a Replica (we did not overwrite its status), and the entry is drained.
     assert_eq!(
@@ -458,6 +476,7 @@ async fn redelivering_completed_version_is_idempotent() {
     let meta = InMemoryMetadataStore::new();
     let blobs = Arc::new(InMemoryBlobStore::new());
     let sink = FakeReplicationSink::new();
+    let router = SingleSink(sink);
     let clock = TestClock::at_secs(7_000);
     let now = clock.now();
 
@@ -465,10 +484,10 @@ async fn redelivering_completed_version_is_idempotent() {
 
     // First delivery succeeds.
     engine()
-        .run_once(&meta, &sink, &blobs, &clock)
+        .run_once(&meta, &router, &blobs, &clock)
         .await
         .unwrap();
-    assert_eq!(sink.intents().len(), 1);
+    assert_eq!(router.0.intents().len(), 1);
     assert_eq!(
         version_status(&meta, "obj/g", &version).await,
         Some(ReplicationStatus::Completed)
@@ -484,6 +503,7 @@ async fn redelivering_completed_version_is_idempotent() {
         ReplicationOp::ObjectCreate,
         "rule-0",
         now,
+        0,
     );
     // Push the duplicate through the outbox by attaching it to a no-op re-put of the (now
     // Completed) row so the entry lands due.
@@ -502,13 +522,13 @@ async fn redelivering_completed_version_is_idempotent() {
 
     // The duplicate is drained without a second Put: idempotent / harmless.
     let report = engine()
-        .run_once(&meta, &sink, &blobs, &clock)
+        .run_once(&meta, &router, &blobs, &clock)
         .await
         .unwrap();
     assert_eq!(report.claimed, 1);
     assert_eq!(report.completed, 1);
     assert_eq!(
-        sink.intents().len(),
+        router.0.intents().len(),
         1,
         "completed version is not shipped twice"
     );
@@ -519,6 +539,7 @@ async fn per_key_ordering_defers_later_versions_when_earlier_one_stalls() {
     let meta = InMemoryMetadataStore::new();
     let blobs = Arc::new(InMemoryBlobStore::new());
     let sink = FakeReplicationSink::new();
+    let router = SingleSink(sink);
     let clock = TestClock::at_secs(8_000);
     let now = clock.now();
 
@@ -530,16 +551,16 @@ async fn per_key_ordering_defers_later_versions_when_earlier_one_stalls() {
     assert!(v1.as_str() < v2.as_str(), "v7 ids are time-ordered");
 
     // The sink fails retryably, so v1 stalls; v2 must be deferred (not shipped out of order).
-    sink.set_behavior(SinkBehavior::Retryable);
+    router.0.set_behavior(SinkBehavior::Retryable);
     let report = engine()
-        .run_once(&meta, &sink, &blobs, &clock)
+        .run_once(&meta, &router, &blobs, &clock)
         .await
         .unwrap();
     assert_eq!(report.claimed, 2);
     assert_eq!(report.retried, 1, "the earlier version is retried");
     assert_eq!(report.deferred, 1, "the later version is deferred");
     assert_eq!(report.completed, 0);
-    assert!(sink.intents().is_empty());
+    assert!(router.0.intents().is_empty());
 
     // v2 is still pending and was never shipped ahead of v1.
     let future = now.plus_secs(10_000);
@@ -556,6 +577,7 @@ async fn run_until_idle_drains_independent_keys() {
     let meta = InMemoryMetadataStore::new();
     let blobs = Arc::new(InMemoryBlobStore::new());
     let sink = FakeReplicationSink::new();
+    let router = SingleSink(sink);
     let clock = TestClock::at_secs(9_000);
     let now = clock.now();
 
@@ -583,6 +605,7 @@ async fn run_until_idle_drains_independent_keys() {
             ReplicationOp::ObjectCreate,
             "rule-0",
             now,
+            0,
         );
         meta.submit(Mutation::PutObjectVersion {
             row: Box::new(row),
@@ -594,11 +617,11 @@ async fn run_until_idle_drains_independent_keys() {
     }
 
     let total = engine()
-        .run_until_idle(&meta, &sink, &blobs, &clock, 8)
+        .run_until_idle(&meta, &router, &blobs, &clock, 8)
         .await
         .unwrap();
     assert_eq!(total.completed, 5);
-    assert_eq!(sink.intents().len(), 5);
+    assert_eq!(router.0.intents().len(), 5);
     assert!(
         due_entries(&meta, now.plus_secs(1_000_000))
             .await

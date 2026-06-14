@@ -11,6 +11,7 @@ use cairn_types::MetaError;
 use cairn_types::id::{BucketName, ObjectKey, StoragePath, VersionId};
 use cairn_types::meta::{IfNoneMatch, Mutation, MutationOutcome, OutboxEntry, Precondition};
 use cairn_types::object::{ETag, ObjectVersionRow};
+use cairn_types::time::Timestamp;
 
 type R<T> = Result<T, MetaError>;
 
@@ -41,6 +42,11 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
                 size_physical: 0,
                 etag: ETag::from_string(String::new()),
                 content_type: String::new(),
+                content_encoding: None,
+                cache_control: None,
+                content_disposition: None,
+                content_language: None,
+                expires: None,
                 storage_path: None,
                 compression: cairn_types::object::CompressionDescriptor::Uncompressed,
                 storage_class: cairn_types::object::StorageClass::Standard,
@@ -129,6 +135,7 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
             let key = row.key.clone();
             check_precondition(driver, &bucket, &key, &precondition).await?;
             enforce_bucket_quota(driver, &row).await?;
+            enforce_user_quota(driver, &row).await?;
             let version_id = row.version_id.clone();
             let superseded = upsert_version(driver, *row).await?;
             driver
@@ -287,6 +294,44 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
                 .await?;
             Ok(MutationOutcome::Ack)
         }
+        Mutation::SetUserQuota {
+            user_id,
+            quota_bytes,
+        } => {
+            driver
+                .execute(
+                    "UPDATE users SET quota_bytes=?2 WHERE id=?1",
+                    vec![
+                        Value::Text(user_id.0.as_str().to_owned()),
+                        quota_bytes.map_or(Value::Null, |q| Value::Int(q as i64)),
+                    ],
+                )
+                .await?;
+            Ok(MutationOutcome::Ack)
+        }
+        Mutation::RetryFailedReplication { bucket, now } => {
+            match bucket {
+                Some(b) => {
+                    driver
+                        .execute(
+                            "UPDATE replication_outbox SET status='pending', next_attempt_at=?2, attempts=0, lease_until=NULL \
+                             WHERE status='failed' AND bucket_name=?1",
+                            vec![Value::Text(b.as_str().to_owned()), Value::Int(now.0)],
+                        )
+                        .await?;
+                }
+                None => {
+                    driver
+                        .execute(
+                            "UPDATE replication_outbox SET status='pending', next_attempt_at=?1, attempts=0, lease_until=NULL \
+                             WHERE status='failed'",
+                            vec![Value::Int(now.0)],
+                        )
+                        .await?;
+                }
+            }
+            Ok(MutationOutcome::Ack)
+        }
         Mutation::SetAccountPublicAccessBlock(bpa) => {
             driver
                 .execute(
@@ -398,6 +443,11 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
                 .await?;
             Ok(MutationOutcome::Ack)
         }
+        Mutation::ClaimReplicationBatch {
+            limit,
+            now,
+            lease_secs,
+        } => claim_replication_batch(driver, limit, now, lease_secs).await,
         Mutation::MarkReplicationDone(id) => {
             if let Some(row) = query_one(
                 driver,
@@ -485,6 +535,7 @@ async fn put_version(
 ) -> R<MutationOutcome> {
     check_precondition(driver, &row.bucket, &row.key, precondition).await?;
     enforce_bucket_quota(driver, &row).await?;
+    enforce_user_quota(driver, &row).await?;
     let version_id = row.version_id.clone();
     let superseded = upsert_version(driver, row).await?;
     if let Some(e) = replication {
@@ -520,6 +571,48 @@ async fn enforce_bucket_quota(driver: &dyn AsyncSqlDriver, row: &ObjectVersionRo
         "SELECT COALESCE(SUM(size_logical), 0) FROM object_versions
          WHERE bucket_name=?1 AND NOT (key=?2 AND version_id=?3)",
         vec![
+            Value::Text(row.bucket.as_str().to_owned()),
+            Value::Text(row.key.as_str().to_owned()),
+            Value::Text(row.version_id.as_str().to_owned()),
+        ],
+    )
+    .await?
+    .map_or(0, |r| r.get_i64(0));
+    // Saturating add in u128 so a pathological size can never wrap past the quota check.
+    let projected = u128::from(current.max(0) as u64) + u128::from(row.size_logical);
+    if projected > u128::from(quota.max(0) as u64) {
+        return Err(MetaError::QuotaExceeded);
+    }
+    Ok(())
+}
+
+/// Enforce the owning user's optional byte quota inside the commit transaction (ARCH §27.5).
+///
+/// Mirrors [`enforce_bucket_quota`] but scoped to the row's `owner_id`: if that user has a
+/// non-NULL `quota_bytes`, the write is rejected with [`MetaError::QuotaExceeded`] when the
+/// user's resulting logical bytes — summed over `size_logical` of every `object_versions` row
+/// they own across all buckets — would exceed the quota. The existing row at the same
+/// (bucket, key, version_id), if any, is excluded because the upsert replaces it. Delete
+/// markers carry no logical bytes, so they never trip the quota.
+async fn enforce_user_quota(driver: &dyn AsyncSqlDriver, row: &ObjectVersionRow) -> R<()> {
+    let quota: Option<i64> = query_one(
+        driver,
+        "SELECT quota_bytes FROM users WHERE id=?1",
+        vec![Value::Text(row.owner_id.0.clone())],
+    )
+    .await?
+    .and_then(|r| r.get_opt_i64(0));
+    let Some(quota) = quota else {
+        return Ok(());
+    };
+    // Current logical bytes owned by this user across all buckets, excluding the row this
+    // upsert will replace.
+    let current: i64 = query_one(
+        driver,
+        "SELECT COALESCE(SUM(size_logical), 0) FROM object_versions
+         WHERE owner_id=?1 AND NOT (bucket_name=?2 AND key=?3 AND version_id=?4)",
+        vec![
+            Value::Text(row.owner_id.0.clone()),
             Value::Text(row.bucket.as_str().to_owned()),
             Value::Text(row.key.as_str().to_owned()),
             Value::Text(row.version_id.as_str().to_owned()),
@@ -586,8 +679,9 @@ async fn insert_version(driver: &dyn AsyncSqlDriver, row: &ObjectVersionRow) -> 
             "INSERT INTO object_versions
              (id, bucket_name, key, version_id, is_latest, is_delete_marker, size_logical, size_physical,
               etag, content_type, storage_path, compression, storage_class, cold_locator, owner_id,
-              user_metadata, acl, checksums, sse_descriptor, replication_status, created_at, updated_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)",
+              user_metadata, acl, checksums, sse_descriptor, replication_status, created_at, updated_at,
+              content_encoding, cache_control, content_disposition, content_language, expires)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27)",
             vec![
                 Value::Text(row.id.clone()),
                 Value::Text(row.bucket.as_str().to_owned()),
@@ -611,6 +705,11 @@ async fn insert_version(driver: &dyn AsyncSqlDriver, row: &ObjectVersionRow) -> 
                 opt_text(row.replication_status.map(|s| repl_status_str(s).to_owned())),
                 Value::Int(row.created_at.0),
                 Value::Int(row.updated_at.0),
+                opt_text(row.content_encoding.clone()),
+                opt_text(row.cache_control.clone()),
+                opt_text(row.content_disposition.clone()),
+                opt_text(row.content_language.clone()),
+                opt_text(row.expires.clone()),
             ],
         )
         .await?;
@@ -765,8 +864,8 @@ async fn enqueue(driver: &dyn AsyncSqlDriver, e: &OutboxEntry) -> R<()> {
     driver
         .execute(
             "INSERT INTO replication_outbox
-             (id, bucket_name, key, version_id, operation, rule_id, attempts, next_attempt_at, status, last_error)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+             (id, bucket_name, key, version_id, operation, rule_id, attempts, next_attempt_at, status, last_error, priority, lease_until)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
             vec![
                 Value::Text(e.id.clone()),
                 Value::Text(e.bucket.as_str().to_owned()),
@@ -778,10 +877,56 @@ async fn enqueue(driver: &dyn AsyncSqlDriver, e: &OutboxEntry) -> R<()> {
                 Value::Int(e.next_attempt_at.0),
                 Value::Text(repl_status_str(e.status).to_owned()),
                 opt_text(e.last_error.clone()),
+                Value::Int(e.priority),
+                e.lease_until.map_or(Value::Null, |t| Value::Int(t.0)),
             ],
         )
         .await?;
     Ok(())
+}
+
+/// Atomically claim up to `limit` due outbox entries: an entry is due when it is `pending`, or
+/// `claimed` with an expired lease, and its `next_attempt_at` has passed. Claimed entries are
+/// marked `status='claimed', lease_until = now + lease_secs` and returned. This runs inside the
+/// writer's transaction, so the select-and-mark is atomic against other claimers.
+async fn claim_replication_batch(
+    driver: &dyn AsyncSqlDriver,
+    limit: u32,
+    now: Timestamp,
+    lease_secs: i64,
+) -> R<MutationOutcome> {
+    let lease_until = now.0 + lease_secs * 1000;
+    let id_rows = driver
+        .query(
+            "SELECT id FROM replication_outbox
+             WHERE (status='pending' OR (status='claimed' AND lease_until < ?1))
+               AND next_attempt_at <= ?1
+             ORDER BY priority DESC, next_attempt_at LIMIT ?2",
+            vec![Value::Int(now.0), Value::Int(i64::from(limit))],
+        )
+        .await?;
+    let ids: Vec<String> = id_rows.iter().map(|r| r.get_text(0)).collect();
+    let mut claimed = Vec::with_capacity(ids.len());
+    for id in &ids {
+        driver
+            .execute(
+                "UPDATE replication_outbox SET status='claimed', lease_until=?2 WHERE id=?1",
+                vec![Value::Text(id.clone()), Value::Int(lease_until)],
+            )
+            .await?;
+        let row = query_one(
+            driver,
+            &format!(
+                "SELECT {} FROM replication_outbox WHERE id=?1",
+                model::OUTBOX_COLS
+            ),
+            vec![Value::Text(id.clone())],
+        )
+        .await?
+        .ok_or_else(|| MetaError::Engine("claimed outbox row vanished".to_owned()))?;
+        claimed.push(model::outbox_from_row(&row)?);
+    }
+    Ok(MutationOutcome::ReplicationBatch(claimed))
 }
 
 fn config_aspect_str(a: cairn_types::bucket::ConfigAspect) -> &'static str {
@@ -792,6 +937,7 @@ fn config_aspect_str(a: cairn_types::bucket::ConfigAspect) -> &'static str {
         Cors => "cors",
         Lifecycle => "lifecycle",
         Replication => "replication",
+        ReplicationTargets => "replication_targets",
         Tagging => "tagging",
         PublicAccessBlock => "public_access_block",
         Encryption => "encryption",

@@ -26,10 +26,10 @@ spec sheet. Re-run on the target hardware for absolute figures.
 The streaming chunked decoder de-frames `aws-chunked` upload bodies. ARCH §30.1 wants the byte
 path bound by hardware, not by framing CPU, so the de-framer must run well above device bandwidth.
 
-`crates/cairn-s3/benches/decode.rs` decodes an 8 MiB unsigned body in 64 KiB chunks:
+`crates/cairn-protocol/benches/decode.rs` decodes an 8 MiB unsigned body in 64 KiB chunks:
 
 ```sh
-cargo bench -p cairn-s3 --bench decode
+cargo bench -p cairn-protocol --bench decode
 ```
 
 **Observed** (this host):

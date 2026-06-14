@@ -6,6 +6,9 @@
 
 use crate::wire;
 use bytes::Bytes;
+use cairn_replication::{
+    RemoteTarget, RemoteTargetInput, parse_targets, resolve_target, serialize_targets,
+};
 use cairn_types::auth::{Principal, Role};
 use cairn_types::bucket::{
     Bucket, CompressionAlgorithm, CompressionPolicy, ConfigAspect, ConfigDoc, VersioningState,
@@ -16,6 +19,7 @@ use cairn_types::traits::{BlobStore, Clock, Crypto, MetadataStore};
 use http::{Method, StatusCode};
 use serde::Serialize;
 use std::sync::Arc;
+use uuid::Uuid;
 
 /// The bound on a single management-API listing page, and the batch size used when paging a
 /// bucket for force-delete or per-bucket aggregation. Keeps every loop bounded in memory.
@@ -25,14 +29,21 @@ const PAGE_LIMIT: u32 = 1000;
 /// aggregation), so a hostile or corrupt cursor can never spin forever.
 const MAX_PAGES: u32 = 100_000;
 
-/// A management-API response: an HTTP status and a JSON body. The caller sets
-/// `content-type: application/json`.
+/// A management-API response: an HTTP status, a JSON body, and a per-request id. The caller sets
+/// `content-type: application/json` and emits `request_id` as the `x-amz-request-id` header on
+/// every response, success or error (ARCH §25.1).
 #[derive(Debug, Clone)]
 pub struct ControlResponse {
     /// The HTTP status code.
     pub status: StatusCode,
     /// The JSON-encoded body.
     pub body: Vec<u8>,
+    /// The per-request id. Mirrored into the `x-amz-request-id` response header and, for error
+    /// envelopes, into the body's `request_id` field. Constructors leave this empty; [`handle`]
+    /// stamps the real id into the response (and re-renders error envelopes) before returning.
+    ///
+    /// [`handle`]: ControlService::handle
+    pub request_id: String,
 }
 
 impl ControlResponse {
@@ -40,18 +51,29 @@ impl ControlResponse {
     /// crate's own DTOs; a failure degrades to a `500` error envelope rather than panicking.
     fn json<T: Serialize>(status: StatusCode, value: &T) -> Self {
         match serde_json::to_vec(value) {
-            Ok(body) => Self { status, body },
+            Ok(body) => Self {
+                status,
+                body,
+                request_id: String::new(),
+            },
             Err(e) => Self::error_internal(&e.to_string()),
         }
     }
 
-    /// An error envelope `{ "error": <message> }` at `status`.
+    /// An error envelope `{ "error": <message>, "request_id": "" }` at `status`. The request id is
+    /// filled in centrally by [`ControlResponse::stamp_request_id`] once it is known, so every
+    /// error path carries the same id as the response header.
     fn error(status: StatusCode, message: &str) -> Self {
         let body = serde_json::to_vec(&wire::ErrorResp {
             error: message.to_owned(),
+            request_id: String::new(),
         })
-        .unwrap_or_else(|_| br#"{"error":"internal error"}"#.to_vec());
-        Self { status, body }
+        .unwrap_or_else(|_| br#"{"error":"internal error","request_id":""}"#.to_vec());
+        Self {
+            status,
+            body,
+            request_id: String::new(),
+        }
     }
 
     fn forbidden() -> Self {
@@ -75,7 +97,35 @@ impl ControlResponse {
         Self {
             status: StatusCode::NO_CONTENT,
             body: Vec::new(),
+            request_id: String::new(),
         }
+    }
+
+    /// Stamp the resolved request id onto this response: it always lands in `request_id` (the
+    /// header source), and for an error envelope it is also rewritten into the body's
+    /// `request_id` field so the body and header agree. Success bodies are left byte-for-byte
+    /// intact. This is the single choke point through which every response acquires its id.
+    fn stamp_request_id(mut self, id: &str) -> Self {
+        self.request_id = id.to_owned();
+        // Only error envelopes carry a `request_id` in the body. Detect one structurally rather
+        // than by status so a non-2xx success (e.g. 204) is never mis-rewritten: an error body is
+        // a JSON object with an `error` string and an (empty) `request_id` placeholder.
+        if !self.body.is_empty() {
+            if let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(&self.body) {
+                if let Some(obj) = v.as_object_mut() {
+                    if obj.contains_key("error") && obj.contains_key("request_id") {
+                        obj.insert(
+                            "request_id".to_owned(),
+                            serde_json::Value::String(id.to_owned()),
+                        );
+                        if let Ok(bytes) = serde_json::to_vec(&v) {
+                            self.body = bytes;
+                        }
+                    }
+                }
+            }
+        }
+        self
     }
 }
 
@@ -146,11 +196,32 @@ impl ControlService {
         principal: Option<&Principal>,
         body: Bytes,
     ) -> ControlResponse {
+        // One id per control request, carried into the JSON error envelope and emitted as the
+        // `x-amz-request-id` response header on every response (ARCH §25.1).
+        let request_id = Uuid::new_v4().simple().to_string();
+        let resp = self.route(method, subpath, query, principal, body).await;
+        resp.stamp_request_id(&request_id)
+    }
+
+    /// The inner router: produces a [`ControlResponse`] whose request id is stamped on by
+    /// [`handle`]. Splitting this out keeps the request-id stamping a single choke point that
+    /// every routed path — including the `404` fall-through and the unauthenticated `/health`
+    /// branch — passes through.
+    ///
+    /// [`handle`]: ControlService::handle
+    async fn route(
+        &self,
+        method: &Method,
+        subpath: &str,
+        query: &[(String, String)],
+        principal: Option<&Principal>,
+        body: Bytes,
+    ) -> ControlResponse {
         let segments = split_path(subpath);
 
         // /health is the only unauthenticated endpoint.
         if matches!(segments.as_slice(), ["health"]) {
-            return self.health(method);
+            return self.health(method).await;
         }
 
         // Everything else is admin-gated.
@@ -164,35 +235,64 @@ impl ControlService {
             (&Method::GET, ["system"]) => self.system(),
 
             (&Method::GET, ["buckets"]) => self.list_buckets().await,
-            (&Method::POST, ["buckets"]) => self.create_bucket(&body).await,
+            (&Method::POST, ["buckets"]) => self.create_bucket(&body, principal).await,
             (&Method::GET, ["buckets", name]) => self.bucket_detail(name).await,
-            (&Method::DELETE, ["buckets", name]) => self.delete_bucket(name).await,
+            (&Method::DELETE, ["buckets", name]) => self.delete_bucket(name, principal).await,
             (&Method::GET, ["buckets", name, "objects"]) => self.list_objects(name, query).await,
 
             (&Method::GET, ["buckets", name, "config"]) => self.bucket_config(name).await,
             (&Method::PUT, ["buckets", name, "versioning"]) => {
-                self.set_versioning(name, &body).await
+                self.set_versioning(name, &body, principal).await
             }
-            (&Method::PUT, ["buckets", name, "quota"]) => self.set_quota(name, &body).await,
+            (&Method::PUT, ["buckets", name, "quota"]) => {
+                self.set_quota(name, &body, principal).await
+            }
             (&Method::PUT, ["buckets", name, "compression"]) => {
-                self.set_compression(name, &body).await
+                self.set_compression(name, &body, principal).await
             }
             (&Method::PUT, ["buckets", name, "encryption"]) => {
-                self.set_encryption(name, &body).await
+                self.set_encryption(name, &body, principal).await
             }
-            (&Method::PUT, ["buckets", name, "policy"]) => self.set_policy(name, &body).await,
-            (&Method::DELETE, ["buckets", name, "policy"]) => self.delete_policy(name).await,
+            (&Method::PUT, ["buckets", name, "policy"]) => {
+                self.set_policy(name, &body, principal).await
+            }
+            (&Method::DELETE, ["buckets", name, "policy"]) => {
+                self.delete_policy(name, principal).await
+            }
+
+            (&Method::POST, ["buckets", name, "replication", "targets"]) => {
+                self.add_replication_target(name, &body, principal).await
+            }
+            (&Method::GET, ["buckets", name, "replication", "targets"]) => {
+                self.list_replication_targets(name).await
+            }
+            (&Method::DELETE, ["buckets", name, "replication", "targets", arn]) => {
+                self.delete_replication_target(name, arn, principal).await
+            }
+            (&Method::POST, ["buckets", name, "replication", "retry"]) => {
+                self.retry_replication(name, principal).await
+            }
+            (&Method::GET, ["buckets", name, "replication", "status"]) => {
+                self.replication_status(name).await
+            }
 
             (&Method::GET, ["users"]) => self.list_users().await,
-            (&Method::POST, ["users"]) => self.create_user(&body).await,
+            (&Method::POST, ["users"]) => self.create_user(&body, principal).await,
             (&Method::GET, ["users", id]) => self.user_detail(id).await,
-            (&Method::PATCH, ["users", id]) => self.patch_user(id, &body).await,
+            (&Method::PATCH, ["users", id]) => self.patch_user(id, &body, principal).await,
             (&Method::POST, ["users", id, "rotate-credentials"]) => {
-                self.rotate_credentials(id).await
+                self.rotate_credentials(id, principal).await
+            }
+            (&Method::PUT, ["users", id, "quota"]) => {
+                self.set_user_quota(id, &body, principal).await
             }
             (&Method::GET, ["users", id, "policy"]) => self.get_user_policy(id).await,
-            (&Method::PUT, ["users", id, "policy"]) => self.set_user_policy(id, &body).await,
-            (&Method::DELETE, ["users", id, "policy"]) => self.delete_user_policy(id).await,
+            (&Method::PUT, ["users", id, "policy"]) => {
+                self.set_user_policy(id, &body, principal).await
+            }
+            (&Method::DELETE, ["users", id, "policy"]) => {
+                self.delete_user_policy(id, principal).await
+            }
 
             (&Method::GET, ["replication", "failed"]) => self.failed_replication(query).await,
 
@@ -206,15 +306,20 @@ impl ControlService {
     // Health & overview
     // -----------------------------------------------------------------------------------
 
-    fn health(&self, method: &Method) -> ControlResponse {
+    /// `GET /health`: liveness is unconditional (`status: "ok"`); readiness reflects a real probe
+    /// of the metadata store — a bounded `list_buckets` call — rather than a hardcoded constant
+    /// (ARCH §26.4). The endpoint is always `200`; an unready store surfaces as `ready: false` so
+    /// a load balancer can drain the node without the probe itself erroring.
+    async fn health(&self, method: &Method) -> ControlResponse {
         if method != Method::GET {
             return ControlResponse::not_found();
         }
+        let ready = self.meta.list_buckets(None).await.is_ok();
         ControlResponse::json(
             StatusCode::OK,
             &wire::HealthResp {
                 status: "ok",
-                ready: true,
+                ready,
             },
         )
     }
@@ -299,7 +404,7 @@ impl ControlService {
         ControlResponse::json(StatusCode::OK, &wire::BucketListResp { buckets: entries })
     }
 
-    async fn create_bucket(&self, body: &Bytes) -> ControlResponse {
+    async fn create_bucket(&self, body: &Bytes, principal: Option<&Principal>) -> ControlResponse {
         let req: wire::CreateBucketReq = match serde_json::from_slice(body) {
             Ok(r) => r,
             Err(e) => return ControlResponse::bad_request(&e.to_string()),
@@ -339,7 +444,7 @@ impl ControlService {
             Err(e) => return ControlResponse::error_internal(&e.to_string()),
         }
 
-        self.record_activity("CreateBucket", Some(name.as_str()), None)
+        self.record_activity("CreateBucket", Some(name.as_str()), None, principal)
             .await;
 
         ControlResponse::json(
@@ -421,7 +526,7 @@ impl ControlService {
         Ok((object_count, logical_bytes))
     }
 
-    async fn delete_bucket(&self, name: &str) -> ControlResponse {
+    async fn delete_bucket(&self, name: &str, principal: Option<&Principal>) -> ControlResponse {
         let bucket_name = match BucketName::parse(name) {
             Ok(n) => n,
             Err(_) => return ControlResponse::not_found(),
@@ -479,7 +584,7 @@ impl ControlService {
             return ControlResponse::error_internal(&e.to_string());
         }
 
-        self.record_activity("DeleteBucket", Some(bucket_name.as_str()), None)
+        self.record_activity("DeleteBucket", Some(bucket_name.as_str()), None, principal)
             .await;
 
         ControlResponse::no_content()
@@ -626,7 +731,12 @@ impl ControlService {
     }
 
     /// `PUT /buckets/{name}/versioning`: set the bucket's versioning state.
-    async fn set_versioning(&self, name: &str, body: &Bytes) -> ControlResponse {
+    async fn set_versioning(
+        &self,
+        name: &str,
+        body: &Bytes,
+        principal: Option<&Principal>,
+    ) -> ControlResponse {
         let bucket_name = match self.require_bucket(name).await {
             Ok(n) => n,
             Err(resp) => return resp,
@@ -655,13 +765,18 @@ impl ControlService {
             return ControlResponse::error_internal(&e.to_string());
         }
 
-        self.record_activity("SetVersioning", Some(bucket_name.as_str()), None)
+        self.record_activity("SetVersioning", Some(bucket_name.as_str()), None, principal)
             .await;
         ControlResponse::no_content()
     }
 
     /// `PUT /buckets/{name}/quota`: set or clear the bucket's byte quota.
-    async fn set_quota(&self, name: &str, body: &Bytes) -> ControlResponse {
+    async fn set_quota(
+        &self,
+        name: &str,
+        body: &Bytes,
+        principal: Option<&Principal>,
+    ) -> ControlResponse {
         let bucket_name = match self.require_bucket(name).await {
             Ok(n) => n,
             Err(resp) => return resp,
@@ -682,14 +797,24 @@ impl ControlService {
             return ControlResponse::error_internal(&e.to_string());
         }
 
-        self.record_activity("SetBucketQuota", Some(bucket_name.as_str()), None)
-            .await;
+        self.record_activity(
+            "SetBucketQuota",
+            Some(bucket_name.as_str()),
+            None,
+            principal,
+        )
+        .await;
         ControlResponse::no_content()
     }
 
     /// `PUT /buckets/{name}/compression`: set or disable the bucket's compression policy, applied to
     /// subsequent object writes. Body: `{"algorithm": "zstd"|"lz4"|"none", "block_size": 65536}`.
-    async fn set_compression(&self, name: &str, body: &Bytes) -> ControlResponse {
+    async fn set_compression(
+        &self,
+        name: &str,
+        body: &Bytes,
+        principal: Option<&Principal>,
+    ) -> ControlResponse {
         let bucket_name = match self.require_bucket(name).await {
             Ok(n) => n,
             Err(resp) => return resp,
@@ -736,8 +861,13 @@ impl ControlService {
             return ControlResponse::error_internal(&e.to_string());
         }
 
-        self.record_activity("SetBucketCompression", Some(bucket_name.as_str()), None)
-            .await;
+        self.record_activity(
+            "SetBucketCompression",
+            Some(bucket_name.as_str()),
+            None,
+            principal,
+        )
+        .await;
         ControlResponse::no_content()
     }
 
@@ -745,7 +875,12 @@ impl ControlService {
     /// `"AES256"` makes every new upload SSE-S3-encrypted (unless the request carries its own
     /// `x-amz-server-side-encryption` header); `"none"` returns to unencrypted-by-default.
     /// Existing objects are never rewritten.
-    async fn set_encryption(&self, name: &str, body: &Bytes) -> ControlResponse {
+    async fn set_encryption(
+        &self,
+        name: &str,
+        body: &Bytes,
+        principal: Option<&Principal>,
+    ) -> ControlResponse {
         let bucket_name = match self.require_bucket(name).await {
             Ok(n) => n,
             Err(resp) => return resp,
@@ -776,14 +911,24 @@ impl ControlService {
             return ControlResponse::error_internal(&e.to_string());
         }
 
-        self.record_activity("SetBucketEncryption", Some(bucket_name.as_str()), None)
-            .await;
+        self.record_activity(
+            "SetBucketEncryption",
+            Some(bucket_name.as_str()),
+            None,
+            principal,
+        )
+        .await;
         ControlResponse::no_content()
     }
 
     /// `PUT /buckets/{name}/policy`: validate the raw policy JSON via `cairn_authz::parse_policy`
     /// and store it as the bucket's `Policy` config aspect.
-    async fn set_policy(&self, name: &str, body: &Bytes) -> ControlResponse {
+    async fn set_policy(
+        &self,
+        name: &str,
+        body: &Bytes,
+        principal: Option<&Principal>,
+    ) -> ControlResponse {
         let bucket_name = match self.require_bucket(name).await {
             Ok(n) => n,
             Err(resp) => return resp,
@@ -811,13 +956,18 @@ impl ControlService {
             return ControlResponse::error_internal(&e.to_string());
         }
 
-        self.record_activity("PutBucketPolicy", Some(bucket_name.as_str()), None)
-            .await;
+        self.record_activity(
+            "PutBucketPolicy",
+            Some(bucket_name.as_str()),
+            None,
+            principal,
+        )
+        .await;
         ControlResponse::no_content()
     }
 
     /// `DELETE /buckets/{name}/policy`: clear the bucket's policy.
-    async fn delete_policy(&self, name: &str) -> ControlResponse {
+    async fn delete_policy(&self, name: &str, principal: Option<&Principal>) -> ControlResponse {
         let bucket_name = match self.require_bucket(name).await {
             Ok(n) => n,
             Err(resp) => return resp,
@@ -835,8 +985,13 @@ impl ControlService {
             return ControlResponse::error_internal(&e.to_string());
         }
 
-        self.record_activity("DeleteBucketPolicy", Some(bucket_name.as_str()), None)
-            .await;
+        self.record_activity(
+            "DeleteBucketPolicy",
+            Some(bucket_name.as_str()),
+            None,
+            principal,
+        )
+        .await;
         ControlResponse::no_content()
     }
 
@@ -873,7 +1028,7 @@ impl ControlService {
         ControlResponse::json(StatusCode::OK, &wire::UserListResp { users: entries })
     }
 
-    async fn create_user(&self, body: &Bytes) -> ControlResponse {
+    async fn create_user(&self, body: &Bytes, principal: Option<&Principal>) -> ControlResponse {
         let req: wire::CreateUserReq = match serde_json::from_slice(body) {
             Ok(r) => r,
             Err(e) => return ControlResponse::bad_request(&e.to_string()),
@@ -885,6 +1040,17 @@ impl ControlService {
         if req.display_name.trim().is_empty() {
             return ControlResponse::bad_request("display_name must not be empty");
         }
+
+        // If a canned replication policy was requested, validate the destination bucket name and
+        // build the policy JSON up front — before any state is created — so a bad bucket name is a
+        // clean `400` rather than a half-provisioned user (ARCH §20.5).
+        let replication_policy = match req.replication_policy_bucket.as_deref() {
+            Some(b) => match replication_policy_for_bucket(b) {
+                Ok(json) => Some(json),
+                Err(resp) => return resp,
+            },
+            None => None,
+        };
 
         // Mint the Bearer credential. The access-key id is public; only the hash of the secret
         // is persisted, so the plaintext secret is returned exactly once below.
@@ -934,7 +1100,24 @@ impl ControlService {
             Err(e) => return ControlResponse::error_internal(&e.to_string()),
         }
 
-        self.record_activity("CreateUser", None, None).await;
+        // Attach the canned replication identity policy when requested, so the dedicated
+        // destination credential is minted ready to receive replicated writes (ARCH §20.5). The
+        // policy JSON was validated above before any state was touched.
+        if let Some(policy) = replication_policy {
+            if let Err(e) = self
+                .meta
+                .submit(Mutation::SetUserPolicy {
+                    user_id: user_id.clone(),
+                    policy: Some(policy),
+                })
+                .await
+            {
+                return ControlResponse::error_internal(&e.to_string());
+            }
+        }
+
+        self.record_activity("CreateUser", None, None, principal)
+            .await;
 
         ControlResponse::json(
             StatusCode::CREATED,
@@ -950,7 +1133,12 @@ impl ControlService {
 
     /// `PATCH /users/{id}`: update a user's mutable fields (activation and/or role). Absent
     /// fields are left unchanged. Returns the updated public user view.
-    async fn patch_user(&self, id: &str, body: &Bytes) -> ControlResponse {
+    async fn patch_user(
+        &self,
+        id: &str,
+        body: &Bytes,
+        principal: Option<&Principal>,
+    ) -> ControlResponse {
         let req: wire::PatchUserReq = match serde_json::from_slice(body) {
             Ok(r) => r,
             Err(e) => return ControlResponse::bad_request(&e.to_string()),
@@ -1001,7 +1189,8 @@ impl ControlService {
             return ControlResponse::error_internal(&e.to_string());
         }
 
-        self.record_activity("UpdateUser", None, None).await;
+        self.record_activity("UpdateUser", None, None, principal)
+            .await;
 
         ControlResponse::json(
             StatusCode::OK,
@@ -1017,7 +1206,7 @@ impl ControlService {
 
     /// `POST /users/{id}/rotate-credentials`: mint a fresh Bearer secret for the existing user,
     /// persist only its hash, and return the plaintext exactly once.
-    async fn rotate_credentials(&self, id: &str) -> ControlResponse {
+    async fn rotate_credentials(&self, id: &str, principal: Option<&Principal>) -> ControlResponse {
         let user_id = UserId(id.to_owned());
         let mut record = match self.load_user_record(&user_id).await {
             Ok(Some(r)) => r,
@@ -1038,7 +1227,8 @@ impl ControlService {
             return ControlResponse::error_internal(&e.to_string());
         }
 
-        self.record_activity("RotateCredentials", None, None).await;
+        self.record_activity("RotateCredentials", None, None, principal)
+            .await;
 
         ControlResponse::json(
             StatusCode::OK,
@@ -1145,7 +1335,12 @@ impl ControlService {
 
     /// `PUT /users/{id}/policy`: validate the raw identity-policy JSON via `parse_user_policy`
     /// (Principal-less; the principal is this user) and attach it. Rejected at the edge if malformed.
-    async fn set_user_policy(&self, id: &str, body: &Bytes) -> ControlResponse {
+    async fn set_user_policy(
+        &self,
+        id: &str,
+        body: &Bytes,
+        principal: Option<&Principal>,
+    ) -> ControlResponse {
         let user_id = UserId(id.to_owned());
         match self.load_user_record(&user_id).await {
             Ok(Some(_)) => {}
@@ -1169,12 +1364,13 @@ impl ControlService {
         {
             return ControlResponse::error_internal(&e.to_string());
         }
-        self.record_activity("SetUserPolicy", None, None).await;
+        self.record_activity("SetUserPolicy", None, None, principal)
+            .await;
         ControlResponse::no_content()
     }
 
     /// `DELETE /users/{id}/policy`: detach the user's identity policy.
-    async fn delete_user_policy(&self, id: &str) -> ControlResponse {
+    async fn delete_user_policy(&self, id: &str, principal: Option<&Principal>) -> ControlResponse {
         let user_id = UserId(id.to_owned());
         match self.load_user_record(&user_id).await {
             Ok(Some(_)) => {}
@@ -1191,7 +1387,8 @@ impl ControlService {
         {
             return ControlResponse::error_internal(&e.to_string());
         }
-        self.record_activity("DeleteUserPolicy", None, None).await;
+        self.record_activity("DeleteUserPolicy", None, None, principal)
+            .await;
         ControlResponse::no_content()
     }
 
@@ -1206,6 +1403,44 @@ impl ControlService {
             Ok(None) => Ok(None),
             Err(e) => Err(ControlResponse::error_internal(&e.to_string())),
         }
+    }
+
+    /// `PUT /users/{id}/quota`: set or clear a user's byte quota. The quota is enforced inside the
+    /// writer's commit transaction for the objects the user owns (ARCH §27.5); this endpoint only
+    /// persists the configured value (there is no by-id user-quota reader to echo it back, so the
+    /// set is the contract — see the wire DTO note). Returns `204` on success.
+    async fn set_user_quota(
+        &self,
+        id: &str,
+        body: &Bytes,
+        principal: Option<&Principal>,
+    ) -> ControlResponse {
+        let user_id = UserId(id.to_owned());
+        // Confirm the user exists so a missing user is a clean 404 rather than a silent no-op.
+        match self.load_user_record(&user_id).await {
+            Ok(Some(_)) => {}
+            Ok(None) => return ControlResponse::not_found(),
+            Err(resp) => return resp,
+        }
+        let req: wire::SetUserQuotaReq = match serde_json::from_slice(body) {
+            Ok(r) => r,
+            Err(e) => return ControlResponse::bad_request(&e.to_string()),
+        };
+
+        if let Err(e) = self
+            .meta
+            .submit(Mutation::SetUserQuota {
+                user_id,
+                quota_bytes: req.quota_bytes,
+            })
+            .await
+        {
+            return ControlResponse::error_internal(&e.to_string());
+        }
+
+        self.record_activity("SetUserQuota", None, None, principal)
+            .await;
+        ControlResponse::no_content()
     }
 
     // -----------------------------------------------------------------------------------
@@ -1239,6 +1474,297 @@ impl ControlService {
     }
 
     // -----------------------------------------------------------------------------------
+    // Per-bucket remote replication targets (ARCH §20.5)
+    // -----------------------------------------------------------------------------------
+
+    /// Read and parse a bucket's stored `ReplicationTargets` config-aspect document into the typed
+    /// target list. An unset aspect parses to an empty list. Maps a store/parse failure to a
+    /// `500` error response.
+    async fn load_replication_targets(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<Vec<RemoteTarget>, ControlResponse> {
+        let doc = self
+            .meta
+            .get_bucket_config(bucket, ConfigAspect::ReplicationTargets)
+            .await
+            .map_err(|e| ControlResponse::error_internal(&e.to_string()))?;
+        let bytes = doc.map(|d| d.0).unwrap_or_default();
+        parse_targets(bytes.as_bytes()).map_err(|e| ControlResponse::error_internal(&e.to_string()))
+    }
+
+    /// Serialize the target set and store it back as the bucket's `ReplicationTargets` aspect.
+    async fn store_replication_targets(
+        &self,
+        bucket: &BucketName,
+        targets: &[RemoteTarget],
+    ) -> Result<(), ControlResponse> {
+        let doc = serialize_targets(targets);
+        self.meta
+            .submit(Mutation::SetBucketConfig {
+                bucket: bucket.clone(),
+                aspect: ConfigAspect::ReplicationTargets,
+                doc: Some(ConfigDoc(doc)),
+            })
+            .await
+            .map_err(|e| ControlResponse::error_internal(&e.to_string()))?;
+        Ok(())
+    }
+
+    /// `POST /buckets/{name}/replication/targets`: seal the destination secret under the master
+    /// key, mint a stable ARN, append the target to the bucket's stored set, and persist it. The
+    /// response returns only the minted ARN — the secret is never echoed back (ARCH §20.5).
+    async fn add_replication_target(
+        &self,
+        name: &str,
+        body: &Bytes,
+        principal: Option<&Principal>,
+    ) -> ControlResponse {
+        let bucket_name = match self.require_bucket(name).await {
+            Ok(n) => n,
+            Err(resp) => return resp,
+        };
+        let req: wire::CreateReplicationTargetReq = match serde_json::from_slice(body) {
+            Ok(r) => r,
+            Err(e) => return ControlResponse::bad_request(&e.to_string()),
+        };
+        if req.endpoint.trim().is_empty()
+            || req.region.trim().is_empty()
+            || req.dest_bucket.trim().is_empty()
+            || req.access_key.trim().is_empty()
+            || req.secret.is_empty()
+        {
+            return ControlResponse::bad_request(
+                "endpoint, region, dest_bucket, access_key, and secret are all required",
+            );
+        }
+
+        let input = RemoteTargetInput {
+            endpoint: req.endpoint,
+            region: req.region,
+            dest_bucket: req.dest_bucket,
+            access_key_id: req.access_key,
+            secret: req.secret,
+        };
+        // Seal the destination secret under the master key via the Crypto trait spine and mint the
+        // stable ARN, exactly as `cairn_replication::seal_target` does (it needs the concrete
+        // `SystemCrypto`; the control plane only holds `Arc<dyn Crypto>`, so it seals here).
+        let target = match self.seal_remote_target(input) {
+            Ok(t) => t,
+            Err(resp) => return resp,
+        };
+        let arn = target.arn.clone();
+
+        let mut targets = match self.load_replication_targets(&bucket_name).await {
+            Ok(t) => t,
+            Err(resp) => return resp,
+        };
+        targets.push(target);
+        if let Err(resp) = self.store_replication_targets(&bucket_name, &targets).await {
+            return resp;
+        }
+
+        self.record_activity(
+            "AddReplicationTarget",
+            Some(bucket_name.as_str()),
+            None,
+            principal,
+        )
+        .await;
+        ControlResponse::json(
+            StatusCode::CREATED,
+            &wire::CreateReplicationTargetResp { arn },
+        )
+    }
+
+    /// `GET /buckets/{name}/replication/targets`: list the bucket's targets WITHOUT any secret
+    /// material — only the ARN, endpoint, region, destination bucket, and access-key id.
+    async fn list_replication_targets(&self, name: &str) -> ControlResponse {
+        let bucket_name = match self.require_bucket(name).await {
+            Ok(n) => n,
+            Err(resp) => return resp,
+        };
+        let targets = match self.load_replication_targets(&bucket_name).await {
+            Ok(t) => t,
+            Err(resp) => return resp,
+        };
+        let targets = targets
+            .into_iter()
+            .map(|t| wire::ReplicationTargetEntry {
+                arn: t.arn,
+                endpoint: t.endpoint,
+                region: t.region,
+                dest_bucket: t.dest_bucket,
+                access_key_id: t.access_key_id,
+            })
+            .collect();
+        ControlResponse::json(StatusCode::OK, &wire::ReplicationTargetListResp { targets })
+    }
+
+    /// `DELETE /buckets/{name}/replication/targets/{arn}`: remove the target with the given ARN
+    /// from the bucket's stored set and persist the remainder. A `404` when no such ARN exists.
+    async fn delete_replication_target(
+        &self,
+        name: &str,
+        arn: &str,
+        principal: Option<&Principal>,
+    ) -> ControlResponse {
+        let bucket_name = match self.require_bucket(name).await {
+            Ok(n) => n,
+            Err(resp) => return resp,
+        };
+        // The ARN arrives as a single path segment; it may have been percent-encoded by the
+        // client (it contains colons), so decode before matching.
+        let arn = percent_decode(arn);
+        let mut targets = match self.load_replication_targets(&bucket_name).await {
+            Ok(t) => t,
+            Err(resp) => return resp,
+        };
+        if resolve_target(&targets, &arn).is_none() {
+            return ControlResponse::not_found();
+        }
+        targets.retain(|t| t.arn != arn);
+        if let Err(resp) = self.store_replication_targets(&bucket_name, &targets).await {
+            return resp;
+        }
+
+        self.record_activity(
+            "DeleteReplicationTarget",
+            Some(bucket_name.as_str()),
+            None,
+            principal,
+        )
+        .await;
+        ControlResponse::no_content()
+    }
+
+    /// `POST /buckets/{name}/replication/retry`: requeue this bucket's terminally-failed outbox
+    /// entries for another attempt (ARCH §20.5). Observes the failed count first (bounded) so the
+    /// ack can report how many entries were requeued, then submits the retry mutation.
+    async fn retry_replication(
+        &self,
+        name: &str,
+        principal: Option<&Principal>,
+    ) -> ControlResponse {
+        let bucket_name = match self.require_bucket(name).await {
+            Ok(n) => n,
+            Err(resp) => return resp,
+        };
+
+        // Count this bucket's failed entries before the requeue, so the ack reports a real figure.
+        let failed_observed = match self.meta.list_failed_replication(PAGE_LIMIT).await {
+            Ok(entries) => entries
+                .iter()
+                .filter(|e| e.bucket.as_str() == bucket_name.as_str())
+                .count() as u64,
+            Err(e) => return ControlResponse::error_internal(&e.to_string()),
+        };
+
+        if let Err(e) = self
+            .meta
+            .submit(Mutation::RetryFailedReplication {
+                bucket: Some(bucket_name.clone()),
+                now: self.clock.now(),
+            })
+            .await
+        {
+            return ControlResponse::error_internal(&e.to_string());
+        }
+
+        self.record_activity(
+            "RetryFailedReplication",
+            Some(bucket_name.as_str()),
+            None,
+            principal,
+        )
+        .await;
+        ControlResponse::json(
+            StatusCode::OK,
+            &wire::ReplicationRetryResp {
+                requeued: true,
+                failed_observed,
+            },
+        )
+    }
+
+    /// `GET /buckets/{name}/replication/status`: per-bucket replication counters — `pending` (due
+    /// entries filtered to this bucket) and `failed` (terminal entries filtered to this bucket) —
+    /// plus the most recent failed entries' errors. Every figure is bounded by [`PAGE_LIMIT`].
+    async fn replication_status(&self, name: &str) -> ControlResponse {
+        let bucket_name = match self.require_bucket(name).await {
+            Ok(n) => n,
+            Err(resp) => return resp,
+        };
+
+        let now = self.clock.now();
+        let pending = match self.meta.list_due_replication(PAGE_LIMIT, now).await {
+            Ok(entries) => entries
+                .iter()
+                .filter(|e| e.bucket.as_str() == bucket_name.as_str())
+                .count() as u64,
+            Err(e) => return ControlResponse::error_internal(&e.to_string()),
+        };
+
+        let failed_entries = match self.meta.list_failed_replication(PAGE_LIMIT).await {
+            Ok(entries) => entries,
+            Err(e) => return ControlResponse::error_internal(&e.to_string()),
+        };
+        let bucket_failed: Vec<_> = failed_entries
+            .into_iter()
+            .filter(|e| e.bucket.as_str() == bucket_name.as_str())
+            .collect();
+        let failed = bucket_failed.len() as u64;
+        let recent_errors = bucket_failed
+            .into_iter()
+            .map(|e| wire::ReplicationStatusError {
+                key: e.key.as_str().to_owned(),
+                version_id: e.version_id.as_str().to_owned(),
+                error: e.last_error,
+            })
+            .collect();
+
+        ControlResponse::json(
+            StatusCode::OK,
+            &wire::ReplicationStatusResp {
+                bucket: bucket_name.as_str().to_owned(),
+                pending,
+                failed,
+                recent_errors,
+            },
+        )
+    }
+
+    /// Seal a [`RemoteTargetInput`] into a storable [`RemoteTarget`] through the `Crypto` trait
+    /// spine the control plane holds (an `Arc<dyn Crypto>`), minting the same
+    /// `arn:cairn:replication:<region>:<uuid>:<dest_bucket>` ARN shape as
+    /// `cairn_replication::seal_target`. The standalone function takes the concrete `SystemCrypto`,
+    /// so the seal is performed here against the trait object instead.
+    fn seal_remote_target(
+        &self,
+        input: RemoteTargetInput,
+    ) -> Result<RemoteTarget, ControlResponse> {
+        let sealed = self
+            .crypto
+            .seal(input.secret.as_bytes())
+            .map_err(|e| ControlResponse::error_internal(&e.to_string()))?;
+        let arn = format!(
+            "arn:cairn:replication:{}:{}:{}",
+            input.region,
+            Uuid::new_v4().simple(),
+            input.dest_bucket
+        );
+        Ok(RemoteTarget {
+            arn,
+            endpoint: input.endpoint,
+            region: input.region,
+            dest_bucket: input.dest_bucket,
+            access_key_id: input.access_key_id,
+            secret_ciphertext: sealed.ciphertext,
+            nonce: sealed.nonce.0,
+        })
+    }
+
+    // -----------------------------------------------------------------------------------
     // Activity
     // -----------------------------------------------------------------------------------
 
@@ -1266,8 +1792,18 @@ impl ControlService {
     // Internal helpers
     // -----------------------------------------------------------------------------------
 
-    /// Append an audit/activity entry for a mutating endpoint (best-effort).
-    async fn record_activity(&self, action: &str, bucket: Option<&str>, key: Option<&str>) {
+    /// Append an audit/activity entry for a mutating endpoint (best-effort). The `actor` is the
+    /// authenticated administrator's Bearer access-key id — a stable, human-recognizable identity
+    /// that survives display-name changes — so the audit trail names who performed each mutation
+    /// (ARCH §26.3). `None` only when no principal was threaded in (which the admin gate prevents
+    /// for every mutating route).
+    async fn record_activity(
+        &self,
+        action: &str,
+        bucket: Option<&str>,
+        key: Option<&str>,
+        principal: Option<&Principal>,
+    ) {
         let entry = cairn_types::meta::ActivityEntry {
             id: uuid::Uuid::new_v4().simple().to_string(),
             action: action.to_owned(),
@@ -1275,7 +1811,7 @@ impl ControlService {
             key: key.map(str::to_owned),
             size: None,
             etag: None,
-            actor: None,
+            actor: principal.map(|p| p.access_key_id.clone()),
             at: self.clock.now(),
         };
         let _ = self
@@ -1301,6 +1837,67 @@ fn find_query<'a>(query: &'a [(String, String)], name: &str) -> Option<&'a str> 
         .iter()
         .find(|(k, _)| k == name)
         .map(|(_, v)| v.as_str())
+}
+
+/// Percent-decode a single URL path segment (used for the replication-target ARN, which contains
+/// colons a client may encode). Unrecognized escapes are passed through unchanged.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| s.to_owned())
+}
+
+/// Build the canned **replication** identity-policy JSON for a destination bucket: a Principal-less
+/// per-user policy granting the four actions a dedicated destination credential needs to receive
+/// replicated writes — `s3:ReplicateObject`, `s3:ReplicateDelete`, `s3:GetObject`, `s3:PutObject` —
+/// scoped to `arn:aws:s3:::<bucket>/*` (and the bucket ARN itself, for listing) (ARCH §20.5).
+///
+/// The destination bucket name is validated up front (a `400` on a bad name); the produced JSON is
+/// re-validated through `parse_user_policy` so a future action-spelling drift is caught here rather
+/// than failing open. Returns a `500` only if that self-check unexpectedly fails.
+fn replication_policy_for_bucket(bucket: &str) -> Result<String, ControlResponse> {
+    let bucket = BucketName::parse(bucket).map_err(|e| {
+        ControlResponse::bad_request(&format!("invalid replication_policy_bucket: {e}"))
+    })?;
+    let b = bucket.as_str();
+    let policy = serde_json::json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Sid": "CairnReplicationDestination",
+            "Effect": "Allow",
+            "Action": [
+                "s3:ReplicateObject",
+                "s3:ReplicateDelete",
+                "s3:GetObject",
+                "s3:PutObject"
+            ],
+            "Resource": [
+                format!("arn:aws:s3:::{b}"),
+                format!("arn:aws:s3:::{b}/*")
+            ]
+        }]
+    });
+    let json = serde_json::to_string(&policy)
+        .unwrap_or_else(|_| "{\"Version\":\"2012-10-17\",\"Statement\":[]}".to_owned());
+    // Self-check: the canned document must be a valid identity policy. This guards against a future
+    // action-name change silently producing a document the engine would reject.
+    cairn_authz::parse_user_policy(&json)
+        .map_err(|e| ControlResponse::error_internal(&format!("canned replication policy: {e}")))?;
+    Ok(json)
 }
 
 /// Total and unprivileged-available bytes of the filesystem holding `path`, or `None` when the

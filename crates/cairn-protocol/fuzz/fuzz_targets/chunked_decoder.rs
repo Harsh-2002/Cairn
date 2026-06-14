@@ -4,7 +4,7 @@
 //! without bound; it either decodes or returns a typed error.
 
 use arbitrary::Arbitrary;
-use cairn_s3::ChunkDecoder;
+use cairn_protocol::ChunkDecoder;
 use libfuzzer_sys::fuzz_target;
 
 #[derive(Arbitrary, Debug)]

@@ -24,6 +24,11 @@ fn row(
         size_physical: 3,
         etag: ETag::from_string(etag.to_owned()),
         content_type: "text/plain".to_owned(),
+        content_encoding: None,
+        cache_control: None,
+        content_disposition: None,
+        content_language: None,
+        expires: None,
         storage_path: with_blob.then(|| StoragePath::generate(bucket)),
         compression: CompressionDescriptor::Uncompressed,
         storage_class: StorageClass::Standard,
@@ -492,6 +497,8 @@ async fn plant_outbox(
         next_attempt_at: Timestamp(0),
         status: ReplicationStatus::Pending,
         last_error: None,
+        priority: 0,
+        lease_until: None,
     };
     store
         .submit(Mutation::PutObjectVersion {

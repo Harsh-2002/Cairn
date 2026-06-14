@@ -100,6 +100,7 @@ pub fn mp_status_from(s: &str) -> MultipartStatus {
 pub fn repl_status_str(s: ReplicationStatus) -> &'static str {
     match s {
         ReplicationStatus::Pending => "pending",
+        ReplicationStatus::Claimed => "claimed",
         ReplicationStatus::Completed => "completed",
         ReplicationStatus::Failed => "failed",
         ReplicationStatus::Replica => "replica",
@@ -107,6 +108,7 @@ pub fn repl_status_str(s: ReplicationStatus) -> &'static str {
 }
 pub fn repl_status_from(s: &str) -> ReplicationStatus {
     match s {
+        "claimed" => ReplicationStatus::Claimed,
         "completed" => ReplicationStatus::Completed,
         "failed" => ReplicationStatus::Failed,
         "replica" => ReplicationStatus::Replica,
@@ -162,6 +164,11 @@ pub fn object_version_from_row(row: &Row) -> rusqlite::Result<ObjectVersionRow> 
         size_physical: row.get::<_, i64>("size_physical")? as u64,
         etag: ETag::from_string(row.get("etag")?),
         content_type: row.get("content_type")?,
+        content_encoding: row.get::<_, Option<String>>("content_encoding")?,
+        cache_control: row.get::<_, Option<String>>("cache_control")?,
+        content_disposition: row.get::<_, Option<String>>("content_disposition")?,
+        content_language: row.get::<_, Option<String>>("content_language")?,
+        expires: row.get::<_, Option<String>>("expires")?,
         storage_path: row
             .get::<_, Option<String>>("storage_path")?
             .map(StoragePath::from_string),
@@ -295,6 +302,8 @@ pub fn outbox_from_row(row: &Row) -> rusqlite::Result<OutboxEntry> {
         next_attempt_at: Timestamp(row.get("next_attempt_at")?),
         status: repl_status_from(&row.get::<_, String>("status")?),
         last_error: row.get("last_error")?,
+        priority: row.get::<_, i64>("priority")?,
+        lease_until: row.get::<_, Option<i64>>("lease_until")?.map(Timestamp),
     })
 }
 

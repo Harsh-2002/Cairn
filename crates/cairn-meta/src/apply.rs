@@ -8,6 +8,7 @@ use cairn_types::MetaError;
 use cairn_types::id::{BucketName, ObjectKey, StoragePath, VersionId};
 use cairn_types::meta::{IfNoneMatch, Mutation, MutationOutcome, OutboxEntry, Precondition};
 use cairn_types::object::{ETag, ObjectVersionRow};
+use cairn_types::time::Timestamp;
 use rusqlite::{Connection, OptionalExtension, params};
 
 type R<T> = Result<T, MetaError>;
@@ -39,6 +40,11 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
                 size_physical: 0,
                 etag: ETag::from_string(String::new()),
                 content_type: String::new(),
+                content_encoding: None,
+                cache_control: None,
+                content_disposition: None,
+                content_language: None,
+                expires: None,
                 storage_path: None,
                 compression: cairn_types::object::CompressionDescriptor::Uncompressed,
                 storage_class: cairn_types::object::StorageClass::Standard,
@@ -123,6 +129,7 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             let key = row.key.clone();
             check_precondition(conn, &bucket, &key, &precondition)?;
             enforce_bucket_quota(conn, &row)?;
+            enforce_user_quota(conn, &row)?;
             let version_id = row.version_id.clone();
             let superseded = upsert_version(conn, *row)?;
             conn.execute(
@@ -237,6 +244,35 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             .map_err(engine_err)?;
             Ok(MutationOutcome::Ack)
         }
+        Mutation::SetUserQuota {
+            user_id,
+            quota_bytes,
+        } => {
+            conn.execute(
+                "UPDATE users SET quota_bytes=?2 WHERE id=?1",
+                params![user_id.0.as_str(), quota_bytes.map(|q| q as i64)],
+            )
+            .map_err(engine_err)?;
+            Ok(MutationOutcome::Ack)
+        }
+        Mutation::RetryFailedReplication { bucket, now } => {
+            // Reset `attempts=0`: a terminally-failed entry sits at the max-attempts boundary, so
+            // requeuing without clearing the count would re-fail on the very next attempt.
+            match bucket {
+                Some(b) => conn.execute(
+                    "UPDATE replication_outbox SET status='pending', next_attempt_at=?2, attempts=0, lease_until=NULL \
+                     WHERE status='failed' AND bucket_name=?1",
+                    params![b.as_str(), now.0],
+                ),
+                None => conn.execute(
+                    "UPDATE replication_outbox SET status='pending', next_attempt_at=?1, attempts=0, lease_until=NULL \
+                     WHERE status='failed'",
+                    params![now.0],
+                ),
+            }
+            .map_err(engine_err)?;
+            Ok(MutationOutcome::Ack)
+        }
         Mutation::SetAccountPublicAccessBlock(bpa) => {
             conn.execute(
                 "INSERT OR REPLACE INTO account_config (k, v) VALUES ('public_access_block', ?1)",
@@ -333,6 +369,11 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
                 .map_err(engine_err)?;
             Ok(MutationOutcome::Ack)
         }
+        Mutation::ClaimReplicationBatch {
+            limit,
+            now,
+            lease_secs,
+        } => claim_replication_batch(conn, limit, now, lease_secs),
         Mutation::MarkReplicationDone(id) => {
             if let Some((bucket, key, version)) = conn
                 .query_row(
@@ -409,6 +450,7 @@ fn put_version(
 ) -> R<MutationOutcome> {
     check_precondition(conn, &row.bucket, &row.key, precondition)?;
     enforce_bucket_quota(conn, &row)?;
+    enforce_user_quota(conn, &row)?;
     let version_id = row.version_id.clone();
     let superseded = upsert_version(conn, row)?;
     if let Some(e) = replication {
@@ -446,6 +488,50 @@ fn enforce_bucket_quota(conn: &Connection, row: &ObjectVersionRow) -> R<()> {
             "SELECT COALESCE(SUM(size_logical), 0) FROM object_versions
              WHERE bucket_name=?1 AND NOT (key=?2 AND version_id=?3)",
             params![
+                row.bucket.as_str(),
+                row.key.as_str(),
+                row.version_id.as_str()
+            ],
+            |r| r.get(0),
+        )
+        .map_err(engine_err)?;
+    // Saturating add in u128 so a pathological size can never wrap past the quota check.
+    let projected = u128::from(current.max(0) as u64) + u128::from(row.size_logical);
+    if projected > u128::from(quota.max(0) as u64) {
+        return Err(MetaError::QuotaExceeded);
+    }
+    Ok(())
+}
+
+/// Enforce the owning user's optional byte quota inside the commit transaction (ARCH §27.5).
+///
+/// Mirrors [`enforce_bucket_quota`] but scoped to the row's `owner_id`: if that user has a
+/// non-NULL `quota_bytes`, the write is rejected with [`MetaError::QuotaExceeded`] when the
+/// user's resulting logical bytes — summed over `size_logical` of every `object_versions` row
+/// they own across all buckets — would exceed the quota. The existing row at the same
+/// (bucket, key, version_id), if any, is excluded because the upsert replaces it. Delete
+/// markers carry no logical bytes, so they never trip the quota.
+fn enforce_user_quota(conn: &Connection, row: &ObjectVersionRow) -> R<()> {
+    let quota: Option<i64> = conn
+        .query_row(
+            "SELECT quota_bytes FROM users WHERE id=?1",
+            params![row.owner_id.0.as_str()],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(engine_err)?
+        .flatten();
+    let Some(quota) = quota else {
+        return Ok(());
+    };
+    // Current logical bytes owned by this user across all buckets, excluding the row this
+    // upsert will replace.
+    let current: i64 = conn
+        .query_row(
+            "SELECT COALESCE(SUM(size_logical), 0) FROM object_versions
+             WHERE owner_id=?1 AND NOT (bucket_name=?2 AND key=?3 AND version_id=?4)",
+            params![
+                row.owner_id.0.as_str(),
                 row.bucket.as_str(),
                 row.key.as_str(),
                 row.version_id.as_str()
@@ -500,9 +586,10 @@ fn insert_version(conn: &Connection, row: &ObjectVersionRow) -> R<()> {
     conn.execute(
         "INSERT INTO object_versions
          (id, bucket_name, key, version_id, is_latest, is_delete_marker, size_logical, size_physical,
-          etag, content_type, storage_path, compression, storage_class, cold_locator, owner_id,
+          etag, content_type, content_encoding, cache_control, content_disposition, content_language,
+          expires, storage_path, compression, storage_class, cold_locator, owner_id,
           user_metadata, acl, checksums, sse_descriptor, replication_status, created_at, updated_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)",
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27)",
         params![
             row.id,
             row.bucket.as_str(),
@@ -514,6 +601,11 @@ fn insert_version(conn: &Connection, row: &ObjectVersionRow) -> R<()> {
             row.size_physical as i64,
             row.etag.as_str(),
             row.content_type,
+            row.content_encoding,
+            row.cache_control,
+            row.content_disposition,
+            row.content_language,
+            row.expires,
             row.storage_path.as_ref().map(|p| p.as_str().to_owned()),
             to_json(&row.compression),
             storage_class_str(row.storage_class),
@@ -657,8 +749,8 @@ fn check_precondition(
 fn enqueue(conn: &Connection, e: &OutboxEntry) -> R<()> {
     conn.execute(
         "INSERT INTO replication_outbox
-         (id, bucket_name, key, version_id, operation, rule_id, attempts, next_attempt_at, status, last_error)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+         (id, bucket_name, key, version_id, operation, rule_id, attempts, next_attempt_at, status, last_error, priority, lease_until)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
         params![
             e.id,
             e.bucket.as_str(),
@@ -670,10 +762,56 @@ fn enqueue(conn: &Connection, e: &OutboxEntry) -> R<()> {
             e.next_attempt_at.0,
             repl_status_str(e.status),
             e.last_error,
+            e.priority,
+            e.lease_until.map(|t| t.0),
         ],
     )
     .map_err(engine_err)?;
     Ok(())
+}
+
+/// Atomically claim up to `limit` due outbox entries: an entry is due when it is `pending`, or
+/// `claimed` with an expired lease, and its `next_attempt_at` has passed. Claimed entries are
+/// marked `status='claimed', lease_until = now + lease_secs` and returned. This runs inside the
+/// writer's transaction, so the select-and-mark is atomic against other claimers.
+fn claim_replication_batch(
+    conn: &Connection,
+    limit: u32,
+    now: Timestamp,
+    lease_secs: i64,
+) -> R<MutationOutcome> {
+    let lease_until = now.0 + lease_secs * 1000;
+    let ids: Vec<String> = {
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT id FROM replication_outbox
+                 WHERE (status='pending' OR (status='claimed' AND lease_until < ?1))
+                   AND next_attempt_at <= ?1
+                 ORDER BY priority DESC, next_attempt_at LIMIT ?2",
+            )
+            .map_err(engine_err)?;
+        stmt.query_map(params![now.0, i64::from(limit)], |r| r.get::<_, String>(0))
+            .map_err(engine_err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(engine_err)?
+    };
+    let mut claimed = Vec::with_capacity(ids.len());
+    for id in &ids {
+        conn.execute(
+            "UPDATE replication_outbox SET status='claimed', lease_until=?2 WHERE id=?1",
+            params![id, lease_until],
+        )
+        .map_err(engine_err)?;
+        let entry = conn
+            .query_row(
+                "SELECT * FROM replication_outbox WHERE id=?1",
+                params![id],
+                model::outbox_from_row,
+            )
+            .map_err(engine_err)?;
+        claimed.push(entry);
+    }
+    Ok(MutationOutcome::ReplicationBatch(claimed))
 }
 
 fn config_aspect_str(a: cairn_types::bucket::ConfigAspect) -> &'static str {
@@ -684,6 +822,7 @@ fn config_aspect_str(a: cairn_types::bucket::ConfigAspect) -> &'static str {
         Cors => "cors",
         Lifecycle => "lifecycle",
         Replication => "replication",
+        ReplicationTargets => "replication_targets",
         Tagging => "tagging",
         PublicAccessBlock => "public_access_block",
         Encryption => "encryption",
@@ -717,6 +856,38 @@ mod tests {
         .unwrap();
     }
 
+    fn seed_user(conn: &Connection, id: &str, quota: Option<i64>) {
+        conn.execute(
+            "INSERT INTO users
+             (id, display_name, access_key_id, secret_hash, role, is_active, created_at, updated_at, quota_bytes)
+             VALUES (?1, ?1, ?1, 'h', 'member', 1, 0, 0, ?2)",
+            params![id, quota],
+        )
+        .unwrap();
+    }
+
+    fn obj_row_owned(
+        bucket: &str,
+        key: &str,
+        version: &str,
+        size: u64,
+        owner: &str,
+    ) -> ObjectVersionRow {
+        ObjectVersionRow {
+            owner_id: UserId(owner.to_owned()),
+            ..obj_row(bucket, key, version, size)
+        }
+    }
+
+    fn user_logical_bytes(conn: &Connection, owner: &str) -> i64 {
+        conn.query_row(
+            "SELECT COALESCE(SUM(size_logical),0) FROM object_versions WHERE owner_id=?1",
+            params![owner],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
     fn obj_row(bucket: &str, key: &str, version: &str, size: u64) -> ObjectVersionRow {
         ObjectVersionRow {
             id: uuid::Uuid::new_v4().simple().to_string(),
@@ -729,6 +900,11 @@ mod tests {
             size_physical: size,
             etag: ETag::from_string("e".to_owned()),
             content_type: "text/plain".to_owned(),
+            content_encoding: None,
+            cache_control: None,
+            content_disposition: None,
+            content_language: None,
+            expires: None,
             storage_path: Some(StoragePath::from_string(format!("{bucket}/{version}"))),
             compression: CompressionDescriptor::Uncompressed,
             storage_class: StorageClass::Standard,
@@ -857,5 +1033,76 @@ mod tests {
             },
         )
         .unwrap();
+    }
+
+    #[test]
+    fn put_under_user_quota_succeeds() {
+        let conn = conn_with_schema();
+        seed_bucket(&conn, "bkt", None);
+        seed_user(&conn, "alice", Some(100));
+        apply(&conn, put(obj_row_owned("bkt", "k", "v1", 60, "alice"))).unwrap();
+        assert_eq!(user_logical_bytes(&conn, "alice"), 60);
+    }
+
+    #[test]
+    fn put_exceeding_user_quota_rejected_and_commits_nothing() {
+        let conn = conn_with_schema();
+        // Two buckets with no bucket quota: the user quota must aggregate across both.
+        seed_bucket(&conn, "bkt1", None);
+        seed_bucket(&conn, "bkt2", None);
+        seed_user(&conn, "alice", Some(100));
+        apply_in_savepoint(&conn, put(obj_row_owned("bkt1", "k1", "v1", 60, "alice"))).unwrap();
+        // 60 (in bkt1) + 50 (in bkt2) = 110 > 100: rejected and rolled back.
+        let err = apply_in_savepoint(&conn, put(obj_row_owned("bkt2", "k2", "v1", 50, "alice")))
+            .unwrap_err();
+        assert!(matches!(err, MetaError::QuotaExceeded));
+        assert_eq!(user_logical_bytes(&conn, "alice"), 60);
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM object_versions WHERE owner_id='alice'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1);
+    }
+
+    #[test]
+    fn unset_user_quota_is_unlimited() {
+        let conn = conn_with_schema();
+        seed_bucket(&conn, "bkt", None);
+        // User row exists but quota_bytes is NULL -> no enforcement.
+        seed_user(&conn, "alice", None);
+        apply(
+            &conn,
+            put(obj_row_owned("bkt", "k", "v1", 1_000_000, "alice")),
+        )
+        .unwrap();
+        assert_eq!(user_logical_bytes(&conn, "alice"), 1_000_000);
+    }
+
+    #[test]
+    fn missing_user_row_is_unlimited() {
+        let conn = conn_with_schema();
+        seed_bucket(&conn, "bkt", None);
+        // No users row for the owner at all -> no enforcement.
+        apply(
+            &conn,
+            put(obj_row_owned("bkt", "k", "v1", 1_000_000, "nobody")),
+        )
+        .unwrap();
+        assert_eq!(user_logical_bytes(&conn, "nobody"), 1_000_000);
+    }
+
+    #[test]
+    fn overwriting_same_version_counts_only_new_size_for_user_quota() {
+        let conn = conn_with_schema();
+        seed_bucket(&conn, "bkt", None);
+        seed_user(&conn, "alice", Some(100));
+        apply(&conn, put(obj_row_owned("bkt", "k", "v1", 90, "alice"))).unwrap();
+        // Replacing the same (bucket,key,version) with 95 bytes supersedes the old 90, so the
+        // user's total is 95 (not 185) and the 100-byte quota is not exceeded.
+        apply(&conn, put(obj_row_owned("bkt", "k", "v1", 95, "alice"))).unwrap();
+        assert_eq!(user_logical_bytes(&conn, "alice"), 95);
     }
 }

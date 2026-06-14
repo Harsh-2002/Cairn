@@ -27,6 +27,11 @@ struct State {
     /// Per-bucket byte quota (`buckets.quota_bytes`), absent when unlimited. The double does not
     /// enforce the quota (that lives in the SQLite writer), but it records the configured value so
     /// `get_bucket_quota` round-trips a `SetBucketQuota`.
+    ///
+    /// The per-user byte quota (`users.quota_bytes`, ARCH §27.5) is likewise enforced only in the
+    /// SQLite writer's commit transaction; like the bucket quota it is not enforced here, and —
+    /// having no `SetUserQuota` mutation or reader on `MetadataStore` — there is nothing for the
+    /// double to round-trip, so no user-quota state is modeled.
     bucket_quotas: HashMap<String, u64>,
     config: HashMap<(String, ConfigAspect), ConfigDoc>,
     account_bpa: PublicAccessBlock,
@@ -172,13 +177,37 @@ fn summarize(r: &ObjectVersionRow) -> ObjectSummary {
 }
 
 /// Page a set of rows (already filtered) honouring prefix, delimiter, cursor, and limit.
-fn page_rows(rows: Vec<&ObjectVersionRow>, q: &ListQuery) -> ListPage<ObjectSummary> {
+fn page_rows(
+    rows: Vec<&ObjectVersionRow>,
+    q: &ListQuery,
+    version_listing: bool,
+) -> ListPage<ObjectSummary> {
     let prefix = q.prefix.clone().unwrap_or_default();
     let after = key_after(q).map(str::to_owned);
+    // A version-id marker (paired with the cursor key) resumes strictly after `(key, marker)`
+    // within that key. Versions sort `version_id DESC`, so entries already returned for the marker
+    // key have `version_id >= marker`; we exclude exactly those, plus all rows at-or-before the key.
+    let vid_marker: Option<(String, String)> = q
+        .version_id_marker
+        .as_deref()
+        .zip(q.cursor.as_deref())
+        .map(|(vid, key)| (key.to_owned(), vid.to_owned()));
     let mut ordered: Vec<&ObjectVersionRow> = rows
         .into_iter()
         .filter(|r| r.key.as_str().starts_with(&prefix))
-        .filter(|r| after.as_deref().is_none_or(|a| r.key.as_str() > a))
+        .filter(|r| match (&after, &vid_marker) {
+            // When a version-id marker is in play, the marker key itself is not excluded by the
+            // key cursor; its post-marker versions resume below.
+            (Some(a), Some((mk, _))) => {
+                r.key.as_str() > a.as_str() || r.key.as_str() == mk.as_str()
+            }
+            (Some(a), None) => r.key.as_str() > a.as_str(),
+            (None, _) => true,
+        })
+        .filter(|r| match &vid_marker {
+            Some((mk, mv)) if r.key.as_str() == mk.as_str() => r.version_id.as_str() < mv.as_str(),
+            _ => true,
+        })
         .collect();
     ordered.sort_by(|a, b| {
         a.key
@@ -191,12 +220,16 @@ fn page_rows(rows: Vec<&ObjectVersionRow>, q: &ListQuery) -> ListPage<ObjectSumm
     let mut seen_cp: HashSet<String> = HashSet::new();
     let limit = q.limit.max(1) as usize;
     let mut last_key: Option<String> = None;
+    let mut last_version: Option<String> = None;
 
     for r in ordered {
         let count = page.items.len() + page.common_prefixes.len();
         if count >= limit {
             page.truncated = true;
             page.next_cursor = last_key.clone();
+            if version_listing {
+                page.next_version_id_marker = last_version.clone();
+            }
             break;
         }
         if let Some(delim) = q.delimiter.as_deref() {
@@ -212,6 +245,7 @@ fn page_rows(rows: Vec<&ObjectVersionRow>, q: &ListQuery) -> ListPage<ObjectSumm
         }
         page.items.push(summarize(r));
         last_key = Some(r.key.as_str().to_owned());
+        last_version = Some(r.version_id.as_str().to_owned());
     }
     page
 }
@@ -257,6 +291,11 @@ impl MetadataStore for InMemoryMetadataStore {
                     size_physical: 0,
                     etag: ETag::from_string(String::new()),
                     content_type: String::new(),
+                    content_encoding: None,
+                    cache_control: None,
+                    content_disposition: None,
+                    content_language: None,
+                    expires: None,
                     storage_path: None,
                     compression: crate::object::CompressionDescriptor::Uncompressed,
                     storage_class: crate::object::StorageClass::Standard,
@@ -427,6 +466,30 @@ impl MetadataStore for InMemoryMetadataStore {
                 };
                 Ok(MutationOutcome::Ack)
             }
+            Mutation::SetUserQuota {
+                user_id: _,
+                quota_bytes: _,
+            } => {
+                // User-quota enforcement lives in the SQLite writer's commit transaction (like the
+                // bucket quota); the double neither enforces nor — absent a user-quota reader on the
+                // trait — round-trips it, so this is an accepted no-op.
+                Ok(MutationOutcome::Ack)
+            }
+            Mutation::RetryFailedReplication { bucket, now } => {
+                for e in &mut st.outbox {
+                    if e.status == ReplicationStatus::Failed
+                        && bucket
+                            .as_ref()
+                            .is_none_or(|b| e.bucket.as_str() == b.as_str())
+                    {
+                        e.status = ReplicationStatus::Pending;
+                        e.next_attempt_at = now;
+                        e.attempts = 0;
+                        e.lease_until = None;
+                    }
+                }
+                Ok(MutationOutcome::Ack)
+            }
             Mutation::SetAccountPublicAccessBlock(bpa) => {
                 st.account_bpa = bpa;
                 Ok(MutationOutcome::Ack)
@@ -490,6 +553,42 @@ impl MetadataStore for InMemoryMetadataStore {
                 }
                 Ok(MutationOutcome::Ack)
             }
+            Mutation::ClaimReplicationBatch {
+                limit,
+                now,
+                lease_secs,
+            } => {
+                let lease_until = Timestamp(now.0 + lease_secs * 1000);
+                // Due = pending, or claimed with an expired lease, and next_attempt_at has passed.
+                let mut due: Vec<usize> = st
+                    .outbox
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, e)| {
+                        e.next_attempt_at <= now
+                            && (e.status == ReplicationStatus::Pending
+                                || (e.status == ReplicationStatus::Claimed
+                                    && e.lease_until.is_some_and(|l| l < now)))
+                    })
+                    .map(|(i, _)| i)
+                    .collect();
+                // Order by priority DESC, then next_attempt_at ASC (mirroring the SQL claim).
+                due.sort_by(|&a, &b| {
+                    let (ea, eb) = (&st.outbox[a], &st.outbox[b]);
+                    eb.priority
+                        .cmp(&ea.priority)
+                        .then(ea.next_attempt_at.cmp(&eb.next_attempt_at))
+                });
+                due.truncate(limit as usize);
+                let mut claimed = Vec::with_capacity(due.len());
+                for i in due {
+                    let e = &mut st.outbox[i];
+                    e.status = ReplicationStatus::Claimed;
+                    e.lease_until = Some(lease_until);
+                    claimed.push(e.clone());
+                }
+                Ok(MutationOutcome::ReplicationBatch(claimed))
+            }
             Mutation::MarkReplicationDone(id) => {
                 if let Some(e) = st.outbox.iter_mut().find(|e| e.id == id) {
                     e.status = ReplicationStatus::Completed;
@@ -505,7 +604,13 @@ impl MetadataStore for InMemoryMetadataStore {
                     e.attempts += 1;
                     e.last_error = Some(error);
                     match next_attempt_at {
-                        Some(t) => e.next_attempt_at = t,
+                        // Reschedule: release the claim back to pending (mirrors the SQL
+                        // `status='pending'` reset) so the entry is re-claimable after backoff.
+                        Some(t) => {
+                            e.next_attempt_at = t;
+                            e.status = ReplicationStatus::Pending;
+                            e.lease_until = None;
+                        }
                         None => e.status = ReplicationStatus::Failed,
                     }
                 }
@@ -612,7 +717,7 @@ impl MetadataStore for InMemoryMetadataStore {
             .values()
             .filter(|r| r.bucket.as_str() == bucket.as_str() && r.is_latest && !r.is_delete_marker)
             .collect();
-        Ok(page_rows(rows, query))
+        Ok(page_rows(rows, query, false))
     }
 
     async fn list_versions(
@@ -626,7 +731,7 @@ impl MetadataStore for InMemoryMetadataStore {
             .values()
             .filter(|r| r.bucket.as_str() == bucket.as_str())
             .collect();
-        Ok(page_rows(rows, query))
+        Ok(page_rows(rows, query, true))
     }
 
     async fn enumerate_storage_paths(
@@ -655,6 +760,7 @@ impl MetadataStore for InMemoryMetadataStore {
             items: paths.into_iter().map(StoragePath::from_string).collect(),
             common_prefixes: Vec::new(),
             next_cursor,
+            next_version_id_marker: None,
             truncated,
         })
     }
@@ -718,6 +824,7 @@ impl MetadataStore for InMemoryMetadataStore {
             items,
             common_prefixes: Vec::new(),
             next_cursor,
+            next_version_id_marker: None,
             truncated,
         })
     }
@@ -729,6 +836,7 @@ impl MetadataStore for InMemoryMetadataStore {
     ) -> Result<ListPage<MultipartSession>, MetaError> {
         let st = self.state.lock().unwrap();
         let prefix = query.prefix.clone().unwrap_or_default();
+        let after = query.cursor.as_deref();
         let mut items: Vec<MultipartSession> = st
             .multipart
             .values()
@@ -736,16 +844,29 @@ impl MetadataStore for InMemoryMetadataStore {
                 s.bucket.as_str() == bucket.as_str()
                     && s.status == MultipartStatus::Active
                     && s.key.as_str().starts_with(&prefix)
+                    && after.is_none_or(|c| s.key.as_str() > c)
             })
             .cloned()
             .collect();
-        items.sort_by(|a, b| a.key.as_str().cmp(b.key.as_str()));
-        let truncated = items.len() > query.limit.max(1) as usize;
-        items.truncate(query.limit.max(1) as usize);
+        items.sort_by(|a, b| {
+            a.key
+                .as_str()
+                .cmp(b.key.as_str())
+                .then_with(|| a.upload_id.as_str().cmp(b.upload_id.as_str()))
+        });
+        let limit = query.limit.max(1) as usize;
+        let truncated = items.len() > limit;
+        items.truncate(limit);
+        let next_cursor = if truncated {
+            items.last().map(|s| s.key.as_str().to_owned())
+        } else {
+            None
+        };
         Ok(ListPage {
             items,
             common_prefixes: Vec::new(),
-            next_cursor: None,
+            next_cursor,
+            next_version_id_marker: None,
             truncated,
         })
     }
@@ -790,14 +911,47 @@ impl MetadataStore for InMemoryMetadataStore {
         limit: u32,
         now: Timestamp,
     ) -> Result<Vec<OutboxEntry>, MetaError> {
+        // Mirror the real stores: claiming is a write that marks entries `claimed` under a lease.
+        match self
+            .submit(Mutation::ClaimReplicationBatch {
+                limit,
+                now,
+                lease_secs: 300,
+            })
+            .await?
+        {
+            MutationOutcome::ReplicationBatch(entries) => Ok(entries),
+            other => Err(MetaError::Engine(format!(
+                "unexpected outcome for ClaimReplicationBatch: {other:?}"
+            ))),
+        }
+    }
+
+    async fn list_due_replication(
+        &self,
+        limit: u32,
+        now: Timestamp,
+    ) -> Result<Vec<OutboxEntry>, MetaError> {
+        // Read-only mirror of the claim predicate; no mutation.
         let st = self.state.lock().unwrap();
-        Ok(st
+        let mut due: Vec<OutboxEntry> = st
             .outbox
             .iter()
-            .filter(|e| e.status == ReplicationStatus::Pending && e.next_attempt_at <= now)
-            .take(limit as usize)
+            .filter(|e| {
+                e.next_attempt_at <= now
+                    && (e.status == ReplicationStatus::Pending
+                        || (e.status == ReplicationStatus::Claimed
+                            && e.lease_until.is_some_and(|l| l < now)))
+            })
             .cloned()
-            .collect())
+            .collect();
+        due.sort_by(|a, b| {
+            b.priority
+                .cmp(&a.priority)
+                .then(a.next_attempt_at.cmp(&b.next_attempt_at))
+        });
+        due.truncate(limit as usize);
+        Ok(due)
     }
 
     async fn list_failed_replication(&self, limit: u32) -> Result<Vec<OutboxEntry>, MetaError> {

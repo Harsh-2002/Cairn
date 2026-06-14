@@ -1,4 +1,4 @@
-//! `cairn-s3` — the S3 protocol layer: request dispatch, the request lifecycles, the streaming
+//! `cairn-protocol` — the S3 protocol layer: request dispatch, the request lifecycles, the streaming
 //! chunked-upload decoder, and the total error translator to S3 XML. Handlers depend only on
 //! the trait spine in `cairn-types`.
 

@@ -32,6 +32,7 @@ pub fn map(err: &Error) -> (StatusCode, &'static str) {
         SignatureDoesNotMatch => (StatusCode::FORBIDDEN, "SignatureDoesNotMatch"),
         InvalidRange => (StatusCode::RANGE_NOT_SATISFIABLE, "InvalidRange"),
         NotImplemented => (StatusCode::NOT_IMPLEMENTED, "NotImplemented"),
+        AclNotSupported => (StatusCode::BAD_REQUEST, "AccessControlListNotSupported"),
         Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "InternalError"),
     }
 }

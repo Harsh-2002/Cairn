@@ -1,5 +1,5 @@
 //! SigV4 streaming chunk-signature primitives (ARCH §14.3). The ingest-path chunk decoder
-//! (in `cairn-s3`) calls these per chunk to verify the rolling signature chain seeded by the
+//! (in `cairn-protocol`) calls these per chunk to verify the rolling signature chain seeded by the
 //! request's header signature. Verified against the AWS streaming example.
 
 use crate::crypto_util::sha256_hex;

@@ -114,6 +114,11 @@ async fn put_object(h: &Harness, bucket: &str, key: &str, data: &'static [u8]) {
         size_physical: staged.size_physical,
         etag: ETag::from_md5_hex(staged.md5_hex.clone()),
         content_type: "application/octet-stream".to_owned(),
+        content_encoding: None,
+        cache_control: None,
+        content_disposition: None,
+        content_language: None,
+        expires: None,
         storage_path: Some(staged.storage_path.clone()),
         compression: CompressionDescriptor::Uncompressed,
         storage_class: StorageClass::Standard,
@@ -1167,6 +1172,8 @@ async fn failed_replication_reflects_a_planted_terminal_entry() {
         next_attempt_at: cairn_types::time::Timestamp(0),
         status: cairn_types::meta::ReplicationStatus::Pending,
         last_error: None,
+        priority: 0,
+        lease_until: None,
     };
     let now = h.clock.now();
     let row = ObjectVersionRow {
@@ -1180,6 +1187,11 @@ async fn failed_replication_reflects_a_planted_terminal_entry() {
         size_physical: 4,
         etag: ETag::from_md5_hex("deadbeef".to_owned()),
         content_type: "image/jpeg".to_owned(),
+        content_encoding: None,
+        cache_control: None,
+        content_disposition: None,
+        content_language: None,
+        expires: None,
         storage_path: Some(cairn_types::id::StoragePath::from_string(
             "repl/00000001".to_owned(),
         )),
@@ -1331,6 +1343,478 @@ async fn config_mutations_record_activity() {
         .map(|e| e["action"].as_str().unwrap())
         .collect();
     assert!(actions.contains(&"SetVersioning"));
+}
+
+#[tokio::test]
+async fn health_reflects_store_readiness() {
+    let h = harness();
+    // A working store probes ready.
+    let resp = h
+        .svc
+        .handle(&Method::GET, "/health", &[], None, Bytes::new())
+        .await;
+    assert_eq!(resp.status, StatusCode::OK);
+    let v = json(&resp);
+    assert_eq!(v["status"], "ok");
+    assert_eq!(v["ready"], true);
+
+    // Every control response, including the unauthenticated health probe, carries a request id.
+    assert!(!resp.request_id.is_empty());
+}
+
+#[tokio::test]
+async fn error_envelope_and_response_carry_request_id() {
+    let h = harness();
+    let a = admin();
+
+    // An error path: a 404 envelope carries a non-empty request_id that matches the response field.
+    let resp = h
+        .svc
+        .handle(&Method::GET, "/nope/nowhere", &[], Some(&a), Bytes::new())
+        .await;
+    assert_eq!(resp.status, StatusCode::NOT_FOUND);
+    assert!(!resp.request_id.is_empty());
+    let v = json(&resp);
+    assert_eq!(v["error"], "not found");
+    assert_eq!(v["request_id"], resp.request_id.as_str());
+
+    // A success path also carries a request id (on the response, for the header).
+    let resp = h
+        .svc
+        .handle(&Method::GET, "/health", &[], Some(&a), Bytes::new())
+        .await;
+    assert!(!resp.request_id.is_empty());
+
+    // Two requests get distinct ids.
+    let r1 = h
+        .svc
+        .handle(&Method::GET, "/health", &[], None, Bytes::new())
+        .await;
+    let r2 = h
+        .svc
+        .handle(&Method::GET, "/health", &[], None, Bytes::new())
+        .await;
+    assert_ne!(r1.request_id, r2.request_id);
+}
+
+#[tokio::test]
+async fn record_activity_populates_actor() {
+    let h = harness();
+    let a = admin();
+    make_bucket(&h, &a, "audited").await;
+
+    // The recorded activity entry names the acting administrator by access-key id.
+    let entries = h.meta.list_activity(100).await.unwrap();
+    let create = entries
+        .iter()
+        .find(|e| e.action == "CreateBucket")
+        .expect("CreateBucket activity entry");
+    assert_eq!(create.actor.as_deref(), Some("cairn_admin"));
+}
+
+#[tokio::test]
+async fn set_user_quota_is_accepted_and_gated() {
+    let h = harness();
+    let a = admin();
+    let (id, _key) = create_member(&h, &a).await;
+
+    // Set a quota.
+    let resp = h
+        .svc
+        .handle(
+            &Method::PUT,
+            &format!("/users/{id}/quota"),
+            &[],
+            Some(&a),
+            Bytes::from_static(br#"{"quota_bytes":1048576}"#),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::NO_CONTENT);
+
+    // Clear it (null).
+    let resp = h
+        .svc
+        .handle(
+            &Method::PUT,
+            &format!("/users/{id}/quota"),
+            &[],
+            Some(&a),
+            Bytes::from_static(br#"{"quota_bytes":null}"#),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::NO_CONTENT);
+
+    // Unknown user -> 404.
+    let resp = h
+        .svc
+        .handle(
+            &Method::PUT,
+            "/users/nobody/quota",
+            &[],
+            Some(&a),
+            Bytes::from_static(br#"{"quota_bytes":1}"#),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::NOT_FOUND);
+
+    // Bad body -> 400.
+    let resp = h
+        .svc
+        .handle(
+            &Method::PUT,
+            &format!("/users/{id}/quota"),
+            &[],
+            Some(&a),
+            Bytes::from_static(b"not json"),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::BAD_REQUEST);
+
+    // Non-admin -> 403.
+    let m = member();
+    let resp = h
+        .svc
+        .handle(
+            &Method::PUT,
+            &format!("/users/{id}/quota"),
+            &[],
+            Some(&m),
+            Bytes::from_static(br#"{"quota_bytes":1}"#),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn create_user_with_replication_policy_attaches_it() {
+    let h = harness();
+    let a = admin();
+    make_bucket(&h, &a, "mirror").await;
+
+    let resp = h
+        .svc
+        .handle(
+            &Method::POST,
+            "/users",
+            &[],
+            Some(&a),
+            Bytes::from_static(
+                br#"{"display_name":"Replicator","role":"member","replication_policy_bucket":"mirror"}"#,
+            ),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::CREATED);
+    let id = json(&resp)["id"].as_str().unwrap().to_owned();
+
+    // The canned replication policy is attached and grants the replication actions on the bucket.
+    let resp = h
+        .svc
+        .handle(
+            &Method::GET,
+            &format!("/users/{id}/policy"),
+            &[],
+            Some(&a),
+            Bytes::new(),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::OK);
+    let v = json(&resp);
+    let actions: Vec<&str> = v["policy"]["Statement"][0]["Action"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_str().unwrap())
+        .collect();
+    assert!(actions.contains(&"s3:ReplicateObject"));
+    assert!(actions.contains(&"s3:ReplicateDelete"));
+    assert!(actions.contains(&"s3:GetObject"));
+    assert!(actions.contains(&"s3:PutObject"));
+    let resources: Vec<&str> = v["policy"]["Statement"][0]["Resource"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_str().unwrap())
+        .collect();
+    assert!(resources.contains(&"arn:aws:s3:::mirror/*"));
+
+    // A bad destination bucket name -> 400 (and no user is half-provisioned).
+    let resp = h
+        .svc
+        .handle(
+            &Method::POST,
+            "/users",
+            &[],
+            Some(&a),
+            Bytes::from_static(
+                br#"{"display_name":"X","role":"member","replication_policy_bucket":"A"}"#,
+            ),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn replication_target_add_list_hides_secret_and_delete_round_trip() {
+    let h = harness();
+    let a = admin();
+    make_bucket(&h, &a, "src").await;
+
+    // Add a target.
+    let resp = h
+        .svc
+        .handle(
+            &Method::POST,
+            "/buckets/src/replication/targets",
+            &[],
+            Some(&a),
+            Bytes::from_static(
+                br#"{"endpoint":"https://peer.example.com:9000","region":"us-west-2","dest_bucket":"mirror","access_key":"AKIDPEER","secret":"super-secret-key"}"#,
+            ),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::CREATED);
+    let v = json(&resp);
+    let arn = v["arn"].as_str().unwrap().to_owned();
+    assert!(arn.starts_with("arn:cairn:replication:us-west-2:"));
+    assert!(arn.ends_with(":mirror"));
+    // The creation response must NOT echo the secret.
+    assert!(
+        !resp
+            .body
+            .windows(b"super-secret-key".len())
+            .any(|w| w == b"super-secret-key")
+    );
+
+    // List shows the target WITHOUT any secret material.
+    let resp = h
+        .svc
+        .handle(
+            &Method::GET,
+            "/buckets/src/replication/targets",
+            &[],
+            Some(&a),
+            Bytes::new(),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::OK);
+    let v = json(&resp);
+    let targets = v["targets"].as_array().unwrap();
+    assert_eq!(targets.len(), 1);
+    assert_eq!(targets[0]["arn"], arn.as_str());
+    assert_eq!(targets[0]["endpoint"], "https://peer.example.com:9000");
+    assert_eq!(targets[0]["region"], "us-west-2");
+    assert_eq!(targets[0]["dest_bucket"], "mirror");
+    assert_eq!(targets[0]["access_key_id"], "AKIDPEER");
+    // No secret field of any name leaks into the listing.
+    assert!(targets[0].get("secret").is_none());
+    assert!(targets[0].get("secret_ciphertext").is_none());
+    assert!(
+        !resp
+            .body
+            .windows(b"super-secret-key".len())
+            .any(|w| w == b"super-secret-key")
+    );
+
+    // Delete by ARN -> 204, and the list is empty again.
+    let resp = h
+        .svc
+        .handle(
+            &Method::DELETE,
+            &format!("/buckets/src/replication/targets/{arn}"),
+            &[],
+            Some(&a),
+            Bytes::new(),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::NO_CONTENT);
+
+    let resp = h
+        .svc
+        .handle(
+            &Method::GET,
+            "/buckets/src/replication/targets",
+            &[],
+            Some(&a),
+            Bytes::new(),
+        )
+        .await;
+    assert!(json(&resp)["targets"].as_array().unwrap().is_empty());
+
+    // Deleting an unknown ARN -> 404.
+    let resp = h
+        .svc
+        .handle(
+            &Method::DELETE,
+            "/buckets/src/replication/targets/arn:cairn:replication:x:y:z",
+            &[],
+            Some(&a),
+            Bytes::new(),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::NOT_FOUND);
+
+    // Missing bucket -> 404; non-admin -> 403.
+    let resp = h
+        .svc
+        .handle(
+            &Method::GET,
+            "/buckets/nope/replication/targets",
+            &[],
+            Some(&a),
+            Bytes::new(),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::NOT_FOUND);
+    let m = member();
+    let resp = h
+        .svc
+        .handle(
+            &Method::POST,
+            "/buckets/src/replication/targets",
+            &[],
+            Some(&m),
+            Bytes::from_static(
+                br#"{"endpoint":"e","region":"r","dest_bucket":"d","access_key":"k","secret":"s"}"#,
+            ),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn replication_retry_endpoint_requeues_failed_for_bucket() {
+    let h = harness();
+    let a = admin();
+
+    // Plant a terminally-failed outbox entry for bucket "repl".
+    let bucket = BucketName::parse("repl").unwrap();
+    let key = ObjectKey::parse("photo.jpg").unwrap();
+    let version = VersionId::from_string("00000001".to_owned());
+    let entry = cairn_types::meta::OutboxEntry {
+        id: "outbox-1".to_owned(),
+        bucket: bucket.clone(),
+        key: key.clone(),
+        version_id: version.clone(),
+        operation: cairn_types::meta::ReplicationOp::ObjectCreate,
+        rule_id: "rule-1".to_owned(),
+        attempts: 0,
+        next_attempt_at: cairn_types::time::Timestamp(0),
+        status: cairn_types::meta::ReplicationStatus::Pending,
+        last_error: None,
+        priority: 0,
+        lease_until: None,
+    };
+    let now = h.clock.now();
+    let row = ObjectVersionRow {
+        id: uuid::Uuid::new_v4().simple().to_string(),
+        bucket: bucket.clone(),
+        key: key.clone(),
+        version_id: version.clone(),
+        is_latest: true,
+        is_delete_marker: false,
+        size_logical: 4,
+        size_physical: 4,
+        etag: ETag::from_md5_hex("deadbeef".to_owned()),
+        content_type: "image/jpeg".to_owned(),
+        content_encoding: None,
+        cache_control: None,
+        content_disposition: None,
+        content_language: None,
+        expires: None,
+        storage_path: Some(cairn_types::id::StoragePath::from_string(
+            "repl/00000001".to_owned(),
+        )),
+        compression: CompressionDescriptor::Uncompressed,
+        storage_class: StorageClass::Standard,
+        cold_locator: None,
+        owner_id: UserId("admin".to_owned()),
+        user_metadata: Vec::new(),
+        acl: None,
+        checksums: Vec::new(),
+        sse_descriptor: None,
+        replication_status: Some(cairn_types::meta::ReplicationStatus::Pending),
+        created_at: now,
+        updated_at: now,
+    };
+    h.meta
+        .submit(Mutation::PutObjectVersion {
+            row: Box::new(row),
+            precondition: Precondition::default(),
+            replication: Some(entry),
+        })
+        .await
+        .unwrap();
+    h.meta
+        .submit(Mutation::MarkReplicationFailed {
+            id: "outbox-1".to_owned(),
+            error: "destination unreachable".to_owned(),
+            next_attempt_at: None,
+        })
+        .await
+        .unwrap();
+    // The bucket row must exist for require_bucket to pass.
+    make_bucket(&h, &a, "repl").await;
+
+    // Status reflects the one failed entry with its error.
+    let resp = h
+        .svc
+        .handle(
+            &Method::GET,
+            "/buckets/repl/replication/status",
+            &[],
+            Some(&a),
+            Bytes::new(),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::OK);
+    let v = json(&resp);
+    assert_eq!(v["bucket"], "repl");
+    assert_eq!(v["failed"], 1);
+    assert_eq!(v["recent_errors"][0]["key"], "photo.jpg");
+    assert_eq!(v["recent_errors"][0]["error"], "destination unreachable");
+
+    // Retry requeues it and reports the observed failed count.
+    let resp = h
+        .svc
+        .handle(
+            &Method::POST,
+            "/buckets/repl/replication/retry",
+            &[],
+            Some(&a),
+            Bytes::new(),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::OK);
+    let v = json(&resp);
+    assert_eq!(v["requeued"], true);
+    assert_eq!(v["failed_observed"], 1);
+
+    // After the requeue, the failed list is empty (the entry is pending again).
+    let resp = h
+        .svc
+        .handle(
+            &Method::GET,
+            "/buckets/repl/replication/status",
+            &[],
+            Some(&a),
+            Bytes::new(),
+        )
+        .await;
+    assert_eq!(json(&resp)["failed"], 0);
+
+    // Non-admin -> 403.
+    let m = member();
+    let resp = h
+        .svc
+        .handle(
+            &Method::POST,
+            "/buckets/repl/replication/retry",
+            &[],
+            Some(&m),
+            Bytes::new(),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::FORBIDDEN);
 }
 
 // Keep the versioning enum referenced so a future contract change is caught at compile time.
