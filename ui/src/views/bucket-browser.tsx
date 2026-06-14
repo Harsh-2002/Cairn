@@ -22,6 +22,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
   Dialog,
   DialogContent,
@@ -59,6 +60,8 @@ import { StatusBadge } from "@/components/status-badge";
 import { api, errorMessage } from "@/lib/api";
 import { bytes, whenMs } from "@/lib/format";
 import {
+  bulkDelete,
+  copyObject,
   createFolder,
   deleteObject,
   getObjectBlob,
@@ -166,6 +169,11 @@ export function BucketBrowser() {
     void load();
   }, [load]);
 
+  // Selection is scoped to the current folder/mode; clear it on any navigation.
+  useEffect(() => {
+    setSelected(new Set());
+  }, [name, listPrefix, showVersions]);
+
   async function loadMore() {
     if (!next || loadingMore) return;
     const ticket = seqRef.current;
@@ -266,6 +274,73 @@ export function BucketBrowser() {
   const [tagsKey, setTagsKey] = useState<string | null>(null);
   const [pendingDelete, setPendingDelete] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
+
+  // Multi-select for bulk delete (object mode only).
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [bulkDeleting, setBulkDeleting] = useState(false);
+  const [confirmBulk, setConfirmBulk] = useState(false);
+
+  function toggleSelected(key: string) {
+    setSelected((cur) => {
+      const next = new Set(cur);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }
+
+  async function confirmBulkDelete() {
+    if (selected.size === 0) return;
+    setBulkDeleting(true);
+    try {
+      const r = await bulkDelete(name, [...selected]);
+      if (r.errors.length > 0) {
+        toast.error(`Deleted ${r.deleted}, ${r.errors.length} failed.`);
+      } else {
+        toast.success(
+          `Deleted ${r.deleted} object${r.deleted === 1 ? "" : "s"}.`,
+        );
+      }
+      setSelected(new Set());
+      setConfirmBulk(false);
+      void load();
+    } catch (e) {
+      toast.error(errorMessage(e, "Bulk delete failed."));
+    } finally {
+      setBulkDeleting(false);
+    }
+  }
+
+  // Copy / move (rename) one object via server-side CopyObject.
+  const [copySource, setCopySource] = useState<string | null>(null);
+  const [copyDest, setCopyDest] = useState("");
+  const [copyAsMove, setCopyAsMove] = useState(false);
+  const [copying, setCopying] = useState(false);
+
+  async function submitCopy() {
+    const src = copySource;
+    const dest = copyDest.trim();
+    if (!src || !dest) {
+      toast.error("Enter a destination key.");
+      return;
+    }
+    if (dest === src) {
+      toast.error("Choose a different destination key.");
+      return;
+    }
+    setCopying(true);
+    try {
+      await copyObject(name, src, dest);
+      if (copyAsMove) await deleteObject(name, src);
+      toast.success(copyAsMove ? "Object moved." : "Object copied.");
+      setCopySource(null);
+      void load();
+    } catch (e) {
+      toast.error(errorMessage(e, "Copy failed."));
+    } finally {
+      setCopying(false);
+    }
+  }
 
   // Create-folder dialog (a zero-byte "prefix/" marker in the current folder).
   const [createFolderOpen, setCreateFolderOpen] = useState(false);
@@ -585,6 +660,31 @@ export function BucketBrowser() {
         )
       ) : objects !== null ? (
         <>
+          {selected.size > 0 ? (
+            <div className="mb-3 flex flex-wrap items-center justify-between gap-2 rounded-lg border bg-muted/40 px-3 py-2">
+              <span className="text-[13px]">
+                {selected.size} selected
+              </span>
+              <span className="flex gap-2">
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => setSelected(new Set())}
+                >
+                  Clear
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="text-destructive"
+                  disabled={bulkDeleting}
+                  onClick={() => setConfirmBulk(true)}
+                >
+                  Delete selected
+                </Button>
+              </span>
+            </div>
+          ) : null}
           <div
             className={cn(
               "overflow-x-auto rounded-lg border transition-colors",
@@ -623,13 +723,23 @@ export function BucketBrowser() {
                 ))}
                 {!showVersions &&
                   objects.map((o) => (
-                    <TableRow key={o.key}>
+                    <TableRow
+                      key={o.key}
+                      data-state={selected.has(o.key) ? "selected" : undefined}
+                    >
                       <TableCell className="max-w-[28rem]">
-                        <span
-                          className="block truncate font-mono text-[13px]"
-                          title={o.key}
-                        >
-                          {o.key.slice(path.length) || o.key}
+                        <span className="flex items-center gap-2">
+                          <Checkbox
+                            checked={selected.has(o.key)}
+                            onCheckedChange={() => toggleSelected(o.key)}
+                            aria-label={`Select ${o.key}`}
+                          />
+                          <span
+                            className="block truncate font-mono text-[13px]"
+                            title={o.key}
+                          >
+                            {o.key.slice(path.length) || o.key}
+                          </span>
                         </span>
                       </TableCell>
                       <TableCell className="text-right text-[13px] tabular-nums">
@@ -659,6 +769,15 @@ export function BucketBrowser() {
                             <DropdownMenuItem onSelect={() => setTagsKey(o.key)}>
                               <Tag aria-hidden="true" />
                               Edit tags
+                            </DropdownMenuItem>
+                            <DropdownMenuItem
+                              onSelect={() => {
+                                setCopySource(o.key);
+                                setCopyDest(o.key);
+                                setCopyAsMove(false);
+                              }}
+                            >
+                              Copy or move…
                             </DropdownMenuItem>
                             <DropdownMenuItem onSelect={() => setShareKey(o.key)}>
                               Share
@@ -822,6 +941,20 @@ export function BucketBrowser() {
         onConfirm={() => void confirmVersionDelete()}
       />
 
+      <ConfirmDialog
+        open={confirmBulk}
+        onOpenChange={(open) => {
+          if (!open) setConfirmBulk(false);
+        }}
+        title="Delete selected objects"
+        description={`This permanently deletes ${selected.size} object${selected.size === 1 ? "" : "s"}. This cannot be undone.`}
+        confirmLabel={bulkDeleting ? "Deleting…" : "Delete selected"}
+        cancelLabel="Keep objects"
+        destructive
+        busy={bulkDeleting}
+        onConfirm={() => void confirmBulkDelete()}
+      />
+
       <ObjectTagsDialog
         bucket={name}
         objectKey={tagsKey ?? ""}
@@ -830,6 +963,61 @@ export function BucketBrowser() {
           if (!open) setTagsKey(null);
         }}
       />
+
+      <Dialog
+        open={copySource !== null}
+        onOpenChange={(open) => {
+          if (!open && !copying) setCopySource(null);
+        }}
+      >
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>{copyAsMove ? "Move object" : "Copy object"}</DialogTitle>
+            <DialogDescription className="break-all">
+              {copyAsMove ? "Moving" : "Copying"} from{" "}
+              <span className="font-mono">{copySource}</span>
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3">
+            <div className="grid gap-1.5">
+              <Label htmlFor={`${filterId}-dest`}>Destination key</Label>
+              <Input
+                id={`${filterId}-dest`}
+                value={copyDest}
+                autoComplete="off"
+                spellCheck={false}
+                className="font-mono"
+                onChange={(e) => setCopyDest(e.target.value)}
+              />
+            </div>
+            <label className="flex items-center gap-2 text-[13px]">
+              <Checkbox
+                checked={copyAsMove}
+                onCheckedChange={(v) => setCopyAsMove(v === true)}
+              />
+              Move (delete the original after copying)
+            </label>
+          </div>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setCopySource(null)}
+              disabled={copying}
+            >
+              Cancel
+            </Button>
+            <Button onClick={() => void submitCopy()} disabled={copying}>
+              {copying
+                ? copyAsMove
+                  ? "Moving…"
+                  : "Copying…"
+                : copyAsMove
+                  ? "Move"
+                  : "Copy"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <Dialog
         open={createFolderOpen}
