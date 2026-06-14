@@ -1,9 +1,7 @@
 import { useId, useState, type FormEvent } from "react";
 import { NavLink, useNavigate } from "react-router";
-import { Database, MoreHorizontal } from "lucide-react";
+import { Database, MoreHorizontal, Plus } from "lucide-react";
 import { toast } from "sonner";
-import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -22,17 +20,12 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Skeleton } from "@/components/ui/skeleton";
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
+import { TableCell, TableRow } from "@/components/ui/table";
+import { DataTable, SkeletonRows, type Column } from "@/components/data-table";
 import { EmptyState } from "@/components/empty-state";
+import { ErrorAlert } from "@/components/error-alert";
 import { Page, PageHeader } from "@/components/page-header";
+import { StatusBadge, type StatusTone } from "@/components/status-badge";
 import { TypedConfirmDialog } from "@/components/typed-confirm-dialog";
 import { api, ApiError, errorMessage } from "@/lib/api";
 import { bytes, count, whenMs } from "@/lib/format";
@@ -50,6 +43,22 @@ function nameIssue(name: string): string | null {
   if (!/^[a-z0-9]/.test(name) || !/[a-z0-9]$/.test(name))
     return "Names must start and end with a letter or digit.";
   return null;
+}
+
+const COLUMNS: Column[] = [
+  { key: "name", label: "Name" },
+  { key: "objects", label: "Objects", className: "text-right" },
+  { key: "size", label: "Size", className: "text-right" },
+  { key: "versioning", label: "Versioning" },
+  { key: "created", label: "Created" },
+  { key: "actions", label: "Actions", srOnly: true },
+];
+
+/** Map a bucket's versioning state to a semantic badge tone. */
+function versioningTone(state: string): StatusTone {
+  if (state === "Enabled") return "positive";
+  if (state === "Suspended") return "warning";
+  return "neutral";
 }
 
 export function Buckets() {
@@ -132,7 +141,9 @@ export function Buckets() {
   }
 
   const createButton = (
-    <Button onClick={() => openCreate(true)}>Create bucket</Button>
+    <Button onClick={() => openCreate(true)}>
+      <Plus aria-hidden="true" /> Create bucket
+    </Button>
   );
 
   return (
@@ -144,57 +155,20 @@ export function Buckets() {
       />
 
       {list.error ? (
-        <Alert variant="destructive" role="alert" className="mb-4">
-          <AlertTitle>Couldn&apos;t load buckets</AlertTitle>
-          <AlertDescription>{list.error}</AlertDescription>
-        </Alert>
+        <ErrorAlert
+          title="Couldn't load buckets"
+          message={list.error}
+          onRetry={list.refresh}
+        />
       ) : null}
 
       {list.loading ? (
-        <div className="overflow-x-auto rounded-lg border">
-          <Table className="min-w-[720px]">
-            <TableHeader>
-              <TableRow>
-                <TableHead className="text-xs text-muted-foreground">Name</TableHead>
-                <TableHead className="text-right text-xs text-muted-foreground">
-                  Objects
-                </TableHead>
-                <TableHead className="text-right text-xs text-muted-foreground">
-                  Size
-                </TableHead>
-                <TableHead className="text-xs text-muted-foreground">Versioning</TableHead>
-                <TableHead className="text-xs text-muted-foreground">Created</TableHead>
-                <TableHead>
-                  <span className="visually-hidden">Actions</span>
-                </TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {Array.from({ length: 3 }, (_, i) => (
-                <TableRow key={i}>
-                  <TableCell>
-                    <Skeleton className="h-4 w-32" />
-                  </TableCell>
-                  <TableCell>
-                    <Skeleton className="ml-auto h-4 w-10" />
-                  </TableCell>
-                  <TableCell>
-                    <Skeleton className="ml-auto h-4 w-16" />
-                  </TableCell>
-                  <TableCell>
-                    <Skeleton className="h-4 w-20" />
-                  </TableCell>
-                  <TableCell>
-                    <Skeleton className="h-4 w-36" />
-                  </TableCell>
-                  <TableCell>
-                    <Skeleton className="ml-auto size-8" />
-                  </TableCell>
-                </TableRow>
-              ))}
-            </TableBody>
-          </Table>
-        </div>
+        <DataTable columns={COLUMNS} minWidth={720}>
+          <SkeletonRows
+            rows={3}
+            widths={["w-32", "w-10", "w-16", "w-20", "w-36", "w-8"]}
+          />
+        </DataTable>
       ) : buckets.length === 0 && !list.error ? (
         <EmptyState
           icon={Database}
@@ -203,89 +177,70 @@ export function Buckets() {
           action={createButton}
         />
       ) : (
-        <div className="overflow-x-auto rounded-lg border">
-          <Table className="min-w-[720px]">
-            <TableHeader>
-              <TableRow>
-                <TableHead className="text-xs text-muted-foreground">Name</TableHead>
-                <TableHead className="text-right text-xs text-muted-foreground">
-                  Objects
-                </TableHead>
-                <TableHead className="text-right text-xs text-muted-foreground">
-                  Size
-                </TableHead>
-                <TableHead className="text-xs text-muted-foreground">Versioning</TableHead>
-                <TableHead className="text-xs text-muted-foreground">Created</TableHead>
-                <TableHead>
-                  <span className="visually-hidden">Actions</span>
-                </TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {buckets.map((b) => (
-                <TableRow key={b.name}>
-                  <TableCell>
-                    <NavLink
-                      to={`/buckets/${encodeURIComponent(b.name)}/browser`}
-                      className="font-mono text-[13px] text-link hover:underline underline-offset-4"
+        <DataTable columns={COLUMNS} minWidth={720}>
+          {buckets.map((b) => (
+            <TableRow key={b.name}>
+              <TableCell>
+                <NavLink
+                  to={`/buckets/${encodeURIComponent(b.name)}/browser`}
+                  className="font-mono text-[13px] text-link hover:underline underline-offset-4"
+                >
+                  {b.name}
+                </NavLink>
+              </TableCell>
+              <TableCell className="text-right text-[13px] tabular-nums">
+                {count(list.data?.usage.get(b.name)?.objects ?? null)}
+              </TableCell>
+              <TableCell className="text-right text-[13px] tabular-nums">
+                {bytes(list.data?.usage.get(b.name)?.logical_bytes ?? null)}
+              </TableCell>
+              <TableCell>
+                <StatusBadge tone={versioningTone(b.versioning)}>
+                  {b.versioning}
+                </StatusBadge>
+              </TableCell>
+              <TableCell className="text-[13px] text-muted-foreground tabular-nums">
+                {whenMs(b.created_at_ms)}
+              </TableCell>
+              <TableCell className="text-right">
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      aria-label={`Actions for ${b.name}`}
                     >
-                      {b.name}
-                    </NavLink>
-                  </TableCell>
-                  <TableCell className="text-right text-[13px] tabular-nums">
-                    {count(list.data?.usage.get(b.name)?.objects ?? null)}
-                  </TableCell>
-                  <TableCell className="text-right text-[13px] tabular-nums">
-                    {bytes(list.data?.usage.get(b.name)?.logical_bytes ?? null)}
-                  </TableCell>
-                  <TableCell>
-                    <Badge variant="outline">{b.versioning}</Badge>
-                  </TableCell>
-                  <TableCell className="text-[13px] text-muted-foreground tabular-nums">
-                    {whenMs(b.created_at_ms)}
-                  </TableCell>
-                  <TableCell className="text-right">
-                    <DropdownMenu>
-                      <DropdownMenuTrigger asChild>
-                        <Button
-                          variant="ghost"
-                          size="icon-sm"
-                          aria-label={`Actions for ${b.name}`}
-                        >
-                          <MoreHorizontal aria-hidden="true" />
-                        </Button>
-                      </DropdownMenuTrigger>
-                      <DropdownMenuContent align="end">
-                        <DropdownMenuItem
-                          onSelect={() =>
-                            navigate(`/buckets/${encodeURIComponent(b.name)}/browser`)
-                          }
-                        >
-                          Browse
-                        </DropdownMenuItem>
-                        <DropdownMenuItem
-                          onSelect={() =>
-                            navigate(`/buckets/${encodeURIComponent(b.name)}/settings`)
-                          }
-                        >
-                          Settings
-                        </DropdownMenuItem>
-                        <DropdownMenuSeparator />
-                        <DropdownMenuItem
-                          variant="destructive"
-                          className="text-destructive"
-                          onSelect={() => setPendingDelete(b.name)}
-                        >
-                          Delete
-                        </DropdownMenuItem>
-                      </DropdownMenuContent>
-                    </DropdownMenu>
-                  </TableCell>
-                </TableRow>
-              ))}
-            </TableBody>
-          </Table>
-        </div>
+                      <MoreHorizontal aria-hidden="true" />
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end">
+                    <DropdownMenuItem
+                      onSelect={() =>
+                        navigate(`/buckets/${encodeURIComponent(b.name)}/browser`)
+                      }
+                    >
+                      Browse
+                    </DropdownMenuItem>
+                    <DropdownMenuItem
+                      onSelect={() =>
+                        navigate(`/buckets/${encodeURIComponent(b.name)}/settings`)
+                      }
+                    >
+                      Settings
+                    </DropdownMenuItem>
+                    <DropdownMenuSeparator />
+                    <DropdownMenuItem
+                      variant="destructive"
+                      onSelect={() => setPendingDelete(b.name)}
+                    >
+                      Delete
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              </TableCell>
+            </TableRow>
+          ))}
+        </DataTable>
       )}
 
       <Dialog open={createOpen} onOpenChange={creating ? undefined : openCreate}>

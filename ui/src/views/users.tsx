@@ -5,9 +5,8 @@
 
 import { useEffect, useId, useState } from "react";
 import { NavLink } from "react-router";
-import { CircleAlert, Plus, Users as UsersIcon } from "lucide-react";
+import { Plus, Users as UsersIcon } from "lucide-react";
 import { toast } from "sonner";
-import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -19,23 +18,25 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Skeleton } from "@/components/ui/skeleton";
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
+import { TableCell, TableRow } from "@/components/ui/table";
 import { CredentialsPanel } from "@/components/credentials-panel";
+import { DataTable, SkeletonRows, type Column } from "@/components/data-table";
 import { EmptyState } from "@/components/empty-state";
+import { ErrorAlert } from "@/components/error-alert";
 import { Page, PageHeader } from "@/components/page-header";
 import { PermissionBuilder } from "@/components/permission-builder";
+import { StatusBadge } from "@/components/status-badge";
 import { api, errorMessage } from "@/lib/api";
 import { useResource } from "@/lib/use-resource";
 import type { CreateUserResp } from "@/lib/types";
 import type { PolicyDoc } from "@/lib/policy";
+
+const COLUMNS: Column[] = [
+  { key: "name", label: "Name" },
+  { key: "key", label: "Bearer key" },
+  { key: "role", label: "Role" },
+  { key: "status", label: "Status" },
+];
 
 export function Users() {
   const nameId = useId();
@@ -252,42 +253,17 @@ export function Users() {
       </Dialog>
 
       {users.error ? (
-        <Alert variant="destructive" className="mb-4" role="alert">
-          <CircleAlert aria-hidden="true" />
-          <AlertTitle>Could not load users</AlertTitle>
-          <AlertDescription>
-            {users.error}
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={users.refresh}
-              className="mt-2"
-            >
-              Try again
-            </Button>
-          </AlertDescription>
-        </Alert>
+        <ErrorAlert
+          title="Could not load users"
+          message={users.error}
+          onRetry={users.refresh}
+        />
       ) : null}
 
       {users.loading ? (
-        <UsersTableShell>
-          {[0, 1, 2].map((i) => (
-            <TableRow key={i}>
-              <TableCell>
-                <Skeleton className="h-4 w-32" />
-              </TableCell>
-              <TableCell>
-                <Skeleton className="h-4 w-44" />
-              </TableCell>
-              <TableCell>
-                <Skeleton className="h-4 w-16" />
-              </TableCell>
-              <TableCell>
-                <Skeleton className="h-4 w-14" />
-              </TableCell>
-            </TableRow>
-          ))}
-        </UsersTableShell>
+        <DataTable columns={COLUMNS} minWidth={560}>
+          <SkeletonRows rows={3} widths={["w-32", "w-44", "w-16", "w-14"]} />
+        </DataTable>
       ) : list.length === 0 && !users.error ? (
         <EmptyState
           icon={UsersIcon}
@@ -300,7 +276,7 @@ export function Users() {
           }
         />
       ) : list.length > 0 ? (
-        <UsersTableShell>
+        <DataTable columns={COLUMNS} minWidth={560}>
           {list.map((u) => (
             <TableRow key={u.id}>
               <TableCell>
@@ -318,40 +294,14 @@ export function Users() {
                 <Badge variant="outline">{u.role}</Badge>
               </TableCell>
               <TableCell>
-                {u.is_active ? (
-                  <Badge variant="outline">Active</Badge>
-                ) : (
-                  <Badge variant="outline" className="text-muted-foreground">
-                    Inactive
-                  </Badge>
-                )}
+                <StatusBadge tone={u.is_active ? "positive" : "neutral"}>
+                  {u.is_active ? "Active" : "Inactive"}
+                </StatusBadge>
               </TableCell>
             </TableRow>
           ))}
-        </UsersTableShell>
+        </DataTable>
       ) : null}
     </Page>
-  );
-}
-
-function UsersTableShell({ children }: { children: React.ReactNode }) {
-  return (
-    <div className="overflow-x-auto rounded-lg border">
-      <Table className="min-w-[560px]">
-        <TableHeader>
-          <TableRow>
-            <TableHead className="text-xs text-muted-foreground">Name</TableHead>
-            <TableHead className="text-xs text-muted-foreground">
-              Bearer key
-            </TableHead>
-            <TableHead className="text-xs text-muted-foreground">Role</TableHead>
-            <TableHead className="text-xs text-muted-foreground">
-              Status
-            </TableHead>
-          </TableRow>
-        </TableHeader>
-        <TableBody>{children}</TableBody>
-      </Table>
-    </div>
   );
 }

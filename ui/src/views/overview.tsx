@@ -4,16 +4,17 @@
 
 import { useMemo } from "react";
 import { NavLink, useNavigate } from "react-router";
-import { Database, RotateCw } from "lucide-react";
+import { Database } from "lucide-react";
 import { api } from "@/lib/api";
 import { bytes, count, duration, ratio, whenMs } from "@/lib/format";
 import { useResource } from "@/lib/use-resource";
 import { EmptyState } from "@/components/empty-state";
+import { ErrorAlert } from "@/components/error-alert";
 import { Page, PageHeader } from "@/components/page-header";
+import { RefreshButton } from "@/components/refresh-button";
 import { StatCard } from "@/components/stat-card";
+import { StatusBadge } from "@/components/status-badge";
 import { UsageBar } from "@/components/usage-bar";
-import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -76,36 +77,20 @@ export function Overview() {
         title="Overview"
         description="Storage, compression, and per-bucket usage across this node."
         actions={
-          <Button
-            variant="outline"
+          <RefreshButton
+            loading={loading}
+            refreshing={refreshing}
             onClick={refresh}
-            disabled={refreshing}
-            aria-busy={refreshing}
-          >
-            <RotateCw
-              aria-hidden="true"
-              className={refreshing ? "animate-spin" : undefined}
-            />
-            {refreshing ? "Refreshing…" : "Refresh"}
-          </Button>
+          />
         }
       />
 
       {error ? (
-        <Alert variant="destructive" role="alert" className="mb-4">
-          <AlertTitle>Could not load the overview</AlertTitle>
-          <AlertDescription>
-            <p>{error}</p>
-            <Button
-              variant="outline"
-              size="sm"
-              className="mt-1 text-foreground"
-              onClick={refresh}
-            >
-              Try again
-            </Button>
-          </AlertDescription>
-        </Alert>
+        <ErrorAlert
+          title="Could not load the overview"
+          message={error}
+          onRetry={refresh}
+        />
       ) : null}
 
       {loading ? (
@@ -126,7 +111,7 @@ export function Overview() {
 
           <div className="grid gap-4 lg:grid-cols-2">
             {/* Node card: identity and health facts for this instance. */}
-            <Card className="gap-4 rounded-lg shadow-none">
+            <Card className="gap-4">
               <CardHeader className="gap-1">
                 <CardTitle>Node</CardTitle>
                 <CardDescription>This Cairn instance.</CardDescription>
@@ -165,9 +150,9 @@ export function Overview() {
                   <div className="flex items-center justify-between gap-4">
                     <dt className="shrink-0 text-muted-foreground">TLS</dt>
                     <dd>
-                      <Badge variant="outline">
+                      <StatusBadge tone={sys.tls ? "positive" : "neutral"}>
                         {sys.tls ? "TLS on" : "TLS off"}
-                      </Badge>
+                      </StatusBadge>
                     </dd>
                   </div>
                   <div className="flex items-baseline justify-between gap-4">
@@ -211,7 +196,7 @@ export function Overview() {
             </Card>
 
             {/* Compression card: how much disk space compression saves. */}
-            <Card className="gap-4 rounded-lg shadow-none">
+            <Card className="gap-4">
               <CardHeader className="gap-1">
                 <CardTitle>Compression</CardTitle>
                 <CardDescription className="tabular-nums">
@@ -265,7 +250,7 @@ export function Overview() {
           </div>
 
           {/* Per-bucket usage: each bucket's share of total original bytes. */}
-          <Card className="gap-4 rounded-lg shadow-none">
+          <Card className="gap-4">
             <CardHeader className="gap-1">
               <CardTitle>Storage by bucket</CardTitle>
               <CardDescription>
@@ -296,21 +281,26 @@ export function Overview() {
                     return (
                       <li
                         key={b.name}
-                        className="grid grid-cols-[minmax(0,11rem)_1fr_auto] items-center gap-4"
+                        className="grid grid-cols-[1fr_auto] items-center gap-x-4 gap-y-2 sm:grid-cols-[minmax(0,11rem)_1fr_auto]"
                       >
                         <NavLink
                           to={`/buckets/${encodeURIComponent(b.name)}/browser`}
-                          className="truncate font-mono text-[13px] text-link hover:underline underline-offset-4"
+                          className="min-w-0 truncate font-mono text-[13px] text-link hover:underline underline-offset-4"
                           title={b.name}
                         >
                           {b.name}
                         </NavLink>
-                        <UsageBar
-                          percent={pct}
-                          label={`${b.name}: ${bytes(
-                            b.logical_bytes,
-                          )}, ${pct}% of total storage`}
-                        />
+                        {/* On mobile the bar drops to its own full-width row
+                            below the name + bytes; at sm: it sits inline as the
+                            middle column of the 3-column grid. */}
+                        <div className="order-last col-span-2 sm:order-none sm:col-span-1">
+                          <UsageBar
+                            percent={pct}
+                            label={`${b.name}: ${bytes(
+                              b.logical_bytes,
+                            )}, ${pct}% of total storage`}
+                          />
+                        </div>
                         <div className="text-right">
                           <p className="font-mono text-[13px] tabular-nums">
                             {bytes(b.logical_bytes)}
@@ -330,7 +320,7 @@ export function Overview() {
           {/* Recent activity teaser: the latest administrative changes, with
               the full log one click away. */}
           {data && data.activity.length > 0 ? (
-            <Card className="gap-3 rounded-lg shadow-none">
+            <Card className="gap-3">
               <CardHeader className="flex-row items-baseline justify-between">
                 <div>
                   <CardTitle>Recent activity</CardTitle>
