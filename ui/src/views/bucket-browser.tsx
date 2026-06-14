@@ -14,6 +14,7 @@ import {
   FileBox,
   Folder,
   FolderPlus,
+  FolderUp,
   Loader2,
   MoreHorizontal,
   Search,
@@ -40,6 +41,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Progress } from "@/components/ui/progress";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
   Table,
@@ -58,7 +60,7 @@ import { RefreshButton } from "@/components/refresh-button";
 import { ShareDialog } from "@/components/share-dialog";
 import { StatusBadge } from "@/components/status-badge";
 import { api, errorMessage } from "@/lib/api";
-import { bytes, whenMs } from "@/lib/format";
+import { bytes, speed, whenMs } from "@/lib/format";
 import {
   bulkDelete,
   copyObject,
@@ -66,7 +68,7 @@ import {
   deleteObject,
   getObjectBlob,
   listObjectVersions,
-  putObject,
+  putObjectWithProgress,
   type ObjectVersion,
 } from "@/lib/s3";
 import type { ObjectEntry } from "@/lib/types";
@@ -75,7 +77,17 @@ import { cn } from "@/lib/utils";
 interface UploadItem {
   name: string;
   status: "uploading" | "done" | "failed";
+  loaded: number;
+  total: number;
+  bytesPerSec: number;
   message?: string;
+}
+
+// A file plus its target key suffix under the current folder (preserves nested
+// structure for folder uploads: "myfolder/sub/file.txt").
+interface PendingUpload {
+  file: File;
+  rel: string;
 }
 
 const UPLOAD_STATUS_WORD: Record<UploadItem["status"], string> = {
@@ -209,28 +221,48 @@ export function BucketBrowser() {
 
   // ---- uploads -------------------------------------------------------------------
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const folderInputRef = useRef<HTMLInputElement>(null);
   const [uploads, setUploads] = useState<UploadItem[]>([]);
   const [uploading, setUploading] = useState(false);
   const [dragOver, setDragOver] = useState(false);
   // Counter-based drag tracking: child enter/leave events would flicker a boolean.
   const dragDepth = useRef(0);
 
-  const uploadFiles = useCallback(
-    async (files: File[]) => {
-      if (files.length === 0 || uploading) return;
+  const uploadAll = useCallback(
+    async (items: PendingUpload[]) => {
+      if (items.length === 0 || uploading) return;
       setUploading(true);
       setUploads(
-        files.map((f) => ({ name: path + f.name, status: "uploading" as const })),
+        items.map((it) => ({
+          name: path + it.rel,
+          status: "uploading" as const,
+          loaded: 0,
+          total: it.file.size,
+          bytesPerSec: 0,
+        })),
       );
       let okCount = 0;
-      for (const [i, f] of files.entries()) {
+      for (const [i, it] of items.entries()) {
         try {
-          // Uploads land in the folder being viewed. Encryption is the
-          // bucket's default-SSE setting — no per-upload choice.
-          await putObject(name, path + f.name, f);
+          // Uploads land under the folder being viewed, preserving any nested
+          // path from a folder pick. Encryption is the bucket's default-SSE
+          // setting — no per-upload choice.
+          await putObjectWithProgress(name, path + it.rel, it.file, (p) => {
+            setUploads((u) =>
+              u.map((x, j) =>
+                j === i
+                  ? { ...x, loaded: p.loaded, total: p.total, bytesPerSec: p.bytesPerSec }
+                  : x,
+              ),
+            );
+          });
           okCount++;
           setUploads((u) =>
-            u.map((x, j) => (j === i ? { ...x, status: "done" as const } : x)),
+            u.map((x, j) =>
+              j === i
+                ? { ...x, status: "done" as const, loaded: x.total, bytesPerSec: 0 }
+                : x,
+            ),
           );
         } catch (err) {
           setUploads((u) =>
@@ -239,6 +271,7 @@ export function BucketBrowser() {
                 ? {
                     ...x,
                     status: "failed" as const,
+                    bytesPerSec: 0,
                     message: errorMessage(err, "Upload failed."),
                   }
                 : x,
@@ -250,22 +283,64 @@ export function BucketBrowser() {
       if (okCount > 0) {
         toast.success(`${okCount} file${okCount === 1 ? "" : "s"} uploaded`);
         void load();
+      } else {
+        toast.error("Upload failed.");
       }
     },
     [name, path, uploading, load],
   );
 
+  // Map picked Files to uploads, honoring webkitRelativePath (set by a folder pick).
+  function toPending(files: File[]): PendingUpload[] {
+    return files.map((f) => ({
+      file: f,
+      rel: (f as File & { webkitRelativePath?: string }).webkitRelativePath || f.name,
+    }));
+  }
+
   function onFilesPicked(e: ChangeEvent<HTMLInputElement>) {
     const files = Array.from(e.target.files ?? []);
     e.target.value = ""; // allow re-picking the same file later
-    void uploadFiles(files);
+    void uploadAll(toPending(files));
+  }
+
+  // Walk a dropped folder tree (webkitGetAsEntry) into a flat list with relative
+  // paths, so dropping a folder uploads its whole contents. Entries must be read
+  // synchronously during the drop event, before any await.
+  async function gatherDropped(dt: DataTransfer): Promise<PendingUpload[]> {
+    const entries = Array.from(dt.items ?? [])
+      .map((it) => (it.webkitGetAsEntry ? it.webkitGetAsEntry() : null))
+      .filter((e): e is FileSystemEntry => e !== null);
+    if (entries.length === 0) return toPending(Array.from(dt.files ?? []));
+
+    const out: PendingUpload[] = [];
+    const walk = async (entry: FileSystemEntry, prefix: string): Promise<void> => {
+      if (entry.isFile) {
+        const file = await new Promise<File>((res, rej) =>
+          (entry as FileSystemFileEntry).file(res, rej),
+        );
+        out.push({ file, rel: prefix + entry.name });
+      } else if (entry.isDirectory) {
+        const reader = (entry as FileSystemDirectoryEntry).createReader();
+        // readEntries returns one batch at a time; loop until it returns none.
+        for (;;) {
+          const batch = await new Promise<FileSystemEntry[]>((res, rej) =>
+            reader.readEntries(res, rej),
+          );
+          if (batch.length === 0) break;
+          for (const child of batch) await walk(child, `${prefix}${entry.name}/`);
+        }
+      }
+    };
+    for (const e of entries) await walk(e, "");
+    return out;
   }
 
   function onDrop(e: DragEvent) {
     e.preventDefault();
     dragDepth.current = 0;
     setDragOver(false);
-    void uploadFiles(Array.from(e.dataTransfer.files ?? []));
+    void gatherDropped(e.dataTransfer).then((items) => uploadAll(items));
   }
 
   // ---- per-object actions ----------------------------------------------------------
@@ -428,6 +503,21 @@ export function BucketBrowser() {
   const itemCount = showVersions ? versions.length : (objects?.length ?? 0);
   const showEmpty = objects !== null && itemCount === 0 && folders.length === 0;
 
+  // Upload batch aggregates (overall % + combined live speed).
+  const uploadDone = uploads.filter((u) => u.status === "done").length;
+  const uploadTotalBytes = uploads.reduce((s, u) => s + u.total, 0);
+  const uploadLoadedBytes = uploads.reduce(
+    (s, u) => s + (u.status === "done" ? u.total : u.loaded),
+    0,
+  );
+  const uploadOverallPct =
+    uploadTotalBytes > 0
+      ? Math.floor((uploadLoadedBytes / uploadTotalBytes) * 100)
+      : 0;
+  const uploadAggSpeed = uploads
+    .filter((u) => u.status === "uploading")
+    .reduce((s, u) => s + u.bytesPerSec, 0);
+
   return (
     <div
       className="space-y-4"
@@ -496,6 +586,23 @@ export function BucketBrowser() {
             aria-hidden="true"
             onChange={onFilesPicked}
           />
+          {/* webkitdirectory turns this into a folder picker; it isn't a typed
+              React prop, so set it on the DOM node via the ref callback. */}
+          <input
+            ref={(el) => {
+              folderInputRef.current = el;
+              if (el) {
+                el.setAttribute("webkitdirectory", "");
+                el.setAttribute("directory", "");
+              }
+            }}
+            type="file"
+            multiple
+            className="hidden"
+            tabIndex={-1}
+            aria-hidden="true"
+            onChange={onFilesPicked}
+          />
           <Button
             type="button"
             variant="outline"
@@ -506,6 +613,15 @@ export function BucketBrowser() {
           >
             <FolderPlus aria-hidden="true" />
             New folder
+          </Button>
+          <Button
+            type="button"
+            variant="outline"
+            disabled={uploading}
+            onClick={() => folderInputRef.current?.click()}
+          >
+            <FolderUp aria-hidden="true" />
+            Upload folder
           </Button>
           <Button
             type="button"
@@ -559,11 +675,16 @@ export function BucketBrowser() {
         })}
       </nav>
 
-      {/* Per-file upload progress for the current batch. */}
+      {/* Per-file upload progress (live %, speed) for the current batch. */}
       {uploads.length > 0 ? (
         <div className="rounded-lg border p-3">
           <div className="mb-2 flex items-center justify-between gap-2">
-            <p className="text-xs font-medium text-muted-foreground">Uploads</p>
+            <p className="text-xs font-medium text-muted-foreground">
+              Uploads — {uploadDone}/{uploads.length}
+              {uploading
+                ? ` · ${uploadOverallPct}% · ${speed(uploadAggSpeed)}`
+                : ""}
+            </p>
             <Button
               type="button"
               variant="ghost"
@@ -574,31 +695,61 @@ export function BucketBrowser() {
               Clear
             </Button>
           </div>
-          <ul aria-live="polite" className="space-y-1.5">
-            {uploads.map((u, i) => (
-              <li key={i} className="flex items-start gap-2 text-[13px]">
-                {u.status === "uploading" ? (
-                  <Loader2
-                    aria-hidden="true"
-                    className="mt-0.5 size-4 shrink-0 animate-spin text-muted-foreground"
-                  />
-                ) : u.status === "done" ? (
-                  <Check aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-success" />
-                ) : (
-                  <CircleAlert
-                    aria-hidden="true"
-                    className="mt-0.5 size-4 shrink-0 text-destructive"
-                  />
-                )}
-                <span className="min-w-0 truncate font-mono" title={u.name}>
-                  {u.name}
-                </span>
-                <span className="visually-hidden">{UPLOAD_STATUS_WORD[u.status]}</span>
-                {u.status === "failed" && u.message ? (
-                  <span className="text-destructive">{u.message}</span>
-                ) : null}
-              </li>
-            ))}
+          <ul aria-live="polite" className="space-y-2">
+            {uploads.map((u, i) => {
+              const pct =
+                u.total > 0
+                  ? Math.floor((u.loaded / u.total) * 100)
+                  : u.status === "done"
+                    ? 100
+                    : 0;
+              return (
+                <li key={i} className="space-y-1 text-[13px]">
+                  <div className="flex items-center gap-2">
+                    {u.status === "uploading" ? (
+                      <Loader2
+                        aria-hidden="true"
+                        className="size-4 shrink-0 animate-spin text-muted-foreground"
+                      />
+                    ) : u.status === "done" ? (
+                      <Check
+                        aria-hidden="true"
+                        className="size-4 shrink-0 text-success"
+                      />
+                    ) : (
+                      <CircleAlert
+                        aria-hidden="true"
+                        className="size-4 shrink-0 text-destructive"
+                      />
+                    )}
+                    <span
+                      className="min-w-0 flex-1 truncate font-mono"
+                      title={u.name}
+                    >
+                      {u.name}
+                    </span>
+                    <span className="visually-hidden">
+                      {UPLOAD_STATUS_WORD[u.status]}
+                    </span>
+                    {u.status === "uploading" ? (
+                      <span className="shrink-0 tabular-nums text-muted-foreground">
+                        {pct}% · {speed(u.bytesPerSec)}
+                      </span>
+                    ) : u.status === "done" ? (
+                      <span className="shrink-0 tabular-nums text-muted-foreground">
+                        {bytes(u.total)}
+                      </span>
+                    ) : null}
+                  </div>
+                  {u.status === "uploading" ? (
+                    <Progress value={pct} className="h-1.5" />
+                  ) : null}
+                  {u.status === "failed" && u.message ? (
+                    <p className="text-destructive">{u.message}</p>
+                  ) : null}
+                </li>
+              );
+            })}
           </ul>
         </div>
       ) : null}

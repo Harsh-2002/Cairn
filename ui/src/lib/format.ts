@@ -14,6 +14,17 @@ export function bytes(n: number | null | undefined): string {
   return `${i === 0 ? v : v.toFixed(2)} ${units[i]}`;
 }
 
+/** A transfer rate in BYTES per second → "2.34 MiB/s" (never bits/kbps). */
+export function speed(bytesPerSec: number | null | undefined): string {
+  if (bytesPerSec === null || bytesPerSec === undefined) return "—";
+  const n = Number(bytesPerSec);
+  if (!Number.isFinite(n) || n <= 0) return "—";
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+  const i = Math.min(units.length - 1, Math.floor(Math.log(n) / Math.log(1024)));
+  const v = n / Math.pow(1024, i);
+  return `${i === 0 ? Math.round(v) : v.toFixed(1)} ${units[i]}/s`;
+}
+
 export function count(n: number | null | undefined): string {
   if (n === null || n === undefined) return "—";
   return Number(n).toLocaleString();

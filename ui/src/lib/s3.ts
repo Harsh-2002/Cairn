@@ -35,6 +35,67 @@ export async function putObject(
   if (!res.ok) throw new ApiError(`upload failed (${res.status})`, res.status);
 }
 
+export interface UploadProgress {
+  loaded: number;
+  total: number;
+  /** Smoothed transfer rate in BYTES per second. */
+  bytesPerSec: number;
+}
+
+// Upload with live progress. fetch() gives no upload-progress events, so this
+// uses XMLHttpRequest (whose upload.onprogress reports loaded/total). The rate
+// is the byte delta over the wall-clock delta between events, lightly smoothed.
+export function putObjectWithProgress(
+  bucket: string,
+  key: string,
+  file: File,
+  onProgress: (p: UploadProgress) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("PUT", objectPath(bucket, key));
+    const tok = loadToken();
+    if (tok) xhr.setRequestHeader("Authorization", `Bearer ${tok}`);
+    xhr.setRequestHeader(
+      "Content-Type",
+      file.type || "application/octet-stream",
+    );
+
+    let lastLoaded = 0;
+    let lastTime = performance.now();
+    let rate = 0;
+    xhr.upload.onprogress = (e) => {
+      if (!e.lengthComputable) return;
+      const now = performance.now();
+      const dt = (now - lastTime) / 1000;
+      // Recompute the rate at most ~6×/s so it's stable, not jumpy.
+      if (dt >= 0.15) {
+        const inst = (e.loaded - lastLoaded) / dt;
+        rate = rate === 0 ? inst : rate * 0.6 + inst * 0.4;
+        lastLoaded = e.loaded;
+        lastTime = now;
+      }
+      onProgress({ loaded: e.loaded, total: e.total, bytesPerSec: rate });
+    };
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) resolve();
+      else reject(new ApiError(`upload failed (${xhr.status})`, xhr.status));
+    };
+    xhr.onerror = () =>
+      reject(new ApiError("network error during upload", 0));
+    xhr.onabort = () => reject(new ApiError("upload cancelled", 0));
+    if (signal) {
+      if (signal.aborted) {
+        xhr.abort();
+        return;
+      }
+      signal.addEventListener("abort", () => xhr.abort(), { once: true });
+    }
+    xhr.send(file);
+  });
+}
+
 export async function getObjectBlob(
   bucket: string,
   key: string,
