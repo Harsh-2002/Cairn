@@ -5,13 +5,12 @@
 use crate::config::Config;
 use cairn_auth::AuthChain;
 use cairn_blob::LocalBlobStore;
-use cairn_crypto::{HmacPublicUrl, SystemClock, SystemCrypto};
+use cairn_crypto::{SystemClock, SystemCrypto};
 use cairn_meta::{CachedMetadataStore, OpenOptions, SqliteMetadataStore};
 use cairn_protocol::S3Service;
 use cairn_types::blob::ReconcileOpts;
 use cairn_types::traits::{
-    Authenticator, AuthorizationEngine, BlobStore, Clock, Crypto, MetadataStore, PublicUrl,
-    ReconcileOracle,
+    Authenticator, AuthorizationEngine, BlobStore, Clock, Crypto, MetadataStore, ReconcileOracle,
 };
 use std::sync::Arc;
 
@@ -49,9 +48,6 @@ pub struct AppStack {
     /// The master-key crypto facility, threaded to the replication drain so it can unseal stored
     /// per-bucket remote replication targets (`ConfigAspect::ReplicationTargets`, ARCH §20.5).
     pub crypto: Arc<SystemCrypto>,
-    /// Signer/verifier for Cairn's signed public-read ("share") URLs (ARCH §14.5). Keyed off the
-    /// master key so links stay valid across restarts when `CAIRN_MASTER_KEY` is set.
-    pub public_url: Arc<dyn PublicUrl>,
     /// The base domain for virtual-host-style S3 addressing (`CAIRN_S3_DOMAIN`, ARCH §13.1), e.g.
     /// `s3.example.com`. When set, a request whose `Host` is `<bucket>.<s3_domain>` routes to that
     /// bucket with the whole path as the key; `None` leaves path-style addressing as the only form.
@@ -235,24 +231,6 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
     // key + secret log into the web UI, authenticate the management API, and sign S3 requests.
     ensure_root_admin(&meta, &crypto, &clock, cfg).await?;
 
-    // The public-read ("share") URL signer is derived from the master key via a domain-separated
-    // HMAC-SHA256 PRF over the raw 32 key *bytes* (not the hex string), so signed links survive
-    // restarts when CAIRN_MASTER_KEY is set. With no master key, an ephemeral per-process key is
-    // used — links are valid only within this process and, unlike the former hardcoded constant,
-    // are not forgeable from the source.
-    let public_url: Arc<dyn PublicUrl> = match &cfg.master_key {
-        Some(hex) => Arc::new(
-            HmacPublicUrl::from_master_key_hex(hex)
-                .map_err(|e| format!("deriving public-URL key from master_key: {e}"))?,
-        ),
-        None => {
-            tracing::warn!(
-                "no master_key configured; public-read share links use an ephemeral per-process key (do not use in production)"
-            );
-            Arc::new(HmacPublicUrl::ephemeral())
-        }
-    };
-
     // Startup reconciliation reclaims orphaned blobs from any crash window before serving. The
     // oracle is taken by `&dyn ReconcileOracle`, so the boxed oracle is borrowed via `as_ref`.
     match blob
@@ -277,7 +255,6 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
         blob,
         oracle,
         store,
-        public_url,
         s3_domain: cfg.s3_domain.clone(),
     })
 }

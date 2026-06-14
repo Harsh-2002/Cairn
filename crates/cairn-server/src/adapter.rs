@@ -12,9 +12,9 @@ use bytes::Bytes;
 use cairn_crypto::SystemClock;
 use cairn_protocol::{S3Body, S3Request, S3Response, error_response};
 use cairn_types::auth::{AuthMethod, AuthOutcome, Principal, RequestView, Role};
-use cairn_types::crypto::Signature;
 use cairn_types::error::{BodyError, Error};
-use cairn_types::id::{BucketName, ObjectKey, UserId};
+use cairn_types::id::{BucketName, ObjectKey, UserId, VersionId};
+use cairn_types::meta::{ActivityEntry, Mutation, ShareDisposition, ShareRow};
 use cairn_types::time::Timestamp;
 use cairn_types::traits::Clock;
 use futures_util::StreamExt;
@@ -94,14 +94,15 @@ pub async fn handle(
             Ok(c) => c.to_bytes(),
             Err(_) => Bytes::new(),
         };
-        // Signing a public-read ("share") URL is handled here, not in cairn-control, because the
-        // signer lives in the server stack: POST /api/v1/buckets/{bucket}/objects/share.
+        // Minting a persistent public-read ("share") URL is handled here, not in cairn-control,
+        // because it streams object bytes through the server stack on redemption:
+        // POST /api/v1/buckets/{bucket}/objects/share.
         if method == Method::POST {
             if let Some(bucket) = subpath
                 .strip_prefix("/buckets/")
                 .and_then(|r| r.strip_suffix("/objects/share"))
             {
-                return sign_share(stack, bucket, &body_bytes, principal.as_ref());
+                return create_share(stack, bucket, &body_bytes, principal.as_ref()).await;
             }
         }
         let resp = stack
@@ -144,11 +145,14 @@ pub async fn handle(
         }
     }
 
-    // Signed public-read ("share") URLs: GET /p/{bucket}/{key}?expires=..&sig=.. — unauthenticated,
-    // authorized solely by the HMAC signature over the path + expiry.
-    if method == Method::GET && (raw_path.starts_with("/p/")) {
-        let escaped = &raw_path[2..]; // keep the leading '/', drop the "/p" prefix
-        return serve_public(stack, escaped, &query_str, peer, secure, request_id).await;
+    // Persistent public-read ("share") URLs: GET|HEAD /p/{token} — unauthenticated, resolved by an
+    // opaque registry token (ARCH §15.8). The token is a single path segment.
+    if (method == Method::GET || method == Method::HEAD) && raw_path.starts_with("/p/") {
+        let token = &raw_path[3..]; // after "/p/"
+        if token.is_empty() || token.contains('/') {
+            return json_status(404, r#"{"error":"not found"}"#);
+        }
+        return serve_share(stack, token, method, &headers, peer, secure, request_id).await;
     }
 
     // Virtual-host-style addressing (ARCH §13.1): when `CAIRN_S3_DOMAIN` is configured and the
@@ -199,24 +203,28 @@ fn json_status(status: u16, body: &str) -> Response<ResponseBody> {
         .unwrap_or_else(|_| Response::new(full_body(Bytes::new())))
 }
 
-/// Percent-encode a key for the wire, keeping the unreserved set and `/` (path separators).
-fn pct_encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for &b in s.as_bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
-                out.push(b as char);
-            }
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
+/// Strip header-injection and quoting characters from a download filename before it goes into
+/// `Content-Disposition`.
+fn sanitize_filename(s: &str) -> String {
+    s.chars()
+        .filter(|c| !matches!(c, '"' | '\\' | '\r' | '\n'))
+        .collect()
 }
 
-/// Sign a public-read ("share") URL for an object. Admin-only. The signature covers the decoded
-/// canonical path (`/{bucket}/{key}`) and the expiry; the returned URL percent-encodes the key for
-/// the wire. Body: `{"key": "...", "expires_in_secs": 3600}`.
-fn sign_share(
+/// A 256-bit opaque share token (two v4 UUIDs of hex), URL-safe and unguessable. Matches the
+/// bootstrap secret construction; the row's existence is the capability.
+fn generate_share_token() -> String {
+    format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    )
+}
+
+/// Mint a persistent public-read ("share") token for an object (ARCH §15.8). Admin-only. Body:
+/// `{"key", "expires_in_secs"?: null=forever, "disposition"?: "inline"|"attachment", "filename"?,
+/// "version_id"?}`. Returns `{"token","url":"/p/{token}","expires_at_ms": ms|null}`.
+async fn create_share(
     stack: &AppStack,
     bucket: &str,
     body: &Bytes,
@@ -225,92 +233,192 @@ fn sign_share(
     if principal.map(|p| p.role) != Some(Role::Administrator) {
         return json_status(403, r#"{"error":"forbidden"}"#);
     }
+    let bname = match BucketName::parse(bucket) {
+        Ok(b) => b,
+        Err(_) => return json_status(404, r#"{"error":"no such bucket"}"#),
+    };
     #[derive(serde::Deserialize)]
     struct ShareReq {
         key: String,
         #[serde(default)]
         expires_in_secs: Option<u64>,
+        #[serde(default)]
+        disposition: Option<String>,
+        #[serde(default)]
+        filename: Option<String>,
+        #[serde(default)]
+        version_id: Option<String>,
     }
     let req: ShareReq = match serde_json::from_slice(body) {
         Ok(r) => r,
         Err(_) => return json_status(400, r#"{"error":"invalid request body"}"#),
     };
-    if req.key.is_empty() {
-        return json_status(400, r#"{"error":"key is required"}"#);
+    let key = match ObjectKey::parse(&req.key) {
+        Ok(k) if !req.key.is_empty() => k,
+        _ => return json_status(400, r#"{"error":"a valid key is required"}"#),
+    };
+    let now = SystemClock::new().now();
+    // null/absent expiry = forever (admin-minted, revocable, audited).
+    let expires_at = req
+        .expires_in_secs
+        .map(|s| Timestamp(now.as_millis() + (s as i64) * 1000));
+    let disposition = match req.disposition.as_deref() {
+        Some("attachment") => ShareDisposition::Attachment,
+        _ => ShareDisposition::Inline,
+    };
+    let token = generate_share_token();
+    let row = ShareRow {
+        token: token.clone(),
+        bucket: bname.clone(),
+        key: key.clone(),
+        version_id: req.version_id.map(VersionId::from_string),
+        expires_at,
+        disposition,
+        filename: req.filename,
+        created_by: principal
+            .map(|p| p.user_id.clone())
+            .unwrap_or_else(UserId::generate),
+        created_at: now,
+        revoked_at: None,
+    };
+    if stack
+        .meta
+        .submit(Mutation::CreateShare(Box::new(row)))
+        .await
+        .is_err()
+    {
+        return json_status(500, r#"{"error":"could not create share"}"#);
     }
-    let ttl = req.expires_in_secs.unwrap_or(3600).clamp(1, 7 * 24 * 3600);
-    let expiry = Timestamp(SystemClock::new().now().as_millis() + (ttl as i64) * 1000);
-    let canonical = format!("/{bucket}/{}", req.key);
-    let sig = stack.public_url.sign("GET", &canonical, expiry);
-    let url = format!(
-        "/p/{bucket}/{}?expires={}&sig={}",
-        pct_encode(&req.key),
-        expiry.as_millis(),
-        sig.0
-    );
+    // Audit the mint (best-effort; never blocks the response).
+    let _ = stack
+        .meta
+        .submit(Mutation::RecordActivity(Box::new(ActivityEntry {
+            id: uuid::Uuid::new_v4().simple().to_string(),
+            action: "CreateShare".to_owned(),
+            bucket: Some(bname.as_str().to_owned()),
+            key: Some(key.as_str().to_owned()),
+            size: None,
+            etag: None,
+            actor: principal.map(|p| p.access_key_id.clone()),
+            at: now,
+        })))
+        .await;
+    let expires_json = expires_at.map_or_else(|| "null".to_owned(), |t| t.0.to_string());
     json_status(
         200,
-        &format!(
-            r#"{{"url":"{url}","expires_at_ms":{}}}"#,
-            expiry.as_millis()
-        ),
+        &format!(r#"{{"token":"{token}","url":"/p/{token}","expires_at_ms":{expires_json}}}"#),
     )
 }
 
-/// Serve a signed public-read URL: verify the signature + expiry, then serve the object through the
-/// normal S3 GET path with a synthetic administrator principal (the signature is the authorization;
-/// an administrator short-circuits bucket authz — ARCH §15.3). `escaped` is the path after `/p`.
-async fn serve_public(
+/// Serve a persistent share by its token: look it up, reject revoked/expired (`410`) or unknown
+/// (`404`), then stream the object through the normal S3 read path under a least-privilege synthetic
+/// principal scoped to read-only of the one key. Version-pinned shares serve the pinned version;
+/// the server sets `Content-Disposition` from the share and `Referrer-Policy: no-referrer`.
+async fn serve_share(
     stack: &AppStack,
-    escaped: &str,
-    query_str: &str,
+    token: &str,
+    method: Method,
+    in_headers: &[(String, String)],
     peer: IpAddr,
     secure: bool,
     request_id: String,
 ) -> Response<ResponseBody> {
-    let q = parse_query(query_str);
-    let expires = q
-        .iter()
-        .find(|(k, _)| k == "expires")
-        .and_then(|(_, v)| v.parse::<i64>().ok());
-    let sig = q.iter().find(|(k, _)| k == "sig").map(|(_, v)| v.clone());
-    let (Some(expires), Some(sig)) = (expires, sig) else {
-        return json_status(403, r#"{"error":"invalid signed url"}"#);
+    let row = match stack.meta.get_share(token).await {
+        Ok(Some(r)) => r,
+        Ok(None) => return json_status(404, r#"{"error":"not found"}"#),
+        Err(_) => return json_status(500, r#"{"error":"internal error"}"#),
     };
-    let (bucket, key) = route_path(escaped);
-    let (Some(bucket), Some(key)) = (bucket, key) else {
-        return json_status(404, r#"{"error":"not found"}"#);
-    };
-    let canonical = format!("/{}/{}", bucket.as_str(), key.as_str());
-    let now = SystemClock::new().now();
-    if !stack
-        .public_url
-        .verify("GET", &canonical, Timestamp(expires), &Signature(sig), now)
-    {
-        return json_status(403, r#"{"error":"invalid or expired signed url"}"#);
+    if row.revoked_at.is_some() {
+        return json_status(410, r#"{"error":"this share has been revoked"}"#);
     }
+    if let Some(exp) = row.expires_at {
+        if SystemClock::new().now().as_millis() > exp.0 {
+            return json_status(410, r#"{"error":"this share has expired"}"#);
+        }
+    }
+
+    // A least-privilege synthetic principal: a member whose ONLY grant is reading this one key. As
+    // an identity (not public) grant it bypasses Block Public Access — the intended per-object
+    // share semantics — yet it can never reach another object or a write, even if a downstream bug
+    // let it try. A fresh random user id matches no named policy/ACL statement.
+    let resource = format!("arn:aws:s3:::{}/{}", row.bucket.as_str(), row.key.as_str());
+    let policy = cairn_types::authz::Policy {
+        version: "2012-10-17".to_owned(),
+        id: None,
+        statements: vec![cairn_types::authz::Statement {
+            sid: None,
+            effect: cairn_types::Effect::Allow,
+            principals: cairn_types::authz::PrincipalSpec::Any,
+            actions: cairn_types::authz::ActionMatch::In(vec![
+                cairn_types::authz::ActionPattern::Exact("s3:GetObject".to_owned()),
+                cairn_types::authz::ActionPattern::Exact("s3:GetObjectVersion".to_owned()),
+            ]),
+            resources: cairn_types::authz::ResourceMatch::In(vec![resource]),
+            conditions: Vec::new(),
+        }],
+    };
     let principal = Principal {
         user_id: UserId::generate(),
-        display_name: "public-url".to_owned(),
-        access_key_id: "public-url".to_owned(),
-        role: Role::Administrator,
+        display_name: "object-share".to_owned(),
+        access_key_id: "object-share".to_owned(),
+        role: Role::Member,
         method: AuthMethod::Bearer,
         chunk_signing: None,
-        user_policy: None,
+        user_policy: Some(Box::new(policy)),
     };
+
+    // Pin the version when the share is version-pinned; forward only safe read-shaping headers.
+    let mut query: Vec<(String, String)> = Vec::new();
+    if let Some(v) = &row.version_id {
+        query.push(("versionId".to_owned(), v.as_str().to_owned()));
+    }
+    let headers: Vec<(String, String)> = in_headers
+        .iter()
+        .filter(|(k, _)| {
+            matches!(
+                k.as_str(),
+                "range"
+                    | "if-none-match"
+                    | "if-modified-since"
+                    | "if-match"
+                    | "if-unmodified-since"
+            )
+        })
+        .cloned()
+        .collect();
+
     let s3req = S3Request {
-        method: Method::GET,
-        bucket: Some(bucket),
-        key: Some(key),
-        query: Vec::new(),
-        headers: Vec::new(),
+        method,
+        bucket: Some(row.bucket.clone()),
+        key: Some(row.key.clone()),
+        query,
+        headers,
         principal: Some(principal),
         source: peer,
         secure,
         request_id,
     };
     let empty: cairn_types::BodyStream = Box::pin(futures_util::stream::empty());
-    render(stack.s3.handle(s3req, empty).await)
+    let mut resp = render(stack.s3.handle(s3req, empty).await);
+
+    // Server-controlled delivery + privacy: override any object-set disposition, and never leak the
+    // token through a referer.
+    let disp = match (row.disposition, row.filename.as_deref()) {
+        (ShareDisposition::Attachment, Some(name)) => {
+            format!("attachment; filename=\"{}\"", sanitize_filename(name))
+        }
+        (ShareDisposition::Attachment, None) => "attachment".to_owned(),
+        (ShareDisposition::Inline, _) => "inline".to_owned(),
+    };
+    let h = resp.headers_mut();
+    if let Ok(v) = http::HeaderValue::from_str(&disp) {
+        h.insert(http::header::CONTENT_DISPOSITION, v);
+    }
+    h.insert(
+        "referrer-policy",
+        http::HeaderValue::from_static("no-referrer"),
+    );
+    resp
 }
 
 /// Route a request to a `(bucket, key)`, preferring virtual-host-style addressing when configured.
