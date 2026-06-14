@@ -5,10 +5,11 @@
 
 import { useEffect, useId, useState } from "react";
 import { useParams } from "react-router";
-import { Trash2 } from "lucide-react";
+import { Plus, Trash2, X } from "lucide-react";
 import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
   Card,
   CardContent,
@@ -64,12 +65,39 @@ function statusFromState(s: string): string {
   return "Unversioned";
 }
 
+// CORS / Lifecycle / ACL remain read-only here (set via the S3 API); ownership,
+// public access block, and bucket tags have dedicated editors below.
 const ASPECTS: [keyof AspectsSource, string][] = [
   ["cors", "CORS"],
-  ["tagging", "Tagging"],
   ["lifecycle", "Lifecycle"],
   ["acl", "ACL"],
-  ["public_access_block", "Public access block"],
+];
+
+const PAB_TOGGLES: {
+  key: keyof import("@/lib/s3").PublicAccessBlock;
+  label: string;
+  hint: string;
+}[] = [
+  {
+    key: "blockPublicAcls",
+    label: "Block public ACLs",
+    hint: "Reject new public ACLs on the bucket and objects.",
+  },
+  {
+    key: "ignorePublicAcls",
+    label: "Ignore public ACLs",
+    hint: "Ignore any existing public ACL grants.",
+  },
+  {
+    key: "blockPublicPolicy",
+    label: "Block public policy",
+    hint: "Reject bucket policies that grant public access.",
+  },
+  {
+    key: "restrictPublicBuckets",
+    label: "Restrict public buckets",
+    hint: "Limit access to authenticated principals when a public policy exists.",
+  },
 ];
 
 interface AspectsSource {
@@ -111,7 +139,19 @@ export function BucketSettings() {
     } catch {
       /* status unavailable */
     }
-    return { config, compression, repl, targets, replStatus };
+    let pab: s3.PublicAccessBlock | null = null;
+    try {
+      pab = await s3.getPublicAccessBlock(name);
+    } catch {
+      /* unset / unavailable */
+    }
+    let bucketTags: s3.ObjectTag[] = [];
+    try {
+      bucketTags = await s3.getBucketTagging(name);
+    } catch {
+      /* none */
+    }
+    return { config, compression, repl, targets, replStatus, pab, bucketTags };
   }, [name]);
 
   // Per-card editable state, seeded from the loaded snapshot.
@@ -143,6 +183,24 @@ export function BucketSettings() {
     null,
   );
 
+  // Object Ownership (kebab-case from the API ↔ PascalCase S3 ObjectOwnership).
+  const OWNERSHIP_TO_S3: Record<string, string> = {
+    "bucket-owner-enforced": "BucketOwnerEnforced",
+    "bucket-owner-preferred": "BucketOwnerPreferred",
+    "object-writer": "ObjectWriter",
+  };
+  const [ownership, setOwnership] = useState("BucketOwnerEnforced");
+
+  // Public Access Block toggles + bucket-level tags.
+  const PAB_OFF: s3.PublicAccessBlock = {
+    blockPublicAcls: false,
+    ignorePublicAcls: false,
+    blockPublicPolicy: false,
+    restrictPublicBuckets: false,
+  };
+  const [pab, setPab] = useState<s3.PublicAccessBlock>(PAB_OFF);
+  const [bucketTags, setBucketTags] = useState<s3.ObjectTag[]>([]);
+
   useEffect(() => {
     const d = res.data;
     if (!d) return;
@@ -155,9 +213,13 @@ export function BucketSettings() {
     );
     setReplDest(d.repl?.dest_bucket ?? "");
     setReplPrefix(d.repl?.prefix ?? "");
+    setOwnership(OWNERSHIP_TO_S3[d.config.ownership_mode] ?? "BucketOwnerEnforced");
+    setPab(d.pab ?? PAB_OFF);
+    setBucketTags(d.bucketTags);
     setQuotaError("");
     setPolicyError("");
     setReplError("");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [res.data]);
 
   // Live JSON validity for the policy editor (inline, before save).
@@ -355,6 +417,31 @@ export function BucketSettings() {
     void run("resync", async () => {
       await api.resyncReplication(name);
       toast.success("Backfill started for existing objects.");
+    });
+  }
+
+  function saveOwnership() {
+    void run("ownership", async () => {
+      await s3.putOwnershipControls(name, ownership);
+      toast.success("Object ownership updated.");
+    });
+  }
+
+  function savePab() {
+    void run("pab", async () => {
+      await s3.putPublicAccessBlock(name, pab);
+      toast.success("Public Access Block updated.");
+    });
+  }
+
+  function saveBucketTags() {
+    void run("buckettags", async () => {
+      const cleaned = bucketTags
+        .map((t) => ({ key: t.key.trim(), value: t.value }))
+        .filter((t) => t.key !== "");
+      if (cleaned.length === 0) await s3.deleteBucketTagging(name);
+      else await s3.putBucketTagging(name, cleaned);
+      toast.success("Bucket tags saved.");
     });
   }
 
@@ -821,20 +908,161 @@ export function BucketSettings() {
         </CardFooter>
       </Card>
 
-      {/* ---- Configured aspects (read-only) ---- */}
+      {/* ---- Object ownership ---- */}
+      <Card className="gap-4">
+        <CardHeader>
+          <CardTitle className="text-base">Object ownership</CardTitle>
+          <CardDescription>
+            Controls whether ACLs apply. <strong>Bucket owner enforced</strong>{" "}
+            disables ACLs entirely (the safe default); the other modes let object
+            writers set ACLs.
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <Select value={ownership} onValueChange={setOwnership}>
+            <SelectTrigger className="w-full sm:w-56" aria-label="Object ownership">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="BucketOwnerEnforced">
+                Bucket owner enforced
+              </SelectItem>
+              <SelectItem value="BucketOwnerPreferred">
+                Bucket owner preferred
+              </SelectItem>
+              <SelectItem value="ObjectWriter">Object writer</SelectItem>
+            </SelectContent>
+          </Select>
+        </CardContent>
+        <CardFooter className="justify-end border-t pt-4!">
+          <Button onClick={saveOwnership} disabled={busy === "ownership"}>
+            {busy === "ownership" ? "Saving…" : "Save"}
+          </Button>
+        </CardFooter>
+      </Card>
+
+      {/* ---- Public Access Block ---- */}
+      <Card className="gap-4">
+        <CardHeader>
+          <CardTitle className="text-base">Public Access Block</CardTitle>
+          <CardDescription>
+            Guardrails that neutralise public access regardless of ACLs or
+            policy. Enabling all four is the safe default.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          {PAB_TOGGLES.map((t) => (
+            <label key={t.key} className="flex items-start gap-3">
+              <Checkbox
+                checked={pab[t.key]}
+                onCheckedChange={(v) => setPab({ ...pab, [t.key]: v === true })}
+                aria-label={t.label}
+                className="mt-0.5"
+              />
+              <span>
+                <span className="block text-sm">{t.label}</span>
+                <span className="block text-[13px] text-muted-foreground">
+                  {t.hint}
+                </span>
+              </span>
+            </label>
+          ))}
+        </CardContent>
+        <CardFooter className="justify-end border-t pt-4!">
+          <Button onClick={savePab} disabled={busy === "pab"}>
+            {busy === "pab" ? "Saving…" : "Save"}
+          </Button>
+        </CardFooter>
+      </Card>
+
+      {/* ---- Bucket tags ---- */}
+      <Card className="gap-4">
+        <CardHeader>
+          <CardTitle className="text-base">Bucket tags</CardTitle>
+          <CardDescription>
+            Key-value tags on the bucket, for organisation and policy
+            conditioning.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-2">
+          {bucketTags.length === 0 ? (
+            <p className="text-[13px] text-muted-foreground">
+              No tags. Add one below.
+            </p>
+          ) : (
+            bucketTags.map((t, i) => (
+              <div key={i} className="flex items-center gap-2">
+                <Input
+                  aria-label={`Tag ${i + 1} key`}
+                  placeholder="Key"
+                  value={t.key}
+                  className="font-mono"
+                  onChange={(e) =>
+                    setBucketTags((cur) =>
+                      cur.map((x, j) =>
+                        j === i ? { ...x, key: e.target.value } : x,
+                      ),
+                    )
+                  }
+                />
+                <Input
+                  aria-label={`Tag ${i + 1} value`}
+                  placeholder="Value"
+                  value={t.value}
+                  className="font-mono"
+                  onChange={(e) =>
+                    setBucketTags((cur) =>
+                      cur.map((x, j) =>
+                        j === i ? { ...x, value: e.target.value } : x,
+                      ),
+                    )
+                  }
+                />
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  aria-label={`Remove tag ${i + 1}`}
+                  onClick={() =>
+                    setBucketTags((cur) => cur.filter((_, j) => j !== i))
+                  }
+                >
+                  <X aria-hidden="true" />
+                </Button>
+              </div>
+            ))
+          )}
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            disabled={bucketTags.length >= 50}
+            onClick={() =>
+              setBucketTags((cur) => [...cur, { key: "", value: "" }])
+            }
+          >
+            <Plus aria-hidden="true" />
+            Add tag
+          </Button>
+        </CardContent>
+        <CardFooter className="justify-end border-t pt-4!">
+          <Button onClick={saveBucketTags} disabled={busy === "buckettags"}>
+            {busy === "buckettags" ? "Saving…" : "Save tags"}
+          </Button>
+        </CardFooter>
+      </Card>
+
+      {/* ---- Configured aspects (read-only: CORS / Lifecycle / ACL) ---- */}
       <Card className="gap-4">
         <CardHeader>
           <CardTitle className="text-base">Other S3 aspects</CardTitle>
           <CardDescription>
-            Aspects configured through the S3 API are shown here for reference.
+            CORS, lifecycle, and ACL are configured through the S3 API and shown
+            here for reference.
           </CardDescription>
         </CardHeader>
         <CardContent>
           <dl className="grid grid-cols-2 gap-x-6 gap-y-3 sm:grid-cols-3">
-            <div>
-              <dt className="text-[13px] text-muted-foreground">Ownership mode</dt>
-              <dd className="mt-0.5 text-sm">{config.ownership_mode}</dd>
-            </div>
             {ASPECTS.map(([key, label]) => (
               <div key={key}>
                 <dt className="text-[13px] text-muted-foreground">{label}</dt>

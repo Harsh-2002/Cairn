@@ -259,6 +259,119 @@ export async function bulkDelete(
   return { deleted, errors };
 }
 
+// --- Public Access Block (?publicAccessBlock) -----------------------------------
+
+export interface PublicAccessBlock {
+  blockPublicAcls: boolean;
+  ignorePublicAcls: boolean;
+  blockPublicPolicy: boolean;
+  restrictPublicBuckets: boolean;
+}
+
+export async function getPublicAccessBlock(
+  bucket: string,
+): Promise<PublicAccessBlock | null> {
+  const res = await fetch(`/${encodeURIComponent(bucket)}?publicAccessBlock`, {
+    headers: s3headers(),
+  });
+  if (res.status === 404) return null;
+  if (!res.ok)
+    throw new ApiError(`load access block failed (${res.status})`, res.status);
+  const doc = parseXml(await res.text());
+  const flag = (tag: string) =>
+    (doc.getElementsByTagName(tag)[0]?.textContent ?? "").trim() === "true";
+  return {
+    blockPublicAcls: flag("BlockPublicAcls"),
+    ignorePublicAcls: flag("IgnorePublicAcls"),
+    blockPublicPolicy: flag("BlockPublicPolicy"),
+    restrictPublicBuckets: flag("RestrictPublicBuckets"),
+  };
+}
+
+export async function putPublicAccessBlock(
+  bucket: string,
+  b: PublicAccessBlock,
+): Promise<void> {
+  const body =
+    `<PublicAccessBlockConfiguration>` +
+    `<BlockPublicAcls>${b.blockPublicAcls}</BlockPublicAcls>` +
+    `<IgnorePublicAcls>${b.ignorePublicAcls}</IgnorePublicAcls>` +
+    `<BlockPublicPolicy>${b.blockPublicPolicy}</BlockPublicPolicy>` +
+    `<RestrictPublicBuckets>${b.restrictPublicBuckets}</RestrictPublicBuckets>` +
+    `</PublicAccessBlockConfiguration>`;
+  const res = await fetch(`/${encodeURIComponent(bucket)}?publicAccessBlock`, {
+    method: "PUT",
+    headers: s3headers({ "Content-Type": "application/xml" }),
+    body,
+  });
+  if (!res.ok && res.status !== 204)
+    throw new ApiError(`save access block failed (${res.status})`, res.status);
+}
+
+// --- Object Ownership (?ownershipControls) --------------------------------------
+
+// `mode` is the S3 ObjectOwnership value: BucketOwnerEnforced | BucketOwnerPreferred | ObjectWriter.
+export async function putOwnershipControls(
+  bucket: string,
+  mode: string,
+): Promise<void> {
+  const body = `<OwnershipControls><Rule><ObjectOwnership>${mode}</ObjectOwnership></Rule></OwnershipControls>`;
+  const res = await fetch(`/${encodeURIComponent(bucket)}?ownershipControls`, {
+    method: "PUT",
+    headers: s3headers({ "Content-Type": "application/xml" }),
+    body,
+  });
+  if (!res.ok && res.status !== 204)
+    throw new ApiError(`save ownership failed (${res.status})`, res.status);
+}
+
+// --- Bucket tagging (?tagging on the bucket) ------------------------------------
+
+export async function getBucketTagging(bucket: string): Promise<ObjectTag[]> {
+  const res = await fetch(`/${encodeURIComponent(bucket)}?tagging`, {
+    headers: s3headers(),
+  });
+  if (res.status === 404) return [];
+  if (!res.ok)
+    throw new ApiError(`load bucket tags failed (${res.status})`, res.status);
+  const doc = parseXml(await res.text());
+  return Array.from(doc.getElementsByTagName("Tag")).map((el) => ({
+    key: childText(el, "Key"),
+    value: childText(el, "Value"),
+  }));
+}
+
+export async function putBucketTagging(
+  bucket: string,
+  tags: ObjectTag[],
+): Promise<void> {
+  const body =
+    `<Tagging><TagSet>` +
+    tags
+      .map(
+        (t) =>
+          `<Tag><Key>${xmlEscape(t.key)}</Key><Value>${xmlEscape(t.value)}</Value></Tag>`,
+      )
+      .join("") +
+    `</TagSet></Tagging>`;
+  const res = await fetch(`/${encodeURIComponent(bucket)}?tagging`, {
+    method: "PUT",
+    headers: s3headers({ "Content-Type": "application/xml" }),
+    body,
+  });
+  if (!res.ok && res.status !== 204)
+    throw new ApiError(`save bucket tags failed (${res.status})`, res.status);
+}
+
+export async function deleteBucketTagging(bucket: string): Promise<void> {
+  const res = await fetch(`/${encodeURIComponent(bucket)}?tagging`, {
+    method: "DELETE",
+    headers: s3headers(),
+  });
+  if (!res.ok && res.status !== 204)
+    throw new ApiError(`clear bucket tags failed (${res.status})`, res.status);
+}
+
 // Per-bucket replication rule via the S3 subresource (?replication). Returns the rule's
 // destination bucket + prefix (or null when no rule is configured).
 export async function getReplication(
