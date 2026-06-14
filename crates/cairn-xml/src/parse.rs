@@ -253,6 +253,69 @@ pub fn parse_tagging(body: &[u8]) -> Result<Vec<(String, String)>, Error> {
     Ok(out)
 }
 
+/// Maximum tags per object (the S3 limit).
+pub const MAX_TAGS_OBJECT: usize = 10;
+/// Maximum tags per bucket (the S3 limit).
+pub const MAX_TAGS_BUCKET: usize = 50;
+const MAX_TAG_KEY_LEN: usize = 128;
+const MAX_TAG_VALUE_LEN: usize = 256;
+
+/// Whether a tag key/value character is in the S3-permitted set: Unicode letters and digits,
+/// whitespace, and the punctuation `+ - = . _ : / @`.
+fn tag_char_ok(c: char) -> bool {
+    c.is_alphanumeric()
+        || c.is_whitespace()
+        || matches!(c, '+' | '-' | '=' | '.' | '_' | ':' | '/' | '@')
+}
+
+/// Enforce the S3 tag-set quantitative limits (ARCH §17.1) on an already-parsed tag list: at most
+/// `max_tags` entries; each key 1..=128 and value 0..=256 Unicode scalars; only permitted
+/// characters; unique keys; and no key carrying the reserved `aws:` prefix. `max_tags` is
+/// [`MAX_TAGS_OBJECT`] or [`MAX_TAGS_BUCKET`].
+///
+/// # Errors
+/// Returns [`Error::InvalidTag`] describing the first violation (distinct from `MalformedXml`,
+/// matching S3, which returns `InvalidTag` for a well-formed body that breaks a limit).
+pub fn validate_tags(tags: &[(String, String)], max_tags: usize) -> Result<(), Error> {
+    use std::collections::HashSet;
+    if tags.len() > max_tags {
+        return Err(Error::InvalidTag(format!(
+            "too many tags ({}, max {max_tags})",
+            tags.len()
+        )));
+    }
+    let mut seen: HashSet<&str> = HashSet::with_capacity(tags.len());
+    for (k, v) in tags {
+        if k.is_empty() {
+            return Err(Error::InvalidTag("a tag key must not be empty".to_owned()));
+        }
+        if k.chars().count() > MAX_TAG_KEY_LEN {
+            return Err(Error::InvalidTag(format!(
+                "tag key longer than {MAX_TAG_KEY_LEN} characters"
+            )));
+        }
+        if v.chars().count() > MAX_TAG_VALUE_LEN {
+            return Err(Error::InvalidTag(format!(
+                "tag value longer than {MAX_TAG_VALUE_LEN} characters"
+            )));
+        }
+        if k.to_ascii_lowercase().starts_with("aws:") {
+            return Err(Error::InvalidTag(
+                "tag keys may not begin with the reserved prefix \"aws:\"".to_owned(),
+            ));
+        }
+        if !k.chars().all(tag_char_ok) || !v.chars().all(tag_char_ok) {
+            return Err(Error::InvalidTag(
+                "a tag key or value contains a disallowed character".to_owned(),
+            ));
+        }
+        if !seen.insert(k.as_str()) {
+            return Err(Error::InvalidTag(format!("duplicate tag key {k:?}")));
+        }
+    }
+    Ok(())
+}
+
 // ===========================================================================================
 // VersioningConfiguration
 // ===========================================================================================

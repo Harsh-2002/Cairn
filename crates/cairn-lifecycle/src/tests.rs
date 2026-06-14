@@ -62,6 +62,7 @@ async fn put_object(
                 size_ceiling: 1 << 30,
                 content_type: "application/octet-stream".to_owned(),
                 encryption: None,
+                content_length: None,
             },
         )
         .await

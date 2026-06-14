@@ -85,6 +85,7 @@ async fn put_get_list_delete_roundtrip() {
                     size_ceiling: 1 << 20,
                     content_type: "text/plain".to_owned(),
                     encryption: None,
+                    content_length: None,
                 },
             )
             .await
@@ -315,6 +316,7 @@ fn opts() -> StageOptions {
         size_ceiling: 1 << 20,
         content_type: "application/octet-stream".to_owned(),
         encryption: None,
+        content_length: None,
     }
 }
 

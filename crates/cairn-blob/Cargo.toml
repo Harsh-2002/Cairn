@@ -33,6 +33,11 @@ tracing.workspace = true
 # `io-uring` feature; with the feature off this dependency is not compiled at all.
 tokio-uring = { version = "0.5", optional = true }
 
+# Safe wrappers for the file-placement syscalls (fallocate/fadvise) used by the write fast path
+# (ARCH §7.5). rustix's API is safe — it borrows an `AsFd`, so the crate keeps `forbid(unsafe_code)`.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs"] }
+
 [features]
 # Arms the test-only fault-injection seam in the durable commit path.
 failpoints = ["fail/failpoints"]

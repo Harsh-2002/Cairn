@@ -88,6 +88,11 @@ pub struct Config {
     /// authorization does not re-read SQLite on every request. `0` disables the cache. Default
     /// 64 MiB.
     pub meta_cache_bytes: u64,
+    /// Maximum number of concurrent blob transfers (`CAIRN_BLOB_IO_POOL_SIZE`, ARCH §7.4). Each
+    /// object read/write/assemble holds one permit for its file I/O, so a flood of large transfers
+    /// cannot exhaust the runtime's blocking-pool threads. Tune to the device's useful I/O
+    /// concurrency: lower for a single spinning disk, higher for a fast NVMe array. Default 64.
+    pub blob_io_pool_size: usize,
     /// Replication destination endpoint (e.g. `http://backup-host:9000`). When set, the
     /// replication worker ships outbox entries to this S3-compatible target (ARCH §20).
     pub replication_endpoint: Option<String>,
@@ -145,6 +150,7 @@ impl Default for Config {
             wal_checkpoint_size_bytes: 64 * 1024 * 1024,
             s3_domain: None,
             meta_cache_bytes: 64 * 1024 * 1024,
+            blob_io_pool_size: 64,
             replication_endpoint: None,
             replication_dest_bucket: None,
             replication_access_key: None,
@@ -311,6 +317,22 @@ impl Config {
             return Err(ConfigError::Invalid(
                 "wal_checkpoint_interval_secs must be positive".into(),
             ));
+        }
+        // The replication drain cadence was previously unvalidated; a `0` would busy-spin the worker.
+        if self.replication_interval_secs == 0 {
+            return Err(ConfigError::Invalid(
+                "replication_interval_secs must be positive".into(),
+            ));
+        }
+        // A present master key must be 32 bytes of hex (64 hex characters), so a typo fails fast at
+        // load rather than at the first secret seal/open. (There is no separate public-read signing
+        // secret to validate — the signed-share-URL key is derived from the master key.)
+        if let Some(mk) = &self.master_key {
+            if mk.len() != 64 || !mk.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(ConfigError::Invalid(
+                    "master_key must be 64 hex characters (a 32-byte key)".into(),
+                ));
+            }
         }
         // A malformed replication-targets document is an operator error that must surface at load,
         // not when the first drain tries to route an object. Reject targets that set both a CA
@@ -575,5 +597,35 @@ mod tests {
     #[test]
     fn parse_targets_empty_when_unset() {
         assert!(base().parse_replication_targets().unwrap().is_empty());
+    }
+
+    #[test]
+    fn rejects_zero_replication_interval() {
+        let mut c = base();
+        c.replication_interval_secs = 0;
+        assert!(c.validate().is_err(), "a zero drain interval busy-spins");
+        c.replication_interval_secs = 30;
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_malformed_master_key() {
+        let mut c = base();
+        c.master_key = Some("not-hex".to_owned());
+        assert!(c.validate().is_err(), "non-hex master key rejected");
+        c.master_key = Some("ab".repeat(31)); // 62 hex chars — wrong length
+        assert!(c.validate().is_err(), "wrong-length master key rejected");
+        c.master_key = Some("zz".repeat(32)); // 64 chars but not hex digits
+        assert!(c.validate().is_err(), "non-hex characters rejected");
+        c.master_key = Some("ab".repeat(32)); // 64 valid hex chars = 32 bytes
+        assert!(
+            c.validate().is_ok(),
+            "a valid 64-hex master key is accepted"
+        );
+        c.master_key = None;
+        assert!(
+            c.validate().is_ok(),
+            "absent master key allowed (dev fallback)"
+        );
     }
 }

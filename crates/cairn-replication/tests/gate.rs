@@ -46,6 +46,7 @@ async fn stage_blob(blobs: &InMemoryBlobStore, data: &'static [u8]) -> (StorageP
                 size_ceiling: 1 << 30,
                 content_type: "text/plain".to_owned(),
                 encryption: None,
+                content_length: None,
             },
         )
         .await

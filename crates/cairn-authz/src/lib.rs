@@ -19,7 +19,7 @@ pub use acl::{expand_canned_acl, permission_satisfies};
 pub use matching::{resource_arn, resource_matches, wildcard_match};
 pub use parse::{parse_policy, parse_user_policy};
 
-use cairn_types::authz::{ActionPattern, PrincipalSpec};
+use cairn_types::authz::{ActionMatch, ActionPattern, PrincipalSpec, ResourceMatch};
 use cairn_types::{
     Acl, Action, AuthorizationEngine, AuthzInput, Decision, DenyReason, Effect, Grantee,
     OwnershipMode, Policy, PublicAccessBlock, RequesterClass, Resource, Statement, UserId,
@@ -192,18 +192,10 @@ fn user_policy_matches(input: &AuthzInput, effect: Effect) -> bool {
 /// Like [`statement_matches`] but skips the principal gate, for identity (per-user) policy
 /// statements where the requester is implicitly the principal.
 fn statement_matches_no_principal(s: &Statement, input: &AuthzInput) -> bool {
-    if !s
-        .actions
-        .iter()
-        .any(|a| action_pattern_matches(a, input.action))
-    {
+    if !action_clause_matches(&s.actions, input.action) {
         return false;
     }
-    if !s
-        .resources
-        .iter()
-        .any(|r| matching::resource_matches(r, &input.resource))
-    {
+    if !resource_clause_matches(&s.resources, &input.resource) {
         return false;
     }
     conditions_match(&s.conditions, &input.context, &input.requester)
@@ -227,21 +219,33 @@ fn statement_matches(
     ) {
         return false;
     }
-    if !s
-        .actions
-        .iter()
-        .any(|a| action_pattern_matches(a, input.action))
-    {
+    if !action_clause_matches(&s.actions, input.action) {
         return false;
     }
-    if !s
-        .resources
-        .iter()
-        .any(|r| matching::resource_matches(r, &input.resource))
-    {
+    if !resource_clause_matches(&s.resources, &input.resource) {
         return false;
     }
     conditions_match(&s.conditions, &input.context, &input.requester)
+}
+
+/// Whether a statement's action clause matches the request action. A positive `Action` clause
+/// matches when the action matches **any** listed pattern; a negated `NotAction` clause matches
+/// when it matches **none** of them (§15.5).
+fn action_clause_matches(clause: &ActionMatch, action: Action) -> bool {
+    match clause {
+        ActionMatch::In(ps) => ps.iter().any(|a| action_pattern_matches(a, action)),
+        ActionMatch::NotIn(ps) => !ps.iter().any(|a| action_pattern_matches(a, action)),
+    }
+}
+
+/// Whether a statement's resource clause matches the request resource. A positive `Resource`
+/// clause matches **any** listed ARN pattern; a negated `NotResource` clause matches when the
+/// request resource matches **none** of them (§15.5).
+fn resource_clause_matches(clause: &ResourceMatch, resource: &Resource) -> bool {
+    match clause {
+        ResourceMatch::In(rs) => rs.iter().any(|r| matching::resource_matches(r, resource)),
+        ResourceMatch::NotIn(rs) => !rs.iter().any(|r| matching::resource_matches(r, resource)),
+    }
 }
 
 /// Whether a [`PrincipalSpec`] matches the requester, honouring the principal-form gates.
@@ -265,6 +269,20 @@ fn principal_matches(
                 RequesterClass::Anonymous => false,
             }
         }
+        // `NotPrincipal`: matches everyone *except* the listed users. Anonymous requesters are
+        // "not any named user", so the clause covers them — but only when public principals are
+        // permitted, so Block Public Access still governs a `NotPrincipal` Allow exactly as it
+        // governs a `"*"` Allow (see `policy_grants_public`, which flags both as public).
+        // Authenticated members match when public *or* user principals are permitted and they are
+        // not in the excluded set. Owner/admin is authorised on a separate path and never matched
+        // here, mirroring the positive `Users` arm.
+        PrincipalSpec::NotUsers(ids) => match requester {
+            RequesterClass::OwnerOrAdmin => false,
+            RequesterClass::Anonymous => allow_public_principal,
+            RequesterClass::AuthenticatedMember(uid) => {
+                (allow_public_principal || allow_user_principal) && !ids.contains(uid)
+            }
+        },
     }
 }
 
@@ -354,14 +372,19 @@ fn requester_is_authenticated(requester: &RequesterClass) -> bool {
     )
 }
 
-/// Whether the given policy (already parsed) contains any statement that grants public access
-/// (a `*`-principal `Allow`). Exposed for the management surface's BPA warnings.
+/// Whether the given policy (already parsed) contains any statement that grants public access:
+/// an `Allow` whose principal is the `*` wildcard, or a `NotPrincipal` form (which excludes only
+/// named users and therefore still covers anonymous requesters). Exposed for the management
+/// surface's BPA warnings, and the reason BPA suppression treats both forms identically.
 #[must_use]
 pub fn policy_grants_public(policy: &Policy) -> bool {
-    policy
-        .statements
-        .iter()
-        .any(|s| s.effect == Effect::Allow && matches!(s.principals, PrincipalSpec::Any))
+    policy.statements.iter().any(|s| {
+        s.effect == Effect::Allow
+            && matches!(
+                s.principals,
+                PrincipalSpec::Any | PrincipalSpec::NotUsers(_)
+            )
+    })
 }
 
 #[cfg(test)]

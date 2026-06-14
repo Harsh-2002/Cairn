@@ -155,24 +155,53 @@ pub struct Statement {
     pub sid: Option<String>,
     /// Allow or deny.
     pub effect: Effect,
-    /// Principals the statement applies to.
+    /// Principals the statement applies to (a positive `Principal` or a negated `NotPrincipal`).
     pub principals: PrincipalSpec,
-    /// Actions the statement governs.
-    pub actions: Vec<ActionPattern>,
-    /// Resources the statement scopes to (ARN-like strings).
-    pub resources: Vec<String>,
+    /// Actions the statement governs: a positive `Action` set or a negated `NotAction` set.
+    pub actions: ActionMatch,
+    /// Resources the statement scopes to: a positive `Resource` set or a negated `NotResource` set.
+    pub resources: ResourceMatch,
     /// Conditions that must all hold for the statement to match.
     #[serde(default)]
     pub conditions: Vec<Condition>,
 }
 
+/// A statement's action clause: the positive `Action` list, or the negated `NotAction` list.
+///
+/// `NotAction` matches every action *except* those listed — the IAM/S3 negated form (§15.5). A
+/// statement carries exactly one of the two (the parser rejects both-present and neither-present),
+/// so the type makes the invalid "both at once" state unrepresentable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ActionMatch {
+    /// `Action`: the request action must match one of these patterns.
+    In(Vec<ActionPattern>),
+    /// `NotAction`: the request action must match *none* of these patterns.
+    NotIn(Vec<ActionPattern>),
+}
+
+/// A statement's resource clause: the positive `Resource` list, or the negated `NotResource` list.
+///
+/// `NotResource` matches every resource *except* those listed (§15.5). As with [`ActionMatch`], a
+/// statement carries exactly one of the two forms.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResourceMatch {
+    /// `Resource`: the request resource must match one of these ARN patterns.
+    In(Vec<String>),
+    /// `NotResource`: the request resource must match *none* of these ARN patterns.
+    NotIn(Vec<String>),
+}
+
 /// Whom a statement applies to.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PrincipalSpec {
-    /// The wildcard `*`: anyone, including anonymous.
+    /// `Principal: "*"` — the wildcard: anyone, including anonymous.
     Any,
-    /// A specific set of Cairn users.
+    /// `Principal: {"AWS": ...}` — a specific set of Cairn users.
     Users(Vec<UserId>),
+    /// `NotPrincipal: {"AWS": ...}` — everyone *except* the listed users (§15.5). A powerful,
+    /// rarely-needed negated form; in an `Allow` it grants broadly and is therefore treated as a
+    /// public grant for Block Public Access purposes.
+    NotUsers(Vec<UserId>),
 }
 
 /// An action pattern in a policy: exact, the `*` wildcard, or a `prefix*` form.

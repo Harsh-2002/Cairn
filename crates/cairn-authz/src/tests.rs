@@ -1,7 +1,9 @@
 //! Table-driven matrix and property tests for the evaluation order (ARCH §15.3).
 
 use super::*;
-use cairn_types::authz::{ActionPattern, Condition, ConditionOperator, PrincipalSpec};
+use cairn_types::authz::{
+    ActionMatch, ActionPattern, Condition, ConditionOperator, PrincipalSpec, ResourceMatch,
+};
 use cairn_types::{
     Acl, Action, AuthzInput, BucketName, Decision, DenyReason, Effect, Grant, Grantee, ObjectKey,
     OwnershipMode, Permission, Policy, PublicAccessBlock, RequestContext, RequesterClass, Resource,
@@ -78,8 +80,8 @@ fn allow_get_statement(principals: PrincipalSpec, conditions: Vec<Condition>) ->
         sid: None,
         effect: Effect::Allow,
         principals,
-        actions: vec![ActionPattern::Exact("s3:GetObject".to_owned())],
-        resources: vec!["arn:aws:s3:::my-bucket/*".to_owned()],
+        actions: ActionMatch::In(vec![ActionPattern::Exact("s3:GetObject".to_owned())]),
+        resources: ResourceMatch::In(vec!["arn:aws:s3:::my-bucket/*".to_owned()]),
         conditions,
     }
 }
@@ -89,8 +91,8 @@ fn deny_get_statement(principals: PrincipalSpec) -> Statement {
         sid: None,
         effect: Effect::Deny,
         principals,
-        actions: vec![ActionPattern::All],
-        resources: vec!["arn:aws:s3:::my-bucket/*".to_owned()],
+        actions: ActionMatch::In(vec![ActionPattern::All]),
+        resources: ResourceMatch::In(vec!["arn:aws:s3:::my-bucket/*".to_owned()]),
         conditions: vec![],
     }
 }
@@ -119,8 +121,8 @@ fn user_stmt(effect: Effect, action: &str) -> Statement {
         sid: None,
         effect,
         principals: PrincipalSpec::Any,
-        actions: vec![ActionPattern::Exact(action.to_owned())],
-        resources: vec!["arn:aws:s3:::my-bucket/*".to_owned()],
+        actions: ActionMatch::In(vec![ActionPattern::Exact(action.to_owned())]),
+        resources: ResourceMatch::In(vec!["arn:aws:s3:::my-bucket/*".to_owned()]),
         conditions: vec![],
     }
 }
@@ -337,6 +339,121 @@ fn bucket_owner_enforced_user_grant_also_ignored() {
     assert_eq!(evaluate(&input), Decision::Allow);
 }
 
+// --- Negated policy forms: NotAction / NotResource / NotPrincipal (ARCH §15.5) ----------
+
+#[test]
+fn not_action_allow_grants_all_actions_except_listed() {
+    let mut input = base_input();
+    input.requester = RequesterClass::AuthenticatedMember(uid("bob"));
+    // Allow every action EXCEPT GetObject (NotAction) on the bucket's objects.
+    input.policy = Some(policy(vec![Statement {
+        sid: None,
+        effect: Effect::Allow,
+        principals: PrincipalSpec::Users(vec![uid("bob")]),
+        actions: ActionMatch::NotIn(vec![ActionPattern::Exact("s3:GetObject".to_owned())]),
+        resources: ResourceMatch::In(vec!["arn:aws:s3:::my-bucket/*".to_owned()]),
+        conditions: vec![],
+    }]));
+    // PutObject is not excluded → the NotAction Allow grants it.
+    input.action = Action::PutObject;
+    assert_eq!(evaluate(&input), Decision::Allow);
+    // GetObject is excluded → nothing grants it → default deny.
+    input.action = Action::GetObject;
+    assert_eq!(evaluate(&input), Decision::Deny(DenyReason::DefaultDeny));
+}
+
+#[test]
+fn deny_not_resource_locks_out_everything_except_listed() {
+    // The classic `Deny` + `NotResource` lockout: deny on every resource *except* a carve-out.
+    let mut input = base_input();
+    input.requester = RequesterClass::AuthenticatedMember(uid("alice"));
+    input.policy = Some(policy(vec![
+        // A broad grant so there is something to deny over.
+        Statement {
+            sid: None,
+            effect: Effect::Allow,
+            principals: PrincipalSpec::Users(vec![uid("alice")]),
+            actions: ActionMatch::In(vec![ActionPattern::All]),
+            resources: ResourceMatch::In(vec![
+                "arn:aws:s3:::my-bucket".to_owned(),
+                "arn:aws:s3:::my-bucket/*".to_owned(),
+            ]),
+            conditions: vec![],
+        },
+        // Deny everything whose resource is NOT under public/.
+        Statement {
+            sid: None,
+            effect: Effect::Deny,
+            principals: PrincipalSpec::Users(vec![uid("alice")]),
+            actions: ActionMatch::In(vec![ActionPattern::All]),
+            resources: ResourceMatch::NotIn(vec!["arn:aws:s3:::my-bucket/public/*".to_owned()]),
+            conditions: vec![],
+        },
+    ]));
+    // photos/a.jpg is not under public/ → the NotResource deny matches → locked out.
+    input.resource = object_resource();
+    assert_eq!(
+        evaluate(&input),
+        Decision::Deny(DenyReason::ExplicitPolicyDeny)
+    );
+    // A resource under public/ is exempt from the deny → the broad allow grants it.
+    input.resource = Resource::Object {
+        bucket: BucketName::parse("my-bucket").unwrap(),
+        key: ObjectKey::parse("public/welcome.txt").unwrap(),
+    };
+    assert_eq!(evaluate(&input), Decision::Allow);
+}
+
+#[test]
+fn not_principal_allow_grants_everyone_except_listed() {
+    let mut input = base_input();
+    input.action = Action::GetObject;
+    input.policy = Some(policy(vec![Statement {
+        sid: None,
+        effect: Effect::Allow,
+        principals: PrincipalSpec::NotUsers(vec![uid("alice")]),
+        actions: ActionMatch::In(vec![ActionPattern::Exact("s3:GetObject".to_owned())]),
+        resources: ResourceMatch::In(vec!["arn:aws:s3:::my-bucket/*".to_owned()]),
+        conditions: vec![],
+    }]));
+    // bob is not excluded → the NotPrincipal Allow covers him.
+    input.requester = RequesterClass::AuthenticatedMember(uid("bob"));
+    assert_eq!(evaluate(&input), Decision::Allow);
+    // alice is excluded → nothing grants her → default deny.
+    input.requester = RequesterClass::AuthenticatedMember(uid("alice"));
+    assert_eq!(evaluate(&input), Decision::Deny(DenyReason::DefaultDeny));
+}
+
+#[test]
+fn not_principal_allow_is_public_and_suppressed_by_bpa() {
+    let mut input = base_input();
+    input.requester = RequesterClass::Anonymous;
+    input.action = Action::GetObject;
+    let pol = policy(vec![Statement {
+        sid: None,
+        effect: Effect::Allow,
+        principals: PrincipalSpec::NotUsers(vec![uid("alice")]),
+        actions: ActionMatch::In(vec![ActionPattern::Exact("s3:GetObject".to_owned())]),
+        resources: ResourceMatch::In(vec!["arn:aws:s3:::my-bucket/*".to_owned()]),
+        conditions: vec![],
+    }]);
+    // The management surface must flag a NotPrincipal Allow as a public grant.
+    assert!(crate::policy_grants_public(&pol));
+    input.policy = Some(pol);
+    // Anonymous is "not any named user", so the NotPrincipal Allow covers it when BPA is off.
+    assert_eq!(evaluate(&input), Decision::Allow);
+    // Blocking public policy neutralises it exactly like a `"*"` grant.
+    input.account_bpa = PublicAccessBlock {
+        block_public_policy: true,
+        restrict_public_buckets: true,
+        ..PublicAccessBlock::default()
+    };
+    assert_eq!(
+        evaluate(&input),
+        Decision::Deny(DenyReason::BlockPublicAccess)
+    );
+}
+
 #[test]
 fn matching_string_equals_condition_allows() {
     let mut input = base_input();
@@ -530,6 +647,7 @@ mod props {
         prop_oneof![
             Just(PrincipalSpec::Any),
             "[a-z]{1,6}".prop_map(|s| PrincipalSpec::Users(vec![uid(&s)])),
+            "[a-z]{1,6}".prop_map(|s| PrincipalSpec::NotUsers(vec![uid(&s)])),
         ]
     }
 
@@ -551,18 +669,35 @@ mod props {
             arb_effect(),
             arb_principal(),
             prop::collection::vec(arb_action_pattern(), 1..3),
+            any::<bool>(),
+            any::<bool>(),
         )
-            .prop_map(|(effect, principals, actions)| Statement {
-                sid: None,
-                effect,
-                principals,
-                actions,
-                resources: vec![
-                    "arn:aws:s3:::my-bucket".to_owned(),
-                    "arn:aws:s3:::my-bucket/*".to_owned(),
-                ],
-                conditions: vec![],
-            })
+            .prop_map(
+                |(effect, principals, actions, negate_action, negate_resource)| {
+                    let actions = if negate_action {
+                        ActionMatch::NotIn(actions)
+                    } else {
+                        ActionMatch::In(actions)
+                    };
+                    let resources = vec![
+                        "arn:aws:s3:::my-bucket".to_owned(),
+                        "arn:aws:s3:::my-bucket/*".to_owned(),
+                    ];
+                    let resources = if negate_resource {
+                        ResourceMatch::NotIn(resources)
+                    } else {
+                        ResourceMatch::In(resources)
+                    };
+                    Statement {
+                        sid: None,
+                        effect,
+                        principals,
+                        actions,
+                        resources,
+                        conditions: vec![],
+                    }
+                },
+            )
     }
 
     fn arb_policy() -> impl Strategy<Value = Option<Policy>> {
@@ -624,11 +759,11 @@ mod props {
                 sid: None,
                 effect: Effect::Deny,
                 principals: PrincipalSpec::Any,
-                actions: vec![ActionPattern::All],
-                resources: vec![
+                actions: ActionMatch::In(vec![ActionPattern::All]),
+                resources: ResourceMatch::In(vec![
                     "arn:aws:s3:::my-bucket".to_owned(),
                     "arn:aws:s3:::my-bucket/*".to_owned(),
-                ],
+                ]),
                 conditions: vec![],
             });
             input.policy = Some(Policy {

@@ -446,6 +446,14 @@ impl S3Service {
         let user_metadata = user_metadata(&req);
         let content_md5 = req.header("content-md5").map(str::to_owned);
 
+        // Reject an invalid inline tag set up front — before any blob is staged — so a bad
+        // `x-amz-tagging` header (over the limit, bad charset, duplicate/aws: key) returns
+        // `InvalidTag` without leaving an orphaned staged blob (ARCH §17.1).
+        cairn_xml::validate_tags(
+            &parse_tagging_header(req.header("x-amz-tagging")),
+            cairn_xml::MAX_TAGS_OBJECT,
+        )?;
+
         // De-frame SigV4 streaming bodies (the F-5 fix); plain bodies pass through. A signed
         // sentinel selects the signature-verifying decoder seeded from the principal's context.
         let request_id = req.request_id.clone();
@@ -468,12 +476,21 @@ impl S3Service {
             (None, None)
         };
 
+        // The declared payload length for preallocation (ARCH §7.5): for a SigV4-streaming upload
+        // the client sends the real payload length in `x-amz-decoded-content-length` (the
+        // `content-length` is the larger framed size), so prefer it; a plain PUT uses
+        // `content-length`. An absent/unparseable value simply skips preallocation.
+        let content_length = req
+            .header("x-amz-decoded-content-length")
+            .or_else(|| req.header("content-length"))
+            .and_then(|v| v.parse::<u64>().ok());
         let opts = StageOptions {
             compression: bucket.compression,
             extra_checksums: extra,
             size_ceiling: self.max_object_size,
             content_type: content_type.clone(),
             encryption: sse_dek,
+            content_length,
         };
         let staged = self
             .blob
@@ -1059,6 +1076,8 @@ impl S3Service {
             compression: bucket.compression,
             extra_checksums: ChecksumSet::none(),
             size_ceiling: self.max_object_size,
+            // `assemble` preallocates from the sum of the parts' sizes itself.
+            content_length: None,
             content_type: session.content_type.clone(),
             encryption: None,
         };
@@ -1276,6 +1295,8 @@ impl S3Service {
             size_ceiling: self.max_object_size,
             content_type: content_type.clone(),
             encryption: None,
+            // The source object's plaintext size is known, so preallocate the destination blob.
+            content_length: Some(src_row.size_logical),
         };
         let staged = self.blob.stage(&dest_bucket.name, src_stream, opts).await?;
 
@@ -1615,7 +1636,8 @@ impl S3Service {
                 cairn_xml::parse_cors_configuration(&doc)?;
             }
             ConfigAspect::Tagging => {
-                cairn_xml::parse_tagging(&doc)?;
+                let tags = cairn_xml::parse_tagging(&doc)?;
+                cairn_xml::validate_tags(&tags, cairn_xml::MAX_TAGS_BUCKET)?;
             }
             _ => {}
         }
@@ -1875,6 +1897,7 @@ impl S3Service {
             .ok_or(Error::NoSuchKey)?;
         let doc = drain_body(body, 64 * 1024).await?;
         let tags = cairn_xml::parse_tagging(&doc)?;
+        cairn_xml::validate_tags(&tags, cairn_xml::MAX_TAGS_OBJECT)?;
         self.meta
             .submit(Mutation::PutObjectTags {
                 bucket: bucket.name,

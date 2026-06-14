@@ -9,6 +9,8 @@
 
 mod compress;
 mod hash;
+// Safe file-placement hints (preallocation + access advice) for the write fast path (ARCH §7.5).
+mod raw_io;
 #[cfg(feature = "io-uring")]
 mod uring;
 // The staging sink abstracts the durable-write file ops so the default `tokio::fs` path and the
@@ -60,7 +62,16 @@ pub struct LocalBlobStore {
     /// unconditionally so the struct shape is feature-independent, but it can only be set `true`
     /// under the feature (see [`LocalBlobStore::with_io_uring`]).
     use_uring: bool,
+    /// Bounds the number of concurrent blob transfers (ARCH §7.4). Each stage/read/assemble holds a
+    /// permit for the duration of its file I/O, so a flood of large transfers can occupy at most
+    /// this many of the runtime's blocking-pool threads and cannot starve the threads the reactor
+    /// and metadata reads need. Sized to the device's useful I/O concurrency.
+    io_permits: Arc<tokio::sync::Semaphore>,
 }
+
+/// The default bound on concurrent blob transfers when not overridden (ARCH §7.4). A reasonable
+/// general value for SSD/NVMe-backed storage; tune down for spinning disks, up for fast arrays.
+pub const DEFAULT_BLOB_IO_CONCURRENCY: usize = 64;
 
 impl LocalBlobStore {
     /// Open (creating the staging area) a blob store rooted at `data_root`.
@@ -80,6 +91,7 @@ impl LocalBlobStore {
         Ok(Self {
             data_root: Arc::new(data_root),
             use_uring: cfg!(feature = "io-uring"),
+            io_permits: Arc::new(tokio::sync::Semaphore::new(DEFAULT_BLOB_IO_CONCURRENCY)),
         })
     }
 
@@ -91,6 +103,35 @@ impl LocalBlobStore {
     pub fn with_io_uring(mut self, enabled: bool) -> Self {
         self.use_uring = enabled && cfg!(feature = "io-uring");
         self
+    }
+
+    /// Set the bound on concurrent blob transfers (ARCH §7.4). A value of `0` is treated as `1` so
+    /// the store always makes progress. Defaults to [`DEFAULT_BLOB_IO_CONCURRENCY`].
+    #[must_use]
+    pub fn with_io_pool_size(mut self, permits: usize) -> Self {
+        self.io_permits = Arc::new(tokio::sync::Semaphore::new(permits.max(1)));
+        self
+    }
+
+    /// Acquire one blob-I/O permit, bounding concurrent transfers (ARCH §7.4). Held by the caller
+    /// for the duration of its file I/O. The semaphore is never closed, so this never errors in
+    /// practice; the `Result` is for forward-compatibility with a shutdown that closes it.
+    async fn acquire_io(&self) -> Result<tokio::sync::SemaphorePermit<'_>, BlobError> {
+        self.io_permits
+            .acquire()
+            .await
+            .map_err(|_| BlobError::Io("blob I/O pool closed".to_owned()))
+    }
+
+    /// Acquire an owned blob-I/O permit that can be moved into a spawned read task and dropped when
+    /// the transfer finishes (the read body is streamed after the call returns, so the permit must
+    /// outlive this function — hence the owned form keyed on the shared `Arc<Semaphore>`).
+    async fn acquire_io_owned(&self) -> Result<tokio::sync::OwnedSemaphorePermit, BlobError> {
+        self.io_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| BlobError::Io("blob I/O pool closed".to_owned()))
     }
 
     fn resolve(&self, sp: &StoragePath) -> Result<PathBuf, BlobError> {
@@ -278,9 +319,13 @@ fn read_stream(
     dek: Option<[u8; 32]>,
     offset: u64,
     len: u64,
+    permit: tokio::sync::OwnedSemaphorePermit,
 ) -> cairn_types::BlobStream {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, BlobError>>(4);
     tokio::task::spawn_blocking(move || {
+        // Held for the whole streamed transfer so it counts against the blob-I/O bound (ARCH §7.4),
+        // then released when this task ends.
+        let _permit = permit;
         let result = (|| -> Result<(), BlobError> {
             use std::io::{Read, Seek, SeekFrom};
             if compressed {
@@ -387,13 +432,15 @@ impl BlobStore for LocalBlobStore {
         body: cairn_types::BodyStream,
         opts: StageOptions,
     ) -> Result<StagedBlob, BlobError> {
+        // Bound concurrent blob transfers (ARCH §7.4): held for the whole staged write + commit.
+        let _permit = self.acquire_io().await?;
         let id = uuid::Uuid::new_v4().simple().to_string();
         let staging = self.data_root.join(STAGING).join(format!("{id}.tmp"));
         let bucket_dir = self.data_root.join(bucket.as_str());
         let final_path = bucket_dir.join(&id);
         let storage_path = StoragePath::from_string(format!("{}/{}", bucket.as_str(), id));
 
-        let mut sink = Staging::create(staging, self.use_uring).await?;
+        let mut sink = Staging::create(staging, self.use_uring, opts.content_length).await?;
         let outcome = write_staged(&mut sink, body, &opts).await;
         let (logical, physical, md5, checksums, descriptor) = match outcome {
             Ok(v) => v,
@@ -459,7 +506,10 @@ impl BlobStore for LocalBlobStore {
             None => (0, logical_len, None),
         };
 
-        let body = read_stream(file_path.clone(), compressed, dek, offset, len);
+        // Hold a blob-I/O permit for the streamed transfer (ARCH §7.4); released when the read
+        // task finishes. (The kernel sendfile fast path below is bounded separately by the server.)
+        let permit = self.acquire_io_owned().await?;
+        let body = read_stream(file_path.clone(), compressed, dek, offset, len, permit);
         // Uncompressed, plaintext blobs may take the kernel file-to-socket fast path. Encrypted
         // blobs are always block-formatted (so `compressed` is true) and therefore never reach this
         // branch — the kernel cannot decrypt, so a DEK-bearing read must go through `read_stream`.
@@ -500,6 +550,7 @@ impl BlobStore for LocalBlobStore {
         body: cairn_types::BodyStream,
         size_ceiling: u64,
     ) -> Result<StagedPart, BlobError> {
+        let _permit = self.acquire_io().await?;
         let dir = self
             .data_root
             .join(STAGING)
@@ -515,7 +566,9 @@ impl BlobStore for LocalBlobStore {
             content_type: String::new(),
             ..StageOptions::default()
         };
-        let mut sink = Staging::create(path, self.use_uring).await?;
+        // A part's length is not known to this seam, so no preallocation here; the assembled blob
+        // (whose size is the sum of the parts) is preallocated in `assemble`.
+        let mut sink = Staging::create(path, self.use_uring, None).await?;
         let (logical, _phys, md5, _checks, _desc) = match write_staged(&mut sink, body, &opts).await
         {
             Ok(v) => v,
@@ -543,6 +596,7 @@ impl BlobStore for LocalBlobStore {
         parts: &[PartRef],
         opts: StageOptions,
     ) -> Result<StagedBlob, BlobError> {
+        let _permit = self.acquire_io().await?;
         let id = uuid::Uuid::new_v4().simple().to_string();
         let staging = self.data_root.join(STAGING).join(format!("{id}.tmp"));
         let bucket_dir = self.data_root.join(bucket.as_str());
@@ -563,7 +617,10 @@ impl BlobStore for LocalBlobStore {
                 block_size: DEFAULT_ENCRYPTED_BLOCK_SIZE,
             })
         });
-        let mut sink = Staging::create(staging, self.use_uring).await?;
+        // The assembled object's size is the sum of the parts' plaintext sizes — known up front, so
+        // preallocate the staging file to place it contiguously (ARCH §7.5).
+        let assembled_len: u64 = parts.iter().map(|p| p.size).sum();
+        let mut sink = Staging::create(staging, self.use_uring, Some(assembled_len)).await?;
         use md5::Digest;
         let mut hasher = md5::Md5::new();
         let mut logical: u64 = 0;

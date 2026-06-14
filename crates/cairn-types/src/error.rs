@@ -167,6 +167,10 @@ pub enum Error {
     /// A request/XML body was malformed.
     #[error("malformed xml")]
     MalformedXml,
+    /// A tag set violated the S3 tag limits (count, key/value length, charset, duplicates, or a
+    /// reserved `aws:` key prefix) — distinct from a malformed body (ARCH §17.1).
+    #[error("invalid tag: {0}")]
+    InvalidTag(String),
     /// A policy document was malformed.
     #[error("malformed policy")]
     MalformedPolicy,

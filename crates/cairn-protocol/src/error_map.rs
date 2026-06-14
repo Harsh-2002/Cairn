@@ -24,6 +24,7 @@ pub fn map(err: &Error) -> (StatusCode, &'static str) {
         BadDigest => (StatusCode::BAD_REQUEST, "BadDigest"),
         InvalidDigest => (StatusCode::BAD_REQUEST, "InvalidDigest"),
         MalformedXml => (StatusCode::BAD_REQUEST, "MalformedXML"),
+        InvalidTag(_) => (StatusCode::BAD_REQUEST, "InvalidTag"),
         MalformedPolicy => (StatusCode::BAD_REQUEST, "MalformedPolicy"),
         InvalidArgument(_) => (StatusCode::BAD_REQUEST, "InvalidArgument"),
         InvalidRequest(_) => (StatusCode::BAD_REQUEST, "InvalidRequest"),

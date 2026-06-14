@@ -181,7 +181,8 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
 
     let blob_impl = LocalBlobStore::open(cfg.data_dir.clone())
         .await
-        .map_err(|e| format!("open blob store: {e}"))?;
+        .map_err(|e| format!("open blob store: {e}"))?
+        .with_io_pool_size(cfg.blob_io_pool_size);
 
     // Fail fast if the data root and staging are on different filesystems: the commit protocol's
     // atomic rename would fail with EXDEV on every write (ARCH §2.4, §9.2, GAP medium #10).

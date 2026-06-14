@@ -83,6 +83,53 @@ async fn uncompressed_roundtrip_and_etag() {
 }
 
 #[tokio::test]
+async fn preallocated_write_roundtrips_and_size_is_exact() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let b = BucketName::parse("bkt").unwrap();
+
+    // A >1 MiB object so the preallocation/fadvise fast path runs (ARCH §7.5). The blob must
+    // round-trip byte-identically and report its exact size — preallocation must never pad it.
+    let data: Vec<u8> = (0..2 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let opts = StageOptions {
+        size_ceiling: 100 * 1024 * 1024,
+        content_length: Some(data.len() as u64),
+        ..StageOptions::default()
+    };
+    let staged = store
+        .stage(&b, chunked_body(data.clone(), 64 * 1024), opts)
+        .await
+        .unwrap();
+    assert_eq!(
+        staged.size_logical,
+        data.len() as u64,
+        "preallocation must not change the logical size"
+    );
+    assert_eq!(
+        read_all(&store, &staged.storage_path, None).await,
+        data,
+        "byte-identical round-trip through the preallocated path"
+    );
+
+    // KEEP_SIZE safety: an OVER-declared content length (e.g. a client that sends a larger
+    // Content-Length than the body) must leave the stored blob exactly the bytes written — the
+    // reserved-but-unused blocks must not appear as zero padding.
+    let short = b"short body".to_vec();
+    let opts2 = StageOptions {
+        size_ceiling: 100 * 1024 * 1024,
+        content_length: Some(8 * 1024 * 1024),
+        ..StageOptions::default()
+    };
+    let staged2 = store.stage(&b, body(short.clone()), opts2).await.unwrap();
+    assert_eq!(
+        staged2.size_logical,
+        short.len() as u64,
+        "an over-declared content length must not pad the blob"
+    );
+    assert_eq!(read_all(&store, &staged2.storage_path, None).await, short);
+}
+
+#[tokio::test]
 async fn compression_is_transparent_and_etag_invariant() {
     let dir = tempfile::tempdir().unwrap();
     let store = LocalBlobStore::open(dir.path()).await.unwrap();

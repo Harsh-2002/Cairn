@@ -336,6 +336,54 @@ fn round_trip_tagging() {
 }
 
 #[test]
+fn validate_tags_enforces_s3_limits() {
+    use crate::parse::{MAX_TAGS_BUCKET, MAX_TAGS_OBJECT, validate_tags};
+    fn pairs(p: &[(&str, &str)]) -> Vec<(String, String)> {
+        p.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+    fn assert_invalid<T: std::fmt::Debug>(r: Result<T, cairn_types::Error>) {
+        assert!(
+            matches!(r, Err(cairn_types::Error::InvalidTag(_))),
+            "expected InvalidTag, got {r:?}"
+        );
+    }
+
+    // Count limits: 10 ok / 11 reject for objects; 50 ok / 51 reject for buckets.
+    let n = |c: usize| -> Vec<(String, String)> {
+        (0..c).map(|i| (format!("k{i}"), "v".to_owned())).collect()
+    };
+    assert!(validate_tags(&n(10), MAX_TAGS_OBJECT).is_ok());
+    assert_invalid(validate_tags(&n(11), MAX_TAGS_OBJECT));
+    assert!(validate_tags(&n(50), MAX_TAGS_BUCKET).is_ok());
+    assert_invalid(validate_tags(&n(51), MAX_TAGS_BUCKET));
+
+    // Length boundaries counted in Unicode scalars (multibyte proves it is not byte length).
+    let k128 = "é".repeat(128);
+    assert!(validate_tags(&pairs(&[(&k128, "v")]), MAX_TAGS_OBJECT).is_ok());
+    let k129 = "é".repeat(129);
+    assert_invalid(validate_tags(&pairs(&[(&k129, "v")]), MAX_TAGS_OBJECT));
+    let v256 = "x".repeat(256);
+    assert!(validate_tags(&pairs(&[("k", &v256)]), MAX_TAGS_OBJECT).is_ok());
+    let v257 = "x".repeat(257);
+    assert_invalid(validate_tags(&pairs(&[("k", &v257)]), MAX_TAGS_OBJECT));
+
+    // Charset, empty key, duplicate key, reserved aws: prefix.
+    assert_invalid(validate_tags(&pairs(&[("bad*key", "v")]), MAX_TAGS_OBJECT));
+    assert_invalid(validate_tags(&pairs(&[("", "v")]), MAX_TAGS_OBJECT));
+    assert_invalid(validate_tags(
+        &pairs(&[("dup", "1"), ("dup", "2")]),
+        MAX_TAGS_OBJECT,
+    ));
+    assert_invalid(validate_tags(&pairs(&[("aws:foo", "v")]), MAX_TAGS_OBJECT));
+    assert_invalid(validate_tags(&pairs(&[("AWS:foo", "v")]), MAX_TAGS_OBJECT));
+
+    // All permitted punctuation + spaces + unicode letters pass.
+    assert!(validate_tags(&pairs(&[("a+b-c=d.e_f:g/h@i", "v 1 é")]), MAX_TAGS_OBJECT).is_ok());
+}
+
+#[test]
 fn round_trip_versioning_configuration() {
     for state in [
         VersioningState::Enabled,

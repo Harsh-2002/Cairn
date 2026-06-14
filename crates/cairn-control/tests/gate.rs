@@ -98,6 +98,7 @@ async fn put_object(h: &Harness, bucket: &str, key: &str, data: &'static [u8]) {
                 size_ceiling: 1 << 30,
                 content_type: "application/octet-stream".to_owned(),
                 encryption: None,
+                content_length: Some(data.len() as u64),
             },
         )
         .await

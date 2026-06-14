@@ -29,7 +29,9 @@ pub use parse::{
     CorsRule, parse_access_control_policy, parse_complete_multipart, parse_cors_configuration,
     parse_delete,
 };
-pub use parse::{parse_tagging, parse_versioning_configuration};
+pub use parse::{
+    MAX_TAGS_BUCKET, MAX_TAGS_OBJECT, parse_tagging, parse_versioning_configuration, validate_tags,
+};
 pub use timefmt::format_iso8601;
 
 // ===========================================================================================

@@ -23,6 +23,13 @@ pub struct StageOptions {
     /// blocks as before; the field is additive and defaults to `None` so existing callers are
     /// unaffected (ARCH §27, SSE-S3).
     pub encryption: Option<[u8; 32]>,
+    /// The object's declared content length, when known up front (from the `Content-Length` header
+    /// on a non-streaming PUT). `Some` lets the write path preallocate the staging file so the
+    /// filesystem places it contiguously and an out-of-space condition surfaces immediately (ARCH
+    /// §7.5); `None` (streaming/chunked uploads, multipart parts) skips preallocation. It is the
+    /// PLAINTEXT length; with compression the physical file may be smaller, which preallocation
+    /// tolerates (it reserves blocks without padding the file).
+    pub content_length: Option<u64>,
 }
 
 impl Default for StageOptions {
@@ -36,6 +43,7 @@ impl Default for StageOptions {
             size_ceiling: 5 * 1024 * 1024 * 1024,
             content_type: "application/octet-stream".to_owned(),
             encryption: None,
+            content_length: None,
         }
     }
 }

@@ -429,6 +429,7 @@ dependencies = [
  "hmac",
  "lz4_flex",
  "md-5",
+ "rustix 1.1.4",
  "sha1",
  "sha2",
  "tempfile",

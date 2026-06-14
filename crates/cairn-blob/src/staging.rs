@@ -19,6 +19,9 @@ pub(crate) enum Staging {
     Tokio {
         writer: BufWriter<tokio::fs::File>,
         staging_path: PathBuf,
+        /// When preallocation ran (a known-large write), the reserved length, so `commit` can
+        /// advise the kernel to drop the written pages afterwards (ARCH §7.5). `None` skips it.
+        release_len: Option<u64>,
     },
     /// The io_uring backend: file ops run on the dedicated io_uring executor.
     #[cfg(feature = "io-uring")]
@@ -26,8 +29,14 @@ pub(crate) enum Staging {
 }
 
 impl Staging {
-    /// Create the staging tmp file using the active backend.
-    pub(crate) async fn create(staging_path: PathBuf, use_uring: bool) -> Result<Self, BlobError> {
+    /// Create the staging tmp file using the active backend. When `prealloc` is `Some(len)` and the
+    /// length clears the hint threshold, the `tokio::fs` backend reserves blocks and advises
+    /// sequential access up front (ARCH §7.5), all on the blocking pool in one hop.
+    pub(crate) async fn create(
+        staging_path: PathBuf,
+        use_uring: bool,
+        prealloc: Option<u64>,
+    ) -> Result<Self, BlobError> {
         if use_uring {
             #[cfg(feature = "io-uring")]
             {
@@ -42,12 +51,23 @@ impl Staging {
                 let _ = &staging_path;
             }
         }
-        let file = tokio::fs::File::create(&staging_path)
-            .await
-            .map_err(io_err)?;
+        let release_len = prealloc.filter(|&n| n >= crate::raw_io::HINT_THRESHOLD);
+        // Create the file and apply the placement hints in a single blocking hop, then wrap the
+        // std handle for the async streamed write.
+        let sp = staging_path.clone();
+        let file = tokio::task::spawn_blocking(move || -> Result<std::fs::File, BlobError> {
+            let file = std::fs::File::create(&sp).map_err(io_err)?;
+            if let Some(len) = release_len {
+                crate::raw_io::preallocate_sequential(&file, len);
+            }
+            Ok(file)
+        })
+        .await
+        .map_err(|e| BlobError::Io(e.to_string()))??;
         Ok(Staging::Tokio {
-            writer: BufWriter::new(file),
+            writer: BufWriter::new(tokio::fs::File::from_std(file)),
             staging_path,
+            release_len,
         })
     }
 
@@ -74,12 +94,22 @@ impl Staging {
             Staging::Tokio {
                 writer,
                 staging_path,
+                release_len,
             } => {
                 let mut writer = writer;
                 writer.flush().await.map_err(io_err)?;
                 let file = writer.into_inner();
                 // 1) fsync the staged file, 2) rename it in, 3) fsync the destination directory.
                 file.sync_all().await.map_err(io_err)?;
+                // For a known-large write, drop the just-written pages so a stream of bulk uploads
+                // does not evict the page cache hot reads depend on (ARCH §7.5). Best-effort.
+                if let Some(len) = release_len {
+                    let std_file = file.into_std().await;
+                    let _ = tokio::task::spawn_blocking(move || {
+                        crate::raw_io::release_pages(&std_file, len);
+                    })
+                    .await;
+                }
                 tokio::fs::rename(&staging_path, final_path)
                     .await
                     .map_err(io_err)?;

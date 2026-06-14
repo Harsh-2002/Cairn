@@ -2,7 +2,10 @@
 //!
 //! Structural problems yield [`cairn_types::Error::MalformedPolicy`].
 
-use cairn_types::authz::{ActionPattern, Condition, ConditionOperator, NumericOp, PrincipalSpec};
+use cairn_types::authz::{
+    ActionMatch, ActionPattern, Condition, ConditionOperator, NumericOp, PrincipalSpec,
+    ResourceMatch,
+};
 use cairn_types::{Effect, Error, Policy, Statement, UserId};
 use serde_json::Value;
 
@@ -82,14 +85,31 @@ fn parse_statement(v: &Value, require_principal: bool) -> Result<Statement, Erro
         _ => return Err(Error::MalformedPolicy),
     };
 
-    let principals = match obj.get("Principal") {
-        Some(p) => parse_principal(p)?,
-        None if require_principal => return Err(Error::MalformedPolicy),
+    // Each of principal/action/resource may be given in its positive or its negated (`Not*`) form,
+    // but never both at once (AWS forbids it, and the type model can hold only one). The negated
+    // forms are the IAM/S3 `NotPrincipal`/`NotAction`/`NotResource` (§15.5): they match everything
+    // *except* what is listed. Omitting both is a malformed statement (fail closed) — except an
+    // identity policy may omit the principal, where it defaults to the attached user.
+    let principals = match (obj.get("Principal"), obj.get("NotPrincipal")) {
+        (Some(_), Some(_)) => return Err(Error::MalformedPolicy),
+        (Some(p), None) => parse_principal(p)?,
+        (None, Some(np)) => parse_not_principal(np)?,
+        (None, None) if require_principal => return Err(Error::MalformedPolicy),
         // Identity (per-user) policy: the principal is the attached user; default to `Any`.
-        None => PrincipalSpec::Any,
+        (None, None) => PrincipalSpec::Any,
     };
-    let actions = parse_actions(obj.get("Action").ok_or(Error::MalformedPolicy)?)?;
-    let resources = parse_resources(obj.get("Resource").ok_or(Error::MalformedPolicy)?)?;
+    let actions = match (obj.get("Action"), obj.get("NotAction")) {
+        (Some(_), Some(_)) => return Err(Error::MalformedPolicy),
+        (Some(a), None) => ActionMatch::In(parse_actions(a)?),
+        (None, Some(na)) => ActionMatch::NotIn(parse_actions(na)?),
+        (None, None) => return Err(Error::MalformedPolicy),
+    };
+    let resources = match (obj.get("Resource"), obj.get("NotResource")) {
+        (Some(_), Some(_)) => return Err(Error::MalformedPolicy),
+        (Some(r), None) => ResourceMatch::In(parse_resources(r)?),
+        (None, Some(nr)) => ResourceMatch::NotIn(parse_resources(nr)?),
+        (None, None) => return Err(Error::MalformedPolicy),
+    };
     let conditions = match obj.get("Condition") {
         None | Some(Value::Null) => Vec::new(),
         Some(c) => parse_conditions(c)?,
@@ -131,6 +151,36 @@ fn parse_principal(v: &Value) -> Result<PrincipalSpec, Error> {
         }
         _ => Err(Error::MalformedPolicy),
     }
+}
+
+/// Parse `NotPrincipal: {"AWS": id | [ids]}` into [`PrincipalSpec::NotUsers`].
+///
+/// Unlike `Principal`, the wildcard (`"*"` or `{"AWS": "*"}`) is rejected: "everyone except
+/// everyone" denotes the empty set, AWS forbids it, and silently accepting it could only mislead.
+/// An empty user list is likewise rejected — a `NotPrincipal` that excludes no one would match
+/// every requester, which fails closed here rather than producing a surprising blanket match.
+fn parse_not_principal(v: &Value) -> Result<PrincipalSpec, Error> {
+    let map = v.as_object().ok_or(Error::MalformedPolicy)?;
+    let aws = map.get("AWS").ok_or(Error::MalformedPolicy)?;
+    let mut ids = Vec::new();
+    match aws {
+        Value::String(s) if s == "*" => return Err(Error::MalformedPolicy),
+        Value::String(s) => ids.push(UserId(s.clone())),
+        Value::Array(arr) => {
+            for item in arr {
+                let s = item.as_str().ok_or(Error::MalformedPolicy)?;
+                if s == "*" {
+                    return Err(Error::MalformedPolicy);
+                }
+                ids.push(UserId(s.to_owned()));
+            }
+        }
+        _ => return Err(Error::MalformedPolicy),
+    }
+    if ids.is_empty() {
+        return Err(Error::MalformedPolicy);
+    }
+    Ok(PrincipalSpec::NotUsers(ids))
 }
 
 /// Parse `Action` (string or array of strings) into [`ActionPattern`]s.
@@ -276,12 +326,15 @@ mod tests {
         assert_eq!(s0.principals, PrincipalSpec::Any);
         assert_eq!(
             s0.actions,
-            vec![
+            ActionMatch::In(vec![
                 ActionPattern::Exact("s3:GetObject".to_owned()),
                 ActionPattern::Exact("s3:GetObjectVersion".to_owned())
-            ]
+            ])
         );
-        assert_eq!(s0.resources, vec!["arn:aws:s3:::my-bucket/*".to_owned()]);
+        assert_eq!(
+            s0.resources,
+            ResourceMatch::In(vec!["arn:aws:s3:::my-bucket/*".to_owned()])
+        );
         assert_eq!(s0.conditions.len(), 2);
         assert!(
             s0.conditions
@@ -300,8 +353,11 @@ mod tests {
                 UserId("user-b".to_owned())
             ])
         );
-        assert_eq!(s1.actions, vec![ActionPattern::All]);
-        assert_eq!(s1.resources.len(), 2);
+        assert_eq!(s1.actions, ActionMatch::In(vec![ActionPattern::All]));
+        let ResourceMatch::In(s1_resources) = &s1.resources else {
+            panic!("expected positive Resource clause");
+        };
+        assert_eq!(s1_resources.len(), 2);
     }
 
     #[test]
@@ -335,7 +391,7 @@ mod tests {
         assert_eq!(p.statements[0].principals, PrincipalSpec::Any);
         assert_eq!(
             p.statements[0].actions,
-            vec![ActionPattern::Prefix("s3:Get".to_owned())]
+            ActionMatch::In(vec![ActionPattern::Prefix("s3:Get".to_owned())])
         );
     }
 
@@ -383,5 +439,82 @@ mod tests {
         assert!(matches!(parse_policy(json), Err(Error::MalformedPolicy)));
         let json = r#"{"Version":"2012-10-17","Statement":{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*","Condition":{"Bogus":{"k":"v"}}}}"#;
         assert!(matches!(parse_policy(json), Err(Error::MalformedPolicy)));
+    }
+
+    #[test]
+    fn parses_negated_action_resource_principal_forms() {
+        let json = r#"{
+            "Version": "2012-10-17",
+            "Statement": {
+                "Effect": "Deny",
+                "NotPrincipal": { "AWS": ["admin"] },
+                "NotAction": ["s3:GetObject", "s3:ListBucket"],
+                "NotResource": "arn:aws:s3:::vault/*"
+            }
+        }"#;
+        let p = parse_policy(json).unwrap();
+        let s = &p.statements[0];
+        assert_eq!(s.effect, Effect::Deny);
+        assert_eq!(
+            s.principals,
+            PrincipalSpec::NotUsers(vec![UserId("admin".to_owned())])
+        );
+        assert_eq!(
+            s.actions,
+            ActionMatch::NotIn(vec![
+                ActionPattern::Exact("s3:GetObject".to_owned()),
+                ActionPattern::Exact("s3:ListBucket".to_owned()),
+            ])
+        );
+        assert_eq!(
+            s.resources,
+            ResourceMatch::NotIn(vec!["arn:aws:s3:::vault/*".to_owned()])
+        );
+    }
+
+    #[test]
+    fn rejects_both_positive_and_negated_of_same_clause() {
+        // Action + NotAction together is malformed (and likewise for Resource / Principal).
+        let both_action = r#"{"Version":"2012-10-17","Statement":{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","NotAction":"s3:PutObject","Resource":"arn:aws:s3:::b/*"}}"#;
+        assert!(matches!(
+            parse_policy(both_action),
+            Err(Error::MalformedPolicy)
+        ));
+        let both_resource = r#"{"Version":"2012-10-17","Statement":{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*","NotResource":"arn:aws:s3:::c/*"}}"#;
+        assert!(matches!(
+            parse_policy(both_resource),
+            Err(Error::MalformedPolicy)
+        ));
+        let both_principal = r#"{"Version":"2012-10-17","Statement":{"Effect":"Deny","Principal":"*","NotPrincipal":{"AWS":"x"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*"}}"#;
+        assert!(matches!(
+            parse_policy(both_principal),
+            Err(Error::MalformedPolicy)
+        ));
+    }
+
+    #[test]
+    fn rejects_statement_missing_both_action_and_resource_forms() {
+        // Neither Action nor NotAction: fail closed.
+        let no_action = r#"{"Version":"2012-10-17","Statement":{"Effect":"Allow","Principal":"*","Resource":"arn:aws:s3:::b/*"}}"#;
+        assert!(matches!(
+            parse_policy(no_action),
+            Err(Error::MalformedPolicy)
+        ));
+        // Neither Resource nor NotResource.
+        let no_resource = r#"{"Version":"2012-10-17","Statement":{"Effect":"Allow","Principal":"*","Action":"s3:GetObject"}}"#;
+        assert!(matches!(
+            parse_policy(no_resource),
+            Err(Error::MalformedPolicy)
+        ));
+    }
+
+    #[test]
+    fn rejects_wildcard_and_empty_not_principal() {
+        // NotPrincipal "*" / {"AWS":"*"} would denote the empty set — rejected.
+        let star = r#"{"Version":"2012-10-17","Statement":{"Effect":"Deny","NotPrincipal":{"AWS":"*"},"Action":"s3:*","Resource":"arn:aws:s3:::b/*"}}"#;
+        assert!(matches!(parse_policy(star), Err(Error::MalformedPolicy)));
+        // A NotPrincipal excluding no one would match everyone — rejected.
+        let empty = r#"{"Version":"2012-10-17","Statement":{"Effect":"Deny","NotPrincipal":{"AWS":[]},"Action":"s3:*","Resource":"arn:aws:s3:::b/*"}}"#;
+        assert!(matches!(parse_policy(empty), Err(Error::MalformedPolicy)));
     }
 }
