@@ -116,6 +116,7 @@ export interface UserDetailResp {
   sigv4_access_key_id: string | null;
   role: string;
   is_active: boolean;
+  quota_bytes: number | null;
   policy: PolicyDoc | null;
 }
 

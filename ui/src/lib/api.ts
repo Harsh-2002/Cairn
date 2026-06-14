@@ -241,6 +241,9 @@ export const api = {
       "POST",
       `/users/${enc(id)}/rotate-credentials`,
     ),
+  // Per-user byte quota (ARCH §27.5); null clears the limit.
+  setUserQuota: (id: string, quota_bytes: number | null) =>
+    request<null>("PUT", `/users/${enc(id)}/quota`, { quota_bytes }),
   // Identity (per-user) policy. The body is a raw policy JSON document sent verbatim.
   getUserPolicy: (id: string) =>
     request<UserPolicyResp>("GET", `/users/${enc(id)}/policy`),

@@ -2,11 +2,10 @@
 // rotation, and the attached identity policy edited via the PermissionBuilder.
 // Created users are S3-API-only.
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { NavLink, useParams } from "react-router";
-import { CircleAlert, ShieldOff } from "lucide-react";
+import { ShieldOff } from "lucide-react";
 import { toast } from "sonner";
-import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import {
   Breadcrumb,
@@ -25,14 +24,19 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
 import { ConfirmDialog } from "@/components/confirm-dialog";
 import { CopyField } from "@/components/copy-field";
 import { CredentialsPanel } from "@/components/credentials-panel";
 import { EmptyState } from "@/components/empty-state";
+import { ErrorAlert } from "@/components/error-alert";
 import { Page } from "@/components/page-header";
 import { PermissionBuilder } from "@/components/permission-builder";
+import { StatusBadge } from "@/components/status-badge";
 import { api, errorMessage } from "@/lib/api";
+import { bytes } from "@/lib/format";
 import { useResource } from "@/lib/use-resource";
 import type { RotateCredentialsResp } from "@/lib/types";
 import type { PolicyDoc } from "@/lib/policy";
@@ -70,6 +74,40 @@ export function UserDetail() {
   const [rotated, setRotated] = useState<RotateCredentialsResp | null>(null);
   // Reveals the builder on a user that has no policy yet.
   const [attaching, setAttaching] = useState(false);
+
+  // Storage quota, edited in GiB (operators don't think in bytes). Seeded from
+  // the loaded value and re-seeded when the server value changes.
+  const GIB = 1024 ** 3;
+  const quotaId = useId();
+  const [quotaGiB, setQuotaGiB] = useState("");
+  const [savingQuota, setSavingQuota] = useState(false);
+  useEffect(() => {
+    if (!user) return;
+    setQuotaGiB(user.quota_bytes != null ? String(user.quota_bytes / GIB) : "");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user?.id, user?.quota_bytes]);
+
+  async function saveQuota(clear: boolean) {
+    let next: number | null = null;
+    if (!clear) {
+      const g = Number.parseFloat(quotaGiB);
+      if (!Number.isFinite(g) || g <= 0) {
+        toast.error("Enter a quota in GiB, or remove the limit.");
+        return;
+      }
+      next = Math.round(g * GIB);
+    }
+    setSavingQuota(true);
+    try {
+      await api.setUserQuota(id, next);
+      toast.success(clear ? "Quota removed" : "Quota updated");
+      res.refresh();
+    } catch (e) {
+      toast.error(errorMessage(e, "Failed to update the quota."));
+    } finally {
+      setSavingQuota(false);
+    }
+  }
 
   // Bring a fresh one-time secret into view so it is not scrolled off unnoticed.
   const rotatedRef = useRef<HTMLDivElement>(null);
@@ -163,21 +201,11 @@ export function UserDetail() {
       </Breadcrumb>
 
       {res.error ? (
-        <Alert variant="destructive" role="alert" className="mb-4">
-          <CircleAlert aria-hidden="true" />
-          <AlertTitle>Could not load this user</AlertTitle>
-          <AlertDescription>
-            {res.error}
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={res.refresh}
-              className="mt-2"
-            >
-              Try again
-            </Button>
-          </AlertDescription>
-        </Alert>
+        <ErrorAlert
+          title="Could not load this user"
+          message={res.error}
+          onRetry={res.refresh}
+        />
       ) : null}
 
       {res.loading ? (
@@ -195,13 +223,9 @@ export function UserDetail() {
               </h1>
               <p className="mt-1.5 flex flex-wrap items-center gap-1.5">
                 <Badge variant="outline">{user.role}</Badge>
-                {user.is_active ? (
-                  <Badge variant="outline">Active</Badge>
-                ) : (
-                  <Badge variant="outline" className="text-muted-foreground">
-                    Inactive
-                  </Badge>
-                )}
+                <StatusBadge tone={user.is_active ? "positive" : "neutral"}>
+                  {user.is_active ? "Active" : "Inactive"}
+                </StatusBadge>
                 <span className="text-[13px] text-muted-foreground">
                   Signs in to the S3 API only
                 </span>
@@ -223,7 +247,7 @@ export function UserDetail() {
             </div>
           </header>
 
-          <Card className="gap-4 rounded-lg shadow-none">
+          <Card className="gap-4">
             <CardHeader>
               <CardTitle className="text-base">Access keys</CardTitle>
               <CardDescription>
@@ -271,7 +295,55 @@ export function UserDetail() {
             </CardContent>
           </Card>
 
-          <Card className="gap-4 rounded-lg shadow-none">
+          <Card className="gap-4">
+            <CardHeader>
+              <CardTitle className="text-base">Storage quota</CardTitle>
+              <CardDescription>
+                Cap the total bytes this user's uploads may consume across all
+                buckets. Leave empty for no limit.
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              <div className="flex flex-wrap items-end gap-2">
+                <div className="grid gap-1.5">
+                  <Label htmlFor={quotaId}>Quota (GiB)</Label>
+                  <Input
+                    id={quotaId}
+                    type="number"
+                    min="0"
+                    step="any"
+                    inputMode="decimal"
+                    placeholder="No limit"
+                    value={quotaGiB}
+                    onChange={(e) => setQuotaGiB(e.target.value)}
+                    className="w-full sm:w-44"
+                  />
+                </div>
+                <Button
+                  onClick={() => saveQuota(false)}
+                  disabled={savingQuota}
+                  aria-busy={savingQuota || undefined}
+                >
+                  {savingQuota ? "Saving…" : "Save quota"}
+                </Button>
+                {user.quota_bytes != null ? (
+                  <Button
+                    variant="outline"
+                    onClick={() => saveQuota(true)}
+                    disabled={savingQuota}
+                  >
+                    Remove limit
+                  </Button>
+                ) : null}
+              </div>
+              <p className="mt-2 text-[13px] text-muted-foreground">
+                Current limit:{" "}
+                {user.quota_bytes != null ? bytes(user.quota_bytes) : "No limit"}
+              </p>
+            </CardContent>
+          </Card>
+
+          <Card className="gap-4">
             <CardHeader>
               <CardTitle className="text-base">Access policy</CardTitle>
               <CardDescription>
