@@ -12,7 +12,8 @@ use cairn_types::bucket::{Bucket, CompressionPolicy, VersioningState};
 use cairn_types::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
 use cairn_types::meta::{
     ActivityEntry, MultipartSession, MultipartStatus, ObjectSummary, OutboxEntry, PartRecord,
-    ReplicationOp, ReplicationStatus, User, UserRecord, UserSigV4Credentials, UserWithBearerHash,
+    ReplicationOp, ReplicationStatus, ShareDisposition, ShareRow, User, UserRecord,
+    UserSigV4Credentials, UserWithBearerHash,
 };
 use cairn_types::object::{
     ChecksumValue, CompressionDescriptor, ETag, ObjectVersionRow, StorageClass, UserMetadata,
@@ -50,6 +51,8 @@ pub const OUTBOX_COLS: &str = "id, bucket_name, key, version_id, operation, rule
 
 /// `activity` columns in mapper order.
 pub const ACTIVITY_COLS: &str = "id, action, bucket, key, size, etag, actor, at";
+pub const SHARE_COLS: &str = "token, bucket_name, key, version_id, expires_at, disposition, \
+     filename, created_by, created_at, revoked_at";
 
 /// `object_summary` listing columns in mapper order.
 pub const SUMMARY_COLS: &str = "key, version_id, is_latest, is_delete_marker, etag, size_logical, \
@@ -338,6 +341,34 @@ pub fn activity_from_row(row: &Row) -> Result<ActivityEntry, MetaError> {
         etag: row.get_opt_text(5),
         actor: row.get_opt_text(6),
         at: Timestamp(row.get_i64(7)),
+    })
+}
+
+pub fn disposition_str(d: ShareDisposition) -> &'static str {
+    match d {
+        ShareDisposition::Inline => "inline",
+        ShareDisposition::Attachment => "attachment",
+    }
+}
+pub fn disposition_from(s: &str) -> ShareDisposition {
+    match s {
+        "attachment" => ShareDisposition::Attachment,
+        _ => ShareDisposition::Inline,
+    }
+}
+
+pub fn share_from_row(row: &Row) -> Result<ShareRow, MetaError> {
+    Ok(ShareRow {
+        token: row.get_text(0),
+        bucket: BucketName::parse(&row.get_text(1)).unwrap_or_else(|_| unreachable_bucket()),
+        key: ObjectKey::parse(&row.get_text(2)).unwrap_or_else(|_| unreachable_key()),
+        version_id: row.get_opt_text(3).map(VersionId::from_string),
+        expires_at: row.get_opt_i64(4).map(Timestamp),
+        disposition: disposition_from(&row.get_text(5)),
+        filename: row.get_opt_text(6),
+        created_by: UserId(row.get_text(7)),
+        created_at: Timestamp(row.get_i64(8)),
+        revoked_at: row.get_opt_i64(9).map(Timestamp),
     })
 }
 

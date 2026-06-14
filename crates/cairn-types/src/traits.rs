@@ -20,7 +20,7 @@ use crate::error::{BlobError, CryptoError, MetaError, ReplicationError};
 use crate::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
 use crate::meta::{
     ActivityEntry, BucketCounts, ListPage, ListQuery, MultipartSession, Mutation, MutationOutcome,
-    ObjectSummary, OutboxEntry, PartRecord, ReplicationStatus, StoreCounts, User,
+    ObjectSummary, OutboxEntry, PartRecord, ReplicationStatus, ShareRow, StoreCounts, User,
     UserSigV4Credentials, UserWithBearerHash,
 };
 use crate::object::ObjectVersionRow;
@@ -259,6 +259,17 @@ pub trait MetadataStore: Send + Sync {
     /// Fetch a user's attached identity-policy JSON document, or `None` if the user has none (or
     /// does not exist). The raw stored JSON is returned; the caller parses/validates it.
     async fn get_user_policy(&self, user_id: &UserId) -> Result<Option<String>, MetaError>;
+
+    // --- object shares (ARCH §15.8) ---
+    /// Fetch a share by its token, or `None` if no such token exists. The caller checks
+    /// revoked/expired state; the store returns the row verbatim.
+    async fn get_share(&self, token: &str) -> Result<Option<ShareRow>, MetaError>;
+    /// List a bucket's shares (most recent first), optionally narrowed to a single key.
+    async fn list_shares(
+        &self,
+        bucket: &BucketName,
+        key: Option<&ObjectKey>,
+    ) -> Result<Vec<ShareRow>, MetaError>;
 
     // --- audit & aggregates ---
     /// List recent activity (most recent first), up to `limit`.

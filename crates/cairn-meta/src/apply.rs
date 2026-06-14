@@ -465,6 +465,36 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             .map_err(engine_err)?;
             Ok(MutationOutcome::Ack)
         }
+        Mutation::CreateShare(s) => {
+            conn.execute(
+                "INSERT INTO object_shares
+                 (token, bucket_name, key, version_id, expires_at, disposition, filename, created_by, created_at, revoked_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                params![
+                    s.token,
+                    s.bucket.as_str(),
+                    s.key.as_str(),
+                    s.version_id.as_ref().map(|v| v.as_str()),
+                    s.expires_at.map(|t| t.0),
+                    model::disposition_str(s.disposition),
+                    s.filename,
+                    s.created_by.0,
+                    s.created_at.0,
+                    s.revoked_at.map(|t| t.0),
+                ],
+            )
+            .map_err(engine_err)?;
+            Ok(MutationOutcome::Ack)
+        }
+        Mutation::RevokeShare { token, now } => {
+            // Idempotent: revoking an already-revoked or missing token is a no-op.
+            conn.execute(
+                "UPDATE object_shares SET revoked_at=?2 WHERE token=?1 AND revoked_at IS NULL",
+                params![token, now.0],
+            )
+            .map_err(engine_err)?;
+            Ok(MutationOutcome::Ack)
+        }
     }
 }
 

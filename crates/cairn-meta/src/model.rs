@@ -7,7 +7,8 @@ use cairn_types::bucket::{Bucket, CompressionPolicy, VersioningState};
 use cairn_types::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
 use cairn_types::meta::{
     ActivityEntry, MultipartSession, MultipartStatus, ObjectSummary, OutboxEntry, PartRecord,
-    ReplicationOp, ReplicationStatus, User, UserRecord, UserSigV4Credentials, UserWithBearerHash,
+    ReplicationOp, ReplicationStatus, ShareDisposition, ShareRow, User, UserRecord,
+    UserSigV4Credentials, UserWithBearerHash,
 };
 use cairn_types::object::{
     ChecksumValue, CompressionDescriptor, ETag, ObjectVersionRow, StorageClass, UserMetadata,
@@ -95,6 +96,37 @@ pub fn mp_status_from(s: &str) -> MultipartStatus {
         "aborted" => MultipartStatus::Aborted,
         _ => MultipartStatus::Active,
     }
+}
+
+pub fn disposition_str(d: ShareDisposition) -> &'static str {
+    match d {
+        ShareDisposition::Inline => "inline",
+        ShareDisposition::Attachment => "attachment",
+    }
+}
+pub fn disposition_from(s: &str) -> ShareDisposition {
+    match s {
+        "attachment" => ShareDisposition::Attachment,
+        _ => ShareDisposition::Inline,
+    }
+}
+
+pub fn share_from_row(row: &Row) -> rusqlite::Result<ShareRow> {
+    Ok(ShareRow {
+        token: row.get("token")?,
+        bucket: BucketName::parse(&row.get::<_, String>("bucket_name")?)
+            .unwrap_or_else(|_| unreachable_bucket()),
+        key: ObjectKey::parse(&row.get::<_, String>("key")?).unwrap_or_else(|_| unreachable_key()),
+        version_id: row
+            .get::<_, Option<String>>("version_id")?
+            .map(VersionId::from_string),
+        expires_at: row.get::<_, Option<i64>>("expires_at")?.map(Timestamp),
+        disposition: disposition_from(&row.get::<_, String>("disposition")?),
+        filename: row.get("filename")?,
+        created_by: UserId(row.get("created_by")?),
+        created_at: Timestamp(row.get("created_at")?),
+        revoked_at: row.get::<_, Option<i64>>("revoked_at")?.map(Timestamp),
+    })
 }
 
 pub fn repl_status_str(s: ReplicationStatus) -> &'static str {

@@ -241,6 +241,15 @@ pub enum Mutation {
     EnqueueReplication(Box<OutboxEntry>),
     /// Append an audit/activity entry.
     RecordActivity(Box<ActivityEntry>),
+    /// Create a persistent object-share token (ARCH §15.8).
+    CreateShare(Box<ShareRow>),
+    /// Revoke a share token (idempotent; sets `revoked_at` if still active).
+    RevokeShare {
+        /// The token to revoke.
+        token: String,
+        /// The revocation time.
+        now: Timestamp,
+    },
 }
 
 /// The typed result of applying a [`Mutation`].
@@ -406,6 +415,42 @@ pub enum MultipartStatus {
     Completing,
     /// Aborted.
     Aborted,
+}
+
+/// How a shared object is delivered to the browser (the `Content-Disposition`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ShareDisposition {
+    /// `inline` — render in the browser when possible.
+    Inline,
+    /// `attachment` — force a download (optionally with a chosen filename).
+    Attachment,
+}
+
+/// A persistent, revocable, optionally-forever object-share token (ARCH §15.8). The token is the
+/// bearer capability served at `GET /p/{token}`; revoking flips `revoked_at` without rotating any
+/// global key. Stored in the `object_shares` table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShareRow {
+    /// The opaque bearer token (base64url of 32 CSPRNG bytes); the table primary key.
+    pub token: String,
+    /// The shared object's bucket.
+    pub bucket: BucketName,
+    /// The shared object's key.
+    pub key: ObjectKey,
+    /// A pinned version id, or `None` to always follow the current version.
+    pub version_id: Option<VersionId>,
+    /// Expiry, or `None` for a forever share (valid until revoked).
+    pub expires_at: Option<Timestamp>,
+    /// How the object is delivered (inline vs forced download).
+    pub disposition: ShareDisposition,
+    /// The download filename for `attachment`, or `None` to use the object's basename.
+    pub filename: Option<String>,
+    /// The user id that minted the share (for audit).
+    pub created_by: UserId,
+    /// When it was minted.
+    pub created_at: Timestamp,
+    /// When it was revoked, or `None` while active.
+    pub revoked_at: Option<Timestamp>,
 }
 
 /// A recorded multipart part.

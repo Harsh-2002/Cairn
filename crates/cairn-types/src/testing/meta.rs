@@ -10,7 +10,7 @@ use crate::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, VersionId}
 use crate::meta::{
     ActivityEntry, BucketCounts, ClaimOutcome, IfNoneMatch, ListPage, ListQuery, MultipartSession,
     MultipartStatus, Mutation, MutationOutcome, ObjectSummary, OutboxEntry, PartRecord,
-    Precondition, ReplicationStatus, StoreCounts, User, UserRecord, UserSigV4Credentials,
+    Precondition, ReplicationStatus, ShareRow, StoreCounts, User, UserRecord, UserSigV4Credentials,
     UserWithBearerHash,
 };
 use crate::object::{ETag, ObjectVersionRow};
@@ -46,6 +46,8 @@ struct State {
     /// shared `UserRecord` type.
     user_policies: BTreeMap<String, String>,
     activity: Vec<ActivityEntry>,
+    /// Object-share tokens (ARCH §15.8), keyed by token.
+    shares: BTreeMap<String, ShareRow>,
 }
 
 impl State {
@@ -623,6 +625,18 @@ impl MetadataStore for InMemoryMetadataStore {
                 }
                 Ok(MutationOutcome::Ack)
             }
+            Mutation::CreateShare(s) => {
+                st.shares.insert(s.token.clone(), *s);
+                Ok(MutationOutcome::Ack)
+            }
+            Mutation::RevokeShare { token, now } => {
+                if let Some(s) = st.shares.get_mut(&token) {
+                    if s.revoked_at.is_none() {
+                        s.revoked_at = Some(now);
+                    }
+                }
+                Ok(MutationOutcome::Ack)
+            }
             Mutation::RecordActivity(entry) => {
                 st.activity.push(*entry);
                 Ok(MutationOutcome::Ack)
@@ -1043,6 +1057,31 @@ impl MetadataStore for InMemoryMetadataStore {
             .take(limit as usize)
             .cloned()
             .collect())
+    }
+
+    async fn get_share(&self, token: &str) -> Result<Option<ShareRow>, MetaError> {
+        let st = self.state.lock().unwrap();
+        Ok(st.shares.get(token).cloned())
+    }
+
+    async fn list_shares(
+        &self,
+        bucket: &BucketName,
+        key: Option<&ObjectKey>,
+    ) -> Result<Vec<ShareRow>, MetaError> {
+        let st = self.state.lock().unwrap();
+        let mut out: Vec<ShareRow> = st
+            .shares
+            .values()
+            .filter(|s| {
+                s.bucket.as_str() == bucket.as_str()
+                    && key.is_none_or(|k| s.key.as_str() == k.as_str())
+            })
+            .cloned()
+            .collect();
+        // Most recent first, matching the SQL stores.
+        out.sort_by_key(|s| std::cmp::Reverse(s.created_at.0));
+        Ok(out)
     }
 
     async fn aggregate_counts(&self) -> Result<StoreCounts, MetaError> {

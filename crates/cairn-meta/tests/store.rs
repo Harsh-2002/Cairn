@@ -104,6 +104,70 @@ async fn user_policy_round_trips() {
 }
 
 #[tokio::test]
+async fn object_shares_round_trip_and_revoke() {
+    let store = cairn_meta::open_in_memory().unwrap();
+    let bucket = BucketName::parse("photos").unwrap();
+    let key = ObjectKey::parse("a/b.jpg").unwrap();
+    let row = ShareRow {
+        token: "tok-abc".to_owned(),
+        bucket: bucket.clone(),
+        key: key.clone(),
+        version_id: Some(VersionId::from_string("v1".to_owned())),
+        expires_at: None, // forever
+        disposition: ShareDisposition::Attachment,
+        filename: Some("download.jpg".to_owned()),
+        created_by: UserId("admin".to_owned()),
+        created_at: Timestamp(100),
+        revoked_at: None,
+    };
+    store
+        .submit(Mutation::CreateShare(Box::new(row.clone())))
+        .await
+        .unwrap();
+
+    // Round-trips by token, preserving every field including the forever (None) expiry.
+    let got = store.get_share("tok-abc").await.unwrap().unwrap();
+    assert_eq!(got, row);
+    // Listed per-key and per-bucket.
+    assert_eq!(
+        store.list_shares(&bucket, Some(&key)).await.unwrap().len(),
+        1
+    );
+    assert_eq!(store.list_shares(&bucket, None).await.unwrap().len(), 1);
+    // Unknown token → None.
+    assert!(store.get_share("nope").await.unwrap().is_none());
+
+    // Revoke sets revoked_at; the row remains readable (the resolver checks the flag).
+    store
+        .submit(Mutation::RevokeShare {
+            token: "tok-abc".to_owned(),
+            now: Timestamp(200),
+        })
+        .await
+        .unwrap();
+    let revoked = store.get_share("tok-abc").await.unwrap().unwrap();
+    assert_eq!(revoked.revoked_at, Some(Timestamp(200)));
+
+    // Revoke is idempotent: a second revoke does not move the timestamp.
+    store
+        .submit(Mutation::RevokeShare {
+            token: "tok-abc".to_owned(),
+            now: Timestamp(999),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get_share("tok-abc")
+            .await
+            .unwrap()
+            .unwrap()
+            .revoked_at,
+        Some(Timestamp(200))
+    );
+}
+
+#[tokio::test]
 async fn put_is_visible_only_after_commit() {
     let store = cairn_meta::open_in_memory().unwrap();
     let b = BucketName::parse("bkt").unwrap();

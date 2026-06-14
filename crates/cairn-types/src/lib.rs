@@ -58,8 +58,8 @@ pub use id::{BucketName, InvalidName, ObjectKey, StoragePath, UploadId, UserId, 
 pub use meta::{
     ActivityEntry, BucketCounts, ClaimOutcome, IfNoneMatch, ListPage, ListQuery, MultipartSession,
     MultipartStatus, Mutation, MutationOutcome, ObjectSummary, OutboxEntry, PartRecord,
-    Precondition, ReplicationOp, ReplicationStatus, StoreCounts, User, UserRecord,
-    UserSigV4Credentials, UserWithBearerHash,
+    Precondition, ReplicationOp, ReplicationStatus, ShareDisposition, ShareRow, StoreCounts, User,
+    UserRecord, UserSigV4Credentials, UserWithBearerHash,
 };
 pub use object::{
     ChecksumAlgorithm, ChecksumSet, ChecksumValue, CompressionDescriptor, ETag, ObjectVersionRow,

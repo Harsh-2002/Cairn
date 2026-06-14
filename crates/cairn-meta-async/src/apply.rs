@@ -550,6 +550,37 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
                 .await?;
             Ok(MutationOutcome::Ack)
         }
+        Mutation::CreateShare(s) => {
+            driver
+                .execute(
+                    "INSERT INTO object_shares
+                     (token, bucket_name, key, version_id, expires_at, disposition, filename, created_by, created_at, revoked_at)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                    vec![
+                        Value::Text(s.token.clone()),
+                        Value::Text(s.bucket.as_str().to_owned()),
+                        Value::Text(s.key.as_str().to_owned()),
+                        opt_text(s.version_id.as_ref().map(|v| v.as_str().to_owned())),
+                        s.expires_at.map_or(Value::Null, |t| Value::Int(t.0)),
+                        Value::Text(model::disposition_str(s.disposition).to_owned()),
+                        opt_text(s.filename.clone()),
+                        Value::Text(s.created_by.0.clone()),
+                        Value::Int(s.created_at.0),
+                        s.revoked_at.map_or(Value::Null, |t| Value::Int(t.0)),
+                    ],
+                )
+                .await?;
+            Ok(MutationOutcome::Ack)
+        }
+        Mutation::RevokeShare { token, now } => {
+            driver
+                .execute(
+                    "UPDATE object_shares SET revoked_at=?2 WHERE token=?1 AND revoked_at IS NULL",
+                    vec![Value::Text(token.clone()), Value::Int(now.0)],
+                )
+                .await?;
+            Ok(MutationOutcome::Ack)
+        }
     }
 }
 

@@ -218,6 +218,29 @@ ALTER TABLE users ADD COLUMN quota_bytes INTEGER;
 ALTER TABLE replication_outbox ADD COLUMN target_arn TEXT;
 "#,
     },
+    Migration {
+        version: 7,
+        name: "object share tokens (persistent public sharing)",
+        sql: r#"
+-- Persistent, revocable, optionally-forever object-share tokens (ARCH §15.8). The opaque token is
+-- the bearer capability served at GET /p/{token}; revoke flips revoked_at with no global key
+-- rotation. version_id NULL follows the current version; expires_at NULL is a forever share.
+CREATE TABLE object_shares (
+    token        TEXT PRIMARY KEY,
+    bucket_name  TEXT NOT NULL,
+    key          TEXT NOT NULL,
+    version_id   TEXT,
+    expires_at   INTEGER,
+    disposition  TEXT NOT NULL DEFAULT 'inline',
+    filename     TEXT,
+    created_by   TEXT NOT NULL,
+    created_at   INTEGER NOT NULL,
+    revoked_at   INTEGER
+);
+CREATE INDEX idx_object_shares_bucket_key ON object_shares (bucket_name, key);
+CREATE INDEX idx_object_shares_created_by ON object_shares (created_by);
+"#,
+    },
 ];
 
 /// Run all pending migrations on the write connection, recording each as applied.

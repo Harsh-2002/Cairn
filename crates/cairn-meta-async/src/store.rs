@@ -6,7 +6,7 @@
 use crate::driver::{AsyncSqlDriver, Row, Value, query_one};
 use crate::model::{
     self, ACTIVITY_COLS, BUCKET_COLS, MULTIPART_COLS, OBJECT_VERSION_COLS, OUTBOX_COLS, PART_COLS,
-    SUMMARY_COLS, USER_COLS,
+    SHARE_COLS, SUMMARY_COLS, USER_COLS,
 };
 use crate::range::{prefix_upper_bound, successor};
 use crate::writer::Writer;
@@ -16,7 +16,7 @@ use cairn_types::bucket::{Bucket, ConfigAspect, ConfigDoc};
 use cairn_types::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
 use cairn_types::meta::{
     ActivityEntry, BucketCounts, ListPage, ListQuery, MultipartSession, Mutation, MutationOutcome,
-    ObjectSummary, OutboxEntry, PartRecord, ReplicationStatus, StoreCounts, User,
+    ObjectSummary, OutboxEntry, PartRecord, ReplicationStatus, ShareRow, StoreCounts, User,
     UserSigV4Credentials, UserWithBearerHash,
 };
 use cairn_types::object::ObjectVersionRow;
@@ -704,6 +704,50 @@ impl MetadataStore for AsyncMetadataStore {
             )
             .await?;
         rows.iter().map(model::activity_from_row).collect()
+    }
+
+    async fn get_share(&self, token: &str) -> Result<Option<ShareRow>, MetaError> {
+        let rows = self
+            .reader()
+            .query(
+                &format!("SELECT {SHARE_COLS} FROM object_shares WHERE token=?1"),
+                vec![Value::Text(token.to_owned())],
+            )
+            .await?;
+        rows.first().map(model::share_from_row).transpose()
+    }
+
+    async fn list_shares(
+        &self,
+        bucket: &BucketName,
+        key: Option<&ObjectKey>,
+    ) -> Result<Vec<ShareRow>, MetaError> {
+        let rows = match key {
+            Some(k) => {
+                self.reader()
+                    .query(
+                        &format!(
+                            "SELECT {SHARE_COLS} FROM object_shares WHERE bucket_name=?1 AND key=?2 ORDER BY created_at DESC"
+                        ),
+                        vec![
+                            Value::Text(bucket.as_str().to_owned()),
+                            Value::Text(k.as_str().to_owned()),
+                        ],
+                    )
+                    .await?
+            }
+            None => {
+                self.reader()
+                    .query(
+                        &format!(
+                            "SELECT {SHARE_COLS} FROM object_shares WHERE bucket_name=?1 ORDER BY created_at DESC"
+                        ),
+                        vec![Value::Text(bucket.as_str().to_owned())],
+                    )
+                    .await?
+            }
+        };
+        rows.iter().map(model::share_from_row).collect()
     }
 
     async fn aggregate_counts(&self) -> Result<StoreCounts, MetaError> {

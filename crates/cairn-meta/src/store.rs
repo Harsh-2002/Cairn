@@ -11,7 +11,7 @@ use cairn_types::bucket::{Bucket, ConfigAspect, ConfigDoc};
 use cairn_types::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
 use cairn_types::meta::{
     ActivityEntry, BucketCounts, ListPage, ListQuery, MultipartSession, Mutation, MutationOutcome,
-    ObjectSummary, OutboxEntry, PartRecord, ReplicationStatus, StoreCounts, User,
+    ObjectSummary, OutboxEntry, PartRecord, ReplicationStatus, ShareRow, StoreCounts, User,
     UserSigV4Credentials, UserWithBearerHash,
 };
 use cairn_types::object::ObjectVersionRow;
@@ -792,6 +792,54 @@ impl MetadataStore for SqliteMetadataStore {
                 .map_err(engine_err)?
                 .collect::<rusqlite::Result<Vec<_>>>()
                 .map_err(engine_err)
+        })
+        .await
+    }
+
+    async fn get_share(&self, token: &str) -> Result<Option<ShareRow>, MetaError> {
+        let token = token.to_owned();
+        self.with_read(move |conn| {
+            conn.query_row(
+                "SELECT * FROM object_shares WHERE token=?1",
+                params![token],
+                model::share_from_row,
+            )
+            .optional()
+            .map_err(engine_err)
+        })
+        .await
+    }
+
+    async fn list_shares(
+        &self,
+        bucket: &BucketName,
+        key: Option<&ObjectKey>,
+    ) -> Result<Vec<ShareRow>, MetaError> {
+        let bucket = bucket.as_str().to_owned();
+        let key = key.map(|k| k.as_str().to_owned());
+        self.with_read(move |conn| match key {
+            Some(k) => {
+                let mut stmt = conn
+                    .prepare_cached(
+                        "SELECT * FROM object_shares WHERE bucket_name=?1 AND key=?2 ORDER BY created_at DESC",
+                    )
+                    .map_err(engine_err)?;
+                stmt.query_map(params![bucket, k], model::share_from_row)
+                    .map_err(engine_err)?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(engine_err)
+            }
+            None => {
+                let mut stmt = conn
+                    .prepare_cached(
+                        "SELECT * FROM object_shares WHERE bucket_name=?1 ORDER BY created_at DESC",
+                    )
+                    .map_err(engine_err)?;
+                stmt.query_map(params![bucket], model::share_from_row)
+                    .map_err(engine_err)?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(engine_err)
+            }
         })
         .await
     }

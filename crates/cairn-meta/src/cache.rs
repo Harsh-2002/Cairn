@@ -36,7 +36,7 @@ use cairn_types::error::MetaError;
 use cairn_types::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
 use cairn_types::meta::{
     ActivityEntry, BucketCounts, ListPage, ListQuery, MultipartSession, Mutation, MutationOutcome,
-    ObjectSummary, OutboxEntry, PartRecord, ReplicationStatus, StoreCounts, User,
+    ObjectSummary, OutboxEntry, PartRecord, ReplicationStatus, ShareRow, StoreCounts, User,
     UserSigV4Credentials, UserWithBearerHash,
 };
 use cairn_types::object::ObjectVersionRow;
@@ -350,7 +350,9 @@ impl CachedMetadataStore {
             | Mutation::MarkReplicationFailed { .. }
             | Mutation::RetryFailedReplication { .. }
             | Mutation::EnqueueReplication(_)
-            | Mutation::RecordActivity(_) => {}
+            | Mutation::RecordActivity(_)
+            | Mutation::CreateShare(_)
+            | Mutation::RevokeShare { .. } => {}
         }
     }
 }
@@ -584,6 +586,19 @@ impl MetadataStore for CachedMetadataStore {
         self.inner.list_activity(limit).await
     }
 
+    async fn get_share(&self, token: &str) -> Result<Option<ShareRow>, MetaError> {
+        // Shares are uncached so a revoke takes effect immediately on the next fetch.
+        self.inner.get_share(token).await
+    }
+
+    async fn list_shares(
+        &self,
+        bucket: &BucketName,
+        key: Option<&ObjectKey>,
+    ) -> Result<Vec<ShareRow>, MetaError> {
+        self.inner.list_shares(bucket, key).await
+    }
+
     async fn aggregate_counts(&self) -> Result<StoreCounts, MetaError> {
         self.inner.aggregate_counts().await
     }
@@ -785,6 +800,16 @@ mod tests {
         }
         async fn list_activity(&self, limit: u32) -> Result<Vec<ActivityEntry>, MetaError> {
             self.inner.list_activity(limit).await
+        }
+        async fn get_share(&self, token: &str) -> Result<Option<ShareRow>, MetaError> {
+            self.inner.get_share(token).await
+        }
+        async fn list_shares(
+            &self,
+            bucket: &BucketName,
+            key: Option<&ObjectKey>,
+        ) -> Result<Vec<ShareRow>, MetaError> {
+            self.inner.list_shares(bucket, key).await
         }
         async fn aggregate_counts(&self) -> Result<StoreCounts, MetaError> {
             self.inner.aggregate_counts().await
