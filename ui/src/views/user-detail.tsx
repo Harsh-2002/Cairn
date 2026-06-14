@@ -83,13 +83,19 @@ export function UserDetail() {
   }, [rotated]);
 
   async function setActive(next: boolean) {
-    setConfirming(null);
+    // Busy-guarded: keep the confirm dialog open (and disabled) until the PATCH
+    // settles, so a fast double-click can't fire two requests and the action
+    // shows an in-flight state.
+    setBusyConfirm(true);
     try {
       await api.patchUser(id, { is_active: next });
+      setConfirming(null);
       toast.success(next ? "User activated" : "User deactivated");
       res.refresh();
     } catch (e) {
       toast.error(errorMessage(e, "Failed to update the user."));
+    } finally {
+      setBusyConfirm(false);
     }
   }
 
@@ -204,6 +210,7 @@ export function UserDetail() {
             <div className="flex shrink-0 gap-2">
               <Button
                 variant="outline"
+                disabled={busyConfirm}
                 onClick={() =>
                   user.is_active ? setConfirming("deactivate") : setActive(true)
                 }
@@ -325,6 +332,7 @@ export function UserDetail() {
         open={confirming === "deactivate"}
         onOpenChange={(o) => !o && setConfirming(null)}
         destructive
+        busy={busyConfirm}
         title="Deactivate this user?"
         description="Deactivating blocks this user's S3 access immediately. You can reactivate them later."
         confirmLabel="Deactivate user"

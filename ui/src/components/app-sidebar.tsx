@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { NavLink, useLocation } from "react-router";
+import { Link, useLocation } from "react-router";
 import { Activity, Database, Home, RefreshCw, Users } from "lucide-react";
 import {
   Sidebar,
@@ -44,7 +44,7 @@ export function AppSidebar() {
   return (
     <Sidebar>
       <SidebarHeader className="px-4 py-4">
-        <NavLink to="/overview" className="flex items-center gap-2">
+        <Link to="/overview" className="flex items-center gap-2">
           {/* The wordmark: a quiet filled square + name, Geist 600. */}
           <span
             aria-hidden="true"
@@ -53,30 +53,35 @@ export function AppSidebar() {
           <span className="text-[15px] font-semibold tracking-tight text-foreground">
             Cairn
           </span>
-        </NavLink>
+        </Link>
       </SidebarHeader>
       <SidebarContent>
         <SidebarGroup>
           <SidebarGroupContent>
             <SidebarMenu>
-              {NAV.map((item) => (
-                <SidebarMenuItem key={item.path}>
-                  <SidebarMenuButton
-                    asChild
-                    isActive={isActive(item.path, location.pathname)}
-                  >
-                    <NavLink
-                      to={item.path}
-                      onClick={() => {
-                        if (isMobile) setOpenMobile(false);
-                      }}
-                    >
-                      <item.icon aria-hidden="true" />
-                      <span>{item.label}</span>
-                    </NavLink>
-                  </SidebarMenuButton>
-                </SidebarMenuItem>
-              ))}
+              {NAV.map((item) => {
+                // One source of truth for "current section": both the visual
+                // highlight and the announced aria-current come from the same
+                // helper, so they can never disagree (plain Link, not NavLink,
+                // whose own exact-match aria-current would override ours).
+                const active = isActive(item.path, location.pathname);
+                return (
+                  <SidebarMenuItem key={item.path}>
+                    <SidebarMenuButton asChild isActive={active}>
+                      <Link
+                        to={item.path}
+                        aria-current={active ? "page" : undefined}
+                        onClick={() => {
+                          if (isMobile) setOpenMobile(false);
+                        }}
+                      >
+                        <item.icon aria-hidden="true" />
+                        <span>{item.label}</span>
+                      </Link>
+                    </SidebarMenuButton>
+                  </SidebarMenuItem>
+                );
+              })}
             </SidebarMenu>
           </SidebarGroupContent>
         </SidebarGroup>

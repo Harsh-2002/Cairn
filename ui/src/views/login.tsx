@@ -11,7 +11,7 @@ import {
   type FormEvent,
   type KeyboardEvent,
 } from "react";
-import { Navigate, useNavigate } from "react-router";
+import { Navigate, useLocation, useNavigate } from "react-router";
 import { Eye, EyeOff } from "lucide-react";
 import { errorMessage } from "@/lib/api";
 import { useAuth } from "@/providers/auth-provider";
@@ -24,6 +24,11 @@ import { Label } from "@/components/ui/label";
 export function Login() {
   const { authed, login } = useAuth();
   const navigate = useNavigate();
+  const location = useLocation();
+  // Where to land after signing in: the page a session-expiry bounce came from
+  // (captured by RequireAuth), otherwise the overview.
+  const from =
+    (location.state as { from?: string } | null)?.from ?? "/overview";
 
   const [accessKey, setAccessKey] = useState("");
   const [secretKey, setSecretKey] = useState("");
@@ -60,7 +65,7 @@ export function Login() {
     setBusy(true);
     try {
       await login(id, secretKey);
-      navigate("/overview");
+      navigate(from, { replace: true });
     } catch (err) {
       setError(errorMessage(err, "Could not sign in."));
     } finally {
@@ -69,7 +74,7 @@ export function Login() {
   }
 
   if (authed) {
-    return <Navigate to="/overview" replace />;
+    return <Navigate to={from} replace />;
   }
 
   return (

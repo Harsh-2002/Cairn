@@ -49,6 +49,7 @@ export function ConfirmDialog({
           <AlertDialogCancel disabled={busy}>{cancelLabel}</AlertDialogCancel>
           <AlertDialogAction
             disabled={busy}
+            aria-busy={busy || undefined}
             className={cn(
               destructive &&
                 buttonVariants({ variant: "destructive" }),

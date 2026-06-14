@@ -3,10 +3,12 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useRef,
   useState,
   type ReactNode,
 } from "react";
 import { Navigate, useLocation } from "react-router";
+import { toast } from "sonner";
 import {
   ApiError,
   api,
@@ -31,6 +33,9 @@ const AuthContext = createContext<AuthContextValue | null>(null);
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [authed, setAuthed] = useState<boolean>(hasToken);
+  // Read the live authed flag from the 401 handler without re-subscribing it.
+  const authedRef = useRef(authed);
+  authedRef.current = authed;
 
   const logout = useCallback(() => {
     clearToken();
@@ -38,9 +43,17 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, []);
 
   // Any 401 from any request means the session is gone: drop the token so
-  // RequireAuth bounces to the login screen.
+  // RequireAuth bounces to the login screen. Announce it only when we WERE
+  // signed in — a 401 during a login attempt is handled by `login` itself, and
+  // would otherwise double up with a spurious "session expired" toast.
   useEffect(() => {
-    onUnauthorized(logout);
+    const onExpired = () => {
+      if (authedRef.current) {
+        toast.error("Your session expired. Please sign in again.");
+      }
+      logout();
+    };
+    onUnauthorized(onExpired);
     return () => onUnauthorized(null);
   }, [logout]);
 
