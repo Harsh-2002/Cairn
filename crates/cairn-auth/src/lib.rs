@@ -13,7 +13,10 @@ mod sigv4;
 pub use bearer::{hash_bearer_secret, parse_bearer};
 pub use chunked::{chunk_string_to_sign, next_chunk_signature, streaming_signing_key};
 pub use crypto_util::sha256_hex;
-pub use sigv4::{ParsedSig, canonical_request, compute_signature, signing_key, string_to_sign};
+pub use sigv4::{
+    ParsedSig, PresignRequest, canonical_request, compute_signature, mint_presigned, signing_key,
+    string_to_sign,
+};
 
 use async_trait::async_trait;
 use cairn_types::auth::{AuthMethod, AuthOutcome, Principal, RequestView, Role};

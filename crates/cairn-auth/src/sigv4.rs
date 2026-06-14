@@ -325,6 +325,99 @@ pub fn verify_presigned(
     }
 }
 
+/// Inputs for minting a presigned URL. The signature reuses the exact verification primitives
+/// ([`canonical_request`] / [`string_to_sign`] / [`signing_key`] / [`compute_signature`]), so a
+/// minted URL is byte-for-byte what `aws s3 presign` would produce and verifies via
+/// [`verify_presigned`].
+#[derive(Debug)]
+pub struct PresignRequest<'a> {
+    /// `GET` (download) or `PUT` (upload).
+    pub method: &'a str,
+    /// The signed `Host` (authority, with port iff the redemption host has one).
+    pub host: &'a str,
+    /// Target bucket.
+    pub bucket: &'a str,
+    /// Target object key (raw, undecoded).
+    pub key: &'a str,
+    /// The signer's SigV4 access-key id.
+    pub access_key_id: &'a str,
+    /// The signer's SigV4 secret (used transiently; never stored here).
+    pub secret: &'a str,
+    /// The SigV4 region (must match the verifier's, derived from the credential).
+    pub region: &'a str,
+    /// Validity in seconds; clamped to the SigV4 1..=604800 (7-day) range.
+    pub expires_secs: i64,
+    /// `X-Amz-Date` (`YYYYMMDDTHHMMSSZ`).
+    pub amz_date: &'a str,
+    /// Extra query params folded into the signature (e.g. `versionId`,
+    /// `response-content-disposition`, `response-content-type`).
+    pub extra_query: Vec<(String, String)>,
+    /// Headers signed beyond `host` (e.g. `("content-type", …)` to pin a PUT's content type).
+    pub extra_signed_headers: Vec<(String, String)>,
+}
+
+/// Mint a presigned S3 URL, returning the path + query (the caller prepends `scheme://host`).
+#[must_use]
+pub fn mint_presigned(req: &PresignRequest) -> String {
+    let scope_date = &req.amz_date[..8.min(req.amz_date.len())];
+    let scope = format!("{scope_date}/{}/s3/aws4_request", req.region);
+    let credential = format!("{}/{scope}", req.access_key_id);
+    let expires = req.expires_secs.clamp(1, 604_800);
+
+    // Signed headers: host plus any extras (e.g. content-type), sorted.
+    let mut signed: Vec<(String, String)> = vec![("host".to_owned(), req.host.to_owned())];
+    for (n, v) in &req.extra_signed_headers {
+        signed.push((n.to_ascii_lowercase(), v.clone()));
+    }
+    signed.sort();
+    let signed_names = signed
+        .iter()
+        .map(|(n, _)| n.clone())
+        .collect::<Vec<_>>()
+        .join(";");
+
+    // Query params (all but the signature), folded into the canonical query.
+    let mut params: Vec<(String, String)> = vec![
+        ("X-Amz-Algorithm".to_owned(), ALGORITHM.to_owned()),
+        ("X-Amz-Credential".to_owned(), credential),
+        ("X-Amz-Date".to_owned(), req.amz_date.to_owned()),
+        ("X-Amz-Expires".to_owned(), expires.to_string()),
+        ("X-Amz-SignedHeaders".to_owned(), signed_names.clone()),
+    ];
+    params.extend(req.extra_query.iter().cloned());
+    let canon_query = encode_query(&params);
+
+    let canonical_uri = uri_encode(&format!("/{}/{}", req.bucket, req.key), false);
+    let cr = canonical_request(
+        req.method,
+        &canonical_uri,
+        &canon_query,
+        &signed,
+        &signed_names,
+        "UNSIGNED-PAYLOAD",
+    );
+    let sts = string_to_sign(req.amz_date, &scope, &cr);
+    let key = signing_key(req.secret, scope_date, req.region, "s3");
+    let signature = compute_signature(&key, &sts);
+
+    format!("{canonical_uri}?{canon_query}&X-Amz-Signature={signature}")
+}
+
+/// Build a canonical query string from decoded (name, value) pairs: URI-encode each, sort, join.
+/// Matches [`canonical_query`] but takes already-decoded pairs (so values may contain `=`/`&`).
+fn encode_query(params: &[(String, String)]) -> String {
+    let mut pairs: Vec<(String, String)> = params
+        .iter()
+        .map(|(k, v)| (uri_encode(k, true), uri_encode(v, true)))
+        .collect();
+    pairs.sort();
+    pairs
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
 fn sorted_names(names: &[String]) -> String {
     let mut n: Vec<String> = names.iter().map(|s| s.to_ascii_lowercase()).collect();
     n.sort();
@@ -401,6 +494,57 @@ mod tests {
             sig,
             "5fa00fa31553b73ebf1942676e86291e8372ff2a2260956d9b8aae1d763fbf31"
         );
+    }
+
+    #[test]
+    fn mint_presigned_round_trips_through_verify() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let amz = "20250101T000000Z";
+        let secret = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
+        let req = PresignRequest {
+            method: "GET",
+            host: "cairn.example.com",
+            bucket: "my-bucket",
+            key: "a/b c.txt", // space + '/' exercise canonical-uri encoding
+            access_key_id: "AKIDEXAMPLE",
+            secret,
+            region: "us-east-1",
+            expires_secs: 3600,
+            amz_date: amz,
+            // A value with '=', ';', spaces and quotes exercises the query encoder.
+            extra_query: vec![(
+                "response-content-disposition".to_owned(),
+                "attachment; filename=\"x.txt\"".to_owned(),
+            )],
+            extra_signed_headers: vec![],
+        };
+        let url = mint_presigned(&req);
+        let (path, query) = url.split_once('?').unwrap();
+        let view = RequestView {
+            method: "GET",
+            path,
+            query,
+            headers: &[],
+            host: "cairn.example.com",
+            source: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            secure_transport: true,
+        };
+        let (parsed, expires) = parse_presigned(view.query).expect("parses");
+        let start = parse_amz_date(amz).unwrap();
+        let now = Timestamp(start + 1000);
+        // The minter and verifier agree: a freshly minted URL verifies.
+        assert!(verify_presigned(&view, &parsed, expires, secret, now).is_ok());
+        // Tampering the path (a different key) breaks the signature.
+        let tampered = RequestView {
+            method: "GET",
+            path: "/my-bucket/evil.txt",
+            query,
+            headers: &[],
+            host: "cairn.example.com",
+            source: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            secure_transport: true,
+        };
+        assert!(verify_presigned(&tampered, &parsed, expires, secret, now).is_err());
     }
 
     #[test]
