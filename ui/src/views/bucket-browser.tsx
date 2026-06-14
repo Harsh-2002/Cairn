@@ -13,15 +13,23 @@ import {
   CircleAlert,
   FileBox,
   Folder,
+  FolderPlus,
   Loader2,
   MoreHorizontal,
-  RotateCw,
   Search,
+  Tag,
   Upload,
 } from "lucide-react";
 import { toast } from "sonner";
-import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -30,6 +38,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
   Table,
@@ -41,11 +50,19 @@ import {
 } from "@/components/ui/table";
 import { ConfirmDialog } from "@/components/confirm-dialog";
 import { EmptyState } from "@/components/empty-state";
+import { ErrorAlert } from "@/components/error-alert";
 import { ObjectPreviewDialog } from "@/components/object-preview-dialog";
+import { ObjectTagsDialog } from "@/components/object-tags-dialog";
+import { RefreshButton } from "@/components/refresh-button";
 import { ShareDialog } from "@/components/share-dialog";
 import { api, errorMessage } from "@/lib/api";
 import { bytes, whenMs } from "@/lib/format";
-import { deleteObject, getObjectBlob, putObject } from "@/lib/s3";
+import {
+  createFolder,
+  deleteObject,
+  getObjectBlob,
+  putObject,
+} from "@/lib/s3";
 import type { ObjectEntry } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
@@ -228,8 +245,38 @@ export function BucketBrowser() {
   // ---- per-object actions ----------------------------------------------------------
   const [previewKey, setPreviewKey] = useState<string | null>(null);
   const [shareKey, setShareKey] = useState<string | null>(null);
+  const [tagsKey, setTagsKey] = useState<string | null>(null);
   const [pendingDelete, setPendingDelete] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
+
+  // Create-folder dialog (a zero-byte "prefix/" marker in the current folder).
+  const [createFolderOpen, setCreateFolderOpen] = useState(false);
+  const [folderName, setFolderName] = useState("");
+  const [creatingFolder, setCreatingFolder] = useState(false);
+
+  async function submitCreateFolder() {
+    const seg = folderName.trim().replace(/\/+$/, "");
+    if (!seg) {
+      toast.error("Enter a folder name.");
+      return;
+    }
+    if (seg.includes("/")) {
+      toast.error("Folder names can't contain “/”.");
+      return;
+    }
+    setCreatingFolder(true);
+    try {
+      await createFolder(name, path + seg);
+      toast.success(`Folder “${seg}” created`);
+      setCreateFolderOpen(false);
+      setFolderName("");
+      void load();
+    } catch (e) {
+      toast.error(errorMessage(e, "Failed to create the folder."));
+    } finally {
+      setCreatingFolder(false);
+    }
+  }
 
   async function download(key: string) {
     try {
@@ -301,19 +348,15 @@ export function BucketBrowser() {
             placeholder="Filter this folder"
             autoComplete="off"
             spellCheck={false}
-            className="w-56 pl-8 font-mono text-[13px]"
+            className="w-full pl-8 font-mono text-[13px] sm:w-56"
             onChange={(e) => setFilterInput(e.target.value)}
           />
         </div>
-        <Button
-          type="button"
-          variant="outline"
-          aria-busy={refreshing}
+        <RefreshButton
+          loading={objects === null}
+          refreshing={refreshing}
           onClick={() => void load()}
-        >
-          <RotateCw aria-hidden="true" className={cn(refreshing && "animate-spin")} />
-          Refresh
-        </Button>
+        />
 
         <div className="ms-auto flex items-center gap-3">
           <p className="hidden text-[13px] text-muted-foreground sm:block">
@@ -328,6 +371,17 @@ export function BucketBrowser() {
             aria-hidden="true"
             onChange={onFilesPicked}
           />
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => {
+              setFolderName("");
+              setCreateFolderOpen(true);
+            }}
+          >
+            <FolderPlus aria-hidden="true" />
+            New folder
+          </Button>
           <Button
             type="button"
             disabled={uploading}
@@ -425,10 +479,11 @@ export function BucketBrowser() {
       ) : null}
 
       {error ? (
-        <Alert variant="destructive" role="alert">
-          <AlertTitle>Couldn&apos;t load objects</AlertTitle>
-          <AlertDescription>{error}</AlertDescription>
-        </Alert>
+        <ErrorAlert
+          title="Couldn't load objects"
+          message={error}
+          onRetry={() => void load()}
+        />
       ) : null}
 
       {showSkeleton ? (
@@ -537,7 +592,7 @@ export function BucketBrowser() {
                         <DropdownMenuTrigger asChild>
                           <Button
                             variant="ghost"
-                            size="icon-sm"
+                            size="icon"
                             aria-label={`Actions for ${o.key}`}
                           >
                             <MoreHorizontal aria-hidden="true" />
@@ -550,13 +605,16 @@ export function BucketBrowser() {
                           <DropdownMenuItem onSelect={() => void download(o.key)}>
                             Download
                           </DropdownMenuItem>
+                          <DropdownMenuItem onSelect={() => setTagsKey(o.key)}>
+                            <Tag aria-hidden="true" />
+                            Edit tags
+                          </DropdownMenuItem>
                           <DropdownMenuItem onSelect={() => setShareKey(o.key)}>
                             Share
                           </DropdownMenuItem>
                           <DropdownMenuSeparator />
                           <DropdownMenuItem
                             variant="destructive"
-                            className="text-destructive"
                             onSelect={() => setPendingDelete(o.key)}
                           >
                             Delete
@@ -624,6 +682,58 @@ export function BucketBrowser() {
         busy={deleting}
         onConfirm={() => void confirmDelete()}
       />
+
+      <ObjectTagsDialog
+        bucket={name}
+        objectKey={tagsKey ?? ""}
+        open={tagsKey !== null}
+        onOpenChange={(open) => {
+          if (!open) setTagsKey(null);
+        }}
+      />
+
+      <Dialog
+        open={createFolderOpen}
+        onOpenChange={creatingFolder ? undefined : setCreateFolderOpen}
+      >
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>New folder</DialogTitle>
+            <DialogDescription>
+              Creates an empty folder marker in{" "}
+              <span className="font-mono">{path || `${name}/`}</span>. Folders are
+              just key prefixes; uploading a file into one works without this.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="grid gap-1.5">
+            <Label htmlFor={`${filterId}-folder`}>Folder name</Label>
+            <Input
+              id={`${filterId}-folder`}
+              value={folderName}
+              autoFocus
+              autoComplete="off"
+              spellCheck={false}
+              className="font-mono"
+              onChange={(e) => setFolderName(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") void submitCreateFolder();
+              }}
+            />
+          </div>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setCreateFolderOpen(false)}
+              disabled={creatingFolder}
+            >
+              Cancel
+            </Button>
+            <Button onClick={() => void submitCreateFolder()} disabled={creatingFolder}>
+              {creatingFolder ? "Creating…" : "Create folder"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
