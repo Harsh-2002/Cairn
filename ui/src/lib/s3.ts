@@ -38,8 +38,10 @@ export async function putObject(
 export async function getObjectBlob(
   bucket: string,
   key: string,
+  versionId?: string,
 ): Promise<Blob> {
-  const res = await fetch(objectPath(bucket, key), { headers: s3headers() });
+  const q = versionId ? `?versionId=${encodeURIComponent(versionId)}` : "";
+  const res = await fetch(objectPath(bucket, key) + q, { headers: s3headers() });
   if (!res.ok)
     throw new ApiError(`download failed (${res.status})`, res.status);
   return await res.blob();

@@ -55,13 +55,16 @@ import { ObjectPreviewDialog } from "@/components/object-preview-dialog";
 import { ObjectTagsDialog } from "@/components/object-tags-dialog";
 import { RefreshButton } from "@/components/refresh-button";
 import { ShareDialog } from "@/components/share-dialog";
+import { StatusBadge } from "@/components/status-badge";
 import { api, errorMessage } from "@/lib/api";
 import { bytes, whenMs } from "@/lib/format";
 import {
   createFolder,
   deleteObject,
   getObjectBlob,
+  listObjectVersions,
   putObject,
+  type ObjectVersion,
 } from "@/lib/s3";
 import type { ObjectEntry } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -92,6 +95,8 @@ export function BucketBrowser() {
   const [filterInput, setFilterInput] = useState("");
   const [filter, setFilter] = useState("");
   const [objects, setObjects] = useState<ObjectEntry[] | null>(null);
+  const [versions, setVersions] = useState<ObjectVersion[]>([]);
+  const [showVersions, setShowVersions] = useState(false);
   const [folders, setFolders] = useState<string[]>([]);
   const [next, setNext] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
@@ -108,6 +113,8 @@ export function BucketBrowser() {
     setFilterInput("");
     setFilter("");
     setObjects(null);
+    setVersions([]);
+    setShowVersions(false);
     setFolders([]);
     setNext(null);
     setError(null);
@@ -127,22 +134,33 @@ export function BucketBrowser() {
     setError(null);
     setRefreshing(true);
     try {
-      const res = await api.listObjects(name, {
-        prefix: listPrefix,
-        delimiter: "/",
-        limit: 100,
-      });
-      if (ticket !== seqRef.current) return;
-      setObjects(res.objects ?? []);
-      setFolders(res.common_prefixes ?? []);
-      setNext(res.next ?? null);
+      if (showVersions) {
+        // Version mode lists every version + delete marker (no server paging here).
+        const res = await listObjectVersions(name, listPrefix, "/");
+        if (ticket !== seqRef.current) return;
+        setVersions(res.versions);
+        setFolders(res.commonPrefixes);
+        setObjects([]); // mark "loaded" so the skeleton clears
+        setNext(null);
+      } else {
+        const res = await api.listObjects(name, {
+          prefix: listPrefix,
+          delimiter: "/",
+          limit: 100,
+        });
+        if (ticket !== seqRef.current) return;
+        setObjects(res.objects ?? []);
+        setVersions([]);
+        setFolders(res.common_prefixes ?? []);
+        setNext(res.next ?? null);
+      }
     } catch (e) {
       if (ticket !== seqRef.current) return;
       setError(errorMessage(e, "Failed to load objects."));
     } finally {
       if (ticket === seqRef.current) setRefreshing(false);
     }
-  }, [name, listPrefix]);
+  }, [name, listPrefix, showVersions]);
 
   useEffect(() => {
     void load();
@@ -278,9 +296,9 @@ export function BucketBrowser() {
     }
   }
 
-  async function download(key: string) {
+  async function download(key: string, versionId?: string) {
     try {
-      const blob = await getObjectBlob(name, key);
+      const blob = await getObjectBlob(name, key, versionId);
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
@@ -291,6 +309,27 @@ export function BucketBrowser() {
       URL.revokeObjectURL(url);
     } catch (e) {
       toast.error(errorMessage(e, "Download failed."));
+    }
+  }
+
+  // Permanently deleting a specific version (versioned buckets only).
+  const [pendingVersionDelete, setPendingVersionDelete] =
+    useState<ObjectVersion | null>(null);
+  const [deletingVersion, setDeletingVersion] = useState(false);
+
+  async function confirmVersionDelete() {
+    const v = pendingVersionDelete;
+    if (!v || deletingVersion) return;
+    setDeletingVersion(true);
+    try {
+      await deleteObject(name, v.key, v.versionId);
+      toast.success("Version permanently deleted.");
+      setPendingVersionDelete(null);
+      void load();
+    } catch (e) {
+      toast.error(errorMessage(e, "Delete failed."));
+    } finally {
+      setDeletingVersion(false);
     }
   }
 
@@ -311,8 +350,8 @@ export function BucketBrowser() {
   }
 
   const showSkeleton = objects === null && !error;
-  const showEmpty =
-    objects !== null && objects.length === 0 && folders.length === 0;
+  const itemCount = showVersions ? versions.length : (objects?.length ?? 0);
+  const showEmpty = objects !== null && itemCount === 0 && folders.length === 0;
 
   return (
     <div
@@ -357,6 +396,17 @@ export function BucketBrowser() {
           refreshing={refreshing}
           onClick={() => void load()}
         />
+        <Button
+          type="button"
+          variant={showVersions ? "secondary" : "outline"}
+          aria-pressed={showVersions}
+          onClick={() => {
+            setObjects(null);
+            setShowVersions((v) => !v);
+          }}
+        >
+          {showVersions ? "Hide versions" : "Show versions"}
+        </Button>
 
         <div className="ms-auto flex items-center gap-3">
           <p className="hidden text-[13px] text-muted-foreground sm:block">
@@ -571,59 +621,122 @@ export function BucketBrowser() {
                     <TableCell />
                   </TableRow>
                 ))}
-                {objects.map((o) => (
-                  <TableRow key={o.key}>
-                    <TableCell className="max-w-[28rem]">
-                      <span
-                        className="block truncate font-mono text-[13px]"
-                        title={o.key}
-                      >
-                        {o.key.slice(path.length) || o.key}
-                      </span>
-                    </TableCell>
-                    <TableCell className="text-right text-[13px] tabular-nums">
-                      {bytes(o.size)}
-                    </TableCell>
-                    <TableCell className="whitespace-nowrap text-[13px] text-muted-foreground tabular-nums">
-                      {whenMs(o.last_modified_ms)}
-                    </TableCell>
-                    <TableCell className="text-right">
-                      <DropdownMenu>
-                        <DropdownMenuTrigger asChild>
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            aria-label={`Actions for ${o.key}`}
+                {!showVersions &&
+                  objects.map((o) => (
+                    <TableRow key={o.key}>
+                      <TableCell className="max-w-[28rem]">
+                        <span
+                          className="block truncate font-mono text-[13px]"
+                          title={o.key}
+                        >
+                          {o.key.slice(path.length) || o.key}
+                        </span>
+                      </TableCell>
+                      <TableCell className="text-right text-[13px] tabular-nums">
+                        {bytes(o.size)}
+                      </TableCell>
+                      <TableCell className="whitespace-nowrap text-[13px] text-muted-foreground tabular-nums">
+                        {whenMs(o.last_modified_ms)}
+                      </TableCell>
+                      <TableCell className="text-right">
+                        <DropdownMenu>
+                          <DropdownMenuTrigger asChild>
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              aria-label={`Actions for ${o.key}`}
+                            >
+                              <MoreHorizontal aria-hidden="true" />
+                            </Button>
+                          </DropdownMenuTrigger>
+                          <DropdownMenuContent align="end">
+                            <DropdownMenuItem onSelect={() => setPreviewKey(o.key)}>
+                              Preview
+                            </DropdownMenuItem>
+                            <DropdownMenuItem onSelect={() => void download(o.key)}>
+                              Download
+                            </DropdownMenuItem>
+                            <DropdownMenuItem onSelect={() => setTagsKey(o.key)}>
+                              <Tag aria-hidden="true" />
+                              Edit tags
+                            </DropdownMenuItem>
+                            <DropdownMenuItem onSelect={() => setShareKey(o.key)}>
+                              Share
+                            </DropdownMenuItem>
+                            <DropdownMenuSeparator />
+                            <DropdownMenuItem
+                              variant="destructive"
+                              onSelect={() => setPendingDelete(o.key)}
+                            >
+                              Delete
+                            </DropdownMenuItem>
+                          </DropdownMenuContent>
+                        </DropdownMenu>
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                {showVersions &&
+                  versions.map((v) => (
+                    <TableRow key={`${v.key}:${v.versionId}`}>
+                      <TableCell className="max-w-[28rem]">
+                        <span
+                          className="block truncate font-mono text-[13px]"
+                          title={v.key}
+                        >
+                          {v.key.slice(path.length) || v.key}
+                        </span>
+                        <span className="flex items-center gap-1.5 pt-1">
+                          {v.isLatest ? (
+                            <StatusBadge tone="positive">Latest</StatusBadge>
+                          ) : null}
+                          {v.isDeleteMarker ? (
+                            <StatusBadge tone="warning">Delete marker</StatusBadge>
+                          ) : null}
+                          <span
+                            className="truncate font-mono text-[11px] text-muted-foreground"
+                            title={v.versionId}
                           >
-                            <MoreHorizontal aria-hidden="true" />
-                          </Button>
-                        </DropdownMenuTrigger>
-                        <DropdownMenuContent align="end">
-                          <DropdownMenuItem onSelect={() => setPreviewKey(o.key)}>
-                            Preview
-                          </DropdownMenuItem>
-                          <DropdownMenuItem onSelect={() => void download(o.key)}>
-                            Download
-                          </DropdownMenuItem>
-                          <DropdownMenuItem onSelect={() => setTagsKey(o.key)}>
-                            <Tag aria-hidden="true" />
-                            Edit tags
-                          </DropdownMenuItem>
-                          <DropdownMenuItem onSelect={() => setShareKey(o.key)}>
-                            Share
-                          </DropdownMenuItem>
-                          <DropdownMenuSeparator />
-                          <DropdownMenuItem
-                            variant="destructive"
-                            onSelect={() => setPendingDelete(o.key)}
-                          >
-                            Delete
-                          </DropdownMenuItem>
-                        </DropdownMenuContent>
-                      </DropdownMenu>
-                    </TableCell>
-                  </TableRow>
-                ))}
+                            {v.versionId}
+                          </span>
+                        </span>
+                      </TableCell>
+                      <TableCell className="text-right text-[13px] tabular-nums">
+                        {v.isDeleteMarker ? "—" : bytes(v.size)}
+                      </TableCell>
+                      <TableCell className="whitespace-nowrap text-[13px] text-muted-foreground tabular-nums">
+                        {whenMs(v.lastModifiedMs)}
+                      </TableCell>
+                      <TableCell className="text-right">
+                        <DropdownMenu>
+                          <DropdownMenuTrigger asChild>
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              aria-label={`Actions for version ${v.versionId} of ${v.key}`}
+                            >
+                              <MoreHorizontal aria-hidden="true" />
+                            </Button>
+                          </DropdownMenuTrigger>
+                          <DropdownMenuContent align="end">
+                            {!v.isDeleteMarker ? (
+                              <DropdownMenuItem
+                                onSelect={() => void download(v.key, v.versionId)}
+                              >
+                                Download this version
+                              </DropdownMenuItem>
+                            ) : null}
+                            <DropdownMenuSeparator />
+                            <DropdownMenuItem
+                              variant="destructive"
+                              onSelect={() => setPendingVersionDelete(v)}
+                            >
+                              Delete this version
+                            </DropdownMenuItem>
+                          </DropdownMenuContent>
+                        </DropdownMenu>
+                      </TableCell>
+                    </TableRow>
+                  ))}
               </TableBody>
             </Table>
           </div>
@@ -681,6 +794,32 @@ export function BucketBrowser() {
         destructive
         busy={deleting}
         onConfirm={() => void confirmDelete()}
+      />
+
+      <ConfirmDialog
+        open={pendingVersionDelete !== null}
+        onOpenChange={(open) => {
+          if (!open) setPendingVersionDelete(null);
+        }}
+        title="Delete this version"
+        description={
+          <>
+            This permanently removes version{" "}
+            <span className="break-all font-mono text-[13px] text-foreground">
+              {pendingVersionDelete?.versionId}
+            </span>{" "}
+            of{" "}
+            <span className="break-all font-mono text-[13px] text-foreground">
+              {pendingVersionDelete?.key}
+            </span>
+            . This cannot be undone.
+          </>
+        }
+        confirmLabel={deletingVersion ? "Deleting…" : "Delete version"}
+        cancelLabel="Keep version"
+        destructive
+        busy={deletingVersion}
+        onConfirm={() => void confirmVersionDelete()}
       />
 
       <ObjectTagsDialog
