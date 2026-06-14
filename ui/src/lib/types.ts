@@ -133,6 +133,7 @@ export interface ActivityEntry {
   action: string;
   bucket: string | null;
   key: string | null;
+  actor: string | null;
   at_ms: number;
 }
 

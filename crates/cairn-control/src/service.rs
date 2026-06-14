@@ -1849,6 +1849,7 @@ impl ControlService {
                 action: e.action,
                 bucket: e.bucket,
                 key: e.key,
+                actor: e.actor,
                 at_ms: e.at.as_millis(),
             })
             .collect();

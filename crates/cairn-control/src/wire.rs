@@ -319,6 +319,8 @@ pub struct ActivityListEntry {
     pub bucket: Option<String>,
     /// The key, if applicable.
     pub key: Option<String>,
+    /// The actor (the admin access-key id that performed it), if recorded.
+    pub actor: Option<String>,
     /// When it happened, in epoch milliseconds.
     pub at_ms: i64,
 }
