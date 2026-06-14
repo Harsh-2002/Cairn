@@ -39,6 +39,46 @@ impl HmacPublicUrl {
         }
     }
 
+    /// Derive the signing secret from the 32-byte master key via a domain-separated
+    /// HMAC-SHA256 PRF (`HMAC(master_key, "cairn/public-url/v1")`). This makes the public-URL
+    /// key independent of every other use of the master key, and — crucially — keys off the
+    /// raw key *bytes*, not the master key's hex encoding.
+    #[must_use]
+    pub fn from_master_key(master_key: &[u8; 32]) -> Self {
+        let mut mac =
+            HmacSha256::new_from_slice(master_key).expect("HMAC accepts a key of any length");
+        mac.update(b"cairn/public-url/v1");
+        let subkey = Zeroizing::new(mac.finalize().into_bytes().to_vec());
+        Self::new(subkey.to_vec())
+    }
+
+    /// Derive from a hex-encoded 32-byte master key (64 hex digits), as held in config.
+    ///
+    /// # Errors
+    /// [`KeyError::Malformed`] if not valid hex; [`KeyError::WrongLength`] if it does not
+    /// decode to exactly 32 bytes.
+    pub fn from_master_key_hex(hex_key: &str) -> Result<Self, crate::KeyError> {
+        let bytes =
+            Zeroizing::new(hex::decode(hex_key.trim()).map_err(|_| crate::KeyError::Malformed)?);
+        let arr: [u8; 32] = bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| crate::KeyError::WrongLength)?;
+        // `bytes` is a Zeroizing buffer; it is scrubbed on drop at function return.
+        Ok(Self::from_master_key(&arr))
+    }
+
+    /// A random per-process signing secret, used when no master key is configured. Links are
+    /// valid only within this process (like the development master key) and — unlike the old
+    /// hardcoded constant — are NOT forgeable from the source.
+    #[must_use]
+    pub fn ephemeral() -> Self {
+        use rand::RngCore;
+        let mut secret = Zeroizing::new(vec![0u8; 32]);
+        rand::thread_rng().fill_bytes(&mut secret);
+        Self::new(secret.to_vec())
+    }
+
     /// The canonical string that is MAC'd: method, escaped path, and expiry millis joined by
     /// newlines. Keeping this in one place guarantees `sign` and `verify` agree.
     fn canonical(method: &str, escaped_path: &str, expiry: Timestamp) -> String {
@@ -98,6 +138,37 @@ mod tests {
         let u = url();
         let sig = u.sign("GET", "/bucket/object%20key.txt", EXPIRY);
         assert!(u.verify("GET", "/bucket/object%20key.txt", EXPIRY, &sig, NOW));
+    }
+
+    #[test]
+    fn master_key_derivation_is_deterministic_and_domain_separated() {
+        let key = [7u8; 32];
+        let a = HmacPublicUrl::from_master_key(&key);
+        let b = HmacPublicUrl::from_master_key(&key);
+        let sig_a = a.sign("GET", "/b/k", EXPIRY);
+        // Same master key → same signer → same signature (links survive restarts).
+        assert_eq!(sig_a, b.sign("GET", "/b/k", EXPIRY));
+        // A different master key yields a different (non-verifying) signature.
+        let other = HmacPublicUrl::from_master_key(&[8u8; 32]);
+        assert!(!other.verify("GET", "/b/k", EXPIRY, &sig_a, NOW));
+        // The derived key is the HMAC-PRF subkey, NOT the raw master key used directly.
+        let raw = HmacPublicUrl::new(key.to_vec());
+        assert!(!raw.verify("GET", "/b/k", EXPIRY, &sig_a, NOW));
+    }
+
+    #[test]
+    fn from_hex_matches_from_bytes_and_ephemeral_is_random() {
+        let key = [0xABu8; 32];
+        let hex = hex::encode(key);
+        let from_hex = HmacPublicUrl::from_master_key_hex(&hex).unwrap();
+        let sig = HmacPublicUrl::from_master_key(&key).sign("GET", "/b/k", EXPIRY);
+        // Hex path keys off the decoded bytes, agreeing with the byte path.
+        assert!(from_hex.verify("GET", "/b/k", EXPIRY, &sig, NOW));
+        assert!(HmacPublicUrl::from_master_key_hex("nothex").is_err());
+        // Two ephemeral signers almost surely differ (random per-process key).
+        let e1 = HmacPublicUrl::ephemeral().sign("GET", "/b/k", EXPIRY);
+        let e2 = HmacPublicUrl::ephemeral().sign("GET", "/b/k", EXPIRY);
+        assert_ne!(e1, e2);
     }
 
     #[test]

@@ -235,14 +235,23 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
     // key + secret log into the web UI, authenticate the management API, and sign S3 requests.
     ensure_root_admin(&meta, &crypto, &clock, cfg).await?;
 
-    // The public-read ("share") URL signer is keyed off the master key (its hex string as the HMAC
-    // secret) so signed links survive restarts when CAIRN_MASTER_KEY is set; without it, a fixed
-    // dev key is used (links are valid only within a process lifetime, like the dev master key).
-    let pu_secret = cfg
-        .master_key
-        .clone()
-        .unwrap_or_else(|| "cairn-development-public-url-key".to_owned());
-    let public_url: Arc<dyn PublicUrl> = Arc::new(HmacPublicUrl::new(pu_secret.into_bytes()));
+    // The public-read ("share") URL signer is derived from the master key via a domain-separated
+    // HMAC-SHA256 PRF over the raw 32 key *bytes* (not the hex string), so signed links survive
+    // restarts when CAIRN_MASTER_KEY is set. With no master key, an ephemeral per-process key is
+    // used — links are valid only within this process and, unlike the former hardcoded constant,
+    // are not forgeable from the source.
+    let public_url: Arc<dyn PublicUrl> = match &cfg.master_key {
+        Some(hex) => Arc::new(
+            HmacPublicUrl::from_master_key_hex(hex)
+                .map_err(|e| format!("deriving public-URL key from master_key: {e}"))?,
+        ),
+        None => {
+            tracing::warn!(
+                "no master_key configured; public-read share links use an ephemeral per-process key (do not use in production)"
+            );
+            Arc::new(HmacPublicUrl::ephemeral())
+        }
+    };
 
     // Startup reconciliation reclaims orphaned blobs from any crash window before serving. The
     // oracle is taken by `&dyn ReconcileOracle`, so the boxed oracle is borrowed via `as_ref`.
