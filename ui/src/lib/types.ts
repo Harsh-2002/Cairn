@@ -68,10 +68,56 @@ export interface ListObjectsResp {
   next: string | null;
 }
 
-export interface ShareResp {
-  /** A path (`/p/...`) the caller turns into an absolute link. */
-  url: string;
+export type ShareDisposition = "inline" | "attachment";
+export type ShareStatus = "active" | "expired" | "revoked";
+
+/** A persistent object-share (ARCH §15.8). */
+export interface ShareRecord {
+  token: string;
+  bucket: string;
+  key: string;
+  version_id: string | null;
+  expires_at_ms: number | null; // null = forever
+  created_at_ms: number;
+  created_by: string;
+  disposition: ShareDisposition;
+  filename: string | null;
+  status: ShareStatus; // server-derived
+}
+
+export interface CreateShareReq {
+  key: string;
+  expires_in_secs?: number | null; // null/absent = forever
+  disposition?: ShareDisposition;
+  filename?: string | null;
+  version_id?: string | null;
+}
+
+export interface CreateShareResp {
+  token: string;
+  url: string; // path "/p/{token}"
+  expires_at_ms: number | null;
+}
+
+export interface ShareListResp {
+  shares: ShareRecord[];
+}
+
+/** Presigned-URL minting request (interoperable S3 link). */
+export interface PresignReq {
+  key: string;
+  method?: "GET" | "PUT";
+  expires_in_secs: number; // 1..=604800
+  version_id?: string | null;
+  response_content_disposition?: string | null;
+  response_content_type?: string | null;
+  content_type?: string | null; // PUT: pin the content type
+}
+
+export interface PresignResp {
+  url: string; // absolute
   expires_at_ms: number;
+  absolute: true;
 }
 
 export interface BucketConfigResp {

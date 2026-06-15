@@ -11,17 +11,21 @@ import type {
   BucketDetailResp,
   BucketListResp,
   CreateReplicationTargetReq,
+  CreateShareReq,
+  CreateShareResp,
   CreateUserResp,
   FailedReplicationResp,
   ListObjectsResp,
   OverviewBucketsResp,
   OverviewResp,
+  PresignReq,
+  PresignResp,
   ReplicationResyncResp,
   ReplicationRetryResp,
   ReplicationStatusResp,
   ReplicationTargetListResp,
   RotateCredentialsResp,
-  ShareResp,
+  ShareListResp,
   SystemResp,
   UserDetailResp,
   UserListResp,
@@ -202,13 +206,33 @@ export const api = {
     );
   },
 
-  // Mint a signed, time-limited public-read ("share") URL for an object. Returns { url,
-  // expires_at_ms }; `url` is a path (/p/...) the caller turns into an absolute link.
-  shareObject: (name: string, key: string, expires_in_secs = 3600) =>
-    request<ShareResp>("POST", `/buckets/${enc(name)}/objects/share`, {
-      key,
-      expires_in_secs,
-    }),
+  // Persistent object shares (ARCH §15.8): revocable, optionally forever. `url` is a path
+  // (/p/{token}) the caller turns into an absolute link.
+  createShare: (name: string, body: CreateShareReq) =>
+    request<CreateShareResp>(
+      "POST",
+      `/buckets/${enc(name)}/objects/share`,
+      body,
+    ),
+  listShares: (name: string, key?: string) => {
+    const qs = key ? `?key=${enc(key)}` : "";
+    return request<ShareListResp>(
+      "GET",
+      `/buckets/${enc(name)}/objects/shares${qs}`,
+    );
+  },
+  revokeShare: (name: string, token: string) =>
+    request<null>(
+      "DELETE",
+      `/buckets/${enc(name)}/objects/shares/${enc(token)}`,
+    ),
+  // Mint an interoperable S3 presigned URL (GET download / PUT upload), returned absolute.
+  presignShare: (name: string, body: PresignReq) =>
+    request<PresignResp>(
+      "POST",
+      `/buckets/${enc(name)}/objects/presign`,
+      body,
+    ),
 
   // Bucket configuration (ARCH §22.2).
   getBucketConfig: (name: string) =>

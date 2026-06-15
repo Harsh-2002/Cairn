@@ -57,6 +57,7 @@ import { ErrorAlert } from "@/components/error-alert";
 import { ObjectPreviewDialog } from "@/components/object-preview-dialog";
 import { ObjectTagsDialog } from "@/components/object-tags-dialog";
 import { RefreshButton } from "@/components/refresh-button";
+import { ManageSharesDialog } from "@/components/manage-shares-dialog";
 import { ShareDialog } from "@/components/share-dialog";
 import { StatusBadge } from "@/components/status-badge";
 import { api, errorMessage } from "@/lib/api";
@@ -346,6 +347,7 @@ export function BucketBrowser() {
   // ---- per-object actions ----------------------------------------------------------
   const [previewKey, setPreviewKey] = useState<string | null>(null);
   const [shareKey, setShareKey] = useState<string | null>(null);
+  const [manageSharesKey, setManageSharesKey] = useState<string | null>(null);
   const [tagsKey, setTagsKey] = useState<string | null>(null);
   const [pendingDelete, setPendingDelete] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
@@ -933,6 +935,11 @@ export function BucketBrowser() {
                             <DropdownMenuItem onSelect={() => setShareKey(o.key)}>
                               Share
                             </DropdownMenuItem>
+                            <DropdownMenuItem
+                              onSelect={() => setManageSharesKey(o.key)}
+                            >
+                              Manage shares
+                            </DropdownMenuItem>
                             <DropdownMenuSeparator />
                             <DropdownMenuItem
                               variant="destructive"
@@ -1041,6 +1048,15 @@ export function BucketBrowser() {
         open={shareKey !== null}
         onOpenChange={(open) => {
           if (!open) setShareKey(null);
+        }}
+      />
+
+      <ManageSharesDialog
+        bucket={name}
+        objectKey={manageSharesKey ?? ""}
+        open={manageSharesKey !== null}
+        onOpenChange={(open) => {
+          if (!open) setManageSharesKey(null);
         }}
       />
 
