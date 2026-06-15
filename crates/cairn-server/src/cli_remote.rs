@@ -79,8 +79,70 @@ pub enum RemoteCommand {
         #[command(subcommand)]
         cmd: ObjectCmd,
     },
+    /// Object sharing: persistent share links + interoperable presigned URLs (ARCH §15.8).
+    Share {
+        #[command(subcommand)]
+        cmd: ShareCmd,
+    },
     /// Print the store overview (`GET /api/v1/overview`).
     Overview,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ShareCmd {
+    /// Create a persistent, revocable share link for an object.
+    Create {
+        /// The bucket.
+        bucket: String,
+        /// The object key.
+        key: String,
+        /// Validity, e.g. `24h`, `7d`, `3600s`. Defaults to 24h; use `--forever` for no expiry.
+        #[arg(long)]
+        expires: Option<String>,
+        /// Never expire (works until revoked).
+        #[arg(long, conflicts_with = "expires")]
+        forever: bool,
+        /// Force download instead of viewing inline.
+        #[arg(long)]
+        download: bool,
+        /// Download filename (with `--download`).
+        #[arg(long)]
+        filename: Option<String>,
+        /// Pin to a specific version id (default: always the current version).
+        #[arg(long)]
+        version: Option<String>,
+    },
+    /// Mint an interoperable S3 presigned URL (download by default; `--upload` for PUT).
+    Presign {
+        /// The bucket.
+        bucket: String,
+        /// The object key.
+        key: String,
+        /// Validity, e.g. `1h`, `7d` (max 7 days).
+        #[arg(long)]
+        expires: String,
+        /// Make an upload (PUT) link instead of a download (GET) link.
+        #[arg(long)]
+        upload: bool,
+        /// Pin the content type for an upload link.
+        #[arg(long)]
+        content_type: Option<String>,
+    },
+    /// List a bucket's shares, or one object's.
+    List {
+        /// The bucket.
+        bucket: String,
+        /// Restrict to one object key.
+        #[arg(long)]
+        key: Option<String>,
+    },
+    /// Revoke a share by its token.
+    Revoke {
+        /// The bucket.
+        bucket: String,
+        /// The share token.
+        token: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -604,6 +666,7 @@ async fn dispatch(
         RemoteCommand::User { cmd } => user(client, cfg, cmd).await,
         RemoteCommand::Replication { cmd } => replication(client, cfg, cmd).await,
         RemoteCommand::Object { cmd } => object(client, cfg, cmd).await,
+        RemoteCommand::Share { cmd } => share(client, cfg, cmd).await,
         RemoteCommand::Overview => overview(client, cfg).await,
     }
 }
@@ -1028,6 +1091,171 @@ async fn object(client: &HttpClient, cfg: &ClientConfig, cmd: ObjectCmd) -> Resu
 }
 
 // ---------------------------------------------------------------------------------------
+// Share
+// ---------------------------------------------------------------------------------------
+
+async fn share(client: &HttpClient, cfg: &ClientConfig, cmd: ShareCmd) -> Result<(), String> {
+    match cmd {
+        ShareCmd::Create {
+            bucket,
+            key,
+            expires,
+            forever,
+            download,
+            filename,
+            version,
+        } => {
+            let expires_in_secs = if forever {
+                serde_json::Value::Null
+            } else {
+                let secs = match &expires {
+                    Some(e) => {
+                        parse_duration(e).ok_or_else(|| format!("invalid --expires: {e}"))?
+                    }
+                    None => 86_400,
+                };
+                serde_json::Value::from(secs)
+            };
+            let body = serde_json::json!({
+                "key": key,
+                "expires_in_secs": expires_in_secs,
+                "disposition": if download { "attachment" } else { "inline" },
+                "filename": filename,
+                "version_id": version,
+            })
+            .to_string();
+            let resp = api_send(
+                client,
+                cfg,
+                Method::POST,
+                &format!("/buckets/{bucket}/objects/share"),
+                Some(Bytes::from(body)),
+            )
+            .await?;
+            print_share_url(&resp, cfg)
+        }
+        ShareCmd::Presign {
+            bucket,
+            key,
+            expires,
+            upload,
+            content_type,
+        } => {
+            let secs =
+                parse_duration(&expires).ok_or_else(|| format!("invalid --expires: {expires}"))?;
+            if !(1..=604_800).contains(&secs) {
+                return Err("--expires must be between 1s and 7d for a presigned URL".to_owned());
+            }
+            let body = serde_json::json!({
+                "key": key,
+                "method": if upload { "PUT" } else { "GET" },
+                "expires_in_secs": secs,
+                "content_type": content_type,
+            })
+            .to_string();
+            let resp = api_send(
+                client,
+                cfg,
+                Method::POST,
+                &format!("/buckets/{bucket}/objects/presign"),
+                Some(Bytes::from(body)),
+            )
+            .await?;
+            print_share_url(&resp, cfg)
+        }
+        ShareCmd::List { bucket, key } => {
+            let subpath = match &key {
+                Some(k) => format!("/buckets/{bucket}/objects/shares?key={}", encode_query(k)),
+                None => format!("/buckets/{bucket}/objects/shares"),
+            };
+            let resp = api_get(client, cfg, &subpath).await?;
+            if cfg.json {
+                print_json_body(&resp.body);
+            } else {
+                let v: serde_json::Value =
+                    serde_json::from_slice(&resp.body).map_err(|e| e.to_string())?;
+                let shares = v.get("shares").and_then(|s| s.as_array());
+                match shares {
+                    Some(s) if !s.is_empty() => {
+                        for sh in s {
+                            let g = |k: &str| sh.get(k).and_then(|x| x.as_str()).unwrap_or("");
+                            println!("{:8}  {}  {}", g("status"), g("token"), g("key"));
+                        }
+                    }
+                    _ => println!("no shares"),
+                }
+            }
+            Ok(())
+        }
+        ShareCmd::Revoke { bucket, token } => {
+            api_send(
+                client,
+                cfg,
+                Method::DELETE,
+                &format!("/buckets/{bucket}/objects/shares/{token}"),
+                None,
+            )
+            .await?;
+            if cfg.json {
+                println!(r#"{{"revoked":true}}"#);
+            } else {
+                println!("revoked");
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Print the `url` from a share/presign response (or the raw JSON with `--json`).
+fn print_share_url(resp: &HttpResponse, cfg: &ClientConfig) -> Result<(), String> {
+    if cfg.json {
+        print_json_body(&resp.body);
+        return Ok(());
+    }
+    let v: serde_json::Value = serde_json::from_slice(&resp.body).map_err(|e| e.to_string())?;
+    if let Some(url) = v.get("url").and_then(|u| u.as_str()) {
+        // A persistent share returns a path (/p/{token}); make it absolute against the endpoint.
+        if let Some(path) = url.strip_prefix('/') {
+            let base = cfg.endpoint.trim_end_matches('/');
+            println!("{base}/{path}");
+        } else {
+            println!("{url}");
+        }
+    }
+    Ok(())
+}
+
+/// Parse a duration like `24h`, `7d`, `30m`, `3600s`, or bare seconds → seconds.
+fn parse_duration(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let (num, mult) = if let Some(n) = s.strip_suffix('d') {
+        (n, 86_400)
+    } else if let Some(n) = s.strip_suffix('h') {
+        (n, 3_600)
+    } else if let Some(n) = s.strip_suffix('m') {
+        (n, 60)
+    } else if let Some(n) = s.strip_suffix('s') {
+        (n, 1)
+    } else {
+        (s, 1)
+    };
+    let v: i64 = num.trim().parse().ok()?;
+    (v >= 0).then_some(v * mult)
+}
+
+/// Percent-encode a query value (the unreserved set passes through).
+fn encode_query(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------------------
 // Overview
 // ---------------------------------------------------------------------------------------
 
@@ -1143,6 +1371,17 @@ mod tests {
             cfg.api_url("/users/u1/quota"),
             "http://127.0.0.1:7374/api/v1/users/u1/quota"
         );
+    }
+
+    #[test]
+    fn parse_duration_units() {
+        assert_eq!(parse_duration("1h"), Some(3600));
+        assert_eq!(parse_duration("7d"), Some(604_800));
+        assert_eq!(parse_duration("30m"), Some(1800));
+        assert_eq!(parse_duration("3600s"), Some(3600));
+        assert_eq!(parse_duration("42"), Some(42)); // bare seconds
+        assert_eq!(parse_duration("-1h"), None);
+        assert_eq!(parse_duration("abc"), None);
     }
 
     #[test]

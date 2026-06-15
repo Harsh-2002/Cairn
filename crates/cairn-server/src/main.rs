@@ -110,6 +110,13 @@ enum Command {
         #[command(subcommand)]
         cmd: cli_remote::ObjectCmd,
     },
+    /// Object sharing on a running server: share links + presigned URLs.
+    Share {
+        #[command(flatten)]
+        opts: cli_remote::RemoteOpts,
+        #[command(subcommand)]
+        cmd: cli_remote::ShareCmd,
+    },
     /// Print a running server's store overview.
     Overview {
         #[command(flatten)]
@@ -137,6 +144,9 @@ fn main() -> ExitCode {
         }
         Command::Object { opts, cmd } => {
             return cli_remote::run(&opts, cli_remote::RemoteCommand::Object { cmd });
+        }
+        Command::Share { opts, cmd } => {
+            return cli_remote::run(&opts, cli_remote::RemoteCommand::Share { cmd });
         }
         Command::Overview { opts } => {
             return cli_remote::run(&opts, cli_remote::RemoteCommand::Overview);
@@ -169,6 +179,7 @@ fn main() -> ExitCode {
         | Command::User { .. }
         | Command::Replication { .. }
         | Command::Object { .. }
+        | Command::Share { .. }
         | Command::Overview { .. } => unreachable!("remote commands dispatched above"),
     }
 }
