@@ -15,10 +15,10 @@ use cairn_types::authz::PublicAccessBlock;
 use cairn_types::bucket::{Bucket, ConfigAspect, ConfigDoc};
 use cairn_types::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
 use cairn_types::meta::{
-    ActivityEntry, BucketCounts, BucketRequestCount, ListPage, ListQuery, MetricsRange,
-    MultipartSession, Mutation, MutationOutcome, ObjectSummary, OpCount, OutboxEntry, PartRecord,
-    ReplicationStatus, RequestMetricsSeries, ShareRow, StoreCounts, TimePoint, User,
-    UserSigV4Credentials, UserWithBearerHash,
+    ActivityEntry, BucketCounts, BucketRequestCount, LATENCY_BUCKETS, ListPage, ListQuery,
+    MetricsRange, MultipartSession, Mutation, MutationOutcome, ObjectSummary, OpCount, OutboxEntry,
+    PartRecord, ReplicationStatus, RequestMetricsSeries, ShareRow, StatusCount, StoreCounts,
+    TimePoint, User, UserSigV4Credentials, UserWithBearerHash, latency_quantile_ms,
 };
 use cairn_types::object::ObjectVersionRow;
 use cairn_types::time::Timestamp;
@@ -814,42 +814,62 @@ impl MetadataStore for AsyncMetadataStore {
         let window = range.window_secs().max(1);
         let driver = self.reader();
 
-        // Timeline: re-bucket the per-minute rollup into the range's downsampling window.
-        let timeline = driver
+        // Timeline: re-bucket into the range's window, carrying errors, bytes, and average latency.
+        let timeline: Vec<TimePoint> = driver
             .query(
-                "SELECT (ts_bucket / ?2) * ?2 AS w, COALESCE(SUM(count),0)
+                "SELECT (ts_bucket / ?2) * ?2 AS w,
+                    COALESCE(SUM(count),0),
+                    COALESCE(SUM(CASE WHEN status_class IN ('4xx','5xx') THEN count ELSE 0 END),0),
+                    COALESCE(SUM(bytes_in),0), COALESCE(SUM(bytes_out),0),
+                    COALESCE(SUM(lat_sum_ms),0)
                  FROM request_metrics WHERE ts_bucket >= ?1
                  GROUP BY w ORDER BY w",
                 vec![Value::Int(since), Value::Int(window)],
             )
             .await?
             .iter()
-            .map(|r| TimePoint {
-                ts: r.get_i64(0),
-                count: r.get_i64(1) as u64,
+            .map(|r| {
+                let count = r.get_i64(1) as u64;
+                let lat_sum = r.get_i64(5) as u64;
+                TimePoint {
+                    ts: r.get_i64(0),
+                    count,
+                    errors: r.get_i64(2) as u64,
+                    bytes_in: r.get_i64(3) as u64,
+                    bytes_out: r.get_i64(4) as u64,
+                    latency_avg_ms: lat_sum.checked_div(count).unwrap_or(0),
+                }
             })
             .collect();
 
-        // Breakdown by operation, descending.
+        // Breakdown by operation: count, bytes, average latency; descending.
         let by_operation: Vec<OpCount> = driver
             .query(
-                "SELECT operation, COALESCE(SUM(count),0) AS c
+                "SELECT operation, COALESCE(SUM(count),0) AS c,
+                    COALESCE(SUM(bytes_in + bytes_out),0), COALESCE(SUM(lat_sum_ms),0)
                  FROM request_metrics WHERE ts_bucket >= ?1
                  GROUP BY operation ORDER BY c DESC",
                 vec![Value::Int(since)],
             )
             .await?
             .iter()
-            .map(|r| OpCount {
-                operation: r.get_text(0),
-                count: r.get_i64(1) as u64,
+            .map(|r| {
+                let count = r.get_i64(1) as u64;
+                let lat_sum = r.get_i64(3) as u64;
+                OpCount {
+                    operation: r.get_text(0),
+                    count,
+                    bytes: r.get_i64(2) as u64,
+                    latency_avg_ms: lat_sum.checked_div(count).unwrap_or(0),
+                }
             })
             .collect();
 
         // Most-active buckets (excluding the non-bucket sentinel), top 10.
         let top_buckets = driver
             .query(
-                "SELECT bucket_name, COALESCE(SUM(count),0) AS c
+                "SELECT bucket_name, COALESCE(SUM(count),0) AS c,
+                    COALESCE(SUM(bytes_in + bytes_out),0)
                  FROM request_metrics WHERE ts_bucket >= ?1 AND bucket_name <> ''
                  GROUP BY bucket_name ORDER BY c DESC LIMIT 10",
                 vec![Value::Int(since)],
@@ -859,15 +879,76 @@ impl MetadataStore for AsyncMetadataStore {
             .map(|r| BucketRequestCount {
                 bucket: r.get_text(0),
                 count: r.get_i64(1) as u64,
+                bytes: r.get_i64(2) as u64,
             })
             .collect();
 
-        let total = by_operation.iter().map(|o| o.count).sum();
+        // Breakdown by HTTP status class.
+        let by_status: Vec<StatusCount> = driver
+            .query(
+                "SELECT status_class, COALESCE(SUM(count),0) AS c
+                 FROM request_metrics WHERE ts_bucket >= ?1
+                 GROUP BY status_class ORDER BY c DESC",
+                vec![Value::Int(since)],
+            )
+            .await?
+            .iter()
+            .map(|r| StatusCount {
+                status_class: r.get_text(0),
+                count: r.get_i64(1) as u64,
+            })
+            .collect();
+
+        // Range-wide totals + latency histogram (for the average and p95).
+        let agg = query_one(
+            driver,
+            "SELECT COALESCE(SUM(bytes_in),0), COALESCE(SUM(bytes_out),0),
+                COALESCE(SUM(lat_sum_ms),0),
+                COALESCE(SUM(lat_le_5),0), COALESCE(SUM(lat_le_20),0),
+                COALESCE(SUM(lat_le_50),0), COALESCE(SUM(lat_le_200),0),
+                COALESCE(SUM(lat_le_1000),0), COALESCE(SUM(lat_gt_1000),0)
+             FROM request_metrics WHERE ts_bucket >= ?1",
+            vec![Value::Int(since)],
+        )
+        .await?
+        .unwrap_or_default();
+        let total_bytes_in = agg.get_i64(0) as u64;
+        let total_bytes_out = agg.get_i64(1) as u64;
+        let lat_sum = agg.get_i64(2) as u64;
+        let hist: [u64; LATENCY_BUCKETS] = [
+            agg.get_i64(3) as u64,
+            agg.get_i64(4) as u64,
+            agg.get_i64(5) as u64,
+            agg.get_i64(6) as u64,
+            agg.get_i64(7) as u64,
+            agg.get_i64(8) as u64,
+        ];
+
+        let active_buckets = query_one(
+            driver,
+            "SELECT COUNT(DISTINCT bucket_name) FROM request_metrics
+             WHERE ts_bucket >= ?1 AND bucket_name <> ''",
+            vec![Value::Int(since)],
+        )
+        .await?
+        .map_or(0, |r| r.get_i64(0)) as u64;
+
+        let total: u64 = by_operation.iter().map(|o| o.count).sum();
+        let total_errors: u64 = timeline.iter().map(|p| p.errors).sum();
+        let peak_window_count = timeline.iter().map(|p| p.count).max().unwrap_or(0);
         Ok(RequestMetricsSeries {
             timeline,
             by_operation,
             top_buckets,
+            by_status,
             total,
+            total_errors,
+            total_bytes_in,
+            total_bytes_out,
+            latency_avg_ms: lat_sum.checked_div(total).unwrap_or(0),
+            latency_p95_ms: latency_quantile_ms(&hist, 0.95),
+            peak_window_count,
+            active_buckets,
             window_secs: window,
         })
     }

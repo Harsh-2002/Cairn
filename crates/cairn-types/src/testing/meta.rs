@@ -8,11 +8,11 @@ use crate::bucket::{Bucket, ConfigAspect, ConfigDoc};
 use crate::error::MetaError;
 use crate::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
 use crate::meta::{
-    ActivityEntry, BucketCounts, BucketRequestCount, ClaimOutcome, IfNoneMatch, ListPage,
-    ListQuery, MetricsRange, MultipartSession, MultipartStatus, Mutation, MutationOutcome,
-    ObjectSummary, OpCount, OutboxEntry, PartRecord, Precondition, ReplicationStatus,
-    RequestMetricsSeries, ShareRow, StoreCounts, TimePoint, User, UserRecord, UserSigV4Credentials,
-    UserWithBearerHash,
+    ActivityEntry, BucketCounts, BucketRequestCount, ClaimOutcome, IfNoneMatch, LATENCY_BUCKETS,
+    ListPage, ListQuery, MetricsRange, MultipartSession, MultipartStatus, Mutation,
+    MutationOutcome, ObjectSummary, OpCount, OutboxEntry, PartRecord, Precondition,
+    ReplicationStatus, RequestMetricsSeries, ShareRow, StatusCount, StoreCounts, TimePoint, User,
+    UserRecord, UserSigV4Credentials, UserWithBearerHash, latency_quantile_ms,
 };
 use crate::object::{ETag, ObjectVersionRow};
 use crate::time::Timestamp;
@@ -50,7 +50,17 @@ struct State {
     /// Object-share tokens (ARCH §15.8), keyed by token.
     shares: BTreeMap<String, ShareRow>,
     /// Request-metrics rollup (ARCH §26.5), keyed by (ts_bucket, operation, bucket, status_class).
-    request_metrics: BTreeMap<(i64, String, String, String), u64>,
+    request_metrics: BTreeMap<(i64, String, String, String), MetricCell>,
+}
+
+/// The accumulated metrics for one rollup key in the in-memory double (mirrors the SQL columns).
+#[derive(Default, Clone)]
+struct MetricCell {
+    count: u64,
+    bytes_in: u64,
+    bytes_out: u64,
+    lat_sum_ms: u64,
+    lat_hist: [u64; LATENCY_BUCKETS],
 }
 
 impl State {
@@ -646,9 +656,17 @@ impl MetadataStore for InMemoryMetadataStore {
             }
             Mutation::RecordRequestMetrics { rows, prune_before } => {
                 for r in rows {
-                    *st.request_metrics
+                    let cell = st
+                        .request_metrics
                         .entry((r.ts_bucket, r.operation, r.bucket, r.status_class))
-                        .or_insert(0) += r.count;
+                        .or_default();
+                    cell.count += r.count;
+                    cell.bytes_in += r.bytes_in;
+                    cell.bytes_out += r.bytes_out;
+                    cell.lat_sum_ms += r.lat_sum_ms;
+                    for i in 0..LATENCY_BUCKETS {
+                        cell.lat_hist[i] += r.lat_hist[i];
+                    }
                 }
                 if let Some(before) = prune_before {
                     st.request_metrics.retain(|(ts, ..), _| *ts >= before);
@@ -1154,45 +1172,108 @@ impl MetadataStore for InMemoryMetadataStore {
         let window = range.window_secs().max(1);
         let st = self.state.lock().unwrap();
 
-        let mut timeline_map: BTreeMap<i64, u64> = BTreeMap::new();
-        let mut by_op_map: BTreeMap<String, u64> = BTreeMap::new();
-        let mut by_bucket_map: BTreeMap<String, u64> = BTreeMap::new();
-        for ((ts, op, bucket, _status), count) in &st.request_metrics {
+        // (count, errors, bytes_in, bytes_out, lat_sum) accumulators per dimension.
+        let mut tl: BTreeMap<i64, (u64, u64, u64, u64, u64)> = BTreeMap::new();
+        let mut by_op: BTreeMap<String, (u64, u64, u64)> = BTreeMap::new(); // count, bytes, lat_sum
+        let mut by_bkt: BTreeMap<String, (u64, u64)> = BTreeMap::new(); // count, bytes
+        let mut by_st: BTreeMap<String, u64> = BTreeMap::new();
+        let (mut t_in, mut t_out, mut t_lat) = (0u64, 0u64, 0u64);
+        let mut hist = [0u64; LATENCY_BUCKETS];
+
+        for ((ts, op, bucket, status), c) in &st.request_metrics {
             if *ts < since {
                 continue;
             }
-            *timeline_map.entry((ts / window) * window).or_insert(0) += *count;
-            *by_op_map.entry(op.clone()).or_insert(0) += *count;
+            let is_err = status == "4xx" || status == "5xx";
+            let bytes = c.bytes_in + c.bytes_out;
+            let e = tl.entry((ts / window) * window).or_default();
+            e.0 += c.count;
+            e.1 += if is_err { c.count } else { 0 };
+            e.2 += c.bytes_in;
+            e.3 += c.bytes_out;
+            e.4 += c.lat_sum_ms;
+            let o = by_op.entry(op.clone()).or_default();
+            o.0 += c.count;
+            o.1 += bytes;
+            o.2 += c.lat_sum_ms;
             if !bucket.is_empty() {
-                *by_bucket_map.entry(bucket.clone()).or_insert(0) += *count;
+                let b = by_bkt.entry(bucket.clone()).or_default();
+                b.0 += c.count;
+                b.1 += bytes;
+            }
+            *by_st.entry(status.clone()).or_insert(0) += c.count;
+            t_in += c.bytes_in;
+            t_out += c.bytes_out;
+            t_lat += c.lat_sum_ms;
+            for (h, x) in hist.iter_mut().zip(c.lat_hist.iter()) {
+                *h += *x;
             }
         }
 
-        let timeline: Vec<TimePoint> = timeline_map
+        let timeline: Vec<TimePoint> = tl
             .into_iter()
-            .map(|(ts, count)| TimePoint { ts, count })
+            .map(|(ts, (count, errors, bi, bo, lat))| TimePoint {
+                ts,
+                count,
+                errors,
+                bytes_in: bi,
+                bytes_out: bo,
+                latency_avg_ms: lat.checked_div(count).unwrap_or(0),
+            })
             .collect();
 
-        // Sort the breakdowns descending by count (ties broken by name for determinism).
-        let mut by_operation: Vec<OpCount> = by_op_map
+        let mut by_operation: Vec<OpCount> = by_op
             .into_iter()
-            .map(|(operation, count)| OpCount { operation, count })
+            .map(|(operation, (count, bytes, lat))| OpCount {
+                operation,
+                count,
+                bytes,
+                latency_avg_ms: lat.checked_div(count).unwrap_or(0),
+            })
             .collect();
         by_operation.sort_by(|a, b| b.count.cmp(&a.count).then(a.operation.cmp(&b.operation)));
 
-        let mut top_buckets: Vec<BucketRequestCount> = by_bucket_map
+        let mut top_buckets: Vec<BucketRequestCount> = by_bkt
             .into_iter()
-            .map(|(bucket, count)| BucketRequestCount { bucket, count })
+            .map(|(bucket, (count, bytes))| BucketRequestCount {
+                bucket,
+                count,
+                bytes,
+            })
             .collect();
         top_buckets.sort_by(|a, b| b.count.cmp(&a.count).then(a.bucket.cmp(&b.bucket)));
+        let active_buckets = top_buckets.len() as u64;
         top_buckets.truncate(10);
 
-        let total = by_operation.iter().map(|o| o.count).sum();
+        let mut by_status: Vec<StatusCount> = by_st
+            .into_iter()
+            .map(|(status_class, count)| StatusCount {
+                status_class,
+                count,
+            })
+            .collect();
+        by_status.sort_by(|a, b| {
+            b.count
+                .cmp(&a.count)
+                .then(a.status_class.cmp(&b.status_class))
+        });
+
+        let total: u64 = by_operation.iter().map(|o| o.count).sum();
+        let total_errors: u64 = timeline.iter().map(|p| p.errors).sum();
+        let peak_window_count = timeline.iter().map(|p| p.count).max().unwrap_or(0);
         Ok(RequestMetricsSeries {
             timeline,
             by_operation,
             top_buckets,
+            by_status,
             total,
+            total_errors,
+            total_bytes_in: t_in,
+            total_bytes_out: t_out,
+            latency_avg_ms: t_lat.checked_div(total).unwrap_or(0),
+            latency_p95_ms: latency_quantile_ms(&hist, 0.95),
+            peak_window_count,
+            active_buckets,
             window_secs: window,
         })
     }

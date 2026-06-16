@@ -261,6 +261,25 @@ CREATE TABLE request_metrics (
 CREATE INDEX idx_request_metrics_ts ON request_metrics (ts_bucket);
 "#,
     },
+    Migration {
+        version: 9,
+        name: "request metrics bytes + latency capture",
+        sql: r#"
+-- Enrich the request-metrics rollup (ARCH §26.5) with transferred bytes and a latency histogram so
+-- the console can chart throughput and p95/avg latency, not just request counts. Old v8 rows keep 0
+-- for every new column (they predate the capture). lat_sum_ms drives the average; the six histogram
+-- buckets (boundaries 5/20/50/200/1000 ms, last is the >1000ms overflow) drive the percentiles.
+ALTER TABLE request_metrics ADD COLUMN bytes_in    INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE request_metrics ADD COLUMN bytes_out   INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE request_metrics ADD COLUMN lat_sum_ms  INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE request_metrics ADD COLUMN lat_le_5    INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE request_metrics ADD COLUMN lat_le_20   INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE request_metrics ADD COLUMN lat_le_50   INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE request_metrics ADD COLUMN lat_le_200  INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE request_metrics ADD COLUMN lat_le_1000 INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE request_metrics ADD COLUMN lat_gt_1000 INTEGER NOT NULL DEFAULT 0;
+"#,
+    },
 ];
 
 /// Run all pending migrations on the write connection, recording each as applied.
@@ -448,5 +467,42 @@ mod tests {
             .unwrap();
         assert_eq!(rows, 1, "same key must upsert into one row");
         assert_eq!(total, 8, "count must accumulate");
+    }
+
+    #[test]
+    fn migration_v9_adds_bytes_and_latency_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        for col in [
+            "bytes_in",
+            "bytes_out",
+            "lat_sum_ms",
+            "lat_le_5",
+            "lat_le_20",
+            "lat_le_50",
+            "lat_le_200",
+            "lat_le_1000",
+            "lat_gt_1000",
+        ] {
+            assert!(
+                column_exists(&conn, "request_metrics", col),
+                "missing column {col}"
+            );
+        }
+        // The new columns default to 0 for a minimal insert (mirrors old v8 rows).
+        conn.execute(
+            "INSERT INTO request_metrics (ts_bucket, operation, bucket_name, status_class, count)
+             VALUES (60, 'GetObject', 'b', '2xx', 1)",
+            [],
+        )
+        .unwrap();
+        let (bin, lat): (i64, i64) = conn
+            .query_row(
+                "SELECT bytes_in, lat_sum_ms FROM request_metrics",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((bin, lat), (0, 0));
     }
 }

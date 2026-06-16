@@ -408,9 +408,11 @@ impl ControlService {
     }
 
     /// `GET /metrics/requests?range=1d|1w|2w|1m`: the request-metrics series for the console's
-    /// activity chart — a downsampled timeline plus breakdowns by operation and most-active bucket.
-    /// An unknown or absent `range` falls back to `1d`. Timeline timestamps are converted from the
-    /// store's epoch *seconds* into epoch *milliseconds* (`ts_ms`) for the UI.
+    /// activity dashboard — a downsampled timeline plus breakdowns by operation, most-active
+    /// bucket, and HTTP status class, with range-wide totals (bytes, errors, latency average and
+    /// p95, peak window, active buckets). An unknown or absent `range` falls back to `1d`. Timeline
+    /// timestamps are converted from the store's epoch *seconds* into epoch *milliseconds* (`ts_ms`)
+    /// for the UI.
     async fn request_metrics(&self, query: &[(String, String)]) -> ControlResponse {
         let range = MetricsRange::parse(find_query(query, "range").unwrap_or("1d"));
         let now_secs = self.clock.now().as_secs();
@@ -423,12 +425,23 @@ impl ControlService {
             &wire::RequestMetricsResp {
                 window_secs: series.window_secs,
                 total: series.total,
+                total_errors: series.total_errors,
+                total_bytes_in: series.total_bytes_in,
+                total_bytes_out: series.total_bytes_out,
+                latency_avg_ms: series.latency_avg_ms,
+                latency_p95_ms: series.latency_p95_ms,
+                peak_window_count: series.peak_window_count,
+                active_buckets: series.active_buckets,
                 timeline: series
                     .timeline
                     .into_iter()
                     .map(|p| wire::MetricPoint {
                         ts_ms: p.ts * 1000,
                         count: p.count,
+                        errors: p.errors,
+                        bytes_in: p.bytes_in,
+                        bytes_out: p.bytes_out,
+                        latency_avg_ms: p.latency_avg_ms,
                     })
                     .collect(),
                 by_operation: series
@@ -437,6 +450,8 @@ impl ControlService {
                     .map(|o| wire::MetricOp {
                         operation: o.operation,
                         count: o.count,
+                        bytes: o.bytes,
+                        latency_avg_ms: o.latency_avg_ms,
                     })
                     .collect(),
                 top_buckets: series
@@ -445,6 +460,15 @@ impl ControlService {
                     .map(|b| wire::MetricBucket {
                         bucket: b.bucket,
                         count: b.count,
+                        bytes: b.bytes,
+                    })
+                    .collect(),
+                by_status: series
+                    .by_status
+                    .into_iter()
+                    .map(|s| wire::MetricStatus {
+                        status_class: s.status_class,
+                        count: s.count,
                     })
                     .collect(),
             },

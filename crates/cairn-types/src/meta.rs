@@ -673,8 +673,61 @@ pub struct BucketCounts {
 // Request metrics (usage analytics, ARCH §26.5)
 // ---------------------------------------------------------------------------------------
 
-/// One accumulated request-metrics rollup row: a count of requests in window `ts_bucket` for a given
-/// operation, bucket (empty string for non-bucket ops), and HTTP status class.
+/// The inclusive upper bounds (milliseconds) of the request-latency histogram buckets; the implicit
+/// final bucket catches everything slower. Mirrors the `lat_le_*`/`lat_gt_1000` columns added in
+/// schema migration v9. Used both by the ingestion aggregator (to bucket a sample) and by the query
+/// path (to estimate percentiles). Keep in lockstep with the SQL column names.
+pub const LATENCY_BUCKET_BOUNDS_MS: [u64; 5] = [5, 20, 50, 200, 1000];
+
+/// The number of latency histogram buckets: one per bound plus the overflow bucket.
+pub const LATENCY_BUCKETS: usize = LATENCY_BUCKET_BOUNDS_MS.len() + 1;
+
+/// Map a latency sample (ms) to its histogram bucket index in `0..LATENCY_BUCKETS`.
+pub fn latency_bucket_index(ms: u64) -> usize {
+    for (i, bound) in LATENCY_BUCKET_BOUNDS_MS.iter().enumerate() {
+        if ms <= *bound {
+            return i;
+        }
+    }
+    LATENCY_BUCKETS - 1
+}
+
+/// Estimate the `q`-quantile (e.g. 0.95) in milliseconds from aggregated histogram bucket counts,
+/// linearly interpolating within the bucket that contains the quantile. The overflow bucket reports
+/// its lower bound (we cannot bound it above). Returns 0 when there are no samples.
+pub fn latency_quantile_ms(hist: &[u64; LATENCY_BUCKETS], q: f64) -> u64 {
+    let total: u64 = hist.iter().sum();
+    if total == 0 {
+        return 0;
+    }
+    let target = (q * total as f64).ceil() as u64;
+    let mut cumulative = 0u64;
+    let mut lower = 0u64;
+    for (i, &c) in hist.iter().enumerate() {
+        let upper = LATENCY_BUCKET_BOUNDS_MS.get(i).copied();
+        cumulative += c;
+        if cumulative >= target {
+            match upper {
+                // Interpolate within [lower, upper] by how far into this bucket the target falls.
+                Some(up) if c > 0 => {
+                    let into = cumulative - target; // remaining above target within this bucket
+                    let frac = 1.0 - (into as f64 / c as f64);
+                    return lower + ((up - lower) as f64 * frac) as u64;
+                }
+                Some(up) => return up,
+                None => return lower, // overflow bucket: report its lower bound
+            }
+        }
+        if let Some(up) = upper {
+            lower = up;
+        }
+    }
+    lower
+}
+
+/// One accumulated request-metrics rollup row: counts, transferred bytes, and a latency histogram for
+/// requests in window `ts_bucket` for a given operation, bucket (empty string for non-bucket ops),
+/// and HTTP status class (ARCH §26.5).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestMetricRow {
     /// Epoch seconds floored to the rollup window.
@@ -687,6 +740,14 @@ pub struct RequestMetricRow {
     pub status_class: String,
     /// Number of requests accumulated for this key.
     pub count: u64,
+    /// Total request (received) bytes for these requests.
+    pub bytes_in: u64,
+    /// Total response (sent) bytes for these requests.
+    pub bytes_out: u64,
+    /// Sum of request latencies in milliseconds (divide by `count` for the average).
+    pub lat_sum_ms: u64,
+    /// Latency histogram bucket counts (see [`LATENCY_BUCKET_BOUNDS_MS`]).
+    pub lat_hist: [u64; LATENCY_BUCKETS],
 }
 
 /// The time range the console asks for, which also fixes the query-time downsampling window so each
@@ -740,36 +801,60 @@ impl MetricsRange {
     }
 }
 
-/// One point on the requests-over-time timeline: `ts` is the window start (epoch seconds), `count`
-/// the requests in that window.
+/// One point on the requests-over-time timeline: `ts` is the window start (epoch seconds). Each point
+/// carries enough to drive the requests, errors, throughput, and latency charts from one series.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TimePoint {
     /// Window start, epoch seconds.
     pub ts: i64,
     /// Requests in the window.
     pub count: u64,
+    /// Of which were errors (4xx + 5xx).
+    pub errors: u64,
+    /// Received bytes in the window.
+    pub bytes_in: u64,
+    /// Sent bytes in the window.
+    pub bytes_out: u64,
+    /// Average request latency in the window, milliseconds.
+    pub latency_avg_ms: u64,
 }
 
-/// A request count attributed to one operation name.
+/// A breakdown attributed to one operation name: request count, total bytes, and average latency.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpCount {
     /// The operation name.
     pub operation: String,
     /// Requests for this operation in range.
     pub count: u64,
+    /// Total bytes (in + out) for this operation in range.
+    pub bytes: u64,
+    /// Average latency for this operation, milliseconds.
+    pub latency_avg_ms: u64,
 }
 
-/// A request count attributed to one bucket.
+/// A breakdown attributed to one bucket: request count and total bytes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BucketRequestCount {
     /// The bucket name.
     pub bucket: String,
     /// Requests against this bucket in range.
     pub count: u64,
+    /// Total bytes (in + out) against this bucket in range.
+    pub bytes: u64,
 }
 
-/// The aggregated request-metrics answer for a [`MetricsRange`]: a downsampled timeline plus
-/// breakdowns by operation and by most-active bucket, with the grand total and the timeline window.
+/// A request count attributed to one HTTP status class (`2xx`/`3xx`/`4xx`/`5xx`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusCount {
+    /// The status class.
+    pub status_class: String,
+    /// Requests with this status class in range.
+    pub count: u64,
+}
+
+/// The aggregated request-metrics answer for a [`MetricsRange`]: a rich downsampled timeline plus
+/// breakdowns by operation, bucket, and status class, and range-wide totals (bytes, errors, latency
+/// average and p95, peak window, active buckets) — enough to drive the whole console dashboard.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RequestMetricsSeries {
     /// Requests over time, one point per downsampling window (ascending by `ts`).
@@ -778,8 +863,24 @@ pub struct RequestMetricsSeries {
     pub by_operation: Vec<OpCount>,
     /// The most-active buckets, descending by count (capped to a small N).
     pub top_buckets: Vec<BucketRequestCount>,
+    /// Requests broken down by HTTP status class.
+    pub by_status: Vec<StatusCount>,
     /// Grand total requests in range.
     pub total: u64,
+    /// Total error requests (4xx + 5xx) in range.
+    pub total_errors: u64,
+    /// Total received bytes in range.
+    pub total_bytes_in: u64,
+    /// Total sent bytes in range.
+    pub total_bytes_out: u64,
+    /// Range-wide average latency, milliseconds.
+    pub latency_avg_ms: u64,
+    /// Range-wide 95th-percentile latency, milliseconds (estimated from the histogram).
+    pub latency_p95_ms: u64,
+    /// The busiest single window's request count (for a peak req/s stat).
+    pub peak_window_count: u64,
+    /// Number of distinct buckets that saw any traffic in range.
+    pub active_buckets: u64,
     /// The timeline downsampling window, in seconds (for the UI to derive req/s).
     pub window_secs: i64,
 }

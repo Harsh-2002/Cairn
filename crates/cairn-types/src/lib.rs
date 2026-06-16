@@ -56,11 +56,12 @@ pub use error::{
 };
 pub use id::{BucketName, InvalidName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
 pub use meta::{
-    ActivityEntry, BucketCounts, BucketRequestCount, ClaimOutcome, IfNoneMatch, ListPage,
-    ListQuery, MetricsRange, MultipartSession, MultipartStatus, Mutation, MutationOutcome,
-    ObjectSummary, OpCount, OutboxEntry, PartRecord, Precondition, ReplicationOp,
-    ReplicationStatus, RequestMetricRow, RequestMetricsSeries, ShareDisposition, ShareRow,
-    StoreCounts, TimePoint, User, UserRecord, UserSigV4Credentials, UserWithBearerHash,
+    ActivityEntry, BucketCounts, BucketRequestCount, ClaimOutcome, IfNoneMatch,
+    LATENCY_BUCKET_BOUNDS_MS, LATENCY_BUCKETS, ListPage, ListQuery, MetricsRange, MultipartSession,
+    MultipartStatus, Mutation, MutationOutcome, ObjectSummary, OpCount, OutboxEntry, PartRecord,
+    Precondition, ReplicationOp, ReplicationStatus, RequestMetricRow, RequestMetricsSeries,
+    ShareDisposition, ShareRow, StatusCount, StoreCounts, TimePoint, User, UserRecord,
+    UserSigV4Credentials, UserWithBearerHash, latency_bucket_index, latency_quantile_ms,
 };
 pub use object::{
     ChecksumAlgorithm, ChecksumSet, ChecksumValue, CompressionDescriptor, ETag, ObjectVersionRow,

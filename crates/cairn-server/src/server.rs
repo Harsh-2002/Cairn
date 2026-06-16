@@ -352,7 +352,8 @@ async fn handle(
             Err(_) => error_response(StatusCode::SERVICE_UNAVAILABLE, "RequestTimeout"),
         };
         let status = resp.status();
-        let elapsed = start.elapsed().as_secs_f64();
+        let elapsed_dur = start.elapsed();
+        let elapsed = elapsed_dur.as_secs_f64();
         // A low-cardinality `route` label (ARCH §26): the request is bucketed into a small fixed set
         // of route classes rather than the raw path, so the time series stay bounded.
         let route = classify_route(&path);
@@ -387,10 +388,18 @@ async fn handle(
                 let now_secs = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0, |d| d.as_secs() as i64);
-                state
-                    .stack
-                    .request_metrics
-                    .record(&op, &bucket, status.as_u16(), now_secs);
+                // Latency and byte counts reuse the exact values fed to the Prometheus
+                // throughput/duration metrics above so the two views agree.
+                let latency_ms = elapsed_dur.as_millis() as u64;
+                state.stack.request_metrics.record(
+                    &op,
+                    &bucket,
+                    status.as_u16(),
+                    latency_ms,
+                    req_bytes,
+                    resp_bytes,
+                    now_secs,
+                );
             }
         }
         tracing::info!(

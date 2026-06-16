@@ -264,6 +264,25 @@ CREATE TABLE request_metrics (
 CREATE INDEX idx_request_metrics_ts ON request_metrics (ts_bucket);
 "#,
     },
+    Migration {
+        version: 9,
+        name: "request metrics bytes + latency capture",
+        sql: r#"
+-- Enrich the request-metrics rollup (ARCH §26.5) with transferred bytes and a latency histogram so
+-- the console can chart throughput and p95/avg latency, not just request counts. Old v8 rows keep 0
+-- for every new column (they predate the capture). lat_sum_ms drives the average; the six histogram
+-- buckets (boundaries 5/20/50/200/1000 ms, last is the >1000ms overflow) drive the percentiles.
+ALTER TABLE request_metrics ADD COLUMN bytes_in    INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE request_metrics ADD COLUMN bytes_out   INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE request_metrics ADD COLUMN lat_sum_ms  INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE request_metrics ADD COLUMN lat_le_5    INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE request_metrics ADD COLUMN lat_le_20   INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE request_metrics ADD COLUMN lat_le_50   INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE request_metrics ADD COLUMN lat_le_200  INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE request_metrics ADD COLUMN lat_le_1000 INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE request_metrics ADD COLUMN lat_gt_1000 INTEGER NOT NULL DEFAULT 0;
+"#,
+    },
 ];
 
 /// Run all pending migrations on the write driver, recording each as applied. Each migration is

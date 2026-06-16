@@ -251,27 +251,52 @@ export interface ReplicationResyncResp {
 
 // Usage-analytics metrics (the Metrics view). Mirrors the management API's
 // /metrics/requests aggregation and the bulk prefix-delete response.
+
+/** One timeline bucket: a sample window of request activity. */
 export interface MetricPoint {
   ts_ms: number;
   count: number;
+  errors: number;
+  bytes_in: number;
+  bytes_out: number;
+  latency_avg_ms: number;
 }
 
+/** Per-S3-operation roll-up over the whole window. */
 export interface MetricOp {
   operation: string;
   count: number;
+  bytes: number;
+  latency_avg_ms: number;
 }
 
+/** Per-bucket roll-up over the whole window. */
 export interface MetricBucket {
   bucket: string;
+  count: number;
+  bytes: number;
+}
+
+/** Response-status-class roll-up ("2xx", "3xx", "4xx", "5xx"). */
+export interface MetricStatus {
+  status_class: string;
   count: number;
 }
 
 export interface RequestMetricsResp {
   window_secs: number;
   total: number;
+  total_errors: number;
+  total_bytes_in: number;
+  total_bytes_out: number;
+  latency_avg_ms: number;
+  latency_p95_ms: number;
+  peak_window_count: number;
+  active_buckets: number;
   timeline: MetricPoint[];
   by_operation: MetricOp[];
   top_buckets: MetricBucket[];
+  by_status: MetricStatus[];
 }
 
 export interface DeletePrefixError {

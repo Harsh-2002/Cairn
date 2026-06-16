@@ -1,7 +1,9 @@
-// Metrics: API request volume and usage analytics. A rolling-window view of
-// how the S3 data plane is being exercised — request volume over time, the
-// operation mix, and which buckets are busiest. One load per range; the range
-// tabs swap the window without tearing the page down to a skeleton.
+// Metrics: a Grafana-style dashboard over the S3 data plane. A responsive
+// auto-grid of stat tiles + chart panels — request volume and errors over
+// time, throughput and latency, the operation/status mix, and the busiest
+// buckets. Two loads: metrics(range) keyed on the range tabs, and a one-shot
+// overview() for the system stat tiles. The grid collapses 3 → 2 → 1 column
+// from desktop to mobile; the hero "Requests over time" chart spans the row.
 
 import { useMemo, useState } from "react";
 import {
@@ -10,6 +12,11 @@ import {
   Bar,
   BarChart,
   CartesianGrid,
+  Cell,
+  Line,
+  LineChart,
+  Pie,
+  PieChart,
   ResponsiveContainer,
   Tooltip,
   XAxis,
@@ -17,13 +24,19 @@ import {
 } from "recharts";
 import { Activity as ActivityIcon } from "lucide-react";
 import { api } from "@/lib/api";
-import { count } from "@/lib/format";
-import type { MetricsRange } from "@/lib/types";
+import { bytes, count } from "@/lib/format";
+import type {
+  MetricOp,
+  MetricStatus,
+  MetricsRange,
+  RequestMetricsResp,
+} from "@/lib/types";
 import { useResource } from "@/lib/use-resource";
 import { EmptyState } from "@/components/empty-state";
 import { ErrorAlert } from "@/components/error-alert";
 import { Page, PageHeader } from "@/components/page-header";
 import { RefreshButton } from "@/components/refresh-button";
+import { StatCard } from "@/components/stat-card";
 import { UsageBar } from "@/components/usage-bar";
 import {
   Card,
@@ -35,7 +48,7 @@ import {
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 
-// Seconds in each range window — drives the "avg N req/s" derived stat. The
+// Seconds in each range window — drives the "avg req/s" derived stat. The
 // 1-month figure is the canonical 31-day month the backend windows on.
 const RANGE_SECS: Record<MetricsRange, number> = {
   "1d": 86400,
@@ -51,22 +64,54 @@ const RANGES: { value: MetricsRange; label: string }[] = [
   { value: "1m", label: "1 month" },
 ];
 
-/** A request-rate string with sensible precision: "12.3 req/s", "0.04 req/s". */
-function reqPerSec(total: number, secs: number): string {
-  if (secs <= 0) return "—";
-  const r = total / secs;
-  if (r === 0) return "0 req/s";
-  if (r >= 100) return `${Math.round(r).toLocaleString()} req/s`;
-  if (r >= 1) return `${r.toFixed(1)} req/s`;
-  return `${r.toFixed(2)} req/s`;
+// S3 operations that read vs. write — the "reads vs writes" split. Anything
+// not listed (e.g. control-plane probes) lands in neither bucket.
+const WRITE_OPS = new Set([
+  "PutObject",
+  "DeleteObject",
+  "DeleteObjects",
+  "UploadPart",
+  "CreateMultipartUpload",
+  "CompleteMultipartUpload",
+  "CreateBucket",
+  "DeleteBucket",
+]);
+const READ_OPS = new Set(["GetObject", "HeadObject", "ListObjects"]);
+
+/** A request-rate string with sensible precision: "12.3/s", "0.04/s". */
+function reqPerSec(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return "0/s";
+  if (value >= 100) return `${Math.round(value).toLocaleString()}/s`;
+  if (value >= 1) return `${value.toFixed(1)}/s`;
+  return `${value.toFixed(2)}/s`;
+}
+
+/** A latency string in milliseconds: "12 ms", "1.4 ms", "0 ms". */
+function ms(value: number | null | undefined): string {
+  if (value === null || value === undefined) return "—";
+  const n = Number(value);
+  if (!Number.isFinite(n)) return "—";
+  if (n === 0) return "0 ms";
+  if (n >= 100) return `${Math.round(n).toLocaleString()} ms`;
+  if (n >= 10) return `${n.toFixed(1)} ms`;
+  return `${n.toFixed(2)} ms`;
+}
+
+/** A percentage with one decimal below 10%, none above: "0.4%", "23%". */
+function pct(part: number, whole: number): string {
+  if (whole <= 0) return "0%";
+  const p = (part / whole) * 100;
+  if (p === 0) return "0%";
+  if (p < 10) return `${p.toFixed(1)}%`;
+  return `${Math.round(p)}%`;
 }
 
 // On a 1-day window the x-axis reads as wall-clock time; over longer windows a
 // month/day label keeps ticks legible. The tooltip always shows the full
 // timestamp so a hovered point is never ambiguous.
 function tickTime(range: MetricsRange) {
-  return (ms: number): string => {
-    const d = new Date(ms);
+  return (value: number): string => {
+    const d = new Date(value);
     if (Number.isNaN(d.getTime())) return "";
     if (range === "1d") {
       return d.toLocaleTimeString(undefined, {
@@ -78,36 +123,36 @@ function tickTime(range: MetricsRange) {
   };
 }
 
-function fullTime(ms: number): string {
-  const d = new Date(ms);
+function fullTime(value: number): string {
+  const d = new Date(value);
   if (Number.isNaN(d.getTime())) return "";
   return d.toLocaleString();
+}
+
+// Map a status class to a semantic chart tone: success / neutral / amber / red.
+function statusColor(cls: string): string {
+  if (cls.startsWith("2")) return "var(--color-success)";
+  if (cls.startsWith("4")) return "var(--color-warning)";
+  if (cls.startsWith("5")) return "var(--color-destructive)";
+  return "var(--color-chart-3)";
 }
 
 export function Metrics() {
   const [range, setRange] = useState<MetricsRange>("1d");
 
-  const { data, error, loading, refreshing, refresh } = useResource(
-    () => api.metrics(range),
-    [range],
-  );
+  const metrics = useResource(() => api.metrics(range), [range]);
+  const overview = useResource(() => api.overview(), []);
 
-  const total = data?.total ?? 0;
-  const avgRate = useMemo(
-    () => reqPerSec(total, RANGE_SECS[range]),
-    [total, range],
-  );
+  const { data, error, loading, refreshing } = metrics;
+
+  // A single Refresh button re-fetches both resources; the busy/disabled state
+  // tracks the metrics load (the primary content) but kicks both.
+  const refresh = () => {
+    metrics.refresh();
+    overview.refresh();
+  };
 
   const tickFmt = useMemo(() => tickTime(range), [range]);
-
-  const maxBucket = useMemo(
-    () =>
-      (data?.top_buckets ?? []).reduce(
-        (m, b) => Math.max(m, b.count),
-        0,
-      ),
-    [data],
-  );
 
   return (
     <Page>
@@ -155,235 +200,684 @@ export function Metrics() {
 
       {loading ? (
         <MetricsSkeleton />
-      ) : data && total === 0 ? (
-        <EmptyState
-          icon={ActivityIcon}
-          title="No request activity yet"
-          body="Once objects are read and written over the S3 API, request volume will appear here."
-        />
       ) : data ? (
-        <div className="space-y-4">
-          {/* Card 1 — request volume over the window, as an area chart. */}
-          <Card className="gap-4">
-            <CardHeader className="flex-row items-start justify-between gap-4">
-              <div className="min-w-0 space-y-1">
-                <CardTitle>Requests over time</CardTitle>
-                <CardDescription>
-                  {count(total)} requests in this window.
-                </CardDescription>
-              </div>
-              <div className="shrink-0 text-right">
-                <p className="text-lg font-semibold tabular-nums">{avgRate}</p>
-                <p className="text-xs text-muted-foreground">average rate</p>
-              </div>
-            </CardHeader>
-            <CardContent>
-              <div className="h-72 w-full">
-                <ResponsiveContainer width="100%" height="100%">
-                  <AreaChart
-                    data={data.timeline}
-                    margin={{ top: 8, right: 8, bottom: 0, left: 0 }}
-                  >
-                    <defs>
-                      <linearGradient
-                        id="metrics-area"
-                        x1="0"
-                        y1="0"
-                        x2="0"
-                        y2="1"
-                      >
-                        <stop
-                          offset="0%"
-                          stopColor="var(--color-link)"
-                          stopOpacity={0.25}
-                        />
-                        <stop
-                          offset="100%"
-                          stopColor="var(--color-link)"
-                          stopOpacity={0}
-                        />
-                      </linearGradient>
-                    </defs>
-                    <CartesianGrid
-                      strokeDasharray="3 3"
-                      stroke="var(--color-border)"
-                      vertical={false}
-                    />
-                    <XAxis
-                      dataKey="ts_ms"
-                      type="number"
-                      domain={["dataMin", "dataMax"]}
-                      scale="time"
-                      tickFormatter={tickFmt}
-                      tickLine={false}
-                      axisLine={{ stroke: "var(--color-border)" }}
-                      tick={{
-                        fill: "var(--color-muted-foreground)",
-                        fontSize: 12,
-                      }}
-                      minTickGap={40}
-                    />
-                    <YAxis
-                      allowDecimals={false}
-                      width={44}
-                      tickLine={false}
-                      axisLine={false}
-                      tick={{
-                        fill: "var(--color-muted-foreground)",
-                        fontSize: 12,
-                      }}
-                      tickFormatter={(v: number) => count(v)}
-                    />
-                    <Tooltip
-                      cursor={{ stroke: "var(--color-border)" }}
-                      contentStyle={tooltipStyle}
-                      labelStyle={tooltipLabelStyle}
-                      itemStyle={tooltipItemStyle}
-                      labelFormatter={(label) => fullTime(Number(label))}
-                      formatter={(value) => [count(Number(value)), "Requests"]}
-                    />
-                    <Area
-                      type="monotone"
-                      dataKey="count"
-                      stroke="var(--color-link)"
-                      strokeWidth={2}
-                      fill="url(#metrics-area)"
-                      isAnimationActive={false}
-                    />
-                  </AreaChart>
-                </ResponsiveContainer>
-              </div>
-            </CardContent>
-          </Card>
-
-          {/* Card 2 — the operation mix, as a horizontal bar chart. */}
-          <Card className="gap-4">
-            <CardHeader className="gap-1">
-              <CardTitle>By operation</CardTitle>
-              <CardDescription>
-                Requests broken down by S3 operation.
-              </CardDescription>
-            </CardHeader>
-            <CardContent>
-              {data.by_operation.length === 0 ? (
-                <p className="text-sm text-muted-foreground">
-                  No operations recorded in this window.
-                </p>
-              ) : (
-                <div
-                  className="w-full"
-                  style={{
-                    height: Math.max(
-                      160,
-                      data.by_operation.length * 34 + 16,
-                    ),
-                  }}
-                >
-                  <ResponsiveContainer width="100%" height="100%">
-                    <BarChart
-                      layout="vertical"
-                      data={data.by_operation}
-                      margin={{ top: 0, right: 16, bottom: 0, left: 0 }}
-                    >
-                      <CartesianGrid
-                        strokeDasharray="3 3"
-                        stroke="var(--color-border)"
-                        horizontal={false}
-                      />
-                      <XAxis
-                        type="number"
-                        allowDecimals={false}
-                        tickLine={false}
-                        axisLine={{ stroke: "var(--color-border)" }}
-                        tick={{
-                          fill: "var(--color-muted-foreground)",
-                          fontSize: 12,
-                        }}
-                        tickFormatter={(v: number) => count(v)}
-                      />
-                      <YAxis
-                        type="category"
-                        dataKey="operation"
-                        width={120}
-                        tickLine={false}
-                        axisLine={false}
-                        tick={{
-                          fill: "var(--color-muted-foreground)",
-                          fontSize: 12,
-                        }}
-                      />
-                      <Tooltip
-                        cursor={{ fill: "var(--color-muted)" }}
-                        contentStyle={tooltipStyle}
-                        labelStyle={tooltipLabelStyle}
-                        itemStyle={tooltipItemStyle}
-                        formatter={(value) => [
-                          count(Number(value)),
-                          "Requests",
-                        ]}
-                      />
-                      <Bar
-                        dataKey="count"
-                        fill="var(--color-chart-4)"
-                        radius={[0, 4, 4, 0]}
-                        isAnimationActive={false}
-                      />
-                    </BarChart>
-                  </ResponsiveContainer>
-                </div>
-              )}
-            </CardContent>
-          </Card>
-
-          {/* Card 3 — busiest buckets, each as a share of the busiest. */}
-          <Card className="gap-4">
-            <CardHeader className="gap-1">
-              <CardTitle>Most active buckets</CardTitle>
-              <CardDescription>
-                Buckets ranked by request count in this window.
-              </CardDescription>
-            </CardHeader>
-            <CardContent>
-              {data.top_buckets.length === 0 ? (
-                <p className="text-sm text-muted-foreground">
-                  No bucket activity in this window.
-                </p>
-              ) : (
-                <ul className="space-y-3">
-                  {data.top_buckets.map((b) => {
-                    const pct = (b.count / Math.max(1, maxBucket)) * 100;
-                    return (
-                      <li
-                        key={b.bucket}
-                        className="grid grid-cols-[1fr_auto] items-center gap-x-4 gap-y-2 sm:grid-cols-[minmax(0,11rem)_1fr_auto]"
-                      >
-                        <span
-                          className="min-w-0 truncate font-mono text-[13px]"
-                          title={b.bucket}
-                        >
-                          {b.bucket}
-                        </span>
-                        <div className="order-last col-span-2 sm:order-none sm:col-span-1">
-                          <UsageBar
-                            percent={pct}
-                            label={`${b.bucket}: ${count(b.count)} requests`}
-                          />
-                        </div>
-                        <span className="text-right font-mono text-[13px] tabular-nums">
-                          {count(b.count)}
-                        </span>
-                      </li>
-                    );
-                  })}
-                </ul>
-              )}
-            </CardContent>
-          </Card>
-        </div>
+        <Dashboard
+          data={data}
+          range={range}
+          tickFmt={tickFmt}
+          overview={overview.data}
+        />
       ) : null}
     </Page>
   );
 }
+
+// The dashboard grid. `total === 0` still renders the system stat tiles (which
+// describe stored data, not request traffic) with an empty-state in between.
+function Dashboard({
+  data,
+  range,
+  tickFmt,
+  overview,
+}: {
+  data: RequestMetricsResp;
+  range: MetricsRange;
+  tickFmt: (v: number) => string;
+  overview:
+    | { objects: number; physical_bytes: number; compression_ratio: number }
+    | undefined;
+}) {
+  const total = data.total;
+  const empty = total === 0;
+
+  const avgRate = total / RANGE_SECS[range];
+  const peakRate =
+    data.window_secs > 0 ? data.peak_window_count / data.window_secs : 0;
+
+  const throughputData = useMemo(
+    () =>
+      data.timeline.map((p) => ({
+        ts_ms: p.ts_ms,
+        bytes: p.bytes_in + p.bytes_out,
+      })),
+    [data.timeline],
+  );
+
+  const reads = useMemo(() => splitOps(data.by_operation), [data.by_operation]);
+
+  return (
+    <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+      {/* Request-traffic stat tiles (suppressed when the window is empty). */}
+      {!empty ? (
+        <>
+          <StatCard label="Total requests" value={count(total)} />
+          <StatCard label="Avg req/s" value={reqPerSec(avgRate)} />
+          <StatCard label="Peak req/s" value={reqPerSec(peakRate)} />
+          <StatCard
+            label="Error rate"
+            value={pct(data.total_errors, total)}
+            sub={`${count(data.total_errors)} errors`}
+          />
+          <StatCard label="Active buckets" value={count(data.active_buckets)} />
+          <StatCard label="Data received" value={bytes(data.total_bytes_in)} />
+          <StatCard label="Data sent" value={bytes(data.total_bytes_out)} />
+          <StatCard label="Avg latency" value={ms(data.latency_avg_ms)} />
+          <StatCard label="p95 latency" value={ms(data.latency_p95_ms)} />
+        </>
+      ) : null}
+
+      {/* System stat tiles from the overview snapshot — always shown. */}
+      {overview ? (
+        <>
+          <StatCard label="Objects" value={count(overview.objects)} />
+          <StatCard label="Storage used" value={bytes(overview.physical_bytes)} />
+          <StatCard
+            label="Compression"
+            value={`${overview.compression_ratio.toFixed(2)}×`}
+          />
+        </>
+      ) : null}
+
+      {/* When there's no request traffic, say so — but keep the system tiles
+          above and skip every traffic chart below. */}
+      {empty ? (
+        <div className="sm:col-span-2 lg:col-span-3">
+          <EmptyState
+            icon={ActivityIcon}
+            title="No request activity yet"
+            body="Once objects are read and written over the S3 API, request volume will appear here."
+          />
+        </div>
+      ) : (
+        <>
+          {/* Panel A — the hero: request volume over the window. Spans wide. */}
+          <ChartCard
+            className="lg:col-span-3"
+            title="Requests over time"
+            description={`${count(total)} requests in this window.`}
+          >
+            <div className="h-72 w-full">
+              <ResponsiveContainer width="100%" height="100%">
+                <AreaChart
+                  data={data.timeline}
+                  margin={{ top: 8, right: 8, bottom: 0, left: 0 }}
+                >
+                  <defs>
+                    <linearGradient
+                      id="m-requests"
+                      x1="0"
+                      y1="0"
+                      x2="0"
+                      y2="1"
+                    >
+                      <stop
+                        offset="0%"
+                        stopColor="var(--color-link)"
+                        stopOpacity={0.25}
+                      />
+                      <stop
+                        offset="100%"
+                        stopColor="var(--color-link)"
+                        stopOpacity={0}
+                      />
+                    </linearGradient>
+                  </defs>
+                  <CartesianGrid
+                    strokeDasharray="3 3"
+                    stroke="var(--color-border)"
+                    vertical={false}
+                  />
+                  <TimeXAxis tickFmt={tickFmt} />
+                  <YAxis
+                    allowDecimals={false}
+                    width={44}
+                    tickLine={false}
+                    axisLine={false}
+                    tick={axisTick}
+                    tickFormatter={(v: number) => count(v)}
+                  />
+                  <Tooltip
+                    cursor={{ stroke: "var(--color-border)" }}
+                    contentStyle={tooltipStyle}
+                    labelStyle={tooltipLabelStyle}
+                    itemStyle={tooltipItemStyle}
+                    labelFormatter={(label) => fullTime(Number(label))}
+                    formatter={(value) => [count(Number(value)), "Requests"]}
+                  />
+                  <Area
+                    type="monotone"
+                    dataKey="count"
+                    stroke="var(--color-link)"
+                    strokeWidth={2}
+                    fill="url(#m-requests)"
+                    isAnimationActive={false}
+                  />
+                </AreaChart>
+              </ResponsiveContainer>
+            </div>
+          </ChartCard>
+
+          {/* Panel B — errors over time. */}
+          <ChartCard
+            title="Errors over time"
+            description={`${count(data.total_errors)} errors (${pct(
+              data.total_errors,
+              total,
+            )}).`}
+          >
+            <div className="h-56 w-full">
+              <ResponsiveContainer width="100%" height="100%">
+                <AreaChart
+                  data={data.timeline}
+                  margin={{ top: 8, right: 8, bottom: 0, left: 0 }}
+                >
+                  <defs>
+                    <linearGradient id="m-errors" x1="0" y1="0" x2="0" y2="1">
+                      <stop
+                        offset="0%"
+                        stopColor="var(--color-destructive)"
+                        stopOpacity={0.25}
+                      />
+                      <stop
+                        offset="100%"
+                        stopColor="var(--color-destructive)"
+                        stopOpacity={0}
+                      />
+                    </linearGradient>
+                  </defs>
+                  <CartesianGrid
+                    strokeDasharray="3 3"
+                    stroke="var(--color-border)"
+                    vertical={false}
+                  />
+                  <TimeXAxis tickFmt={tickFmt} />
+                  <YAxis
+                    allowDecimals={false}
+                    width={44}
+                    tickLine={false}
+                    axisLine={false}
+                    tick={axisTick}
+                    tickFormatter={(v: number) => count(v)}
+                  />
+                  <Tooltip
+                    cursor={{ stroke: "var(--color-border)" }}
+                    contentStyle={tooltipStyle}
+                    labelStyle={tooltipLabelStyle}
+                    itemStyle={tooltipItemStyle}
+                    labelFormatter={(label) => fullTime(Number(label))}
+                    formatter={(value) => [count(Number(value)), "Errors"]}
+                  />
+                  <Area
+                    type="monotone"
+                    dataKey="errors"
+                    stroke="var(--color-destructive)"
+                    strokeWidth={2}
+                    fill="url(#m-errors)"
+                    isAnimationActive={false}
+                  />
+                </AreaChart>
+              </ResponsiveContainer>
+            </div>
+          </ChartCard>
+
+          {/* Panel C — throughput (bytes in + out) over time. */}
+          <ChartCard
+            title="Throughput over time"
+            description={`${bytes(
+              data.total_bytes_in + data.total_bytes_out,
+            )} transferred.`}
+          >
+            <div className="h-56 w-full">
+              <ResponsiveContainer width="100%" height="100%">
+                <AreaChart
+                  data={throughputData}
+                  margin={{ top: 8, right: 8, bottom: 0, left: 0 }}
+                >
+                  <defs>
+                    <linearGradient
+                      id="m-throughput"
+                      x1="0"
+                      y1="0"
+                      x2="0"
+                      y2="1"
+                    >
+                      <stop
+                        offset="0%"
+                        stopColor="var(--color-chart-5)"
+                        stopOpacity={0.3}
+                      />
+                      <stop
+                        offset="100%"
+                        stopColor="var(--color-chart-5)"
+                        stopOpacity={0}
+                      />
+                    </linearGradient>
+                  </defs>
+                  <CartesianGrid
+                    strokeDasharray="3 3"
+                    stroke="var(--color-border)"
+                    vertical={false}
+                  />
+                  <TimeXAxis tickFmt={tickFmt} />
+                  <YAxis
+                    width={64}
+                    tickLine={false}
+                    axisLine={false}
+                    tick={axisTick}
+                    tickFormatter={(v: number) => bytes(v)}
+                  />
+                  <Tooltip
+                    cursor={{ stroke: "var(--color-border)" }}
+                    contentStyle={tooltipStyle}
+                    labelStyle={tooltipLabelStyle}
+                    itemStyle={tooltipItemStyle}
+                    labelFormatter={(label) => fullTime(Number(label))}
+                    formatter={(value) => [bytes(Number(value)), "Transferred"]}
+                  />
+                  <Area
+                    type="monotone"
+                    dataKey="bytes"
+                    stroke="var(--color-chart-5)"
+                    strokeWidth={2}
+                    fill="url(#m-throughput)"
+                    isAnimationActive={false}
+                  />
+                </AreaChart>
+              </ResponsiveContainer>
+            </div>
+          </ChartCard>
+
+          {/* Panel D — average latency over time. */}
+          <ChartCard
+            title="Latency over time"
+            description={`${ms(data.latency_avg_ms)} average, ${ms(
+              data.latency_p95_ms,
+            )} p95.`}
+          >
+            <div className="h-56 w-full">
+              <ResponsiveContainer width="100%" height="100%">
+                <LineChart
+                  data={data.timeline}
+                  margin={{ top: 8, right: 8, bottom: 0, left: 0 }}
+                >
+                  <CartesianGrid
+                    strokeDasharray="3 3"
+                    stroke="var(--color-border)"
+                    vertical={false}
+                  />
+                  <TimeXAxis tickFmt={tickFmt} />
+                  <YAxis
+                    width={52}
+                    tickLine={false}
+                    axisLine={false}
+                    tick={axisTick}
+                    tickFormatter={(v: number) => `${Math.round(v)}ms`}
+                  />
+                  <Tooltip
+                    cursor={{ stroke: "var(--color-border)" }}
+                    contentStyle={tooltipStyle}
+                    labelStyle={tooltipLabelStyle}
+                    itemStyle={tooltipItemStyle}
+                    labelFormatter={(label) => fullTime(Number(label))}
+                    formatter={(value) => [ms(Number(value)), "Avg latency"]}
+                  />
+                  <Line
+                    type="monotone"
+                    dataKey="latency_avg_ms"
+                    stroke="var(--color-chart-4)"
+                    strokeWidth={2}
+                    dot={false}
+                    isAnimationActive={false}
+                  />
+                </LineChart>
+              </ResponsiveContainer>
+            </div>
+          </ChartCard>
+
+          {/* Panel E — request mix by operation. */}
+          <ChartCard
+            title="By operation"
+            description="Requests broken down by S3 operation."
+          >
+            {data.by_operation.length === 0 ? (
+              <PanelEmpty>No operations recorded in this window.</PanelEmpty>
+            ) : (
+              <div
+                className="w-full"
+                style={{
+                  height: Math.max(160, data.by_operation.length * 34 + 16),
+                }}
+              >
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart
+                    layout="vertical"
+                    data={data.by_operation}
+                    margin={{ top: 0, right: 16, bottom: 0, left: 0 }}
+                  >
+                    <CartesianGrid
+                      strokeDasharray="3 3"
+                      stroke="var(--color-border)"
+                      horizontal={false}
+                    />
+                    <XAxis
+                      type="number"
+                      allowDecimals={false}
+                      tickLine={false}
+                      axisLine={{ stroke: "var(--color-border)" }}
+                      tick={axisTick}
+                      tickFormatter={(v: number) => count(v)}
+                    />
+                    <YAxis
+                      type="category"
+                      dataKey="operation"
+                      width={120}
+                      tickLine={false}
+                      axisLine={false}
+                      tick={axisTick}
+                    />
+                    <Tooltip
+                      cursor={{ fill: "var(--color-muted)" }}
+                      contentStyle={tooltipStyle}
+                      labelStyle={tooltipLabelStyle}
+                      itemStyle={tooltipItemStyle}
+                      formatter={(value) => [count(Number(value)), "Requests"]}
+                    />
+                    <Bar
+                      dataKey="count"
+                      fill="var(--color-chart-4)"
+                      radius={[0, 4, 4, 0]}
+                      isAnimationActive={false}
+                    />
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+            )}
+          </ChartCard>
+
+          {/* Panel F — response status mix, as a donut. */}
+          <ChartCard
+            title="Status mix"
+            description="Responses by HTTP status class."
+          >
+            {data.by_status.length === 0 ? (
+              <PanelEmpty>No responses recorded in this window.</PanelEmpty>
+            ) : (
+              <StatusDonut by_status={data.by_status} />
+            )}
+          </ChartCard>
+
+          {/* Panel G — busiest buckets by request count. */}
+          <ChartCard
+            title="Most active buckets"
+            description="Buckets ranked by request count."
+          >
+            <BucketBars
+              rows={data.top_buckets.map((b) => ({
+                bucket: b.bucket,
+                value: b.count,
+                display: `${count(b.count)}`,
+                aria: `${b.bucket}: ${count(b.count)} requests`,
+              }))}
+            />
+          </ChartCard>
+
+          {/* Panel H — top buckets by data transferred. */}
+          <ChartCard
+            title="Top buckets by data"
+            description="Buckets ranked by bytes transferred."
+          >
+            <BucketBars
+              rows={[...data.top_buckets]
+                .sort((a, b) => b.bytes - a.bytes)
+                .map((b) => ({
+                  bucket: b.bucket,
+                  value: b.bytes,
+                  display: bytes(b.bytes),
+                  aria: `${b.bucket}: ${bytes(b.bytes)} transferred`,
+                }))}
+            />
+          </ChartCard>
+
+          {/* Panel I — reads vs. writes split, as a small donut. */}
+          <ChartCard
+            title="Reads vs writes"
+            description="Read versus mutating operations."
+          >
+            {reads.reads + reads.writes === 0 ? (
+              <PanelEmpty>No classifiable operations in this window.</PanelEmpty>
+            ) : (
+              <ReadsWritesDonut reads={reads.reads} writes={reads.writes} />
+            )}
+          </ChartCard>
+        </>
+      )}
+    </div>
+  );
+}
+
+// Sum read vs. write request counts from the per-operation roll-up.
+function splitOps(ops: MetricOp[]): { reads: number; writes: number } {
+  let reads = 0;
+  let writes = 0;
+  for (const op of ops) {
+    if (READ_OPS.has(op.operation)) reads += op.count;
+    else if (WRITE_OPS.has(op.operation)) writes += op.count;
+  }
+  return { reads, writes };
+}
+
+// A status-class donut: 2xx green, 3xx neutral, 4xx amber, 5xx red. A small
+// legend below names each slice with its share.
+function StatusDonut({ by_status }: { by_status: MetricStatus[] }) {
+  const total = by_status.reduce((s, x) => s + x.count, 0);
+  const sorted = [...by_status].sort((a, b) =>
+    a.status_class.localeCompare(b.status_class),
+  );
+  return (
+    <div className="flex flex-col items-center gap-4">
+      <div className="h-44 w-full">
+        <ResponsiveContainer width="100%" height="100%">
+          <PieChart>
+            <Pie
+              data={sorted}
+              dataKey="count"
+              nameKey="status_class"
+              innerRadius={48}
+              outerRadius={72}
+              paddingAngle={2}
+              stroke="var(--color-background)"
+              strokeWidth={2}
+              isAnimationActive={false}
+            >
+              {sorted.map((s) => (
+                <Cell
+                  key={s.status_class}
+                  fill={statusColor(s.status_class)}
+                />
+              ))}
+            </Pie>
+            <Tooltip
+              contentStyle={tooltipStyle}
+              labelStyle={tooltipLabelStyle}
+              itemStyle={tooltipItemStyle}
+              formatter={(value, name) => [
+                `${count(Number(value))} (${pct(Number(value), total)})`,
+                String(name),
+              ]}
+            />
+          </PieChart>
+        </ResponsiveContainer>
+      </div>
+      <ul className="flex w-full flex-wrap justify-center gap-x-4 gap-y-1.5 text-[13px]">
+        {sorted.map((s) => (
+          <li
+            key={s.status_class}
+            className="flex items-center gap-1.5 tabular-nums"
+          >
+            <span
+              aria-hidden="true"
+              className="inline-block size-2.5 rounded-sm"
+              style={{ background: statusColor(s.status_class) }}
+            />
+            <span className="font-medium">{s.status_class}</span>
+            <span className="text-muted-foreground">
+              {count(s.count)} · {pct(s.count, total)}
+            </span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+// Reads vs. writes as a two-slice donut with a legend.
+function ReadsWritesDonut({
+  reads,
+  writes,
+}: {
+  reads: number;
+  writes: number;
+}) {
+  const total = reads + writes;
+  const slices = [
+    { name: "Reads", value: reads, fill: "var(--color-chart-4)" },
+    { name: "Writes", value: writes, fill: "var(--color-chart-5)" },
+  ];
+  return (
+    <div className="flex flex-col items-center gap-4">
+      <div className="h-44 w-full">
+        <ResponsiveContainer width="100%" height="100%">
+          <PieChart>
+            <Pie
+              data={slices}
+              dataKey="value"
+              nameKey="name"
+              innerRadius={48}
+              outerRadius={72}
+              paddingAngle={2}
+              stroke="var(--color-background)"
+              strokeWidth={2}
+              isAnimationActive={false}
+            >
+              {slices.map((s) => (
+                <Cell key={s.name} fill={s.fill} />
+              ))}
+            </Pie>
+            <Tooltip
+              contentStyle={tooltipStyle}
+              labelStyle={tooltipLabelStyle}
+              itemStyle={tooltipItemStyle}
+              formatter={(value, name) => [
+                `${count(Number(value))} (${pct(Number(value), total)})`,
+                String(name),
+              ]}
+            />
+          </PieChart>
+        </ResponsiveContainer>
+      </div>
+      <ul className="flex w-full flex-wrap justify-center gap-x-4 gap-y-1.5 text-[13px]">
+        {slices.map((s) => (
+          <li key={s.name} className="flex items-center gap-1.5 tabular-nums">
+            <span
+              aria-hidden="true"
+              className="inline-block size-2.5 rounded-sm"
+              style={{ background: s.fill }}
+            />
+            <span className="font-medium">{s.name}</span>
+            <span className="text-muted-foreground">
+              {count(s.value)} · {pct(s.value, total)}
+            </span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+// A bar-list of buckets, each row a UsageBar scaled to the busiest. Shared by
+// the "most active" (by count) and "top by data" (by bytes) panels.
+function BucketBars({
+  rows,
+}: {
+  rows: { bucket: string; value: number; display: string; aria: string }[];
+}) {
+  if (rows.length === 0) {
+    return <PanelEmpty>No bucket activity in this window.</PanelEmpty>;
+  }
+  const max = rows.reduce((m, r) => Math.max(m, r.value), 0);
+  return (
+    <ul className="space-y-3">
+      {rows.map((r) => (
+        <li key={r.bucket} className="space-y-1.5">
+          <div className="flex items-baseline justify-between gap-3">
+            <span
+              className="min-w-0 truncate font-mono text-[13px]"
+              title={r.bucket}
+            >
+              {r.bucket}
+            </span>
+            <span className="shrink-0 font-mono text-[13px] tabular-nums">
+              {r.display}
+            </span>
+          </div>
+          <UsageBar
+            percent={(r.value / Math.max(1, max)) * 100}
+            label={r.aria}
+          />
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+// A chart panel: a Card with a title + description and the chart as children.
+function ChartCard({
+  title,
+  description,
+  className,
+  children,
+}: {
+  title: string;
+  description: string;
+  className?: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <Card className={`gap-4 ${className ?? ""}`}>
+      <CardHeader className="gap-1">
+        <CardTitle>{title}</CardTitle>
+        <CardDescription>{description}</CardDescription>
+      </CardHeader>
+      <CardContent>{children}</CardContent>
+    </Card>
+  );
+}
+
+function PanelEmpty({ children }: { children: React.ReactNode }) {
+  return <p className="text-sm text-muted-foreground">{children}</p>;
+}
+
+// The shared time x-axis used by every timeline chart.
+function TimeXAxis({ tickFmt }: { tickFmt: (v: number) => string }) {
+  return (
+    <XAxis
+      dataKey="ts_ms"
+      type="number"
+      domain={["dataMin", "dataMax"]}
+      scale="time"
+      tickFormatter={tickFmt}
+      tickLine={false}
+      axisLine={{ stroke: "var(--color-border)" }}
+      tick={axisTick}
+      minTickGap={40}
+    />
+  );
+}
+
+const axisTick = {
+  fill: "var(--color-muted-foreground)",
+  fontSize: 12,
+} as const;
 
 // A floating-layer tooltip styled to match the popover surface (border + soft
 // shadow), the one place this view leans on the theme's surface tokens.
@@ -405,16 +899,23 @@ const tooltipItemStyle: React.CSSProperties = {
   color: "var(--color-popover-foreground)",
 };
 
-/** First-paint skeletons mirroring the three-card layout so nothing jumps. */
+/** First-paint skeletons mirroring the dashboard grid so nothing jumps. */
 function MetricsSkeleton() {
   return (
-    <div className="space-y-4" aria-hidden="true">
+    <div
+      className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3"
+      aria-hidden="true"
+    >
       <p className="sr-only" role="status">
         Loading metrics…
       </p>
-      <Skeleton className="h-96 rounded-lg" />
-      <Skeleton className="h-72 rounded-lg" />
-      <Skeleton className="h-56 rounded-lg" />
+      {Array.from({ length: 12 }).map((_, i) => (
+        <Skeleton key={i} className="h-24 rounded-lg" />
+      ))}
+      <Skeleton className="h-80 rounded-lg lg:col-span-3" />
+      <Skeleton className="h-64 rounded-lg" />
+      <Skeleton className="h-64 rounded-lg" />
+      <Skeleton className="h-64 rounded-lg" />
     </div>
   );
 }

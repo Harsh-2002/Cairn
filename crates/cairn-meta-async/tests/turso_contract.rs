@@ -1035,43 +1035,56 @@ async fn group_commit_isolates_failed_mutations_parity() {
     assert_eq!(store.aggregate_counts().await.unwrap().objects, 50);
 }
 
+/// Build a metric row carrying `count` samples that each had latency `lat_ms` and the given bytes,
+/// landing the histogram in the correct bucket (mirrors what the ingestion aggregator produces).
+#[allow(clippy::too_many_arguments)]
+fn mrow(
+    ts: i64,
+    op: &str,
+    bkt: &str,
+    status: &str,
+    count: u64,
+    bytes_in: u64,
+    bytes_out: u64,
+    lat_ms: u64,
+) -> RequestMetricRow {
+    let mut lat_hist = [0u64; cairn_types::LATENCY_BUCKETS];
+    lat_hist[cairn_types::latency_bucket_index(lat_ms)] = count;
+    RequestMetricRow {
+        ts_bucket: ts,
+        operation: op.into(),
+        bucket: bkt.into(),
+        status_class: status.into(),
+        count,
+        bytes_in: bytes_in * count,
+        bytes_out: bytes_out * count,
+        lat_sum_ms: lat_ms * count,
+        lat_hist,
+    }
+}
+
 #[tokio::test]
 async fn request_metrics_upsert_query_prune_parity() {
     let (a, b) = both().await;
     // `now` is fixed; windows are chosen so a 1-day query (5-minute windows) keeps the rows separate.
     let now: i64 = 10_000_000;
     for s in [&a as &dyn MetadataStore, &b as &dyn MetadataStore] {
-        // Two flushes into the same (window, op, bucket, status) key must accumulate, not duplicate.
-        let rows1 = vec![
-            RequestMetricRow {
-                ts_bucket: now - 100,
-                operation: "GetObject".into(),
-                bucket: "alpha".into(),
-                status_class: "2xx".into(),
-                count: 3,
-            },
-            RequestMetricRow {
-                ts_bucket: now - 100,
-                operation: "PutObject".into(),
-                bucket: "beta".into(),
-                status_class: "2xx".into(),
-                count: 5,
-            },
-        ];
+        // Two flushes into the same (window, op, bucket, status) key must accumulate, not duplicate;
+        // bytes and latency accumulate alongside the count.
         s.submit(Mutation::RecordRequestMetrics {
-            rows: rows1,
+            rows: vec![
+                mrow(now - 100, "GetObject", "alpha", "2xx", 3, 10, 100, 8),
+                mrow(now - 100, "PutObject", "beta", "2xx", 5, 200, 0, 40),
+            ],
             prune_before: None,
         })
         .await
         .unwrap();
         s.submit(Mutation::RecordRequestMetrics {
-            rows: vec![RequestMetricRow {
-                ts_bucket: now - 100,
-                operation: "GetObject".into(),
-                bucket: "alpha".into(),
-                status_class: "2xx".into(),
-                count: 2,
-            }],
+            rows: vec![
+                mrow(now - 100, "GetObject", "alpha", "2xx", 2, 10, 100, 8),
+                mrow(now - 100, "ListObjects", "alpha", "4xx", 1, 0, 0, 2),
+            ],
             prune_before: None,
         })
         .await
@@ -1081,31 +1094,41 @@ async fn request_metrics_upsert_query_prune_parity() {
             .query_request_metrics(MetricsRange::OneDay, now)
             .await
             .unwrap();
-        assert_eq!(series.total, 10, "3 + 2 + 5 across both ops");
+        assert_eq!(series.total, 11, "3 + 2 + 5 + 1");
         assert_eq!(series.window_secs, 300);
-        // by_operation is descending: GetObject accumulated to 5, PutObject 5 — tie broken by name.
-        assert_eq!(series.by_operation.len(), 2);
+        // by_operation is descending; GetObject accumulated to 5.
+        let get = series
+            .by_operation
+            .iter()
+            .find(|o| o.operation == "GetObject")
+            .unwrap();
+        assert_eq!(get.count, 5);
         assert_eq!(
-            series
-                .by_operation
-                .iter()
-                .find(|o| o.operation == "GetObject")
-                .unwrap()
-                .count,
-            5
+            get.bytes,
+            (10 + 100) * 5,
+            "GetObject bytes in+out accumulate"
         );
-        // top_buckets excludes the non-bucket sentinel and ranks by count.
+        assert_eq!(get.latency_avg_ms, 8);
+        // top_buckets excludes the non-bucket sentinel and ranks by count (alpha 6 > beta 5).
         assert_eq!(series.top_buckets.len(), 2);
+        assert_eq!(series.top_buckets[0].bucket, "alpha");
+        assert_eq!(series.active_buckets, 2);
+        // status breakdown: one 4xx error out of 11.
+        assert_eq!(series.total_errors, 1);
+        assert_eq!(series.by_status.iter().map(|s| s.count).sum::<u64>(), 11);
+        // bytes + latency totals.
+        assert_eq!(series.total_bytes_in, 10 * 5 + 200 * 5);
+        assert_eq!(series.total_bytes_out, 100 * 5);
+        assert!(series.latency_avg_ms > 0);
+        assert!(
+            series.latency_p95_ms > 0,
+            "p95 estimated from the histogram"
+        );
+        assert!(series.peak_window_count >= 11);
 
         // A row far in the past is excluded by the range lower bound, and pruned by prune_before.
         s.submit(Mutation::RecordRequestMetrics {
-            rows: vec![RequestMetricRow {
-                ts_bucket: now - 5_000_000,
-                operation: "GetObject".into(),
-                bucket: "".into(),
-                status_class: "2xx".into(),
-                count: 99,
-            }],
+            rows: vec![mrow(now - 5_000_000, "GetObject", "", "2xx", 99, 1, 1, 5)],
             prune_before: Some(now - 1_000_000),
         })
         .await
@@ -1114,14 +1137,13 @@ async fn request_metrics_upsert_query_prune_parity() {
             .query_request_metrics(MetricsRange::OneDay, now)
             .await
             .unwrap();
-        assert_eq!(after.total, 10, "old row is outside the 1-day window");
-        // The full-month range would still exclude it because it was pruned.
+        assert_eq!(after.total, 11, "old row is outside the 1-day window");
         let month = s
             .query_request_metrics(MetricsRange::OneMonth, now)
             .await
             .unwrap();
         assert_eq!(
-            month.total, 10,
+            month.total, 11,
             "pruned row must not resurface in any range"
         );
     }

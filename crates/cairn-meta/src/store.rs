@@ -10,10 +10,10 @@ use cairn_types::authz::PublicAccessBlock;
 use cairn_types::bucket::{Bucket, ConfigAspect, ConfigDoc};
 use cairn_types::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
 use cairn_types::meta::{
-    ActivityEntry, BucketCounts, BucketRequestCount, ListPage, ListQuery, MetricsRange,
-    MultipartSession, Mutation, MutationOutcome, ObjectSummary, OpCount, OutboxEntry, PartRecord,
-    ReplicationStatus, RequestMetricsSeries, ShareRow, StoreCounts, TimePoint, User,
-    UserSigV4Credentials, UserWithBearerHash,
+    ActivityEntry, BucketCounts, BucketRequestCount, LATENCY_BUCKETS, ListPage, ListQuery,
+    MetricsRange, MultipartSession, Mutation, MutationOutcome, ObjectSummary, OpCount, OutboxEntry,
+    PartRecord, ReplicationStatus, RequestMetricsSeries, ShareRow, StatusCount, StoreCounts,
+    TimePoint, User, UserSigV4Credentials, UserWithBearerHash, latency_quantile_ms,
 };
 use cairn_types::object::ObjectVersionRow;
 use cairn_types::time::Timestamp;
@@ -912,30 +912,41 @@ impl MetadataStore for SqliteMetadataStore {
         let since = range.since_secs(now_secs);
         let window = range.window_secs().max(1);
         self.with_read(move |conn| {
-            // Timeline: re-bucket the per-minute rollup into the range's downsampling window.
+            // Timeline: re-bucket the rollup into the range's downsampling window, carrying errors,
+            // bytes, and average latency per window so one series drives every time chart.
             let mut stmt = conn
                 .prepare_cached(
-                    "SELECT (ts_bucket / ?2) * ?2 AS w, COALESCE(SUM(count),0)
+                    "SELECT (ts_bucket / ?2) * ?2 AS w,
+                        COALESCE(SUM(count),0),
+                        COALESCE(SUM(CASE WHEN status_class IN ('4xx','5xx') THEN count ELSE 0 END),0),
+                        COALESCE(SUM(bytes_in),0), COALESCE(SUM(bytes_out),0),
+                        COALESCE(SUM(lat_sum_ms),0)
                      FROM request_metrics WHERE ts_bucket >= ?1
                      GROUP BY w ORDER BY w",
                 )
                 .map_err(engine_err)?;
-            let timeline = stmt
+            let timeline: Vec<TimePoint> = stmt
                 .query_map(params![since, window], |r| {
-                    let (ts, count): (i64, i64) = (r.get(0)?, r.get(1)?);
+                    let count: i64 = r.get(1)?;
+                    let lat_sum: i64 = r.get(5)?;
                     Ok(TimePoint {
-                        ts,
+                        ts: r.get(0)?,
                         count: count as u64,
+                        errors: r.get::<_, i64>(2)? as u64,
+                        bytes_in: r.get::<_, i64>(3)? as u64,
+                        bytes_out: r.get::<_, i64>(4)? as u64,
+                        latency_avg_ms: if count > 0 { (lat_sum / count) as u64 } else { 0 },
                     })
                 })
                 .map_err(engine_err)?
                 .collect::<rusqlite::Result<Vec<_>>>()
                 .map_err(engine_err)?;
 
-            // Breakdown by operation, descending.
+            // Breakdown by operation: count, bytes, average latency; descending by count.
             let mut stmt = conn
                 .prepare_cached(
-                    "SELECT operation, COALESCE(SUM(count),0) AS c
+                    "SELECT operation, COALESCE(SUM(count),0) AS c,
+                        COALESCE(SUM(bytes_in + bytes_out),0), COALESCE(SUM(lat_sum_ms),0)
                      FROM request_metrics WHERE ts_bucket >= ?1
                      GROUP BY operation ORDER BY c DESC",
                 )
@@ -943,9 +954,12 @@ impl MetadataStore for SqliteMetadataStore {
             let by_operation = stmt
                 .query_map(params![since], |r| {
                     let count: i64 = r.get(1)?;
+                    let lat_sum: i64 = r.get(3)?;
                     Ok(OpCount {
                         operation: r.get(0)?,
                         count: count as u64,
+                        bytes: r.get::<_, i64>(2)? as u64,
+                        latency_avg_ms: if count > 0 { (lat_sum / count) as u64 } else { 0 },
                     })
                 })
                 .map_err(engine_err)?
@@ -955,29 +969,98 @@ impl MetadataStore for SqliteMetadataStore {
             // Most-active buckets (excluding the non-bucket sentinel), top 10.
             let mut stmt = conn
                 .prepare_cached(
-                    "SELECT bucket_name, COALESCE(SUM(count),0) AS c
+                    "SELECT bucket_name, COALESCE(SUM(count),0) AS c,
+                        COALESCE(SUM(bytes_in + bytes_out),0)
                      FROM request_metrics WHERE ts_bucket >= ?1 AND bucket_name <> ''
                      GROUP BY bucket_name ORDER BY c DESC LIMIT 10",
                 )
                 .map_err(engine_err)?;
             let top_buckets = stmt
                 .query_map(params![since], |r| {
-                    let count: i64 = r.get(1)?;
                     Ok(BucketRequestCount {
                         bucket: r.get(0)?,
-                        count: count as u64,
+                        count: r.get::<_, i64>(1)? as u64,
+                        bytes: r.get::<_, i64>(2)? as u64,
                     })
                 })
                 .map_err(engine_err)?
                 .collect::<rusqlite::Result<Vec<_>>>()
                 .map_err(engine_err)?;
 
-            let total = by_operation.iter().map(|o| o.count).sum();
+            // Breakdown by HTTP status class.
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT status_class, COALESCE(SUM(count),0) AS c
+                     FROM request_metrics WHERE ts_bucket >= ?1
+                     GROUP BY status_class ORDER BY c DESC",
+                )
+                .map_err(engine_err)?;
+            let by_status = stmt
+                .query_map(params![since], |r| {
+                    Ok(StatusCount {
+                        status_class: r.get(0)?,
+                        count: r.get::<_, i64>(1)? as u64,
+                    })
+                })
+                .map_err(engine_err)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(engine_err)?;
+
+            // Range-wide totals + the latency histogram (for the average and p95).
+            let (total_bytes_in, total_bytes_out, lat_sum, hist) = conn
+                .query_row(
+                    "SELECT COALESCE(SUM(bytes_in),0), COALESCE(SUM(bytes_out),0),
+                        COALESCE(SUM(lat_sum_ms),0),
+                        COALESCE(SUM(lat_le_5),0), COALESCE(SUM(lat_le_20),0),
+                        COALESCE(SUM(lat_le_50),0), COALESCE(SUM(lat_le_200),0),
+                        COALESCE(SUM(lat_le_1000),0), COALESCE(SUM(lat_gt_1000),0)
+                     FROM request_metrics WHERE ts_bucket >= ?1",
+                    params![since],
+                    |r| {
+                        let hist: [u64; LATENCY_BUCKETS] = [
+                            r.get::<_, i64>(3)? as u64,
+                            r.get::<_, i64>(4)? as u64,
+                            r.get::<_, i64>(5)? as u64,
+                            r.get::<_, i64>(6)? as u64,
+                            r.get::<_, i64>(7)? as u64,
+                            r.get::<_, i64>(8)? as u64,
+                        ];
+                        Ok((
+                            r.get::<_, i64>(0)? as u64,
+                            r.get::<_, i64>(1)? as u64,
+                            r.get::<_, i64>(2)? as u64,
+                            hist,
+                        ))
+                    },
+                )
+                .map_err(engine_err)?;
+
+            // Distinct buckets that saw traffic (excluding the non-bucket sentinel).
+            let active_buckets: i64 = conn
+                .query_row(
+                    "SELECT COUNT(DISTINCT bucket_name) FROM request_metrics
+                     WHERE ts_bucket >= ?1 AND bucket_name <> ''",
+                    params![since],
+                    |r| r.get(0),
+                )
+                .map_err(engine_err)?;
+
+            let total: u64 = by_operation.iter().map(|o| o.count).sum();
+            let total_errors: u64 = timeline.iter().map(|p| p.errors).sum();
+            let peak_window_count = timeline.iter().map(|p| p.count).max().unwrap_or(0);
             Ok(RequestMetricsSeries {
                 timeline,
                 by_operation,
                 top_buckets,
+                by_status,
                 total,
+                total_errors,
+                total_bytes_in,
+                total_bytes_out,
+                latency_avg_ms: lat_sum.checked_div(total).unwrap_or(0),
+                latency_p95_ms: latency_quantile_ms(&hist, 0.95),
+                peak_window_count,
+                active_buckets: active_buckets as u64,
                 window_secs: window,
             })
         })

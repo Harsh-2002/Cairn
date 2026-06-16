@@ -40,10 +40,22 @@ fn shard_of(key: &MetricKey) -> usize {
     (h.finish() as usize) & (SHARDS - 1)
 }
 
+/// The per-key accumulated totals for a rollup window: the request count alongside the byte
+/// throughput and latency aggregates (sum + a fixed-width histogram). One [`Cell`] coalesces every
+/// request that maps to the same [`MetricKey`].
+#[derive(Default, Clone)]
+struct Cell {
+    count: u64,
+    bytes_in: u64,
+    bytes_out: u64,
+    lat_sum_ms: u64,
+    lat_hist: [u64; cairn_types::LATENCY_BUCKETS],
+}
+
 /// A sharded, in-process accumulator of per-window request counts. Cheap to `record` into
 /// (one shard lock, one hashmap bump) and drained in batches by the background flush loop.
 pub struct RequestMetricsAgg {
-    shards: Vec<Mutex<HashMap<MetricKey, u64>>>,
+    shards: Vec<Mutex<HashMap<MetricKey, Cell>>>,
     /// The rollup window granularity in seconds; counts are floored to this window.
     bucket_secs: i64,
 }
@@ -76,9 +88,22 @@ impl RequestMetricsAgg {
     }
 
     /// Count one completed request. `operation` is the classified op name, `bucket` the targeted
-    /// bucket (`""` for non-bucket ops), `status` the HTTP status code, and `now_secs` the current
-    /// epoch seconds. The lock is held only for the hashmap bump.
-    pub fn record(&self, operation: &str, bucket: &str, status: u16, now_secs: i64) {
+    /// bucket (`""` for non-bucket ops), `status` the HTTP status code, `latency_ms` the request
+    /// duration in whole milliseconds, `bytes_in`/`bytes_out` the received/sent byte counts, and
+    /// `now_secs` the current epoch seconds. The lock is held only for the hashmap bump.
+    // Each parameter is an independent dimension of the metric sample; bundling them into a struct
+    // at this hot call site buys no clarity, so the eight-argument shape is deliberate.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record(
+        &self,
+        operation: &str,
+        bucket: &str,
+        status: u16,
+        latency_ms: u64,
+        bytes_in: u64,
+        bytes_out: u64,
+        now_secs: i64,
+    ) {
         let ts_bucket = (now_secs / self.bucket_secs) * self.bucket_secs;
         let key: MetricKey = (
             ts_bucket,
@@ -88,7 +113,12 @@ impl RequestMetricsAgg {
         );
         let shard = &self.shards[shard_of(&key)];
         let mut guard = shard.lock().unwrap();
-        *guard.entry(key).or_insert(0) += 1;
+        let cell = guard.entry(key).or_default();
+        cell.count += 1;
+        cell.bytes_in += bytes_in;
+        cell.bytes_out += bytes_out;
+        cell.lat_sum_ms += latency_ms;
+        cell.lat_hist[cairn_types::latency_bucket_index(latency_ms)] += 1;
     }
 
     /// Atomically swap every shard's map out and flatten the accumulated counts into rows for a
@@ -102,13 +132,17 @@ impl RequestMetricsAgg {
                 let mut guard = shard.lock().unwrap();
                 std::mem::take(&mut *guard)
             };
-            for ((ts_bucket, operation, bucket, status_class), count) in taken {
+            for ((ts_bucket, operation, bucket, status_class), cell) in taken {
                 rows.push(RequestMetricRow {
                     ts_bucket,
                     operation,
                     bucket,
                     status_class: status_class.to_owned(),
-                    count,
+                    count: cell.count,
+                    bytes_in: cell.bytes_in,
+                    bytes_out: cell.bytes_out,
+                    lat_sum_ms: cell.lat_sum_ms,
+                    lat_hist: cell.lat_hist,
                 });
             }
         }
@@ -140,9 +174,10 @@ mod tests {
     fn floors_to_window_and_coalesces() {
         let agg = RequestMetricsAgg::new(60);
         // Three requests in the same minute window for the same key coalesce into one row.
-        agg.record("GetObject", "b", 200, 125);
-        agg.record("GetObject", "b", 204, 150);
-        agg.record("GetObject", "b", 299, 179);
+        // Latency samples 3/30/300 ms land in distinct histogram buckets (indexes 0/2/3).
+        agg.record("GetObject", "b", 200, 3, 10, 100, 125);
+        agg.record("GetObject", "b", 204, 30, 20, 200, 150);
+        agg.record("GetObject", "b", 299, 300, 30, 300, 179);
         let rows = agg.drain();
         assert_eq!(rows.len(), 1);
         let row = &rows[0];
@@ -154,6 +189,30 @@ mod tests {
         assert_eq!(row.bucket, "b");
         assert_eq!(row.status_class, "2xx");
         assert_eq!(row.count, 3);
+        // Bytes and latency accumulate across the coalesced requests.
+        assert_eq!(row.bytes_in, 60, "10 + 20 + 30");
+        assert_eq!(row.bytes_out, 600, "100 + 200 + 300");
+        assert_eq!(row.lat_sum_ms, 333, "3 + 30 + 300");
+        assert_eq!(
+            row.lat_hist[cairn_types::latency_bucket_index(3)],
+            1,
+            "the 3 ms sample fell in its histogram bucket"
+        );
+        assert_eq!(
+            row.lat_hist[cairn_types::latency_bucket_index(30)],
+            1,
+            "the 30 ms sample fell in its histogram bucket"
+        );
+        assert_eq!(
+            row.lat_hist[cairn_types::latency_bucket_index(300)],
+            1,
+            "the 300 ms sample fell in its histogram bucket"
+        );
+        assert_eq!(
+            row.lat_hist.iter().sum::<u64>(),
+            row.count,
+            "every request contributes exactly one histogram entry"
+        );
         // Draining clears the accumulator.
         assert!(agg.drain().is_empty());
     }
@@ -161,11 +220,11 @@ mod tests {
     #[test]
     fn distinct_keys_stay_separate() {
         let agg = RequestMetricsAgg::new(60);
-        agg.record("GetObject", "b", 200, 0); // 2xx
-        agg.record("GetObject", "b", 404, 0); // different status class
-        agg.record("PutObject", "b", 200, 0); // different op
-        agg.record("GetObject", "c", 200, 0); // different bucket
-        agg.record("GetObject", "b", 200, 60); // different window
+        agg.record("GetObject", "b", 200, 1, 0, 0, 0); // 2xx
+        agg.record("GetObject", "b", 404, 1, 0, 0, 0); // different status class
+        agg.record("PutObject", "b", 200, 1, 0, 0, 0); // different op
+        agg.record("GetObject", "c", 200, 1, 0, 0, 0); // different bucket
+        agg.record("GetObject", "b", 200, 1, 0, 0, 60); // different window
         let rows = agg.drain();
         assert_eq!(rows.len(), 5, "five distinct keys, none coalesced");
         assert!(rows.iter().all(|r| r.count == 1));

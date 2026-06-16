@@ -141,19 +141,36 @@ pub struct OverviewBucketsResp {
 // ---------------------------------------------------------------------------------------
 
 /// `GET /metrics/requests` response: the downsampled request timeline plus breakdowns by
-/// operation and most-active bucket, with the grand total and the timeline window.
+/// operation, most-active bucket, and HTTP status class, with range-wide totals (bytes, errors,
+/// latency average and p95, peak window, active buckets) and the timeline window.
 #[derive(Debug, Serialize)]
 pub struct RequestMetricsResp {
     /// The timeline downsampling window, in seconds (for the UI to derive req/s).
     pub window_secs: i64,
     /// Grand total requests in range.
     pub total: u64,
+    /// Total error requests (4xx + 5xx) in range.
+    pub total_errors: u64,
+    /// Total received bytes in range.
+    pub total_bytes_in: u64,
+    /// Total sent bytes in range.
+    pub total_bytes_out: u64,
+    /// Range-wide average latency, milliseconds.
+    pub latency_avg_ms: u64,
+    /// Range-wide 95th-percentile latency, milliseconds.
+    pub latency_p95_ms: u64,
+    /// The busiest single window's request count (for a peak req/s stat).
+    pub peak_window_count: u64,
+    /// Number of distinct buckets that saw any traffic in range.
+    pub active_buckets: u64,
     /// Requests over time, one point per downsampling window (ascending by `ts_ms`).
     pub timeline: Vec<MetricPoint>,
     /// Requests broken down by operation, descending by count.
     pub by_operation: Vec<MetricOp>,
     /// The most-active buckets, descending by count.
     pub top_buckets: Vec<MetricBucket>,
+    /// Requests broken down by HTTP status class.
+    pub by_status: Vec<MetricStatus>,
 }
 
 /// One point on the requests-over-time timeline.
@@ -163,6 +180,14 @@ pub struct MetricPoint {
     pub ts_ms: i64,
     /// Requests in the window.
     pub count: u64,
+    /// Of which were errors (4xx + 5xx).
+    pub errors: u64,
+    /// Received bytes in the window.
+    pub bytes_in: u64,
+    /// Sent bytes in the window.
+    pub bytes_out: u64,
+    /// Average request latency in the window, milliseconds.
+    pub latency_avg_ms: u64,
 }
 
 /// A request count attributed to one operation name.
@@ -172,6 +197,10 @@ pub struct MetricOp {
     pub operation: String,
     /// Requests for this operation in range.
     pub count: u64,
+    /// Total bytes (in + out) for this operation in range.
+    pub bytes: u64,
+    /// Average latency for this operation, milliseconds.
+    pub latency_avg_ms: u64,
 }
 
 /// A request count attributed to one bucket.
@@ -180,6 +209,17 @@ pub struct MetricBucket {
     /// The bucket name.
     pub bucket: String,
     /// Requests against this bucket in range.
+    pub count: u64,
+    /// Total bytes (in + out) against this bucket in range.
+    pub bytes: u64,
+}
+
+/// A request count attributed to one HTTP status class (`2xx`/`3xx`/`4xx`/`5xx`).
+#[derive(Debug, Serialize)]
+pub struct MetricStatus {
+    /// The status class.
+    pub status_class: String,
+    /// Requests with this status class in range.
     pub count: u64,
 }
 

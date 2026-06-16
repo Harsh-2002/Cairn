@@ -496,21 +496,42 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             Ok(MutationOutcome::Ack)
         }
         Mutation::RecordRequestMetrics { rows, prune_before } => {
-            // Accumulate each window/op/bucket/status bucket; the composite PK upsert sums counts so
-            // repeated flushes never double-insert (ARCH §26.5).
+            // Accumulate each window/op/bucket/status bucket; the composite PK upsert sums counts,
+            // bytes, and latency histogram so repeated flushes never double-insert (ARCH §26.5).
             for r in &rows {
                 conn.execute(
                     "INSERT INTO request_metrics
-                     (ts_bucket, operation, bucket_name, status_class, count)
-                     VALUES (?1,?2,?3,?4,?5)
+                     (ts_bucket, operation, bucket_name, status_class, count,
+                      bytes_in, bytes_out, lat_sum_ms,
+                      lat_le_5, lat_le_20, lat_le_50, lat_le_200, lat_le_1000, lat_gt_1000)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
                      ON CONFLICT(ts_bucket, operation, bucket_name, status_class)
-                     DO UPDATE SET count = count + excluded.count",
+                     DO UPDATE SET
+                        count       = count       + excluded.count,
+                        bytes_in    = bytes_in    + excluded.bytes_in,
+                        bytes_out   = bytes_out   + excluded.bytes_out,
+                        lat_sum_ms  = lat_sum_ms  + excluded.lat_sum_ms,
+                        lat_le_5    = lat_le_5    + excluded.lat_le_5,
+                        lat_le_20   = lat_le_20   + excluded.lat_le_20,
+                        lat_le_50   = lat_le_50   + excluded.lat_le_50,
+                        lat_le_200  = lat_le_200  + excluded.lat_le_200,
+                        lat_le_1000 = lat_le_1000 + excluded.lat_le_1000,
+                        lat_gt_1000 = lat_gt_1000 + excluded.lat_gt_1000",
                     params![
                         r.ts_bucket,
                         r.operation,
                         r.bucket,
                         r.status_class,
-                        r.count as i64
+                        r.count as i64,
+                        r.bytes_in as i64,
+                        r.bytes_out as i64,
+                        r.lat_sum_ms as i64,
+                        r.lat_hist[0] as i64,
+                        r.lat_hist[1] as i64,
+                        r.lat_hist[2] as i64,
+                        r.lat_hist[3] as i64,
+                        r.lat_hist[4] as i64,
+                        r.lat_hist[5] as i64,
                     ],
                 )
                 .map_err(engine_err)?;
