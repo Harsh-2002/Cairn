@@ -15,8 +15,9 @@ use cairn_types::authz::PublicAccessBlock;
 use cairn_types::bucket::{Bucket, ConfigAspect, ConfigDoc};
 use cairn_types::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
 use cairn_types::meta::{
-    ActivityEntry, BucketCounts, ListPage, ListQuery, MultipartSession, Mutation, MutationOutcome,
-    ObjectSummary, OutboxEntry, PartRecord, ReplicationStatus, ShareRow, StoreCounts, User,
+    ActivityEntry, BucketCounts, BucketRequestCount, ListPage, ListQuery, MetricsRange,
+    MultipartSession, Mutation, MutationOutcome, ObjectSummary, OpCount, OutboxEntry, PartRecord,
+    ReplicationStatus, RequestMetricsSeries, ShareRow, StoreCounts, TimePoint, User,
     UserSigV4Credentials, UserWithBearerHash,
 };
 use cairn_types::object::ObjectVersionRow;
@@ -802,6 +803,73 @@ impl MetadataStore for AsyncMetadataStore {
                 physical_bytes: r.get_i64(3) as u64,
             })
             .collect())
+    }
+
+    async fn query_request_metrics(
+        &self,
+        range: MetricsRange,
+        now_secs: i64,
+    ) -> Result<RequestMetricsSeries, MetaError> {
+        let since = range.since_secs(now_secs);
+        let window = range.window_secs().max(1);
+        let driver = self.reader();
+
+        // Timeline: re-bucket the per-minute rollup into the range's downsampling window.
+        let timeline = driver
+            .query(
+                "SELECT (ts_bucket / ?2) * ?2 AS w, COALESCE(SUM(count),0)
+                 FROM request_metrics WHERE ts_bucket >= ?1
+                 GROUP BY w ORDER BY w",
+                vec![Value::Int(since), Value::Int(window)],
+            )
+            .await?
+            .iter()
+            .map(|r| TimePoint {
+                ts: r.get_i64(0),
+                count: r.get_i64(1) as u64,
+            })
+            .collect();
+
+        // Breakdown by operation, descending.
+        let by_operation: Vec<OpCount> = driver
+            .query(
+                "SELECT operation, COALESCE(SUM(count),0) AS c
+                 FROM request_metrics WHERE ts_bucket >= ?1
+                 GROUP BY operation ORDER BY c DESC",
+                vec![Value::Int(since)],
+            )
+            .await?
+            .iter()
+            .map(|r| OpCount {
+                operation: r.get_text(0),
+                count: r.get_i64(1) as u64,
+            })
+            .collect();
+
+        // Most-active buckets (excluding the non-bucket sentinel), top 10.
+        let top_buckets = driver
+            .query(
+                "SELECT bucket_name, COALESCE(SUM(count),0) AS c
+                 FROM request_metrics WHERE ts_bucket >= ?1 AND bucket_name <> ''
+                 GROUP BY bucket_name ORDER BY c DESC LIMIT 10",
+                vec![Value::Int(since)],
+            )
+            .await?
+            .iter()
+            .map(|r| BucketRequestCount {
+                bucket: r.get_text(0),
+                count: r.get_i64(1) as u64,
+            })
+            .collect();
+
+        let total = by_operation.iter().map(|o| o.count).sum();
+        Ok(RequestMetricsSeries {
+            timeline,
+            by_operation,
+            top_buckets,
+            total,
+            window_secs: window,
+        })
     }
 }
 

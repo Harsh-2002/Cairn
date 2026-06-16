@@ -1034,3 +1034,95 @@ async fn group_commit_isolates_failed_mutations_parity() {
     ));
     assert_eq!(store.aggregate_counts().await.unwrap().objects, 50);
 }
+
+#[tokio::test]
+async fn request_metrics_upsert_query_prune_parity() {
+    let (a, b) = both().await;
+    // `now` is fixed; windows are chosen so a 1-day query (5-minute windows) keeps the rows separate.
+    let now: i64 = 10_000_000;
+    for s in [&a as &dyn MetadataStore, &b as &dyn MetadataStore] {
+        // Two flushes into the same (window, op, bucket, status) key must accumulate, not duplicate.
+        let rows1 = vec![
+            RequestMetricRow {
+                ts_bucket: now - 100,
+                operation: "GetObject".into(),
+                bucket: "alpha".into(),
+                status_class: "2xx".into(),
+                count: 3,
+            },
+            RequestMetricRow {
+                ts_bucket: now - 100,
+                operation: "PutObject".into(),
+                bucket: "beta".into(),
+                status_class: "2xx".into(),
+                count: 5,
+            },
+        ];
+        s.submit(Mutation::RecordRequestMetrics {
+            rows: rows1,
+            prune_before: None,
+        })
+        .await
+        .unwrap();
+        s.submit(Mutation::RecordRequestMetrics {
+            rows: vec![RequestMetricRow {
+                ts_bucket: now - 100,
+                operation: "GetObject".into(),
+                bucket: "alpha".into(),
+                status_class: "2xx".into(),
+                count: 2,
+            }],
+            prune_before: None,
+        })
+        .await
+        .unwrap();
+
+        let series = s
+            .query_request_metrics(MetricsRange::OneDay, now)
+            .await
+            .unwrap();
+        assert_eq!(series.total, 10, "3 + 2 + 5 across both ops");
+        assert_eq!(series.window_secs, 300);
+        // by_operation is descending: GetObject accumulated to 5, PutObject 5 — tie broken by name.
+        assert_eq!(series.by_operation.len(), 2);
+        assert_eq!(
+            series
+                .by_operation
+                .iter()
+                .find(|o| o.operation == "GetObject")
+                .unwrap()
+                .count,
+            5
+        );
+        // top_buckets excludes the non-bucket sentinel and ranks by count.
+        assert_eq!(series.top_buckets.len(), 2);
+
+        // A row far in the past is excluded by the range lower bound, and pruned by prune_before.
+        s.submit(Mutation::RecordRequestMetrics {
+            rows: vec![RequestMetricRow {
+                ts_bucket: now - 5_000_000,
+                operation: "GetObject".into(),
+                bucket: "".into(),
+                status_class: "2xx".into(),
+                count: 99,
+            }],
+            prune_before: Some(now - 1_000_000),
+        })
+        .await
+        .unwrap();
+        let after = s
+            .query_request_metrics(MetricsRange::OneDay, now)
+            .await
+            .unwrap();
+        assert_eq!(after.total, 10, "old row is outside the 1-day window");
+        // The full-month range would still exclude it because it was pruned.
+        let month = s
+            .query_request_metrics(MetricsRange::OneMonth, now)
+            .await
+            .unwrap();
+        assert_eq!(
+            month.total, 10,
+            "pruned row must not resurface in any range"
+        );
+    }
+}

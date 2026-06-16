@@ -152,7 +152,7 @@ export function ShareDialog({
             <div className="grid gap-1.5">
               <Label htmlFor={`${idp}-pe`}>Expires</Label>
               <Select value={pExpiry} onValueChange={setPExpiry}>
-                <SelectTrigger id={`${idp}-pe`} className="w-full sm:w-56">
+                <SelectTrigger id={`${idp}-pe`} className="w-full">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
@@ -175,7 +175,7 @@ export function ShareDialog({
                 value={pDisposition}
                 onValueChange={(v) => setPDisposition(v as ShareDisposition)}
               >
-                <SelectTrigger id={`${idp}-pd`} className="w-full sm:w-56">
+                <SelectTrigger id={`${idp}-pd`} className="w-full">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
@@ -231,7 +231,7 @@ export function ShareDialog({
                 value={sMethod}
                 onValueChange={(v) => setSMethod(v as "GET" | "PUT")}
               >
-                <SelectTrigger id={`${idp}-sm`} className="w-full sm:w-56">
+                <SelectTrigger id={`${idp}-sm`} className="w-full">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
@@ -243,7 +243,7 @@ export function ShareDialog({
             <div className="grid gap-1.5">
               <Label htmlFor={`${idp}-se`}>Expires</Label>
               <Select value={sExpiry} onValueChange={setSExpiry}>
-                <SelectTrigger id={`${idp}-se`} className="w-full sm:w-56">
+                <SelectTrigger id={`${idp}-se`} className="w-full">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>

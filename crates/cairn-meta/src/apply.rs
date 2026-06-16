@@ -495,6 +495,35 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             .map_err(engine_err)?;
             Ok(MutationOutcome::Ack)
         }
+        Mutation::RecordRequestMetrics { rows, prune_before } => {
+            // Accumulate each window/op/bucket/status bucket; the composite PK upsert sums counts so
+            // repeated flushes never double-insert (ARCH §26.5).
+            for r in &rows {
+                conn.execute(
+                    "INSERT INTO request_metrics
+                     (ts_bucket, operation, bucket_name, status_class, count)
+                     VALUES (?1,?2,?3,?4,?5)
+                     ON CONFLICT(ts_bucket, operation, bucket_name, status_class)
+                     DO UPDATE SET count = count + excluded.count",
+                    params![
+                        r.ts_bucket,
+                        r.operation,
+                        r.bucket,
+                        r.status_class,
+                        r.count as i64
+                    ],
+                )
+                .map_err(engine_err)?;
+            }
+            if let Some(before) = prune_before {
+                conn.execute(
+                    "DELETE FROM request_metrics WHERE ts_bucket < ?1",
+                    params![before],
+                )
+                .map_err(engine_err)?;
+            }
+            Ok(MutationOutcome::Ack)
+        }
     }
 }
 

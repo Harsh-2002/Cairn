@@ -137,6 +137,53 @@ pub struct OverviewBucketsResp {
 }
 
 // ---------------------------------------------------------------------------------------
+// Request metrics
+// ---------------------------------------------------------------------------------------
+
+/// `GET /metrics/requests` response: the downsampled request timeline plus breakdowns by
+/// operation and most-active bucket, with the grand total and the timeline window.
+#[derive(Debug, Serialize)]
+pub struct RequestMetricsResp {
+    /// The timeline downsampling window, in seconds (for the UI to derive req/s).
+    pub window_secs: i64,
+    /// Grand total requests in range.
+    pub total: u64,
+    /// Requests over time, one point per downsampling window (ascending by `ts_ms`).
+    pub timeline: Vec<MetricPoint>,
+    /// Requests broken down by operation, descending by count.
+    pub by_operation: Vec<MetricOp>,
+    /// The most-active buckets, descending by count.
+    pub top_buckets: Vec<MetricBucket>,
+}
+
+/// One point on the requests-over-time timeline.
+#[derive(Debug, Serialize)]
+pub struct MetricPoint {
+    /// Window start, epoch milliseconds.
+    pub ts_ms: i64,
+    /// Requests in the window.
+    pub count: u64,
+}
+
+/// A request count attributed to one operation name.
+#[derive(Debug, Serialize)]
+pub struct MetricOp {
+    /// The operation name.
+    pub operation: String,
+    /// Requests for this operation in range.
+    pub count: u64,
+}
+
+/// A request count attributed to one bucket.
+#[derive(Debug, Serialize)]
+pub struct MetricBucket {
+    /// The bucket name.
+    pub bucket: String,
+    /// Requests against this bucket in range.
+    pub count: u64,
+}
+
+// ---------------------------------------------------------------------------------------
 // Buckets
 // ---------------------------------------------------------------------------------------
 
@@ -219,6 +266,28 @@ pub struct ObjectListResp {
     pub common_prefixes: Vec<String>,
     /// The continuation cursor, or `null` if this is the last page.
     pub next: Option<String>,
+}
+
+/// `DELETE /buckets/{name}/objects?prefix=P` response: how many versions were permanently
+/// deleted, any per-item failures, and whether more work remains (the page budget was exhausted
+/// while items still matched the prefix, so the caller should re-invoke).
+#[derive(Debug, Serialize)]
+pub struct DeletePrefixResp {
+    /// The number of versions (and delete markers) permanently deleted.
+    pub deleted: u64,
+    /// Per-item failures encountered; deletion continued past each one.
+    pub errors: Vec<DeletePrefixError>,
+    /// `true` when the page budget was exhausted with items still remaining (re-invoke to finish).
+    pub more: bool,
+}
+
+/// One per-item failure in a prefix delete.
+#[derive(Debug, Serialize)]
+pub struct DeletePrefixError {
+    /// The object key that failed to delete.
+    pub key: String,
+    /// The failure message.
+    pub message: String,
 }
 
 // ---------------------------------------------------------------------------------------

@@ -35,9 +35,9 @@ use cairn_types::bucket::{Bucket, ConfigAspect, ConfigDoc};
 use cairn_types::error::MetaError;
 use cairn_types::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
 use cairn_types::meta::{
-    ActivityEntry, BucketCounts, ListPage, ListQuery, MultipartSession, Mutation, MutationOutcome,
-    ObjectSummary, OutboxEntry, PartRecord, ReplicationStatus, ShareRow, StoreCounts, User,
-    UserSigV4Credentials, UserWithBearerHash,
+    ActivityEntry, BucketCounts, ListPage, ListQuery, MetricsRange, MultipartSession, Mutation,
+    MutationOutcome, ObjectSummary, OutboxEntry, PartRecord, ReplicationStatus,
+    RequestMetricsSeries, ShareRow, StoreCounts, User, UserSigV4Credentials, UserWithBearerHash,
 };
 use cairn_types::object::ObjectVersionRow;
 use cairn_types::time::Timestamp;
@@ -352,7 +352,8 @@ impl CachedMetadataStore {
             | Mutation::EnqueueReplication(_)
             | Mutation::RecordActivity(_)
             | Mutation::CreateShare(_)
-            | Mutation::RevokeShare { .. } => {}
+            | Mutation::RevokeShare { .. }
+            | Mutation::RecordRequestMetrics { .. } => {}
         }
     }
 }
@@ -606,6 +607,14 @@ impl MetadataStore for CachedMetadataStore {
     async fn bucket_counts(&self) -> Result<Vec<BucketCounts>, MetaError> {
         self.inner.bucket_counts().await
     }
+
+    async fn query_request_metrics(
+        &self,
+        range: MetricsRange,
+        now_secs: i64,
+    ) -> Result<RequestMetricsSeries, MetaError> {
+        self.inner.query_request_metrics(range, now_secs).await
+    }
 }
 
 #[cfg(test)]
@@ -816,6 +825,13 @@ mod tests {
         }
         async fn bucket_counts(&self) -> Result<Vec<BucketCounts>, MetaError> {
             self.inner.bucket_counts().await
+        }
+        async fn query_request_metrics(
+            &self,
+            range: MetricsRange,
+            now_secs: i64,
+        ) -> Result<RequestMetricsSeries, MetaError> {
+            self.inner.query_request_metrics(range, now_secs).await
         }
     }
 

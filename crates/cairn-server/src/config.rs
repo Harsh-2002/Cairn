@@ -114,6 +114,21 @@ pub struct Config {
     /// [`ReplicationTarget`]; parsed with `serde_json` on load.
     pub replication_targets: Option<String>,
 
+    /// Whether the request-metrics usage-analytics subsystem is enabled
+    /// (`CAIRN_REQUEST_METRICS_ENABLED`). When off, no per-request counters accumulate and the
+    /// flush loop is not spawned; the `/api/v1/metrics/requests` endpoint then returns empty series
+    /// (ARCH §26.5).
+    pub request_metrics_enabled: bool,
+    /// How often the in-process request-metrics aggregator is flushed to the rollup table and pruned,
+    /// in seconds (`CAIRN_REQUEST_METRICS_FLUSH_SECS`).
+    pub request_metrics_flush_secs: u64,
+    /// The rollup window granularity in seconds (`CAIRN_REQUEST_METRICS_BUCKET_SECS`): request counts
+    /// are floored to this window before storage. Smaller is finer-grained but more rows.
+    pub request_metrics_bucket_secs: u64,
+    /// How many days of request-metrics rollup rows to retain
+    /// (`CAIRN_REQUEST_METRICS_RETENTION_DAYS`); older rows are pruned on each flush.
+    pub request_metrics_retention_days: u64,
+
     /// The root administrator's access key (`CAIRN_ROOT_ACCESS_KEY`). On every startup an active
     /// administrator with this access key is ensured in the store; the same access key + secret work
     /// for the web UI login, the management API (as a Bearer token `access.secret`), and the S3 API
@@ -158,6 +173,10 @@ impl Default for Config {
             replication_region: None,
             replication_interval_secs: 30,
             replication_targets: None,
+            request_metrics_enabled: true,
+            request_metrics_flush_secs: 15,
+            request_metrics_bucket_secs: 60,
+            request_metrics_retention_days: 31,
             root_access_key: "cairn".to_owned(),
             root_secret_key: "cairnadmin".to_owned(),
         }
@@ -324,6 +343,25 @@ impl Config {
                 "replication_interval_secs must be positive".into(),
             ));
         }
+        // Request-metrics cadences must be positive when the subsystem is enabled, else the flush
+        // loop would busy-spin and the rollup window would divide by zero (ARCH §26.5).
+        if self.request_metrics_enabled {
+            if self.request_metrics_flush_secs == 0 {
+                return Err(ConfigError::Invalid(
+                    "request_metrics_flush_secs must be positive".into(),
+                ));
+            }
+            if self.request_metrics_bucket_secs == 0 {
+                return Err(ConfigError::Invalid(
+                    "request_metrics_bucket_secs must be positive".into(),
+                ));
+            }
+            if self.request_metrics_retention_days == 0 {
+                return Err(ConfigError::Invalid(
+                    "request_metrics_retention_days must be positive".into(),
+                ));
+            }
+        }
         // A present master key must be 32 bytes of hex (64 hex characters), so a typo fails fast at
         // load rather than at the first secret seal/open. (There is no separate public-read signing
         // secret to validate — the signed-share-URL key is derived from the master key.)
@@ -429,6 +467,26 @@ mod tests {
     }
 
     #[test]
+    fn rejects_zero_request_metrics_cadences_when_enabled() {
+        for mutate in [
+            (|c: &mut Config| c.request_metrics_flush_secs = 0) as fn(&mut Config),
+            |c: &mut Config| c.request_metrics_bucket_secs = 0,
+            |c: &mut Config| c.request_metrics_retention_days = 0,
+        ] {
+            let mut c = base();
+            mutate(&mut c);
+            assert!(c.validate().is_err());
+        }
+        // The same zeros are tolerated when the subsystem is disabled (nothing reads them).
+        let mut c = base();
+        c.request_metrics_enabled = false;
+        c.request_metrics_flush_secs = 0;
+        c.request_metrics_bucket_secs = 0;
+        c.request_metrics_retention_days = 0;
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
     fn accepts_custom_background_intervals() {
         let mut c = base();
         c.lifecycle_interval_secs = 600;
@@ -499,11 +557,15 @@ mod tests {
             jail.set_env("CAIRN_LISTEN_ADDR", "0.0.0.0:8080");
             jail.set_env("CAIRN_LOG_FORMAT", "json");
             jail.set_env("CAIRN_REPLICATION_INTERVAL_SECS", "7");
+            jail.set_env("CAIRN_REQUEST_METRICS_RETENTION_DAYS", "14");
+            jail.set_env("CAIRN_REQUEST_METRICS_FLUSH_SECS", "5");
             let cfg = Config::load().expect("env overrides load and validate");
             assert_eq!(cfg.region, "eu-west-1");
             assert_eq!(cfg.listen_addr, "0.0.0.0:8080".parse().unwrap());
             assert_eq!(cfg.log_format, LogFormat::Json);
             assert_eq!(cfg.replication_interval_secs, 7);
+            assert_eq!(cfg.request_metrics_retention_days, 14);
+            assert_eq!(cfg.request_metrics_flush_secs, 5);
             Ok(())
         });
     }

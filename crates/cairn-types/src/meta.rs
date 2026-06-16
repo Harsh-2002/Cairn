@@ -250,6 +250,16 @@ pub enum Mutation {
         /// The revocation time.
         now: Timestamp,
     },
+    /// Flush a batch of accumulated request-metric rows (upsert-accumulate by composite key) and
+    /// optionally prune rows older than `prune_before` (ARCH §26.5). One mutation = one transaction,
+    /// so the request hot path never touches the DB; the in-process aggregator coalesces and the
+    /// background flush submits this periodically.
+    RecordRequestMetrics {
+        /// The accumulated rows to upsert.
+        rows: Vec<RequestMetricRow>,
+        /// When set, delete rows whose `ts_bucket` is strictly less than this epoch-seconds bound.
+        prune_before: Option<i64>,
+    },
 }
 
 /// The typed result of applying a [`Mutation`].
@@ -657,4 +667,119 @@ pub struct BucketCounts {
     pub logical_bytes: u64,
     /// Total physical bytes across all versions.
     pub physical_bytes: u64,
+}
+
+// ---------------------------------------------------------------------------------------
+// Request metrics (usage analytics, ARCH §26.5)
+// ---------------------------------------------------------------------------------------
+
+/// One accumulated request-metrics rollup row: a count of requests in window `ts_bucket` for a given
+/// operation, bucket (empty string for non-bucket ops), and HTTP status class.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestMetricRow {
+    /// Epoch seconds floored to the rollup window.
+    pub ts_bucket: i64,
+    /// The classified operation name (e.g. `GetObject`, `PutObject`, `Management`).
+    pub operation: String,
+    /// The bucket the request targeted, or `""` for non-bucket operations.
+    pub bucket: String,
+    /// The HTTP status class: `2xx`, `3xx`, `4xx`, or `5xx`.
+    pub status_class: String,
+    /// Number of requests accumulated for this key.
+    pub count: u64,
+}
+
+/// The time range the console asks for, which also fixes the query-time downsampling window so each
+/// range returns a bounded number of points regardless of the underlying row count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetricsRange {
+    /// Last 24 hours, downsampled to 5-minute points.
+    OneDay,
+    /// Last 7 days, downsampled to hourly points.
+    OneWeek,
+    /// Last 14 days, downsampled to 3-hour points.
+    TwoWeeks,
+    /// Last ~31 days, downsampled to 6-hour points.
+    OneMonth,
+}
+
+impl MetricsRange {
+    /// Parse the wire token (`1d`/`1w`/`2w`/`1m`); unknown values fall back to [`Self::OneDay`].
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "1w" => Self::OneWeek,
+            "2w" => Self::TwoWeeks,
+            "1m" => Self::OneMonth,
+            _ => Self::OneDay,
+        }
+    }
+
+    /// The downsampling window, in seconds, that timeline points are bucketed into.
+    pub fn window_secs(self) -> i64 {
+        match self {
+            Self::OneDay => 300,      // 5 minutes
+            Self::OneWeek => 3_600,   // 1 hour
+            Self::TwoWeeks => 10_800, // 3 hours
+            Self::OneMonth => 21_600, // 6 hours
+        }
+    }
+
+    /// The total span of the range, in seconds.
+    pub fn span_secs(self) -> i64 {
+        match self {
+            Self::OneDay => 86_400,
+            Self::OneWeek => 604_800,
+            Self::TwoWeeks => 1_209_600,
+            Self::OneMonth => 2_678_400, // 31 days
+        }
+    }
+
+    /// The inclusive lower bound (epoch seconds) for rows in this range, given `now` (epoch seconds).
+    pub fn since_secs(self, now: i64) -> i64 {
+        now - self.span_secs()
+    }
+}
+
+/// One point on the requests-over-time timeline: `ts` is the window start (epoch seconds), `count`
+/// the requests in that window.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimePoint {
+    /// Window start, epoch seconds.
+    pub ts: i64,
+    /// Requests in the window.
+    pub count: u64,
+}
+
+/// A request count attributed to one operation name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpCount {
+    /// The operation name.
+    pub operation: String,
+    /// Requests for this operation in range.
+    pub count: u64,
+}
+
+/// A request count attributed to one bucket.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BucketRequestCount {
+    /// The bucket name.
+    pub bucket: String,
+    /// Requests against this bucket in range.
+    pub count: u64,
+}
+
+/// The aggregated request-metrics answer for a [`MetricsRange`]: a downsampled timeline plus
+/// breakdowns by operation and by most-active bucket, with the grand total and the timeline window.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestMetricsSeries {
+    /// Requests over time, one point per downsampling window (ascending by `ts`).
+    pub timeline: Vec<TimePoint>,
+    /// Requests broken down by operation, descending by count.
+    pub by_operation: Vec<OpCount>,
+    /// The most-active buckets, descending by count (capped to a small N).
+    pub top_buckets: Vec<BucketRequestCount>,
+    /// Grand total requests in range.
+    pub total: u64,
+    /// The timeline downsampling window, in seconds (for the UI to derive req/s).
+    pub window_secs: i64,
 }

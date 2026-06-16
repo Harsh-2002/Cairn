@@ -14,16 +14,19 @@ import type {
   CreateShareReq,
   CreateShareResp,
   CreateUserResp,
+  DeletePrefixResp,
   FailedReplicationResp,
   ListObjectsResp,
   OverviewBucketsResp,
   OverviewResp,
+  MetricsRange,
   PresignReq,
   PresignResp,
   ReplicationResyncResp,
   ReplicationRetryResp,
   ReplicationStatusResp,
   ReplicationTargetListResp,
+  RequestMetricsResp,
   RotateCredentialsResp,
   ShareListResp,
   SystemResp,
@@ -324,4 +327,15 @@ export const api = {
 
   activity: (limit = 50) =>
     request<ActivityResp>("GET", `/activity?limit=${limit}`),
+
+  // Usage analytics: aggregated request volume over a rolling window (the
+  // Metrics view).
+  metrics: (range: MetricsRange) =>
+    request<RequestMetricsResp>("GET", `/metrics/requests?range=${range}`),
+  // Bulk-delete every object under a prefix. Consumed by the bucket browser.
+  deletePrefix: (bucket: string, prefix: string) =>
+    request<DeletePrefixResp>(
+      "DELETE",
+      `/buckets/${enc(bucket)}/objects?prefix=${encodeURIComponent(prefix)}`,
+    ),
 };

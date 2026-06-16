@@ -15,7 +15,8 @@ use cairn_types::bucket::{
 };
 use cairn_types::id::{BucketName, ObjectKey, UserId};
 use cairn_types::meta::{
-    ListQuery, Mutation, MutationOutcome, ShareDisposition, ShareRow, StoreCounts, User, UserRecord,
+    ListQuery, MetricsRange, Mutation, MutationOutcome, ShareDisposition, ShareRow, StoreCounts,
+    User, UserRecord,
 };
 use cairn_types::time::Timestamp;
 use cairn_types::traits::{BlobStore, Clock, Crypto, MetadataStore};
@@ -236,12 +237,16 @@ impl ControlService {
             (&Method::GET, ["overview"]) => self.overview().await,
             (&Method::GET, ["overview", "buckets"]) => self.overview_buckets().await,
             (&Method::GET, ["system"]) => self.system(),
+            (&Method::GET, ["metrics", "requests"]) => self.request_metrics(query).await,
 
             (&Method::GET, ["buckets"]) => self.list_buckets().await,
             (&Method::POST, ["buckets"]) => self.create_bucket(&body, principal).await,
             (&Method::GET, ["buckets", name]) => self.bucket_detail(name).await,
             (&Method::DELETE, ["buckets", name]) => self.delete_bucket(name, principal).await,
             (&Method::GET, ["buckets", name, "objects"]) => self.list_objects(name, query).await,
+            (&Method::DELETE, ["buckets", name, "objects"]) => {
+                self.delete_prefix(name, query, principal).await
+            }
 
             // Persistent object-share management (ARCH §15.8). Minting is handled in the server
             // adapter (it streams object bytes on redemption); listing and revoking are pure
@@ -398,6 +403,50 @@ impl ControlService {
                 data_dir: self.system.data_dir.display().to_string(),
                 disk_total_bytes,
                 disk_free_bytes,
+            },
+        )
+    }
+
+    /// `GET /metrics/requests?range=1d|1w|2w|1m`: the request-metrics series for the console's
+    /// activity chart — a downsampled timeline plus breakdowns by operation and most-active bucket.
+    /// An unknown or absent `range` falls back to `1d`. Timeline timestamps are converted from the
+    /// store's epoch *seconds* into epoch *milliseconds* (`ts_ms`) for the UI.
+    async fn request_metrics(&self, query: &[(String, String)]) -> ControlResponse {
+        let range = MetricsRange::parse(find_query(query, "range").unwrap_or("1d"));
+        let now_secs = self.clock.now().as_secs();
+        let series = match self.meta.query_request_metrics(range, now_secs).await {
+            Ok(s) => s,
+            Err(e) => return ControlResponse::error_internal(&e.to_string()),
+        };
+        ControlResponse::json(
+            StatusCode::OK,
+            &wire::RequestMetricsResp {
+                window_secs: series.window_secs,
+                total: series.total,
+                timeline: series
+                    .timeline
+                    .into_iter()
+                    .map(|p| wire::MetricPoint {
+                        ts_ms: p.ts * 1000,
+                        count: p.count,
+                    })
+                    .collect(),
+                by_operation: series
+                    .by_operation
+                    .into_iter()
+                    .map(|o| wire::MetricOp {
+                        operation: o.operation,
+                        count: o.count,
+                    })
+                    .collect(),
+                top_buckets: series
+                    .top_buckets
+                    .into_iter()
+                    .map(|b| wire::MetricBucket {
+                        bucket: b.bucket,
+                        count: b.count,
+                    })
+                    .collect(),
             },
         )
     }
@@ -607,6 +656,100 @@ impl ControlService {
             .await;
 
         ControlResponse::no_content()
+    }
+
+    /// `DELETE /buckets/{name}/objects?prefix=P`: permanently delete every version (and delete
+    /// marker) under `prefix` — the proven force-empty path of [`delete_bucket`], scoped to a
+    /// prefix. We re-list from the start each round because each deletion removes the rows the
+    /// cursor was anchored against, so the loop converges. If [`MAX_PAGES`] is exhausted while
+    /// items remain, `more = true` signals the UI to re-invoke.
+    async fn delete_prefix(
+        &self,
+        name: &str,
+        query: &[(String, String)],
+        principal: Option<&Principal>,
+    ) -> ControlResponse {
+        let prefix = match find_query(query, "prefix") {
+            Some(p) if !p.is_empty() => p,
+            _ => return ControlResponse::bad_request("prefix is required"),
+        };
+
+        let bucket_name = match BucketName::parse(name) {
+            Ok(n) => n,
+            Err(_) => return ControlResponse::not_found(),
+        };
+        match self.meta.get_bucket(&bucket_name).await {
+            Ok(Some(_)) => {}
+            Ok(None) => return ControlResponse::not_found(),
+            Err(e) => return ControlResponse::error_internal(&e.to_string()),
+        }
+
+        let mut deleted: u64 = 0;
+        let mut errors: Vec<wire::DeletePrefixError> = Vec::new();
+        let mut more = true;
+
+        for _ in 0..MAX_PAGES {
+            let query = ListQuery {
+                prefix: Some(prefix.to_owned()),
+                limit: PAGE_LIMIT,
+                ..Default::default()
+            };
+            let page = match self.meta.list_versions(&bucket_name, &query).await {
+                Ok(p) => p,
+                Err(e) => return ControlResponse::error_internal(&e.to_string()),
+            };
+            if page.items.is_empty() {
+                more = false;
+                break;
+            }
+            for item in &page.items {
+                match self
+                    .meta
+                    .submit(Mutation::DeleteVersion {
+                        bucket: bucket_name.clone(),
+                        key: item.key.clone(),
+                        version_id: item.version_id.clone(),
+                    })
+                    .await
+                {
+                    Ok(MutationOutcome::Deleted { freed, .. }) => {
+                        if let Some(path) = freed {
+                            // Blob reclamation is best-effort and idempotent.
+                            let _ = self.blob.delete(&path).await;
+                        }
+                        deleted += 1;
+                    }
+                    Ok(_) => {
+                        deleted += 1;
+                    }
+                    Err(e) => {
+                        // Record the per-item failure but keep going so one bad row does not
+                        // strand the rest of the prefix.
+                        errors.push(wire::DeletePrefixError {
+                            key: item.key.as_str().to_owned(),
+                            message: e.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+
+        self.record_activity(
+            "DeletePrefix",
+            Some(bucket_name.as_str()),
+            Some(prefix),
+            principal,
+        )
+        .await;
+
+        ControlResponse::json(
+            StatusCode::OK,
+            &wire::DeletePrefixResp {
+                deleted,
+                errors,
+                more,
+            },
+        )
     }
 
     async fn list_objects(&self, name: &str, query: &[(String, String)]) -> ControlResponse {

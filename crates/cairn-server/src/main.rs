@@ -18,6 +18,7 @@ mod adapter;
 mod background;
 mod cli_remote;
 mod config;
+mod metrics_agg;
 mod observability;
 mod server;
 // Linux-only zero-copy syscall helpers for the `fast-io` perf path (kTLS probe + sendfile(2)).

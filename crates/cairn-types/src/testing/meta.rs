@@ -8,9 +8,10 @@ use crate::bucket::{Bucket, ConfigAspect, ConfigDoc};
 use crate::error::MetaError;
 use crate::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
 use crate::meta::{
-    ActivityEntry, BucketCounts, ClaimOutcome, IfNoneMatch, ListPage, ListQuery, MultipartSession,
-    MultipartStatus, Mutation, MutationOutcome, ObjectSummary, OutboxEntry, PartRecord,
-    Precondition, ReplicationStatus, ShareRow, StoreCounts, User, UserRecord, UserSigV4Credentials,
+    ActivityEntry, BucketCounts, BucketRequestCount, ClaimOutcome, IfNoneMatch, ListPage,
+    ListQuery, MetricsRange, MultipartSession, MultipartStatus, Mutation, MutationOutcome,
+    ObjectSummary, OpCount, OutboxEntry, PartRecord, Precondition, ReplicationStatus,
+    RequestMetricsSeries, ShareRow, StoreCounts, TimePoint, User, UserRecord, UserSigV4Credentials,
     UserWithBearerHash,
 };
 use crate::object::{ETag, ObjectVersionRow};
@@ -48,6 +49,8 @@ struct State {
     activity: Vec<ActivityEntry>,
     /// Object-share tokens (ARCH §15.8), keyed by token.
     shares: BTreeMap<String, ShareRow>,
+    /// Request-metrics rollup (ARCH §26.5), keyed by (ts_bucket, operation, bucket, status_class).
+    request_metrics: BTreeMap<(i64, String, String, String), u64>,
 }
 
 impl State {
@@ -641,6 +644,17 @@ impl MetadataStore for InMemoryMetadataStore {
                 st.activity.push(*entry);
                 Ok(MutationOutcome::Ack)
             }
+            Mutation::RecordRequestMetrics { rows, prune_before } => {
+                for r in rows {
+                    *st.request_metrics
+                        .entry((r.ts_bucket, r.operation, r.bucket, r.status_class))
+                        .or_insert(0) += r.count;
+                }
+                if let Some(before) = prune_before {
+                    st.request_metrics.retain(|(ts, ..), _| *ts >= before);
+                }
+                Ok(MutationOutcome::Ack)
+            }
         }
     }
 
@@ -1129,6 +1143,58 @@ impl MetadataStore for InMemoryMetadataStore {
             c.physical_bytes += r.size_physical;
         }
         Ok(by_bucket.into_values().collect())
+    }
+
+    async fn query_request_metrics(
+        &self,
+        range: MetricsRange,
+        now_secs: i64,
+    ) -> Result<RequestMetricsSeries, MetaError> {
+        let since = range.since_secs(now_secs);
+        let window = range.window_secs().max(1);
+        let st = self.state.lock().unwrap();
+
+        let mut timeline_map: BTreeMap<i64, u64> = BTreeMap::new();
+        let mut by_op_map: BTreeMap<String, u64> = BTreeMap::new();
+        let mut by_bucket_map: BTreeMap<String, u64> = BTreeMap::new();
+        for ((ts, op, bucket, _status), count) in &st.request_metrics {
+            if *ts < since {
+                continue;
+            }
+            *timeline_map.entry((ts / window) * window).or_insert(0) += *count;
+            *by_op_map.entry(op.clone()).or_insert(0) += *count;
+            if !bucket.is_empty() {
+                *by_bucket_map.entry(bucket.clone()).or_insert(0) += *count;
+            }
+        }
+
+        let timeline: Vec<TimePoint> = timeline_map
+            .into_iter()
+            .map(|(ts, count)| TimePoint { ts, count })
+            .collect();
+
+        // Sort the breakdowns descending by count (ties broken by name for determinism).
+        let mut by_operation: Vec<OpCount> = by_op_map
+            .into_iter()
+            .map(|(operation, count)| OpCount { operation, count })
+            .collect();
+        by_operation.sort_by(|a, b| b.count.cmp(&a.count).then(a.operation.cmp(&b.operation)));
+
+        let mut top_buckets: Vec<BucketRequestCount> = by_bucket_map
+            .into_iter()
+            .map(|(bucket, count)| BucketRequestCount { bucket, count })
+            .collect();
+        top_buckets.sort_by(|a, b| b.count.cmp(&a.count).then(a.bucket.cmp(&b.bucket)));
+        top_buckets.truncate(10);
+
+        let total = by_operation.iter().map(|o| o.count).sum();
+        Ok(RequestMetricsSeries {
+            timeline,
+            by_operation,
+            top_buckets,
+            total,
+            window_secs: window,
+        })
     }
 }
 

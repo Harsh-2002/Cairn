@@ -19,6 +19,7 @@ import {
   MoreHorizontal,
   Search,
   Tag,
+  Trash2,
   Upload,
 } from "lucide-react";
 import { toast } from "sonner";
@@ -54,7 +55,6 @@ import {
 import { ConfirmDialog } from "@/components/confirm-dialog";
 import { EmptyState } from "@/components/empty-state";
 import { ErrorAlert } from "@/components/error-alert";
-import { ObjectPreviewDialog } from "@/components/object-preview-dialog";
 import { ObjectTagsDialog } from "@/components/object-tags-dialog";
 import { RefreshButton } from "@/components/refresh-button";
 import { ManageSharesDialog } from "@/components/manage-shares-dialog";
@@ -345,7 +345,6 @@ export function BucketBrowser() {
   }
 
   // ---- per-object actions ----------------------------------------------------------
-  const [previewKey, setPreviewKey] = useState<string | null>(null);
   const [shareKey, setShareKey] = useState<string | null>(null);
   const [manageSharesKey, setManageSharesKey] = useState<string | null>(null);
   const [tagsKey, setTagsKey] = useState<string | null>(null);
@@ -356,6 +355,43 @@ export function BucketBrowser() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [bulkDeleting, setBulkDeleting] = useState(false);
   const [confirmBulk, setConfirmBulk] = useState(false);
+
+  // Recursive folder (prefix) delete: removes every object + version under a prefix.
+  const [pendingFolderDelete, setPendingFolderDelete] = useState<string | null>(
+    null,
+  );
+  const [deletingFolder, setDeletingFolder] = useState(false);
+
+  async function confirmFolderDelete() {
+    const prefix = pendingFolderDelete;
+    if (!prefix || deletingFolder) return;
+    setDeletingFolder(true);
+    try {
+      let total = 0;
+      let errorCount = 0;
+      // The endpoint deletes in batches; loop while `more` is true, capped to
+      // avoid an unbounded loop if the server keeps reporting more.
+      for (let i = 0; i < 50; i++) {
+        const r = await api.deletePrefix(name, prefix);
+        total += r.deleted;
+        errorCount += r.errors.length;
+        if (!r.more) break;
+      }
+      if (errorCount > 0) {
+        toast.error(
+          `Deleted ${total} object${total === 1 ? "" : "s"}, ${errorCount} failed.`,
+        );
+      } else {
+        toast.success(`Deleted ${total} object${total === 1 ? "" : "s"}`);
+      }
+      setPendingFolderDelete(null);
+      void load();
+    } catch (e) {
+      toast.error(errorMessage(e, "Failed to delete folder."));
+    } finally {
+      setDeletingFolder(false);
+    }
+  }
 
   function toggleSelected(key: string) {
     setSelected((cur) => {
@@ -445,6 +481,24 @@ export function BucketBrowser() {
       toast.error(errorMessage(e, "Failed to create the folder."));
     } finally {
       setCreatingFolder(false);
+    }
+  }
+
+  // Open an object in a new browser tab via a short-lived presigned GET URL, so
+  // the browser natively renders PDFs/images/etc and the URL carries no auth header.
+  async function openPreview(key: string) {
+    try {
+      const res = await api.presignShare(name, {
+        key,
+        method: "GET",
+        expires_in_secs: 3600,
+        version_id: null,
+        response_content_disposition: null,
+        content_type: null,
+      });
+      window.open(res.url, "_blank", "noopener,noreferrer");
+    } catch (e) {
+      toast.error(errorMessage(e, "Could not open preview."));
     }
   }
 
@@ -871,7 +925,28 @@ export function BucketBrowser() {
                         {f.slice(path.length)}
                       </button>
                     </TableCell>
-                    <TableCell />
+                    <TableCell className="text-right">
+                      <DropdownMenu>
+                        <DropdownMenuTrigger asChild>
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            aria-label={`Actions for folder ${f}`}
+                          >
+                            <MoreHorizontal aria-hidden="true" />
+                          </Button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent align="end">
+                          <DropdownMenuItem
+                            variant="destructive"
+                            onSelect={() => setPendingFolderDelete(f)}
+                          >
+                            <Trash2 aria-hidden="true" />
+                            Delete folder
+                          </DropdownMenuItem>
+                        </DropdownMenuContent>
+                      </DropdownMenu>
+                    </TableCell>
                   </TableRow>
                 ))}
                 {!showVersions &&
@@ -913,7 +988,7 @@ export function BucketBrowser() {
                             </Button>
                           </DropdownMenuTrigger>
                           <DropdownMenuContent align="end">
-                            <DropdownMenuItem onSelect={() => setPreviewKey(o.key)}>
+                            <DropdownMenuItem onSelect={() => void openPreview(o.key)}>
                               Preview
                             </DropdownMenuItem>
                             <DropdownMenuItem onSelect={() => void download(o.key)}>
@@ -1033,15 +1108,6 @@ export function BucketBrowser() {
         </>
       ) : null}
 
-      <ObjectPreviewDialog
-        bucket={name}
-        objectKey={previewKey ?? ""}
-        open={previewKey !== null}
-        onOpenChange={(open) => {
-          if (!open) setPreviewKey(null);
-        }}
-      />
-
       <ShareDialog
         bucket={name}
         objectKey={shareKey ?? ""}
@@ -1120,6 +1186,28 @@ export function BucketBrowser() {
         destructive
         busy={bulkDeleting}
         onConfirm={() => void confirmBulkDelete()}
+      />
+
+      <ConfirmDialog
+        open={pendingFolderDelete !== null}
+        onOpenChange={(open) => {
+          if (!open && !deletingFolder) setPendingFolderDelete(null);
+        }}
+        title="Delete folder?"
+        description={
+          <>
+            This permanently deletes every object (and all versions) under{" "}
+            <span className="break-all font-mono text-[13px] text-foreground">
+              {pendingFolderDelete}
+            </span>
+            . This cannot be undone.
+          </>
+        }
+        confirmLabel={deletingFolder ? "Deleting…" : "Delete folder"}
+        cancelLabel="Keep folder"
+        destructive
+        busy={deletingFolder}
+        onConfirm={() => void confirmFolderDelete()}
       />
 
       <ObjectTagsDialog

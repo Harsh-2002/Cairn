@@ -31,6 +31,9 @@ struct AppState {
     request_timeout: Duration,
     /// The Prometheus render handle.
     metrics: PrometheusHandle,
+    /// Whether the request-metrics usage-analytics subsystem is enabled (`CAIRN_REQUEST_METRICS_*`,
+    /// ARCH §26.5). When off, no per-request counters accumulate on the hot path.
+    request_metrics_enabled: bool,
     /// The assembled S3/engine stack.
     stack: Arc<AppStack>,
 }
@@ -59,6 +62,7 @@ pub async fn serve(
         concurrency: Semaphore::new(config.concurrency_limit),
         request_timeout: Duration::from_secs(config.request_timeout_secs),
         metrics,
+        request_metrics_enabled: config.request_metrics_enabled,
         stack,
     });
 
@@ -305,6 +309,9 @@ async fn handle(
     let request_id = uuid::Uuid::new_v4().simple().to_string();
     let method = req.method().clone();
     let path = req.uri().path().to_owned();
+    // Capture the raw query before `req` is consumed by the router: the request-metrics operation
+    // classifier needs it to distinguish e.g. `?uploads`/`?partNumber`/`?list-type` sub-resources.
+    let query = req.uri().query().unwrap_or("").to_owned();
     // Approximate inbound payload size from the declared content-length (the body itself is streamed
     // and never fully buffered here, so the header is the cheapest available proxy).
     let req_bytes = content_length(req.headers());
@@ -371,6 +378,21 @@ async fn handle(
         if resp_bytes > 0 {
             metrics::counter!("cairn_bytes_sent_total").increment(resp_bytes);
         }
+        // Usage-analytics ingestion (ARCH §26.5): count this completed request into the in-process
+        // aggregator. This is a single sharded hashmap bump — zero DB I/O on the hot path; the
+        // background flush loop drains it periodically. Gated on the subsystem being enabled, and
+        // skipped for infra/UI/share/root paths the classifier returns `None` for.
+        if state.request_metrics_enabled {
+            if let Some((op, bucket)) = classify_operation(&method, &path, &query) {
+                let now_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs() as i64);
+                state
+                    .stack
+                    .request_metrics
+                    .record(&op, &bucket, status.as_u16(), now_secs);
+            }
+        }
         tracing::info!(
             status = status.as_u16(),
             elapsed_ms = elapsed * 1000.0,
@@ -417,6 +439,98 @@ fn classify_route(path: &str) -> &'static str {
         }
         _ => "s3",
     }
+}
+
+/// Classify a completed request into a `(operation, bucket)` pair for usage-analytics ingestion
+/// (ARCH §26.5), or `None` for paths that should not be counted.
+///
+/// `None` is returned for the infra endpoints (`/healthz`, `/readyz`, `/metrics`), the web console
+/// and its assets, the signed-share redeem path (`/p/…`), and the bare root (`/`) — none of which
+/// are an S3 or management API operation worth charting. Management API calls (`/api/v1/…`) collapse
+/// to a single `Management` operation with no bucket. Everything else is treated as path-style S3
+/// addressing: the first path segment is the bucket and the method + sub-resource query select the
+/// S3 operation name. Virtual-host attribution is out of scope, so a request whose bucket cannot be
+/// read from the path falls back to an empty bucket string.
+fn classify_operation(method: &Method, path: &str, query: &str) -> Option<(String, String)> {
+    // Not-counted families. Mirror `classify_route`'s buckets so the two stay consistent.
+    match path {
+        "/" | "/healthz" | "/readyz" | "/metrics" => return None,
+        _ => {}
+    }
+    if path.starts_with("/p/")
+        || path.starts_with("/assets/")
+        || path.starts_with("/web/")
+        || path.starts_with("/ui/")
+    {
+        return None;
+    }
+    if path.starts_with("/api/v1") {
+        return Some(("Management".to_owned(), String::new()));
+    }
+
+    // Path-style S3 addressing: `/{bucket}` or `/{bucket}/{key}`. Take the first segment as the
+    // bucket label (no validation — the classifier is a cheap string match, not the router) and
+    // whether a key segment follows.
+    let rest = path.strip_prefix('/').unwrap_or(path);
+    if rest.is_empty() {
+        return None;
+    }
+    let (bucket_seg, key_rest) = match rest.split_once('/') {
+        Some((b, k)) => (b, k),
+        None => (rest, ""),
+    };
+    let bucket = bucket_seg.to_owned();
+    let has_key = !key_rest.is_empty();
+
+    // Cheap sub-resource probes over the raw query string.
+    let has = |name: &str| {
+        query.split('&').any(|p| {
+            let k = p.split('=').next().unwrap_or(p);
+            k.eq_ignore_ascii_case(name)
+        })
+    };
+
+    let op = if has_key {
+        // Object-level operations.
+        match *method {
+            Method::GET => "GetObject",
+            Method::HEAD => "HeadObject",
+            Method::PUT => {
+                if has("partNumber") {
+                    "UploadPart"
+                } else {
+                    "PutObject"
+                }
+            }
+            Method::POST => {
+                if has("uploads") {
+                    "CreateMultipartUpload"
+                } else if has("uploadId") {
+                    "CompleteMultipartUpload"
+                } else {
+                    "S3"
+                }
+            }
+            Method::DELETE => {
+                if has("uploadId") {
+                    "AbortMultipartUpload"
+                } else {
+                    "DeleteObject"
+                }
+            }
+            _ => "S3",
+        }
+    } else {
+        // Bucket-level operations.
+        match *method {
+            Method::GET | Method::HEAD => "ListObjects",
+            Method::PUT => "CreateBucket",
+            Method::DELETE => "DeleteBucket",
+            Method::POST if has("delete") => "DeleteObjects",
+            _ => "S3",
+        }
+    };
+    Some((op.to_owned(), bucket))
 }
 
 /// Liveness, readiness, and metrics endpoints (the S3 and management families are dispatched

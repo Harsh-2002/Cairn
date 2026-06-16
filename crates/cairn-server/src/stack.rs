@@ -58,6 +58,11 @@ pub struct AppStack {
     /// The public base URL (`CAIRN_PUBLIC_BASE_URL`) shares/presigned links are built against; when
     /// `None`, the minting request's own scheme + Host is used.
     pub public_base_url: Option<String>,
+    /// The in-process request-metrics aggregator (ARCH §26.5). Every completed request bumps a
+    /// counter here (zero DB I/O on the hot path); the background flush loop drains it into a
+    /// batched upsert through the single writer. Held behind an `Arc` so the request path and the
+    /// flush loop share one accumulator.
+    pub request_metrics: Arc<crate::metrics_agg::RequestMetricsAgg>,
 }
 
 impl std::fmt::Debug for AppStack {
@@ -264,6 +269,9 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
         s3_domain: cfg.s3_domain.clone(),
         region: cfg.region.clone(),
         public_base_url: cfg.public_base_url.clone(),
+        request_metrics: Arc::new(crate::metrics_agg::RequestMetricsAgg::new(
+            cfg.request_metrics_bucket_secs,
+        )),
     })
 }
 

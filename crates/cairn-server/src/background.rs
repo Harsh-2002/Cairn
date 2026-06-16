@@ -88,7 +88,50 @@ pub fn spawn(stack: Arc<AppStack>, cfg: &Config) {
         ));
         tracing::info!("replication worker enabled (per-bucket stored targets)");
     }
+    // Request-metrics flush loop (ARCH §26.5). Gated on the subsystem being enabled: when off, the
+    // hot path accumulates nothing and there is nothing to flush. Otherwise it periodically drains
+    // the in-process aggregator into a batched upsert and prunes rows past the retention horizon.
+    if cfg.request_metrics_enabled {
+        let flush_interval = Duration::from_secs(cfg.request_metrics_flush_secs.max(1));
+        #[allow(clippy::cast_possible_wrap)]
+        let retention_secs = (cfg.request_metrics_retention_days as i64) * 86_400;
+        tokio::spawn(request_metrics_flush_loop(
+            stack.clone(),
+            flush_interval,
+            retention_secs,
+        ));
+        tracing::info!("request-metrics ingestion enabled");
+    }
+
     tokio::spawn(metrics_loop(stack));
+}
+
+/// Periodically flush the in-process request-metrics aggregator into the rollup table and prune
+/// rows past the retention horizon (ARCH §26.5). Each tick drains the accumulated counts and submits
+/// a single `RecordRequestMetrics` mutation through the single writer — the only DB touch the
+/// request-metrics subsystem makes, keeping the request hot path free of any DB I/O. `prune_before`
+/// is always supplied so old rows are reclaimed even on idle ticks, but a submit is skipped entirely
+/// when there is no traffic to flush to avoid a pointless write each interval.
+async fn request_metrics_flush_loop(stack: Arc<AppStack>, interval: Duration, retention_secs: i64) {
+    let clock = SystemClock::new();
+    loop {
+        tokio::time::sleep(interval).await;
+        let rows = stack.request_metrics.drain();
+        let now_secs = clock.now().as_secs();
+        let prune_before = Some(now_secs - retention_secs);
+        // Skip the write on a fully idle tick (no rows). The next tick with traffic carries the
+        // prune, so retention is still bounded; a long-idle table simply prunes a little later.
+        if rows.is_empty() {
+            continue;
+        }
+        if let Err(e) = stack
+            .meta
+            .submit(Mutation::RecordRequestMetrics { rows, prune_before })
+            .await
+        {
+            tracing::warn!(error = %e, "request metrics flush failed");
+        }
+    }
 }
 
 /// Build the single-target sink configuration from the `CAIRN_REPLICATION_*` keys, or `None` when

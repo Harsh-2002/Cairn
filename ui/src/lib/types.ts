@@ -248,3 +248,41 @@ export interface ReplicationRetryResp {
 export interface ReplicationResyncResp {
   started: boolean;
 }
+
+// Usage-analytics metrics (the Metrics view). Mirrors the management API's
+// /metrics/requests aggregation and the bulk prefix-delete response.
+export interface MetricPoint {
+  ts_ms: number;
+  count: number;
+}
+
+export interface MetricOp {
+  operation: string;
+  count: number;
+}
+
+export interface MetricBucket {
+  bucket: string;
+  count: number;
+}
+
+export interface RequestMetricsResp {
+  window_secs: number;
+  total: number;
+  timeline: MetricPoint[];
+  by_operation: MetricOp[];
+  top_buckets: MetricBucket[];
+}
+
+export interface DeletePrefixError {
+  key: string;
+  message: string;
+}
+
+export interface DeletePrefixResp {
+  deleted: number;
+  errors: DeletePrefixError[];
+  more: boolean;
+}
+
+export type MetricsRange = "1d" | "1w" | "2w" | "1m";

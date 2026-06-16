@@ -10,8 +10,9 @@ use cairn_types::authz::PublicAccessBlock;
 use cairn_types::bucket::{Bucket, ConfigAspect, ConfigDoc};
 use cairn_types::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
 use cairn_types::meta::{
-    ActivityEntry, BucketCounts, ListPage, ListQuery, MultipartSession, Mutation, MutationOutcome,
-    ObjectSummary, OutboxEntry, PartRecord, ReplicationStatus, ShareRow, StoreCounts, User,
+    ActivityEntry, BucketCounts, BucketRequestCount, ListPage, ListQuery, MetricsRange,
+    MultipartSession, Mutation, MutationOutcome, ObjectSummary, OpCount, OutboxEntry, PartRecord,
+    ReplicationStatus, RequestMetricsSeries, ShareRow, StoreCounts, TimePoint, User,
     UserSigV4Credentials, UserWithBearerHash,
 };
 use cairn_types::object::ObjectVersionRow;
@@ -899,6 +900,86 @@ impl MetadataStore for SqliteMetadataStore {
             .map_err(engine_err)?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(engine_err)
+        })
+        .await
+    }
+
+    async fn query_request_metrics(
+        &self,
+        range: MetricsRange,
+        now_secs: i64,
+    ) -> Result<RequestMetricsSeries, MetaError> {
+        let since = range.since_secs(now_secs);
+        let window = range.window_secs().max(1);
+        self.with_read(move |conn| {
+            // Timeline: re-bucket the per-minute rollup into the range's downsampling window.
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT (ts_bucket / ?2) * ?2 AS w, COALESCE(SUM(count),0)
+                     FROM request_metrics WHERE ts_bucket >= ?1
+                     GROUP BY w ORDER BY w",
+                )
+                .map_err(engine_err)?;
+            let timeline = stmt
+                .query_map(params![since, window], |r| {
+                    let (ts, count): (i64, i64) = (r.get(0)?, r.get(1)?);
+                    Ok(TimePoint {
+                        ts,
+                        count: count as u64,
+                    })
+                })
+                .map_err(engine_err)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(engine_err)?;
+
+            // Breakdown by operation, descending.
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT operation, COALESCE(SUM(count),0) AS c
+                     FROM request_metrics WHERE ts_bucket >= ?1
+                     GROUP BY operation ORDER BY c DESC",
+                )
+                .map_err(engine_err)?;
+            let by_operation = stmt
+                .query_map(params![since], |r| {
+                    let count: i64 = r.get(1)?;
+                    Ok(OpCount {
+                        operation: r.get(0)?,
+                        count: count as u64,
+                    })
+                })
+                .map_err(engine_err)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(engine_err)?;
+
+            // Most-active buckets (excluding the non-bucket sentinel), top 10.
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT bucket_name, COALESCE(SUM(count),0) AS c
+                     FROM request_metrics WHERE ts_bucket >= ?1 AND bucket_name <> ''
+                     GROUP BY bucket_name ORDER BY c DESC LIMIT 10",
+                )
+                .map_err(engine_err)?;
+            let top_buckets = stmt
+                .query_map(params![since], |r| {
+                    let count: i64 = r.get(1)?;
+                    Ok(BucketRequestCount {
+                        bucket: r.get(0)?,
+                        count: count as u64,
+                    })
+                })
+                .map_err(engine_err)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(engine_err)?;
+
+            let total = by_operation.iter().map(|o| o.count).sum();
+            Ok(RequestMetricsSeries {
+                timeline,
+                by_operation,
+                top_buckets,
+                total,
+                window_secs: window,
+            })
         })
         .await
     }

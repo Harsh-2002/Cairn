@@ -1,0 +1,173 @@
+//! In-process request-metrics aggregator (ARCH §26.5). Every completed S3 and management API
+//! request is counted into a sharded set of maps with **zero database I/O on the hot path**: a
+//! request only takes one shard lock for the few microseconds it costs to bump a `u64`. A
+//! background flush periodically [`drain`](RequestMetricsAgg::drain)s the accumulated counts into a
+//! batched upsert through the single metadata writer.
+//!
+//! The sharding mirrors the idiom in `cairn-meta`'s config cache: a fixed power-of-two number of
+//! independent `Mutex<HashMap<…>>` shards chosen by key hash, so concurrent recorders for different
+//! keys rarely contend on the same lock.
+
+use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::sync::Mutex;
+
+use cairn_types::meta::RequestMetricRow;
+
+/// Number of lock shards. A power of two keeps the hash-to-shard reduction a single mask.
+const SHARDS: usize = 16;
+
+/// The composite key one count accumulates under: the rollup window, the operation name, the
+/// targeted bucket (`""` for non-bucket ops), and the HTTP status class (a `&'static str`, one of
+/// `"2xx"`, `"3xx"`, `"4xx"`, `"5xx"`).
+type MetricKey = (i64, String, String, &'static str);
+
+/// Map an HTTP status code to its low-cardinality class label.
+fn status_class(status: u16) -> &'static str {
+    match status {
+        200..=299 => "2xx",
+        300..=399 => "3xx",
+        400..=499 => "4xx",
+        _ => "5xx",
+    }
+}
+
+/// Compute the shard index for a key.
+fn shard_of(key: &MetricKey) -> usize {
+    let mut h = DefaultHasher::new();
+    key.hash(&mut h);
+    (h.finish() as usize) & (SHARDS - 1)
+}
+
+/// A sharded, in-process accumulator of per-window request counts. Cheap to `record` into
+/// (one shard lock, one hashmap bump) and drained in batches by the background flush loop.
+pub struct RequestMetricsAgg {
+    shards: Vec<Mutex<HashMap<MetricKey, u64>>>,
+    /// The rollup window granularity in seconds; counts are floored to this window.
+    bucket_secs: i64,
+}
+
+impl std::fmt::Debug for RequestMetricsAgg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RequestMetricsAgg")
+            .field("shards", &self.shards.len())
+            .field("bucket_secs", &self.bucket_secs)
+            .finish()
+    }
+}
+
+impl RequestMetricsAgg {
+    /// Construct an aggregator that floors timestamps to a `bucket_secs`-second window. A
+    /// `bucket_secs` of `0` is coerced to `1` so the floor division never divides by zero (config
+    /// validation already forbids `0` when the subsystem is enabled; this is belt-and-braces).
+    #[must_use]
+    pub fn new(bucket_secs: u64) -> Self {
+        let mut shards = Vec::with_capacity(SHARDS);
+        for _ in 0..SHARDS {
+            shards.push(Mutex::new(HashMap::new()));
+        }
+        #[allow(clippy::cast_possible_wrap)]
+        let bucket_secs = (bucket_secs.max(1)) as i64;
+        Self {
+            shards,
+            bucket_secs,
+        }
+    }
+
+    /// Count one completed request. `operation` is the classified op name, `bucket` the targeted
+    /// bucket (`""` for non-bucket ops), `status` the HTTP status code, and `now_secs` the current
+    /// epoch seconds. The lock is held only for the hashmap bump.
+    pub fn record(&self, operation: &str, bucket: &str, status: u16, now_secs: i64) {
+        let ts_bucket = (now_secs / self.bucket_secs) * self.bucket_secs;
+        let key: MetricKey = (
+            ts_bucket,
+            operation.to_owned(),
+            bucket.to_owned(),
+            status_class(status),
+        );
+        let shard = &self.shards[shard_of(&key)];
+        let mut guard = shard.lock().unwrap();
+        *guard.entry(key).or_insert(0) += 1;
+    }
+
+    /// Atomically swap every shard's map out and flatten the accumulated counts into rows for a
+    /// batched upsert. Returns an empty vector when no traffic has been recorded since the last
+    /// drain.
+    #[must_use]
+    pub fn drain(&self) -> Vec<RequestMetricRow> {
+        let mut rows = Vec::new();
+        for shard in &self.shards {
+            let taken = {
+                let mut guard = shard.lock().unwrap();
+                std::mem::take(&mut *guard)
+            };
+            for ((ts_bucket, operation, bucket, status_class), count) in taken {
+                rows.push(RequestMetricRow {
+                    ts_bucket,
+                    operation,
+                    bucket,
+                    status_class: status_class.to_owned(),
+                    count,
+                });
+            }
+        }
+        rows
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_classes_bucket_correctly() {
+        assert_eq!(status_class(200), "2xx");
+        assert_eq!(status_class(204), "2xx");
+        assert_eq!(status_class(301), "3xx");
+        assert_eq!(status_class(404), "4xx");
+        assert_eq!(status_class(500), "5xx");
+        assert_eq!(status_class(0), "5xx");
+    }
+
+    #[test]
+    fn empty_drain_when_no_traffic() {
+        let agg = RequestMetricsAgg::new(60);
+        assert!(agg.drain().is_empty());
+    }
+
+    #[test]
+    fn floors_to_window_and_coalesces() {
+        let agg = RequestMetricsAgg::new(60);
+        // Three requests in the same minute window for the same key coalesce into one row.
+        agg.record("GetObject", "b", 200, 125);
+        agg.record("GetObject", "b", 204, 150);
+        agg.record("GetObject", "b", 299, 179);
+        let rows = agg.drain();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(
+            row.ts_bucket, 120,
+            "125/150/179 all floor to the 120s window"
+        );
+        assert_eq!(row.operation, "GetObject");
+        assert_eq!(row.bucket, "b");
+        assert_eq!(row.status_class, "2xx");
+        assert_eq!(row.count, 3);
+        // Draining clears the accumulator.
+        assert!(agg.drain().is_empty());
+    }
+
+    #[test]
+    fn distinct_keys_stay_separate() {
+        let agg = RequestMetricsAgg::new(60);
+        agg.record("GetObject", "b", 200, 0); // 2xx
+        agg.record("GetObject", "b", 404, 0); // different status class
+        agg.record("PutObject", "b", 200, 0); // different op
+        agg.record("GetObject", "c", 200, 0); // different bucket
+        agg.record("GetObject", "b", 200, 60); // different window
+        let rows = agg.drain();
+        assert_eq!(rows.len(), 5, "five distinct keys, none coalesced");
+        assert!(rows.iter().all(|r| r.count == 1));
+    }
+}

@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { useNavigate } from "react-router";
 import {
   Activity,
+  BarChart3,
   Database,
   Home,
   Moon,
@@ -84,6 +85,9 @@ export function CommandMenu() {
           <CommandGroup heading="Views">
             <CommandItem onSelect={() => go("/overview")}>
               <Home aria-hidden="true" /> Overview
+            </CommandItem>
+            <CommandItem onSelect={() => go("/metrics")}>
+              <BarChart3 aria-hidden="true" /> Metrics
             </CommandItem>
             <CommandItem onSelect={() => go("/buckets")}>
               <Database aria-hidden="true" /> Buckets

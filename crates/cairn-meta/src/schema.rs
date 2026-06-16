@@ -241,6 +241,26 @@ CREATE INDEX idx_object_shares_bucket_key ON object_shares (bucket_name, key);
 CREATE INDEX idx_object_shares_created_by ON object_shares (created_by);
 "#,
     },
+    Migration {
+        version: 8,
+        name: "request metrics rollup (usage analytics)",
+        sql: r#"
+-- Per-window rollup of API request counts for the console's usage analytics (ARCH §26.5). Each row
+-- is one (window, operation, bucket, status-class) bucket; the in-process aggregator flushes batched
+-- upserts that accumulate `count`, and a periodic prune drops rows older than the retention window.
+-- bucket_name is '' (never NULL) for non-bucket operations. The composite PRIMARY KEY gives the
+-- accumulating upsert (ON CONFLICT … DO UPDATE); the ts index serves range queries and the prune.
+CREATE TABLE request_metrics (
+    ts_bucket    INTEGER NOT NULL,
+    operation    TEXT    NOT NULL,
+    bucket_name  TEXT    NOT NULL,
+    status_class TEXT    NOT NULL,
+    count        INTEGER NOT NULL,
+    PRIMARY KEY (ts_bucket, operation, bucket_name, status_class)
+);
+CREATE INDEX idx_request_metrics_ts ON request_metrics (ts_bucket);
+"#,
+    },
 ];
 
 /// Run all pending migrations on the write connection, recording each as applied.
@@ -394,5 +414,39 @@ mod tests {
             .query_row("SELECT policy FROM users WHERE id='u'", [], |r| r.get(0))
             .unwrap();
         assert!(policy.is_none());
+    }
+
+    #[test]
+    fn migration_v8_request_metrics_table_and_upsert() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        // The rollup table + its timestamp index exist (ARCH §26.5).
+        let table: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='request_metrics'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(table, 1);
+        assert!(index_exists(&conn, "idx_request_metrics_ts"));
+
+        // The composite-key upsert accumulates count rather than inserting duplicates.
+        let up =
+            "INSERT INTO request_metrics (ts_bucket, operation, bucket_name, status_class, count)
+                  VALUES (60, 'GetObject', 'b', '2xx', ?1)
+                  ON CONFLICT(ts_bucket, operation, bucket_name, status_class)
+                  DO UPDATE SET count = count + excluded.count";
+        conn.execute(up, rusqlite::params![3_i64]).unwrap();
+        conn.execute(up, rusqlite::params![5_i64]).unwrap();
+        let (rows, total): (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(count), 0) FROM request_metrics",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(rows, 1, "same key must upsert into one row");
+        assert_eq!(total, 8, "count must accumulate");
     }
 }

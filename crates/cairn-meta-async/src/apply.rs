@@ -581,6 +581,37 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
                 .await?;
             Ok(MutationOutcome::Ack)
         }
+        Mutation::RecordRequestMetrics { rows, prune_before } => {
+            // Accumulate each window/op/bucket/status bucket; the composite PK upsert sums counts so
+            // repeated flushes never double-insert (ARCH §26.5).
+            for r in &rows {
+                driver
+                    .execute(
+                        "INSERT INTO request_metrics
+                         (ts_bucket, operation, bucket_name, status_class, count)
+                         VALUES (?1,?2,?3,?4,?5)
+                         ON CONFLICT(ts_bucket, operation, bucket_name, status_class)
+                         DO UPDATE SET count = count + excluded.count",
+                        vec![
+                            Value::Int(r.ts_bucket),
+                            Value::Text(r.operation.clone()),
+                            Value::Text(r.bucket.clone()),
+                            Value::Text(r.status_class.clone()),
+                            Value::Int(r.count as i64),
+                        ],
+                    )
+                    .await?;
+            }
+            if let Some(before) = prune_before {
+                driver
+                    .execute(
+                        "DELETE FROM request_metrics WHERE ts_bucket < ?1",
+                        vec![Value::Int(before)],
+                    )
+                    .await?;
+            }
+            Ok(MutationOutcome::Ack)
+        }
     }
 }
 

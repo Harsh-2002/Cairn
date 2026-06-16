@@ -244,6 +244,26 @@ CREATE INDEX idx_object_shares_bucket_key ON object_shares (bucket_name, key);
 CREATE INDEX idx_object_shares_created_by ON object_shares (created_by);
 "#,
     },
+    Migration {
+        version: 8,
+        name: "request metrics rollup (usage analytics)",
+        sql: r#"
+-- Per-window rollup of API request counts for the console's usage analytics (ARCH §26.5). Each row
+-- is one (window, operation, bucket, status-class) bucket; the in-process aggregator flushes batched
+-- upserts that accumulate `count`, and a periodic prune drops rows older than the retention window.
+-- bucket_name is '' (never NULL) for non-bucket operations. The composite PRIMARY KEY gives the
+-- accumulating upsert (ON CONFLICT … DO UPDATE); the ts index serves range queries and the prune.
+CREATE TABLE request_metrics (
+    ts_bucket    INTEGER NOT NULL,
+    operation    TEXT    NOT NULL,
+    bucket_name  TEXT    NOT NULL,
+    status_class TEXT    NOT NULL,
+    count        INTEGER NOT NULL,
+    PRIMARY KEY (ts_bucket, operation, bucket_name, status_class)
+);
+CREATE INDEX idx_request_metrics_ts ON request_metrics (ts_bucket);
+"#,
+    },
 ];
 
 /// Run all pending migrations on the write driver, recording each as applied. Each migration is
