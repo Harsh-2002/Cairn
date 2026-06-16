@@ -5,9 +5,9 @@
 //    with any S3 tool, capped at 7 days, stateless (not revocable).
 
 import { useEffect, useId, useState } from "react";
+import { TriangleAlert } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
-import { Checkbox } from "@/components/ui/checkbox";
 import {
   Dialog,
   DialogContent,
@@ -265,12 +265,17 @@ export function ShareDialog({
                     className="font-mono"
                   />
                 </div>
-                <label className="flex items-start gap-2 text-[13px] text-warning">
-                  <Checkbox checked disabled className="mt-0.5" aria-hidden />
-                  Anyone with this link can upload to{" "}
-                  <span className="font-mono">{objectKey}</span> as you until it
-                  expires. It can’t be revoked.
-                </label>
+                <div className="flex items-start gap-2 text-[13px] text-warning">
+                  <TriangleAlert
+                    aria-hidden="true"
+                    className="mt-0.5 size-4 shrink-0"
+                  />
+                  <span>
+                    Anyone with this link can upload to{" "}
+                    <span className="font-mono">{objectKey}</span> as you until
+                    it expires. It can’t be revoked.
+                  </span>
+                </div>
               </>
             ) : null}
 
