@@ -4,7 +4,6 @@
 // bucket's browser.
 
 import { useState } from "react";
-import { Link } from "react-router";
 import { Tags as TagsIcon } from "lucide-react";
 import { api } from "@/lib/api";
 import { bytes, count, whenMs } from "@/lib/format";
@@ -14,6 +13,7 @@ import { EmptyState } from "@/components/empty-state";
 import { ErrorAlert } from "@/components/error-alert";
 import { Page, PageHeader } from "@/components/page-header";
 import { RefreshButton } from "@/components/refresh-button";
+import { TextLink } from "@/components/text-link";
 import {
   Card,
   CardContent,
@@ -78,9 +78,13 @@ export function Tags() {
         />
       ) : null}
 
-      {/* Two-column split on desktop (tag list left, objects right); stacks on
-          mobile. */}
-      <div className="grid gap-4 lg:grid-cols-[320px_1fr]">
+      {/* Only render the master/detail split once the tag load has succeeded,
+          so a failed load shows the error alert alone — not "No tags yet"
+          stranded beneath it. */}
+      {!tags.error ? (
+      // Two-column split (tag list left, objects right); stacks on mobile and
+      // splits early (md:) with a flexible master column so chips don't crowd.
+      <div className="grid gap-4 md:grid-cols-[minmax(16rem,22rem)_1fr]">
         {/* ---- Master: the tag list ---------------------------------------- */}
         <Card className="gap-4">
           <CardHeader className="gap-1">
@@ -98,7 +102,7 @@ export function Tags() {
               <DataTable columns={TAG_COLUMNS}>
                 <SkeletonRows rows={6} widths={["w-40", "w-10"]} />
               </DataTable>
-            ) : list.length === 0 && !tags.error ? (
+            ) : list.length === 0 ? (
               <EmptyState
                 icon={TagsIcon}
                 title="No tags yet"
@@ -112,15 +116,21 @@ export function Tags() {
                   return (
                     <TableRow
                       key={`${t.tag_key}=${t.tag_value}`}
-                      onClick={() => setSel(t)}
                       data-state={active ? "selected" : undefined}
-                      className={cn(
-                        "cursor-pointer",
-                        active && "bg-muted/60",
-                      )}
+                      aria-current={active || undefined}
+                      className={cn(active && "bg-muted/60")}
                     >
-                      <TableCell>
-                        <TagChip tagKey={t.tag_key} value={t.tag_value} />
+                      {/* A real button so keyboard users can select the tag and
+                          reach the detail pane; spans the row's intent via the
+                          ::after overlay. */}
+                      <TableCell className="relative">
+                        <button
+                          type="button"
+                          onClick={() => setSel(t)}
+                          className="rounded-sm text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring after:absolute after:inset-0 after:cursor-pointer"
+                        >
+                          <TagChip tagKey={t.tag_key} value={t.tag_value} />
+                        </button>
                       </TableCell>
                       <TableCell className="text-right text-[13px] tabular-nums">
                         {count(t.object_count)}
@@ -136,6 +146,7 @@ export function Tags() {
         {/* ---- Detail: objects carrying the selected tag ------------------- */}
         <TagObjects sel={sel} />
       </div>
+      ) : null}
     </Page>
   );
 }
@@ -160,11 +171,9 @@ function TagObjects({ sel }: { sel: TagSummaryItem | null }) {
         <CardTitle>Objects</CardTitle>
         <CardDescription>
           {sel ? (
-            <span className="inline-flex items-baseline gap-1.5">
+            <span className="inline-flex max-w-full items-baseline gap-1.5">
               Tagged
-              <span className="font-mono text-[13px]">
-                {sel.tag_key}={sel.tag_value}
-              </span>
+              <TagChip tagKey={sel.tag_key} value={sel.tag_value} />
             </span>
           ) : (
             "Objects carrying the selected tag."
@@ -203,21 +212,20 @@ function TagObjects({ sel }: { sel: TagSummaryItem | null }) {
                 {rows.map((o) => (
                   <TableRow key={`${o.bucket}/${o.key}@${o.version_id}`}>
                     <TableCell className="font-mono text-[13px]">
-                      <Link
+                      <TextLink
                         to={`/buckets/${encodeURIComponent(o.bucket)}/browser`}
-                        className="text-link underline-offset-4 hover:underline"
                       >
                         {o.bucket}
-                      </Link>
+                      </TextLink>
                     </TableCell>
                     <TableCell className="font-mono text-[13px]">
-                      <Link
+                      <TextLink
                         to={`/buckets/${encodeURIComponent(o.bucket)}/browser`}
-                        className="block max-w-[36ch] truncate text-link underline-offset-4 hover:underline"
+                        className="block max-w-[36ch] truncate"
                         title={o.key}
                       >
                         {o.key}
-                      </Link>
+                      </TextLink>
                     </TableCell>
                     <TableCell className="text-right text-[13px] tabular-nums">
                       {bytes(o.size)}

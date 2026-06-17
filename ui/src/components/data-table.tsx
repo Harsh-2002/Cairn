@@ -28,15 +28,19 @@ export interface Column {
 
 export function DataTable({
   columns,
-  minWidth,
+  minWidth = 560,
   children,
 }: {
   columns: Column[];
-  /** A min table width in px; applied as an inline style so it survives the JIT. */
+  /**
+   * Min table width in px (default 560), applied as an inline style so it survives
+   * the JIT. Guarantees the `overflow-x-auto` shell scrolls on a narrow viewport
+   * instead of letting columns clip — keeping every list table consistent on mobile.
+   */
   minWidth?: number;
   children: ReactNode;
 }) {
-  const style: CSSProperties | undefined = minWidth ? { minWidth } : undefined;
+  const style: CSSProperties = { minWidth };
   return (
     <div className="overflow-x-auto rounded-lg border">
       <Table style={style}>

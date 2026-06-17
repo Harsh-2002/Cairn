@@ -8,9 +8,11 @@ import {
   Dialog,
   DialogContent,
   DialogDescription,
+  DialogFooter,
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { FieldError } from "@/components/field-error";
 import { CopyField } from "@/components/copy-field";
 import { StatusBadge, type StatusTone } from "@/components/status-badge";
 import { api, errorMessage } from "@/lib/api";
@@ -77,9 +79,7 @@ export function ManageSharesDialog({
         </DialogHeader>
 
         {error ? (
-          <p role="alert" className="text-[13px] text-destructive">
-            {error}
-          </p>
+          <FieldError>{error}</FieldError>
         ) : shares === null ? (
           <p className="py-4 text-sm text-muted-foreground">Loading…</p>
         ) : shares.length === 0 ? (
@@ -119,6 +119,8 @@ export function ManageSharesDialog({
             ))}
           </ul>
         )}
+
+        <DialogFooter showCloseButton />
       </DialogContent>
     </Dialog>
   );

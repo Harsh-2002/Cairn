@@ -15,7 +15,7 @@ import { Navigate, useLocation, useNavigate } from "react-router";
 import { Eye, EyeOff } from "lucide-react";
 import { errorMessage } from "@/lib/api";
 import { useAuth } from "@/providers/auth-provider";
-import { Alert, AlertDescription } from "@/components/ui/alert";
+import { FieldError } from "@/components/field-error";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardFooter, CardHeader } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -79,7 +79,7 @@ export function Login() {
 
   return (
     <main className="flex min-h-svh items-center justify-center bg-background px-4 py-10">
-      <Card className="w-full max-w-sm gap-5 rounded-lg border shadow-none">
+      <Card className="w-full max-w-sm">
         <CardHeader className="gap-1.5">
           <div className="mb-2 flex items-center gap-2">
             <span aria-hidden="true" className="size-4 rounded bg-foreground" />
@@ -94,11 +94,7 @@ export function Login() {
         </CardHeader>
         <CardContent>
           <form onSubmit={onSubmit} className="space-y-4" noValidate>
-            {error ? (
-              <Alert variant="destructive" role="alert">
-                <AlertDescription>{error}</AlertDescription>
-              </Alert>
-            ) : null}
+            <FieldError>{error}</FieldError>
 
             <div className="space-y-2">
               <Label htmlFor={accessKeyId}>Access key</Label>

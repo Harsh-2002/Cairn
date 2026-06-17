@@ -4,7 +4,6 @@
 // PermissionBuilder.
 
 import { useEffect, useId, useState } from "react";
-import { NavLink } from "react-router";
 import { Plus, Users as UsersIcon } from "lucide-react";
 import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
@@ -23,9 +22,11 @@ import { CredentialsPanel } from "@/components/credentials-panel";
 import { DataTable, SkeletonRows, type Column } from "@/components/data-table";
 import { EmptyState } from "@/components/empty-state";
 import { ErrorAlert } from "@/components/error-alert";
+import { FieldError } from "@/components/field-error";
 import { Page, PageHeader } from "@/components/page-header";
 import { PermissionBuilder } from "@/components/permission-builder";
 import { StatusBadge } from "@/components/status-badge";
+import { TextLink } from "@/components/text-link";
 import { api, errorMessage } from "@/lib/api";
 import { useResource } from "@/lib/use-resource";
 import type { CreateUserResp } from "@/lib/types";
@@ -33,7 +34,7 @@ import type { PolicyDoc } from "@/lib/policy";
 
 const COLUMNS: Column[] = [
   { key: "name", label: "Name" },
-  { key: "key", label: "Bearer key" },
+  { key: "key", label: "Access key ID" },
   { key: "role", label: "Role" },
   { key: "status", label: "Status" },
 ];
@@ -200,17 +201,10 @@ export function Users() {
                     onChange={(e) => setDisplayName(e.target.value)}
                     onBlur={() => setNameTouched(true)}
                     aria-invalid={nameError ? true : undefined}
-                    aria-describedby={nameError ? `${nameId}-err` : undefined}
                   />
-                  {nameError ? (
-                    <p
-                      id={`${nameId}-err`}
-                      role="alert"
-                      className="text-[13px] text-destructive"
-                    >
-                      {nameError}
-                    </p>
-                  ) : null}
+                  {/* role="alert" (inside FieldError) announces the message; it
+                      renders nothing while nameError is empty. */}
+                  <FieldError>{nameError}</FieldError>
                 </div>
 
                 <div className="space-y-1.5">
@@ -242,7 +236,11 @@ export function Users() {
                   >
                     Cancel
                   </Button>
-                  <Button type="submit" disabled={!canCreate}>
+                  <Button
+                    type="submit"
+                    disabled={!canCreate}
+                    aria-busy={creating || undefined}
+                  >
                     {creating ? "Creating…" : "Create user"}
                   </Button>
                 </div>
@@ -280,12 +278,9 @@ export function Users() {
           {list.map((u) => (
             <TableRow key={u.id}>
               <TableCell>
-                <NavLink
-                  to={`/users/${encodeURIComponent(u.id)}`}
-                  className="text-link hover:underline underline-offset-4"
-                >
+                <TextLink to={`/users/${encodeURIComponent(u.id)}`}>
                   {u.display_name}
-                </NavLink>
+                </TextLink>
               </TableCell>
               <TableCell className="font-mono text-[13px]">
                 {u.access_key_id}

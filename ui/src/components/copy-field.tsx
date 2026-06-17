@@ -83,7 +83,7 @@ export function CopyField({
             type="button"
             variant="outline"
             size="icon"
-            className="size-8 shrink-0"
+            className="size-9 shrink-0 sm:size-8"
             aria-pressed={revealed}
             aria-label={revealed ? `Hide ${label}` : `Show ${label}`}
             onClick={() => setRevealed((r) => !r)}
@@ -95,7 +95,7 @@ export function CopyField({
           type="button"
           variant="outline"
           size="icon"
-          className="size-8 shrink-0"
+          className="size-9 shrink-0 sm:size-8"
           aria-label={`Copy ${label}`}
           onClick={onCopy}
         >
@@ -106,7 +106,7 @@ export function CopyField({
           )}
         </Button>
       </div>
-      <span aria-live="polite" className="visually-hidden">
+      <span aria-live="polite" className="sr-only">
         {copied ? `${label} copied to clipboard` : ""}
       </span>
     </div>

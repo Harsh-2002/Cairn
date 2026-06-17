@@ -3,7 +3,7 @@
 // the page arrives as a whole; Refresh re-fetches without tearing it down.
 
 import { useMemo } from "react";
-import { NavLink, useNavigate } from "react-router";
+import { useNavigate } from "react-router";
 import { Database } from "lucide-react";
 import { api } from "@/lib/api";
 import { bytes, count, duration, ratio, whenMs } from "@/lib/format";
@@ -14,10 +14,12 @@ import { Page, PageHeader } from "@/components/page-header";
 import { RefreshButton } from "@/components/refresh-button";
 import { StatCard } from "@/components/stat-card";
 import { StatusBadge } from "@/components/status-badge";
+import { TextLink } from "@/components/text-link";
 import { UsageBar } from "@/components/usage-bar";
 import { Button } from "@/components/ui/button";
 import {
   Card,
+  CardAction,
   CardContent,
   CardDescription,
   CardHeader,
@@ -120,26 +122,26 @@ export function Overview() {
                 <dl className="space-y-3 text-sm">
                   <div className="flex items-baseline justify-between gap-4">
                     <dt className="shrink-0 text-muted-foreground">Version</dt>
-                    <dd className="font-mono text-[13px] tabular-nums">
+                    <dd className="font-mono text-[13px]">
                       v{sys.version}
                     </dd>
                   </div>
                   <div className="flex items-baseline justify-between gap-4">
                     <dt className="shrink-0 text-muted-foreground">Uptime</dt>
-                    <dd className="text-[13px] tabular-nums">
+                    <dd className="text-[13px]">
                       {duration(sys.uptime_secs)}
                     </dd>
                   </div>
                   <div className="flex items-baseline justify-between gap-4">
                     <dt className="shrink-0 text-muted-foreground">S3 API</dt>
-                    <dd className="min-w-0 truncate font-mono text-[13px] tabular-nums">
+                    <dd className="min-w-0 truncate font-mono text-[13px]">
                       {sys.s3_addr}
                     </dd>
                   </div>
                   <div className="flex items-baseline justify-between gap-4">
                     <dt className="shrink-0 text-muted-foreground">Console</dt>
                     <dd className="min-w-0 text-right">
-                      <span className="block truncate font-mono text-[13px] tabular-nums">
+                      <span className="block truncate font-mono text-[13px]">
                         {sys.ui_addr}
                       </span>
                       <span className="block text-xs text-muted-foreground">
@@ -147,7 +149,7 @@ export function Overview() {
                       </span>
                     </dd>
                   </div>
-                  <div className="flex items-center justify-between gap-4">
+                  <div className="flex items-baseline justify-between gap-4">
                     <dt className="shrink-0 text-muted-foreground">TLS</dt>
                     <dd>
                       <StatusBadge tone={sys.tls ? "positive" : "neutral"}>
@@ -182,7 +184,7 @@ export function Overview() {
                         sys.disk_total_bytes - sys.disk_free_bytes,
                       )} used of ${bytes(sys.disk_total_bytes)}`}
                     />
-                    <p className="text-xs text-muted-foreground tabular-nums">
+                    <p className="text-xs text-muted-foreground">
                       {bytes(sys.disk_free_bytes)} free of{" "}
                       {bytes(sys.disk_total_bytes)}
                     </p>
@@ -199,7 +201,7 @@ export function Overview() {
             <Card className="gap-4">
               <CardHeader className="gap-1">
                 <CardTitle>Compression</CardTitle>
-                <CardDescription className="tabular-nums">
+                <CardDescription>
                   {compressed
                     ? `${savedPct}% smaller · ${ratio(o.compression_ratio)}`
                     : "How much disk space compression saves."}
@@ -221,19 +223,19 @@ export function Overview() {
                     <dl className="space-y-2 text-sm">
                       <div className="flex items-baseline justify-between gap-4">
                         <dt className="text-muted-foreground">Stored</dt>
-                        <dd className="font-mono text-[13px] tabular-nums">
+                        <dd className="font-mono text-[13px]">
                           {bytes(physical)}
                         </dd>
                       </div>
                       <div className="flex items-baseline justify-between gap-4">
                         <dt className="text-muted-foreground">Saved</dt>
-                        <dd className="font-mono text-[13px] tabular-nums">
+                        <dd className="font-mono text-[13px]">
                           {bytes(saved)}
                         </dd>
                       </div>
                       <div className="flex items-baseline justify-between gap-4">
                         <dt className="text-muted-foreground">Original</dt>
-                        <dd className="font-mono text-[13px] tabular-nums">
+                        <dd className="font-mono text-[13px]">
                           {bytes(logical)}
                         </dd>
                       </div>
@@ -283,13 +285,13 @@ export function Overview() {
                         key={b.name}
                         className="grid grid-cols-[1fr_auto] items-center gap-x-4 gap-y-2 sm:grid-cols-[minmax(0,11rem)_1fr_auto]"
                       >
-                        <NavLink
+                        <TextLink
                           to={`/buckets/${encodeURIComponent(b.name)}/browser`}
-                          className="min-w-0 truncate font-mono text-[13px] text-link hover:underline underline-offset-4"
+                          className="min-w-0 truncate font-mono text-[13px]"
                           title={b.name}
                         >
                           {b.name}
-                        </NavLink>
+                        </TextLink>
                         {/* On mobile the bar drops to its own full-width row
                             below the name + bytes; at sm: it sits inline as the
                             middle column of the 3-column grid. */}
@@ -302,10 +304,10 @@ export function Overview() {
                           />
                         </div>
                         <div className="text-right">
-                          <p className="font-mono text-[13px] tabular-nums">
+                          <p className="font-mono text-[13px]">
                             {bytes(b.logical_bytes)}
                           </p>
-                          <p className="text-xs text-muted-foreground tabular-nums">
+                          <p className="text-xs text-muted-foreground">
                             {count(b.objects)} {b.objects === 1 ? "object" : "objects"}
                           </p>
                         </div>
@@ -321,19 +323,16 @@ export function Overview() {
               the full log one click away. */}
           {data && data.activity.length > 0 ? (
             <Card className="gap-3">
-              <CardHeader className="flex-row items-baseline justify-between">
-                <div>
-                  <CardTitle>Recent activity</CardTitle>
-                  <CardDescription className="mt-1">
-                    The latest administrative changes on this node.
-                  </CardDescription>
-                </div>
-                <NavLink
-                  to="/activity"
-                  className="shrink-0 text-[13px] text-link hover:underline underline-offset-4"
-                >
-                  View all
-                </NavLink>
+              <CardHeader className="gap-1">
+                <CardTitle>Recent activity</CardTitle>
+                <CardDescription>
+                  The latest administrative changes on this node.
+                </CardDescription>
+                <CardAction>
+                  <TextLink to="/activity" className="text-[13px]">
+                    View all
+                  </TextLink>
+                </CardAction>
               </CardHeader>
               <CardContent>
                 <ul className="divide-y">
@@ -344,12 +343,12 @@ export function Overview() {
                     >
                       <span className="text-sm font-medium">{e.action}</span>
                       {e.bucket ? (
-                        <NavLink
+                        <TextLink
                           to={`/buckets/${encodeURIComponent(e.bucket)}/browser`}
-                          className="font-mono text-[13px] text-link hover:underline underline-offset-4"
+                          className="font-mono text-[13px]"
                         >
                           {e.bucket}
-                        </NavLink>
+                        </TextLink>
                       ) : null}
                       {e.key ? (
                         <span
@@ -359,7 +358,7 @@ export function Overview() {
                           {e.key}
                         </span>
                       ) : null}
-                      <span className="ms-auto text-[13px] text-muted-foreground tabular-nums">
+                      <span className="ms-auto text-[13px] text-muted-foreground">
                         {whenMs(e.at_ms)}
                       </span>
                     </li>

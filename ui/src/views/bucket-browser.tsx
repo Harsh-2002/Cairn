@@ -6,10 +6,12 @@ import {
   useState,
   type ChangeEvent,
   type DragEvent,
+  type FormEvent,
 } from "react";
 import { useParams } from "react-router";
 import {
   Check,
+  ChevronDown,
   CircleAlert,
   FileBox,
   Folder,
@@ -53,16 +55,18 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { Skeleton } from "@/components/ui/skeleton";
+import { TableCell, TableRow } from "@/components/ui/table";
 import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
+  Breadcrumb,
+  BreadcrumbItem,
+  BreadcrumbLink,
+  BreadcrumbList,
+  BreadcrumbPage,
+  BreadcrumbSeparator,
+} from "@/components/ui/breadcrumb";
 import { ConfirmDialog } from "@/components/confirm-dialog";
+import { DataTable, SkeletonRows, type Column } from "@/components/data-table";
+import { FieldError } from "@/components/field-error";
 import { EmptyState } from "@/components/empty-state";
 import { ErrorAlert } from "@/components/error-alert";
 import { ObjectTagsDialog } from "@/components/object-tags-dialog";
@@ -110,6 +114,26 @@ const UPLOAD_STATUS_WORD: Record<UploadItem["status"], string> = {
   done: "uploaded",
   failed: "failed",
 };
+
+// Column definitions for the three listing tables (folder/object listing, version
+// listing, tag-filtered listing). All share the same Size/Modified/Actions shape;
+// only the first column's label differs.
+const OBJECT_COLUMNS: Column[] = [
+  { key: "name", label: "Name" },
+  { key: "size", label: "Size", className: "text-right" },
+  { key: "modified", label: "Modified" },
+  { key: "actions", label: "Actions", srOnly: true },
+];
+
+const TAG_COLUMNS: Column[] = [
+  { key: "object", label: "Object" },
+  { key: "size", label: "Size", className: "text-right" },
+  { key: "modified", label: "Modified" },
+  { key: "actions", label: "Actions", srOnly: true },
+];
+
+// One skeleton width per column, written as literal Tailwind classes for the JIT.
+const LISTING_SKELETON_WIDTHS = ["w-64", "w-16", "w-36", "w-8"];
 
 export function BucketBrowser() {
   // :name comes from the parent /buckets/:name layout route.
@@ -507,18 +531,21 @@ export function BucketBrowser() {
   const [copyDest, setCopyDest] = useState("");
   const [copyAsMove, setCopyAsMove] = useState(false);
   const [copying, setCopying] = useState(false);
+  const [copyError, setCopyError] = useState<string | null>(null);
 
-  async function submitCopy() {
+  async function submitCopy(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault();
     const src = copySource;
     const dest = copyDest.trim();
     if (!src || !dest) {
-      toast.error("Enter a destination key.");
+      setCopyError("Enter a destination key.");
       return;
     }
     if (dest === src) {
-      toast.error("Choose a different destination key.");
+      setCopyError("Choose a different destination key.");
       return;
     }
+    setCopyError(null);
     setCopying(true);
     try {
       await copyObject(name, src, dest);
@@ -537,17 +564,20 @@ export function BucketBrowser() {
   const [createFolderOpen, setCreateFolderOpen] = useState(false);
   const [folderName, setFolderName] = useState("");
   const [creatingFolder, setCreatingFolder] = useState(false);
+  const [folderError, setFolderError] = useState<string | null>(null);
 
-  async function submitCreateFolder() {
+  async function submitCreateFolder(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault();
     const seg = folderName.trim().replace(/\/+$/, "");
     if (!seg) {
-      toast.error("Enter a folder name.");
+      setFolderError("Enter a folder name.");
       return;
     }
     if (seg.includes("/")) {
-      toast.error("Folder names can't contain “/”.");
+      setFolderError("Folder names can't contain “/”.");
       return;
     }
+    setFolderError(null);
     setCreatingFolder(true);
     try {
       await createFolder(name, path + seg);
@@ -672,12 +702,12 @@ export function BucketBrowser() {
     >
       {/* Toolbar: filter + refresh on the left, upload on the right. */}
       <div className="flex flex-wrap items-center gap-x-3 gap-y-3">
-        <div className="relative">
+        <div className="relative w-full sm:w-auto">
           <Search
             aria-hidden="true"
             className="pointer-events-none absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground"
           />
-          <label className="visually-hidden" htmlFor={filterId}>
+          <label className="sr-only" htmlFor={filterId}>
             Filter this folder by name prefix
           </label>
           <Input
@@ -690,23 +720,25 @@ export function BucketBrowser() {
             onChange={(e) => setFilterInput(e.target.value)}
           />
         </div>
-        <RefreshButton
-          loading={objects === null}
-          refreshing={refreshing}
-          onClick={() => void load()}
-        />
-        <Button
-          type="button"
-          variant={showVersions ? "secondary" : "outline"}
-          aria-pressed={showVersions}
-          disabled={tagFilter !== null}
-          onClick={() => {
-            setObjects(null);
-            setShowVersions((v) => !v);
-          }}
-        >
-          {showVersions ? "Hide versions" : "Show versions"}
-        </Button>
+        <div className="flex w-full items-center gap-3 sm:w-auto">
+          <RefreshButton
+            loading={objects === null}
+            refreshing={refreshing}
+            onClick={() => void load()}
+          />
+          <Button
+            type="button"
+            variant={showVersions ? "secondary" : "outline"}
+            aria-pressed={showVersions}
+            disabled={tagFilter !== null}
+            onClick={() => {
+              setObjects(null);
+              setShowVersions((v) => !v);
+            }}
+          >
+            {showVersions ? "Hide versions" : "Show versions"}
+          </Button>
+        </div>
 
         {/* Filter by tag: switches the listing to a flat, cross-prefix view of the
             objects carrying the chosen tag. Tags lazy-load on first open. */}
@@ -732,7 +764,7 @@ export function BucketBrowser() {
           }}
         >
           <SelectTrigger
-            className={cn("w-[180px]", tagFilter && "border-ring")}
+            className={cn("w-full sm:w-[180px]", tagFilter && "border-ring")}
             aria-label="Filter by tag"
           >
             <Tag aria-hidden="true" className="size-4 text-muted-foreground" />
@@ -767,7 +799,7 @@ export function BucketBrowser() {
           </SelectContent>
         </Select>
 
-        <div className="ms-auto flex items-center gap-3">
+        <div className="ms-auto flex w-full items-center gap-3 sm:w-auto">
           <p className="hidden text-[13px] text-muted-foreground sm:block">
             or drag files anywhere here
           </p>
@@ -797,79 +829,91 @@ export function BucketBrowser() {
             aria-hidden="true"
             onChange={onFilesPicked}
           />
-          <Button
-            type="button"
-            variant="outline"
-            onClick={() => {
-              setFolderName("");
-              setCreateFolderOpen(true);
-            }}
-          >
-            <FolderPlus aria-hidden="true" />
-            New folder
-          </Button>
-          <Button
-            type="button"
-            variant="outline"
-            disabled={uploading}
-            onClick={() => folderInputRef.current?.click()}
-          >
-            <FolderUp aria-hidden="true" />
-            Upload folder
-          </Button>
-          <Button
-            type="button"
-            disabled={uploading}
-            onClick={() => fileInputRef.current?.click()}
-          >
-            <Upload aria-hidden="true" />
-            {uploading ? "Uploading…" : "Upload files"}
-          </Button>
+          {/* All add/upload affordances collapse into one Upload menu so the
+              toolbar reflows cleanly on narrow viewports. */}
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button type="button" className="w-full sm:w-auto">
+                <Upload aria-hidden="true" />
+                {uploading ? "Uploading…" : "Upload"}
+                <ChevronDown aria-hidden="true" className="ms-auto sm:ms-0" />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end">
+              <DropdownMenuItem
+                disabled={uploading}
+                onSelect={() => fileInputRef.current?.click()}
+              >
+                <Upload aria-hidden="true" />
+                Upload files
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                disabled={uploading}
+                onSelect={() => folderInputRef.current?.click()}
+              >
+                <FolderUp aria-hidden="true" />
+                Upload folder
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem
+                onSelect={() => {
+                  setFolderName("");
+                  setFolderError(null);
+                  setCreateFolderOpen(true);
+                }}
+              >
+                <FolderPlus aria-hidden="true" />
+                New folder
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
         </div>
       </div>
 
       {/* Folder breadcrumb: the bucket root plus each path segment. Hidden while a
           tag filter is active, since tag results span every prefix. */}
       {tagFilter ? null : (
-      <nav aria-label="Folder path" className="flex flex-wrap items-center gap-1 text-[13px]">
-        <button
-          type="button"
-          onClick={() => enterFolder("")}
-          className={cn(
-            "rounded px-1.5 py-0.5 font-mono",
-            path === ""
-              ? "font-medium text-foreground"
-              : "text-link hover:underline underline-offset-4",
-          )}
-          aria-current={path === "" ? "location" : undefined}
-        >
-          {name}
-        </button>
-        {segments.map((seg, i) => {
-          const target = `${segments.slice(0, i + 1).join("/")}/`;
-          const isLast = i === segments.length - 1;
-          return (
-            <span key={target} className="flex items-center gap-1">
-              <span aria-hidden="true" className="text-muted-foreground">
-                /
-              </span>
-              <button
-                type="button"
-                onClick={() => enterFolder(target)}
-                className={cn(
-                  "rounded px-1 py-0.5 font-mono",
-                  isLast
-                    ? "font-medium text-foreground"
-                    : "text-link hover:underline underline-offset-4",
+      <Breadcrumb>
+        <BreadcrumbList className="text-[13px]">
+          <BreadcrumbItem>
+            {path === "" ? (
+              <BreadcrumbPage className="font-mono">{name}</BreadcrumbPage>
+            ) : (
+              <BreadcrumbLink asChild>
+                <button
+                  type="button"
+                  onClick={() => enterFolder("")}
+                  className="font-mono"
+                >
+                  {name}
+                </button>
+              </BreadcrumbLink>
+            )}
+          </BreadcrumbItem>
+          {segments.map((seg, i) => {
+            const target = `${segments.slice(0, i + 1).join("/")}/`;
+            const isLast = i === segments.length - 1;
+            return (
+              <BreadcrumbItem key={target}>
+                <BreadcrumbSeparator />
+                {isLast ? (
+                  <BreadcrumbPage className="font-mono">{seg}</BreadcrumbPage>
+                ) : (
+                  <BreadcrumbLink asChild>
+                    <button
+                      type="button"
+                      onClick={() => enterFolder(target)}
+                      className="font-mono"
+                    >
+                      {seg}
+                    </button>
+                  </BreadcrumbLink>
                 )}
-                aria-current={isLast ? "location" : undefined}
-              >
-                {seg}
-              </button>
-            </span>
-          );
-        })}
-      </nav>
+              </BreadcrumbItem>
+            );
+          })}
+        </BreadcrumbList>
+      </Breadcrumb>
       )}
 
       {/* Per-file upload progress (live %, speed) for the current batch. */}
@@ -925,7 +969,7 @@ export function BucketBrowser() {
                     >
                       {u.name}
                     </span>
-                    <span className="visually-hidden">
+                    <span className="sr-only">
                       {UPLOAD_STATUS_WORD[u.status]}
                     </span>
                     {u.status === "uploading" ? (
@@ -984,38 +1028,9 @@ export function BucketBrowser() {
           ) : null}
 
           {tagBusy && tagObjects === null ? (
-            <div className="overflow-x-auto rounded-lg border">
-              <Table className="min-w-[640px]">
-                <TableHeader>
-                  <TableRow>
-                    <TableHead className="text-xs text-muted-foreground">Object</TableHead>
-                    <TableHead className="text-right text-xs text-muted-foreground">Size</TableHead>
-                    <TableHead className="text-xs text-muted-foreground">Modified</TableHead>
-                    <TableHead>
-                      <span className="visually-hidden">Actions</span>
-                    </TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {Array.from({ length: 4 }, (_, i) => (
-                    <TableRow key={i}>
-                      <TableCell>
-                        <Skeleton className="h-4 w-64" />
-                      </TableCell>
-                      <TableCell>
-                        <Skeleton className="ml-auto h-4 w-16" />
-                      </TableCell>
-                      <TableCell>
-                        <Skeleton className="h-4 w-36" />
-                      </TableCell>
-                      <TableCell>
-                        <Skeleton className="ml-auto size-8" />
-                      </TableCell>
-                    </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
-            </div>
+            <DataTable columns={TAG_COLUMNS} minWidth={640}>
+              <SkeletonRows rows={4} widths={LISTING_SKELETON_WIDTHS} />
+            </DataTable>
           ) : tagObjects !== null && tagObjects.length === 0 && !tagError ? (
             <EmptyState
               icon={Tag}
@@ -1023,80 +1038,67 @@ export function BucketBrowser() {
               body="No current objects carry this tag. Clear the filter to return to the folder listing."
             />
           ) : tagObjects !== null && tagObjects.length > 0 ? (
-            <div className="overflow-x-auto rounded-lg border">
-              <Table className="min-w-[640px]">
-                <TableHeader>
-                  <TableRow>
-                    <TableHead className="text-xs text-muted-foreground">Object</TableHead>
-                    <TableHead className="text-right text-xs text-muted-foreground">Size</TableHead>
-                    <TableHead className="text-xs text-muted-foreground">Modified</TableHead>
-                    <TableHead>
-                      <span className="visually-hidden">Actions</span>
-                    </TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {tagObjects.map((o) => (
-                    <TableRow key={`${o.key}:${o.version_id}`}>
-                      <TableCell className="max-w-[28rem]">
-                        <span
-                          className="block truncate font-mono text-[13px]"
-                          title={o.key}
+            <DataTable columns={TAG_COLUMNS} minWidth={640}>
+              {tagObjects.map((o) => (
+                <TableRow key={`${o.key}:${o.version_id}`}>
+                  <TableCell className="max-w-[28rem]">
+                    <span
+                      className="block truncate font-mono text-[13px]"
+                      title={o.key}
+                    >
+                      {o.key}
+                    </span>
+                  </TableCell>
+                  <TableCell className="text-right text-[13px] tabular-nums">
+                    {bytes(o.size)}
+                  </TableCell>
+                  <TableCell className="whitespace-nowrap text-[13px] text-muted-foreground tabular-nums">
+                    {whenMs(o.last_modified_ms)}
+                  </TableCell>
+                  <TableCell className="text-right">
+                    <DropdownMenu>
+                      <DropdownMenuTrigger asChild>
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="size-10 sm:size-9"
+                          aria-label={`Actions for ${o.key}`}
                         >
-                          {o.key}
-                        </span>
-                      </TableCell>
-                      <TableCell className="text-right text-[13px] tabular-nums">
-                        {bytes(o.size)}
-                      </TableCell>
-                      <TableCell className="whitespace-nowrap text-[13px] text-muted-foreground tabular-nums">
-                        {whenMs(o.last_modified_ms)}
-                      </TableCell>
-                      <TableCell className="text-right">
-                        <DropdownMenu>
-                          <DropdownMenuTrigger asChild>
-                            <Button
-                              variant="ghost"
-                              size="icon"
-                              aria-label={`Actions for ${o.key}`}
-                            >
-                              <MoreHorizontal aria-hidden="true" />
-                            </Button>
-                          </DropdownMenuTrigger>
-                          <DropdownMenuContent align="end">
-                            <DropdownMenuItem onSelect={() => void openPreview(o.key)}>
-                              Preview
-                            </DropdownMenuItem>
-                            <DropdownMenuItem onSelect={() => void download(o.key)}>
-                              Download
-                            </DropdownMenuItem>
-                            <DropdownMenuItem onSelect={() => setTagsKey(o.key)}>
-                              <Tag aria-hidden="true" />
-                              Edit tags
-                            </DropdownMenuItem>
-                            <DropdownMenuItem onSelect={() => setShareKey(o.key)}>
-                              Share
-                            </DropdownMenuItem>
-                            <DropdownMenuItem
-                              onSelect={() => setManageSharesKey(o.key)}
-                            >
-                              Manage shares
-                            </DropdownMenuItem>
-                            <DropdownMenuSeparator />
-                            <DropdownMenuItem
-                              variant="destructive"
-                              onSelect={() => setPendingDelete(o.key)}
-                            >
-                              Delete
-                            </DropdownMenuItem>
-                          </DropdownMenuContent>
-                        </DropdownMenu>
-                      </TableCell>
-                    </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
-            </div>
+                          <MoreHorizontal aria-hidden="true" />
+                        </Button>
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="end">
+                        <DropdownMenuItem onSelect={() => void openPreview(o.key)}>
+                          Preview
+                        </DropdownMenuItem>
+                        <DropdownMenuItem onSelect={() => void download(o.key)}>
+                          Download
+                        </DropdownMenuItem>
+                        <DropdownMenuItem onSelect={() => setTagsKey(o.key)}>
+                          <Tag aria-hidden="true" />
+                          Edit tags
+                        </DropdownMenuItem>
+                        <DropdownMenuItem onSelect={() => setShareKey(o.key)}>
+                          Share
+                        </DropdownMenuItem>
+                        <DropdownMenuItem
+                          onSelect={() => setManageSharesKey(o.key)}
+                        >
+                          Manage shares
+                        </DropdownMenuItem>
+                        <DropdownMenuSeparator />
+                        <DropdownMenuItem
+                          variant="destructive"
+                          onSelect={() => setPendingDelete(o.key)}
+                        >
+                          Delete
+                        </DropdownMenuItem>
+                      </DropdownMenuContent>
+                    </DropdownMenu>
+                  </TableCell>
+                </TableRow>
+              ))}
+            </DataTable>
           ) : null}
         </>
       ) : (
@@ -1110,38 +1112,9 @@ export function BucketBrowser() {
       ) : null}
 
       {showSkeleton ? (
-        <div className="overflow-x-auto rounded-lg border">
-          <Table className="min-w-[640px]">
-            <TableHeader>
-              <TableRow>
-                <TableHead className="text-xs text-muted-foreground">Name</TableHead>
-                <TableHead className="text-right text-xs text-muted-foreground">Size</TableHead>
-                <TableHead className="text-xs text-muted-foreground">Modified</TableHead>
-                <TableHead>
-                  <span className="visually-hidden">Actions</span>
-                </TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {Array.from({ length: 4 }, (_, i) => (
-                <TableRow key={i}>
-                  <TableCell>
-                    <Skeleton className="h-4 w-64" />
-                  </TableCell>
-                  <TableCell>
-                    <Skeleton className="ml-auto h-4 w-16" />
-                  </TableCell>
-                  <TableCell>
-                    <Skeleton className="h-4 w-36" />
-                  </TableCell>
-                  <TableCell>
-                    <Skeleton className="ml-auto size-8" />
-                  </TableCell>
-                </TableRow>
-              ))}
-            </TableBody>
-          </Table>
-        </div>
+        <DataTable columns={OBJECT_COLUMNS} minWidth={640}>
+          <SkeletonRows rows={4} widths={LISTING_SKELETON_WIDTHS} />
+        </DataTable>
       ) : showEmpty ? (
         filter ? (
           <EmptyState
@@ -1172,9 +1145,8 @@ export function BucketBrowser() {
                   Clear
                 </Button>
                 <Button
-                  variant="outline"
+                  variant="destructive-outline"
                   size="sm"
-                  className="text-destructive"
                   disabled={bulkDeleting}
                   onClick={() => setConfirmBulk(true)}
                 >
@@ -1185,22 +1157,11 @@ export function BucketBrowser() {
           ) : null}
           <div
             className={cn(
-              "overflow-x-auto rounded-lg border transition-colors",
-              dragOver && "border-ring bg-muted/60",
+              "rounded-lg transition-colors",
+              dragOver && "ring-2 ring-ring bg-muted/60",
             )}
           >
-            <Table className="min-w-[640px]">
-              <TableHeader>
-                <TableRow>
-                  <TableHead className="text-xs text-muted-foreground">Name</TableHead>
-                  <TableHead className="text-right text-xs text-muted-foreground">Size</TableHead>
-                  <TableHead className="text-xs text-muted-foreground">Modified</TableHead>
-                  <TableHead>
-                    <span className="visually-hidden">Actions</span>
-                  </TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
+            <DataTable columns={OBJECT_COLUMNS} minWidth={640}>
                 {folders.map((f) => (
                   <TableRow key={f}>
                     <TableCell colSpan={3}>
@@ -1222,6 +1183,7 @@ export function BucketBrowser() {
                           <Button
                             variant="ghost"
                             size="icon"
+                            className="size-10 sm:size-9"
                             aria-label={`Actions for folder ${f}`}
                           >
                             <MoreHorizontal aria-hidden="true" />
@@ -1273,6 +1235,7 @@ export function BucketBrowser() {
                             <Button
                               variant="ghost"
                               size="icon"
+                              className="size-10 sm:size-9"
                               aria-label={`Actions for ${o.key}`}
                             >
                               <MoreHorizontal aria-hidden="true" />
@@ -1294,6 +1257,7 @@ export function BucketBrowser() {
                                 setCopySource(o.key);
                                 setCopyDest(o.key);
                                 setCopyAsMove(false);
+                                setCopyError(null);
                               }}
                             >
                               Copy or move…
@@ -1355,6 +1319,7 @@ export function BucketBrowser() {
                             <Button
                               variant="ghost"
                               size="icon"
+                              className="size-10 sm:size-9"
                               aria-label={`Actions for version ${v.versionId} of ${v.key}`}
                             >
                               <MoreHorizontal aria-hidden="true" />
@@ -1380,8 +1345,7 @@ export function BucketBrowser() {
                       </TableCell>
                     </TableRow>
                   ))}
-              </TableBody>
-            </Table>
+            </DataTable>
           </div>
           {next ? (
             <div className="flex justify-center">
@@ -1519,51 +1483,59 @@ export function BucketBrowser() {
         }}
       >
         <DialogContent className="sm:max-w-lg">
-          <DialogHeader>
-            <DialogTitle>{copyAsMove ? "Move object" : "Copy object"}</DialogTitle>
-            <DialogDescription className="break-all">
-              {copyAsMove ? "Moving" : "Copying"} from{" "}
-              <span className="font-mono">{copySource}</span>
-            </DialogDescription>
-          </DialogHeader>
-          <div className="space-y-3">
-            <div className="grid gap-1.5">
-              <Label htmlFor={`${filterId}-dest`}>Destination key</Label>
-              <Input
-                id={`${filterId}-dest`}
-                value={copyDest}
-                autoComplete="off"
-                spellCheck={false}
-                className="font-mono"
-                onChange={(e) => setCopyDest(e.target.value)}
-              />
+          <form onSubmit={(e) => void submitCopy(e)} noValidate>
+            <DialogHeader>
+              <DialogTitle>{copyAsMove ? "Move object" : "Copy object"}</DialogTitle>
+              <DialogDescription className="break-all">
+                {copyAsMove ? "Moving" : "Copying"} from{" "}
+                <span className="font-mono">{copySource}</span>
+              </DialogDescription>
+            </DialogHeader>
+            <div className="space-y-3 py-4">
+              <div className="space-y-1.5">
+                <Label htmlFor={`${filterId}-dest`}>Destination key</Label>
+                <Input
+                  id={`${filterId}-dest`}
+                  value={copyDest}
+                  autoComplete="off"
+                  spellCheck={false}
+                  className="font-mono"
+                  aria-invalid={copyError ? true : undefined}
+                  onChange={(e) => {
+                    setCopyDest(e.target.value);
+                    setCopyError(null);
+                  }}
+                />
+                <FieldError>{copyError}</FieldError>
+              </div>
+              <label className="flex items-center gap-2 text-[13px]">
+                <Checkbox
+                  checked={copyAsMove}
+                  onCheckedChange={(v) => setCopyAsMove(v === true)}
+                />
+                Move (delete the original after copying)
+              </label>
             </div>
-            <label className="flex items-center gap-2 text-[13px]">
-              <Checkbox
-                checked={copyAsMove}
-                onCheckedChange={(v) => setCopyAsMove(v === true)}
-              />
-              Move (delete the original after copying)
-            </label>
-          </div>
-          <DialogFooter>
-            <Button
-              variant="outline"
-              onClick={() => setCopySource(null)}
-              disabled={copying}
-            >
-              Cancel
-            </Button>
-            <Button onClick={() => void submitCopy()} disabled={copying}>
-              {copying
-                ? copyAsMove
-                  ? "Moving…"
-                  : "Copying…"
-                : copyAsMove
-                  ? "Move"
-                  : "Copy"}
-            </Button>
-          </DialogFooter>
+            <DialogFooter>
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => setCopySource(null)}
+                disabled={copying}
+              >
+                Cancel
+              </Button>
+              <Button type="submit" disabled={copying}>
+                {copying
+                  ? copyAsMove
+                    ? "Moving…"
+                    : "Copying…"
+                  : copyAsMove
+                    ? "Move"
+                    : "Copy"}
+              </Button>
+            </DialogFooter>
+          </form>
         </DialogContent>
       </Dialog>
 
@@ -1572,41 +1544,46 @@ export function BucketBrowser() {
         onOpenChange={creatingFolder ? undefined : setCreateFolderOpen}
       >
         <DialogContent className="sm:max-w-md">
-          <DialogHeader>
-            <DialogTitle>New folder</DialogTitle>
-            <DialogDescription>
-              Creates an empty folder marker in{" "}
-              <span className="font-mono">{path || `${name}/`}</span>. Folders are
-              just key prefixes; uploading a file into one works without this.
-            </DialogDescription>
-          </DialogHeader>
-          <div className="grid gap-1.5">
-            <Label htmlFor={`${filterId}-folder`}>Folder name</Label>
-            <Input
-              id={`${filterId}-folder`}
-              value={folderName}
-              autoFocus
-              autoComplete="off"
-              spellCheck={false}
-              className="font-mono"
-              onChange={(e) => setFolderName(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") void submitCreateFolder();
-              }}
-            />
-          </div>
-          <DialogFooter>
-            <Button
-              variant="outline"
-              onClick={() => setCreateFolderOpen(false)}
-              disabled={creatingFolder}
-            >
-              Cancel
-            </Button>
-            <Button onClick={() => void submitCreateFolder()} disabled={creatingFolder}>
-              {creatingFolder ? "Creating…" : "Create folder"}
-            </Button>
-          </DialogFooter>
+          <form onSubmit={(e) => void submitCreateFolder(e)} noValidate>
+            <DialogHeader>
+              <DialogTitle>New folder</DialogTitle>
+              <DialogDescription>
+                Creates an empty folder marker in{" "}
+                <span className="font-mono">{path || `${name}/`}</span>. Folders are
+                just key prefixes; uploading a file into one works without this.
+              </DialogDescription>
+            </DialogHeader>
+            <div className="space-y-1.5 py-4">
+              <Label htmlFor={`${filterId}-folder`}>Folder name</Label>
+              <Input
+                id={`${filterId}-folder`}
+                value={folderName}
+                autoFocus
+                autoComplete="off"
+                spellCheck={false}
+                className="font-mono"
+                aria-invalid={folderError ? true : undefined}
+                onChange={(e) => {
+                  setFolderName(e.target.value);
+                  setFolderError(null);
+                }}
+              />
+              <FieldError>{folderError}</FieldError>
+            </div>
+            <DialogFooter>
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => setCreateFolderOpen(false)}
+                disabled={creatingFolder}
+              >
+                Cancel
+              </Button>
+              <Button type="submit" disabled={creatingFolder}>
+                {creatingFolder ? "Creating…" : "Create folder"}
+              </Button>
+            </DialogFooter>
+          </form>
         </DialogContent>
       </Dialog>
     </div>

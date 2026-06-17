@@ -1,5 +1,5 @@
 import { useId, useState, type FormEvent } from "react";
-import { NavLink, useNavigate } from "react-router";
+import { useNavigate } from "react-router";
 import { Database, MoreHorizontal, Plus } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
@@ -24,8 +24,11 @@ import { TableCell, TableRow } from "@/components/ui/table";
 import { DataTable, SkeletonRows, type Column } from "@/components/data-table";
 import { EmptyState } from "@/components/empty-state";
 import { ErrorAlert } from "@/components/error-alert";
+import { FieldError } from "@/components/field-error";
 import { Page, PageHeader } from "@/components/page-header";
+import { RefreshButton } from "@/components/refresh-button";
 import { StatusBadge, type StatusTone } from "@/components/status-badge";
+import { TextLink } from "@/components/text-link";
 import { TypedConfirmDialog } from "@/components/typed-confirm-dialog";
 import { api, ApiError, errorMessage } from "@/lib/api";
 import { bytes, count, whenMs } from "@/lib/format";
@@ -151,7 +154,16 @@ export function Buckets() {
       <PageHeader
         title="Buckets"
         description="Top-level containers for your objects."
-        actions={createButton}
+        actions={
+          <>
+            <RefreshButton
+              loading={list.loading}
+              refreshing={list.refreshing}
+              onClick={list.refresh}
+            />
+            {createButton}
+          </>
+        }
       />
 
       {list.error ? (
@@ -181,12 +193,12 @@ export function Buckets() {
           {buckets.map((b) => (
             <TableRow key={b.name}>
               <TableCell>
-                <NavLink
+                <TextLink
                   to={`/buckets/${encodeURIComponent(b.name)}/browser`}
-                  className="font-mono text-[13px] text-link hover:underline underline-offset-4"
+                  className="font-mono text-[13px]"
                 >
                   {b.name}
-                </NavLink>
+                </TextLink>
               </TableCell>
               <TableCell className="text-right text-[13px] tabular-nums">
                 {count(list.data?.usage.get(b.name)?.objects ?? null)}
@@ -271,11 +283,9 @@ export function Buckets() {
               <p id={helpId} className="text-[13px] text-muted-foreground">
                 {NAME_RULE}
               </p>
-              {fieldError ? (
-                <p id={errId} className="text-[13px] text-destructive" role="alert">
-                  {fieldError}
-                </p>
-              ) : null}
+              <div id={errId}>
+                <FieldError>{fieldError}</FieldError>
+              </div>
             </div>
             <DialogFooter>
               <Button

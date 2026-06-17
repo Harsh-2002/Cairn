@@ -12,9 +12,11 @@ import {
   Dialog,
   DialogContent,
   DialogDescription,
+  DialogFooter,
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { FieldError } from "@/components/field-error";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
@@ -301,11 +303,9 @@ export function ShareDialog({
           </TabsContent>
         </Tabs>
 
-        {error ? (
-          <p role="alert" className="text-[13px] text-destructive">
-            {error}
-          </p>
-        ) : null}
+        <FieldError>{error}</FieldError>
+
+        <DialogFooter showCloseButton />
       </DialogContent>
     </Dialog>
   );

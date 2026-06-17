@@ -570,7 +570,7 @@ function Dashboard({
                     <YAxis
                       type="category"
                       dataKey="operation"
-                      width={120}
+                      width={160}
                       tickLine={false}
                       axisLine={false}
                       tick={axisTick}
@@ -708,11 +708,11 @@ function StatusDonut({ by_status }: { by_status: MetricStatus[] }) {
           </PieChart>
         </ResponsiveContainer>
       </div>
-      <ul className="flex w-full flex-wrap justify-center gap-x-4 gap-y-1.5 text-[13px]">
+      <ul className="grid w-full grid-cols-2 justify-start gap-x-4 gap-y-1.5 text-[13px] sm:flex sm:flex-wrap">
         {sorted.map((s) => (
           <li
             key={s.status_class}
-            className="flex items-center gap-1.5 tabular-nums"
+            className="flex items-center gap-1.5"
           >
             <span
               aria-hidden="true"
@@ -775,9 +775,9 @@ function ReadsWritesDonut({
           </PieChart>
         </ResponsiveContainer>
       </div>
-      <ul className="flex w-full flex-wrap justify-center gap-x-4 gap-y-1.5 text-[13px]">
+      <ul className="grid w-full grid-cols-2 justify-start gap-x-4 gap-y-1.5 text-[13px] sm:flex sm:flex-wrap">
         {slices.map((s) => (
-          <li key={s.name} className="flex items-center gap-1.5 tabular-nums">
+          <li key={s.name} className="flex items-center gap-1.5">
             <span
               aria-hidden="true"
               className="inline-block size-2.5 rounded-sm"
@@ -853,8 +853,14 @@ function ChartCard({
   );
 }
 
+// A small, consistent in-panel empty state — one convention across every chart
+// panel (the page-level EmptyState is reserved for the whole-view empty case).
 function PanelEmpty({ children }: { children: React.ReactNode }) {
-  return <p className="text-sm text-muted-foreground">{children}</p>;
+  return (
+    <p className="flex min-h-32 items-center justify-center text-center text-sm text-muted-foreground">
+      {children}
+    </p>
+  );
 }
 
 // The shared time x-axis used by every timeline chart.
@@ -902,20 +908,22 @@ const tooltipItemStyle: React.CSSProperties = {
 /** First-paint skeletons mirroring the dashboard grid so nothing jumps. */
 function MetricsSkeleton() {
   return (
-    <div
-      className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3"
-      aria-hidden="true"
-    >
+    <>
       <p className="sr-only" role="status">
         Loading metrics…
       </p>
-      {Array.from({ length: 12 }).map((_, i) => (
-        <Skeleton key={i} className="h-24 rounded-lg" />
-      ))}
-      <Skeleton className="h-80 rounded-lg lg:col-span-3" />
-      <Skeleton className="h-64 rounded-lg" />
-      <Skeleton className="h-64 rounded-lg" />
-      <Skeleton className="h-64 rounded-lg" />
-    </div>
+      <div
+        className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3"
+        aria-hidden="true"
+      >
+        {Array.from({ length: 12 }).map((_, i) => (
+          <StatCard key={i} label="" value="" loading />
+        ))}
+        <Skeleton className="h-80 rounded-lg lg:col-span-3" />
+        <Skeleton className="h-64 rounded-lg" />
+        <Skeleton className="h-64 rounded-lg" />
+        <Skeleton className="h-64 rounded-lg" />
+      </div>
+    </>
   );
 }

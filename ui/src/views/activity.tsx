@@ -3,7 +3,6 @@
 
 import { useMemo, useState } from "react";
 import { History } from "lucide-react";
-import { NavLink } from "react-router";
 import { api } from "@/lib/api";
 import { whenMs } from "@/lib/format";
 import { useResource } from "@/lib/use-resource";
@@ -13,6 +12,7 @@ import { ErrorAlert } from "@/components/error-alert";
 import { Input } from "@/components/ui/input";
 import { Page, PageHeader } from "@/components/page-header";
 import { RefreshButton } from "@/components/refresh-button";
+import { TextLink } from "@/components/text-link";
 import {
   Select,
   SelectContent,
@@ -130,12 +130,9 @@ export function Activity() {
               </TableCell>
               <TableCell className="font-mono text-[13px]">
                 {e.bucket ? (
-                  <NavLink
-                    to={`/buckets/${encodeURIComponent(e.bucket)}/browser`}
-                    className="text-link underline-offset-4 hover:underline"
-                  >
+                  <TextLink to={`/buckets/${encodeURIComponent(e.bucket)}/browser`}>
                     {e.bucket}
-                  </NavLink>
+                  </TextLink>
                 ) : (
                   <span className="text-muted-foreground">—</span>
                 )}

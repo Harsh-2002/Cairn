@@ -209,11 +209,7 @@ export function UserDetail() {
       ) : null}
 
       {res.loading ? (
-        <div className="space-y-4">
-          <Skeleton className="h-8 w-56" />
-          <Skeleton className="h-40 w-full" />
-          <Skeleton className="h-64 w-full" />
-        </div>
+        <UserDetailSkeleton />
       ) : user ? (
         <div className="space-y-5">
           <header className="flex flex-wrap items-start justify-between gap-3">
@@ -231,9 +227,10 @@ export function UserDetail() {
                 </span>
               </p>
             </div>
-            <div className="flex shrink-0 gap-2">
+            <div className="flex w-full flex-col gap-2 sm:w-auto sm:flex-row sm:shrink-0">
               <Button
-                variant="outline"
+                variant={user.is_active ? "destructive-outline" : "outline"}
+                className="w-full sm:w-auto"
                 disabled={busyConfirm}
                 onClick={() =>
                   user.is_active ? setConfirming("deactivate") : setActive(true)
@@ -241,7 +238,11 @@ export function UserDetail() {
               >
                 {user.is_active ? "Deactivate user" : "Activate user"}
               </Button>
-              <Button variant="outline" onClick={() => setConfirming("rotate")}>
+              <Button
+                variant="outline"
+                className="w-full sm:w-auto"
+                onClick={() => setConfirming("rotate")}
+              >
                 Rotate Bearer secret
               </Button>
             </div>
@@ -365,8 +366,7 @@ export function UserDetail() {
                 <CardFooter className="justify-end gap-2 border-t pt-4!">
                   {user.policy ? (
                     <Button
-                      variant="outline"
-                      className="text-destructive"
+                      variant="destructive-outline"
                       disabled={saving}
                       onClick={() => setConfirming("remove-policy")}
                     >
@@ -434,5 +434,39 @@ export function UserDetail() {
         onConfirm={removePolicy}
       />
     </Page>
+  );
+}
+
+/** First-paint skeletons mirroring the real header + three cards so the
+    layout doesn't jump when the user arrives. */
+function UserDetailSkeleton() {
+  return (
+    <div className="space-y-5" aria-hidden="true">
+      <p className="sr-only" role="status">
+        Loading user…
+      </p>
+      <header className="flex flex-wrap items-start justify-between gap-3">
+        <div className="space-y-2">
+          <Skeleton className="h-7 w-48" />
+          <Skeleton className="h-5 w-64" />
+        </div>
+        <div className="flex w-full flex-col gap-2 sm:w-auto sm:flex-row sm:shrink-0">
+          <Skeleton className="h-9 w-full sm:w-36" />
+          <Skeleton className="h-9 w-full sm:w-44" />
+        </div>
+      </header>
+      {[0, 1, 2].map((i) => (
+        <Card key={i} className="gap-4">
+          <CardHeader>
+            <Skeleton className="h-5 w-32" />
+            <Skeleton className="h-4 w-full max-w-md" />
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <Skeleton className="h-9 w-full" />
+            <Skeleton className="h-9 w-3/4" />
+          </CardContent>
+        </Card>
+      ))}
+    </div>
   );
 }

@@ -1,7 +1,7 @@
 // Failed-replication tracker: objects that could not be copied to their
 // replication destination after repeated tries. Empty is the good state.
 
-import { CircleCheck } from "lucide-react";
+import { CircleAlert, CircleCheck } from "lucide-react";
 import { api } from "@/lib/api";
 import { whenMs } from "@/lib/format";
 import { useResource } from "@/lib/use-resource";
@@ -86,11 +86,14 @@ export function Replication() {
                 <Tooltip>
                   <TooltipTrigger asChild>
                     <span
-                      tabIndex={0}
                       title={e.error}
-                      className="block max-w-[32ch] truncate"
+                      className="flex max-w-[32ch] items-center gap-1.5"
                     >
-                      {e.error}
+                      <CircleAlert
+                        aria-hidden="true"
+                        className="size-3.5 shrink-0"
+                      />
+                      <span className="truncate">{e.error}</span>
                     </span>
                   </TooltipTrigger>
                   <TooltipContent className="max-w-sm break-words">

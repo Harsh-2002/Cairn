@@ -3,6 +3,7 @@ import { Info } from "lucide-react";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
+import { FieldError } from "@/components/field-error";
 import { Input } from "@/components/ui/input";
 import { JsonEditor } from "@/components/json-editor";
 import { Label } from "@/components/ui/label";
@@ -361,10 +362,10 @@ export function PermissionBuilder({
                       )}
                     </div>
                     {noBuckets ? (
-                      <p className="text-[13px] text-destructive" role="alert">
+                      <FieldError>
                         Pick at least one bucket, or switch to All buckets. With
                         none selected this user gets no access.
-                      </p>
+                      </FieldError>
                     ) : (
                       <p className="text-[13px] text-muted-foreground">
                         {model.pickedBuckets.length} selected.
@@ -464,10 +465,10 @@ export function PermissionBuilder({
                     ))}
                   </div>
                   {noActions ? (
-                    <p className="text-[13px] text-destructive" role="alert">
+                    <FieldError>
                       Pick at least one action. With none selected this user gets
                       no access.
-                    </p>
+                    </FieldError>
                   ) : null}
                 </div>
               )}

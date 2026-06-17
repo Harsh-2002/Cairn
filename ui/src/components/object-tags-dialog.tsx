@@ -15,6 +15,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { FieldError } from "@/components/field-error";
 import { Input } from "@/components/ui/input";
 import { errorMessage } from "@/lib/api";
 import {
@@ -111,9 +112,7 @@ export function ObjectTagsDialog({
         {loading ? (
           <p className="py-4 text-sm text-muted-foreground">Loading tags…</p>
         ) : error ? (
-          <p role="alert" className="py-4 text-sm text-destructive">
-            {error}
-          </p>
+          <FieldError className="py-4">{error}</FieldError>
         ) : (
           <div className="space-y-2">
             {tags.length === 0 ? (

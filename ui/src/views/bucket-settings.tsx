@@ -3,9 +3,9 @@
 // BucketDetail layout (which owns the <Page> column), one bordered Card per
 // concern with its action in the footer — the settings-page idiom.
 
-import { useEffect, useId, useState } from "react";
+import { useEffect, useId, useState, type ReactNode } from "react";
 import { useParams } from "react-router";
-import { Plus, Trash2, X } from "lucide-react";
+import { CircleAlert, Plus, Trash2, X } from "lucide-react";
 import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -30,6 +30,7 @@ import {
 import { Skeleton } from "@/components/ui/skeleton";
 import { ConfirmDialog } from "@/components/confirm-dialog";
 import { ErrorAlert } from "@/components/error-alert";
+import { FieldError } from "@/components/field-error";
 import { JsonEditor } from "@/components/json-editor";
 import { StatusBadge } from "@/components/status-badge";
 import { ApiError, api, errorMessage } from "@/lib/api";
@@ -37,6 +38,7 @@ import { bytes, count } from "@/lib/format";
 import { pretty, validate } from "@/lib/policy";
 import * as s3 from "@/lib/s3";
 import { useResource } from "@/lib/use-resource";
+import { cn } from "@/lib/utils";
 import type {
   CreateReplicationTargetReq,
   ReplicationRule,
@@ -106,6 +108,46 @@ interface AspectsSource {
   lifecycle: unknown | null;
   acl: unknown | null;
   public_access_block: unknown | null;
+}
+
+// Single-source the settings-card chrome: the `gap-4` Card, the `text-base`
+// CardTitle, the optional description, and the `border-t pt-4` footer that the
+// ~11 cards below all share. Each card supplies only its title, body, and
+// footer actions; pass `footer={null}` for a card with no action row.
+function SettingsCard({
+  title,
+  description,
+  headerExtra,
+  children,
+  footer,
+  footerClassName,
+}: {
+  title: ReactNode;
+  description?: ReactNode;
+  headerExtra?: ReactNode;
+  children: ReactNode;
+  footer?: ReactNode;
+  footerClassName?: string;
+}) {
+  return (
+    <Card className="gap-4">
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2 text-base">
+          {title}
+        </CardTitle>
+        {description ? <CardDescription>{description}</CardDescription> : null}
+        {headerExtra}
+      </CardHeader>
+      {children}
+      {footer !== undefined && footer !== null ? (
+        <CardFooter
+          className={cn("justify-end border-t pt-4!", footerClassName)}
+        >
+          {footer}
+        </CardFooter>
+      ) : null}
+    </Card>
+  );
 }
 
 export function BucketSettings() {
@@ -445,639 +487,678 @@ export function BucketSettings() {
     });
   }
 
-  if (res.loading) {
-    return (
-      <div className="space-y-4" aria-busy="true">
-        <span className="visually-hidden" role="status">
-          Loading bucket settings…
-        </span>
-        {[0, 1, 2].map((i) => (
-          <Card key={i} className="p-5">
-            <Skeleton className="mb-3 h-5 w-36" />
-            <Skeleton className="mb-2 h-4 w-2/3" />
-            <Skeleton className="h-9 w-64" />
-          </Card>
-        ))}
-      </div>
-    );
-  }
-
-  if (res.error || !res.data) {
-    return (
-      <ErrorAlert
-        title="Could not load bucket settings"
-        message={res.error ?? "Unknown error."}
-        onRetry={res.refresh}
-      />
-    );
-  }
-
-  const { config, repl, targets, replStatus } = res.data;
+  const data = res.data;
+  const { config, repl, targets, replStatus } = data ?? {
+    config: undefined,
+    repl: undefined,
+    targets: undefined,
+    replStatus: undefined,
+  };
 
   return (
     <div className="space-y-4">
-      <h2 className="visually-hidden">Settings for {name}</h2>
+      <h2 className="sr-only">Settings for {name}</h2>
 
-      {/* ---- Versioning ---- */}
-      <Card className="gap-4">
-        <CardHeader>
-          <CardTitle className="text-base">Versioning</CardTitle>
-          <CardDescription>
-            Keep previous versions of an object when it is overwritten or
-            deleted, so you can recover them later.
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
-          <Select value={versioning} onValueChange={setVersioning}>
-            <SelectTrigger className="w-full sm:w-56" aria-label="Versioning state">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="Enabled">Enabled</SelectItem>
-              <SelectItem value="Suspended">Suspended</SelectItem>
-              <SelectItem value="Unversioned">Unversioned</SelectItem>
-            </SelectContent>
-          </Select>
-        </CardContent>
-        <CardFooter className="justify-end border-t pt-4!">
-          <Button onClick={saveVersioning} disabled={busy === "versioning"}>
-            {busy === "versioning" ? "Saving…" : "Save"}
-          </Button>
-        </CardFooter>
-      </Card>
+      {/* Errored refresh shows the alert ABOVE the retained cards (overview
+          idiom) rather than tearing the operator's view down. */}
+      {res.error ? (
+        <ErrorAlert
+          title="Could not load bucket settings"
+          message={res.error}
+          onRetry={res.refresh}
+        />
+      ) : null}
 
-      {/* ---- Quota ---- */}
-      <Card className="gap-4">
-        <CardHeader>
-          <CardTitle className="text-base">Storage quota</CardTitle>
-          <CardDescription>
-            Cap how much this bucket can store, in bytes. Leave empty for no
-            limit.
-            {config.quota_bytes != null
-              ? ` Current limit: ${bytes(config.quota_bytes)}.`
-              : ""}
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-1.5">
-          <Label htmlFor={quotaId} className="visually-hidden">
-            Quota in bytes
-          </Label>
-          <Input
-            id={quotaId}
-            value={quotaInput}
-            placeholder="No limit"
-            inputMode="numeric"
-            autoComplete="off"
-            className="w-full font-mono sm:w-56"
-            onChange={(e) => {
-              setQuotaInput(e.target.value);
-              setQuotaError("");
-            }}
-            aria-invalid={quotaError ? true : undefined}
-            aria-describedby={quotaError ? `${quotaId}-err` : `${quotaId}-hint`}
-          />
-          {quotaError ? (
-            <p id={`${quotaId}-err`} role="alert" className="text-[13px] text-destructive">
-              {quotaError}
-            </p>
-          ) : (
-            <p id={`${quotaId}-hint`} className="text-[13px] text-muted-foreground">
-              {/^\d+$/.test(quotaInput.trim())
-                ? `= ${bytes(Number(quotaInput.trim()))}`
-                : "Whole bytes, e.g. 10737418240 for 10 GiB."}
-            </p>
-          )}
-        </CardContent>
-        <CardFooter className="justify-end gap-2 border-t pt-4!">
-          {config.quota_bytes != null ? (
-            <Button
-              variant="outline"
-              onClick={() => void saveQuota(true)}
-              disabled={busy === "quota"}
-            >
-              Remove quota
-            </Button>
-          ) : null}
-          <Button onClick={() => void saveQuota()} disabled={busy === "quota"}>
-            {busy === "quota" ? "Saving…" : "Set quota"}
-          </Button>
-        </CardFooter>
-      </Card>
-
-      {/* ---- Compression ---- */}
-      <Card className="gap-4">
-        <CardHeader>
-          <CardTitle className="text-base">Compression</CardTitle>
-          <CardDescription>
-            Compress new uploads at rest to save space. Existing objects are not
-            changed.
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
-          <Select value={compression} onValueChange={setCompression}>
-            <SelectTrigger className="w-full sm:w-56" aria-label="Compression algorithm">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="zstd">Zstandard (zstd)</SelectItem>
-              <SelectItem value="lz4">LZ4</SelectItem>
-              <SelectItem value="none">Off</SelectItem>
-            </SelectContent>
-          </Select>
-        </CardContent>
-        <CardFooter className="justify-end border-t pt-4!">
-          <Button onClick={saveCompression} disabled={busy === "compression"}>
-            {busy === "compression" ? "Saving…" : "Save"}
-          </Button>
-        </CardFooter>
-      </Card>
-
-      {/* ---- Replication ---- */}
-      <Card className="gap-4">
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2 text-base">
-            Replication
-            <StatusBadge tone={repl ? "positive" : "neutral"}>
-              {repl ? "Active" : "Off"}
-            </StatusBadge>
-          </CardTitle>
-          <CardDescription>
-            Continuously copy new objects to another bucket. Needs versioning
-            enabled and a remote target (below) for the destination.
-            {repl
-              ? ` Currently replicating to "${repl.dest_bucket}"${repl.prefix ? ` (prefix "${repl.prefix}")` : ""}.`
-              : ""}
-          </CardDescription>
-          {replStatus && (replStatus.pending > 0 || replStatus.failed > 0) ? (
-            <p className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[13px]">
-              <span className="text-muted-foreground">
-                Pending:{" "}
-                <span className="tabular-nums text-foreground">
-                  {count(replStatus.pending)}
-                </span>
-              </span>
-              {replStatus.failed > 0 ? (
-                <span className="text-destructive">
-                  Failed:{" "}
-                  <span className="tabular-nums">
-                    {count(replStatus.failed)}
-                  </span>
-                </span>
-              ) : null}
-            </p>
-          ) : null}
-        </CardHeader>
-        <CardContent className="space-y-1.5">
-          <div className="flex flex-wrap gap-2">
-            <Input
-              value={replDest}
-              placeholder="Destination bucket"
-              autoComplete="off"
-              aria-label="Replication destination bucket"
-              aria-invalid={replError ? true : undefined}
-              className="w-full font-mono sm:w-56"
-              onChange={(e) => {
-                setReplDest(e.target.value);
-                setReplError("");
-              }}
-            />
-            <Input
-              value={replPrefix}
-              placeholder="Prefix (optional)"
-              autoComplete="off"
-              aria-label="Replication prefix"
-              className="w-full font-mono sm:w-44"
-              onChange={(e) => setReplPrefix(e.target.value)}
-            />
-          </div>
-          {replError ? (
-            <p role="alert" className="text-[13px] text-destructive">
-              {replError}
-            </p>
-          ) : null}
-        </CardContent>
-        <CardFooter className="flex-wrap justify-end gap-2 border-t pt-4!">
-          {replStatus && replStatus.failed > 0 ? (
-            <Button
-              variant="outline"
-              onClick={retryReplication}
-              disabled={busy === "retry"}
-              aria-busy={busy === "retry" || undefined}
-            >
-              {busy === "retry" ? "Retrying…" : "Retry failed"}
-            </Button>
-          ) : null}
-          <Button
-            variant="outline"
-            onClick={resyncReplication}
-            disabled={busy === "resync"}
-            aria-busy={busy === "resync" || undefined}
-            title="Enqueue existing objects for replication (needs ExistingObjectReplication enabled)"
-          >
-            {busy === "resync" ? "Starting…" : "Resync existing"}
-          </Button>
-          {repl ? (
-            <Button
-              variant="outline"
-              onClick={() => setConfirmClearRepl(true)}
-              disabled={busy === "replication"}
-            >
-              Remove rule
-            </Button>
-          ) : null}
-          <Button onClick={() => void saveReplication()} disabled={busy === "replication"}>
-            {busy === "replication" ? "Saving…" : "Save"}
-          </Button>
-        </CardFooter>
-      </Card>
-
-      {/* ---- Replication targets (remote endpoints + sealed credentials) ---- */}
-      <Card className="gap-4">
-        <CardHeader>
-          <CardTitle className="text-base">Replication targets</CardTitle>
-          <CardDescription>
-            Remote destinations this bucket can replicate into. Each holds the
-            endpoint and credentials of a bucket on another Cairn (or S3) node;
-            the secret is sealed on the server and never shown again.
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          {targets.length > 0 ? (
-            <ul className="divide-y rounded-lg border">
-              {targets.map((t) => (
-                <li
-                  key={t.arn}
-                  className="flex flex-wrap items-center justify-between gap-2 px-3 py-2.5"
-                >
-                  <div className="min-w-0">
-                    <p className="truncate font-mono text-[13px]" title={t.arn}>
-                      {t.dest_bucket}{" "}
-                      <span className="text-muted-foreground">@ {t.endpoint}</span>
-                    </p>
-                    <p className="text-xs text-muted-foreground">
-                      {t.region} · key {t.access_key_id}
-                    </p>
-                  </div>
-                  <Button
-                    variant="outline"
-                    size="icon"
-                    className="text-destructive"
-                    aria-label={`Remove target ${t.dest_bucket}`}
-                    disabled={busy === "target"}
-                    onClick={() => setConfirmDeleteTarget(t.arn)}
-                  >
-                    <Trash2 aria-hidden="true" />
-                  </Button>
-                </li>
-              ))}
-            </ul>
-          ) : (
-            <p className="text-[13px] text-muted-foreground">
-              No remote targets yet. Add one below, then set the replication rule
-              above to its destination bucket.
-            </p>
-          )}
-
-          <div className="grid gap-3 rounded-lg border p-3 sm:grid-cols-2">
-            <div className="grid gap-1.5 sm:col-span-2">
-              <Label htmlFor={`${quotaId}-ep`}>Endpoint</Label>
-              <Input
-                id={`${quotaId}-ep`}
-                value={targetForm.endpoint}
-                placeholder="https://s3.peer.example.com:7373"
-                autoComplete="off"
-                className="font-mono"
-                onChange={(e) =>
-                  setTargetForm({ ...targetForm, endpoint: e.target.value })
-                }
-              />
-            </div>
-            <div className="grid gap-1.5">
-              <Label htmlFor={`${quotaId}-region`}>Region</Label>
-              <Input
-                id={`${quotaId}-region`}
-                value={targetForm.region}
-                autoComplete="off"
-                className="font-mono"
-                onChange={(e) =>
-                  setTargetForm({ ...targetForm, region: e.target.value })
-                }
-              />
-            </div>
-            <div className="grid gap-1.5">
-              <Label htmlFor={`${quotaId}-db`}>Destination bucket</Label>
-              <Input
-                id={`${quotaId}-db`}
-                value={targetForm.dest_bucket}
-                autoComplete="off"
-                className="font-mono"
-                onChange={(e) =>
-                  setTargetForm({ ...targetForm, dest_bucket: e.target.value })
-                }
-              />
-            </div>
-            <div className="grid gap-1.5">
-              <Label htmlFor={`${quotaId}-ak`}>Access key</Label>
-              <Input
-                id={`${quotaId}-ak`}
-                value={targetForm.access_key}
-                autoComplete="off"
-                className="font-mono"
-                onChange={(e) =>
-                  setTargetForm({ ...targetForm, access_key: e.target.value })
-                }
-              />
-            </div>
-            <div className="grid gap-1.5">
-              <Label htmlFor={`${quotaId}-sk`}>Secret key</Label>
-              <Input
-                id={`${quotaId}-sk`}
-                type="password"
-                value={targetForm.secret}
-                autoComplete="off"
-                className="font-mono"
-                onChange={(e) =>
-                  setTargetForm({ ...targetForm, secret: e.target.value })
-                }
-              />
-            </div>
-          </div>
-        </CardContent>
-        <CardFooter className="justify-end border-t pt-4!">
-          <Button onClick={addTarget} disabled={addingTarget}>
-            {addingTarget ? "Adding…" : "Add target"}
-          </Button>
-        </CardFooter>
-      </Card>
-
-      {/* ---- Encryption at rest ---- */}
-      <Card className="gap-4">
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2 text-base">
-            Encryption at rest
-            <StatusBadge tone={config.encryption ? "positive" : "neutral"}>
-              {config.encryption ? "AES-256" : "Off"}
-            </StatusBadge>
-          </CardTitle>
-          <CardDescription>
-            Encrypt every new upload with a server-managed key (SSE-S3,
-            AES-256). The key never leaves the server and downloads are
-            transparent. Existing objects are not rewritten.
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
-          <Select value={encryption} onValueChange={setEncryption}>
-            <SelectTrigger className="w-full sm:w-56" aria-label="Default encryption">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="AES256">AES-256 (SSE-S3)</SelectItem>
-              <SelectItem value="none">Off</SelectItem>
-            </SelectContent>
-          </Select>
-        </CardContent>
-        <CardFooter className="justify-end border-t pt-4!">
-          <Button onClick={saveEncryption} disabled={busy === "encryption"}>
-            {busy === "encryption" ? "Saving…" : "Save"}
-          </Button>
-        </CardFooter>
-      </Card>
-
-      {/* ---- Bucket policy ---- */}
-      <Card className="gap-4">
-        <CardHeader>
-          <CardTitle className="text-base">Bucket policy</CardTitle>
-          <CardDescription>
-            A JSON document that grants or denies access to this bucket and its
-            objects. Bucket policies need a <code className="font-mono text-[12px]">Principal</code> per
-            statement. If you would rather not write JSON, the Users page has a
-            visual permission builder that writes per-user policies for you.
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-2">
-          <div className="flex items-center justify-between">
-            <Button
-              type="button"
-              variant="ghost"
-              size="sm"
-              onClick={() => {
-                setPolicyText(EXAMPLE_POLICY.replace(/BUCKET/g, name));
-                setPolicyError("");
-              }}
-            >
-              Insert example
-            </Button>
-          </div>
-          <JsonEditor
-            value={policyText}
-            onChange={(t) => {
-              setPolicyText(t);
-              setPolicyError("");
-            }}
-            error={policyText.trim() === "" ? null : policyEditorError}
-            label="Bucket policy JSON"
-            rows={12}
-            validLabel="Valid policy document"
-          />
-          {policyText.trim() === "" ? (
-            <p className="text-[13px] text-muted-foreground">
-              No policy set. Paste a policy document, or use “Insert example” to
-              start from a template.
-            </p>
-          ) : null}
-        </CardContent>
-        <CardFooter className="justify-end gap-2 border-t pt-4!">
-          <Button
-            variant="outline"
-            className="text-destructive"
-            onClick={() => setConfirmDeletePolicy(true)}
-            disabled={busy === "policy" || !config.policy}
-          >
-            Delete policy
-          </Button>
-          <Button
-            onClick={() => void savePolicy()}
-            disabled={
-              busy === "policy" ||
-              policyText.trim() === "" ||
-              (policyValidation !== null && !policyValidation.ok)
+      {res.loading && !data ? (
+        <div aria-busy="true" className="space-y-4">
+          <span className="sr-only" role="status">
+            Loading bucket settings…
+          </span>
+          {[0, 1, 2].map((i) => (
+            <Card key={i} className="p-5">
+              <Skeleton className="mb-3 h-5 w-36" />
+              <Skeleton className="mb-2 h-4 w-2/3" />
+              <Skeleton className="h-9 w-64" />
+            </Card>
+          ))}
+        </div>
+      ) : data && config ? (
+        <>
+          {/* ---- Versioning ---- */}
+          <SettingsCard
+            title="Versioning"
+            description="Keep previous versions of an object when it is overwritten or deleted, so you can recover them later."
+            footer={
+              <Button onClick={saveVersioning} disabled={busy === "versioning"}>
+                {busy === "versioning" ? "Saving…" : "Save"}
+              </Button>
             }
           >
-            {busy === "policy" ? "Saving…" : "Save policy"}
-          </Button>
-        </CardFooter>
-      </Card>
+            <CardContent>
+              <Select value={versioning} onValueChange={setVersioning}>
+                <SelectTrigger
+                  className="w-full sm:w-56"
+                  aria-label="Versioning state"
+                >
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="Enabled">Enabled</SelectItem>
+                  <SelectItem value="Suspended">Suspended</SelectItem>
+                  <SelectItem value="Unversioned">Unversioned</SelectItem>
+                </SelectContent>
+              </Select>
+            </CardContent>
+          </SettingsCard>
 
-      {/* ---- Object ownership ---- */}
-      <Card className="gap-4">
-        <CardHeader>
-          <CardTitle className="text-base">Object ownership</CardTitle>
-          <CardDescription>
-            Controls whether ACLs apply. <strong>Bucket owner enforced</strong>{" "}
-            disables ACLs entirely (the safe default); the other modes let object
-            writers set ACLs.
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
-          <Select value={ownership} onValueChange={setOwnership}>
-            <SelectTrigger className="w-full sm:w-56" aria-label="Object ownership">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="BucketOwnerEnforced">
-                Bucket owner enforced
-              </SelectItem>
-              <SelectItem value="BucketOwnerPreferred">
-                Bucket owner preferred
-              </SelectItem>
-              <SelectItem value="ObjectWriter">Object writer</SelectItem>
-            </SelectContent>
-          </Select>
-        </CardContent>
-        <CardFooter className="justify-end border-t pt-4!">
-          <Button onClick={saveOwnership} disabled={busy === "ownership"}>
-            {busy === "ownership" ? "Saving…" : "Save"}
-          </Button>
-        </CardFooter>
-      </Card>
-
-      {/* ---- Public Access Block ---- */}
-      <Card className="gap-4">
-        <CardHeader>
-          <CardTitle className="text-base">Public Access Block</CardTitle>
-          <CardDescription>
-            Guardrails that neutralise public access regardless of ACLs or
-            policy. Enabling all four is the safe default.
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-3">
-          {PAB_TOGGLES.map((t) => (
-            <label key={t.key} className="flex items-start gap-3">
-              <Checkbox
-                checked={pab[t.key]}
-                onCheckedChange={(v) => setPab({ ...pab, [t.key]: v === true })}
-                aria-label={t.label}
-                className="mt-0.5"
+          {/* ---- Quota ---- */}
+          <SettingsCard
+            title="Storage quota"
+            description={
+              <>
+                Cap how much this bucket can store, in bytes. Leave empty for no
+                limit.
+                {config.quota_bytes != null
+                  ? ` Current limit: ${bytes(config.quota_bytes)}.`
+                  : ""}
+              </>
+            }
+            footerClassName="gap-2"
+            footer={
+              <>
+                {config.quota_bytes != null ? (
+                  <Button
+                    variant="outline"
+                    onClick={() => void saveQuota(true)}
+                    disabled={busy === "quota"}
+                  >
+                    Remove quota
+                  </Button>
+                ) : null}
+                <Button
+                  onClick={() => void saveQuota()}
+                  disabled={busy === "quota"}
+                >
+                  {busy === "quota" ? "Saving…" : "Set quota"}
+                </Button>
+              </>
+            }
+          >
+            <CardContent className="space-y-1.5">
+              <Label htmlFor={quotaId} className="sr-only">
+                Quota in bytes
+              </Label>
+              <Input
+                id={quotaId}
+                value={quotaInput}
+                placeholder="No limit"
+                inputMode="numeric"
+                autoComplete="off"
+                className="w-full font-mono sm:w-56"
+                onChange={(e) => {
+                  setQuotaInput(e.target.value);
+                  setQuotaError("");
+                }}
+                aria-invalid={quotaError ? true : undefined}
+                aria-describedby={
+                  quotaError ? `${quotaId}-err` : `${quotaId}-hint`
+                }
               />
-              <span>
-                <span className="block text-sm">{t.label}</span>
-                <span className="block text-[13px] text-muted-foreground">
-                  {t.hint}
-                </span>
-              </span>
-            </label>
-          ))}
-        </CardContent>
-        <CardFooter className="justify-end border-t pt-4!">
-          <Button onClick={savePab} disabled={busy === "pab"}>
-            {busy === "pab" ? "Saving…" : "Save"}
-          </Button>
-        </CardFooter>
-      </Card>
+              {quotaError ? (
+                <FieldError>
+                  <span id={`${quotaId}-err`}>{quotaError}</span>
+                </FieldError>
+              ) : (
+                <p
+                  id={`${quotaId}-hint`}
+                  className="text-[13px] text-muted-foreground"
+                >
+                  {/^\d+$/.test(quotaInput.trim())
+                    ? `= ${bytes(Number(quotaInput.trim()))}`
+                    : "Whole bytes, e.g. 10737418240 for 10 GiB."}
+                </p>
+              )}
+            </CardContent>
+          </SettingsCard>
 
-      {/* ---- Bucket tags ---- */}
-      <Card className="gap-4">
-        <CardHeader>
-          <CardTitle className="text-base">Bucket tags</CardTitle>
-          <CardDescription>
-            Key-value tags on the bucket, for organisation and policy
-            conditioning.
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-2">
-          {bucketTags.length === 0 ? (
-            <p className="text-[13px] text-muted-foreground">
-              No tags. Add one below.
-            </p>
-          ) : (
-            bucketTags.map((t, i) => (
-              <div key={i} className="flex items-center gap-2">
+          {/* ---- Compression ---- */}
+          <SettingsCard
+            title="Compression"
+            description="Compress new uploads at rest to save space. Existing objects are not changed."
+            footer={
+              <Button
+                onClick={saveCompression}
+                disabled={busy === "compression"}
+              >
+                {busy === "compression" ? "Saving…" : "Save"}
+              </Button>
+            }
+          >
+            <CardContent>
+              <Select value={compression} onValueChange={setCompression}>
+                <SelectTrigger
+                  className="w-full sm:w-56"
+                  aria-label="Compression algorithm"
+                >
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="zstd">Zstandard (zstd)</SelectItem>
+                  <SelectItem value="lz4">LZ4</SelectItem>
+                  <SelectItem value="none">Off</SelectItem>
+                </SelectContent>
+              </Select>
+            </CardContent>
+          </SettingsCard>
+
+          {/* ---- Replication ---- */}
+          <SettingsCard
+            title={
+              <>
+                Replication
+                <StatusBadge tone={repl ? "positive" : "neutral"}>
+                  {repl ? "Active" : "Off"}
+                </StatusBadge>
+              </>
+            }
+            description={
+              <>
+                Continuously copy new objects to another bucket. Needs
+                versioning enabled and a remote target (below) for the
+                destination.
+                {repl
+                  ? ` Currently replicating to "${repl.dest_bucket}"${repl.prefix ? ` (prefix "${repl.prefix}")` : ""}.`
+                  : ""}
+              </>
+            }
+            headerExtra={
+              replStatus &&
+              (replStatus.pending > 0 || replStatus.failed > 0) ? (
+                <p className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[13px]">
+                  <span className="text-muted-foreground">
+                    Pending:{" "}
+                    <span className="tabular-nums text-foreground">
+                      {count(replStatus.pending)}
+                    </span>
+                  </span>
+                  {replStatus.failed > 0 ? (
+                    <span className="flex items-center gap-1 text-destructive">
+                      <CircleAlert
+                        aria-hidden="true"
+                        className="size-3.5 shrink-0"
+                      />
+                      Failed:{" "}
+                      <span className="tabular-nums">
+                        {count(replStatus.failed)}
+                      </span>
+                    </span>
+                  ) : null}
+                </p>
+              ) : null
+            }
+            footerClassName="flex-wrap gap-2"
+            footer={
+              <>
+                {replStatus && replStatus.failed > 0 ? (
+                  <Button
+                    variant="outline"
+                    onClick={retryReplication}
+                    disabled={busy === "retry"}
+                    aria-busy={busy === "retry" || undefined}
+                  >
+                    {busy === "retry" ? "Retrying…" : "Retry failed"}
+                  </Button>
+                ) : null}
+                <Button
+                  variant="outline"
+                  onClick={resyncReplication}
+                  disabled={busy === "resync"}
+                  aria-busy={busy === "resync" || undefined}
+                  title="Enqueue existing objects for replication (needs ExistingObjectReplication enabled)"
+                >
+                  {busy === "resync" ? "Starting…" : "Resync existing"}
+                </Button>
+                {repl ? (
+                  <Button
+                    variant="outline"
+                    onClick={() => setConfirmClearRepl(true)}
+                    disabled={busy === "replication"}
+                  >
+                    Remove rule
+                  </Button>
+                ) : null}
+                <Button
+                  onClick={() => void saveReplication()}
+                  disabled={busy === "replication"}
+                >
+                  {busy === "replication" ? "Saving…" : "Save"}
+                </Button>
+              </>
+            }
+          >
+            <CardContent className="space-y-1.5">
+              <div className="flex flex-wrap gap-2">
                 <Input
-                  aria-label={`Tag ${i + 1} key`}
-                  placeholder="Key"
-                  value={t.key}
-                  className="font-mono"
-                  onChange={(e) =>
-                    setBucketTags((cur) =>
-                      cur.map((x, j) =>
-                        j === i ? { ...x, key: e.target.value } : x,
-                      ),
-                    )
-                  }
+                  value={replDest}
+                  placeholder="Destination bucket"
+                  autoComplete="off"
+                  aria-label="Replication destination bucket"
+                  aria-invalid={replError ? true : undefined}
+                  className="w-full font-mono sm:w-56"
+                  onChange={(e) => {
+                    setReplDest(e.target.value);
+                    setReplError("");
+                  }}
                 />
                 <Input
-                  aria-label={`Tag ${i + 1} value`}
-                  placeholder="Value"
-                  value={t.value}
-                  className="font-mono"
-                  onChange={(e) =>
-                    setBucketTags((cur) =>
-                      cur.map((x, j) =>
-                        j === i ? { ...x, value: e.target.value } : x,
-                      ),
-                    )
-                  }
+                  value={replPrefix}
+                  placeholder="Prefix (optional)"
+                  autoComplete="off"
+                  aria-label="Replication prefix"
+                  className="w-full font-mono sm:w-44"
+                  onChange={(e) => setReplPrefix(e.target.value)}
                 />
+              </div>
+              <FieldError>{replError || null}</FieldError>
+            </CardContent>
+          </SettingsCard>
+
+          {/* ---- Replication targets (remote endpoints + sealed credentials) ---- */}
+          <SettingsCard
+            title="Replication targets"
+            description="Remote destinations this bucket can replicate into. Each holds the endpoint and credentials of a bucket on another Cairn (or S3) node; the secret is sealed on the server and never shown again."
+            footer={
+              <Button onClick={addTarget} disabled={addingTarget}>
+                {addingTarget ? "Adding…" : "Add target"}
+              </Button>
+            }
+          >
+            <CardContent className="space-y-4">
+              {targets.length > 0 ? (
+                <ul className="divide-y rounded-lg border">
+                  {targets.map((t) => (
+                    <li
+                      key={t.arn}
+                      className="flex flex-wrap items-center justify-between gap-2 px-3 py-2.5"
+                    >
+                      <div className="min-w-0">
+                        <p
+                          className="truncate font-mono text-[13px]"
+                          title={t.arn}
+                        >
+                          {t.dest_bucket}{" "}
+                          <span className="text-muted-foreground">
+                            @ {t.endpoint}
+                          </span>
+                        </p>
+                        <p className="text-xs text-muted-foreground">
+                          {t.region} · key {t.access_key_id}
+                        </p>
+                      </div>
+                      <Button
+                        variant="destructive-outline"
+                        size="icon"
+                        aria-label={`Remove target ${t.dest_bucket}`}
+                        disabled={busy === "target"}
+                        onClick={() => setConfirmDeleteTarget(t.arn)}
+                      >
+                        <Trash2 aria-hidden="true" />
+                      </Button>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="text-[13px] text-muted-foreground">
+                  No remote targets yet. Add one below, then set the replication
+                  rule above to its destination bucket.
+                </p>
+              )}
+
+              <div className="grid gap-3 rounded-lg border p-3 md:grid-cols-2">
+                <div className="grid gap-1.5 md:col-span-2">
+                  <Label htmlFor={`${quotaId}-ep`}>Endpoint</Label>
+                  <Input
+                    id={`${quotaId}-ep`}
+                    value={targetForm.endpoint}
+                    placeholder="https://s3.peer.example.com:7373"
+                    autoComplete="off"
+                    className="font-mono"
+                    onChange={(e) =>
+                      setTargetForm({ ...targetForm, endpoint: e.target.value })
+                    }
+                  />
+                </div>
+                <div className="grid gap-1.5">
+                  <Label htmlFor={`${quotaId}-region`}>Region</Label>
+                  <Input
+                    id={`${quotaId}-region`}
+                    value={targetForm.region}
+                    autoComplete="off"
+                    className="font-mono"
+                    onChange={(e) =>
+                      setTargetForm({ ...targetForm, region: e.target.value })
+                    }
+                  />
+                </div>
+                <div className="grid gap-1.5">
+                  <Label htmlFor={`${quotaId}-db`}>Destination bucket</Label>
+                  <Input
+                    id={`${quotaId}-db`}
+                    value={targetForm.dest_bucket}
+                    autoComplete="off"
+                    className="font-mono"
+                    onChange={(e) =>
+                      setTargetForm({
+                        ...targetForm,
+                        dest_bucket: e.target.value,
+                      })
+                    }
+                  />
+                </div>
+                <div className="grid gap-1.5">
+                  <Label htmlFor={`${quotaId}-ak`}>Access key</Label>
+                  <Input
+                    id={`${quotaId}-ak`}
+                    value={targetForm.access_key}
+                    autoComplete="off"
+                    className="font-mono"
+                    onChange={(e) =>
+                      setTargetForm({
+                        ...targetForm,
+                        access_key: e.target.value,
+                      })
+                    }
+                  />
+                </div>
+                <div className="grid gap-1.5">
+                  <Label htmlFor={`${quotaId}-sk`}>Secret key</Label>
+                  <Input
+                    id={`${quotaId}-sk`}
+                    type="password"
+                    value={targetForm.secret}
+                    autoComplete="off"
+                    className="font-mono"
+                    onChange={(e) =>
+                      setTargetForm({ ...targetForm, secret: e.target.value })
+                    }
+                  />
+                </div>
+              </div>
+            </CardContent>
+          </SettingsCard>
+
+          {/* ---- Encryption at rest ---- */}
+          <SettingsCard
+            title={
+              <>
+                Encryption at rest
+                <StatusBadge tone={config.encryption ? "positive" : "neutral"}>
+                  {config.encryption ? "AES-256" : "Off"}
+                </StatusBadge>
+              </>
+            }
+            description="Encrypt every new upload with a server-managed key (SSE-S3, AES-256). The key never leaves the server and downloads are transparent. Existing objects are not rewritten."
+            footer={
+              <Button onClick={saveEncryption} disabled={busy === "encryption"}>
+                {busy === "encryption" ? "Saving…" : "Save"}
+              </Button>
+            }
+          >
+            <CardContent>
+              <Select value={encryption} onValueChange={setEncryption}>
+                <SelectTrigger
+                  className="w-full sm:w-56"
+                  aria-label="Default encryption"
+                >
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="AES256">AES-256 (SSE-S3)</SelectItem>
+                  <SelectItem value="none">Off</SelectItem>
+                </SelectContent>
+              </Select>
+            </CardContent>
+          </SettingsCard>
+
+          {/* ---- Bucket policy ---- */}
+          <SettingsCard
+            title="Bucket policy"
+            description={
+              <>
+                A JSON document that grants or denies access to this bucket and
+                its objects. Bucket policies need a{" "}
+                <code className="font-mono text-[12px]">Principal</code> per
+                statement. If you would rather not write JSON, the Users page has
+                a visual permission builder that writes per-user policies for
+                you.
+              </>
+            }
+            footerClassName="gap-2"
+            footer={
+              <>
+                <Button
+                  variant="destructive-outline"
+                  onClick={() => setConfirmDeletePolicy(true)}
+                  disabled={busy === "policy" || !config.policy}
+                >
+                  Delete policy
+                </Button>
+                <Button
+                  onClick={() => void savePolicy()}
+                  disabled={
+                    busy === "policy" ||
+                    policyText.trim() === "" ||
+                    (policyValidation !== null && !policyValidation.ok)
+                  }
+                >
+                  {busy === "policy" ? "Saving…" : "Save policy"}
+                </Button>
+              </>
+            }
+          >
+            <CardContent className="space-y-2">
+              <div className="flex items-center justify-between">
                 <Button
                   type="button"
                   variant="ghost"
-                  size="icon"
-                  aria-label={`Remove tag ${i + 1}`}
-                  onClick={() =>
-                    setBucketTags((cur) => cur.filter((_, j) => j !== i))
-                  }
+                  size="sm"
+                  onClick={() => {
+                    setPolicyText(EXAMPLE_POLICY.replace(/BUCKET/g, name));
+                    setPolicyError("");
+                  }}
                 >
-                  <X aria-hidden="true" />
+                  Insert example
                 </Button>
               </div>
-            ))
-          )}
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            disabled={bucketTags.length >= 50}
-            onClick={() =>
-              setBucketTags((cur) => [...cur, { key: "", value: "" }])
+              <JsonEditor
+                value={policyText}
+                onChange={(t) => {
+                  setPolicyText(t);
+                  setPolicyError("");
+                }}
+                error={policyText.trim() === "" ? null : policyEditorError}
+                label="Bucket policy JSON"
+                rows={12}
+                validLabel="Valid policy document"
+              />
+              {policyText.trim() === "" ? (
+                <p className="text-[13px] text-muted-foreground">
+                  No policy set. Paste a policy document, or use “Insert example”
+                  to start from a template.
+                </p>
+              ) : null}
+            </CardContent>
+          </SettingsCard>
+
+          {/* ---- Object ownership ---- */}
+          <SettingsCard
+            title="Object ownership"
+            description={
+              <>
+                Controls whether ACLs apply.{" "}
+                <strong>Bucket owner enforced</strong> disables ACLs entirely
+                (the safe default); the other modes let object writers set ACLs.
+              </>
+            }
+            footer={
+              <Button onClick={saveOwnership} disabled={busy === "ownership"}>
+                {busy === "ownership" ? "Saving…" : "Save"}
+              </Button>
             }
           >
-            <Plus aria-hidden="true" />
-            Add tag
-          </Button>
-        </CardContent>
-        <CardFooter className="justify-end border-t pt-4!">
-          <Button onClick={saveBucketTags} disabled={busy === "buckettags"}>
-            {busy === "buckettags" ? "Saving…" : "Save tags"}
-          </Button>
-        </CardFooter>
-      </Card>
+            <CardContent>
+              <Select value={ownership} onValueChange={setOwnership}>
+                <SelectTrigger
+                  className="w-full sm:w-56"
+                  aria-label="Object ownership"
+                >
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="BucketOwnerEnforced">
+                    Bucket owner enforced
+                  </SelectItem>
+                  <SelectItem value="BucketOwnerPreferred">
+                    Bucket owner preferred
+                  </SelectItem>
+                  <SelectItem value="ObjectWriter">Object writer</SelectItem>
+                </SelectContent>
+              </Select>
+            </CardContent>
+          </SettingsCard>
 
-      {/* ---- Configured aspects (read-only: CORS / Lifecycle / ACL) ---- */}
-      <Card className="gap-4">
-        <CardHeader>
-          <CardTitle className="text-base">Other S3 aspects</CardTitle>
-          <CardDescription>
-            CORS, lifecycle, and ACL are configured through the S3 API and shown
-            here for reference.
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
-          <dl className="grid grid-cols-2 gap-x-6 gap-y-3 sm:grid-cols-3">
-            {ASPECTS.map(([key, label]) => (
-              <div key={key}>
-                <dt className="text-[13px] text-muted-foreground">{label}</dt>
-                <dd className="mt-0.5">
-                  {(config as unknown as AspectsSource)[key] ? (
-                    <Badge variant="outline">Set</Badge>
-                  ) : (
-                    <span className="text-sm text-muted-foreground">—</span>
-                  )}
-                </dd>
-              </div>
-            ))}
-          </dl>
-        </CardContent>
-      </Card>
+          {/* ---- Public Access Block ---- */}
+          <SettingsCard
+            title="Public Access Block"
+            description="Guardrails that neutralise public access regardless of ACLs or policy. Enabling all four is the safe default."
+            footer={
+              <Button onClick={savePab} disabled={busy === "pab"}>
+                {busy === "pab" ? "Saving…" : "Save"}
+              </Button>
+            }
+          >
+            <CardContent className="space-y-3">
+              {PAB_TOGGLES.map((t) => (
+                <label key={t.key} className="flex items-start gap-3">
+                  <Checkbox
+                    checked={pab[t.key]}
+                    onCheckedChange={(v) =>
+                      setPab({ ...pab, [t.key]: v === true })
+                    }
+                    aria-label={t.label}
+                    className="mt-0.5"
+                  />
+                  <span>
+                    <span className="block text-sm">{t.label}</span>
+                    <span className="block text-[13px] text-muted-foreground">
+                      {t.hint}
+                    </span>
+                  </span>
+                </label>
+              ))}
+            </CardContent>
+          </SettingsCard>
+
+          {/* ---- Bucket tags ---- */}
+          <SettingsCard
+            title="Bucket tags"
+            description="Key-value tags on the bucket, for organisation and policy conditioning."
+            footer={
+              <Button onClick={saveBucketTags} disabled={busy === "buckettags"}>
+                {busy === "buckettags" ? "Saving…" : "Save tags"}
+              </Button>
+            }
+          >
+            <CardContent className="space-y-2">
+              {bucketTags.length === 0 ? (
+                <p className="text-[13px] text-muted-foreground">
+                  No tags. Add one below.
+                </p>
+              ) : (
+                bucketTags.map((t, i) => (
+                  <div key={i} className="flex items-center gap-2">
+                    <Input
+                      aria-label={`Tag ${i + 1} key`}
+                      placeholder="Key"
+                      value={t.key}
+                      className="font-mono"
+                      onChange={(e) =>
+                        setBucketTags((cur) =>
+                          cur.map((x, j) =>
+                            j === i ? { ...x, key: e.target.value } : x,
+                          ),
+                        )
+                      }
+                    />
+                    <Input
+                      aria-label={`Tag ${i + 1} value`}
+                      placeholder="Value"
+                      value={t.value}
+                      className="font-mono"
+                      onChange={(e) =>
+                        setBucketTags((cur) =>
+                          cur.map((x, j) =>
+                            j === i ? { ...x, value: e.target.value } : x,
+                          ),
+                        )
+                      }
+                    />
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      aria-label={`Remove tag ${i + 1}`}
+                      onClick={() =>
+                        setBucketTags((cur) => cur.filter((_, j) => j !== i))
+                      }
+                    >
+                      <X aria-hidden="true" />
+                    </Button>
+                  </div>
+                ))
+              )}
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                disabled={bucketTags.length >= 50}
+                onClick={() =>
+                  setBucketTags((cur) => [...cur, { key: "", value: "" }])
+                }
+              >
+                <Plus aria-hidden="true" />
+                Add tag
+              </Button>
+            </CardContent>
+          </SettingsCard>
+
+          {/* ---- Configured aspects (read-only: CORS / Lifecycle / ACL) ---- */}
+          <SettingsCard
+            title="Other S3 aspects"
+            description="CORS, lifecycle, and ACL are configured through the S3 API and shown here for reference."
+            footer={null}
+          >
+            <CardContent>
+              <dl className="grid grid-cols-2 gap-x-6 gap-y-3 sm:grid-cols-3">
+                {ASPECTS.map(([key, label]) => (
+                  <div key={key}>
+                    <dt className="text-[13px] text-muted-foreground">
+                      {label}
+                    </dt>
+                    <dd className="mt-0.5">
+                      {(config as unknown as AspectsSource)[key] ? (
+                        <Badge variant="outline">Set</Badge>
+                      ) : (
+                        <span className="text-sm text-muted-foreground">—</span>
+                      )}
+                    </dd>
+                  </div>
+                ))}
+              </dl>
+            </CardContent>
+          </SettingsCard>
+        </>
+      ) : null}
 
       <ConfirmDialog
         open={confirmDeletePolicy}
