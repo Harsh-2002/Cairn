@@ -712,7 +712,7 @@ export function BucketBrowser() {
             objects carrying the chosen tag. Tags lazy-load on first open. */}
         <Select
           value={
-            tagFilter ? `${tagFilter.key} ${tagFilter.value}` : "__all__"
+            tagFilter ? JSON.stringify([tagFilter.key, tagFilter.value]) : "__all__"
           }
           onOpenChange={(open) => {
             if (open && bucketTags === null) void loadBucketTags();
@@ -723,7 +723,7 @@ export function BucketBrowser() {
               return;
             }
             const tag = (bucketTags ?? []).find(
-              (t) => `${t.tag_key} ${t.tag_value}` === v,
+              (t) => JSON.stringify([t.tag_key, t.tag_value]) === v,
             );
             if (tag) {
               if (showVersions) setShowVersions(false);
@@ -753,8 +753,8 @@ export function BucketBrowser() {
                 <SelectLabel>Tags in use</SelectLabel>
                 {bucketTags?.map((t) => (
                   <SelectItem
-                    key={`${t.tag_key} ${t.tag_value}`}
-                    value={`${t.tag_key} ${t.tag_value}`}
+                    key={JSON.stringify([t.tag_key, t.tag_value])}
+                    value={JSON.stringify([t.tag_key, t.tag_value])}
                   >
                     <span className="font-mono text-[13px]">
                       {t.tag_key}={t.tag_value}
