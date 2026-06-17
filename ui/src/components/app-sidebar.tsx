@@ -7,6 +7,7 @@ import {
   Database,
   Home,
   RefreshCw,
+  Tags,
   Users,
 } from "lucide-react";
 import {
@@ -36,6 +37,7 @@ const NAV = [
   { label: "Overview", path: "/overview", icon: Home },
   { label: "Metrics", path: "/metrics", icon: BarChart3 },
   { label: "Buckets", path: "/buckets", icon: Database },
+  { label: "Tags", path: "/tags", icon: Tags },
   { label: "Users", path: "/users", icon: Users },
   { label: "Activity", path: "/activity", icon: Activity },
   { label: "Replication", path: "/replication", icon: RefreshCw },

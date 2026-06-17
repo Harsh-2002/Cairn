@@ -11,8 +11,9 @@ use crate::meta::{
     ActivityEntry, BucketCounts, BucketRequestCount, ClaimOutcome, IfNoneMatch, LATENCY_BUCKETS,
     ListPage, ListQuery, MetricsRange, MultipartSession, MultipartStatus, Mutation,
     MutationOutcome, ObjectSummary, OpCount, OutboxEntry, PartRecord, Precondition,
-    ReplicationStatus, RequestMetricsSeries, ShareRow, StatusCount, StoreCounts, TimePoint, User,
-    UserRecord, UserSigV4Credentials, UserWithBearerHash, latency_quantile_ms,
+    ReplicationStatus, RequestMetricsSeries, ShareRow, StatusCount, StoreCounts, TagSummary,
+    TaggedObject, TimePoint, User, UserRecord, UserSigV4Credentials, UserWithBearerHash,
+    latency_quantile_ms,
 };
 use crate::object::{ETag, ObjectVersionRow};
 use crate::time::Timestamp;
@@ -1113,6 +1114,81 @@ impl MetadataStore for InMemoryMetadataStore {
             .collect();
         // Most recent first, matching the SQL stores.
         out.sort_by_key(|s| std::cmp::Reverse(s.created_at.0));
+        Ok(out)
+    }
+
+    async fn list_tag_summary(
+        &self,
+        bucket: Option<&BucketName>,
+    ) -> Result<Vec<TagSummary>, MetaError> {
+        let st = self.state.lock().unwrap();
+        let mut counts: BTreeMap<(String, String), u64> = BTreeMap::new();
+        for (vkey, tag_list) in &st.tags {
+            let Some(v) = st.versions.get(vkey) else {
+                continue;
+            };
+            // Only current objects (latest, non-delete-marker), optionally bucket-scoped.
+            if !v.is_latest || v.is_delete_marker {
+                continue;
+            }
+            if bucket.is_some_and(|b| b.as_str() != vkey.0) {
+                continue;
+            }
+            for (k, val) in tag_list {
+                *counts.entry((k.clone(), val.clone())).or_insert(0) += 1;
+            }
+        }
+        let mut out: Vec<TagSummary> = counts
+            .into_iter()
+            .map(|((tag_key, tag_value), object_count)| TagSummary {
+                tag_key,
+                tag_value,
+                object_count,
+            })
+            .collect();
+        out.sort_by(|a, b| {
+            b.object_count
+                .cmp(&a.object_count)
+                .then(a.tag_key.cmp(&b.tag_key))
+                .then(a.tag_value.cmp(&b.tag_value))
+        });
+        Ok(out)
+    }
+
+    async fn list_objects_by_tag(
+        &self,
+        bucket: Option<&BucketName>,
+        tag_key: &str,
+        tag_value: &str,
+        limit: u32,
+    ) -> Result<Vec<TaggedObject>, MetaError> {
+        let st = self.state.lock().unwrap();
+        let mut out: Vec<TaggedObject> = Vec::new();
+        for (vkey, tag_list) in &st.tags {
+            let Some(v) = st.versions.get(vkey) else {
+                continue;
+            };
+            if !v.is_latest || v.is_delete_marker {
+                continue;
+            }
+            if bucket.is_some_and(|b| b.as_str() != vkey.0) {
+                continue;
+            }
+            if tag_list
+                .iter()
+                .any(|(k, val)| k == tag_key && val == tag_value)
+            {
+                out.push(TaggedObject {
+                    bucket: vkey.0.clone(),
+                    key: vkey.1.clone(),
+                    version_id: vkey.2.clone(),
+                    size: v.size_logical,
+                    last_modified: v.updated_at,
+                });
+            }
+        }
+        out.sort_by(|a, b| a.bucket.cmp(&b.bucket).then(a.key.cmp(&b.key)));
+        out.truncate(limit as usize);
         Ok(out)
     }
 

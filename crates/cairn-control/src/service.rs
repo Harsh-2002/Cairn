@@ -16,7 +16,7 @@ use cairn_types::bucket::{
 use cairn_types::id::{BucketName, ObjectKey, UserId};
 use cairn_types::meta::{
     ListQuery, MetricsRange, Mutation, MutationOutcome, ShareDisposition, ShareRow, StoreCounts,
-    User, UserRecord,
+    TagSummary, TaggedObject, User, UserRecord,
 };
 use cairn_types::time::Timestamp;
 use cairn_types::traits::{BlobStore, Clock, Crypto, MetadataStore};
@@ -238,6 +238,9 @@ impl ControlService {
             (&Method::GET, ["overview", "buckets"]) => self.overview_buckets().await,
             (&Method::GET, ["system"]) => self.system(),
             (&Method::GET, ["metrics", "requests"]) => self.request_metrics(query).await,
+
+            (&Method::GET, ["tags"]) => self.list_tags(query).await,
+            (&Method::GET, ["tags", "objects"]) => self.list_tag_objects(query).await,
 
             (&Method::GET, ["buckets"]) => self.list_buckets().await,
             (&Method::POST, ["buckets"]) => self.create_bucket(&body, principal).await,
@@ -469,6 +472,79 @@ impl ControlService {
                     .map(|s| wire::MetricStatus {
                         status_class: s.status_class,
                         count: s.count,
+                    })
+                    .collect(),
+            },
+        )
+    }
+
+    // -----------------------------------------------------------------------------------
+    // Object tag browsing (ARCH §17.2)
+    // -----------------------------------------------------------------------------------
+
+    /// `GET /tags[?bucket=<name>]`: the distinct object tags in use (`key=value`, each with a
+    /// current-object count), optionally scoped to one bucket. An invalid `bucket` is a `400`.
+    async fn list_tags(&self, query: &[(String, String)]) -> ControlResponse {
+        let bucket = match find_query(query, "bucket") {
+            Some(b) => match BucketName::parse(b) {
+                Ok(n) => Some(n),
+                Err(_) => return ControlResponse::bad_request("invalid bucket"),
+            },
+            None => None,
+        };
+        let summary = match self.meta.list_tag_summary(bucket.as_ref()).await {
+            Ok(s) => s,
+            Err(e) => return ControlResponse::error_internal(&e.to_string()),
+        };
+        ControlResponse::json(
+            StatusCode::OK,
+            &wire::TagSummaryResp {
+                tags: summary
+                    .into_iter()
+                    .map(|t: TagSummary| wire::TagSummaryItem {
+                        tag_key: t.tag_key,
+                        tag_value: t.tag_value,
+                        object_count: t.object_count,
+                    })
+                    .collect(),
+            },
+        )
+    }
+
+    /// `GET /tags/objects?key=<k>&value=<v>[&bucket=<name>]`: the current objects carrying the
+    /// exact `key=value` tag, bounded by [`PAGE_LIMIT`]. Missing `key`/`value` is a `400`; an
+    /// invalid `bucket` is a `400`.
+    async fn list_tag_objects(&self, query: &[(String, String)]) -> ControlResponse {
+        let (Some(key), Some(value)) = (find_query(query, "key"), find_query(query, "value"))
+        else {
+            return ControlResponse::bad_request("key and value are required");
+        };
+        let bucket = match find_query(query, "bucket") {
+            Some(b) => match BucketName::parse(b) {
+                Ok(n) => Some(n),
+                Err(_) => return ControlResponse::bad_request("invalid bucket"),
+            },
+            None => None,
+        };
+        let objects = match self
+            .meta
+            .list_objects_by_tag(bucket.as_ref(), key, value, PAGE_LIMIT)
+            .await
+        {
+            Ok(o) => o,
+            Err(e) => return ControlResponse::error_internal(&e.to_string()),
+        };
+        ControlResponse::json(
+            StatusCode::OK,
+            &wire::TagObjectsResp {
+                objects: objects
+                    .into_iter()
+                    .map(|o: TaggedObject| wire::TagObjectItem {
+                        bucket: o.bucket,
+                        key: o.key,
+                        version_id: o.version_id,
+                        size: o.size,
+                        last_modified_ms: o.last_modified.as_millis(),
                     })
                     .collect(),
             },

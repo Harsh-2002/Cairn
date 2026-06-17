@@ -311,3 +311,30 @@ export interface DeletePrefixResp {
 }
 
 export type MetricsRange = "1d" | "1w" | "2w" | "1m";
+
+// Object tagging, surfaced node-wide in the Tags view. Mirrors the management
+// API's /tags summary + /tags/objects drill-down.
+
+/** One distinct tag (key=value) and how many objects carry it. */
+export interface TagSummaryItem {
+  tag_key: string;
+  tag_value: string;
+  object_count: number;
+}
+
+export interface TagSummaryResp {
+  tags: TagSummaryItem[];
+}
+
+/** An object carrying a selected tag. */
+export interface TagObjectItem {
+  bucket: string;
+  key: string;
+  version_id: string;
+  size: number;
+  last_modified_ms: number;
+}
+
+export interface TagObjectsResp {
+  objects: TagObjectItem[];
+}

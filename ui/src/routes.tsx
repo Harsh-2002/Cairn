@@ -11,6 +11,7 @@ import { Buckets } from "@/views/buckets";
 import { Login } from "@/views/login";
 import { Overview } from "@/views/overview";
 import { Replication } from "@/views/replication";
+import { Tags } from "@/views/tags";
 import { UserDetail } from "@/views/user-detail";
 import { Users } from "@/views/users";
 
@@ -54,6 +55,7 @@ export const router = createHashRouter([
       },
       { path: "users", element: <Users /> },
       { path: "users/:id", element: <UserDetail /> },
+      { path: "tags", element: <Tags /> },
       { path: "activity", element: <Activity /> },
       { path: "replication", element: <Replication /> },
       // Parity with the old router: anything unknown lands on the overview.

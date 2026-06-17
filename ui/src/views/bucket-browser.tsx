@@ -23,6 +23,7 @@ import {
   Upload,
 } from "lucide-react";
 import { toast } from "sonner";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import {
@@ -43,6 +44,15 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Progress } from "@/components/ui/progress";
+import {
+  Select,
+  SelectContent,
+  SelectGroup,
+  SelectItem,
+  SelectLabel,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
   Table,
@@ -72,7 +82,11 @@ import {
   putObjectWithProgress,
   type ObjectVersion,
 } from "@/lib/s3";
-import type { ObjectEntry } from "@/lib/types";
+import type {
+  ObjectEntry,
+  TagObjectItem,
+  TagSummaryItem,
+} from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 interface UploadItem {
@@ -119,6 +133,19 @@ export function BucketBrowser() {
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // ---- tag filter --------------------------------------------------------------
+  // When set, the browser switches from the folder listing to a flat list of the
+  // objects carrying this exact tag (cross-prefix). `bucketTags` lazy-loads the
+  // tags in use in this bucket for the toolbar control; null means "not loaded".
+  const [tagFilter, setTagFilter] = useState<{ key: string; value: string } | null>(
+    null,
+  );
+  const [bucketTags, setBucketTags] = useState<TagSummaryItem[] | null>(null);
+  const [tagsLoading, setTagsLoading] = useState(false);
+  const [tagObjects, setTagObjects] = useState<TagObjectItem[] | null>(null);
+  const [tagBusy, setTagBusy] = useState(false);
+  const [tagError, setTagError] = useState<string | null>(null);
+
   // Stale-response guard: any new load (or a bucket/path change) bumps the
   // ticket so an older in-flight response can't clobber newer state.
   const seqRef = useRef(0);
@@ -135,6 +162,10 @@ export function BucketBrowser() {
     setNext(null);
     setError(null);
     setUploads([]);
+    setTagFilter(null);
+    setBucketTags(null);
+    setTagObjects(null);
+    setTagError(null);
   }, [name]);
 
   // Debounce the filter; changing it resets paging via load().
@@ -179,8 +210,55 @@ export function BucketBrowser() {
   }, [name, listPrefix, showVersions]);
 
   useEffect(() => {
+    // Tag-filter mode owns the listing; the folder load() pauses while it's active.
+    if (tagFilter) return;
     void load();
-  }, [load]);
+  }, [load, tagFilter]);
+
+  // Lazy-load the bucket's in-use tags for the "Filter by tag" control. Runs on
+  // first open (or when the bucket changes via the reset above).
+  const loadBucketTags = useCallback(async () => {
+    if (tagsLoading) return;
+    setTagsLoading(true);
+    try {
+      const res = await api.listTags(name);
+      setBucketTags(res.tags ?? []);
+    } catch (e) {
+      setBucketTags([]);
+      toast.error(errorMessage(e, "Failed to load tags."));
+    } finally {
+      setTagsLoading(false);
+    }
+  }, [name, tagsLoading]);
+
+  // Tag-filter listing: fetch the flat set of objects carrying the chosen tag.
+  useEffect(() => {
+    if (!tagFilter) {
+      setTagObjects(null);
+      setTagError(null);
+      return;
+    }
+    let cancelled = false;
+    setTagBusy(true);
+    setTagError(null);
+    setTagObjects(null);
+    api
+      .listTagObjects(tagFilter.key, tagFilter.value, name)
+      .then((res) => {
+        if (cancelled) return;
+        setTagObjects(res.objects ?? []);
+      })
+      .catch((e) => {
+        if (cancelled) return;
+        setTagError(errorMessage(e, "Failed to load tagged objects."));
+      })
+      .finally(() => {
+        if (!cancelled) setTagBusy(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [tagFilter, name]);
 
   // Selection is scoped to the current folder/mode; clear it on any navigation.
   useEffect(() => {
@@ -621,6 +699,7 @@ export function BucketBrowser() {
           type="button"
           variant={showVersions ? "secondary" : "outline"}
           aria-pressed={showVersions}
+          disabled={tagFilter !== null}
           onClick={() => {
             setObjects(null);
             setShowVersions((v) => !v);
@@ -628,6 +707,65 @@ export function BucketBrowser() {
         >
           {showVersions ? "Hide versions" : "Show versions"}
         </Button>
+
+        {/* Filter by tag: switches the listing to a flat, cross-prefix view of the
+            objects carrying the chosen tag. Tags lazy-load on first open. */}
+        <Select
+          value={
+            tagFilter ? `${tagFilter.key} ${tagFilter.value}` : "__all__"
+          }
+          onOpenChange={(open) => {
+            if (open && bucketTags === null) void loadBucketTags();
+          }}
+          onValueChange={(v) => {
+            if (v === "__all__") {
+              setTagFilter(null);
+              return;
+            }
+            const tag = (bucketTags ?? []).find(
+              (t) => `${t.tag_key} ${t.tag_value}` === v,
+            );
+            if (tag) {
+              if (showVersions) setShowVersions(false);
+              setTagFilter({ key: tag.tag_key, value: tag.tag_value });
+            }
+          }}
+        >
+          <SelectTrigger
+            className={cn("w-[180px]", tagFilter && "border-ring")}
+            aria-label="Filter by tag"
+          >
+            <Tag aria-hidden="true" className="size-4 text-muted-foreground" />
+            <SelectValue placeholder="Filter by tag" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="__all__">All objects</SelectItem>
+            {tagsLoading ? (
+              <div className="px-2 py-1.5 text-[13px] text-muted-foreground">
+                Loading tags…
+              </div>
+            ) : (bucketTags?.length ?? 0) === 0 ? (
+              <div className="px-2 py-1.5 text-[13px] text-muted-foreground">
+                No tags in this bucket
+              </div>
+            ) : (
+              <SelectGroup>
+                <SelectLabel>Tags in use</SelectLabel>
+                {bucketTags?.map((t) => (
+                  <SelectItem
+                    key={`${t.tag_key} ${t.tag_value}`}
+                    value={`${t.tag_key} ${t.tag_value}`}
+                  >
+                    <span className="font-mono text-[13px]">
+                      {t.tag_key}={t.tag_value}
+                    </span>{" "}
+                    <span className="text-muted-foreground">({t.object_count})</span>
+                  </SelectItem>
+                ))}
+              </SelectGroup>
+            )}
+          </SelectContent>
+        </Select>
 
         <div className="ms-auto flex items-center gap-3">
           <p className="hidden text-[13px] text-muted-foreground sm:block">
@@ -690,7 +828,9 @@ export function BucketBrowser() {
         </div>
       </div>
 
-      {/* Folder breadcrumb: the bucket root plus each path segment. */}
+      {/* Folder breadcrumb: the bucket root plus each path segment. Hidden while a
+          tag filter is active, since tag results span every prefix. */}
+      {tagFilter ? null : (
       <nav aria-label="Folder path" className="flex flex-wrap items-center gap-1 text-[13px]">
         <button
           type="button"
@@ -730,6 +870,7 @@ export function BucketBrowser() {
           );
         })}
       </nav>
+      )}
 
       {/* Per-file upload progress (live %, speed) for the current batch. */}
       {uploads.length > 0 ? (
@@ -810,6 +951,156 @@ export function BucketBrowser() {
         </div>
       ) : null}
 
+      {tagFilter ? (
+        <>
+          {/* Active tag-filter banner with the matched count and a clear affordance. */}
+          <div className="flex flex-wrap items-center gap-2 rounded-lg border bg-muted/40 px-3 py-2 text-[13px]">
+            <span className="text-muted-foreground">Filtered by tag:</span>
+            <Badge variant="secondary" className="font-mono">
+              {tagFilter.key}={tagFilter.value}
+            </Badge>
+            <span className="text-muted-foreground">
+              {tagBusy
+                ? "loading…"
+                : `${tagObjects?.length ?? 0} object${(tagObjects?.length ?? 0) === 1 ? "" : "s"}`}
+            </span>
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              className="ms-auto"
+              onClick={() => setTagFilter(null)}
+            >
+              Clear filter
+            </Button>
+          </div>
+
+          {tagError ? (
+            <ErrorAlert
+              title="Couldn't load tagged objects"
+              message={tagError}
+              onRetry={() => setTagFilter({ ...tagFilter })}
+            />
+          ) : null}
+
+          {tagBusy && tagObjects === null ? (
+            <div className="overflow-x-auto rounded-lg border">
+              <Table className="min-w-[640px]">
+                <TableHeader>
+                  <TableRow>
+                    <TableHead className="text-xs text-muted-foreground">Object</TableHead>
+                    <TableHead className="text-right text-xs text-muted-foreground">Size</TableHead>
+                    <TableHead className="text-xs text-muted-foreground">Modified</TableHead>
+                    <TableHead>
+                      <span className="visually-hidden">Actions</span>
+                    </TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {Array.from({ length: 4 }, (_, i) => (
+                    <TableRow key={i}>
+                      <TableCell>
+                        <Skeleton className="h-4 w-64" />
+                      </TableCell>
+                      <TableCell>
+                        <Skeleton className="ml-auto h-4 w-16" />
+                      </TableCell>
+                      <TableCell>
+                        <Skeleton className="h-4 w-36" />
+                      </TableCell>
+                      <TableCell>
+                        <Skeleton className="ml-auto size-8" />
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </div>
+          ) : tagObjects !== null && tagObjects.length === 0 && !tagError ? (
+            <EmptyState
+              icon={Tag}
+              title="No objects with this tag"
+              body="No current objects carry this tag. Clear the filter to return to the folder listing."
+            />
+          ) : tagObjects !== null && tagObjects.length > 0 ? (
+            <div className="overflow-x-auto rounded-lg border">
+              <Table className="min-w-[640px]">
+                <TableHeader>
+                  <TableRow>
+                    <TableHead className="text-xs text-muted-foreground">Object</TableHead>
+                    <TableHead className="text-right text-xs text-muted-foreground">Size</TableHead>
+                    <TableHead className="text-xs text-muted-foreground">Modified</TableHead>
+                    <TableHead>
+                      <span className="visually-hidden">Actions</span>
+                    </TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {tagObjects.map((o) => (
+                    <TableRow key={`${o.key}:${o.version_id}`}>
+                      <TableCell className="max-w-[28rem]">
+                        <span
+                          className="block truncate font-mono text-[13px]"
+                          title={o.key}
+                        >
+                          {o.key}
+                        </span>
+                      </TableCell>
+                      <TableCell className="text-right text-[13px] tabular-nums">
+                        {bytes(o.size)}
+                      </TableCell>
+                      <TableCell className="whitespace-nowrap text-[13px] text-muted-foreground tabular-nums">
+                        {whenMs(o.last_modified_ms)}
+                      </TableCell>
+                      <TableCell className="text-right">
+                        <DropdownMenu>
+                          <DropdownMenuTrigger asChild>
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              aria-label={`Actions for ${o.key}`}
+                            >
+                              <MoreHorizontal aria-hidden="true" />
+                            </Button>
+                          </DropdownMenuTrigger>
+                          <DropdownMenuContent align="end">
+                            <DropdownMenuItem onSelect={() => void openPreview(o.key)}>
+                              Preview
+                            </DropdownMenuItem>
+                            <DropdownMenuItem onSelect={() => void download(o.key)}>
+                              Download
+                            </DropdownMenuItem>
+                            <DropdownMenuItem onSelect={() => setTagsKey(o.key)}>
+                              <Tag aria-hidden="true" />
+                              Edit tags
+                            </DropdownMenuItem>
+                            <DropdownMenuItem onSelect={() => setShareKey(o.key)}>
+                              Share
+                            </DropdownMenuItem>
+                            <DropdownMenuItem
+                              onSelect={() => setManageSharesKey(o.key)}
+                            >
+                              Manage shares
+                            </DropdownMenuItem>
+                            <DropdownMenuSeparator />
+                            <DropdownMenuItem
+                              variant="destructive"
+                              onSelect={() => setPendingDelete(o.key)}
+                            >
+                              Delete
+                            </DropdownMenuItem>
+                          </DropdownMenuContent>
+                        </DropdownMenu>
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </div>
+          ) : null}
+        </>
+      ) : (
+      <>
       {error ? (
         <ErrorAlert
           title="Couldn't load objects"
@@ -1107,6 +1398,8 @@ export function BucketBrowser() {
           ) : null}
         </>
       ) : null}
+      </>
+      )}
 
       <ShareDialog
         bucket={name}

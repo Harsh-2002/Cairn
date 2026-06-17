@@ -13,7 +13,8 @@ use cairn_types::meta::{
     ActivityEntry, BucketCounts, BucketRequestCount, LATENCY_BUCKETS, ListPage, ListQuery,
     MetricsRange, MultipartSession, Mutation, MutationOutcome, ObjectSummary, OpCount, OutboxEntry,
     PartRecord, ReplicationStatus, RequestMetricsSeries, ShareRow, StatusCount, StoreCounts,
-    TimePoint, User, UserSigV4Credentials, UserWithBearerHash, latency_quantile_ms,
+    TagSummary, TaggedObject, TimePoint, User, UserSigV4Credentials, UserWithBearerHash,
+    latency_quantile_ms,
 };
 use cairn_types::object::ObjectVersionRow;
 use cairn_types::time::Timestamp;
@@ -841,6 +842,81 @@ impl MetadataStore for SqliteMetadataStore {
                     .collect::<rusqlite::Result<Vec<_>>>()
                     .map_err(engine_err)
             }
+        })
+        .await
+    }
+
+    async fn list_tag_summary(
+        &self,
+        bucket: Option<&BucketName>,
+    ) -> Result<Vec<TagSummary>, MetaError> {
+        let bucket = bucket.map(|b| b.as_str().to_owned());
+        self.with_read(move |conn| {
+            // Join to the current version so the count is of live objects, not historical versions.
+            // `?1 IS NULL` makes the bucket filter optional in a single prepared statement.
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT ot.tag_key, ot.tag_value, COUNT(*) AS c
+                     FROM object_tags ot
+                     JOIN object_versions ov
+                       ON ov.bucket_name = ot.bucket_name AND ov.key = ot.key
+                          AND ov.version_id = ot.version_id
+                     WHERE ov.is_latest = 1 AND ov.is_delete_marker = 0
+                       AND (?1 IS NULL OR ot.bucket_name = ?1)
+                     GROUP BY ot.tag_key, ot.tag_value
+                     ORDER BY c DESC, ot.tag_key, ot.tag_value",
+                )
+                .map_err(engine_err)?;
+            stmt.query_map(params![bucket], |r| {
+                Ok(TagSummary {
+                    tag_key: r.get(0)?,
+                    tag_value: r.get(1)?,
+                    object_count: r.get::<_, i64>(2)? as u64,
+                })
+            })
+            .map_err(engine_err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(engine_err)
+        })
+        .await
+    }
+
+    async fn list_objects_by_tag(
+        &self,
+        bucket: Option<&BucketName>,
+        tag_key: &str,
+        tag_value: &str,
+        limit: u32,
+    ) -> Result<Vec<TaggedObject>, MetaError> {
+        let bucket = bucket.map(|b| b.as_str().to_owned());
+        let (tag_key, tag_value) = (tag_key.to_owned(), tag_value.to_owned());
+        self.with_read(move |conn| {
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT ot.bucket_name, ot.key, ot.version_id, ov.size_logical, ov.updated_at
+                     FROM object_tags ot
+                     JOIN object_versions ov
+                       ON ov.bucket_name = ot.bucket_name AND ov.key = ot.key
+                          AND ov.version_id = ot.version_id
+                     WHERE ot.tag_key = ?1 AND ot.tag_value = ?2
+                       AND ov.is_latest = 1 AND ov.is_delete_marker = 0
+                       AND (?3 IS NULL OR ot.bucket_name = ?3)
+                     ORDER BY ot.bucket_name, ot.key
+                     LIMIT ?4",
+                )
+                .map_err(engine_err)?;
+            stmt.query_map(params![tag_key, tag_value, bucket, limit], |r| {
+                Ok(TaggedObject {
+                    bucket: r.get(0)?,
+                    key: r.get(1)?,
+                    version_id: r.get(2)?,
+                    size: r.get::<_, i64>(3)? as u64,
+                    last_modified: Timestamp(r.get::<_, i64>(4)?),
+                })
+            })
+            .map_err(engine_err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(engine_err)
         })
         .await
     }

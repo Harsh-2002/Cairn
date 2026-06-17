@@ -37,7 +37,8 @@ use cairn_types::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, Vers
 use cairn_types::meta::{
     ActivityEntry, BucketCounts, ListPage, ListQuery, MetricsRange, MultipartSession, Mutation,
     MutationOutcome, ObjectSummary, OutboxEntry, PartRecord, ReplicationStatus,
-    RequestMetricsSeries, ShareRow, StoreCounts, User, UserSigV4Credentials, UserWithBearerHash,
+    RequestMetricsSeries, ShareRow, StoreCounts, TagSummary, TaggedObject, User,
+    UserSigV4Credentials, UserWithBearerHash,
 };
 use cairn_types::object::ObjectVersionRow;
 use cairn_types::time::Timestamp;
@@ -600,6 +601,25 @@ impl MetadataStore for CachedMetadataStore {
         self.inner.list_shares(bucket, key).await
     }
 
+    async fn list_tag_summary(
+        &self,
+        bucket: Option<&BucketName>,
+    ) -> Result<Vec<TagSummary>, MetaError> {
+        self.inner.list_tag_summary(bucket).await
+    }
+
+    async fn list_objects_by_tag(
+        &self,
+        bucket: Option<&BucketName>,
+        tag_key: &str,
+        tag_value: &str,
+        limit: u32,
+    ) -> Result<Vec<TaggedObject>, MetaError> {
+        self.inner
+            .list_objects_by_tag(bucket, tag_key, tag_value, limit)
+            .await
+    }
+
     async fn aggregate_counts(&self) -> Result<StoreCounts, MetaError> {
         self.inner.aggregate_counts().await
     }
@@ -819,6 +839,23 @@ mod tests {
             key: Option<&ObjectKey>,
         ) -> Result<Vec<ShareRow>, MetaError> {
             self.inner.list_shares(bucket, key).await
+        }
+        async fn list_tag_summary(
+            &self,
+            bucket: Option<&BucketName>,
+        ) -> Result<Vec<TagSummary>, MetaError> {
+            self.inner.list_tag_summary(bucket).await
+        }
+        async fn list_objects_by_tag(
+            &self,
+            bucket: Option<&BucketName>,
+            tag_key: &str,
+            tag_value: &str,
+            limit: u32,
+        ) -> Result<Vec<TaggedObject>, MetaError> {
+            self.inner
+                .list_objects_by_tag(bucket, tag_key, tag_value, limit)
+                .await
         }
         async fn aggregate_counts(&self) -> Result<StoreCounts, MetaError> {
             self.inner.aggregate_counts().await

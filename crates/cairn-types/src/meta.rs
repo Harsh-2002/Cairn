@@ -884,3 +884,33 @@ pub struct RequestMetricsSeries {
     /// The timeline downsampling window, in seconds (for the UI to derive req/s).
     pub window_secs: i64,
 }
+
+// ---------------------------------------------------------------------------------------
+// Object tag browsing (ARCH §17.2)
+// ---------------------------------------------------------------------------------------
+
+/// One distinct object tag (`tag_key=tag_value`) in use, with how many current objects carry it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TagSummary {
+    /// The tag key.
+    pub tag_key: String,
+    /// The tag value.
+    pub tag_value: String,
+    /// Number of current objects (latest, non-delete-marker) carrying this exact key=value.
+    pub object_count: u64,
+}
+
+/// A current object that carries a queried tag, with enough to render it and link into its browser.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaggedObject {
+    /// The bucket the object lives in.
+    pub bucket: String,
+    /// The object key.
+    pub key: String,
+    /// The current version id the tag is attached to.
+    pub version_id: String,
+    /// The object's logical size in bytes.
+    pub size: u64,
+    /// When the current version was last modified.
+    pub last_modified: Timestamp,
+}

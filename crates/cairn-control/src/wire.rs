@@ -331,6 +331,50 @@ pub struct DeletePrefixError {
 }
 
 // ---------------------------------------------------------------------------------------
+// Object tag browsing (ARCH §17.2)
+// ---------------------------------------------------------------------------------------
+
+/// `GET /tags` response: the distinct object tags in use, descending by count.
+#[derive(Debug, Serialize)]
+pub struct TagSummaryResp {
+    /// The distinct tags.
+    pub tags: Vec<TagSummaryItem>,
+}
+
+/// One distinct object tag (`tag_key=tag_value`) with its current-object count.
+#[derive(Debug, Serialize)]
+pub struct TagSummaryItem {
+    /// The tag key.
+    pub tag_key: String,
+    /// The tag value.
+    pub tag_value: String,
+    /// Number of current objects carrying this exact key=value.
+    pub object_count: u64,
+}
+
+/// `GET /tags/objects` response: the current objects carrying a queried tag.
+#[derive(Debug, Serialize)]
+pub struct TagObjectsResp {
+    /// The matching objects (bounded by the standard page limit).
+    pub objects: Vec<TagObjectItem>,
+}
+
+/// One current object carrying a queried tag.
+#[derive(Debug, Serialize)]
+pub struct TagObjectItem {
+    /// The bucket the object lives in.
+    pub bucket: String,
+    /// The object key.
+    pub key: String,
+    /// The current version id the tag is attached to.
+    pub version_id: String,
+    /// The object's logical size in bytes.
+    pub size: u64,
+    /// When the current version was last modified, in epoch milliseconds.
+    pub last_modified_ms: i64,
+}
+
+// ---------------------------------------------------------------------------------------
 // Users
 // ---------------------------------------------------------------------------------------
 

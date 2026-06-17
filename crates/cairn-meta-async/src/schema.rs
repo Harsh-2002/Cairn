@@ -283,6 +283,16 @@ ALTER TABLE request_metrics ADD COLUMN lat_le_1000 INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE request_metrics ADD COLUMN lat_gt_1000 INTEGER NOT NULL DEFAULT 0;
 "#,
     },
+    Migration {
+        version: 10,
+        name: "object tags reverse index (tag browser)",
+        sql: r#"
+-- The object_tags PK is (bucket, key, version, tag_key) — indexed by object. The tag browser
+-- (ARCH §17.2) asks the reverse question — which objects carry a given tag — so add a covering
+-- index on (tag_key, tag_value) so "list all tags" and "objects by tag" are index seeks, not scans.
+CREATE INDEX idx_object_tags_kv ON object_tags (tag_key, tag_value);
+"#,
+    },
 ];
 
 /// Run all pending migrations on the write driver, recording each as applied. Each migration is

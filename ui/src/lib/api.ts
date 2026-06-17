@@ -30,6 +30,8 @@ import type {
   RotateCredentialsResp,
   ShareListResp,
   SystemResp,
+  TagObjectsResp,
+  TagSummaryResp,
   UserDetailResp,
   UserListResp,
   UserPolicyResp,
@@ -337,5 +339,22 @@ export const api = {
     request<DeletePrefixResp>(
       "DELETE",
       `/buckets/${enc(bucket)}/objects?prefix=${encodeURIComponent(prefix)}`,
+    ),
+
+  // Object tagging (the Tags view). The summary lists every distinct key=value
+  // tag in use; the drill-down lists the objects carrying a chosen tag. Both
+  // optionally scope to a single bucket. `enc` is encodeURIComponent, so it is
+  // the correct escaper for these query-string values too.
+  listTags: (bucket?: string) =>
+    request<TagSummaryResp>(
+      "GET",
+      `/tags${bucket ? `?bucket=${enc(bucket)}` : ""}`,
+    ),
+  listTagObjects: (key: string, value: string, bucket?: string) =>
+    request<TagObjectsResp>(
+      "GET",
+      `/tags/objects?key=${enc(key)}&value=${enc(value)}${
+        bucket ? `&bucket=${enc(bucket)}` : ""
+      }`,
     ),
 };

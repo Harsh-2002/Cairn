@@ -21,7 +21,8 @@ use crate::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, VersionId}
 use crate::meta::{
     ActivityEntry, BucketCounts, ListPage, ListQuery, MetricsRange, MultipartSession, Mutation,
     MutationOutcome, ObjectSummary, OutboxEntry, PartRecord, ReplicationStatus,
-    RequestMetricsSeries, ShareRow, StoreCounts, User, UserSigV4Credentials, UserWithBearerHash,
+    RequestMetricsSeries, ShareRow, StoreCounts, TagSummary, TaggedObject, User,
+    UserSigV4Credentials, UserWithBearerHash,
 };
 use crate::object::ObjectVersionRow;
 use crate::replication::ReplicatedObject;
@@ -270,6 +271,23 @@ pub trait MetadataStore: Send + Sync {
         bucket: &BucketName,
         key: Option<&ObjectKey>,
     ) -> Result<Vec<ShareRow>, MetaError>;
+
+    // --- object tag browsing (ARCH §17.2) ---
+    /// Summarize the distinct object tags in use (each `key=value` with a current-object count),
+    /// descending by count. Scoped to `bucket` when set, else across all buckets.
+    async fn list_tag_summary(
+        &self,
+        bucket: Option<&BucketName>,
+    ) -> Result<Vec<TagSummary>, MetaError>;
+    /// List the current objects (latest, non-delete-marker) carrying the exact `tag_key=tag_value`,
+    /// up to `limit`. Scoped to `bucket` when set, else across all buckets.
+    async fn list_objects_by_tag(
+        &self,
+        bucket: Option<&BucketName>,
+        tag_key: &str,
+        tag_value: &str,
+        limit: u32,
+    ) -> Result<Vec<TaggedObject>, MetaError>;
 
     // --- audit & aggregates ---
     /// List recent activity (most recent first), up to `limit`.

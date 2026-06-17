@@ -1148,3 +1148,98 @@ async fn request_metrics_upsert_query_prune_parity() {
         );
     }
 }
+
+#[tokio::test]
+async fn tag_browser_parity() {
+    let (a, b) = both().await;
+    for s in [&a as &dyn MetadataStore, &b as &dyn MetadataStore] {
+        let ba = BucketName::parse("bucket-a").unwrap();
+        let bb = BucketName::parse("bucket-b").unwrap();
+        for name in ["bucket-a", "bucket-b"] {
+            s.submit(Mutation::CreateBucket(Box::new(bucket(
+                name,
+                VersioningState::Enabled,
+            ))))
+            .await
+            .unwrap();
+        }
+        // ba/a1 {env=prod}; ba/a2 {env=prod, team=core}; bb/b1 {env=dev}.
+        let fixtures = [
+            (&ba, "a1", vec![("env".into(), "prod".into())]),
+            (
+                &ba,
+                "a2",
+                vec![
+                    ("env".into(), "prod".into()),
+                    ("team".into(), "core".into()),
+                ],
+            ),
+            (&bb, "b1", vec![("env".into(), "dev".into())]),
+        ];
+        for (bk, key, tags) in fixtures {
+            let v = VersionId::from_string(format!("{key}-v1"));
+            s.submit(put(
+                row(bk, key, v.clone(), "e", 7),
+                Precondition::default(),
+            ))
+            .await
+            .unwrap();
+            s.submit(Mutation::PutObjectTags {
+                bucket: bk.clone(),
+                key: ObjectKey::parse(key).unwrap(),
+                version_id: v,
+                tags,
+            })
+            .await
+            .unwrap();
+        }
+
+        // Global summary: env=prod is the most-used (2 objects), then the singletons.
+        let all = s.list_tag_summary(None).await.unwrap();
+        assert_eq!(all[0].tag_key, "env");
+        assert_eq!(all[0].tag_value, "prod");
+        assert_eq!(all[0].object_count, 2);
+        assert_eq!(all.len(), 3, "env=prod, env=dev, team=core");
+
+        // Bucket-scoped summary excludes bb's env=dev.
+        let in_ba = s.list_tag_summary(Some(&ba)).await.unwrap();
+        assert!(
+            in_ba
+                .iter()
+                .all(|t| !(t.tag_key == "env" && t.tag_value == "dev"))
+        );
+        assert_eq!(
+            in_ba
+                .iter()
+                .find(|t| t.tag_value == "prod")
+                .unwrap()
+                .object_count,
+            2
+        );
+
+        // Objects by tag: env=prod globally returns both ba objects, sorted by (bucket, key).
+        let prod = s
+            .list_objects_by_tag(None, "env", "prod", 100)
+            .await
+            .unwrap();
+        assert_eq!(prod.len(), 2);
+        assert_eq!(
+            (prod[0].bucket.as_str(), prod[0].key.as_str()),
+            ("bucket-a", "a1")
+        );
+        assert_eq!(prod[0].size, 7);
+
+        // Bucket-scoped objects-by-tag respects the scope.
+        let dev_in_ba = s
+            .list_objects_by_tag(Some(&ba), "env", "dev", 100)
+            .await
+            .unwrap();
+        assert!(dev_in_ba.is_empty(), "env=dev lives in bb, not ba");
+        let dev_in_bb = s
+            .list_objects_by_tag(Some(&bb), "env", "dev", 100)
+            .await
+            .unwrap();
+        assert_eq!(dev_in_bb.len(), 1);
+        assert_eq!(dev_in_bb[0].key, "b1");
+    }
+}

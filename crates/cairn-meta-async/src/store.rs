@@ -18,7 +18,8 @@ use cairn_types::meta::{
     ActivityEntry, BucketCounts, BucketRequestCount, LATENCY_BUCKETS, ListPage, ListQuery,
     MetricsRange, MultipartSession, Mutation, MutationOutcome, ObjectSummary, OpCount, OutboxEntry,
     PartRecord, ReplicationStatus, RequestMetricsSeries, ShareRow, StatusCount, StoreCounts,
-    TimePoint, User, UserSigV4Credentials, UserWithBearerHash, latency_quantile_ms,
+    TagSummary, TaggedObject, TimePoint, User, UserSigV4Credentials, UserWithBearerHash,
+    latency_quantile_ms,
 };
 use cairn_types::object::ObjectVersionRow;
 use cairn_types::time::Timestamp;
@@ -749,6 +750,83 @@ impl MetadataStore for AsyncMetadataStore {
             }
         };
         rows.iter().map(model::share_from_row).collect()
+    }
+
+    async fn list_tag_summary(
+        &self,
+        bucket: Option<&BucketName>,
+    ) -> Result<Vec<TagSummary>, MetaError> {
+        let bucket_param = match bucket {
+            Some(b) => Value::Text(b.as_str().to_owned()),
+            None => Value::Null,
+        };
+        let rows = self
+            .reader()
+            .query(
+                "SELECT ot.tag_key, ot.tag_value, COUNT(*) AS c
+                 FROM object_tags ot
+                 JOIN object_versions ov
+                   ON ov.bucket_name = ot.bucket_name AND ov.key = ot.key
+                      AND ov.version_id = ot.version_id
+                 WHERE ov.is_latest = 1 AND ov.is_delete_marker = 0
+                   AND (?1 IS NULL OR ot.bucket_name = ?1)
+                 GROUP BY ot.tag_key, ot.tag_value
+                 ORDER BY c DESC, ot.tag_key, ot.tag_value",
+                vec![bucket_param],
+            )
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|r| TagSummary {
+                tag_key: r.get_text(0),
+                tag_value: r.get_text(1),
+                object_count: r.get_i64(2) as u64,
+            })
+            .collect())
+    }
+
+    async fn list_objects_by_tag(
+        &self,
+        bucket: Option<&BucketName>,
+        tag_key: &str,
+        tag_value: &str,
+        limit: u32,
+    ) -> Result<Vec<TaggedObject>, MetaError> {
+        let bucket_param = match bucket {
+            Some(b) => Value::Text(b.as_str().to_owned()),
+            None => Value::Null,
+        };
+        let rows = self
+            .reader()
+            .query(
+                "SELECT ot.bucket_name, ot.key, ot.version_id, ov.size_logical, ov.updated_at
+                 FROM object_tags ot
+                 JOIN object_versions ov
+                   ON ov.bucket_name = ot.bucket_name AND ov.key = ot.key
+                      AND ov.version_id = ot.version_id
+                 WHERE ot.tag_key = ?1 AND ot.tag_value = ?2
+                   AND ov.is_latest = 1 AND ov.is_delete_marker = 0
+                   AND (?3 IS NULL OR ot.bucket_name = ?3)
+                 ORDER BY ot.bucket_name, ot.key
+                 LIMIT ?4",
+                vec![
+                    Value::Text(tag_key.to_owned()),
+                    Value::Text(tag_value.to_owned()),
+                    bucket_param,
+                    Value::Int(limit as i64),
+                ],
+            )
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|r| TaggedObject {
+                bucket: r.get_text(0),
+                key: r.get_text(1),
+                version_id: r.get_text(2),
+                size: r.get_i64(3) as u64,
+                last_modified: Timestamp(r.get_i64(4)),
+            })
+            .collect())
     }
 
     async fn aggregate_counts(&self) -> Result<StoreCounts, MetaError> {

@@ -10,6 +10,7 @@ import {
   Search,
   Sun,
   SunMoon,
+  Tags,
   Users,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -91,6 +92,9 @@ export function CommandMenu() {
             </CommandItem>
             <CommandItem onSelect={() => go("/buckets")}>
               <Database aria-hidden="true" /> Buckets
+            </CommandItem>
+            <CommandItem onSelect={() => go("/tags")}>
+              <Tags aria-hidden="true" /> Tags
             </CommandItem>
             <CommandItem onSelect={() => go("/users")}>
               <Users aria-hidden="true" /> Users
