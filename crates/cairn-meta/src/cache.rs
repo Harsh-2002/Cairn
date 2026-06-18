@@ -28,7 +28,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use cairn_types::authz::PublicAccessBlock;
 use cairn_types::bucket::{Bucket, ConfigAspect, ConfigDoc};
@@ -104,15 +104,26 @@ where
     }
 
     /// Insert (or replace) an entry costing `cost` bytes, evicting within the shard to keep the
-    /// running total under budget. Eviction is intentionally simple (drop an arbitrary entry):
-    /// correctness of membership matters here, not eviction optimality.
-    fn put(&self, key: K, val: Val, cost: u64) {
+    /// running total under budget — but only if the invalidation `generation` has not advanced past
+    /// `gen_snapshot` (taken by the caller before its inner read). Eviction is intentionally simple
+    /// (drop an arbitrary entry): correctness of membership matters here, not eviction optimality.
+    ///
+    /// The generation re-check happens **inside the shard lock**, which the invalidation paths
+    /// (`invalidate` / `invalidate_matching`) also take after bumping the generation. That closes
+    /// the read-install TOCTOU: an invalidation racing our inner read either bumps the generation
+    /// before we re-check (so we skip the install) or removes our freshly-inserted entry under the
+    /// same lock afterward — a stale value can never be pinned past the invalidation.
+    fn put_checked(&self, key: K, val: Val, cost: u64, gen_snapshot: u64, generation: &AtomicU64) {
         if !self.enabled() {
             return;
         }
         let cost = cost + ENTRY_OVERHEAD;
         let shard = &self.shards[shard_of(&key)];
         let mut guard = shard.lock().unwrap();
+
+        if generation.load(Ordering::Acquire) != gen_snapshot {
+            return;
+        }
 
         // Replace: refund the prior cost first.
         if let Some((_, old_cost)) = guard.remove(&key) {
@@ -180,10 +191,17 @@ pub struct CachedMetadataStore {
     /// `get_bucket_config` cache, keyed by `(bucket, aspect)`.
     config: ShardedCache<(BucketName, ConfigAspect), CachedConfig>,
     /// `get_account_public_access_block` cache (a single account-wide value). The whole
-    /// [`PublicAccessBlock`] is four booleans, so it packs into one `AtomicU8` (bit 0 = "present",
-    /// bits 1-4 = the flags) — a truly lock-free load/store on this very-hot, account-wide read,
-    /// with no mutex to serialize concurrent authorizers. `0` means "not cached".
-    account_bpa: AtomicU8,
+    /// [`PublicAccessBlock`] is four booleans, so it packs into the low 8 bits (bit 0 = "present",
+    /// bits 1-4 = the flags) of a lock-free `AtomicU64` whose high bits carry the `account_bpa_gen`
+    /// the value was fetched at — a truly lock-free load/store on this very-hot read with no mutex.
+    /// `0` means "not cached". A hit is served only when the packed generation still equals the live
+    /// `account_bpa_gen`, so an invalidation that races the read-install can never be lost (a stale
+    /// install carries an older generation and is simply not served).
+    account_bpa: AtomicU64,
+    /// Dedicated invalidation generation for `account_bpa`, bumped only on a public-access-block
+    /// change. Kept separate from the global `generation` so an unrelated bucket-config invalidation
+    /// does not spuriously evict this account-wide value from the very-hot authorization path.
+    account_bpa_gen: AtomicU64,
     /// Whether caching is on at all (`budget_bytes != 0`).
     enabled: bool,
     /// Monotonic invalidation epoch, bumped on *every* cache invalidation (both around `submit`
@@ -263,7 +281,8 @@ impl CachedMetadataStore {
             inner,
             bucket: ShardedCache::new(bucket_budget),
             config: ShardedCache::new(config_budget),
-            account_bpa: AtomicU8::new(0),
+            account_bpa: AtomicU64::new(0),
+            account_bpa_gen: AtomicU64::new(0),
             enabled: budget_bytes != 0,
             generation: AtomicU64::new(0),
             hits: AtomicU64::new(0),
@@ -357,10 +376,13 @@ impl CachedMetadataStore {
         self.config.invalidate(&(bucket.clone(), aspect));
     }
 
-    /// Drop the cached account-wide public-access-block.
+    /// Drop the cached account-wide public-access-block. Bumps the dedicated `account_bpa_gen`
+    /// first, then clears the slot: a read-install that snapshotted the old generation will carry it
+    /// in the packed value and so be rejected on the next hit, even if its `store` lands after this
+    /// `store(0)` — the invalidation can never be lost.
     fn invalidate_account_bpa(&self) {
         if self.enabled {
-            self.bump_generation();
+            self.account_bpa_gen.fetch_add(1, Ordering::Release);
             self.account_bpa.store(0, Ordering::Release);
         }
     }
@@ -457,11 +479,12 @@ impl MetadataStore for CachedMetadataStore {
         // and we must not install our (now possibly pre-commit, stale) snapshot.
         let gen_before = self.generation();
         let fetched = self.inner.get_bucket(name).await?;
-        if self.generation() == gen_before {
-            let arc = fetched.clone().map(Arc::new);
-            let cost = Self::bucket_cost(&arc);
-            self.bucket.put(name.clone(), arc, cost);
-        }
+        let arc = fetched.clone().map(Arc::new);
+        let cost = Self::bucket_cost(&arc);
+        // The generation re-check is now atomic with the install (inside the shard lock), closing
+        // the window where an invalidation between the check and the insert could pin a stale value.
+        self.bucket
+            .put_checked(name.clone(), arc, cost, gen_before, &self.generation);
         Ok(fetched)
     }
 
@@ -481,31 +504,35 @@ impl MetadataStore for CachedMetadataStore {
         // epoch advances and we must not install our (now possibly pre-commit, stale) snapshot.
         let gen_before = self.generation();
         let fetched = self.inner.get_bucket_config(name, aspect).await?;
-        if self.generation() == gen_before {
-            let arc: CachedConfig = fetched.clone().map(Arc::new);
-            let cost = Self::config_cost(&arc);
-            self.config.put(key, arc, cost);
-        }
+        let arc: CachedConfig = fetched.clone().map(Arc::new);
+        let cost = Self::config_cost(&arc);
+        self.config
+            .put_checked(key, arc, cost, gen_before, &self.generation);
         Ok(fetched)
     }
 
     async fn get_account_public_access_block(&self) -> Result<PublicAccessBlock, MetaError> {
         if self.enabled {
-            // Lock-free load of the packed account-wide value.
-            if let Some(cached) = decode_bpa(self.account_bpa.load(Ordering::Acquire)) {
-                self.hit();
-                return Ok(cached);
+            // Lock-free load of the packed value; serve only while its generation is still current,
+            // so a stale install (carrying an older generation) is never served.
+            let packed = self.account_bpa.load(Ordering::Acquire);
+            if packed != 0 && (packed >> 8) == self.account_bpa_gen.load(Ordering::Acquire) {
+                if let Some(cached) = decode_bpa((packed & 0xff) as u8) {
+                    self.hit();
+                    return Ok(cached);
+                }
             }
         }
         self.miss();
-        // Same epoch guard as the other cached reads: only install if no invalidation raced the
-        // inner read, so a `SetAccountPublicAccessBlock` committed during our `.await` is never
-        // overwritten by our pre-commit snapshot.
-        let gen_before = self.generation();
+        // Snapshot the dedicated generation BEFORE the inner read, then tag the installed value with
+        // it. An invalidation racing the read bumps the generation, so our tagged value carries the
+        // stale generation and the hit path above refuses to serve it — the invalidation is never
+        // lost, even though the store is lock-free and unconditional.
+        let gen_before = self.account_bpa_gen.load(Ordering::Acquire);
         let fetched = self.inner.get_account_public_access_block().await?;
-        if self.enabled && self.generation() == gen_before {
-            self.account_bpa
-                .store(encode_bpa(Some(fetched)), Ordering::Release);
+        if self.enabled {
+            let packed = (gen_before << 8) | u64::from(encode_bpa(Some(fetched)));
+            self.account_bpa.store(packed, Ordering::Release);
         }
         Ok(fetched)
     }
@@ -747,6 +774,54 @@ mod tests {
         }
     }
 
+    /// A `SetAccountPublicAccessBlock` that lands while a BPA read is parked between its generation
+    /// snapshot and its install must NOT be lost: the next read must serve the new value, not the
+    /// stale one the parked read installs. Guards the lock-free account-BPA fix (audit #6).
+    #[tokio::test]
+    async fn account_bpa_lost_invalidation_is_closed() {
+        let counting = Arc::new(CountingStore::new());
+        counting
+            .submit(Mutation::SetAccountPublicAccessBlock(
+                PublicAccessBlock::default(),
+            ))
+            .await
+            .unwrap();
+        let cache = Arc::new(CachedMetadataStore::new(counting.clone(), 64 * 1024));
+
+        // Gate the next BPA read so it parks mid-flight (generation already snapshotted).
+        counting.bpa_gated.store(true, Ordering::Release);
+        let cache2 = cache.clone();
+        let read =
+            tokio::spawn(async move { cache2.get_account_public_access_block().await.unwrap() });
+
+        // Once the read is parked inside the inner store, invalidate + flip the value to all-true.
+        counting.bpa_entered.notified().await;
+        cache
+            .submit(Mutation::SetAccountPublicAccessBlock(PublicAccessBlock {
+                block_public_acls: true,
+                ignore_public_acls: true,
+                block_public_policy: true,
+                restrict_public_buckets: true,
+            }))
+            .await
+            .unwrap();
+        // Release the parked read; it installs the OLD value tagged with the now-stale generation.
+        counting.bpa_gated.store(false, Ordering::Release);
+        counting.bpa_release.notify_one();
+        let observed = read.await.unwrap();
+        assert!(
+            !observed.block_public_acls,
+            "the in-flight read returns the pre-change value"
+        );
+
+        // The next read must reflect the post-invalidation value, not the stale install.
+        let fresh = cache.get_account_public_access_block().await.unwrap();
+        assert!(
+            fresh.block_public_acls,
+            "lost-invalidation: a read after the racing invalidation must serve the NEW value"
+        );
+    }
+
     /// An inner store that forwards to an [`InMemoryMetadataStore`] while counting how often each
     /// cached read actually reaches it. Lets a test assert a hit served from the cache without a
     /// second inner call.
@@ -755,6 +830,11 @@ mod tests {
         get_bucket: AtomicU64,
         get_config: AtomicU64,
         get_bpa: AtomicU64,
+        // When `bpa_gated` is set, `get_account_public_access_block` signals `bpa_entered` and then
+        // parks on `bpa_release`, letting a test interleave an invalidation mid-read.
+        bpa_gated: std::sync::atomic::AtomicBool,
+        bpa_entered: tokio::sync::Notify,
+        bpa_release: tokio::sync::Notify,
     }
 
     impl CountingStore {
@@ -764,6 +844,9 @@ mod tests {
                 get_bucket: AtomicU64::new(0),
                 get_config: AtomicU64::new(0),
                 get_bpa: AtomicU64::new(0),
+                bpa_gated: std::sync::atomic::AtomicBool::new(false),
+                bpa_entered: tokio::sync::Notify::new(),
+                bpa_release: tokio::sync::Notify::new(),
             }
         }
     }
@@ -796,7 +879,14 @@ mod tests {
         }
         async fn get_account_public_access_block(&self) -> Result<PublicAccessBlock, MetaError> {
             self.get_bpa.fetch_add(1, Ordering::Relaxed);
-            self.inner.get_account_public_access_block().await
+            // Capture the value first so a change interleaved during the gate does not affect what
+            // THIS in-flight read returns (modeling a read that observed the pre-change state).
+            let v = self.inner.get_account_public_access_block().await?;
+            if self.bpa_gated.load(Ordering::Acquire) {
+                self.bpa_entered.notify_one();
+                self.bpa_release.notified().await;
+            }
+            Ok(v)
         }
         async fn is_bucket_empty(&self, name: &BucketName) -> Result<bool, MetaError> {
             self.inner.is_bucket_empty(name).await
