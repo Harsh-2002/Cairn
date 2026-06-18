@@ -180,6 +180,13 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             .map_err(engine_err)?;
             conn.execute("DELETE FROM buckets WHERE name=?1", params![name.as_str()])
                 .map_err(engine_err)?;
+            // A bucket is empty when deleted, so its roll-up row is already zero; drop it to keep
+            // the counter table from accumulating tombstones for recreated bucket names.
+            conn.execute(
+                "DELETE FROM bucket_stats WHERE bucket_name=?1",
+                params![name.as_str()],
+            )
+            .map_err(engine_err)?;
             Ok(MutationOutcome::Ack)
         }
         Mutation::SetBucketConfig {
@@ -659,18 +666,24 @@ fn enforce_user_quota(conn: &Connection, row: &ObjectVersionRow) -> R<()> {
 /// Replace any existing row at (bucket,key,version_id) — capturing its blob for reclamation —
 /// demote the key's other versions, and insert the new latest row.
 fn upsert_version(conn: &Connection, row: ObjectVersionRow) -> R<Option<StoragePath>> {
-    let superseded: Option<String> = conn
+    // Read the row this upsert replaces (if any): its blob to reclaim, plus its owner and byte
+    // sizes so the roll-up counters can be decremented for it before the replacement is inserted.
+    let existing: Option<(Option<String>, String, i64, i64)> = conn
         .prepare_cached(
-            "SELECT storage_path FROM object_versions WHERE bucket_name=?1 AND key=?2 AND version_id=?3",
+            "SELECT storage_path, owner_id, size_logical, size_physical
+             FROM object_versions WHERE bucket_name=?1 AND key=?2 AND version_id=?3",
         )
         .map_err(engine_err)?
         .query_row(
-            params![row.bucket.as_str(), row.key.as_str(), row.version_id.as_str()],
-            |r| r.get(0),
+            params![
+                row.bucket.as_str(),
+                row.key.as_str(),
+                row.version_id.as_str()
+            ],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .optional()
-        .map_err(engine_err)?
-        .flatten();
+        .map_err(engine_err)?;
     conn.prepare_cached(
         "DELETE FROM object_versions WHERE bucket_name=?1 AND key=?2 AND version_id=?3",
     )
@@ -681,6 +694,14 @@ fn upsert_version(conn: &Connection, row: ObjectVersionRow) -> R<Option<StorageP
         row.version_id.as_str()
     ])
     .map_err(engine_err)?;
+    let superseded = match &existing {
+        Some((sp, owner, sl, sp_bytes)) => {
+            // The replaced row leaves the table: subtract its version and bytes from the counters.
+            adjust_stats(conn, row.bucket.as_str(), owner, -1, -sl, -sp_bytes)?;
+            sp.clone()
+        }
+        None => None,
+    };
     demote_latest(conn, &row.bucket, &row.key)?;
     insert_version(conn, &row)?;
     Ok(superseded.map(StoragePath::from_string))
@@ -692,6 +713,40 @@ fn demote_latest(conn: &Connection, bucket: &BucketName, key: &ObjectKey) -> R<(
     )
     .map_err(engine_err)?
     .execute(params![bucket.as_str(), key.as_str()])
+    .map_err(engine_err)?;
+    Ok(())
+}
+
+/// Apply a signed delta to the maintained roll-up counters (Phase 2.1, ARCH §30) for `bucket` and
+/// `owner`. One accumulating upsert per table, run in the same transaction as the `object_versions`
+/// row change that produced the delta, so the counters never diverge from the table across a commit
+/// boundary. `versions`/byte totals sum over ALL versions, matching the prior scan semantics; the
+/// current-visible `objects` count is not tracked here (it stays an index-only count).
+fn adjust_stats(
+    conn: &Connection,
+    bucket: &str,
+    owner: &str,
+    d_versions: i64,
+    d_logical: i64,
+    d_physical: i64,
+) -> R<()> {
+    conn.prepare_cached(
+        "INSERT INTO bucket_stats (bucket_name, versions, logical_bytes, physical_bytes)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(bucket_name) DO UPDATE SET
+            versions       = versions       + excluded.versions,
+            logical_bytes  = logical_bytes  + excluded.logical_bytes,
+            physical_bytes = physical_bytes + excluded.physical_bytes",
+    )
+    .map_err(engine_err)?
+    .execute(params![bucket, d_versions, d_logical, d_physical])
+    .map_err(engine_err)?;
+    conn.prepare_cached(
+        "INSERT INTO user_stats (owner_id, logical_bytes) VALUES (?1, ?2)
+         ON CONFLICT(owner_id) DO UPDATE SET logical_bytes = logical_bytes + excluded.logical_bytes",
+    )
+    .map_err(engine_err)?
+    .execute(params![owner, d_logical])
     .map_err(engine_err)?;
     Ok(())
 }
@@ -736,6 +791,15 @@ fn insert_version(conn: &Connection, row: &ObjectVersionRow) -> R<()> {
             row.updated_at.0,
         ])
     .map_err(engine_err)?;
+    // Maintain the roll-up counters in lockstep: this new row adds one version and its bytes.
+    adjust_stats(
+        conn,
+        row.bucket.as_str(),
+        row.owner_id.0.as_str(),
+        1,
+        row.size_logical as i64,
+        row.size_physical as i64,
+    )?;
     Ok(())
 }
 
@@ -745,20 +809,27 @@ fn delete_version(
     key: &ObjectKey,
     version_id: &VersionId,
 ) -> R<MutationOutcome> {
-    let existing: Option<(Option<String>, i64)> = conn
+    // Read the row's blob, latest flag, and owner/byte sizes before deleting it, so we can both
+    // promote a successor and decrement the roll-up counters for the removed version.
+    let existing: Option<(Option<String>, i64, String, i64, i64)> = conn
         .prepare_cached(
-            "SELECT storage_path, is_latest FROM object_versions WHERE bucket_name=?1 AND key=?2 AND version_id=?3",
+            "SELECT storage_path, is_latest, owner_id, size_logical, size_physical
+             FROM object_versions WHERE bucket_name=?1 AND key=?2 AND version_id=?3",
         )
         .map_err(engine_err)?
         .query_row(
             params![bucket.as_str(), key.as_str(), version_id.as_str()],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )
         .optional()
         .map_err(engine_err)?;
-    let (freed, was_latest) = match existing {
-        Some((sp, latest)) => (sp.map(StoragePath::from_string), latest != 0),
-        None => (None, false),
+    let (freed, was_latest, removed) = match existing {
+        Some((sp, latest, owner, sl, sp_bytes)) => (
+            sp.map(StoragePath::from_string),
+            latest != 0,
+            Some((owner, sl, sp_bytes)),
+        ),
+        None => (None, false, None),
     };
     conn.prepare_cached(
         "DELETE FROM object_versions WHERE bucket_name=?1 AND key=?2 AND version_id=?3",
@@ -766,6 +837,10 @@ fn delete_version(
     .map_err(engine_err)?
     .execute(params![bucket.as_str(), key.as_str(), version_id.as_str()])
     .map_err(engine_err)?;
+    if let Some((owner, sl, sp_bytes)) = removed {
+        // The deleted row leaves the table: subtract its version and bytes from the counters.
+        adjust_stats(conn, bucket.as_str(), &owner, -1, -sl, -sp_bytes)?;
+    }
     let mut promoted = false;
     if was_latest {
         let promote: Option<String> = conn
@@ -1071,6 +1146,154 @@ mod tests {
                 Err(e)
             }
         }
+    }
+
+    /// The maintained roll-up counters (Phase 2.1) must agree exactly with a fresh full scan of
+    /// `object_versions` — the global sums catch any over- or under-counting, the per-bucket rows
+    /// catch a misattributed delta.
+    fn assert_counters_match_scan(conn: &Connection) {
+        // Global: the counter sums equal the table's totals.
+        let (sv, sl, sp): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT COALESCE(SUM(versions),0), COALESCE(SUM(logical_bytes),0),
+                        COALESCE(SUM(physical_bytes),0) FROM bucket_stats",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        let (tv, tl, tp): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(size_logical),0), COALESCE(SUM(size_physical),0)
+                 FROM object_versions",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (sv, sl, sp),
+            (tv, tl, tp),
+            "bucket_stats global sums must equal the object_versions scan"
+        );
+        let su: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(logical_bytes),0) FROM user_stats",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            su, tl,
+            "user_stats logical sum must equal the object_versions scan"
+        );
+
+        // Per-bucket: every bucket that has rows must match its counter row exactly.
+        let mut stmt = conn
+            .prepare(
+                "SELECT bucket_name, COUNT(*), COALESCE(SUM(size_logical),0),
+                        COALESCE(SUM(size_physical),0) FROM object_versions GROUP BY bucket_name",
+            )
+            .unwrap();
+        let scanned: Vec<(String, i64, i64, i64)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        for (b, v, l, p) in scanned {
+            let (cv, cl, cp): (i64, i64, i64) = conn
+                .query_row(
+                    "SELECT versions, logical_bytes, physical_bytes FROM bucket_stats WHERE bucket_name=?1",
+                    params![b],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                (cv, cl, cp),
+                (v, l, p),
+                "bucket_stats mismatch for bucket {b}"
+            );
+        }
+    }
+
+    #[test]
+    fn stat_counters_stay_consistent_through_lifecycle() {
+        let conn = conn_with_schema();
+        seed_bucket(&conn, "bkt", None);
+        seed_bucket(&conn, "cct", None);
+        assert_counters_match_scan(&conn);
+
+        // Inserts across two buckets and two owners.
+        apply(&conn, put(obj_row_owned("bkt", "k1", "v1", 10, "alice"))).unwrap();
+        apply(&conn, put(obj_row_owned("bkt", "k2", "v1", 20, "bob"))).unwrap();
+        apply(&conn, put(obj_row_owned("cct", "k1", "v1", 5, "alice"))).unwrap();
+        assert_counters_match_scan(&conn);
+
+        // A new version of k1 (history grows; both versions are counted).
+        apply(&conn, put(obj_row_owned("bkt", "k1", "v2", 15, "alice"))).unwrap();
+        assert_counters_match_scan(&conn);
+
+        // Replace the same (key, version) — the upsert delete+insert path must net the size change.
+        apply(&conn, put(obj_row_owned("bkt", "k2", "v1", 25, "bob"))).unwrap();
+        assert_counters_match_scan(&conn);
+
+        // A delete marker (a zero-byte version row).
+        apply(
+            &conn,
+            Mutation::CreateDeleteMarker {
+                bucket: BucketName::parse("bkt").unwrap(),
+                key: ObjectKey::parse("k1").unwrap(),
+                version_id: VersionId::from_string("v3".to_owned()),
+                owner_id: UserId("alice".to_owned()),
+                now: Timestamp(2),
+                replication: None,
+            },
+        )
+        .unwrap();
+        assert_counters_match_scan(&conn);
+
+        // Delete a specific historical version.
+        apply(
+            &conn,
+            Mutation::DeleteVersion {
+                bucket: BucketName::parse("bkt").unwrap(),
+                key: ObjectKey::parse("k1").unwrap(),
+                version_id: VersionId::from_string("v1".to_owned()),
+            },
+        )
+        .unwrap();
+        assert_counters_match_scan(&conn);
+
+        // Delete the current version (triggers a promotion of the predecessor).
+        apply(
+            &conn,
+            Mutation::DeleteVersion {
+                bucket: BucketName::parse("bkt").unwrap(),
+                key: ObjectKey::parse("k1").unwrap(),
+                version_id: VersionId::from_string("v3".to_owned()),
+            },
+        )
+        .unwrap();
+        assert_counters_match_scan(&conn);
+    }
+
+    #[test]
+    fn rejected_quota_write_leaves_counters_unchanged() {
+        let conn = conn_with_schema();
+        seed_bucket(&conn, "bkt", Some(100));
+        apply_in_savepoint(&conn, put(obj_row("bkt", "k1", "v1", 60))).unwrap();
+        assert_counters_match_scan(&conn);
+        // This put would exceed the quota: it is rolled back in its savepoint, and the counter
+        // upserts — which run inside that savepoint — must be rolled back with it.
+        let err = apply_in_savepoint(&conn, put(obj_row("bkt", "k2", "v1", 50))).unwrap_err();
+        assert!(matches!(err, MetaError::QuotaExceeded));
+        assert_counters_match_scan(&conn);
+        let versions: i64 = conn
+            .query_row(
+                "SELECT versions FROM bucket_stats WHERE bucket_name='bkt'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(versions, 1, "only the first, accepted write is counted");
     }
 
     #[test]

@@ -312,6 +312,36 @@ CREATE INDEX idx_ov_latest_cover ON object_versions
     WHERE is_latest = 1;
 "#,
     },
+    Migration {
+        version: 12,
+        name: "maintained per-bucket / per-user roll-up counters (ARCH §30, Phase 2.1)",
+        sql: r#"
+-- Maintained roll-ups so the overview aggregates and the quota checks read O(buckets)/O(1)
+-- counters instead of scanning every object version. The writer keeps these in lockstep with
+-- object_versions inside the same transaction: +1 row + bytes on insert, -1 row - bytes on delete.
+-- Latest / delete-marker transitions don't change byte or version totals, so they are not tracked
+-- here; `objects` (the current-visible count) stays an index-only count over the partial
+-- current-version index, since it needs transition logic and is not a quota input. The byte totals
+-- sum over ALL versions, matching the prior scan-based semantics. Seed both tables from the
+-- existing rows so an upgrade starts consistent.
+CREATE TABLE bucket_stats (
+    bucket_name    TEXT PRIMARY KEY,
+    versions       INTEGER NOT NULL DEFAULT 0,
+    logical_bytes  INTEGER NOT NULL DEFAULT 0,
+    physical_bytes INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE user_stats (
+    owner_id       TEXT PRIMARY KEY,
+    logical_bytes  INTEGER NOT NULL DEFAULT 0
+);
+INSERT INTO bucket_stats (bucket_name, versions, logical_bytes, physical_bytes)
+    SELECT bucket_name, COUNT(*), COALESCE(SUM(size_logical), 0), COALESCE(SUM(size_physical), 0)
+    FROM object_versions GROUP BY bucket_name;
+INSERT INTO user_stats (owner_id, logical_bytes)
+    SELECT owner_id, COALESCE(SUM(size_logical), 0)
+    FROM object_versions GROUP BY owner_id;
+"#,
+    },
 ];
 
 /// Run all pending migrations on the write driver, recording each as applied. Each migration is

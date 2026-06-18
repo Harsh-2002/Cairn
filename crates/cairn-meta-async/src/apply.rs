@@ -194,6 +194,14 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
                     vec![Value::Text(name.as_str().to_owned())],
                 )
                 .await?;
+            // A bucket is empty when deleted, so its roll-up row is already zero; drop it to keep
+            // the counter table from accumulating tombstones for recreated bucket names.
+            driver
+                .execute(
+                    "DELETE FROM bucket_stats WHERE bucket_name=?1",
+                    vec![Value::Text(name.as_str().to_owned())],
+                )
+                .await?;
             Ok(MutationOutcome::Ack)
         }
         Mutation::SetBucketConfig {
@@ -739,21 +747,60 @@ async fn enforce_user_quota(driver: &dyn AsyncSqlDriver, row: &ObjectVersionRow)
 
 /// Replace any existing row at (bucket,key,version_id) — capturing its blob for reclamation —
 /// demote the key's other versions, and insert the new latest row.
+/// Apply a signed delta to the maintained roll-up counters (Phase 2.1, ARCH §30) for `bucket` and
+/// `owner`. Byte-identical SQL to the rusqlite store's `adjust_stats`; runs in the same transaction
+/// as the row change so the counters never diverge from `object_versions`.
+async fn adjust_stats(
+    driver: &dyn AsyncSqlDriver,
+    bucket: &str,
+    owner: &str,
+    d_versions: i64,
+    d_logical: i64,
+    d_physical: i64,
+) -> R<()> {
+    driver
+        .execute(
+            "INSERT INTO bucket_stats (bucket_name, versions, logical_bytes, physical_bytes)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(bucket_name) DO UPDATE SET
+                versions       = versions       + excluded.versions,
+                logical_bytes  = logical_bytes  + excluded.logical_bytes,
+                physical_bytes = physical_bytes + excluded.physical_bytes",
+            vec![
+                Value::Text(bucket.to_owned()),
+                Value::Int(d_versions),
+                Value::Int(d_logical),
+                Value::Int(d_physical),
+            ],
+        )
+        .await?;
+    driver
+        .execute(
+            "INSERT INTO user_stats (owner_id, logical_bytes) VALUES (?1, ?2)
+             ON CONFLICT(owner_id) DO UPDATE SET logical_bytes = logical_bytes + excluded.logical_bytes",
+            vec![Value::Text(owner.to_owned()), Value::Int(d_logical)],
+        )
+        .await?;
+    Ok(())
+}
+
 async fn upsert_version(
     driver: &dyn AsyncSqlDriver,
     row: ObjectVersionRow,
 ) -> R<Option<StoragePath>> {
-    let superseded: Option<String> = query_one(
+    // Read the row this upsert replaces (if any): its blob plus owner/byte sizes so the counters
+    // can be decremented for it before the replacement is inserted.
+    let existing = query_one(
         driver,
-        "SELECT storage_path FROM object_versions WHERE bucket_name=?1 AND key=?2 AND version_id=?3",
+        "SELECT storage_path, owner_id, size_logical, size_physical
+         FROM object_versions WHERE bucket_name=?1 AND key=?2 AND version_id=?3",
         vec![
             Value::Text(row.bucket.as_str().to_owned()),
             Value::Text(row.key.as_str().to_owned()),
             Value::Text(row.version_id.as_str().to_owned()),
         ],
     )
-    .await?
-    .and_then(|r| r.get_opt_text(0));
+    .await?;
     driver
         .execute(
             "DELETE FROM object_versions WHERE bucket_name=?1 AND key=?2 AND version_id=?3",
@@ -764,6 +811,22 @@ async fn upsert_version(
             ],
         )
         .await?;
+    let superseded = match existing {
+        Some(r) => {
+            let sp = r.get_opt_text(0);
+            adjust_stats(
+                driver,
+                row.bucket.as_str(),
+                &r.get_text(1),
+                -1,
+                -r.get_i64(2),
+                -r.get_i64(3),
+            )
+            .await?;
+            sp
+        }
+        None => None,
+    };
     demote_latest(driver, &row.bucket, &row.key).await?;
     insert_version(driver, &row).await?;
     Ok(superseded.map(StoragePath::from_string))
@@ -822,6 +885,16 @@ async fn insert_version(driver: &dyn AsyncSqlDriver, row: &ObjectVersionRow) -> 
             ],
         )
         .await?;
+    // Maintain the roll-up counters in lockstep: this new row adds one version and its bytes.
+    adjust_stats(
+        driver,
+        row.bucket.as_str(),
+        row.owner_id.0.as_str(),
+        1,
+        row.size_logical as i64,
+        row.size_physical as i64,
+    )
+    .await?;
     Ok(())
 }
 
@@ -831,9 +904,12 @@ async fn delete_version(
     key: &ObjectKey,
     version_id: &VersionId,
 ) -> R<MutationOutcome> {
+    // Read the row's blob, latest flag, and owner/byte sizes before deleting, so we can promote a
+    // successor and decrement the roll-up counters for the removed version.
     let existing = query_one(
         driver,
-        "SELECT storage_path, is_latest FROM object_versions WHERE bucket_name=?1 AND key=?2 AND version_id=?3",
+        "SELECT storage_path, is_latest, owner_id, size_logical, size_physical
+         FROM object_versions WHERE bucket_name=?1 AND key=?2 AND version_id=?3",
         vec![
             Value::Text(bucket.as_str().to_owned()),
             Value::Text(key.as_str().to_owned()),
@@ -841,12 +917,13 @@ async fn delete_version(
         ],
     )
     .await?;
-    let (freed, was_latest) = match existing {
+    let (freed, was_latest, removed) = match existing {
         Some(r) => (
             r.get_opt_text(0).map(StoragePath::from_string),
             r.get_i64(1) != 0,
+            Some((r.get_text(2), r.get_i64(3), r.get_i64(4))),
         ),
-        None => (None, false),
+        None => (None, false, None),
     };
     driver
         .execute(
@@ -858,6 +935,10 @@ async fn delete_version(
             ],
         )
         .await?;
+    if let Some((owner, sl, sp_bytes)) = removed {
+        // The deleted row leaves the table: subtract its version and bytes from the counters.
+        adjust_stats(driver, bucket.as_str(), &owner, -1, -sl, -sp_bytes).await?;
+    }
     let mut promoted = false;
     if was_latest {
         let promote: Option<String> = query_one(

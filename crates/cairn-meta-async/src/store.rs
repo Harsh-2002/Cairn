@@ -834,21 +834,27 @@ impl MetadataStore for AsyncMetadataStore {
         let buckets = query_one(driver, "SELECT COUNT(*) FROM buckets", vec![])
             .await?
             .map_or(0, |r| r.get_i64(0));
+        // Versions and byte totals come from the maintained roll-up (O(buckets)), not a scan of
+        // every object version (Phase 2.1).
         let agg = query_one(
             driver,
-            "SELECT
-                COALESCE(SUM(CASE WHEN is_latest=1 AND is_delete_marker=0 THEN 1 ELSE 0 END),0),
-                COALESCE(SUM(size_logical),0),
-                COALESCE(SUM(size_physical),0)
-             FROM object_versions",
+            "SELECT COALESCE(SUM(versions),0), COALESCE(SUM(logical_bytes),0),
+                    COALESCE(SUM(physical_bytes),0)
+             FROM bucket_stats",
             vec![],
         )
         .await?
         .unwrap_or_default();
-        let (objects, logical, physical) = (agg.get_i64(0), agg.get_i64(1), agg.get_i64(2));
-        let versions = query_one(driver, "SELECT COUNT(*) FROM object_versions", vec![])
-            .await?
-            .map_or(0, |r| r.get_i64(0));
+        let (versions, logical, physical) = (agg.get_i64(0), agg.get_i64(1), agg.get_i64(2));
+        // The current-visible object count is an index-only scan of the partial current-version
+        // index (idx_ov_latest_cover): one entry per live object, not every version.
+        let objects = query_one(
+            driver,
+            "SELECT COUNT(*) FROM object_versions WHERE is_latest=1 AND is_delete_marker=0",
+            vec![],
+        )
+        .await?
+        .map_or(0, |r| r.get_i64(0));
         Ok(StoreCounts {
             buckets: buckets as u64,
             objects: objects as u64,
@@ -859,16 +865,23 @@ impl MetadataStore for AsyncMetadataStore {
     }
 
     async fn bucket_counts(&self) -> Result<Vec<BucketCounts>, MetaError> {
+        // Byte totals from the maintained roll-up (LEFT JOIN so empty buckets show zeros); the
+        // current-object count joins a GROUP BY over the partial current-version index. Neither
+        // path scans historical versions for the byte sums.
         let rows = self
             .reader()
             .query(
                 "SELECT b.name,
-                    COALESCE(SUM(CASE WHEN ov.is_latest=1 AND ov.is_delete_marker=0 THEN 1 ELSE 0 END),0),
-                    COALESCE(SUM(ov.size_logical),0),
-                    COALESCE(SUM(ov.size_physical),0)
+                    COALESCE(o.objects, 0),
+                    COALESCE(s.logical_bytes, 0),
+                    COALESCE(s.physical_bytes, 0)
                  FROM buckets b
-                 LEFT JOIN object_versions ov ON ov.bucket_name = b.name
-                 GROUP BY b.name ORDER BY b.name",
+                 LEFT JOIN bucket_stats s ON s.bucket_name = b.name
+                 LEFT JOIN (
+                    SELECT bucket_name, COUNT(*) AS objects FROM object_versions
+                    WHERE is_latest=1 AND is_delete_marker=0 GROUP BY bucket_name
+                 ) o ON o.bucket_name = b.name
+                 ORDER BY b.name",
                 vec![],
             )
             .await?;

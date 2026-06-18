@@ -923,21 +923,28 @@ impl MetadataStore for SqliteMetadataStore {
 
     async fn aggregate_counts(&self) -> Result<StoreCounts, MetaError> {
         self.with_read(move |conn| {
-            let buckets: i64 =
-                conn.query_row("SELECT COUNT(*) FROM buckets", [], |r| r.get(0)).map_err(engine_err)?;
-            let (objects, logical, physical): (i64, i64, i64) = conn
+            let buckets: i64 = conn
+                .query_row("SELECT COUNT(*) FROM buckets", [], |r| r.get(0))
+                .map_err(engine_err)?;
+            // Versions and byte totals come from the maintained roll-up (O(buckets)), not a scan of
+            // every object version (Phase 2.1).
+            let (versions, logical, physical): (i64, i64, i64) = conn
                 .query_row(
-                    "SELECT
-                        COALESCE(SUM(CASE WHEN is_latest=1 AND is_delete_marker=0 THEN 1 ELSE 0 END),0),
-                        COALESCE(SUM(size_logical),0),
-                        COALESCE(SUM(size_physical),0)
-                     FROM object_versions",
+                    "SELECT COALESCE(SUM(versions),0), COALESCE(SUM(logical_bytes),0),
+                            COALESCE(SUM(physical_bytes),0)
+                     FROM bucket_stats",
                     [],
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )
                 .map_err(engine_err)?;
-            let versions: i64 = conn
-                .query_row("SELECT COUNT(*) FROM object_versions", [], |r| r.get(0))
+            // The current-visible object count is an index-only scan of the partial current-version
+            // index (idx_ov_latest_cover), so it visits one entry per live object, not every version.
+            let objects: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM object_versions WHERE is_latest=1 AND is_delete_marker=0",
+                    [],
+                    |r| r.get(0),
+                )
                 .map_err(engine_err)?;
             Ok(StoreCounts {
                 buckets: buckets as u64,
@@ -952,15 +959,22 @@ impl MetadataStore for SqliteMetadataStore {
 
     async fn bucket_counts(&self) -> Result<Vec<BucketCounts>, MetaError> {
         self.with_read(move |conn| {
+            // Byte totals come from the maintained roll-up (LEFT JOIN so buckets with no objects
+            // still appear with zeros); the current-object count joins a GROUP BY over the partial
+            // current-version index. Neither path scans historical versions for the byte sums.
             let mut stmt = conn
                 .prepare_cached(
                     "SELECT b.name,
-                        COALESCE(SUM(CASE WHEN ov.is_latest=1 AND ov.is_delete_marker=0 THEN 1 ELSE 0 END),0),
-                        COALESCE(SUM(ov.size_logical),0),
-                        COALESCE(SUM(ov.size_physical),0)
+                        COALESCE(o.objects, 0),
+                        COALESCE(s.logical_bytes, 0),
+                        COALESCE(s.physical_bytes, 0)
                      FROM buckets b
-                     LEFT JOIN object_versions ov ON ov.bucket_name = b.name
-                     GROUP BY b.name ORDER BY b.name",
+                     LEFT JOIN bucket_stats s ON s.bucket_name = b.name
+                     LEFT JOIN (
+                        SELECT bucket_name, COUNT(*) AS objects FROM object_versions
+                        WHERE is_latest=1 AND is_delete_marker=0 GROUP BY bucket_name
+                     ) o ON o.bucket_name = b.name
+                     ORDER BY b.name",
                 )
                 .map_err(engine_err)?;
             stmt.query_map([], |r| {
