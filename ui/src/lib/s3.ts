@@ -13,7 +13,15 @@ function s3headers(extra?: Record<string, string>): Record<string, string> {
 }
 
 export function objectPath(bucket: string, key: string): string {
-  const k = String(key).split("/").map(encodeURIComponent).join("/");
+  const k = String(key)
+    .split("/")
+    .map((seg) =>
+      // encodeURIComponent leaves dots unescaped, so a "." or ".." key segment would let the
+      // browser normalize the URL and escape the bucket prefix (audit #31). Percent-encode the
+      // dots of a pure-dot segment so it round-trips as a literal key segment, not navigation.
+      seg === "." || seg === ".." ? seg.replace(/\./g, "%2E") : encodeURIComponent(seg),
+    )
+    .join("/");
   return `/${encodeURIComponent(bucket)}/${k}`;
 }
 
@@ -460,8 +468,8 @@ export async function putReplication(
 ): Promise<void> {
   const xml =
     `<ReplicationConfiguration><Role>cairn</Role><Rule><ID>cairn-ui</ID>` +
-    `<Status>Enabled</Status><Filter><Prefix>${prefix}</Prefix></Filter>` +
-    `<Destination><Bucket>arn:aws:s3:::${destBucket}</Bucket></Destination></Rule>` +
+    `<Status>Enabled</Status><Filter><Prefix>${xmlEscape(prefix)}</Prefix></Filter>` +
+    `<Destination><Bucket>arn:aws:s3:::${xmlEscape(destBucket)}</Bucket></Destination></Rule>` +
     `</ReplicationConfiguration>`;
   const res = await fetch(`/${encodeURIComponent(bucket)}?replication`, {
     method: "PUT",

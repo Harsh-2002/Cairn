@@ -93,10 +93,11 @@ pub struct ObjectKey(String);
 
 impl ObjectKey {
     /// Validate and construct an object key: non-empty, at most [`MAX_KEY_LEN`] bytes,
-    /// valid UTF-8 (guaranteed by `&str`), and free of NUL bytes.
+    /// valid UTF-8 (guaranteed by `&str`), and free of XML-illegal control characters.
     ///
     /// # Errors
-    /// Returns [`InvalidName`] if the key is empty, too long, or contains a NUL.
+    /// Returns [`InvalidName`] if the key is empty, too long, or contains a control character
+    /// that XML 1.0 cannot represent.
     pub fn parse(s: &str) -> Result<Self, InvalidName> {
         if s.is_empty() {
             return Err(InvalidName::Empty);
@@ -104,7 +105,11 @@ impl ObjectKey {
         if s.len() > MAX_KEY_LEN {
             return Err(InvalidName::Length);
         }
-        if s.bytes().any(|b| b == 0) {
+        // Reject the C0 control characters XML 1.0 cannot represent — every byte below 0x20 except
+        // tab, LF and CR (NUL included) (audit #32). Such a key could never be emitted into a
+        // ListObjects/ListVersions XML response, not even as a numeric character reference, so it
+        // must not be storable in the first place.
+        if s.bytes().any(|b| b < 0x20 && !matches!(b, b'\t' | b'\n' | b'\r')) {
             return Err(InvalidName::Charset);
         }
         Ok(Self(s.to_owned()))
@@ -304,6 +309,12 @@ mod tests {
         assert_eq!(ObjectKey::parse("a\0b"), Err(InvalidName::Charset));
         let long = "x".repeat(MAX_KEY_LEN + 1);
         assert_eq!(ObjectKey::parse(&long), Err(InvalidName::Length));
+        // Audit #32: XML-illegal C0 control characters are rejected...
+        assert_eq!(ObjectKey::parse("a\u{1}b"), Err(InvalidName::Charset));
+        assert_eq!(ObjectKey::parse("a\u{1f}b"), Err(InvalidName::Charset));
+        assert_eq!(ObjectKey::parse("a\u{8}b"), Err(InvalidName::Charset));
+        // ...but tab, LF and CR (the XML-legal whitespace controls) are allowed.
+        assert!(ObjectKey::parse("a\tb\nc\rd").is_ok());
     }
 
     #[test]

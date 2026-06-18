@@ -33,6 +33,10 @@ const PAGE_LIMIT: u32 = 1000;
 /// aggregation), so a hostile or corrupt cursor can never spin forever.
 const MAX_PAGES: u32 = 100_000;
 
+/// Cap on the per-item error list a single force-delete-prefix response carries, so a prefix that
+/// fails to delete cannot accumulate an unbounded error list in memory (audit #26).
+const MAX_DELETE_PREFIX_ERRORS: usize = 1_000;
+
 /// A management-API response: an HTTP status, a JSON body, and a per-request id. The caller sets
 /// `content-type: application/json` and emits `request_id` as the `x-amz-request-id` header on
 /// every response, success or error (ARCH §25.1).
@@ -802,6 +806,7 @@ impl ControlService {
                 more = false;
                 break;
             }
+            let deleted_before = deleted;
             for item in &page.items {
                 match self
                     .meta
@@ -824,13 +829,22 @@ impl ControlService {
                     }
                     Err(e) => {
                         // Record the per-item failure but keep going so one bad row does not
-                        // strand the rest of the prefix.
-                        errors.push(wire::DeletePrefixError {
-                            key: item.key.as_str().to_owned(),
-                            message: e.to_string(),
-                        });
+                        // strand the rest of the prefix. The list is capped (audit #26) so a
+                        // wholesale failure cannot grow it without bound.
+                        if errors.len() < MAX_DELETE_PREFIX_ERRORS {
+                            errors.push(wire::DeletePrefixError {
+                                key: item.key.as_str().to_owned(),
+                                message: e.to_string(),
+                            });
+                        }
                     }
                 }
+            }
+            // The list query is re-anchored at the prefix each page, so it only converges when a
+            // page actually deletes rows. A page that deleted nothing (every item errored) would
+            // recur identically until MAX_PAGES — stop early instead of spinning (audit #26).
+            if deleted == deleted_before {
+                break;
             }
         }
 
@@ -2137,10 +2151,13 @@ impl ControlService {
             return resp;
         }
         match self.meta.get_share(token).await {
-            Ok(Some(s)) => {
+            Ok(Some(s)) if s.bucket.as_str() == name => {
                 ControlResponse::json(StatusCode::OK, &share_record(s, self.clock.now()))
             }
-            Ok(None) => ControlResponse::not_found(),
+            // Absent, or belonging to another bucket: 404 either way — a share is only visible
+            // through its own bucket's path, and we never reveal cross-bucket token existence
+            // (audit #27).
+            Ok(_) => ControlResponse::not_found(),
             Err(e) => ControlResponse::error_internal(&e.to_string()),
         }
     }
@@ -2156,6 +2173,15 @@ impl ControlService {
             Ok(n) => n,
             Err(resp) => return resp,
         };
+        // Scope the token to the path bucket (audit #27): only revoke a share that belongs to this
+        // bucket, so an admin for one bucket cannot revoke another bucket's share by token. A token
+        // that is absent or belongs to another bucket is an idempotent no-op, not a cross-bucket
+        // revoke.
+        match self.meta.get_share(token).await {
+            Ok(Some(s)) if s.bucket.as_str() == name => {}
+            Ok(_) => return ControlResponse::no_content(),
+            Err(e) => return ControlResponse::error_internal(&e.to_string()),
+        }
         if let Err(e) = self
             .meta
             .submit(Mutation::RevokeShare {

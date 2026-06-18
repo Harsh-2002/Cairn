@@ -42,7 +42,16 @@ pub fn map(err: &Error) -> (StatusCode, &'static str) {
 #[must_use]
 pub fn error_response(err: &Error, resource: &str, request_id: &str) -> S3Response {
     let (status, code) = map(err);
-    let message = err.to_string();
+    // Never surface internal error detail (crypto/blob/IO/internal messages) in the client-facing
+    // `<Message>` (audit #28): a 5xx logs the real cause server-side and returns a generic message,
+    // matching AWS's opaque InternalError. Client (4xx) errors keep their descriptive, S3-standard
+    // message.
+    let message = if status.is_server_error() {
+        tracing::error!(error = %err, request_id, resource, "internal error serving request");
+        "We encountered an internal error. Please try again.".to_owned()
+    } else {
+        err.to_string()
+    };
     let body = cairn_xml::error_document(code, &message, resource, request_id);
     S3Response::xml(status, body).with_header("x-amz-request-id", request_id)
 }
@@ -83,5 +92,23 @@ mod tests {
         let s = String::from_utf8(b.to_vec()).unwrap();
         assert!(s.contains("NoSuchKey"));
         assert!(s.contains("req-123"));
+    }
+
+    #[test]
+    fn internal_error_detail_is_not_leaked() {
+        // Audit #28: a 5xx must not echo the internal error detail in the client-facing message.
+        let r = error_response(
+            &Error::Internal("sekret crypto/blob/io detail".to_owned()),
+            "/b/k",
+            "req-9",
+        );
+        assert_eq!(r.status, StatusCode::INTERNAL_SERVER_ERROR);
+        let crate::request::S3Body::Bytes(b) = r.body else {
+            panic!("expected bytes body")
+        };
+        let s = String::from_utf8(b.to_vec()).unwrap();
+        assert!(!s.contains("sekret"), "internal detail leaked: {s}");
+        assert!(s.contains("InternalError"), "keeps the generic S3 code");
+        assert!(s.contains("req-9"));
     }
 }

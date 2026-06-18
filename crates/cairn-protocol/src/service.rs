@@ -445,6 +445,20 @@ impl S3Service {
         let precond = precondition(&req);
         let user_metadata = user_metadata(&req);
         let content_md5 = req.header("content-md5").map(str::to_owned);
+        // audit #25: when the client SIGNED a concrete payload hash (a real hex digest, not
+        // UNSIGNED-PAYLOAD or a STREAMING-* sentinel), the body must actually hash to it — the hash
+        // is part of the SigV4 signature, so an unverified body is not truly authenticated. Compute
+        // SHA-256 over the body during staging only when there is a hash to verify; don't persist it
+        // unless the client also asked to store a SHA-256 checksum.
+        let signed_sha256 = req.header("x-amz-content-sha256").and_then(|v| {
+            let v = v.trim();
+            (v.len() == 64 && v.bytes().all(|b| b.is_ascii_hexdigit())).then(|| v.to_ascii_lowercase())
+        });
+        let store_sha256 = extra.0.contains(&ChecksumAlgorithm::Sha256);
+        let mut stage_checksums = extra;
+        if signed_sha256.is_some() && !store_sha256 {
+            stage_checksums.0.push(ChecksumAlgorithm::Sha256);
+        }
 
         // Reject an invalid inline tag set up front — before any blob is staged — so a bad
         // `x-amz-tagging` header (over the limit, bad charset, duplicate/aws: key) returns
@@ -486,13 +500,13 @@ impl S3Service {
             .and_then(|v| v.parse::<u64>().ok());
         let opts = StageOptions {
             compression: bucket.compression,
-            extra_checksums: extra,
+            extra_checksums: stage_checksums,
             size_ceiling: self.max_object_size,
             content_type: content_type.clone(),
             encryption: sse_dek,
             content_length,
         };
-        let staged = self
+        let mut staged = self
             .blob
             .stage(&bucket.name, body, opts)
             .await
@@ -506,6 +520,31 @@ impl S3Service {
             if hex::decode(staged.md5_hex.as_bytes()).ok().as_deref() != Some(&want) {
                 let _ = self.blob.delete(&staged.storage_path).await;
                 return Err(Error::BadDigest);
+            }
+        }
+
+        // Verify the signed SHA-256 payload hash against the body actually staged (audit #25).
+        if let Some(want_hex) = &signed_sha256 {
+            let got_hex = staged
+                .checksums
+                .iter()
+                .find(|c| c.algorithm == ChecksumAlgorithm::Sha256)
+                .and_then(|c| {
+                    base64::engine::general_purpose::STANDARD
+                        .decode(c.value.as_bytes())
+                        .ok()
+                })
+                .map(hex::encode);
+            if got_hex.as_deref() != Some(want_hex.as_str()) {
+                let _ = self.blob.delete(&staged.storage_path).await;
+                return Err(Error::BadDigest);
+            }
+            // Drop the verification-only checksum so it is not persisted/advertised unless the
+            // client explicitly requested a SHA-256 checksum.
+            if !store_sha256 {
+                staged
+                    .checksums
+                    .retain(|c| c.algorithm != ChecksumAlgorithm::Sha256);
             }
         }
 

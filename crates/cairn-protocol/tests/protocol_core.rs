@@ -1720,6 +1720,56 @@ async fn object_tagging_honors_version_id() {
     );
 }
 
+/// A non-streaming PUT that signs a concrete payload hash must have its body verified against it
+/// (audit #25): the correct sha256 succeeds, a wrong one is rejected.
+#[tokio::test]
+async fn put_verifies_signed_content_sha256() {
+    let h = harness().await;
+    drain(send(&h.svc, req(Method::PUT, Some("shab"), None, &[], &[], vec![])).await).await;
+
+    // sha256("hi").
+    let good = "8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4";
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("shab"),
+                Some("k"),
+                &[],
+                &[("x-amz-content-sha256", good)],
+                b"hi".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "a body matching the signed sha256 is accepted");
+
+    // The same body with a wrong signed hash must be rejected.
+    let bad = "0000000000000000000000000000000000000000000000000000000000000000";
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("shab"),
+                Some("k2"),
+                &[],
+                &[("x-amz-content-sha256", bad)],
+                b"hi".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::BAD_REQUEST,
+        "a body that does not match the signed sha256 is rejected"
+    );
+}
+
 #[tokio::test]
 async fn bucket_policy_roundtrip() {
     let h = harness().await;
