@@ -1,102 +1,71 @@
 # Cairn
 
-A production-grade, fully **S3-compatible object storage server** written from scratch in
-pure Rust. Object bytes live as plain files on a local POSIX filesystem; all metadata lives
-in an embedded SQLite database (the single source of truth). Cairn adds transparent per-bucket
-block compression, native TLS, asynchronous bucket replication, an embedded React management
-UI, and a CLI — shipped as **one static binary**.
+A production-grade, **S3-compatible object storage server** written from scratch in pure Rust.
+Object bytes are plain files on a POSIX filesystem; all metadata lives in an embedded SQLite
+database (the single source of truth). Ships as **one static binary**.
 
-> The full engineering specification is in [`ARCH.md`](./ARCH.md). Cairn is built from scratch
-> in Rust from that specification.
+- **S3 API** — buckets and objects (ranges, conditionals, checksums, SSE-S3), multipart, copy,
+  bulk delete, listing v1/v2 + versions, versioning, tagging, CORS, policies, lifecycle, and
+  replication — with the SigV4 streaming chunked decoder and a full authorization pipeline
+  (policy / ACL / public-access-block / ownership).
+- **Durable & crash-consistent** — staged writes with file + directory fsync and rename, hash
+  validation, and a metadata transaction as the single linearization point; startup
+  reconciliation reclaims any orphaned blob with no manual intervention.
+- **Built in** — transparent per-bucket block compression, native TLS (rustls + aws-lc-rs),
+  AES-256-GCM envelope encryption of secrets at rest with master-key rotation, asynchronous
+  bucket replication, an embedded React management console, Prometheus metrics, and a CLI.
 
-## Status
+The full engineering specification is **[`ARCH.md`](./ARCH.md)**; contributor / AI-agent onboarding
+is **[`CLAUDE.md`](./CLAUDE.md)**; operations guides live in **[`docs/`](./docs)**.
 
-All build waves (ARCH §32, Phases 0–14) are complete. **Cairn is a runnable, S3-compatible
-server, validated against a real AWS SDK.**
-
-- **Foundations** — the 8-trait spine + in-memory doubles; `cairn-meta` (group-committing SQLite
-  writer + WAL read pool, savepoint-isolated batches); `cairn-blob` (durable commit with
-  directory fsync + range-friendly block compression + bounded reconcile); `cairn-auth` (SigV4
-  header/presigned + Bearer, validated against the AWS `get-vanilla` vector); `cairn-crypto`
-  (AES-256-GCM envelope), `cairn-authz` (policy/ACL/BPA/ownership engine), `cairn-xml`.
-- **S3 surface** — the SigV4 streaming **chunked decoder** (F-5) with fuzz target; bucket CRUD;
-  object PUT/GET/HEAD/DELETE (ranges, conditionals, streaming uploads, checksums); listing
-  v1/v2 + versions; multipart; copy; bulk delete; versioning, tagging, CORS, policy, lifecycle,
-  replication subresources; the full authorization pipeline.
-- **Engines** — lifecycle scanner + multipart sweeper + metrics refresher run in the background;
-  outbox-driven replication engine.
-- **Control plane** — management JSON API (`/api/v1`) + embedded **React console** (its own listener, port 7374) + CLI
-  (`bootstrap`, `integrity`, `validate-config`, `serve`); **native TLS** (rustls + aws-lc-rs).
-
-**Verification:** 318 unit/integration/property tests; `clippy -D warnings` and `rustfmt`
-clean; a verified static `musl` binary; a **live crash-consistency test** (F-4: crash in the
-durability window → orphan → reconcile reclaims it); the F-5 chunked decoder survives **2.1M
-fuzz iterations** (plus XML + policy fuzz targets) and benchmarks at **~1 GiB/s**; a **boto3
-conformance suite** (a real AWS SDK) drives the full object lifecycle; **node→node replication**
-verified end to end; signed-streaming integrity verified (tampered chunk rejected); and the
-**web console** (React + shadcn/ui) verified in a real browser.
-
-A multi-agent audit against ARCH.md (see [`docs/GAPS.md`](./docs/GAPS.md)) drove a remediation
-pass that closed all critical and high findings (signed-streaming verification, subresource
-mis-routing, real replication, ACL/BPA/quotas/checkpointer/streaming-bodies/conditionals).
-
-### Try it
+## Quickstart
 
 ```sh
-cargo build --bin cairn
-export CAIRN_DATA_DIR=/tmp/cairn CAIRN_DB_PATH=/tmp/cairn/cairn.db
-export CAIRN_MASTER_KEY=$(openssl rand -hex 32)
-./target/debug/cairn bootstrap          # prints admin credentials once
-./target/debug/cairn serve &            # serves on 127.0.0.1:9000
-AUTH="Authorization: Bearer <id>.<secret>"   # from bootstrap output
-curl -X PUT -H "$AUTH" http://127.0.0.1:9000/my-bucket
-curl -X PUT -H "$AUTH" --data-binary "hello cairn" http://127.0.0.1:9000/my-bucket/hi.txt
-curl -H "$AUTH" http://127.0.0.1:9000/my-bucket/hi.txt     # -> hello cairn
-# then open http://127.0.0.1:9000/ui/ for the management UI
+cargo build --release --bin cairn          # add `(cd ui && npm install && npm run build)` first for the console
+
+export CAIRN_DATA_DIR=/var/lib/cairn CAIRN_DB_PATH=/var/lib/cairn/cairn.db
+export CAIRN_MASTER_KEY=$(openssl rand -hex 32)     # a 32-byte key, hex-encoded
+./target/release/cairn serve
 ```
 
-Run the AWS-SDK conformance suite: `pip install boto3 && bash conformance/run.sh`.
-See [`docs/`](./docs) for the operations guide, the backup/restore procedure, and the S3 API
-support matrix.
-
-## Workspace layout
-
-| Crate | Responsibility |
-|---|---|
-| `cairn-types` | The 8 traits (the spine), domain types, the error tree, and the in-memory doubles (`feature = "testing"`). Depends on no engine. |
-| `cairn-meta` | SQLite `MetadataStore`: single group-committing writer + read pool + cache. *(Wave 1)* |
-| `cairn-blob` | Local-filesystem `BlobStore`: durable commit + compression + reconciliation. The only crate doing filesystem syscalls. *(Wave 1)* |
-| `cairn-crypto` | `Crypto` (AEAD envelope + zeroize), `Clock`, `PublicUrl`. *(Wave 1)* |
-| `cairn-auth` | `Authenticator` chain: SigV4 + Bearer + chunked-signature primitives. *(Wave 1)* |
-| `cairn-authz` | `AuthorizationEngine`: pure policy/ACL/BPA/ownership evaluation. *(Wave 1)* |
-| `cairn-xml` | quick-xml S3 request/response codec. *(Wave 1)* |
-| `cairn-protocol` | S3 handlers, the 7 request lifecycles, the streaming chunked decoder. *(Wave 2)* |
-| `cairn-replication` / `cairn-lifecycle` | Replication engine; lifecycle scanner. *(Wave 3)* |
-| `cairn-control` / `cairn-ui` / `cairn-cli` | Management API; embedded React console; CLI. *(Wave 4)* |
-| `cairn-server` | The binary: wires concrete impls, the hyper/rustls stack, middleware, shutdown. |
-
-## Building
+- **S3 API** on `:7373` — point any S3 client (AWS CLI, boto3, s3cmd) at `http://localhost:7373`.
+- **Web console + management API** (`/api/v1`) on `:7374` — open `http://localhost:7374`.
+- Default credentials are `cairn` / `cairnadmin` (override with `CAIRN_ROOT_ACCESS_KEY` /
+  `CAIRN_ROOT_SECRET_KEY`). Health at `/healthz`, readiness at `/readyz`, metrics at `/metrics`.
 
 ```sh
-# Development build + tests (host gnu target)
-cargo build
-cargo nextest run --workspace        # or: cargo test --workspace
+# With the AWS CLI configured for the access key / secret above (any region):
+aws --endpoint-url http://localhost:7373 s3 mb s3://demo
+echo 'hello cairn' | aws --endpoint-url http://localhost:7373 s3 cp - s3://demo/hi.txt
+aws --endpoint-url http://localhost:7373 s3 cp s3://demo/hi.txt -        # -> hello cairn
+```
 
-# Static, dependency-free binary for distroless/scratch containers
+## Configuration
+
+Configuration is **environment-only**: every setting is a `CAIRN_*` variable, validated on load
+(`cairn validate-config`) — there is no config file and no flags. The full reference is **ARCH §28**.
+Common knobs: `CAIRN_LISTEN_ADDR` (S3, default `0.0.0.0:7373`), `CAIRN_UI_ADDR` (console, default
+`0.0.0.0:7374`; set `off` for headless), `CAIRN_REGION`, `CAIRN_MASTER_KEY` (or `CAIRN_MASTER_KEY_RING`
+for rotation), `CAIRN_TLS_CERT_PATH` / `CAIRN_TLS_KEY_PATH`, `CAIRN_META_SHARDS`.
+
+CLI subcommands: `cairn serve` (default), `validate-config`, `bootstrap`, `integrity [--repair]`.
+
+## Build & test
+
+```sh
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo nextest run --workspace
+(cd ui && npm run build)            # builds the console bundle embedded into the binary
+
+# Static, dependency-free musl binary for distroless / scratch containers:
 cargo build --release --bin cairn --target x86_64-unknown-linux-musl
-ldd target/x86_64-unknown-linux-musl/release/cairn   # -> "statically linked"
 ```
 
-## Running
-
-```sh
-cairn validate-config        # validate configuration and exit
-cairn serve                  # run the server (defaults to 127.0.0.1:9000)
-```
-
-Configuration layers flags > environment (`CAIRN_*`) > optional TOML file > defaults, and is
-validated on load. Liveness at `/healthz`, readiness at `/readyz`, Prometheus metrics at
-`/metrics`.
+The workspace is ~14 crates under `crates/` (see **[`CLAUDE.md`](./CLAUDE.md)** for the map and
+ARCH §12 for the trait spine). Heavier conformance harnesses — boto3 (real AWS SDK),
+crash-consistency, a two-node replication soak, and the MinIO warp benchmark — live in
+`conformance/` and run in CI.
 
 ## License
 
