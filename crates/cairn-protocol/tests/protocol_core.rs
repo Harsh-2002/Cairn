@@ -1023,6 +1023,148 @@ async fn multipart_lifecycle() {
     assert_eq!(got, expected);
 }
 
+/// A part-validation failure on CompleteMultipartUpload must leave the upload retryable rather than
+/// bricking it in `completing` (audit #14): a first complete carrying a wrong ETag fails, and a
+/// second complete with the correct ETags then succeeds.
+#[tokio::test]
+async fn complete_multipart_part_validation_failure_is_retryable() {
+    let h = harness().await;
+    drain(send(&h.svc, req(Method::PUT, Some("mpr"), None, &[], &[], vec![])).await).await;
+
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::POST,
+                Some("mpr"),
+                Some("o"),
+                &[("uploads", "")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let upload_id = between(&String::from_utf8(body).unwrap(), "<UploadId>", "</UploadId>");
+
+    let part1 = vec![b'a'; 5 * 1024 * 1024];
+    let part2 = b"tail".to_vec();
+    let (_, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("mpr"),
+                Some("o"),
+                &[("uploadId", upload_id.as_str()), ("partNumber", "1")],
+                &[],
+                part1.clone(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    let etag1 = header(&hdrs, "etag").unwrap().to_owned();
+    let (_, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("mpr"),
+                Some("o"),
+                &[("uploadId", upload_id.as_str()), ("partNumber", "2")],
+                &[],
+                part2.clone(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    let etag2 = header(&hdrs, "etag").unwrap().to_owned();
+
+    // First complete carries a wrong ETag for part 2 — validation must fail.
+    let bad = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag1}</ETag></Part>\
+         <Part><PartNumber>2</PartNumber><ETag>\"deadbeefdeadbeefdeadbeefdeadbeef\"</ETag></Part></CompleteMultipartUpload>"
+    );
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::POST,
+                Some("mpr"),
+                Some("o"),
+                &[("uploadId", upload_id.as_str())],
+                &[],
+                bad.into_bytes(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_ne!(st, StatusCode::OK, "a bad-ETag complete must fail");
+
+    // The upload is NOT bricked: a retry with the correct ETags succeeds.
+    let good = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag1}</ETag></Part>\
+         <Part><PartNumber>2</PartNumber><ETag>{etag2}</ETag></Part></CompleteMultipartUpload>"
+    );
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::POST,
+                Some("mpr"),
+                Some("o"),
+                &[("uploadId", upload_id.as_str())],
+                &[],
+                good.into_bytes(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "retry after a part-validation failure must succeed (upload not bricked)"
+    );
+}
+
+/// Object GET/HEAD must carry `x-content-type-options: nosniff` so attacker-uploaded bytes served
+/// inline same-origin cannot be MIME-sniffed into executable content (audit #13).
+#[tokio::test]
+async fn object_get_sets_nosniff() {
+    let h = harness().await;
+    drain(send(&h.svc, req(Method::PUT, Some("snb"), None, &[], &[], vec![])).await).await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("snb"), Some("k"), &[], &[], b"hi".to_vec()),
+        )
+        .await,
+    )
+    .await;
+    for method in [Method::GET, Method::HEAD] {
+        let (st, hdrs, _) = drain(
+            send(
+                &h.svc,
+                req(method.clone(), Some("snb"), Some("k"), &[], &[], vec![]),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(
+            header(&hdrs, "x-content-type-options"),
+            Some("nosniff"),
+            "{method} must set nosniff"
+        );
+    }
+}
+
 /// A full multipart cycle must work under metadata sharding (audit #4): the upload id the client
 /// receives from Initiate must carry the owning shard, so the later UploadPart / Complete route back
 /// to the shard that holds the session. Before the fix the protocol returned the un-encoded local id
@@ -1483,6 +1625,98 @@ async fn versioning_and_object_tagging() {
     assert!(
         xml.contains("env") && xml.contains("prod"),
         "tags returned: {xml}"
+    );
+}
+
+/// Tag GET/PUT operate on the version named by `?versionId`, not always the current one (audit
+/// #15): tagging an older version must not tag — nor be read from — the current version.
+#[tokio::test]
+async fn object_tagging_honors_version_id() {
+    let h = harness().await;
+    versioned_bucket(&h, "vtag").await;
+
+    let (_, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("vtag"), Some("k"), &[], &[], b"one".to_vec()),
+        )
+        .await,
+    )
+    .await;
+    let v1 = header(&hdrs, "x-amz-version-id").unwrap().to_owned();
+    let (_, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("vtag"), Some("k"), &[], &[], b"two".to_vec()),
+        )
+        .await,
+    )
+    .await;
+    let v2 = header(&hdrs, "x-amz-version-id").unwrap().to_owned();
+    assert_ne!(v1, v2);
+
+    // Tag the OLDER version (v1) explicitly via ?versionId.
+    let tags =
+        b"<Tagging><TagSet><Tag><Key>which</Key><Value>v1</Value></Tag></TagSet></Tagging>".to_vec();
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("vtag"),
+                Some("k"),
+                &[("tagging", ""), ("versionId", v1.as_str())],
+                &[],
+                tags,
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    // Reading v1's tags returns them.
+    let (_, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("vtag"),
+                Some("k"),
+                &[("tagging", ""), ("versionId", v1.as_str())],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    let xml_v1 = String::from_utf8(body).unwrap();
+    assert!(
+        xml_v1.contains("which") && xml_v1.contains("v1"),
+        "v1 tags: {xml_v1}"
+    );
+
+    // The CURRENT version (v2) must have NO tags — the tag did not leak onto it.
+    let (_, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("vtag"),
+                Some("k"),
+                &[("tagging", "")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    let xml_cur = String::from_utf8(body).unwrap();
+    assert!(
+        !xml_cur.contains("which"),
+        "the current version must be untagged: {xml_cur}"
     );
 }
 
@@ -3266,6 +3500,45 @@ async fn inbound_replica_marks_status_and_skips_outbox() {
     assert_eq!(
         row.replication_status,
         Some(cairn_types::meta::ReplicationStatus::Replica)
+    );
+
+    // Audit #16: a non-admin (member) cannot forge the replica marker. The same header from a
+    // member is ignored, so the write replicates normally and is NOT recorded as a Replica —
+    // closing a replication-evasion / loop-prevention bypass.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req_with_principal(
+                Method::PUT,
+                Some("repl"),
+                Some("c"),
+                &[],
+                &[("x-amz-meta-cairn-replica", "true")],
+                b"z".to_vec(),
+                member("intruder"),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let due = h.meta.list_due_replication(100, now).await.unwrap();
+    assert_eq!(
+        due.len(),
+        2,
+        "a member's replica header is ignored, so the write enqueues replication"
+    );
+    let key_c = ObjectKey::parse("c").unwrap();
+    let row_c = h
+        .meta
+        .current_version(&BucketName::parse("repl").unwrap(), &key_c)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(
+        row_c.replication_status,
+        Some(cairn_types::meta::ReplicationStatus::Replica),
+        "a member must not be able to self-classify a write as a Replica"
     );
 }
 

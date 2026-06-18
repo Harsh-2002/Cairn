@@ -532,9 +532,19 @@ impl S3Service {
         // An inbound replica is a PUT carrying `x-amz-meta-cairn-replica: true` (ARCH §20.4): mark
         // the version a `Replica` so it is never re-replicated, and skip the outbox entirely (loop
         // prevention). The marker is matched case-insensitively on the value.
+        // Only a privileged replication principal may classify a write as an inbound replica
+        // (audit #16). Honoring the bare client header would let any writer mark their write a
+        // `Replica` to suppress its own replication (skip the outbox) or otherwise downgrade how
+        // it is handled. Replication ships under the destination's Administrator-role credential,
+        // so gate the marker on that role; a normal member's header is ignored and the write
+        // replicates normally.
         let is_replica = req
             .header("x-amz-meta-cairn-replica")
-            .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+            .is_some_and(|v| v.eq_ignore_ascii_case("true"))
+            && req
+                .principal
+                .as_ref()
+                .is_some_and(|p| p.role == Role::Administrator);
         let replication_status =
             is_replica.then_some(cairn_types::meta::ReplicationStatus::Replica);
         // The system response headers (ARCH §13.4) are stored verbatim from the request.
@@ -721,9 +731,19 @@ impl S3Service {
         // An inbound replicated delete-marker propagation carries the loop-prevention marker; the
         // marker it creates must NOT itself be re-enqueued for replication (ARCH §20.4), which
         // matters for two-way replication where the destination bucket also has a rule.
+        // Only a privileged replication principal may classify a write as an inbound replica
+        // (audit #16). Honoring the bare client header would let any writer mark their write a
+        // `Replica` to suppress its own replication (skip the outbox) or otherwise downgrade how
+        // it is handled. Replication ships under the destination's Administrator-role credential,
+        // so gate the marker on that role; a normal member's header is ignored and the write
+        // replicates normally.
         let is_replica = req
             .header("x-amz-meta-cairn-replica")
-            .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+            .is_some_and(|v| v.eq_ignore_ascii_case("true"))
+            && req
+                .principal
+                .as_ref()
+                .is_some_and(|p| p.role == Role::Administrator);
 
         // A versioned DELETE (?versionId) permanently removes that version (no delete marker). A
         // plain DELETE in an Enabled bucket inserts a new identified delete marker; in a Suspended
@@ -1059,15 +1079,12 @@ impl S3Service {
             return Err(Error::InvalidArgument("no parts specified".to_owned()));
         }
 
-        let session = match self
-            .meta
-            .submit(Mutation::ClaimMultipart(upload_id.clone()))
-            .await?
-        {
-            MutationOutcome::MultipartClaim(ClaimOutcome::Claimed(s)) => *s,
-            _ => return Err(Error::NoSuchUpload),
-        };
-
+        // Validate the requested parts against what was uploaded BEFORE claiming the session, so a
+        // part-validation failure (the common client error: wrong ETag, gap, out-of-order, or an
+        // undersized part) leaves the upload `active` and retryable rather than bricking it in
+        // `completing` with no way to retry or abort (audit #14). Listing and validating parts is
+        // read-only and independent of the session status; only once every part checks out do we
+        // claim the session and assemble.
         let stored: std::collections::HashMap<u16, cairn_types::meta::PartRecord> = self
             .meta
             .list_parts(&upload_id, 0, 10_000)
@@ -1103,6 +1120,18 @@ impl S3Service {
             });
             part_md5s.push(rec.etag.clone());
         }
+
+        // Every requested part validated: now claim the session (active -> completing) and
+        // assemble. A failure past this point is server-side (assembly/commit), not a client part
+        // error, so the narrow `completing` window is acceptable.
+        let session = match self
+            .meta
+            .submit(Mutation::ClaimMultipart(upload_id.clone()))
+            .await?
+        {
+            MutationOutcome::MultipartClaim(ClaimOutcome::Claimed(s)) => *s,
+            _ => return Err(Error::NoSuchUpload),
+        };
 
         let opts = StageOptions {
             compression: bucket.compression,
@@ -1929,11 +1958,20 @@ impl S3Service {
     async fn get_object_tagging(&self, req: &S3Request) -> Result<S3Response> {
         let bucket = self.fetch_bucket(req).await?;
         let key = req.key.clone().expect("key present");
-        let row = self
-            .meta
-            .current_version(&bucket.name, &key)
-            .await?
-            .ok_or(Error::NoSuchKey)?;
+        let row = match req.query("versionId") {
+            // Tag GET/PUT/DELETE operate on the named version when `?versionId` is given, not
+            // always the current one (audit #15) — matching PutObjectAcl's resolution.
+            Some(vid) => self
+                .meta
+                .get_version(&bucket.name, &key, &VersionId::from_string(vid.to_owned()))
+                .await?
+                .ok_or(Error::NoSuchVersion)?,
+            None => self
+                .meta
+                .current_version(&bucket.name, &key)
+                .await?
+                .ok_or(Error::NoSuchKey)?,
+        };
         let tags = self
             .meta
             .get_object_tags(&bucket.name, &key, &row.version_id)
@@ -1949,11 +1987,20 @@ impl S3Service {
     ) -> Result<S3Response> {
         let bucket = self.fetch_bucket(&req).await?;
         let key = req.key.clone().expect("key present");
-        let row = self
-            .meta
-            .current_version(&bucket.name, &key)
-            .await?
-            .ok_or(Error::NoSuchKey)?;
+        let row = match req.query("versionId") {
+            // Tag GET/PUT/DELETE operate on the named version when `?versionId` is given, not
+            // always the current one (audit #15) — matching PutObjectAcl's resolution.
+            Some(vid) => self
+                .meta
+                .get_version(&bucket.name, &key, &VersionId::from_string(vid.to_owned()))
+                .await?
+                .ok_or(Error::NoSuchVersion)?,
+            None => self
+                .meta
+                .current_version(&bucket.name, &key)
+                .await?
+                .ok_or(Error::NoSuchKey)?,
+        };
         let doc = drain_body(body, 64 * 1024).await?;
         let tags = cairn_xml::parse_tagging(&doc)?;
         cairn_xml::validate_tags(&tags, cairn_xml::MAX_TAGS_OBJECT)?;
@@ -1971,11 +2018,20 @@ impl S3Service {
     async fn delete_object_tagging(&self, req: &S3Request) -> Result<S3Response> {
         let bucket = self.fetch_bucket(req).await?;
         let key = req.key.clone().expect("key present");
-        let row = self
-            .meta
-            .current_version(&bucket.name, &key)
-            .await?
-            .ok_or(Error::NoSuchKey)?;
+        let row = match req.query("versionId") {
+            // Tag GET/PUT/DELETE operate on the named version when `?versionId` is given, not
+            // always the current one (audit #15) — matching PutObjectAcl's resolution.
+            Some(vid) => self
+                .meta
+                .get_version(&bucket.name, &key, &VersionId::from_string(vid.to_owned()))
+                .await?
+                .ok_or(Error::NoSuchVersion)?,
+            None => self
+                .meta
+                .current_version(&bucket.name, &key)
+                .await?
+                .ok_or(Error::NoSuchKey)?,
+        };
         self.meta
             .submit(Mutation::DeleteObjectTags {
                 bucket: bucket.name,
@@ -2632,7 +2688,12 @@ fn object_headers(resp: S3Response, row: &ObjectVersionRow) -> S3Response {
         .with_header("etag", quoted(&row.etag))
         .with_header("content-type", row.content_type.clone())
         .with_header("last-modified", http_date(row.updated_at))
-        .with_header("accept-ranges", "bytes");
+        .with_header("accept-ranges", "bytes")
+        // Never let a browser MIME-sniff object bytes into an executable type (audit #13): an
+        // attacker-uploaded object served inline same-origin (S3 GET, or a `/p/` share) could
+        // otherwise be sniffed into HTML/JS and run as stored XSS. The declared content-type is
+        // honored verbatim; nothing is sniffed.
+        .with_header("x-content-type-options", "nosniff");
     if !row.version_id.is_null() {
         resp = resp.with_header("x-amz-version-id", row.version_id.as_str());
     }
