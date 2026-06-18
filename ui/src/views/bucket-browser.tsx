@@ -592,8 +592,11 @@ export function BucketBrowser() {
     }
   }
 
-  // Open an object in a new browser tab via a short-lived presigned GET URL, so
-  // the browser natively renders PDFs/images/etc and the URL carries no auth header.
+  // Open an object via a short-lived presigned GET URL. Object bytes are never rendered inline
+  // same-origin: an attacker-uploaded object whose stored Content-Type is active (text/html,
+  // image/svg+xml, ...) would otherwise execute as stored XSS in the console origin (audit #13).
+  // Force an attachment disposition and a benign content type so the browser saves the bytes
+  // instead of interpreting them; the server also sends X-Content-Type-Options: nosniff.
   async function openPreview(key: string) {
     try {
       const res = await api.presignShare(name, {
@@ -601,8 +604,8 @@ export function BucketBrowser() {
         method: "GET",
         expires_in_secs: 3600,
         version_id: null,
-        response_content_disposition: null,
-        content_type: null,
+        response_content_disposition: "attachment",
+        content_type: "application/octet-stream",
       });
       window.open(res.url, "_blank", "noopener,noreferrer");
     } catch (e) {
