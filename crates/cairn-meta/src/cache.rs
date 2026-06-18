@@ -28,7 +28,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use cairn_types::authz::PublicAccessBlock;
 use cairn_types::bucket::{Bucket, ConfigAspect, ConfigDoc};
@@ -179,8 +179,11 @@ pub struct CachedMetadataStore {
     bucket: ShardedCache<BucketName, Option<Arc<Bucket>>>,
     /// `get_bucket_config` cache, keyed by `(bucket, aspect)`.
     config: ShardedCache<(BucketName, ConfigAspect), CachedConfig>,
-    /// `get_account_public_access_block` cache (a single account-wide value).
-    account_bpa: Mutex<Option<PublicAccessBlock>>,
+    /// `get_account_public_access_block` cache (a single account-wide value). The whole
+    /// [`PublicAccessBlock`] is four booleans, so it packs into one `AtomicU8` (bit 0 = "present",
+    /// bits 1-4 = the flags) — a truly lock-free load/store on this very-hot, account-wide read,
+    /// with no mutex to serialize concurrent authorizers. `0` means "not cached".
+    account_bpa: AtomicU8,
     /// Whether caching is on at all (`budget_bytes != 0`).
     enabled: bool,
     /// Monotonic invalidation epoch, bumped on *every* cache invalidation (both around `submit`
@@ -197,6 +200,37 @@ pub struct CachedMetadataStore {
     /// change. Independent of `enabled`: the auth cache must stay coherent even when this config
     /// cache is turned off (`budget_bytes == 0`).
     auth_epoch: Arc<AtomicU64>,
+}
+
+/// "Present" bit for the packed account-BPA byte; `0` means "not cached".
+const BPA_PRESENT: u8 = 1;
+
+/// Pack an `Option<PublicAccessBlock>` into the single byte stored in `account_bpa` (bit 0 present,
+/// bits 1-4 the flags).
+fn encode_bpa(v: Option<PublicAccessBlock>) -> u8 {
+    match v {
+        None => 0,
+        Some(b) => {
+            BPA_PRESENT
+                | (u8::from(b.block_public_acls) << 1)
+                | (u8::from(b.ignore_public_acls) << 2)
+                | (u8::from(b.block_public_policy) << 3)
+                | (u8::from(b.restrict_public_buckets) << 4)
+        }
+    }
+}
+
+/// Unpack a byte produced by [`encode_bpa`]; `None` for the "not cached" sentinel `0`.
+fn decode_bpa(x: u8) -> Option<PublicAccessBlock> {
+    if x & BPA_PRESENT == 0 {
+        return None;
+    }
+    Some(PublicAccessBlock {
+        block_public_acls: x & (1 << 1) != 0,
+        ignore_public_acls: x & (1 << 2) != 0,
+        block_public_policy: x & (1 << 3) != 0,
+        restrict_public_buckets: x & (1 << 4) != 0,
+    })
 }
 
 impl std::fmt::Debug for CachedMetadataStore {
@@ -229,7 +263,7 @@ impl CachedMetadataStore {
             inner,
             bucket: ShardedCache::new(bucket_budget),
             config: ShardedCache::new(config_budget),
-            account_bpa: Mutex::new(None),
+            account_bpa: AtomicU8::new(0),
             enabled: budget_bytes != 0,
             generation: AtomicU64::new(0),
             hits: AtomicU64::new(0),
@@ -327,7 +361,7 @@ impl CachedMetadataStore {
     fn invalidate_account_bpa(&self) {
         if self.enabled {
             self.bump_generation();
-            *self.account_bpa.lock().unwrap() = None;
+            self.account_bpa.store(0, Ordering::Release);
         }
     }
 
@@ -442,24 +476,36 @@ impl MetadataStore for CachedMetadataStore {
             return Ok(cached.as_deref().cloned());
         }
         self.miss();
+        // Snapshot the invalidation epoch *before* reading inner, mirroring `get_bucket`: if a
+        // concurrent `submit` invalidates this aspect while we are parked at the `.await`, the
+        // epoch advances and we must not install our (now possibly pre-commit, stale) snapshot.
+        let gen_before = self.generation();
         let fetched = self.inner.get_bucket_config(name, aspect).await?;
-        let arc: CachedConfig = fetched.clone().map(Arc::new);
-        let cost = Self::config_cost(&arc);
-        self.config.put(key, arc, cost);
+        if self.generation() == gen_before {
+            let arc: CachedConfig = fetched.clone().map(Arc::new);
+            let cost = Self::config_cost(&arc);
+            self.config.put(key, arc, cost);
+        }
         Ok(fetched)
     }
 
     async fn get_account_public_access_block(&self) -> Result<PublicAccessBlock, MetaError> {
         if self.enabled {
-            if let Some(cached) = *self.account_bpa.lock().unwrap() {
+            // Lock-free load of the packed account-wide value.
+            if let Some(cached) = decode_bpa(self.account_bpa.load(Ordering::Acquire)) {
                 self.hit();
                 return Ok(cached);
             }
         }
         self.miss();
+        // Same epoch guard as the other cached reads: only install if no invalidation raced the
+        // inner read, so a `SetAccountPublicAccessBlock` committed during our `.await` is never
+        // overwritten by our pre-commit snapshot.
+        let gen_before = self.generation();
         let fetched = self.inner.get_account_public_access_block().await?;
-        if self.enabled {
-            *self.account_bpa.lock().unwrap() = Some(fetched);
+        if self.enabled && self.generation() == gen_before {
+            self.account_bpa
+                .store(encode_bpa(Some(fetched)), Ordering::Release);
         }
         Ok(fetched)
     }
@@ -682,6 +728,24 @@ mod tests {
     use cairn_types::bucket::VersioningState;
     use cairn_types::testing::InMemoryMetadataStore;
     use std::sync::atomic::AtomicU64;
+
+    #[test]
+    fn bpa_packing_round_trips_every_flag_combination() {
+        // The "not cached" sentinel decodes to None.
+        assert_eq!(decode_bpa(0), None);
+        // Every one of the 16 flag combinations survives encode → decode, and "present" is set.
+        for bits in 0u8..16 {
+            let bpa = PublicAccessBlock {
+                block_public_acls: bits & 1 != 0,
+                ignore_public_acls: bits & 2 != 0,
+                block_public_policy: bits & 4 != 0,
+                restrict_public_buckets: bits & 8 != 0,
+            };
+            let encoded = encode_bpa(Some(bpa));
+            assert_ne!(encoded & BPA_PRESENT, 0, "present bit must be set");
+            assert_eq!(decode_bpa(encoded), Some(bpa), "round-trip must be exact");
+        }
+    }
 
     /// An inner store that forwards to an [`InMemoryMetadataStore`] while counting how often each
     /// cached read actually reaches it. Lets a test assert a hit served from the cache without a
