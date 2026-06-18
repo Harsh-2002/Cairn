@@ -130,11 +130,13 @@ function fullTime(value: number): string {
 }
 
 // Map a status class to a semantic chart tone: success / neutral / amber / red.
+// 3xx (and anything non-2/4/5) reads as neutral, but a mid-gray (chart-2) so the
+// slice stays visible on a white card; the faint chart-3 nearly vanishes.
 function statusColor(cls: string): string {
   if (cls.startsWith("2")) return "var(--color-success)";
   if (cls.startsWith("4")) return "var(--color-warning)";
   if (cls.startsWith("5")) return "var(--color-destructive)";
-  return "var(--color-chart-3)";
+  return "var(--color-chart-2)";
 }
 
 export function Metrics() {
@@ -296,9 +298,14 @@ function Dashboard({
             title="Requests over time"
             description={`${count(total)} requests in this window.`}
           >
-            <div className="h-72 w-full">
+            <div
+              className="h-72 w-full"
+              role="img"
+              aria-label={`Requests over time: ${count(total)} requests in this window.`}
+            >
               <ResponsiveContainer width="100%" height="100%">
                 <AreaChart
+                  accessibilityLayer
                   data={data.timeline}
                   margin={{ top: 8, right: 8, bottom: 0, left: 0 }}
                 >
@@ -312,12 +319,12 @@ function Dashboard({
                     >
                       <stop
                         offset="0%"
-                        stopColor="var(--color-link)"
+                        stopColor="var(--color-chart-4)"
                         stopOpacity={0.25}
                       />
                       <stop
                         offset="100%"
-                        stopColor="var(--color-link)"
+                        stopColor="var(--color-chart-4)"
                         stopOpacity={0}
                       />
                     </linearGradient>
@@ -347,7 +354,7 @@ function Dashboard({
                   <Area
                     type="monotone"
                     dataKey="count"
-                    stroke="var(--color-link)"
+                    stroke="var(--color-chart-4)"
                     strokeWidth={2}
                     fill="url(#m-requests)"
                     isAnimationActive={false}
@@ -365,9 +372,17 @@ function Dashboard({
               total,
             )}).`}
           >
-            <div className="h-56 w-full">
+            <div
+              className="h-56 w-full"
+              role="img"
+              aria-label={`Errors over time: ${count(data.total_errors)} errors (${pct(
+                data.total_errors,
+                total,
+              )}).`}
+            >
               <ResponsiveContainer width="100%" height="100%">
                 <AreaChart
+                  accessibilityLayer
                   data={data.timeline}
                   margin={{ top: 8, right: 8, bottom: 0, left: 0 }}
                 >
@@ -427,9 +442,16 @@ function Dashboard({
               data.total_bytes_in + data.total_bytes_out,
             )} transferred.`}
           >
-            <div className="h-56 w-full">
+            <div
+              className="h-56 w-full"
+              role="img"
+              aria-label={`Throughput over time: ${bytes(
+                data.total_bytes_in + data.total_bytes_out,
+              )} transferred.`}
+            >
               <ResponsiveContainer width="100%" height="100%">
                 <AreaChart
+                  accessibilityLayer
                   data={throughputData}
                   margin={{ top: 8, right: 8, bottom: 0, left: 0 }}
                 >
@@ -494,9 +516,16 @@ function Dashboard({
               data.latency_p95_ms,
             )} p95.`}
           >
-            <div className="h-56 w-full">
+            <div
+              className="h-56 w-full"
+              role="img"
+              aria-label={`Latency over time: ${ms(data.latency_avg_ms)} average, ${ms(
+                data.latency_p95_ms,
+              )} p95.`}
+            >
               <ResponsiveContainer width="100%" height="100%">
                 <LineChart
+                  accessibilityLayer
                   data={data.timeline}
                   margin={{ top: 8, right: 8, bottom: 0, left: 0 }}
                 >
@@ -544,12 +573,15 @@ function Dashboard({
             ) : (
               <div
                 className="w-full"
+                role="img"
+                aria-label="Requests broken down by S3 operation."
                 style={{
                   height: Math.max(160, data.by_operation.length * 34 + 16),
                 }}
               >
                 <ResponsiveContainer width="100%" height="100%">
                   <BarChart
+                    accessibilityLayer
                     layout="vertical"
                     data={data.by_operation}
                     margin={{ top: 0, right: 16, bottom: 0, left: 0 }}
@@ -675,7 +707,7 @@ function StatusDonut({ by_status }: { by_status: MetricStatus[] }) {
   );
   return (
     <div className="flex flex-col items-center gap-4">
-      <div className="h-44 w-full">
+      <div className="h-44 w-full" role="img" aria-label="Response status mix by HTTP status class.">
         <ResponsiveContainer width="100%" height="100%">
           <PieChart>
             <Pie
@@ -745,7 +777,11 @@ function ReadsWritesDonut({
   ];
   return (
     <div className="flex flex-col items-center gap-4">
-      <div className="h-44 w-full">
+      <div
+        className="h-44 w-full"
+        role="img"
+        aria-label={`Reads versus writes: ${count(reads)} reads, ${count(writes)} writes.`}
+      >
         <ResponsiveContainer width="100%" height="100%">
           <PieChart>
             <Pie
