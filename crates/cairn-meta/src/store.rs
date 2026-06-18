@@ -199,7 +199,11 @@ impl SqliteMetadataStore {
             .await
     }
 
-    /// The re-wrap cursor for `stream` (None = not started / complete).
+    /// The resume cursor for `stream`'s in-flight re-wrap pass (None = no pass mid-flight). This is
+    /// only for resumability — it does NOT signal completion; see [`rewrap_done_active_ids`] for
+    /// that (a NULL cursor means "not started" just as much as "finished", audit #29).
+    ///
+    /// [`rewrap_done_active_ids`]: Self::rewrap_done_active_ids
     pub async fn rewrap_cursor(&self, stream: String) -> Result<Option<String>, MetaError> {
         self.with_read(move |conn| {
             Ok(conn
@@ -246,6 +250,47 @@ impl SqliteMetadataStore {
                 Ok(())
             })
             .await
+    }
+
+    /// Record the end of a re-wrap pass for `stream`: clear the resume cursor and set the active
+    /// key id the pass completed under — `done_active_id` is the active id ONLY when a full,
+    /// failure-free pass actually re-sealed (or confirmed) every row under it, else 0 (audit #29).
+    /// Upserts, so a stream whose table held zero rows still records completion.
+    pub async fn rewrap_finish_pass(
+        &self,
+        stream: String,
+        done_active_id: u16,
+        now: i64,
+    ) -> Result<(), MetaError> {
+        self.writer
+            .run_exec(move |conn| {
+                conn.execute(
+                    "INSERT INTO rewrap_progress (stream, cursor, rows_done, rows_failed, updated_at, done_active_id)
+                     VALUES (?1, NULL, 0, 0, ?2, ?3)
+                     ON CONFLICT(stream) DO UPDATE SET cursor=NULL, updated_at=?2, done_active_id=?3",
+                    params![stream, now, done_active_id as i64],
+                )
+                .map_err(engine_err)?;
+                Ok(())
+            })
+            .await
+    }
+
+    /// The active key id under which each stream's last full re-wrap pass completed (0 = none yet).
+    /// The crypto-status endpoint compares these against the live active id, on every shard, to
+    /// decide whether a retired key's data is fully re-wrapped (audit #29).
+    pub async fn rewrap_done_active_ids(&self) -> Result<Vec<(String, u16)>, MetaError> {
+        self.with_read(|conn| {
+            conn.prepare_cached("SELECT stream, done_active_id FROM rewrap_progress")
+                .map_err(engine_err)?
+                .query_map([], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u16))
+                })
+                .map_err(engine_err)?
+                .collect::<rusqlite::Result<Vec<(String, u16)>>>()
+                .map_err(engine_err)
+        })
+        .await
     }
 
     /// Upsert per-key ring state (id, key-hash prefix, active flag) for operator visibility.

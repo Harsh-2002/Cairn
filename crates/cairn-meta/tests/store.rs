@@ -735,3 +735,71 @@ async fn set_object_acl_updates_the_version_row() {
             .is_none()
     );
 }
+
+/// Audit #29 regression: re-wrap completion must NOT be inferred from a cleared cursor (which is
+/// also the never-started state). `done_active_id` only reaches the active id after a real pass.
+#[tokio::test]
+async fn rewrap_completion_is_not_inferred_from_a_cleared_cursor() {
+    let store = cairn_meta::open_in_memory().unwrap();
+    let stream = "object_versions.sse_descriptor".to_owned();
+
+    // Never started: no row at all -> the endpoint sees no done id, so it is NOT complete.
+    assert!(store.rewrap_done_active_ids().await.unwrap().is_empty());
+    assert!(store.rewrap_cursor(stream.clone()).await.unwrap().is_none());
+
+    // Mid-pass: the cursor advances but completion stays 0 (not the active id).
+    store
+        .rewrap_set_progress(stream.clone(), Some("v-100".to_owned()), 50, 0, 1)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.rewrap_cursor(stream.clone()).await.unwrap(),
+        Some("v-100".to_owned())
+    );
+    let done: std::collections::HashMap<String, u16> = store
+        .rewrap_done_active_ids()
+        .await
+        .unwrap()
+        .into_iter()
+        .collect();
+    assert_eq!(
+        done.get(stream.as_str()).copied(),
+        Some(0),
+        "mid-pass is not complete"
+    );
+
+    // A full pass under active id 2 finishes: cursor cleared AND done_active_id = 2.
+    store
+        .rewrap_finish_pass(stream.clone(), 2, 2)
+        .await
+        .unwrap();
+    assert!(store.rewrap_cursor(stream.clone()).await.unwrap().is_none());
+    let done: std::collections::HashMap<String, u16> = store
+        .rewrap_done_active_ids()
+        .await
+        .unwrap()
+        .into_iter()
+        .collect();
+    assert_eq!(
+        done.get(stream.as_str()).copied(),
+        Some(2),
+        "complete under active id 2"
+    );
+
+    // A failed/partial pass records 0 again -> a later rotation is never falsely retire-eligible.
+    store
+        .rewrap_finish_pass(stream.clone(), 0, 3)
+        .await
+        .unwrap();
+    let done: std::collections::HashMap<String, u16> = store
+        .rewrap_done_active_ids()
+        .await
+        .unwrap()
+        .into_iter()
+        .collect();
+    assert_eq!(
+        done.get(stream.as_str()).copied(),
+        Some(0),
+        "a pass with failures is not complete"
+    );
+}

@@ -666,19 +666,38 @@ async fn crypto_status_response(
             }
         }
     }
-    // Per-stream re-wrap completion: a cleared cursor (None) on every shard means complete.
-    let mut rewrap = Vec::new();
-    let mut all_complete = true;
-    for stream in ["object_versions.sse_descriptor", "users.sigv4_secret"] {
-        let mut complete = true;
-        for s in &stack.store {
-            if matches!(s.rewrap_cursor(stream.to_owned()).await, Ok(Some(_))) {
-                complete = false;
+    // Per-stream re-wrap completion: a stream is complete ONLY when every shard recorded a full,
+    // failure-free re-wrap pass under the CURRENT active key (audit #29). A cleared cursor alone is
+    // also the never-started state, so it must not read as complete — we compare the persisted
+    // `done_active_id` against the live active id instead. With no sqlite shards (async backends,
+    // which do not auto-re-wrap) nothing is verifiable, so nothing is ever reported complete.
+    let active = stack.crypto.active_key_id();
+    let has_shards = !stack.store.is_empty();
+    let streams = [
+        "object_versions.sse_descriptor",
+        "users.sigv4_secret",
+        "bucket_config.replication_targets",
+    ];
+    let mut complete_by_stream: std::collections::BTreeMap<&str, bool> =
+        streams.iter().map(|s| (*s, has_shards)).collect();
+    for s in &stack.store {
+        let done: std::collections::HashMap<String, u16> = s
+            .rewrap_done_active_ids()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        for stream in streams {
+            if done.get(stream).copied() != Some(active) {
+                complete_by_stream.insert(stream, false);
             }
         }
-        all_complete = all_complete && complete;
-        rewrap.push(serde_json::json!({ "stream": stream, "complete": complete }));
     }
+    let all_complete = has_shards && complete_by_stream.values().all(|&c| c);
+    let rewrap: Vec<_> = streams
+        .iter()
+        .map(|stream| serde_json::json!({ "stream": stream, "complete": complete_by_stream[stream] }))
+        .collect();
     let keys_json: Vec<_> = keys
         .into_iter()
         .map(|(id, (hash, is_active, count))| {

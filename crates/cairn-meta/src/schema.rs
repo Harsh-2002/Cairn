@@ -364,11 +364,23 @@ CREATE TABLE key_ring_state (
 -- Resumable cursor per re-wrap stream (Phase D). One row per (table.column) being migrated.
 CREATE TABLE rewrap_progress (
     stream        TEXT PRIMARY KEY,   -- e.g. 'object_versions.sse_descriptor'
-    cursor        TEXT,               -- last id processed; NULL = not started / complete
+    cursor        TEXT,               -- last id processed within the in-flight pass; NULL = no pass mid-flight
     rows_done     INTEGER NOT NULL DEFAULT 0,
     rows_failed   INTEGER NOT NULL DEFAULT 0,
     updated_at    INTEGER NOT NULL DEFAULT 0
 );
+"#,
+    },
+    Migration {
+        version: 14,
+        name: "rewrap completion marker",
+        sql: r#"
+-- audit #29 fix: a NULL `cursor` alone cannot tell "re-wrap not started yet" from "re-wrap done",
+-- so a freshly-rotated key wrongly looked retire-eligible before any pass ran. `done_active_id` is
+-- the active key id under which a FULL, failure-free re-wrap pass last completed for this stream
+-- (0 = none yet). A key is retire-eligible only when EVERY stream's `done_active_id` equals the
+-- current active id on EVERY shard.
+ALTER TABLE rewrap_progress ADD COLUMN done_active_id INTEGER NOT NULL DEFAULT 0;
 "#,
     },
 ];
@@ -484,6 +496,27 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn migration_v14_adds_rewrap_completion_marker() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        assert!(column_exists(&conn, "rewrap_progress", "done_active_id"));
+        // It defaults to 0 (= no completed pass) so a freshly-created stream is never "complete".
+        conn.execute(
+            "INSERT INTO rewrap_progress (stream, updated_at) VALUES ('s', 0)",
+            [],
+        )
+        .unwrap();
+        let done: i64 = conn
+            .query_row(
+                "SELECT done_active_id FROM rewrap_progress WHERE stream='s'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(done, 0, "done_active_id defaults to 0 (not started)");
     }
 
     #[test]

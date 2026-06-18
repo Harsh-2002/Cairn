@@ -21,6 +21,7 @@ use std::time::Duration;
 const BATCH: u32 = 500;
 const SSE_STREAM: &str = "object_versions.sse_descriptor";
 const USER_STREAM: &str = "users.sigv4_secret";
+const TARGETS_STREAM: &str = "bucket_config.replication_targets";
 
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -87,7 +88,10 @@ async fn run_once(store: &SqliteMetadataStore, crypto: &SystemCrypto) -> Result<
 }
 
 async fn rewrap_sse(store: &SqliteMetadataStore, crypto: &SystemCrypto) -> Result<(), MetaError> {
+    let active = crypto.active_key_id();
     let mut cursor = store.rewrap_cursor(SSE_STREAM.to_owned()).await?;
+    let started_fresh = cursor.is_none();
+    let mut pass_failed = 0u64;
     loop {
         let page = store.rewrap_sse_page(cursor.clone(), BATCH).await?;
         if page.is_empty() {
@@ -110,6 +114,7 @@ async fn rewrap_sse(store: &SqliteMetadataStore, crypto: &SystemCrypto) -> Resul
                 }
             }
         }
+        pass_failed += failed;
         store
             .rewrap_set_progress(SSE_STREAM.to_owned(), last.clone(), done, failed, now_ms())
             .await?;
@@ -118,9 +123,17 @@ async fn rewrap_sse(store: &SqliteMetadataStore, crypto: &SystemCrypto) -> Resul
             break;
         }
     }
-    // Pass complete: clear the cursor so a future rotation re-scans from the start.
+    // Completion (clearing the cursor for a future rotation) records the active id ONLY for an
+    // uninterrupted full pass (started at the head) with zero failures — so a key is never shown
+    // retire-eligible before its data is actually re-wrapped (audit #29). A resumed pass or any
+    // failure records 0, leaving the stream "not complete" until a clean full pass confirms it.
+    let done_id = if started_fresh && pass_failed == 0 {
+        active
+    } else {
+        0
+    };
     store
-        .rewrap_set_progress(SSE_STREAM.to_owned(), None, 0, 0, now_ms())
+        .rewrap_finish_pass(SSE_STREAM.to_owned(), done_id, now_ms())
         .await
 }
 
@@ -147,7 +160,10 @@ fn rewrap_sse_descriptor(crypto: &SystemCrypto, json: &str) -> Result<Option<Str
 }
 
 async fn rewrap_users(store: &SqliteMetadataStore, crypto: &SystemCrypto) -> Result<(), MetaError> {
+    let active = crypto.active_key_id();
     let mut cursor = store.rewrap_cursor(USER_STREAM.to_owned()).await?;
+    let started_fresh = cursor.is_none();
+    let mut pass_failed = 0u64;
     loop {
         let page = store.rewrap_users_page(cursor.clone(), BATCH).await?;
         if page.is_empty() {
@@ -180,6 +196,7 @@ async fn rewrap_users(store: &SqliteMetadataStore, crypto: &SystemCrypto) -> Res
                 }
             }
         }
+        pass_failed += failed;
         store
             .rewrap_set_progress(USER_STREAM.to_owned(), last.clone(), done, failed, now_ms())
             .await?;
@@ -188,8 +205,13 @@ async fn rewrap_users(store: &SqliteMetadataStore, crypto: &SystemCrypto) -> Res
             break;
         }
     }
+    let done_id = if started_fresh && pass_failed == 0 {
+        active
+    } else {
+        0
+    };
     store
-        .rewrap_set_progress(USER_STREAM.to_owned(), None, 0, 0, now_ms())
+        .rewrap_finish_pass(USER_STREAM.to_owned(), done_id, now_ms())
         .await
 }
 
@@ -197,6 +219,8 @@ async fn rewrap_targets(
     store: &SqliteMetadataStore,
     crypto: &SystemCrypto,
 ) -> Result<(), MetaError> {
+    let active = crypto.active_key_id();
+    let mut pass_failed = 0u64;
     for b in store.list_buckets(None).await? {
         let Some(doc) = store
             .get_bucket_config(&b.name, ConfigAspect::ReplicationTargets)
@@ -212,11 +236,18 @@ async fn rewrap_targets(
             if !crypto.needs_rewrap(&t.secret_ciphertext) {
                 continue;
             }
-            if let Ok(secret) = crypto.open(&t.secret_ciphertext, &Nonce(t.nonce.clone())) {
-                if let Ok(resealed) = crypto.seal(&secret) {
+            match crypto
+                .open(&t.secret_ciphertext, &Nonce(t.nonce.clone()))
+                .and_then(|secret| crypto.seal(&secret))
+            {
+                Ok(resealed) => {
                     t.secret_ciphertext = resealed.ciphertext;
                     t.nonce = Vec::new();
                     changed = true;
+                }
+                Err(_) => {
+                    pass_failed += 1;
+                    tracing::warn!(bucket = %b.name, "replication target re-wrap could not open; skipping");
                 }
             }
         }
@@ -230,5 +261,10 @@ async fn rewrap_targets(
                 .await?;
         }
     }
-    Ok(())
+    // Targets have no resume cursor (each pass scans every bucket), so any pass with zero failures
+    // is a complete pass under the active key (audit #29).
+    let done_id = if pass_failed == 0 { active } else { 0 };
+    store
+        .rewrap_finish_pass(TARGETS_STREAM.to_owned(), done_id, now_ms())
+        .await
 }
