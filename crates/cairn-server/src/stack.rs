@@ -181,6 +181,91 @@ async fn prime_key_state(store: &[Arc<SqliteMetadataStore>], crypto: &SystemCryp
     }
 }
 
+/// The set of ring ids in the current env config (audit #29 retire-gate).
+fn env_ring_ids(cfg: &Config) -> std::collections::HashSet<u16> {
+    ring_for_state(cfg)
+        .into_iter()
+        .map(|(id, _, _)| id)
+        .collect()
+}
+
+/// The re-wrap streams whose completion gates a key retirement (audit #29).
+const REWRAP_STREAMS: [&str; 3] = [
+    "object_versions.sse_descriptor",
+    "users.sigv4_secret",
+    "bucket_config.replication_targets",
+];
+
+/// Pure retire-gate decision for one shard (audit #29 / spec §5.4). Given the key ids this shard has
+/// ever recorded, the current env ring ids, the active id, and the lowest `done_active_id` across
+/// the re-wrap streams, return the removed ids whose data is NOT proven re-wrapped off them.
+///
+/// In the forward-rotation model (ids increase, `active` is the newest), a removed key K is unsafe
+/// iff `K < active` (it is an older key the active one supersedes) AND the re-wrap has not swept past
+/// it (`min_done <= K`). A removed key newer than `active`, or one fully swept (`min_done > K`), is
+/// safe. An empty result means it is safe to start.
+fn retire_gate_unsafe_ids(
+    recorded_ids: &[u16],
+    env_ids: &std::collections::HashSet<u16>,
+    active: u16,
+    min_done: u16,
+) -> Vec<u16> {
+    let mut bad: Vec<u16> = recorded_ids
+        .iter()
+        .copied()
+        .filter(|id| !env_ids.contains(id) && *id < active && min_done <= *id)
+        .collect();
+    bad.sort_unstable();
+    bad.dedup();
+    bad
+}
+
+/// Enforce the retire-gate across every sqlite shard before the listener binds (audit #29). Returns
+/// an `Err` (failing startup) naming the offending key id(s) and shard when a removed key still has
+/// un-re-wrapped data; a read error on a shard is logged and skipped (it never wedges startup), and
+/// the async backends (no concrete shard handles) are not gated.
+async fn enforce_retire_gate(
+    store: &[Arc<SqliteMetadataStore>],
+    crypto: &SystemCrypto,
+    cfg: &Config,
+) -> Result<(), String> {
+    let env_ids = env_ring_ids(cfg);
+    let active = crypto.active_key_id();
+    for (i, s) in store.iter().enumerate() {
+        let recorded: Vec<u16> = match s.key_ring_states().await {
+            Ok(rows) => rows.into_iter().map(|r| r.id).collect(),
+            Err(e) => {
+                tracing::warn!(error = %e, shard = i, "retire-gate: could not read key_ring_state; skipping");
+                continue;
+            }
+        };
+        let dones: std::collections::HashMap<String, u16> = match s.rewrap_done_active_ids().await {
+            Ok(v) => v.into_iter().collect(),
+            Err(e) => {
+                tracing::warn!(error = %e, shard = i, "retire-gate: could not read rewrap progress; skipping");
+                continue;
+            }
+        };
+        // The lowest completion across the gated streams (0 = a stream never finished a clean pass).
+        let min_done = REWRAP_STREAMS
+            .iter()
+            .map(|st| dones.get(*st).copied().unwrap_or(0))
+            .min()
+            .unwrap_or(0);
+        let unsafe_ids = retire_gate_unsafe_ids(&recorded, &env_ids, active, min_done);
+        if !unsafe_ids.is_empty() {
+            return Err(format!(
+                "audit #29 retire-gate: shard {i} still holds data sealed under master key id(s) \
+                 {unsafe_ids:?} that were removed from CAIRN_MASTER_KEY_RING before re-wrap onto the \
+                 active key {active} completed (re-wrap reached id {min_done}). Restore those key \
+                 id(s) to the ring and wait for GET /api/v1/system/crypto-status to report them \
+                 retire_eligible before removing them; refusing to start to avoid unreadable data."
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// The on-disk path for shard `i`: shard 0 is `base` itself (so existing single-shard data is
 /// shard 0 untouched), and shard `i>0` is a sibling `base.shard{i}`.
 fn shard_db_path(base: &std::path::Path, i: usize) -> std::path::PathBuf {
@@ -429,6 +514,12 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
     // bound survives a restart. No-op for the async backends (no concrete shard handles).
     prime_key_state(&store, &system_crypto, cfg).await;
 
+    // Retire-gate (audit #29 / spec §5.4): refuse to start if a master key was removed from the ring
+    // before its data was re-wrapped onto the active key — otherwise that data (object DEKs, SigV4
+    // secrets) is unreadable and the failure surfaces only as a confusing flood of per-request
+    // errors. Fail fast with a diagnostic naming the key id(s) and shard instead.
+    enforce_retire_gate(&store, &system_crypto, cfg).await?;
+
     Ok(AppStack {
         s3,
         control,
@@ -522,6 +613,36 @@ async fn ensure_root_admin(
         tracing::info!(access_key = %akid, "root administrator ensured");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod retire_gate_tests {
+    use super::retire_gate_unsafe_ids;
+    use std::collections::HashSet;
+
+    fn ids(xs: &[u16]) -> HashSet<u16> {
+        xs.iter().copied().collect()
+    }
+
+    #[test]
+    fn flags_only_unswept_removed_keys() {
+        // Removed id=1 with NO re-wrap (min_done=0) under active 2 -> unsafe (the P4 brick case).
+        assert_eq!(retire_gate_unsafe_ids(&[1, 2], &ids(&[2]), 2, 0), vec![1]);
+        // Removed id=1 but re-wrap completed to id=2 -> safe to retire (the legitimate P3 flow).
+        assert!(retire_gate_unsafe_ids(&[1, 2], &ids(&[2]), 2, 2).is_empty());
+        // Multi-rotation: id=1 long-removed and swept to 2; now active=3 mid-pass -> still safe
+        // (no false refusal just because the new rotation has not finished).
+        assert!(retire_gate_unsafe_ids(&[1, 2, 3], &ids(&[2, 3]), 3, 2).is_empty());
+        // Dangerous: active=3 but data only swept to 2, and id=2 (which still holds data) removed.
+        assert_eq!(
+            retire_gate_unsafe_ids(&[1, 2, 3], &ids(&[1, 3]), 3, 2),
+            vec![2]
+        );
+        // A removed id newer than the active id (unusual/pinned active) is not flagged.
+        assert!(retire_gate_unsafe_ids(&[1, 2, 3], &ids(&[1, 2]), 2, 2).is_empty());
+        // No keys removed (every recorded id still in the ring) -> always safe.
+        assert!(retire_gate_unsafe_ids(&[1, 2], &ids(&[1, 2]), 2, 0).is_empty());
+    }
 }
 
 #[cfg(test)]
