@@ -1,7 +1,7 @@
 //! Integration tests for the authenticator chain against the in-memory doubles: a real SigV4
 //! signed request round-trips, a tampered signature is denied, and Bearer works end to end.
 
-use cairn_auth::{AuthChain, compute_signature, hash_bearer_secret, signing_key};
+use cairn_auth::{AuthCache, AuthChain, compute_signature, hash_bearer_secret, signing_key};
 use cairn_types::Timestamp;
 use cairn_types::auth::{AuthMethod, AuthOutcome, RequestView, Role};
 use cairn_types::meta::{Mutation, User, UserRecord};
@@ -9,6 +9,8 @@ use cairn_types::testing::{InMemoryMetadataStore, StubCrypto, TestClock};
 use cairn_types::traits::{Authenticator, Crypto, MetadataStore};
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::time::Duration;
 
 const SECRET: &str = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
 const AKID: &str = "AKIDEXAMPLE";
@@ -40,8 +42,47 @@ async fn setup() -> (AuthChain, Arc<InMemoryMetadataStore>) {
     .await
     .unwrap();
 
-    let chain = AuthChain::new(meta.clone(), crypto, clock, false);
+    // Exercise the auth path through an enabled cache (a fresh epoch; this suite performs no user
+    // mutations after the chain is built, so the cached entries stay valid).
+    let cache = Arc::new(AuthCache::new(
+        Duration::from_secs(60),
+        Arc::new(AtomicU64::new(0)),
+    ));
+    let chain = AuthChain::new(meta.clone(), crypto, clock, cache, false);
     (chain, meta)
+}
+
+/// Like [`setup`] but returns the shared auth epoch so a test can simulate what the metadata layer
+/// does on a user mutation (bump the epoch), proving it gates cache invalidation.
+async fn setup_with_epoch() -> (AuthChain, Arc<InMemoryMetadataStore>, Arc<AtomicU64>) {
+    let meta = Arc::new(InMemoryMetadataStore::new());
+    let crypto = Arc::new(StubCrypto);
+    let clock = Arc::new(TestClock::at_secs(1_440_938_160));
+    let sealed = crypto.seal(SECRET.as_bytes()).unwrap();
+    let user = User {
+        id: cairn_types::UserId("u1".to_owned()),
+        display_name: "alice".to_owned(),
+        access_key_id: "bearer-key".to_owned(),
+        sigv4_access_key_id: Some(AKID.to_owned()),
+        role: Role::Member,
+        is_active: true,
+        quota_bytes: None,
+        created_at: Timestamp(0),
+        updated_at: Timestamp(0),
+    };
+    meta.submit(Mutation::CreateUser(Box::new(UserRecord {
+        user,
+        bearer_secret_hash: hash_bearer_secret("topsecret"),
+        sigv4_secret_ciphertext: Some(sealed.ciphertext),
+        sigv4_secret_nonce: Some(sealed.nonce.0),
+    })))
+    .await
+    .unwrap();
+
+    let epoch = Arc::new(AtomicU64::new(0));
+    let cache = Arc::new(AuthCache::new(Duration::from_secs(60), epoch.clone()));
+    let chain = AuthChain::new(meta.clone(), crypto, clock, cache, false);
+    (chain, meta, epoch)
 }
 
 /// Sign a request the way a client would, returning the Authorization header value.
@@ -105,6 +146,50 @@ async fn sigv4_header_roundtrip_authenticates() {
         }
         other => panic!("expected authenticated, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn deactivation_takes_effect_only_after_epoch_bump() {
+    // The security-critical property of the auth cache: a credential change (here, deactivation)
+    // is honored the moment the shared epoch is bumped, and the epoch is the load-bearing signal.
+    let (chain, meta, epoch) = setup_with_epoch().await;
+    let host = "s3.example.com";
+    let payload = cairn_auth::sha256_hex(b"");
+    let base = vec![
+        ("host".to_owned(), host.to_owned()),
+        ("x-amz-date".to_owned(), "20150830T123600Z".to_owned()),
+        ("x-amz-content-sha256".to_owned(), payload.clone()),
+    ];
+    let auth = sign("GET", "/bucket/key", &base, &payload);
+    let mut headers = base.clone();
+    headers.push(("authorization".to_owned(), auth));
+    let v = view(&headers, host);
+
+    // First request authenticates and populates the cache.
+    assert!(matches!(
+        chain.authenticate(&v).await,
+        AuthOutcome::Authenticated(_)
+    ));
+
+    // Deactivate the user in the store but do NOT bump the epoch: the cached (active) credential is
+    // still served, demonstrating the cache is real and the epoch is what gates it.
+    meta.submit(Mutation::DeactivateUser(cairn_types::UserId(
+        "u1".to_owned(),
+    )))
+    .await
+    .unwrap();
+    assert!(
+        matches!(chain.authenticate(&v).await, AuthOutcome::Authenticated(_)),
+        "without an epoch bump the cached credential is still served"
+    );
+
+    // Bump the epoch as the metadata layer does on a user mutation: the stale entry is dropped, the
+    // fresh lookup finds an inactive user, and authentication is now denied.
+    epoch.fetch_add(1, std::sync::atomic::Ordering::Release);
+    assert!(
+        matches!(chain.authenticate(&v).await, AuthOutcome::Denied(_)),
+        "after the epoch bump the deactivation must take effect"
+    );
 }
 
 #[tokio::test]

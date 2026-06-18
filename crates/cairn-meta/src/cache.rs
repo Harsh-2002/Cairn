@@ -191,6 +191,12 @@ pub struct CachedMetadataStore {
     generation: AtomicU64,
     hits: AtomicU64,
     misses: AtomicU64,
+    /// A monotonic epoch shared with the authenticator's credential/policy cache (`cairn-auth`).
+    /// Bumped on every user-identity mutation (create / update / deactivate / set-policy) so that
+    /// cache — which never observes these mutations directly — drops any entry minted before the
+    /// change. Independent of `enabled`: the auth cache must stay coherent even when this config
+    /// cache is turned off (`budget_bytes == 0`).
+    auth_epoch: Arc<AtomicU64>,
 }
 
 impl std::fmt::Debug for CachedMetadataStore {
@@ -228,6 +234,31 @@ impl CachedMetadataStore {
             generation: AtomicU64::new(0),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
+            auth_epoch: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// A handle to the shared user-mutation epoch, handed to the authenticator's credential/policy
+    /// cache so it can treat any user-identity change as "drop my cached entries" without observing
+    /// the mutation stream itself. See the `auth_epoch` field docs.
+    #[must_use]
+    pub fn auth_epoch_handle(&self) -> Arc<AtomicU64> {
+        self.auth_epoch.clone()
+    }
+
+    /// Bump the shared auth epoch when `mutation` changes a user's credentials, active state, or
+    /// identity policy — the inputs the authenticator caches. Runs regardless of `enabled` (the
+    /// auth cache is independent of the config cache). `SetUserQuota` is intentionally excluded:
+    /// quota is enforced at write time and is not part of any cached authentication answer.
+    fn note_user_mutation(&self, mutation: &Mutation) {
+        if matches!(
+            mutation,
+            Mutation::CreateUser(_)
+                | Mutation::UpdateUser(_)
+                | Mutation::DeactivateUser(_)
+                | Mutation::SetUserPolicy { .. }
+        ) {
+            self.auth_epoch.fetch_add(1, Ordering::Release);
         }
     }
 
@@ -329,7 +360,10 @@ impl CachedMetadataStore {
             // --- the account-wide public-access-block singleton ---
             Mutation::SetAccountPublicAccessBlock(_) => self.invalidate_account_bpa(),
 
-            // --- mutations that never touch cached config reads: nothing to do ---
+            // --- mutations that never touch cached config reads: nothing to do here ---
+            // (the user-identity mutations below are handled for the auth cache by
+            // `note_user_mutation`, which bumps the shared auth epoch; the config cache holds no
+            // user rows, so they are no-ops for *this* cache).
             Mutation::PutObjectVersion { .. }
             | Mutation::CreateDeleteMarker { .. }
             | Mutation::DeleteVersion { .. }
@@ -363,10 +397,14 @@ impl CachedMetadataStore {
 impl MetadataStore for CachedMetadataStore {
     async fn submit(&self, mutation: Mutation) -> Result<MutationOutcome, MetaError> {
         // Invalidate around the write so no reader can repopulate a stale entry from a snapshot
-        // taken before the commit: drop before forwarding, and again after it lands.
+        // taken before the commit: drop before forwarding, and again after it lands. The auth
+        // epoch is bumped on the same before/after schedule so the authenticator's cache cannot
+        // serve a credential/policy minted from a pre-commit view.
+        self.note_user_mutation(&mutation);
         self.invalidate_for(&mutation);
         let outcome = self.inner.submit(mutation.clone()).await;
         if outcome.is_ok() {
+            self.note_user_mutation(&mutation);
             self.invalidate_for(&mutation);
         }
         outcome

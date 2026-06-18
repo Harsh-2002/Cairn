@@ -240,10 +240,19 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
     let crypto: Arc<dyn Crypto> = system_crypto.clone();
     let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
 
+    // The authentication cache (ARCH §30): credential + parsed-policy memoization keyed by
+    // access-key-id / user-id, sharing the metadata cache's user-mutation epoch so a
+    // create/update/deactivate/set-policy drops every cached entry immediately. The TTL is a
+    // staleness backstop; `auth_cache_ttl_secs == 0` disables it.
+    let auth_cache = Arc::new(cairn_auth::AuthCache::new(
+        std::time::Duration::from_secs(cfg.auth_cache_ttl_secs),
+        meta_cache.auth_epoch_handle(),
+    ));
     let auth: Arc<dyn Authenticator> = Arc::new(AuthChain::new(
         meta.clone(),
         crypto.clone(),
         clock.clone(),
+        auth_cache,
         cfg.dev_auth,
     ));
     let authz: Arc<dyn AuthorizationEngine> = Arc::new(cairn_authz::PolicyEngine);

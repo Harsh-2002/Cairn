@@ -113,6 +113,14 @@ pub struct Config {
     /// authorization does not re-read SQLite on every request. `0` disables the cache. Default
     /// 64 MiB.
     pub meta_cache_bytes: u64,
+    /// Time-to-live, in seconds, for the authentication cache (`CAIRN_AUTH_CACHE_TTL_SECS`, ARCH
+    /// §30). It memoizes the per-request credential lookup (sealed secret + the user fields a
+    /// principal needs) keyed by access-key-id and the parsed identity policy keyed by user-id, so
+    /// a stream of requests from one identity skips two metadata reads and a policy parse. Changes
+    /// to a user's credentials, active state, or policy take effect immediately regardless of the
+    /// TTL (a user mutation bumps a shared epoch that drops every cached entry); the TTL only bounds
+    /// staleness for entries no mutation ever touches. `0` disables the cache. Default 30 s.
+    pub auth_cache_ttl_secs: u64,
     /// Maximum number of concurrent blob transfers (`CAIRN_BLOB_IO_POOL_SIZE`, ARCH §7.4). Each
     /// object read/write/assemble holds one permit for its file I/O, so a flood of large transfers
     /// cannot exhaust the runtime's blocking-pool threads. Tune to the device's useful I/O
@@ -200,6 +208,7 @@ impl Default for Config {
             meta_mmap_bytes: 256 * 1024 * 1024,
             s3_domain: None,
             meta_cache_bytes: 64 * 1024 * 1024,
+            auth_cache_ttl_secs: 30,
             blob_io_pool_size: 64,
             replication_endpoint: None,
             replication_dest_bucket: None,
@@ -332,6 +341,15 @@ impl Config {
         if !(1..=64).contains(&self.meta_read_pool_size) {
             return Err(ConfigError::Invalid(
                 "meta_read_pool_size must be between 1 and 64".into(),
+            ));
+        }
+        // The auth cache's TTL is a staleness backstop, not the primary invalidation (user
+        // mutations drop entries immediately via the shared epoch). Cap it at one hour so a
+        // mis-set value can never let a stale credential/policy linger unboundedly, while still
+        // allowing `0` to disable the cache.
+        if self.auth_cache_ttl_secs > 3600 {
+            return Err(ConfigError::Invalid(
+                "auth_cache_ttl_secs must be <= 3600 (1 hour); 0 disables the cache".into(),
             ));
         }
         // Cache-budget clamp (R3 guardrail): the writer connection plus every reader each provision
@@ -593,6 +611,22 @@ mod tests {
             c.meta_synchronous = s.to_owned();
             assert!(c.validate().is_ok());
         }
+    }
+
+    #[test]
+    fn auth_cache_ttl_bounds() {
+        // 0 (disabled) and any value up to the one-hour cap validate; above it is refused.
+        for ttl in [0_u64, 1, 30, 3600] {
+            let mut c = base();
+            c.auth_cache_ttl_secs = ttl;
+            assert!(c.validate().is_ok(), "ttl {ttl} must validate");
+        }
+        let mut c = base();
+        c.auth_cache_ttl_secs = 3601;
+        assert!(
+            c.validate().is_err(),
+            "ttl above the 1-hour cap must be rejected"
+        );
     }
 
     #[test]
