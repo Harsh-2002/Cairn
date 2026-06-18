@@ -22,6 +22,19 @@ fn admin() -> Principal {
     }
 }
 
+/// A non-admin member principal identified by `user`; buckets it creates are owned by it.
+fn member(user: &str) -> Principal {
+    Principal {
+        user_id: UserId(user.to_owned()),
+        display_name: user.to_owned(),
+        access_key_id: format!("{user}-key"),
+        role: Role::Member,
+        method: AuthMethod::Bearer,
+        chunk_signing: None,
+        user_policy: None,
+    }
+}
+
 struct Harness {
     svc: S3Service,
     meta: Arc<dyn MetadataStore>,
@@ -1033,6 +1046,116 @@ async fn copy_object_works() {
     .await;
     assert_eq!(st, StatusCode::OK);
     assert_eq!(body, b"original");
+}
+
+/// A non-admin who owns a destination bucket must NOT be able to copy another tenant's object via
+/// `x-amz-copy-source`: the SOURCE read is now authorized against the source bucket. Under the real
+/// policy engine, the attacker owns the destination (so the write is allowed) but has no grant on
+/// the victim's bucket, so the source read is denied — exactly the hole this fixes (before the fix
+/// the copy succeeded with no source check).
+#[tokio::test]
+async fn copy_source_read_is_authorized_cross_tenant_denied() {
+    let h = harness_with_authz(Arc::new(cairn_authz::PolicyEngine)).await;
+    let victim = member("victim");
+    let attacker = member("attacker");
+
+    // victim owns victimbkt and writes a secret object (owner short-circuit allows both).
+    drain(
+        send(
+            &h.svc,
+            req_with_principal(
+                Method::PUT,
+                Some("victimbkt"),
+                None,
+                &[],
+                &[],
+                vec![],
+                victim.clone(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req_with_principal(
+                Method::PUT,
+                Some("victimbkt"),
+                Some("secret"),
+                &[],
+                &[("content-type", "text/plain")],
+                b"top secret".to_vec(),
+                victim.clone(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    // attacker owns their own bucket.
+    drain(
+        send(
+            &h.svc,
+            req_with_principal(
+                Method::PUT,
+                Some("attackerbkt"),
+                None,
+                &[],
+                &[],
+                vec![],
+                attacker.clone(),
+            ),
+        )
+        .await,
+    )
+    .await;
+
+    // attacker copies victim's object into their own bucket → source read DENIED (403).
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req_with_principal(
+                Method::PUT,
+                Some("attackerbkt"),
+                Some("stolen"),
+                &[],
+                &[("x-amz-copy-source", "/victimbkt/secret")],
+                vec![],
+                attacker.clone(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::FORBIDDEN,
+        "cross-tenant copy source must be denied"
+    );
+
+    // Sanity: the victim CAN copy their own object within their own bucket (owner short-circuit).
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req_with_principal(
+                Method::PUT,
+                Some("victimbkt"),
+                Some("copy"),
+                &[],
+                &[("x-amz-copy-source", "/victimbkt/secret")],
+                vec![],
+                victim.clone(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "owner copy within their own bucket must succeed"
+    );
 }
 
 #[tokio::test]
