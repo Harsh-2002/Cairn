@@ -19,8 +19,18 @@ use cairn_types::time::Timestamp;
 use cairn_types::traits::{BlobStore, Clock, MetadataStore};
 
 use cairn_replication::{
-    ReplicationEngine, ReplicationOpts, SingleSink, next_backoff, outbox_entry_for,
+    BucketRoutedSink, ReplicationEngine, ReplicationOpts, SingleSink, SinkRouter, next_backoff,
+    outbox_entry_for,
 };
+
+/// A router that resolves NO sink for any target — models a transient target-resolve failure
+/// (audit #20): the stored target's sink could not be built this drain.
+struct NoSinkRouter;
+impl SinkRouter for NoSinkRouter {
+    fn sink_for<'a>(&'a self, _target_arn: Option<&str>) -> Option<&'a dyn BucketRoutedSink> {
+        None
+    }
+}
 
 const BUCKET: &str = "repl-bucket";
 
@@ -417,6 +427,35 @@ async fn later_version_defers_until_earlier_version_replicates() {
         }
         other => panic!("expected two ordered Put intents, got {other:?}"),
     }
+}
+
+/// A target that resolves to no sink — modelling a transient target-resolve fault when building
+/// the router — must NOT terminally fail the entry. It retries with backoff, bounded by the
+/// attempt budget (audit #20).
+#[tokio::test]
+async fn unresolved_target_is_retried_not_terminally_failed() {
+    let meta = InMemoryMetadataStore::new();
+    let blobs = Arc::new(InMemoryBlobStore::new());
+    let clock = TestClock::at_secs(5_000);
+    let now = clock.now();
+    let _ = put_with_outbox(&meta, &blobs, "e-nosink", "obj/x", b"data", now, now).await;
+
+    let report = engine()
+        .run_once(&meta, &NoSinkRouter, &blobs, &clock)
+        .await
+        .unwrap();
+    assert_eq!(report.retried, 1, "an unresolved target retries");
+    assert_eq!(report.failed, 0, "and is NOT terminally failed");
+
+    // Rescheduled with backoff (pending in the future), not terminal.
+    assert!(
+        due_entries(&meta, now).await.is_empty(),
+        "backed off, not due now"
+    );
+    let later = due_entries(&meta, now.plus_secs(10_000)).await;
+    assert_eq!(later.len(), 1, "still pending for a later attempt");
+    assert_eq!(later[0].status, ReplicationStatus::Pending);
+    assert_eq!(later[0].attempts, 1);
 }
 
 #[tokio::test]

@@ -315,9 +315,14 @@ impl ReplicationEngine {
         // destination that does not exist.
         let target_arn = entry_target_arn(entry);
         let Some(sink) = router.sink_for(target_arn) else {
-            self.mark_failed(meta, entry, "no replication sink for target", None)
-                .await?;
-            return Ok(EntryOutcome::Failed);
+            // No sink resolved for this entry's target. This is frequently TRANSIENT — the stored
+            // target's sink failed to build this drain pass (e.g. a momentary unseal/resolve fault)
+            // — so terminally failing every entry for the target would be wrong (audit #20). Retry
+            // with backoff instead; the attempt budget still turns a genuinely-removed or
+            // misconfigured target terminal after a few tries.
+            return self
+                .retry_or_exhaust(meta, entry, now, "no replication sink for target")
+                .await;
         };
 
         // Drive the sink for this operation. The source bucket (`entry.bucket`) is threaded
@@ -359,20 +364,7 @@ impl ReplicationEngine {
             }
             Err(ReplicationError::Retryable(msg)) => {
                 // Exhausting the attempt budget turns a retryable failure terminal.
-                if entry.attempts.saturating_add(1) >= self.opts.max_attempts {
-                    self.mark_failed(meta, entry, &format!("max attempts exhausted: {msg}"), None)
-                        .await?;
-                    Ok(EntryOutcome::Failed)
-                } else {
-                    let delay = next_backoff(
-                        entry.attempts.saturating_add(1),
-                        self.opts.base_backoff_secs,
-                        self.opts.max_backoff_secs,
-                    );
-                    let next = now.plus_secs(delay as i64);
-                    self.mark_failed(meta, entry, &msg, Some(next)).await?;
-                    Ok(EntryOutcome::Retried)
-                }
+                self.retry_or_exhaust(meta, entry, now, &msg).await
             }
             Err(ReplicationError::Terminal(msg)) => {
                 self.mark_failed(meta, entry, &msg, None).await?;
@@ -486,6 +478,35 @@ impl ReplicationEngine {
             }
         }
         Ok(())
+    }
+
+    /// Reschedule a transiently-failed entry with backoff, or — once the attempt budget is
+    /// exhausted — mark it terminally failed. Shared by retryable sink errors and a target that
+    /// could not be resolved to a sink this drain (audit #20).
+    async fn retry_or_exhaust<M>(
+        &self,
+        meta: &M,
+        entry: &OutboxEntry,
+        now: Timestamp,
+        msg: &str,
+    ) -> Result<EntryOutcome, MetaError>
+    where
+        M: MetadataStore + ?Sized,
+    {
+        if entry.attempts.saturating_add(1) >= self.opts.max_attempts {
+            self.mark_failed(meta, entry, &format!("max attempts exhausted: {msg}"), None)
+                .await?;
+            Ok(EntryOutcome::Failed)
+        } else {
+            let delay = next_backoff(
+                entry.attempts.saturating_add(1),
+                self.opts.base_backoff_secs,
+                self.opts.max_backoff_secs,
+            );
+            let next = now.plus_secs(delay as i64);
+            self.mark_failed(meta, entry, msg, Some(next)).await?;
+            Ok(EntryOutcome::Retried)
+        }
     }
 }
 
