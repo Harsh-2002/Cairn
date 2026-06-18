@@ -99,8 +99,11 @@ impl Staging {
                 let mut writer = writer;
                 writer.flush().await.map_err(io_err)?;
                 let file = writer.into_inner();
-                // 1) fsync the staged file, 2) rename it in, 3) fsync the destination directory.
-                file.sync_all().await.map_err(io_err)?;
+                // 1) fdatasync the staged file, 2) rename it in, 3) fsync the destination directory.
+                // `sync_data` (fdatasync) persists the bytes and the size needed to read them back,
+                // skipping only the inode timestamps we never depend on — one fewer metadata-journal
+                // write per PUT than `sync_all` while keeping the blob fully durable (ARCH §8.2).
+                file.sync_data().await.map_err(io_err)?;
                 // For a known-large write, drop the just-written pages so a stream of bulk uploads
                 // does not evict the page cache hot reads depend on (ARCH §7.5). Best-effort.
                 if let Some(len) = release_len {
@@ -132,7 +135,9 @@ impl Staging {
             Staging::Tokio { writer, .. } => {
                 let mut writer = writer;
                 writer.flush().await.map_err(io_err)?;
-                writer.into_inner().sync_all().await.map_err(io_err)?;
+                // fdatasync: the part's bytes and size must be durable for `assemble` to read it;
+                // its timestamps are irrelevant, so skip the extra metadata flush (ARCH §8.2).
+                writer.into_inner().sync_data().await.map_err(io_err)?;
                 Ok(())
             }
             #[cfg(feature = "io-uring")]

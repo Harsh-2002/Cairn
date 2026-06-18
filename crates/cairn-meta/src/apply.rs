@@ -448,20 +448,21 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             Ok(MutationOutcome::Ack)
         }
         Mutation::RecordActivity(e) => {
-            conn.execute(
+            conn.prepare_cached(
                 "INSERT INTO activity (id, action, bucket, key, size, etag, actor, at)
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-                params![
-                    e.id,
-                    e.action,
-                    e.bucket,
-                    e.key,
-                    e.size.map(|s| s as i64),
-                    e.etag,
-                    e.actor,
-                    e.at.0
-                ],
             )
+            .map_err(engine_err)?
+            .execute(params![
+                e.id,
+                e.action,
+                e.bucket,
+                e.key,
+                e.size.map(|s| s as i64),
+                e.etag,
+                e.actor,
+                e.at.0
+            ])
             .map_err(engine_err)?;
             Ok(MutationOutcome::Ack)
         }
@@ -499,7 +500,7 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             // Accumulate each window/op/bucket/status bucket; the composite PK upsert sums counts,
             // bytes, and latency histogram so repeated flushes never double-insert (ARCH §26.5).
             for r in &rows {
-                conn.execute(
+                conn.prepare_cached(
                     "INSERT INTO request_metrics
                      (ts_bucket, operation, bucket_name, status_class, count,
                       bytes_in, bytes_out, lat_sum_ms,
@@ -517,31 +518,31 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
                         lat_le_200  = lat_le_200  + excluded.lat_le_200,
                         lat_le_1000 = lat_le_1000 + excluded.lat_le_1000,
                         lat_gt_1000 = lat_gt_1000 + excluded.lat_gt_1000",
-                    params![
-                        r.ts_bucket,
-                        r.operation,
-                        r.bucket,
-                        r.status_class,
-                        r.count as i64,
-                        r.bytes_in as i64,
-                        r.bytes_out as i64,
-                        r.lat_sum_ms as i64,
-                        r.lat_hist[0] as i64,
-                        r.lat_hist[1] as i64,
-                        r.lat_hist[2] as i64,
-                        r.lat_hist[3] as i64,
-                        r.lat_hist[4] as i64,
-                        r.lat_hist[5] as i64,
-                    ],
                 )
+                .map_err(engine_err)?
+                .execute(params![
+                    r.ts_bucket,
+                    r.operation,
+                    r.bucket,
+                    r.status_class,
+                    r.count as i64,
+                    r.bytes_in as i64,
+                    r.bytes_out as i64,
+                    r.lat_sum_ms as i64,
+                    r.lat_hist[0] as i64,
+                    r.lat_hist[1] as i64,
+                    r.lat_hist[2] as i64,
+                    r.lat_hist[3] as i64,
+                    r.lat_hist[4] as i64,
+                    r.lat_hist[5] as i64,
+                ])
                 .map_err(engine_err)?;
             }
             if let Some(before) = prune_before {
-                conn.execute(
-                    "DELETE FROM request_metrics WHERE ts_bucket < ?1",
-                    params![before],
-                )
-                .map_err(engine_err)?;
+                conn.prepare_cached("DELETE FROM request_metrics WHERE ts_bucket < ?1")
+                    .map_err(engine_err)?
+                    .execute(params![before])
+                    .map_err(engine_err)?;
             }
             Ok(MutationOutcome::Ack)
         }
@@ -577,11 +578,9 @@ fn put_version(
 /// replaces it. Delete markers carry no logical bytes, so they never trip the quota.
 fn enforce_bucket_quota(conn: &Connection, row: &ObjectVersionRow) -> R<()> {
     let quota: Option<i64> = conn
-        .query_row(
-            "SELECT quota_bytes FROM buckets WHERE name=?1",
-            params![row.bucket.as_str()],
-            |r| r.get(0),
-        )
+        .prepare_cached("SELECT quota_bytes FROM buckets WHERE name=?1")
+        .map_err(engine_err)?
+        .query_row(params![row.bucket.as_str()], |r| r.get(0))
         .optional()
         .map_err(engine_err)?
         .flatten();
@@ -590,9 +589,12 @@ fn enforce_bucket_quota(conn: &Connection, row: &ObjectVersionRow) -> R<()> {
     };
     // Current logical bytes in the bucket, excluding the row this upsert will replace.
     let current: i64 = conn
-        .query_row(
+        .prepare_cached(
             "SELECT COALESCE(SUM(size_logical), 0) FROM object_versions
              WHERE bucket_name=?1 AND NOT (key=?2 AND version_id=?3)",
+        )
+        .map_err(engine_err)?
+        .query_row(
             params![
                 row.bucket.as_str(),
                 row.key.as_str(),
@@ -619,11 +621,9 @@ fn enforce_bucket_quota(conn: &Connection, row: &ObjectVersionRow) -> R<()> {
 /// markers carry no logical bytes, so they never trip the quota.
 fn enforce_user_quota(conn: &Connection, row: &ObjectVersionRow) -> R<()> {
     let quota: Option<i64> = conn
-        .query_row(
-            "SELECT quota_bytes FROM users WHERE id=?1",
-            params![row.owner_id.0.as_str()],
-            |r| r.get(0),
-        )
+        .prepare_cached("SELECT quota_bytes FROM users WHERE id=?1")
+        .map_err(engine_err)?
+        .query_row(params![row.owner_id.0.as_str()], |r| r.get(0))
         .optional()
         .map_err(engine_err)?
         .flatten();
@@ -633,9 +633,12 @@ fn enforce_user_quota(conn: &Connection, row: &ObjectVersionRow) -> R<()> {
     // Current logical bytes owned by this user across all buckets, excluding the row this
     // upsert will replace.
     let current: i64 = conn
-        .query_row(
+        .prepare_cached(
             "SELECT COALESCE(SUM(size_logical), 0) FROM object_versions
              WHERE owner_id=?1 AND NOT (bucket_name=?2 AND key=?3 AND version_id=?4)",
+        )
+        .map_err(engine_err)?
+        .query_row(
             params![
                 row.owner_id.0.as_str(),
                 row.bucket.as_str(),
@@ -657,22 +660,26 @@ fn enforce_user_quota(conn: &Connection, row: &ObjectVersionRow) -> R<()> {
 /// demote the key's other versions, and insert the new latest row.
 fn upsert_version(conn: &Connection, row: ObjectVersionRow) -> R<Option<StoragePath>> {
     let superseded: Option<String> = conn
-        .query_row(
+        .prepare_cached(
             "SELECT storage_path FROM object_versions WHERE bucket_name=?1 AND key=?2 AND version_id=?3",
+        )
+        .map_err(engine_err)?
+        .query_row(
             params![row.bucket.as_str(), row.key.as_str(), row.version_id.as_str()],
             |r| r.get(0),
         )
         .optional()
         .map_err(engine_err)?
         .flatten();
-    conn.execute(
+    conn.prepare_cached(
         "DELETE FROM object_versions WHERE bucket_name=?1 AND key=?2 AND version_id=?3",
-        params![
-            row.bucket.as_str(),
-            row.key.as_str(),
-            row.version_id.as_str()
-        ],
     )
+    .map_err(engine_err)?
+    .execute(params![
+        row.bucket.as_str(),
+        row.key.as_str(),
+        row.version_id.as_str()
+    ])
     .map_err(engine_err)?;
     demote_latest(conn, &row.bucket, &row.key)?;
     insert_version(conn, &row)?;
@@ -680,23 +687,26 @@ fn upsert_version(conn: &Connection, row: ObjectVersionRow) -> R<Option<StorageP
 }
 
 fn demote_latest(conn: &Connection, bucket: &BucketName, key: &ObjectKey) -> R<()> {
-    conn.execute(
+    conn.prepare_cached(
         "UPDATE object_versions SET is_latest=0 WHERE bucket_name=?1 AND key=?2 AND is_latest=1",
-        params![bucket.as_str(), key.as_str()],
     )
+    .map_err(engine_err)?
+    .execute(params![bucket.as_str(), key.as_str()])
     .map_err(engine_err)?;
     Ok(())
 }
 
 fn insert_version(conn: &Connection, row: &ObjectVersionRow) -> R<()> {
-    conn.execute(
+    conn.prepare_cached(
         "INSERT INTO object_versions
          (id, bucket_name, key, version_id, is_latest, is_delete_marker, size_logical, size_physical,
           etag, content_type, content_encoding, cache_control, content_disposition, content_language,
           expires, storage_path, compression, storage_class, cold_locator, owner_id,
           user_metadata, acl, checksums, sse_descriptor, replication_status, created_at, updated_at)
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27)",
-        params![
+    )
+    .map_err(engine_err)?
+    .execute(params![
             row.id,
             row.bucket.as_str(),
             row.key.as_str(),
@@ -724,8 +734,7 @@ fn insert_version(conn: &Connection, row: &ObjectVersionRow) -> R<()> {
             row.replication_status.map(repl_status_str),
             row.created_at.0,
             row.updated_at.0,
-        ],
-    )
+        ])
     .map_err(engine_err)?;
     Ok(())
 }
@@ -737,8 +746,11 @@ fn delete_version(
     version_id: &VersionId,
 ) -> R<MutationOutcome> {
     let existing: Option<(Option<String>, i64)> = conn
-        .query_row(
+        .prepare_cached(
             "SELECT storage_path, is_latest FROM object_versions WHERE bucket_name=?1 AND key=?2 AND version_id=?3",
+        )
+        .map_err(engine_err)?
+        .query_row(
             params![bucket.as_str(), key.as_str(), version_id.as_str()],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
@@ -748,27 +760,27 @@ fn delete_version(
         Some((sp, latest)) => (sp.map(StoragePath::from_string), latest != 0),
         None => (None, false),
     };
-    conn.execute(
+    conn.prepare_cached(
         "DELETE FROM object_versions WHERE bucket_name=?1 AND key=?2 AND version_id=?3",
-        params![bucket.as_str(), key.as_str(), version_id.as_str()],
     )
+    .map_err(engine_err)?
+    .execute(params![bucket.as_str(), key.as_str(), version_id.as_str()])
     .map_err(engine_err)?;
     let mut promoted = false;
     if was_latest {
         let promote: Option<String> = conn
-            .query_row(
+            .prepare_cached(
                 "SELECT id FROM object_versions WHERE bucket_name=?1 AND key=?2 ORDER BY version_id DESC LIMIT 1",
-                params![bucket.as_str(), key.as_str()],
-                |r| r.get(0),
             )
+            .map_err(engine_err)?
+            .query_row(params![bucket.as_str(), key.as_str()], |r| r.get(0))
             .optional()
             .map_err(engine_err)?;
         if let Some(id) = promote {
-            conn.execute(
-                "UPDATE object_versions SET is_latest=1 WHERE id=?1",
-                params![id],
-            )
-            .map_err(engine_err)?;
+            conn.prepare_cached("UPDATE object_versions SET is_latest=1 WHERE id=?1")
+                .map_err(engine_err)?
+                .execute(params![id])
+                .map_err(engine_err)?;
             promoted = true;
         }
     }
@@ -821,12 +833,12 @@ fn check_precondition(
         return Ok(());
     }
     let current: Option<String> = conn
-        .query_row(
+        .prepare_cached(
             "SELECT etag FROM object_versions
              WHERE bucket_name=?1 AND key=?2 AND is_latest=1 AND is_delete_marker=0",
-            params![bucket.as_str(), key.as_str()],
-            |r| r.get(0),
         )
+        .map_err(engine_err)?
+        .query_row(params![bucket.as_str(), key.as_str()], |r| r.get(0))
         .optional()
         .map_err(engine_err)?;
     if let Some(want) = &pc.if_match {
@@ -853,11 +865,13 @@ fn check_precondition(
 }
 
 fn enqueue(conn: &Connection, e: &OutboxEntry) -> R<()> {
-    conn.execute(
+    conn.prepare_cached(
         "INSERT INTO replication_outbox
          (id, bucket_name, key, version_id, operation, rule_id, target_arn, attempts, next_attempt_at, status, last_error, priority, lease_until)
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
-        params![
+    )
+    .map_err(engine_err)?
+    .execute(params![
             e.id,
             e.bucket.as_str(),
             e.key.as_str(),
@@ -871,8 +885,7 @@ fn enqueue(conn: &Connection, e: &OutboxEntry) -> R<()> {
             e.last_error,
             e.priority,
             e.lease_until.map(|t| t.0),
-        ],
-    )
+        ])
     .map_err(engine_err)?;
     Ok(())
 }

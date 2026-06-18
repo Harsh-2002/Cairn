@@ -109,6 +109,11 @@ pub fn open(db_path: &Path, opts: &OpenOptions) -> Result<SqliteMetadataStore, M
         ))
         .map_err(map)?;
     apply_common_pragmas(&write_conn, opts).map_err(map)?;
+    // The writer owns this connection for the process lifetime and re-runs a fixed set of hot
+    // statements (insert/demote/quota/enqueue) on every mutation, so cache every prepared
+    // statement instead of recompiling per call. The capacity covers the distinct hot SQL in
+    // `apply.rs` with headroom so the LRU never evicts a hot statement mid-batch (ARCH §30.3).
+    write_conn.set_prepared_statement_cache_capacity(64);
     schema::run_migrations(&write_conn).map_err(map)?;
     let writer = Writer::spawn(write_conn, opts.group_commit_linger);
 

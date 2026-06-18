@@ -6,16 +6,25 @@
 use crate::driver::{AsyncSqlDriver, Row, Value};
 use async_trait::async_trait;
 use cairn_types::MetaError;
-use libsql::{Connection, Value as LValue};
+use libsql::{Connection, Statement, Value as LValue};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 /// SQLite's primary result code for a constraint violation (`SQLITE_CONSTRAINT`). libSQL surfaces
 /// it in `Error::SqliteFailure(code, _)`; the extended code is `19 | (sub << 8)`, so the primary
 /// code is the low byte.
 const SQLITE_CONSTRAINT: i32 = 19;
 
-/// One libSQL connection behind the async driver seam.
+/// One libSQL connection behind the async driver seam, plus a per-connection prepared-statement
+/// cache. libSQL's local `Connection::execute`/`query` re-compile the SQL on every call, so the
+/// hot apply/read statements would pay a fresh `sqlite3_prepare` each time; caching the compiled
+/// [`Statement`] keyed by SQL text mirrors the rusqlite store's `prepare_cached` write win
+/// (ARCH §30.3, Phase 1.1). Each driver wraps one connection that is used by exactly one task at a
+/// time (the single writer task, or a reader checked out exclusively from the pool), so a cached
+/// `Statement` is never driven concurrently; the `Mutex` only guards the map, never an `await`.
 pub struct LibsqlDriver {
     conn: Connection,
+    stmts: Mutex<HashMap<String, Arc<Statement>>>,
 }
 
 impl std::fmt::Debug for LibsqlDriver {
@@ -28,7 +37,22 @@ impl LibsqlDriver {
     /// Wrap an already-connected libSQL connection.
     #[must_use]
     pub fn new(conn: Connection) -> Self {
-        Self { conn }
+        Self {
+            conn,
+            stmts: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Return the cached prepared statement for `sql`, preparing and caching it on first use. The
+    /// map lock is only held to look up / insert the `Arc`, never across the `prepare` await, so
+    /// the returned future stays `Send`. A benign prepare race just drops the loser's statement.
+    async fn cached_stmt(&self, sql: &str) -> Result<Arc<Statement>, MetaError> {
+        if let Some(s) = self.stmts.lock().unwrap().get(sql).cloned() {
+            return Ok(s);
+        }
+        let stmt = Arc::new(self.conn.prepare(sql).await.map_err(map_err)?);
+        let mut g = self.stmts.lock().unwrap();
+        Ok(g.entry(sql.to_owned()).or_insert(stmt).clone())
     }
 }
 
@@ -69,12 +93,18 @@ fn from_libsql(v: LValue) -> Value {
 impl AsyncSqlDriver for LibsqlDriver {
     async fn execute(&self, sql: &str, params: Vec<Value>) -> Result<u64, MetaError> {
         let params: Vec<LValue> = params.into_iter().map(to_libsql).collect();
-        self.conn.execute(sql, params).await.map_err(map_err)
+        let stmt = self.cached_stmt(sql).await?;
+        // Clear any binding/iteration state left by a prior use before re-running it.
+        stmt.reset();
+        let n = stmt.execute(params).await.map_err(map_err)?;
+        Ok(n as u64)
     }
 
     async fn query(&self, sql: &str, params: Vec<Value>) -> Result<Vec<Row>, MetaError> {
         let params: Vec<LValue> = params.into_iter().map(to_libsql).collect();
-        let mut rows = self.conn.query(sql, params).await.map_err(map_err)?;
+        let stmt = self.cached_stmt(sql).await?;
+        stmt.reset();
+        let mut rows = stmt.query(params).await.map_err(map_err)?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().await.map_err(map_err)? {
             let n = row.column_count();

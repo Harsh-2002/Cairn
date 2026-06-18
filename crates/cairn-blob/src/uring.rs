@@ -304,7 +304,8 @@ async fn writer_task(
                 return;
             }
             WriteCmd::FsyncInPlace(reply) => {
-                let res = file.sync_all().await.map_err(io_err);
+                // fdatasync: the part's bytes + size must be durable; timestamps need not be.
+                let res = file.sync_data().await.map_err(io_err);
                 let _ = file.close().await;
                 let _ = reply.send(res.clone_shallow());
                 let _ = final_tx.send(res);
@@ -335,8 +336,9 @@ async fn commit_on_executor(
     final_path: &Path,
     bucket_dir: &Path,
 ) -> Result<(), BlobError> {
-    // 1) fsync the staged file.
-    file.sync_all().await.map_err(io_err)?;
+    // 1) fdatasync the staged file: persist its bytes and size, skipping the timestamp-only
+    //    metadata `sync_all` would also flush — one fewer journal write per PUT (ARCH §8.2).
+    file.sync_data().await.map_err(io_err)?;
     file.close().await.map_err(io_err)?;
     // 2) rename the staged file into the (already-ensured) bucket directory.
     tokio_uring::fs::rename(staging, final_path)

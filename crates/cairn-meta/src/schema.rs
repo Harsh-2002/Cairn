@@ -290,6 +290,25 @@ ALTER TABLE request_metrics ADD COLUMN lat_gt_1000 INTEGER NOT NULL DEFAULT 0;
 CREATE INDEX idx_object_tags_kv ON object_tags (tag_key, tag_value);
 "#,
     },
+    Migration {
+        version: 11,
+        name: "partial covering index for current-version reads (ARCH §30.3)",
+        sql: r#"
+-- A partial, covering index for the hot current-version read paths (Phase 1.7). The latest-only
+-- listing (`fetch_rows`) and single-key current-version lookups all filter `is_latest = 1`; this
+-- index keeps ONLY current rows (the partial `WHERE is_latest = 1` makes it one entry per live
+-- key, not one per historical version) and carries every column the listing projects, so a
+-- latest-only ListObjects is answered index-only — no per-row table fetch and no stepping over
+-- superseded versions. `is_latest` itself is constant (1) under the partial predicate, so it need
+-- not be stored. This supersedes idx_object_versions_latest, whose sole role was is_latest=1 seeks
+-- over (bucket_name, key); dropping it keeps the number of maintained indexes flat.
+DROP INDEX idx_object_versions_latest;
+CREATE INDEX idx_ov_latest_cover ON object_versions
+    (bucket_name, key, version_id, is_delete_marker, etag, size_logical, updated_at,
+     storage_class, owner_id)
+    WHERE is_latest = 1;
+"#,
+    },
 ];
 
 /// Run all pending migrations on the write connection, recording each as applied.
@@ -521,5 +540,56 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         run_migrations(&conn).unwrap();
         assert!(index_exists(&conn, "idx_object_tags_kv"));
+    }
+
+    #[test]
+    fn migration_v11_swaps_latest_index_for_partial_cover() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        // The partial covering index replaces the narrow latest index (ARCH §30.3).
+        assert!(index_exists(&conn, "idx_ov_latest_cover"));
+        assert!(!index_exists(&conn, "idx_object_versions_latest"));
+        // It is a partial index (carries a WHERE predicate) so it holds only current rows.
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_ov_latest_cover'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            sql.to_ascii_lowercase().contains("where is_latest"),
+            "index must be partial on is_latest=1, got: {sql}"
+        );
+
+        // The query planner answers the latest-only listing from this index alone (covering): the
+        // plan must reference the index and must NOT fall back to a full table scan.
+        conn.execute_batch(
+            "INSERT INTO object_versions
+             (id, bucket_name, key, version_id, is_latest, is_delete_marker, size_logical,
+              size_physical, etag, content_type, compression, storage_class, owner_id,
+              user_metadata, checksums, created_at, updated_at)
+             VALUES ('i','b','k','v',1,0,1,1,'e','text/plain','\"Uncompressed\"','Standard',
+                     'o','[]','[]',0,0);",
+        )
+        .unwrap();
+        let plan: String = conn
+            .query_row(
+                "EXPLAIN QUERY PLAN
+                 SELECT key, version_id, is_latest, is_delete_marker, etag, size_logical,
+                        updated_at, storage_class, owner_id
+                 FROM object_versions
+                 WHERE bucket_name = 'b' AND key >= '' AND is_latest = 1 AND is_delete_marker = 0
+                 ORDER BY key ASC LIMIT 10",
+                [],
+                |r| r.get::<_, String>(3),
+            )
+            .unwrap();
+        // "USING COVERING INDEX <name>" is SQLite's label for an index-only scan: the projection
+        // is satisfied entirely from the index, with no table B-tree lookups.
+        assert!(
+            plan.contains("COVERING INDEX idx_ov_latest_cover"),
+            "latest-only listing must be index-only via the covering index, plan was: {plan}"
+        );
     }
 }
