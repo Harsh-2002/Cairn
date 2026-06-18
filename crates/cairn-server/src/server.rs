@@ -598,7 +598,9 @@ async fn is_ready(state: &AppState) -> bool {
     if state.stack.meta.list_buckets(None).await.is_err() {
         return false;
     }
-    if let Some(store) = state.stack.store.as_ref() {
+    // Every sqlite shard's writer must be responsive (one entry when unsharded; none for the
+    // self-WAL-managing libSQL/Turso backends).
+    for store in &state.stack.store {
         if store.writer_probe().await.is_err() {
             return false;
         }

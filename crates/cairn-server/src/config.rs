@@ -103,6 +103,14 @@ pub struct Config {
     pub meta_cache_total_budget_bytes: u64,
     /// `mmap_size` in bytes for metadata read connections (`CAIRN_META_MMAP_BYTES`). Default 256 MiB.
     pub meta_mmap_bytes: u64,
+    /// Number of metadata shards (`CAIRN_META_SHARDS`, ARCH §30, Phase 3.2). Default `1` (the
+    /// metadata lives in one database, as before). With `N > 1` the metadata is partitioned across
+    /// N databases by bucket name — `db_path`, then `db_path.shard1`, `.shard2`, … — so disjoint
+    /// buckets commit through N independent single-writers in parallel. This is a **deployment-time
+    /// decision fixed at first init**: changing it on populated data would route a bucket to a shard
+    /// that does not hold its rows. Supported on the `sqlite` backend only; capped at 64. User-quota
+    /// enforcement becomes eventually-consistent under sharding (it cannot be atomic across shards).
+    pub meta_shards: usize,
     /// The base domain for **virtual-host-style** S3 addressing (`CAIRN_S3_DOMAIN`), e.g.
     /// `s3.example.com`. When set, a request whose `Host` is `<bucket>.<domain>` is routed to that
     /// bucket with the whole path as the key; path-style addressing always remains supported. Unset
@@ -215,6 +223,7 @@ impl Default for Config {
             meta_cache_bytes_per_conn: 64 * 1024 * 1024,
             meta_cache_total_budget_bytes: 2 * 1024 * 1024 * 1024,
             meta_mmap_bytes: 256 * 1024 * 1024,
+            meta_shards: 1,
             s3_domain: None,
             meta_cache_bytes: 64 * 1024 * 1024,
             auth_cache_ttl_secs: 30,
@@ -386,6 +395,19 @@ impl Config {
             return Err(ConfigError::Invalid(
                 "auth_cache_ttl_secs must be <= 3600 (1 hour); 0 disables the cache".into(),
             ));
+        }
+        // Metadata sharding (Phase 3.2): 1..=64, and >1 only on the sqlite backend (the libSQL /
+        // Turso engines self-manage their WAL and are not wired for the per-shard checkpointer).
+        if !(1..=64).contains(&self.meta_shards) {
+            return Err(ConfigError::Invalid(
+                "meta_shards must be between 1 and 64".into(),
+            ));
+        }
+        if self.meta_shards > 1 && self.meta_backend != "sqlite" {
+            return Err(ConfigError::Invalid(format!(
+                "meta_shards > 1 is supported only on the sqlite backend, not {:?}",
+                self.meta_backend
+            )));
         }
         // Runtime blocking-pool floor: `spawn_blocking` serves both the metadata read pool and blob
         // file I/O, so an explicit cap set below their combined concurrency would stall reads and
@@ -662,6 +684,30 @@ mod tests {
             c.meta_synchronous = s.to_owned();
             assert!(c.validate().is_ok());
         }
+    }
+
+    #[test]
+    fn meta_shards_bounds_and_backend() {
+        // 1 (default) and any value up to 64 validate on sqlite.
+        for n in [1usize, 2, 16, 64] {
+            let mut c = base();
+            c.meta_shards = n;
+            assert!(c.validate().is_ok(), "shards {n} on sqlite must validate");
+        }
+        // 0 and >64 are rejected.
+        for n in [0usize, 65] {
+            let mut c = base();
+            c.meta_shards = n;
+            assert!(c.validate().is_err(), "shards {n} must be rejected");
+        }
+        // >1 is sqlite-only.
+        let mut c = base();
+        c.meta_shards = 4;
+        c.meta_backend = "libsql".to_owned();
+        assert!(
+            c.validate().is_err(),
+            "sharding requires the sqlite backend"
+        );
     }
 
     #[test]

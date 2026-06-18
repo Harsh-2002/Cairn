@@ -14,6 +14,21 @@ use cairn_types::traits::{
 };
 use std::sync::Arc;
 
+/// What [`open_meta`] yields: the (possibly sharded) trait-object store, the boxed reconcile oracle,
+/// and the per-shard typed sqlite handles for the WAL checkpointer (empty for libSQL/Turso).
+type OpenedMeta = (
+    Arc<dyn MetadataStore>,
+    Box<dyn ReconcileOracle + Send + Sync>,
+    Vec<Arc<SqliteMetadataStore>>,
+);
+
+/// One opened sqlite shard: its trait-object store, reconcile oracle, and typed handle.
+type OpenedShard = (
+    Arc<dyn MetadataStore>,
+    Box<dyn ReconcileOracle + Send + Sync>,
+    Arc<SqliteMetadataStore>,
+);
+
 /// The assembled runtime stack shared across requests.
 pub struct AppStack {
     /// The S3 protocol service.
@@ -33,13 +48,14 @@ pub struct AppStack {
     /// Boxed because the concrete oracle type differs per backend (sqlite vs the shared async one).
     #[allow(dead_code)]
     pub oracle: Box<dyn ReconcileOracle + Send + Sync>,
-    /// A typed handle to the concrete SQLite store, **only present for the `sqlite` backend**. The
-    /// WAL checkpointer's `checkpoint()` and `wal_size_bytes()` are inherent methods on
-    /// `SqliteMetadataStore`, not part of the `MetadataStore` trait object, so the concrete store
-    /// is threaded through here rather than reached via `meta` (ARCH §8.4/§11.2). The libSQL and
-    /// Turso engines self-manage their WAL, so this is `None` for them and the WAL-checkpointer
+    /// Typed handles to the concrete SQLite shard stores, **only populated for the `sqlite`
+    /// backend** (one per `CAIRN_META_SHARDS`; a single entry when unsharded). The WAL
+    /// checkpointer's `checkpoint()` and `wal_size_bytes()` are inherent methods on
+    /// `SqliteMetadataStore`, not part of the `MetadataStore` trait object, so the concrete stores
+    /// are threaded through here rather than reached via `meta` (ARCH §8.4/§11.2). The libSQL and
+    /// Turso engines self-manage their WAL, so this is **empty** for them and the WAL-checkpointer
     /// background loop does not run.
-    pub store: Option<Arc<SqliteMetadataStore>>,
+    pub store: Vec<Arc<SqliteMetadataStore>>,
     /// A typed handle to the read-through config cache wrapping `meta`, kept so the metrics loop can
     /// scrape its `(hits, misses)` counters into `cairn_meta_cache_hits_total`/`_misses_total`
     /// (ARCH §11.5). `meta` above is this same store behind the trait object; this handle exists
@@ -84,21 +100,34 @@ pub(crate) fn build_crypto(cfg: &Config) -> Result<SystemCrypto, String> {
     }
 }
 
-/// Open the metadata store for the configured backend (ARCH §12.7). Returns the trait-object
-/// store, the boxed reconcile oracle, and — for the `sqlite` backend only — the typed
-/// `SqliteMetadataStore` handle the WAL checkpointer drives (the libSQL and Turso engines
-/// self-manage their WAL, so they return `None`). The on-disk database is the same SQLite file
-/// format for all three engines; the backend only changes which engine drives it.
-async fn open_meta(
-    cfg: &Config,
-) -> Result<
-    (
-        Arc<dyn MetadataStore>,
-        Box<dyn ReconcileOracle + Send + Sync>,
-        Option<Arc<SqliteMetadataStore>>,
-    ),
-    String,
-> {
+/// The on-disk path for shard `i`: shard 0 is `base` itself (so existing single-shard data is
+/// shard 0 untouched), and shard `i>0` is a sibling `base.shard{i}`.
+fn shard_db_path(base: &std::path::Path, i: usize) -> std::path::PathBuf {
+    if i == 0 {
+        base.to_path_buf()
+    } else {
+        let mut name = base.as_os_str().to_owned();
+        name.push(format!(".shard{i}"));
+        std::path::PathBuf::from(name)
+    }
+}
+
+/// Open one sqlite shard at `db_path`, returning its trait-object store, reconcile oracle, and the
+/// typed handle the WAL checkpointer drives.
+fn open_sqlite_shard(db_path: &std::path::Path, opts: &OpenOptions) -> Result<OpenedShard, String> {
+    let store = cairn_meta::open(db_path, opts)
+        .map_err(|e| format!("open metadata store (sqlite) at {}: {e}", db_path.display()))?;
+    let oracle: Box<dyn ReconcileOracle + Send + Sync> = Box::new(store.reconcile_oracle());
+    let store = Arc::new(store);
+    let meta: Arc<dyn MetadataStore> = store.clone();
+    Ok((meta, oracle, store))
+}
+
+/// Open the metadata store for the configured backend (ARCH §12.7). Returns the trait-object store
+/// (a [`cairn_meta::ShardedMetadataStore`] router when `meta_shards > 1`), the boxed reconcile
+/// oracle, and — for the `sqlite` backend only — the typed `SqliteMetadataStore` handles the WAL
+/// checkpointer drives (one per shard; empty for the self-WAL-managing libSQL/Turso engines).
+async fn open_meta(cfg: &Config) -> Result<OpenedMeta, String> {
     // Throughput tuning from config (ARCH §28.2/§30), applied identically to whichever backend is
     // selected. `cache_size` follows SQLite's convention: negative => KiB of page cache.
     let synchronous_full = cfg.meta_synchronous == "full";
@@ -111,7 +140,7 @@ async fn open_meta(
     match cfg.meta_backend.as_str() {
         "sqlite" => {
             // The default, byte-identical path: the rusqlite/bundled-C store. Migrations run
-            // inside `open`. A typed handle is kept for the WAL checkpointer.
+            // inside `open`. Typed handles are kept for the WAL checkpointer (one per shard).
             let opts = OpenOptions {
                 synchronous_full,
                 read_pool_size,
@@ -120,12 +149,28 @@ async fn open_meta(
                 mmap_bytes,
                 cache_size,
             };
-            let store = cairn_meta::open(&cfg.db_path, &opts)
-                .map_err(|e| format!("open metadata store (sqlite): {e}"))?;
-            let oracle = Box::new(store.reconcile_oracle());
-            let store = Arc::new(store);
-            let meta: Arc<dyn MetadataStore> = store.clone();
-            Ok((meta, oracle, Some(store)))
+            if cfg.meta_shards <= 1 {
+                let (meta, oracle, store) = open_sqlite_shard(&cfg.db_path, &opts)?;
+                return Ok((meta, oracle, vec![store]));
+            }
+            // Sharded (Phase 3.2): open N shard databases, partition by bucket name through the
+            // routing store, and route each storage path to its owning shard for reconcile.
+            let mut metas: Vec<Arc<dyn MetadataStore>> = Vec::with_capacity(cfg.meta_shards);
+            let mut oracles: Vec<Box<dyn ReconcileOracle + Send + Sync>> =
+                Vec::with_capacity(cfg.meta_shards);
+            let mut handles: Vec<Arc<SqliteMetadataStore>> = Vec::with_capacity(cfg.meta_shards);
+            for i in 0..cfg.meta_shards {
+                let (meta, oracle, store) =
+                    open_sqlite_shard(&shard_db_path(&cfg.db_path, i), &opts)?;
+                metas.push(meta);
+                oracles.push(oracle);
+                handles.push(store);
+            }
+            let meta: Arc<dyn MetadataStore> =
+                Arc::new(cairn_meta::ShardedMetadataStore::new(metas));
+            let oracle: Box<dyn ReconcileOracle + Send + Sync> =
+                Box::new(cairn_meta::ShardedReconcileOracle::new(oracles));
+            Ok((meta, oracle, handles))
         }
         #[cfg(feature = "meta-async")]
         "libsql" => {
@@ -142,7 +187,7 @@ async fn open_meta(
                 .map_err(|e| format!("open metadata store (libsql): {e}"))?;
             let oracle = Box::new(store.reconcile_oracle());
             let meta: Arc<dyn MetadataStore> = Arc::new(store);
-            Ok((meta, oracle, None))
+            Ok((meta, oracle, vec![]))
         }
         #[cfg(feature = "meta-async")]
         "turso" => {
@@ -159,7 +204,7 @@ async fn open_meta(
                 .map_err(|e| format!("turso backend unavailable: {e}"))?;
             let oracle = Box::new(store.reconcile_oracle());
             let meta: Arc<dyn MetadataStore> = Arc::new(store);
-            Ok((meta, oracle, None))
+            Ok((meta, oracle, vec![]))
         }
         // The libSQL/Turso backends are compiled in only with the `meta-async` cargo feature, so the
         // default release binary links only the rusqlite engine (no dual-bundled-SQLite collision —
@@ -390,4 +435,67 @@ async fn ensure_root_admin(
         tracing::info!(access_key = %akid, "root administrator ensured");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod sharding_tests {
+    use super::*;
+    use cairn_types::authz::OwnershipMode;
+    use cairn_types::bucket::{Bucket, VersioningState};
+    use cairn_types::{BucketName, Mutation, Timestamp, UserId};
+
+    fn bucket(name: &str) -> Mutation {
+        Mutation::CreateBucket(Box::new(Bucket {
+            name: BucketName::parse(name).unwrap(),
+            owner_id: UserId("o".to_owned()),
+            created_at: Timestamp(1),
+            versioning: VersioningState::Enabled,
+            ownership_mode: OwnershipMode::BucketOwnerEnforced,
+            region: "us-east-1".to_owned(),
+            compression: None,
+        }))
+    }
+
+    #[tokio::test]
+    async fn open_meta_shards_partition_buckets_across_db_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            data_dir: dir.path().to_path_buf(),
+            db_path: dir.path().join("meta.db"),
+            meta_backend: "sqlite".to_owned(),
+            meta_shards: 3,
+            ..Config::default()
+        };
+        assert!(cfg.validate().is_ok());
+
+        let (meta, _oracle, handles) = open_meta(&cfg).await.unwrap();
+        assert_eq!(handles.len(), 3, "one WAL-checkpointer handle per shard");
+
+        for name in ["alpha", "bravo", "charlie", "delta", "echo"] {
+            meta.submit(bucket(name)).await.unwrap();
+        }
+
+        // The router sees every bucket; each shard holds only the buckets that hash to it, with no
+        // loss or duplication across the partition.
+        assert_eq!(meta.list_buckets(None).await.unwrap().len(), 5);
+        let mut total = 0;
+        for (i, h) in handles.iter().enumerate() {
+            let on_shard = h.list_buckets(None).await.unwrap();
+            for b in &on_shard {
+                assert_eq!(
+                    cairn_meta::shard_for_bucket(b.name.as_str(), 3),
+                    i,
+                    "bucket {} must live on its hashed shard",
+                    b.name.as_str()
+                );
+            }
+            total += on_shard.len();
+        }
+        assert_eq!(total, 5, "buckets partitioned with no loss or duplication");
+
+        // The sibling shard database files exist on disk.
+        assert!(dir.path().join("meta.db").exists());
+        assert!(dir.path().join("meta.db.shard1").exists());
+        assert!(dir.path().join("meta.db.shard2").exists());
+    }
 }

@@ -34,9 +34,9 @@ pub fn spawn(stack: Arc<AppStack>, cfg: &Config) {
     ));
     tokio::spawn(lifecycle_loop(stack.clone(), lifecycle_interval));
     // The WAL checkpointer drives inherent methods on the concrete `SqliteMetadataStore`, so it
-    // runs only for the `sqlite` backend (where `stack.store` is `Some`). The libSQL and Turso
-    // engines self-manage their WAL, so the loop is simply not spawned for them.
-    if stack.store.is_some() {
+    // runs only for the `sqlite` backend (where `stack.store` holds one handle per shard). The
+    // libSQL and Turso engines self-manage their WAL, so the loop is not spawned for them.
+    if !stack.store.is_empty() {
         tokio::spawn(checkpoint_loop(
             stack.clone(),
             checkpoint_interval,
@@ -572,9 +572,25 @@ impl BucketRoutedSink for StoredTargetRouter {
 /// contending), and a `busy` result means a reader pinned the log so the truncation was
 /// deferred — that is observable via `cairn_wal_checkpoints_busy_total`.
 async fn checkpoint_loop(stack: Arc<AppStack>, interval: Duration, size_threshold_bytes: u64) {
-    // Only spawned when `store` is Some (the sqlite backend); bind the typed handle once.
-    let Some(store) = stack.store.clone() else {
+    // Only spawned when there is at least one sqlite shard handle; bind them once. Under sharding
+    // (Phase 3.2) there is one handle per shard, each with its own WAL to checkpoint.
+    let stores = stack.store.clone();
+    if stores.is_empty() {
         return;
+    }
+    // Sum the WAL footprint across all shards for the gauge and the size trigger.
+    let total_wal_bytes = |stores: &[Arc<cairn_meta::SqliteMetadataStore>]| {
+        let stores = stores.to_vec();
+        async move {
+            let mut total = 0u64;
+            for s in &stores {
+                match s.wal_size_bytes().await {
+                    Ok(bytes) => total += bytes,
+                    Err(e) => tracing::warn!(error = %e, "wal size probe failed"),
+                }
+            }
+            total
+        }
     };
     // Poll on a cadence fine enough to react to the size threshold between interval ticks, but
     // never longer than the interval itself. When the size trigger is disabled (threshold 0) the
@@ -591,20 +607,12 @@ async fn checkpoint_loop(stack: Arc<AppStack>, interval: Duration, size_threshol
         tokio::time::sleep(poll).await;
         elapsed += poll;
 
-        // Probe the WAL size every tick so the gauge stays live and the size trigger can fire.
-        let wal_bytes = match store.wal_size_bytes().await {
-            Ok(bytes) => {
-                metrics::gauge!("cairn_wal_bytes").set(bytes as f64);
-                bytes
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "wal size probe failed");
-                0
-            }
-        };
+        // Probe the total WAL size every tick so the gauge stays live and the size trigger can fire.
+        let wal_bytes = total_wal_bytes(&stores).await;
+        metrics::gauge!("cairn_wal_bytes").set(wal_bytes as f64);
 
-        // Checkpoint when the interval has elapsed OR the WAL has grown past the configured size
-        // threshold (ARCH §8.4) — the latter bounds `-wal` growth under sustained writes with a
+        // Checkpoint when the interval has elapsed OR the combined WAL has grown past the configured
+        // size threshold (ARCH §8.4) — the latter bounds `-wal` growth under sustained writes with a
         // long-lived reader rather than waiting out the whole interval.
         let interval_due = elapsed >= interval;
         let size_due = size_threshold_bytes > 0 && wal_bytes >= size_threshold_bytes;
@@ -620,28 +628,28 @@ async fn checkpoint_loop(stack: Arc<AppStack>, interval: Duration, size_threshol
         }
         elapsed = Duration::ZERO;
 
-        match store.checkpoint().await {
-            Ok(stats) => {
-                metrics::counter!("cairn_wal_checkpoints_total").increment(1);
-                if stats.busy {
-                    metrics::counter!("cairn_wal_checkpoints_busy_total").increment(1);
+        // Checkpoint every shard's WAL.
+        for store in &stores {
+            match store.checkpoint().await {
+                Ok(stats) => {
+                    metrics::counter!("cairn_wal_checkpoints_total").increment(1);
+                    if stats.busy {
+                        metrics::counter!("cairn_wal_checkpoints_busy_total").increment(1);
+                    }
+                    metrics::counter!("cairn_wal_checkpointed_frames_total")
+                        .increment(stats.checkpointed_frames);
+                    tracing::debug!(
+                        busy = stats.busy,
+                        log_frames = stats.log_frames,
+                        checkpointed_frames = stats.checkpointed_frames,
+                        "wal checkpoint complete"
+                    );
                 }
-                metrics::counter!("cairn_wal_checkpointed_frames_total")
-                    .increment(stats.checkpointed_frames);
-                tracing::debug!(
-                    busy = stats.busy,
-                    log_frames = stats.log_frames,
-                    checkpointed_frames = stats.checkpointed_frames,
-                    "wal checkpoint complete"
-                );
+                Err(e) => tracing::warn!(error = %e, "wal checkpoint failed"),
             }
-            Err(e) => tracing::warn!(error = %e, "wal checkpoint failed"),
         }
         // Refresh the gauge post-checkpoint so a truncating checkpoint's effect is visible.
-        match store.wal_size_bytes().await {
-            Ok(bytes) => metrics::gauge!("cairn_wal_bytes").set(bytes as f64),
-            Err(e) => tracing::warn!(error = %e, "wal size probe failed"),
-        }
+        metrics::gauge!("cairn_wal_bytes").set(total_wal_bytes(&stores).await as f64);
     }
 }
 
@@ -668,8 +676,9 @@ async fn metrics_loop(stack: Arc<AppStack>) {
         // Writer inbound queue depth (ARCH §26.2): the headline write-backpressure signal. Only the
         // concrete sqlite store exposes the writer handle; libSQL/Turso self-manage and have no
         // such gauge.
-        if let Some(store) = stack.store.as_ref() {
-            metrics::gauge!("cairn_writer_queue_depth").set(store.writer_queue_depth() as f64);
+        if !stack.store.is_empty() {
+            let depth: usize = stack.store.iter().map(|s| s.writer_queue_depth()).sum();
+            metrics::gauge!("cairn_writer_queue_depth").set(depth as f64);
         }
 
         // Metadata config-cache effectiveness (ARCH §11.5). The cache is not a `metrics` dependency,
