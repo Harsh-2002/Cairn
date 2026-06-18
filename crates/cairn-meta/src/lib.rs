@@ -46,8 +46,15 @@ pub struct OpenOptions {
 impl Default for OpenOptions {
     fn default() -> Self {
         Self {
-            synchronous_full: true,
+            // Throughput posture: WAL + NORMAL never corrupts the DB and removes the per-commit
+            // fsync (≈1.7× writer throughput on disk); on power loss it loses at most the last
+            // uncheckpointed txn, which blob-first ordering downgrades to a reconcile-GC'd orphan
+            // blob, not a corrupt store (ARCH §8/§30). Operators wanting zero-loss set FULL.
+            synchronous_full: false,
             read_pool_size: 8,
+            // None by default: with NORMAL there is no per-commit fsync to amortize, so the
+            // opportunistic batch-drain already coalesces concurrent writes and a linger sleep only
+            // adds latency. The knob earns its keep under synchronous=FULL (then it batches fsyncs).
             group_commit_linger: None,
             busy_timeout_ms: 5000,
             mmap_bytes: 256 * 1024 * 1024,
@@ -60,6 +67,7 @@ fn apply_common_pragmas(conn: &Connection, opts: &OpenOptions) -> rusqlite::Resu
     conn.busy_timeout(Duration::from_millis(opts.busy_timeout_ms))?;
     conn.execute_batch(&format!(
         "PRAGMA foreign_keys=ON;
+         PRAGMA temp_store=MEMORY;
          PRAGMA mmap_size={};
          PRAGMA cache_size={};",
         opts.mmap_bytes, opts.cache_size
@@ -76,16 +84,28 @@ pub fn open(db_path: &Path, opts: &OpenOptions) -> Result<SqliteMetadataStore, M
     let map = |e: rusqlite::Error| MetaError::Engine(e.to_string());
 
     // The single write connection, owned by the writer thread.
+    //
+    // `wal_autocheckpoint=0` makes the background TRUNCATE checkpointer
+    // (`cairn-server::background::checkpoint_loop`, interval + size-triggered) the *sole*
+    // checkpointer, so the writer never stalls mid-commit to checkpoint inline. The server's
+    // config validation guarantees that loop keeps the WAL bounded (the W3 guardrail).
+    // `journal_size_limit` caps the on-disk WAL footprint reclaimed after a checkpoint;
+    // `analysis_limit` bounds the cost of the periodic `PRAGMA optimize` so it can never become a
+    // writer stall.
     let write_conn = Connection::open(db_path).map_err(map)?;
     write_conn
         .execute_batch(&format!(
             "PRAGMA journal_mode=WAL;
-             PRAGMA synchronous={};",
+             PRAGMA synchronous={};
+             PRAGMA wal_autocheckpoint=0;
+             PRAGMA journal_size_limit={};
+             PRAGMA analysis_limit=400;",
             if opts.synchronous_full {
                 "FULL"
             } else {
                 "NORMAL"
-            }
+            },
+            64 * 1024 * 1024,
         ))
         .map_err(map)?;
     apply_common_pragmas(&write_conn, opts).map_err(map)?;

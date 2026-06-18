@@ -99,11 +99,28 @@ async fn open_meta(
     ),
     String,
 > {
+    // Throughput tuning from config (ARCH §28.2/§30), applied identically to whichever backend is
+    // selected. `cache_size` follows SQLite's convention: negative => KiB of page cache.
+    let synchronous_full = cfg.meta_synchronous == "full";
+    let group_commit_linger = (cfg.meta_group_commit_linger_micros > 0)
+        .then(|| std::time::Duration::from_micros(cfg.meta_group_commit_linger_micros));
+    let read_pool_size = cfg.meta_read_pool_size;
+    let cache_size = -((cfg.meta_cache_bytes_per_conn / 1024) as i64);
+    let mmap_bytes = cfg.meta_mmap_bytes as i64;
+
     match cfg.meta_backend.as_str() {
         "sqlite" => {
             // The default, byte-identical path: the rusqlite/bundled-C store. Migrations run
             // inside `open`. A typed handle is kept for the WAL checkpointer.
-            let store = cairn_meta::open(&cfg.db_path, &OpenOptions::default())
+            let opts = OpenOptions {
+                synchronous_full,
+                read_pool_size,
+                group_commit_linger,
+                busy_timeout_ms: 5000,
+                mmap_bytes,
+                cache_size,
+            };
+            let store = cairn_meta::open(&cfg.db_path, &opts)
                 .map_err(|e| format!("open metadata store (sqlite): {e}"))?;
             let oracle = Box::new(store.reconcile_oracle());
             let store = Arc::new(store);
@@ -112,7 +129,15 @@ async fn open_meta(
         }
         #[cfg(feature = "meta-async")]
         "libsql" => {
-            let store = cairn_meta_async::open_libsql(&cfg.db_path, &Default::default())
+            let opts = cairn_meta_async::OpenOptions {
+                synchronous_full,
+                read_pool_size,
+                group_commit_linger,
+                busy_timeout_ms: 5000,
+                mmap_bytes,
+                cache_size,
+            };
+            let store = cairn_meta_async::open_libsql(&cfg.db_path, &opts)
                 .await
                 .map_err(|e| format!("open metadata store (libsql): {e}"))?;
             let oracle = Box::new(store.reconcile_oracle());
@@ -121,7 +146,15 @@ async fn open_meta(
         }
         #[cfg(feature = "meta-async")]
         "turso" => {
-            let store = cairn_meta_async::open_turso(&cfg.db_path, &Default::default())
+            let opts = cairn_meta_async::OpenOptions {
+                synchronous_full,
+                read_pool_size,
+                group_commit_linger,
+                busy_timeout_ms: 5000,
+                mmap_bytes,
+                cache_size,
+            };
+            let store = cairn_meta_async::open_turso(&cfg.db_path, &opts)
                 .await
                 .map_err(|e| format!("turso backend unavailable: {e}"))?;
             let oracle = Box::new(store.reconcile_oracle());

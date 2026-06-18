@@ -78,6 +78,31 @@ pub struct Config {
     /// regular interval ticks (`CAIRN_WAL_CHECKPOINT_SIZE_BYTES`, ARCH §8.4). `0` disables the
     /// size-based trigger, leaving only the interval. Default 64 MiB.
     pub wal_checkpoint_size_bytes: u64,
+    /// Metadata write durability (`CAIRN_META_SYNCHRONOUS`): `normal` or `full` (ARCH §30). The
+    /// default `normal` runs `PRAGMA synchronous=NORMAL` under WAL — no per-commit fsync (≈1.7×
+    /// writer throughput on disk) and never corrupts; on power loss it loses at most the last
+    /// uncheckpointed transaction. Set `full` for zero-loss durability at lower write throughput.
+    pub meta_synchronous: String,
+    /// Group-commit linger window in microseconds (`CAIRN_META_GROUP_COMMIT_LINGER_MICROS`): how
+    /// long the single writer waits to coalesce more concurrent writes into one commit. Default `0`
+    /// (off): under `synchronous=normal` there is no per-commit fsync to amortize, so lingering only
+    /// adds latency; it helps only under `synchronous=full`. Capped at 1000 (1 ms).
+    pub meta_group_commit_linger_micros: u64,
+    /// Number of read-only WAL connections in the metadata read pool
+    /// (`CAIRN_META_READ_POOL_SIZE`). Default `max(8, cpu_count)`, capped at 64. Readers take
+    /// independent WAL snapshots and never block the writer, so this scales concurrent read
+    /// throughput; the cap bounds memory (each reader holds its own page cache, see below).
+    pub meta_read_pool_size: u32,
+    /// Page-cache budget per metadata connection, in bytes (`CAIRN_META_CACHE_BYTES_PER_CONN`).
+    /// Default 64 MiB. Total provisioned cache is roughly this × `(read_pool_size + 1)`.
+    pub meta_cache_bytes_per_conn: u64,
+    /// Hard ceiling, in bytes, on the total metadata page cache across all connections
+    /// (`CAIRN_META_CACHE_TOTAL_BUDGET_BYTES`). Default 2 GiB. Startup refuses a configuration whose
+    /// `cache_bytes_per_conn × (read_pool_size + 1)` exceeds this, so a large pool cannot silently
+    /// provision enough cache to OOM the process.
+    pub meta_cache_total_budget_bytes: u64,
+    /// `mmap_size` in bytes for metadata read connections (`CAIRN_META_MMAP_BYTES`). Default 256 MiB.
+    pub meta_mmap_bytes: u64,
     /// The base domain for **virtual-host-style** S3 addressing (`CAIRN_S3_DOMAIN`), e.g.
     /// `s3.example.com`. When set, a request whose `Host` is `<bucket>.<domain>` is routed to that
     /// bucket with the whole path as the key; path-style addressing always remains supported. Unset
@@ -163,6 +188,16 @@ impl Default for Config {
             multipart_upload_lifetime_secs: 86_400,
             wal_checkpoint_interval_secs: 300,
             wal_checkpoint_size_bytes: 64 * 1024 * 1024,
+            meta_synchronous: "normal".to_owned(),
+            meta_group_commit_linger_micros: 0,
+            // Scale read concurrency with the host; floor 8 so a small box still parallelizes
+            // reads, cap 64 so the cache budget stays bounded.
+            meta_read_pool_size: std::thread::available_parallelism()
+                .map(|n| (n.get() as u32).clamp(8, 64))
+                .unwrap_or(8),
+            meta_cache_bytes_per_conn: 64 * 1024 * 1024,
+            meta_cache_total_budget_bytes: 2 * 1024 * 1024 * 1024,
+            meta_mmap_bytes: 256 * 1024 * 1024,
             s3_domain: None,
             meta_cache_bytes: 64 * 1024 * 1024,
             blob_io_pool_size: 64,
@@ -281,6 +316,52 @@ impl Config {
                 "meta_backend must be one of sqlite|libsql|turso, got {:?}",
                 self.meta_backend
             )));
+        }
+        // --- metadata throughput tuning (ARCH §28.2/§30) ---
+        if !matches!(self.meta_synchronous.as_str(), "normal" | "full") {
+            return Err(ConfigError::Invalid(format!(
+                "meta_synchronous must be normal|full, got {:?}",
+                self.meta_synchronous
+            )));
+        }
+        if self.meta_group_commit_linger_micros > 1000 {
+            return Err(ConfigError::Invalid(
+                "meta_group_commit_linger_micros must be <= 1000 (1 ms)".into(),
+            ));
+        }
+        if !(1..=64).contains(&self.meta_read_pool_size) {
+            return Err(ConfigError::Invalid(
+                "meta_read_pool_size must be between 1 and 64".into(),
+            ));
+        }
+        // Cache-budget clamp (R3 guardrail): the writer connection plus every reader each provision
+        // `cache_bytes_per_conn`, so a large pool can silently OOM the host. Refuse at startup.
+        let total_cache = self
+            .meta_cache_bytes_per_conn
+            .saturating_mul(u64::from(self.meta_read_pool_size) + 1);
+        if total_cache > self.meta_cache_total_budget_bytes {
+            return Err(ConfigError::Invalid(format!(
+                "metadata cache budget exceeded: {} bytes/conn × {} conns = {} > total budget {} \
+                 (lower CAIRN_META_CACHE_BYTES_PER_CONN / CAIRN_META_READ_POOL_SIZE or raise \
+                 CAIRN_META_CACHE_TOTAL_BUDGET_BYTES)",
+                self.meta_cache_bytes_per_conn,
+                self.meta_read_pool_size + 1,
+                total_cache,
+                self.meta_cache_total_budget_bytes
+            )));
+        }
+        // W3 guardrail: the store disables inline auto-checkpointing (PRAGMA wal_autocheckpoint=0),
+        // so the background checkpointer is the WAL's only bound. A disabled size trigger plus a
+        // long interval could let the WAL grow large between checkpoints; require a deterministic
+        // bound (a size trigger, or a sub-minute interval) for the sqlite/libsql backends.
+        if self.meta_backend != "turso"
+            && self.wal_checkpoint_size_bytes == 0
+            && self.wal_checkpoint_interval_secs > 60
+        {
+            return Err(ConfigError::Invalid(
+                "with inline WAL auto-checkpointing disabled, set CAIRN_WAL_CHECKPOINT_SIZE_BYTES > 0 \
+                 or CAIRN_WAL_CHECKPOINT_INTERVAL_SECS <= 60 to keep the WAL bounded".into(),
+            ));
         }
         if let Some(url) = &self.public_base_url {
             if !(url.starts_with("http://") || url.starts_with("https://")) {
@@ -484,6 +565,65 @@ mod tests {
         c.request_metrics_bucket_secs = 0;
         c.request_metrics_retention_days = 0;
         assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn metadata_tuning_defaults_validate() {
+        // The throughput defaults (synchronous=normal, linger 0, cpu-scaled pool, 64 MiB/conn)
+        // must pass validation out of the box.
+        assert!(base().validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_bad_metadata_tuning() {
+        let cases: [fn(&mut Config); 4] = [
+            |c| c.meta_synchronous = "sometimes".to_owned(),
+            |c| c.meta_group_commit_linger_micros = 2000, // > 1 ms cap
+            |c| c.meta_read_pool_size = 0,
+            |c| c.meta_read_pool_size = 128, // > 64 cap
+        ];
+        for mutate in cases {
+            let mut c = base();
+            mutate(&mut c);
+            assert!(c.validate().is_err());
+        }
+        // Both normal and full are accepted.
+        for s in ["normal", "full"] {
+            let mut c = base();
+            c.meta_synchronous = s.to_owned();
+            assert!(c.validate().is_ok());
+        }
+    }
+
+    #[test]
+    fn rejects_metadata_cache_budget_overflow() {
+        // 64 readers + writer × 64 MiB ≈ 4.1 GiB, over the 2 GiB default budget → refuse.
+        let mut c = base();
+        c.meta_read_pool_size = 64;
+        c.meta_cache_bytes_per_conn = 64 * 1024 * 1024;
+        assert!(c.validate().is_err());
+        // Raising the budget (or shrinking per-conn cache) makes it valid again.
+        c.meta_cache_total_budget_bytes = 8 * 1024 * 1024 * 1024;
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_unbounded_wal_when_autocheckpoint_disabled() {
+        // wal_autocheckpoint is always 0 now; a disabled size trigger + a long interval would let
+        // the WAL grow unbounded between checkpoints (sqlite/libsql) → refuse (the W3 guardrail).
+        let mut c = base();
+        c.wal_checkpoint_size_bytes = 0;
+        c.wal_checkpoint_interval_secs = 3600;
+        assert!(c.validate().is_err());
+        // A sub-minute interval is a sufficient bound on its own.
+        c.wal_checkpoint_interval_secs = 30;
+        assert!(c.validate().is_ok());
+        // turso self-manages its WAL, so the guard does not apply there.
+        let mut t = base();
+        t.meta_backend = "turso".to_owned();
+        t.wal_checkpoint_size_bytes = 0;
+        t.wal_checkpoint_interval_secs = 3600;
+        assert!(t.validate().is_ok());
     }
 
     #[test]

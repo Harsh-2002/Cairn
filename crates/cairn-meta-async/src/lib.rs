@@ -71,7 +71,9 @@ pub struct OpenOptions {
 impl Default for OpenOptions {
     fn default() -> Self {
         Self {
-            synchronous_full: true,
+            // Throughput posture mirroring cairn-meta: WAL + NORMAL (no per-commit fsync, never
+            // corrupts) by default; no linger (nothing to amortize under NORMAL). FULL is opt-in.
+            synchronous_full: false,
             read_pool_size: 8,
             group_commit_linger: None,
             busy_timeout_ms: 5000,
@@ -81,12 +83,13 @@ impl Default for OpenOptions {
     }
 }
 
-/// Apply the pragmas every connection shares (foreign keys, busy timeout, mmap, cache).
+/// Apply the pragmas every connection shares (foreign keys, temp-store, busy timeout, mmap, cache).
 async fn apply_common_pragmas(conn: &Connection, opts: &OpenOptions) -> Result<(), MetaError> {
     conn.busy_timeout(Duration::from_millis(opts.busy_timeout_ms))
         .map_err(|e| MetaError::Engine(e.to_string()))?;
     conn.execute_batch(&format!(
         "PRAGMA foreign_keys=ON;
+         PRAGMA temp_store=MEMORY;
          PRAGMA mmap_size={};
          PRAGMA cache_size={};",
         opts.mmap_bytes, opts.cache_size
@@ -111,17 +114,24 @@ pub async fn open_libsql(
     // mode (the rusqlite store likewise opens one write connection + an r2d2 read pool on the file).
     let db = Builder::new_local(db_path).build().await.map_err(map)?;
 
-    // The single write connection, owned by the writer task.
+    // The single write connection, owned by the writer task. Mirrors the rusqlite store:
+    // wal_autocheckpoint=0 hands all checkpointing to the background TRUNCATE loop (gated by the
+    // server's W3 validation), journal_size_limit caps the WAL footprint, analysis_limit bounds the
+    // periodic optimize.
     let write_conn = db.connect().map_err(map)?;
     write_conn
         .execute_batch(&format!(
             "PRAGMA journal_mode=WAL;
-             PRAGMA synchronous={};",
+             PRAGMA synchronous={};
+             PRAGMA wal_autocheckpoint=0;
+             PRAGMA journal_size_limit={};
+             PRAGMA analysis_limit=400;",
             if opts.synchronous_full {
                 "FULL"
             } else {
                 "NORMAL"
-            }
+            },
+            64 * 1024 * 1024,
         ))
         .await
         .map_err(map)?;
@@ -196,10 +206,12 @@ pub async fn open_libsql_in_memory() -> Result<LibsqlMetadataStore, MetaError> {
 // ----------------------------------------------------------------------------------------------
 
 /// Apply the per-connection settings every Turso connection shares. Turso (beta) does not yet
-/// honour the full SQLite PRAGMA surface, so this is intentionally minimal: only the busy timeout
-/// (a Turso connection method, not a PRAGMA) and `foreign_keys=ON` (best-effort) are set. The
-/// cache/mmap PRAGMAs the libSQL/rusqlite stores tune are not applied here; the behaviour-relevant
-/// semantics are driven entirely by the shared schema/apply code, which is engine-agnostic.
+/// honour the full SQLite PRAGMA surface, so this is intentionally minimal and best-effort: the
+/// busy timeout (a Turso connection method, not a PRAGMA) and a short batch of throughput PRAGMAs
+/// whose individual failures are ignored so a PRAGMA the beta engine has not implemented cannot
+/// abort startup. `synchronous` and `temp_store` are applied best-effort; `wal_autocheckpoint`
+/// and `journal_size_limit` are deliberately NOT set — Turso self-manages its native WAL and has
+/// no external checkpointer, so those are meaningless (and the W3 guardrail does not apply).
 async fn apply_turso_pragmas(
     conn: &turso::Connection,
     opts: &OpenOptions,
@@ -208,7 +220,16 @@ async fn apply_turso_pragmas(
         .map_err(|e| MetaError::Engine(e.to_string()))?;
     // Best-effort: ignore an error so a PRAGMA the beta engine does not implement does not abort
     // startup. Turso enforces foreign keys for the multipart-parts cascade the store relies on.
+    let sync = if opts.synchronous_full {
+        "FULL"
+    } else {
+        "NORMAL"
+    };
     let _ = conn.execute_batch("PRAGMA foreign_keys=ON;").await;
+    let _ = conn
+        .execute_batch(&format!("PRAGMA synchronous={sync};"))
+        .await;
+    let _ = conn.execute_batch("PRAGMA temp_store=MEMORY;").await;
     Ok(())
 }
 
