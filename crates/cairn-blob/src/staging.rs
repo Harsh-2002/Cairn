@@ -81,15 +81,12 @@ impl Staging {
         }
     }
 
-    /// Commit the staged file durably into `final_path` inside `bucket_dir`, preserving the F-1
-    /// ordering: fsync the file, rename it in, then fsync the destination directory. The caller is
-    /// responsible for having created `bucket_dir` (and fsynced its parent when newly created)
-    /// *before* calling this, exactly as on the legacy path.
-    pub(crate) async fn commit(
-        self,
-        final_path: &Path,
-        bucket_dir: &Path,
-    ) -> Result<(), BlobError> {
+    /// Commit the staged file durably into `final_path`, preserving the F-1 ordering up to the
+    /// rename: fdatasync the file, then rename it in. The caller must have created the destination
+    /// (bucket) directory beforehand, and must fsync that directory *after* this returns — through
+    /// [`crate::commit::DirSyncCoalescer`], which coalesces concurrent same-directory PUTs into one
+    /// fsync — before treating the blob as durable (ARCH §8.2).
+    pub(crate) async fn commit(self, final_path: &Path) -> Result<(), BlobError> {
         match self {
             Staging::Tokio {
                 writer,
@@ -99,10 +96,10 @@ impl Staging {
                 let mut writer = writer;
                 writer.flush().await.map_err(io_err)?;
                 let file = writer.into_inner();
-                // 1) fdatasync the staged file, 2) rename it in, 3) fsync the destination directory.
-                // `sync_data` (fdatasync) persists the bytes and the size needed to read them back,
-                // skipping only the inode timestamps we never depend on — one fewer metadata-journal
-                // write per PUT than `sync_all` while keeping the blob fully durable (ARCH §8.2).
+                // 1) fdatasync the staged file, 2) rename it in. The destination-directory fsync is
+                // the caller's coalesced step. `sync_data` (fdatasync) persists the bytes and the
+                // size needed to read them back, skipping only the inode timestamps we never depend
+                // on — one fewer metadata-journal write per PUT than `sync_all` (ARCH §8.2).
                 file.sync_data().await.map_err(io_err)?;
                 // For a known-large write, drop the just-written pages so a stream of bulk uploads
                 // does not evict the page cache hot reads depend on (ARCH §7.5). Best-effort.
@@ -116,14 +113,10 @@ impl Staging {
                 tokio::fs::rename(&staging_path, final_path)
                     .await
                     .map_err(io_err)?;
-                crate::fsync_dir(bucket_dir).await?;
                 Ok(())
             }
             #[cfg(feature = "io-uring")]
-            Staging::Uring(s) => {
-                s.commit(final_path.to_path_buf(), bucket_dir.to_path_buf())
-                    .await
-            }
+            Staging::Uring(s) => s.commit(final_path.to_path_buf()).await,
         }
     }
 

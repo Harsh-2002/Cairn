@@ -148,10 +148,10 @@ pub(crate) struct UringStaging {
 enum WriteCmd {
     /// Append these bytes at the current offset; ack over the bundled sender.
     Chunk(Vec<u8>, oneshot::Sender<Result<(), BlobError>>),
-    /// fsync file → rename(tmp,dst) → fsync(dst_dir); the staging task ends after this.
+    /// fdatasync file → rename(tmp,dst); the staging task ends after this. The destination-directory
+    /// fsync is the caller's coalesced step (see [`crate::commit::DirSyncCoalescer`]).
     Commit {
         final_path: PathBuf,
-        bucket_dir: PathBuf,
         reply: oneshot::Sender<Result<(), BlobError>>,
     },
     /// fsync the file in place (no rename); the staging task ends after this.
@@ -199,18 +199,14 @@ impl UringStaging {
             .map_err(|_| BlobError::Io("io_uring staging writer dropped a write".into()))?
     }
 
-    /// Commit the staged file durably: fsync the file, rename it into `final_path`, then fsync the
-    /// destination directory — the exact F-1 ordering of the `tokio::fs` path.
-    pub(crate) async fn commit(
-        mut self,
-        final_path: PathBuf,
-        bucket_dir: PathBuf,
-    ) -> Result<(), BlobError> {
+    /// Commit the staged file durably up to the rename: fdatasync the file, then rename it into
+    /// `final_path` — matching the `tokio::fs` path. The caller issues the coalesced
+    /// destination-directory fsync afterward (see [`crate::commit::DirSyncCoalescer`]).
+    pub(crate) async fn commit(mut self, final_path: PathBuf) -> Result<(), BlobError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.cmd_tx
             .send(WriteCmd::Commit {
                 final_path,
-                bucket_dir,
                 reply: reply_tx,
             })
             .await
@@ -293,12 +289,8 @@ async fn writer_task(
                     }
                 }
             }
-            WriteCmd::Commit {
-                final_path,
-                bucket_dir,
-                reply,
-            } => {
-                let result = commit_on_executor(&staging, file, &final_path, &bucket_dir).await;
+            WriteCmd::Commit { final_path, reply } => {
+                let result = commit_on_executor(&staging, file, &final_path).await;
                 let _ = reply.send(result.clone_shallow());
                 let _ = final_tx.send(result);
                 return;
@@ -327,14 +319,14 @@ async fn writer_task(
     let _ = final_tx.send(Ok(()));
 }
 
-/// The durable commit, issued entirely as io_uring ops on the executor thread that owns `file`:
-/// fsync the staged file, rename it into place, then fsync the destination directory. This is the
-/// F-1 ordering (ARCH §8.2) and matches the `tokio::fs` path step for step.
+/// The durable commit up to the rename, issued as io_uring ops on the executor thread that owns
+/// `file`: fdatasync the staged file, then rename it into place. The destination-directory fsync
+/// (F-1 step 3) is the caller's coalesced step (see [`crate::commit::DirSyncCoalescer`]); this
+/// matches the `tokio::fs` path step for step.
 async fn commit_on_executor(
     staging: &Path,
     file: tokio_uring::fs::File,
     final_path: &Path,
-    bucket_dir: &Path,
 ) -> Result<(), BlobError> {
     // 1) fdatasync the staged file: persist its bytes and size, skipping the timestamp-only
     //    metadata `sync_all` would also flush — one fewer journal write per PUT (ARCH §8.2).
@@ -344,17 +336,7 @@ async fn commit_on_executor(
     tokio_uring::fs::rename(staging, final_path)
         .await
         .map_err(io_err)?;
-    // 3) fsync the destination directory so the new entry is durable (F-1).
-    fsync_dir_uring(bucket_dir).await?;
     Ok(())
-}
-
-/// fsync a directory via io_uring: open it read-only (a directory fd) and issue `IORING_OP_FSYNC`.
-pub(crate) async fn fsync_dir_uring(dir: &Path) -> Result<(), BlobError> {
-    let d = tokio_uring::fs::File::open(dir).await.map_err(io_err)?;
-    let res = d.sync_all().await.map_err(io_err);
-    let _ = d.close().await;
-    res
 }
 
 /// `BlobError` is not `Clone`; this gives us a cheap shallow clone for the two-sink fan-out

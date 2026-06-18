@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+mod commit;
 mod compress;
 mod hash;
 // Safe file-placement hints (preallocation + access advice) for the write fast path (ARCH §7.5).
@@ -67,6 +68,10 @@ pub struct LocalBlobStore {
     /// this many of the runtime's blocking-pool threads and cannot starve the threads the reactor
     /// and metadata reads need. Sized to the device's useful I/O concurrency.
     io_permits: Arc<tokio::sync::Semaphore>,
+    /// Coalesces the per-bucket-directory fsync of the commit sequence: concurrent PUTs into the
+    /// same bucket share one directory fsync instead of issuing one each (ARCH §8.2). Shared across
+    /// clones of the store, so every writer feeds the same coordinator.
+    dir_sync: Arc<commit::DirSyncCoalescer>,
 }
 
 /// The default bound on concurrent blob transfers when not overridden (ARCH §7.4). A reasonable
@@ -92,6 +97,7 @@ impl LocalBlobStore {
             data_root: Arc::new(data_root),
             use_uring: cfg!(feature = "io-uring"),
             io_permits: Arc::new(tokio::sync::Semaphore::new(DEFAULT_BLOB_IO_CONCURRENCY)),
+            dir_sync: Arc::new(commit::DirSyncCoalescer::spawn()),
         })
     }
 
@@ -451,9 +457,13 @@ impl BlobStore for LocalBlobStore {
         };
         // Create (and fsync the parent of) the bucket directory *before* the rename, so the
         // commit can rename into an already-durable directory entry (F-1, ARCH §8.2 step 4). The
-        // commit itself performs: fsync the staged file → rename → fsync the destination dir.
+        // commit performs: fdatasync the staged file → rename. The destination-directory fsync that
+        // makes the new entry durable is then issued through the coalescer, which batches it with
+        // any concurrent PUTs into the same bucket into a single fsync. `sync_dir` resolves only
+        // after that fsync completes, so the blob is fully durable before we proceed.
         ensure_bucket_dir(&self.data_root, &bucket_dir).await?;
-        sink.commit(&final_path, &bucket_dir).await?;
+        sink.commit(&final_path).await?;
+        self.dir_sync.sync_dir(&bucket_dir).await?;
         // The crash window the durability ordering protects: the blob is now durable but no
         // metadata row references it yet. A crash here leaves an orphan that reconcile reclaims.
         fail::fail_point!("blob_after_durable");
@@ -668,7 +678,8 @@ impl BlobStore for LocalBlobStore {
         };
 
         ensure_bucket_dir(&self.data_root, &bucket_dir).await?;
-        sink.commit(&final_path, &bucket_dir).await?;
+        sink.commit(&final_path).await?;
+        self.dir_sync.sync_dir(&bucket_dir).await?;
         fail::fail_point!("blob_after_assemble");
 
         let md5_hex = hex::encode(hasher.finalize());
