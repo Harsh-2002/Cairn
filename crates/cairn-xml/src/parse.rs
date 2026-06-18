@@ -44,33 +44,53 @@ where
     cfg.trim_text(true);
 
     let mut depth: u32 = 0;
+    // Coalesce consecutive Text/CData into a single buffer, flushed as ONE `Sax::Text` on the next
+    // structural event. quick-xml splits an element's character data into multiple events around
+    // CDATA boundaries and the like, so emitting each chunk separately made handlers that store the
+    // "current" text keep only the LAST chunk — corrupting keys/ETags and splitting CORS origins
+    // across chunks (audit #24). Buffering yields exactly one Text event per contiguous text run,
+    // preserving the prior "emit a Text whenever character data was seen" semantics.
+    let mut text_buf: Option<String> = None;
+    macro_rules! flush_text {
+        () => {
+            if let Some(s) = text_buf.take() {
+                on_event(Sax::Text(std::borrow::Cow::Owned(s)))?;
+            }
+        };
+    }
     loop {
         match reader.read_event().map_err(|_| malformed())? {
             Event::Start(e) => {
+                flush_text!();
                 depth += 1;
                 on_event(Sax::Open(local(e.name())))?;
             }
             Event::Empty(e) => {
                 // A self-closing tag is an open immediately followed by a close.
+                flush_text!();
                 let name = local(e.name());
                 on_event(Sax::Open(name.clone()))?;
                 on_event(Sax::Close(name))?;
             }
             Event::Text(t) => {
                 let text = t.unescape().map_err(|_| malformed())?;
-                on_event(Sax::Text(text))?;
+                text_buf.get_or_insert_with(String::new).push_str(&text);
             }
             Event::CData(t) => {
                 let text = t.decode().map_err(|_| malformed())?;
-                on_event(Sax::Text(text))?;
+                text_buf.get_or_insert_with(String::new).push_str(&text);
             }
             Event::End(e) => {
                 // quick-xml's check_end_names guarantees this matches the open, but guard
                 // against an underflow regardless.
+                flush_text!();
                 depth = depth.checked_sub(1).ok_or_else(malformed)?;
                 on_event(Sax::Close(local(e.name())))?;
             }
-            Event::Eof => break,
+            Event::Eof => {
+                flush_text!();
+                break;
+            }
             _ => {}
         }
     }

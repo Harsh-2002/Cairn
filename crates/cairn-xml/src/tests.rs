@@ -336,6 +336,24 @@ fn round_trip_tagging() {
 }
 
 #[test]
+fn text_split_across_cdata_is_coalesced() {
+    // Audit #24: character data split across text/CDATA chunks must coalesce into the full value,
+    // not collapse to only the last chunk.
+    let body = "<Tagging><TagSet><Tag>\
+        <Key>k</Key><Value>foo<![CDATA[bar]]>baz</Value>\
+        </Tag></TagSet></Tagging>";
+    let tags = parse_tagging(body.as_bytes()).unwrap();
+    assert_eq!(tags, vec![("k".to_owned(), "foobarbaz".to_owned())]);
+
+    // Same for a CompleteMultipartUpload ETag split by a CDATA section.
+    let mp = "<CompleteMultipartUpload><Part>\
+        <PartNumber>1</PartNumber><ETag>\"ab<![CDATA[cd]]>ef\"</ETag>\
+        </Part></CompleteMultipartUpload>";
+    let parts = parse_complete_multipart(mp.as_bytes()).unwrap();
+    assert_eq!(parts, vec![(1, "abcdef".to_owned())]);
+}
+
+#[test]
 fn validate_tags_enforces_s3_limits() {
     use crate::parse::{MAX_TAGS_BUCKET, MAX_TAGS_OBJECT, validate_tags};
     fn pairs(p: &[(&str, &str)]) -> Vec<(String, String)> {
