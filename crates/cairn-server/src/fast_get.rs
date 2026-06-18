@@ -95,12 +95,15 @@ pub async fn try_sendfile_get(stream: TcpStream, stack: &AppStack, peer: SocketA
     let Some(head) = parse_head(&buf[..head_len]) else {
         return Fast::Fallback { stream };
     };
-    // Only a clean, full, unconditional GET with no body is eligible; everything else goes to hyper.
+    // A clean, unconditional GET with no body is eligible — including a single-`Range` GET, which
+    // `S3Service::handle` resolves to a sub-range `ZeroCopy{offset,length}` with a 206 status and a
+    // `Content-Range` header that we relay verbatim (Phase 2.6). Conditional GETs, bodies, and
+    // upgrades still go to hyper. A multi-range or unsatisfiable range makes `handle` return a
+    // non-`ZeroCopy` body, which falls back below — so this stays strictly additive.
     let has = |n: &str| head.headers.iter().any(|(k, _)| k == n);
     if !head.is_get
         || has("content-length")
         || has("transfer-encoding")
-        || has("range")
         || has("if-none-match")
         || has("if-modified-since")
         || has("if-match")
@@ -176,8 +179,10 @@ pub async fn try_sendfile_get(stream: TcpStream, stack: &AppStack, peer: SocketA
     };
 
     // Build the response head. `sendfile` writes the body, and we always close (no keep-alive on the
-    // fast path), so drop any inbound connection header and append our own.
-    let mut out = format!("HTTP/1.1 {} OK\r\n", resp.status.as_u16());
+    // fast path), so drop any inbound connection header and append our own. Use the status's
+    // canonical reason phrase so a ranged response is the correct `206 Partial Content`, not `OK`.
+    let reason = resp.status.canonical_reason().unwrap_or("OK");
+    let mut out = format!("HTTP/1.1 {} {reason}\r\n", resp.status.as_u16());
     for (k, v) in &resp.headers {
         if k.eq_ignore_ascii_case("connection") {
             continue;
