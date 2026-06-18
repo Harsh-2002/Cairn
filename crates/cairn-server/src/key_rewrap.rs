@@ -9,10 +9,9 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use cairn_crypto::SystemCrypto;
 use cairn_meta::SqliteMetadataStore;
-use cairn_types::bucket::{ConfigAspect, ConfigDoc};
+use cairn_types::bucket::ConfigAspect;
 use cairn_types::crypto::Nonce;
 use cairn_types::error::MetaError;
-use cairn_types::meta::Mutation;
 use cairn_types::traits::{Crypto, MetadataStore};
 use std::sync::Arc;
 use std::time::Duration;
@@ -103,10 +102,15 @@ async fn rewrap_sse(store: &SqliteMetadataStore, crypto: &SystemCrypto) -> Resul
         for (pk, descriptor) in page {
             last = Some(pk.clone());
             match rewrap_sse_descriptor(crypto, &descriptor) {
-                Ok(Some(new_desc)) => match store.rewrap_set_sse(pk.clone(), new_desc).await {
-                    Ok(()) => done += 1,
-                    Err(_) => failed += 1,
-                },
+                // Compare-and-swap on the descriptor we read: if a concurrent write changed the row
+                // meanwhile, the CAS no-ops (it is already current) rather than clobbering it.
+                Ok(Some(new_desc)) => {
+                    match store.rewrap_set_sse(pk.clone(), descriptor, new_desc).await {
+                        Ok(true) => done += 1,
+                        Ok(false) => {} // CAS miss: row changed concurrently; leave it
+                        Err(_) => failed += 1,
+                    }
+                }
                 Ok(None) => {} // already active key — skip
                 Err(()) => {
                     failed += 1;
@@ -181,12 +185,15 @@ async fn rewrap_users(store: &SqliteMetadataStore, crypto: &SystemCrypto) -> Res
                 .open(&ct, &Nonce(nonce.unwrap_or_default()))
                 .and_then(|secret| crypto.seal(&secret))
             {
+                // Compare-and-swap on the secret we read: a concurrent credential rotation (which
+                // re-seals under the active key) is NOT clobbered — the CAS just no-ops.
                 Ok(resealed) => {
                     match store
-                        .rewrap_set_user_sigv4(id.clone(), resealed.ciphertext)
+                        .rewrap_set_user_sigv4(id.clone(), ct, resealed.ciphertext)
                         .await
                     {
-                        Ok(()) => done += 1,
+                        Ok(true) => done += 1,
+                        Ok(false) => {} // CAS miss: rotated concurrently; the newer value stands
                         Err(_) => failed += 1,
                     }
                 }
@@ -228,7 +235,10 @@ async fn rewrap_targets(
         else {
             continue;
         };
-        let Ok(mut targets) = cairn_replication::parse_targets(doc.0.as_bytes()) else {
+        // Keep the doc we read as the compare-and-swap witness, so a concurrently-added/edited
+        // target list is never clobbered by our re-seal (audit #29 lost-update).
+        let expected = doc.0;
+        let Ok(mut targets) = cairn_replication::parse_targets(expected.as_bytes()) else {
             continue;
         };
         let mut changed = false;
@@ -252,13 +262,22 @@ async fn rewrap_targets(
             }
         }
         if changed {
-            store
-                .submit(Mutation::SetBucketConfig {
-                    bucket: b.name.clone(),
-                    aspect: ConfigAspect::ReplicationTargets,
-                    doc: Some(ConfigDoc(cairn_replication::serialize_targets(&targets))),
-                })
-                .await?;
+            let new_doc = cairn_replication::serialize_targets(&targets);
+            match store
+                .rewrap_set_bucket_config_cas(
+                    b.name.to_string(),
+                    ConfigAspect::ReplicationTargets,
+                    expected,
+                    new_doc,
+                )
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::debug!(bucket = %b.name, "target re-wrap CAS miss; retrying next pass");
+                }
+                Err(e) => return Err(e),
+            }
         }
     }
     // Targets have no resume cursor (each pass scans every bucket), so any pass with zero failures

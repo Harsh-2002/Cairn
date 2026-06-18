@@ -139,20 +139,26 @@ impl SqliteMetadataStore {
         .await
     }
 
-    /// Replace one object version's SSE descriptor (re-wrapped under the active key).
+    /// Replace one object version's SSE descriptor with its re-wrapped form, but ONLY if the stored
+    /// descriptor still equals what the worker read (`expected`). The compare-and-swap closes the
+    /// re-wrap lost-update window: if anything changed the row meanwhile, the update is a no-op and
+    /// returns `false` rather than clobbering the newer value (audit #29). Returns whether a row was
+    /// updated.
     pub async fn rewrap_set_sse(
         &self,
         version_pk: String,
+        expected: String,
         descriptor: String,
-    ) -> Result<(), MetaError> {
+    ) -> Result<bool, MetaError> {
         self.writer
             .run_exec(move |conn| {
-                conn.execute(
-                    "UPDATE object_versions SET sse_descriptor=?1 WHERE id=?2",
-                    params![descriptor, version_pk],
-                )
-                .map_err(engine_err)?;
-                Ok(())
+                let n = conn
+                    .execute(
+                        "UPDATE object_versions SET sse_descriptor=?1 WHERE id=?2 AND sse_descriptor=?3",
+                        params![descriptor, version_pk, expected],
+                    )
+                    .map_err(engine_err)?;
+                Ok(n > 0)
             })
             .await
     }
@@ -181,20 +187,51 @@ impl SqliteMetadataStore {
         .await
     }
 
-    /// Replace one user's SigV4 secret ciphertext (re-wrapped) and NULL the legacy nonce column.
+    /// Replace one user's SigV4 secret ciphertext with its re-wrapped form (NULLing the legacy
+    /// nonce), but ONLY if the stored ciphertext still equals what the worker read (`expected`). The
+    /// compare-and-swap closes the lost-update window where a concurrent credential rotation would
+    /// otherwise be reverted by the re-wrap write (audit #29). Returns whether a row was updated.
     pub async fn rewrap_set_user_sigv4(
         &self,
         user_id: String,
+        expected: Vec<u8>,
         ciphertext: Vec<u8>,
-    ) -> Result<(), MetaError> {
+    ) -> Result<bool, MetaError> {
         self.writer
             .run_exec(move |conn| {
-                conn.execute(
-                    "UPDATE users SET sigv4_secret_ciphertext=?1, sigv4_secret_nonce=NULL WHERE id=?2",
-                    params![ciphertext, user_id],
-                )
-                .map_err(engine_err)?;
-                Ok(())
+                let n = conn
+                    .execute(
+                        "UPDATE users SET sigv4_secret_ciphertext=?1, sigv4_secret_nonce=NULL
+                         WHERE id=?2 AND sigv4_secret_ciphertext=?3",
+                        params![ciphertext, user_id, expected],
+                    )
+                    .map_err(engine_err)?;
+                Ok(n > 0)
+            })
+            .await
+    }
+
+    /// Compare-and-swap a bucket-config aspect document: replace `aspect`'s doc with `new_doc` only
+    /// if it still equals `expected`. Used by the re-wrap worker to update re-sealed replication
+    /// targets without clobbering a concurrently-edited target list (audit #29). Returns whether a
+    /// row was updated.
+    pub async fn rewrap_set_bucket_config_cas(
+        &self,
+        bucket: String,
+        aspect: ConfigAspect,
+        expected: String,
+        new_doc: String,
+    ) -> Result<bool, MetaError> {
+        let aspect_s = crate::apply::aspect_str(aspect);
+        self.writer
+            .run_exec(move |conn| {
+                let n = conn
+                    .execute(
+                        "UPDATE bucket_config SET doc=?1 WHERE bucket_name=?2 AND aspect=?3 AND doc=?4",
+                        params![new_doc, bucket, aspect_s, expected],
+                    )
+                    .map_err(engine_err)?;
+                Ok(n > 0)
             })
             .await
     }

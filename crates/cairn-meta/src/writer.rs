@@ -30,7 +30,9 @@ pub struct WalCheckpointStats {
 }
 
 /// A boxed write closure run on the writer thread, serialized with mutations (audit #29 re-wrap).
-type ExecJob = Box<dyn FnOnce(&Connection) -> Result<(), MetaError> + Send>;
+/// The closure owns its own typed reply channel (so [`Writer::run_exec`] can return any `T`), and
+/// is run under a panic guard so a panicking closure cannot wedge the single writer thread.
+type ExecJob = Box<dyn FnOnce(&Connection) + Send>;
 
 /// A control message multiplexed onto the writer's queue so it runs on the writer thread,
 /// serialized with — and never contending against — ordinary mutations.
@@ -42,8 +44,9 @@ enum Control {
     Probe(oneshot::Sender<()>),
     /// Run an arbitrary write closure on the writer's connection, serialized with all mutations
     /// (so it never races them or hits SQLITE_BUSY). Used by the master-key re-wrap worker to
-    /// re-seal stored secrets and update the rotation state tables (audit #29, sqlite-only).
-    Exec(ExecJob, oneshot::Sender<Result<(), MetaError>>),
+    /// re-seal stored secrets and update the rotation state tables (audit #29, sqlite-only). The
+    /// closure carries its own typed reply channel and is run under a panic guard.
+    Exec(ExecJob),
 }
 
 /// One unit of work for the writer loop: either a batched mutation or a control message.
@@ -136,13 +139,19 @@ impl Writer {
     ///
     /// # Errors
     /// [`MetaError::WriterClosed`] if the writer has shut down, or whatever the closure returns.
-    pub async fn run_exec<F>(&self, f: F) -> Result<(), MetaError>
+    pub async fn run_exec<F, T>(&self, f: F) -> Result<T, MetaError>
     where
-        F: FnOnce(&Connection) -> Result<(), MetaError> + Send + 'static,
+        F: FnOnce(&Connection) -> Result<T, MetaError> + Send + 'static,
+        T: Send + 'static,
     {
         let (reply_tx, reply_rx) = oneshot::channel();
+        let job: ExecJob = Box::new(move |conn| {
+            // The closure owns the reply channel, so `run_exec` can return any `T`. A panic inside
+            // `f` is caught in `run_control`; the dropped sender then surfaces as `WriterClosed`.
+            let _ = reply_tx.send(f(conn));
+        });
         self.tx
-            .send(Job::Control(Control::Exec(Box::new(f), reply_tx)))
+            .send(Job::Control(Control::Exec(job)))
             .await
             .map_err(|_| MetaError::WriterClosed)?;
         reply_rx.await.map_err(|_| MetaError::WriterClosed)?
@@ -224,8 +233,11 @@ fn run_control(conn: &Connection, ctl: Control) {
         Control::Probe(reply) => {
             let _ = reply.send(());
         }
-        Control::Exec(job, reply) => {
-            let _ = reply.send(job(conn));
+        Control::Exec(job) => {
+            // Run arbitrary re-wrap closures under a panic guard: a panicking job must not unwind
+            // and kill the single writer thread (audit #29). On panic the job's reply sender is
+            // dropped, so its caller observes `WriterClosed` while the writer keeps draining.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(conn)));
         }
     }
 }

@@ -558,6 +558,14 @@ impl Config {
         // first secret seal/open. Otherwise a present single `master_key` must be 64 hex chars.
         // (There is no separate public-read signing secret — the share-URL key derives from the
         // master key.)
+        // A pinned active id only makes sense with a ring; without one it would be silently ignored
+        // (a single `master_key` is always id 1), so reject the combination rather than mislead.
+        if self.master_key_ring.is_none() && self.master_key_active_id.is_some() {
+            return Err(ConfigError::Invalid(
+                "CAIRN_MASTER_KEY_ACTIVE_ID is only valid together with CAIRN_MASTER_KEY_RING"
+                    .into(),
+            ));
+        }
         if let Some(ring_json) = &self.master_key_ring {
             let keys = parse_key_ring(ring_json)
                 .map_err(|e| ConfigError::Invalid(format!("CAIRN_MASTER_KEY_RING {e}")))?;
@@ -599,8 +607,10 @@ impl Config {
     }
 }
 
-/// One entry of the master-key ring (`CAIRN_MASTER_KEY_RING`, audit #29).
+/// One entry of the master-key ring (`CAIRN_MASTER_KEY_RING`, audit #29). Strict like [`Config`]:
+/// an unexpected field (e.g. a typo'd key name) is rejected rather than silently ignored.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct KeySpec {
     id: u16,
     key: String,
@@ -662,6 +672,65 @@ mod tests {
     #[test]
     fn default_is_valid() {
         assert!(base().validate().is_ok());
+    }
+
+    fn hex64(b: u8) -> String {
+        format!("{b:02x}").repeat(32)
+    }
+
+    #[test]
+    fn parse_key_ring_accepts_a_valid_ring() {
+        let json = format!(
+            r#"[{{"id":1,"key":"{}"}},{{"id":2,"key":"{}"}}]"#,
+            hex64(0xab),
+            hex64(0xcd)
+        );
+        let keys = parse_key_ring(&json).expect("valid ring");
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].0, 1);
+        assert_eq!(keys[1].0, 2);
+        assert_eq!(keys[0].1, [0xabu8; 32]);
+    }
+
+    #[test]
+    fn parse_key_ring_rejects_malformed_rings() {
+        assert!(parse_key_ring("not json").is_err());
+        assert!(parse_key_ring("[]").is_err(), "empty ring");
+        assert!(
+            parse_key_ring(&format!(r#"[{{"id":0,"key":"{}"}}]"#, hex64(1))).is_err(),
+            "id 0 reserved"
+        );
+        let dup = format!(
+            r#"[{{"id":1,"key":"{}"}},{{"id":1,"key":"{}"}}]"#,
+            hex64(1),
+            hex64(2)
+        );
+        assert!(parse_key_ring(&dup).is_err(), "duplicate id");
+        assert!(
+            parse_key_ring(r#"[{"id":1,"key":"abcd"}]"#).is_err(),
+            "key not 64 hex chars"
+        );
+        assert!(
+            parse_key_ring(&format!(r#"[{{"id":1,"key":"{}","oops":1}}]"#, hex64(1))).is_err(),
+            "unknown field rejected (deny_unknown_fields)"
+        );
+    }
+
+    #[test]
+    fn rejects_active_id_without_a_ring() {
+        let mut c = base();
+        c.master_key = Some(hex64(7));
+        c.master_key_active_id = Some(2);
+        assert!(c.validate().is_err(), "active id requires a ring");
+        // With a matching ring it validates.
+        c.master_key_ring = Some(format!(r#"[{{"id":2,"key":"{}"}}]"#, hex64(7)));
+        assert!(c.validate().is_ok());
+        // An active id absent from the ring is rejected.
+        c.master_key_active_id = Some(9);
+        assert!(
+            c.validate().is_err(),
+            "active id must be present in the ring"
+        );
     }
 
     #[test]

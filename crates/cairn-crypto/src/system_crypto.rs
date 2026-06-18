@@ -13,7 +13,7 @@ use cairn_types::error::CryptoError;
 use cairn_types::traits::Crypto;
 use rand::RngCore;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -89,6 +89,9 @@ pub struct SystemCrypto {
     seal_count: AtomicU64,
     /// The seal count loaded from durable state at startup, added to `seal_count` (Phase E).
     seal_count_base: AtomicU64,
+    /// One-shot latch so the 75% "rotate soon" alert logs exactly once per process — even when the
+    /// counter is primed (restart) past the threshold or concurrent seals step over the exact value.
+    alerted: AtomicBool,
 }
 
 impl core::fmt::Debug for SystemCrypto {
@@ -114,6 +117,7 @@ impl SystemCrypto {
             legacy_id: 1,
             seal_count: AtomicU64::new(0),
             seal_count_base: AtomicU64::new(0),
+            alerted: AtomicBool::new(false),
         }
     }
 
@@ -174,6 +178,7 @@ impl SystemCrypto {
             legacy_id,
             seal_count: AtomicU64::new(0),
             seal_count_base: AtomicU64::new(seal_count_base),
+            alerted: AtomicBool::new(false),
         })
     }
 
@@ -282,7 +287,9 @@ impl Crypto for SystemCrypto {
         if count >= STOP_THRESHOLD {
             return Err(CryptoError::KeyRotationRequired);
         }
-        if count == ALERT_THRESHOLD {
+        // Fire the "rotate soon" alert once, on the first seal at/above 75% — using `>=` plus a
+        // one-shot latch so a primed-past-threshold restart or concurrent seals can't skip it.
+        if count >= ALERT_THRESHOLD && !self.alerted.swap(true, Ordering::Relaxed) {
             tracing::warn!(
                 active_key_id = self.active_id,
                 seal_count = count,
@@ -541,6 +548,24 @@ mod tests {
             c.open(&ct, &Nonce(nonce.to_vec())).expect("open"),
             b"still readable"
         );
+    }
+
+    #[test]
+    fn seal_warns_once_above_alert_without_blocking() {
+        let c = crypto();
+        // Primed past 75% but below the 95% hard stop (the restart-past-threshold case): seals must
+        // still succeed and the one-shot alert latch must flip (so the warning fires exactly once).
+        c.prime_seal_count(ALERT_THRESHOLD + 5);
+        assert!(!c.alerted.load(Ordering::Relaxed));
+        assert!(
+            c.seal(b"a").is_ok(),
+            "a seal above the alert still succeeds"
+        );
+        assert!(
+            c.alerted.load(Ordering::Relaxed),
+            "alert latched on first seal past 75%"
+        );
+        assert!(c.seal(b"b").is_ok(), "subsequent seals keep succeeding");
     }
 
     #[test]
