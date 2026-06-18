@@ -865,9 +865,18 @@ impl S3Service {
             created_at: now,
             updated_at: now,
         };
-        self.meta
+        // Use the upload id the STORE returns, not the locally-generated one: under metadata
+        // sharding the store encodes the owning shard into the id so every later part/complete/abort
+        // op routes back to the same shard. Returning the un-encoded local id would strand the
+        // upload on the wrong shard (audit #4).
+        let upload_id = match self
+            .meta
             .submit(Mutation::CreateMultipart(Box::new(session)))
-            .await?;
+            .await?
+        {
+            MutationOutcome::MultipartCreated(id) => id,
+            _ => return Err(Error::Internal("unexpected multipart outcome".to_owned())),
+        };
         let body = cairn_xml::initiate_multipart_result(
             bucket.name.as_str(),
             key.as_str(),

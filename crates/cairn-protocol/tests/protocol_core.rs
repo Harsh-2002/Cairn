@@ -69,6 +69,35 @@ async fn harness_with_authz(authz: Arc<dyn cairn_types::traits::AuthorizationEng
     }
 }
 
+/// A harness whose metadata store is a [`ShardedMetadataStore`] over `shards` in-memory shards, to
+/// exercise the protocol layer end-to-end under metadata sharding.
+async fn harness_sharded(shards: usize) -> Harness {
+    let dir = tempfile::tempdir().unwrap();
+    let inner: Vec<Arc<dyn MetadataStore>> = (0..shards)
+        .map(|_| Arc::new(cairn_meta::open_in_memory().unwrap()) as Arc<dyn MetadataStore>)
+        .collect();
+    let meta: Arc<dyn MetadataStore> = Arc::new(cairn_meta::ShardedMetadataStore::new(inner));
+    let blob: Arc<dyn BlobStore> =
+        Arc::new(cairn_blob::LocalBlobStore::open(dir.path()).await.unwrap());
+    let clock = Arc::new(cairn_types::testing::TestClock::default());
+    let crypto: Arc<dyn cairn_types::traits::Crypto> =
+        Arc::new(cairn_crypto::SystemCrypto::new([7u8; 32]));
+    let svc = S3Service::new(
+        meta.clone(),
+        blob,
+        Arc::new(cairn_types::testing::AllowAll),
+        clock,
+        crypto,
+        "us-east-1".to_owned(),
+        5 * 1024 * 1024 * 1024,
+    );
+    Harness {
+        svc,
+        meta,
+        _dir: dir,
+    }
+}
+
 fn req(
     method: Method,
     bucket: Option<&str>,
@@ -992,6 +1021,105 @@ async fn multipart_lifecycle() {
     expected.extend_from_slice(&part2);
     assert_eq!(got.len(), expected.len());
     assert_eq!(got, expected);
+}
+
+/// A full multipart cycle must work under metadata sharding (audit #4): the upload id the client
+/// receives from Initiate must carry the owning shard, so the later UploadPart / Complete route back
+/// to the shard that holds the session. Before the fix the protocol returned the un-encoded local id
+/// and UploadPart 404'd on the wrong shard.
+#[tokio::test]
+async fn multipart_cycle_works_under_sharding() {
+    let h = harness_sharded(3).await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("mpshard"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+
+    // Initiate → the returned upload id is shard-encoded.
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::POST,
+                Some("mpshard"),
+                Some("big"),
+                &[("uploads", "")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let upload_id = between(
+        &String::from_utf8(body).unwrap(),
+        "<UploadId>",
+        "</UploadId>",
+    );
+
+    // A single part (last part may be small).
+    let part = vec![b'z'; 4096];
+    let (st, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("mpshard"),
+                Some("big"),
+                &[("uploadId", upload_id.as_str()), ("partNumber", "1")],
+                &[],
+                part.clone(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "UploadPart must route to the upload's shard"
+    );
+    let etag = header(&hdrs, "etag").unwrap().to_owned();
+
+    let complete = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part></CompleteMultipartUpload>"
+    );
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::POST,
+                Some("mpshard"),
+                Some("big"),
+                &[("uploadId", upload_id.as_str())],
+                &[],
+                complete.into_bytes(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "CompleteMultipartUpload must route to the upload's shard"
+    );
+
+    let (st, _, got) = drain(
+        send(
+            &h.svc,
+            req(Method::GET, Some("mpshard"), Some("big"), &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(got, part);
 }
 
 #[tokio::test]
