@@ -207,25 +207,6 @@ async fn ensure_bucket_dir(data_root: &Path, bucket_dir: &Path) -> Result<(), Bl
     Ok(())
 }
 
-/// Detect the compressed format by its self-describing trailer magic.
-async fn is_compressed_blob(path: &Path) -> Result<bool, BlobError> {
-    let meta = tokio::fs::metadata(path).await.map_err(io_err)?;
-    if meta.len() < 34 {
-        return Ok(false);
-    }
-    let path = path.to_owned();
-    tokio::task::spawn_blocking(move || {
-        use std::io::{Read, Seek, SeekFrom};
-        let mut f = std::fs::File::open(&path).map_err(io_err)?;
-        f.seek(SeekFrom::End(-34)).map_err(io_err)?;
-        let mut magic = [0u8; 4];
-        f.read_exact(&mut magic).map_err(io_err)?;
-        Ok(&magic == b"CRNB")
-    })
-    .await
-    .map_err(|e| BlobError::Io(e.to_string()))?
-}
-
 /// Stream a body into a staging file, applying compression and hashing in one pass. The staging
 /// sink abstracts the file backend (default `tokio::fs`, or io_uring under the feature), so this
 /// transform is identical on both paths.
@@ -319,6 +300,78 @@ async fn write_staged(
 /// Stream a read of `[offset, offset+len)` logical bytes from a blob file, decompressing (and,
 /// when `dek` is supplied, decrypting) only the overlapping blocks. Runs the blocking file work off
 /// the reactor and yields chunks.
+/// The blocking body of a streamed read: open the file and push chunks of `[offset, offset+len)`
+/// into `tx`, decompressing/decrypting per block when `compressed`. A send failure (the consumer
+/// dropped the body) ends the transfer early. Factored out of [`read_stream`] so the open + read
+/// happen only when the stream is actually polled.
+fn stream_blob(
+    path: &Path,
+    compressed: bool,
+    dek: Option<[u8; 32]>,
+    offset: u64,
+    len: u64,
+    tx: &tokio::sync::mpsc::Sender<Result<Bytes, BlobError>>,
+) -> Result<(), BlobError> {
+    use std::io::{Read, Seek, SeekFrom};
+    if compressed {
+        let f = std::fs::File::open(path).map_err(io_err)?;
+        let mut reader = CompressedReader::open_with_dek(f, dek)?;
+        let bs = reader.block_size();
+        let end = offset.saturating_add(len).min(reader.logical_len());
+        if bs == 0 || offset >= end {
+            return Ok(());
+        }
+        let first = offset / bs;
+        let last = (end - 1) / bs;
+        for b in first..=last {
+            let bstart = b * bs;
+            let lo = offset.max(bstart);
+            let hi = end.min(bstart + bs);
+            let data = reader.read_range(lo, hi - lo)?;
+            if !data.is_empty() && tx.blocking_send(Ok(Bytes::from(data))).is_err() {
+                return Ok(());
+            }
+        }
+    } else {
+        let mut f = std::fs::File::open(path).map_err(io_err)?;
+        f.seek(SeekFrom::Start(offset)).map_err(io_err)?;
+        let mut remaining = len;
+        let mut buf = vec![0u8; READ_CHUNK];
+        while remaining > 0 {
+            let want = (remaining as usize).min(READ_CHUNK);
+            let n = f.read(&mut buf[..want]).map_err(io_err)?;
+            if n == 0 {
+                break;
+            }
+            if tx
+                .blocking_send(Ok(Bytes::copy_from_slice(&buf[..n])))
+                .is_err()
+            {
+                return Ok(());
+            }
+            remaining -= n as u64;
+        }
+    }
+    Ok(())
+}
+
+/// The lazy state of a streamed read: the open + read is deferred until the body is first polled,
+/// so a request that takes the kernel zero-copy fast path (and drops this body unpolled) performs
+/// no file open and releases its I/O permit immediately (Phase 2.5).
+enum StreamSrc {
+    Pending(
+        (
+            PathBuf,
+            bool,
+            Option<[u8; 32]>,
+            u64,
+            u64,
+            tokio::sync::OwnedSemaphorePermit,
+        ),
+    ),
+    Running(tokio::sync::mpsc::Receiver<Result<Bytes, BlobError>>),
+}
+
 fn read_stream(
     path: PathBuf,
     compressed: bool,
@@ -327,60 +380,24 @@ fn read_stream(
     len: u64,
     permit: tokio::sync::OwnedSemaphorePermit,
 ) -> cairn_types::BlobStream {
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, BlobError>>(4);
-    tokio::task::spawn_blocking(move || {
-        // Held for the whole streamed transfer so it counts against the blob-I/O bound (ARCH §7.4),
-        // then released when this task ends.
-        let _permit = permit;
-        let result = (|| -> Result<(), BlobError> {
-            use std::io::{Read, Seek, SeekFrom};
-            if compressed {
-                let f = std::fs::File::open(&path).map_err(io_err)?;
-                let mut reader = CompressedReader::open_with_dek(f, dek)?;
-                let bs = reader.block_size();
-                let end = offset.saturating_add(len).min(reader.logical_len());
-                if bs == 0 || offset >= end {
-                    return Ok(());
-                }
-                let first = offset / bs;
-                let last = (end - 1) / bs;
-                for b in first..=last {
-                    let bstart = b * bs;
-                    let lo = offset.max(bstart);
-                    let hi = end.min(bstart + bs);
-                    let data = reader.read_range(lo, hi - lo)?;
-                    if !data.is_empty() && tx.blocking_send(Ok(Bytes::from(data))).is_err() {
-                        return Ok(());
+    let initial = StreamSrc::Pending((path, compressed, dek, offset, len, permit));
+    Box::pin(futures_util::stream::unfold(initial, |state| async move {
+        let mut rx = match state {
+            StreamSrc::Pending((path, compressed, dek, offset, len, permit)) => {
+                let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, BlobError>>(4);
+                tokio::task::spawn_blocking(move || {
+                    // The permit is held for the whole transfer so it counts against the blob-I/O
+                    // bound (ARCH §7.4), then released when this task ends.
+                    let _permit = permit;
+                    if let Err(e) = stream_blob(&path, compressed, dek, offset, len, &tx) {
+                        let _ = tx.blocking_send(Err(e));
                     }
-                }
-            } else {
-                let mut f = std::fs::File::open(&path).map_err(io_err)?;
-                f.seek(SeekFrom::Start(offset)).map_err(io_err)?;
-                let mut remaining = len;
-                let mut buf = vec![0u8; READ_CHUNK];
-                while remaining > 0 {
-                    let want = (remaining as usize).min(READ_CHUNK);
-                    let n = f.read(&mut buf[..want]).map_err(io_err)?;
-                    if n == 0 {
-                        break;
-                    }
-                    if tx
-                        .blocking_send(Ok(Bytes::copy_from_slice(&buf[..n])))
-                        .is_err()
-                    {
-                        return Ok(());
-                    }
-                    remaining -= n as u64;
-                }
+                });
+                rx
             }
-            Ok(())
-        })();
-        if let Err(e) = result {
-            let _ = tx.blocking_send(Err(e));
-        }
-    });
-    Box::pin(futures_util::stream::unfold(rx, |mut rx| async move {
-        rx.recv().await.map(|item| (item, rx))
+            StreamSrc::Running(rx) => rx,
+        };
+        rx.recv().await.map(|item| (item, StreamSrc::Running(rx)))
     }))
 }
 
@@ -486,21 +503,46 @@ impl BlobStore for LocalBlobStore {
         dek: Option<[u8; 32]>,
     ) -> Result<BlobReadHandle, BlobError> {
         let file_path = self.resolve(path)?;
-        if !tokio::fs::try_exists(&file_path).await.map_err(io_err)? {
-            return Err(BlobError::NotFound);
-        }
-        let compressed = is_compressed_blob(&file_path).await?;
-        let logical_len = if compressed {
-            let p = file_path.clone();
-            tokio::task::spawn_blocking(move || {
-                let f = std::fs::File::open(&p).map_err(io_err)?;
-                CompressedReader::open_with_dek(f, dek).map(|r| r.logical_len())
-            })
-            .await
-            .map_err(|e| BlobError::Io(e.to_string()))??
-        } else {
-            tokio::fs::metadata(&file_path).await.map_err(io_err)?.len()
-        };
+        // One open + one fstat handles existence, length, and compression detection together,
+        // replacing the prior try_exists + two metadata stats + a separate compression-probe open
+        // (Phase 2.5). On the common uncompressed branch the opened fd is handed back to serve the
+        // zero-copy sendfile path, so an uncompressed GET no longer reopens the same file.
+        let probe_path = file_path.clone();
+        let (compressed, logical_len, reuse_file) = tokio::task::spawn_blocking(
+            move || -> Result<(bool, u64, Option<std::fs::File>), BlobError> {
+                use std::io::{Read, Seek, SeekFrom};
+                let mut f = match std::fs::File::open(&probe_path) {
+                    Ok(f) => f,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        return Err(BlobError::NotFound);
+                    }
+                    Err(e) => return Err(io_err(e)),
+                };
+                let file_len = f.metadata().map_err(io_err)?.len();
+                // Compression is self-describing via the 34-byte trailer magic, read from this fd.
+                let compressed = if file_len >= 34 {
+                    f.seek(SeekFrom::End(-34)).map_err(io_err)?;
+                    let mut magic = [0u8; 4];
+                    f.read_exact(&mut magic).map_err(io_err)?;
+                    &magic == b"CRNB"
+                } else {
+                    false
+                };
+                if compressed {
+                    // Parse the header for the logical length; the fd is consumed by the reader and
+                    // not reused (compressed/encrypted blobs never take the kernel fast path).
+                    f.seek(SeekFrom::Start(0)).map_err(io_err)?;
+                    let logical = CompressedReader::open_with_dek(f, dek)?.logical_len();
+                    Ok((true, logical, None))
+                } else {
+                    // Uncompressed: the file length is the logical length, and the open fd is reused
+                    // as the zero-copy source below.
+                    Ok((false, file_len, Some(f)))
+                }
+            },
+        )
+        .await
+        .map_err(|e| BlobError::Io(e.to_string()))??;
 
         let (offset, len, content_range) = match range {
             Some(r) => {
@@ -520,21 +562,14 @@ impl BlobStore for LocalBlobStore {
         // task finishes. (The kernel sendfile fast path below is bounded separately by the server.)
         let permit = self.acquire_io_owned().await?;
         let body = read_stream(file_path.clone(), compressed, dek, offset, len, permit);
-        // Uncompressed, plaintext blobs may take the kernel file-to-socket fast path. Encrypted
-        // blobs are always block-formatted (so `compressed` is true) and therefore never reach this
-        // branch — the kernel cannot decrypt, so a DEK-bearing read must go through `read_stream`.
-        let zero_copy = if compressed {
-            None
-        } else {
-            match std::fs::File::open(&file_path) {
-                Ok(f) => Some(ZeroCopyRead {
-                    file: Arc::new(f),
-                    offset,
-                    len,
-                }),
-                Err(_) => None,
-            }
-        };
+        // Uncompressed, plaintext blobs may take the kernel file-to-socket fast path, reusing the fd
+        // the probe already opened. Encrypted blobs are always block-formatted (so `compressed` is
+        // true), so `reuse_file` is `None` for them and the kernel never sees ciphertext.
+        let zero_copy = reuse_file.map(|f| ZeroCopyRead {
+            file: Arc::new(f),
+            offset,
+            len,
+        });
 
         Ok(BlobReadHandle {
             logical_len: len,
