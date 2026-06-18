@@ -356,12 +356,17 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             Ok(MutationOutcome::UserCreated(rec.user.id.clone()))
         }
         Mutation::UpdateUser(rec) => {
+            // A column-scoped UPDATE, NOT `INSERT OR REPLACE`: the latter delete-and-reinserts the
+            // row, nulling the `policy` and `quota_bytes` columns it does not list — silently wiping
+            // a user's identity policy and quota on every role/credential change (audit #10). This
+            // UPDATE touches only the mutable identity columns and leaves policy/quota untouched.
             let c = model::user_record_columns(&rec);
             conn.execute(
-                "INSERT OR REPLACE INTO users
-                 (id, display_name, access_key_id, secret_hash, sigv4_access_key_id,
-                  sigv4_secret_ciphertext, sigv4_secret_nonce, role, is_active, created_at, updated_at)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                "UPDATE users SET
+                   display_name=?2, access_key_id=?3, secret_hash=?4, sigv4_access_key_id=?5,
+                   sigv4_secret_ciphertext=?6, sigv4_secret_nonce=?7, role=?8, is_active=?9,
+                   created_at=?10, updated_at=?11
+                 WHERE id=?1",
                 params![
                     c.id, c.display_name, c.access_key_id, c.secret_hash, c.sigv4_access_key_id,
                     c.sigv4_secret_ciphertext, c.sigv4_secret_nonce, c.role, c.is_active,

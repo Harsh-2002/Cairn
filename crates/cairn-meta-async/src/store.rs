@@ -322,7 +322,9 @@ impl MetadataStore for AsyncMetadataStore {
     async fn is_bucket_empty(&self, name: &BucketName) -> Result<bool, MetaError> {
         let row = query_one(
             self.reader(),
-            "SELECT EXISTS(SELECT 1 FROM object_versions WHERE bucket_name=?1 AND is_latest=1 AND is_delete_marker=0)",
+            // Empty means NO object_versions rows at all (any version or delete marker), matching
+            // S3 DeleteBucket semantics (audit #3).
+            "SELECT EXISTS(SELECT 1 FROM object_versions WHERE bucket_name=?1)",
             vec![Value::Text(name.as_str().to_owned())],
         )
         .await?;

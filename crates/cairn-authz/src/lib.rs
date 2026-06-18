@@ -305,9 +305,12 @@ fn acl_allows_scoped(input: &AuthzInput, allow_public_grantees: bool) -> bool {
         return false;
     }
 
-    // Object actions consult the object ACL; bucket actions consult the bucket ACL.
+    // Object actions consult the OBJECT ACL only; bucket actions consult the bucket ACL. An object
+    // with no explicit ACL is private to its owner (the owner is already allowed via the
+    // OwnerOrAdmin short-circuit), so it must NOT inherit the bucket ACL — otherwise a `public-read`
+    // bucket grant would silently expose object *contents* (audit #2).
     let acl = match &input.resource {
-        Resource::Object { .. } => input.object_acl.as_ref().or(input.bucket_acl.as_ref()),
+        Resource::Object { .. } => input.object_acl.as_ref(),
         Resource::Bucket(_) => input.bucket_acl.as_ref(),
     };
     let Some(acl) = acl else {

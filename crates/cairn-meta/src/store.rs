@@ -370,7 +370,11 @@ impl MetadataStore for SqliteMetadataStore {
         self.with_read(move |conn| {
             let exists: bool = conn
                 .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM object_versions WHERE bucket_name=?1 AND is_latest=1 AND is_delete_marker=0)",
+                    // Empty means NO object_versions rows at all — including non-current versions
+                    // and delete markers — so S3 DeleteBucket correctly refuses a bucket that still
+                    // holds version history (audit #3). A bucket with only old versions / delete
+                    // markers is NOT deletable in S3, and deleting it would orphan those rows.
+                    "SELECT EXISTS(SELECT 1 FROM object_versions WHERE bucket_name=?1)",
                     params![name],
                     |r| r.get::<_, i64>(0),
                 )

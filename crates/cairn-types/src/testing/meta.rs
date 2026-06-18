@@ -726,11 +726,13 @@ impl MetadataStore for InMemoryMetadataStore {
     }
 
     async fn is_bucket_empty(&self, name: &BucketName) -> Result<bool, MetaError> {
+        // Empty means NO versions at all (any version or delete marker), matching S3 DeleteBucket
+        // semantics (audit #3).
         let st = self.state.lock().unwrap();
         Ok(!st
             .versions
             .values()
-            .any(|r| r.bucket.as_str() == name.as_str() && r.is_latest && !r.is_delete_marker))
+            .any(|r| r.bucket.as_str() == name.as_str()))
     }
 
     async fn current_version(

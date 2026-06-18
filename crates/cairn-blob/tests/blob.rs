@@ -455,7 +455,13 @@ async fn reconcile_reclaims_orphans_only() {
     };
 
     let report = store
-        .reconcile(&oracle, ReconcileOpts::default())
+        .reconcile(
+            &oracle,
+            ReconcileOpts {
+                staging_safety_margin_secs: 0,
+                ..ReconcileOpts::default()
+            },
+        )
         .await
         .unwrap();
     assert_eq!(report.orphans_reclaimed, 1);
@@ -465,6 +471,39 @@ async fn reconcile_reclaims_orphans_only() {
         store.open(&orphan.storage_path, None).await,
         Err(BlobError::NotFound)
     ));
+}
+
+/// A blob younger than the staging safety margin must NOT be reclaimed even when the oracle reports
+/// it as not-live: it may be an in-flight PUT whose metadata row has not yet committed (audit #7).
+#[tokio::test]
+async fn reconcile_skips_recent_orphan_within_safety_margin() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let b = BucketName::parse("bkt").unwrap();
+    let orphan = store
+        .stage(&b, body(b"fresh".to_vec()), opts(None, "text/plain"))
+        .await
+        .unwrap();
+    // The oracle says nothing is live, but the just-written blob is within the safety margin.
+    let oracle = SetReconcileOracle {
+        live_paths: Default::default(),
+        live_uploads: Default::default(),
+    };
+    let report = store
+        .reconcile(
+            &oracle,
+            ReconcileOpts {
+                staging_safety_margin_secs: 3600,
+                ..ReconcileOpts::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        report.orphans_reclaimed, 0,
+        "a blob younger than the safety margin must not be reclaimed"
+    );
+    assert_eq!(read_all(&store, &orphan.storage_path, None).await, b"fresh");
 }
 
 #[tokio::test]
@@ -491,7 +530,13 @@ async fn reconcile_prunes_emptied_bucket_dir() {
     };
 
     let report = store
-        .reconcile(&oracle, ReconcileOpts::default())
+        .reconcile(
+            &oracle,
+            ReconcileOpts {
+                staging_safety_margin_secs: 0,
+                ..ReconcileOpts::default()
+            },
+        )
         .await
         .unwrap();
     assert_eq!(report.orphans_reclaimed, 1);
@@ -526,6 +571,9 @@ async fn reconcile_honours_parallelism_across_buckets() {
     let oracle = SetReconcileOracle::default(); // nothing is live
     let opts = ReconcileOpts {
         parallelism: 3,
+        // margin 0 so the just-staged orphans are reclaimed immediately (this test exercises
+        // parallel reclamation, not the safety margin).
+        staging_safety_margin_secs: 0,
         ..ReconcileOpts::default()
     };
     let report = store.reconcile(&oracle, opts).await.unwrap();

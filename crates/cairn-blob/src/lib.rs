@@ -815,7 +815,14 @@ async fn reconcile_inner(
             let Some((path, name)) = iter.next() else {
                 break;
             };
-            inflight.push(reconcile_bucket(path, name, oracle, batch_size));
+            inflight.push(reconcile_bucket(
+                path,
+                name,
+                oracle,
+                batch_size,
+                opts.staging_safety_margin_secs,
+                now,
+            ));
         }
         let Some(part) = inflight.next().await else {
             break;
@@ -844,6 +851,8 @@ async fn reconcile_bucket(
     bucket: String,
     oracle: &dyn ReconcileOracle,
     batch_size: u32,
+    margin_secs: i64,
+    now: Timestamp,
 ) -> Result<ReconcileReport, BlobError> {
     let mut report = ReconcileReport::default();
     let mut rd = tokio::fs::read_dir(&dir).await.map_err(io_err)?;
@@ -867,6 +876,12 @@ async fn reconcile_bucket(
                 .map_err(|e| BlobError::Io(e.to_string()))?;
             for ((path, _), is_live) in batch.drain(..).zip(live) {
                 if !is_live {
+                    // Do not reclaim a blob younger than the safety margin: it may belong to an
+                    // in-flight PUT whose metadata row has not yet committed, which the oracle would
+                    // report as not-live (audit #7). Mirrors the staging safety margin.
+                    if blob_too_young(&path, margin_secs, now).await {
+                        continue;
+                    }
                     if tokio::fs::remove_file(&path).await.is_ok() {
                         report.orphans_reclaimed += 1;
                     } else {
@@ -951,6 +966,28 @@ async fn reconcile_staging(
 /// is compared against the file's mtime; an artifact whose mtime cannot be read (or sits in the
 /// future relative to `now`) is treated as fresh and preserved, erring toward never deleting a
 /// possibly-live in-flight write.
+/// Whether `path`'s mtime is within `margin_secs` of `now` — too recently written to safely reclaim
+/// as an orphan (it may be an in-flight PUT whose metadata row has not yet committed, ARCH §9). A
+/// margin of `0` (tests) or a path that cannot be stat-ed (already deleted, racing) is treated as
+/// not-young so the caller proceeds. The inverse of [`staging_artifact_expired`]'s age check.
+async fn blob_too_young(path: &Path, margin_secs: i64, now: Timestamp) -> bool {
+    if margin_secs <= 0 {
+        return false;
+    }
+    let Ok(meta) = tokio::fs::metadata(path).await else {
+        return false;
+    };
+    let Ok(modified) = meta.modified() else {
+        return false;
+    };
+    let mtime_secs = match modified.duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_secs() as i64,
+        // mtime predates the epoch: unambiguously old, so not "young".
+        Err(_) => return false,
+    };
+    now.as_secs() - mtime_secs < margin_secs
+}
+
 async fn staging_artifact_expired(
     entry: &tokio::fs::DirEntry,
     margin_secs: i64,

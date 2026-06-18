@@ -277,6 +277,24 @@ fn anonymous_public_read_acl_allows_get_object() {
 }
 
 #[test]
+fn object_with_no_acl_does_not_inherit_a_public_bucket_acl() {
+    // An object with no explicit ACL must be private to its owner — it must NOT pick up a
+    // `public-read` BUCKET ACL grant, which would expose object contents to anyone (audit #2).
+    let mut input = base_input();
+    input.requester = RequesterClass::Anonymous;
+    input.object_acl = None;
+    input.bucket_acl = Some(public_read_object_acl()); // a public-read grant on the BUCKET
+    assert_eq!(
+        evaluate(&input),
+        Decision::Deny(DenyReason::DefaultDeny),
+        "anonymous GetObject must be denied when only the bucket ACL is public"
+    );
+    // Sanity: a public-read OBJECT ACL still grants (unchanged behavior).
+    input.object_acl = Some(public_read_object_acl());
+    assert_eq!(evaluate(&input), Decision::Allow);
+}
+
+#[test]
 fn public_read_acl_denied_when_ignore_public_acls() {
     let mut input = base_input();
     input.requester = RequesterClass::Anonymous;

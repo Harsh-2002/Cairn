@@ -314,8 +314,9 @@ async fn delete_marker_hides_current_parity() {
         // The latest version is now the delete marker.
         let cur = s.current_version(&bk, &k).await.unwrap().unwrap();
         assert!(cur.is_delete_marker);
-        // The bucket is "empty" of current real objects (delete-marker semantics).
-        assert!(s.is_bucket_empty(&bk).await.unwrap());
+        // is_bucket_empty means "no rows at all" (S3 DeleteBucket semantics, audit #3): the prior
+        // version v1 and the delete marker v2 both remain, so the bucket is NOT empty.
+        assert!(!s.is_bucket_empty(&bk).await.unwrap());
         // list_current excludes the marker; list_versions includes both.
         assert_eq!(
             s.list_current(
