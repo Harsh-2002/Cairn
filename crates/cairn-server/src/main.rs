@@ -719,8 +719,9 @@ fn bootstrap(cfg: Config) -> ExitCode {
                 updated_at: now,
             },
             bearer_secret_hash: cairn_auth::hash_bearer_secret(&bearer_secret),
+            // CRK1 envelope (audit #29): the nonce is inside the ciphertext; store NULL nonce.
             sigv4_secret_ciphertext: Some(sealed.ciphertext),
-            sigv4_secret_nonce: Some(sealed.nonce.0),
+            sigv4_secret_nonce: None,
         };
 
         if let Err(e) = store.submit(Mutation::CreateUser(Box::new(record))).await {

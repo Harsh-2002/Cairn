@@ -2726,8 +2726,12 @@ impl S3Service {
         let sealed = self.crypto.seal(&dek)?;
         let descriptor = SseDescriptor {
             alg: SSE_DESCRIPTOR_ALG.to_owned(),
+            // The CRK1 envelope (audit #29) is self-describing — it carries its own key id and
+            // nonce — so the whole envelope goes in `wrapped_dek_b64` and the separate nonce field
+            // is left empty. Legacy descriptors keep a populated `nonce_b64`; `open_sse_dek` routes
+            // on its presence.
             wrapped_dek_b64: base64::engine::general_purpose::STANDARD.encode(&sealed.ciphertext),
-            nonce_b64: base64::engine::general_purpose::STANDARD.encode(&sealed.nonce.0),
+            nonce_b64: String::new(),
         };
         let json = serde_json::to_string(&descriptor)
             .map_err(|e| Error::Internal(format!("serialize sse descriptor: {e}")))?;
@@ -2742,9 +2746,15 @@ impl S3Service {
         let ciphertext = base64::engine::general_purpose::STANDARD
             .decode(d.wrapped_dek_b64.as_bytes())
             .map_err(|_| Error::Internal("sse descriptor: bad wrapped key base64".to_owned()))?;
-        let nonce_bytes = base64::engine::general_purpose::STANDARD
-            .decode(d.nonce_b64.as_bytes())
-            .map_err(|_| Error::Internal("sse descriptor: bad nonce base64".to_owned()))?;
+        // A CRK1 envelope leaves `nonce_b64` empty (its nonce is inside the envelope and `open`
+        // ignores this argument for it); a legacy descriptor carries the nonce separately (#29).
+        let nonce_bytes = if d.nonce_b64.is_empty() {
+            Vec::new()
+        } else {
+            base64::engine::general_purpose::STANDARD
+                .decode(d.nonce_b64.as_bytes())
+                .map_err(|_| Error::Internal("sse descriptor: bad nonce base64".to_owned()))?
+        };
         let raw = self.crypto.open(&ciphertext, &Nonce(nonce_bytes))?;
         raw.as_slice().try_into().map_err(|_| {
             Error::Internal("sse descriptor: unwrapped key is not 32 bytes".to_owned())

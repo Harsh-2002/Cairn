@@ -104,8 +104,9 @@ pub fn seal_target(
         region: input.region,
         dest_bucket: input.dest_bucket,
         access_key_id: input.access_key_id,
+        // CRK1 envelope (audit #29): the nonce is inside the ciphertext; store an empty nonce.
         secret_ciphertext: sealed.ciphertext,
-        nonce: sealed.nonce.0,
+        nonce: Vec::new(),
     })
 }
 

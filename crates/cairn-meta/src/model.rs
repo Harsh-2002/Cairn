@@ -312,13 +312,17 @@ pub fn user_with_bearer_from_row(row: &Row) -> rusqlite::Result<UserWithBearerHa
 pub fn user_sigv4_from_row(row: &Row) -> rusqlite::Result<Option<UserSigV4Credentials>> {
     let ct: Option<Vec<u8>> = row.get("sigv4_secret_ciphertext")?;
     let nonce: Option<Vec<u8>> = row.get("sigv4_secret_nonce")?;
-    match (ct, nonce) {
-        (Some(secret_ciphertext), Some(secret_nonce)) => Ok(Some(UserSigV4Credentials {
+    // A CRK1-sealed secret (audit #29) stores the envelope in `sigv4_secret_ciphertext` with a
+    // NULL `sigv4_secret_nonce` (the nonce is inside the envelope). A legacy secret has both
+    // populated. Having the ciphertext is enough; `open` routes on the envelope magic and ignores
+    // an empty nonce.
+    match ct {
+        Some(secret_ciphertext) => Ok(Some(UserSigV4Credentials {
             user: user_from_row(row)?,
             secret_ciphertext,
-            secret_nonce,
+            secret_nonce: nonce.unwrap_or_default(),
         })),
-        _ => Ok(None),
+        None => Ok(None),
     }
 }
 

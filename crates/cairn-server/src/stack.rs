@@ -435,8 +435,9 @@ async fn ensure_root_admin(
             updated_at: now,
         },
         bearer_secret_hash: want_hash,
+        // CRK1 envelope (audit #29): the nonce is inside the ciphertext; store NULL nonce.
         sigv4_secret_ciphertext: Some(sealed.ciphertext),
-        sigv4_secret_nonce: Some(sealed.nonce.0),
+        sigv4_secret_nonce: None,
     };
     let mutation = if existing.is_some() {
         Mutation::UpdateUser(Box::new(record))

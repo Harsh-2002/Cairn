@@ -1346,7 +1346,8 @@ impl ControlService {
         let sigv4_secret = generate_secret();
         let (sigv4_secret_ciphertext, sigv4_secret_nonce) =
             match self.crypto.seal(sigv4_secret.as_bytes()) {
-                Ok(sealed) => (Some(sealed.ciphertext), Some(sealed.nonce.0)),
+                // CRK1 envelope (audit #29): the nonce is inside the ciphertext; store NULL nonce.
+                Ok(sealed) => (Some(sealed.ciphertext), None),
                 Err(e) => return ControlResponse::error_internal(&e.to_string()),
             };
 
@@ -2099,8 +2100,9 @@ impl ControlService {
             region: input.region,
             dest_bucket: input.dest_bucket,
             access_key_id: input.access_key_id,
+            // CRK1 envelope (audit #29): the nonce is inside the ciphertext; store an empty nonce.
             secret_ciphertext: sealed.ciphertext,
-            nonce: sealed.nonce.0,
+            nonce: Vec::new(),
         })
     }
 
