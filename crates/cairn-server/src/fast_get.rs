@@ -18,10 +18,24 @@ use cairn_protocol::{S3Body, S3Request};
 use cairn_types::auth::{AuthOutcome, RequestView};
 use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
+use std::time::Duration;
 use tokio::net::TcpStream;
 
 /// Cap on the request head we will peek before giving up and falling back to hyper.
 const MAX_HEAD: usize = 16 * 1024;
+
+/// Overall deadline for peeking a complete request head before falling back to hyper (audit #12).
+/// Bounds a slow or stalled (slow-loris) head so the fast path never waits on it indefinitely.
+const HEAD_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Pause between head peeks when no new bytes have arrived. The fast path only PEEKs (never
+/// consumes), so the socket reports readable as long as any bytes are buffered; sleeping briefly on
+/// no-progress avoids a busy-spin while still waking promptly once more of the head lands (#12).
+const HEAD_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// How long the blocking sender waits to drain the client's bytes during an orderly close before
+/// giving up, so a stalled peer cannot pin the blocking thread (audit #23).
+const FAST_LINGER: Duration = Duration::from_secs(2);
 
 /// The result of the fast-path attempt.
 pub enum Fast {
@@ -73,22 +87,40 @@ pub async fn try_sendfile_get(stream: TcpStream, stack: &AppStack, peer: SocketA
     // Peek the head WITHOUT consuming it: `peek` always returns from the start of the socket buffer,
     // so on a fallback the socket is pristine for hyper.
     let mut buf = vec![0u8; MAX_HEAD];
-    let head_len = loop {
-        match stream.peek(&mut buf).await {
-            Ok(0) => return Fast::Fallback { stream },
-            Ok(n) => {
-                if let Some(e) = head_end(&buf[..n]) {
-                    break e;
-                }
-                if n >= MAX_HEAD {
-                    return Fast::Fallback { stream };
-                }
-                // The head hasn't fully arrived yet; wait for more bytes, then peek again.
-                if stream.readable().await.is_err() {
-                    return Fast::Fallback { stream };
+    let head_len = {
+        // Peek a complete request head under an overall deadline (audit #12). Because we only PEEK
+        // (the socket must stay pristine for a hyper fallback), readiness alone cannot signal "new
+        // bytes" — the same buffered bytes keep the socket readable — so awaiting it in a loop
+        // hot-spins on a stalled head. Instead, sleep briefly when a peek makes no progress, and
+        // bound the whole head read with a timeout.
+        let peek = async {
+            let mut last_n = 0usize;
+            loop {
+                match stream.peek(&mut buf).await {
+                    Ok(0) => return None, // peer closed before sending a head
+                    Ok(n) => {
+                        if let Some(e) = head_end(&buf[..n]) {
+                            return Some(e);
+                        }
+                        if n >= MAX_HEAD {
+                            return None; // head larger than we will buffer; let hyper handle it
+                        }
+                        if n == last_n {
+                            tokio::time::sleep(HEAD_POLL_INTERVAL).await;
+                        } else {
+                            last_n = n;
+                            tokio::task::yield_now().await;
+                        }
+                    }
+                    Err(_) => return None,
                 }
             }
-            Err(_) => return Fast::Fallback { stream },
+        };
+        match tokio::time::timeout(HEAD_TIMEOUT, peek).await {
+            Ok(Some(e)) => e,
+            // Closed, oversize, a read error, or the head never completed in time: hand the
+            // still-unconsumed socket back to hyper untouched.
+            Ok(None) | Err(_) => return Fast::Fallback { stream },
         }
     };
 
@@ -202,7 +234,7 @@ pub async fn try_sendfile_get(stream: TcpStream, stack: &AppStack, peer: SocketA
         Err(_) => return Fast::Handled,
     };
     let result = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-        use std::io::Write;
+        use std::io::{Read, Write};
         std_stream.set_nonblocking(false)?;
         let mut s = std_stream;
         s.write_all(out.as_bytes())?;
@@ -212,7 +244,24 @@ pub async fn try_sendfile_get(stream: TcpStream, stack: &AppStack, peer: SocketA
             zero_copy.offset,
             length,
         )?;
-        s.flush()
+        s.flush()?;
+        // Orderly close (audit #23): we PEEKED the request but never consumed it, so closing now
+        // with unread bytes in the socket buffer makes Linux send a RST instead of a FIN — and a
+        // RST can discard the response still in flight, truncating the body the client is reading.
+        // Half-close our write side (flushing a FIN), then drain the client's pending bytes (the
+        // un-consumed request and its FIN) under a bounded read timeout so the final close is an
+        // orderly shutdown rather than a reset.
+        let _ = s.shutdown(std::net::Shutdown::Write);
+        s.set_read_timeout(Some(FAST_LINGER))?;
+        let mut scratch = [0u8; 2048];
+        loop {
+            match s.read(&mut scratch) {
+                Ok(0) => break,    // client closed its side — orderly
+                Ok(_) => continue, // discard any pending request bytes
+                Err(_) => break,   // read timeout or error — stop draining
+            }
+        }
+        Ok(())
     })
     .await;
     match result {

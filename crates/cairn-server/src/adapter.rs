@@ -91,8 +91,30 @@ pub async fn handle(
     // The management JSON API and the embedded web UI share the listener with the S3 surface.
     if let Some(subpath) = raw_path.strip_prefix("/api/v1") {
         let query = parse_query(&query_str);
-        let body_bytes = match req.into_body().collect().await {
+        // Bound the management-API request body (audit #11). The whole body is buffered for JSON
+        // parsing, so an unbounded request would let a client pin arbitrary server memory. Cap it
+        // and refuse oversize bodies with 413 instead of buffering them.
+        const MAX_API_BODY: usize = 8 * 1024 * 1024;
+        let body_bytes = match http_body_util::Limited::new(req.into_body(), MAX_API_BODY)
+            .collect()
+            .await
+        {
             Ok(c) => c.to_bytes(),
+            Err(e) if e.downcast_ref::<http_body_util::LengthLimitError>().is_some() => {
+                let mut builder = Response::builder()
+                    .status(http::StatusCode::PAYLOAD_TOO_LARGE)
+                    .header("content-type", "application/json");
+                if let Ok(v) = http::HeaderValue::from_str(&request_id) {
+                    builder = builder.header("x-amz-request-id", v);
+                }
+                return builder
+                    .body(full_body(Bytes::from_static(
+                        br#"{"error":"RequestEntityTooLarge","message":"request body exceeds the maximum allowed size"}"#,
+                    )))
+                    .unwrap_or_else(|_| Response::new(full_body(Bytes::new())));
+            }
+            // A transient read error (e.g. the client hung up): preserve the prior behavior of
+            // proceeding with an empty body rather than synthesizing a misleading 413.
             Err(_) => Bytes::new(),
         };
         // Minting a persistent public-read ("share") URL is handled here, not in cairn-control,

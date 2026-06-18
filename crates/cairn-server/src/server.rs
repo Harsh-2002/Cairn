@@ -345,9 +345,19 @@ async fn handle(
         method == Method::GET && matches!(path.as_str(), "/healthz" | "/readyz" | "/metrics");
 
     let response = async move {
-        let _permit = match state.concurrency.try_acquire() {
-            Ok(p) => p,
-            Err(_) => return error_response(StatusCode::SERVICE_UNAVAILABLE, "TooManyRequests"),
+        // Infra endpoints (`/healthz`, `/readyz`, `/metrics`) must answer even when the server is
+        // shedding load, so a liveness/readiness probe or scrape never trips the concurrency
+        // limiter and flaps the instance out of rotation (audit #21). Only real S3/UI work takes a
+        // permit; the guard is held for the whole request via the `Option`.
+        let _permit = if infra {
+            None
+        } else {
+            match state.concurrency.try_acquire() {
+                Ok(p) => Some(p),
+                Err(_) => {
+                    return error_response(StatusCode::SERVICE_UNAVAILABLE, "TooManyRequests");
+                }
+            }
         };
         let start = Instant::now();
         let work = async {

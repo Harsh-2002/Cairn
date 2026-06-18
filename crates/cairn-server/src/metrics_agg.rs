@@ -18,6 +18,18 @@ use cairn_types::meta::RequestMetricRow;
 /// Number of lock shards. A power of two keeps the hash-to-shard reduction a single mask.
 const SHARDS: usize = 16;
 
+/// Per-shard cap on distinct metric keys (audit #22). The `bucket` dimension is derived from the
+/// request path, so a client can spray arbitrarily many distinct (even well-formed) bucket labels;
+/// without a cap that grows the in-process map and the flushed `request_metrics` time series
+/// without bound. Once a shard is saturated, a *new* key folds into [`OVERFLOW_BUCKET`] so total
+/// cardinality stays bounded by `SHARDS * MAX_KEYS_PER_SHARD`. Real deployments key by a bounded
+/// op × status × touched-bucket set per flush window, comfortably under this ceiling.
+const MAX_KEYS_PER_SHARD: usize = 4096;
+
+/// Sentinel `bucket` label that overflow keys fold into once a shard is saturated. The additive
+/// flush upsert coalesces it across shards, so it may legitimately appear in several shard maps.
+const OVERFLOW_BUCKET: &str = "__other__";
+
 /// The composite key one count accumulates under: the rollup window, the operation name, the
 /// targeted bucket (`""` for non-bucket ops), and the HTTP status class (a `&'static str`, one of
 /// `"2xx"`, `"3xx"`, `"4xx"`, `"5xx"`).
@@ -113,7 +125,20 @@ impl RequestMetricsAgg {
         );
         let shard = &self.shards[shard_of(&key)];
         let mut guard = shard.lock().unwrap();
-        let cell = guard.entry(key).or_default();
+        // Cardinality guard (audit #22): once the shard is full, a new (attacker-influenceable)
+        // bucket label must not grow the map — fold it into the sentinel instead. An already-known
+        // key keeps accumulating in place.
+        let cell = if guard.len() >= MAX_KEYS_PER_SHARD && !guard.contains_key(&key) {
+            let overflow: MetricKey = (
+                ts_bucket,
+                operation.to_owned(),
+                OVERFLOW_BUCKET.to_owned(),
+                status_class(status),
+            );
+            guard.entry(overflow).or_default()
+        } else {
+            guard.entry(key).or_default()
+        };
         cell.count += 1;
         cell.bytes_in += bytes_in;
         cell.bytes_out += bytes_out;
@@ -215,6 +240,36 @@ mod tests {
         );
         // Draining clears the accumulator.
         assert!(agg.drain().is_empty());
+    }
+
+    #[test]
+    fn bucket_cardinality_is_capped() {
+        // Audit #22: spraying more distinct bucket labels than the cap must not grow the rollup
+        // without bound — excess folds into the sentinel, and no request is lost.
+        let agg = RequestMetricsAgg::new(60);
+        let n = SHARDS * MAX_KEYS_PER_SHARD + 5_000;
+        for i in 0..n {
+            agg.record("GetObject", &format!("bucket-{i}"), 200, 1, 0, 0, 0);
+        }
+        let rows = agg.drain();
+        // Every recorded request is still counted (real key or sentinel) — nothing dropped.
+        let total: u64 = rows.iter().map(|r| r.count).sum();
+        assert_eq!(total as usize, n, "every recorded request is counted somewhere");
+        // Distinct keys are bounded by the per-shard cap (+1 sentinel per shard), far below the
+        // `n` distinct buckets we sprayed.
+        assert!(
+            rows.len() <= SHARDS * (MAX_KEYS_PER_SHARD + 1),
+            "cardinality capped, got {} rows",
+            rows.len()
+        );
+        assert!(rows.len() < n, "folding actually happened");
+        // The excess landed in the overflow sentinel.
+        let overflow: u64 = rows
+            .iter()
+            .filter(|r| r.bucket == OVERFLOW_BUCKET)
+            .map(|r| r.count)
+            .sum();
+        assert!(overflow > 0, "overflow keys folded into the sentinel");
     }
 
     #[test]
