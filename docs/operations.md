@@ -122,3 +122,57 @@ from bucket replication.
 
 See [`backup-restore.md`](./backup-restore.md) for the backup procedure and its consistency
 argument.
+
+## 7. Master-key rotation
+
+Secrets at rest — per-object SSE-S3 data keys, users' SigV4 secrets, and replication-target
+secrets — are sealed under a 32-byte master key. A single key is fine for most deployments
+(`CAIRN_MASTER_KEY`, 64 hex chars). To rotate the master key without re-encrypting object data,
+use a **key ring** and follow this procedure. The whole flow is online; no downtime and no
+re-upload of objects.
+
+**Config.** A ring is a JSON array set in `CAIRN_MASTER_KEY_RING`, replacing `CAIRN_MASTER_KEY`:
+
+```
+CAIRN_MASTER_KEY_RING=[{"id":1,"key":"<64-hex old key>"},{"id":2,"key":"<64-hex new key>"}]
+CAIRN_MASTER_KEY_ACTIVE_ID=2          # which id NEW seals use (default: the highest id)
+CAIRN_KEY_REWRAP_INTERVAL_SECS=300    # background re-wrap cadence (0 disables); sqlite backend only
+CAIRN_KEY_COUNTER_SYNC_SECS=60        # active-key seal-count flush cadence
+```
+
+Each `id` is a small integer (1–65535); keys are never logged. New seals always use the active
+id; every other id in the ring stays available to **open** existing data, so nothing becomes
+unreadable when you add a key.
+
+**Procedure (rotate id 1 → id 2):**
+
+1. **Add the new key, keep the old.** Deploy with the ring above (`id:1` + `id:2`, active `2`).
+   New writes seal under id 2; all existing id-1 data still opens. (A single-key deployment that
+   has never used a ring is just `[{"id":1,"key":"<current CAIRN_MASTER_KEY>"}]`.)
+2. **Let re-wrap run.** A background worker re-seals existing secrets onto the active key,
+   resumably and idempotently. It never deletes or rewrites data it cannot open; it only re-seals.
+3. **Wait for completion.** Poll the admin endpoint:
+
+   ```
+   GET /api/v1/system/crypto-status        # Bearer admin token
+   ```
+
+   It reports the active id, the seal count vs the 75%/95% thresholds, per-key state (with a short
+   non-reversible key-hash, never key material), per-stream re-wrap completion, and a
+   `retire_eligible` flag per key. **Wait until the old key shows `retire_eligible: true`** (every
+   stream re-wrapped onto the active key, on every shard, with no failures).
+4. **Retire the old key.** Remove `id:1` from `CAIRN_MASTER_KEY_RING` and redeploy.
+
+> **Do not remove a key before it is `retire_eligible`.** Startup enforces a **retire-gate**: if a
+> removed key still has data sealed under it, the server **refuses to start** with a diagnostic
+> naming the key id and shard, rather than booting into unreadable data. Restore the key to the
+> ring, wait for re-wrap to finish, then retire it.
+
+**Seal-count bound.** Each key uses fresh random 96-bit GCM nonces; the active key's seal count is
+tracked (and survives restarts). At 75% of the safe ceiling the server logs a "rotate soon"
+warning; at 95% it refuses *new* seals (opens are never blocked) — rotate before then.
+
+**Backend note.** Automatic re-wrap and the durable seal counter are implemented for the default
+`sqlite` backend. The libSQL/Turso backends can rotate and read all data (old keys still open
+everything), but do not auto-re-wrap or persist the counter, so the retire-gate and
+`retire_eligible` are not available there — keep retired keys in the ring on those backends.
