@@ -87,16 +87,38 @@ impl std::fmt::Debug for AppStack {
     }
 }
 
-/// Build the cryptography facility from the configured master key (or a development key).
+/// Build the cryptography facility from the configured master key ring (or single key, or a
+/// development key). With a ring (`CAIRN_MASTER_KEY_RING`, audit #29) new seals use the active key
+/// (`CAIRN_MASTER_KEY_ACTIVE_ID`, default = highest id) and the legacy (pre-ring, no-magic) blobs
+/// decrypt under the lowest id — the conventional original key (§3.4.1). The Phase-E seal-count
+/// base is primed later from durable state (`prime_seal_count`).
 pub(crate) fn build_crypto(cfg: &Config) -> Result<SystemCrypto, String> {
-    match &cfg.master_key {
-        Some(hex) => SystemCrypto::from_hex(hex).map_err(|e| format!("invalid master_key: {e}")),
-        None => {
-            tracing::warn!(
-                "no master_key configured; using a fixed DEVELOPMENT key (insecure). Set CAIRN_MASTER_KEY in production."
-            );
-            Ok(SystemCrypto::new([0u8; 32]))
+    if let Some(ring_json) = &cfg.master_key_ring {
+        let keys = crate::config::parse_key_ring(ring_json)
+            .map_err(|e| format!("invalid CAIRN_MASTER_KEY_RING {e}"))?;
+        let max_id = keys
+            .iter()
+            .map(|(id, _)| *id)
+            .max()
+            .expect("ring is non-empty");
+        let min_id = keys
+            .iter()
+            .map(|(id, _)| *id)
+            .min()
+            .expect("ring is non-empty");
+        let active = cfg.master_key_active_id.unwrap_or(max_id);
+        if cfg.master_key.is_some() {
+            tracing::debug!("CAIRN_MASTER_KEY_RING is set; CAIRN_MASTER_KEY is ignored");
         }
+        SystemCrypto::from_ring(keys, active, min_id, 0)
+            .map_err(|e| format!("invalid master key ring: {e}"))
+    } else if let Some(hex) = &cfg.master_key {
+        SystemCrypto::from_hex(hex).map_err(|e| format!("invalid master_key: {e}"))
+    } else {
+        tracing::warn!(
+            "no master_key configured; using a fixed DEVELOPMENT key (insecure). Set CAIRN_MASTER_KEY in production."
+        );
+        Ok(SystemCrypto::new([0u8; 32]))
     }
 }
 

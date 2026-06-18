@@ -103,6 +103,10 @@ pub enum CryptoError {
     /// The master key was required but absent or malformed.
     #[error("master key missing or malformed")]
     Key,
+    /// The active master key reached its seal-count hard stop; rotate to a new active key
+    /// before sealing more secrets (audit #29, Phase E). Opens are never affected.
+    #[error("active master key reached its seal-count limit; rotate the master key")]
+    KeyRotationRequired,
 }
 
 /// Failures driving a replication sink.

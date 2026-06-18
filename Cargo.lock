@@ -471,6 +471,7 @@ dependencies = [
  "rand 0.8.6",
  "sha2",
  "subtle",
+ "tracing",
  "zeroize",
 ]
 
@@ -608,6 +609,7 @@ dependencies = [
  "fail",
  "figment",
  "futures-util",
+ "hex",
  "http",
  "http-body-util",
  "hyper",

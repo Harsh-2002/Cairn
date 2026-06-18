@@ -18,6 +18,7 @@ subtle.workspace = true
 zeroize.workspace = true
 rand.workspace = true
 hex.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 cairn-types = { workspace = true, features = ["testing"] }

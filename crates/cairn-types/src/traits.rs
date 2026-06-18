@@ -360,13 +360,23 @@ pub trait ReplicationSink: Send + Sync {
 /// The cryptography facility: envelope encryption of secrets at rest and constant-time
 /// comparison. Key handling is isolated here.
 pub trait Crypto: Send + Sync {
-    /// Envelope-encrypt a secret under the master key.
+    /// Envelope-encrypt a secret under the ACTIVE master key, returning a self-describing `CRK1`
+    /// envelope in `Sealed.ciphertext` (`magic ‖ key_id ‖ nonce ‖ ct‖tag`, audit #29). The nonce
+    /// is *inside* the envelope; `Sealed.nonce` is set to the same bytes for source-compat but
+    /// callers persisting a `CRK1` envelope MUST store only `Sealed.ciphertext` and leave any
+    /// separate nonce column empty/NULL.
     fn seal(&self, plaintext: &[u8]) -> Result<Sealed, CryptoError>;
-    /// Decrypt a sealed secret (the plaintext is returned in a zeroizing container by the
-    /// implementation).
+    /// Decrypt a sealed secret (plaintext returned in a zeroizing container). Routes by content: a
+    /// `CRK1`-magic `ciphertext` parses its own key_id + nonce and ignores `nonce`; a legacy blob
+    /// (no magic) decrypts under the legacy key using the separate `nonce`. A missing key id or any
+    /// tag/AAD failure is a hard error (fail-closed), never a fallback.
     fn open(&self, ciphertext: &[u8], nonce: &Nonce) -> Result<Vec<u8>, CryptoError>;
     /// Constant-time byte comparison.
     fn ct_eq(&self, a: &[u8], b: &[u8]) -> bool;
+    /// The ring id new seals use. Defaulted to `1` so test doubles need no change (audit #29).
+    fn active_key_id(&self) -> u16 {
+        1
+    }
 }
 
 /// The clock, injected wherever time governs behaviour so it is tested deterministically.

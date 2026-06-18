@@ -59,7 +59,16 @@ pub struct Config {
     pub region: String,
     /// The 32-byte master key (64 hex chars) for envelope-encrypting secrets at rest. Required
     /// in production; absent, a fixed development key is used (insecure, for local testing).
+    /// Ignored when [`master_key_ring`](Self::master_key_ring) is set.
     pub master_key: Option<String>,
+    /// A master-key RING for rotation (`CAIRN_MASTER_KEY_RING`, audit #29): a JSON array of
+    /// `{"id":<u16 1..65535>,"key":"<64-hex>"}`. When set it replaces `master_key`; new secrets
+    /// seal under the active key id and old keys stay available to open existing data. Leave
+    /// unset for a single-key deployment (no new config required).
+    pub master_key_ring: Option<String>,
+    /// Which ring id NEW seals use (`CAIRN_MASTER_KEY_ACTIVE_ID`). Defaults to the highest id in
+    /// the ring. Must name a key present in [`master_key_ring`](Self::master_key_ring).
+    pub master_key_active_id: Option<u16>,
     /// Log verbosity filter (e.g. `info`, `cairn=debug`).
     pub log_level: String,
     /// Log output format.
@@ -205,6 +214,8 @@ impl Default for Config {
             max_object_size: 5 * 1024 * 1024 * 1024 * 1024, // 5 TiB
             region: "us-east-1".to_owned(),
             master_key: None,
+            master_key_ring: None,
+            master_key_active_id: None,
             log_level: "info".to_owned(),
             log_format: LogFormat::Text,
             dev_auth: false,
@@ -534,10 +545,22 @@ impl Config {
                 ));
             }
         }
-        // A present master key must be 32 bytes of hex (64 hex characters), so a typo fails fast at
-        // load rather than at the first secret seal/open. (There is no separate public-read signing
-        // secret to validate — the signed-share-URL key is derived from the master key.)
-        if let Some(mk) = &self.master_key {
+        // Master key / ring (audit #29). A ring (`CAIRN_MASTER_KEY_RING`) replaces the single key;
+        // validate its JSON, ids, and active id at load so a typo fails fast rather than at the
+        // first secret seal/open. Otherwise a present single `master_key` must be 64 hex chars.
+        // (There is no separate public-read signing secret — the share-URL key derives from the
+        // master key.)
+        if let Some(ring_json) = &self.master_key_ring {
+            let keys = parse_key_ring(ring_json)
+                .map_err(|e| ConfigError::Invalid(format!("CAIRN_MASTER_KEY_RING {e}")))?;
+            if let Some(active) = self.master_key_active_id {
+                if !keys.iter().any(|(id, _)| *id == active) {
+                    return Err(ConfigError::Invalid(format!(
+                        "CAIRN_MASTER_KEY_ACTIVE_ID {active} is not present in CAIRN_MASTER_KEY_RING"
+                    )));
+                }
+            }
+        } else if let Some(mk) = &self.master_key {
             if mk.len() != 64 || !mk.bytes().all(|b| b.is_ascii_hexdigit()) {
                 return Err(ConfigError::Invalid(
                     "master_key must be 64 hex characters (a 32-byte key)".into(),
@@ -566,6 +589,43 @@ impl Config {
         }
         Ok(())
     }
+}
+
+/// One entry of the master-key ring (`CAIRN_MASTER_KEY_RING`, audit #29).
+#[derive(Debug, Clone, Deserialize)]
+struct KeySpec {
+    id: u16,
+    key: String,
+}
+
+/// Parse and validate the master-key ring JSON into `(id, 32-byte key)` pairs: non-empty, no id 0,
+/// no duplicate id, each key exactly 64 hex chars. Decoded key bytes are returned to the caller
+/// (and never logged). Returns a human-readable reason on failure.
+pub(crate) fn parse_key_ring(json: &str) -> Result<Vec<(u16, [u8; 32])>, String> {
+    let specs: Vec<KeySpec> =
+        serde_json::from_str(json).map_err(|e| format!("is not a valid JSON ring: {e}"))?;
+    if specs.is_empty() {
+        return Err("must contain at least one key".to_owned());
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(specs.len());
+    for s in specs {
+        if s.id == 0 {
+            return Err("key id 0 is reserved".to_owned());
+        }
+        if !seen.insert(s.id) {
+            return Err(format!("duplicate key id {}", s.id));
+        }
+        if s.key.len() != 64 || !s.key.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(format!("key id {} must be 64 hex characters", s.id));
+        }
+        let bytes = hex::decode(&s.key).map_err(|_| format!("key id {} has invalid hex", s.id))?;
+        let arr: [u8; 32] = bytes
+            .try_into()
+            .map_err(|_| format!("key id {} must decode to 32 bytes", s.id))?;
+        out.push((s.id, arr));
+    }
+    Ok(out)
 }
 
 /// A configuration load/validation error.
