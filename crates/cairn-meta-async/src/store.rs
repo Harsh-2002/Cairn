@@ -26,6 +26,11 @@ use cairn_types::time::Timestamp;
 use cairn_types::traits::MetadataStore;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use tokio::sync::{Mutex, OwnedMutexGuard};
+
+/// An exclusive read-connection checkout: a pooled driver connection held under its own lock for
+/// the whole duration of one (possibly multi-query) read. Dereferences to the driver.
+pub(crate) type ReadGuard = OwnedMutexGuard<Arc<dyn AsyncSqlDriver>>;
 
 const LIST_BATCH: usize = 1024;
 
@@ -33,15 +38,18 @@ const LIST_BATCH: usize = 1024;
 /// (a stalled worker) becomes eligible for re-claim after this many seconds.
 const REPLICATION_LEASE_SECS: i64 = 300;
 
-/// A round-robin pool of read-only driver connections. WAL readers take consistent snapshots and
-/// never block the writer or each other, so concurrent reads simply pick the next connection.
+/// A round-robin pool of read-only driver connections, each behind its own lock. A single
+/// libSQL/Turso connection cannot serve two reads at once — concurrent queries would interleave on
+/// the one connection and its cursors, returning wrong or leaked rows (audit #8) — so a read checks
+/// out a connection *exclusively* for its whole duration. WAL readers take consistent snapshots and
+/// never block the writer, so distinct connections still run fully in parallel.
 ///
 /// The underlying engine's `Database` handle the connections were opened from is retained behind
 /// an opaque keep-alive box so it (and, for a shared-cache in-memory database, the underlying
 /// memory) outlives every connection. The box is engine-agnostic so the same pool serves any
 /// [`AsyncSqlDriver`] backend (libSQL, Turso, …).
 pub(crate) struct ReadPool {
-    conns: Vec<Arc<dyn AsyncSqlDriver>>,
+    conns: Vec<Arc<Mutex<Arc<dyn AsyncSqlDriver>>>>,
     next: AtomicUsize,
     // Held only to keep the engine's database handle alive for the store's lifetime.
     _keepalive: Box<dyn std::any::Any + Send + Sync>,
@@ -54,15 +62,18 @@ impl ReadPool {
     ) -> Self {
         assert!(!conns.is_empty(), "read pool must have at least one conn");
         Self {
-            conns,
+            conns: conns.into_iter().map(|c| Arc::new(Mutex::new(c))).collect(),
             next: AtomicUsize::new(0),
             _keepalive: keepalive,
         }
     }
 
-    fn pick(&self) -> &dyn AsyncSqlDriver {
+    /// Check out the next connection, awaiting exclusive access. Round-robin spreads load; if the
+    /// chosen connection is busy the caller waits, so read concurrency is bounded by the pool size
+    /// and no connection is ever driven by two reads at once (audit #8).
+    async fn acquire(&self) -> ReadGuard {
         let i = self.next.fetch_add(1, Ordering::Relaxed) % self.conns.len();
-        self.conns[i].as_ref()
+        self.conns[i].clone().lock_owned().await
     }
 }
 
@@ -90,9 +101,11 @@ impl AsyncMetadataStore {
         }
     }
 
-    /// A read-only driver connection from the pool.
-    fn reader(&self) -> &dyn AsyncSqlDriver {
-        self.reads.pick()
+    /// Check out a read-only driver connection from the pool, held exclusively for the whole read
+    /// (audit #8). Bind the returned guard for the duration of the read and deref it (`&**guard`)
+    /// to reach the driver.
+    async fn reader(&self) -> ReadGuard {
+        self.reads.acquire().await
     }
 
     /// A reconciliation oracle backed by this store, for the blob store's `reconcile`.
@@ -254,7 +267,7 @@ impl MetadataStore for AsyncMetadataStore {
 
     async fn get_bucket(&self, name: &BucketName) -> Result<Option<Bucket>, MetaError> {
         let row = query_one(
-            self.reader(),
+            &**self.reader().await,
             &format!("SELECT {BUCKET_COLS} FROM buckets WHERE name=?1"),
             vec![Value::Text(name.as_str().to_owned())],
         )
@@ -273,7 +286,7 @@ impl MetadataStore for AsyncMetadataStore {
                 vec![],
             ),
         };
-        let rows = self.reader().query(&sql, params).await?;
+        let rows = self.reader().await.query(&sql, params).await?;
         rows.iter().map(model::bucket_from_row).collect()
     }
 
@@ -284,7 +297,7 @@ impl MetadataStore for AsyncMetadataStore {
     ) -> Result<Option<ConfigDoc>, MetaError> {
         let aspect = crate::apply::aspect_str(aspect);
         let row = query_one(
-            self.reader(),
+            &**self.reader().await,
             "SELECT doc FROM bucket_config WHERE bucket_name=?1 AND aspect=?2",
             vec![
                 Value::Text(name.as_str().to_owned()),
@@ -297,7 +310,7 @@ impl MetadataStore for AsyncMetadataStore {
 
     async fn get_account_public_access_block(&self) -> Result<PublicAccessBlock, MetaError> {
         let row = query_one(
-            self.reader(),
+            &**self.reader().await,
             "SELECT v FROM account_config WHERE k='public_access_block'",
             vec![],
         )
@@ -311,7 +324,7 @@ impl MetadataStore for AsyncMetadataStore {
         // The query returns no row for "no such bucket"; a NULL cell for "no quota set". Both
         // present to the reader as "no quota". A stored negative is clamped to 0 defensively.
         let row = query_one(
-            self.reader(),
+            &**self.reader().await,
             "SELECT quota_bytes FROM buckets WHERE name=?1",
             vec![Value::Text(bucket.as_str().to_owned())],
         )
@@ -321,7 +334,7 @@ impl MetadataStore for AsyncMetadataStore {
 
     async fn is_bucket_empty(&self, name: &BucketName) -> Result<bool, MetaError> {
         let row = query_one(
-            self.reader(),
+            &**self.reader().await,
             // Empty means NO object_versions rows at all (any version or delete marker), matching
             // S3 DeleteBucket semantics (audit #3).
             "SELECT EXISTS(SELECT 1 FROM object_versions WHERE bucket_name=?1)",
@@ -337,7 +350,7 @@ impl MetadataStore for AsyncMetadataStore {
         key: &ObjectKey,
     ) -> Result<Option<ObjectVersionRow>, MetaError> {
         let row = query_one(
-            self.reader(),
+            &**self.reader().await,
             &format!(
                 "SELECT {OBJECT_VERSION_COLS} FROM object_versions WHERE bucket_name=?1 AND key=?2 AND is_latest=1"
             ),
@@ -357,7 +370,7 @@ impl MetadataStore for AsyncMetadataStore {
         version: &VersionId,
     ) -> Result<Option<ObjectVersionRow>, MetaError> {
         let row = query_one(
-            self.reader(),
+            &**self.reader().await,
             &format!(
                 "SELECT {OBJECT_VERSION_COLS} FROM object_versions WHERE bucket_name=?1 AND key=?2 AND version_id=?3"
             ),
@@ -376,7 +389,7 @@ impl MetadataStore for AsyncMetadataStore {
         bucket: &BucketName,
         query: &ListQuery,
     ) -> Result<ListPage<ObjectSummary>, MetaError> {
-        list_impl(self.reader(), bucket.as_str(), query, true).await
+        list_impl(&**self.reader().await, bucket.as_str(), query, true).await
     }
 
     async fn list_versions(
@@ -384,7 +397,7 @@ impl MetadataStore for AsyncMetadataStore {
         bucket: &BucketName,
         query: &ListQuery,
     ) -> Result<ListPage<ObjectSummary>, MetaError> {
-        list_impl(self.reader(), bucket.as_str(), query, false).await
+        list_impl(&**self.reader().await, bucket.as_str(), query, false).await
     }
 
     async fn enumerate_storage_paths(
@@ -394,7 +407,7 @@ impl MetadataStore for AsyncMetadataStore {
         batch: u32,
     ) -> Result<ListPage<StoragePath>, MetaError> {
         let rows = self
-            .reader()
+            .reader().await
             .query(
                 "SELECT storage_path FROM object_versions
                  WHERE bucket_name=?1 AND storage_path IS NOT NULL AND storage_path > ?2
@@ -430,7 +443,7 @@ impl MetadataStore for AsyncMetadataStore {
         version: &VersionId,
     ) -> Result<Vec<(String, String)>, MetaError> {
         let rows = self
-            .reader()
+            .reader().await
             .query(
                 "SELECT tag_key, tag_value FROM object_tags WHERE bucket_name=?1 AND key=?2 AND version_id=?3 ORDER BY tag_key",
                 vec![
@@ -451,7 +464,7 @@ impl MetadataStore for AsyncMetadataStore {
         upload: &UploadId,
     ) -> Result<Option<MultipartSession>, MetaError> {
         let row = query_one(
-            self.reader(),
+            &**self.reader().await,
             &format!("SELECT {MULTIPART_COLS} FROM multipart_uploads WHERE id=?1"),
             vec![Value::Text(upload.as_str().to_owned())],
         )
@@ -466,7 +479,7 @@ impl MetadataStore for AsyncMetadataStore {
         limit: u32,
     ) -> Result<ListPage<PartRecord>, MetaError> {
         let rows = self
-            .reader()
+            .reader().await
             .query(
                 &format!(
                     "SELECT {PART_COLS} FROM multipart_parts WHERE upload_id=?1 AND part_number>?2 ORDER BY part_number LIMIT ?3"
@@ -527,7 +540,7 @@ impl MetadataStore for AsyncMetadataStore {
             upper.map_or(Value::Null, Value::Text),
             Value::Int((limit + 1) as i64),
         ];
-        let rows = self.reader().query(&sql, params).await?;
+        let rows = self.reader().await.query(&sql, params).await?;
         let mut items: Vec<MultipartSession> = rows
             .iter()
             .map(model::multipart_from_row)
@@ -554,7 +567,7 @@ impl MetadataStore for AsyncMetadataStore {
         batch: u32,
     ) -> Result<Vec<MultipartSession>, MetaError> {
         let rows = self
-            .reader()
+            .reader().await
             .query(
                 &format!(
                     "SELECT {MULTIPART_COLS} FROM multipart_uploads WHERE updated_at < ?1 LIMIT ?2"
@@ -572,7 +585,7 @@ impl MetadataStore for AsyncMetadataStore {
         version: &VersionId,
     ) -> Result<Option<ReplicationStatus>, MetaError> {
         let row = query_one(
-            self.reader(),
+            &**self.reader().await,
             "SELECT replication_status FROM object_versions WHERE bucket_name=?1 AND key=?2 AND version_id=?3",
             vec![
                 Value::Text(bucket.as_str().to_owned()),
@@ -596,7 +609,7 @@ impl MetadataStore for AsyncMetadataStore {
         // completed entry keeps its row with status='completed'; anything else is still owed to
         // the destination and must ship before this later version (per-key ordering, audit #9).
         let row = query_one(
-            self.reader(),
+            &**self.reader().await,
             "SELECT EXISTS(SELECT 1 FROM replication_outbox \
              WHERE bucket_name=?1 AND key=?2 AND version_id<?3 AND status!='completed')",
             vec![
@@ -638,7 +651,7 @@ impl MetadataStore for AsyncMetadataStore {
     ) -> Result<Vec<OutboxEntry>, MetaError> {
         // Read-only mirror of the claim predicate; no mutation (see the sync store for rationale).
         let rows = self
-            .reader()
+            .reader().await
             .query(
                 &format!(
                     "SELECT {OUTBOX_COLS} FROM replication_outbox \
@@ -654,7 +667,7 @@ impl MetadataStore for AsyncMetadataStore {
 
     async fn list_failed_replication(&self, limit: u32) -> Result<Vec<OutboxEntry>, MetaError> {
         let rows = self
-            .reader()
+            .reader().await
             .query(
                 &format!(
                     "SELECT {OUTBOX_COLS} FROM replication_outbox WHERE status='failed' ORDER BY next_attempt_at DESC LIMIT ?1"
@@ -670,7 +683,7 @@ impl MetadataStore for AsyncMetadataStore {
         access_key_id: &str,
     ) -> Result<Option<UserWithBearerHash>, MetaError> {
         let row = query_one(
-            self.reader(),
+            &**self.reader().await,
             &format!("SELECT {USER_COLS} FROM users WHERE access_key_id=?1"),
             vec![Value::Text(access_key_id.to_owned())],
         )
@@ -685,7 +698,7 @@ impl MetadataStore for AsyncMetadataStore {
         access_key_id: &str,
     ) -> Result<Option<UserSigV4Credentials>, MetaError> {
         let row = query_one(
-            self.reader(),
+            &**self.reader().await,
             &format!("SELECT {USER_COLS} FROM users WHERE sigv4_access_key_id=?1"),
             vec![Value::Text(access_key_id.to_owned())],
         )
@@ -697,13 +710,13 @@ impl MetadataStore for AsyncMetadataStore {
     }
 
     async fn count_users(&self) -> Result<u64, MetaError> {
-        let row = query_one(self.reader(), "SELECT COUNT(*) FROM users", vec![]).await?;
+        let row = query_one(&**self.reader().await, "SELECT COUNT(*) FROM users", vec![]).await?;
         Ok(row.map_or(0, |r| r.get_i64(0)) as u64)
     }
 
     async fn list_users(&self) -> Result<Vec<User>, MetaError> {
         let rows = self
-            .reader()
+            .reader().await
             .query(
                 &format!("SELECT {USER_COLS} FROM users ORDER BY created_at"),
                 vec![],
@@ -714,7 +727,7 @@ impl MetadataStore for AsyncMetadataStore {
 
     async fn get_user_policy(&self, user_id: &UserId) -> Result<Option<String>, MetaError> {
         let row = query_one(
-            self.reader(),
+            &**self.reader().await,
             "SELECT policy FROM users WHERE id=?1",
             vec![Value::Text(user_id.0.as_str().to_owned())],
         )
@@ -724,7 +737,7 @@ impl MetadataStore for AsyncMetadataStore {
 
     async fn list_activity(&self, limit: u32) -> Result<Vec<ActivityEntry>, MetaError> {
         let rows = self
-            .reader()
+            .reader().await
             .query(
                 &format!("SELECT {ACTIVITY_COLS} FROM activity ORDER BY at DESC LIMIT ?1"),
                 vec![Value::Int(i64::from(limit))],
@@ -735,7 +748,7 @@ impl MetadataStore for AsyncMetadataStore {
 
     async fn get_share(&self, token: &str) -> Result<Option<ShareRow>, MetaError> {
         let rows = self
-            .reader()
+            .reader().await
             .query(
                 &format!("SELECT {SHARE_COLS} FROM object_shares WHERE token=?1"),
                 vec![Value::Text(token.to_owned())],
@@ -749,9 +762,10 @@ impl MetadataStore for AsyncMetadataStore {
         bucket: &BucketName,
         key: Option<&ObjectKey>,
     ) -> Result<Vec<ShareRow>, MetaError> {
+        let guard = self.reader().await;
         let rows = match key {
             Some(k) => {
-                self.reader()
+                guard
                     .query(
                         &format!(
                             "SELECT {SHARE_COLS} FROM object_shares WHERE bucket_name=?1 AND key=?2 ORDER BY created_at DESC"
@@ -764,7 +778,7 @@ impl MetadataStore for AsyncMetadataStore {
                     .await?
             }
             None => {
-                self.reader()
+                guard
                     .query(
                         &format!(
                             "SELECT {SHARE_COLS} FROM object_shares WHERE bucket_name=?1 ORDER BY created_at DESC"
@@ -786,7 +800,7 @@ impl MetadataStore for AsyncMetadataStore {
             None => Value::Null,
         };
         let rows = self
-            .reader()
+            .reader().await
             .query(
                 "SELECT ot.tag_key, ot.tag_value, COUNT(*) AS c
                  FROM object_tags ot
@@ -822,7 +836,7 @@ impl MetadataStore for AsyncMetadataStore {
             None => Value::Null,
         };
         let rows = self
-            .reader()
+            .reader().await
             .query(
                 "SELECT ot.bucket_name, ot.key, ot.version_id, ov.size_logical, ov.updated_at
                  FROM object_tags ot
@@ -855,7 +869,8 @@ impl MetadataStore for AsyncMetadataStore {
     }
 
     async fn aggregate_counts(&self) -> Result<StoreCounts, MetaError> {
-        let driver = self.reader();
+        let driver_guard = self.reader().await;
+        let driver: &dyn AsyncSqlDriver = &**driver_guard;
         let buckets = query_one(driver, "SELECT COUNT(*) FROM buckets", vec![])
             .await?
             .map_or(0, |r| r.get_i64(0));
@@ -894,7 +909,7 @@ impl MetadataStore for AsyncMetadataStore {
         // current-object count joins a GROUP BY over the partial current-version index. Neither
         // path scans historical versions for the byte sums.
         let rows = self
-            .reader()
+            .reader().await
             .query(
                 "SELECT b.name,
                     COALESCE(o.objects, 0),
@@ -928,7 +943,8 @@ impl MetadataStore for AsyncMetadataStore {
     ) -> Result<RequestMetricsSeries, MetaError> {
         let since = range.since_secs(now_secs);
         let window = range.window_secs().max(1);
-        let driver = self.reader();
+        let driver_guard = self.reader().await;
+        let driver: &dyn AsyncSqlDriver = &**driver_guard;
 
         // Timeline: re-bucket into the range's window, carrying errors, bytes, and average latency.
         let timeline: Vec<TimePoint> = driver
@@ -1088,7 +1104,8 @@ impl std::fmt::Debug for AsyncReconcileOracle {
 #[async_trait::async_trait]
 impl cairn_types::traits::ReconcileOracle for AsyncReconcileOracle {
     async fn live_blobs(&self, candidates: &[StoragePath]) -> Result<Vec<bool>, MetaError> {
-        let driver = self.reads.pick();
+        let guard = self.reads.acquire().await;
+        let driver: &dyn AsyncSqlDriver = &**guard;
         let mut out = Vec::with_capacity(candidates.len());
         for p in candidates {
             let row: Option<Row> = query_one(
@@ -1104,7 +1121,7 @@ impl cairn_types::traits::ReconcileOracle for AsyncReconcileOracle {
 
     async fn live_session(&self, upload: &UploadId) -> Result<bool, MetaError> {
         let row = query_one(
-            self.reads.pick(),
+            &**self.reads.acquire().await,
             "SELECT EXISTS(SELECT 1 FROM multipart_uploads WHERE id=?1)",
             vec![Value::Text(upload.as_str().to_owned())],
         )

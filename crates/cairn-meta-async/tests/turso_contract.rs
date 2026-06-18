@@ -1245,3 +1245,55 @@ async fn tag_browser_parity() {
         assert_eq!(dev_in_bb[0].key, "b1");
     }
 }
+
+/// Concurrent reads must not interleave on a shared connection (audit #8). With the pool's
+/// per-connection locking, many parallel listings — more readers than pool connections — each see
+/// the full, uncorrupted result.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_reads_are_isolated_per_connection() {
+    let s = cairn_meta_async::open_turso_in_memory().await.unwrap();
+    let bk = BucketName::parse("conc").unwrap();
+    s.submit(Mutation::CreateBucket(Box::new(bucket(
+        "conc",
+        VersioningState::Enabled,
+    ))))
+    .await
+    .unwrap();
+    const N: usize = 200;
+    for i in 0..N {
+        let key = format!("k{i:04}");
+        s.submit(put(
+            row(&bk, &key, VersionId::from_string(format!("v{i:04}")), "e", 3),
+            Precondition::default(),
+        ))
+        .await
+        .unwrap();
+    }
+
+    // More concurrent readers than the pool's connections, each a multi-query paging listing.
+    let mut handles = Vec::new();
+    for _ in 0..32 {
+        let s2 = s.clone();
+        let bk2 = bk.clone();
+        handles.push(tokio::spawn(async move {
+            s2.list_current(
+                &bk2,
+                &ListQuery {
+                    limit: 10_000,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .items
+            .len()
+        }));
+    }
+    for h in handles {
+        assert_eq!(
+            h.await.unwrap(),
+            N,
+            "every concurrent reader sees the full, uncorrupted listing"
+        );
+    }
+}
