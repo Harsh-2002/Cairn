@@ -655,6 +655,34 @@ impl MetadataStore for SqliteMetadataStore {
         .await
     }
 
+    async fn has_unreplicated_predecessor(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        before: &VersionId,
+    ) -> Result<bool, MetaError> {
+        let (b, k, v) = (
+            bucket.as_str().to_owned(),
+            key.as_str().to_owned(),
+            before.as_str().to_owned(),
+        );
+        self.with_read(move |conn| {
+            // version_id is uuidv7 (time-ordered), so a strictly-lower id is an earlier write.
+            // A completed entry keeps its row with status='completed'; anything else
+            // (pending/claimed/failed) is still owed to the destination and must ship first.
+            let exists: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM replication_outbox \
+                     WHERE bucket_name=?1 AND key=?2 AND version_id<?3 AND status!='completed')",
+                    params![b, k, v],
+                    |r| r.get(0),
+                )
+                .map_err(engine_err)?;
+            Ok(exists)
+        })
+        .await
+    }
+
     async fn claim_replication_batch(
         &self,
         limit: u32,

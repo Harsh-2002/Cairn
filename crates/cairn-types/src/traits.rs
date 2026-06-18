@@ -215,6 +215,18 @@ pub trait MetadataStore: Send + Sync {
         key: &ObjectKey,
         version: &VersionId,
     ) -> Result<Option<ReplicationStatus>, MetaError>;
+    /// Whether the outbox holds an earlier (lower `version_id`, i.e. created-before, since
+    /// version ids are time-ordered uuidv7) entry for the same `(bucket, key)` that has not yet
+    /// completed replication. The replication engine consults this before shipping an entry so it
+    /// can defer a later version whose predecessor is still in flight in a *separate* drain batch,
+    /// preserving per-key write order at the destination across batches (audit #9). Completed
+    /// entries keep their outbox row with `status='completed'`, so they are correctly excluded.
+    async fn has_unreplicated_predecessor(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        before: &VersionId,
+    ) -> Result<bool, MetaError>;
     /// Claim a batch of due replication entries (a write; routed through the writer
     /// internally by the implementation, exposed here for the worker pool). Claiming marks the
     /// entries `Claimed` with a lease so a concurrent worker cannot also process them.

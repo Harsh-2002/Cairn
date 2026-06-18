@@ -200,6 +200,12 @@ impl ReplicationEngine {
                         report.failed += 1;
                         blocked = true;
                     }
+                    EntryOutcome::Deferred => {
+                        // A predecessor in another batch is still in flight: block the rest of
+                        // this key's versions too, exactly as Retried/Failed would.
+                        report.deferred += 1;
+                        blocked = true;
+                    }
                 }
             }
         }
@@ -285,6 +291,21 @@ impl ReplicationEngine {
                 return Ok(EntryOutcome::Completed { bytes: 0 });
             }
             _ => {}
+        }
+
+        // Per-key ordering across drain batches (audit #9). Within one batch the engine sorts a
+        // key's versions and blocks on the first that does not complete, but a later version
+        // claimed in a *separate* batch has no sibling here to block on — so without this guard it
+        // could ship ahead of an earlier version still pending/failed in the outbox, reordering
+        // writes at the destination. Before shipping, defer if any earlier (lower version_id)
+        // outbox entry for this key has not completed; the entry stays claimed and is re-tried on
+        // a later drain once the predecessor ships. Applies to both object ships and delete
+        // markers, mirroring the within-batch block which is operation-agnostic.
+        if meta
+            .has_unreplicated_predecessor(&entry.bucket, &entry.key, &entry.version_id)
+            .await?
+        {
+            return Ok(EntryOutcome::Deferred);
         }
 
         // Route this entry to the sink for its rule's remote target. The outbox entry's identity is
@@ -472,6 +493,11 @@ enum EntryOutcome {
     Completed { bytes: u64 },
     Retried,
     Failed,
+    /// An earlier version of this key has not yet replicated (it is in flight in a separate drain
+    /// batch). The entry was left untouched — still `claimed` under its lease — so a later drain
+    /// re-claims and re-tries it once the predecessor completes, without contacting the sink or
+    /// burning a retry attempt. This preserves per-key write order across batches (audit #9).
+    Deferred,
 }
 
 /// Re-upsert a version row with a new replication status, enqueueing no replication.

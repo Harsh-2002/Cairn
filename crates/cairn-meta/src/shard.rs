@@ -374,6 +374,18 @@ impl MetadataStore for ShardedMetadataStore {
             .await
     }
 
+    async fn has_unreplicated_predecessor(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        before: &VersionId,
+    ) -> Result<bool, MetaError> {
+        // The outbox is a per-bucket table, so this key's predecessors live in the same shard.
+        self.for_bucket(bucket.as_str())
+            .has_unreplicated_predecessor(bucket, key, before)
+            .await
+    }
+
     async fn claim_replication_batch(
         &self,
         limit: u32,

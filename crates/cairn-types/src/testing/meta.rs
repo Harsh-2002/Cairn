@@ -962,6 +962,23 @@ impl MetadataStore for InMemoryMetadataStore {
             .and_then(|r| r.replication_status))
     }
 
+    async fn has_unreplicated_predecessor(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        before: &VersionId,
+    ) -> Result<bool, MetaError> {
+        // version_id is uuidv7 (time-ordered); a strictly-lower id is an earlier write that has
+        // not shipped unless its outbox row is `Completed` (audit #9).
+        let st = self.state.lock().unwrap();
+        Ok(st.outbox.iter().any(|e| {
+            e.bucket.as_str() == bucket.as_str()
+                && e.key.as_str() == key.as_str()
+                && e.version_id.as_str() < before.as_str()
+                && e.status != ReplicationStatus::Completed
+        }))
+    }
+
     async fn claim_replication_batch(
         &self,
         limit: u32,

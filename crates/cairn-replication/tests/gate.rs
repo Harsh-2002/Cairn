@@ -139,6 +139,48 @@ async fn put_with_outbox(
     version
 }
 
+/// Commit an ObjectCreate version with an *explicit* version id (so the test controls per-key
+/// ordering) plus a pending, due outbox entry, staging its blob.
+async fn enqueue_versioned(
+    meta: &InMemoryMetadataStore,
+    blobs: &InMemoryBlobStore,
+    entry_id: &str,
+    key: &str,
+    version: &VersionId,
+    data: &'static [u8],
+    due_at: Timestamp,
+) {
+    let (path, etag, size) = stage_blob(blobs, data).await;
+    let row = version_row(
+        key,
+        version,
+        Some(path),
+        etag,
+        size,
+        false,
+        ReplicationStatus::Pending,
+        due_at,
+    );
+    let entry = outbox_entry_for(
+        entry_id,
+        bucket(),
+        ObjectKey::parse(key).unwrap(),
+        version.clone(),
+        ReplicationOp::ObjectCreate,
+        "rule-0",
+        None,
+        due_at,
+        0,
+    );
+    meta.submit(Mutation::PutObjectVersion {
+        row: Box::new(row),
+        precondition: Precondition::default(),
+        replication: Some(entry),
+    })
+    .await
+    .unwrap();
+}
+
 /// How many due Pending entries the outbox would hand a worker at `now` (test introspection
 /// via the public trait surface).
 async fn due_entries(meta: &InMemoryMetadataStore, now: Timestamp) -> Vec<OutboxEntry> {
@@ -284,6 +326,97 @@ async fn retryable_failure_reschedules_then_succeeds_after_clock_advance() {
             .await
             .is_empty()
     );
+}
+
+/// Per-key replication ordering is preserved *across* drain batches (audit #9). Within one batch
+/// the engine already sorts a key's versions and blocks on the first that does not complete; the
+/// gap is a later version claimed in a *separate* batch, with no in-batch sibling to block on.
+/// Here v1 fails retryably and backs off out of the due set, then v2 arrives as the only due
+/// entry with a healthy sink — it must defer behind the still-pending v1 rather than ship ahead
+/// of it, then both ship in order once v1 recovers.
+#[tokio::test]
+async fn later_version_defers_until_earlier_version_replicates() {
+    let meta = InMemoryMetadataStore::new();
+    let blobs = Arc::new(InMemoryBlobStore::new());
+    let sink = FakeReplicationSink::new();
+    let router = SingleSink(sink);
+    let clock = TestClock::at_secs(1_000);
+    let now = clock.now();
+
+    let key = "obj/ordered";
+    // Deterministic, lexicographically time-ordered ids (v1 < v2), matching uuidv7 semantics.
+    let v1 = VersionId::from_string("v1".into());
+    let v2 = VersionId::from_string("v2".into());
+
+    // v1 is enqueued and fails retryably, so its backoff pushes it out of the due set — landing
+    // it in a different batch from v2.
+    enqueue_versioned(&meta, &blobs, "e-v1", key, &v1, b"first", now).await;
+    router.0.set_behavior(SinkBehavior::Retryable);
+    let r = engine()
+        .run_once(&meta, &router, &blobs, &clock)
+        .await
+        .unwrap();
+    assert_eq!(r.retried, 1);
+    assert!(
+        due_entries(&meta, now).await.is_empty(),
+        "v1 backed off and is no longer due"
+    );
+
+    // v2 now arrives as the only due entry, with a *healthy* sink. Absent the cross-batch guard it
+    // would ship immediately and reorder ahead of v1; with the guard it defers.
+    enqueue_versioned(&meta, &blobs, "e-v2", key, &v2, b"second", now).await;
+    router.0.set_behavior(SinkBehavior::Succeed);
+    let r = engine()
+        .run_once(&meta, &router, &blobs, &clock)
+        .await
+        .unwrap();
+    assert_eq!(r.deferred, 1, "v2 must defer behind the un-replicated v1");
+    assert_eq!(r.completed, 0);
+    assert!(
+        router.0.intents().is_empty(),
+        "v2 must not ship while v1 is still owed to the destination"
+    );
+    assert_eq!(
+        version_status(&meta, key, &v2).await,
+        Some(ReplicationStatus::Pending)
+    );
+
+    // Recovery: advance past v1's backoff and v2's claim lease, heal the sink, and drain. v1 ships
+    // first; once it completes, v2 is free to ship — in order, exactly once each.
+    clock.set(now.plus_secs(100_000));
+    for _ in 0..6 {
+        let r = engine()
+            .run_once(&meta, &router, &blobs, &clock)
+            .await
+            .unwrap();
+        if r.claimed == 0 {
+            break;
+        }
+    }
+    assert_eq!(
+        version_status(&meta, key, &v1).await,
+        Some(ReplicationStatus::Completed)
+    );
+    assert_eq!(
+        version_status(&meta, key, &v2).await,
+        Some(ReplicationStatus::Completed)
+    );
+    let intents = router.0.intents();
+    assert_eq!(intents.len(), 2, "both versions shipped exactly once");
+    match (&intents[0], &intents[1]) {
+        (
+            RecordedIntent::Put {
+                version_id: first, ..
+            },
+            RecordedIntent::Put {
+                version_id: second, ..
+            },
+        ) => {
+            assert_eq!(first, &v1, "v1 ships first");
+            assert_eq!(second, &v2, "v2 ships after v1 — order preserved");
+        }
+        other => panic!("expected two ordered Put intents, got {other:?}"),
+    }
 }
 
 #[tokio::test]

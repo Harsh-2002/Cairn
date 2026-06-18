@@ -645,6 +645,17 @@ impl MetadataStore for CachedMetadataStore {
             .await
     }
 
+    async fn has_unreplicated_predecessor(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        before: &VersionId,
+    ) -> Result<bool, MetaError> {
+        self.inner
+            .has_unreplicated_predecessor(bucket, key, before)
+            .await
+    }
+
     async fn claim_replication_batch(
         &self,
         limit: u32,
@@ -976,6 +987,16 @@ mod tests {
         ) -> Result<Option<ReplicationStatus>, MetaError> {
             self.inner
                 .object_replication_status(bucket, key, version)
+                .await
+        }
+        async fn has_unreplicated_predecessor(
+            &self,
+            bucket: &BucketName,
+            key: &ObjectKey,
+            before: &VersionId,
+        ) -> Result<bool, MetaError> {
+            self.inner
+                .has_unreplicated_predecessor(bucket, key, before)
                 .await
         }
         async fn claim_replication_batch(
