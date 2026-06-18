@@ -313,7 +313,7 @@ async fn repair_dangling_rows(
                 // missing blob yields `NotFound`, which is exactly the dangling case we repair. Any
                 // other error is surfaced rather than treated as "missing", so a transient I/O fault
                 // never deletes good metadata.
-                match blob.open(&path, None).await {
+                match blob.open(&path, None, &row.compression).await {
                     Ok(_) => {}
                     Err(BlobError::NotFound) => {
                         match meta

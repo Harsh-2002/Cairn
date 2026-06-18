@@ -665,7 +665,10 @@ impl S3Service {
             Some(d) => Some(self.open_sse_dek(d)?),
             None => None,
         };
-        let handle = self.blob.open_with_dek(&storage, range, dek).await?;
+        let handle = self
+            .blob
+            .open_with_dek(&storage, range, dek, &row.compression)
+            .await?;
         let status = if handle.content_range.is_some() {
             StatusCode::PARTIAL_CONTENT
         } else {
@@ -1024,7 +1027,10 @@ impl S3Service {
             Some(d) => Some(self.open_sse_dek(d)?),
             None => None,
         };
-        let handle = self.blob.open_with_dek(&src_path, range, src_dek).await?;
+        let handle = self
+            .blob
+            .open_with_dek(&src_path, range, src_dek, &src_row.compression)
+            .await?;
         let src_stream: cairn_types::BodyStream =
             {
                 use futures_util::StreamExt;
@@ -1368,7 +1374,10 @@ impl S3Service {
             Some(d) => Some(self.open_sse_dek(d)?),
             None => None,
         };
-        let handle = self.blob.open_with_dek(&src_path, None, src_dek).await?;
+        let handle = self
+            .blob
+            .open_with_dek(&src_path, None, src_dek, &src_row.compression)
+            .await?;
         // Re-tag the blob read errors as body errors so the source can feed `stage`.
         let src_stream: cairn_types::BodyStream =
             {

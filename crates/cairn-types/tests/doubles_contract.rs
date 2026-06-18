@@ -122,7 +122,11 @@ async fn put_get_list_delete_roundtrip() {
         .unwrap()
         .unwrap();
     let handle = blob
-        .open(current.storage_path.as_ref().unwrap(), None)
+        .open(
+            current.storage_path.as_ref().unwrap(),
+            None,
+            &current.compression,
+        )
         .await
         .unwrap();
     assert_eq!(read_all(handle).await, b"hello");

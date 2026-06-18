@@ -508,8 +508,15 @@ impl BlobStore for LocalBlobStore {
         path: &StoragePath,
         range: Option<ByteRange>,
         dek: Option<[u8; 32]>,
+        compression: &CompressionDescriptor,
     ) -> Result<BlobReadHandle, BlobError> {
         let file_path = self.resolve(path)?;
+        // The blob is a self-describing CRNB block container iff it was compressed OR encrypted at
+        // write time (audit #18). Decide that from the caller's stored compression descriptor and
+        // the DEK — both authoritative — rather than sniffing the 34-byte trailer magic, which an
+        // uncompressed object's own bytes can collide with.
+        let is_container =
+            dek.is_some() || !matches!(compression, CompressionDescriptor::Uncompressed);
         // One open + one fstat handles existence, length, and compression detection together,
         // replacing the prior try_exists + two metadata stats + a separate compression-probe open
         // (Phase 2.5). On the common uncompressed branch the opened fd is handed back to serve the
@@ -517,7 +524,7 @@ impl BlobStore for LocalBlobStore {
         let probe_path = file_path.clone();
         let (compressed, logical_len, reuse_file) = tokio::task::spawn_blocking(
             move || -> Result<(bool, u64, Option<std::fs::File>), BlobError> {
-                use std::io::{Read, Seek, SeekFrom};
+                use std::io::{Seek, SeekFrom};
                 let mut f = match std::fs::File::open(&probe_path) {
                     Ok(f) => f,
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -526,15 +533,10 @@ impl BlobStore for LocalBlobStore {
                     Err(e) => return Err(io_err(e)),
                 };
                 let file_len = f.metadata().map_err(io_err)?.len();
-                // Compression is self-describing via the 34-byte trailer magic, read from this fd.
-                let compressed = if file_len >= 34 {
-                    f.seek(SeekFrom::End(-34)).map_err(io_err)?;
-                    let mut magic = [0u8; 4];
-                    f.read_exact(&mut magic).map_err(io_err)?;
-                    &magic == b"CRNB"
-                } else {
-                    false
-                };
+                // Whether this blob is a CRNB block container is authoritative from the caller's
+                // stored descriptor + DEK (`is_container`, audit #18), so there is no trailer sniff
+                // to misfire on an uncompressed object whose own bytes happen to end in "CRNB".
+                let compressed = is_container;
                 if compressed {
                     // Parse the header for the logical length; the fd is consumed by the reader and
                     // not reused (compressed/encrypted blobs never take the kernel fast path).

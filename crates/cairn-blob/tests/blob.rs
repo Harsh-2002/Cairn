@@ -47,9 +47,14 @@ fn opts_encrypted(
     }
 }
 
-async fn read_all(store: &LocalBlobStore, path: &StoragePath, range: Option<ByteRange>) -> Vec<u8> {
+async fn read_all(
+    store: &LocalBlobStore,
+    path: &StoragePath,
+    range: Option<ByteRange>,
+    compression: &CompressionDescriptor,
+) -> Vec<u8> {
     use futures_util::StreamExt;
-    let handle = store.open(path, range).await.unwrap();
+    let handle = store.open(path, range, compression).await.unwrap();
     let mut out = Vec::new();
     let mut body = handle.body;
     while let Some(c) = body.next().await {
@@ -74,12 +79,39 @@ async fn uncompressed_roundtrip_and_etag() {
         CompressionDescriptor::Uncompressed
     ));
     assert_eq!(
-        read_all(&store, &staged.storage_path, None).await,
+        read_all(&store, &staged.storage_path, None, &staged.compression).await,
         b"hello world"
     );
     // The uncompressed path exposes a zero-copy hint.
-    let handle = store.open(&staged.storage_path, None).await.unwrap();
+    let handle = store.open(&staged.storage_path, None, &staged.compression).await.unwrap();
     assert!(handle.zero_copy.is_some());
+}
+
+#[tokio::test]
+async fn uncompressed_blob_ending_in_crnb_magic_is_not_misdetected() {
+    // Audit #18: an uncompressed object whose trailing bytes collide with the 34-byte CRNB
+    // block-container trailer magic must NOT be misread as a compressed container — the stored
+    // descriptor is authoritative, not a trailer sniff.
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let b = BucketName::parse("bkt").unwrap();
+    // Plant "CRNB" exactly at offset len-34, where the trailer magic would sit — the worst case.
+    let mut data = vec![0u8; 64];
+    let pos = data.len() - 34;
+    data[pos..pos + 4].copy_from_slice(b"CRNB");
+    let staged = store
+        .stage(&b, body(data.clone()), opts(None, "application/octet-stream"))
+        .await
+        .unwrap();
+    assert!(matches!(
+        staged.compression,
+        CompressionDescriptor::Uncompressed
+    ));
+    assert_eq!(
+        read_all(&store, &staged.storage_path, None, &staged.compression).await,
+        data,
+        "an uncompressed blob colliding with the CRNB trailer must read back intact"
+    );
 }
 
 #[tokio::test]
@@ -106,7 +138,7 @@ async fn preallocated_write_roundtrips_and_size_is_exact() {
         "preallocation must not change the logical size"
     );
     assert_eq!(
-        read_all(&store, &staged.storage_path, None).await,
+        read_all(&store, &staged.storage_path, None, &staged.compression).await,
         data,
         "byte-identical round-trip through the preallocated path"
     );
@@ -126,7 +158,7 @@ async fn preallocated_write_roundtrips_and_size_is_exact() {
         short.len() as u64,
         "an over-declared content length must not pad the blob"
     );
-    assert_eq!(read_all(&store, &staged2.storage_path, None).await, short);
+    assert_eq!(read_all(&store, &staged2.storage_path, None, &staged2.compression).await, short);
 }
 
 #[tokio::test]
@@ -169,20 +201,20 @@ async fn compression_is_transparent_and_etag_invariant() {
     assert_eq!(comp.size_logical, data.len() as u64);
 
     // Full read is transparent.
-    assert_eq!(read_all(&store, &comp.storage_path, None).await, data);
+    assert_eq!(read_all(&store, &comp.storage_path, None, &comp.compression).await, data);
     // A range starting mid-block near the end (the case block compression exists for).
     let range = ByteRange {
         offset: 5000,
         length: 1234,
     };
     assert_eq!(
-        read_all(&store, &comp.storage_path, Some(range)).await,
+        read_all(&store, &comp.storage_path, Some(range), &comp.compression).await,
         &data[5000..6234]
     );
     // A compressed read offers no zero-copy hint.
     assert!(
         store
-            .open(&comp.storage_path, Some(range))
+            .open(&comp.storage_path, Some(range), &comp.compression)
             .await
             .unwrap()
             .zero_copy
@@ -195,9 +227,10 @@ async fn read_all_dek(
     path: &StoragePath,
     range: Option<ByteRange>,
     dek: Option<[u8; 32]>,
+    compression: &CompressionDescriptor,
 ) -> Result<Vec<u8>, cairn_types::error::BlobError> {
     use futures_util::StreamExt;
-    let handle = store.open_with_dek(path, range, dek).await?;
+    let handle = store.open_with_dek(path, range, dek, compression).await?;
     let mut out = Vec::new();
     let mut body = handle.body;
     while let Some(c) = body.next().await {
@@ -248,7 +281,7 @@ async fn encrypted_roundtrip_etag_invariant_and_ranged() {
 
     // Full read with the correct DEK returns the original bytes.
     assert_eq!(
-        read_all_dek(&store, &enc.storage_path, None, Some(dek))
+        read_all_dek(&store, &enc.storage_path, None, Some(dek), &enc.compression)
             .await
             .unwrap(),
         data
@@ -259,7 +292,7 @@ async fn encrypted_roundtrip_etag_invariant_and_ranged() {
         length: 1234,
     };
     assert_eq!(
-        read_all_dek(&store, &enc.storage_path, Some(range), Some(dek))
+        read_all_dek(&store, &enc.storage_path, Some(range), Some(dek), &enc.compression)
             .await
             .unwrap(),
         &data[5000..6234]
@@ -267,7 +300,7 @@ async fn encrypted_roundtrip_etag_invariant_and_ranged() {
     // An encrypted blob never offers a zero-copy hint (the kernel cannot decrypt).
     assert!(
         store
-            .open_with_dek(&enc.storage_path, None, Some(dek))
+            .open_with_dek(&enc.storage_path, None, Some(dek), &enc.compression)
             .await
             .unwrap()
             .zero_copy
@@ -302,23 +335,26 @@ async fn encrypted_without_compression_and_wrong_dek_fails() {
 
     // Correct DEK reads the original bytes.
     assert_eq!(
-        read_all_dek(&store, &enc.storage_path, None, Some(dek))
+        read_all_dek(&store, &enc.storage_path, None, Some(dek), &enc.compression)
             .await
             .unwrap(),
         data
     );
     // The wrong DEK fails authentication.
-    let wrong = read_all_dek(&store, &enc.storage_path, None, Some([0x23u8; 32])).await;
+    let wrong = read_all_dek(&store, &enc.storage_path, None, Some([0x23u8; 32]), &enc.compression).await;
     assert!(matches!(
         wrong,
         Err(cairn_types::error::BlobError::Corruption(_))
     ));
-    // Opening an encrypted blob with no DEK at all fails fast.
-    let none = store.open_with_dek(&enc.storage_path, None, None).await;
-    assert!(matches!(
-        none,
-        Err(cairn_types::error::BlobError::Corruption(_))
-    ));
+    // With the descriptor+DEK contract (audit #18) the blob layer trusts the caller's signals
+    // instead of sniffing the trailer. Reading this (uncompressed-descriptor) encrypted blob with
+    // NO DEK therefore yields the stored CRNB-container bytes as-is rather than erroring — but
+    // never the plaintext. This cannot occur on the production GET path, which always supplies the
+    // DEK derived from the object's SSE descriptor when the object is encrypted.
+    let none = read_all_dek(&store, &enc.storage_path, None, None, &enc.compression)
+        .await
+        .expect("trusting the descriptor, a no-DEK read returns the raw stored bytes");
+    assert_ne!(none, data, "a no-DEK read must never yield plaintext");
 }
 
 /// An old-format (unencrypted) blob still reads unchanged through both `open` and `open_with_dek`
@@ -343,9 +379,9 @@ async fn old_unencrypted_blob_reads_unchanged() {
         .await
         .unwrap();
     // Reads via the legacy `open` and via `open_with_dek(None)` both succeed and match.
-    assert_eq!(read_all(&store, &staged.storage_path, None).await, data);
+    assert_eq!(read_all(&store, &staged.storage_path, None, &staged.compression).await, data);
     assert_eq!(
-        read_all_dek(&store, &staged.storage_path, None, None)
+        read_all_dek(&store, &staged.storage_path, None, None, &staged.compression)
             .await
             .unwrap(),
         data
@@ -425,7 +461,7 @@ async fn multipart_assembly_roundtrip() {
         .unwrap();
     assert_eq!(assembled.size_logical, (p1.size + p2.size));
     assert_eq!(
-        read_all(&store, &assembled.storage_path, None).await,
+        read_all(&store, &assembled.storage_path, None, &assembled.compression).await,
         b"part-one-part-two"
     );
     store.delete_session(&upload).await.unwrap();
@@ -466,9 +502,9 @@ async fn reconcile_reclaims_orphans_only() {
         .unwrap();
     assert_eq!(report.orphans_reclaimed, 1);
     // keep is still readable, orphan is gone.
-    assert_eq!(read_all(&store, &keep.storage_path, None).await, b"keep");
+    assert_eq!(read_all(&store, &keep.storage_path, None, &keep.compression).await, b"keep");
     assert!(matches!(
-        store.open(&orphan.storage_path, None).await,
+        store.open(&orphan.storage_path, None, &orphan.compression).await,
         Err(BlobError::NotFound)
     ));
 }
@@ -503,7 +539,7 @@ async fn reconcile_skips_recent_orphan_within_safety_margin() {
         report.orphans_reclaimed, 0,
         "a blob younger than the safety margin must not be reclaimed"
     );
-    assert_eq!(read_all(&store, &orphan.storage_path, None).await, b"fresh");
+    assert_eq!(read_all(&store, &orphan.storage_path, None, &orphan.compression).await, b"fresh");
 }
 
 #[tokio::test]
@@ -605,7 +641,12 @@ async fn delete_is_idempotent_and_paths_are_safe() {
 
     // A traversal path is rejected structurally.
     let evil = StoragePath::from_string("../../../etc/passwd".to_owned());
-    assert!(store.open(&evil, None).await.is_err());
+    assert!(
+        store
+            .open(&evil, None, &CompressionDescriptor::Uncompressed)
+            .await
+            .is_err()
+    );
 }
 
 /// An object staged through the io_uring write path reads back byte-for-byte identically and with
@@ -656,10 +697,10 @@ async fn io_uring_staged_object_reads_back_identically() {
     assert_eq!(via_uring.size_physical, via_epoll.size_physical);
 
     // The blob committed by the io_uring path reads back byte-for-byte.
-    assert_eq!(read_all(&uring, &via_uring.storage_path, None).await, data);
+    assert_eq!(read_all(&uring, &via_uring.storage_path, None, &via_uring.compression).await, data);
     // And it is fully readable through a store using the default backend, too — the on-disk
     // artifact is identical regardless of which path wrote it.
-    assert_eq!(read_all(&epoll, &via_uring.storage_path, None).await, data);
+    assert_eq!(read_all(&epoll, &via_uring.storage_path, None, &via_uring.compression).await, data);
 
     // A ranged read of the io_uring-staged blob returns the matching slice.
     let range = ByteRange {
@@ -667,7 +708,7 @@ async fn io_uring_staged_object_reads_back_identically() {
         length: 4096,
     };
     assert_eq!(
-        read_all(&uring, &via_uring.storage_path, Some(range)).await,
+        read_all(&uring, &via_uring.storage_path, Some(range), &via_uring.compression).await,
         &data[100_000..104_096]
     );
 }
@@ -706,7 +747,7 @@ async fn io_uring_compressed_encrypted_and_multipart_roundtrip() {
         .unwrap();
     assert!(enc.size_physical < enc.size_logical, "compressed on disk");
     assert_eq!(
-        read_all_dek(&store, &enc.storage_path, None, Some(dek))
+        read_all_dek(&store, &enc.storage_path, None, Some(dek), &enc.compression)
             .await
             .unwrap(),
         data
@@ -739,7 +780,7 @@ async fn io_uring_compressed_encrypted_and_multipart_roundtrip() {
         .await
         .unwrap();
     assert_eq!(
-        read_all(&store, &assembled.storage_path, None).await,
+        read_all(&store, &assembled.storage_path, None, &assembled.compression).await,
         b"uring-part-one-uring-part-two"
     );
     store.delete_session(&upload).await.unwrap();

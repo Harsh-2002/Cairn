@@ -115,7 +115,10 @@ impl BlobStore for InMemoryBlobStore {
         path: &StoragePath,
         range: Option<ByteRange>,
         dek: Option<[u8; 32]>,
+        _compression: &CompressionDescriptor,
     ) -> Result<BlobReadHandle, BlobError> {
+        // The in-memory double stores logical bytes directly (no CRNB container), so the stored
+        // compression descriptor is irrelevant to reads here.
         let data = {
             let blobs = self.blobs.lock().unwrap();
             let stored = blobs.get(path.as_str()).ok_or(BlobError::NotFound)?;

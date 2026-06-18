@@ -24,7 +24,7 @@ use crate::meta::{
     RequestMetricsSeries, ShareRow, StoreCounts, TagSummary, TaggedObject, User,
     UserSigV4Credentials, UserWithBearerHash,
 };
-use crate::object::ObjectVersionRow;
+use crate::object::{CompressionDescriptor, ObjectVersionRow};
 use crate::replication::ReplicatedObject;
 use crate::time::Timestamp;
 use async_trait::async_trait;
@@ -56,8 +56,9 @@ pub trait BlobStore: Send + Sync {
         &self,
         path: &StoragePath,
         range: Option<ByteRange>,
+        compression: &CompressionDescriptor,
     ) -> Result<BlobReadHandle, BlobError> {
-        self.open_with_dek(path, range, None).await
+        self.open_with_dek(path, range, None, compression).await
     }
 
     /// Open a committed blob for reading, transparently decompressing and — when `dek` is
@@ -65,11 +66,17 @@ pub trait BlobStore: Send + Sync {
     /// data-encryption key, optionally for a range expressed in logical (plaintext) coordinates.
     /// An encrypted blob opened with the wrong (or no) DEK fails with [`BlobError::Corruption`]
     /// rather than yielding plaintext (ARCH §27, SSE-S3).
+    ///
+    /// `compression` is the object version's stored compression descriptor, the source of truth
+    /// for whether the blob is a self-describing CRNB block container. The reader trusts it (and
+    /// `dek` — encryption also uses the container) rather than sniffing the trailer magic, which
+    /// an uncompressed object's bytes can collide with (audit #18).
     async fn open_with_dek(
         &self,
         path: &StoragePath,
         range: Option<ByteRange>,
         dek: Option<[u8; 32]>,
+        compression: &CompressionDescriptor,
     ) -> Result<BlobReadHandle, BlobError>;
 
     /// Idempotently delete a committed blob (absence is success).

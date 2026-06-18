@@ -411,7 +411,10 @@ impl ReplicationEngine {
             offset: 0,
             length: row.size_logical,
         });
-        let handle = blobs.open(path, range).await.map_err(map_blob_err)?;
+        let handle = blobs
+            .open(path, range, &row.compression)
+            .await
+            .map_err(map_blob_err)?;
 
         let size = row.size_logical;
         let object = ReplicatedObject {
