@@ -18,6 +18,7 @@ mod adapter;
 mod background;
 mod cli_remote;
 mod config;
+mod key_rewrap;
 mod metrics_agg;
 mod observability;
 mod server;

@@ -9,7 +9,7 @@
 
 use crate::stack::AppStack;
 use bytes::Bytes;
-use cairn_crypto::SystemClock;
+use cairn_crypto::{SystemClock, SystemCrypto};
 use cairn_protocol::{S3Body, S3Request, S3Response, error_response};
 use cairn_types::auth::{AuthMethod, AuthOutcome, Principal, RequestView, Role};
 use cairn_types::crypto::Nonce;
@@ -120,6 +120,11 @@ pub async fn handle(
             // proceeding with an empty body rather than synthesizing a misleading 413.
             Err(_) => Bytes::new(),
         };
+        // Master-key rotation status (audit #29, Phase E): an admin-only operator surface served
+        // from the server stack because it reads the concrete per-shard handles + the key ring.
+        if method == Method::GET && subpath == "/system/crypto-status" {
+            return crypto_status_response(stack, principal.as_ref(), &request_id).await;
+        }
         // Minting a persistent public-read ("share") URL is handled here, not in cairn-control,
         // because it streams object bytes through the server stack on redemption:
         // POST /api/v1/buckets/{bucket}/objects/share.
@@ -634,6 +639,77 @@ async fn serve_share(
         http::HeaderValue::from_static("no-referrer"),
     );
     resp
+}
+
+/// Build the admin-only `GET /api/v1/system/crypto-status` JSON (audit #29, Phase E): the active
+/// master key, its seal count vs the thresholds, the ring key states (aggregated across shards),
+/// and per-stream re-wrap completion. Contains NO key material — only ids, key-hash prefixes, and
+/// counters — so an operator can tell when a retired key's data is fully re-wrapped.
+async fn crypto_status_response(
+    stack: &AppStack,
+    principal: Option<&Principal>,
+    request_id: &str,
+) -> Response<ResponseBody> {
+    if principal.map(|p| p.role) != Some(Role::Administrator) {
+        return json_status(403, r#"{"error":"forbidden"}"#);
+    }
+    // Aggregate ring states across shards: union of ids, active if any shard says so, max count.
+    let mut keys: std::collections::BTreeMap<u16, (String, bool, u64)> =
+        std::collections::BTreeMap::new();
+    for s in &stack.store {
+        if let Ok(rows) = s.key_ring_states().await {
+            for r in rows {
+                let e = keys.entry(r.id).or_insert((String::new(), false, 0));
+                e.0 = r.key_hash;
+                e.1 = e.1 || r.is_active;
+                e.2 = e.2.max(r.sealed_count);
+            }
+        }
+    }
+    // Per-stream re-wrap completion: a cleared cursor (None) on every shard means complete.
+    let mut rewrap = Vec::new();
+    let mut all_complete = true;
+    for stream in ["object_versions.sse_descriptor", "users.sigv4_secret"] {
+        let mut complete = true;
+        for s in &stack.store {
+            if matches!(s.rewrap_cursor(stream.to_owned()).await, Ok(Some(_))) {
+                complete = false;
+            }
+        }
+        all_complete = all_complete && complete;
+        rewrap.push(serde_json::json!({ "stream": stream, "complete": complete }));
+    }
+    let keys_json: Vec<_> = keys
+        .into_iter()
+        .map(|(id, (hash, is_active, count))| {
+            serde_json::json!({
+                "id": id,
+                "key_hash": hash,
+                "active": is_active,
+                "sealed_count": count,
+                "retire_eligible": !is_active && all_complete,
+            })
+        })
+        .collect();
+    let body = serde_json::json!({
+        "active_key_id": stack.crypto.active_key_id(),
+        "seal_count": stack.crypto.seal_count(),
+        "nonce_ceiling": SystemCrypto::nonce_ceiling(),
+        "alert_threshold": SystemCrypto::seal_alert_threshold(),
+        "hard_stop_threshold": SystemCrypto::seal_stop_threshold(),
+        "keys": keys_json,
+        "rewrap": rewrap,
+    })
+    .to_string();
+    let mut builder = Response::builder()
+        .status(200)
+        .header("content-type", "application/json");
+    if let Ok(v) = http::HeaderValue::from_str(request_id) {
+        builder = builder.header("x-amz-request-id", v);
+    }
+    builder
+        .body(full_body(Bytes::from(body)))
+        .unwrap_or_else(|_| Response::new(full_body(Bytes::new())))
 }
 
 /// Route a request to a `(bucket, key)`, preferring virtual-host-style addressing when configured.

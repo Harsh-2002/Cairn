@@ -113,6 +113,218 @@ impl SqliteMetadataStore {
         .await
         .map_err(|e| MetaError::Engine(e.to_string()))?
     }
+
+    // --- master-key re-wrap support (audit #29, Phase D/E; sqlite-only) ---
+    // (see `RewrapUserRow` below)
+
+    /// Page `(object_version_pk, sse_descriptor)` for rows carrying an SSE descriptor, after
+    /// `cursor` (exclusive), ordered by PK so the cursor advances deterministically.
+    pub async fn rewrap_sse_page(
+        &self,
+        cursor: Option<String>,
+        limit: u32,
+    ) -> Result<Vec<(String, String)>, MetaError> {
+        self.with_read(move |conn| {
+            let cur = cursor.unwrap_or_default();
+            conn.prepare_cached(
+                "SELECT id, sse_descriptor FROM object_versions
+                 WHERE sse_descriptor IS NOT NULL AND id > ?1 ORDER BY id LIMIT ?2",
+            )
+            .map_err(engine_err)?
+            .query_map(params![cur, limit], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(engine_err)?
+            .collect::<rusqlite::Result<Vec<(String, String)>>>()
+            .map_err(engine_err)
+        })
+        .await
+    }
+
+    /// Replace one object version's SSE descriptor (re-wrapped under the active key).
+    pub async fn rewrap_set_sse(
+        &self,
+        version_pk: String,
+        descriptor: String,
+    ) -> Result<(), MetaError> {
+        self.writer
+            .run_exec(move |conn| {
+                conn.execute(
+                    "UPDATE object_versions SET sse_descriptor=?1 WHERE id=?2",
+                    params![descriptor, version_pk],
+                )
+                .map_err(engine_err)?;
+                Ok(())
+            })
+            .await
+    }
+
+    /// Page `(user_id, ciphertext, nonce_opt)` for users with a sealed SigV4 secret, after
+    /// `cursor` (exclusive).
+    pub async fn rewrap_users_page(
+        &self,
+        cursor: Option<String>,
+        limit: u32,
+    ) -> Result<Vec<RewrapUserRow>, MetaError> {
+        self.with_read(move |conn| {
+            let cur = cursor.unwrap_or_default();
+            conn.prepare_cached(
+                "SELECT id, sigv4_secret_ciphertext, sigv4_secret_nonce FROM users
+                 WHERE sigv4_secret_ciphertext IS NOT NULL AND id > ?1 ORDER BY id LIMIT ?2",
+            )
+            .map_err(engine_err)?
+            .query_map(params![cur, limit], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .map_err(engine_err)?
+            .collect::<rusqlite::Result<Vec<(String, Vec<u8>, Option<Vec<u8>>)>>>()
+            .map_err(engine_err)
+        })
+        .await
+    }
+
+    /// Replace one user's SigV4 secret ciphertext (re-wrapped) and NULL the legacy nonce column.
+    pub async fn rewrap_set_user_sigv4(
+        &self,
+        user_id: String,
+        ciphertext: Vec<u8>,
+    ) -> Result<(), MetaError> {
+        self.writer
+            .run_exec(move |conn| {
+                conn.execute(
+                    "UPDATE users SET sigv4_secret_ciphertext=?1, sigv4_secret_nonce=NULL WHERE id=?2",
+                    params![ciphertext, user_id],
+                )
+                .map_err(engine_err)?;
+                Ok(())
+            })
+            .await
+    }
+
+    /// The re-wrap cursor for `stream` (None = not started / complete).
+    pub async fn rewrap_cursor(&self, stream: String) -> Result<Option<String>, MetaError> {
+        self.with_read(move |conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT cursor FROM rewrap_progress WHERE stream=?1",
+                    params![stream],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+                .optional()
+                .map_err(engine_err)?
+                .flatten())
+        })
+        .await
+    }
+
+    /// Upsert the re-wrap cursor + accumulate the row counters for `stream`.
+    pub async fn rewrap_set_progress(
+        &self,
+        stream: String,
+        cursor: Option<String>,
+        rows_done_delta: u64,
+        rows_failed_delta: u64,
+        now: i64,
+    ) -> Result<(), MetaError> {
+        self.writer
+            .run_exec(move |conn| {
+                conn.execute(
+                    "INSERT INTO rewrap_progress (stream, cursor, rows_done, rows_failed, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT(stream) DO UPDATE SET
+                       cursor=excluded.cursor,
+                       rows_done=rows_done+excluded.rows_done,
+                       rows_failed=rows_failed+excluded.rows_failed,
+                       updated_at=excluded.updated_at",
+                    params![
+                        stream,
+                        cursor,
+                        rows_done_delta as i64,
+                        rows_failed_delta as i64,
+                        now
+                    ],
+                )
+                .map_err(engine_err)?;
+                Ok(())
+            })
+            .await
+    }
+
+    /// Upsert per-key ring state (id, key-hash prefix, active flag) for operator visibility.
+    pub async fn key_ring_upsert(
+        &self,
+        id: u16,
+        key_hash: String,
+        is_active: bool,
+        now: i64,
+    ) -> Result<(), MetaError> {
+        self.writer
+            .run_exec(move |conn| {
+                conn.execute(
+                    "INSERT INTO key_ring_state (id, key_hash, is_active, created_at)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(id) DO UPDATE SET key_hash=excluded.key_hash, is_active=excluded.is_active",
+                    params![id, key_hash, is_active as i64, now],
+                )
+                .map_err(engine_err)?;
+                Ok(())
+            })
+            .await
+    }
+
+    /// Sync the high-water seal count for a key (Phase E durable counter).
+    pub async fn key_ring_sync_seal_count(&self, id: u16, count: u64) -> Result<(), MetaError> {
+        self.writer
+            .run_exec(move |conn| {
+                conn.execute(
+                    "UPDATE key_ring_state SET sealed_count=MAX(sealed_count, ?2) WHERE id=?1",
+                    params![id, count as i64],
+                )
+                .map_err(engine_err)?;
+                Ok(())
+            })
+            .await
+    }
+
+    /// Read all ring-state rows (for the crypto-status endpoint + startup priming).
+    pub async fn key_ring_states(&self) -> Result<Vec<KeyRingStateRow>, MetaError> {
+        self.with_read(|conn| {
+            conn.prepare_cached(
+                "SELECT id, key_hash, is_active, sealed_count, created_at
+                 FROM key_ring_state ORDER BY id",
+            )
+            .map_err(engine_err)?
+            .query_map([], |r| {
+                Ok(KeyRingStateRow {
+                    id: r.get::<_, i64>(0)? as u16,
+                    key_hash: r.get(1)?,
+                    is_active: r.get::<_, i64>(2)? != 0,
+                    sealed_count: r.get::<_, i64>(3)? as u64,
+                    created_at: r.get(4)?,
+                })
+            })
+            .map_err(engine_err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(engine_err)
+        })
+        .await
+    }
+}
+
+/// One paged user row for the re-wrap worker: `(user_id, ciphertext, nonce_opt)` (audit #29).
+pub type RewrapUserRow = (String, Vec<u8>, Option<Vec<u8>>);
+
+/// A row of `key_ring_state` for the crypto-status endpoint (audit #29).
+#[derive(Debug, Clone)]
+pub struct KeyRingStateRow {
+    /// Ring id.
+    pub id: u16,
+    /// First 8 hex of SHA-256(key) for operator display (never key material).
+    pub key_hash: String,
+    /// Whether this is the active (sealing) key.
+    pub is_active: bool,
+    /// High-water seal count synced from the active key's in-process counter.
+    pub sealed_count: u64,
+    /// Wall-clock millis the row was first seen.
+    pub created_at: i64,
 }
 
 /// SQLite names the write-ahead log sidecar `<database>-wal`; build that path.

@@ -339,6 +339,38 @@ INSERT INTO user_stats (owner_id, logical_bytes)
     FROM object_versions GROUP BY owner_id;
 "#,
     },
+    Migration {
+        version: 13,
+        name: "master-key rotation: key-ring state + re-wrap progress (#29, Phase D/E)",
+        sql: r#"
+-- Per-key durable state for the active-key seal-count bound (Phase E) and the re-wrap progress
+-- accounting (Phase D). Key MATERIAL never lives here — only ids, a short hash prefix for
+-- operator display, and counters.
+--   id              : u16 ring id (1..65535).
+--   key_hash        : first 8 hex chars of SHA-256(key) for operator-visible identification only.
+--   is_active       : 1 for the current active id, else 0 (advisory; env is the source of truth).
+--   sealed_count    : high-water seal count under this key (synced from memory, Phase E).
+--   rewrapped_count : rows re-sealed FROM this key onto the active key (Phase D progress).
+--   created_at / retired_at : wall-clock millis; retired_at NULL while in the env ring.
+CREATE TABLE key_ring_state (
+    id              INTEGER PRIMARY KEY CHECK (id > 0 AND id <= 65535),
+    key_hash        TEXT    NOT NULL,
+    is_active       INTEGER NOT NULL DEFAULT 0 CHECK (is_active IN (0,1)),
+    sealed_count    INTEGER NOT NULL DEFAULT 0,
+    rewrapped_count INTEGER NOT NULL DEFAULT 0,
+    created_at      INTEGER NOT NULL,
+    retired_at      INTEGER
+);
+-- Resumable cursor per re-wrap stream (Phase D). One row per (table.column) being migrated.
+CREATE TABLE rewrap_progress (
+    stream        TEXT PRIMARY KEY,   -- e.g. 'object_versions.sse_descriptor'
+    cursor        TEXT,               -- last id processed; NULL = not started / complete
+    rows_done     INTEGER NOT NULL DEFAULT 0,
+    rows_failed   INTEGER NOT NULL DEFAULT 0,
+    updated_at    INTEGER NOT NULL DEFAULT 0
+);
+"#,
+    },
 ];
 
 /// Run all pending migrations on the write connection, recording each as applied.
@@ -421,6 +453,37 @@ mod tests {
         )
         .unwrap()
             > 0
+    }
+
+    #[test]
+    fn migration_v13_adds_rotation_state_tables() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        for table in ["key_ring_state", "rewrap_progress"] {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    rusqlite::params![table],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "{table} created by v13");
+        }
+        // The id CHECK rejects 0 but accepts a valid ring id.
+        assert!(
+            conn.execute(
+                "INSERT INTO key_ring_state (id, key_hash, created_at) VALUES (0, 'x', 0)",
+                [],
+            )
+            .is_err()
+        );
+        assert!(
+            conn.execute(
+                "INSERT INTO key_ring_state (id, key_hash, created_at) VALUES (1, 'abc12345', 0)",
+                [],
+            )
+            .is_ok()
+        );
     }
 
     #[test]

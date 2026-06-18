@@ -197,6 +197,43 @@ impl SystemCrypto {
         self.seal_count_base.store(base, Ordering::Relaxed);
     }
 
+    /// The number of keys in the ring (Phase D: a single-key ring with only CRK1 data has nothing
+    /// to re-wrap).
+    #[must_use]
+    pub fn ring_len(&self) -> usize {
+        self.ring.len()
+    }
+
+    /// The AES-GCM random-nonce ceiling per key (`2^32`) for the crypto-status surface (#29).
+    #[must_use]
+    pub const fn nonce_ceiling() -> u64 {
+        NONCE_CEILING
+    }
+
+    /// The seal-count alert threshold (75% of the ceiling).
+    #[must_use]
+    pub const fn seal_alert_threshold() -> u64 {
+        ALERT_THRESHOLD
+    }
+
+    /// The seal-count hard-stop threshold (95% of the ceiling); past it, new seals are refused.
+    #[must_use]
+    pub const fn seal_stop_threshold() -> u64 {
+        STOP_THRESHOLD
+    }
+
+    /// Whether a stored blob needs re-wrapping onto the active key (Phase D): true unless it is
+    /// already a CRK1 envelope sealed under the active key id. Legacy (no-magic) blobs always need
+    /// re-wrapping. Pure byte inspection — no decryption.
+    #[must_use]
+    pub fn needs_rewrap(&self, ciphertext: &[u8]) -> bool {
+        if ciphertext.len() >= VERSIONED_PREFIX && ciphertext[..MAGIC.len()] == MAGIC {
+            u16::from_be_bytes([ciphertext[4], ciphertext[5]]) != self.active_id
+        } else {
+            true
+        }
+    }
+
     /// Decrypt `ct` under `cipher` with `nonce_bytes` (must be exactly 12 bytes) and optional AAD,
     /// scrubbing the transient plaintext (ARCH §27, F-15). A wrong nonce length fails closed.
     fn decrypt(
@@ -588,5 +625,21 @@ mod tests {
             SystemCrypto::from_hex("abcd").err(),
             Some(KeyError::WrongLength)
         );
+    }
+
+    #[test]
+    fn needs_rewrap_detects_stale_keys() {
+        let c = SystemCrypto::from_ring(vec![(1, [1u8; KEY_LEN]), (2, [2u8; KEY_LEN])], 2, 1, 0)
+            .expect("ring");
+        // A blob sealed under the active key (2) does not need re-wrap.
+        let active = c.seal(b"x").expect("seal");
+        assert!(!c.needs_rewrap(&active.ciphertext));
+        // A CRK1 blob under a non-active key (1) does.
+        let mut under1 = active.ciphertext.clone();
+        under1[5] = 1;
+        assert!(c.needs_rewrap(&under1));
+        // A legacy (no-magic) blob does.
+        assert!(c.needs_rewrap(b"legacy-no-magic-bytes"));
+        assert_eq!(c.ring_len(), 2);
     }
 }

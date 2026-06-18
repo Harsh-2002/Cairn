@@ -122,6 +122,65 @@ pub(crate) fn build_crypto(cfg: &Config) -> Result<SystemCrypto, String> {
     }
 }
 
+/// The `(id, key_hash, is_active)` rows to record in `key_ring_state` for operator display
+/// (audit #29). The hash is the first 8 hex of SHA-256(key) — never key material. Re-derived from
+/// config (the key bytes were scrubbed into ciphers by `build_crypto`).
+fn ring_for_state(cfg: &Config) -> Vec<(u16, String, bool)> {
+    use sha2::{Digest, Sha256};
+    let hash = |bytes: &[u8]| hex::encode(&Sha256::digest(bytes)[..4]);
+    if let Some(ring_json) = &cfg.master_key_ring {
+        if let Ok(keys) = crate::config::parse_key_ring(ring_json) {
+            let max_id = keys.iter().map(|(id, _)| *id).max().unwrap_or(1);
+            let active = cfg.master_key_active_id.unwrap_or(max_id);
+            return keys
+                .iter()
+                .map(|(id, k)| (*id, hash(k), *id == active))
+                .collect();
+        }
+    }
+    if let Some(mk) = &cfg.master_key {
+        if let Ok(bytes) = hex::decode(mk) {
+            return vec![(1, hash(&bytes), true)];
+        }
+    }
+    vec![(1, hash(&[0u8; 32]), true)] // development key
+}
+
+/// Seed each sqlite shard's `key_ring_state` for the env ring keys and prime the in-process
+/// active-key seal counter from the max durable count across shards (audit #29, Phase E).
+async fn prime_key_state(store: &[Arc<SqliteMetadataStore>], crypto: &SystemCrypto, cfg: &Config) {
+    let ring = ring_for_state(cfg);
+    let active = crypto.active_key_id();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64);
+    let mut base = 0u64;
+    for s in store {
+        for (id, key_hash, is_active) in &ring {
+            if let Err(e) = s
+                .key_ring_upsert(*id, key_hash.clone(), *is_active, now)
+                .await
+            {
+                tracing::warn!(error = %e, "key_ring_state upsert failed");
+            }
+        }
+        if let Ok(states) = s.key_ring_states().await {
+            if let Some(row) = states.iter().find(|r| r.id == active) {
+                base = base.max(row.sealed_count);
+            }
+        }
+    }
+    crypto.prime_seal_count(base);
+    if !store.is_empty() {
+        tracing::info!(
+            active_key_id = active,
+            primed_seal_count = base,
+            ring_keys = ring.len(),
+            "master-key rotation state primed (audit #29)"
+        );
+    }
+}
+
 /// The on-disk path for shard `i`: shard 0 is `base` itself (so existing single-shard data is
 /// shard 0 untouched), and shard `i>0` is a sibling `base.shard{i}`.
 fn shard_db_path(base: &std::path::Path, i: usize) -> std::path::PathBuf {
@@ -364,6 +423,11 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
         ),
         Err(e) => tracing::warn!(error = %e, "startup reconciliation failed"),
     }
+
+    // Master-key rotation state (audit #29, Phase E): seed each sqlite shard's key_ring_state for
+    // the env ring keys and prime the in-process seal counter from durable state so the seal-count
+    // bound survives a restart. No-op for the async backends (no concrete shard handles).
+    prime_key_state(&store, &system_crypto, cfg).await;
 
     Ok(AppStack {
         s3,

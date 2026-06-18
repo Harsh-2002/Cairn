@@ -25,7 +25,7 @@ use std::time::Duration;
 pub use cache::CachedMetadataStore;
 pub use range::{prefix_upper_bound, successor};
 pub use shard::{ShardHandles, ShardedMetadataStore, ShardedReconcileOracle, shard_for_bucket};
-pub use store::SqliteMetadataStore;
+pub use store::{KeyRingStateRow, SqliteMetadataStore};
 pub use writer::{WalCheckpointStats, Writer};
 
 /// Tuning knobs for opening the store (ARCH §28).

@@ -79,6 +79,12 @@ pub struct Config {
     pub lifecycle_interval_secs: u64,
     /// How often the multipart sweeper reclaims stale upload sessions, in seconds.
     pub multipart_sweep_interval_secs: u64,
+    /// How often the master-key re-wrap worker re-seals secrets onto the active key, in seconds
+    /// (`CAIRN_KEY_REWRAP_INTERVAL_SECS`, audit #29 Phase D; `0` disables). SQLite backend only.
+    pub key_rewrap_interval_secs: u64,
+    /// How often the active key's seal counter is flushed to durable state, in seconds
+    /// (`CAIRN_KEY_COUNTER_SYNC_SECS`, audit #29 Phase E; `0` disables). SQLite backend only.
+    pub key_counter_sync_secs: u64,
     /// How long an idle multipart upload session lives before the sweeper aborts it, in seconds.
     pub multipart_upload_lifetime_secs: u64,
     /// How often the WAL checkpointer runs a truncating checkpoint, in seconds.
@@ -221,6 +227,8 @@ impl Default for Config {
             dev_auth: false,
             lifecycle_interval_secs: 3600,
             multipart_sweep_interval_secs: 3600,
+            key_rewrap_interval_secs: 300,
+            key_counter_sync_secs: 60,
             multipart_upload_lifetime_secs: 86_400,
             wal_checkpoint_interval_secs: 300,
             wal_checkpoint_size_bytes: 64 * 1024 * 1024,

@@ -42,6 +42,20 @@ pub fn spawn(stack: Arc<AppStack>, cfg: &Config) {
             checkpoint_interval,
             cfg.wal_checkpoint_size_bytes,
         ));
+        // Master-key re-wrap + seal-count flush (audit #29, Phase D/E), one per sqlite shard,
+        // sharing the one master-key ring. Disabled when the interval is 0.
+        for store in &stack.store {
+            crate::key_rewrap::spawn(
+                store.clone(),
+                stack.crypto.clone(),
+                cfg.key_rewrap_interval_secs,
+            );
+            crate::key_rewrap::spawn_counter_sync(
+                store.clone(),
+                stack.crypto.clone(),
+                cfg.key_counter_sync_secs,
+            );
+        }
     } else {
         tracing::info!(
             "WAL checkpointer disabled: the active metadata backend self-manages its WAL"

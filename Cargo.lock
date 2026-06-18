@@ -592,6 +592,7 @@ name = "cairn-server"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
  "bytes",
  "cairn-auth",
  "cairn-authz",
@@ -624,6 +625,7 @@ dependencies = [
  "rustls-pemfile",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

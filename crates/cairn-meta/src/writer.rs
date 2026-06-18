@@ -29,6 +29,9 @@ pub struct WalCheckpointStats {
     pub checkpointed_frames: u64,
 }
 
+/// A boxed write closure run on the writer thread, serialized with mutations (audit #29 re-wrap).
+type ExecJob = Box<dyn FnOnce(&Connection) -> Result<(), MetaError> + Send>;
+
 /// A control message multiplexed onto the writer's queue so it runs on the writer thread,
 /// serialized with — and never contending against — ordinary mutations.
 enum Control {
@@ -37,6 +40,10 @@ enum Control {
     /// A liveness probe: the writer simply acks, proving its thread is draining the queue. Used by
     /// the readiness check so `/readyz` reflects a responsive writer, not just a readable pool.
     Probe(oneshot::Sender<()>),
+    /// Run an arbitrary write closure on the writer's connection, serialized with all mutations
+    /// (so it never races them or hits SQLITE_BUSY). Used by the master-key re-wrap worker to
+    /// re-seal stored secrets and update the rotation state tables (audit #29, sqlite-only).
+    Exec(ExecJob, oneshot::Sender<Result<(), MetaError>>),
 }
 
 /// One unit of work for the writer loop: either a batched mutation or a control message.
@@ -123,6 +130,23 @@ impl Writer {
             .map_err(|_| MetaError::WriterClosed)?;
         reply_rx.await.map_err(|_| MetaError::WriterClosed)?
     }
+
+    /// Run a write closure on the writer thread (the only owner of the write connection),
+    /// serialized with mutations. Used by the master-key re-wrap worker (audit #29, sqlite-only).
+    ///
+    /// # Errors
+    /// [`MetaError::WriterClosed`] if the writer has shut down, or whatever the closure returns.
+    pub async fn run_exec<F>(&self, f: F) -> Result<(), MetaError>
+    where
+        F: FnOnce(&Connection) -> Result<(), MetaError> + Send + 'static,
+    {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(Job::Control(Control::Exec(Box::new(f), reply_tx)))
+            .await
+            .map_err(|_| MetaError::WriterClosed)?;
+        reply_rx.await.map_err(|_| MetaError::WriterClosed)?
+    }
 }
 
 fn writer_loop(
@@ -199,6 +223,9 @@ fn run_control(conn: &Connection, ctl: Control) {
         }
         Control::Probe(reply) => {
             let _ = reply.send(());
+        }
+        Control::Exec(job, reply) => {
+            let _ = reply.send(job(conn));
         }
     }
 }
