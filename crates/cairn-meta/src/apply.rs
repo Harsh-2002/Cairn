@@ -368,9 +368,17 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
                    created_at=?10, updated_at=?11
                  WHERE id=?1",
                 params![
-                    c.id, c.display_name, c.access_key_id, c.secret_hash, c.sigv4_access_key_id,
-                    c.sigv4_secret_ciphertext, c.sigv4_secret_nonce, c.role, c.is_active,
-                    c.created_at, c.updated_at
+                    c.id,
+                    c.display_name,
+                    c.access_key_id,
+                    c.secret_hash,
+                    c.sigv4_access_key_id,
+                    c.sigv4_secret_ciphertext,
+                    c.sigv4_secret_nonce,
+                    c.role,
+                    c.is_active,
+                    c.created_at,
+                    c.updated_at
                 ],
             )
             .map_err(engine_err)?;

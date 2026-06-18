@@ -407,7 +407,8 @@ impl MetadataStore for AsyncMetadataStore {
         batch: u32,
     ) -> Result<ListPage<StoragePath>, MetaError> {
         let rows = self
-            .reader().await
+            .reader()
+            .await
             .query(
                 "SELECT storage_path FROM object_versions
                  WHERE bucket_name=?1 AND storage_path IS NOT NULL AND storage_path > ?2
@@ -567,7 +568,8 @@ impl MetadataStore for AsyncMetadataStore {
         batch: u32,
     ) -> Result<Vec<MultipartSession>, MetaError> {
         let rows = self
-            .reader().await
+            .reader()
+            .await
             .query(
                 &format!(
                     "SELECT {MULTIPART_COLS} FROM multipart_uploads WHERE updated_at < ?1 LIMIT ?2"
@@ -651,7 +653,8 @@ impl MetadataStore for AsyncMetadataStore {
     ) -> Result<Vec<OutboxEntry>, MetaError> {
         // Read-only mirror of the claim predicate; no mutation (see the sync store for rationale).
         let rows = self
-            .reader().await
+            .reader()
+            .await
             .query(
                 &format!(
                     "SELECT {OUTBOX_COLS} FROM replication_outbox \
@@ -716,7 +719,8 @@ impl MetadataStore for AsyncMetadataStore {
 
     async fn list_users(&self) -> Result<Vec<User>, MetaError> {
         let rows = self
-            .reader().await
+            .reader()
+            .await
             .query(
                 &format!("SELECT {USER_COLS} FROM users ORDER BY created_at"),
                 vec![],
@@ -737,7 +741,8 @@ impl MetadataStore for AsyncMetadataStore {
 
     async fn list_activity(&self, limit: u32) -> Result<Vec<ActivityEntry>, MetaError> {
         let rows = self
-            .reader().await
+            .reader()
+            .await
             .query(
                 &format!("SELECT {ACTIVITY_COLS} FROM activity ORDER BY at DESC LIMIT ?1"),
                 vec![Value::Int(i64::from(limit))],
@@ -748,7 +753,8 @@ impl MetadataStore for AsyncMetadataStore {
 
     async fn get_share(&self, token: &str) -> Result<Option<ShareRow>, MetaError> {
         let rows = self
-            .reader().await
+            .reader()
+            .await
             .query(
                 &format!("SELECT {SHARE_COLS} FROM object_shares WHERE token=?1"),
                 vec![Value::Text(token.to_owned())],
@@ -800,7 +806,8 @@ impl MetadataStore for AsyncMetadataStore {
             None => Value::Null,
         };
         let rows = self
-            .reader().await
+            .reader()
+            .await
             .query(
                 "SELECT ot.tag_key, ot.tag_value, COUNT(*) AS c
                  FROM object_tags ot
@@ -836,7 +843,8 @@ impl MetadataStore for AsyncMetadataStore {
             None => Value::Null,
         };
         let rows = self
-            .reader().await
+            .reader()
+            .await
             .query(
                 "SELECT ot.bucket_name, ot.key, ot.version_id, ov.size_logical, ov.updated_at
                  FROM object_tags ot
@@ -909,7 +917,8 @@ impl MetadataStore for AsyncMetadataStore {
         // current-object count joins a GROUP BY over the partial current-version index. Neither
         // path scans historical versions for the byte sums.
         let rows = self
-            .reader().await
+            .reader()
+            .await
             .query(
                 "SELECT b.name,
                     COALESCE(o.objects, 0),

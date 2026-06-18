@@ -251,7 +251,9 @@ fn commit_batch(conn: &Connection, batch: Vec<WriteRequest>) {
                     let msg = e.to_string();
                     acks.push((
                         ack,
-                        Err(MetaError::Engine(format!("savepoint release failed: {msg}"))),
+                        Err(MetaError::Engine(format!(
+                            "savepoint release failed: {msg}"
+                        ))),
                     ));
                     break Some(msg);
                 }
@@ -264,7 +266,9 @@ fn commit_batch(conn: &Connection, batch: Vec<WriteRequest>) {
                     let msg = re.to_string();
                     acks.push((
                         ack,
-                        Err(MetaError::Engine(format!("savepoint rollback failed: {msg}"))),
+                        Err(MetaError::Engine(format!(
+                            "savepoint rollback failed: {msg}"
+                        ))),
                     ));
                     break Some(msg);
                 }

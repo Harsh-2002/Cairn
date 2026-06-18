@@ -1029,7 +1029,14 @@ async fn multipart_lifecycle() {
 #[tokio::test]
 async fn complete_multipart_part_validation_failure_is_retryable() {
     let h = harness().await;
-    drain(send(&h.svc, req(Method::PUT, Some("mpr"), None, &[], &[], vec![])).await).await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("mpr"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
 
     let (st, _, body) = drain(
         send(
@@ -1047,7 +1054,11 @@ async fn complete_multipart_part_validation_failure_is_retryable() {
     )
     .await;
     assert_eq!(st, StatusCode::OK);
-    let upload_id = between(&String::from_utf8(body).unwrap(), "<UploadId>", "</UploadId>");
+    let upload_id = between(
+        &String::from_utf8(body).unwrap(),
+        "<UploadId>",
+        "</UploadId>",
+    );
 
     let part1 = vec![b'a'; 5 * 1024 * 1024];
     let part2 = b"tail".to_vec();
@@ -1138,11 +1149,25 @@ async fn complete_multipart_part_validation_failure_is_retryable() {
 #[tokio::test]
 async fn object_get_sets_nosniff() {
     let h = harness().await;
-    drain(send(&h.svc, req(Method::PUT, Some("snb"), None, &[], &[], vec![])).await).await;
     drain(
         send(
             &h.svc,
-            req(Method::PUT, Some("snb"), Some("k"), &[], &[], b"hi".to_vec()),
+            req(Method::PUT, Some("snb"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("snb"),
+                Some("k"),
+                &[],
+                &[],
+                b"hi".to_vec(),
+            ),
         )
         .await,
     )
@@ -1638,7 +1663,14 @@ async fn object_tagging_honors_version_id() {
     let (_, hdrs, _) = drain(
         send(
             &h.svc,
-            req(Method::PUT, Some("vtag"), Some("k"), &[], &[], b"one".to_vec()),
+            req(
+                Method::PUT,
+                Some("vtag"),
+                Some("k"),
+                &[],
+                &[],
+                b"one".to_vec(),
+            ),
         )
         .await,
     )
@@ -1647,7 +1679,14 @@ async fn object_tagging_honors_version_id() {
     let (_, hdrs, _) = drain(
         send(
             &h.svc,
-            req(Method::PUT, Some("vtag"), Some("k"), &[], &[], b"two".to_vec()),
+            req(
+                Method::PUT,
+                Some("vtag"),
+                Some("k"),
+                &[],
+                &[],
+                b"two".to_vec(),
+            ),
         )
         .await,
     )
@@ -1656,8 +1695,8 @@ async fn object_tagging_honors_version_id() {
     assert_ne!(v1, v2);
 
     // Tag the OLDER version (v1) explicitly via ?versionId.
-    let tags =
-        b"<Tagging><TagSet><Tag><Key>which</Key><Value>v1</Value></Tag></TagSet></Tagging>".to_vec();
+    let tags = b"<Tagging><TagSet><Tag><Key>which</Key><Value>v1</Value></Tag></TagSet></Tagging>"
+        .to_vec();
     let (st, _, _) = drain(
         send(
             &h.svc,
@@ -1725,7 +1764,14 @@ async fn object_tagging_honors_version_id() {
 #[tokio::test]
 async fn put_verifies_signed_content_sha256() {
     let h = harness().await;
-    drain(send(&h.svc, req(Method::PUT, Some("shab"), None, &[], &[], vec![])).await).await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("shab"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
 
     // sha256("hi").
     let good = "8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4";
@@ -1744,7 +1790,11 @@ async fn put_verifies_signed_content_sha256() {
         .await,
     )
     .await;
-    assert_eq!(st, StatusCode::OK, "a body matching the signed sha256 is accepted");
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "a body matching the signed sha256 is accepted"
+    );
 
     // The same body with a wrong signed hash must be rejected.
     let bad = "0000000000000000000000000000000000000000000000000000000000000000";

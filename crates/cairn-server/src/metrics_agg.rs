@@ -254,7 +254,10 @@ mod tests {
         let rows = agg.drain();
         // Every recorded request is still counted (real key or sentinel) — nothing dropped.
         let total: u64 = rows.iter().map(|r| r.count).sum();
-        assert_eq!(total as usize, n, "every recorded request is counted somewhere");
+        assert_eq!(
+            total as usize, n,
+            "every recorded request is counted somewhere"
+        );
         // Distinct keys are bounded by the per-shard cap (+1 sentinel per shard), far below the
         // `n` distinct buckets we sprayed.
         assert!(

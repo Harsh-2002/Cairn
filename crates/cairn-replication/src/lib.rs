@@ -514,7 +514,9 @@ impl ReplicationEngine {
 /// object ship carries the logical byte count it shipped (zero for a drained replica/duplicate or a
 /// delete marker) so the pass can total replicated bytes.
 enum EntryOutcome {
-    Completed { bytes: u64 },
+    Completed {
+        bytes: u64,
+    },
     Retried,
     Failed,
     /// An earlier version of this key has not yet replicated (it is in flight in a separate drain

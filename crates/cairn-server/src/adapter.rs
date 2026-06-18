@@ -100,7 +100,10 @@ pub async fn handle(
             .await
         {
             Ok(c) => c.to_bytes(),
-            Err(e) if e.downcast_ref::<http_body_util::LengthLimitError>().is_some() => {
+            Err(e)
+                if e.downcast_ref::<http_body_util::LengthLimitError>()
+                    .is_some() =>
+            {
                 let mut builder = Response::builder()
                     .status(http::StatusCode::PAYLOAD_TOO_LARGE)
                     .header("content-type", "application/json");

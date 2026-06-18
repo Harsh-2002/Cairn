@@ -109,7 +109,9 @@ impl ObjectKey {
         // tab, LF and CR (NUL included) (audit #32). Such a key could never be emitted into a
         // ListObjects/ListVersions XML response, not even as a numeric character reference, so it
         // must not be storable in the first place.
-        if s.bytes().any(|b| b < 0x20 && !matches!(b, b'\t' | b'\n' | b'\r')) {
+        if s.bytes()
+            .any(|b| b < 0x20 && !matches!(b, b'\t' | b'\n' | b'\r'))
+        {
             return Err(InvalidName::Charset);
         }
         Ok(Self(s.to_owned()))

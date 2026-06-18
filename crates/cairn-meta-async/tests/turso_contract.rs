@@ -1263,7 +1263,13 @@ async fn concurrent_reads_are_isolated_per_connection() {
     for i in 0..N {
         let key = format!("k{i:04}");
         s.submit(put(
-            row(&bk, &key, VersionId::from_string(format!("v{i:04}")), "e", 3),
+            row(
+                &bk,
+                &key,
+                VersionId::from_string(format!("v{i:04}")),
+                "e",
+                3,
+            ),
             Precondition::default(),
         ))
         .await

@@ -452,7 +452,8 @@ impl S3Service {
         // unless the client also asked to store a SHA-256 checksum.
         let signed_sha256 = req.header("x-amz-content-sha256").and_then(|v| {
             let v = v.trim();
-            (v.len() == 64 && v.bytes().all(|b| b.is_ascii_hexdigit())).then(|| v.to_ascii_lowercase())
+            (v.len() == 64 && v.bytes().all(|b| b.is_ascii_hexdigit()))
+                .then(|| v.to_ascii_lowercase())
         });
         let store_sha256 = extra.0.contains(&ChecksumAlgorithm::Sha256);
         let mut stage_checksums = extra;
