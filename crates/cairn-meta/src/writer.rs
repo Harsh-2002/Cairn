@@ -227,7 +227,16 @@ fn commit_batch(conn: &Connection, batch: Vec<WriteRequest>) {
     }
 
     let mut acks: Vec<(Ack, Result<MutationOutcome, MetaError>)> = Vec::with_capacity(batch.len());
-    for (idx, (mutation, ack)) in batch.into_iter().enumerate() {
+    let mut iter = batch.into_iter().enumerate();
+    // A savepoint RELEASE/ROLLBACK that itself fails (audit #17) leaves the transaction's
+    // per-mutation isolation untrustworthy: a failed ROLLBACK-TO can leave a failed mutation's
+    // partial writes live, and committing would persist them. When that happens we record the
+    // error and stop processing, so the block below aborts the WHOLE transaction instead of
+    // committing suspect state.
+    let abort: Option<String> = loop {
+        let Some((idx, (mutation, ack))) = iter.next() else {
+            break None;
+        };
         let sp = format!("sp{idx}");
         if conn.execute_batch(&format!("SAVEPOINT {sp}")).is_err() {
             acks.push((
@@ -238,15 +247,44 @@ fn commit_batch(conn: &Connection, batch: Vec<WriteRequest>) {
         }
         match apply(conn, mutation) {
             Ok(outcome) => {
-                let _ = conn.execute_batch(&format!("RELEASE {sp}"));
+                if let Err(e) = conn.execute_batch(&format!("RELEASE {sp}")) {
+                    let msg = e.to_string();
+                    acks.push((
+                        ack,
+                        Err(MetaError::Engine(format!("savepoint release failed: {msg}"))),
+                    ));
+                    break Some(msg);
+                }
                 acks.push((ack, Ok(outcome)));
             }
             Err(e) => {
-                // Roll back only this mutation; the rest of the batch is unaffected.
-                let _ = conn.execute_batch(&format!("ROLLBACK TO {sp}; RELEASE {sp}"));
+                // Roll back only this mutation; the rest of the batch is unaffected — unless the
+                // rollback itself fails, in which case the whole batch must abort.
+                if let Err(re) = conn.execute_batch(&format!("ROLLBACK TO {sp}; RELEASE {sp}")) {
+                    let msg = re.to_string();
+                    acks.push((
+                        ack,
+                        Err(MetaError::Engine(format!("savepoint rollback failed: {msg}"))),
+                    ));
+                    break Some(msg);
+                }
                 acks.push((ack, Err(e)));
             }
         }
+    };
+
+    if let Some(msg) = abort {
+        // Abort the entire transaction and fail every submitter — those already applied and those
+        // not yet reached (still in `iter`) — rather than commit a transaction whose savepoint
+        // bookkeeping is broken (#17).
+        let _ = conn.execute_batch("ROLLBACK");
+        for (ack, _) in acks {
+            let _ = ack.send(Err(MetaError::Engine(format!("batch aborted: {msg}"))));
+        }
+        for (_, (_, ack)) in iter {
+            let _ = ack.send(Err(MetaError::Engine(format!("batch aborted: {msg}"))));
+        }
+        return;
     }
 
     // One commit = one durability barrier covering every surviving mutation in the batch.
