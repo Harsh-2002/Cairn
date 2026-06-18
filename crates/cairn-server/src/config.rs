@@ -126,6 +126,15 @@ pub struct Config {
     /// cannot exhaust the runtime's blocking-pool threads. Tune to the device's useful I/O
     /// concurrency: lower for a single spinning disk, higher for a fast NVMe array. Default 64.
     pub blob_io_pool_size: usize,
+    /// Tokio runtime worker (compute) threads (`CAIRN_RUNTIME_WORKER_THREADS`, ARCH §30). `0` lets
+    /// the runtime pick the CPU count (the default). Set it to pin compute parallelism explicitly.
+    pub runtime_worker_threads: usize,
+    /// Tokio runtime max blocking threads (`CAIRN_RUNTIME_MAX_BLOCKING_THREADS`, ARCH §30): the cap
+    /// on threads serving `spawn_blocking`, which is where every metadata read (the WAL read pool)
+    /// and blob file transfer runs. `0` derives a safe value: `max(512, blob_io_pool_size +
+    /// meta_read_pool_size + 64)`, so the blocking pool can never be starved below the concurrency
+    /// those two pools demand. A non-zero value is validated to stay at or above that floor.
+    pub runtime_max_blocking_threads: usize,
     /// Replication destination endpoint (e.g. `http://backup-host:9000`). When set, the
     /// replication worker ships outbox entries to this S3-compatible target (ARCH §20).
     pub replication_endpoint: Option<String>,
@@ -210,6 +219,8 @@ impl Default for Config {
             meta_cache_bytes: 64 * 1024 * 1024,
             auth_cache_ttl_secs: 30,
             blob_io_pool_size: 64,
+            runtime_worker_threads: 0,
+            runtime_max_blocking_threads: 0,
             replication_endpoint: None,
             replication_dest_bucket: None,
             replication_access_key: None,
@@ -309,6 +320,30 @@ impl Config {
         self.tls_cert_path.is_some() && self.tls_key_path.is_some()
     }
 
+    /// The minimum blocking-pool size the metadata read pool + blob I/O pool require so neither
+    /// starves the other's `spawn_blocking` work, plus headroom for incidental blocking calls.
+    fn blocking_pool_floor(&self) -> usize {
+        self.blob_io_pool_size + self.meta_read_pool_size as usize + 64
+    }
+
+    /// The blocking-thread cap to configure the runtime with: the explicit value, or a derived safe
+    /// default of `max(512, floor)` when unset (`0`). Validation guarantees an explicit value is at
+    /// or above the floor.
+    #[must_use]
+    pub fn effective_max_blocking_threads(&self) -> usize {
+        if self.runtime_max_blocking_threads != 0 {
+            self.runtime_max_blocking_threads
+        } else {
+            self.blocking_pool_floor().max(512)
+        }
+    }
+
+    /// The explicit worker-thread count, or `None` to let the runtime default to the CPU count.
+    #[must_use]
+    pub fn effective_worker_threads(&self) -> Option<usize> {
+        (self.runtime_worker_threads != 0).then_some(self.runtime_worker_threads)
+    }
+
     /// Validate the configuration, rejecting the cases ARCH §28.2 enumerates.
     ///
     /// # Errors
@@ -351,6 +386,22 @@ impl Config {
             return Err(ConfigError::Invalid(
                 "auth_cache_ttl_secs must be <= 3600 (1 hour); 0 disables the cache".into(),
             ));
+        }
+        // Runtime blocking-pool floor: `spawn_blocking` serves both the metadata read pool and blob
+        // file I/O, so an explicit cap set below their combined concurrency would stall reads and
+        // transfers. `0` auto-derives a safe value (see `effective_max_blocking_threads`).
+        let blocking_floor = self.blocking_pool_floor();
+        if self.runtime_max_blocking_threads != 0
+            && self.runtime_max_blocking_threads < blocking_floor
+        {
+            return Err(ConfigError::Invalid(format!(
+                "runtime_max_blocking_threads ({}) is below the floor {} required by the blob I/O \
+                 pool ({}) + metadata read pool ({}); raise it or set 0 to auto-derive",
+                self.runtime_max_blocking_threads,
+                blocking_floor,
+                self.blob_io_pool_size,
+                self.meta_read_pool_size,
+            )));
         }
         // Cache-budget clamp (R3 guardrail): the writer connection plus every reader each provision
         // `cache_bytes_per_conn`, so a large pool can silently OOM the host. Refuse at startup.
@@ -611,6 +662,32 @@ mod tests {
             c.meta_synchronous = s.to_owned();
             assert!(c.validate().is_ok());
         }
+    }
+
+    #[test]
+    fn runtime_blocking_pool_floor_is_enforced() {
+        let mut c = base();
+        c.blob_io_pool_size = 64;
+        c.meta_read_pool_size = 16;
+        // floor = 64 + 16 + 64 = 144.
+        let floor = c.blocking_pool_floor();
+        assert_eq!(floor, 144);
+        // 0 auto-derives max(512, floor) and validates.
+        c.runtime_max_blocking_threads = 0;
+        assert!(c.validate().is_ok());
+        assert_eq!(c.effective_max_blocking_threads(), 512);
+        // An explicit value at or above the floor validates.
+        c.runtime_max_blocking_threads = floor;
+        assert!(c.validate().is_ok());
+        assert_eq!(c.effective_max_blocking_threads(), floor);
+        // Below the floor is rejected (would starve reads/transfers).
+        c.runtime_max_blocking_threads = floor - 1;
+        assert!(c.validate().is_err());
+        // Worker threads: 0 = auto (None), explicit = pinned.
+        c.runtime_max_blocking_threads = 0;
+        assert_eq!(c.effective_worker_threads(), None);
+        c.runtime_worker_threads = 8;
+        assert_eq!(c.effective_worker_threads(), Some(8));
     }
 
     #[test]

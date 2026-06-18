@@ -189,7 +189,7 @@ fn integrity(cfg: Config, repair: bool) -> ExitCode {
     use cairn_types::blob::ReconcileOpts;
     use cairn_types::traits::BlobStore;
 
-    let rt = match runtime() {
+    let rt = match runtime(&cfg) {
         Ok(rt) => rt,
         Err(e) => {
             eprintln!("failed to start runtime: {e}");
@@ -397,7 +397,7 @@ fn schema_version(db_path: &std::path::Path) -> Result<i64, String> {
 /// blobs from writes after the snapshot are reclaimed by reconciliation on restore. The master
 /// key is deliberately not part of the data dir, so it is not disclosed by the snapshot.
 fn backup(cfg: Config, dir: &std::path::Path) -> ExitCode {
-    let rt = match runtime() {
+    let rt = match runtime(&cfg) {
         Ok(rt) => rt,
         Err(e) => {
             eprintln!("failed to start runtime: {e}");
@@ -464,7 +464,7 @@ fn restore(cfg: Config, dir: &std::path::Path) -> ExitCode {
     use cairn_types::blob::ReconcileOpts;
     use cairn_types::traits::BlobStore;
 
-    let rt = match runtime() {
+    let rt = match runtime(&cfg) {
         Ok(rt) => rt,
         Err(e) => {
             eprintln!("failed to start runtime: {e}");
@@ -584,10 +584,16 @@ async fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std
     Ok(())
 }
 
-fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
+fn runtime(cfg: &Config) -> std::io::Result<tokio::runtime::Runtime> {
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.enable_all();
+    // Size the blocking pool to cover the metadata read pool + blob I/O concurrency so neither
+    // starves the other (ARCH §30); compute parallelism is pinned only when set explicitly.
+    builder.max_blocking_threads(cfg.effective_max_blocking_threads());
+    if let Some(workers) = cfg.effective_worker_threads() {
+        builder.worker_threads(workers);
+    }
+    builder.build()
 }
 
 fn run_server(cfg: Config) -> ExitCode {
@@ -599,7 +605,7 @@ fn run_server(cfg: Config) -> ExitCode {
     #[cfg(feature = "failpoints")]
     let _fail_scenario = fail::FailScenario::setup();
 
-    let rt = match runtime() {
+    let rt = match runtime(&cfg) {
         Ok(rt) => rt,
         Err(e) => {
             eprintln!("failed to start runtime: {e}");
@@ -631,7 +637,7 @@ fn bootstrap(cfg: Config) -> ExitCode {
     use cairn_types::meta::{Mutation, User, UserRecord};
     use cairn_types::traits::{Clock, Crypto};
 
-    let rt = match runtime() {
+    let rt = match runtime(&cfg) {
         Ok(rt) => rt,
         Err(e) => {
             eprintln!("failed to start runtime: {e}");
