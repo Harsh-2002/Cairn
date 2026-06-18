@@ -455,8 +455,13 @@ impl BlobStore for LocalBlobStore {
         body: cairn_types::BodyStream,
         opts: StageOptions,
     ) -> Result<StagedBlob, BlobError> {
-        // Bound concurrent blob transfers (ARCH §7.4): held for the whole staged write + commit.
-        let _permit = self.acquire_io().await?;
+        // Bound concurrent blob *copy* I/O (ARCH §7.4). Held through the data copy and the per-file
+        // durability (fdatasync + rename), then released BEFORE the coalesced directory-fsync
+        // barrier (Phase 2.4) so a PUT awaiting that barrier no longer occupies blob-I/O concurrency
+        // that concurrent GETs need — reads stop queueing behind writers' fsync barriers. The
+        // barrier itself is bounded by the coalescer (one fsync per directory per batch), not by
+        // this semaphore, and a waiter only parks on a oneshot, holding no blocking thread.
+        let copy_permit = self.acquire_io().await?;
         let id = uuid::Uuid::new_v4().simple().to_string();
         let staging = self.data_root.join(STAGING).join(format!("{id}.tmp"));
         let bucket_dir = self.data_root.join(bucket.as_str());
@@ -480,6 +485,8 @@ impl BlobStore for LocalBlobStore {
         // after that fsync completes, so the blob is fully durable before we proceed.
         ensure_bucket_dir(&self.data_root, &bucket_dir).await?;
         sink.commit(&final_path).await?;
+        // Release the copy permit before parking on the coalesced directory-fsync barrier.
+        drop(copy_permit);
         self.dir_sync.sync_dir(&bucket_dir).await?;
         // The crash window the durability ordering protects: the blob is now durable but no
         // metadata row references it yet. A crash here leaves an orphan that reconcile reclaims.
@@ -641,7 +648,9 @@ impl BlobStore for LocalBlobStore {
         parts: &[PartRef],
         opts: StageOptions,
     ) -> Result<StagedBlob, BlobError> {
-        let _permit = self.acquire_io().await?;
+        // As in `stage`, the copy permit is released before the coalesced directory-fsync barrier
+        // (Phase 2.4) so the assembly does not hold blob-I/O concurrency through its fsync wait.
+        let copy_permit = self.acquire_io().await?;
         let id = uuid::Uuid::new_v4().simple().to_string();
         let staging = self.data_root.join(STAGING).join(format!("{id}.tmp"));
         let bucket_dir = self.data_root.join(bucket.as_str());
@@ -714,6 +723,8 @@ impl BlobStore for LocalBlobStore {
 
         ensure_bucket_dir(&self.data_root, &bucket_dir).await?;
         sink.commit(&final_path).await?;
+        // Release the copy permit before parking on the coalesced directory-fsync barrier.
+        drop(copy_permit);
         self.dir_sync.sync_dir(&bucket_dir).await?;
         fail::fail_point!("blob_after_assemble");
 
