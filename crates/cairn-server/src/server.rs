@@ -15,7 +15,7 @@ use hyper_util::server::conn::auto;
 use metrics_exporter_prometheus::PrometheusHandle;
 use std::convert::Infallible;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, watch};
@@ -297,6 +297,24 @@ async fn serve_io<S>(
     }
 }
 
+/// Mint a per-request correlation id without per-request randomness. A request id only needs to be
+/// unique (it correlates logs/headers, it is not a security token), so it is a one-time random
+/// 64-bit process salt — drawn once at first use — concatenated with a monotonic atomic counter,
+/// hex-encoded to the same 32-char width as the previous UUIDv4. This drops the per-request RNG
+/// draw and string re-parse from the hot path while keeping ids collision-free across processes
+/// and restarts (distinct salts) and within a process (distinct counters).
+fn next_request_id() -> String {
+    static SALT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let salt = *SALT.get_or_init(|| {
+        // One UUIDv4 at startup seeds the salt — no new dependency, no per-request RNG.
+        let b = *uuid::Uuid::new_v4().as_bytes();
+        u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
+    });
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("{salt:016x}{seq:016x}")
+}
+
 /// The outer middleware: request id, tracing span, concurrency limit, timeout, and the
 /// request/latency metrics, wrapping the router.
 async fn handle(
@@ -306,7 +324,7 @@ async fn handle(
     serve_ui: bool,
     req: Request<Incoming>,
 ) -> Result<Response<ResponseBody>, Infallible> {
-    let request_id = uuid::Uuid::new_v4().simple().to_string();
+    let request_id = next_request_id();
     let method = req.method().clone();
     let path = req.uri().path().to_owned();
     // Capture the raw query before `req` is consumed by the router: the request-metrics operation
