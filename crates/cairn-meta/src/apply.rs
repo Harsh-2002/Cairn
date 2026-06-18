@@ -594,11 +594,19 @@ fn enforce_bucket_quota(conn: &Connection, row: &ObjectVersionRow) -> R<()> {
     let Some(quota) = quota else {
         return Ok(());
     };
-    // Current logical bytes in the bucket, excluding the row this upsert will replace.
-    let current: i64 = conn
+    // Current logical bytes in the bucket, read O(1) from the maintained counter (Phase 2.1/2.2)
+    // instead of summing every version, minus the row this upsert will replace (if present).
+    let total: i64 = conn
+        .prepare_cached("SELECT logical_bytes FROM bucket_stats WHERE bucket_name=?1")
+        .map_err(engine_err)?
+        .query_row(params![row.bucket.as_str()], |r| r.get(0))
+        .optional()
+        .map_err(engine_err)?
+        .unwrap_or(0);
+    let existing: i64 = conn
         .prepare_cached(
-            "SELECT COALESCE(SUM(size_logical), 0) FROM object_versions
-             WHERE bucket_name=?1 AND NOT (key=?2 AND version_id=?3)",
+            "SELECT size_logical FROM object_versions
+             WHERE bucket_name=?1 AND key=?2 AND version_id=?3",
         )
         .map_err(engine_err)?
         .query_row(
@@ -609,9 +617,12 @@ fn enforce_bucket_quota(conn: &Connection, row: &ObjectVersionRow) -> R<()> {
             ],
             |r| r.get(0),
         )
-        .map_err(engine_err)?;
+        .optional()
+        .map_err(engine_err)?
+        .unwrap_or(0);
+    let current = (total - existing).max(0);
     // Saturating add in u128 so a pathological size can never wrap past the quota check.
-    let projected = u128::from(current.max(0) as u64) + u128::from(row.size_logical);
+    let projected = u128::from(current as u64) + u128::from(row.size_logical);
     if projected > u128::from(quota.max(0) as u64) {
         return Err(MetaError::QuotaExceeded);
     }
@@ -637,26 +648,37 @@ fn enforce_user_quota(conn: &Connection, row: &ObjectVersionRow) -> R<()> {
     let Some(quota) = quota else {
         return Ok(());
     };
-    // Current logical bytes owned by this user across all buckets, excluding the row this
-    // upsert will replace.
-    let current: i64 = conn
+    // Current logical bytes owned by this user across all buckets, read O(1) from the maintained
+    // counter (Phase 2.1/2.2), minus the row this upsert replaces — but only when that existing
+    // row is owned by THIS user (otherwise it is not part of this user's total to begin with).
+    let total: i64 = conn
+        .prepare_cached("SELECT logical_bytes FROM user_stats WHERE owner_id=?1")
+        .map_err(engine_err)?
+        .query_row(params![row.owner_id.0.as_str()], |r| r.get(0))
+        .optional()
+        .map_err(engine_err)?
+        .unwrap_or(0);
+    let existing: i64 = conn
         .prepare_cached(
-            "SELECT COALESCE(SUM(size_logical), 0) FROM object_versions
-             WHERE owner_id=?1 AND NOT (bucket_name=?2 AND key=?3 AND version_id=?4)",
+            "SELECT size_logical FROM object_versions
+             WHERE bucket_name=?1 AND key=?2 AND version_id=?3 AND owner_id=?4",
         )
         .map_err(engine_err)?
         .query_row(
             params![
-                row.owner_id.0.as_str(),
                 row.bucket.as_str(),
                 row.key.as_str(),
-                row.version_id.as_str()
+                row.version_id.as_str(),
+                row.owner_id.0.as_str()
             ],
             |r| r.get(0),
         )
-        .map_err(engine_err)?;
+        .optional()
+        .map_err(engine_err)?
+        .unwrap_or(0);
+    let current = (total - existing).max(0);
     // Saturating add in u128 so a pathological size can never wrap past the quota check.
-    let projected = u128::from(current.max(0) as u64) + u128::from(row.size_logical);
+    let projected = u128::from(current as u64) + u128::from(row.size_logical);
     if projected > u128::from(quota.max(0) as u64) {
         return Err(MetaError::QuotaExceeded);
     }
