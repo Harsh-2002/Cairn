@@ -148,8 +148,14 @@ impl S3Service {
             self.require_principal(&req)?;
         } else {
             let bucket = self.fetch_bucket(&req).await?;
-            self.authorize(&req, &bucket, action, Resource::Bucket(bucket.name.clone()))
-                .await?;
+            self.authorize(
+                &req,
+                &bucket,
+                action,
+                Resource::Bucket(bucket.name.clone()),
+                None,
+            )
+            .await?;
         }
         match req.method {
             // Subresources first (they share the bucket path with the plain operations).
@@ -258,6 +264,11 @@ impl S3Service {
         let action = object_action(&req)?;
         let bucket = self.fetch_bucket(&req).await?;
         let key = req.key.clone().ok_or(Error::NoSuchKey)?;
+        // When the request names a `?versionId`, gate version-scoped policy conditions
+        // (s3:ExistingObjectTag, object ACL) on THAT version, not the current one (audit #33).
+        let req_version = req
+            .query("versionId")
+            .map(|v| VersionId::from_string(v.to_owned()));
         self.authorize(
             &req,
             &bucket,
@@ -266,6 +277,7 @@ impl S3Service {
                 bucket: bucket.name.clone(),
                 key,
             },
+            req_version.as_ref(),
         )
         .await?;
         match req.method {
@@ -1051,6 +1063,7 @@ impl S3Service {
                 bucket: src_bucket.clone(),
                 key: src_key.clone(),
             },
+            Some(&src_row.version_id),
         )
         .await?;
         let src_path = src_row.storage_path.clone().ok_or(Error::NoSuchKey)?;
@@ -1388,6 +1401,7 @@ impl S3Service {
                 bucket: src_bucket.clone(),
                 key: src_key.clone(),
             },
+            Some(&src_row.version_id),
         )
         .await?;
         let src_path = src_row.storage_path.clone().ok_or(Error::NoSuchKey)?;
@@ -1545,6 +1559,8 @@ impl S3Service {
             } else {
                 Action::DeleteObject
             };
+            // Evaluate version-scoped policy conditions against the named version (audit #33).
+            let acl_version = version.as_ref().map(|v| VersionId::from_string(v.clone()));
             if let Err(e) = self
                 .authorize(
                     req,
@@ -1554,6 +1570,7 @@ impl S3Service {
                         bucket: bucket.name.clone(),
                         key: key.clone(),
                     },
+                    acl_version.as_ref(),
                 )
                 .await
             {
@@ -2117,6 +2134,10 @@ impl S3Service {
         bucket: &Bucket,
         action: Action,
         resource: Resource,
+        // The object version whose ACL + tags the policy conditions evaluate against, when a
+        // specific version is being acted on (a `?versionId` read, or a versioned copy source).
+        // `None` selects the current version (audit #33).
+        acl_version: Option<&VersionId>,
     ) -> Result<()> {
         let requester = match req.principal.as_ref() {
             Some(p) if p.role == Role::Administrator || p.user_id == bucket.owner_id => {
@@ -2149,6 +2170,18 @@ impl S3Service {
             ),
             None => None,
         };
+        // Resolve the version whose ACL + tags the policy conditions evaluate against (audit #33):
+        // the specific version when one is named (a `?versionId` read, or a versioned copy source),
+        // otherwise the current version. Evaluating against the current version when a *different*
+        // version is being acted on would gate `s3:ExistingObjectTag` / object-ACL conditions on
+        // the wrong version's metadata. Loaded once and shared by the ACL and tag paths below.
+        let acl_row = match &resource {
+            Resource::Object { key, .. } => match acl_version {
+                Some(vid) => self.meta.get_version(&bucket.name, key, vid).await?,
+                None => self.meta.current_version(&bucket.name, key).await?,
+            },
+            Resource::Bucket(_) => None,
+        };
         // Load ACLs only when ownership mode keeps them enabled; under BucketOwnerEnforced
         // (the default) ACLs are disabled, so this stays a no-op on the hot path.
         let (bucket_acl, object_acl) =
@@ -2165,32 +2198,19 @@ impl S3Service {
                     })?),
                     None => None,
                 };
-                let object_acl = match &resource {
-                    Resource::Object { key, .. } => self
-                        .meta
-                        .current_version(&bucket.name, key)
-                        .await?
-                        .and_then(|row| row.acl),
-                    _ => None,
-                };
-                (bucket_acl, object_acl)
+                (bucket_acl, acl_row.as_ref().and_then(|row| row.acl.clone()))
             };
         // Load the existing object's tags and parse any request-supplied tags so policies
         // conditioned on s3:ExistingObjectTag/aws:RequestTag evaluate correctly (ARCH §15.6,
-        // Medium #5). Existing tags are read only for object resources; the request tags come
-        // from the inline `x-amz-tagging` header (a `PutObject`/copy form-encoded tag set).
-        let existing_tags = match &resource {
-            Resource::Object { key, .. } => {
-                match self.meta.current_version(&bucket.name, key).await? {
-                    Some(row) => {
-                        self.meta
-                            .get_object_tags(&bucket.name, key, &row.version_id)
-                            .await?
-                    }
-                    None => Vec::new(),
-                }
+        // Medium #5) — against the resolved version (audit #33). The request tags come from the
+        // inline `x-amz-tagging` header (a `PutObject`/copy form-encoded tag set).
+        let existing_tags = match (&resource, &acl_row) {
+            (Resource::Object { key, .. }, Some(row)) => {
+                self.meta
+                    .get_object_tags(&bucket.name, key, &row.version_id)
+                    .await?
             }
-            Resource::Bucket(_) => Vec::new(),
+            _ => Vec::new(),
         };
         let request_tags = parse_tagging_header(req.header("x-amz-tagging"));
         let mut context = build_context(req, self.clock.now());

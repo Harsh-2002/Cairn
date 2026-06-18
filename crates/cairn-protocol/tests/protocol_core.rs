@@ -1453,6 +1453,197 @@ async fn copy_source_read_is_authorized_cross_tenant_denied() {
     );
 }
 
+/// Version-scoped authorization (audit #33): a policy condition on `s3:ExistingObjectTag` must be
+/// evaluated against the version named by `?versionId`, not the current version. An attacker must
+/// not read a restricted OLD version merely because the CURRENT version carries the tag the policy
+/// allows.
+#[tokio::test]
+async fn versioned_read_evaluates_existing_tag_against_named_version() {
+    let h = harness_with_authz(Arc::new(cairn_authz::PolicyEngine)).await;
+    let owner = member("owner-v");
+    let reader = member("reader-v");
+
+    // Owner creates a versioned bucket whose policy allows any principal to read `obj` ONLY when
+    // its `tier` tag is `public`.
+    drain(
+        send(
+            &h.svc,
+            req_with_principal(
+                Method::PUT,
+                Some("vbkt"),
+                None,
+                &[],
+                &[],
+                vec![],
+                owner.clone(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    let vcfg =
+        b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>".to_vec();
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req_with_principal(
+                Method::PUT,
+                Some("vbkt"),
+                None,
+                &[("versioning", "")],
+                &[],
+                vcfg,
+                owner.clone(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let policy = br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":["s3:GetObject","s3:GetObjectVersion"],"Resource":"arn:aws:s3:::vbkt/obj","Condition":{"StringEquals":{"s3:ExistingObjectTag/tier":"public"}}}]}"#.to_vec();
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req_with_principal(
+                Method::PUT,
+                Some("vbkt"),
+                None,
+                &[("policy", "")],
+                &[],
+                policy,
+                owner.clone(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+
+    // v1 = restricted (tier=secret); then v2 (current) = public (tier=public).
+    let (_, hv1, _) = drain(
+        send(
+            &h.svc,
+            req_with_principal(
+                Method::PUT,
+                Some("vbkt"),
+                Some("obj"),
+                &[],
+                &[],
+                b"v1".to_vec(),
+                owner.clone(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    let v1 = header(&hv1, "x-amz-version-id").unwrap().to_owned();
+    let tag_secret =
+        b"<Tagging><TagSet><Tag><Key>tier</Key><Value>secret</Value></Tag></TagSet></Tagging>"
+            .to_vec();
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req_with_principal(
+                Method::PUT,
+                Some("vbkt"),
+                Some("obj"),
+                &[("tagging", ""), ("versionId", v1.as_str())],
+                &[],
+                tag_secret,
+                owner.clone(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let (_, hv2, _) = drain(
+        send(
+            &h.svc,
+            req_with_principal(
+                Method::PUT,
+                Some("vbkt"),
+                Some("obj"),
+                &[],
+                &[],
+                b"v2".to_vec(),
+                owner.clone(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    let v2 = header(&hv2, "x-amz-version-id").unwrap().to_owned();
+    assert_ne!(v1, v2);
+    let tag_public =
+        b"<Tagging><TagSet><Tag><Key>tier</Key><Value>public</Value></Tag></TagSet></Tagging>"
+            .to_vec();
+    drain(
+        send(
+            &h.svc,
+            req_with_principal(
+                Method::PUT,
+                Some("vbkt"),
+                Some("obj"),
+                &[("tagging", ""), ("versionId", v2.as_str())],
+                &[],
+                tag_public,
+                owner.clone(),
+            ),
+        )
+        .await,
+    )
+    .await;
+
+    // reader CAN read the public current version (condition met on v2's tier=public).
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req_with_principal(
+                Method::GET,
+                Some("vbkt"),
+                Some("obj"),
+                &[("versionId", v2.as_str())],
+                &[],
+                vec![],
+                reader.clone(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "the public version is readable (condition met)"
+    );
+
+    // reader must NOT read the restricted OLD version: the condition is evaluated against v1's
+    // `tier=secret`, not the current v2's `tier=public`. Before #33 this leaked v1.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req_with_principal(
+                Method::GET,
+                Some("vbkt"),
+                Some("obj"),
+                &[("versionId", v1.as_str())],
+                &[],
+                vec![],
+                reader.clone(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::FORBIDDEN,
+        "the restricted version must be denied even though the current version is public (#33)"
+    );
+}
+
 #[tokio::test]
 async fn bulk_delete_works() {
     let h = harness().await;
