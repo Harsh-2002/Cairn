@@ -1,0 +1,161 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-06-18T00:00:00Z",
+  "title": "Design System: Cairn Console",
+  "extensions": {
+    "colorMeta": {
+      "neutral-primary": {
+        "role": "primary",
+        "displayName": "Neutral Primary",
+        "canonical": "oklch(0.205 0 0)",
+        "tonalRamp": ["oklch(0.145 0 0)", "oklch(0.205 0 0)", "oklch(0.31 0 0)", "oklch(0.45 0 0)", "oklch(0.51 0 0)", "oklch(0.708 0 0)", "oklch(0.922 0 0)", "oklch(0.985 0 0)"]
+      },
+      "link-blue": {
+        "role": "primary",
+        "displayName": "Link Blue",
+        "canonical": "oklch(0.5 0.2 255)",
+        "tonalRamp": ["oklch(0.25 0.1 255)", "oklch(0.35 0.15 255)", "oklch(0.43 0.19 255)", "oklch(0.5 0.2 255)", "oklch(0.53 0.2 255)", "oklch(0.62 0.19 255)", "oklch(0.74 0.13 255)", "oklch(0.88 0.06 255)"]
+      },
+      "hairline": {
+        "role": "neutral",
+        "displayName": "Hairline",
+        "canonical": "oklch(0.922 0 0)",
+        "tonalRamp": ["oklch(0.145 0 0)", "oklch(0.205 0 0)", "oklch(0.31 0 0)", "oklch(0.51 0 0)", "oklch(0.708 0 0)", "oklch(0.922 0 0)", "oklch(0.97 0 0)", "oklch(1 0 0)"]
+      },
+      "success-green": {
+        "role": "tertiary",
+        "displayName": "Success Green",
+        "canonical": "oklch(0.52 0.13 155)",
+        "tonalRamp": ["oklch(0.25 0.07 155)", "oklch(0.35 0.1 155)", "oklch(0.45 0.12 155)", "oklch(0.52 0.13 155)", "oklch(0.62 0.14 155)", "oklch(0.72 0.14 155)", "oklch(0.83 0.1 155)", "oklch(0.93 0.05 155)"]
+      },
+      "warning-amber": {
+        "role": "tertiary",
+        "displayName": "Warning Amber",
+        "canonical": "oklch(0.55 0.13 75)",
+        "tonalRamp": ["oklch(0.3 0.07 75)", "oklch(0.4 0.1 75)", "oklch(0.5 0.12 75)", "oklch(0.55 0.13 75)", "oklch(0.66 0.14 75)", "oklch(0.75 0.13 80)", "oklch(0.85 0.1 80)", "oklch(0.94 0.05 80)"]
+      },
+      "destructive-red": {
+        "role": "tertiary",
+        "displayName": "Destructive Red",
+        "canonical": "oklch(0.577 0.245 27.3)",
+        "tonalRamp": ["oklch(0.3 0.12 27)", "oklch(0.4 0.17 27)", "oklch(0.5 0.22 27)", "oklch(0.577 0.245 27.3)", "oklch(0.66 0.21 25)", "oklch(0.74 0.16 25)", "oklch(0.84 0.1 25)", "oklch(0.93 0.05 25)"]
+      }
+    },
+    "typographyMeta": {
+      "headline": { "displayName": "Headline", "purpose": "Page title (<h1> in PageHeader); the largest type on a normal screen. No hero/display tier above it." },
+      "title": { "displayName": "Title", "purpose": "Card titles and section headings (16px / 600)." },
+      "body": { "displayName": "Body", "purpose": "All prose, sentence-case labels, descriptions (14px / 400). Capped at 65-75ch." },
+      "mono": { "displayName": "Mono / Data", "purpose": "Every literal value: key, size, id, address, count. Geist Mono with tabular numerals. The most common text in the console." },
+      "label": { "displayName": "Label", "purpose": "Table headers, meta, badges (12px / 500). Sentence case, never all-caps." }
+    },
+    "shadows": [
+      { "name": "floating-layer", "value": "0 8px 24px -8px rgba(0,0,0,0.18), 0 2px 6px -2px rgba(0,0,0,0.12)", "purpose": "The only shadow in the system. Popovers, dropdown menus, dialogs, command palette, toasts: layers that leave the document flow and float above content. Flat surfaces never use it." }
+    ],
+    "motion": [
+      { "name": "ease-out-standard", "value": "cubic-bezier(0.16, 1, 0.3, 1)", "purpose": "Default exponential ease-out for state transitions (hover, open/close, fills). No bounce, no elastic." },
+      { "name": "duration-state", "value": "180ms", "purpose": "State transitions sit in the 150-250ms band; users are in flow, not watching choreography." },
+      { "name": "reduced-motion", "value": "0.01ms", "purpose": "prefers-reduced-motion collapses all animation/transition to instant; motion conveys state, so it degrades, never gates content." }
+    ],
+    "breakpoints": [
+      { "name": "sm", "value": "640px" },
+      { "name": "md", "value": "768px" },
+      { "name": "lg", "value": "1024px" }
+    ]
+  },
+  "components": [
+    {
+      "name": "Primary Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "The single top-emphasis action on a screen. Neutral, never blue.",
+      "html": "<button class=\"ds-btn-primary\">Save changes</button>",
+      "css": ".ds-btn-primary { display: inline-flex; align-items: center; justify-content: center; gap: 8px; height: 36px; padding: 0 16px; border: none; border-radius: 6px; background: oklch(0.205 0 0); color: oklch(1 0 0); font: 500 0.875rem/1 'Geist Sans', ui-sans-serif, system-ui, sans-serif; cursor: pointer; transition: background 180ms cubic-bezier(0.16,1,0.3,1); } .ds-btn-primary:hover { background: oklch(0.27 0 0); } .ds-btn-primary:focus-visible { outline: 2px solid oklch(0.53 0.2 255); outline-offset: 2px; } .ds-btn-primary:disabled { opacity: 0.5; pointer-events: none; }"
+    },
+    {
+      "name": "Outline Button",
+      "kind": "button",
+      "refersTo": "button-outline",
+      "description": "Secondary actions: a hairline border on the surface, neutral ink.",
+      "html": "<button class=\"ds-btn-outline\">Refresh</button>",
+      "css": ".ds-btn-outline { display: inline-flex; align-items: center; justify-content: center; gap: 8px; height: 36px; padding: 0 16px; border: 1px solid oklch(0.922 0 0); border-radius: 6px; background: oklch(1 0 0); color: oklch(0.145 0 0); font: 500 0.875rem/1 'Geist Sans', ui-sans-serif, system-ui, sans-serif; cursor: pointer; transition: background 180ms cubic-bezier(0.16,1,0.3,1); } .ds-btn-outline:hover { background: oklch(0.97 0 0); } .ds-btn-outline:focus-visible { outline: 2px solid oklch(0.53 0.2 255); outline-offset: 2px; }"
+    },
+    {
+      "name": "Destructive-Outline Button",
+      "kind": "button",
+      "refersTo": "button-destructive-outline",
+      "description": "A destructive-but-secondary action (e.g. Deactivate user). Red is carried by border + text, never text alone.",
+      "html": "<button class=\"ds-btn-destructive-outline\">Delete bucket</button>",
+      "css": ".ds-btn-destructive-outline { display: inline-flex; align-items: center; justify-content: center; gap: 8px; height: 36px; padding: 0 16px; border: 1px solid oklch(0.577 0.245 27.3 / 0.4); border-radius: 6px; background: oklch(1 0 0); color: oklch(0.577 0.245 27.3); font: 500 0.875rem/1 'Geist Sans', ui-sans-serif, system-ui, sans-serif; cursor: pointer; transition: background 180ms cubic-bezier(0.16,1,0.3,1); } .ds-btn-destructive-outline:hover { background: oklch(0.577 0.245 27.3 / 0.1); } .ds-btn-destructive-outline:focus-visible { outline: 2px solid oklch(0.577 0.245 27.3 / 0.5); outline-offset: 2px; }"
+    },
+    {
+      "name": "Text Input",
+      "kind": "input",
+      "refersTo": "input",
+      "description": "Standard field: hairline border, 6px radius, focus ring (no glow).",
+      "html": "<input class=\"ds-input\" placeholder=\"my-bucket\" />",
+      "css": ".ds-input { width: 100%; height: 36px; padding: 0 12px; border: 1px solid oklch(0.922 0 0); border-radius: 6px; background: oklch(1 0 0); color: oklch(0.145 0 0); font: 400 0.875rem/1 'Geist Sans', ui-sans-serif, system-ui, sans-serif; } .ds-input::placeholder { color: oklch(0.51 0 0); } .ds-input:focus-visible { outline: 2px solid oklch(0.53 0.2 255); outline-offset: 2px; border-color: oklch(0.53 0.2 255); } .ds-input[aria-invalid='true'] { border-color: oklch(0.577 0.245 27.3); }"
+    },
+    {
+      "name": "Card",
+      "kind": "card",
+      "refersTo": "card",
+      "description": "Flat surface separated by a 1px hairline; no shadow. Title (16px/600), description (muted), body.",
+      "html": "<div class=\"ds-card\"><div class=\"ds-card-title\">Storage quota</div><div class=\"ds-card-desc\">Cap how much this bucket can store, in bytes.</div></div>",
+      "css": ".ds-card { border: 1px solid oklch(0.922 0 0); border-radius: 8px; background: oklch(1 0 0); padding: 24px; } .ds-card-title { font: 600 1rem/1.4 'Geist Sans', ui-sans-serif, system-ui, sans-serif; color: oklch(0.145 0 0); } .ds-card-desc { margin-top: 4px; font: 400 0.875rem/1.5 'Geist Sans', ui-sans-serif, system-ui, sans-serif; color: oklch(0.51 0 0); }"
+    },
+    {
+      "name": "Status Badge (active)",
+      "kind": "chip",
+      "refersTo": null,
+      "description": "Semantic state pill: a tinted dot + label. Green only because 'active' is a meaningful positive state.",
+      "html": "<span class=\"ds-badge\"><span class=\"ds-dot\"></span>Active</span>",
+      "css": ".ds-badge { display: inline-flex; align-items: center; gap: 6px; padding: 2px 8px; border: 1px solid oklch(0.922 0 0); border-radius: 9999px; background: oklch(1 0 0); font: 500 0.75rem/1.4 'Geist Sans', ui-sans-serif, system-ui, sans-serif; color: oklch(0.145 0 0); } .ds-dot { width: 6px; height: 6px; border-radius: 9999px; background: oklch(0.52 0.13 155); }"
+    },
+    {
+      "name": "Mono Data Cell",
+      "kind": "custom",
+      "refersTo": "data-cell-mono",
+      "description": "How every literal value reads in a table: Geist Mono, tabular, near-black.",
+      "html": "<span class=\"ds-mono\">1.68 MiB</span>",
+      "css": ".ds-mono { font: 400 0.8125rem/1.4 'Geist Mono', ui-monospace, SFMono-Regular, Menlo, monospace; font-feature-settings: 'tnum'; color: oklch(0.145 0 0); }"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Plain-Spoken Utility",
+    "overview": "Cairn is infrastructure: a self-hosted, S3-compatible object store that someone is trusting with production data. The console is the reason a person picks Cairn over MinIO, so its whole job is to make running your own storage feel calm and legible instead of intimidating. The look is Vercel/Geist restraint in service of that legibility, executed in React + shadcn/ui on the Geist Sans/Mono faces: pure-white (or near-black) surfaces, hairline borders, near-black ink, and one neutral primary button. Color is silent until it has something to say. This system is built on subtraction: depth comes from a single 1px border, not a stack of shadows; hierarchy from scale and weight, not boxes-within-boxes; the primary action is neutral black-on-white so the loudest thing on screen is a warning, not a Save button. The deliberate opposite of MinIO's cramped widget-soup.",
+    "keyCharacteristics": [
+      "Pure-neutral surfaces (white / near-black) with hairline borders; depth is structural, never shadowy.",
+      "One neutral primary button. Blue is for links and focus only. Green/amber/red appear only as meaning.",
+      "Geist Sans for everything UI; Geist Mono with tabular numerals for every identifier, size, address, and number.",
+      "Fixed rem type scale (12 / 13px-mono / 14 / 16 / 20 / 24), never fluid clamp().",
+      "Spacious by default; dense only where data demands it, and calm even there.",
+      "Light and dark at contrast parity; motion conveys state, never decorates."
+    ],
+    "rules": [
+      { "name": "The Meaningful-Color Rule", "body": "Green, amber, and red appear only when they carry meaning (state, warning, harm). Forbidden as decoration or category coding. If a colored element doesn't change meaning when grayed out, it shouldn't be colored.", "section": "colors" },
+      { "name": "The One Blue Rule", "body": "Blue is reserved for links and the focus ring. Never a button fill, heading color, or background. The primary action is neutral; a tool full of irreversible operations must not teach the eye that blue means 'press me.'", "section": "colors" },
+      { "name": "The Mono-for-Truth Rule", "body": "Every value an operator reads as a literal (key, size, id, address, count) is Geist Mono with tabular numerals. Prose is Geist Sans. The font is the signal of 'this is exact data, not commentary.'", "section": "typography" },
+      { "name": "The Fixed-Scale Rule", "body": "Type is a fixed rem scale (12/13/14/16/20/24). Fluid clamp() headings are forbidden; no type element exceeds 24px.", "section": "typography" },
+      { "name": "The 1px-Border Rule", "body": "Structure is hairline borders, not shadows. If a flat surface reaches for a box-shadow to separate from the page, it's wrong: use the hairline border. A shadow on a non-floating element is a bug.", "section": "elevation" },
+      { "name": "The No-Nested-Card Rule", "body": "Cards never nest. A bordered surface inside a bordered surface is two boxes competing; flatten to one, or separate with a divider and spacing.", "section": "elevation" }
+    ],
+    "dos": [
+      "Do convey all structure with the 1px Hairline border (#e5e5e5 light, #2e2e2e dark). Reserve box-shadow for floating layers only (popover, dialog, menu, toast).",
+      "Do keep the primary button neutral. Make the loudest thing on a screen the destructive/warning state, not a routine action.",
+      "Do set every literal value (key, size, id, address, count) in Geist Mono with tabular numerals; keep prose in Geist Sans.",
+      "Do state plainly what an irreversible action will do before it happens, and confirm before harm.",
+      "Do use the shared vocabulary (Page/PageHeader, Card, DataTable/SkeletonRows, StatCard, StatusBadge, TextLink, FieldError, ConfirmDialog): one button shape, one form-control set, one icon style everywhere.",
+      "Do render ErrorAlert above retained content and skeletons only on first load; teach the interface in empty states, never 'nothing here.'",
+      "Do hold muted and placeholder text to real contrast (>=4.5:1), targeting AAA where it doesn't fight the task; honor prefers-reduced-motion."
+    ],
+    "donts": [
+      "Don't use border-left/border-right greater than 1px as a colored accent stripe. Full hairline borders or background tints instead.",
+      "Don't use gradient text, decorative glassmorphism, or a gradient hero. This is the generic AI-SaaS template Cairn rejects.",
+      "Don't drift toward consumer-cute / toy-like UI: no mascots, no playful illustrations, no bouncy or elastic motion, no emoji-as-UI.",
+      "Don't ship MinIO's utilitarian density: controls jammed together with no hierarchy or air.",
+      "Don't color anything that isn't carrying meaning; no blue except links and the focus ring; no full-saturation accents on inactive states.",
+      "Don't nest cards, reach for a modal as the first thought, or reinvent a standard affordance for flavor.",
+      "Don't use fluid clamp() type or text above 24px; don't set body or section labels in all-caps; don't add a tiny tracked uppercase eyebrow above sections."
+    ]
+  }
+}
