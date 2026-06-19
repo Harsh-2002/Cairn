@@ -114,6 +114,16 @@ jobs:
       - name: Persistent share tokens + SigV4 presigned URLs, end to end
         run: BIN=target/debug/cairn bash conformance/share.sh
 
+  concurrency:
+    name: concurrency contention (single-key races)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+      - run: cargo build --bin cairn
+      - name: Race N clients on one key (create / CAS / last-writer); assert atomic, no corruption
+        run: BIN=target/debug/cairn PY=python3 N=32 bash conformance/concurrency.sh
+
   crash-consistency:
     name: crash consistency (F-4)
     runs-on: ubuntu-latest
