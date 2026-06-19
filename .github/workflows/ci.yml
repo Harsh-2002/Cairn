@@ -174,6 +174,17 @@ jobs:
       - name: Run the real MinIO warp benchmark against a fresh Cairn (get/put/mixed, strict)
         run: BIN=target/debug/cairn bash conformance/warp.sh
 
+  warp-escalate:
+    name: warp escalating-concurrency limit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+      - run: cargo build --bin cairn
+      - name: Ramp warp concurrency to the single-writer ceiling; assert zero errors + alive + integrity
+        run: BIN=target/debug/cairn LEVELS="8 32 64 128 256" DURATION=8s bash conformance/warp_escalate.sh
+
   fuzz-smoke:
     name: fuzz smoke (decoder, xml, policy)
     runs-on: ubuntu-latest
