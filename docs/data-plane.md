@@ -1,0 +1,72 @@
+# Data plane: system model, concurrency, and I/O
+
+> Part of the Cairn reference docs (split from the former ARCH.md). The section numbers below are stable identifiers used throughout the code and docs; see the index in [`README.md`](./README.md) and [`../CLAUDE.md`](../CLAUDE.md).
+
+## 6. System overview: data plane, control plane, node model
+
+### 6.1 The node model
+
+A Cairn deployment is one process on one host owning one data filesystem. That process is the entirety of the system for that deployment: there is no coordinator, no metadata service, no separate gateway. Multiple Cairn deployments relate to each other only through asynchronous bucket replication (Section 20), which is an S3 client relationship, not a cluster membership. This is the deliberate simplicity at the heart of the design (Section 2.3). The unit of scaling is the host: a bigger host, faster disks, and more network serve more load; cross-host capacity and redundancy come from running more independent deployments and replicating buckets between them.
+
+### 6.2 Data plane and control plane
+
+Within the process, two logical planes share the same address space and the same metadata store but are reasoned about separately.
+
+The **data plane** is the S3 request path: accept a connection, parse and authenticate and authorize the request, and move object bytes between the socket and the disk, touching metadata at the commit point. It is latency- and throughput-critical and is where the I/O model (Section 7) and the durability model (Section 8) live.
+
+The **control plane** is everything that configures and observes the system: the management API and its two clients (the embedded UI and the CLI), the background subsystems (lifecycle scanner, replication workers, multipart sweeper, WAL checkpointer, metrics refresher), and bootstrap. The control plane is not on the object hot path; it values correctness, observability, and clear operator semantics over raw throughput.
+
+### 6.3 The request path, end to end
+
+Every S3 request traverses the same outer pipeline before reaching an operation handler. A connection is accepted by the async HTTP server, optionally over built-in TLS (Section 7.7) or behind a terminating proxy. A middleware stack, ordered deliberately, applies: assignment of a request identifier and the opening of a tracing span; structured access logging; a global concurrency limit and a request timeout; a request-body size guard; and CORS handling, which for Cairn is per-bucket and therefore partly deferred into the handler (Section 18). The request is then routed by host and path and query string into one of the four families. For S3 requests, authentication (Section 14) establishes the principal, and authorization (Section 15) evaluates the combined decision of Block Public Access, bucket policy, ACL, and ownership for the specific action and resource. Only then does the operation handler run, depending solely on the internal interfaces (Section 12) rather than on concrete storage. The handler's result is rendered to the wire as S3 XML or, for the management API, JSON, with errors passed through the single error translator (Section 25).
+
+### 6.4 The subsystems at a glance
+
+The process hosts, besides request handling: the metadata writer task and the read-connection pool (Section 11); the blob I/O facility (Section 9); the replication engine and its worker pool (Section 20); the lifecycle scanner (Section 19); the multipart-upload sweeper; the WAL checkpointer; and the metrics and audit facilities (Section 26). Startup wires these, runs reconciliation (Section 8), and only then binds the listener. Shutdown reverses this in a defined order (Section 31).
+
+---
+
+
+## 7. Concurrency, runtime, and the I/O model
+
+This section is the heart of the performance design and is specified with care, because the operator's premise is that Rust is chosen precisely for its command of hardware and I/O, and that premise is only realised if the I/O model is right.
+
+### 7.1 ADR: a multi-threaded asynchronous runtime, with the data plane able to escalate to io_uring
+
+Cairn runs on a multi-threaded asynchronous runtime (the mainstream Tokio model) as its baseline. This choice is for portability, for the maturity of the HTTP, TLS, and S3-client libraries that build on it, and for the practicality of sharing the metadata writer and the caches across tasks, which a strict thread-per-core shared-nothing runtime would complicate. The cost is that the very lowest-latency disk path and kernel-side batching are not the default. Cairn addresses this by keeping blob I/O behind an interface (Section 12) so that an io_uring-based data-plane implementation can be selected at build time without touching protocol code. The recommendation is to ship the portable runtime first, measure, and adopt io_uring for the blob path where the workload's syscall rate justifies it. The reason io_uring matters for this workload is that it lets many disk and socket operations be submitted and completed with very few syscalls and supports registered buffers and files, which removes per-operation setup cost; for a server doing a high rate of reads and writes this reduces CPU spent in the kernel boundary, which is exactly where a busy storage server spends it.
+
+### 7.2 ADR: the metadata writer is a single, serialized, group-committing task
+
+SQLite permits exactly one writer and many concurrent readers in WAL mode. Cairn models this directly rather than fighting it. All mutations are submitted to one writer task that owns the single write connection. This removes write-write lock contention entirely, because there is only one writer, so the database is never busy for a competing writer and the busy-timeout path effectively never triggers. Serialization is not a limitation to be worked around here; it is the physical reality of the storage engine, made explicit.
+
+On its own, a single writer that does one transaction and one durability barrier per request would cap the small-object write rate at the device's synchronous-commit rate, which is far too low for production. The decisive optimisation is **group commit**. The writer drains its inbound queue opportunistically: it begins one transaction, applies every mutation currently waiting in the queue, commits that transaction once with a single durability barrier, and only then signals completion to every caller whose mutation was in that batch. Under load the queue refills during the previous commit's barrier, so batches form naturally without any artificial delay; under light load batches are size one and latency is minimal. An optional small linger window can be configured to deliberately wait a few hundred microseconds to enlarge batches under bursty load, trading a little latency for more throughput. The throughput ceiling rises from one commit per write to one commit per batch, so effective small-write throughput scales with batch size up to the point where the writer is CPU-bound rather than fsync-bound.
+
+Two correctness details make group commit safe. First, each mutation in the batch is wrapped in its own savepoint within the shared transaction, so a mutation that must logically fail (a failed conditional-write precondition, a unique-constraint conflict surfaced as an S3 error) rolls back only its own effects and returns its own error, while the rest of the batch proceeds and commits. Second, the durability acknowledgement contract is preserved: a caller's await returns success only after the commit that included its mutation has been made durable, so no client is told its write succeeded before that write is on stable storage. Mutations are applied in submission order, so last-writer-wins for concurrent writes to the same key follows submission order deterministically.
+
+### 7.3 Reads: a pool of read-only WAL connections
+
+Reads do not go through the writer. A pool of read-only connections, opened in WAL mode, serves all metadata queries concurrently. WAL readers take a consistent snapshot and never block the writer or each other, so read throughput scales with the pool size and the available cores. The pool size defaults to roughly the core count and is configurable. Listing, get-object-metadata, head, policy and ACL lookups, and the management read endpoints all use this pool. Because reads never contend with the single writer, a read-heavy workload is unaffected by the write-rate ceiling, and a write-heavy workload does not starve reads.
+
+### 7.4 Blob I/O: a bounded facility, streamed and backpressured
+
+Object bytes are handled separately from metadata. On the baseline runtime, file operations execute on a dedicated, bounded blocking pool rather than the runtime's general-purpose blocking pool, so a flood of large transfers cannot exhaust threads needed elsewhere and cannot block the asynchronous reactor that drives request parsing and the network. The size of this pool is tuned to the useful I/O concurrency of the underlying device. Transfers are streamed in bounded chunks with end-to-end backpressure: the rate at which bytes are read from the network is coupled to the rate at which they are written to disk (and vice versa on reads), so a slow disk slows the network read rather than buffering unboundedly in memory, and a slow client slows the disk read rather than reading the whole object into memory. No operation buffers a whole object; memory use per transfer is a small constant.
+
+### 7.5 The write data path
+
+On a write, bytes arrive from the socket as a stream. They pass through a fan-out that simultaneously feeds the content hashers (always the MD5 that becomes the ETag, plus any client-requested checksum algorithms, computed once over the plaintext) and the disk writer, sharing the same buffers by reference rather than copying. When the object's length is known in advance from the content-length header, the staging file is preallocated to that length, which avoids fragmentation, lets the filesystem place the file well, and surfaces an out-of-space condition immediately and cleanly rather than partway through. For large transfers the kernel can be advised that access is sequential and, after the transfer, that the just-written pages are no longer needed, so a stream of large uploads does not evict the page cache that hot reads depend on. Where the deployment opts into it for objects above a size threshold, the staging write can bypass the page cache entirely, which gives more predictable write latency and avoids polluting the cache with write-once bulk data, at the cost of requiring aligned buffers and transfer sizes that the blob facility manages internally.
+
+### 7.6 The read data path and zero-copy
+
+A read that serves a whole object or a contiguous range from an uncompressed blob is, ideally, a transfer from the page cache to the socket with no copy through userspace. Cairn's portable default streams the file to the response body in bounded chunks, which incurs one userspace copy per chunk and is entirely adequate behind a proxy or for modest rates. For high-rate large-object serving, Cairn provides a zero-copy fast path that uses the kernel's file-to-socket transfer (sendfile, or splice through a pipe for finer control), moving bytes from page cache to the socket without entering userspace. This fast path applies only to uncompressed blobs served in plaintext, because compression and userspace TLS both require the bytes to pass through userspace. To keep TLS reads zero-copy as well, Cairn can use kernel-TLS where the platform supports it: the TLS handshake is performed in userspace by the Rust TLS stack, after which the symmetric encryption is offloaded to the kernel, so a file-to-socket transfer feeds the kernel-TLS socket and the kernel encrypts in place. Where kernel-TLS is unavailable, TLS reads fall back to userspace encryption with the attendant copy. The fast path is feature-gated because it involves platform-specific code and a small amount of carefully isolated unsafe; the portable path is always present. Range reads on uncompressed blobs seek to the offset and transfer the requested length; range reads on compressed blobs follow the decompression path in Section 10 and are necessarily served through userspace.
+
+### 7.7 Network front end and TLS
+
+Cairn serves HTTP/1.1 and HTTP/2. It can terminate TLS itself using a Rust TLS stack with modern defaults, reading certificate and key material from configured paths and supporting reload on change, which lets a deployment be secure on the wire with no external proxy. It also runs cleanly behind a terminating reverse proxy, in which case it serves plaintext on a trusted interface and trusts the proxy to pass through the authorization, range, conditional, and S3-specific headers unmodified and to stream rather than buffer large bodies. Both deployment shapes are first-class and documented (Section 31). When TLS is terminated upstream, the zero-copy-with-kernel-TLS consideration of Section 7.6 does not apply to Cairn, since Cairn sees plaintext.
+
+### 7.8 Backpressure, limits, and fairness
+
+A global concurrency limit caps the number of in-flight requests so that overload sheds cleanly rather than collapsing; excess requests wait briefly or are rejected with a retryable status. Per-request timeouts bound how long any single request can hold resources. The bounded blob pool and the streamed, backpressured transfers ensure that a small number of very large transfers cannot monopolise memory or threads. These mechanisms together give the server a defined behaviour at and beyond saturation, which is a production requirement a naive single-node server does not address.
+
+---
+
+

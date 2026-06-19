@@ -15,8 +15,9 @@ database (the single source of truth). Ships as **one static binary**.
   AES-256-GCM envelope encryption of secrets at rest with master-key rotation, asynchronous
   bucket replication, an embedded React management console, Prometheus metrics, and a CLI.
 
-The full engineering specification is **[`ARCH.md`](./ARCH.md)**; contributor / AI-agent onboarding
-is **[`CLAUDE.md`](./CLAUDE.md)**; operations guides live in **[`docs/`](./docs)**.
+The full engineering specification lives in **[`docs/`](./docs)** (section-numbered reference docs;
+start at [`docs/README.md`](./docs/README.md)); contributor / AI-agent onboarding is
+**[`CLAUDE.md`](./CLAUDE.md)**.
 
 ## Quickstart
 

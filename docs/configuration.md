@@ -1,0 +1,49 @@
+# Configuration reference
+
+> Part of the Cairn reference docs (split from the former ARCH.md). The section numbers below are stable identifiers used throughout the code and docs; see the index in [`README.md`](./README.md) and [`../CLAUDE.md`](../CLAUDE.md).
+
+## 28. Configuration reference
+
+### 28.1 Surface and conventions
+
+Server configuration comes entirely from **environment variables** in the `CAIRN_*` namespace, overlaid on the built-in defaults and validated on load so that an invalid configuration fails fast with a clear message rather than at first use. Cairn deliberately has **no configuration file and no server command-line flags**: a single, explicit environment surface keeps a deployment reproducible — identical whether run directly on a host or in a container — and avoids the precedence ambiguity of layering flags over a file over the environment. (The CLI subcommands accept their own flags, as any command-line tool does; this constraint concerns the server's own configuration, not the CLI.) The table below names settings logically; each maps to a `CAIRN_<SETTING>` variable. The settings continue the operational vocabulary an operator coming from a comparable server would expect. Note that **per-bucket replication targets and rules are primarily stored S3 resource state** — set through the management API, the UI, or the CLI (Section 20), with destination credentials sealed at rest under the master key — while a default or fallback target can still be configured through the `CAIRN_REPLICATION_*` environment variables and `CAIRN_REPLICATION_TARGETS`, used for any source bucket that has no stored target.
+
+### 28.2 Settings
+
+| Setting | Variable | Default | Meaning |
+|---|---|---|---|
+| S3 API listen address | `CAIRN_LISTEN_ADDR` | `0.0.0.0:7373` | Where the S3 data-plane listener binds: the S3 protocol, the signed public-read share URLs, and the liveness, readiness, and metrics endpoints. |
+| Web-UI listen address | `CAIRN_UI_ADDR` | `0.0.0.0:7374` | Where the web console, the management API, and the S3 data plane the console drives are served at the root path; set it empty, or `off`/`none`/`disabled`, to run headless with no UI listener. |
+| Metadata backend | `CAIRN_META_BACKEND` | `sqlite` | Which engine drives the metadata store: `sqlite` (the bundled-C rusqlite store), `libsql` (the async embedded driver), or `turso` (the pure-Rust SQLite rewrite). |
+| TLS certificate and key paths | `CAIRN_TLS_CERT_PATH` / `CAIRN_TLS_KEY_PATH` | unset (plaintext) | Enable built-in TLS when both are set; otherwise serve plaintext behind a proxy. |
+| Database path | `CAIRN_DB_PATH` | under the data root | Location of the SQLite metadata file. |
+| Data directory | `CAIRN_DATA_DIR` | a data root | Root of the staging and per-bucket blob directories; must share a filesystem with the database. |
+| Region | `CAIRN_REGION` | `us-east-1` | The region label returned by the location operation and used in SigV4 scope checks. |
+| Public base URL | `CAIRN_PUBLIC_BASE_URL` | unset | External base URL used when generating URLs behind ingress. |
+| Virtual-host base domain | `CAIRN_S3_DOMAIN` | unset | The base domain for virtual-host-style addressing (`<bucket>.<domain>`); unset serves path-style only. |
+| Metadata cache budget | `CAIRN_META_CACHE_BYTES` | 64 MiB | Byte budget for the metadata and configuration cache; zero disables it. |
+| Maximum object size | `CAIRN_MAX_OBJECT_SIZE` | a large ceiling | Hard per-object size limit. |
+| Write-ahead-log checkpoint interval | `CAIRN_WAL_CHECKPOINT_INTERVAL_SECS` | on the order of a minute | Cadence of the truncating checkpoint. |
+| Write-ahead-log checkpoint size threshold | `CAIRN_WAL_CHECKPOINT_SIZE_BYTES` | 64 MiB | Trigger a truncating checkpoint between interval ticks once the log grows past this; zero leaves only the interval. |
+| Multipart session lifetime and sweep interval | `CAIRN_MULTIPART_UPLOAD_LIFETIME_SECS` / `CAIRN_MULTIPART_SWEEP_INTERVAL_SECS` | a day and an hour | When idle uploads become stale and how often the sweeper runs. |
+| Lifecycle scan interval | `CAIRN_LIFECYCLE_INTERVAL_SECS` | on the order of hours | How often the lifecycle scanner runs. |
+| Replication interval | `CAIRN_REPLICATION_INTERVAL_SECS` | tens of seconds | How often the replication worker drains the outbox. |
+| Request metrics | `CAIRN_REQUEST_METRICS_ENABLED` / `_FLUSH_SECS` / `_BUCKET_SECS` / `_RETENTION_DAYS` | on, 15s flush, 60s window, 31-day retention | Whether the usage-analytics subsystem accumulates request counts, how often the in-memory aggregator flushes and prunes, the rollup window granularity, and how long history is kept (Section 26.5). |
+| Metadata durability + throughput | `CAIRN_META_SYNCHRONOUS` / `_GROUP_COMMIT_LINGER_MICROS` / `_READ_POOL_SIZE` / `_CACHE_BYTES_PER_CONN` / `_CACHE_TOTAL_BUDGET_BYTES` / `_MMAP_BYTES` | `normal`, 0, `max(8,cores)`, 64 MiB, 2 GiB, 256 MiB | Tune the metadata store for throughput (Section 30): write durability (`normal`/`full`), the group-commit linger window (≤1 ms), the WAL read-pool size (≤64), the page cache per connection, the hard total-cache budget (startup refuses a pool×cache combination over this), and the mmap size. Defaults are throughput-tuned: WAL+NORMAL with the background checkpointer as the sole checkpointer. |
+| Authentication cache TTL | `CAIRN_AUTH_CACHE_TTL_SECS` | 30 s | Time-to-live for the credential + parsed-policy cache (Section 30.4); a user-identity mutation invalidates it immediately via a shared epoch, so the TTL only bounds staleness for untouched entries. Capped at 1 hour; zero disables the cache. |
+| Runtime thread sizing | `CAIRN_RUNTIME_WORKER_THREADS` / `_MAX_BLOCKING_THREADS` | auto (CPU count) / auto (`max(512, blob_io_pool + read_pool + 64)`) | Tokio compute and blocking-pool sizing (Section 30.4). `0` auto-derives; an explicit blocking cap is validated to stay at or above the floor the WAL read pool plus blob I/O pool require, so neither starves. |
+| Metadata shards | `CAIRN_META_SHARDS` | 1 | Partition the metadata across N databases by bucket name so disjoint buckets commit through N parallel single-writers (Section 30.4). `1` is the unsharded store; `>1` is sqlite-only, capped at 64, and is a deployment-time decision fixed at first init (user-quota becomes eventually-consistent). |
+| Default replication target | `CAIRN_REPLICATION_ENDPOINT` / `_DEST_BUCKET` / `_ACCESS_KEY` / `_SECRET` / `_REGION` | unset | A single default destination shipped to for any source bucket without a stored target (Section 20). |
+| Named replication targets | `CAIRN_REPLICATION_TARGETS` | unset | A JSON array of named destinations; a source bucket is routed to the matching named target. |
+| Root administrator credentials | `CAIRN_ROOT_ACCESS_KEY` / `CAIRN_ROOT_SECRET_KEY` | a well-known default | The access key and secret of an administrator ensured on every startup; override in production. |
+| Master key | `CAIRN_MASTER_KEY` | required when any encrypted secret exists | The authenticated-encryption key for secrets at rest, supplied out of band. |
+| Concurrency limit and request timeout | `CAIRN_CONCURRENCY_LIMIT` / `CAIRN_REQUEST_TIMEOUT_SECS` | bounded defaults | Maximum in-flight requests and per-request timeout. |
+| Development authentication bypass | `CAIRN_DEV_AUTH` | off | Enables the loopback-only development administrator (debug builds only). |
+| Log level and format | `CAIRN_LOG_LEVEL` / `CAIRN_LOG_FORMAT` | informational and text | Verbosity and whether logs are text or JSON. |
+
+Validation rejects an empty listen address or paths, a public base URL that does not parse, TLS configuration that is incomplete, non-positive timeouts, a sweep or scan interval below a sane floor, a development bind that is not loopback, the presence of encrypted secrets without a master key, and any unrecognised `CAIRN_*` variable.
+
+---
+
+
+

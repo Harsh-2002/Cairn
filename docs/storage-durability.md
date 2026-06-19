@@ -1,0 +1,92 @@
+# Storage and durability
+
+> Part of the Cairn reference docs (split from the former ARCH.md). The section numbers below are stable identifiers used throughout the code and docs; see the index in [`README.md`](./README.md) and [`../CLAUDE.md`](../CLAUDE.md).
+
+## 8. Durability and crash consistency
+
+### 8.1 The guarantee Cairn makes
+
+Cairn guarantees that after any crash, on restart it converges to a state in which every metadata row that is visible references a present, complete, durable blob, and no orphaned blob remains, with no manual intervention. It guarantees that a write acknowledged to a client as successful is durable on the local storage as configured. It does not, by itself, guarantee survival of a drive failure; that is delegated to the storage layer the operator places underneath (Section 8.6), and survival of a host failure is provided by bucket replication (Section 20). Stating this boundary precisely is itself a requirement (N-1), because a production operator must know exactly where Cairn's guarantee ends and theirs begins.
+
+### 8.2 The commit sequence
+
+Every mutating operation follows one ordered sequence, and the order is the durability design.
+
+First, the object's bytes are streamed to a staging file in the staging directory, with hashes computed inline and, where compression is enabled, the framed compressed form and its index trailer produced during the same pass. Second, the staging file is fsynced, which makes its data and inode durable. Third, the staging file is renamed into its final per-bucket directory under its UUID name; rename is atomic within the filesystem, which is why the staging directory must share the filesystem with the data directory. Fourth, and this is the step a naive temp-then-rename omits, the destination directory is fsynced, which makes the rename itself durable; without this the directory entry can be lost on power failure even though the file data is safe. Fifth, the computed hashes are validated against any client-supplied checksums, and on mismatch the blob is deleted and the operation fails with no metadata written. Sixth, the metadata transaction is submitted to the writer and committed; this is the single linearization point, and for conditional writes the precondition is evaluated inside this transaction so the check and the upsert are inseparable. Only after this commit is the operation acknowledged to the client. Seventh, after the commit, any superseded blob is deleted on a best-effort basis and the activity and metrics are recorded.
+
+The invariant this produces is that a committed, visible row never references a blob that is not already durable, because blob durability (steps two through four) strictly precedes metadata commit (step six). A crash between step four and step six leaves a durable blob with no row, which is an orphan that reconciliation reclaims; a crash after step six leaves a consistent state. There is no ordering in which a visible row points at a blob that the filesystem has not promised to keep.
+
+### 8.3 Durability and group commit
+
+Group commit (Section 7.2) does not weaken this. The single durability barrier of a batch covers every mutation in that batch, and each caller is acknowledged only after that barrier completes, so the per-request durability contract holds for every member of the batch. The blob durability steps for each write happen before that write's mutation is submitted to the writer, so by the time a mutation is in a batch its blob is already durable irrespective of when the batch commits.
+
+### 8.4 SQLite durability settings
+
+The metadata database's own durability is governed by its synchronous setting. Cairn defaults to the fully-synchronous setting, under which a committed transaction is durable against power loss, and exposes a relaxed setting as a documented throughput option under which the last few committed transactions may be lost on power loss without database corruption. The write-ahead log is checkpointed by a background task on an interval and when it exceeds a size threshold, using a truncating checkpoint so the log does not grow without bound under sustained writes; checkpoint runs and the log size are observable as metrics so an operator can see whether long-lived readers are starving the checkpointer.
+
+### 8.5 Reconciliation as the recovery and integrity mechanism
+
+Reconciliation reconciles the on-disk blobs against the metadata. It exists to reclaim orphaned blobs left by crashes in the step-four-to-six window and to detect, as an integrity check, any divergence. It is engineered to be bounded in memory and time (F-8, F-9): it walks the per-bucket directories and, for each blob it encounters, checks membership against the metadata in fixed-size batches rather than loading the keyspace, deleting any blob and its index trailer that no row references and any staging artifact older than a safety margin and any multipart staging directory whose upload session no longer exists. It prunes emptied directories. It runs with bounded parallelism across buckets, logs progress, and reports counts as metrics. The full walk runs at startup before the listener binds by default, and can be deferred by configuration on very large stores in favour of running it out of band, in which case a lazy per-read integrity check remains the always-on safety net: a read whose blob is unexpectedly missing returns a clear error, emits a metric, and flags the row for repair. A repair mode of reconciliation can additionally drop rows whose blobs are missing, which is needed only for recovery from external damage or from a backup taken in the narrow window described in Section 31.4.
+
+### 8.6 Single-node durability guidance for operators
+
+Because Cairn does not implement drive redundancy, its single-node durability is exactly the durability of the storage beneath it. The guidance, stated in the operations section, is to place the data filesystem on redundant storage: a checksumming, redundant filesystem such as ZFS gives both redundancy and silent-corruption detection, software or hardware RAID gives redundancy, and a cloud block volume gives provider-level redundancy. Cairn's contribution is that it never lies about durability: it acknowledges a write only when the kernel has acknowledged the underlying writes per the configured synchronous settings, so whatever guarantee the storage layer provides is faithfully reflected to the client, and bit-rot in the stored bytes can be detected by the stored content hash (Section 26 notes an optional background scrub that re-verifies blobs against their recorded hashes).
+
+---
+
+
+## 9. On-disk storage model and layout
+
+### 9.1 Principles
+
+Object bytes live as files named by an opaque identifier, never by key; metadata is the source of truth; a blob is live only when referenced. Versioning, tagging, ACLs, and the rest are metadata concerns and do not change the fundamental on-disk shape: a version of an object is simply another row referencing another blob, and a delete marker is a row with no blob at all. This is why the storage model scales to the full feature set without a redesign: features accrete in metadata, not on disk.
+
+### 9.2 Directory layout
+
+The data filesystem holds a staging area for in-progress single-part writes, a multipart staging area organised per upload session, and one directory per bucket holding that bucket's committed blobs under their opaque identifiers. The database file lives on the same filesystem. The staging areas exist so that the only way a blob enters a bucket directory is by atomic rename after being fully written and fsynced, which is the basis of the commit protocol. Per-bucket directories keep the number of entries per directory bounded by the bucket's object count rather than by the whole store, and very large buckets can be sharded across subdirectories by a prefix of the identifier if a filesystem's per-directory scaling warrants it, which is an internal layout decision invisible to clients.
+
+### 9.3 The blob file format
+
+An uncompressed object is stored as exactly its bytes, with no header and no framing, so the simplicity and the byte-for-byte promise are preserved for the default case and an operator can read a blob directly if they ever need to. A compressed object is stored in a self-describing format: a sequence of independently-compressed logical blocks followed by an index that records, for each block, its size and offset, followed by a fixed trailer that records the index's location, the block size, the compression algorithm, the logical (plaintext) length, and a magic marker. This makes a compressed blob self-contained: a reader opens it, reads the trailer, reads the index, and can then seek to and decompress only the blocks it needs. Reconciliation and backup treat the whole file as one artifact; there is no sidecar to keep in sync. Whether a blob is compressed and which algorithm it uses is also recorded in the metadata row, so the reader knows the format before opening the file, and the trailer is the authoritative description for reading. Section 10 specifies the compression scheme in full.
+
+### 9.4 Storage paths, versions, and delete markers
+
+A storage path identifies a blob within the data directory and is recorded on the object-version row. Each distinct version of a key has its own row and its own blob under its own identifier; overwriting a key in a versioning-enabled bucket creates a new row and a new blob and leaves the previous version's row and blob untouched, which is what makes versioning cheap and safe under the UUID model. A delete marker is a version row carrying a flag and no storage path, representing a logical deletion that hides older versions from a plain GET while leaving them retrievable by version identifier. Permanent deletion of a specific version removes its row and reclaims its blob through the normal post-commit reclamation path.
+
+### 9.5 Multipart staging
+
+Each multipart upload session has a staging directory holding its parts, each part written under a fresh identifier so that re-uploading a part number does not clobber the previous attempt; the superseded part file is reclaimed at completion or abort. Assembly streams the ordered parts into a single committed blob through the same durable commit sequence as a single-part write, applying compression during the assembly pass if the bucket enables it. Part files and their staging directory are removed after the completion transaction commits, and the multipart sweeper removes the staging directories of sessions that exceed their lifetime or are aborted.
+
+---
+
+
+## 10. Transparent compression at rest
+
+### 10.1 Goals and the tension with simplicity
+
+Compression saves disk and, for compressible data, can save I/O time because fewer bytes are read and written. It is in scope by operator request. It is in tension with the byte-for-byte simplicity that is one of Cairn's selling points, and the design resolves the tension by making compression opt-in per bucket and off by default. A bucket with compression disabled stores blobs exactly as received, preserving the simple model; a bucket with compression enabled gains the space saving while Cairn hides the compression entirely behind the S3 contract, so clients neither know nor need to know that bytes are compressed on disk.
+
+### 10.2 Preserving S3 semantics
+
+Two S3 semantics must survive compression. The object's reported size is its logical, plaintext length, which is what a client wrote and what range arithmetic is computed against; the physical on-disk size is separate and is exposed only to the operator through metrics and the management API. The object's ETag must remain what S3 clients expect: for a single-part object it is the MD5 of the plaintext content, computed during ingest over the uncompressed bytes before or as they are compressed; for a multipart object it is the MD5 of the concatenated per-part plaintext MD5 digests with the part-count suffix, where each part's MD5 is computed over that part's plaintext as it is uploaded. Compression therefore never enters the ETag computation, and an object's ETag is identical whether or not the bucket compresses. Client-supplied checksums are likewise validated against the plaintext.
+
+### 10.3 The block scheme and why it is block-based
+
+Compression is applied per fixed-size logical block rather than as one stream over the whole object, and this is the central design choice that keeps ranged reads efficient. If an object were one compressed stream, serving a range that begins near the end of a large object would require decompressing everything before it, turning a cheap range read into a full-object decompression. By compressing independent blocks of a fixed logical size and recording each compressed block's location in the index trailer (Section 9.3), Cairn can serve a range by reading and decompressing only the blocks that overlap the requested range and then slicing to the exact bounds, so the cost of a ranged read is proportional to the range plus at most one block of overhead, not to the offset. The block scheme also makes decompression parallelisable across blocks for large reads and keeps per-block memory bounded.
+
+### 10.4 Algorithm choice and the incompressibility heuristic
+
+The default algorithm balances ratio and speed and is the modern general-purpose choice; a faster, lower-ratio algorithm is available for throughput-sensitive deployments, and compression can be off even within an otherwise compression-enabled policy. The algorithm and level are part of the per-bucket compression policy. Compressing already-compressed or incompressible data wastes CPU and can slightly enlarge the data, so Cairn applies a heuristic: object content types that are known to be already compressed, such as common image, video, audio, and archive formats, are stored uncompressed regardless of the policy, and for other content the first block is test-compressed and, if it fails to shrink beyond a threshold, the object is stored uncompressed. This keeps compression from ever hurting, at the cost of a small test on ingest. The decision per object is recorded so reads know the truth.
+
+### 10.5 Interaction with the write, read, and multipart paths
+
+On a single-part write to a compressing bucket, the ingest pass computes the plaintext MD5 and any requested checksums and simultaneously feeds the block compressor, producing the framed blob and its index in one streaming pass with bounded memory, after which the normal durable commit sequence applies to the framed file. On a read, an uncompressed blob takes the ordinary and possibly zero-copy path, while a compressed blob is read by consulting its trailer and index and decompressing the needed blocks through userspace, which is why compressed objects do not use the zero-copy fast path; for a full-object read this is a streaming decompression with bounded memory, and for a ranged read it is the block-selective path of Section 10.3. On multipart completion to a compressing bucket, compression is applied during the assembly pass that concatenates the parts, while the part MD5s used for the ETag were already computed over plaintext at upload time, so the multipart ETag is unaffected. Copy operations that change nothing about the bytes can copy the stored representation directly when source and destination compression policies match, and otherwise decompress and recompress as needed.
+
+### 10.6 Operability of compression
+
+The space saved is observable: the management API and metrics expose logical versus physical bytes per bucket and overall, so an operator can see the compression ratio being achieved and decide whether a bucket's policy is worthwhile. Changing a bucket's compression policy affects only objects written after the change; existing objects keep their stored form and remain readable because each blob is self-describing, and a deliberate rewrite, which a lifecycle action or an administrative tool can perform, is required to recompress existing data. This keeps policy changes cheap and safe.
+
+---
+
+
+

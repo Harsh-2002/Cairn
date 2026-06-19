@@ -5,22 +5,33 @@ Object bytes are plain files on a POSIX filesystem; all metadata is an embedded 
 (the single source of truth). It ships as one static binary with transparent compression, native
 TLS, async bucket replication, an embedded React console, and a CLI.
 
-> **[`ARCH.md`](./ARCH.md) is the authoritative engineering specification (0–34).** It is the
-> source of truth; this file is only the index. Read the relevant ARCH.md section before any
-> non-trivial change, and keep changes consistent with it.
+> The **engineering specification is the single source of truth** and lives in [`docs/`](./docs),
+> split into focused, section-numbered reference documents (the former monolithic `ARCH.md`). The
+> **section numbers are stable** — code comments say e.g. "ARCH 28"; use the table below to open the
+> exact document instead of grepping. Read the relevant doc before any non-trivial change.
 
-## Documentation map
+## Documentation map — open the doc for what you're touching
 
-- **[`ARCH.md`](./ARCH.md)** — architecture & spec. Jump to the section you're touching: data plane
-  & concurrency 6–7, durability/crash-consistency 8, on-disk layout 9, metadata store 11,
-  abstraction traits 12, S3 surface 13, auth 14, authz 15, replication 20, request lifecycles
-  21, error model 25, security/threat model 27, **configuration reference 28**, testing &
-  conformance 29.
-- **[`DESIGN.md`](./DESIGN.md)** — the management console's visual design system (read for UI work).
-- **[`docs/`](./docs)** — `operations.md` (deployment + the master-key rotation runbook),
-  `backup-restore.md`, `s3-api-matrix.md`, `benchmarks.md`.
-- **[`README.md`](./README.md)** — overview. (Its "Try it"/"Running" ports and config-layering text
-  are out of date; this file and ARCH 28 reflect the current env-only, two-port reality.)
+| Need | Document | Sections |
+|---|---|---|
+| Summary, scope, why-Rust, baseline architecture | [`docs/overview.md`](./docs/overview.md) | 0–5 |
+| System/node model; concurrency, runtime, I/O | [`docs/data-plane.md`](./docs/data-plane.md) | 6–7 |
+| Durability & crash consistency; storage layout; compression | [`docs/storage-durability.md`](./docs/storage-durability.md) | 8–10 |
+| Metadata store (writer/WAL/cache); trait spine | [`docs/metadata.md`](./docs/metadata.md) | 11–12 |
+| S3 protocol, versioning, tagging, CORS, lifecycle, request lifecycles | [`docs/s3-api.md`](./docs/s3-api.md) | 13, 16–19, 21 |
+| Authentication & authorization (SigV4/Bearer, policy/ACL/BPA/ownership) | [`docs/auth.md`](./docs/auth.md) | 14–15 |
+| Bucket replication | [`docs/replication.md`](./docs/replication.md) | 20 |
+| Management API, web console, CLI | [`docs/control-plane.md`](./docs/control-plane.md) | 22–24 |
+| **Configuration reference (`CAIRN_*`)** | [`docs/configuration.md`](./docs/configuration.md) | 28 |
+| Error model + security & threat model | [`docs/security-errors.md`](./docs/security-errors.md) | 25, 27 |
+| Metrics, logging, audit | [`docs/observability.md`](./docs/observability.md) | 26 |
+| Testing, conformance, performance | [`docs/testing-performance.md`](./docs/testing-performance.md) | 29–30 |
+| Build/deploy, roadmap, decision log, appendices | [`docs/delivery.md`](./docs/delivery.md) | 31–34 |
+
+Operator runbooks (not the spec): [`docs/operations.md`](./docs/operations.md) (deploy + master-key
+rotation), [`docs/backup-restore.md`](./docs/backup-restore.md),
+[`docs/s3-api-matrix.md`](./docs/s3-api-matrix.md), [`docs/benchmarks.md`](./docs/benchmarks.md).
+UI visual system: [`DESIGN.md`](./DESIGN.md). Doc index: [`docs/README.md`](./docs/README.md).
 
 ## Build, test, and the gate
 
