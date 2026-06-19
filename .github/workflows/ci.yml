@@ -133,6 +133,19 @@ jobs:
       - name: Arm the durability fault seam, crash in the window, assert reconcile reclaims
         run: bash conformance/crash_consistency.sh
 
+  crash-multipoint:
+    name: durability multi-point crash
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Crash at every blob-commit seam (PutObject + multipart); assert reconcile reclaims each orphan
+        run: BIN=target/debug/cairn PY=python3 bash conformance/crash_multipoint.sh
+
   soak:
     name: replication soak (multi-host)
     runs-on: ubuntu-latest
