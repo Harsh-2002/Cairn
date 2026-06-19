@@ -15,7 +15,7 @@ authorizes.
 | GetBucketCors / PutBucketCors / DeleteBucketCors | ✅ | Per-bucket config (validated). |
 | GetBucketTagging / PutBucketTagging / DeleteBucketTagging | ✅ | |
 | GetBucketLifecycleConfiguration / Put / Delete | ✅ | Expiration, noncurrent expiration, abort-incomplete, delete-marker removal; transition is a v1 no-op. |
-| GetBucketReplication / Put / Delete | ✅ | Enqueue-on-write + worker drains the outbox to a configured remote via a real SigV4-signing sink (verified node→node); single configured target today. |
+| GetBucketReplication / Put / Delete | ✅ | Enqueue-on-write + worker drains the outbox to a configured remote via a real SigV4-signing sink (verified node→node); one or more named targets (`CAIRN_REPLICATION_TARGETS`) with per-rule destinations. |
 | ListObjectsV2 / ListObjects (v1) | ✅ | Prefix, delimiter, pagination (opaque tokens), start-after / marker. |
 | ListObjectVersions | ✅ | Distinguishes versions from delete markers. |
 | ListMultipartUploads | ✅ | |
@@ -24,11 +24,11 @@ authorizes.
 | DeleteObject | ✅ | Delete marker in a versioned bucket; permanent with a version id. |
 | DeleteObjects (bulk) | ✅ | Quiet mode; up to the request cap. |
 | CopyObject | ✅ | COPY/REPLACE metadata directive; same-key metadata change; versioned source. |
-| CreateMultipartUpload / UploadPart / ListParts / CompleteMultipartUpload / AbortMultipartUpload | ✅ | Correct multipart ETag (`md5(concat(part-md5s))-N`); part validation; double-completion guarded. |
+| CreateMultipartUpload / UploadPart / UploadPartCopy / ListParts / CompleteMultipartUpload / AbortMultipartUpload | ✅ | Correct multipart ETag (`md5(concat(part-md5s))-N`); part validation; double-completion guarded; `UploadPartCopy` stages a ranged copy of a source object (`x-amz-copy-source-range`). |
+| GetObjectAttributes | ✅ | Returns ETag, object size, storage class, checksum, and the parts list. |
 | GetObjectTagging / PutObjectTagging / DeleteObjectTagging | ✅ | Stored as queryable rows; usable by lifecycle/policy. |
 | Presigned GET / PUT | ✅ | SigV4 query form. |
 | GetObjectAcl / PutObjectAcl, GetBucketAcl / PutBucketAcl | ◑ | ACLs are off by default under the recommended BucketOwnerEnforced mode; the policy engine is primary. |
-| UploadPartCopy, GetObjectAttributes | ◐ | Planned. |
 | Object Lock / retention, SSE config, website / accelerate / analytics / inventory / requester-pays | ✖ | Out of scope; answered as NotImplemented. |
 
 **Management API** (`/api/v1`, admin-gated JSON) and the **embedded React console** (its own listener, port 7374) provide
