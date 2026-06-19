@@ -198,6 +198,20 @@ jobs:
       - name: Ramp warp concurrency to the single-writer ceiling; assert zero errors + alive + integrity
         run: BIN=target/debug/cairn LEVELS="8 32 64 128 256" DURATION=8s bash conformance/warp_escalate.sh
 
+  blob-limits:
+    name: blob store limits (out-of-space, huge, many)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - run: cargo build --bin cairn
+      - name: Out-of-space 507 on a constrained FS, huge-object round-trip, many objects paginated
+        run: BIN=target/debug/cairn PY=python3 bash conformance/blob_limits.sh
+
   fuzz-smoke:
     name: fuzz smoke (decoder, xml, policy)
     runs-on: ubuntu-latest
