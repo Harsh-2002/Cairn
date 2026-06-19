@@ -1,4 +1,4 @@
-//! In-process request-metrics aggregator (ARCH §26.5). Every completed S3 and management API
+//! In-process request-metrics aggregator (ARCH 26.5). Every completed S3 and management API
 //! request is counted into a sharded set of maps with **zero database I/O on the hot path**: a
 //! request only takes one shard lock for the few microseconds it costs to bump a `u64`. A
 //! background flush periodically [`drain`](RequestMetricsAgg::drain)s the accumulated counts into a

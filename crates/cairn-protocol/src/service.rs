@@ -1,4 +1,4 @@
-//! The S3 service: dispatch and the core request lifecycles (ARCH §21) for buckets and
+//! The S3 service: dispatch and the core request lifecycles (ARCH 21) for buckets and
 //! objects. Handlers depend only on the trait spine; the authorization wiring here is the
 //! owner/admin baseline (the full policy/ACL/anonymous pipeline lands in Wave 3).
 
@@ -39,7 +39,7 @@ pub struct S3Service {
     authz: Arc<dyn AuthorizationEngine>,
     clock: Arc<dyn Clock>,
     /// The cryptography facility, used to wrap (seal) and unwrap (open) per-object SSE-S3
-    /// data-encryption keys under the master key (ARCH §27).
+    /// data-encryption keys under the master key (ARCH 27).
     crypto: Arc<dyn Crypto>,
     region: String,
     max_object_size: u64,
@@ -90,7 +90,7 @@ impl S3Service {
     async fn dispatch(&self, req: S3Request, body: cairn_types::BodyStream) -> Result<S3Response> {
         // A CORS preflight (OPTIONS) is evaluated against the bucket's stored CORS configuration
         // before any authentication/authorization — a browser sends preflight without credentials
-        // (ARCH §18.2, Medium #3).
+        // (ARCH 18.2, Medium #3).
         if req.method == Method::OPTIONS {
             return self.cors_preflight(&req).await;
         }
@@ -105,7 +105,7 @@ impl S3Service {
     /// Handle a CORS preflight (`OPTIONS` with `Origin` + `Access-Control-Request-Method`):
     /// evaluate the request against the bucket's stored CORS rules and, on a match, return 200
     /// with the `Access-Control-Allow-*`/`Vary: Origin` headers; on no match return 403 (ARCH
-    /// §18.2, Medium #3).
+    /// 18.2, Medium #3).
     async fn cors_preflight(&self, req: &S3Request) -> Result<S3Response> {
         let Some(origin) = req.header("origin") else {
             // A bare OPTIONS without an Origin is not a CORS preflight.
@@ -475,7 +475,7 @@ impl S3Service {
 
         // Reject an invalid inline tag set up front — before any blob is staged — so a bad
         // `x-amz-tagging` header (over the limit, bad charset, duplicate/aws: key) returns
-        // `InvalidTag` without leaving an orphaned staged blob (ARCH §17.1).
+        // `InvalidTag` without leaving an orphaned staged blob (ARCH 17.1).
         cairn_xml::validate_tags(
             &parse_tagging_header(req.header("x-amz-tagging")),
             cairn_xml::MAX_TAGS_OBJECT,
@@ -486,7 +486,7 @@ impl S3Service {
         let request_id = req.request_id.clone();
         let body = streaming_body(&req, raw_body, self.max_object_size)?;
 
-        // SSE-S3 (ARCH §27): when the client requests AES256 server-side encryption, mint a fresh
+        // SSE-S3 (ARCH 27): when the client requests AES256 server-side encryption, mint a fresh
         // random DEK, hand it to the blob store (which compress-then-encrypts each block), and seal
         // it under the master key for the metadata row. The plaintext-MD5 ETag is unaffected
         // because the blob store hashes the plaintext before any transform. Without a header, the
@@ -503,7 +503,7 @@ impl S3Service {
             (None, None)
         };
 
-        // The declared payload length for preallocation (ARCH §7.5): for a SigV4-streaming upload
+        // The declared payload length for preallocation (ARCH 7.5): for a SigV4-streaming upload
         // the client sends the real payload length in `x-amz-decoded-content-length` (the
         // `content-length` is the larger framed size), so prefer it; a plain PUT uses
         // `content-length`. An absent/unparseable value simply skips preallocation.
@@ -561,7 +561,7 @@ impl S3Service {
             }
         }
 
-        // Verify any client-supplied x-amz-checksum-* against the computed checksum (§21.1).
+        // Verify any client-supplied x-amz-checksum-* against the computed checksum (21.1).
         if let Err(e) = verify_client_checksums(&req, &staged.checksums) {
             let _ = self.blob.delete(&staged.storage_path).await;
             return Err(e);
@@ -581,7 +581,7 @@ impl S3Service {
             }
             _ => None,
         };
-        // An inbound replica is a PUT carrying `x-amz-meta-cairn-replica: true` (ARCH §20.4): mark
+        // An inbound replica is a PUT carrying `x-amz-meta-cairn-replica: true` (ARCH 20.4): mark
         // the version a `Replica` so it is never re-replicated, and skip the outbox entirely (loop
         // prevention). The marker is matched case-insensitively on the value.
         // Only a privileged replication principal may classify a write as an inbound replica
@@ -599,7 +599,7 @@ impl S3Service {
                 .is_some_and(|p| p.role == Role::Administrator);
         let replication_status =
             is_replica.then_some(cairn_types::meta::ReplicationStatus::Replica);
-        // The system response headers (ARCH §13.4) are stored verbatim from the request.
+        // The system response headers (ARCH 13.4) are stored verbatim from the request.
         let header_owned = |name: &str| req.header(name).map(str::to_owned);
         let row = ObjectVersionRow {
             id: uuid::Uuid::new_v4().simple().to_string(),
@@ -631,7 +631,7 @@ impl S3Service {
             updated_at: now,
         };
 
-        // An inbound replica must NOT itself enqueue replication (loop prevention, ARCH §20.4);
+        // An inbound replica must NOT itself enqueue replication (loop prevention, ARCH 20.4);
         // a normal create enqueues when an enabled rule matches the key and the object's inline
         // tags (the `x-amz-tagging` header tag set, applied to this version below).
         let replication = if is_replica {
@@ -664,7 +664,7 @@ impl S3Service {
                     let _ = self.blob.delete(&old).await;
                 }
                 // Persist the inline `x-amz-tagging` header as the object's initial tag set
-                // (ARCH §17.1, Medium #5). Tags are a separate mutation; commit them after the
+                // (ARCH 17.1, Medium #5). Tags are a separate mutation; commit them after the
                 // object version exists so they attach to the just-written version.
                 let initial_tags = parse_tagging_header(req.header("x-amz-tagging"));
                 if !initial_tags.is_empty() {
@@ -684,7 +684,7 @@ impl S3Service {
                 if versioned {
                     resp = resp.with_header("x-amz-version-id", version_id.as_str());
                 }
-                // Echo the SSE algorithm on the PUT response for an encrypted object (ARCH §27).
+                // Echo the SSE algorithm on the PUT response for an encrypted object (ARCH 27).
                 if sse_descriptor.is_some() {
                     resp = resp.with_header("x-amz-server-side-encryption", SSE_AES256);
                 }
@@ -711,7 +711,7 @@ impl S3Service {
         }
         let range = parse_range(req.header("range"), row.size_logical)?;
         let storage = row.storage_path.clone().ok_or(Error::NoSuchKey)?;
-        // SSE-S3 (ARCH §27): if the version is encrypted, unwrap its DEK under the master key and
+        // SSE-S3 (ARCH 27): if the version is encrypted, unwrap its DEK under the master key and
         // decrypt transparently while reading. An unencrypted version passes `None`.
         let dek = match row.sse_descriptor.as_deref() {
             Some(d) => Some(self.open_sse_dek(d)?),
@@ -750,7 +750,7 @@ impl S3Service {
             body,
         };
         resp = object_headers(resp, &row).with_header("content-length", logical_len.to_string());
-        // Response-header overrides (ARCH §21.2): the `response-*` query params override the
+        // Response-header overrides (ARCH 21.2): the `response-*` query params override the
         // corresponding response headers for this GET, applied after `object_headers` so they win.
         resp = apply_response_overrides(resp, req);
         if let Some(cr) = content_range {
@@ -784,7 +784,7 @@ impl S3Service {
         let key = req.key.clone().expect("key present");
         let now = self.clock.now();
         // An inbound replicated delete-marker propagation carries the loop-prevention marker; the
-        // marker it creates must NOT itself be re-enqueued for replication (ARCH §20.4), which
+        // marker it creates must NOT itself be re-enqueued for replication (ARCH 20.4), which
         // matters for two-way replication where the destination bucket also has a rule.
         // Only a privileged replication principal may classify a write as an inbound replica
         // (audit #16). Honoring the bare client header would let any writer mark their write a
@@ -803,7 +803,7 @@ impl S3Service {
         // A versioned DELETE (?versionId) permanently removes that version (no delete marker). A
         // plain DELETE in an Enabled bucket inserts a new identified delete marker; in a Suspended
         // bucket it inserts a NULL-version delete marker that replaces the null version (avoiding
-        // the silent permanent removal of the null version — ARCH §16.1/§16.3, Medium #4); in an
+        // the silent permanent removal of the null version — ARCH 16.1/16.3, Medium #4); in an
         // Unversioned bucket it removes the sentinel version.
         if let Some(vid) = req.query("versionId") {
             let outcome = self
@@ -1002,7 +1002,7 @@ impl S3Service {
             .with_header("x-amz-request-id", &req.request_id))
     }
 
-    /// `UploadPartCopy` (ARCH §21.3, §34.3): stage a part from a range of an existing object
+    /// `UploadPartCopy` (ARCH 21.3, 34.3): stage a part from a range of an existing object
     /// rather than from a request body. The copy source (`/bucket/key[?versionId]`) and the
     /// optional `x-amz-copy-source-range` are parsed; the source range is opened from the blob
     /// store (logical coordinates), restaged as a part, recorded, and a `CopyPartResult` carrying
@@ -1075,7 +1075,7 @@ impl S3Service {
 
         // Open the source range and feed its logical bytes into the part stager, re-tagging blob
         // read errors as body errors so the source can drive `stage_part`. An SSE-encrypted source
-        // is decrypted transparently via its unwrapped DEK (ARCH §27).
+        // is decrypted transparently via its unwrapped DEK (ARCH 27).
         let src_dek = match src_row.sse_descriptor.as_deref() {
             Some(d) => Some(self.open_sse_dek(d)?),
             None => None,
@@ -1377,7 +1377,7 @@ impl S3Service {
         if src_row.is_delete_marker {
             return Err(Error::NoSuchKey);
         }
-        // Evaluate any x-amz-copy-source-if-* preconditions against the source version (§21.6).
+        // Evaluate any x-amz-copy-source-if-* preconditions against the source version (21.6).
         check_copy_source_conditions(req, &src_row)?;
         // Authorize the SOURCE read: a copy reads the source object's bytes, so the requester must
         // hold s3:GetObject(Version) on the SOURCE, evaluated against the source bucket's policy /
@@ -1423,7 +1423,7 @@ impl S3Service {
             src_row.user_metadata.clone()
         };
 
-        // An SSE-encrypted source is decrypted transparently via its unwrapped DEK (ARCH §27).
+        // An SSE-encrypted source is decrypted transparently via its unwrapped DEK (ARCH 27).
         let src_dek = match src_row.sse_descriptor.as_deref() {
             Some(d) => Some(self.open_sse_dek(d)?),
             None => None,
@@ -1530,7 +1530,7 @@ impl S3Service {
         let bucket = self.fetch_bucket(req).await?;
         let xml = drain_body(body, 8 * 1024 * 1024).await?;
         let (quiet, keys) = cairn_xml::parse_delete(&xml)?;
-        // S3 caps a multi-object delete at 1000 keys per request (ARCH §21.5); reject a larger
+        // S3 caps a multi-object delete at 1000 keys per request (ARCH 21.5); reject a larger
         // batch as a malformed request rather than processing it partially.
         if keys.len() > 1000 {
             return Err(Error::MalformedXml);
@@ -1840,7 +1840,7 @@ impl S3Service {
             .with_header("x-amz-request-id", &req.request_id))
     }
 
-    /// `PutBucketAcl` (ARCH §13.2, §15.4): set the bucket ACL from either a canned `x-amz-acl`
+    /// `PutBucketAcl` (ARCH 13.2, 15.4): set the bucket ACL from either a canned `x-amz-acl`
     /// header or a parsed `AccessControlPolicy` request body. ACLs are disabled under
     /// `BucketOwnerEnforced` ownership (S3: `AccessControlListNotSupported`).
     async fn put_bucket_acl(
@@ -1875,7 +1875,7 @@ impl S3Service {
             .with_header("x-amz-request-id", &req.request_id))
     }
 
-    /// `GetObjectAttributes` (ARCH §21.3, §34.3): return an object's metadata attributes —
+    /// `GetObjectAttributes` (ARCH 21.3, 34.3): return an object's metadata attributes —
     /// `ETag`, `ObjectSize`, `StorageClass`, any stored `Checksum`, and `ObjectParts` when the
     /// object is multipart and its parts can still be enumerated. Cairn discards a session's part
     /// rows on completion, so `ObjectParts` is omitted for completed multipart objects (S3 also
@@ -1898,7 +1898,7 @@ impl S3Service {
         Ok(resp)
     }
 
-    /// `PutObjectAcl` (ARCH §13.3, §15.4): replace the current (or `?versionId`) object version's
+    /// `PutObjectAcl` (ARCH 13.3, 15.4): replace the current (or `?versionId`) object version's
     /// ACL with either a canned `x-amz-acl` header or a parsed `AccessControlPolicy` request body.
     /// ACLs are disabled under `BucketOwnerEnforced` ownership (S3: `AccessControlListNotSupported`).
     async fn put_object_acl(
@@ -2125,7 +2125,7 @@ impl S3Service {
             .ok_or(Error::NoSuchBucket)
     }
 
-    /// Evaluate the full authorization decision (ARCH §15): assemble the requester class, the
+    /// Evaluate the full authorization decision (ARCH 15): assemble the requester class, the
     /// account/bucket Block Public Access settings, the bucket policy, and the request context,
     /// then run the pure policy engine.
     async fn authorize(
@@ -2147,7 +2147,7 @@ impl S3Service {
             None => RequesterClass::Anonymous,
         };
         let account_bpa = self.meta.get_account_public_access_block().await?;
-        // Corrupt security configs MUST fail closed (ARCH §15.3/§15.5): a BPA doc that does not
+        // Corrupt security configs MUST fail closed (ARCH 15.3/15.5): a BPA doc that does not
         // parse must not silently open access, and an unparseable policy must not silently drop
         // its (possibly Deny) statements.
         let bucket_bpa = match self
@@ -2201,7 +2201,7 @@ impl S3Service {
                 (bucket_acl, acl_row.as_ref().and_then(|row| row.acl.clone()))
             };
         // Load the existing object's tags and parse any request-supplied tags so policies
-        // conditioned on s3:ExistingObjectTag/aws:RequestTag evaluate correctly (ARCH §15.6,
+        // conditioned on s3:ExistingObjectTag/aws:RequestTag evaluate correctly (ARCH 15.6,
         // Medium #5) — against the resolved version (audit #33). The request tags come from the
         // inline `x-amz-tagging` header (a `PutObject`/copy form-encoded tag set).
         let existing_tags = match (&resource, &acl_row) {
@@ -2243,12 +2243,12 @@ impl S3Service {
     }
 
     /// Build a replication outbox entry for a write when the bucket has an enabled replication
-    /// rule matching the key (ARCH §20). Replication requires versioning. The entry rides the same
+    /// rule matching the key (ARCH 20). Replication requires versioning. The entry rides the same
     /// commit transaction as the write, so enqueue is atomic with the version.
     ///
     /// For an object-create the rule must match the key AND the object's `tags` (the full
-    /// [`Filter::matches`] predicate, ARCH §20). For a [`ReplicationOp::DeleteMarker`] the rule
-    /// must additionally have `delete_marker_replication` enabled (ARCH §20.3/§21.5); delete
+    /// [`Filter::matches`] predicate, ARCH 20). For a [`ReplicationOp::DeleteMarker`] the rule
+    /// must additionally have `delete_marker_replication` enabled (ARCH 20.3/21.5); delete
     /// markers carry no tags, so an empty tag set is used for the prefix-only match.
     async fn replication_outbox(
         &self,
@@ -2270,7 +2270,7 @@ impl S3Service {
         let is_marker = op == ReplicationOp::DeleteMarker;
         // Among all rules whose filter matches, the highest-priority one wins (ties → document
         // order), matching S3/MinIO rule-priority semantics; `find` would wrongly take the first
-        // document-order match regardless of `<Priority>` (ARCH §20.2).
+        // document-order match regardless of `<Priority>` (ARCH 20.2).
         let rule = cfg
             .rules
             .iter()
@@ -2315,7 +2315,7 @@ impl S3Service {
         Ok((row, bucket))
     }
 
-    /// Resolve a GET/HEAD read target with full delete-marker fidelity (ARCH §16, Medium #4).
+    /// Resolve a GET/HEAD read target with full delete-marker fidelity (ARCH 16, Medium #4).
     ///
     /// - A plain read (no `?versionId`) of a key whose latest version is a delete marker returns a
     ///   404 carrying `x-amz-delete-marker: true` and the marker's `x-amz-version-id`.
@@ -2363,7 +2363,7 @@ enum ReadTarget {
 }
 
 /// The 404 returned when the latest version of a key is a delete marker: the marker's identity is
-/// signaled via `x-amz-delete-marker` and `x-amz-version-id` (ARCH §16.1, Medium #4).
+/// signaled via `x-amz-delete-marker` and `x-amz-version-id` (ARCH 16.1, Medium #4).
 fn not_found_marker(req: &S3Request, marker: &ObjectVersionRow) -> S3Response {
     let body = cairn_xml::error_document(
         "NoSuchKey",
@@ -2380,7 +2380,7 @@ fn not_found_marker(req: &S3Request, marker: &ObjectVersionRow) -> S3Response {
     resp
 }
 
-/// The 405 returned when a GET/HEAD names a delete marker's own version id (ARCH §16.1, Medium #4).
+/// The 405 returned when a GET/HEAD names a delete marker's own version id (ARCH 16.1, Medium #4).
 fn method_not_allowed_marker(req: &S3Request, marker: &ObjectVersionRow) -> S3Response {
     let body = cairn_xml::error_document(
         "MethodNotAllowed",
@@ -2610,7 +2610,7 @@ fn bucket_action(req: &S3Request) -> Result<Action> {
 ///
 /// A read or delete that names a `?versionId` maps to the version-scoped action
 /// (`GetObjectVersion`/`DeleteObjectVersion`) so a policy written against those distinct actions
-/// grants or denies as written (ARCH §34.4, Medium #9). The multipart lifecycle
+/// grants or denies as written (ARCH 34.4, Medium #9). The multipart lifecycle
 /// (create/complete/upload-part) has no distinct `Action` variant in `cairn_types::authz::Action`
 /// — only `AbortMultipartUpload` and `ListMultipartUploadParts` exist — so those stay mapped to
 /// the closest existing action (`PutObject`). NOTE: add `CreateMultipartUpload`/`UploadPart` etc.
@@ -2628,7 +2628,7 @@ fn object_action(req: &S3Request) -> Result<Action> {
         Method::GET if q("attributes") => GetObjectAttributes,
         Method::GET if q("uploadId") => ListMultipartUploadParts,
         Method::DELETE if q("uploadId") => AbortMultipartUpload,
-        // An inbound replica PUT (`x-amz-meta-cairn-replica: true`, ARCH §20.4) authorizes against
+        // An inbound replica PUT (`x-amz-meta-cairn-replica: true`, ARCH 20.4) authorizes against
         // `s3:ReplicateObject`, so a dedicated replication user scoped to that action is allowed
         // (and a normal writer's `s3:PutObject` grant does not silently accept replica traffic).
         // Only a genuine body PUT is reclassified — a copy (which carries `x-amz-copy-source`) stays
@@ -2647,7 +2647,7 @@ fn object_action(req: &S3Request) -> Result<Action> {
         Method::GET | Method::HEAD if versioned => GetObjectVersion,
         Method::GET | Method::HEAD => GetObject,
         // An inbound replicated delete-marker propagation (`x-amz-meta-cairn-replica: true`,
-        // ARCH §20.4) authorizes against `s3:ReplicateDelete`, matching the dedicated replication
+        // ARCH 20.4) authorizes against `s3:ReplicateDelete`, matching the dedicated replication
         // user's policy rather than requiring full `s3:DeleteObject`.
         Method::DELETE
             if !versioned
@@ -2674,7 +2674,7 @@ const SSE_DESCRIPTOR_ALG: &str = "AES256-GCM";
 
 /// The JSON `sse_descriptor` persisted on an encrypted object version: the algorithm, the
 /// data-encryption key sealed under the master key (base64), and the wrapping nonce (base64). The
-/// raw DEK is never stored — only this wrapped form (ARCH §27, SSE-S3).
+/// raw DEK is never stored — only this wrapped form (ARCH 27, SSE-S3).
 #[derive(serde::Serialize, serde::Deserialize)]
 struct SseDescriptor {
     alg: String,
@@ -2776,7 +2776,7 @@ fn object_headers(resp: S3Response, row: &ObjectVersionRow) -> S3Response {
     if !row.version_id.is_null() {
         resp = resp.with_header("x-amz-version-id", row.version_id.as_str());
     }
-    // Emit the stored system response headers when present (ARCH §13.4).
+    // Emit the stored system response headers when present (ARCH 13.4).
     if let Some(v) = &row.content_encoding {
         resp = resp.with_header("content-encoding", v.clone());
     }
@@ -2792,7 +2792,7 @@ fn object_headers(resp: S3Response, row: &ObjectVersionRow) -> S3Response {
     if let Some(v) = &row.expires {
         resp = resp.with_header("expires", v.clone());
     }
-    // Echo the SSE algorithm on GET/HEAD for a server-side-encrypted object (ARCH §27).
+    // Echo the SSE algorithm on GET/HEAD for a server-side-encrypted object (ARCH 27).
     if row.sse_descriptor.is_some() {
         resp = resp.with_header("x-amz-server-side-encryption", SSE_AES256);
     }
@@ -2805,7 +2805,7 @@ fn object_headers(resp: S3Response, row: &ObjectVersionRow) -> S3Response {
     resp
 }
 
-/// Apply the GET `response-*` query-parameter header overrides (ARCH §21.2): each present param
+/// Apply the GET `response-*` query-parameter header overrides (ARCH 21.2): each present param
 /// REPLACES the corresponding response header (set rather than append, so no duplicate is emitted).
 /// Applied after `object_headers`, so a client override always wins over the stored value.
 fn apply_response_overrides(resp: S3Response, req: &S3Request) -> S3Response {
@@ -2829,7 +2829,7 @@ fn apply_response_overrides(resp: S3Response, req: &S3Request) -> S3Response {
     resp
 }
 
-/// For GET and HEAD: return a 304/412 short-circuit when conditional headers dictate it (§21.2).
+/// For GET and HEAD: return a 304/412 short-circuit when conditional headers dictate it (21.2).
 /// Evaluates If-Match / If-Unmodified-Since (412 conditions) and If-None-Match / If-Modified-Since
 /// (304 conditions). Per RFC 7232 / S3, If-Match takes precedence over If-Unmodified-Since and
 /// If-None-Match over If-Modified-Since; the time comparisons use the object's last-modified
@@ -2864,7 +2864,7 @@ fn conditional_short_circuit(req: &S3Request, row: &ObjectVersionRow) -> Option<
     None
 }
 
-/// Evaluate the `x-amz-copy-source-if-*` preconditions against the source object version (§21.6).
+/// Evaluate the `x-amz-copy-source-if-*` preconditions against the source object version (21.6).
 /// Every failed precondition fails the copy with [`Error::PreconditionFailed`] (412); a copy never
 /// returns 304. Time comparisons use the source's last-modified (`updated_at`); a malformed date
 /// header is ignored.
@@ -3046,7 +3046,7 @@ fn requested_checksums(req: &S3Request) -> ChecksumSet {
 }
 
 /// Compare each client-supplied `x-amz-checksum-{algo}` header (base64) against the corresponding
-/// computed checksum from the staged result (§21.1). Returns [`Error::BadDigest`] on mismatch and
+/// computed checksum from the staged result (21.1). Returns [`Error::BadDigest`] on mismatch and
 /// [`Error::InvalidDigest`] when a checksum header has no computed counterpart (its algorithm was
 /// not staged — it should have been requested via `extra_checksums`). The `x-amz-checksum-algorithm`
 /// selector header (no per-algorithm value) is ignored here.
@@ -3074,7 +3074,7 @@ fn verify_client_checksums(req: &S3Request, computed: &[ChecksumValue]) -> Resul
     Ok(())
 }
 
-/// Evaluate a CORS preflight against the bucket's rules (ARCH §18.2). Returns the 200 preflight
+/// Evaluate a CORS preflight against the bucket's rules (ARCH 18.2). Returns the 200 preflight
 /// response (with `Access-Control-Allow-*` and `Vary: Origin`) for the first rule that allows the
 /// `origin` + `method` + every requested header, or `None` if no rule matches.
 fn cors_match(
@@ -3183,7 +3183,7 @@ fn user_metadata(req: &S3Request) -> Vec<(String, String)> {
 }
 
 /// Parse the inline `x-amz-tagging` header, a URL-encoded `Key=Value&Key2=Value2` tag set as used
-/// by `PutObject` and copy (ARCH §17.1, Medium #5). An empty/absent header yields no tags; a
+/// by `PutObject` and copy (ARCH 17.1, Medium #5). An empty/absent header yields no tags; a
 /// segment with no `=` is treated as a key with an empty value.
 fn parse_tagging_header(header: Option<&str>) -> Vec<(String, String)> {
     let Some(raw) = header else {
@@ -3257,7 +3257,7 @@ async fn drain_body(body: cairn_types::BodyStream, limit: usize) -> Result<Vec<u
 }
 
 /// The multipart ETag: MD5 of the concatenated per-part binary MD5 digests, suffixed with the
-/// part count (ARCH §10.2).
+/// part count (ARCH 10.2).
 fn multipart_etag(part_md5_hexes: &[String]) -> ETag {
     use md5::{Digest, Md5};
     let mut h = Md5::new();

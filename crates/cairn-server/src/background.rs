@@ -1,4 +1,4 @@
-//! Background subsystems (ARCH §6.4): the multipart-upload sweeper, the lifecycle scanner, the
+//! Background subsystems (ARCH 6.4): the multipart-upload sweeper, the lifecycle scanner, the
 //! WAL checkpointer, and the store-metrics refresher. Each runs on a configurable interval
 //! against the shared engine stack. Replication workers are wired once a remote sink is
 //! configured.
@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Spawn the background tasks, reading their intervals and the multipart lifetime from the
-/// configured §28.2 knobs.
+/// configured 28.2 knobs.
 pub fn spawn(stack: Arc<AppStack>, cfg: &Config) {
     let sweep_interval = Duration::from_secs(cfg.multipart_sweep_interval_secs);
     #[allow(clippy::cast_possible_wrap)]
@@ -75,7 +75,7 @@ pub fn spawn(stack: Arc<AppStack>, cfg: &Config) {
     //    rule. Unchanged.
     //
     // In both shapes outbox entries accumulate (never silently dropped) until a sink is configured
-    // (ARCH §20).
+    // (ARCH 20).
     let interval = Duration::from_secs(cfg.replication_interval_secs);
     let targets = cfg.parse_replication_targets().unwrap_or_default();
     if !targets.is_empty() {
@@ -102,7 +102,7 @@ pub fn spawn(stack: Arc<AppStack>, cfg: &Config) {
         ));
         tracing::info!("replication worker enabled (per-bucket stored targets)");
     }
-    // Request-metrics flush loop (ARCH §26.5). Gated on the subsystem being enabled: when off, the
+    // Request-metrics flush loop (ARCH 26.5). Gated on the subsystem being enabled: when off, the
     // hot path accumulates nothing and there is nothing to flush. Otherwise it periodically drains
     // the in-process aggregator into a batched upsert and prunes rows past the retention horizon.
     if cfg.request_metrics_enabled {
@@ -121,7 +121,7 @@ pub fn spawn(stack: Arc<AppStack>, cfg: &Config) {
 }
 
 /// Periodically flush the in-process request-metrics aggregator into the rollup table and prune
-/// rows past the retention horizon (ARCH §26.5). Each tick drains the accumulated counts and submits
+/// rows past the retention horizon (ARCH 26.5). Each tick drains the accumulated counts and submits
 /// a single `RecordRequestMetrics` mutation through the single writer — the only DB touch the
 /// request-metrics subsystem makes, keeping the request hot path free of any DB I/O. `prune_before`
 /// is always supplied so old rows are reclaimed even on idle ticks, but a submit is skipped entirely
@@ -175,7 +175,7 @@ fn single_target_sink_cfg(cfg: &Config) -> Option<cairn_replication::S3SinkConfi
     }
 }
 
-/// Drain the replication outbox to the configured remote sink on an interval (ARCH §20).
+/// Drain the replication outbox to the configured remote sink on an interval (ARCH 20).
 ///
 /// `base_cfg` carries the endpoint, credentials, region, and the *default* destination bucket.
 /// Before each drain the per-source-bucket destination map is rebuilt from every bucket's stored
@@ -255,7 +255,7 @@ async fn bucket_rule_dest(stack: &Arc<AppStack>, bucket: &BucketName) -> Option<
         .map(ToOwned::to_owned)
 }
 
-/// Drain the replication outbox across many named targets on an interval (ARCH §20). Each source
+/// Drain the replication outbox across many named targets on an interval (ARCH 20). Each source
 /// bucket is routed to the target whose `dest_bucket` (or, failing that, `name`) matches the
 /// bucket's stored replication rule; objects ship through that target's own sink (its endpoint,
 /// credentials, and TLS trust). A source bucket matching no named target falls back to the
@@ -299,7 +299,7 @@ async fn multi_target_replication_loop(
 
     if target_sinks.is_empty() && default_sink.is_none() {
         // No env sinks — this is the stored-targets-only shape. Do NOT bail: per-bucket stored
-        // remote targets are resolved from bucket config on every drain below (ARCH §20).
+        // remote targets are resolved from bucket config on every drain below (ARCH 20).
         tracing::debug!("no env replication sinks; serving per-bucket stored targets only");
     }
 
@@ -346,7 +346,7 @@ async fn drain_with_router(
 }
 
 /// Resolve the `target-ARN -> built sink` map from every bucket's stored remote replication targets
-/// (`ConfigAspect::ReplicationTargets`, ARCH §20.5). Each stored [`RemoteTarget`] is unsealed under
+/// (`ConfigAspect::ReplicationTargets`, ARCH 20.5). Each stored [`RemoteTarget`] is unsealed under
 /// the master key and built into an [`HttpS3Sink`] keyed by its ARN, so a drained outbox entry —
 /// which carries the ARN its matching rule named at enqueue — routes to exactly its destination.
 /// Keying by ARN (rather than by source bucket) is what lets one bucket fan out to several distinct
@@ -509,7 +509,7 @@ fn match_target(
 /// (per-entry, so one bucket fans out to several distinct targets correctly). An entry with no ARN
 /// (the legacy env path) routes by source bucket through the env named route, then the env default.
 /// An entry whose ARN resolves to no sink, or a no-ARN entry with no env route/default, terminates
-/// for operator attention rather than silently dropping (ARCH §20).
+/// for operator attention rather than silently dropping (ARCH 20).
 struct StoredTargetRouter {
     /// `target ARN -> sink` for the per-bucket stored remote targets — the primary path.
     by_arn: HashMap<String, Arc<HttpS3Sink>>,
@@ -580,7 +580,7 @@ impl BucketRoutedSink for StoredTargetRouter {
 }
 
 /// Periodically run a truncating WAL checkpoint on the metadata store and publish the WAL size
-/// and checkpoint stats as metrics (ARCH §8.4/§11.2, F-3). Without this the `-wal` file can grow
+/// and checkpoint stats as metrics (ARCH 8.4/11.2, F-3). Without this the `-wal` file can grow
 /// unbounded under sustained writes with a long-lived reader, inflating disk use and read
 /// latency. `checkpoint()` runs on the writer thread (serialized with mutations, never
 /// contending), and a `busy` result means a reader pinned the log so the truncation was
@@ -626,7 +626,7 @@ async fn checkpoint_loop(stack: Arc<AppStack>, interval: Duration, size_threshol
         metrics::gauge!("cairn_wal_bytes").set(wal_bytes as f64);
 
         // Checkpoint when the interval has elapsed OR the combined WAL has grown past the configured
-        // size threshold (ARCH §8.4) — the latter bounds `-wal` growth under sustained writes with a
+        // size threshold (ARCH 8.4) — the latter bounds `-wal` growth under sustained writes with a
         // long-lived reader rather than waiting out the whole interval.
         let interval_due = elapsed >= interval;
         let size_due = size_threshold_bytes > 0 && wal_bytes >= size_threshold_bytes;
@@ -687,7 +687,7 @@ async fn metrics_loop(stack: Arc<AppStack>) {
             metrics::gauge!("cairn_compression_ratio").set(ratio);
         }
 
-        // Writer inbound queue depth (ARCH §26.2): the headline write-backpressure signal. Only the
+        // Writer inbound queue depth (ARCH 26.2): the headline write-backpressure signal. Only the
         // concrete sqlite store exposes the writer handle; libSQL/Turso self-manage and have no
         // such gauge.
         if !stack.store.is_empty() {
@@ -695,14 +695,14 @@ async fn metrics_loop(stack: Arc<AppStack>) {
             metrics::gauge!("cairn_writer_queue_depth").set(depth as f64);
         }
 
-        // Metadata config-cache effectiveness (ARCH §11.5). The cache is not a `metrics` dependency,
+        // Metadata config-cache effectiveness (ARCH 11.5). The cache is not a `metrics` dependency,
         // so it exposes cumulative counters we mirror into the registry here.
         // Cumulative monotonic totals: set the counters to their absolute values each tick.
         let (hits, misses) = stack.meta_cache.stats();
         metrics::counter!("cairn_meta_cache_hits_total").absolute(hits);
         metrics::counter!("cairn_meta_cache_misses_total").absolute(misses);
 
-        // Replication queue depth + lag (ARCH §20/§26). `list_due_replication` is a read-only mirror
+        // Replication queue depth + lag (ARCH 20/26). `list_due_replication` is a read-only mirror
         // of the claim predicate; the oldest due entry's age is the replication lag.
         let now = clock.now();
         match stack.meta.list_due_replication(10_000, now).await {
@@ -926,7 +926,7 @@ mod tests {
 
     /// An entry routes to the sink for ITS target ARN (per-entry), so one source can fan out to
     /// several distinct targets; an ARN with no sink terminates; an ARN-less (env) entry falls back
-    /// to the source-bucket route, then the env default (ARCH §20.4/§20.5).
+    /// to the source-bucket route, then the env default (ARCH 20.4/20.5).
     #[test]
     fn router_routes_per_entry_arn_then_falls_back_to_env() {
         let target_a = test_sink("https://a.example:9000", "dest-a");

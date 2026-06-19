@@ -1,4 +1,4 @@
-//! The async single, serialized, group-committing writer (ARCH §7.2), the async analogue of
+//! The async single, serialized, group-committing writer (ARCH 7.2), the async analogue of
 //! `cairn-meta/src/writer.rs`. All mutations are submitted to one writer task that owns the only
 //! write driver. It drains its queue, applies every waiting mutation in one transaction — each
 //! wrapped in its own savepoint so a logical failure rolls back only itself — commits once with a

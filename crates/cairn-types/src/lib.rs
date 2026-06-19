@@ -1,5 +1,5 @@
 //! `cairn-types` — the shared domain types, the typed error tree, and the trait spine that
-//! every other Cairn crate is written against (ARCH §12). This crate depends on no engine
+//! every other Cairn crate is written against (ARCH 12). This crate depends on no engine
 //! implementation, so freezing it freezes the seams: the protocol and control layers consume
 //! only these traits, and the canonical in-memory [`testing`] doubles make the whole engine
 //! unit-testable without a disk or a database.

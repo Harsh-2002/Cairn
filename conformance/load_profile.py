@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Macro load profiles for Cairn (ARCH §30.2, docs/GAPS.md Medium #11).
+"""Macro load profiles for Cairn (ARCH 30.2, docs/GAPS.md Medium #11).
 
 MinIO's `warp` is unavailable in this environment, so this is an equivalent concurrent harness
 built directly on boto3 (real SigV4 signing, the same client path the conformance suite drives).
@@ -8,14 +8,14 @@ characterize the **single-writer ceiling** the spec foregrounds:
 
   (a) LARGE-OBJECT BANDWIDTH — N concurrent workers each PUT then GET a large object (default
       32 MiB). Reports aggregate up/down throughput in MiB/s. This profile is bound by disk and
-      network bandwidth plus the two durable-commit fsyncs (ARCH §30.1), not by the writer.
+      network bandwidth plus the two durable-commit fsyncs (ARCH 30.1), not by the writer.
 
   (b) SMALL-OBJECT RATE — N concurrent workers PUT many 4 KiB objects. Reports ops/s and the
-      p50/p99/p999 PUT latency. Per ARCH §30.1/§30.2 the binding constraint here is the single
+      p50/p99/p999 PUT latency. Per ARCH 30.1/30.2 the binding constraint here is the single
       group-committing metadata writer and the fsync rate; this is where the single-writer
       ceiling shows up. The profile is swept across concurrency 1, 4, 16 so the report shows how
       ops/s and tail latency move as concurrency rises — the operator-visible signature of the
-      writer becoming the bottleneck (ARCH §30.2). Between sweeps it samples `/metrics` so the
+      writer becoming the bottleneck (ARCH 30.2). Between sweeps it samples `/metrics` so the
       `cairn_*` gauges and the request-duration summary are recorded alongside the client-side
       numbers.
 
@@ -296,7 +296,7 @@ def main():
         pass
 
     print("=" * 92)
-    print("CAIRN MACRO LOAD PROFILES (boto3 concurrent harness; warp-equivalent) — ARCH §30.2")
+    print("CAIRN MACRO LOAD PROFILES (boto3 concurrent harness; warp-equivalent) — ARCH 30.2")
     print("=" * 92)
 
     g0, d0, err0 = scrape_metrics(args.endpoint)
@@ -348,7 +348,7 @@ def main():
 
     # ---- single-writer-ceiling interpretation ----
     print("\n" + "-" * 92)
-    print("SINGLE-WRITER CEILING (ARCH §8.3 / §30.2)")
+    print("SINGLE-WRITER CEILING (ARCH 8.3 / 30.2)")
     print("-" * 92)
     base = small_results[0]
     top = small_results[-1]
@@ -361,12 +361,12 @@ def main():
         f"p999 {base['p999_ms']:.2f}ms->{top['p999_ms']:.2f}ms ({tail_growth:.2f}x)"
     )
     print(
-        "  Reading: a single group-committing writer owns the one write connection (ARCH §7.2).\n"
+        "  Reading: a single group-committing writer owns the one write connection (ARCH 7.2).\n"
         "  As small-object concurrency rises, group commit coalesces more mutations per durability\n"
         "  barrier, so ops/s climbs sublinearly while per-op tail latency grows: arriving PUTs wait\n"
         "  behind the in-flight batch. ops/s scaling well below the concurrency multiple, together\n"
         "  with growing p999, is the operator-visible signature that the single writer + fsync rate\n"
-        "  is the binding constraint (ARCH §30.1). The write-queue-depth gauge (ARCH §30.2) would\n"
+        "  is the binding constraint (ARCH 30.1). The write-queue-depth gauge (ARCH 30.2) would\n"
         "  make this directly observable server-side; until it is wired, the request-duration\n"
         "  summary above and this client-side tail-vs-concurrency curve are the available window."
     )

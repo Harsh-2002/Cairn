@@ -229,7 +229,7 @@ pub fn object_summary_from_row(row: &Row) -> Result<ObjectSummary, MetaError> {
 }
 
 pub fn bucket_from_row(row: &Row) -> Result<Bucket, MetaError> {
-    // The column is `compression_policy` per ARCH §34.1; the domain field stays `compression`.
+    // The column is `compression_policy` per ARCH 34.1; the domain field stays `compression`.
     let compression: Option<CompressionPolicy> = match row.get_opt_text(6) {
         Some(s) => Some(json_col(&s)?),
         None => None,

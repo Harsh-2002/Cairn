@@ -1,4 +1,4 @@
-//! Parsing of AWS-style bucket-policy JSON into [`cairn_types::Policy`] (ARCH §15.5).
+//! Parsing of AWS-style bucket-policy JSON into [`cairn_types::Policy`] (ARCH 15.5).
 //!
 //! Structural problems yield [`cairn_types::Error::MalformedPolicy`].
 
@@ -24,7 +24,7 @@ pub fn parse_policy(json: &str) -> Result<Policy, Error> {
     parse_policy_inner(json, true)
 }
 
-/// Parse a Principal-less **identity** (per-user) policy (ARCH §15 / user-centric authz).
+/// Parse a Principal-less **identity** (per-user) policy (ARCH 15 / user-centric authz).
 ///
 /// Identical to [`parse_policy`], except a statement may omit `Principal`: the principal is
 /// implicitly the user the policy is attached to. An omitted `Principal` parses to
@@ -87,7 +87,7 @@ fn parse_statement(v: &Value, require_principal: bool) -> Result<Statement, Erro
 
     // Each of principal/action/resource may be given in its positive or its negated (`Not*`) form,
     // but never both at once (AWS forbids it, and the type model can hold only one). The negated
-    // forms are the IAM/S3 `NotPrincipal`/`NotAction`/`NotResource` (§15.5): they match everything
+    // forms are the IAM/S3 `NotPrincipal`/`NotAction`/`NotResource` (15.5): they match everything
     // *except* what is listed. Omitting both is a malformed statement (fail closed) — except an
     // identity policy may omit the principal, where it defaults to the attached user.
     let principals = match (obj.get("Principal"), obj.get("NotPrincipal")) {

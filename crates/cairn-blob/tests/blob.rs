@@ -127,7 +127,7 @@ async fn preallocated_write_roundtrips_and_size_is_exact() {
     let store = LocalBlobStore::open(dir.path()).await.unwrap();
     let b = BucketName::parse("bkt").unwrap();
 
-    // A >1 MiB object so the preallocation/fadvise fast path runs (ARCH §7.5). The blob must
+    // A >1 MiB object so the preallocation/fadvise fast path runs (ARCH 7.5). The blob must
     // round-trip byte-identically and report its exact size — preallocation must never pad it.
     let data: Vec<u8> = (0..2 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
     let opts = StageOptions {
@@ -200,7 +200,7 @@ async fn compression_is_transparent_and_etag_invariant() {
         .await
         .unwrap();
 
-    // ETag is the plaintext MD5 either way (ARCH §10.2).
+    // ETag is the plaintext MD5 either way (ARCH 10.2).
     assert_eq!(plain.etag.as_str(), comp.etag.as_str());
     assert!(matches!(
         comp.compression,

@@ -1,6 +1,6 @@
 //! Lifecycle-configuration types and the S3 `<LifecycleConfiguration>` XML parser.
 //!
-//! A bucket's lifecycle configuration (ARCH §19.1) is a list of [`LifecycleRule`]s. Each rule
+//! A bucket's lifecycle configuration (ARCH 19.1) is a list of [`LifecycleRule`]s. Each rule
 //! carries an identifier, an enabled/disabled status, an optional [`Filter`] selecting which
 //! objects it applies to, and one or more [`Action`]s. The parser is a total function over an
 //! arbitrary byte slice: any malformed input — invalid UTF-8, unbalanced tags, a number that
@@ -29,7 +29,7 @@ pub struct LifecycleRule {
     pub actions: Vec<Action>,
 }
 
-/// The selector that scopes a rule to a subset of a bucket's objects (ARCH §19.1). An empty
+/// The selector that scopes a rule to a subset of a bucket's objects (ARCH 19.1). An empty
 /// filter (all fields `None`/empty) matches every object. Multiple constraints combine as a
 /// conjunction, matching S3's `<And>` semantics.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -81,7 +81,7 @@ impl Filter {
     }
 }
 
-/// One lifecycle action (ARCH §19.1). A rule may carry several.
+/// One lifecycle action (ARCH 19.1). A rule may carry several.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     /// Expire the current object after it ages past a threshold.
@@ -102,7 +102,7 @@ pub enum Action {
     /// Remove a delete marker once it is the only remaining version of its key.
     ExpiredObjectDeleteMarker,
     /// Transition the object to a remote cold tier. v1 is a documented NO-OP placeholder
-    /// (ARCH §19.5); the scanner counts it but performs no movement.
+    /// (ARCH 19.5); the scanner counts it but performs no movement.
     Transition(Transition),
 }
 

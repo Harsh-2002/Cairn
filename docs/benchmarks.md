@@ -3,18 +3,18 @@
 This document covers Cairn's layers of performance verification:
 
 1. a **criterion micro-benchmark** of the SigV4 streaming chunked decoder (the hottest pure-CPU
-   stage on the ingest path) — §1;
+   stage on the ingest path) — 1;
 2. a **boto3 macro load harness** (`conformance/load_profile.py`) that drives a real `cairn`
    binary with concurrent clients to characterize large-object bandwidth, small-object rate, and
-   — the point of ARCH §30.2 — the **single-writer ceiling** — §2;
+   — the point of ARCH 30.2 — the **single-writer ceiling** — 2;
 3. the **real MinIO `warp` macro benchmark** (`conformance/warp.sh`), the industry-standard S3
-   load tool, run against a fresh Cairn — §3; and
+   load tool, run against a fresh Cairn — 3; and
 4. a **multi-host replication soak** (`conformance/soak.sh`): two Cairn nodes, a sustained PUT
-   workload, byte-for-byte replication verification, and a source-RSS leak check — §4.
+   workload, byte-for-byte replication verification, and a source-RSS leak check — 4.
 
-The boto3 harness (§2) and `warp` (§3) overlap deliberately: §2 is the always-available,
-dependency-free generator that the single-writer-ceiling analysis is built on; §3 is the external
-ground-truth tool. Where `warp` can run, it corroborates §2; see §3 for an important caveat.
+The boto3 harness (2) and `warp` (3) overlap deliberately: 2 is the always-available,
+dependency-free generator that the single-writer-ceiling analysis is built on; 3 is the external
+ground-truth tool. Where `warp` can run, it corroborates 2; see 3 for an important caveat.
 
 All numbers below were recorded on this host; they are illustrative of *shape*, not a hardware
 spec sheet. Re-run on the target hardware for absolute figures.
@@ -23,7 +23,7 @@ spec sheet. Re-run on the target hardware for absolute figures.
 
 ## 1. Chunked-decoder micro-benchmark (criterion)
 
-The streaming chunked decoder de-frames `aws-chunked` upload bodies. ARCH §30.1 wants the byte
+The streaming chunked decoder de-frames `aws-chunked` upload bodies. ARCH 30.1 wants the byte
 path bound by hardware, not by framing CPU, so the de-framer must run well above device bandwidth.
 
 `crates/cairn-protocol/benches/decode.rs` decodes an 8 MiB unsigned body in 64 KiB chunks:
@@ -42,7 +42,7 @@ chunked_decode/8MiB_64KiB_chunks
 
 So **~1 GiB/s** through the de-framer. That is comfortably above the large-object PUT bandwidth a
 single durable-commit write path sustains (see below), confirming the de-framer is not the ingest
-bottleneck — exactly the §30.1/§29.6 expectation.
+bottleneck — exactly the 30.1/29.6 expectation.
 
 ---
 
@@ -71,13 +71,13 @@ an already-running server directly:
 ### What it measures
 
 **Profile (a) — large-object bandwidth.** N concurrent workers each PUT then GET a large object
-(default 32 MiB, 16 objects, 8 workers). Reports aggregate up/down MiB/s. Per ARCH §30.1 this is
+(default 32 MiB, 16 objects, 8 workers). Reports aggregate up/down MiB/s. Per ARCH 30.1 this is
 bound by disk and network bandwidth plus the two durable-commit fsyncs (fsync file, fsync dir),
 **not** by the writer — every worker stages and fsyncs its own blob in parallel before the short
 metadata commit.
 
 **Profile (b) — small-object rate.** N concurrent workers PUT many 4 KiB objects. Reports ops/s
-and p50/p99/p999 PUT latency, swept across concurrency **1, 4, 16**. Per ARCH §30.1 the binding
+and p50/p99/p999 PUT latency, swept across concurrency **1, 4, 16**. Per ARCH 30.1 the binding
 constraint here is the single group-committing metadata writer and the fsync rate; the sweep makes
 the ceiling visible.
 
@@ -113,16 +113,16 @@ incompressible-ish payload is stored raw, as expected). The server-side
 `cairn_request_duration_seconds` PUT summary tracked the client view (p50 ≈ 20 ms cumulative,
 with multi-second p999 outliers from the cold-start window — see below).
 
-### Interpreting the single-writer ceiling (ARCH §8.3 / §30.2)
+### Interpreting the single-writer ceiling (ARCH 8.3 / 30.2)
 
 The defining number: **concurrency 1 → 16 (16×) moved ops/s only 165.6 → 275.4 (1.66×) while p999
 latency grew 18.3 ms → 198.2 ms (10.8×).** That is the single-writer ceiling, made visible.
 
 Why it happens, per the spec:
 
-- A **single group-committing writer** owns the one write connection (ARCH §7.2/§11.6). Every
+- A **single group-committing writer** owns the one write connection (ARCH 7.2/11.6). Every
   small-object PUT must pass through it.
-- **Group commit** (ARCH §8.3) coalesces the mutations that arrive during one durability barrier
+- **Group commit** (ARCH 8.3) coalesces the mutations that arrive during one durability barrier
   into a single COMMIT and a single fsync, then acks every member of the batch after that barrier.
   This is why ops/s *rises at all* as concurrency goes 1 → 4: more concurrent arrivals mean a
   larger batch factor, so the effective rate climbs above the bare synchronous-commit rate while
@@ -132,10 +132,10 @@ Why it happens, per the spec:
   queue of PUTs waiting behind the in-flight batch, which is exactly why p50/p99/p999 climb
   steeply (5 → 53 ms p50; 18 → 198 ms p999) while throughput plateaus.
 
-This is the §30.1 prediction stated plainly in §30.2: **ops/s scaling well below the concurrency
+This is the 30.1 prediction stated plainly in 30.2: **ops/s scaling well below the concurrency
 multiple, together with growing tail latency, is the operator-visible signature that the single
 writer and the fsync rate are the binding constraint** for small-object writes. The operator
-levers §30.2 lists follow directly from this curve: enlarge the group-commit linger (bigger
+levers 30.2 lists follow directly from this curve: enlarge the group-commit linger (bigger
 batches, a little more latency), relax the `synchronous`/blob-fsync durability setting if the
 workload tolerates it (cheaper barrier), or accept the ceiling as the honest limit of one node and
 scale out with replication.
@@ -150,14 +150,14 @@ small-write latency; the steady-state picture is the monotonic p50/p99 growth ac
 
 #### The write-queue-depth gauge
 
-ARCH §26/§30.2 names the **write-queue-depth** metric as *the* server-side window onto this
+ARCH 26/30.2 names the **write-queue-depth** metric as *the* server-side window onto this
 ceiling — a depth that grows under load is the early-warning signal for write saturation before it
 becomes latency. It is published as the `cairn_writer_queue_depth` gauge (alongside
 `cairn_requests_total`, `cairn_request_duration_seconds`, the store/byte gauges, and the
 WAL/replication series). This harness reads the ceiling from three windows: that gauge, the
 server-side `cairn_request_duration_seconds` summary, and the client-side
 tail-latency-versus-concurrency curve above. All show the same thing — the writer saturating —
-which is what §30.2 asks an operator to be able to see.
+which is what 30.2 asks an operator to be able to see.
 
 ### Caveats
 
@@ -219,7 +219,7 @@ error fails the run.
 | `warp mixed` | **~98 MiB/s** total (163 obj/s) |
 | errors | **0** |
 
-These `warp put` figures sit in the same band as the boto3 §2(a) large-object PUT path once you
+These `warp put` figures sit in the same band as the boto3 2(a) large-object PUT path once you
 account for object size and concurrency — both are bounded by the durable-commit write cost, not
 by client framing — so `warp` corroborates the boto3 harness where it can run.
 
@@ -228,11 +228,11 @@ by client framing — so `warp` corroborates the boto3 harness where it can run.
 ## 4. Multi-host replication soak
 
 `conformance/soak.sh` stands up **two** Cairn nodes and exercises asynchronous bucket replication
-(ARCH §20) under sustained load while watching for two failure modes the spec cares about:
+(ARCH 20) under sustained load while watching for two failure modes the spec cares about:
 replication *correctness* (every replicated object is byte-identical) and a *memory leak* on the
 busy source.
 
-Topology (the single-target node→node shape from `docs/operations.md` §2):
+Topology (the single-target node→node shape from `docs/operations.md` 2):
 
 - **node-1 = replication TARGET** — a plain Cairn mirror.
 - **node-2 = SOURCE** — started with `CAIRN_REPLICATION_ENDPOINT` pointed at node-1, so its
@@ -240,7 +240,7 @@ Topology (the single-target node→node shape from `docs/operations.md` §2):
   `serve` share one master key, or the sealed SigV4 secret cannot be unsealed at serve time.)
 
 The boto3 driver (`conformance/soak.py`, run with the `/tmp/cairnvenv` python) enables versioning
-+ an enabled replication rule on the source bucket (replication requires both, ARCH §20), then for
++ an enabled replication rule on the source bucket (replication requires both, ARCH 20), then for
 `DURATION` seconds:
 
 - runs a continuous multi-worker PUT workload against the **source** (the soak focuses on

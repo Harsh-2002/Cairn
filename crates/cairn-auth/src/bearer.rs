@@ -1,4 +1,4 @@
-//! The first-party Bearer scheme (ARCH §14.4): a high-entropy machine token compared against a
+//! The first-party Bearer scheme (ARCH 14.4): a high-entropy machine token compared against a
 //! stored fast hash in constant time.
 
 use crate::crypto_util::sha256_hex;

@@ -1,4 +1,4 @@
-//! Canned-ACL expansion (ARCH §15.7) and the mapping from ACL [`Permission`] to the
+//! Canned-ACL expansion (ARCH 15.7) and the mapping from ACL [`Permission`] to the
 //! [`Action`]s it satisfies.
 
 use cairn_types::{Acl, Action, Grant, Grantee, Permission, Resource, UserId};
@@ -6,7 +6,7 @@ use cairn_types::{Acl, Action, Grant, Grantee, Permission, Resource, UserId};
 /// The well-known log-delivery group is modelled as the [`Grantee::LogDelivery`] group.
 ///
 /// Expand a canned-ACL name into a concrete [`Acl`] owned by `owner`. Returns `None` for an
-/// unrecognised name. The supported names follow ARCH §15.7:
+/// unrecognised name. The supported names follow ARCH 15.7:
 /// `private`, `public-read`, `public-read-write`, `authenticated-read`, `bucket-owner-read`,
 /// `bucket-owner-full-control`, and `log-delivery-write`.
 ///
@@ -71,7 +71,7 @@ pub fn expand_canned_acl(name: &str, owner: &UserId) -> Option<Acl> {
 }
 
 /// Whether an ACL `permission` granted on a resource of the same kind as `resource` satisfies
-/// `action`. Implements the mapping of ARCH §15.7:
+/// `action`. Implements the mapping of ARCH 15.7:
 ///
 /// * `Read` on an object => `GetObject*` (data, version, attributes, tagging-get reads).
 /// * `Read` on a bucket => `ListBucket*`.

@@ -1,6 +1,6 @@
 //! Replication-configuration types and the S3 `<ReplicationConfiguration>` XML parser.
 //!
-//! A bucket's replication configuration (ARCH §20.1) carries an IAM `<Role>` and a list of
+//! A bucket's replication configuration (ARCH 20.1) carries an IAM `<Role>` and a list of
 //! [`ReplicationRule`]s. Each rule has an identifier, an enabled/disabled status, an optional
 //! prefix [`Filter`] selecting which keys it applies to, and a [`Destination`] naming the
 //! remote bucket (by ARN). The server consumes the typed [`ReplicationConfig`] to decide

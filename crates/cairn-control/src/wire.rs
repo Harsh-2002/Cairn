@@ -1,4 +1,4 @@
-//! The JSON request/response shapes of the management API contract (ARCH §22). These are the
+//! The JSON request/response shapes of the management API contract (ARCH 22). These are the
 //! stable wire DTOs; the domain types in `cairn-types` are translated into and out of them
 //! here so that the contract never drifts with internal representation changes.
 
@@ -74,7 +74,7 @@ pub struct HealthResp {
     /// Liveness marker (always `"ok"`).
     pub status: &'static str,
     /// Whether the store is ready to serve. Reflects a real probe of the metadata store
-    /// (`list_buckets` succeeds), not a hardcoded constant (ARCH §26.4).
+    /// (`list_buckets` succeeds), not a hardcoded constant (ARCH 26.4).
     pub ready: bool,
 }
 
@@ -331,7 +331,7 @@ pub struct DeletePrefixError {
 }
 
 // ---------------------------------------------------------------------------------------
-// Object tag browsing (ARCH §17.2)
+// Object tag browsing (ARCH 17.2)
 // ---------------------------------------------------------------------------------------
 
 /// `GET /tags` response: the distinct object tags in use, descending by count.
@@ -410,7 +410,7 @@ pub struct CreateUserReq {
     /// When set, attach a canned **replication** identity policy to the new user scoped to this
     /// destination bucket: it grants `s3:ReplicateObject`, `s3:ReplicateDelete`, `s3:GetObject`,
     /// and `s3:PutObject` on `arn:aws:s3:::<bucket>/*`. This mints a dedicated destination
-    /// credential in one step (ARCH §20.5). Absent/null leaves the user with no attached policy.
+    /// credential in one step (ARCH 20.5). Absent/null leaves the user with no attached policy.
     #[serde(default)]
     pub replication_policy_bucket: Option<String>,
 }
@@ -446,7 +446,7 @@ pub struct UserDetailResp {
     pub role: &'static str,
     /// Whether the user is active.
     pub is_active: bool,
-    /// The per-user byte quota (ARCH §27.5), or null when unset (no limit).
+    /// The per-user byte quota (ARCH 27.5), or null when unset (no limit).
     pub quota_bytes: Option<u64>,
     /// The attached identity (per-user) policy document, or null if none.
     pub policy: Option<Value>,
@@ -485,7 +485,7 @@ pub struct ActivityListResp {
     pub entries: Vec<ActivityListEntry>,
 }
 
-/// A persistent object-share, as returned by the management API (ARCH §15.8).
+/// A persistent object-share, as returned by the management API (ARCH 15.8).
 #[derive(Debug, Serialize)]
 pub struct ShareRecord {
     /// The opaque token; also the `/p/{token}` path tail.
@@ -611,7 +611,7 @@ pub struct RotateCredentialsResp {
 }
 
 /// `PUT /users/{id}/quota` request body. The quota is enforced inside the writer's commit
-/// transaction (ARCH §27.5); this endpoint only sets the configured value.
+/// transaction (ARCH 27.5); this endpoint only sets the configured value.
 #[derive(Debug, Deserialize)]
 pub struct SetUserQuotaReq {
     /// The new byte quota, or `null` to remove the limit.
@@ -742,7 +742,7 @@ pub struct ReplicationStatusError {
 
 /// The JSON error envelope used by every non-success response. The `request_id` mirrors the
 /// `x-amz-request-id` response header so an operator can correlate a failed call with logs
-/// (ARCH §25.1).
+/// (ARCH 25.1).
 #[derive(Debug, Serialize)]
 pub struct ErrorResp {
     /// A short, stable error message.

@@ -1,7 +1,7 @@
-//! Native TLS termination using rustls with the aws-lc-rs provider (ARCH §7.7, §27.2). The
+//! Native TLS termination using rustls with the aws-lc-rs provider (ARCH 7.7, 27.2). The
 //! server can terminate TLS itself or run behind a terminating proxy on a trusted interface.
 //!
-//! ## Hot reload (ARCH §27.2)
+//! ## Hot reload (ARCH 27.2)
 //! The served configuration lives behind a [`tokio::sync::watch`] channel so the certificate and
 //! key can be rotated without dropping the listener. The accept loop reads the *current*
 //! [`ServerConfig`] from its watch receiver per connection; a `SIGHUP` handler reloads the

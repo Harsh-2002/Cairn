@@ -1,7 +1,7 @@
-//! `cairn-authz` — the pure authorization engine (ARCH §15).
+//! `cairn-authz` — the pure authorization engine (ARCH 15).
 //!
 //! [`PolicyEngine`] implements [`cairn_types::AuthorizationEngine`] with the fixed evaluation
-//! order of ARCH §15.3: owner/admin short-circuit (subject to explicit deny), the Block
+//! order of ARCH 15.3: owner/admin short-circuit (subject to explicit deny), the Block
 //! Public Access gate, explicit policy deny, any-allow (policy or ACL), then default deny.
 //! Everything here is a pure function of the [`AuthzInput`]; there is no I/O.
 //!
@@ -76,7 +76,7 @@ pub fn evaluate(input: &AuthzInput) -> Decision {
     Decision::Deny(DenyReason::DefaultDeny)
 }
 
-/// The Block Public Access gate (ARCH §15.3 step 2).
+/// The Block Public Access gate (ARCH 15.3 step 2).
 ///
 /// We compute whether the request would be granted at all, and whether it would still be
 /// granted with public grants removed (as BPA neutralises them). If something grants it now
@@ -230,7 +230,7 @@ fn statement_matches(
 
 /// Whether a statement's action clause matches the request action. A positive `Action` clause
 /// matches when the action matches **any** listed pattern; a negated `NotAction` clause matches
-/// when it matches **none** of them (§15.5).
+/// when it matches **none** of them (15.5).
 fn action_clause_matches(clause: &ActionMatch, action: Action) -> bool {
     match clause {
         ActionMatch::In(ps) => ps.iter().any(|a| action_pattern_matches(a, action)),
@@ -240,7 +240,7 @@ fn action_clause_matches(clause: &ActionMatch, action: Action) -> bool {
 
 /// Whether a statement's resource clause matches the request resource. A positive `Resource`
 /// clause matches **any** listed ARN pattern; a negated `NotResource` clause matches when the
-/// request resource matches **none** of them (§15.5).
+/// request resource matches **none** of them (15.5).
 fn resource_clause_matches(clause: &ResourceMatch, resource: &Resource) -> bool {
     match clause {
         ResourceMatch::In(rs) => rs.iter().any(|r| matching::resource_matches(r, resource)),

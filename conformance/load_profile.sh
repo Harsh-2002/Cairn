@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Bootstrap a fresh temp Cairn, run the macro load profiles against it, print the report, tear
 # down. Equivalent to MinIO's `warp` (unavailable here) but built on boto3 — the same client path
-# the conformance suite drives. See docs/benchmarks.md for interpretation. (ARCH §30.2)
+# the conformance suite drives. See docs/benchmarks.md for interpretation. (ARCH 30.2)
 #
 # Usage:
 #   conformance/load_profile.sh

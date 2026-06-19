@@ -2,7 +2,7 @@
 //! authentication, and routes path-style addressing into the S3 service.
 //!
 //! Object reads (`S3Body::Stream`) are forwarded to hyper as a streaming body so a large GET
-//! flows blob -> socket with bounded memory (ARCH §7.4/§7.6/§7.8): no whole-object buffer is ever
+//! flows blob -> socket with bounded memory (ARCH 7.4/7.6/7.8): no whole-object buffer is ever
 //! materialised. Empty and in-memory (XML/error) bodies stay fully buffered, which is correct —
 //! they are already small and bounded. Request bodies for object PUT are streamed separately via
 //! [`incoming_to_stream`].
@@ -157,7 +157,7 @@ pub async fn handle(
             .handle(&method, subpath, &query, principal.as_ref(), body_bytes)
             .await;
         // Emit the per-request id as `x-amz-request-id` on every control response, success or
-        // error, so an operator can correlate a call with logs and the error envelope (ARCH §25.1).
+        // error, so an operator can correlate a call with logs and the error envelope (ARCH 25.1).
         let mut builder = Response::builder()
             .status(resp.status)
             .header("content-type", "application/json");
@@ -193,7 +193,7 @@ pub async fn handle(
     }
 
     // Persistent public-read ("share") URLs: GET|HEAD /p/{token} — unauthenticated, resolved by an
-    // opaque registry token (ARCH §15.8). The token is a single path segment.
+    // opaque registry token (ARCH 15.8). The token is a single path segment.
     if (method == Method::GET || method == Method::HEAD) && raw_path.starts_with("/p/") {
         let token = &raw_path[3..]; // after "/p/"
         if token.is_empty() || token.contains('/') {
@@ -202,7 +202,7 @@ pub async fn handle(
         return serve_share(stack, token, method, &headers, peer, secure, request_id).await;
     }
 
-    // Virtual-host-style addressing (ARCH §13.1): when `CAIRN_S3_DOMAIN` is configured and the
+    // Virtual-host-style addressing (ARCH 13.1): when `CAIRN_S3_DOMAIN` is configured and the
     // request Host is `<bucket>.<s3_domain>`, the bucket is taken from the Host and the entire path
     // is the key. Otherwise fall back to path-style routing (`/<bucket>/<key>`).
     let (bucket, key) = route_request(stack.s3_domain.as_deref(), &host, &raw_path);
@@ -268,7 +268,7 @@ fn generate_share_token() -> String {
     )
 }
 
-/// Mint a persistent public-read ("share") token for an object (ARCH §15.8). Admin-only. Body:
+/// Mint a persistent public-read ("share") token for an object (ARCH 15.8). Admin-only. Body:
 /// `{"key", "expires_in_secs"?: null=forever, "disposition"?: "inline"|"attachment", "filename"?,
 /// "version_id"?}`. Returns `{"token","url":"/p/{token}","expires_at_ms": ms|null}`.
 async fn create_share(
@@ -357,7 +357,7 @@ async fn create_share(
     )
 }
 
-/// Mint an interoperable S3 presigned URL (ARCH §14.2). Admin-only. Body: `{"key","method"?:
+/// Mint an interoperable S3 presigned URL (ARCH 14.2). Admin-only. Body: `{"key","method"?:
 /// "GET"|"PUT","expires_in_secs":1..=604800,"version_id"?,"response_content_disposition"?,
 /// "response_content_type"?,"content_type"?}`. Signs with the requester's own SigV4 secret.
 async fn presign(
@@ -735,7 +735,7 @@ async fn crypto_status_response(
 ///
 /// When `s3_domain` is `Some` and the request `Host` (port stripped) is `<bucket>.<s3_domain>`, the
 /// bucket is the leading Host label and the **entire** request path (sans the leading `/`) is the
-/// key (ARCH §13.1). Any other Host — including a bare `<s3_domain>` with no bucket label, or a Host
+/// key (ARCH 13.1). Any other Host — including a bare `<s3_domain>` with no bucket label, or a Host
 /// that is not under the domain — falls through to path-style [`route_path`]. With `s3_domain`
 /// `None`, routing is always path-style.
 pub(crate) fn route_request(
@@ -812,7 +812,7 @@ fn incoming_to_stream(body: Incoming) -> cairn_types::BodyStream {
 /// Render an [`S3Response`] onto the wire. `Empty`/`Bytes` bodies are already bounded and stay
 /// buffered; a `Stream` body (object read) is forwarded to hyper as a `StreamBody` so bytes flow
 /// from the blob store to the socket in bounded chunks with backpressure, never materialising the
-/// whole object in memory (ARCH §7.4/§7.6/§7.8). The stream's `BlobError` is mapped onto the
+/// whole object in memory (ARCH 7.4/7.6/7.8). The stream's `BlobError` is mapped onto the
 /// body's `BodyError`; a mid-stream blob failure terminates the body, which surfaces to the
 /// client as a truncated transfer (the status line is already sent by then).
 fn render(resp: S3Response) -> Response<ResponseBody> {
@@ -877,7 +877,7 @@ mod tests {
 
     /// A `Stream` response body is forwarded frame-by-frame, not drained into one buffer: the
     /// rendered body yields one HTTP data frame per source chunk and the bytes round-trip
-    /// unchanged (ARCH §7.4/§7.6/§7.8, High #4).
+    /// unchanged (ARCH 7.4/7.6/7.8, High #4).
     #[tokio::test]
     async fn stream_response_is_forwarded_chunk_by_chunk() {
         let chunks: Vec<Result<Bytes, BlobError>> = vec![
@@ -909,7 +909,7 @@ mod tests {
     }
 
     /// Virtual-host addressing: with `CAIRN_S3_DOMAIN` set and a `<bucket>.<domain>` Host, the
-    /// bucket comes from the Host and the entire path is the key (ARCH §13.1).
+    /// bucket comes from the Host and the entire path is the key (ARCH 13.1).
     #[test]
     fn route_request_virtual_host_takes_bucket_from_host() {
         let (b, k) = route_request(

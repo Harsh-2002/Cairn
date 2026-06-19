@@ -1,4 +1,4 @@
-//! `cairn-replication` — the outbox-driven asynchronous bucket-replication engine (ARCH §20).
+//! `cairn-replication` — the outbox-driven asynchronous bucket-replication engine (ARCH 20).
 //!
 //! Replication is eventually consistent with at-least-once delivery and idempotent
 //! application. A durable outbox in the [`MetadataStore`] records what remains to be

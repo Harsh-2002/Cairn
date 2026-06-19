@@ -1,4 +1,4 @@
-//! The configuration surface (ARCH §28). Configuration is **environment-only**: the whole config
+//! The configuration surface (ARCH 28). Configuration is **environment-only**: the whole config
 //! is `Config::default()` overlaid with `CAIRN_*` environment variables, so the binary runs on a
 //! bare host or inside a container configured purely by env with no file to mount. The config is
 //! validated on load so an invalid configuration fails fast with a clear message rather than at
@@ -20,7 +20,7 @@ pub enum LogFormat {
     Json,
 }
 
-/// The full server configuration. A subset of the ARCH §28.2 surface is wired in the
+/// The full server configuration. A subset of the ARCH 28.2 surface is wired in the
 /// skeleton; later waves extend it (compression, quotas, replication, lifecycle, TLS).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -90,10 +90,10 @@ pub struct Config {
     /// How often the WAL checkpointer runs a truncating checkpoint, in seconds.
     pub wal_checkpoint_interval_secs: u64,
     /// Size threshold, in bytes, above which a truncating WAL checkpoint is triggered between the
-    /// regular interval ticks (`CAIRN_WAL_CHECKPOINT_SIZE_BYTES`, ARCH §8.4). `0` disables the
+    /// regular interval ticks (`CAIRN_WAL_CHECKPOINT_SIZE_BYTES`, ARCH 8.4). `0` disables the
     /// size-based trigger, leaving only the interval. Default 64 MiB.
     pub wal_checkpoint_size_bytes: u64,
-    /// Metadata write durability (`CAIRN_META_SYNCHRONOUS`): `normal` or `full` (ARCH §30). The
+    /// Metadata write durability (`CAIRN_META_SYNCHRONOUS`): `normal` or `full` (ARCH 30). The
     /// default `normal` runs `PRAGMA synchronous=NORMAL` under WAL — no per-commit fsync (≈1.7×
     /// writer throughput on disk) and never corrupts; on power loss it loses at most the last
     /// uncheckpointed transaction. Set `full` for zero-loss durability at lower write throughput.
@@ -118,7 +118,7 @@ pub struct Config {
     pub meta_cache_total_budget_bytes: u64,
     /// `mmap_size` in bytes for metadata read connections (`CAIRN_META_MMAP_BYTES`). Default 256 MiB.
     pub meta_mmap_bytes: u64,
-    /// Number of metadata shards (`CAIRN_META_SHARDS`, ARCH §30, Phase 3.2). Default `1` (the
+    /// Number of metadata shards (`CAIRN_META_SHARDS`, ARCH 30, Phase 3.2). Default `1` (the
     /// metadata lives in one database, as before). With `N > 1` the metadata is partitioned across
     /// N databases by bucket name — `db_path`, then `db_path.shard1`, `.shard2`, … — so disjoint
     /// buckets commit through N independent single-writers in parallel. This is a **deployment-time
@@ -129,37 +129,37 @@ pub struct Config {
     /// The base domain for **virtual-host-style** S3 addressing (`CAIRN_S3_DOMAIN`), e.g.
     /// `s3.example.com`. When set, a request whose `Host` is `<bucket>.<domain>` is routed to that
     /// bucket with the whole path as the key; path-style addressing always remains supported. Unset
-    /// disables virtual-host routing (path-style only). (ARCH §13.1)
+    /// disables virtual-host routing (path-style only). (ARCH 13.1)
     pub s3_domain: Option<String>,
     /// Byte budget for the in-memory metadata/configuration cache (`CAIRN_META_CACHE_BYTES`, ARCH
-    /// §11.5). The cache fronts hot bucket-config reads (policy/ACL/CORS/public-access-block) so
+    /// 11.5). The cache fronts hot bucket-config reads (policy/ACL/CORS/public-access-block) so
     /// authorization does not re-read SQLite on every request. `0` disables the cache. Default
     /// 64 MiB.
     pub meta_cache_bytes: u64,
     /// Time-to-live, in seconds, for the authentication cache (`CAIRN_AUTH_CACHE_TTL_SECS`, ARCH
-    /// §30). It memoizes the per-request credential lookup (sealed secret + the user fields a
+    /// 30). It memoizes the per-request credential lookup (sealed secret + the user fields a
     /// principal needs) keyed by access-key-id and the parsed identity policy keyed by user-id, so
     /// a stream of requests from one identity skips two metadata reads and a policy parse. Changes
     /// to a user's credentials, active state, or policy take effect immediately regardless of the
     /// TTL (a user mutation bumps a shared epoch that drops every cached entry); the TTL only bounds
     /// staleness for entries no mutation ever touches. `0` disables the cache. Default 30 s.
     pub auth_cache_ttl_secs: u64,
-    /// Maximum number of concurrent blob transfers (`CAIRN_BLOB_IO_POOL_SIZE`, ARCH §7.4). Each
+    /// Maximum number of concurrent blob transfers (`CAIRN_BLOB_IO_POOL_SIZE`, ARCH 7.4). Each
     /// object read/write/assemble holds one permit for its file I/O, so a flood of large transfers
     /// cannot exhaust the runtime's blocking-pool threads. Tune to the device's useful I/O
     /// concurrency: lower for a single spinning disk, higher for a fast NVMe array. Default 64.
     pub blob_io_pool_size: usize,
-    /// Tokio runtime worker (compute) threads (`CAIRN_RUNTIME_WORKER_THREADS`, ARCH §30). `0` lets
+    /// Tokio runtime worker (compute) threads (`CAIRN_RUNTIME_WORKER_THREADS`, ARCH 30). `0` lets
     /// the runtime pick the CPU count (the default). Set it to pin compute parallelism explicitly.
     pub runtime_worker_threads: usize,
-    /// Tokio runtime max blocking threads (`CAIRN_RUNTIME_MAX_BLOCKING_THREADS`, ARCH §30): the cap
+    /// Tokio runtime max blocking threads (`CAIRN_RUNTIME_MAX_BLOCKING_THREADS`, ARCH 30): the cap
     /// on threads serving `spawn_blocking`, which is where every metadata read (the WAL read pool)
     /// and blob file transfer runs. `0` derives a safe value: `max(512, blob_io_pool_size +
     /// meta_read_pool_size + 64)`, so the blocking pool can never be starved below the concurrency
     /// those two pools demand. A non-zero value is validated to stay at or above that floor.
     pub runtime_max_blocking_threads: usize,
     /// Replication destination endpoint (e.g. `http://backup-host:9000`). When set, the
-    /// replication worker ships outbox entries to this S3-compatible target (ARCH §20).
+    /// replication worker ships outbox entries to this S3-compatible target (ARCH 20).
     pub replication_endpoint: Option<String>,
     /// Destination bucket at the replication endpoint (path-style).
     pub replication_dest_bucket: Option<String>,
@@ -174,7 +174,7 @@ pub struct Config {
     /// A JSON array of named replication targets (`CAIRN_REPLICATION_TARGETS`). When present each
     /// source bucket's destination is resolved to the matching named target (by the target's
     /// `dest_bucket` or `name`) and shipped with that target's own endpoint, credentials, and TLS
-    /// trust (ARCH §20). The single-target `CAIRN_REPLICATION_*` keys above remain as the default
+    /// trust (ARCH 20). The single-target `CAIRN_REPLICATION_*` keys above remain as the default
     /// target used for any source bucket that does not match a named target. Each element is a
     /// [`ReplicationTarget`]; parsed with `serde_json` on load.
     pub replication_targets: Option<String>,
@@ -182,7 +182,7 @@ pub struct Config {
     /// Whether the request-metrics usage-analytics subsystem is enabled
     /// (`CAIRN_REQUEST_METRICS_ENABLED`). When off, no per-request counters accumulate and the
     /// flush loop is not spawned; the `/api/v1/metrics/requests` endpoint then returns empty series
-    /// (ARCH §26.5).
+    /// (ARCH 26.5).
     pub request_metrics_enabled: bool,
     /// How often the in-process request-metrics aggregator is flushed to the rollup table and pruned,
     /// in seconds (`CAIRN_REQUEST_METRICS_FLUSH_SECS`).
@@ -267,7 +267,7 @@ impl Default for Config {
 }
 
 /// One entry of the `CAIRN_REPLICATION_TARGETS` JSON array: a named replication destination with
-/// its own endpoint, credentials, and TLS trust knobs (ARCH §20). A source bucket is routed to the
+/// its own endpoint, credentials, and TLS trust knobs (ARCH 20). A source bucket is routed to the
 /// target whose `dest_bucket` (or, failing that, `name`) matches the bucket's replication rule.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplicationTarget {
@@ -329,7 +329,7 @@ impl Config {
 impl Config {
     /// Load configuration from the environment only: the built-in [`Config::default`] overlaid
     /// with `CAIRN_*` environment variables, then validated. There is no configuration file — a
-    /// Cairn host or container is configured purely by env (ARCH §28).
+    /// Cairn host or container is configured purely by env (ARCH 28).
     ///
     /// # Errors
     /// Returns a [`ConfigError`] if the environment fails to parse or validation fails.
@@ -372,7 +372,7 @@ impl Config {
         (self.runtime_worker_threads != 0).then_some(self.runtime_worker_threads)
     }
 
-    /// Validate the configuration, rejecting the cases ARCH §28.2 enumerates.
+    /// Validate the configuration, rejecting the cases ARCH 28.2 enumerates.
     ///
     /// # Errors
     /// Returns a [`ConfigError`] describing the first invalid setting.
@@ -389,7 +389,7 @@ impl Config {
                 self.meta_backend
             )));
         }
-        // --- metadata throughput tuning (ARCH §28.2/§30) ---
+        // --- metadata throughput tuning (ARCH 28.2/30) ---
         if !matches!(self.meta_synchronous.as_str(), "normal" | "full") {
             return Err(ConfigError::Invalid(format!(
                 "meta_synchronous must be normal|full, got {:?}",
@@ -535,7 +535,7 @@ impl Config {
             ));
         }
         // Request-metrics cadences must be positive when the subsystem is enabled, else the flush
-        // loop would busy-spin and the rollup window would divide by zero (ARCH §26.5).
+        // loop would busy-spin and the rollup window would divide by zero (ARCH 26.5).
         if self.request_metrics_enabled {
             if self.request_metrics_flush_secs == 0 {
                 return Err(ConfigError::Invalid(

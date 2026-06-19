@@ -1,4 +1,4 @@
-//! Directory-fsync coalescing for the durable commit path (ARCH §8.2, Phase 1.5).
+//! Directory-fsync coalescing for the durable commit path (ARCH 8.2, Phase 1.5).
 //!
 //! The commit sequence is: fdatasync the staged file, rename it into the per-bucket directory,
 //! then fsync that directory so the new entry survives a crash. Under concurrent writes to the

@@ -1,5 +1,5 @@
 #![no_main]
-//! The foremost fuzz target (ARCH §29.3): the SigV4 streaming chunked decoder fed arbitrary
+//! The foremost fuzz target (ARCH 29.3): the SigV4 streaming chunked decoder fed arbitrary
 //! bytes with arbitrary read-boundary splits. The decoder must never panic and never buffer
 //! without bound; it either decodes or returns a typed error.
 

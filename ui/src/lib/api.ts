@@ -1,4 +1,4 @@
-// Thin client of the Cairn management API (ARCH §22, §23).
+// Thin client of the Cairn management API (ARCH 22, 23).
 //
 // Every request is admin-gated via a Bearer token of the form
 // `cairn_<id>.<secret>`. The token is held in memory and mirrored to
@@ -211,7 +211,7 @@ export const api = {
     );
   },
 
-  // Persistent object shares (ARCH §15.8): revocable, optionally forever. `url` is a path
+  // Persistent object shares (ARCH 15.8): revocable, optionally forever. `url` is a path
   // (/p/{token}) the caller turns into an absolute link.
   createShare: (name: string, body: CreateShareReq) =>
     request<CreateShareResp>(
@@ -239,7 +239,7 @@ export const api = {
       body,
     ),
 
-  // Bucket configuration (ARCH §22.2).
+  // Bucket configuration (ARCH 22.2).
   getBucketConfig: (name: string) =>
     request<BucketConfigResp>("GET", `/buckets/${enc(name)}/config`),
   setVersioning: (name: string, status: string) =>
@@ -275,7 +275,7 @@ export const api = {
       "POST",
       `/users/${enc(id)}/rotate-credentials`,
     ),
-  // Per-user byte quota (ARCH §27.5); null clears the limit.
+  // Per-user byte quota (ARCH 27.5); null clears the limit.
   setUserQuota: (id: string, quota_bytes: number | null) =>
     request<null>("PUT", `/users/${enc(id)}/quota`, { quota_bytes }),
   // Identity (per-user) policy. The body is a raw policy JSON document sent verbatim.
@@ -286,7 +286,7 @@ export const api = {
   deleteUserPolicy: (id: string) =>
     request<null>("DELETE", `/users/${enc(id)}/policy`),
 
-  // Per-bucket replication management (ARCH §20). Remote targets hold the
+  // Per-bucket replication management (ARCH 20). Remote targets hold the
   // destination endpoint + credentials (secret sealed server-side) and mint the
   // ARN that replication rules reference.
   listReplicationTargets: (name: string) =>

@@ -1,4 +1,4 @@
-//! The background lifecycle scanner (ARCH §19.2).
+//! The background lifecycle scanner (ARCH 19.2).
 //!
 //! [`LifecycleScanner::run_once`] processes the buckets that carry a lifecycle configuration.
 //! For each bucket it pages through current objects, all versions, and stale multipart
@@ -6,13 +6,13 @@
 //! item against the bucket's rules using the injected [`Clock`] for all age and date math, and
 //! applies the due actions by submitting the appropriate [`Mutation`] and reclaiming blobs.
 //!
-//! The scanner is idempotent (ARCH §19.2): every action is a state transition that is a no-op
+//! The scanner is idempotent (ARCH 19.2): every action is a state transition that is a no-op
 //! once already performed, so a scan that is interrupted and rerun, or simply run twice,
 //! converges to the same end state. Current-object expiration in a versioned bucket relies on
 //! [`MetadataStore::list_current`] excluding delete markers — once a marker hides a key, the
 //! key no longer appears, so no second marker is inserted.
 //!
-//! Transition to a remote cold tier (ARCH §19.5) is a documented NO-OP placeholder in v1: the
+//! Transition to a remote cold tier (ARCH 19.5) is a documented NO-OP placeholder in v1: the
 //! scanner recognizes the action but performs no data movement and does not count it.
 
 use crate::config::{Action, Expiration, Filter, LifecycleRule};
@@ -29,7 +29,7 @@ const PAGE_LIMIT: u32 = 1000;
 /// The number of stale sessions fetched per `enumerate_stale_sessions` call.
 const SESSION_BATCH: u32 = 1000;
 
-/// A tally of the work one scan performed, surfaced as metrics by the caller (ARCH §19.2).
+/// A tally of the work one scan performed, surfaced as metrics by the caller (ARCH 19.2).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LifecycleReport {
     /// Current objects expired (permanently deleted in an unversioned bucket, or hidden behind
@@ -147,7 +147,7 @@ impl LifecycleScanner {
         Ok(report)
     }
 
-    /// Current-object expiration (ARCH §19.3). Pages `list_current` (which excludes delete
+    /// Current-object expiration (ARCH 19.3). Pages `list_current` (which excludes delete
     /// markers), and for each object due under some enabled `Expiration` rule whose filter
     /// matches, either permanently deletes it (unversioned/suspended) or inserts a delete
     /// marker (versioning enabled).
@@ -208,7 +208,7 @@ impl LifecycleScanner {
         Ok(report)
     }
 
-    /// Noncurrent-version expiration (ARCH §19.3). Pages every version, groups by key, and for
+    /// Noncurrent-version expiration (ARCH 19.3). Pages every version, groups by key, and for
     /// each key deletes the noncurrent (non-latest, non-delete-marker) versions that have been
     /// noncurrent longer than the rule's `days`, while preserving the newest
     /// `newer_noncurrent_versions` of them.
@@ -288,7 +288,7 @@ impl LifecycleScanner {
         Ok(report)
     }
 
-    /// Expired-object-delete-marker removal (ARCH §19.3). A delete marker that is the only
+    /// Expired-object-delete-marker removal (ARCH 19.3). A delete marker that is the only
     /// remaining version of its key is removed so fully-expired keys do not accumulate dangling
     /// markers. Applies when any enabled rule whose filter matches the key carries the action.
     async fn remove_expired_delete_markers<M>(
@@ -352,7 +352,7 @@ impl LifecycleScanner {
         Ok(report)
     }
 
-    /// Abort incomplete multipart uploads (ARCH §19.4). Enumerates stale sessions through the
+    /// Abort incomplete multipart uploads (ARCH 19.4). Enumerates stale sessions through the
     /// bounded sweeper interface and aborts those in this bucket older than the smallest
     /// `DaysAfterInitiation` of any enabled rule whose prefix matches the session key. Aborting
     /// removes the session and reclaims its staged parts via the normal abort path.
@@ -514,7 +514,7 @@ impl LifecycleScanner {
     }
 
     /// Insert a delete marker for the current object (versioned-bucket expiration), propagating it
-    /// to replicas where the bucket's replication rule calls for it (ARCH §19.3/§20.3).
+    /// to replicas where the bucket's replication rule calls for it (ARCH 19.3/20.3).
     async fn insert_delete_marker<M>(
         &self,
         meta: &M,
@@ -541,7 +541,7 @@ impl LifecycleScanner {
 
     /// Build a replication-outbox entry for a lifecycle-created delete marker when the bucket has an
     /// enabled replication rule (with delete-marker replication) whose prefix matches the key, so
-    /// expirations propagate to the replica the same way a client delete does (ARCH §20.3/§20.4).
+    /// expirations propagate to the replica the same way a client delete does (ARCH 20.3/20.4).
     /// Replication requires versioning-enabled, so a non-enabled bucket yields `None`.
     async fn marker_replication<M>(
         meta: &M,

@@ -11,7 +11,7 @@
 //!
 //! The durable-commit ordering is preserved byte-for-byte with the `tokio::fs` path: write the
 //! payload, **fsync the file**, **rename** it into the bucket directory, then **fsync that
-//! directory** (the F-1 ordering, ARCH §8.2). All of those steps are issued as io_uring ops on
+//! directory** (the F-1 ordering, ARCH 8.2). All of those steps are issued as io_uring ops on
 //! the executor thread that owns the staging file's fd.
 
 use cairn_types::error::BlobError;
@@ -329,7 +329,7 @@ async fn commit_on_executor(
     final_path: &Path,
 ) -> Result<(), BlobError> {
     // 1) fdatasync the staged file: persist its bytes and size, skipping the timestamp-only
-    //    metadata `sync_all` would also flush — one fewer journal write per PUT (ARCH §8.2).
+    //    metadata `sync_all` would also flush — one fewer journal write per PUT (ARCH 8.2).
     file.sync_data().await.map_err(io_err)?;
     file.close().await.map_err(io_err)?;
     // 2) rename the staged file into the (already-ensured) bucket directory.

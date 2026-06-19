@@ -1,4 +1,4 @@
-//! Integration tests for [`ShardedMetadataStore`] (ARCH §30, Phase 3.2): N=1 is a faithful
+//! Integration tests for [`ShardedMetadataStore`] (ARCH 30, Phase 3.2): N=1 is a faithful
 //! pass-through, and N=3 routes each bucket to its owning shard while cross-bucket reads merge
 //! every shard.
 

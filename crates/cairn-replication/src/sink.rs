@@ -1,5 +1,5 @@
 //! [`HttpS3Sink`] — a production [`ReplicationSink`] that ships objects to a remote
-//! S3-compatible endpoint over HTTP(S) with SigV4-signed requests (ARCH §20.2).
+//! S3-compatible endpoint over HTTP(S) with SigV4-signed requests (ARCH 20.2).
 //!
 //! The engine drives this sink exactly like the test double: [`put_object`](HttpS3Sink::put_object)
 //! `PUT`s the replicated body to `{endpoint}/{dest_bucket}/{key}`, carrying the content type,
@@ -24,7 +24,7 @@
 //! The sink uses a `hyper-util` legacy client over a `hyper-rustls` [`HttpsConnector`] built with
 //! `.https_or_http()`, so the **same** client serves both `http://` and `https://` endpoints:
 //! plaintext endpoints connect directly, TLS endpoints negotiate rustls (aws-lc-rs provider).
-//! There is no longer an https-rejection at construction (ARCH §20.2).
+//! There is no longer an https-rejection at construction (ARCH 20.2).
 //!
 //! ## TLS trust
 //! Which root anchors a `https://` endpoint is verified against is per-target
@@ -318,7 +318,7 @@ impl HttpS3Sink {
     }
 }
 
-/// Build an [`HttpS3Sink`] from an opened remote target (ARCH §20.5). The target supplies the
+/// Build an [`HttpS3Sink`] from an opened remote target (ARCH 20.5). The target supplies the
 /// endpoint, region, destination bucket, and the unsealed credentials; `ca_path` /
 /// `insecure_skip_verify` carry the per-target TLS-trust knobs. The resulting sink ships every
 /// source bucket to the target's single `dest_bucket` (no per-source override map).
@@ -344,7 +344,7 @@ pub fn sink_for_target(
 }
 
 /// Build the `hyper-rustls` connector builder for a sink, selecting the TLS trust source from the
-/// per-target knobs (ARCH §20.2):
+/// per-target knobs (ARCH 20.2):
 ///
 /// * [`ca_cert_path`](S3SinkConfig::ca_cert_path) — trust exactly the CA anchors in that PEM file;
 /// * [`insecure_skip_verify`](S3SinkConfig::insecure_skip_verify) — accept any certificate (logs a
@@ -546,7 +546,7 @@ impl HttpS3Sink {
         let dest_bucket = self.dest_for(source_bucket).to_owned();
         // Stamp the loop-prevention marker so the destination (a) authorizes this as a
         // `ReplicateDelete` for a dedicated replication user and (b) records the propagated marker
-        // as a replica rather than re-replicating it (ARCH §20.4), mirroring the PUT path.
+        // as a replica rather than re-replicating it (ARCH 20.4), mirroring the PUT path.
         let headers = [(
             format!("x-amz-meta-{REPLICA_MARKER_KEY}"),
             "true".to_owned(),

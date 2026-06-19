@@ -13,7 +13,7 @@ workspace = true
 
 [dependencies]
 cairn-types.workspace = true
-# For replicating lifecycle-created delete markers in replication-enabled buckets (ARCH §20/§19.3).
+# For replicating lifecycle-created delete markers in replication-enabled buckets (ARCH 20/19.3).
 cairn-replication.workspace = true
 quick-xml.workspace = true
 async-trait.workspace = true

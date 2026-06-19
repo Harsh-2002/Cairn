@@ -30,7 +30,7 @@ struct State {
     /// enforce the quota (that lives in the SQLite writer), but it records the configured value so
     /// `get_bucket_quota` round-trips a `SetBucketQuota`.
     ///
-    /// The per-user byte quota (`users.quota_bytes`, ARCH §27.5) is likewise enforced only in the
+    /// The per-user byte quota (`users.quota_bytes`, ARCH 27.5) is likewise enforced only in the
     /// SQLite writer's commit transaction; like the bucket quota it is not enforced here, and —
     /// having no `SetUserQuota` mutation or reader on `MetadataStore` — there is nothing for the
     /// double to round-trip, so no user-quota state is modeled.
@@ -48,9 +48,9 @@ struct State {
     /// shared `UserRecord` type.
     user_policies: BTreeMap<String, String>,
     activity: Vec<ActivityEntry>,
-    /// Object-share tokens (ARCH §15.8), keyed by token.
+    /// Object-share tokens (ARCH 15.8), keyed by token.
     shares: BTreeMap<String, ShareRow>,
-    /// Request-metrics rollup (ARCH §26.5), keyed by (ts_bucket, operation, bucket, status_class).
+    /// Request-metrics rollup (ARCH 26.5), keyed by (ts_bucket, operation, bucket, status_class).
     request_metrics: BTreeMap<(i64, String, String, String), MetricCell>,
 }
 

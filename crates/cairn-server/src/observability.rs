@@ -1,4 +1,4 @@
-//! Structured tracing and the Prometheus metrics recorder (ARCH §26).
+//! Structured tracing and the Prometheus metrics recorder (ARCH 26).
 
 use crate::config::LogFormat;
 use metrics::{Unit, describe_counter, describe_gauge, describe_histogram};
@@ -32,7 +32,7 @@ pub fn init_metrics() -> PrometheusHandle {
     handle
 }
 
-/// Register help text and units for the metric series the server emits (ARCH §26). Describing a
+/// Register help text and units for the metric series the server emits (ARCH 26). Describing a
 /// series is idempotent and independent of whether it has been observed yet, so the `/metrics`
 /// exposition carries `# HELP`/`# TYPE` lines from the first scrape. Only the series introduced or
 /// extended by this wave are described here; pre-existing store gauges keep their inline emission.
@@ -60,7 +60,7 @@ fn describe_metrics() {
         "Total response-body bytes sent (from declared content-length)"
     );
 
-    // Metadata config-cache effectiveness (ARCH §11.5). Monotonic cumulative counts.
+    // Metadata config-cache effectiveness (ARCH 11.5). Monotonic cumulative counts.
     describe_counter!(
         "cairn_meta_cache_hits_total",
         "Cumulative metadata config-cache hits"
@@ -70,13 +70,13 @@ fn describe_metrics() {
         "Cumulative metadata config-cache misses"
     );
 
-    // Writer backpressure (ARCH §26.2).
+    // Writer backpressure (ARCH 26.2).
     describe_gauge!(
         "cairn_writer_queue_depth",
         "Inbound metadata-writer queue depth (submitted but not yet committed)"
     );
 
-    // Replication observability (ARCH §20/§26).
+    // Replication observability (ARCH 20/26).
     describe_gauge!(
         "cairn_replication_lag_seconds",
         Unit::Seconds,

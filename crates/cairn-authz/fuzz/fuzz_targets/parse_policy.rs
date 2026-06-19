@@ -1,5 +1,5 @@
 #![no_main]
-//! Fuzz the bucket-policy JSON parser (ARCH §29.3, §15.5; GAPS Medium #11). `parse_policy`
+//! Fuzz the bucket-policy JSON parser (ARCH 29.3, 15.5; GAPS Medium #11). `parse_policy`
 //! turns an attacker-controllable policy document into a typed `Policy`, folding every
 //! structural problem — bad JSON, missing fields, wrong shapes, unknown effect/operator — into
 //! `Error::MalformedPolicy`. It must never panic on arbitrary input.

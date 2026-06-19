@@ -2,7 +2,7 @@
 
 Because the metadata database is the single source of truth and blobs are immutable files named
 by opaque identifier, a consistent backup follows a defined order with a clear consistency
-argument (ARCH §31.4).
+argument (ARCH 31.4).
 
 ## Backup procedure (default: database-first)
 

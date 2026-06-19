@@ -46,7 +46,7 @@ impl std::fmt::Debug for SqliteMetadataStore {
 }
 
 impl SqliteMetadataStore {
-    /// Run a truncating WAL checkpoint on the writer thread (ARCH §8.4/§11.2).
+    /// Run a truncating WAL checkpoint on the writer thread (ARCH 8.4/11.2).
     ///
     /// The writer owns the only write connection, so the checkpoint is submitted to it as a
     /// control message and runs serialized with mutations. Returns the checkpoint's frame
@@ -82,7 +82,7 @@ impl SqliteMetadataStore {
     }
 
     /// The current inbound write-queue depth: mutations submitted to the single writer but not yet
-    /// pulled into a commit batch (ARCH §26.2). Published as `cairn_writer_queue_depth`; a sustained
+    /// pulled into a commit batch (ARCH 26.2). Published as `cairn_writer_queue_depth`; a sustained
     /// nonzero value means writes are arriving faster than the writer can commit them.
     #[must_use]
     pub fn writer_queue_depth(&self) -> usize {

@@ -3335,7 +3335,7 @@ async fn put_bucket_acl_accepts_body_document() {
 /// SSE-S3 end to end against the real backends: a PUT carrying
 /// `x-amz-server-side-encryption: AES256` stores the object encrypted, echoes the SSE header on the
 /// PUT/GET/HEAD responses, returns byte-identical content on GET (including a ranged read), and the
-/// ETag equals the plaintext MD5 — proving encryption is transparent to the entity tag (ARCH §27).
+/// ETag equals the plaintext MD5 — proving encryption is transparent to the entity tag (ARCH 27).
 #[tokio::test]
 async fn sse_s3_put_get_roundtrip_and_etag() {
     let h = harness().await;
@@ -3649,7 +3649,7 @@ async fn system_headers_round_trip_and_response_overrides() {
         .await,
     )
     .await;
-    // PUT with the five system headers (ARCH §13.4).
+    // PUT with the five system headers (ARCH 13.4).
     let put = req(
         Method::PUT,
         Some("syshdr"),
@@ -3701,7 +3701,7 @@ async fn system_headers_round_trip_and_response_overrides() {
     .await;
     assert_eq!(header(&hdrs, "content-encoding"), Some("gzip"));
 
-    // GET response-* overrides REPLACE the corresponding headers (ARCH §21.2), with no duplicate.
+    // GET response-* overrides REPLACE the corresponding headers (ARCH 21.2), with no duplicate.
     let (_, hdrs, _) = drain(
         send(
             &h.svc,

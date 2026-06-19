@@ -1,4 +1,4 @@
-//! `cairn-auth` — the authenticator chain (ARCH §14). It composes the Bearer, SigV4 header,
+//! `cairn-auth` — the authenticator chain (ARCH 14). It composes the Bearer, SigV4 header,
 //! SigV4 presigned, and (debug-only) development schemes into an ordered chain whose first
 //! applicable outcome decides. SigV4 and Bearer verification live here; the streaming
 //! chunk-signature primitives are consumed by the ingest decoder in `cairn-protocol`.
@@ -31,7 +31,7 @@ use std::sync::Arc;
 
 /// The composed authenticator chain. Holds the metadata store (for credential lookup), the
 /// crypto facility (to decrypt SigV4 secrets), the clock (for skew validation), and the
-/// short-lived authentication cache (credential + parsed-policy memoization, ARCH §30).
+/// short-lived authentication cache (credential + parsed-policy memoization, ARCH 30).
 #[derive(Clone)]
 pub struct AuthChain {
     meta: Arc<dyn MetadataStore>,
@@ -242,7 +242,7 @@ impl AuthChain {
         AuthOutcome::NotApplicable
     }
 
-    /// Load and attach the user's identity (per-user) policy (ARCH §15 / user-centric authz). A
+    /// Load and attach the user's identity (per-user) policy (ARCH 15 / user-centric authz). A
     /// malformed stored policy, or a load error, fails closed — the principal proceeds with no
     /// identity policy (no grant), never a silently widened one.
     async fn attach_policy(&self, mut principal: Principal) -> Principal {

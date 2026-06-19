@@ -43,7 +43,7 @@ aws --endpoint-url http://localhost:7373 s3 cp s3://demo/hi.txt -        # -> he
 ## Configuration
 
 Configuration is **environment-only**: every setting is a `CAIRN_*` variable, validated on load
-(`cairn validate-config`) — there is no config file and no flags. The full reference is **ARCH §28**.
+(`cairn validate-config`) — there is no config file and no flags. The full reference is **ARCH 28**.
 Common knobs: `CAIRN_LISTEN_ADDR` (S3, default `0.0.0.0:7373`), `CAIRN_UI_ADDR` (console, default
 `0.0.0.0:7374`; set `off` for headless), `CAIRN_REGION`, `CAIRN_MASTER_KEY` (or `CAIRN_MASTER_KEY_RING`
 for rotation), `CAIRN_TLS_CERT_PATH` / `CAIRN_TLS_KEY_PATH`, `CAIRN_META_SHARDS`.
@@ -63,7 +63,7 @@ cargo build --release --bin cairn --target x86_64-unknown-linux-musl
 ```
 
 The workspace is ~14 crates under `crates/` (see **[`CLAUDE.md`](./CLAUDE.md)** for the map and
-ARCH §12 for the trait spine). Heavier conformance harnesses — boto3 (real AWS SDK),
+ARCH 12 for the trait spine). Heavier conformance harnesses — boto3 (real AWS SDK),
 crash-consistency, a two-node replication soak, and the MinIO warp benchmark — live in
 `conformance/` and run in CI.
 

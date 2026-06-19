@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Conformance gate for object sharing (ARCH §15.8): persistent share tokens and
+# Conformance gate for object sharing (ARCH 15.8): persistent share tokens and
 # interoperable SigV4 presigned URLs, exercised end to end against a freshly
 # bootstrapped Cairn server with plain curl.
 #

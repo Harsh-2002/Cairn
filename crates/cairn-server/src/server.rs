@@ -32,7 +32,7 @@ struct AppState {
     /// The Prometheus render handle.
     metrics: PrometheusHandle,
     /// Whether the request-metrics usage-analytics subsystem is enabled (`CAIRN_REQUEST_METRICS_*`,
-    /// ARCH §26.5). When off, no per-request counters accumulate on the hot path.
+    /// ARCH 26.5). When off, no per-request counters accumulate on the hot path.
     request_metrics_enabled: bool,
     /// The assembled S3/engine stack.
     stack: Arc<AppStack>,
@@ -68,7 +68,7 @@ pub async fn serve(
 
     // Optional native TLS. The served config lives behind a watch channel so a SIGHUP can
     // hot-reload the certificate/key from the same paths without dropping the listener
-    // (ARCH §27.2): the accept loop reads the current config per connection, and the reload
+    // (ARCH 27.2): the accept loop reads the current config per connection, and the reload
     // handler atomically publishes a new one (a bad new cert is logged and the old config kept).
     let tls_rx = match (&config.tls_cert_path, &config.tls_key_path) {
         (Some(cert), Some(key)) => {
@@ -382,7 +382,7 @@ async fn handle(
         let status = resp.status();
         let elapsed_dur = start.elapsed();
         let elapsed = elapsed_dur.as_secs_f64();
-        // A low-cardinality `route` label (ARCH §26): the request is bucketed into a small fixed set
+        // A low-cardinality `route` label (ARCH 26): the request is bucketed into a small fixed set
         // of route classes rather than the raw path, so the time series stay bounded.
         let route = classify_route(&path);
         metrics::counter!(
@@ -398,7 +398,7 @@ async fn handle(
             "route" => route,
         )
         .record(elapsed);
-        // Throughput counters (ARCH §26). Sizes are taken from the content-length declarations, the
+        // Throughput counters (ARCH 26). Sizes are taken from the content-length declarations, the
         // only bounded-cost proxy at this layer (bodies stream past without being buffered).
         if req_bytes > 0 {
             metrics::counter!("cairn_bytes_received_total").increment(req_bytes);
@@ -407,7 +407,7 @@ async fn handle(
         if resp_bytes > 0 {
             metrics::counter!("cairn_bytes_sent_total").increment(resp_bytes);
         }
-        // Usage-analytics ingestion (ARCH §26.5): count this completed request into the in-process
+        // Usage-analytics ingestion (ARCH 26.5): count this completed request into the in-process
         // aggregator. This is a single sharded hashmap bump — zero DB I/O on the hot path; the
         // background flush loop drains it periodically. Gated on the subsystem being enabled, and
         // skipped for infra/UI/share/root paths the classifier returns `None` for.
@@ -457,7 +457,7 @@ fn content_length(headers: &hyper::HeaderMap) -> u64 {
 }
 
 /// Bucket a request path into a small, fixed set of low-cardinality route classes for the metrics
-/// `route` label (ARCH §26). The raw path (which embeds bucket/key names) would explode the time
+/// `route` label (ARCH 26). The raw path (which embeds bucket/key names) would explode the time
 /// series, so it is collapsed to a coarse family: the infra endpoints by name, the management API,
 /// the web console assets, the signed share path, and otherwise the S3 data plane.
 fn classify_route(path: &str) -> &'static str {
@@ -479,7 +479,7 @@ fn classify_route(path: &str) -> &'static str {
 }
 
 /// Classify a completed request into a `(operation, bucket)` pair for usage-analytics ingestion
-/// (ARCH §26.5), or `None` for paths that should not be counted.
+/// (ARCH 26.5), or `None` for paths that should not be counted.
 ///
 /// `None` is returned for the infra endpoints (`/healthz`, `/readyz`, `/metrics`), the web console
 /// and its assets, the signed-share redeem path (`/p/…`), and the bare root (`/`) — none of which
@@ -594,7 +594,7 @@ async fn route_infra(state: &AppState, path: &str) -> Response<ResponseBody> {
     }
 }
 
-/// Readiness reflects real state (ARCH §6.4, §26.4): the process is ready only once startup
+/// Readiness reflects real state (ARCH 6.4, 26.4): the process is ready only once startup
 /// migrations and reconciliation have completed (the `ready` gate) AND both halves of the store are
 /// responsive — a trivial indexed read on the read pool (`list_buckets(None)`) AND a cheap probe of
 /// the single writer (it must be draining its queue, not wedged). `/healthz` stays pure liveness;
@@ -635,7 +635,7 @@ fn error_response(status: StatusCode, code: &str) -> Response<ResponseBody> {
 }
 
 /// Reload the TLS certificate/key on every `SIGHUP`, publishing the new config into `tls_tx` so
-/// subsequently-accepted connections use the rotated certificate (ARCH §27.2). A reload failure
+/// subsequently-accepted connections use the rotated certificate (ARCH 27.2). A reload failure
 /// (e.g. a half-written or invalid new cert) is logged and the previously-served config is kept,
 /// so a rotation mistake never takes the listener down. Each successful reload is logged.
 ///

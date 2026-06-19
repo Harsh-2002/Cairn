@@ -1,4 +1,4 @@
-//! Deterministic exponential backoff for replication retries (ARCH §20.4).
+//! Deterministic exponential backoff for replication retries (ARCH 20.4).
 
 /// Compute the backoff delay, in whole seconds, before the next replication attempt.
 ///

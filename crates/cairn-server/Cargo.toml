@@ -22,7 +22,7 @@ failpoints = ["cairn-blob/failpoints", "dep:fail"]
 # builds on every linker, including the aarch64 cross path (cargo-zigbuild / lld).
 meta-async = ["dep:cairn-meta-async"]
 
-# EXPERIMENTAL, Linux-only zero-copy I/O fast path (off by default; ARCH §7.x perf path).
+# EXPERIMENTAL, Linux-only zero-copy I/O fast path (off by default; ARCH 7.x perf path).
 #
 # Layer (a) kTLS offload: after the rustls handshake the resulting TLS socket is handed to the
 # kernel TLS (kTLS) machinery via the `ktls` crate so the kernel performs the symmetric record
@@ -76,7 +76,7 @@ tokio-rustls = { workspace = true, features = ["aws_lc_rs", "tls12"] }
 rustls-pemfile.workspace = true
 hyper = { workspace = true, features = ["server", "http1", "http2", "client"] }
 hyper-util = { workspace = true, features = ["tokio", "server-auto", "service", "client-legacy", "http1"] }
-# The remote-administration CLI (`cli_remote.rs`, ARCH §24.2) is a thin HTTP client over a running
+# The remote-administration CLI (`cli_remote.rs`, ARCH 24.2) is a thin HTTP client over a running
 # server's management API and S3 data plane. It reuses the same legacy hyper-util client + rustls
 # connector the replication sink uses, so the binary links no new HTTP stack: `hyper-rustls` dials
 # plaintext for `http://` endpoints and negotiates rustls for `https://`.

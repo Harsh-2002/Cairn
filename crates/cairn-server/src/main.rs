@@ -2,7 +2,7 @@
 //! the engine stack, and runs the HTTP server with ordered graceful shutdown. Also carries the
 //! node-local commands that operate directly on the data dir from config: `bootstrap` (mint the
 //! first administrator), `integrity` (on-demand reconciliation), `migrate` (run migrations and
-//! report the schema version), and `backup`/`restore` (the ARCH §31.4 consistent snapshot and its
+//! report the schema version), and `backup`/`restore` (the ARCH 31.4 consistent snapshot and its
 //! inverse). The full remote-admin CLI ships as `cairn-cli` in a later wave.
 
 // The default (and every non-`fast-io`) build keeps the strongest posture: `forbid(unsafe_code)`
@@ -58,7 +58,7 @@ enum Command {
     Bootstrap,
     /// Run reconciliation on demand (reclaim orphaned blobs); a node-local integrity check.
     ///
-    /// With `--repair`, additionally run in repair mode (ARCH §24.3/§29.4): drop metadata rows
+    /// With `--repair`, additionally run in repair mode (ARCH 24.3/29.4): drop metadata rows
     /// whose backing blob is missing on disk, so the store can re-serve the remaining keys cleanly.
     Integrity {
         /// Also drop metadata rows whose backing blob is missing (destructive repair).
@@ -67,20 +67,20 @@ enum Command {
     },
     /// Open the store (running migrations) and report the applied schema version.
     Migrate,
-    /// Take a consistent snapshot of the data dir into DIR (ARCH §31.4): checkpoint + copy the
+    /// Take a consistent snapshot of the data dir into DIR (ARCH 31.4): checkpoint + copy the
     /// database, then copy the blob tree excluding the staging area.
     Backup {
         /// Destination directory for the snapshot (created if absent).
         dir: PathBuf,
     },
     /// Restore a snapshot from DIR into the configured data dir, then run reconciliation
-    /// (ARCH §31.4): place the database and blobs, then reconcile.
+    /// (ARCH 31.4): place the database and blobs, then reconcile.
     Restore {
         /// Source snapshot directory produced by `backup`.
         dir: PathBuf,
     },
 
-    // --- Remote administration (ARCH §24.2): a thin client over a running server's management API
+    // --- Remote administration (ARCH 24.2): a thin client over a running server's management API
     //     and S3 data plane. These commands do not touch the local data dir or config; they are
     //     dispatched before `Config::load()`. Connection + output options come from the flattened
     //     `RemoteOpts` (flags or `CAIRN_*` env).
@@ -231,7 +231,7 @@ fn integrity(cfg: Config, repair: bool) -> ExitCode {
         }
 
         // Then, in repair mode, the inverse pass: drop metadata rows whose backing blob is missing
-        // on disk (ARCH §24.3/§29.4). The forward reconcile cannot detect these — it only walks the
+        // on disk (ARCH 24.3/29.4). The forward reconcile cannot detect these — it only walks the
         // blob tree — so repair walks the metadata instead, probes the blob store for each version's
         // backing object, and deletes the row when the blob is gone.
         if repair {
@@ -256,7 +256,7 @@ const REPAIR_PAGE_LIMIT: u32 = 1000;
 /// Upper bound on paging iterations per bucket, so a hostile/corrupt cursor can never spin forever.
 const REPAIR_MAX_PAGES: u32 = 100_000;
 
-/// Repair-mode reconciliation (ARCH §24.3/§29.4): drop every metadata row whose backing blob is
+/// Repair-mode reconciliation (ARCH 24.3/29.4): drop every metadata row whose backing blob is
 /// missing on disk. Walks each bucket's versions, resolves each non-delete-marker version's
 /// `storage_path`, probes the blob store for it, and submits a `DeleteVersion` mutation when the
 /// blob is absent. Returns the count of rows dropped.
@@ -353,12 +353,12 @@ async fn repair_dangling_rows(
 
 /// Open the metadata store (which runs any pending migrations) and report the resulting schema
 /// version. The server runs the same migrations at startup; this command is for operators who
-/// prefer to migrate explicitly (ARCH §11.2, §24.2).
+/// prefer to migrate explicitly (ARCH 11.2, 24.2).
 fn migrate(cfg: Config) -> ExitCode {
     if let Some(parent) = cfg.db_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    // `open` runs migrations on the write connection before returning (ARCH §11.2). We then read
+    // `open` runs migrations on the write connection before returning (ARCH 11.2). We then read
     // the applied version directly from `schema_migrations` rather than holding the store, which
     // keeps this command a thin reporter over the migration the open already performed.
     match cairn_meta::open(&cfg.db_path, &cairn_meta::OpenOptions::default()) {
@@ -391,7 +391,7 @@ fn schema_version(db_path: &std::path::Path) -> Result<i64, String> {
     .map_err(|e| e.to_string())
 }
 
-/// Take a consistent snapshot into `dir` (ARCH §31.4). The database is snapshotted first
+/// Take a consistent snapshot into `dir` (ARCH 31.4). The database is snapshotted first
 /// (checkpoint to fold the WAL into the main file, then copy it), and the blob tree is copied
 /// second excluding the staging area. Taking the database first guarantees the copied blob set is
 /// a superset of what the snapshot references, so restore finds a blob for every row; any extra
@@ -458,7 +458,7 @@ fn backup(cfg: Config, dir: &std::path::Path) -> ExitCode {
     })
 }
 
-/// Restore a snapshot from `dir` into the configured data dir, then reconcile (ARCH §31.4). The
+/// Restore a snapshot from `dir` into the configured data dir, then reconcile (ARCH 31.4). The
 /// database and blob tree produced by `backup` are placed, and reconciliation reclaims any blobs
 /// written after the snapshot was taken.
 fn restore(cfg: Config, dir: &std::path::Path) -> ExitCode {
@@ -506,7 +506,7 @@ fn restore(cfg: Config, dir: &std::path::Path) -> ExitCode {
             return ExitCode::FAILURE;
         }
 
-        // 2. Reconcile: reclaim any blobs from writes after the snapshot (ARCH §31.4).
+        // 2. Reconcile: reclaim any blobs from writes after the snapshot (ARCH 31.4).
         let store = match cairn_meta::open(&cfg.db_path, &cairn_meta::OpenOptions::default()) {
             Ok(s) => s,
             Err(e) => {
@@ -539,7 +539,7 @@ fn restore(cfg: Config, dir: &std::path::Path) -> ExitCode {
 }
 
 /// Recursively copy the per-bucket blob directories from `src` to `dst`, skipping the `.staging`
-/// area (in-progress writes are not part of a consistent snapshot, ARCH §31.4) and any database
+/// area (in-progress writes are not part of a consistent snapshot, ARCH 31.4) and any database
 /// sidecar files. Returns the number of top-level entries copied.
 async fn copy_blob_tree(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<u64> {
     tokio::fs::create_dir_all(dst).await?;
@@ -589,7 +589,7 @@ fn runtime(cfg: &Config) -> std::io::Result<tokio::runtime::Runtime> {
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.enable_all();
     // Size the blocking pool to cover the metadata read pool + blob I/O concurrency so neither
-    // starves the other (ARCH §30); compute parallelism is pinned only when set explicitly.
+    // starves the other (ARCH 30); compute parallelism is pinned only when set explicitly.
     builder.max_blocking_threads(cfg.effective_max_blocking_threads());
     if let Some(workers) = cfg.effective_worker_threads() {
         builder.worker_threads(workers);
@@ -746,7 +746,7 @@ mod tests {
     use super::{copy_blob_tree, schema_version};
 
     /// `copy_blob_tree` copies committed per-bucket blob directories but skips the staging area
-    /// and database sidecars, so a snapshot contains only durable blobs (ARCH §31.4).
+    /// and database sidecars, so a snapshot contains only durable blobs (ARCH 31.4).
     #[tokio::test]
     async fn backup_copies_blobs_but_excludes_staging_and_db() {
         let src = tempfile::tempdir().unwrap();
@@ -789,7 +789,7 @@ mod tests {
     }
 
     /// A backup of the blob tree, restored into a fresh data dir, reproduces every committed blob
-    /// and nothing from the staging area (the core of the §31.4 round-trip).
+    /// and nothing from the staging area (the core of the 31.4 round-trip).
     #[tokio::test]
     async fn backup_restore_blob_tree_round_trips() {
         let src = tempfile::tempdir().unwrap();

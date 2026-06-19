@@ -1,4 +1,4 @@
-//! Property test for `list_current` (ARCH §29.2, GAPS Medium #11).
+//! Property test for `list_current` (ARCH 29.2, GAPS Medium #11).
 //!
 //! The example-based `listing_prefix_delimiter_and_pagination` test in `tests/store.rs` pins a
 //! few hand-picked cases. This file adds the reference-oracle property the audit found missing:

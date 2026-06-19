@@ -34,7 +34,7 @@ tracing.workspace = true
 tokio-uring = { version = "0.5", optional = true }
 
 # Safe wrappers for the file-placement syscalls (fallocate/fadvise) used by the write fast path
-# (ARCH §7.5). rustix's API is safe — it borrows an `AsFd`, so the crate keeps `forbid(unsafe_code)`.
+# (ARCH 7.5). rustix's API is safe — it borrows an `AsFd`, so the crate keeps `forbid(unsafe_code)`.
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["fs"] }
 

@@ -1,5 +1,5 @@
 //! Builds and owns the concrete engine stack — the only place that names concrete
-//! implementations (ARCH §12.7). It opens the metadata store and blob store, wires the
+//! implementations (ARCH 12.7). It opens the metadata store and blob store, wires the
 //! authenticator chain and the S3 service, and runs startup reconciliation before serving.
 
 use crate::config::Config;
@@ -52,19 +52,19 @@ pub struct AppStack {
     /// backend** (one per `CAIRN_META_SHARDS`; a single entry when unsharded). The WAL
     /// checkpointer's `checkpoint()` and `wal_size_bytes()` are inherent methods on
     /// `SqliteMetadataStore`, not part of the `MetadataStore` trait object, so the concrete stores
-    /// are threaded through here rather than reached via `meta` (ARCH §8.4/§11.2). The libSQL and
+    /// are threaded through here rather than reached via `meta` (ARCH 8.4/11.2). The libSQL and
     /// Turso engines self-manage their WAL, so this is **empty** for them and the WAL-checkpointer
     /// background loop does not run.
     pub store: Vec<Arc<SqliteMetadataStore>>,
     /// A typed handle to the read-through config cache wrapping `meta`, kept so the metrics loop can
     /// scrape its `(hits, misses)` counters into `cairn_meta_cache_hits_total`/`_misses_total`
-    /// (ARCH §11.5). `meta` above is this same store behind the trait object; this handle exists
+    /// (ARCH 11.5). `meta` above is this same store behind the trait object; this handle exists
     /// only for the inherent `stats()` accessor, which is not part of the `MetadataStore` trait.
     pub meta_cache: Arc<CachedMetadataStore>,
     /// The master-key crypto facility, threaded to the replication drain so it can unseal stored
-    /// per-bucket remote replication targets (`ConfigAspect::ReplicationTargets`, ARCH §20.5).
+    /// per-bucket remote replication targets (`ConfigAspect::ReplicationTargets`, ARCH 20.5).
     pub crypto: Arc<SystemCrypto>,
-    /// The base domain for virtual-host-style S3 addressing (`CAIRN_S3_DOMAIN`, ARCH §13.1), e.g.
+    /// The base domain for virtual-host-style S3 addressing (`CAIRN_S3_DOMAIN`, ARCH 13.1), e.g.
     /// `s3.example.com`. When set, a request whose `Host` is `<bucket>.<s3_domain>` routes to that
     /// bucket with the whole path as the key; `None` leaves path-style addressing as the only form.
     pub s3_domain: Option<String>,
@@ -74,7 +74,7 @@ pub struct AppStack {
     /// The public base URL (`CAIRN_PUBLIC_BASE_URL`) shares/presigned links are built against; when
     /// `None`, the minting request's own scheme + Host is used.
     pub public_base_url: Option<String>,
-    /// The in-process request-metrics aggregator (ARCH §26.5). Every completed request bumps a
+    /// The in-process request-metrics aggregator (ARCH 26.5). Every completed request bumps a
     /// counter here (zero DB I/O on the hot path); the background flush loop drains it into a
     /// batched upsert through the single writer. Held behind an `Arc` so the request path and the
     /// flush loop share one accumulator.
@@ -90,7 +90,7 @@ impl std::fmt::Debug for AppStack {
 /// Build the cryptography facility from the configured master key ring (or single key, or a
 /// development key). With a ring (`CAIRN_MASTER_KEY_RING`, audit #29) new seals use the active key
 /// (`CAIRN_MASTER_KEY_ACTIVE_ID`, default = highest id) and the legacy (pre-ring, no-magic) blobs
-/// decrypt under the lowest id — the conventional original key (§3.4.1). The Phase-E seal-count
+/// decrypt under the lowest id — the conventional original key (3.4.1). The Phase-E seal-count
 /// base is primed later from durable state (`prime_seal_count`).
 pub(crate) fn build_crypto(cfg: &Config) -> Result<SystemCrypto, String> {
     if let Some(ring_json) = &cfg.master_key_ring {
@@ -196,7 +196,7 @@ const REWRAP_STREAMS: [&str; 3] = [
     "bucket_config.replication_targets",
 ];
 
-/// Pure retire-gate decision for one shard (audit #29 / spec §5.4). Given the key ids this shard has
+/// Pure retire-gate decision for one shard (audit #29 / spec 5.4). Given the key ids this shard has
 /// ever recorded, the current env ring ids, the active id, and the lowest `done_active_id` across
 /// the re-wrap streams, return the removed ids whose data is NOT proven re-wrapped off them.
 ///
@@ -289,12 +289,12 @@ fn open_sqlite_shard(db_path: &std::path::Path, opts: &OpenOptions) -> Result<Op
     Ok((meta, oracle, store))
 }
 
-/// Open the metadata store for the configured backend (ARCH §12.7). Returns the trait-object store
+/// Open the metadata store for the configured backend (ARCH 12.7). Returns the trait-object store
 /// (a [`cairn_meta::ShardedMetadataStore`] router when `meta_shards > 1`), the boxed reconcile
 /// oracle, and — for the `sqlite` backend only — the typed `SqliteMetadataStore` handles the WAL
 /// checkpointer drives (one per shard; empty for the self-WAL-managing libSQL/Turso engines).
 async fn open_meta(cfg: &Config) -> Result<OpenedMeta, String> {
-    // Throughput tuning from config (ARCH §28.2/§30), applied identically to whichever backend is
+    // Throughput tuning from config (ARCH 28.2/30), applied identically to whichever backend is
     // selected. `cache_size` follows SQLite's convention: negative => KiB of page cache.
     let synchronous_full = cfg.meta_synchronous == "full";
     let group_commit_linger = (cfg.meta_group_commit_linger_micros > 0)
@@ -423,7 +423,7 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
     // (None for the self-WAL-managing libSQL/Turso engines).
     let (inner_meta, oracle, store) = open_meta(cfg).await?;
 
-    // Front the store with the read-through config cache (ARCH §11.5) before handing it to the S3
+    // Front the store with the read-through config cache (ARCH 11.5) before handing it to the S3
     // and control services, so the hot authorization config reads (policy/ACL/CORS/public-access)
     // are memoised instead of re-reading SQLite per request. `meta_cache_bytes == 0` yields a pure
     // pass-through. The typed `meta_cache` handle is kept so the metrics loop can scrape `stats()`.
@@ -436,7 +436,7 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
         .with_io_pool_size(cfg.blob_io_pool_size);
 
     // Fail fast if the data root and staging are on different filesystems: the commit protocol's
-    // atomic rename would fail with EXDEV on every write (ARCH §2.4, §9.2, GAP medium #10).
+    // atomic rename would fail with EXDEV on every write (ARCH 2.4, 9.2, GAP medium #10).
     #[cfg(unix)]
     blob_impl
         .check_single_filesystem()
@@ -451,7 +451,7 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
     let crypto: Arc<dyn Crypto> = system_crypto.clone();
     let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
 
-    // The authentication cache (ARCH §30): credential + parsed-policy memoization keyed by
+    // The authentication cache (ARCH 30): credential + parsed-policy memoization keyed by
     // access-key-id / user-id, sharing the metadata cache's user-mutation epoch so a
     // create/update/deactivate/set-policy drops every cached entry immediately. The TTL is a
     // staleness backstop; `auth_cache_ttl_secs == 0` disables it.
@@ -514,7 +514,7 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
     // bound survives a restart. No-op for the async backends (no concrete shard handles).
     prime_key_state(&store, &system_crypto, cfg).await;
 
-    // Retire-gate (audit #29 / spec §5.4): refuse to start if a master key was removed from the ring
+    // Retire-gate (audit #29 / spec 5.4): refuse to start if a master key was removed from the ring
     // before its data was re-wrapped onto the active key — otherwise that data (object DEKs, SigV4
     // secrets) is unreadable and the failure surfaces only as a confusing flood of per-request
     // errors. Fail fast with a diagnostic naming the key id(s) and shard instead.

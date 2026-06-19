@@ -1,4 +1,4 @@
-//! The self-describing, block-based compressed blob format (ARCH §9.3, §10.3). An object is a
+//! The self-describing, block-based compressed blob format (ARCH 9.3, 10.3). An object is a
 //! sequence of independently (de)compressible fixed-size logical blocks, followed by an index
 //! and a fixed trailer, so a ranged read decompresses only the blocks overlapping the range.
 //! Each block is stored compressed only if it actually shrinks, so incompressible data never
@@ -9,7 +9,7 @@
 //! Trailer (34 bytes): magic(4) `CRNB`, version(1), algo(1), block_size(4), logical_len(8),
 //! block_count(4), index_offset(8), index_len(4).
 //!
-//! **SSE-S3 (ARCH §27).** When a data-encryption key (DEK) is supplied, the format version is
+//! **SSE-S3 (ARCH 27).** When a data-encryption key (DEK) is supplied, the format version is
 //! [`VERSION_ENCRYPTED`] and each block is encrypted with AES-256-GCM *after* compression
 //! (compress-then-encrypt, since ciphertext is incompressible). The per-block 12-byte nonce is
 //! derived deterministically from `(DEK, block_index)` as the first 12 bytes of
@@ -511,7 +511,7 @@ mod tests {
     }
 
     /// A compressed+encrypted blob round-trips: full read and a mid-block ranged read both return
-    /// the original plaintext when opened with the correct DEK (SSE-S3, ARCH §27).
+    /// the original plaintext when opened with the correct DEK (SSE-S3, ARCH 27).
     #[test]
     fn encrypted_roundtrip_full_and_ranges() {
         let data: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();

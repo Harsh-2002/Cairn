@@ -1,4 +1,4 @@
-//! The SigV4 streaming `aws-chunked` decoder (ARCH §21.7) — the single highest-risk ingest
+//! The SigV4 streaming `aws-chunked` decoder (ARCH 21.7) — the single highest-risk ingest
 //! component (F-5: getting it wrong corrupts objects silently). It is a streaming state machine
 //! over the raw body that emits ONLY de-framed payload bytes, never the framing. It keeps a
 //! bounded parse buffer so it is correct when the transport splits a header or payload across

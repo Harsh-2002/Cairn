@@ -1,4 +1,4 @@
-//! `cairn-xml` — the S3-compatible XML request/response codec (ARCH §13.4, §21.4).
+//! `cairn-xml` — the S3-compatible XML request/response codec (ARCH 13.4, 21.4).
 //!
 //! This crate is the single place where Cairn translates its domain types to and from the
 //! XML wire shapes S3 clients expect. Generators return owned `String`s (UTF-8, no BOM,
@@ -92,7 +92,7 @@ fn owner(w: &mut Writer<Cursor<Vec<u8>>>, id: &str, display: &str) {
 // ===========================================================================================
 
 /// The S3 `<Error>` document carrying the error code, human message, the resource path, and
-/// the request id (which also appears as a response header and trace span, ARCH §13.4).
+/// the request id (which also appears as a response header and trace span, ARCH 13.4).
 #[must_use]
 pub fn error_document(code: &str, message: &str, resource: &str, request_id: &str) -> String {
     let mut w = new_doc();
@@ -500,7 +500,7 @@ fn checksum_element(alg: ChecksumAlgorithm) -> &'static str {
     }
 }
 
-/// `GetObjectAttributesResponse` (ARCH §21.3, §34.3). Renders the subset of attributes Cairn
+/// `GetObjectAttributesResponse` (ARCH 21.3, 34.3). Renders the subset of attributes Cairn
 /// stores: the (unquoted) `ETag`, the `Checksum` block for any client-supplied checksums, the
 /// `ObjectParts` enumeration for multipart objects, the `StorageClass`, and the `ObjectSize`.
 ///
@@ -572,7 +572,7 @@ pub fn copy_part_result(etag: &ETag, last_modified: Timestamp) -> String {
 /// Each deleted entry is `(key, version_id, is_delete_marker, delete_marker_version_id)`:
 /// `version_id` is the version named in (or affected by) the delete; when the delete inserted a
 /// delete marker, `is_delete_marker` is `true` and `delete_marker_version_id` carries the new
-/// marker's id, which S3 surfaces as `<DeleteMarker>`/`<DeleteMarkerVersionId>` (ARCH §21.5).
+/// marker's id, which S3 surfaces as `<DeleteMarker>`/`<DeleteMarkerVersionId>` (ARCH 21.5).
 #[must_use]
 pub fn delete_result(
     deleted: &[(String, Option<String>, bool, Option<String>)],

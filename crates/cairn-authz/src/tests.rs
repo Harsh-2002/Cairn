@@ -1,4 +1,4 @@
-//! Table-driven matrix and property tests for the evaluation order (ARCH §15.3).
+//! Table-driven matrix and property tests for the evaluation order (ARCH 15.3).
 
 use super::*;
 use cairn_types::authz::{
@@ -127,7 +127,7 @@ fn user_stmt(effect: Effect, action: &str) -> Statement {
     }
 }
 
-// --- Identity (per-user) policy: ARCH §15 / user-centric authz --------------------------
+// --- Identity (per-user) policy: ARCH 15 / user-centric authz --------------------------
 
 #[test]
 fn user_policy_grants_member_scoped_get_not_put() {
@@ -357,7 +357,7 @@ fn bucket_owner_enforced_user_grant_also_ignored() {
     assert_eq!(evaluate(&input), Decision::Allow);
 }
 
-// --- Negated policy forms: NotAction / NotResource / NotPrincipal (ARCH §15.5) ----------
+// --- Negated policy forms: NotAction / NotResource / NotPrincipal (ARCH 15.5) ----------
 
 #[test]
 fn not_action_allow_grants_all_actions_except_listed() {

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Multi-host replication soak driver (ARCH §20, §29).
+"""Multi-host replication soak driver (ARCH 20, 29).
 
 Driven by conformance/soak.sh, which starts two Cairn nodes:
   * the TARGET (node-1) — a plain mirror;
@@ -9,7 +9,7 @@ This driver runs a sustained boto3 PUT workload against the SOURCE for `--durati
 while it runs:
 
   * enables versioning + a replication rule on the source bucket (replication requires versioning
-    and an enabled rule whose destination is the target bucket, ARCH §20);
+    and an enabled rule whose destination is the target bucket, ARCH 20);
   * every few seconds reads back a random sample of already-PUT objects from the TARGET and
     compares them BYTE-FOR-BYTE against what was written to the source -> any mismatch (wrong
     bytes, or not replicated within the grace window) is counted;

@@ -1,4 +1,4 @@
-//! Per-bucket **remote replication targets** (the MinIO model, ARCH §20.5).
+//! Per-bucket **remote replication targets** (the MinIO model, ARCH 20.5).
 //!
 //! A remote target binds a destination endpoint + credentials to a stable **ARN**; a bucket's
 //! replication *rules* reference a target by that ARN (`<Destination><Bucket>arn:cairn:…</Bucket>`)

@@ -2,7 +2,7 @@
 //! call runs inside its own savepoint (managed by the async writer), so returning `Err` rolls
 //! back only this mutation while its batch-mates commit. Preconditions are evaluated here, inside
 //! the transaction, so the check and the upsert are atomic with respect to every other writer
-//! (ARCH §11.6). The SQL, precondition logic, savepoint semantics, and outcomes are identical to
+//! (ARCH 11.6). The SQL, precondition logic, savepoint semantics, and outcomes are identical to
 //! the rusqlite store.
 
 use crate::driver::{AsyncSqlDriver, Value, query_one};
@@ -162,7 +162,7 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
             Ok(MutationOutcome::Ack)
         }
         Mutation::CreateBucket(b) => {
-            // `compression_policy` is the spec column name (ARCH §34.1); `quota_bytes` defaults to
+            // `compression_policy` is the spec column name (ARCH 34.1); `quota_bytes` defaults to
             // NULL (unlimited) since the frozen `Bucket` domain type carries no quota field.
             driver
                 .execute(
@@ -596,7 +596,7 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
         }
         Mutation::RecordRequestMetrics { rows, prune_before } => {
             // Accumulate each window/op/bucket/status bucket; the composite PK upsert sums counts,
-            // bytes, and latency histogram so repeated flushes never double-insert (ARCH §26.5).
+            // bytes, and latency histogram so repeated flushes never double-insert (ARCH 26.5).
             for r in &rows {
                 driver
                     .execute(
@@ -669,7 +669,7 @@ async fn put_version(
     })
 }
 
-/// Enforce a bucket's optional byte quota inside the commit transaction (ARCH §27.5/§28.2).
+/// Enforce a bucket's optional byte quota inside the commit transaction (ARCH 27.5/28.2).
 ///
 /// If the target bucket has a non-NULL `quota_bytes`, this rejects the write — with
 /// [`MetaError::QuotaExceeded`], which rolls back only this mutation's savepoint — when the
@@ -717,7 +717,7 @@ async fn enforce_bucket_quota(driver: &dyn AsyncSqlDriver, row: &ObjectVersionRo
     Ok(())
 }
 
-/// Enforce the owning user's optional byte quota inside the commit transaction (ARCH §27.5).
+/// Enforce the owning user's optional byte quota inside the commit transaction (ARCH 27.5).
 ///
 /// Mirrors [`enforce_bucket_quota`] but scoped to the row's `owner_id`: if that user has a
 /// non-NULL `quota_bytes`, the write is rejected with [`MetaError::QuotaExceeded`] when the
@@ -770,7 +770,7 @@ async fn enforce_user_quota(driver: &dyn AsyncSqlDriver, row: &ObjectVersionRow)
 
 /// Replace any existing row at (bucket,key,version_id) — capturing its blob for reclamation —
 /// demote the key's other versions, and insert the new latest row.
-/// Apply a signed delta to the maintained roll-up counters (Phase 2.1, ARCH §30) for `bucket` and
+/// Apply a signed delta to the maintained roll-up counters (Phase 2.1, ARCH 30) for `bucket` and
 /// `owner`. Byte-identical SQL to the rusqlite store's `adjust_stats`; runs in the same transaction
 /// as the row change so the counters never diverge from `object_versions`.
 async fn adjust_stats(

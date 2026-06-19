@@ -1,4 +1,4 @@
-//! The single, serialized, group-committing writer (ARCH §7.2). All mutations are submitted
+//! The single, serialized, group-committing writer (ARCH 7.2). All mutations are submitted
 //! to one writer task that owns the only write connection. It drains its queue, applies every
 //! waiting mutation in one transaction — each wrapped in its own savepoint so a logical
 //! failure rolls back only itself — commits once with a single durability barrier, and only
@@ -18,7 +18,7 @@ type WriteRequest = (Mutation, Ack);
 
 const MAX_BATCH: usize = 256;
 
-/// The result of a `PRAGMA wal_checkpoint(TRUNCATE)` run on the writer thread (ARCH §8.4/§11.2).
+/// The result of a `PRAGMA wal_checkpoint(TRUNCATE)` run on the writer thread (ARCH 8.4/11.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WalCheckpointStats {
     /// `true` if the checkpoint could not complete because the WAL was in use by a reader.
@@ -66,7 +66,7 @@ pub struct Writer {
     tx: mpsc::Sender<Job>,
     /// Number of mutations enqueued but not yet drained into a commit batch. Incremented on
     /// `submit` and decremented as the writer loop pulls each job off the channel. Exposed via
-    /// [`Writer::queue_depth`] for the `cairn_writer_queue_depth` gauge (ARCH §26.2). This is the
+    /// [`Writer::queue_depth`] for the `cairn_writer_queue_depth` gauge (ARCH 26.2). This is the
     /// inbound backlog signal — a sustained nonzero depth means writes are arriving faster than the
     /// single writer can commit them.
     queue_depth: Arc<AtomicUsize>,
@@ -124,7 +124,7 @@ impl Writer {
 
     /// Run a truncating WAL checkpoint on the writer thread — the only thread that owns the
     /// write connection — so it is serialized with mutations rather than racing them
-    /// (ARCH §8.4/§11.2). Resolves with the checkpoint's frame counts.
+    /// (ARCH 8.4/11.2). Resolves with the checkpoint's frame counts.
     pub async fn checkpoint(&self) -> Result<WalCheckpointStats, MetaError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx

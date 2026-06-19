@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Multi-host replication soak (ARCH §20, §29). Two Cairn nodes, a sustained PUT workload against
+# Multi-host replication soak (ARCH 20, 29). Two Cairn nodes, a sustained PUT workload against
 # the source, periodic byte-for-byte verification that objects replicated to the target, and a
 # leak check on the source's RSS.
 #
-# Topology (mirrors the single-target node->node replication shape in docs/operations.md §2):
+# Topology (mirrors the single-target node->node replication shape in docs/operations.md 2):
 #   node-1  = replication TARGET (the mirror; a plain Cairn).
 #   node-2  = SOURCE; configured with CAIRN_REPLICATION_ENDPOINT pointed at node-1, so its
 #             replication worker ships the source bucket's versions to node-1.

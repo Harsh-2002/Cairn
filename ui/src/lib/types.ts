@@ -71,7 +71,7 @@ export interface ListObjectsResp {
 export type ShareDisposition = "inline" | "attachment";
 export type ShareStatus = "active" | "expired" | "revoked";
 
-/** A persistent object-share (ARCH §15.8). */
+/** A persistent object-share (ARCH 15.8). */
 export interface ShareRecord {
   token: string;
   bucket: string;

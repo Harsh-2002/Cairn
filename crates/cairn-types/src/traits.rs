@@ -1,4 +1,4 @@
-//! The trait spine (ARCH §12). The protocol and control layers depend only on these
+//! The trait spine (ARCH 12). The protocol and control layers depend only on these
 //! interfaces; every concrete backend (`cairn-meta`, `cairn-blob`, `cairn-crypto`,
 //! `cairn-auth`, `cairn-authz`, `cairn-replication`) is replaceable, and the whole engine
 //! is unit-testable against the in-memory doubles in [`crate::testing`].
@@ -65,7 +65,7 @@ pub trait BlobStore: Send + Sync {
     /// `Some` — transparently decrypting each AES-256-GCM block with the supplied raw 32-byte
     /// data-encryption key, optionally for a range expressed in logical (plaintext) coordinates.
     /// An encrypted blob opened with the wrong (or no) DEK fails with [`BlobError::Corruption`]
-    /// rather than yielding plaintext (ARCH §27, SSE-S3).
+    /// rather than yielding plaintext (ARCH 27, SSE-S3).
     ///
     /// `compression` is the object version's stored compression descriptor, the source of truth
     /// for whether the blob is a self-describing CRNB block container. The reader trusts it (and
@@ -252,12 +252,12 @@ pub trait MetadataStore: Send + Sync {
     ) -> Result<Vec<OutboxEntry>, MetaError>;
     /// List replication-outbox entries the engine has marked terminal/failed (status `Failed`,
     /// i.e. retries exhausted with no further attempt scheduled), most recently due first, up to
-    /// `limit`. The control plane surfaces these for operator attention (ARCH §20.5/§22.2).
+    /// `limit`. The control plane surfaces these for operator attention (ARCH 20.5/22.2).
     async fn list_failed_replication(&self, limit: u32) -> Result<Vec<OutboxEntry>, MetaError>;
 
     // --- bucket quota ---
     /// Read a bucket's optional byte quota (`buckets.quota_bytes`), `None` when the bucket has
-    /// no quota set. The quota is enforced inside the writer's commit transaction (ARCH §27.5);
+    /// no quota set. The quota is enforced inside the writer's commit transaction (ARCH 27.5);
     /// this reader exposes the configured value to the control plane.
     async fn get_bucket_quota(&self, bucket: &BucketName) -> Result<Option<u64>, MetaError>;
 
@@ -280,7 +280,7 @@ pub trait MetadataStore: Send + Sync {
     /// does not exist). The raw stored JSON is returned; the caller parses/validates it.
     async fn get_user_policy(&self, user_id: &UserId) -> Result<Option<String>, MetaError>;
 
-    // --- object shares (ARCH §15.8) ---
+    // --- object shares (ARCH 15.8) ---
     /// Fetch a share by its token, or `None` if no such token exists. The caller checks
     /// revoked/expired state; the store returns the row verbatim.
     async fn get_share(&self, token: &str) -> Result<Option<ShareRow>, MetaError>;
@@ -291,7 +291,7 @@ pub trait MetadataStore: Send + Sync {
         key: Option<&ObjectKey>,
     ) -> Result<Vec<ShareRow>, MetaError>;
 
-    // --- object tag browsing (ARCH §17.2) ---
+    // --- object tag browsing (ARCH 17.2) ---
     /// Summarize the distinct object tags in use (each `key=value` with a current-object count),
     /// descending by count. Scoped to `bucket` when set, else across all buckets.
     async fn list_tag_summary(
@@ -316,7 +316,7 @@ pub trait MetadataStore: Send + Sync {
     /// Per-bucket aggregate counts (sorted by bucket name); empty buckets appear with zeros.
     async fn bucket_counts(&self) -> Result<Vec<BucketCounts>, MetaError>;
 
-    // --- request metrics (usage analytics, ARCH §26.5) ---
+    // --- request metrics (usage analytics, ARCH 26.5) ---
     /// Query the request-metrics rollup for the given range, downsampling the timeline into the
     /// range's window. `now_secs` is the current epoch-seconds reference for the lower bound.
     async fn query_request_metrics(
@@ -328,7 +328,7 @@ pub trait MetadataStore: Send + Sync {
 
 /// An authenticator examines a library-neutral request view and yields one of three
 /// outcomes. Implementations are composed into an ordered chain whose first applicable
-/// outcome decides (ARCH §12.3, §14).
+/// outcome decides (ARCH 12.3, 14).
 #[async_trait]
 pub trait Authenticator: Send + Sync {
     /// Attempt authentication.
@@ -336,7 +336,7 @@ pub trait Authenticator: Send + Sync {
 }
 
 /// The authorization engine: a pure function from fetched inputs to an allow/deny decision,
-/// with the fixed evaluation order of ARCH §15.3. No I/O.
+/// with the fixed evaluation order of ARCH 15.3. No I/O.
 pub trait AuthorizationEngine: Send + Sync {
     /// Evaluate a request.
     fn evaluate(&self, input: &AuthzInput) -> Decision;

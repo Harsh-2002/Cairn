@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Crash-consistency harness (ARCH §29.4, F-4; closes GAPS High #8).
+# Crash-consistency harness (ARCH 29.4, F-4; closes GAPS High #8).
 #
 # The durability ordering (fsync file -> rename -> fsync dir -> *then* metadata commit) means a
 # crash in the window between blob durability and the metadata commit leaves an *orphan blob*:

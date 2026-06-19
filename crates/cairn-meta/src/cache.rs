@@ -1,5 +1,5 @@
 //! A read-through cache decorator for the hot, read-mostly config reads consulted on the
-//! authorization path (ARCH §11.5 / finding F-10).
+//! authorization path (ARCH 11.5 / finding F-10).
 //!
 //! [`CachedMetadataStore`] wraps any [`MetadataStore`] and memoises exactly three lookups —
 //! [`get_bucket`](MetadataStore::get_bucket),

@@ -1,9 +1,9 @@
-//! `cairn-ui` — the embedded React management single-page application (ARCH §23).
+//! `cairn-ui` — the embedded React management single-page application (ARCH 23).
 //!
 //! The management UI is a React SPA built by Vite into `ui/dist`. That bundle is
 //! baked into the Cairn server binary at compile time via [`rust_embed`], so a Cairn
 //! deployment is a single binary that already contains its own management interface
-//! with no separate UI service to deploy or version-match (ARCH §23.1).
+//! with no separate UI service to deploy or version-match (ARCH 23.1).
 //!
 //! This crate exposes a tiny serving surface that the server's management-UI route
 //! family sits on top of:
@@ -13,7 +13,7 @@
 //!   shell.
 //! - [`spa_shell`] returns the application shell directly, for client-side routes that
 //!   do not correspond to a real asset (so framework routing survives a reload —
-//!   ARCH §23.3).
+//!   ARCH 23.3).
 //!
 //! Content types are inferred from the file extension via the `mime-guess` feature of
 //! `rust-embed`, falling back to `application/octet-stream`.
@@ -58,7 +58,7 @@ pub fn asset(path: &str) -> Option<(String, Cow<'static, [u8]>)> {
 ///
 /// The server returns this for management-UI paths that are not concrete assets so
 /// that the framework's client-side router can take over on a fresh load or reload
-/// (ARCH §23.3).
+/// (ARCH 23.3).
 ///
 /// # Panics
 ///

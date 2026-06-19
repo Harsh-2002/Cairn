@@ -1,5 +1,5 @@
 //! The single, total translator from the canonical [`Error`] to an S3 XML error response
-//! (ARCH §25). The match has no wildcard arm, so the compiler guarantees every error variant
+//! (ARCH 25). The match has no wildcard arm, so the compiler guarantees every error variant
 //! maps to a defined HTTP status and S3 error code.
 
 use crate::request::S3Response;

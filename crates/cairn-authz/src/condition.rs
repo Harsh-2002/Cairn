@@ -1,4 +1,4 @@
-//! Condition evaluation against a [`RequestContext`] (ARCH §15.6, Appendix §34.5).
+//! Condition evaluation against a [`RequestContext`] (ARCH 15.6, Appendix 34.5).
 //!
 //! An unrecognised condition key makes the statement *not* match (conservative), so an
 //! unknown condition can never broaden access.

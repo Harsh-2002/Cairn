@@ -39,7 +39,7 @@ const MAX_DELETE_PREFIX_ERRORS: usize = 1_000;
 
 /// A management-API response: an HTTP status, a JSON body, and a per-request id. The caller sets
 /// `content-type: application/json` and emits `request_id` as the `x-amz-request-id` header on
-/// every response, success or error (ARCH §25.1).
+/// every response, success or error (ARCH 25.1).
 #[derive(Debug, Clone)]
 pub struct ControlResponse {
     /// The HTTP status code.
@@ -205,7 +205,7 @@ impl ControlService {
         body: Bytes,
     ) -> ControlResponse {
         // One id per control request, carried into the JSON error envelope and emitted as the
-        // `x-amz-request-id` response header on every response (ARCH §25.1).
+        // `x-amz-request-id` response header on every response (ARCH 25.1).
         let request_id = Uuid::new_v4().simple().to_string();
         let resp = self.route(method, subpath, query, principal, body).await;
         resp.stamp_request_id(&request_id)
@@ -255,7 +255,7 @@ impl ControlService {
                 self.delete_prefix(name, query, principal).await
             }
 
-            // Persistent object-share management (ARCH §15.8). Minting is handled in the server
+            // Persistent object-share management (ARCH 15.8). Minting is handled in the server
             // adapter (it streams object bytes on redemption); listing and revoking are pure
             // metadata operations and live here.
             (&Method::GET, ["buckets", name, "objects", "shares"]) => {
@@ -339,7 +339,7 @@ impl ControlService {
 
     /// `GET /health`: liveness is unconditional (`status: "ok"`); readiness reflects a real probe
     /// of the metadata store — a bounded `list_buckets` call — rather than a hardcoded constant
-    /// (ARCH §26.4). The endpoint is always `200`; an unready store surfaces as `ready: false` so
+    /// (ARCH 26.4). The endpoint is always `200`; an unready store surfaces as `ready: false` so
     /// a load balancer can drain the node without the probe itself erroring.
     async fn health(&self, method: &Method) -> ControlResponse {
         if method != Method::GET {
@@ -483,7 +483,7 @@ impl ControlService {
     }
 
     // -----------------------------------------------------------------------------------
-    // Object tag browsing (ARCH §17.2)
+    // Object tag browsing (ARCH 17.2)
     // -----------------------------------------------------------------------------------
 
     /// `GET /tags[?bucket=<name>]`: the distinct object tags in use (`key=value`, each with a
@@ -921,7 +921,7 @@ impl ControlService {
     }
 
     // -----------------------------------------------------------------------------------
-    // Bucket configuration (ARCH §22.2)
+    // Bucket configuration (ARCH 22.2)
     // -----------------------------------------------------------------------------------
 
     /// `GET /buckets/{name}/config`: the bucket's versioning + ownership state alongside each
@@ -1211,7 +1211,7 @@ impl ControlService {
         };
 
         // The body is the raw policy JSON document. Validate it before storing so a malformed
-        // policy is rejected at the edge rather than failing open later (ARCH §15.5).
+        // policy is rejected at the edge rather than failing open later (ARCH 15.5).
         let policy_json = match std::str::from_utf8(body) {
             Ok(s) => s,
             Err(_) => return ControlResponse::bad_request("policy must be valid UTF-8 JSON"),
@@ -1319,7 +1319,7 @@ impl ControlService {
 
         // If a canned replication policy was requested, validate the destination bucket name and
         // build the policy JSON up front — before any state is created — so a bad bucket name is a
-        // clean `400` rather than a half-provisioned user (ARCH §20.5).
+        // clean `400` rather than a half-provisioned user (ARCH 20.5).
         let replication_policy = match req.replication_policy_bucket.as_deref() {
             Some(b) => match replication_policy_for_bucket(b) {
                 Ok(json) => Some(json),
@@ -1379,7 +1379,7 @@ impl ControlService {
         }
 
         // Attach the canned replication identity policy when requested, so the dedicated
-        // destination credential is minted ready to receive replicated writes (ARCH §20.5). The
+        // destination credential is minted ready to receive replicated writes (ARCH 20.5). The
         // policy JSON was validated above before any state was touched.
         if let Some(policy) = replication_policy {
             if let Err(e) = self
@@ -1685,7 +1685,7 @@ impl ControlService {
     }
 
     /// `PUT /users/{id}/quota`: set or clear a user's byte quota. The quota is enforced inside the
-    /// writer's commit transaction for the objects the user owns (ARCH §27.5); this endpoint only
+    /// writer's commit transaction for the objects the user owns (ARCH 27.5); this endpoint only
     /// persists the configured value (there is no by-id user-quota reader to echo it back, so the
     /// set is the contract — see the wire DTO note). Returns `204` on success.
     async fn set_user_quota(
@@ -1723,7 +1723,7 @@ impl ControlService {
     }
 
     // -----------------------------------------------------------------------------------
-    // Replication operations (ARCH §22.2)
+    // Replication operations (ARCH 22.2)
     // -----------------------------------------------------------------------------------
 
     /// `GET /replication/failed`: list outbox entries the engine has marked terminal/failed,
@@ -1753,7 +1753,7 @@ impl ControlService {
     }
 
     // -----------------------------------------------------------------------------------
-    // Per-bucket remote replication targets (ARCH §20.5)
+    // Per-bucket remote replication targets (ARCH 20.5)
     // -----------------------------------------------------------------------------------
 
     /// Read and parse a bucket's stored `ReplicationTargets` config-aspect document into the typed
@@ -1792,7 +1792,7 @@ impl ControlService {
 
     /// `POST /buckets/{name}/replication/targets`: seal the destination secret under the master
     /// key, mint a stable ARN, append the target to the bucket's stored set, and persist it. The
-    /// response returns only the minted ARN — the secret is never echoed back (ARCH §20.5).
+    /// response returns only the minted ARN — the secret is never echoed back (ARCH 20.5).
     async fn add_replication_target(
         &self,
         name: &str,
@@ -1918,7 +1918,7 @@ impl ControlService {
     }
 
     /// `POST /buckets/{name}/replication/retry`: requeue this bucket's terminally-failed outbox
-    /// entries for another attempt (ARCH §20.5). Observes the failed count first (bounded) so the
+    /// entries for another attempt (ARCH 20.5). Observes the failed count first (bounded) so the
     /// ack can report how many entries were requeued, then submits the retry mutation.
     async fn retry_replication(
         &self,
@@ -1966,7 +1966,7 @@ impl ControlService {
         )
     }
 
-    /// `POST /buckets/{name}/replication/resync`: trigger existing-object backfill (ARCH §20.5).
+    /// `POST /buckets/{name}/replication/resync`: trigger existing-object backfill (ARCH 20.5).
     /// Requires the bucket to have a replication configuration with at least one enabled rule whose
     /// `ExistingObjectReplication` is enabled. The actual enumeration runs as a spawned background
     /// task (a large bucket must not block the request); the entries it enqueues are idempotent, so
@@ -2206,7 +2206,7 @@ impl ControlService {
     /// Append an audit/activity entry for a mutating endpoint (best-effort). The `actor` is the
     /// authenticated administrator's Bearer access-key id — a stable, human-recognizable identity
     /// that survives display-name changes — so the audit trail names who performed each mutation
-    /// (ARCH §26.3). `None` only when no principal was threaded in (which the admin gate prevents
+    /// (ARCH 26.3). `None` only when no principal was threaded in (which the admin gate prevents
     /// for every mutating route).
     async fn record_activity(
         &self,
@@ -2302,7 +2302,7 @@ fn percent_decode(s: &str) -> String {
 /// Build the canned **replication** identity-policy JSON for a destination bucket: a Principal-less
 /// per-user policy granting the four actions a dedicated destination credential needs to receive
 /// replicated writes — `s3:ReplicateObject`, `s3:ReplicateDelete`, `s3:GetObject`, `s3:PutObject` —
-/// scoped to `arn:aws:s3:::<bucket>/*` (and the bucket ARN itself, for listing) (ARCH §20.5).
+/// scoped to `arn:aws:s3:::<bucket>/*` (and the bucket ARN itself, for listing) (ARCH 20.5).
 ///
 /// The destination bucket name is validated up front (a `400` on a bad name); the produced JSON is
 /// re-validated through `parse_user_policy` so a future action-spelling drift is caught here rather
@@ -2382,7 +2382,7 @@ fn generate_secret() -> String {
 }
 
 /// Page a bucket's current object versions and idempotently enqueue a replication-outbox entry for
-/// each one a backfill-enabled rule selects (existing-object replication / resync, ARCH §20.5).
+/// each one a backfill-enabled rule selects (existing-object replication / resync, ARCH 20.5).
 ///
 /// The entry id is deterministic (`backfill:{rule}:{key}:{version}`) and the enqueue is
 /// `INSERT OR IGNORE`, so a repeated resync is a no-op for already-queued versions and an

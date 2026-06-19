@@ -1,4 +1,4 @@
-// Share one object two ways (ARCH §15.8):
+// Share one object two ways (ARCH 15.8):
 //  • "Share link" (default): a persistent, revocable Cairn share — pick a duration
 //    or "Never expires", view-in-browser vs force-download, get a /p/{token} link.
 //  • "S3 link": a standard SigV4 presigned URL (download or upload), interoperable

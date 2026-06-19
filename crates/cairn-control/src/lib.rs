@@ -1,4 +1,4 @@
-//! `cairn-control` — the JSON management API for Cairn (ARCH §22). It is the admin-gated
+//! `cairn-control` — the JSON management API for Cairn (ARCH 22). It is the admin-gated
 //! control surface, distinct from the S3 data plane: JSON over HTTP, versioned in its path
 //! (`/api/v1`), and consumed by both the embedded web UI and the command-line interface.
 //!

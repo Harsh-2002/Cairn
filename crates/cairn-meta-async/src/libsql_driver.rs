@@ -19,7 +19,7 @@ const SQLITE_CONSTRAINT: i32 = 19;
 /// cache. libSQL's local `Connection::execute`/`query` re-compile the SQL on every call, so the
 /// hot apply/read statements would pay a fresh `sqlite3_prepare` each time; caching the compiled
 /// [`Statement`] keyed by SQL text mirrors the rusqlite store's `prepare_cached` write win
-/// (ARCH §30.3, Phase 1.1). Each driver wraps one connection that is used by exactly one task at a
+/// (ARCH 30.3, Phase 1.1). Each driver wraps one connection that is used by exactly one task at a
 /// time — the single writer task, or a reader holding that connection's pool lock for the whole
 /// read (`ReadPool`, audit #8) — so a cached `Statement` is never driven concurrently; the local
 /// `Mutex` here only guards the statement map, never an `await`.

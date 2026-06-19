@@ -1,5 +1,5 @@
 //! [`ShardedMetadataStore`]: partitions the metadata across N independent stores by bucket name
-//! (ARCH §30, Phase 3.2), so disjoint buckets commit through N independent single-writers in
+//! (ARCH 30, Phase 3.2), so disjoint buckets commit through N independent single-writers in
 //! parallel instead of contending on one. `CAIRN_META_SHARDS` selects N; the default `1` makes
 //! this a pure pass-through (every route resolves to the one shard, every fan-out is over one
 //! store), so a single-shard deployment is byte-for-byte the unsharded store.

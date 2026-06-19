@@ -1,5 +1,5 @@
 //! `cairn-blob` — the local-filesystem [`BlobStore`]. This is the ONLY crate that performs
-//! filesystem syscalls, and it owns the durable commit sequence (ARCH §8.2): stream to a
+//! filesystem syscalls, and it owns the durable commit sequence (ARCH 8.2): stream to a
 //! staging file, fsync the file, rename it into the per-bucket directory, fsync that
 //! directory (the F-1 fix), and only then return — so a committed blob is durable before any
 //! metadata references it. Object bytes live under opaque identifiers, never under the key, so
@@ -10,12 +10,12 @@
 mod commit;
 mod compress;
 mod hash;
-// Safe file-placement hints (preallocation + access advice) for the write fast path (ARCH §7.5).
+// Safe file-placement hints (preallocation + access advice) for the write fast path (ARCH 7.5).
 mod raw_io;
 #[cfg(feature = "io-uring")]
 mod uring;
 // The staging sink abstracts the durable-write file ops so the default `tokio::fs` path and the
-// optional io_uring path are interchangeable (ARCH §8.2). Each backend implements create →
+// optional io_uring path are interchangeable (ARCH 8.2). Each backend implements create →
 // streamed writes → commit (fsync file → rename → fsync dir) / abort with the same ordering.
 mod staging;
 
@@ -63,18 +63,18 @@ pub struct LocalBlobStore {
     /// unconditionally so the struct shape is feature-independent, but it can only be set `true`
     /// under the feature (see [`LocalBlobStore::with_io_uring`]).
     use_uring: bool,
-    /// Bounds the number of concurrent blob transfers (ARCH §7.4). Each stage/read/assemble holds a
+    /// Bounds the number of concurrent blob transfers (ARCH 7.4). Each stage/read/assemble holds a
     /// permit for the duration of its file I/O, so a flood of large transfers can occupy at most
     /// this many of the runtime's blocking-pool threads and cannot starve the threads the reactor
     /// and metadata reads need. Sized to the device's useful I/O concurrency.
     io_permits: Arc<tokio::sync::Semaphore>,
     /// Coalesces the per-bucket-directory fsync of the commit sequence: concurrent PUTs into the
-    /// same bucket share one directory fsync instead of issuing one each (ARCH §8.2). Shared across
+    /// same bucket share one directory fsync instead of issuing one each (ARCH 8.2). Shared across
     /// clones of the store, so every writer feeds the same coordinator.
     dir_sync: Arc<commit::DirSyncCoalescer>,
 }
 
-/// The default bound on concurrent blob transfers when not overridden (ARCH §7.4). A reasonable
+/// The default bound on concurrent blob transfers when not overridden (ARCH 7.4). A reasonable
 /// general value for SSD/NVMe-backed storage; tune down for spinning disks, up for fast arrays.
 pub const DEFAULT_BLOB_IO_CONCURRENCY: usize = 64;
 
@@ -111,7 +111,7 @@ impl LocalBlobStore {
         self
     }
 
-    /// Set the bound on concurrent blob transfers (ARCH §7.4). A value of `0` is treated as `1` so
+    /// Set the bound on concurrent blob transfers (ARCH 7.4). A value of `0` is treated as `1` so
     /// the store always makes progress. Defaults to [`DEFAULT_BLOB_IO_CONCURRENCY`].
     #[must_use]
     pub fn with_io_pool_size(mut self, permits: usize) -> Self {
@@ -119,7 +119,7 @@ impl LocalBlobStore {
         self
     }
 
-    /// Acquire one blob-I/O permit, bounding concurrent transfers (ARCH §7.4). Held by the caller
+    /// Acquire one blob-I/O permit, bounding concurrent transfers (ARCH 7.4). Held by the caller
     /// for the duration of its file I/O. The semaphore is never closed, so this never errors in
     /// practice; the `Result` is for forward-compatibility with a shutdown that closes it.
     async fn acquire_io(&self) -> Result<tokio::sync::SemaphorePermit<'_>, BlobError> {
@@ -156,7 +156,7 @@ impl LocalBlobStore {
     }
 
     /// Verify that the data root and its staging directory live on a single filesystem, as the
-    /// commit protocol's atomic rename requires (ARCH §2.4, §9.2): a cross-device rename fails
+    /// commit protocol's atomic rename requires (ARCH 2.4, 9.2): a cross-device rename fails
     /// with `EXDEV` and would break durability. The server calls this at startup so a
     /// misconfiguration (for example a staging directory bind-mounted from another filesystem)
     /// fails fast with a clear diagnostic instead of a generic error at the first write.
@@ -174,7 +174,7 @@ impl LocalBlobStore {
         if root_dev != staging_dev {
             return Err(BlobError::Io(format!(
                 "data root {} (dev {root_dev}) and staging directory {} (dev {staging_dev}) are on \
-                 different filesystems; atomic rename requires one filesystem (ARCH §2.4)",
+                 different filesystems; atomic rename requires one filesystem (ARCH 2.4)",
                 root.display(),
                 staging.display(),
             )));
@@ -190,7 +190,7 @@ pub(crate) async fn fsync_dir(dir: &Path) -> Result<(), BlobError> {
 }
 
 /// Ensure a per-bucket directory exists, fsyncing `data_root` when the directory entry is newly
-/// created (F-1, ARCH §8.2 step 4). `create_dir_all` makes the directory durable only once its
+/// created (F-1, ARCH 8.2 step 4). `create_dir_all` makes the directory durable only once its
 /// own parent records the new entry: a power loss after the rename but before `data_root` is
 /// fsynced can lose the bucket directory entry, orphaning the committed blob inside it. We detect
 /// newness by probing for existence first, so the extra parent fsync is paid only on the rare
@@ -236,7 +236,7 @@ async fn write_staged(
     // encrypts each physical block after compression, so an encrypted-but-uncompressed object still
     // flows through the block encoder with `CompressionAlgorithm::None`. The MD5/ETag is computed
     // over the plaintext (here, via `hashers`) before any transform, so it is identical with or
-    // without compression/encryption (ARCH §21.1, §27).
+    // without compression/encryption (ARCH 21.1, 27).
     let block_pol = compress.or_else(|| {
         opts.encryption.map(|_| CompressionPolicy {
             algorithm: CompressionAlgorithm::None,
@@ -387,7 +387,7 @@ fn read_stream(
                 let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, BlobError>>(4);
                 tokio::task::spawn_blocking(move || {
                     // The permit is held for the whole transfer so it counts against the blob-I/O
-                    // bound (ARCH §7.4), then released when this task ends.
+                    // bound (ARCH 7.4), then released when this task ends.
                     let _permit = permit;
                     if let Err(e) = stream_blob(&path, compressed, dek, offset, len, &tx) {
                         let _ = tx.blocking_send(Err(e));
@@ -455,7 +455,7 @@ impl BlobStore for LocalBlobStore {
         body: cairn_types::BodyStream,
         opts: StageOptions,
     ) -> Result<StagedBlob, BlobError> {
-        // Bound concurrent blob *copy* I/O (ARCH §7.4). Held through the data copy and the per-file
+        // Bound concurrent blob *copy* I/O (ARCH 7.4). Held through the data copy and the per-file
         // durability (fdatasync + rename), then released BEFORE the coalesced directory-fsync
         // barrier (Phase 2.4) so a PUT awaiting that barrier no longer occupies blob-I/O concurrency
         // that concurrent GETs need — reads stop queueing behind writers' fsync barriers. The
@@ -478,7 +478,7 @@ impl BlobStore for LocalBlobStore {
             }
         };
         // Create (and fsync the parent of) the bucket directory *before* the rename, so the
-        // commit can rename into an already-durable directory entry (F-1, ARCH §8.2 step 4). The
+        // commit can rename into an already-durable directory entry (F-1, ARCH 8.2 step 4). The
         // commit performs: fdatasync the staged file → rename. The destination-directory fsync that
         // makes the new entry durable is then issued through the coalescer, which batches it with
         // any concurrent PUTs into the same bucket into a single fsync. `sync_dir` resolves only
@@ -567,7 +567,7 @@ impl BlobStore for LocalBlobStore {
             None => (0, logical_len, None),
         };
 
-        // Hold a blob-I/O permit for the streamed transfer (ARCH §7.4); released when the read
+        // Hold a blob-I/O permit for the streamed transfer (ARCH 7.4); released when the read
         // task finishes. (The kernel sendfile fast path below is bounded separately by the server.)
         let permit = self.acquire_io_owned().await?;
         let body = read_stream(file_path.clone(), compressed, dek, offset, len, permit);
@@ -674,7 +674,7 @@ impl BlobStore for LocalBlobStore {
             })
         });
         // The assembled object's size is the sum of the parts' plaintext sizes — known up front, so
-        // preallocate the staging file to place it contiguously (ARCH §7.5).
+        // preallocate the staging file to place it contiguously (ARCH 7.5).
         let assembled_len: u64 = parts.iter().map(|p| p.size).sum();
         let mut sink = Staging::create(staging, self.use_uring, Some(assembled_len)).await?;
         use md5::Digest;
@@ -936,7 +936,7 @@ async fn reconcile_staging(
             // A leftover single-part staging artifact, possibly from a crash — but possibly an
             // in-flight write from a live process. Only reclaim it once it is older than the
             // safety margin, so an out-of-band reconcile against a live data dir cannot delete a
-            // STAGING/{id}.tmp file that a concurrent write is still streaming into (ARCH §8.5).
+            // STAGING/{id}.tmp file that a concurrent write is still streaming into (ARCH 8.5).
             if staging_artifact_expired(&entry, opts.staging_safety_margin_secs, now).await? {
                 if tokio::fs::remove_file(entry.path()).await.is_ok() {
                     report.staging_cleaned += 1;
@@ -969,7 +969,7 @@ async fn reconcile_staging(
 /// future relative to `now`) is treated as fresh and preserved, erring toward never deleting a
 /// possibly-live in-flight write.
 /// Whether `path`'s mtime is within `margin_secs` of `now` — too recently written to safely reclaim
-/// as an orphan (it may be an in-flight PUT whose metadata row has not yet committed, ARCH §9). A
+/// as an orphan (it may be an in-flight PUT whose metadata row has not yet committed, ARCH 9). A
 /// margin of `0` (tests) or a path that cannot be stat-ed (already deleted, racing) is treated as
 /// not-young so the caller proceeds. The inverse of [`staging_artifact_expired`]'s age check.
 async fn blob_too_young(path: &Path, margin_secs: i64, now: Timestamp) -> bool {
@@ -1023,7 +1023,7 @@ mod tests {
     }
 
     /// A fresh `.staging` artifact (younger than the margin) is preserved while an old one is
-    /// reclaimed, so an out-of-band reconcile cannot delete an in-flight write (ARCH §8.5).
+    /// reclaimed, so an out-of-band reconcile cannot delete an in-flight write (ARCH 8.5).
     #[tokio::test]
     async fn staging_safety_margin_preserves_fresh_reclaims_old() {
         let dir = tempfile::tempdir().unwrap();
@@ -1082,7 +1082,7 @@ mod tests {
     }
 
     /// `ensure_bucket_dir` is a no-op-and-still-Ok on an existing directory and creates a missing
-    /// one; the durable parent fsync runs only on the create path (F-1, ARCH §8.2 step 4).
+    /// one; the durable parent fsync runs only on the create path (F-1, ARCH 8.2 step 4).
     #[tokio::test]
     async fn ensure_bucket_dir_creates_and_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
@@ -1118,7 +1118,7 @@ mod tests {
     }
 
     /// The data root and its in-root staging directory share one filesystem, so the startup check
-    /// passes for a normal temp dir (ARCH §2.4, §9.2).
+    /// passes for a normal temp dir (ARCH 2.4, 9.2).
     #[cfg(unix)]
     #[tokio::test]
     async fn single_filesystem_check_passes_for_same_fs() {

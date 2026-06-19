@@ -1,9 +1,9 @@
-//! The remote-administration CLI client (ARCH §24.2).
+//! The remote-administration CLI client (ARCH 24.2).
 //!
 //! This module is a thin HTTP client over the running server's two surfaces:
 //!
-//!  * the **management JSON API** under `/api/v1` (ARCH §22) — admin-gated, authenticated with a
-//!    first-party Bearer token `Authorization: Bearer <access>.<secret>` (ARCH §14.4); and
+//!  * the **management JSON API** under `/api/v1` (ARCH 22) — admin-gated, authenticated with a
+//!    first-party Bearer token `Authorization: Bearer <access>.<secret>` (ARCH 14.4); and
 //!  * the **S3 data plane** at `/{bucket}/{key}` for object get/put/delete, which accepts the very
 //!    same Bearer token (the authenticator chain treats `Bearer …` uniformly across both surfaces),
 //!    so object operations need no SigV4 signing here.
@@ -79,7 +79,7 @@ pub enum RemoteCommand {
         #[command(subcommand)]
         cmd: ObjectCmd,
     },
-    /// Object sharing: persistent share links + interoperable presigned URLs (ARCH §15.8).
+    /// Object sharing: persistent share links + interoperable presigned URLs (ARCH 15.8).
     Share {
         #[command(subcommand)]
         cmd: ShareCmd,

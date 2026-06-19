@@ -5,22 +5,22 @@ Object bytes are plain files on a POSIX filesystem; all metadata is an embedded 
 (the single source of truth). It ships as one static binary with transparent compression, native
 TLS, async bucket replication, an embedded React console, and a CLI.
 
-> **[`ARCH.md`](./ARCH.md) is the authoritative engineering specification (§0–34).** It is the
+> **[`ARCH.md`](./ARCH.md) is the authoritative engineering specification (0–34).** It is the
 > source of truth; this file is only the index. Read the relevant ARCH.md section before any
 > non-trivial change, and keep changes consistent with it.
 
 ## Documentation map
 
 - **[`ARCH.md`](./ARCH.md)** — architecture & spec. Jump to the section you're touching: data plane
-  & concurrency §6–7, durability/crash-consistency §8, on-disk layout §9, metadata store §11,
-  abstraction traits §12, S3 surface §13, auth §14, authz §15, replication §20, request lifecycles
-  §21, error model §25, security/threat model §27, **configuration reference §28**, testing &
-  conformance §29.
+  & concurrency 6–7, durability/crash-consistency 8, on-disk layout 9, metadata store 11,
+  abstraction traits 12, S3 surface 13, auth 14, authz 15, replication 20, request lifecycles
+  21, error model 25, security/threat model 27, **configuration reference 28**, testing &
+  conformance 29.
 - **[`DESIGN.md`](./DESIGN.md)** — the management console's visual design system (read for UI work).
 - **[`docs/`](./docs)** — `operations.md` (deployment + the master-key rotation runbook),
   `backup-restore.md`, `s3-api-matrix.md`, `benchmarks.md`.
 - **[`README.md`](./README.md)** — overview. (Its "Try it"/"Running" ports and config-layering text
-  are out of date; this file and ARCH §28 reflect the current env-only, two-port reality.)
+  are out of date; this file and ARCH 28 reflect the current env-only, two-port reality.)
 
 ## Build, test, and the gate
 
@@ -65,7 +65,7 @@ cargo nextest run --workspace                                # + cargo test --wo
 
 - **Configuration is environment-only.** Everything is `CAIRN_*` env vars parsed by strict Figment
   (`deny_unknown_fields`) — no config file, no CLI flags. Add new knobs to
-  `crates/cairn-server/src/config.rs` with a doc comment **and** validation (ARCH §28).
+  `crates/cairn-server/src/config.rs` with a doc comment **and** validation (ARCH 28).
 - **Two listeners.** S3 data plane on `:7373` (`CAIRN_LISTEN_ADDR`); web console + `/api/v1` on
   `:7374` (`CAIRN_UI_ADDR`; set to `off`/`none` for headless). `/healthz`, `/readyz`, `/metrics` are
   served on the S3 port, ahead of the concurrency limiter.
@@ -79,7 +79,7 @@ cargo nextest run --workspace                                # + cargo test --wo
   plaintext, zeros, or partial data. Secrets are sealed at rest and are never logged, echoed, or
   returned by any endpoint. Master key via `CAIRN_MASTER_KEY` (or a `CAIRN_MASTER_KEY_RING`;
   rotation runbook in `docs/operations.md`).
-- **Durability is the contract** (ARCH §8): stage → fsync file → rename → fsync dir → validate hashes
+- **Durability is the contract** (ARCH 8): stage → fsync file → rename → fsync dir → validate hashes
   → commit the metadata transaction (the single linearization point) → reclaim superseded blobs.
   Don't reorder these steps.
 - Every fix lands with a regression test in the owning crate, and the full gate is green, before it

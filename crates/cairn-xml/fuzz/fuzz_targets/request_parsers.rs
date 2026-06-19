@@ -1,5 +1,5 @@
 #![no_main]
-//! Fuzz the S3 request-body XML parsers (ARCH §29.3, GAPS Medium #11). Every public parser
+//! Fuzz the S3 request-body XML parsers (ARCH 29.3, GAPS Medium #11). Every public parser
 //! entry point folds malformed input — invalid UTF-8, unbalanced tags, missing required
 //! fields, out-of-range numbers — to a typed `Error::MalformedXml`; none may ever panic. We
 //! feed the same arbitrary bytes through each parser so libfuzzer can drive all of them with a

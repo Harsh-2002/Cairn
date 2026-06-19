@@ -47,7 +47,7 @@ pub trait BucketRoutedSink: Send + Sync {
 }
 
 /// Chooses which [`BucketRoutedSink`] ships a given outbox entry, keyed by the entry's rule's
-/// remote-target ARN (ARCH §20.5).
+/// remote-target ARN (ARCH 20.5).
 ///
 /// Per-bucket remote targets mean different rules can ship to different destinations; the engine
 /// asks a router for the sink that serves a particular target ARN. A `None` ARN is the legacy

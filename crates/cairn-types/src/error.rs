@@ -1,7 +1,7 @@
 //! The typed error tree. Each subsystem returns its own domain error from its trait
 //! methods; the protocol/control layers fold these into the canonical [`Error`], which a
 //! single translator (in `cairn-protocol` / `cairn-control`) maps totally to an S3 XML or JSON
-//! response (ARCH §25). Keeping every wire-mappable condition in one enum is what makes
+//! response (ARCH 25). Keeping every wire-mappable condition in one enum is what makes
 //! that translator total and testable.
 
 use crate::id::InvalidName;
@@ -128,7 +128,7 @@ pub enum ConfigError {
     Invalid(String),
 }
 
-/// The canonical, wire-mappable error. Every condition in the ARCH §25.2 mapping table
+/// The canonical, wire-mappable error. Every condition in the ARCH 25.2 mapping table
 /// is a variant here; the single translator maps each to an HTTP status + S3/JSON code.
 #[derive(Debug, Error)]
 pub enum Error {
@@ -172,7 +172,7 @@ pub enum Error {
     #[error("malformed xml")]
     MalformedXml,
     /// A tag set violated the S3 tag limits (count, key/value length, charset, duplicates, or a
-    /// reserved `aws:` key prefix) — distinct from a malformed body (ARCH §17.1).
+    /// reserved `aws:` key prefix) — distinct from a malformed body (ARCH 17.1).
     #[error("invalid tag: {0}")]
     InvalidTag(String),
     /// A policy document was malformed.

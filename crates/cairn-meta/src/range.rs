@@ -1,5 +1,5 @@
 //! Byte/character helpers that make listing a half-open range seek on the indexed key
-//! column (ARCH §11.4, F-11) rather than a scan. Their correctness is the correctness of
+//! column (ARCH 11.4, F-11) rather than a scan. Their correctness is the correctness of
 //! listing and pagination, so they are unit-tested against empty, maximal, and multibyte
 //! inputs.
 //!

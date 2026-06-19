@@ -1,4 +1,4 @@
-//! The SQLite schema and the async migration runner (ARCH §34.1). The migration SQL is copied
+//! The SQLite schema and the async migration runner (ARCH 34.1). The migration SQL is copied
 //! verbatim from `cairn-meta/src/schema.rs` so the libSQL store materialises a byte-for-byte
 //! identical schema (the same v1..v3 sequence, including the v3 `sse_descriptor` column).
 //! Migrations run on the write connection at startup, before any request is served, and are
@@ -147,7 +147,7 @@ CREATE INDEX idx_activity_at ON activity (at);
     },
     Migration {
         version: 2,
-        name: "storage_path index, bucket quota, schema-name alignment (ARCH §8/§27.5/§34)",
+        name: "storage_path index, bucket quota, schema-name alignment (ARCH 8/27.5/34)",
         sql: r#"
 -- F-8: a seek index over storage_path so reconcile's per-batch membership lookups and
 -- enumerate_storage_paths range-seek instead of full-scanning object_versions, and so the
@@ -156,23 +156,23 @@ CREATE INDEX idx_object_versions_storage_path ON object_versions (storage_path);
 CREATE INDEX idx_multipart_parts_storage_path ON multipart_parts (storage_path);
 
 -- The (bucket_name, key, version_id) UNIQUE constraint already materialises an auto-index that
--- serves current-version lookup and version listing (ARCH §34.2), so this explicit duplicate is
+-- serves current-version lookup and version listing (ARCH 34.2), so this explicit duplicate is
 -- redundant dead weight; drop it.
 DROP INDEX idx_object_versions_bkv;
 
--- §27.5/§28.2: an optional per-bucket byte quota enforced inside the commit transaction.
+-- 27.5/28.2: an optional per-bucket byte quota enforced inside the commit transaction.
 -- NULL means unlimited.
 ALTER TABLE buckets ADD COLUMN quota_bytes INTEGER;
 
--- §34.1/§34: the spec names this column compression_policy; the v1 column was compression.
+-- 34.1/34: the spec names this column compression_policy; the v1 column was compression.
 ALTER TABLE buckets RENAME COLUMN compression TO compression_policy;
 "#,
     },
     Migration {
         version: 3,
-        name: "SSE-S3 object encryption descriptor (ARCH §27)",
+        name: "SSE-S3 object encryption descriptor (ARCH 27)",
         sql: r#"
--- §27 SSE-S3: a nullable per-version descriptor for server-side-encrypted object data. The JSON
+-- 27 SSE-S3: a nullable per-version descriptor for server-side-encrypted object data. The JSON
 -- document is {alg, wrapped_dek_b64, nonce_b64}: the algorithm, the data-encryption key sealed
 -- under the master key (base64), and the wrapping nonce (base64). NULL means the object's data is
 -- stored unencrypted. The raw DEK is never persisted; only its wrapped form lives here.
@@ -181,7 +181,7 @@ ALTER TABLE object_versions ADD COLUMN sse_descriptor TEXT;
     },
     Migration {
         version: 4,
-        name: "per-user identity policy (ARCH §15 / user-centric authz)",
+        name: "per-user identity policy (ARCH 15 / user-centric authz)",
         sql: r#"
 -- An AWS-IAM-style identity policy attached to a user, evaluated for that user's S3 requests in
 -- union with bucket policy/ACL. The JSON document is a Principal-less policy (the principal IS this
@@ -225,7 +225,7 @@ ALTER TABLE replication_outbox ADD COLUMN target_arn TEXT;
         version: 7,
         name: "object share tokens (persistent public sharing)",
         sql: r#"
--- Persistent, revocable, optionally-forever object-share tokens (ARCH §15.8). The opaque token is
+-- Persistent, revocable, optionally-forever object-share tokens (ARCH 15.8). The opaque token is
 -- the bearer capability served at GET /p/{token}; revoke flips revoked_at with no global key
 -- rotation. version_id NULL follows the current version; expires_at NULL is a forever share.
 CREATE TABLE object_shares (
@@ -248,7 +248,7 @@ CREATE INDEX idx_object_shares_created_by ON object_shares (created_by);
         version: 8,
         name: "request metrics rollup (usage analytics)",
         sql: r#"
--- Per-window rollup of API request counts for the console's usage analytics (ARCH §26.5). Each row
+-- Per-window rollup of API request counts for the console's usage analytics (ARCH 26.5). Each row
 -- is one (window, operation, bucket, status-class) bucket; the in-process aggregator flushes batched
 -- upserts that accumulate `count`, and a periodic prune drops rows older than the retention window.
 -- bucket_name is '' (never NULL) for non-bucket operations. The composite PRIMARY KEY gives the
@@ -268,7 +268,7 @@ CREATE INDEX idx_request_metrics_ts ON request_metrics (ts_bucket);
         version: 9,
         name: "request metrics bytes + latency capture",
         sql: r#"
--- Enrich the request-metrics rollup (ARCH §26.5) with transferred bytes and a latency histogram so
+-- Enrich the request-metrics rollup (ARCH 26.5) with transferred bytes and a latency histogram so
 -- the console can chart throughput and p95/avg latency, not just request counts. Old v8 rows keep 0
 -- for every new column (they predate the capture). lat_sum_ms drives the average; the six histogram
 -- buckets (boundaries 5/20/50/200/1000 ms, last is the >1000ms overflow) drive the percentiles.
@@ -288,14 +288,14 @@ ALTER TABLE request_metrics ADD COLUMN lat_gt_1000 INTEGER NOT NULL DEFAULT 0;
         name: "object tags reverse index (tag browser)",
         sql: r#"
 -- The object_tags PK is (bucket, key, version, tag_key) — indexed by object. The tag browser
--- (ARCH §17.2) asks the reverse question — which objects carry a given tag — so add a covering
+-- (ARCH 17.2) asks the reverse question — which objects carry a given tag — so add a covering
 -- index on (tag_key, tag_value) so "list all tags" and "objects by tag" are index seeks, not scans.
 CREATE INDEX idx_object_tags_kv ON object_tags (tag_key, tag_value);
 "#,
     },
     Migration {
         version: 11,
-        name: "partial covering index for current-version reads (ARCH §30.3)",
+        name: "partial covering index for current-version reads (ARCH 30.3)",
         sql: r#"
 -- A partial, covering index for the hot current-version read paths (Phase 1.7). The latest-only
 -- listing (`fetch_rows`) and single-key current-version lookups all filter `is_latest = 1`; this
@@ -314,7 +314,7 @@ CREATE INDEX idx_ov_latest_cover ON object_versions
     },
     Migration {
         version: 12,
-        name: "maintained per-bucket / per-user roll-up counters (ARCH §30, Phase 2.1)",
+        name: "maintained per-bucket / per-user roll-up counters (ARCH 30, Phase 2.1)",
         sql: r#"
 -- Maintained roll-ups so the overview aggregates and the quota checks read O(buckets)/O(1)
 -- counters instead of scanning every object version. The writer keeps these in lockstep with

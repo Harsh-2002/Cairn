@@ -240,7 +240,7 @@ impl SystemCrypto {
     }
 
     /// Decrypt `ct` under `cipher` with `nonce_bytes` (must be exactly 12 bytes) and optional AAD,
-    /// scrubbing the transient plaintext (ARCH §27, F-15). A wrong nonce length fails closed.
+    /// scrubbing the transient plaintext (ARCH 27, F-15). A wrong nonce length fails closed.
     fn decrypt(
         &self,
         cipher: &Aes256Gcm,

@@ -1,5 +1,5 @@
 //! Byte/character helpers that make listing a half-open range seek on the indexed key
-//! column (ARCH §11.4, F-11) rather than a scan. Ported verbatim from `cairn-meta/src/range.rs`
+//! column (ARCH 11.4, F-11) rather than a scan. Ported verbatim from `cairn-meta/src/range.rs`
 //! so listing/pagination behaviour is identical.
 //!
 //! SQLite's default `BINARY` collation orders TEXT by UTF-8 bytes, and UTF-8 preserves code

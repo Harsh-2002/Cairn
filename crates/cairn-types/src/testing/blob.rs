@@ -88,7 +88,7 @@ impl BlobStore for InMemoryBlobStore {
         let buf = Self::drain(body, opts.size_ceiling).await?;
         // The MD5/ETag is computed over the plaintext, before any (modelled) encryption — exactly
         // as the real store computes it pre-transform — so the ETag is identical with or without a
-        // DEK (ARCH §21.1, SSE-S3).
+        // DEK (ARCH 21.1, SSE-S3).
         let md5 = md5_hex(&buf);
         let path = StoragePath::generate(bucket);
         let len = buf.len() as u64;

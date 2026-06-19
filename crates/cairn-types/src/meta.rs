@@ -133,7 +133,7 @@ pub enum Mutation {
         mode: OwnershipMode,
     },
     /// Set (or clear) a bucket's byte quota. The quota is enforced inside the commit transaction
-    /// of subsequent object writes (ARCH §27.5).
+    /// of subsequent object writes (ARCH 27.5).
     SetBucketQuota {
         /// The bucket.
         bucket: BucketName,
@@ -147,7 +147,7 @@ pub enum Mutation {
         /// The new compression policy, or `None` to disable compression.
         policy: Option<CompressionPolicy>,
     },
-    /// Set (or clear) a user's attached identity policy (ARCH §15 / user-centric authz). The value
+    /// Set (or clear) a user's attached identity policy (ARCH 15 / user-centric authz). The value
     /// is the validated policy JSON document, or `None` to detach.
     SetUserPolicy {
         /// The user.
@@ -156,7 +156,7 @@ pub enum Mutation {
         policy: Option<String>,
     },
     /// Set (or clear) a user's byte quota. The quota is enforced inside the commit transaction of
-    /// subsequent object writes the user owns (ARCH §27.5), mirroring [`Mutation::SetBucketQuota`].
+    /// subsequent object writes the user owns (ARCH 27.5), mirroring [`Mutation::SetBucketQuota`].
     SetUserQuota {
         /// The user.
         user_id: UserId,
@@ -186,7 +186,7 @@ pub enum Mutation {
         version_id: VersionId,
     },
     /// Set (or clear) an object version's ACL document (the `PutObjectAcl` commit point). The new
-    /// ACL replaces the version row's stored `acl` column; `None` clears it (ARCH §13.3/§15.4).
+    /// ACL replaces the version row's stored `acl` column; `None` clears it (ARCH 13.3/15.4).
     SetObjectAcl {
         /// The bucket.
         bucket: BucketName,
@@ -227,7 +227,7 @@ pub enum Mutation {
     },
     /// Requeue terminal (`status='failed'`) replication-outbox entries for another attempt: flips
     /// them back to `pending` with `next_attempt_at = now` so the worker picks them up on the next
-    /// drain (ARCH §20.5). Scoped to one bucket when `bucket` is `Some`, else all failed entries.
+    /// drain (ARCH 20.5). Scoped to one bucket when `bucket` is `Some`, else all failed entries.
     RetryFailedReplication {
         /// Restrict to this source bucket, or `None` for every failed entry.
         bucket: Option<BucketName>,
@@ -235,13 +235,13 @@ pub enum Mutation {
         now: Timestamp,
     },
     /// Enqueue a single replication-outbox entry idempotently (INSERT OR IGNORE on the entry id),
-    /// used by existing-object backfill / resync (ARCH §20.5). Unlike the enqueue that rides a
+    /// used by existing-object backfill / resync (ARCH 20.5). Unlike the enqueue that rides a
     /// `PutObjectVersion`, this stands alone for objects written before replication was configured;
     /// the deterministic backfill id makes a repeated resync a no-op for already-queued versions.
     EnqueueReplication(Box<OutboxEntry>),
     /// Append an audit/activity entry.
     RecordActivity(Box<ActivityEntry>),
-    /// Create a persistent object-share token (ARCH §15.8).
+    /// Create a persistent object-share token (ARCH 15.8).
     CreateShare(Box<ShareRow>),
     /// Revoke a share token (idempotent; sets `revoked_at` if still active).
     RevokeShare {
@@ -251,7 +251,7 @@ pub enum Mutation {
         now: Timestamp,
     },
     /// Flush a batch of accumulated request-metric rows (upsert-accumulate by composite key) and
-    /// optionally prune rows older than `prune_before` (ARCH §26.5). One mutation = one transaction,
+    /// optionally prune rows older than `prune_before` (ARCH 26.5). One mutation = one transaction,
     /// so the request hot path never touches the DB; the in-process aggregator coalesces and the
     /// background flush submits this periodically.
     RecordRequestMetrics {
@@ -436,7 +436,7 @@ pub enum ShareDisposition {
     Attachment,
 }
 
-/// A persistent, revocable, optionally-forever object-share token (ARCH §15.8). The token is the
+/// A persistent, revocable, optionally-forever object-share token (ARCH 15.8). The token is the
 /// bearer capability served at `GET /p/{token}`; revoking flips `revoked_at` without rotating any
 /// global key. Stored in the `object_shares` table.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -571,7 +571,7 @@ pub struct User {
     pub role: crate::auth::Role,
     /// Whether active.
     pub is_active: bool,
-    /// The per-user byte quota (`users.quota_bytes`, ARCH §27.5), or `None` when unset (no limit).
+    /// The per-user byte quota (`users.quota_bytes`, ARCH 27.5), or `None` when unset (no limit).
     pub quota_bytes: Option<u64>,
     /// Creation time.
     pub created_at: Timestamp,
@@ -670,7 +670,7 @@ pub struct BucketCounts {
 }
 
 // ---------------------------------------------------------------------------------------
-// Request metrics (usage analytics, ARCH §26.5)
+// Request metrics (usage analytics, ARCH 26.5)
 // ---------------------------------------------------------------------------------------
 
 /// The inclusive upper bounds (milliseconds) of the request-latency histogram buckets; the implicit
@@ -727,7 +727,7 @@ pub fn latency_quantile_ms(hist: &[u64; LATENCY_BUCKETS], q: f64) -> u64 {
 
 /// One accumulated request-metrics rollup row: counts, transferred bytes, and a latency histogram for
 /// requests in window `ts_bucket` for a given operation, bucket (empty string for non-bucket ops),
-/// and HTTP status class (ARCH §26.5).
+/// and HTTP status class (ARCH 26.5).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestMetricRow {
     /// Epoch seconds floored to the rollup window.
@@ -886,7 +886,7 @@ pub struct RequestMetricsSeries {
 }
 
 // ---------------------------------------------------------------------------------------
-// Object tag browsing (ARCH §17.2)
+// Object tag browsing (ARCH 17.2)
 // ---------------------------------------------------------------------------------------
 
 /// One distinct object tag (`tag_key=tag_value`) in use, with how many current objects carry it.

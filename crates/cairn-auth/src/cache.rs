@@ -1,4 +1,4 @@
-//! A short-lived, epoch-invalidated cache for the authentication hot path (Phase 1.3, ARCH §30).
+//! A short-lived, epoch-invalidated cache for the authentication hot path (Phase 1.3, ARCH 30).
 //!
 //! Every authenticated request otherwise pays two metadata reads — the credential lookup by
 //! access-key-id and the identity-policy load by user-id — plus a JSON policy parse, all *before*

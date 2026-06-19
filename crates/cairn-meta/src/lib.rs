@@ -1,5 +1,5 @@
 //! `cairn-meta` — the SQLite [`MetadataStore`] implementation: one serialized,
-//! group-committing writer plus a pool of read-only WAL connections (ARCH §7.2, §7.3, §11).
+//! group-committing writer plus a pool of read-only WAL connections (ARCH 7.2, 7.3, 11).
 //! The metadata commit is the single linearization point of every mutation.
 
 #![forbid(unsafe_code)]
@@ -28,7 +28,7 @@ pub use shard::{ShardHandles, ShardedMetadataStore, ShardedReconcileOracle, shar
 pub use store::{KeyRingStateRow, SqliteMetadataStore};
 pub use writer::{WalCheckpointStats, Writer};
 
-/// Tuning knobs for opening the store (ARCH §28).
+/// Tuning knobs for opening the store (ARCH 28).
 #[derive(Debug, Clone)]
 pub struct OpenOptions {
     /// `true` => `PRAGMA synchronous=FULL` (durable against power loss); `false` => `NORMAL`.
@@ -51,7 +51,7 @@ impl Default for OpenOptions {
             // Throughput posture: WAL + NORMAL never corrupts the DB and removes the per-commit
             // fsync (≈1.7× writer throughput on disk); on power loss it loses at most the last
             // uncheckpointed txn, which blob-first ordering downgrades to a reconcile-GC'd orphan
-            // blob, not a corrupt store (ARCH §8/§30). Operators wanting zero-loss set FULL.
+            // blob, not a corrupt store (ARCH 8/30). Operators wanting zero-loss set FULL.
             synchronous_full: false,
             read_pool_size: 8,
             // None by default: with NORMAL there is no per-commit fsync to amortize, so the
@@ -114,7 +114,7 @@ pub fn open(db_path: &Path, opts: &OpenOptions) -> Result<SqliteMetadataStore, M
     // The writer owns this connection for the process lifetime and re-runs a fixed set of hot
     // statements (insert/demote/quota/enqueue) on every mutation, so cache every prepared
     // statement instead of recompiling per call. The capacity covers the distinct hot SQL in
-    // `apply.rs` with headroom so the LRU never evicts a hot statement mid-batch (ARCH §30.3).
+    // `apply.rs` with headroom so the LRU never evicts a hot statement mid-batch (ARCH 30.3).
     write_conn.set_prepared_statement_cache_capacity(64);
     schema::run_migrations(&write_conn).map_err(map)?;
     let writer = Writer::spawn(write_conn, opts.group_commit_linger);

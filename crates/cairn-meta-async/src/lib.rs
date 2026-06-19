@@ -3,8 +3,8 @@
 //! exactly — the same v1..v3 schema/migrations, the same `Mutation`->SQL `apply` with
 //! per-mutation savepoint isolation and in-transaction precondition/quota checks, the same
 //! half-open range-seek listing — but the writer is an **async** single group-committing task
-//! and reads run async queries directly, all over libSQL's async `Connection` (ARCH §7.2/§7.3,
-//! §11). `cairn-meta` is left untouched; this is a parallel, additive backend behind the same
+//! and reads run async queries directly, all over libSQL's async `Connection` (ARCH 7.2/7.3,
+//! 11). `cairn-meta` is left untouched; this is a parallel, additive backend behind the same
 //! [`MetadataStore`] trait.
 //!
 //! libSQL is async: its `Connection::execute`/`query`/`execute_batch` are `async fn`s. The
@@ -51,7 +51,7 @@ pub type TursoMetadataStore = AsyncMetadataStore;
 /// The Turso incarnation of the engine-agnostic [`AsyncReconcileOracle`].
 pub type TursoReconcileOracle = AsyncReconcileOracle;
 
-/// Tuning knobs for opening the store (ARCH §28), mirroring `cairn-meta::OpenOptions`.
+/// Tuning knobs for opening the store (ARCH 28), mirroring `cairn-meta::OpenOptions`.
 #[derive(Debug, Clone)]
 pub struct OpenOptions {
     /// `true` => `PRAGMA synchronous=FULL` (durable against power loss); `false` => `NORMAL`.

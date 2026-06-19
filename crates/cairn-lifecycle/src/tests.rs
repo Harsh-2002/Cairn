@@ -304,7 +304,7 @@ async fn lifecycle_expiration_replicates_delete_marker() {
     assert_eq!(report.objects_expired, 1);
 
     // The lifecycle-created delete marker was enqueued for replication to the rule's target —
-    // expirations propagate to the replica exactly like a client delete (ARCH §19.3/§20.3).
+    // expirations propagate to the replica exactly like a client delete (ARCH 19.3/20.3).
     let due = meta
         .list_due_replication(100, Timestamp::from_secs(31 * DAY))
         .await

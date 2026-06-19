@@ -43,7 +43,7 @@ without starting: `cairn validate-config`.
 
 ### Replication targets
 
-The replication worker ships outbox entries to one or more S3-compatible destinations (§20).
+The replication worker ships outbox entries to one or more S3-compatible destinations (20).
 
 * **Single target** (node→node) — set `CAIRN_REPLICATION_ENDPOINT`, `CAIRN_REPLICATION_ACCESS_KEY`,
   and `CAIRN_REPLICATION_SECRET` (optionally `CAIRN_REPLICATION_DEST_BUCKET`,

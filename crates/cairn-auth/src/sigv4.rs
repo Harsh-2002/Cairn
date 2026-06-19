@@ -1,5 +1,5 @@
 //! SigV4 canonicalization, signing, and verification for the header and presigned-query forms
-//! (ARCH §14.1, §14.2). The signing pipeline is validated against the AWS published
+//! (ARCH 14.1, 14.2). The signing pipeline is validated against the AWS published
 //! `get-vanilla` test vector so the canonical request, string-to-sign, signing-key derivation,
 //! and signature are all exercised end to end.
 
@@ -205,7 +205,7 @@ fn signed_header_pairs(view: &RequestView<'_>, names: &[String]) -> Vec<(String,
 }
 
 /// The streaming-payload sentinel: the body is an `aws-chunked` stream whose per-chunk signature
-/// chain is seeded by this request's header signature (ARCH §14.3, §21.7).
+/// chain is seeded by this request's header signature (ARCH 14.3, 21.7).
 const STREAMING_SENTINEL: &str = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD";
 
 /// The outcome of a successful header-form SigV4 verification: the auth method and, when the

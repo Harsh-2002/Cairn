@@ -1,7 +1,7 @@
 //! Applying one [`Mutation`] to the write connection. Each call runs inside its own savepoint
 //! (managed by the writer), so returning `Err` rolls back only this mutation while its
 //! batch-mates commit. Preconditions are evaluated here, inside the transaction, so the check
-//! and the upsert are atomic with respect to every other writer (ARCH §11.6).
+//! and the upsert are atomic with respect to every other writer (ARCH 11.6).
 
 use crate::model::{self, engine_err, repl_op_str, repl_status_str, storage_class_str, to_json};
 use cairn_types::MetaError;
@@ -154,7 +154,7 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             Ok(MutationOutcome::Ack)
         }
         Mutation::CreateBucket(b) => {
-            // `compression_policy` is the spec column name (ARCH §34.1); `quota_bytes` defaults to
+            // `compression_policy` is the spec column name (ARCH 34.1); `quota_bytes` defaults to
             // NULL (unlimited) since the frozen `Bucket` domain type carries no quota field.
             conn.execute(
                 "INSERT INTO buckets (name, owner_id, created_at, versioning_state, ownership_mode, region, compression_policy)
@@ -518,7 +518,7 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
         }
         Mutation::RecordRequestMetrics { rows, prune_before } => {
             // Accumulate each window/op/bucket/status bucket; the composite PK upsert sums counts,
-            // bytes, and latency histogram so repeated flushes never double-insert (ARCH §26.5).
+            // bytes, and latency histogram so repeated flushes never double-insert (ARCH 26.5).
             for r in &rows {
                 conn.prepare_cached(
                     "INSERT INTO request_metrics
@@ -589,7 +589,7 @@ fn put_version(
     })
 }
 
-/// Enforce a bucket's optional byte quota inside the commit transaction (ARCH §27.5/§28.2).
+/// Enforce a bucket's optional byte quota inside the commit transaction (ARCH 27.5/28.2).
 ///
 /// If the target bucket has a non-NULL `quota_bytes`, this rejects the write — with
 /// [`MetaError::QuotaExceeded`], which rolls back only this mutation's savepoint — when the
@@ -642,7 +642,7 @@ fn enforce_bucket_quota(conn: &Connection, row: &ObjectVersionRow) -> R<()> {
     Ok(())
 }
 
-/// Enforce the owning user's optional byte quota inside the commit transaction (ARCH §27.5).
+/// Enforce the owning user's optional byte quota inside the commit transaction (ARCH 27.5).
 ///
 /// Mirrors [`enforce_bucket_quota`] but scoped to the row's `owner_id`: if that user has a
 /// non-NULL `quota_bytes`, the write is rejected with [`MetaError::QuotaExceeded`] when the
@@ -752,7 +752,7 @@ fn demote_latest(conn: &Connection, bucket: &BucketName, key: &ObjectKey) -> R<(
     Ok(())
 }
 
-/// Apply a signed delta to the maintained roll-up counters (Phase 2.1, ARCH §30) for `bucket` and
+/// Apply a signed delta to the maintained roll-up counters (Phase 2.1, ARCH 30) for `bucket` and
 /// `owner`. One accumulating upsert per table, run in the same transaction as the `object_versions`
 /// row change that produced the delta, so the counters never diverge from the table across a commit
 /// boundary. `versions`/byte totals sum over ALL versions, matching the prior scan semantics; the

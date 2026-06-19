@@ -168,7 +168,7 @@ pub struct Statement {
 
 /// A statement's action clause: the positive `Action` list, or the negated `NotAction` list.
 ///
-/// `NotAction` matches every action *except* those listed — the IAM/S3 negated form (§15.5). A
+/// `NotAction` matches every action *except* those listed — the IAM/S3 negated form (15.5). A
 /// statement carries exactly one of the two (the parser rejects both-present and neither-present),
 /// so the type makes the invalid "both at once" state unrepresentable.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -181,7 +181,7 @@ pub enum ActionMatch {
 
 /// A statement's resource clause: the positive `Resource` list, or the negated `NotResource` list.
 ///
-/// `NotResource` matches every resource *except* those listed (§15.5). As with [`ActionMatch`], a
+/// `NotResource` matches every resource *except* those listed (15.5). As with [`ActionMatch`], a
 /// statement carries exactly one of the two forms.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResourceMatch {
@@ -198,7 +198,7 @@ pub enum PrincipalSpec {
     Any,
     /// `Principal: {"AWS": ...}` — a specific set of Cairn users.
     Users(Vec<UserId>),
-    /// `NotPrincipal: {"AWS": ...}` — everyone *except* the listed users (§15.5). A powerful,
+    /// `NotPrincipal: {"AWS": ...}` — everyone *except* the listed users (15.5). A powerful,
     /// rarely-needed negated form; in an `Allow` it grants broadly and is therefore treated as a
     /// public grant for Block Public Access purposes.
     NotUsers(Vec<UserId>),
@@ -229,7 +229,7 @@ pub struct Condition {
     pub if_exists: bool,
 }
 
-/// Supported condition operators (the families from ARCH §15.6).
+/// Supported condition operators (the families from ARCH 15.6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConditionOperator {
     /// `StringEquals`
@@ -387,7 +387,7 @@ pub struct AuthzInput {
     pub bucket_bpa: PublicAccessBlock,
     /// The bucket policy, if any.
     pub policy: Option<Policy>,
-    /// The requester's attached identity (per-user) policy, if any (ARCH §15 / user-centric authz).
+    /// The requester's attached identity (per-user) policy, if any (ARCH 15 / user-centric authz).
     /// Evaluated in union with the bucket policy; its statements have no principal (the requester is
     /// implicitly the principal), and its grants are never public, so they survive Block Public
     /// Access. `None` for anonymous requesters and users without an attached policy.

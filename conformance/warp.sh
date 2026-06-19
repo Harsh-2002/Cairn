@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Real MinIO `warp` macro benchmark against a freshly-bootstrapped Cairn (ARCH §30.2).
+# Real MinIO `warp` macro benchmark against a freshly-bootstrapped Cairn (ARCH 30.2).
 #
 # `warp` is the canonical S3 macro-benchmark. This harness downloads the upstream binary (once),
 # bootstraps a throwaway Cairn the same env-only way conformance/run.sh does, creates a bucket, and

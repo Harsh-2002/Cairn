@@ -14,7 +14,7 @@ pip install boto3
 BIN=target/debug/cairn PY=python3 bash conformance/run.sh
 ```
 
-## `crash_consistency.sh` — durability crash window (ARCH §29.4, F-4)
+## `crash_consistency.sh` — durability crash window (ARCH 29.4, F-4)
 
 Makes the durability ordering claim *real* rather than asserted. The blob store commits a blob
 durably (fsync file → rename → fsync dir) **before** the metadata row is committed, so a crash in
@@ -58,7 +58,7 @@ commit places one, proves `cairn integrity` reclaims precisely that orphan while
 live (referenced) blob, and then exits **non-zero** with a diagnostic so CI flags the missing
 wiring. Once `fail::setup()` is wired, the same script takes the live path unchanged.
 
-## Fuzz targets (ARCH §29.3)
+## Fuzz targets (ARCH 29.3)
 
 Three `cargo-fuzz` projects, each detached from the workspace and built on nightly:
 
@@ -77,7 +77,7 @@ cd crates/cairn-xml/fuzz   && cargo +nightly fuzz run request_parsers -- -max_to
 cd crates/cairn-authz/fuzz && cargo +nightly fuzz run parse_policy    -- -max_total_time=20
 ```
 
-## Listing property test (ARCH §29.2)
+## Listing property test (ARCH 29.2)
 
 `crates/cairn-meta/tests/listing_oracle.rs` is a proptest that inserts a random key set into an
 in-memory store and asserts that draining `list_current` across random `prefix`/`delimiter`/

@@ -79,7 +79,7 @@ pub struct Principal {
     /// The SigV4 signed-streaming context, when the request body is a signed chunk stream.
     pub chunk_signing: Option<ChunkSigningContext>,
     /// The user's attached identity (per-user) policy, parsed and loaded at authentication time
-    /// (ARCH §15 / user-centric authz). `None` if the user has no attached policy. Carried into
+    /// (ARCH 15 / user-centric authz). `None` if the user has no attached policy. Carried into
     /// authorization, where it is evaluated in union with the bucket policy. Boxed so the common
     /// `None` case keeps [`Principal`] (and thus `AuthOutcome`) small.
     pub user_policy: Option<Box<crate::authz::Policy>>,

@@ -1,4 +1,4 @@
-//! `cairn-crypto` — the production cryptography facility for Cairn (ARCH §12.6, §27).
+//! `cairn-crypto` — the production cryptography facility for Cairn (ARCH 12.6, 27).
 //!
 //! This crate realises three frozen traits from [`cairn_types`]:
 //!

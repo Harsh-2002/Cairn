@@ -288,7 +288,7 @@ fn tag_char_ok(c: char) -> bool {
         || matches!(c, '+' | '-' | '=' | '.' | '_' | ':' | '/' | '@')
 }
 
-/// Enforce the S3 tag-set quantitative limits (ARCH §17.1) on an already-parsed tag list: at most
+/// Enforce the S3 tag-set quantitative limits (ARCH 17.1) on an already-parsed tag list: at most
 /// `max_tags` entries; each key 1..=128 and value 0..=256 Unicode scalars; only permitted
 /// characters; unique keys; and no key carrying the reserved `aws:` prefix. `max_tags` is
 /// [`MAX_TAGS_OBJECT`] or [`MAX_TAGS_BUCKET`].
