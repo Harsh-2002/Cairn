@@ -293,3 +293,45 @@ over a channel, and that per-op hop dominates a serial fsync-bound loop (the wor
 *slower* there. So the feature is appropriately experimental and off by default; a clear across-the-
 board win would require batching submissions and removing the per-chunk bridge hop. Both probes are
 `#[ignore]` tests in `crates/cairn-blob/tests/blob.rs` (`uring_vs_epoll_*`).
+
+## sendfile fast path (`--features fast-io`, experimental, Linux-only)
+
+The plaintext HTTP/1.1 object-GET fast path (`crates/cairn-server/src/fast_get.rs`) serves a
+**full read** of a committed, **uncompressed, unencrypted** object directly from the page cache to
+the socket with a single `sendfile(2)`, bypassing hyper's userspace body copy. Any ineligible
+request (compressed/encrypted at rest, HTTP/2, TLS, conditional, **or any ranged GET** — ranges are
+served via the stream today) falls back to the unchanged streamed path byte-for-byte. The win is
+**server CPU per GiB sent**, not latency, so the measurement is an A/B of CPU-seconds/GiB at equal
+throughput.
+
+Two properties bound the real-world win, both visible in the engage counters: the fast path takes
+over only the **first request of a fresh TCP connection** (a keep-alive client doing many GETs on
+one pooled connection only accelerates the first), and only **full-object** GETs qualify. Measure
+the engage rate before assuming the win generalizes.
+
+### How to run
+
+`conformance/sendfile_bench.sh` drives a GET-heavy `warp` load, samples the server process's CPU
+time (utime+stime from `/proc/<pid>/stat`) and the new sendfile counters from `/metrics` across the
+GET phase, and reports CPU/GiB plus the **engage rate** (zero-copy GETs vs fall-backs). Build both
+arms and run the A/B:
+
+```sh
+cargo build --release --features fast-io --bin cairn && cp target/release/cairn /tmp/cairn-fastio
+cargo build --release                    --bin cairn && cp target/release/cairn /tmp/cairn-base
+BIN=/tmp/cairn-fastio BASELINE_BIN=/tmp/cairn-base OBJ_SIZE=64MiB DURATION=30s \
+  conformance/sendfile_bench.sh
+```
+
+### What it measures / caveats
+
+- **`cairn_sendfile_get_total{result,transport}`** — zero-copy GETs served (ok/error, `transport=plain`).
+- **`cairn_sendfile_fallback_total{reason}`** — why the fast path declined (`head`, `parse`,
+  `ineligible`, `not_object`, `denied`, `not_zerocopy`) — the engage-rate denominator.
+- The objects must be **uncompressed at rest** to engage; the harness uses incompressible random
+  bodies, but if the bucket has compression enabled the engage rate is ~0 and the report says so.
+- A trustworthy absolute number needs real hardware; on a small/shared box the **A/B ratio** and the
+  engage rate are the durable signals. The CPU window brackets only the GET phase (objects are
+  pre-staged outside it), so PUT/compression cost does not contaminate the read measurement.
+- This path is **plaintext only**; zero-copy over HTTPS needs the (not-yet-built) kTLS takeover, so
+  benchmark over `http://`, not `https://`.

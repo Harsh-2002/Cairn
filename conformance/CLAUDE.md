@@ -18,6 +18,8 @@ fuzz tests live next to their sources). Two kinds — keep them distinct:
 - `warp_escalate.sh` — ramp warp concurrency to the single-writer ceiling; alive + zero errors.
 - `blob_limits.sh` (+`.py`) — out-of-space 507, huge object, many objects paginated.
 - `load_profile.sh` (+`.py`) — throughput methodology (not a gate; see `../docs/benchmarks.md`).
+- `sendfile_bench.sh` — `fast-io` plaintext sendfile A/B: server CPU/GiB + zero-copy engage rate
+  (needs a `--features fast-io` binary; optional non-`fast-io` `BASELINE_BIN`; not a gate).
 
 ## Conventions
 - Invoke as `BIN=target/debug/cairn PY=python3 bash conformance/<name>.sh`. Each makes a `mktemp -d`

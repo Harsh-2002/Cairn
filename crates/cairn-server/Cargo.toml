@@ -31,10 +31,10 @@ meta-async = ["dep:cairn-meta-async"]
 # fails for any reason the connection transparently falls back to the normal userspace TlsStream.
 #
 # Layer (b) sendfile(2) fast path: a self-contained, tested wrapper around the `sendfile(2)`
-# syscall that can copy a blob file fd straight to the socket fd. See `src/sendfile.rs` for why
-# the GET takeover is currently stubbed behind a documented seam (the raw fd is not plumbed across
-# the cairn-protocol boundary, which this crate must not edit). Enabling the feature never changes the
-# always-on portable streamed path for any request.
+# syscall that copies a blob file fd straight to the socket fd. This is LIVE for plaintext HTTP/1.1
+# object GETs (see `src/fast_get.rs`): an uncompressed, unencrypted object (full or one sub-range) is
+# served file->socket with no userspace copy. The kTLS (HTTPS) takeover is the only deferred arm.
+# Enabling the feature never changes the always-on portable streamed path for any non-eligible request.
 #
 # With the feature OFF the optional deps are not compiled and nothing changes.
 fast-io = ["dep:ktls", "dep:libc"]
@@ -46,7 +46,7 @@ path = "src/main.rs"
 [dependencies]
 fail = { workspace = true, optional = true }
 # Optional, enabled only by `fast-io`. `ktls` drives the kernel-TLS offload; `libc` provides the
-# raw `sendfile(2)` syscall for the (currently stubbed) sendfile fast path. Both are
+# raw `sendfile(2)` syscall for the live plaintext GET fast path. Both are
 # effective on Linux only; the source gates every use behind `#[cfg(all(feature = "fast-io",
 # target_os = "linux"))]`, so the feature is a harmless no-op if ever built on a non-Linux target.
 ktls = { version = "6", optional = true, default-features = false, features = ["aws_lc_rs", "tls12"] }

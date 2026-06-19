@@ -260,7 +260,14 @@ async fn serve_plaintext(
     // assets at paths that must be matched before S3 routing, so it always goes straight to hyper.
     #[cfg(all(feature = "fast-io", target_os = "linux"))]
     if !serve_ui {
-        match crate::fast_get::try_sendfile_get(stream, state.stack.as_ref(), peer).await {
+        match crate::fast_get::try_sendfile_get(
+            stream,
+            state.stack.as_ref(),
+            peer,
+            state.request_metrics_enabled,
+        )
+        .await
+        {
             crate::fast_get::Fast::Handled => {}
             crate::fast_get::Fast::Fallback { stream } => {
                 serve_io(stream, state, peer, false, serve_ui, conn_shutdown).await;
@@ -460,7 +467,7 @@ fn content_length(headers: &hyper::HeaderMap) -> u64 {
 /// `route` label (ARCH 26). The raw path (which embeds bucket/key names) would explode the time
 /// series, so it is collapsed to a coarse family: the infra endpoints by name, the management API,
 /// the web console assets, the signed share path, and otherwise the S3 data plane.
-fn classify_route(path: &str) -> &'static str {
+pub(crate) fn classify_route(path: &str) -> &'static str {
     match path {
         "/healthz" => "healthz",
         "/readyz" => "readyz",
@@ -488,7 +495,11 @@ fn classify_route(path: &str) -> &'static str {
 /// addressing: the first path segment is the bucket and the method + sub-resource query select the
 /// S3 operation name. Virtual-host attribution is out of scope, so a request whose bucket cannot be
 /// read from the path falls back to an empty bucket string.
-fn classify_operation(method: &Method, path: &str, query: &str) -> Option<(String, String)> {
+pub(crate) fn classify_operation(
+    method: &Method,
+    path: &str,
+    query: &str,
+) -> Option<(String, String)> {
     // Not-counted families. Mirror `classify_route`'s buckets so the two stay consistent.
     match path {
         "/" | "/healthz" | "/readyz" | "/metrics" => return None,

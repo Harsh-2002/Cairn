@@ -9,9 +9,10 @@
 //!
 //! 2. [`sendfile_all`] — a complete, tested wrapper around the `sendfile(2)` syscall that copies a
 //!    byte range from a file fd straight to a socket fd inside the kernel, never bouncing the bytes
-//!    through userspace. This is the mechanism layer (b) of the feature would use to serve an
-//!    uncompressed, unencrypted, plaintext object GET. See [`sendfile_get_takeover`] for why the
-//!    GET integration is currently a documented stub rather than wired into the live path.
+//!    through userspace. This is layer (b) of the feature, and it is **live**: [`crate::fast_get`]
+//!    calls it to serve a plaintext HTTP/1.1 GET of an uncompressed, unencrypted object (a full
+//!    object or one resolved sub-range) directly from the page cache. The kTLS (HTTPS) takeover is
+//!    not yet wired; see `docs/data-plane.md` 7.6.
 //!
 //! ## On `unsafe`
 //!
@@ -73,12 +74,6 @@ pub fn probe_tcp_ulp_tls() -> bool {
 /// # Errors
 /// Returns the underlying I/O error if `sendfile` fails for a reason other than `EINTR`, or if the
 /// peer closes early (a zero-byte transfer with bytes still outstanding surfaces as `WriteZero`).
-///
-/// `#[allow(dead_code)]`: this is the implemented, tested transfer primitive for layer (b) of the
-/// feature; it is exercised by the unit tests but not yet called from a live serving path (see
-/// [`sendfile_get_takeover`] for why the GET takeover is stubbed). Kept so the mechanism is ready
-/// for the follow-up that plumbs the blob fd across the `cairn-protocol` boundary.
-#[allow(dead_code)]
 pub fn sendfile_all(dst: RawFd, src: RawFd, offset: u64, len: u64) -> io::Result<u64> {
     let mut sent: u64 = 0;
     // `sendfile` mutates the offset through this pointer as it makes progress.
@@ -119,8 +114,9 @@ pub fn sendfile_all(dst: RawFd, src: RawFd, offset: u64, len: u64) -> io::Result
 
 /// Convenience wrapper accepting anything with a raw fd for both ends.
 ///
-/// Kept separate so call sites read clearly and so the test below can pass `File`/socket handles
-/// without leaking `RawFd`s around. `#[allow(dead_code)]` for the same reason as [`sendfile_all`].
+/// Kept separate so the test below can pass `File`/socket handles without leaking `RawFd`s around.
+/// `#[allow(dead_code)]`: only the unit test uses this wrapper today; the live path
+/// ([`crate::fast_get`]) calls [`sendfile_all`] with raw fds directly.
 #[allow(dead_code)]
 pub fn sendfile_all_handles<D: AsRawFd, S: AsRawFd>(
     dst: &D,
@@ -146,45 +142,11 @@ impl Drop for FdGuard {
     }
 }
 
-/// STUB / TODO — the sendfile(2) GET takeover is intentionally not wired into the live path.
-///
-/// ## Why this is a stub
-///
-/// Layer (b) of `fast-io` would, for a GET of an uncompressed/unencrypted/plaintext object, write
-/// the HTTP/1.1 response head and then [`sendfile_all`] the blob file fd straight to the socket fd,
-/// bypassing hyper's body copy. The blob store already opens exactly the right fd for this: a
-/// committed uncompressed blob yields `BlobReadHandle.zero_copy = Some(ZeroCopyRead { file, offset,
-/// len })` (see `cairn-blob`/`cairn-types`).
-///
-/// The blocker is purely a crate boundary this task must not cross. The server never sees that
-/// `ZeroCopyRead`: `cairn-protocol`'s `get_object` consumes the `BlobReadHandle` and returns its body as
-/// `S3Body::Stream { length, stream }` — an opaque `BlobStream` that carries the *bytes* but drops
-/// the raw fd. The adapter then renders that stream into hyper's body. To take over the connection
-/// with sendfile the server would need the fd, which means widening `S3Body` (in `cairn-protocol`) to
-/// carry the `zero_copy` hint and threading it through `get_object` and the adapter. That edits
-/// `cairn-protocol`/`cairn-types`, which are out of scope here, so the takeover is deferred.
-///
-/// Crucially, *not* wiring this changes nothing about correctness: every GET — fast-path-eligible
-/// or not — continues to flow through the always-on portable streamed body. The mechanism this
-/// stub documents is the only missing piece, and it is implemented and tested above
-/// ([`sendfile_all`]); only the plumbing of the fd across the `cairn-protocol` boundary remains.
-///
-/// ## Sketch of the intended integration (for the follow-up that owns `cairn-protocol`)
-///
-/// 1. Add a `ZeroCopy { file: Arc<File>, offset, len, length }` variant (or a side-channel field)
-///    to `S3Body`, populated by `get_object` from `handle.zero_copy` when present and the object is
-///    plaintext/uncompressed and the request is a non-TLS or kTLS connection.
-/// 2. In the adapter, when the response body is `ZeroCopy` *and* hyper is serving HTTP/1.1, write
-///    the response head, then take the underlying socket fd and `spawn_blocking(|| sendfile_all(..))`.
-/// 3. Everything else (ranges hyper can't express as one head, HTTP/2, chunked encoding, any
-///    compressed/encrypted object) keeps using the portable stream — never a regression.
-///
-/// The function is `#[allow(dead_code)]` because it is documentation-bearing scaffolding, not yet
-/// called from any path.
-#[allow(dead_code)]
-pub fn sendfile_get_takeover() {
-    // Intentionally empty: see the doc comment. The transfer primitive lives in `sendfile_all`.
-}
+// The plaintext HTTP/1.1 GET takeover that uses [`sendfile_all`] is LIVE in [`crate::fast_get`]: the
+// `S3Body::ZeroCopy` hint carries the blob fd + offset/len from `cairn-blob` through `cairn-protocol`
+// to the server, which writes the response head and `sendfile`s the body. The remaining, unbuilt arm
+// is the kTLS (HTTPS) takeover — sendfile into a kernel-TLS socket so the kernel encrypts the bytes
+// inline — which is intentionally deferred and tracked in `docs/data-plane.md` 7.6.
 
 #[cfg(test)]
 mod tests {
@@ -195,7 +157,7 @@ mod tests {
     /// `sendfile_all` copies an exact byte range from a real file fd to a socket fd in the kernel,
     /// and the bytes arrive unchanged on the other end. This proves the syscall wrapper (offset
     /// handling, short-write loop, EINTR retry) works against live descriptors — the load-bearing
-    /// mechanism of the sendfile fast path, independent of the (stubbed) hyper takeover.
+    /// mechanism of the sendfile fast path that `fast_get` drives.
     #[test]
     fn sendfile_all_copies_a_range_to_a_socket() {
         // A temp file holding a known payload.
