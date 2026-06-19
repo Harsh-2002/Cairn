@@ -1,23 +1,50 @@
+# --- Rust / Cargo build output ---
 /target
+target/
 **/*.rs.bk
 *.profraw
-/ui/node_modules
-/ui/dist
-.DS_Store
-/data
-*.db
-*.db-wal
-*.db-shm
+*.profdata
+# cargo-fuzz (each fuzz crate is detached from the workspace)
 fuzz/target
 fuzz/corpus
-
-# verification artifacts
-.playwright-mcp/
-*.png
 crates/cairn-protocol/fuzz/corpus/
 crates/cairn-protocol/fuzz/artifacts/
 crates/cairn-xml/fuzz/corpus/
 crates/cairn-xml/fuzz/artifacts/
 crates/cairn-authz/fuzz/corpus/
 crates/cairn-authz/fuzz/artifacts/
-target/
+
+# --- Web UI (built bundle + deps + TS build cache) ---
+/ui/node_modules
+/ui/dist
+/ui/tsconfig.tsbuildinfo
+
+# --- Runtime data / local stores (never commit a server's data dir) ---
+/data
+*.db
+*.db-wal
+*.db-shm
+
+# --- Conformance & benchmark artifacts ---
+# warp writes its result CSVs to the working directory; never commit them.
+warp-*.csv.zst
+warp-*.csv
+*.benchdata.csv.zst
+# coverage output (the `coverage` CI job uploads this as an artifact)
+lcov.info
+
+# --- Python (the conformance drivers) ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# --- Verification / scratch artifacts ---
+.playwright-mcp/
+*.png
+
+# --- Editor / OS noise ---
+.DS_Store
+*.swp
+*~
+.idea/

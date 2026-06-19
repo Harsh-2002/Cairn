@@ -17,6 +17,11 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Harden cargo against flaky crates.io fetches on the runners (the "OpenSSL SSL_read:
+  # unexpected eof" failures): retry transient downloads, and disable HTTP/2 multiplexing,
+  # which is the known trigger for that early-EOF error.
+  CARGO_NET_RETRY: "10"
+  CARGO_HTTP_MULTIPLEXING: "false"
 
 jobs:
   lint:

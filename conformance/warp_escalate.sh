@@ -84,7 +84,7 @@ printf '\n  %-12s %-40s %-8s\n' "concurrency" "throughput (warp report)" "errors
 worst_errors=0
 for C in $LEVELS; do
   set +e
-  out="$("$WARP" put "${common[@]}" --concurrent "$C" --duration "$DURATION" 2>&1)"
+  out="$(cd "$DATA" && "$WARP" put "${common[@]}" --concurrent "$C" --duration "$DURATION" 2>&1)"
   rc=$?
   set -e
   # A crash is the hard breakpoint: the writer saturating must queue, never kill the process.
@@ -103,7 +103,7 @@ done
 
 # --- integrity: everything written must read back ---------------------------------------------
 set +e
-gout="$("$WARP" get "${common[@]}" --concurrent 16 --objects 100 --duration 8s 2>&1)"
+gout="$(cd "$DATA" && "$WARP" get "${common[@]}" --concurrent 16 --objects 100 --duration 8s 2>&1)"
 set -e
 kill -0 "$SRV" 2>/dev/null || fail "server crashed during the verification GET phase"
 gerr="$(printf '%s\n' "$gout" | grep -cE '<ERROR>' || true)"

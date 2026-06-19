@@ -124,7 +124,7 @@ run_phase() {
   # Capture so we can both print the report and parse the error count. warp exits non-zero when
   # prepare aborts (get/mixed); `put` exits zero even with per-op errors.
   set +e
-  out="$("$WARP" "$name" "${common[@]}" "$@" 2>&1)"
+  out="$(cd "$DATA" && "$WARP" "$name" "${common[@]}" "$@" 2>&1)"
   rc=$?
   set -e
   # Drop the per-object error spam (the known key-encoding blocker) and the blank lines warp
