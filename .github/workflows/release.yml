@@ -93,11 +93,9 @@ jobs:
           ENTRYPOINT ["/usr/local/bin/cairn"]
           CMD ["serve"]
           DOCKER
-      - name: Image name + date tag
+      - name: Image name (lowercased for GHCR)
         id: m
-        run: |
-          echo "image=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
-          echo "date=$(date -u +%d%m%y)" >> "$GITHUB_OUTPUT"
+        run: echo "image=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
@@ -110,9 +108,8 @@ jobs:
           file: ctx/Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: |
-            ${{ steps.m.outputs.image }}:${{ steps.m.outputs.date }}
-            ${{ steps.m.outputs.image }}:latest
+          # One active image: always just :latest (overwrites the previous release's image).
+          tags: ${{ steps.m.outputs.image }}:latest
 
   release:
     name: publish dated release (one active)
@@ -141,7 +138,7 @@ jobs:
           gh release delete "$TAG" --repo "$REPO" --yes --cleanup-tag 2>/dev/null || true
           gh release create "$TAG" --repo "$REPO" --target "${{ github.sha }}" \
             --title "$TAG" --latest \
-            --notes "Date-based release \`$TAG\` (ddmmyy). Static linux binaries attached below; multi-arch image at \`$IMG:$TAG\` and \`$IMG:latest\`." \
+            --notes "Date-based release \`$TAG\` (ddmmyy). Static linux binaries (amd64 + arm64) attached below; the multi-arch container image is \`$IMG:latest\` (always current)." \
             rel/cairn-linux-amd64 rel/cairn-linux-arm64 rel/SHA256SUMS
           # one active release: delete every OTHER release and its tag
           gh release list --repo "$REPO" --limit 200 --json tagName --jq '.[].tagName' \
