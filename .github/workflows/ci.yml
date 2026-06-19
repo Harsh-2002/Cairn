@@ -138,6 +138,21 @@ jobs:
       - name: Two-node replication soak — sustained PUTs, byte-identical verify, RSS leak check
         run: BIN=target/debug/cairn PY=python3 DURATION=90 bash conformance/soak.sh
 
+  replication-chaos:
+    name: replication chaos (fault injection)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - run: pip install boto3
+      - run: cargo build --bin cairn
+      - name: Break replication on purpose (target down, source SIGKILL, rapid overwrite); assert no data loss
+        run: BIN=target/debug/cairn PY=python3 bash conformance/replication_chaos.sh
+
   warp:
     name: warp macro benchmark
     runs-on: ubuntu-latest
