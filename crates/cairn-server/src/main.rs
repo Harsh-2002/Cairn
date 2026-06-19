@@ -217,7 +217,14 @@ fn integrity(cfg: Config, repair: bool) -> ExitCode {
         };
 
         // First, the always-on forward pass: reclaim orphaned blobs (blobs with no metadata row).
-        match blob.reconcile(oracle.as_ref(), ReconcileOpts::default()).await {
+        // `integrity` is an explicit, on-demand reconcile run against a quiesced store (no in-flight
+        // writes), so reclaim crash-orphans immediately (margin 0) rather than honouring the live-
+        // operation safety margin.
+        let opts = ReconcileOpts {
+            staging_safety_margin_secs: 0,
+            ..ReconcileOpts::default()
+        };
+        match blob.reconcile(oracle.as_ref(), opts).await {
             Ok(r) => {
                 println!(
                     "reconciliation complete: scanned={} orphans_reclaimed={} staging_cleaned={} sessions_cleaned={} errors={}",
@@ -522,7 +529,16 @@ fn restore(cfg: Config, dir: &std::path::Path) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        match blob.reconcile(&oracle, ReconcileOpts::default()).await {
+        match blob
+            .reconcile(
+                &oracle,
+                ReconcileOpts {
+                    staging_safety_margin_secs: 0,
+                    ..ReconcileOpts::default()
+                },
+            )
+            .await
+        {
             Ok(r) => {
                 println!(
                     "restore complete: reconciled scanned={} orphans_reclaimed={}",

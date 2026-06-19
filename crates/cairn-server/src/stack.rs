@@ -497,8 +497,17 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
 
     // Startup reconciliation reclaims orphaned blobs from any crash window before serving. The
     // oracle is taken by `&dyn ReconcileOracle`, so the boxed oracle is borrowed via `as_ref`.
+    // No request is in flight yet (the listener is not bound), so a crash-orphan is unambiguous —
+    // reclaim it immediately (margin 0); the safety margin only matters for a reconcile that races
+    // live PUTs, which startup never does.
     match blob
-        .reconcile(oracle.as_ref(), ReconcileOpts::default())
+        .reconcile(
+            oracle.as_ref(),
+            ReconcileOpts {
+                staging_safety_margin_secs: 0,
+                ..ReconcileOpts::default()
+            },
+        )
         .await
     {
         Ok(report) => tracing::info!(
