@@ -1,7 +1,8 @@
 # Contributing to Cairn
 
-The full project-specific guidance is in **[`CLAUDE.md`](./CLAUDE.md)** (also exposed as `AGENTS.md`
-for other agent tools) and the per-folder `CLAUDE.md` files. This is the short human version.
+The full project-specific guidance is in **[`CLAUDE.md`](./CLAUDE.md)** and the per-folder
+`CLAUDE.md` files (agent tools that look for `AGENTS.md` are pointed to `CLAUDE.md`). This is the
+short human version.
 
 ## Build and the gate
 
