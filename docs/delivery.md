@@ -1,6 +1,6 @@
 # Delivery: build, deployment, roadmap, decisions, appendices
 
-> Part of the Cairn reference docs (split from the former ARCH.md). The section numbers below are stable identifiers used throughout the code and docs; see the index in [`CLAUDE.md`](./CLAUDE.md) and [`../CLAUDE.md`](../CLAUDE.md).
+> Part of the Cairn reference docs. The section numbers below are stable identifiers used throughout the code and docs; see the index in [`CLAUDE.md`](./CLAUDE.md) and [`../CLAUDE.md`](../CLAUDE.md).
 
 ## 31. Build, packaging, deployment, and operations
 

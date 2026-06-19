@@ -1,7 +1,6 @@
 # Cairn documentation
 
-This is the single source of truth for Cairn. The engineering specification (formerly one large
-`ARCH.md`) is split here into focused, section-numbered reference documents; alongside them are the
+This is the single source of truth for Cairn. The engineering specification is split here into focused, section-numbered reference documents; alongside them are the
 operator guides. The **section numbers are stable identifiers** used throughout the codebase
 (comments say e.g. "ARCH 28") and across these docs — find the number in the table below to jump
 straight to the document that covers it.

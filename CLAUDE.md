@@ -6,7 +6,7 @@ Object bytes are plain files on a POSIX filesystem; all metadata is an embedded 
 TLS, async bucket replication, an embedded React console, and a CLI.
 
 > The **engineering specification is the single source of truth** and lives in [`docs/`](./docs),
-> split into focused, section-numbered reference documents (the former monolithic `ARCH.md`). The
+> split into focused, section-numbered reference documents. The
 > **section numbers are stable** — code comments say e.g. "ARCH 28"; use the table below to open the
 > exact document instead of grepping. Read the relevant doc before any non-trivial change.
 
