@@ -18,7 +18,7 @@ TLS, async bucket replication, an embedded React console, and a CLI.
   conformance §29.
 - **[`DESIGN.md`](./DESIGN.md)** — the management console's visual design system (read for UI work).
 - **[`docs/`](./docs)** — `operations.md` (deployment + the master-key rotation runbook),
-  `backup-restore.md`, `s3-api-matrix.md`, `GAPS.md` (audit findings), `benchmarks.md`.
+  `backup-restore.md`, `s3-api-matrix.md`, `benchmarks.md`.
 - **[`README.md`](./README.md)** — overview. (Its "Try it"/"Running" ports and config-layering text
   are out of date; this file and ARCH §28 reflect the current env-only, two-port reality.)
 

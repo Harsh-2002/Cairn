@@ -152,13 +152,12 @@ small-write latency; the steady-state picture is the monotonic p50/p99 growth ac
 
 ARCH §26/§30.2 names the **write-queue-depth** metric as *the* server-side window onto this
 ceiling — a depth that grows under load is the early-warning signal for write saturation before it
-becomes latency. That gauge is **not yet wired** (`docs/GAPS.md` Medium #11/#12 list it among the
-missing observability series; only `cairn_requests_total`, `cairn_request_duration_seconds`, the
-store/byte gauges, and the WAL/replication series are published today). Until it lands, this
-harness characterizes the ceiling from the two windows that *are* available: the server-side
-`cairn_request_duration_seconds` summary and the client-side tail-latency-versus-concurrency curve
-above. Both show the same thing — the writer saturating — which is what §30.2 asks an operator to
-be able to see.
+becomes latency. It is published as the `cairn_writer_queue_depth` gauge (alongside
+`cairn_requests_total`, `cairn_request_duration_seconds`, the store/byte gauges, and the
+WAL/replication series). This harness reads the ceiling from three windows: that gauge, the
+server-side `cairn_request_duration_seconds` summary, and the client-side
+tail-latency-versus-concurrency curve above. All show the same thing — the writer saturating —
+which is what §30.2 asks an operator to be able to see.
 
 ### Caveats
 

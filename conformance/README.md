@@ -1,8 +1,8 @@
 # Conformance and verification harnesses
 
-This directory holds the end-to-end verification the audit found missing (`docs/GAPS.md`
-High #8, Medium #11), alongside the boto3 compatibility suite. Everything here drives a real
-`cairn` binary; the in-crate unit/property/fuzz tests live next to their sources.
+This directory holds the end-to-end verification harnesses, alongside the boto3 compatibility
+suite. Everything here drives a real `cairn` binary; the in-crate unit/property/fuzz tests live
+next to their sources.
 
 ## `run.sh` + `conformance.py` — boto3 compatibility suite
 
