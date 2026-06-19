@@ -1,118 +1,153 @@
 name: Release
 
-# Cuts a release when a v* tag is pushed (or on manual dispatch): builds static, fully
-# self-contained binaries for linux/amd64 and linux/arm64 (musl, UI embedded), publishes multi-arch
-# Docker images to GHCR, and attaches the binaries + checksums to a GitHub Release.
+# Date-based release policy. A release is a deliberate act (run this workflow from the Actions tab)
+# that is gated on a green CI for the exact commit being released. It then:
+#   * builds static linux/amd64 + linux/arm64 binaries (musl, real UI embedded);
+#   * publishes a multi-arch image to GHCR built from those exact binaries (:<ddmmyy> and :latest);
+#   * publishes ONE GitHub Release named by date (ddmmyy, not a version) and retires the previous
+#     one — so exactly one release is ever active.
 on:
-  push:
-    tags: ["v*"]
   workflow_dispatch:
 
 permissions:
-  contents: write # create the GitHub Release and upload assets
-  packages: write # push images to GHCR
+  contents: write   # create/delete the GitHub Release and its tag
+  packages: write   # push the image to GHCR
+  actions: read     # read the CI run status for the release gate
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: "10"
+  CARGO_HTTP_MULTIPLEXING: "false"
 
 jobs:
+  verify-ci:
+    name: require green CI
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require a successful CI run for this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          conclusion="$(gh run list --repo '${{ github.repository }}' --workflow ci.yml \
+            --branch '${{ github.ref_name }}' --limit 50 \
+            --json headSha,status,conclusion \
+            --jq '[.[] | select(.headSha=="${{ github.sha }}")] | first | (.conclusion // .status // "none")')"
+          echo "CI conclusion for ${{ github.sha }}: $conclusion"
+          if [ "$conclusion" != "success" ]; then
+            echo "::error::CI has not succeeded for this commit ($conclusion); refusing to release."
+            exit 1
+          fi
+
   binaries:
     name: static binary (${{ matrix.arch }})
+    needs: verify-ci
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          - arch: amd64
-            target: x86_64-unknown-linux-musl
-          - arch: arm64
-            target: aarch64-unknown-linux-musl
+          - { arch: amd64, target: x86_64-unknown-linux-musl }
+          - { arch: arm64, target: aarch64-unknown-linux-musl }
     steps:
       - uses: actions/checkout@v4
-      - uses: ./.github/actions/setup
+      - uses: ./.github/actions/setup   # builds the real UI bundle + the Rust toolchain
         with:
           targets: ${{ matrix.target }}
-      # cargo-zigbuild carries a complete musl sysroot for both arches, so the vendored C deps
-      # (aws-lc-rs, bundled SQLite, zstd) cross-compile + statically link cleanly with no Docker.
       - run: pip install ziglang
       - uses: taiki-e/install-action@cargo-zigbuild
-      - name: Build the static release binary
+      - name: Cross-compile the static release binary (no QEMU)
         run: cargo zigbuild --release --bin cairn --target ${{ matrix.target }}
-      - name: Stage + verify the binary
+      - name: Stage + verify it is fully static
         run: |
           mkdir -p dist
-          cp "target/${{ matrix.target }}/release/cairn" "dist/cairn-${{ matrix.arch }}"
-          file "dist/cairn-${{ matrix.arch }}"
-          file "dist/cairn-${{ matrix.arch }}" | grep -qiE "statically linked|static-pie linked" \
+          cp "target/${{ matrix.target }}/release/cairn" "dist/cairn-linux-${{ matrix.arch }}"
+          file "dist/cairn-linux-${{ matrix.arch }}" | grep -qiE "statically linked|static-pie linked" \
             || { echo "binary is not statically linked"; exit 1; }
       - uses: actions/upload-artifact@v4
         with:
           name: cairn-${{ matrix.arch }}
-          path: dist/cairn-${{ matrix.arch }}
+          path: dist/cairn-linux-${{ matrix.arch }}
 
-  docker:
-    name: multi-arch docker image
+  image:
+    name: multi-arch image -> GHCR
     needs: binaries
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Download built binaries
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           pattern: cairn-*
           path: artifacts
-      - name: Assemble the Docker build context
+      - name: Assemble the runtime build context (the exact release binaries)
         run: |
-          mkdir -p dist
-          cp artifacts/cairn-amd64/cairn-amd64 dist/cairn-amd64
-          cp artifacts/cairn-arm64/cairn-arm64 dist/cairn-arm64
-          chmod +x dist/cairn-amd64 dist/cairn-arm64
-      - name: Lowercase image name (GHCR requires lowercase)
-        id: img
-        run: echo "name=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+          mkdir -p ctx
+          cp artifacts/cairn-amd64/cairn-linux-amd64 ctx/
+          cp artifacts/cairn-arm64/cairn-linux-arm64 ctx/
+          chmod +x ctx/cairn-linux-*
+          cat > ctx/Dockerfile <<'DOCKER'
+          FROM gcr.io/distroless/static-debian12:nonroot
+          ARG TARGETARCH
+          COPY cairn-linux-${TARGETARCH} /usr/local/bin/cairn
+          EXPOSE 7373 7374
+          USER nonroot
+          ENTRYPOINT ["/usr/local/bin/cairn"]
+          CMD ["serve"]
+          DOCKER
+      - name: Image name + date tag
+        id: m
+        run: |
+          echo "image=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u +%d%m%y)" >> "$GITHUB_OUTPUT"
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/metadata-action@v5
-        id: meta
+      - uses: docker/build-push-action@v6
         with:
-          images: ${{ steps.img.outputs.name }}
-          tags: |
-            type=ref,event=tag
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
-      - name: Build and push (linux/amd64, linux/arm64)
-        uses: docker/build-push-action@v6
-        with:
-          context: dist
-          file: Dockerfile
+          context: ctx
+          file: ctx/Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: |
+            ${{ steps.m.outputs.image }}:${{ steps.m.outputs.date }}
+            ${{ steps.m.outputs.image }}:latest
 
   release:
-    name: github release
-    needs: binaries
+    name: publish dated release (one active)
+    needs: [binaries, image]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
     steps:
-      - name: Download built binaries
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           pattern: cairn-*
           path: artifacts
-      - name: Assemble release assets + checksums
+      - name: Assemble assets + checksums
         run: |
           mkdir -p rel
-          cp artifacts/cairn-amd64/cairn-amd64 rel/cairn-linux-amd64
-          cp artifacts/cairn-arm64/cairn-arm64 rel/cairn-linux-arm64
-          cd rel && sha256sum cairn-* > SHA256SUMS
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: rel/*
-          generate_release_notes: true
+          cp artifacts/cairn-amd64/cairn-linux-amd64 rel/
+          cp artifacts/cairn-arm64/cairn-linux-arm64 rel/
+          ( cd rel && sha256sum cairn-linux-* > SHA256SUMS )
+      - name: Publish the ddmmyy release and retire the previous one
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="$(date -u +%d%m%y)"
+          REPO="${{ github.repository }}"
+          IMG="ghcr.io/$(echo "$REPO" | tr '[:upper:]' '[:lower:]')"
+          # recreate cleanly if a release for today already exists
+          gh release delete "$TAG" --repo "$REPO" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$TAG" --repo "$REPO" --target "${{ github.sha }}" \
+            --title "$TAG" --latest \
+            --notes "Date-based release \`$TAG\` (ddmmyy). Static linux binaries attached below; multi-arch image at \`$IMG:$TAG\` and \`$IMG:latest\`." \
+            rel/cairn-linux-amd64 rel/cairn-linux-arm64 rel/SHA256SUMS
+          # one active release: delete every OTHER release and its tag
+          gh release list --repo "$REPO" --limit 200 --json tagName --jq '.[].tagName' \
+            | while read -r t; do
+                [ -z "$t" ] && continue
+                [ "$t" = "$TAG" ] && continue
+                echo "retiring previous release: $t"
+                gh release delete "$t" --repo "$REPO" --yes --cleanup-tag || true
+              done
