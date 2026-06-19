@@ -1,6 +1,6 @@
 # Observability and audit
 
-> Part of the Cairn reference docs (split from the former ARCH.md). The section numbers below are stable identifiers used throughout the code and docs; see the index in [`README.md`](./README.md) and [`../CLAUDE.md`](../CLAUDE.md).
+> Part of the Cairn reference docs (split from the former ARCH.md). The section numbers below are stable identifiers used throughout the code and docs; see the index in [`CLAUDE.md`](./CLAUDE.md) and [`../CLAUDE.md`](../CLAUDE.md).
 
 ## 26. Observability and audit
 

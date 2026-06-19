@@ -16,7 +16,7 @@ database (the single source of truth). Ships as **one static binary**.
   bucket replication, an embedded React management console, Prometheus metrics, and a CLI.
 
 The full engineering specification lives in **[`docs/`](./docs)** (section-numbered reference docs;
-start at [`docs/README.md`](./docs/README.md)); contributor / AI-agent onboarding is
+start at [`docs/CLAUDE.md`](./docs/CLAUDE.md)); contributor / AI-agent onboarding is
 **[`CLAUDE.md`](./CLAUDE.md)**.
 
 ## Quickstart

@@ -1,6 +1,6 @@
 # The S3 surface
 
-> Part of the Cairn reference docs (split from the former ARCH.md). The section numbers below are stable identifiers used throughout the code and docs; see the index in [`README.md`](./README.md) and [`../CLAUDE.md`](../CLAUDE.md).
+> Part of the Cairn reference docs (split from the former ARCH.md). The section numbers below are stable identifiers used throughout the code and docs; see the index in [`CLAUDE.md`](./CLAUDE.md) and [`../CLAUDE.md`](../CLAUDE.md).
 >
 > The two S3-surface sections not here live in sibling docs: authentication and authorization
 > (14–15) in [`auth.md`](./auth.md), and bucket replication (20) in [`replication.md`](./replication.md).
