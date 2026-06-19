@@ -33,4 +33,11 @@ straight to the document that covers it.
 | [s3-api-matrix.md](./s3-api-matrix.md) | The S3 API support matrix — which operations are supported, partial, or out of scope |
 | [benchmarks.md](./benchmarks.md) | The benchmarking methodology and the harnesses under `conformance/` |
 
+## Design & product
+
+| Document | Covers |
+|---|---|
+| [design.md](./design.md) | The management console's visual design system (read for UI work) |
+| [product.md](./product.md) | Product positioning, users, brand, and design principles |
+
 The end-to-end verification harnesses themselves live in [`../conformance/`](../conformance).

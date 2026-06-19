@@ -12,4 +12,4 @@ The Rust crate that **embeds** the built React management SPA into the binary (`
   cargo workspace) — see `../../ui/CLAUDE.md`.
 - Build the UI first (`cd ui && npm run build`) or the binary embeds a placeholder that FAILS the
   `index_referenced_bundles_are_embedded` test.
-- Spec: `docs/control-plane.md` (23). Visual system: `../../DESIGN.md`, `../../PRODUCT.md`.
+- Spec: `docs/control-plane.md` (23). Visual system: `../../docs/design.md`, `../../docs/product.md`.

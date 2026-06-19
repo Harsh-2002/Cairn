@@ -16,7 +16,7 @@ the web-UI listener (`CAIRN_UI_ADDR`, :7374). Excluded from the cargo workspace.
 - A real build is required: without it the crate embeds a placeholder that fails the embed test.
 
 ## Notes
-- Follow the visual system in `../DESIGN.md` and the product intent in `../PRODUCT.md`:
+- Follow the visual system in `../docs/design.md` and the product intent in `../docs/product.md`:
   Vercel/Geist minimalism, 1px borders not shadows, neutral primary, semantic colour only when it
   means something; AAA-where-it-helps accessibility, honour `prefers-reduced-motion`.
 - The Rust embed side is `../crates/cairn-ui/`. Spec: `../docs/control-plane.md` (23).
