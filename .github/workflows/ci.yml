@@ -91,6 +91,29 @@ jobs:
       - name: Drive Cairn with the AWS SDK (real SigV4 + aws-chunked streaming, the F-5 path)
         run: BIN=target/debug/cairn PY=python3 bash conformance/run.sh
 
+  rotation:
+    name: master-key rotation e2e (#29)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - run: cargo build --bin cairn
+      - name: Add a key, re-wrap stored secrets onto it, retire the old key (sharded); assert the fail-closed retire-gate
+        run: BIN=target/debug/cairn PY=python3 bash conformance/rotation.sh
+
+  share:
+    name: object sharing e2e
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+      - run: cargo build --bin cairn
+      - name: Persistent share tokens + SigV4 presigned URLs, end to end
+        run: BIN=target/debug/cairn bash conformance/share.sh
+
   crash-consistency:
     name: crash consistency (F-4)
     runs-on: ubuntu-latest
