@@ -47,7 +47,8 @@ pub use blob::{
     StagedBlob, StagedPart, ZeroCopyRead,
 };
 pub use bucket::{
-    Bucket, CompressionAlgorithm, CompressionPolicy, ConfigAspect, ConfigDoc, VersioningState,
+    Bucket, CompressionAlgorithm, CompressionPolicy, ConfigAspect, ConfigDoc, DefaultRetention,
+    ObjectLockConfiguration, RetentionPeriod, VersioningState,
 };
 pub use crypto::{Nonce, Sealed, Signature};
 pub use error::{
@@ -65,8 +66,8 @@ pub use meta::{
     latency_quantile_ms,
 };
 pub use object::{
-    ChecksumAlgorithm, ChecksumSet, ChecksumValue, CompressionDescriptor, ETag, ObjectVersionRow,
-    StorageClass, UserMetadata,
+    ChecksumAlgorithm, ChecksumSet, ChecksumValue, CompressionDescriptor, ETag, ObjectLockMode,
+    ObjectLockState, ObjectRetention, ObjectVersionRow, StorageClass, UserMetadata,
 };
 pub use replication::ReplicatedObject;
 pub use time::Timestamp;

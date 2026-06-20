@@ -34,6 +34,14 @@ pub enum Action {
     PutObjectTagging,
     DeleteObjectTagging,
     GetObjectAttributes,
+    // object lock / retention (WORM)
+    GetObjectRetention,
+    PutObjectRetention,
+    GetObjectLegalHold,
+    PutObjectLegalHold,
+    /// Permits shortening or removing a `GOVERNANCE`-mode retention (or deleting a version still
+    /// under it) when paired with the `x-amz-bypass-governance-retention: true` header.
+    BypassGovernanceRetention,
     // multipart
     AbortMultipartUpload,
     ListMultipartUploadParts,
@@ -47,6 +55,7 @@ pub enum Action {
     GetReplicationConfiguration,
     GetBucketOwnershipControls,
     GetBucketPublicAccessBlock,
+    GetBucketObjectLockConfiguration,
     // bucket config (write)
     PutBucketPolicy,
     PutBucketAcl,
@@ -57,6 +66,7 @@ pub enum Action {
     PutReplicationConfiguration,
     PutBucketOwnershipControls,
     PutBucketPublicAccessBlock,
+    PutBucketObjectLockConfiguration,
     // replication (cross-bucket propagation)
     ReplicateObject,
     ReplicateDelete,
@@ -86,6 +96,11 @@ impl Action {
             PutObjectTagging => "s3:PutObjectTagging",
             DeleteObjectTagging => "s3:DeleteObjectTagging",
             GetObjectAttributes => "s3:GetObjectAttributes",
+            GetObjectRetention => "s3:GetObjectRetention",
+            PutObjectRetention => "s3:PutObjectRetention",
+            GetObjectLegalHold => "s3:GetObjectLegalHold",
+            PutObjectLegalHold => "s3:PutObjectLegalHold",
+            BypassGovernanceRetention => "s3:BypassGovernanceRetention",
             AbortMultipartUpload => "s3:AbortMultipartUpload",
             ListMultipartUploadParts => "s3:ListMultipartUploadParts",
             GetBucketPolicy => "s3:GetBucketPolicy",
@@ -97,6 +112,7 @@ impl Action {
             GetReplicationConfiguration => "s3:GetReplicationConfiguration",
             GetBucketOwnershipControls => "s3:GetBucketOwnershipControls",
             GetBucketPublicAccessBlock => "s3:GetBucketPublicAccessBlock",
+            GetBucketObjectLockConfiguration => "s3:GetBucketObjectLockConfiguration",
             PutBucketPolicy => "s3:PutBucketPolicy",
             PutBucketAcl => "s3:PutBucketAcl",
             PutBucketCors => "s3:PutBucketCORS",
@@ -106,6 +122,7 @@ impl Action {
             PutReplicationConfiguration => "s3:PutReplicationConfiguration",
             PutBucketOwnershipControls => "s3:PutBucketOwnershipControls",
             PutBucketPublicAccessBlock => "s3:PutBucketPublicAccessBlock",
+            PutBucketObjectLockConfiguration => "s3:PutBucketObjectLockConfiguration",
             ReplicateObject => "s3:ReplicateObject",
             ReplicateDelete => "s3:ReplicateDelete",
         }

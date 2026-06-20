@@ -3,6 +3,7 @@
 and — on modern boto3 — default flexible checksums that use the aws-chunked streaming body,
 directly exercising Cairn's streaming chunked decoder, the F-5 fix)."""
 
+import datetime
 import io
 import sys
 
@@ -96,6 +97,69 @@ s3.put_object_tagging(
 )
 tags = {t["Key"]: t["Value"] for t in s3.get_object_tagging(Bucket="conf", Key="hello.txt")["TagSet"]}
 check("object tagging", tags.get("env") == "prod")
+
+# --- Object Lock / WORM / retention / legal hold ---
+# A bucket created with object lock is forced to versioning Enabled and reports its config.
+s3.create_bucket(Bucket="lockb", ObjectLockEnabledForBucket=True)
+check("object-lock bucket is versioned",
+      s3.get_bucket_versioning(Bucket="lockb").get("Status") == "Enabled")
+olc = s3.get_object_lock_configuration(Bucket="lockb")["ObjectLockConfiguration"]
+check("object-lock enabled", olc.get("ObjectLockEnabled") == "Enabled")
+
+far_future = datetime.datetime(2099, 1, 1, tzinfo=datetime.timezone.utc)
+
+# COMPLIANCE retention is immutable until it expires — not even the bypass header lifts it.
+s3.put_object(Bucket="lockb", Key="locked", Body=b"immutable")
+lvid = s3.head_object(Bucket="lockb", Key="locked")["VersionId"]
+s3.put_object_retention(Bucket="lockb", Key="locked", VersionId=lvid,
+                        Retention={"Mode": "COMPLIANCE", "RetainUntilDate": far_future})
+r = s3.get_object_retention(Bucket="lockb", Key="locked", VersionId=lvid)["Retention"]
+check("compliance retention set", r["Mode"] == "COMPLIANCE")
+# HEAD echoes the lock headers.
+hl = s3.head_object(Bucket="lockb", Key="locked")
+check("HEAD echoes lock mode", hl.get("ObjectLockMode") == "COMPLIANCE")
+try:
+    s3.delete_object(Bucket="lockb", Key="locked", VersionId=lvid)
+    check("compliance blocks version delete", False)
+except ClientError:
+    check("compliance blocks version delete", True)
+try:
+    s3.delete_object(Bucket="lockb", Key="locked", VersionId=lvid,
+                     BypassGovernanceRetention=True)
+    check("compliance ignores bypass header", False)
+except ClientError:
+    check("compliance ignores bypass header", True)
+
+# Legal hold blocks a permanent delete regardless of retention, and releasing it re-enables it.
+s3.put_object(Bucket="lockb", Key="held", Body=b"x")
+hvid = s3.head_object(Bucket="lockb", Key="held")["VersionId"]
+s3.put_object_legal_hold(Bucket="lockb", Key="held", VersionId=hvid,
+                         LegalHold={"Status": "ON"})
+check("legal hold on",
+      s3.get_object_legal_hold(Bucket="lockb", Key="held",
+                               VersionId=hvid)["LegalHold"]["Status"] == "ON")
+try:
+    s3.delete_object(Bucket="lockb", Key="held", VersionId=hvid)
+    check("legal hold blocks delete", False)
+except ClientError:
+    check("legal hold blocks delete", True)
+s3.put_object_legal_hold(Bucket="lockb", Key="held", VersionId=hvid,
+                         LegalHold={"Status": "OFF"})
+s3.delete_object(Bucket="lockb", Key="held", VersionId=hvid)
+check("delete after legal-hold release", True)
+
+# GOVERNANCE retention blocks a delete, but the bypass header (with permission) lifts it.
+s3.put_object(Bucket="lockb", Key="gov", Body=b"g")
+gvid = s3.head_object(Bucket="lockb", Key="gov")["VersionId"]
+s3.put_object_retention(Bucket="lockb", Key="gov", VersionId=gvid,
+                        Retention={"Mode": "GOVERNANCE", "RetainUntilDate": far_future})
+try:
+    s3.delete_object(Bucket="lockb", Key="gov", VersionId=gvid)
+    check("governance blocks without bypass", False)
+except ClientError:
+    check("governance blocks without bypass", True)
+s3.delete_object(Bucket="lockb", Key="gov", VersionId=gvid, BypassGovernanceRetention=True)
+check("governance delete with bypass", True)
 
 # --- bulk + single delete ---
 s3.delete_objects(Bucket="conf", Delete={"Objects": [

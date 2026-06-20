@@ -686,3 +686,107 @@ fn etag_quoting_is_a_single_pair() {
     .unwrap();
     assert_eq!(parts[0].1, "abc123");
 }
+
+// -------------------------------------------------------------------------------------------
+// Object Lock codecs (retention / legal hold / bucket config) + ISO8601 parse
+// -------------------------------------------------------------------------------------------
+
+#[test]
+fn iso8601_parse_round_trips_format() {
+    use cairn_types::Timestamp;
+    // format_iso8601 -> parse_iso8601 is the identity at second granularity.
+    let ts = Timestamp(1_700_000_000_000);
+    let s = format_iso8601(ts);
+    assert_eq!(parse_iso8601(&s), Some(ts));
+    // A fractional-seconds suffix is accepted and truncated to the second.
+    assert_eq!(
+        parse_iso8601("2023-11-14T22:13:20.500Z"),
+        Some(Timestamp(1_700_000_000_000)),
+    );
+    // Garbage is rejected (None, never a panic).
+    assert_eq!(parse_iso8601("not-a-date"), None);
+    assert_eq!(parse_iso8601(""), None);
+}
+
+#[test]
+fn retention_codec_round_trips() {
+    use cairn_types::{ObjectLockMode, Timestamp};
+    let body = b"<Retention><Mode>COMPLIANCE</Mode><RetainUntilDate>2099-01-01T00:00:00Z</RetainUntilDate></Retention>";
+    let r = parse_retention(body).unwrap();
+    assert!(matches!(r.mode, ObjectLockMode::Compliance));
+    assert!(r.retain_until.0 > Timestamp(1_700_000_000_000).0);
+    // Serialize and re-parse: stable.
+    let xml = retention_to_xml(Some(&r));
+    let r2 = parse_retention(xml.as_bytes()).unwrap();
+    assert_eq!(r.mode, r2.mode);
+    assert_eq!(r.retain_until, r2.retain_until);
+    // Governance variant.
+    let g = parse_retention(
+        b"<Retention><Mode>GOVERNANCE</Mode><RetainUntilDate>2099-01-01T00:00:00Z</RetainUntilDate></Retention>",
+    )
+    .unwrap();
+    assert!(matches!(g.mode, ObjectLockMode::Governance));
+    // None renders an empty <Retention/>.
+    assert!(retention_to_xml(None).contains("Retention"));
+}
+
+#[test]
+fn retention_malformed_is_error_not_panic() {
+    // Bad mode token.
+    assert_malformed(parse_retention(
+        b"<Retention><Mode>NOPE</Mode><RetainUntilDate>2099-01-01T00:00:00Z</RetainUntilDate></Retention>",
+    ));
+    // Bad date.
+    assert_malformed(parse_retention(
+        b"<Retention><Mode>GOVERNANCE</Mode><RetainUntilDate>tomorrow</RetainUntilDate></Retention>",
+    ));
+    // Invalid UTF-8.
+    assert_malformed(parse_retention(&[0xff, 0xfe]));
+}
+
+#[test]
+fn legal_hold_codec_round_trips() {
+    assert!(parse_legal_hold(b"<LegalHold><Status>ON</Status></LegalHold>").unwrap());
+    assert!(!parse_legal_hold(b"<LegalHold><Status>OFF</Status></LegalHold>").unwrap());
+    // Serialize round-trips.
+    assert!(parse_legal_hold(legal_hold_to_xml(true).as_bytes()).unwrap());
+    assert!(!parse_legal_hold(legal_hold_to_xml(false).as_bytes()).unwrap());
+}
+
+#[test]
+fn object_lock_configuration_codec_round_trips() {
+    use cairn_types::{ObjectLockConfiguration, ObjectLockMode, RetentionPeriod};
+    let body = b"<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled>\
+                 <Rule><DefaultRetention><Mode>GOVERNANCE</Mode><Days>30</Days></DefaultRetention></Rule>\
+                 </ObjectLockConfiguration>";
+    let cfg = parse_object_lock_configuration(body).unwrap();
+    assert!(cfg.enabled);
+    let dr = cfg.default_retention.unwrap();
+    assert!(matches!(dr.mode, ObjectLockMode::Governance));
+    assert!(matches!(dr.period, RetentionPeriod::Days(30)));
+    // Serialize and re-parse.
+    let xml = object_lock_configuration_to_xml(&cfg);
+    let cfg2 = parse_object_lock_configuration(xml.as_bytes()).unwrap();
+    assert_eq!(cfg, cfg2);
+    // Years variant.
+    let y = parse_object_lock_configuration(
+        b"<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled>\
+          <Rule><DefaultRetention><Mode>COMPLIANCE</Mode><Years>7</Years></DefaultRetention></Rule>\
+          </ObjectLockConfiguration>",
+    )
+    .unwrap();
+    assert!(matches!(
+        y.default_retention.unwrap().period,
+        RetentionPeriod::Years(7)
+    ));
+    // Enabled-only (no default retention) round-trips.
+    let enabled_only = ObjectLockConfiguration {
+        enabled: true,
+        default_retention: None,
+    };
+    let xml = object_lock_configuration_to_xml(&enabled_only);
+    assert_eq!(
+        parse_object_lock_configuration(xml.as_bytes()).unwrap(),
+        enabled_only
+    );
+}

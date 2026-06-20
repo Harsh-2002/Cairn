@@ -117,6 +117,8 @@ fn is_object_read(action: Action) -> bool {
             | Action::GetObjectVersion
             | Action::GetObjectTagging
             | Action::GetObjectAttributes
+            | Action::GetObjectRetention
+            | Action::GetObjectLegalHold
             | Action::ListMultipartUploadParts
     )
 }
@@ -141,6 +143,8 @@ fn is_object_write(action: Action) -> bool {
             | Action::DeleteObjectVersion
             | Action::PutObjectTagging
             | Action::DeleteObjectTagging
+            | Action::PutObjectRetention
+            | Action::PutObjectLegalHold
             | Action::AbortMultipartUpload
     )
 }

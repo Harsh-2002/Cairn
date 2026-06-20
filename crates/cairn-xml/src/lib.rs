@@ -15,8 +15,9 @@
 #![forbid(unsafe_code)]
 
 use cairn_types::{
-    Bucket, ChecksumAlgorithm, ChecksumValue, ETag, ListPage, MultipartSession, ObjectSummary,
-    PartRecord, StorageClass, Timestamp, VersioningState,
+    Bucket, ChecksumAlgorithm, ChecksumValue, ETag, ListPage, MultipartSession,
+    ObjectLockConfiguration, ObjectLockMode, ObjectRetention, ObjectSummary, PartRecord,
+    RetentionPeriod, StorageClass, Timestamp, VersioningState,
 };
 use quick_xml::Writer;
 use quick_xml::events::{BytesDecl, BytesText, Event};
@@ -32,7 +33,10 @@ pub use parse::{
 pub use parse::{
     MAX_TAGS_BUCKET, MAX_TAGS_OBJECT, parse_tagging, parse_versioning_configuration, validate_tags,
 };
-pub use timefmt::format_iso8601;
+pub use parse::{
+    parse_legal_hold, parse_lock_mode, parse_object_lock_configuration, parse_retention,
+};
+pub use timefmt::{format_iso8601, parse_iso8601};
 
 // ===========================================================================================
 // Small writer helpers
@@ -648,6 +652,80 @@ pub fn versioning_configuration(state: VersioningState) -> String {
                 VersioningState::Unversioned => {}
                 VersioningState::Enabled => leaf(w, "Status", "Enabled"),
                 VersioningState::Suspended => leaf(w, "Status", "Suspended"),
+            }
+            Ok(())
+        })
+        .expect("infallible");
+    finish(w)
+}
+
+/// The S3 wire spelling of an Object Lock mode (`GOVERNANCE` / `COMPLIANCE`).
+#[must_use]
+pub fn lock_mode_str(m: ObjectLockMode) -> &'static str {
+    match m {
+        ObjectLockMode::Governance => "GOVERNANCE",
+        ObjectLockMode::Compliance => "COMPLIANCE",
+    }
+}
+
+/// Serialize a `Retention` document. `None` renders an empty `<Retention/>` (no retention set).
+#[must_use]
+pub fn retention_to_xml(retention: Option<&ObjectRetention>) -> String {
+    let mut w = new_doc();
+    w.create_element("Retention")
+        .with_attribute(("xmlns", "http://s3.amazonaws.com/doc/2006-03-01/"))
+        .write_inner_content(|w| {
+            if let Some(r) = retention {
+                leaf(w, "Mode", lock_mode_str(r.mode));
+                leaf(
+                    w,
+                    "RetainUntilDate",
+                    &timefmt::format_iso8601(r.retain_until),
+                );
+            }
+            Ok(())
+        })
+        .expect("infallible");
+    finish(w)
+}
+
+/// Serialize a `LegalHold` document.
+#[must_use]
+pub fn legal_hold_to_xml(on: bool) -> String {
+    let mut w = new_doc();
+    w.create_element("LegalHold")
+        .with_attribute(("xmlns", "http://s3.amazonaws.com/doc/2006-03-01/"))
+        .write_inner_content(|w| {
+            leaf(w, "Status", if on { "ON" } else { "OFF" });
+            Ok(())
+        })
+        .expect("infallible");
+    finish(w)
+}
+
+/// Serialize a bucket `ObjectLockConfiguration` document.
+#[must_use]
+pub fn object_lock_configuration_to_xml(cfg: &ObjectLockConfiguration) -> String {
+    let mut w = new_doc();
+    w.create_element("ObjectLockConfiguration")
+        .with_attribute(("xmlns", "http://s3.amazonaws.com/doc/2006-03-01/"))
+        .write_inner_content(|w| {
+            if cfg.enabled {
+                leaf(w, "ObjectLockEnabled", "Enabled");
+            }
+            if let Some(dr) = &cfg.default_retention {
+                w.create_element("Rule").write_inner_content(|w| {
+                    w.create_element("DefaultRetention")
+                        .write_inner_content(|w| {
+                            leaf(w, "Mode", lock_mode_str(dr.mode));
+                            match dr.period {
+                                RetentionPeriod::Days(d) => leaf(w, "Days", &d.to_string()),
+                                RetentionPeriod::Years(y) => leaf(w, "Years", &y.to_string()),
+                            }
+                            Ok(())
+                        })?;
+                    Ok(())
+                })?;
             }
             Ok(())
         })

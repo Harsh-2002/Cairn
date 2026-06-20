@@ -356,6 +356,23 @@ INSERT INTO user_stats (owner_id, logical_bytes)
 ALTER TABLE multipart_uploads ADD COLUMN sse_requested INTEGER NOT NULL DEFAULT 0;
 "#,
     },
+    Migration {
+        version: 16,
+        name: "object lock",
+        sql: r#"
+-- S3 Object Lock side table (WORM): per-version retention + legal hold. Mirrors
+-- cairn-meta/src/schema.rs v16. lock_mode is 'GOVERNANCE'|'COMPLIANCE'|NULL; retain_until is epoch ms.
+CREATE TABLE object_locks (
+    bucket_name  TEXT NOT NULL,
+    key          TEXT NOT NULL,
+    version_id   TEXT NOT NULL,
+    lock_mode    TEXT,
+    retain_until INTEGER,
+    legal_hold   INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (bucket_name, key, version_id)
+);
+"#,
+    },
 ];
 
 /// Run all pending migrations on the write driver, recording each as applied. Each migration is

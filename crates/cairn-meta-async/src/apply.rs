@@ -238,6 +238,57 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
             }
             Ok(MutationOutcome::Ack)
         }
+        Mutation::SetObjectRetention {
+            bucket,
+            key,
+            version_id,
+            retention,
+        } => {
+            let mode = retention
+                .as_ref()
+                .map(|r| model::lock_mode_str(r.mode).to_owned());
+            let until = match retention.as_ref().map(|r| r.retain_until.0) {
+                Some(u) => Value::Int(u),
+                None => Value::Null,
+            };
+            driver
+                .execute(
+                    "INSERT INTO object_locks (bucket_name, key, version_id, lock_mode, retain_until, legal_hold)
+                     VALUES (?1,?2,?3,?4,?5,0)
+                     ON CONFLICT(bucket_name,key,version_id)
+                     DO UPDATE SET lock_mode=excluded.lock_mode, retain_until=excluded.retain_until",
+                    vec![
+                        Value::Text(bucket.as_str().to_owned()),
+                        Value::Text(key.as_str().to_owned()),
+                        Value::Text(version_id.as_str().to_owned()),
+                        opt_text(mode),
+                        until,
+                    ],
+                )
+                .await?;
+            Ok(MutationOutcome::Ack)
+        }
+        Mutation::SetObjectLegalHold {
+            bucket,
+            key,
+            version_id,
+            on,
+        } => {
+            driver
+                .execute(
+                    "INSERT INTO object_locks (bucket_name, key, version_id, lock_mode, retain_until, legal_hold)
+                     VALUES (?1,?2,?3,NULL,NULL,?4)
+                     ON CONFLICT(bucket_name,key,version_id) DO UPDATE SET legal_hold=excluded.legal_hold",
+                    vec![
+                        Value::Text(bucket.as_str().to_owned()),
+                        Value::Text(key.as_str().to_owned()),
+                        Value::Text(version_id.as_str().to_owned()),
+                        Value::Int(on as i64),
+                    ],
+                )
+                .await?;
+            Ok(MutationOutcome::Ack)
+        }
         Mutation::SetVersioning { bucket, state } => {
             driver
                 .execute(
@@ -959,6 +1010,17 @@ async fn delete_version(
             ],
         )
         .await?;
+    // Drop any Object Lock side-row for the removed version (mirrors cairn-meta).
+    driver
+        .execute(
+            "DELETE FROM object_locks WHERE bucket_name=?1 AND key=?2 AND version_id=?3",
+            vec![
+                Value::Text(bucket.as_str().to_owned()),
+                Value::Text(key.as_str().to_owned()),
+                Value::Text(version_id.as_str().to_owned()),
+            ],
+        )
+        .await?;
     if let Some((owner, sl, sp_bytes)) = removed {
         // The deleted row leaves the table: subtract its version and bytes from the counters.
         adjust_stats(driver, bucket.as_str(), &owner, -1, -sl, -sp_bytes).await?;
@@ -1156,6 +1218,7 @@ fn config_aspect_str(a: cairn_types::bucket::ConfigAspect) -> &'static str {
         Tagging => "tagging",
         PublicAccessBlock => "public_access_block",
         Encryption => "encryption",
+        ObjectLock => "object_lock",
     }
 }
 

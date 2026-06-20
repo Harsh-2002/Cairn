@@ -4021,3 +4021,521 @@ async fn bulk_delete_suspended_inserts_null_marker_not_permanent() {
         "identified version retained under Suspended bulk delete: {vxml}"
     );
 }
+
+// ===========================================================================================
+// Object Lock / WORM / retention / legal hold (ARCH 13/15)
+// ===========================================================================================
+
+/// Create an Object-Lock-enabled bucket, PUT one object, and return its `(version_id)`.
+async fn lock_bucket_with_object(h: &Harness, bucket: &str, key: &str) -> String {
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some(bucket),
+                None,
+                &[],
+                &[("x-amz-bucket-object-lock-enabled", "true")],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "create object-lock bucket");
+    let (st, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some(bucket),
+                Some(key),
+                &[],
+                &[],
+                b"payload".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "put object");
+    header(&hdrs, "x-amz-version-id")
+        .expect("object-lock bucket is versioned, so a PUT returns a version id")
+        .to_owned()
+}
+
+fn retention_body(mode: &str, until: &str) -> Vec<u8> {
+    format!("<Retention><Mode>{mode}</Mode><RetainUntilDate>{until}</RetainUntilDate></Retention>")
+        .into_bytes()
+}
+
+/// A bucket created with Object Lock is forced to versioning Enabled and reports its lock config.
+#[tokio::test]
+async fn object_lock_create_forces_versioning_and_reports_config() {
+    let h = harness().await;
+    let _v = lock_bucket_with_object(&h, "olbucket", "k").await;
+
+    // Versioning is Enabled (forced by Object Lock).
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("olbucket"),
+                None,
+                &[("versioning", "")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let xml = String::from_utf8(body).unwrap();
+    assert!(
+        xml.contains("<Status>Enabled</Status>"),
+        "versioning forced Enabled: {xml}"
+    );
+
+    // GET ?object-lock reports it enabled.
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("olbucket"),
+                None,
+                &[("object-lock", "")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let xml = String::from_utf8(body).unwrap();
+    assert!(
+        xml.contains("<ObjectLockEnabled>Enabled</ObjectLockEnabled>"),
+        "{xml}"
+    );
+}
+
+/// COMPLIANCE retention can never be deleted or weakened before it expires — not even with the
+/// governance-bypass header.
+#[tokio::test]
+async fn object_lock_compliance_is_immutable() {
+    let h = harness().await;
+    let v = lock_bucket_with_object(&h, "compl", "doc").await;
+
+    // Apply a COMPLIANCE retention far in the future.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("compl"),
+                Some("doc"),
+                &[("retention", ""), ("versionId", &v)],
+                &[],
+                retention_body("COMPLIANCE", "2099-01-01T00:00:00Z"),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "set compliance retention");
+
+    // Permanent version delete is denied.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::DELETE,
+                Some("compl"),
+                Some("doc"),
+                &[("versionId", &v)],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "compliance blocks delete");
+
+    // Even WITH the bypass header it stays denied (compliance is never bypassable).
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::DELETE,
+                Some("compl"),
+                Some("doc"),
+                &[("versionId", &v)],
+                &[("x-amz-bypass-governance-retention", "true")],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::FORBIDDEN,
+        "compliance ignores bypass header"
+    );
+
+    // Shortening the COMPLIANCE retention is denied too.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("compl"),
+                Some("doc"),
+                &[("retention", ""), ("versionId", &v)],
+                &[],
+                retention_body("COMPLIANCE", "2030-01-01T00:00:00Z"),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "compliance cannot be shortened");
+}
+
+/// GOVERNANCE retention blocks a permanent delete, but the bypass header (with permission) lifts it.
+#[tokio::test]
+async fn object_lock_governance_bypass() {
+    let h = harness().await;
+    let v = lock_bucket_with_object(&h, "gov", "doc").await;
+
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("gov"),
+                Some("doc"),
+                &[("retention", ""), ("versionId", &v)],
+                &[],
+                retention_body("GOVERNANCE", "2099-01-01T00:00:00Z"),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    // Without the bypass header: denied.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::DELETE,
+                Some("gov"),
+                Some("doc"),
+                &[("versionId", &v)],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::FORBIDDEN,
+        "governance blocks without bypass"
+    );
+
+    // With the bypass header (AllowAll authz grants the action): permitted.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::DELETE,
+                Some("gov"),
+                Some("doc"),
+                &[("versionId", &v)],
+                &[("x-amz-bypass-governance-retention", "true")],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT, "governance delete with bypass");
+}
+
+/// Legal hold blocks a permanent delete regardless of retention, and releasing it re-enables delete.
+#[tokio::test]
+async fn object_lock_legal_hold_blocks_then_releases() {
+    let h = harness().await;
+    let v = lock_bucket_with_object(&h, "lhold", "doc").await;
+
+    // Turn legal hold ON.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("lhold"),
+                Some("doc"),
+                &[("legal-hold", ""), ("versionId", &v)],
+                &[],
+                b"<LegalHold><Status>ON</Status></LegalHold>".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    // Delete denied while held — even with the governance-bypass header.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::DELETE,
+                Some("lhold"),
+                Some("doc"),
+                &[("versionId", &v)],
+                &[("x-amz-bypass-governance-retention", "true")],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "legal hold blocks delete");
+
+    // Release it.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("lhold"),
+                Some("doc"),
+                &[("legal-hold", ""), ("versionId", &v)],
+                &[],
+                b"<LegalHold><Status>OFF</Status></LegalHold>".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    // Now the delete succeeds.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::DELETE,
+                Some("lhold"),
+                Some("doc"),
+                &[("versionId", &v)],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::NO_CONTENT,
+        "delete after legal-hold release"
+    );
+}
+
+/// A bucket default retention is stamped onto new objects, surfaced by GET ?retention and echoed
+/// on HEAD; and an over-the-wire GET ?legal-hold round-trips.
+#[tokio::test]
+async fn object_lock_default_retention_stamped_and_echoed() {
+    let h = harness().await;
+    // Create lock-enabled bucket (no object yet).
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("def"),
+                None,
+                &[],
+                &[("x-amz-bucket-object-lock-enabled", "true")],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    // Configure a default GOVERNANCE retention of 30 days.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("def"),
+                None,
+                &[("object-lock", "")],
+                &[],
+                b"<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled>\
+                  <Rule><DefaultRetention><Mode>GOVERNANCE</Mode><Days>30</Days></DefaultRetention>\
+                  </Rule></ObjectLockConfiguration>"
+                    .to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "set default retention");
+
+    // PUT an object — default retention is stamped.
+    let (st, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("def"), Some("d"), &[], &[], b"x".to_vec()),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let v = header(&hdrs, "x-amz-version-id").unwrap().to_owned();
+
+    // GET ?retention shows a GOVERNANCE retention.
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("def"),
+                Some("d"),
+                &[("retention", ""), ("versionId", &v)],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let xml = String::from_utf8(body).unwrap();
+    assert!(
+        xml.contains("<Mode>GOVERNANCE</Mode>"),
+        "default retention surfaced: {xml}"
+    );
+
+    // HEAD echoes the lock headers.
+    let (st, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(Method::HEAD, Some("def"), Some("d"), &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(header(&hdrs, "x-amz-object-lock-mode"), Some("GOVERNANCE"));
+    assert_eq!(header(&hdrs, "x-amz-object-lock-legal-hold"), Some("OFF"));
+
+    // And the default retention blocks an unbypassed permanent delete.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::DELETE,
+                Some("def"),
+                Some("d"),
+                &[("versionId", &v)],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "default retention blocks delete");
+}
+
+/// Retention requires a lock-enabled bucket; object-lock config requires versioning.
+#[tokio::test]
+async fn object_lock_guards() {
+    let h = harness().await;
+    // A plain (non-lock) bucket.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("plain"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("plain"),
+                Some("k"),
+                &[],
+                &[],
+                b"x".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let _ = hdrs;
+
+    // PUT ?retention on a non-lock bucket -> 400 InvalidRequest.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("plain"),
+                Some("k"),
+                &[("retention", "")],
+                &[],
+                retention_body("GOVERNANCE", "2099-01-01T00:00:00Z"),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::BAD_REQUEST,
+        "retention needs a lock-enabled bucket"
+    );
+
+    // PUT ?object-lock (enabled) on a non-versioned bucket -> 400.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("plain"),
+                None,
+                &[("object-lock", "")],
+                &[],
+                b"<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled>\
+                  </ObjectLockConfiguration>"
+                    .to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "object-lock needs versioning");
+}

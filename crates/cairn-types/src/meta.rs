@@ -118,6 +118,30 @@ pub enum Mutation {
         /// The document, or None to delete.
         doc: Option<ConfigDoc>,
     },
+    /// Set or clear the Object Lock retention on one object version (preserving any legal hold).
+    /// The protocol layer enforces the retention policy (no shortening COMPLIANCE, governance bypass)
+    /// before submitting this.
+    SetObjectRetention {
+        /// Target bucket.
+        bucket: BucketName,
+        /// Target key.
+        key: ObjectKey,
+        /// Target version.
+        version_id: VersionId,
+        /// The retention to apply, or None to clear it.
+        retention: Option<crate::object::ObjectRetention>,
+    },
+    /// Set the Object Lock legal-hold flag on one object version (preserving any retention).
+    SetObjectLegalHold {
+        /// Target bucket.
+        bucket: BucketName,
+        /// Target key.
+        key: ObjectKey,
+        /// Target version.
+        version_id: VersionId,
+        /// Whether the legal hold is on.
+        on: bool,
+    },
     /// Set a bucket's versioning state.
     SetVersioning {
         /// The bucket.

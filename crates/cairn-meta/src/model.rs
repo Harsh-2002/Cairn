@@ -98,6 +98,20 @@ pub fn mp_status_from(s: &str) -> MultipartStatus {
     }
 }
 
+pub fn lock_mode_str(m: cairn_types::object::ObjectLockMode) -> &'static str {
+    match m {
+        cairn_types::object::ObjectLockMode::Governance => "GOVERNANCE",
+        cairn_types::object::ObjectLockMode::Compliance => "COMPLIANCE",
+    }
+}
+/// Parse a stored lock-mode string. Unknown values fail safe to the stricter `Compliance`.
+pub fn lock_mode_from(s: &str) -> cairn_types::object::ObjectLockMode {
+    match s {
+        "GOVERNANCE" => cairn_types::object::ObjectLockMode::Governance,
+        _ => cairn_types::object::ObjectLockMode::Compliance,
+    }
+}
+
 pub fn disposition_str(d: ShareDisposition) -> &'static str {
     match d {
         ShareDisposition::Inline => "inline",

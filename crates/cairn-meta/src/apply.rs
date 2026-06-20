@@ -209,6 +209,39 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             .map_err(engine_err)?;
             Ok(MutationOutcome::Ack)
         }
+        Mutation::SetObjectRetention {
+            bucket,
+            key,
+            version_id,
+            retention,
+        } => {
+            let mode = retention.as_ref().map(|r| model::lock_mode_str(r.mode));
+            let until = retention.as_ref().map(|r| r.retain_until.0);
+            conn.execute(
+                "INSERT INTO object_locks (bucket_name, key, version_id, lock_mode, retain_until, legal_hold)
+                 VALUES (?1,?2,?3,?4,?5,0)
+                 ON CONFLICT(bucket_name,key,version_id)
+                 DO UPDATE SET lock_mode=excluded.lock_mode, retain_until=excluded.retain_until",
+                params![bucket.as_str(), key.as_str(), version_id.as_str(), mode, until],
+            )
+            .map_err(engine_err)?;
+            Ok(MutationOutcome::Ack)
+        }
+        Mutation::SetObjectLegalHold {
+            bucket,
+            key,
+            version_id,
+            on,
+        } => {
+            conn.execute(
+                "INSERT INTO object_locks (bucket_name, key, version_id, lock_mode, retain_until, legal_hold)
+                 VALUES (?1,?2,?3,NULL,NULL,?4)
+                 ON CONFLICT(bucket_name,key,version_id) DO UPDATE SET legal_hold=excluded.legal_hold",
+                params![bucket.as_str(), key.as_str(), version_id.as_str(), on as i64],
+            )
+            .map_err(engine_err)?;
+            Ok(MutationOutcome::Ack)
+        }
         Mutation::SetVersioning { bucket, state } => {
             conn.execute(
                 "UPDATE buckets SET versioning_state=?2 WHERE name=?1",
@@ -873,6 +906,14 @@ fn delete_version(
     .map_err(engine_err)?
     .execute(params![bucket.as_str(), key.as_str(), version_id.as_str()])
     .map_err(engine_err)?;
+    // Drop any Object Lock side-row for the removed version (a locked version can only reach here
+    // once its retention has expired and no legal hold remains; see the protocol-layer enforcement).
+    conn.prepare_cached(
+        "DELETE FROM object_locks WHERE bucket_name=?1 AND key=?2 AND version_id=?3",
+    )
+    .map_err(engine_err)?
+    .execute(params![bucket.as_str(), key.as_str(), version_id.as_str()])
+    .map_err(engine_err)?;
     if let Some((owner, sl, sp_bytes)) = removed {
         // The deleted row leaves the table: subtract its version and bytes from the counters.
         adjust_stats(conn, bucket.as_str(), &owner, -1, -sl, -sp_bytes)?;
@@ -1057,6 +1098,7 @@ fn config_aspect_str(a: cairn_types::bucket::ConfigAspect) -> &'static str {
         Tagging => "tagging",
         PublicAccessBlock => "public_access_block",
         Encryption => "encryption",
+        ObjectLock => "object_lock",
     }
 }
 

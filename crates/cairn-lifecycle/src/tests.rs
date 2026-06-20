@@ -908,3 +908,85 @@ fn filter_matches_semantics() {
         "empty filter matches all"
     );
 }
+
+#[tokio::test]
+async fn noncurrent_expiration_preserves_object_locked_version() {
+    let meta = InMemoryMetadataStore::new();
+    let blob = InMemoryBlobStore::new();
+    let clock = TestClock::at_secs(0);
+    make_bucket(&meta, VersioningState::Enabled).await;
+
+    // Three versions of one key on days 0,1,2 — after the third put, day0 and day1 are noncurrent.
+    let mut versions = Vec::new();
+    for day in 0..3 {
+        let v = VersionId::generate();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        put_object(
+            &meta,
+            &blob,
+            "doc.txt",
+            format!("body-{day}").as_bytes(),
+            day,
+            v.clone(),
+        )
+        .await;
+        versions.push(v);
+    }
+    assert_eq!(count_versions(&meta).await, 3);
+
+    // Object Lock the OLDEST noncurrent version (day 0) under a far-future COMPLIANCE retention.
+    meta.submit(Mutation::SetObjectRetention {
+        bucket: bucket_name(),
+        key: ObjectKey::parse("doc.txt").unwrap(),
+        version_id: versions[0].clone(),
+        retention: Some(cairn_types::object::ObjectRetention {
+            mode: cairn_types::object::ObjectLockMode::Compliance,
+            retain_until: Timestamp::from_secs(1000 * DAY),
+        }),
+    })
+    .await
+    .unwrap();
+
+    // Rule: expire EVERY noncurrent version older than 1 day (keep none).
+    let rule = LifecycleRule {
+        id: "ncv".to_owned(),
+        enabled: true,
+        filter: Filter::default(),
+        actions: vec![Action::NoncurrentVersionExpiration {
+            days: 1,
+            newer_noncurrent_versions: None,
+        }],
+    };
+
+    clock.set(Timestamp::from_secs(10 * DAY));
+    let scanner = LifecycleScanner::new();
+    let report = scanner
+        .run_once(&meta, &blob, &clock, &cfg(vec![rule]))
+        .await
+        .unwrap();
+
+    // day1 (unlocked noncurrent) is deleted; day0 (locked) is preserved — not counted as expired
+    // and not an error.
+    assert_eq!(
+        report.versions_expired, 1,
+        "only the unlocked noncurrent version expired"
+    );
+    assert_eq!(report.errors, 0);
+    // Remaining: latest (day2) + locked (day0) = 2.
+    assert_eq!(
+        count_versions(&meta).await,
+        2,
+        "locked version survives expiration"
+    );
+    assert!(
+        meta.get_version(
+            &bucket_name(),
+            &ObjectKey::parse("doc.txt").unwrap(),
+            &versions[0]
+        )
+        .await
+        .unwrap()
+        .is_some(),
+        "the Object-Locked version is still present",
+    );
+}

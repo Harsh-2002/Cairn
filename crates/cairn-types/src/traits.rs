@@ -189,6 +189,14 @@ pub trait MetadataStore: Send + Sync {
         key: &ObjectKey,
         version: &VersionId,
     ) -> Result<Vec<(String, String)>, MetaError>;
+    /// Get the Object Lock state (retention + legal hold) of one object version, or the default
+    /// (no retention, no legal hold) when none is set.
+    async fn get_object_lock(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version: &VersionId,
+    ) -> Result<crate::object::ObjectLockState, MetaError>;
 
     // --- multipart ---
     /// Get a multipart session.

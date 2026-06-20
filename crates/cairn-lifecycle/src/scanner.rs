@@ -190,14 +190,16 @@ impl LifecycleScanner {
                     } else {
                         report.errors += 1;
                     }
-                } else if self
-                    .delete_version(meta, blob, &bucket.name, &obj.key, &obj.version_id)
-                    .await
-                    .is_ok()
-                {
-                    report.objects_expired += 1;
                 } else {
-                    report.errors += 1;
+                    match self
+                        .delete_version(meta, blob, &bucket.name, &obj.key, &obj.version_id, now)
+                        .await
+                    {
+                        Ok(true) => report.objects_expired += 1,
+                        // Ok(false): preserved by Object Lock — neither expired nor an error.
+                        Ok(false) => {}
+                        Err(_) => report.errors += 1,
+                    }
                 }
             }
             match page.next_cursor {
@@ -274,14 +276,14 @@ impl LifecycleScanner {
                 if now.secs_since(obj.last_modified) < i64::from(days) * 86_400 {
                     continue;
                 }
-                if self
-                    .delete_version(meta, blob, &bucket.name, &obj.key, &obj.version_id)
+                match self
+                    .delete_version(meta, blob, &bucket.name, &obj.key, &obj.version_id, now)
                     .await
-                    .is_ok()
                 {
-                    report.versions_expired += 1;
-                } else {
-                    report.errors += 1;
+                    Ok(true) => report.versions_expired += 1,
+                    // Ok(false): preserved by Object Lock — neither expired nor an error.
+                    Ok(false) => {}
+                    Err(_) => report.errors += 1,
                 }
             }
         }
@@ -583,6 +585,10 @@ impl LifecycleScanner {
 
     /// Permanently delete a version and reclaim its freed blob (idempotent: a missing version
     /// or absent blob is success).
+    /// Permanently delete a version, reclaiming its blob. Returns `true` when the version was
+    /// deleted, `false` when it was preserved because Object Lock (retention or legal hold) still
+    /// protects it — lifecycle silently skips a locked version (the WORM guarantee outranks the
+    /// expiry rule) and the rule applies once protection lapses.
     async fn delete_version<M, B>(
         &self,
         meta: &M,
@@ -590,11 +596,19 @@ impl LifecycleScanner {
         bucket: &BucketName,
         key: &ObjectKey,
         version_id: &VersionId,
-    ) -> Result<(), MetaError>
+        now: Timestamp,
+    ) -> Result<bool, MetaError>
     where
         M: MetadataStore + ?Sized,
         B: BlobStore + ?Sized,
     {
+        if meta
+            .get_object_lock(bucket, key, version_id)
+            .await?
+            .is_protected(now)
+        {
+            return Ok(false);
+        }
         let outcome = meta
             .submit(Mutation::DeleteVersion {
                 bucket: bucket.clone(),
@@ -608,7 +622,7 @@ impl LifecycleScanner {
         {
             self.reclaim(blob, &path).await;
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Best-effort blob reclamation; a delete failure is logged, not propagated, because the

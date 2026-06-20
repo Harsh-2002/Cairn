@@ -12,6 +12,9 @@ fuzz tests live next to their sources). Two kinds — keep them distinct:
 - `crash_consistency.sh` — the F-4 durability property at one crash seam.
 - `scrub.sh` — integrity scrub: corrupt a stored blob on disk, assert the background scrub
   (`CAIRN_SCRUB_INTERVAL_SECS`) detects the ETag mismatch (`cairn_scrub_corruption_total`).
+- `object_lock.sh` — Object Lock / WORM: COMPLIANCE immutable (no delete/shorten, bypass ignored),
+  GOVERNANCE yields only to `s3:BypassGovernanceRetention` + the bypass header, legal hold
+  blocks/releases, bucket default retention stamped + echoed on HEAD. (Also folded into `run.sh`.)
 
 ## regression / limit (where does it break?)
 - `replication_chaos.sh` (+`.py`) — break replication on purpose (target down, source SIGKILL); assert no loss.

@@ -444,6 +444,8 @@ impl CachedMetadataStore {
             | Mutation::RecordActivity(_)
             | Mutation::CreateShare(_)
             | Mutation::RevokeShare { .. }
+            | Mutation::SetObjectRetention { .. }
+            | Mutation::SetObjectLegalHold { .. }
             | Mutation::RecordRequestMetrics { .. } => {}
         }
     }
@@ -598,6 +600,15 @@ impl MetadataStore for CachedMetadataStore {
         version: &VersionId,
     ) -> Result<Vec<(String, String)>, MetaError> {
         self.inner.get_object_tags(bucket, key, version).await
+    }
+
+    async fn get_object_lock(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version: &VersionId,
+    ) -> Result<cairn_types::object::ObjectLockState, MetaError> {
+        self.inner.get_object_lock(bucket, key, version).await
     }
 
     async fn get_multipart(
@@ -948,6 +959,14 @@ mod tests {
             version: &VersionId,
         ) -> Result<Vec<(String, String)>, MetaError> {
             self.inner.get_object_tags(bucket, key, version).await
+        }
+        async fn get_object_lock(
+            &self,
+            bucket: &BucketName,
+            key: &ObjectKey,
+            version: &VersionId,
+        ) -> Result<cairn_types::object::ObjectLockState, MetaError> {
+            self.inner.get_object_lock(bucket, key, version).await
         }
         async fn get_multipart(
             &self,

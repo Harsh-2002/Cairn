@@ -808,6 +808,43 @@ impl MetadataStore for SqliteMetadataStore {
         .await
     }
 
+    async fn get_object_lock(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version: &VersionId,
+    ) -> Result<cairn_types::object::ObjectLockState, MetaError> {
+        let (b, k, v) = (
+            bucket.as_str().to_owned(),
+            key.as_str().to_owned(),
+            version.as_str().to_owned(),
+        );
+        self.with_read(move |conn| {
+            let row: Option<(Option<String>, Option<i64>, i64)> = conn
+                .prepare_cached(
+                    "SELECT lock_mode, retain_until, legal_hold FROM object_locks WHERE bucket_name=?1 AND key=?2 AND version_id=?3",
+                )
+                .map_err(engine_err)?
+                .query_row(params![b, k, v], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .optional()
+                .map_err(engine_err)?;
+            Ok(match row {
+                Some((mode, until, lh)) => {
+                    let retention = match (mode, until) {
+                        (Some(m), Some(u)) => Some(cairn_types::object::ObjectRetention {
+                            mode: crate::model::lock_mode_from(&m),
+                            retain_until: cairn_types::time::Timestamp(u),
+                        }),
+                        _ => None,
+                    };
+                    cairn_types::object::ObjectLockState { retention, legal_hold: lh != 0 }
+                }
+                None => cairn_types::object::ObjectLockState::default(),
+            })
+        })
+        .await
+    }
+
     async fn get_multipart(
         &self,
         upload: &UploadId,

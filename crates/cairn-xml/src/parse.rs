@@ -7,7 +7,10 @@
 //! drive the reader through [`Sax`], which tracks element depth and rejects a body that
 //! reaches EOF with any element still open.
 
-use cairn_types::{Acl, Error, Grant, Grantee, Permission, UserId, VersioningState};
+use cairn_types::{
+    Acl, DefaultRetention, Error, Grant, Grantee, ObjectLockConfiguration, ObjectLockMode,
+    ObjectRetention, Permission, RetentionPeriod, UserId, VersioningState,
+};
 use quick_xml::Reader;
 use quick_xml::events::Event;
 
@@ -376,6 +379,169 @@ pub fn parse_versioning_configuration(body: &[u8]) -> Result<VersioningState, Er
         Ok(())
     })?;
     Ok(state)
+}
+
+// ===========================================================================================
+// Object Lock: Retention, LegalHold, ObjectLockConfiguration
+// ===========================================================================================
+
+/// Parse an Object Lock mode token (`GOVERNANCE` / `COMPLIANCE`), as used both in the XML
+/// `<Mode>` element and the `x-amz-object-lock-mode` header.
+///
+/// # Errors
+/// [`Error::MalformedXml`] for any other value.
+pub fn parse_lock_mode(s: &str) -> Result<ObjectLockMode, Error> {
+    match s {
+        "GOVERNANCE" => Ok(ObjectLockMode::Governance),
+        "COMPLIANCE" => Ok(ObjectLockMode::Compliance),
+        _ => Err(malformed()),
+    }
+}
+
+/// Parse a `Retention` body (`<Retention><Mode>…</Mode><RetainUntilDate>…</RetainUntilDate></Retention>`).
+///
+/// # Errors
+/// [`Error::MalformedXml`] if the body is not well-formed or a required field is missing/invalid.
+pub fn parse_retention(body: &[u8]) -> Result<ObjectRetention, Error> {
+    let mut mode: Option<ObjectLockMode> = None;
+    let mut retain_until = None;
+    let mut cur: Option<&'static str> = None;
+    let mut buf = String::new();
+    drive(body, |ev| {
+        match ev {
+            Sax::Open(name) => {
+                cur = if name == b"Mode" {
+                    Some("mode")
+                } else if name == b"RetainUntilDate" {
+                    Some("date")
+                } else {
+                    None
+                };
+                buf.clear();
+            }
+            Sax::Text(t) => {
+                if cur.is_some() {
+                    buf.push_str(&t);
+                }
+            }
+            Sax::Close(name) => {
+                if name == b"Mode" {
+                    mode = Some(parse_lock_mode(buf.trim())?);
+                } else if name == b"RetainUntilDate" {
+                    retain_until =
+                        Some(crate::timefmt::parse_iso8601(buf.trim()).ok_or_else(malformed)?);
+                }
+                cur = None;
+            }
+        }
+        Ok(())
+    })?;
+    match (mode, retain_until) {
+        (Some(mode), Some(retain_until)) => Ok(ObjectRetention { mode, retain_until }),
+        _ => Err(malformed()),
+    }
+}
+
+/// Parse a `LegalHold` body (`<LegalHold><Status>ON|OFF</Status></LegalHold>`) into the on/off flag.
+///
+/// # Errors
+/// [`Error::MalformedXml`] if the body is not well-formed or the status is not `ON`/`OFF`.
+pub fn parse_legal_hold(body: &[u8]) -> Result<bool, Error> {
+    let mut status: Option<bool> = None;
+    let mut in_status = false;
+    let mut buf = String::new();
+    drive(body, |ev| {
+        match ev {
+            Sax::Open(name) => {
+                in_status = name == b"Status";
+                if in_status {
+                    buf.clear();
+                }
+            }
+            Sax::Text(t) => {
+                if in_status {
+                    buf.push_str(&t);
+                }
+            }
+            Sax::Close(name) => {
+                if name == b"Status" {
+                    status = Some(match buf.trim() {
+                        "ON" => true,
+                        "OFF" => false,
+                        _ => return Err(malformed()),
+                    });
+                    in_status = false;
+                }
+            }
+        }
+        Ok(())
+    })?;
+    status.ok_or_else(malformed)
+}
+
+/// Parse an `ObjectLockConfiguration` body (the bucket-level config) into the typed configuration.
+///
+/// # Errors
+/// [`Error::MalformedXml`] if the body is not well-formed or the default retention is partial.
+pub fn parse_object_lock_configuration(body: &[u8]) -> Result<ObjectLockConfiguration, Error> {
+    let mut enabled = false;
+    let mut mode: Option<ObjectLockMode> = None;
+    let mut days: Option<u32> = None;
+    let mut years: Option<u32> = None;
+    let mut cur: Option<&'static str> = None;
+    let mut buf = String::new();
+    drive(body, |ev| {
+        match ev {
+            Sax::Open(name) => {
+                cur = if name == b"ObjectLockEnabled" {
+                    Some("enabled")
+                } else if name == b"Mode" {
+                    Some("mode")
+                } else if name == b"Days" {
+                    Some("days")
+                } else if name == b"Years" {
+                    Some("years")
+                } else {
+                    None
+                };
+                buf.clear();
+            }
+            Sax::Text(t) => {
+                if cur.is_some() {
+                    buf.push_str(&t);
+                }
+            }
+            Sax::Close(name) => {
+                if name == b"ObjectLockEnabled" {
+                    enabled = buf.trim() == "Enabled";
+                } else if name == b"Mode" {
+                    mode = Some(parse_lock_mode(buf.trim())?);
+                } else if name == b"Days" {
+                    days = Some(buf.trim().parse().map_err(|_| malformed())?);
+                } else if name == b"Years" {
+                    years = Some(buf.trim().parse().map_err(|_| malformed())?);
+                }
+                cur = None;
+            }
+        }
+        Ok(())
+    })?;
+    let default_retention = match (mode, days, years) {
+        (Some(mode), Some(d), None) => Some(DefaultRetention {
+            mode,
+            period: RetentionPeriod::Days(d),
+        }),
+        (Some(mode), None, Some(y)) => Some(DefaultRetention {
+            mode,
+            period: RetentionPeriod::Years(y),
+        }),
+        (None, None, None) => None,
+        _ => return Err(malformed()),
+    };
+    Ok(ObjectLockConfiguration {
+        enabled,
+        default_retention,
+    })
 }
 
 // ===========================================================================================

@@ -57,6 +57,49 @@ pub enum ConfigAspect {
     /// The default server-side-encryption setting (SSE-S3 applied to new uploads
     /// that do not carry their own `x-amz-server-side-encryption` header).
     Encryption,
+    /// The bucket Object Lock configuration: whether object lock is enabled and an optional default
+    /// retention (mode + period) stamped onto new object versions.
+    ObjectLock,
+}
+
+/// How long a bucket's default Object Lock retention lasts, as a period from object creation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RetentionPeriod {
+    /// A number of days.
+    Days(u32),
+    /// A number of years (treated as 365 days each).
+    Years(u32),
+}
+
+/// A bucket's default Object Lock retention, applied to every new object version on PUT.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DefaultRetention {
+    /// The retention mode.
+    pub mode: crate::object::ObjectLockMode,
+    /// The retention period from object creation.
+    pub period: RetentionPeriod,
+}
+
+impl DefaultRetention {
+    /// The retain-until instant for an object created at `now`.
+    #[must_use]
+    pub fn retain_until(&self, now: Timestamp) -> Timestamp {
+        let days = match self.period {
+            RetentionPeriod::Days(d) => i64::from(d),
+            RetentionPeriod::Years(y) => i64::from(y) * 365,
+        };
+        Timestamp(now.0 + days * 86_400_000)
+    }
+}
+
+/// A bucket's Object Lock configuration: whether object lock is enabled and an optional default
+/// retention stamped onto new object versions. Stored as JSON under `ConfigAspect::ObjectLock`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ObjectLockConfiguration {
+    /// Whether object lock is enabled on the bucket (requires versioning).
+    pub enabled: bool,
+    /// The default retention applied to new versions, if any.
+    pub default_retention: Option<DefaultRetention>,
 }
 
 /// An opaque validated configuration document (stored as text/JSON). The typed parse lives

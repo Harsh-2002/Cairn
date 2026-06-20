@@ -13,7 +13,9 @@ use cairn_types::authz::{
     PublicAccessBlock, RequestContext, Resource,
 };
 use cairn_types::blob::{ByteRange, PartRef, StageOptions};
-use cairn_types::bucket::{Bucket, ConfigAspect, ConfigDoc, VersioningState};
+use cairn_types::bucket::{
+    Bucket, ConfigAspect, ConfigDoc, ObjectLockConfiguration, VersioningState,
+};
 use cairn_types::crypto::Nonce;
 use cairn_types::error::Error;
 use cairn_types::id::{BucketName, ObjectKey, UploadId, VersionId};
@@ -22,8 +24,8 @@ use cairn_types::meta::{
     Precondition, ReplicationOp,
 };
 use cairn_types::object::{
-    ChecksumAlgorithm, ChecksumSet, ChecksumValue, CompressionDescriptor, ETag, ObjectVersionRow,
-    StorageClass,
+    ChecksumAlgorithm, ChecksumSet, ChecksumValue, CompressionDescriptor, ETag, ObjectLockMode,
+    ObjectRetention, ObjectVersionRow, StorageClass,
 };
 use cairn_types::traits::{AuthorizationEngine, BlobStore, Clock, Crypto, MetadataStore};
 use http::{Method, StatusCode};
@@ -248,6 +250,10 @@ impl S3Service {
             Method::PUT if req.has_query("ownershipControls") => {
                 self.put_ownership_controls(req, body).await
             }
+            Method::GET if req.has_query("object-lock") => self.get_bucket_object_lock(&req).await,
+            Method::PUT if req.has_query("object-lock") => {
+                self.put_bucket_object_lock(req, body).await
+            }
             // An UNRECOGNIZED bucket subresource must not fall through to list/create/delete.
             _ if unhandled_bucket_subresource(&req) => Err(Error::NotImplemented),
             Method::PUT => self.create_bucket(&req).await,
@@ -301,6 +307,12 @@ impl S3Service {
             Method::DELETE if req.has_query("tagging") => self.delete_object_tagging(&req).await,
             Method::GET if req.has_query("acl") => self.get_object_acl(&req).await,
             Method::PUT if req.has_query("acl") => self.put_object_acl(&req, body).await,
+            Method::GET if req.has_query("retention") => self.get_object_retention(&req).await,
+            Method::PUT if req.has_query("retention") => self.put_object_retention(req, body).await,
+            Method::GET if req.has_query("legal-hold") => self.get_object_legal_hold(&req).await,
+            Method::PUT if req.has_query("legal-hold") => {
+                self.put_object_legal_hold(req, body).await
+            }
             Method::GET if req.has_query("attributes") => self.get_object_attributes(&req).await,
             // An UNRECOGNIZED object subresource must never fall through to a data-plane handler
             // (a PUT object?acl must not overwrite the object body). Answer NotImplemented.
@@ -330,11 +342,20 @@ impl S3Service {
     async fn create_bucket(&self, req: &S3Request) -> Result<S3Response> {
         let principal = self.require_principal(req)?;
         let name = req.bucket.clone().expect("bucket present");
+        // Object Lock can only be turned on at creation (S3 semantics): `x-amz-bucket-object-lock-enabled`
+        // forces versioning Enabled and stores an enabled (no default-retention) lock config.
+        let object_lock = req
+            .header("x-amz-bucket-object-lock-enabled")
+            .is_some_and(|v| v.eq_ignore_ascii_case("true"));
         let bucket = Bucket {
             name: name.clone(),
             owner_id: principal.user_id.clone(),
             created_at: self.clock.now(),
-            versioning: VersioningState::Unversioned,
+            versioning: if object_lock {
+                VersioningState::Enabled
+            } else {
+                VersioningState::Unversioned
+            },
             ownership_mode: cairn_types::authz::OwnershipMode::BucketOwnerEnforced,
             region: self.region.clone(),
             compression: None,
@@ -344,9 +365,27 @@ impl S3Service {
             .submit(Mutation::CreateBucket(Box::new(bucket)))
             .await
         {
-            Ok(_) => Ok(S3Response::status(StatusCode::OK)
-                .with_header("location", format!("/{}", name.as_str()))
-                .with_header("x-amz-request-id", &req.request_id)),
+            Ok(_) => {
+                if object_lock {
+                    let config = ObjectLockConfiguration {
+                        enabled: true,
+                        default_retention: None,
+                    };
+                    let text = serde_json::to_string(&config).map_err(|_| {
+                        Error::Internal("config (de)serialization failed".to_owned())
+                    })?;
+                    self.meta
+                        .submit(Mutation::SetBucketConfig {
+                            bucket: name.clone(),
+                            aspect: ConfigAspect::ObjectLock,
+                            doc: Some(ConfigDoc(text)),
+                        })
+                        .await?;
+                }
+                Ok(S3Response::status(StatusCode::OK)
+                    .with_header("location", format!("/{}", name.as_str()))
+                    .with_header("x-amz-request-id", &req.request_id))
+            }
             Err(cairn_types::MetaError::Conflict) => Err(Error::BucketAlreadyOwnedByYou),
             Err(e) => Err(e.into()),
         }
@@ -678,6 +717,9 @@ impl S3Service {
                         })
                         .await;
                 }
+                // Stamp Object Lock retention / legal hold onto the new version (default or header).
+                self.apply_object_lock_on_put(&req, &bucket, &key, &version_id, now)
+                    .await?;
                 let mut resp = S3Response::status(StatusCode::OK)
                     .with_header("etag", quoted(&staged.etag))
                     .with_header("x-amz-request-id", &request_id);
@@ -763,6 +805,11 @@ impl S3Service {
                 format!("bytes {}-{}/{}", cr.start, cr.end, cr.total),
             );
         }
+        let bucket_name = req.bucket.clone().expect("bucket present");
+        let key = req.key.clone().expect("key present");
+        resp = self
+            .append_lock_headers(resp, &bucket_name, &key, &row.version_id)
+            .await?;
         Ok(resp.with_header("x-amz-request-id", &req.request_id))
     }
 
@@ -780,6 +827,11 @@ impl S3Service {
             .with_header("x-amz-request-id", &req.request_id);
         // S3 applies the `response-*` header overrides to HEAD as well as GET.
         let resp = apply_response_overrides(resp, req);
+        let bucket_name = req.bucket.clone().expect("bucket present");
+        let key = req.key.clone().expect("key present");
+        let resp = self
+            .append_lock_headers(resp, &bucket_name, &key, &row.version_id)
+            .await?;
         Ok(resp)
     }
 
@@ -810,12 +862,17 @@ impl S3Service {
         // the silent permanent removal of the null version — ARCH 16.1/16.3, Medium #4); in an
         // Unversioned bucket it removes the sentinel version.
         if let Some(vid) = req.query("versionId") {
+            let version_id = VersionId::from_string(vid.to_owned());
+            // Object Lock: a version still under retention or legal hold cannot be permanently
+            // deleted (a `?versionId` DELETE is the only permanent-removal path for objects).
+            self.enforce_unlocked_for_delete(req, &bucket, &key, &version_id, now)
+                .await?;
             let outcome = self
                 .meta
                 .submit(Mutation::DeleteVersion {
                     bucket: bucket.name.clone(),
                     key,
-                    version_id: VersionId::from_string(vid.to_owned()),
+                    version_id,
                 })
                 .await?;
             if let MutationOutcome::Deleted {
@@ -1603,6 +1660,20 @@ impl S3Service {
                 errors.push((key_s, code.to_owned(), e.to_string()));
                 continue;
             }
+            // Object Lock: a permanent version delete (?versionId) of a still-protected version is
+            // denied per-key (the rest of the batch proceeds). A plain delete-marker insert (no
+            // versionId) creates a NEW version and never destroys a locked one, so it is unaffected.
+            if let Some(v) = &version {
+                let version_id = VersionId::from_string(v.clone());
+                if let Err(e) = self
+                    .enforce_unlocked_for_delete(req, &bucket, &key, &version_id, now)
+                    .await
+                {
+                    let (_, code) = crate::error_map::map(&e);
+                    errors.push((key_s, code.to_owned(), e.to_string()));
+                    continue;
+                }
+            }
             // Per-key delete semantics by versioning state, mirroring the single-object DELETE:
             //  - a versioned delete (?versionId) permanently removes that version;
             //  - Enabled: insert a delete marker (replicated where the rule calls for it);
@@ -1731,6 +1802,16 @@ impl S3Service {
         let bucket = self.fetch_bucket(&req).await?;
         let doc = drain_body(body, 64 * 1024).await?;
         let state = cairn_xml::parse_versioning_configuration(&doc)?;
+        // Object Lock requires versioning to stay Enabled: suspending it would let a null-version
+        // overwrite permanently destroy locked bytes in place, breaking the WORM guarantee. S3
+        // rejects suspending versioning on an Object-Lock-enabled bucket (InvalidBucketState).
+        if state == VersioningState::Suspended
+            && self.bucket_object_lock_config(&bucket.name).await?.enabled
+        {
+            return Err(Error::InvalidRequest(
+                "Cannot suspend versioning on a bucket with Object Lock enabled".to_owned(),
+            ));
+        }
         self.meta
             .submit(Mutation::SetVersioning {
                 bucket: bucket.name,
@@ -2146,6 +2227,353 @@ impl S3Service {
             .await?;
         Ok(S3Response::status(StatusCode::NO_CONTENT)
             .with_header("x-amz-request-id", &req.request_id))
+    }
+
+    // --- object lock: retention / legal hold (WORM, ARCH 13/15) ---
+
+    /// Resolve the version a `?retention`/`?legal-hold` request targets: the named `?versionId`
+    /// when present, otherwise the current version (matching tagging/ACL resolution).
+    async fn resolve_lock_target(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        req: &S3Request,
+    ) -> Result<ObjectVersionRow> {
+        match req.query("versionId") {
+            Some(vid) => self
+                .meta
+                .get_version(bucket, key, &VersionId::from_string(vid.to_owned()))
+                .await?
+                .ok_or(Error::NoSuchVersion),
+            None => self
+                .meta
+                .current_version(bucket, key)
+                .await?
+                .ok_or(Error::NoSuchKey),
+        }
+    }
+
+    /// Read a bucket's Object Lock configuration (default = disabled when unset/corrupt-but-absent).
+    async fn bucket_object_lock_config(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<ObjectLockConfiguration> {
+        match self
+            .meta
+            .get_bucket_config(bucket, ConfigAspect::ObjectLock)
+            .await?
+        {
+            Some(doc) => serde_json::from_str(&doc.0)
+                .map_err(|_| Error::Internal("config (de)serialization failed".to_owned())),
+            None => Ok(ObjectLockConfiguration::default()),
+        }
+    }
+
+    async fn get_object_retention(&self, req: &S3Request) -> Result<S3Response> {
+        let bucket = self.fetch_bucket(req).await?;
+        let key = req.key.clone().expect("key present");
+        let row = self.resolve_lock_target(&bucket.name, &key, req).await?;
+        let state = self
+            .meta
+            .get_object_lock(&bucket.name, &key, &row.version_id)
+            .await?;
+        Ok(S3Response::xml(
+            StatusCode::OK,
+            cairn_xml::retention_to_xml(state.retention.as_ref()),
+        )
+        .with_header("x-amz-request-id", &req.request_id))
+    }
+
+    async fn put_object_retention(
+        &self,
+        req: S3Request,
+        body: cairn_types::BodyStream,
+    ) -> Result<S3Response> {
+        let bucket = self.fetch_bucket(&req).await?;
+        let key = req.key.clone().expect("key present");
+        // Retention can only be set on a bucket that has Object Lock enabled.
+        if !self.bucket_object_lock_config(&bucket.name).await?.enabled {
+            return Err(Error::InvalidRequest(
+                "Bucket is missing Object Lock Configuration".to_owned(),
+            ));
+        }
+        let row = self.resolve_lock_target(&bucket.name, &key, &req).await?;
+        let doc = drain_body(body, 64 * 1024).await?;
+        let new = cairn_xml::parse_retention(&doc)?;
+        // Lowering or removing an active retention is governed: COMPLIANCE is never weakenable;
+        // GOVERNANCE requires `s3:BypassGovernanceRetention` + the bypass header.
+        let now = self.clock.now();
+        let current = self
+            .meta
+            .get_object_lock(&bucket.name, &key, &row.version_id)
+            .await?;
+        if let Some(cur) = current.retention {
+            if cur.retain_until > now && retention_is_weaker(&cur, &new) {
+                match cur.mode {
+                    ObjectLockMode::Compliance => return Err(Error::AccessDenied),
+                    ObjectLockMode::Governance => {
+                        self.require_governance_bypass(&req, &bucket, &key, &row.version_id)
+                            .await?;
+                    }
+                }
+            }
+        }
+        self.meta
+            .submit(Mutation::SetObjectRetention {
+                bucket: bucket.name,
+                key,
+                version_id: row.version_id,
+                retention: Some(new),
+            })
+            .await?;
+        Ok(S3Response::status(StatusCode::OK).with_header("x-amz-request-id", &req.request_id))
+    }
+
+    async fn get_object_legal_hold(&self, req: &S3Request) -> Result<S3Response> {
+        let bucket = self.fetch_bucket(req).await?;
+        let key = req.key.clone().expect("key present");
+        let row = self.resolve_lock_target(&bucket.name, &key, req).await?;
+        let state = self
+            .meta
+            .get_object_lock(&bucket.name, &key, &row.version_id)
+            .await?;
+        Ok(S3Response::xml(
+            StatusCode::OK,
+            cairn_xml::legal_hold_to_xml(state.legal_hold),
+        )
+        .with_header("x-amz-request-id", &req.request_id))
+    }
+
+    async fn put_object_legal_hold(
+        &self,
+        req: S3Request,
+        body: cairn_types::BodyStream,
+    ) -> Result<S3Response> {
+        let bucket = self.fetch_bucket(&req).await?;
+        let key = req.key.clone().expect("key present");
+        if !self.bucket_object_lock_config(&bucket.name).await?.enabled {
+            return Err(Error::InvalidRequest(
+                "Bucket is missing Object Lock Configuration".to_owned(),
+            ));
+        }
+        let row = self.resolve_lock_target(&bucket.name, &key, &req).await?;
+        let doc = drain_body(body, 64 * 1024).await?;
+        let on = cairn_xml::parse_legal_hold(&doc)?;
+        self.meta
+            .submit(Mutation::SetObjectLegalHold {
+                bucket: bucket.name,
+                key,
+                version_id: row.version_id,
+                on,
+            })
+            .await?;
+        Ok(S3Response::status(StatusCode::OK).with_header("x-amz-request-id", &req.request_id))
+    }
+
+    /// Enforce the GOVERNANCE-bypass gate: the `x-amz-bypass-governance-retention: true` header
+    /// AND `s3:BypassGovernanceRetention` on the object. COMPLIANCE retention is never bypassable;
+    /// this path is only ever reached for GOVERNANCE-mode locks.
+    async fn require_governance_bypass(
+        &self,
+        req: &S3Request,
+        bucket: &Bucket,
+        key: &ObjectKey,
+        version: &VersionId,
+    ) -> Result<()> {
+        let header_set = req
+            .header("x-amz-bypass-governance-retention")
+            .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+        if !header_set {
+            return Err(Error::AccessDenied);
+        }
+        self.authorize(
+            req,
+            bucket,
+            Action::BypassGovernanceRetention,
+            Resource::Object {
+                bucket: bucket.name.clone(),
+                key: key.clone(),
+            },
+            Some(version),
+        )
+        .await
+    }
+
+    /// Deny a permanent delete (or permanent overwrite-away) of a still-protected version
+    /// (ARCH 15, WORM). Legal hold always denies; an active COMPLIANCE retention always denies;
+    /// an active GOVERNANCE retention denies unless the request carries `s3:BypassGovernanceRetention`
+    /// plus the `x-amz-bypass-governance-retention: true` header. A version with no active lock
+    /// passes. This is the single chokepoint every permanent-removal path funnels through.
+    async fn enforce_unlocked_for_delete(
+        &self,
+        req: &S3Request,
+        bucket: &Bucket,
+        key: &ObjectKey,
+        version: &VersionId,
+        now: cairn_types::Timestamp,
+    ) -> Result<()> {
+        let lock = self
+            .meta
+            .get_object_lock(&bucket.name, key, version)
+            .await?;
+        if lock.legal_hold {
+            return Err(Error::AccessDenied);
+        }
+        if let Some(ret) = lock.retention {
+            if ret.retain_until > now {
+                match ret.mode {
+                    ObjectLockMode::Compliance => return Err(Error::AccessDenied),
+                    ObjectLockMode::Governance => {
+                        self.require_governance_bypass(req, bucket, key, version)
+                            .await?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn get_bucket_object_lock(&self, req: &S3Request) -> Result<S3Response> {
+        let bucket = self.fetch_bucket(req).await?;
+        let config = self.bucket_object_lock_config(&bucket.name).await?;
+        if !config.enabled {
+            return Ok(S3Response::xml(
+                StatusCode::NOT_FOUND,
+                cairn_xml::error_document(
+                    "ObjectLockConfigurationNotFoundError",
+                    "Object Lock configuration does not exist for this bucket",
+                    &resource_path(req),
+                    &req.request_id,
+                ),
+            ));
+        }
+        Ok(S3Response::xml(
+            StatusCode::OK,
+            cairn_xml::object_lock_configuration_to_xml(&config),
+        )
+        .with_header("x-amz-request-id", &req.request_id))
+    }
+
+    async fn put_bucket_object_lock(
+        &self,
+        req: S3Request,
+        body: cairn_types::BodyStream,
+    ) -> Result<S3Response> {
+        let bucket = self.fetch_bucket(&req).await?;
+        let doc = drain_body(body, 64 * 1024).await?;
+        let config = cairn_xml::parse_object_lock_configuration(&doc)?;
+        // Object Lock requires versioning: a WORM guarantee is meaningless if an overwrite can
+        // destroy the protected bytes in place.
+        if config.enabled && bucket.versioning != VersioningState::Enabled {
+            return Err(Error::InvalidRequest(
+                "Object Lock requires bucket versioning to be enabled".to_owned(),
+            ));
+        }
+        let text = serde_json::to_string(&config)
+            .map_err(|_| Error::Internal("config (de)serialization failed".to_owned()))?;
+        self.meta
+            .submit(Mutation::SetBucketConfig {
+                bucket: bucket.name,
+                aspect: ConfigAspect::ObjectLock,
+                doc: Some(ConfigDoc(text)),
+            })
+            .await?;
+        Ok(S3Response::status(StatusCode::OK).with_header("x-amz-request-id", &req.request_id))
+    }
+
+    /// Apply Object Lock protections to a freshly-written version (ARCH 15): explicit
+    /// `x-amz-object-lock-*` request headers win; otherwise the bucket's default retention (if any)
+    /// is stamped. A no-op (one cached config read) unless the bucket has Object Lock enabled.
+    async fn apply_object_lock_on_put(
+        &self,
+        req: &S3Request,
+        bucket: &Bucket,
+        key: &ObjectKey,
+        version_id: &VersionId,
+        now: cairn_types::Timestamp,
+    ) -> Result<()> {
+        let config = self.bucket_object_lock_config(&bucket.name).await?;
+        if !config.enabled {
+            return Ok(());
+        }
+        // Explicit retention headers take precedence over the bucket default; mode and
+        // retain-until-date must be supplied together.
+        let retention = match (
+            req.header("x-amz-object-lock-mode"),
+            req.header("x-amz-object-lock-retain-until-date"),
+        ) {
+            (Some(m), Some(d)) => {
+                let mode = cairn_xml::parse_lock_mode(m)?;
+                let retain_until = cairn_xml::parse_iso8601(d).ok_or_else(|| {
+                    Error::InvalidArgument("invalid x-amz-object-lock-retain-until-date".to_owned())
+                })?;
+                Some(ObjectRetention { mode, retain_until })
+            }
+            (None, None) => config.default_retention.map(|d| ObjectRetention {
+                mode: d.mode,
+                retain_until: d.retain_until(now),
+            }),
+            _ => {
+                return Err(Error::InvalidRequest(
+                    "x-amz-object-lock-mode and x-amz-object-lock-retain-until-date must be \
+                     supplied together"
+                        .to_owned(),
+                ));
+            }
+        };
+        if let Some(retention) = retention {
+            self.meta
+                .submit(Mutation::SetObjectRetention {
+                    bucket: bucket.name.clone(),
+                    key: key.clone(),
+                    version_id: version_id.clone(),
+                    retention: Some(retention),
+                })
+                .await?;
+        }
+        if req
+            .header("x-amz-object-lock-legal-hold")
+            .is_some_and(|h| h.eq_ignore_ascii_case("ON"))
+        {
+            self.meta
+                .submit(Mutation::SetObjectLegalHold {
+                    bucket: bucket.name.clone(),
+                    key: key.clone(),
+                    version_id: version_id.clone(),
+                    on: true,
+                })
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Append `x-amz-object-lock-*` headers to a GET/HEAD response when the bucket has Object Lock
+    /// enabled and the version carries protection. Buckets without Object Lock pay only one cached
+    /// config read; the per-version lock read happens only for lock-enabled buckets.
+    async fn append_lock_headers(
+        &self,
+        resp: S3Response,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version: &VersionId,
+    ) -> Result<S3Response> {
+        if !self.bucket_object_lock_config(bucket).await?.enabled {
+            return Ok(resp);
+        }
+        let state = self.meta.get_object_lock(bucket, key, version).await?;
+        let mut resp = resp;
+        if let Some(ret) = state.retention {
+            resp = resp
+                .with_header("x-amz-object-lock-mode", cairn_xml::lock_mode_str(ret.mode))
+                .with_header(
+                    "x-amz-object-lock-retain-until-date",
+                    cairn_xml::format_iso8601(ret.retain_until),
+                );
+        }
+        Ok(resp.with_header(
+            "x-amz-object-lock-legal-hold",
+            if state.legal_hold { "ON" } else { "OFF" },
+        ))
     }
 
     // --- helpers ---
@@ -2618,6 +3046,7 @@ fn bucket_action(req: &S3Request) -> Result<Action> {
         Method::PUT if q("acl") => PutBucketAcl,
         Method::PUT if q("publicAccessBlock") => PutBucketPublicAccessBlock,
         Method::PUT if q("ownershipControls") => PutBucketOwnershipControls,
+        Method::PUT if q("object-lock") => PutBucketObjectLockConfiguration,
         Method::PUT => CreateBucket,
         Method::DELETE if q("tagging") => PutBucketTagging,
         Method::DELETE if q("cors") => PutBucketCors,
@@ -2639,10 +3068,20 @@ fn bucket_action(req: &S3Request) -> Result<Action> {
         Method::GET if q("acl") => GetBucketAcl,
         Method::GET if q("publicAccessBlock") => GetBucketPublicAccessBlock,
         Method::GET if q("ownershipControls") => GetBucketOwnershipControls,
+        Method::GET if q("object-lock") => GetBucketObjectLockConfiguration,
         Method::POST if q("delete") => DeleteObject,
         Method::GET => ListBucket,
         _ => return Err(Error::NotImplemented),
     })
+}
+
+/// Whether replacing `current` retention with `new` weakens protection — a shorter retain-until
+/// date or a `COMPLIANCE`→`GOVERNANCE` mode downgrade. Strengthening (a later date, or
+/// `GOVERNANCE`→`COMPLIANCE`) is always allowed; weakening is governed (ARCH 15).
+fn retention_is_weaker(current: &ObjectRetention, new: &ObjectRetention) -> bool {
+    new.retain_until < current.retain_until
+        || (matches!(current.mode, ObjectLockMode::Compliance)
+            && matches!(new.mode, ObjectLockMode::Governance))
 }
 
 /// Map an object-level request to the S3 action it requires.
@@ -2664,6 +3103,10 @@ fn object_action(req: &S3Request) -> Result<Action> {
         Method::DELETE if q("tagging") => DeleteObjectTagging,
         Method::GET if q("acl") => GetObjectAcl,
         Method::PUT if q("acl") => PutObjectAcl,
+        Method::GET if q("retention") => GetObjectRetention,
+        Method::PUT if q("retention") => PutObjectRetention,
+        Method::GET if q("legal-hold") => GetObjectLegalHold,
+        Method::PUT if q("legal-hold") => PutObjectLegalHold,
         Method::GET if q("attributes") => GetObjectAttributes,
         Method::GET if q("uploadId") => ListMultipartUploadParts,
         Method::DELETE if q("uploadId") => AbortMultipartUpload,
