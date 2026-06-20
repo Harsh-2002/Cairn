@@ -29,7 +29,8 @@ authorizes.
 | GetObjectTagging / PutObjectTagging / DeleteObjectTagging | ✅ | Stored as queryable rows; usable by lifecycle/policy. |
 | Presigned GET / PUT | ✅ | SigV4 query form. |
 | GetObjectAcl / PutObjectAcl, GetBucketAcl / PutBucketAcl | ◑ | ACLs are off by default under the recommended BucketOwnerEnforced mode; the policy engine is primary. |
-| Object Lock / retention, SSE config, website / accelerate / analytics / inventory / requester-pays | ✖ | Out of scope; answered as NotImplemented. |
+| Object Lock (PutObjectLockConfiguration / Get; PutObjectRetention / Get; PutObjectLegalHold / Get) | ✅ | WORM retention (`GOVERNANCE`/`COMPLIANCE`) + legal hold. Enable at bucket creation (`x-amz-bucket-object-lock-enabled`, which forces versioning Enabled); optional bucket **default retention** stamped on new versions. Enforced at every permanent-version-delete path (single/bulk delete, lifecycle): `COMPLIANCE` is immutable until expiry; `GOVERNANCE` is bypassable with `s3:BypassGovernanceRetention` + `x-amz-bypass-governance-retention: true`; legal hold blocks regardless. |
+| SSE config, website / accelerate / analytics / inventory / requester-pays | ✖ | Out of scope; answered as NotImplemented. |
 
 **Management API** (`/api/v1`, admin-gated JSON) and the **embedded React console** (its own listener, port 7374) provide
 control-plane operations (overview, bucket/user/activity management) consumed by both the web UI

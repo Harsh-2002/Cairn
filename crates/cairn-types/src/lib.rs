@@ -47,7 +47,8 @@ pub use blob::{
     StagedBlob, StagedPart, ZeroCopyRead,
 };
 pub use bucket::{
-    Bucket, CompressionAlgorithm, CompressionPolicy, ConfigAspect, ConfigDoc, VersioningState,
+    Bucket, CompressionAlgorithm, CompressionPolicy, ConfigAspect, ConfigDoc, DefaultRetention,
+    ObjectLockConfiguration, RetentionPeriod, VersioningState,
 };
 pub use crypto::{Nonce, Sealed, Signature};
 pub use error::{

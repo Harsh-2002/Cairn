@@ -46,6 +46,56 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (year, m, d)
 }
 
+/// Howard Hinnant's `days_from_civil`: the inverse of [`civil_from_days`] — days since 1970-01-01
+/// for a `(year, month, day)` civil date. Exact across the proleptic Gregorian range.
+#[must_use]
+pub fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 } as i64;
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// Parse an ISO-8601 UTC instant of the form `YYYY-MM-DDTHH:MM:SS[.fff]Z` (the form S3 uses for the
+/// Object Lock retain-until date) into a [`Timestamp`], truncating any sub-second fraction. Returns
+/// `None` on any malformed input — total parsing, never a panic.
+#[must_use]
+pub fn parse_iso8601(s: &str) -> Option<Timestamp> {
+    let s = s.trim();
+    let b = s.as_bytes();
+    // Need at least `YYYY-MM-DDTHH:MM:SS` followed by something (a `Z` or a fraction).
+    if b.len() < 20
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+    {
+        return None;
+    }
+    let year: i64 = s.get(0..4)?.parse().ok()?;
+    let month: u32 = s.get(5..7)?.parse().ok()?;
+    let day: u32 = s.get(8..10)?.parse().ok()?;
+    let hour: i64 = s.get(11..13)?.parse().ok()?;
+    let minute: i64 = s.get(14..16)?.parse().ok()?;
+    let second: i64 = s.get(17..19)?.parse().ok()?;
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
+        return None;
+    }
+    let days = days_from_civil(year, month, day);
+    Some(Timestamp(
+        days * 86_400_000 + hour * 3_600_000 + minute * 60_000 + second * 1_000,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -105,16 +155,5 @@ mod tests {
                 "round trip failed for day {d}"
             );
         }
-    }
-
-    /// The inverse algorithm, used only to derive expected values in tests.
-    fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
-        let y = if m <= 2 { y - 1 } else { y };
-        let era = if y >= 0 { y } else { y - 399 } / 400;
-        let yoe = y - era * 400;
-        let mp = if m > 2 { m - 3 } else { m + 9 } as i64;
-        let doy = (153 * mp + 2) / 5 + d as i64 - 1;
-        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-        era * 146_097 + doe - 719_468
     }
 }

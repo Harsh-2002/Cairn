@@ -1304,3 +1304,85 @@ async fn concurrent_reads_are_isolated_per_connection() {
         );
     }
 }
+
+#[tokio::test]
+async fn object_lock_parity() {
+    let (a, b) = both().await;
+    for s in [&a as &dyn MetadataStore, &b as &dyn MetadataStore] {
+        let bk = BucketName::parse("bkt").unwrap();
+        let k = ObjectKey::parse("k").unwrap();
+        let v = VersionId::from_string("v1".into());
+        s.submit(put(
+            row(&bk, "k", v.clone(), "e", 3),
+            Precondition::default(),
+        ))
+        .await
+        .unwrap();
+
+        // No lock initially.
+        let st = s.get_object_lock(&bk, &k, &v).await.unwrap();
+        assert!(st.retention.is_none() && !st.legal_hold);
+
+        // Set a COMPLIANCE retention.
+        s.submit(Mutation::SetObjectRetention {
+            bucket: bk.clone(),
+            key: k.clone(),
+            version_id: v.clone(),
+            retention: Some(cairn_types::object::ObjectRetention {
+                mode: cairn_types::object::ObjectLockMode::Compliance,
+                retain_until: Timestamp::from_secs(2_000_000_000),
+            }),
+        })
+        .await
+        .unwrap();
+        let st = s.get_object_lock(&bk, &k, &v).await.unwrap();
+        let r = st.retention.expect("retention set");
+        assert!(matches!(
+            r.mode,
+            cairn_types::object::ObjectLockMode::Compliance
+        ));
+        assert_eq!(r.retain_until, Timestamp::from_secs(2_000_000_000));
+        assert!(!st.legal_hold);
+
+        // Turn legal hold on (independent of retention).
+        s.submit(Mutation::SetObjectLegalHold {
+            bucket: bk.clone(),
+            key: k.clone(),
+            version_id: v.clone(),
+            on: true,
+        })
+        .await
+        .unwrap();
+        let st = s.get_object_lock(&bk, &k, &v).await.unwrap();
+        assert!(st.legal_hold);
+        assert!(
+            st.retention.is_some(),
+            "retention preserved across legal-hold update"
+        );
+
+        // Release legal hold.
+        s.submit(Mutation::SetObjectLegalHold {
+            bucket: bk.clone(),
+            key: k.clone(),
+            version_id: v.clone(),
+            on: false,
+        })
+        .await
+        .unwrap();
+        assert!(!s.get_object_lock(&bk, &k, &v).await.unwrap().legal_hold);
+
+        // Deleting the version clears its lock row (no orphan).
+        s.submit(Mutation::DeleteVersion {
+            bucket: bk.clone(),
+            key: k.clone(),
+            version_id: v.clone(),
+        })
+        .await
+        .unwrap();
+        let st = s.get_object_lock(&bk, &k, &v).await.unwrap();
+        assert!(
+            st.retention.is_none() && !st.legal_hold,
+            "lock cleared on version delete"
+        );
+    }
+}
