@@ -383,6 +383,16 @@ CREATE TABLE rewrap_progress (
 ALTER TABLE rewrap_progress ADD COLUMN done_active_id INTEGER NOT NULL DEFAULT 0;
 "#,
     },
+    Migration {
+        version: 15,
+        name: "multipart sse intent",
+        sql: r#"
+-- Capture whether SSE-S3 was requested for a multipart upload at initiate time, so completion
+-- encrypts the assembled object at rest (multipart assembly previously always stored plaintext,
+-- silently ignoring a requested or bucket-default SSE). 0 = no SSE; 1 = SSE-S3 (AES256).
+ALTER TABLE multipart_uploads ADD COLUMN sse_requested INTEGER NOT NULL DEFAULT 0;
+"#,
+    },
 ];
 
 /// Run all pending migrations on the write connection, recording each as applied.

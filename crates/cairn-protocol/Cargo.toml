@@ -15,6 +15,7 @@ cairn-auth.workspace = true
 cairn-authz.workspace = true
 cairn-replication.workspace = true
 cairn-xml.workspace = true
+cairn-lifecycle.workspace = true
 async-trait.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true

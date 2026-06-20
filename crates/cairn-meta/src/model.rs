@@ -269,6 +269,7 @@ pub fn multipart_from_row(row: &Row) -> rusqlite::Result<MultipartSession> {
         owner_id: UserId(row.get("owner_id")?),
         intended_acl,
         user_metadata,
+        sse_requested: row.get::<_, i64>("sse_requested")? != 0,
         created_at: Timestamp(row.get("created_at")?),
         updated_at: Timestamp(row.get("updated_at")?),
     })

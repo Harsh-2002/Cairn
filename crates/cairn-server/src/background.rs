@@ -33,6 +33,13 @@ pub fn spawn(stack: Arc<AppStack>, cfg: &Config) {
         multipart_lifetime_secs,
     ));
     tokio::spawn(lifecycle_loop(stack.clone(), lifecycle_interval));
+    // The integrity scrub is opt-in (I/O-heavy): only spawned when an interval is configured.
+    if cfg.scrub_interval_secs > 0 {
+        tokio::spawn(scrub_loop(
+            stack.clone(),
+            Duration::from_secs(cfg.scrub_interval_secs),
+        ));
+    }
     // The WAL checkpointer drives inherent methods on the concrete `SqliteMetadataStore`, so it
     // runs only for the `sqlite` backend (where `stack.store` holds one handle per shard). The
     // libSQL and Turso engines self-manage their WAL, so the loop is not spawned for them.
@@ -746,6 +753,130 @@ async fn sweeper_loop(stack: Arc<AppStack>, interval: Duration, lifetime_secs: i
             Err(e) => tracing::warn!(error = %e, "multipart sweep failed"),
         }
     }
+}
+
+/// Periodically re-read every committed blob and verify it against the recorded ETag, turning silent
+/// on-disk bit-rot into an observable event (ARCH 8.6/26.4). Encrypted and compressed blobs are
+/// already integrity-checked on every read (AES-GCM authentication / the self-describing CRNB block
+/// format), so the scrub targets the otherwise-unverified uncompressed-plaintext path: it re-hashes
+/// the bytes and compares the MD5 to the stored single-part ETag. Enumeration is paged so memory
+/// stays flat regardless of store size.
+async fn scrub_loop(stack: Arc<AppStack>, interval: Duration) {
+    use cairn_types::meta::ListQuery;
+    loop {
+        tokio::time::sleep(interval).await;
+        let started = std::time::Instant::now();
+        let mut scanned: u64 = 0;
+        let mut corrupt: u64 = 0;
+        let buckets = match stack.meta.list_buckets(None).await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(error = %e, "scrub: enumerating buckets failed");
+                continue;
+            }
+        };
+        for bucket in &buckets {
+            let mut cursor: Option<String> = None;
+            let mut vmarker: Option<String> = None;
+            loop {
+                let query = ListQuery {
+                    prefix: None,
+                    delimiter: None,
+                    cursor: cursor.clone(),
+                    version_id_marker: vmarker.clone(),
+                    start_after: None,
+                    limit: 500,
+                };
+                let page = match stack.meta.list_versions(&bucket.name, &query).await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!(bucket = %bucket.name.as_str(), error = %e, "scrub: listing versions failed");
+                        break;
+                    }
+                };
+                for s in &page.items {
+                    if s.is_delete_marker {
+                        continue;
+                    }
+                    let row = match stack
+                        .meta
+                        .get_version(&bucket.name, &s.key, &s.version_id)
+                        .await
+                    {
+                        Ok(Some(r)) => r,
+                        _ => continue,
+                    };
+                    let Some(path) = row.storage_path.clone() else {
+                        continue;
+                    };
+                    // Encrypted blobs are AES-GCM-authenticated on every read, so a real GET already
+                    // detects their corruption; the scrub closes the plaintext gap.
+                    if row.sse_descriptor.is_some() {
+                        continue;
+                    }
+                    scanned += 1;
+                    if let Err(kind) =
+                        scrub_one(&stack, &path, &row.compression, row.etag.as_str()).await
+                    {
+                        corrupt += 1;
+                        metrics::counter!("cairn_scrub_corruption_total", "kind" => kind)
+                            .increment(1);
+                        tracing::error!(
+                            bucket = %bucket.name.as_str(),
+                            key = %s.key.as_str(),
+                            version = %s.version_id.as_str(),
+                            kind,
+                            "scrub: blob failed integrity verification"
+                        );
+                    }
+                }
+                match page.next_cursor {
+                    Some(c) => {
+                        cursor = Some(c);
+                        vmarker = page.next_version_id_marker;
+                    }
+                    None => break,
+                }
+            }
+        }
+        metrics::counter!("cairn_scrub_objects_total").increment(scanned);
+        metrics::histogram!("cairn_scrub_pass_seconds").record(started.elapsed().as_secs_f64());
+        tracing::info!(scanned, corrupt, "scrub pass complete");
+    }
+}
+
+/// Re-read one unencrypted blob and verify it. The read decompresses a CRNB-compressed blob (so a
+/// corrupt compressed blob fails here), and for a single-part object the recomputed plaintext MD5 is
+/// compared to the stored ETag (so a bit flip in an uncompressed plaintext blob is caught). A
+/// multipart ETag (`{md5}-{n}`) is not a whole-object hash, so those are verified for readability
+/// only. Returns a static corruption-kind label on failure.
+async fn scrub_one(
+    stack: &Arc<AppStack>,
+    path: &cairn_types::id::StoragePath,
+    compression: &cairn_types::CompressionDescriptor,
+    etag: &str,
+) -> Result<(), &'static str> {
+    use futures_util::StreamExt;
+    use md5::{Digest, Md5};
+    let handle = stack
+        .blob
+        .open_with_dek(path, None, None, compression)
+        .await
+        .map_err(|_| "open_failed")?;
+    let mut hasher = Md5::new();
+    let mut body = handle.body;
+    while let Some(chunk) = body.next().await {
+        let bytes = chunk.map_err(|_| "read_failed")?;
+        hasher.update(&bytes);
+    }
+    // Single-part ETag is a bare hex MD5; multipart is "{md5}-{partcount}" and is not re-hashable.
+    if !etag.contains('-') {
+        let computed = hex::encode(hasher.finalize());
+        if !computed.eq_ignore_ascii_case(etag.trim_matches('"')) {
+            return Err("hash_mismatch");
+        }
+    }
+    Ok(())
 }
 
 /// Periodically apply each bucket's lifecycle rules.

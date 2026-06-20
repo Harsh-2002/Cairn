@@ -10,6 +10,8 @@ fuzz tests live next to their sources). Two kinds — keep them distinct:
 - `soak.sh` (+`soak.py`) — two-node replication, byte-identical verify + RSS leak check.
 - `warp.sh` — the MinIO warp macro benchmark (get/put/mixed).
 - `crash_consistency.sh` — the F-4 durability property at one crash seam.
+- `scrub.sh` — integrity scrub: corrupt a stored blob on disk, assert the background scrub
+  (`CAIRN_SCRUB_INTERVAL_SECS`) detects the ETag mismatch (`cairn_scrub_corruption_total`).
 
 ## regression / limit (where does it break?)
 - `replication_chaos.sh` (+`.py`) — break replication on purpose (target down, source SIGKILL); assert no loss.

@@ -929,6 +929,15 @@ impl S3Service {
         let key = req.key.clone().expect("key present");
         let upload_id = UploadId::generate();
         let now = self.clock.now();
+        // Capture the SSE-S3 intent now (ARCH 27): the `CompleteMultipartUpload` request carries no
+        // SSE header, so the decision — an explicit `x-amz-server-side-encryption` header here, else
+        // the bucket default-encryption setting — must be recorded on the session and applied when
+        // the object is assembled, exactly mirroring a single-part PUT.
+        let want_sse = match requested_sse(req) {
+            Some(Ok(())) => true,
+            Some(Err(e)) => return Err(e),
+            None => self.bucket_default_sse(&bucket.name).await?,
+        };
         let session = MultipartSession {
             upload_id: upload_id.clone(),
             bucket: bucket.name.clone(),
@@ -941,6 +950,7 @@ impl S3Service {
             owner_id: bucket.owner_id.clone(),
             intended_acl: None,
             user_metadata: user_metadata(req),
+            sse_requested: want_sse,
             created_at: now,
             updated_at: now,
         };
@@ -1196,6 +1206,15 @@ impl S3Service {
             _ => return Err(Error::NoSuchUpload),
         };
 
+        // SSE-S3 (ARCH 27): honor the encryption intent captured at initiate — mint a fresh DEK and
+        // hand it to `assemble`, which compress-then-encrypts each block, then seal the descriptor for
+        // the row, so a multipart object is encrypted at rest exactly like a single-part PUT.
+        let (sse_dek, sse_descriptor) = if session.sse_requested {
+            let (dek, descriptor) = self.new_sse_dek()?;
+            (Some(dek), Some(descriptor))
+        } else {
+            (None, None)
+        };
         let opts = StageOptions {
             compression: bucket.compression,
             extra_checksums: ChecksumSet::none(),
@@ -1203,7 +1222,7 @@ impl S3Service {
             // `assemble` preallocates from the sum of the parts' sizes itself.
             content_length: None,
             content_type: session.content_type.clone(),
-            encryption: None,
+            encryption: sse_dek,
         };
         let staged = self.blob.assemble(&bucket.name, &refs, opts).await?;
         let etag = multipart_etag(&part_md5s);
@@ -1239,8 +1258,7 @@ impl S3Service {
             user_metadata: session.user_metadata.clone(),
             acl: None,
             checksums: Vec::new(),
-            // SSE-S3 is applied to single-part PUTs; multipart assembly stores plaintext for now.
-            sse_descriptor: None,
+            sse_descriptor: sse_descriptor.clone(),
             replication_status: None,
             created_at: now,
             updated_at: now,
@@ -1272,6 +1290,9 @@ impl S3Service {
                     .with_header("x-amz-request-id", &req.request_id);
                 if versioned {
                     resp = resp.with_header("x-amz-version-id", version_id.as_str());
+                }
+                if sse_descriptor.is_some() {
+                    resp = resp.with_header("x-amz-server-side-encryption", "AES256");
                 }
                 Ok(resp)
             }
@@ -1796,6 +1817,20 @@ impl S3Service {
             ConfigAspect::Tagging => {
                 let tags = cairn_xml::parse_tagging(&doc)?;
                 cairn_xml::validate_tags(&tags, cairn_xml::MAX_TAGS_BUCKET)?;
+            }
+            ConfigAspect::Lifecycle => {
+                // Validate the configuration on write (well-formed rules), and REJECT storage-class
+                // transitions/tiering: Cairn does not move object data to a cold tier, so silently
+                // accepting a `Transition` rule would mislead an operator expecting cost savings.
+                // Fail loudly with NotImplemented instead of storing a no-op (release fix 0.3).
+                let rules = cairn_lifecycle::parse_lifecycle(&doc)?;
+                if rules
+                    .iter()
+                    .flat_map(|r| r.actions.iter())
+                    .any(|a| matches!(a, cairn_lifecycle::Action::Transition(_)))
+                {
+                    return Err(Error::NotImplemented);
+                }
             }
             _ => {}
         }

@@ -14,7 +14,7 @@ authorizes.
 | GetBucketPolicy / PutBucketPolicy / DeleteBucketPolicy | ✅ | Validated by the policy engine. |
 | GetBucketCors / PutBucketCors / DeleteBucketCors | ✅ | Per-bucket config (validated). |
 | GetBucketTagging / PutBucketTagging / DeleteBucketTagging | ✅ | |
-| GetBucketLifecycleConfiguration / Put / Delete | ✅ | Expiration, noncurrent expiration, abort-incomplete, delete-marker removal; transition is a v1 no-op. |
+| GetBucketLifecycleConfiguration / Put / Delete | ✅ | Expiration, noncurrent expiration, abort-incomplete, delete-marker removal. **Storage-class transition/tiering is not supported**: a Put containing a `Transition` rule is rejected (`NotImplemented`) rather than silently no-op'd. |
 | GetBucketReplication / Put / Delete | ✅ | Enqueue-on-write + worker drains the outbox to a configured remote via a real SigV4-signing sink (verified node→node); one or more named targets (`CAIRN_REPLICATION_TARGETS`) with per-rule destinations. |
 | ListObjectsV2 / ListObjects (v1) | ✅ | Prefix, delimiter, pagination (opaque tokens), start-after / marker. |
 | ListObjectVersions | ✅ | Distinguishes versions from delete markers. |

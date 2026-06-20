@@ -101,8 +101,11 @@ pub enum Action {
     },
     /// Remove a delete marker once it is the only remaining version of its key.
     ExpiredObjectDeleteMarker,
-    /// Transition the object to a remote cold tier. v1 is a documented NO-OP placeholder
-    /// (ARCH 19.5); the scanner counts it but performs no movement.
+    /// Transition the object to a remote cold tier. **Not supported**: a
+    /// `PutBucketLifecycleConfiguration` containing a Transition rule is rejected at write time with
+    /// `NotImplemented` (Cairn does not tier data, so silently storing a no-op would mislead). This
+    /// variant is still parsed so the write path can detect-and-reject it and so the scanner tolerates
+    /// any pre-existing stored config (it performs no movement).
     Transition(Transition),
 }
 

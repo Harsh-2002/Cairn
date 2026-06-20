@@ -48,10 +48,12 @@ pub struct OpenOptions {
 impl Default for OpenOptions {
     fn default() -> Self {
         Self {
-            // Throughput posture: WAL + NORMAL never corrupts the DB and removes the per-commit
-            // fsync (≈1.7× writer throughput on disk); on power loss it loses at most the last
-            // uncheckpointed txn, which blob-first ordering downgrades to a reconcile-GC'd orphan
-            // blob, not a corrupt store (ARCH 8/30). Operators wanting zero-loss set FULL.
+            // Library default is the throughput posture (WAL + NORMAL): never corrupts the DB and
+            // removes the per-commit fsync (≈1.7× writer throughput on disk); on power loss it loses
+            // at most the last uncheckpointed txn, which blob-first ordering downgrades to a
+            // reconcile-GC'd orphan blob, not a corrupt store (ARCH 8/30). NOTE: the SERVER overrides
+            // this — `CAIRN_META_SYNCHRONOUS` defaults to `full`, so a production node is durable by
+            // default; this `false` applies only to direct cairn-meta use (benchmarks/tests).
             synchronous_full: false,
             read_pool_size: 8,
             // None by default: with NORMAL there is no per-commit fsync to amortize, so the

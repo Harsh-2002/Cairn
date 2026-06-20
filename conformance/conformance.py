@@ -9,6 +9,7 @@ import sys
 import boto3
 from boto3.s3.transfer import TransferConfig
 from botocore.config import Config
+from botocore.exceptions import ClientError
 
 akid, secret, endpoint = sys.argv[1], sys.argv[2], sys.argv[3]
 
@@ -55,6 +56,30 @@ s3.upload_fileobj(io.BytesIO(big), "conf", "big.bin", Config=cfg)
 got = s3.get_object(Bucket="conf", Key="big.bin")["Body"].read()
 check("multipart upload roundtrip (6 MiB)", got == big)
 
+# --- multipart + SSE-S3: the assembled object must be encrypted at rest, not silently plaintext.
+# The SSE header is set at initiate; a round-trip through the real blob store only succeeds if the
+# assembled blob was actually sealed under the same DEK the descriptor records (a plaintext blob
+# could not decrypt), so a correct round-trip + a reported AES256 proves end-to-end encryption.
+s3.upload_fileobj(io.BytesIO(big), "conf", "big-sse.bin", Config=cfg,
+                  ExtraArgs={"ServerSideEncryption": "AES256"})
+sse_head = s3.head_object(Bucket="conf", Key="big-sse.bin")
+check("multipart SSE round-trips byte-identical",
+      s3.get_object(Bucket="conf", Key="big-sse.bin")["Body"].read() == big)
+check("multipart SSE object reports AES256", sse_head.get("ServerSideEncryption") == "AES256")
+
+# --- lifecycle: expiration is accepted; storage-class transition is rejected (not silently no-op'd) ---
+s3.put_bucket_lifecycle_configuration(Bucket="conf", LifecycleConfiguration={
+    "Rules": [{"ID": "exp", "Status": "Enabled", "Filter": {"Prefix": "tmp/"},
+               "Expiration": {"Days": 30}}]})
+check("lifecycle expiration accepted", True)
+try:
+    s3.put_bucket_lifecycle_configuration(Bucket="conf", LifecycleConfiguration={
+        "Rules": [{"ID": "tier", "Status": "Enabled", "Filter": {"Prefix": "cold/"},
+                   "Transitions": [{"Days": 30, "StorageClass": "GLACIER"}]}]})
+    check("lifecycle transition rejected", False)
+except ClientError:
+    check("lifecycle transition rejected", True)
+
 # --- versioning ---
 s3.create_bucket(Bucket="vers")
 s3.put_bucket_versioning(Bucket="vers", VersioningConfiguration={"Status": "Enabled"})
@@ -73,7 +98,8 @@ tags = {t["Key"]: t["Value"] for t in s3.get_object_tagging(Bucket="conf", Key="
 check("object tagging", tags.get("env") == "prod")
 
 # --- bulk + single delete ---
-s3.delete_objects(Bucket="conf", Delete={"Objects": [{"Key": "hello.txt"}, {"Key": "copy.txt"}]})
+s3.delete_objects(Bucket="conf", Delete={"Objects": [
+    {"Key": "hello.txt"}, {"Key": "copy.txt"}, {"Key": "big-sse.bin"}]})
 s3.delete_object(Bucket="conf", Key="big.bin")
 remaining = s3.list_objects_v2(Bucket="conf").get("KeyCount", 0)
 check("bulk + single delete cleared bucket", remaining == 0)

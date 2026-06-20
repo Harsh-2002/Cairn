@@ -79,6 +79,14 @@ pub struct Config {
     pub lifecycle_interval_secs: u64,
     /// How often the multipart sweeper reclaims stale upload sessions, in seconds.
     pub multipart_sweep_interval_secs: u64,
+    /// How often the background integrity scrub re-reads stored blobs and verifies them against the
+    /// recorded ETag, in seconds (`CAIRN_SCRUB_INTERVAL_SECS`, ARCH 8.6/26.4). `0` (default) disables
+    /// it. Encrypted/compressed blobs are already integrity-checked on every read (AES-GCM / the
+    /// CRNB format), so the scrub targets the otherwise-unverified uncompressed-plaintext path,
+    /// turning silent on-disk bit-rot into a logged `cairn_scrub_corruption_total` event instead of
+    /// serving a corrupted byte. It is bounded (paged enumeration) but reads every blob, so it is
+    /// I/O-heavy — schedule it for quiet periods. A checksumming filesystem remains defense-in-depth.
+    pub scrub_interval_secs: u64,
     /// How often the master-key re-wrap worker re-seals secrets onto the active key, in seconds
     /// (`CAIRN_KEY_REWRAP_INTERVAL_SECS`, audit #29 Phase D; `0` disables). SQLite backend only.
     pub key_rewrap_interval_secs: u64,
@@ -93,15 +101,18 @@ pub struct Config {
     /// regular interval ticks (`CAIRN_WAL_CHECKPOINT_SIZE_BYTES`, ARCH 8.4). `0` disables the
     /// size-based trigger, leaving only the interval. Default 64 MiB.
     pub wal_checkpoint_size_bytes: u64,
-    /// Metadata write durability (`CAIRN_META_SYNCHRONOUS`): `normal` or `full` (ARCH 30). The
-    /// default `normal` runs `PRAGMA synchronous=NORMAL` under WAL — no per-commit fsync (≈1.7×
-    /// writer throughput on disk) and never corrupts; on power loss it loses at most the last
-    /// uncheckpointed transaction. Set `full` for zero-loss durability at lower write throughput.
+    /// Metadata write durability (`CAIRN_META_SYNCHRONOUS`): `full` (default) or `normal` (ARCH 30).
+    /// The default `full` runs `PRAGMA synchronous=FULL` under WAL: an acknowledged write is durable
+    /// — it survives power loss — at the cost of a per-commit fsync that the group-commit writer
+    /// amortizes across concurrent writes (see `CAIRN_META_GROUP_COMMIT_LINGER_MICROS`). `normal` is
+    /// an opt-in throughput mode (`PRAGMA synchronous=NORMAL`, ≈1.7× writer throughput, no per-commit
+    /// fsync) that never corrupts but may lose the last few uncheckpointed transactions on power loss.
     pub meta_synchronous: String,
     /// Group-commit linger window in microseconds (`CAIRN_META_GROUP_COMMIT_LINGER_MICROS`): how
     /// long the single writer waits to coalesce more concurrent writes into one commit. Default `0`
-    /// (off): under `synchronous=normal` there is no per-commit fsync to amortize, so lingering only
-    /// adds latency; it helps only under `synchronous=full`. Capped at 1000 (1 ms).
+    /// (off). Lingering amortizes the per-commit fsync under the default `synchronous=full` when many
+    /// writes are concurrent (raise it for write-heavy concurrency); under `synchronous=normal` there
+    /// is no per-commit fsync to amortize, so it only adds latency. Capped at 1000 (1 ms).
     pub meta_group_commit_linger_micros: u64,
     /// Number of read-only WAL connections in the metadata read pool
     /// (`CAIRN_META_READ_POOL_SIZE`). Default `max(8, cpu_count)`, capped at 64. Readers take
@@ -235,12 +246,13 @@ impl Default for Config {
             dev_auth: false,
             lifecycle_interval_secs: 3600,
             multipart_sweep_interval_secs: 3600,
+            scrub_interval_secs: 0,
             key_rewrap_interval_secs: 300,
             key_counter_sync_secs: 60,
             multipart_upload_lifetime_secs: 86_400,
             wal_checkpoint_interval_secs: 300,
             wal_checkpoint_size_bytes: 64 * 1024 * 1024,
-            meta_synchronous: "normal".to_owned(),
+            meta_synchronous: "full".to_owned(),
             meta_group_commit_linger_micros: 0,
             // Scale read concurrency with the host; floor 8 so a small box still parallelizes
             // reads, cap 64 so the cache budget stays bounded.
@@ -806,9 +818,12 @@ mod tests {
 
     #[test]
     fn metadata_tuning_defaults_validate() {
-        // The throughput defaults (synchronous=normal, linger 0, cpu-scaled pool, 64 MiB/conn)
-        // must pass validation out of the box.
+        // The metadata defaults (synchronous=full for durable acked writes, linger 0, cpu-scaled
+        // pool, 64 MiB/conn) must pass validation out of the box.
         assert!(base().validate().is_ok());
+        // Durability is safe by default: acknowledged writes survive power loss unless an operator
+        // explicitly opts into the `normal` throughput mode.
+        assert_eq!(Config::default().meta_synchronous, "full");
     }
 
     #[test]
@@ -981,6 +996,17 @@ mod tests {
         figment::Jail::expect_with(|jail| {
             jail.set_env("CAIRN_FASTIO_MIN_BYTES", "1048576");
             assert_eq!(Config::load().expect("loads").fastio_min_bytes, 1_048_576);
+            Ok(())
+        });
+    }
+
+    /// The integrity scrub is off by default (`0`) and its interval is read from the environment.
+    #[test]
+    fn load_reads_scrub_interval_from_env() {
+        assert_eq!(Config::default().scrub_interval_secs, 0);
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("CAIRN_SCRUB_INTERVAL_SECS", "86400");
+            assert_eq!(Config::load().expect("loads").scrub_interval_secs, 86_400);
             Ok(())
         });
     }

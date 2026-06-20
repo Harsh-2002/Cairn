@@ -132,6 +132,7 @@ async fn make_session(
         owner_id: owner(),
         intended_acl: None,
         user_metadata: Vec::new(),
+        sse_requested: false,
         created_at: ts,
         updated_at: ts,
     };

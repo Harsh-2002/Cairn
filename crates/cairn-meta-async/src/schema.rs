@@ -342,6 +342,20 @@ INSERT INTO user_stats (owner_id, logical_bytes)
     FROM object_versions GROUP BY owner_id;
 "#,
     },
+    // NOTE: versions 13 and 14 are intentionally absent here — they are the #29 key-rotation schema
+    // (rewrap_progress/done_active_id), which the async backend does not implement (rotate-and-read
+    // only). The runner applies any version > the current max, so the v12 -> v15 gap is fine and the
+    // version number stays aligned with cairn-meta for the same logical migration.
+    Migration {
+        version: 15,
+        name: "multipart sse intent",
+        sql: r#"
+-- Capture whether SSE-S3 was requested for a multipart upload at initiate time, so completion
+-- encrypts the assembled object at rest (multipart assembly previously always stored plaintext).
+-- Mirrors cairn-meta/src/schema.rs v15. 0 = no SSE; 1 = SSE-S3 (AES256).
+ALTER TABLE multipart_uploads ADD COLUMN sse_requested INTEGER NOT NULL DEFAULT 0;
+"#,
+    },
 ];
 
 /// Run all pending migrations on the write driver, recording each as applied. Each migration is

@@ -194,6 +194,7 @@ fn list_multipart_uploads_shape() {
         owner_id: UserId("o".to_owned()),
         intended_acl: None,
         user_metadata: vec![],
+        sse_requested: false,
         created_at: Timestamp(1_750_000_000_000),
         updated_at: Timestamp(1_750_000_000_000),
     };

@@ -182,6 +182,7 @@ async fn n3_multipart_rides_the_bucket_shard_via_encoded_id() {
         owner_id: UserId("owner".to_owned()),
         intended_acl: None,
         user_metadata: Vec::new(),
+        sse_requested: false,
         created_at: Timestamp(1),
         updated_at: Timestamp(1),
     };

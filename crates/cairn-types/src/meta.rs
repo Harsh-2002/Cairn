@@ -410,6 +410,11 @@ pub struct MultipartSession {
     pub intended_acl: Option<Acl>,
     /// The metadata to apply on completion.
     pub user_metadata: UserMetadata,
+    /// Whether SSE-S3 was requested for this upload at initiate (via the request header or the
+    /// bucket default-encryption setting). Captured at initiate because the `CompleteMultipartUpload`
+    /// request carries no SSE header; honored at completion so the assembled object is encrypted at
+    /// rest exactly like a single-part PUT (ARCH 27).
+    pub sse_requested: bool,
     /// Creation time.
     pub created_at: Timestamp,
     /// Last-update time.
