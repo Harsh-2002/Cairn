@@ -393,6 +393,24 @@ ALTER TABLE rewrap_progress ADD COLUMN done_active_id INTEGER NOT NULL DEFAULT 0
 ALTER TABLE multipart_uploads ADD COLUMN sse_requested INTEGER NOT NULL DEFAULT 0;
 "#,
     },
+    Migration {
+        version: 16,
+        name: "object lock",
+        sql: r#"
+-- S3 Object Lock (WORM): per-version retention + legal hold (ARCH 19.6). Stored in a side table so
+-- the hot object_versions row is untouched; a row exists only for a version that has ever had a
+-- lock set. lock_mode is 'GOVERNANCE'|'COMPLIANCE'|NULL (no retention); retain_until is epoch ms.
+CREATE TABLE object_locks (
+    bucket_name  TEXT NOT NULL,
+    key          TEXT NOT NULL,
+    version_id   TEXT NOT NULL,
+    lock_mode    TEXT,
+    retain_until INTEGER,
+    legal_hold   INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (bucket_name, key, version_id)
+);
+"#,
+    },
 ];
 
 /// Run all pending migrations on the write connection, recording each as applied.

@@ -460,6 +460,39 @@ impl MetadataStore for AsyncMetadataStore {
             .collect())
     }
 
+    async fn get_object_lock(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version: &VersionId,
+    ) -> Result<cairn_types::object::ObjectLockState, MetaError> {
+        let rows = self
+            .reader().await
+            .query(
+                "SELECT lock_mode, retain_until, legal_hold FROM object_locks WHERE bucket_name=?1 AND key=?2 AND version_id=?3",
+                vec![
+                    Value::Text(bucket.as_str().to_owned()),
+                    Value::Text(key.as_str().to_owned()),
+                    Value::Text(version.as_str().to_owned()),
+                ],
+            )
+            .await?;
+        let Some(r) = rows.first() else {
+            return Ok(cairn_types::object::ObjectLockState::default());
+        };
+        // lock_mode and retain_until are written together, so retention is present iff lock_mode is.
+        let retention = r
+            .get_opt_text(0)
+            .map(|m| cairn_types::object::ObjectRetention {
+                mode: model::lock_mode_from(&m),
+                retain_until: cairn_types::time::Timestamp(r.get_i64(1)),
+            });
+        Ok(cairn_types::object::ObjectLockState {
+            retention,
+            legal_hold: r.get_i64(2) != 0,
+        })
+    }
+
     async fn get_multipart(
         &self,
         upload: &UploadId,

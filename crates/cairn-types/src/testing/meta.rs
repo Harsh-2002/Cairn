@@ -39,6 +39,7 @@ struct State {
     account_bpa: PublicAccessBlock,
     versions: BTreeMap<VKey, ObjectVersionRow>,
     tags: HashMap<VKey, Vec<(String, String)>>,
+    locks: HashMap<VKey, crate::object::ObjectLockState>,
     multipart: BTreeMap<String, MultipartSession>,
     parts: BTreeMap<(String, u16), PartRecord>,
     outbox: Vec<OutboxEntry>,
@@ -347,6 +348,8 @@ impl MetadataStore for InMemoryMetadataStore {
                     version_id.as_str().to_owned(),
                 );
                 let removed = st.versions.remove(&vk);
+                st.tags.remove(&vk);
+                st.locks.remove(&vk);
                 let freed = removed.as_ref().and_then(|r| r.storage_path.clone());
                 let was_latest = removed.as_ref().is_some_and(|r| r.is_latest);
                 let mut promoted = false;
@@ -439,6 +442,34 @@ impl MetadataStore for InMemoryMetadataStore {
                         st.config.remove(&k);
                     }
                 }
+                Ok(MutationOutcome::Ack)
+            }
+            Mutation::SetObjectRetention {
+                bucket,
+                key,
+                version_id,
+                retention,
+            } => {
+                let vk = (
+                    bucket.as_str().to_owned(),
+                    key.as_str().to_owned(),
+                    version_id.as_str().to_owned(),
+                );
+                st.locks.entry(vk).or_default().retention = retention;
+                Ok(MutationOutcome::Ack)
+            }
+            Mutation::SetObjectLegalHold {
+                bucket,
+                key,
+                version_id,
+                on,
+            } => {
+                let vk = (
+                    bucket.as_str().to_owned(),
+                    key.as_str().to_owned(),
+                    version_id.as_str().to_owned(),
+                );
+                st.locks.entry(vk).or_default().legal_hold = on;
                 Ok(MutationOutcome::Ack)
             }
             Mutation::SetVersioning { bucket, state } => {
@@ -839,6 +870,27 @@ impl MetadataStore for InMemoryMetadataStore {
             .tags
             .get(&vk)
             .cloned()
+            .unwrap_or_default())
+    }
+
+    async fn get_object_lock(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version: &VersionId,
+    ) -> Result<crate::object::ObjectLockState, MetaError> {
+        let vk = (
+            bucket.as_str().to_owned(),
+            key.as_str().to_owned(),
+            version.as_str().to_owned(),
+        );
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .locks
+            .get(&vk)
+            .copied()
             .unwrap_or_default())
     }
 

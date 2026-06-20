@@ -65,8 +65,8 @@ pub use meta::{
     latency_quantile_ms,
 };
 pub use object::{
-    ChecksumAlgorithm, ChecksumSet, ChecksumValue, CompressionDescriptor, ETag, ObjectVersionRow,
-    StorageClass, UserMetadata,
+    ChecksumAlgorithm, ChecksumSet, ChecksumValue, CompressionDescriptor, ETag, ObjectLockMode,
+    ObjectLockState, ObjectRetention, ObjectVersionRow, StorageClass, UserMetadata,
 };
 pub use replication::ReplicatedObject;
 pub use time::Timestamp;

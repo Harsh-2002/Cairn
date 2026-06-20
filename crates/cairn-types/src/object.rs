@@ -117,6 +117,46 @@ pub enum CompressionDescriptor {
 /// User-defined metadata (`x-amz-meta-*`) carried with an object.
 pub type UserMetadata = Vec<(String, String)>;
 
+/// The retention mode of an S3 Object Lock (ARCH 19.6). `Compliance` is immutable until the
+/// retain-until date passes — not even an administrator may shorten it or delete the version;
+/// `Governance` is the same but may be bypassed by a principal holding
+/// `s3:BypassGovernanceRetention` who passes `x-amz-bypass-governance-retention: true`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ObjectLockMode {
+    /// Bypassable retention (with the bypass permission + header).
+    Governance,
+    /// Immutable retention until the retain-until date passes.
+    Compliance,
+}
+
+/// A retention setting on a single object version: a mode and the instant until which it holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectRetention {
+    /// The retention mode.
+    pub mode: ObjectLockMode,
+    /// The version is protected from deletion/overwrite until this time.
+    pub retain_until: Timestamp,
+}
+
+/// The full Object Lock state of one version: an optional retention plus an independent legal hold.
+/// A version is protected from permanent deletion while retention is active OR a legal hold is on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectLockState {
+    /// The active retention, if any.
+    pub retention: Option<ObjectRetention>,
+    /// Whether a legal hold is in force (independent of retention; never expires on its own).
+    pub legal_hold: bool,
+}
+
+impl ObjectLockState {
+    /// Whether this version is protected from permanent deletion at `now`: a legal hold is on, or a
+    /// retention is set whose retain-until is still in the future.
+    #[must_use]
+    pub fn is_protected(&self, now: Timestamp) -> bool {
+        self.legal_hold || self.retention.is_some_and(|r| r.retain_until > now)
+    }
+}
+
 /// One version of one object key — the central metadata record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObjectVersionRow {

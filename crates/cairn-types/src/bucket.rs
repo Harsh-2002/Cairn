@@ -57,6 +57,9 @@ pub enum ConfigAspect {
     /// The default server-side-encryption setting (SSE-S3 applied to new uploads
     /// that do not carry their own `x-amz-server-side-encryption` header).
     Encryption,
+    /// The bucket Object Lock configuration: whether object lock is enabled and an optional default
+    /// retention (mode + period) stamped onto new object versions.
+    ObjectLock,
 }
 
 /// An opaque validated configuration document (stored as text/JSON). The typed parse lives

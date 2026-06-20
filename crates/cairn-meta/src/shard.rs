@@ -146,6 +146,8 @@ impl MetadataStore for ShardedMetadataStore {
             | Mutation::PutObjectTags { .. }
             | Mutation::DeleteObjectTags { .. }
             | Mutation::SetObjectAcl { .. }
+            | Mutation::SetObjectRetention { .. }
+            | Mutation::SetObjectLegalHold { .. }
             | Mutation::EnqueueReplication(_) => {
                 let bucket = mutation_bucket(&mutation).expect("per-bucket mutation has a bucket");
                 self.for_bucket(&bucket).submit(mutation).await
@@ -314,6 +316,17 @@ impl MetadataStore for ShardedMetadataStore {
     ) -> Result<Vec<(String, String)>, MetaError> {
         self.for_bucket(bucket.as_str())
             .get_object_tags(bucket, key, version)
+            .await
+    }
+
+    async fn get_object_lock(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version: &VersionId,
+    ) -> Result<cairn_types::object::ObjectLockState, MetaError> {
+        self.for_bucket(bucket.as_str())
+            .get_object_lock(bucket, key, version)
             .await
     }
 
@@ -580,6 +593,8 @@ fn mutation_bucket(m: &Mutation) -> Option<String> {
         Mutation::PutObjectTags { bucket, .. } => bucket.as_str(),
         Mutation::DeleteObjectTags { bucket, .. } => bucket.as_str(),
         Mutation::SetObjectAcl { bucket, .. } => bucket.as_str(),
+        Mutation::SetObjectRetention { bucket, .. } => bucket.as_str(),
+        Mutation::SetObjectLegalHold { bucket, .. } => bucket.as_str(),
         Mutation::EnqueueReplication(e) => e.bucket.as_str(),
         _ => return None,
     };
