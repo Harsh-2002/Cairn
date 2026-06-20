@@ -6,7 +6,7 @@
 use crate::driver::{AsyncSqlDriver, Row, Value, query_one};
 use crate::model::{
     self, ACTIVITY_COLS, BUCKET_COLS, MULTIPART_COLS, OBJECT_VERSION_COLS, OUTBOX_COLS, PART_COLS,
-    SHARE_COLS, SUMMARY_COLS, USER_COLS,
+    SHARE_COLS, SUMMARY_COLS, USER_COLS, WEBHOOK_COLS,
 };
 use crate::range::{prefix_upper_bound, successor};
 use crate::writer::Writer;
@@ -19,7 +19,7 @@ use cairn_types::meta::{
     MetricsRange, MultipartSession, Mutation, MutationOutcome, ObjectSummary, OpCount, OutboxEntry,
     PartRecord, ReplicationStatus, RequestMetricsSeries, ShareRow, StatusCount, StoreCounts,
     TagSummary, TaggedObject, TimePoint, User, UserSigV4Credentials, UserWithBearerHash,
-    latency_quantile_ms,
+    WebhookEntry, latency_quantile_ms,
 };
 use cairn_types::object::ObjectVersionRow;
 use cairn_types::time::Timestamp;
@@ -712,6 +712,60 @@ impl MetadataStore for AsyncMetadataStore {
             )
             .await?;
         rows.iter().map(model::outbox_from_row).collect()
+    }
+
+    async fn claim_webhook_batch(
+        &self,
+        limit: u32,
+        now: Timestamp,
+    ) -> Result<Vec<WebhookEntry>, MetaError> {
+        let outcome = self
+            .submit(Mutation::ClaimWebhookBatch {
+                limit,
+                now,
+                lease_secs: REPLICATION_LEASE_SECS,
+            })
+            .await?;
+        match outcome {
+            MutationOutcome::WebhookBatch(entries) => Ok(entries),
+            other => Err(MetaError::Engine(format!(
+                "unexpected outcome for ClaimWebhookBatch: {other:?}"
+            ))),
+        }
+    }
+
+    async fn list_due_webhooks(
+        &self,
+        limit: u32,
+        now: Timestamp,
+    ) -> Result<Vec<WebhookEntry>, MetaError> {
+        let rows = self
+            .reader()
+            .await
+            .query(
+                &format!(
+                    "SELECT {WEBHOOK_COLS} FROM events_outbox \
+                     WHERE next_attempt_at<=?1 \
+                       AND (status='pending' OR (status='claimed' AND lease_until<?1)) \
+                     ORDER BY priority DESC, next_attempt_at LIMIT ?2"
+                ),
+                vec![Value::Int(now.0), Value::Int(i64::from(limit))],
+            )
+            .await?;
+        rows.iter().map(model::webhook_from_row).collect()
+    }
+
+    async fn list_failed_webhooks(&self, limit: u32) -> Result<Vec<WebhookEntry>, MetaError> {
+        let rows = self
+            .reader().await
+            .query(
+                &format!(
+                    "SELECT {WEBHOOK_COLS} FROM events_outbox WHERE status='failed' ORDER BY next_attempt_at DESC LIMIT ?1"
+                ),
+                vec![Value::Int(i64::from(limit))],
+            )
+            .await?;
+        rows.iter().map(model::webhook_from_row).collect()
     }
 
     async fn user_by_bearer_key(

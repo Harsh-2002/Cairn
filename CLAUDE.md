@@ -68,6 +68,7 @@ cargo nextest run --workspace                                # + cargo test --wo
 - `cairn-protocol` — S3 handlers, the request lifecycles, the streaming chunked decoder. The S3
   surface lives in `service.rs`.
 - `cairn-replication` / `cairn-lifecycle` — outbox-driven replication engine; lifecycle scanner.
+- `cairn-webhook` — outbox-driven webhook event-notification delivery engine (mirrors `cairn-replication`).
 - `cairn-control` / `cairn-ui` — management JSON API (`/api/v1`); embedded React console (source in `ui/`).
 - `cairn-server` — the binary: wires the concrete stack (`stack.rs`), the hyper/rustls server,
   background loops (`background.rs`), config (`config.rs`), and the CLI subcommands (`main.rs`).

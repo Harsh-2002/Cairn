@@ -60,6 +60,9 @@ pub enum ConfigAspect {
     /// The bucket Object Lock configuration: whether object lock is enabled and an optional default
     /// retention (mode + period) stamped onto new object versions.
     ObjectLock,
+    /// The bucket event-notification (webhook) configuration: the list of webhook endpoints and
+    /// their event/prefix/suffix filters (`crate::notification::NotificationConfig`).
+    Notification,
 }
 
 /// How long a bucket's default Object Lock retention lasts, as a period from object creation.

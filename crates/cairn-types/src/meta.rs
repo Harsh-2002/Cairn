@@ -263,6 +263,34 @@ pub enum Mutation {
     /// `PutObjectVersion`, this stands alone for objects written before replication was configured;
     /// the deterministic backfill id makes a repeated resync a no-op for already-queued versions.
     EnqueueReplication(Box<OutboxEntry>),
+    /// Enqueue a batch of event-notification (webhook) outbox entries idempotently (INSERT OR
+    /// IGNORE on the deterministic entry id). Emitted by the protocol layer right after an object
+    /// commit succeeds; delivery is best-effort at-least-once (a crash in the gap drops the
+    /// notification, never the object), matching S3's best-effort event-delivery contract.
+    EnqueueWebhooks(Vec<WebhookEntry>),
+    /// Atomically claim a batch of due webhook-outbox entries (select-and-mark in one transaction,
+    /// so no two workers claim the same entry). Marks each `status='claimed'` with
+    /// `lease_until = now + lease_secs`; returns them as [`MutationOutcome::WebhookBatch`].
+    ClaimWebhookBatch {
+        /// Maximum entries to claim.
+        limit: u32,
+        /// The current time (the due-by cutoff and the lease base).
+        now: Timestamp,
+        /// The claim lease length in seconds.
+        lease_secs: i64,
+    },
+    /// Mark a webhook-outbox entry delivered (status `completed`).
+    MarkWebhookDone(String),
+    /// Mark a webhook-outbox entry failed/retry: bump attempts, store the error, and either
+    /// reschedule (`next_attempt_at = Some`) back to `pending` or give up (`None` = terminal `failed`).
+    MarkWebhookFailed {
+        /// The entry id.
+        id: String,
+        /// The last error.
+        error: String,
+        /// When to next attempt (None = give up / terminal).
+        next_attempt_at: Option<Timestamp>,
+    },
     /// Append an audit/activity entry.
     RecordActivity(Box<ActivityEntry>),
     /// Create a persistent object-share token (ARCH 15.8).
@@ -326,6 +354,8 @@ pub enum MutationOutcome {
     },
     /// A batch of due replication entries was claimed.
     ReplicationBatch(Vec<OutboxEntry>),
+    /// A batch of due webhook-notification entries was claimed.
+    WebhookBatch(Vec<WebhookEntry>),
     /// A user was created.
     UserCreated(UserId),
     /// A generic acknowledgement for mutations with no specific return value.
@@ -578,6 +608,54 @@ pub struct OutboxEntry {
     pub priority: i64,
     /// When the current claim lease expires; `None` when the entry is not claimed. A claimed
     /// entry whose lease has elapsed is eligible to be re-claimed.
+    pub lease_until: Option<Timestamp>,
+}
+
+/// The delivery status of a webhook event-notification outbox entry. Mirrors
+/// [`ReplicationStatus`] minus the inbound-`Replica` state (events are never inbound).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WebhookStatus {
+    /// Awaiting delivery.
+    Pending,
+    /// Claimed by a worker under a lease; eligible for re-claim once the lease expires.
+    Claimed,
+    /// Delivered successfully (endpoint returned 2xx).
+    Completed,
+    /// Delivery failed after the retry budget was exhausted (terminal).
+    Failed,
+}
+
+/// A durable event-notification (webhook) outbox entry: one object event matched to one endpoint.
+/// The S3-event-record JSON is pre-rendered into `payload` at enqueue time so delivery is a pure
+/// HTTP POST that needs no further metadata lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebhookEntry {
+    /// Entry id (deterministic: `{bucket}:{endpoint}:{version}:{event}`, so a re-enqueue is idempotent).
+    pub id: String,
+    /// The source bucket.
+    pub bucket: BucketName,
+    /// The object key.
+    pub key: ObjectKey,
+    /// The version concerned (the sentinel version id for unversioned buckets).
+    pub version_id: VersionId,
+    /// The event that fired.
+    pub event: crate::notification::EventKind,
+    /// The id of the bucket webhook endpoint this entry delivers to (resolved against the bucket's
+    /// notification config at delivery time for the URL + signing secret).
+    pub endpoint_id: String,
+    /// The fully-rendered JSON body to POST.
+    pub payload: String,
+    /// Retry attempt count.
+    pub attempts: u32,
+    /// When the entry is next due.
+    pub next_attempt_at: Timestamp,
+    /// Current status.
+    pub status: WebhookStatus,
+    /// The last delivery error, if any.
+    pub last_error: Option<String>,
+    /// Dispatch priority; higher is claimed first (default 0).
+    pub priority: i64,
+    /// When the current claim lease expires; `None` when not claimed.
     pub lease_until: Option<Timestamp>,
 }
 

@@ -4539,3 +4539,197 @@ async fn object_lock_guards() {
     .await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "object-lock needs versioning");
 }
+
+// ===========================================================================================
+// Webhook event notifications (ARCH 20-style): emission on object events
+// ===========================================================================================
+
+use cairn_types::notification::{NotificationConfig, WebhookEndpoint};
+
+async fn set_notifications(
+    meta: &Arc<dyn MetadataStore>,
+    bucket: &str,
+    endpoints: Vec<WebhookEndpoint>,
+) {
+    let config = NotificationConfig { endpoints };
+    meta.submit(cairn_types::Mutation::SetBucketConfig {
+        bucket: BucketName::parse(bucket).unwrap(),
+        aspect: cairn_types::bucket::ConfigAspect::Notification,
+        doc: Some(cairn_types::bucket::ConfigDoc(
+            serde_json::to_string(&config).unwrap(),
+        )),
+    })
+    .await
+    .unwrap();
+}
+
+fn endpoint(id: &str, events: &[&str], prefix: Option<&str>) -> WebhookEndpoint {
+    WebhookEndpoint {
+        id: id.to_owned(),
+        url: "http://sink.test/hook".to_owned(),
+        events: events.iter().map(|s| (*s).to_owned()).collect(),
+        prefix: prefix.map(str::to_owned),
+        suffix: None,
+        secret: None,
+    }
+}
+
+/// A PUT and a DELETE on a notification-configured bucket enqueue the matching events with the
+/// S3-event-record JSON shape; a non-matching prefix is filtered out.
+#[tokio::test]
+async fn webhook_events_emitted_on_put_and_delete() {
+    let h = harness().await;
+    let now = cairn_types::Timestamp::from_secs(2_000_000_000); // TestClock default is fixed; due immediately.
+
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("evbucket"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    // Two endpoints: one catches everything, one only the "logs/" prefix.
+    set_notifications(
+        &h.meta,
+        "evbucket",
+        vec![
+            endpoint("all", &["s3:ObjectCreated:*", "s3:ObjectRemoved:*"], None),
+            endpoint("logs", &["s3:ObjectCreated:*"], Some("logs/")),
+        ],
+    )
+    .await;
+
+    // PUT a key NOT under logs/ — only the "all" endpoint matches.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("evbucket"),
+                Some("data.txt"),
+                &[],
+                &[],
+                b"hi".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let due = h.meta.list_due_webhooks(100, now).await.unwrap();
+    assert_eq!(
+        due.len(),
+        1,
+        "only the catch-all endpoint matched the non-logs key"
+    );
+    let e = &due[0];
+    assert_eq!(e.endpoint_id, "all");
+    assert!(matches!(
+        e.event,
+        cairn_types::notification::EventKind::ObjectCreatedPut
+    ));
+    // Payload is the S3 event-record JSON.
+    let v: serde_json::Value = serde_json::from_str(&e.payload).unwrap();
+    assert_eq!(v["Records"][0]["eventName"], "s3:ObjectCreated:Put");
+    assert_eq!(v["Records"][0]["s3"]["bucket"]["name"], "evbucket");
+    assert_eq!(v["Records"][0]["s3"]["object"]["key"], "data.txt");
+
+    // PUT under logs/ — BOTH endpoints match → two new entries.
+    drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("evbucket"),
+                Some("logs/a.log"),
+                &[],
+                &[],
+                b"x".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    let due = h.meta.list_due_webhooks(100, now).await.unwrap();
+    let logs_entries: Vec<_> = due
+        .iter()
+        .filter(|e| e.key.as_str() == "logs/a.log")
+        .collect();
+    assert_eq!(
+        logs_entries.len(),
+        2,
+        "both endpoints matched the logs/ key"
+    );
+
+    // DELETE the data.txt key (unversioned bucket → ObjectRemoved:Delete) — only "all" subscribes.
+    drain(
+        send(
+            &h.svc,
+            req(
+                Method::DELETE,
+                Some("evbucket"),
+                Some("data.txt"),
+                &[],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    let removed: Vec<_> = h
+        .meta
+        .list_due_webhooks(100, now)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| {
+            matches!(
+                e.event,
+                cairn_types::notification::EventKind::ObjectRemovedDelete
+            )
+        })
+        .collect();
+    assert_eq!(removed.len(), 1, "delete emitted one ObjectRemoved event");
+    assert_eq!(removed[0].endpoint_id, "all");
+}
+
+/// A bucket with no notification config emits nothing (the common, zero-overhead path).
+#[tokio::test]
+async fn no_webhook_config_emits_nothing() {
+    let h = harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("plainb"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("plainb"),
+                Some("k"),
+                &[],
+                &[],
+                b"x".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    let due = h
+        .meta
+        .list_due_webhooks(100, cairn_types::Timestamp::from_secs(2_000_000_000))
+        .await
+        .unwrap();
+    assert!(
+        due.is_empty(),
+        "no notifications configured → no events enqueued"
+    );
+}

@@ -501,6 +501,43 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             .map_err(engine_err)?;
             Ok(MutationOutcome::Ack)
         }
+        Mutation::EnqueueWebhooks(entries) => {
+            for e in &entries {
+                enqueue_webhook(conn, e)?;
+            }
+            Ok(MutationOutcome::Ack)
+        }
+        Mutation::ClaimWebhookBatch {
+            limit,
+            now,
+            lease_secs,
+        } => claim_webhook_batch(conn, limit, now, lease_secs),
+        Mutation::MarkWebhookDone(id) => {
+            conn.execute(
+                "UPDATE events_outbox SET status='completed' WHERE id=?1",
+                params![id],
+            )
+            .map_err(engine_err)?;
+            Ok(MutationOutcome::Ack)
+        }
+        Mutation::MarkWebhookFailed {
+            id,
+            error,
+            next_attempt_at,
+        } => {
+            match next_attempt_at {
+                Some(t) => conn.execute(
+                    "UPDATE events_outbox SET attempts=attempts+1, last_error=?2, next_attempt_at=?3, status='pending' WHERE id=?1",
+                    params![id, error, t.0],
+                ),
+                None => conn.execute(
+                    "UPDATE events_outbox SET attempts=attempts+1, last_error=?2, status='failed' WHERE id=?1",
+                    params![id, error],
+                ),
+            }
+            .map_err(engine_err)?;
+            Ok(MutationOutcome::Ack)
+        }
         Mutation::RecordActivity(e) => {
             conn.prepare_cached(
                 "INSERT INTO activity (id, action, bucket, key, size, etag, actor, at)
@@ -1086,6 +1123,75 @@ fn claim_replication_batch(
     Ok(MutationOutcome::ReplicationBatch(claimed))
 }
 
+/// Idempotently insert one webhook-outbox entry (INSERT OR IGNORE on the deterministic id).
+fn enqueue_webhook(conn: &Connection, e: &cairn_types::WebhookEntry) -> R<()> {
+    conn.prepare_cached(
+        "INSERT OR IGNORE INTO events_outbox
+         (id, bucket_name, key, version_id, event_type, endpoint_id, payload, attempts,
+          next_attempt_at, status, last_error, priority, lease_until)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+    )
+    .map_err(engine_err)?
+    .execute(params![
+        e.id,
+        e.bucket.as_str(),
+        e.key.as_str(),
+        e.version_id.as_str(),
+        model::event_kind_str(e.event),
+        e.endpoint_id,
+        e.payload,
+        e.attempts as i64,
+        e.next_attempt_at.0,
+        model::webhook_status_str(e.status),
+        e.last_error,
+        e.priority,
+        e.lease_until.map(|t| t.0),
+    ])
+    .map_err(engine_err)?;
+    Ok(())
+}
+
+/// Atomically claim due webhook-outbox entries — the select-and-mark mirrors `claim_replication_batch`.
+fn claim_webhook_batch(
+    conn: &Connection,
+    limit: u32,
+    now: Timestamp,
+    lease_secs: i64,
+) -> R<MutationOutcome> {
+    let lease_until = now.0 + lease_secs * 1000;
+    let ids: Vec<String> = {
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT id FROM events_outbox
+                 WHERE (status='pending' OR (status='claimed' AND lease_until < ?1))
+                   AND next_attempt_at <= ?1
+                 ORDER BY priority DESC, next_attempt_at LIMIT ?2",
+            )
+            .map_err(engine_err)?;
+        stmt.query_map(params![now.0, i64::from(limit)], |r| r.get::<_, String>(0))
+            .map_err(engine_err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(engine_err)?
+    };
+    let mut claimed = Vec::with_capacity(ids.len());
+    for id in &ids {
+        conn.execute(
+            "UPDATE events_outbox SET status='claimed', lease_until=?2 WHERE id=?1",
+            params![id, lease_until],
+        )
+        .map_err(engine_err)?;
+        let entry = conn
+            .query_row(
+                "SELECT * FROM events_outbox WHERE id=?1",
+                params![id],
+                model::webhook_from_row,
+            )
+            .map_err(engine_err)?;
+        claimed.push(entry);
+    }
+    Ok(MutationOutcome::WebhookBatch(claimed))
+}
+
 fn config_aspect_str(a: cairn_types::bucket::ConfigAspect) -> &'static str {
     use cairn_types::bucket::ConfigAspect::*;
     match a {
@@ -1099,6 +1205,7 @@ fn config_aspect_str(a: cairn_types::bucket::ConfigAspect) -> &'static str {
         PublicAccessBlock => "public_access_block",
         Encryption => "encryption",
         ObjectLock => "object_lock",
+        Notification => "notification",
     }
 }
 

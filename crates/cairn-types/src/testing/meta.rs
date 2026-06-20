@@ -13,7 +13,7 @@ use crate::meta::{
     MutationOutcome, ObjectSummary, OpCount, OutboxEntry, PartRecord, Precondition,
     ReplicationStatus, RequestMetricsSeries, ShareRow, StatusCount, StoreCounts, TagSummary,
     TaggedObject, TimePoint, User, UserRecord, UserSigV4Credentials, UserWithBearerHash,
-    latency_quantile_ms,
+    WebhookEntry, WebhookStatus, latency_quantile_ms,
 };
 use crate::object::{ETag, ObjectVersionRow};
 use crate::time::Timestamp;
@@ -43,6 +43,7 @@ struct State {
     multipart: BTreeMap<String, MultipartSession>,
     parts: BTreeMap<(String, u16), PartRecord>,
     outbox: Vec<OutboxEntry>,
+    webhook_outbox: Vec<WebhookEntry>,
     users: BTreeMap<String, UserRecord>,
     /// Per-user identity policy JSON (`users.policy`), keyed by user id. Absent when the user has no
     /// attached policy; mirrors the real stores' nullable `policy` column without touching the
@@ -670,6 +671,73 @@ impl MetadataStore for InMemoryMetadataStore {
                 }
                 Ok(MutationOutcome::Ack)
             }
+            Mutation::EnqueueWebhooks(entries) => {
+                for entry in entries {
+                    if !st.webhook_outbox.iter().any(|e| e.id == entry.id) {
+                        st.webhook_outbox.push(entry);
+                    }
+                }
+                Ok(MutationOutcome::Ack)
+            }
+            Mutation::ClaimWebhookBatch {
+                limit,
+                now,
+                lease_secs,
+            } => {
+                let lease_until = Timestamp(now.0 + lease_secs * 1000);
+                let mut due: Vec<usize> = st
+                    .webhook_outbox
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, e)| {
+                        e.next_attempt_at <= now
+                            && (e.status == WebhookStatus::Pending
+                                || (e.status == WebhookStatus::Claimed
+                                    && e.lease_until.is_some_and(|l| l < now)))
+                    })
+                    .map(|(i, _)| i)
+                    .collect();
+                due.sort_by(|&a, &b| {
+                    let (ea, eb) = (&st.webhook_outbox[a], &st.webhook_outbox[b]);
+                    eb.priority
+                        .cmp(&ea.priority)
+                        .then(ea.next_attempt_at.cmp(&eb.next_attempt_at))
+                });
+                due.truncate(limit as usize);
+                let mut claimed = Vec::with_capacity(due.len());
+                for i in due {
+                    let e = &mut st.webhook_outbox[i];
+                    e.status = WebhookStatus::Claimed;
+                    e.lease_until = Some(lease_until);
+                    claimed.push(e.clone());
+                }
+                Ok(MutationOutcome::WebhookBatch(claimed))
+            }
+            Mutation::MarkWebhookDone(id) => {
+                if let Some(e) = st.webhook_outbox.iter_mut().find(|e| e.id == id) {
+                    e.status = WebhookStatus::Completed;
+                }
+                Ok(MutationOutcome::Ack)
+            }
+            Mutation::MarkWebhookFailed {
+                id,
+                error,
+                next_attempt_at,
+            } => {
+                if let Some(e) = st.webhook_outbox.iter_mut().find(|e| e.id == id) {
+                    e.attempts += 1;
+                    e.last_error = Some(error);
+                    match next_attempt_at {
+                        Some(t) => {
+                            e.next_attempt_at = t;
+                            e.status = WebhookStatus::Pending;
+                            e.lease_until = None;
+                        }
+                        None => e.status = WebhookStatus::Failed,
+                    }
+                }
+                Ok(MutationOutcome::Ack)
+            }
             Mutation::CreateShare(s) => {
                 st.shares.insert(s.token.clone(), *s);
                 Ok(MutationOutcome::Ack)
@@ -1087,6 +1155,65 @@ impl MetadataStore for InMemoryMetadataStore {
             .outbox
             .iter()
             .filter(|e| e.status == ReplicationStatus::Failed)
+            .cloned()
+            .collect();
+        failed.sort_by_key(|e| std::cmp::Reverse(e.next_attempt_at));
+        failed.truncate(limit as usize);
+        Ok(failed)
+    }
+
+    async fn claim_webhook_batch(
+        &self,
+        limit: u32,
+        now: Timestamp,
+    ) -> Result<Vec<WebhookEntry>, MetaError> {
+        match self
+            .submit(Mutation::ClaimWebhookBatch {
+                limit,
+                now,
+                lease_secs: 300,
+            })
+            .await?
+        {
+            MutationOutcome::WebhookBatch(entries) => Ok(entries),
+            other => Err(MetaError::Engine(format!(
+                "unexpected outcome for ClaimWebhookBatch: {other:?}"
+            ))),
+        }
+    }
+
+    async fn list_due_webhooks(
+        &self,
+        limit: u32,
+        now: Timestamp,
+    ) -> Result<Vec<WebhookEntry>, MetaError> {
+        let st = self.state.lock().unwrap();
+        let mut due: Vec<WebhookEntry> = st
+            .webhook_outbox
+            .iter()
+            .filter(|e| {
+                e.next_attempt_at <= now
+                    && (e.status == WebhookStatus::Pending
+                        || (e.status == WebhookStatus::Claimed
+                            && e.lease_until.is_some_and(|l| l < now)))
+            })
+            .cloned()
+            .collect();
+        due.sort_by(|a, b| {
+            b.priority
+                .cmp(&a.priority)
+                .then(a.next_attempt_at.cmp(&b.next_attempt_at))
+        });
+        due.truncate(limit as usize);
+        Ok(due)
+    }
+
+    async fn list_failed_webhooks(&self, limit: u32) -> Result<Vec<WebhookEntry>, MetaError> {
+        let st = self.state.lock().unwrap();
+        let mut failed: Vec<WebhookEntry> = st
+            .webhook_outbox
+            .iter()
+            .filter(|e| e.status == WebhookStatus::Failed)
             .cloned()
             .collect();
         failed.sort_by_key(|e| std::cmp::Reverse(e.next_attempt_at));

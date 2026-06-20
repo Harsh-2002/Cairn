@@ -17,6 +17,7 @@ pub mod crypto;
 pub mod error;
 pub mod id;
 pub mod meta;
+pub mod notification;
 pub mod object;
 pub mod replication;
 pub mod time;
@@ -62,9 +63,10 @@ pub use meta::{
     MultipartStatus, Mutation, MutationOutcome, ObjectSummary, OpCount, OutboxEntry, PartRecord,
     Precondition, ReplicationOp, ReplicationStatus, RequestMetricRow, RequestMetricsSeries,
     ShareDisposition, ShareRow, StatusCount, StoreCounts, TagSummary, TaggedObject, TimePoint,
-    User, UserRecord, UserSigV4Credentials, UserWithBearerHash, latency_bucket_index,
-    latency_quantile_ms,
+    User, UserRecord, UserSigV4Credentials, UserWithBearerHash, WebhookEntry, WebhookStatus,
+    latency_bucket_index, latency_quantile_ms,
 };
+pub use notification::{EventKind, NotificationConfig, WebhookEndpoint};
 pub use object::{
     ChecksumAlgorithm, ChecksumSet, ChecksumValue, CompressionDescriptor, ETag, ObjectLockMode,
     ObjectLockState, ObjectRetention, ObjectVersionRow, StorageClass, UserMetadata,

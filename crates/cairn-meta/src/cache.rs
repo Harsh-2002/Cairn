@@ -38,7 +38,7 @@ use cairn_types::meta::{
     ActivityEntry, BucketCounts, ListPage, ListQuery, MetricsRange, MultipartSession, Mutation,
     MutationOutcome, ObjectSummary, OutboxEntry, PartRecord, ReplicationStatus,
     RequestMetricsSeries, ShareRow, StoreCounts, TagSummary, TaggedObject, User,
-    UserSigV4Credentials, UserWithBearerHash,
+    UserSigV4Credentials, UserWithBearerHash, WebhookEntry,
 };
 use cairn_types::object::ObjectVersionRow;
 use cairn_types::time::Timestamp;
@@ -441,6 +441,10 @@ impl CachedMetadataStore {
             | Mutation::MarkReplicationFailed { .. }
             | Mutation::RetryFailedReplication { .. }
             | Mutation::EnqueueReplication(_)
+            | Mutation::EnqueueWebhooks(_)
+            | Mutation::ClaimWebhookBatch { .. }
+            | Mutation::MarkWebhookDone(_)
+            | Mutation::MarkWebhookFailed { .. }
             | Mutation::RecordActivity(_)
             | Mutation::CreateShare(_)
             | Mutation::RevokeShare { .. }
@@ -685,6 +689,26 @@ impl MetadataStore for CachedMetadataStore {
 
     async fn list_failed_replication(&self, limit: u32) -> Result<Vec<OutboxEntry>, MetaError> {
         self.inner.list_failed_replication(limit).await
+    }
+
+    async fn claim_webhook_batch(
+        &self,
+        limit: u32,
+        now: Timestamp,
+    ) -> Result<Vec<WebhookEntry>, MetaError> {
+        self.inner.claim_webhook_batch(limit, now).await
+    }
+
+    async fn list_due_webhooks(
+        &self,
+        limit: u32,
+        now: Timestamp,
+    ) -> Result<Vec<WebhookEntry>, MetaError> {
+        self.inner.list_due_webhooks(limit, now).await
+    }
+
+    async fn list_failed_webhooks(&self, limit: u32) -> Result<Vec<WebhookEntry>, MetaError> {
+        self.inner.list_failed_webhooks(limit).await
     }
 
     async fn get_bucket_quota(&self, bucket: &BucketName) -> Result<Option<u64>, MetaError> {
@@ -1034,6 +1058,23 @@ mod tests {
         }
         async fn list_failed_replication(&self, limit: u32) -> Result<Vec<OutboxEntry>, MetaError> {
             self.inner.list_failed_replication(limit).await
+        }
+        async fn claim_webhook_batch(
+            &self,
+            limit: u32,
+            now: Timestamp,
+        ) -> Result<Vec<WebhookEntry>, MetaError> {
+            self.inner.claim_webhook_batch(limit, now).await
+        }
+        async fn list_due_webhooks(
+            &self,
+            limit: u32,
+            now: Timestamp,
+        ) -> Result<Vec<WebhookEntry>, MetaError> {
+            self.inner.list_due_webhooks(limit, now).await
+        }
+        async fn list_failed_webhooks(&self, limit: u32) -> Result<Vec<WebhookEntry>, MetaError> {
+            self.inner.list_failed_webhooks(limit).await
         }
         async fn get_bucket_quota(&self, bucket: &BucketName) -> Result<Option<u64>, MetaError> {
             self.inner.get_bucket_quota(bucket).await

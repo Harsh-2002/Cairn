@@ -22,7 +22,7 @@ use crate::meta::{
     ActivityEntry, BucketCounts, ListPage, ListQuery, MetricsRange, MultipartSession, Mutation,
     MutationOutcome, ObjectSummary, OutboxEntry, PartRecord, ReplicationStatus,
     RequestMetricsSeries, ShareRow, StoreCounts, TagSummary, TaggedObject, User,
-    UserSigV4Credentials, UserWithBearerHash,
+    UserSigV4Credentials, UserWithBearerHash, WebhookEntry,
 };
 use crate::object::{CompressionDescriptor, ObjectVersionRow};
 use crate::replication::ReplicatedObject;
@@ -262,6 +262,24 @@ pub trait MetadataStore: Send + Sync {
     /// i.e. retries exhausted with no further attempt scheduled), most recently due first, up to
     /// `limit`. The control plane surfaces these for operator attention (ARCH 20.5/22.2).
     async fn list_failed_replication(&self, limit: u32) -> Result<Vec<OutboxEntry>, MetaError>;
+
+    // --- webhook event-notification outbox (mirrors the replication outbox) ---
+    /// Atomically claim a batch of due webhook-notification entries (a write routed through the
+    /// writer; the select-and-mark is one transaction so two workers never claim the same entry).
+    async fn claim_webhook_batch(
+        &self,
+        limit: u32,
+        now: Timestamp,
+    ) -> Result<Vec<WebhookEntry>, MetaError>;
+    /// Read-only peek of the webhook entries due as of `now`, for observability/tests.
+    async fn list_due_webhooks(
+        &self,
+        limit: u32,
+        now: Timestamp,
+    ) -> Result<Vec<WebhookEntry>, MetaError>;
+    /// List webhook-outbox entries that exhausted their retry budget (status `Failed`), most
+    /// recently due first, up to `limit`, for operator attention.
+    async fn list_failed_webhooks(&self, limit: u32) -> Result<Vec<WebhookEntry>, MetaError>;
 
     // --- bucket quota ---
     /// Read a bucket's optional byte quota (`buckets.quota_bytes`), `None` when the bucket has

@@ -373,6 +373,29 @@ CREATE TABLE object_locks (
 );
 "#,
     },
+    Migration {
+        version: 17,
+        name: "webhook event-notification outbox",
+        sql: r#"
+-- Event-notification (webhook) delivery outbox. Mirrors cairn-meta/src/schema.rs v17.
+CREATE TABLE events_outbox (
+    id              TEXT PRIMARY KEY,
+    bucket_name     TEXT NOT NULL,
+    key             TEXT NOT NULL,
+    version_id      TEXT NOT NULL,
+    event_type      TEXT NOT NULL,
+    endpoint_id     TEXT NOT NULL,
+    payload         TEXT NOT NULL,
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at INTEGER NOT NULL,
+    status          TEXT NOT NULL,
+    last_error      TEXT,
+    priority        INTEGER NOT NULL DEFAULT 0,
+    lease_until     INTEGER
+);
+CREATE INDEX idx_events_outbox_status_next ON events_outbox (status, next_attempt_at);
+"#,
+    },
 ];
 
 /// Run all pending migrations on the write driver, recording each as applied. Each migration is

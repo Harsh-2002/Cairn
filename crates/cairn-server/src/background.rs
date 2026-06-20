@@ -33,6 +33,10 @@ pub fn spawn(stack: Arc<AppStack>, cfg: &Config) {
         multipart_lifetime_secs,
     ));
     tokio::spawn(lifecycle_loop(stack.clone(), lifecycle_interval));
+    tokio::spawn(webhook_loop(
+        stack.clone(),
+        Duration::from_secs(cfg.webhook_interval_secs),
+    ));
     // The integrity scrub is opt-in (I/O-heavy): only spawned when an interval is configured.
     if cfg.scrub_interval_secs > 0 {
         tokio::spawn(scrub_loop(
@@ -915,6 +919,33 @@ async fn lifecycle_loop(stack: Arc<AppStack>, interval: Duration) {
         {
             Ok(report) => tracing::info!(?report, "lifecycle scan complete"),
             Err(e) => tracing::warn!(error = %e, "lifecycle scan failed"),
+        }
+    }
+}
+
+/// The webhook event-notification delivery worker: drains the `events_outbox` to the configured
+/// per-bucket endpoints on a fixed interval (ARCH 20-style). The claim is a cheap indexed query, so
+/// the loop is harmless when no bucket has notifications configured (it claims nothing and sleeps).
+async fn webhook_loop(stack: Arc<AppStack>, interval: Duration) {
+    let engine = cairn_webhook::WebhookEngine::new(cairn_webhook::WebhookOpts::default());
+    let sink = cairn_webhook::HttpWebhookSink::new();
+    let clock = SystemClock::new();
+    loop {
+        tokio::time::sleep(interval).await;
+        match engine.run_until_idle(&*stack.meta, &sink, &clock, 50).await {
+            Ok(report) if !report.is_idle() => {
+                metrics::counter!("cairn_webhook_delivered_total").increment(report.delivered);
+                metrics::counter!("cairn_webhook_failed_total").increment(report.failed);
+                metrics::counter!("cairn_webhook_dropped_total").increment(report.dropped);
+                tracing::info!(
+                    delivered = report.delivered,
+                    failed = report.failed,
+                    dropped = report.dropped,
+                    "webhook delivery progressed"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "webhook drain failed"),
         }
     }
 }

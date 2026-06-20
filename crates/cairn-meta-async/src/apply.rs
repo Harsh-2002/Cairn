@@ -596,6 +596,51 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
                 .await?;
             Ok(MutationOutcome::Ack)
         }
+        Mutation::EnqueueWebhooks(entries) => {
+            for e in &entries {
+                enqueue_webhook(driver, e).await?;
+            }
+            Ok(MutationOutcome::Ack)
+        }
+        Mutation::ClaimWebhookBatch {
+            limit,
+            now,
+            lease_secs,
+        } => claim_webhook_batch(driver, limit, now, lease_secs).await,
+        Mutation::MarkWebhookDone(id) => {
+            driver
+                .execute(
+                    "UPDATE events_outbox SET status='completed' WHERE id=?1",
+                    vec![Value::Text(id)],
+                )
+                .await?;
+            Ok(MutationOutcome::Ack)
+        }
+        Mutation::MarkWebhookFailed {
+            id,
+            error,
+            next_attempt_at,
+        } => {
+            match next_attempt_at {
+                Some(t) => {
+                    driver
+                        .execute(
+                            "UPDATE events_outbox SET attempts=attempts+1, last_error=?2, next_attempt_at=?3, status='pending' WHERE id=?1",
+                            vec![Value::Text(id), Value::Text(error), Value::Int(t.0)],
+                        )
+                        .await?;
+                }
+                None => {
+                    driver
+                        .execute(
+                            "UPDATE events_outbox SET attempts=attempts+1, last_error=?2, status='failed' WHERE id=?1",
+                            vec![Value::Text(id), Value::Text(error)],
+                        )
+                        .await?;
+                }
+            }
+            Ok(MutationOutcome::Ack)
+        }
         Mutation::RecordActivity(e) => {
             driver
                 .execute(
@@ -1206,6 +1251,72 @@ async fn claim_replication_batch(
     Ok(MutationOutcome::ReplicationBatch(claimed))
 }
 
+async fn enqueue_webhook(driver: &dyn AsyncSqlDriver, e: &cairn_types::WebhookEntry) -> R<()> {
+    driver
+        .execute(
+            "INSERT OR IGNORE INTO events_outbox
+             (id, bucket_name, key, version_id, event_type, endpoint_id, payload, attempts, next_attempt_at, status, last_error, priority, lease_until)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+            vec![
+                Value::Text(e.id.clone()),
+                Value::Text(e.bucket.as_str().to_owned()),
+                Value::Text(e.key.as_str().to_owned()),
+                Value::Text(e.version_id.as_str().to_owned()),
+                Value::Text(model::event_kind_str(e.event).to_owned()),
+                Value::Text(e.endpoint_id.clone()),
+                Value::Text(e.payload.clone()),
+                Value::Int(e.attempts as i64),
+                Value::Int(e.next_attempt_at.0),
+                Value::Text(model::webhook_status_str(e.status).to_owned()),
+                opt_text(e.last_error.clone()),
+                Value::Int(e.priority),
+                e.lease_until.map_or(Value::Null, |t| Value::Int(t.0)),
+            ],
+        )
+        .await?;
+    Ok(())
+}
+
+async fn claim_webhook_batch(
+    driver: &dyn AsyncSqlDriver,
+    limit: u32,
+    now: Timestamp,
+    lease_secs: i64,
+) -> R<MutationOutcome> {
+    let lease_until = now.0 + lease_secs * 1000;
+    let id_rows = driver
+        .query(
+            "SELECT id FROM events_outbox
+             WHERE (status='pending' OR (status='claimed' AND lease_until < ?1))
+               AND next_attempt_at <= ?1
+             ORDER BY priority DESC, next_attempt_at LIMIT ?2",
+            vec![Value::Int(now.0), Value::Int(i64::from(limit))],
+        )
+        .await?;
+    let ids: Vec<String> = id_rows.iter().map(|r| r.get_text(0)).collect();
+    let mut claimed = Vec::with_capacity(ids.len());
+    for id in &ids {
+        driver
+            .execute(
+                "UPDATE events_outbox SET status='claimed', lease_until=?2 WHERE id=?1",
+                vec![Value::Text(id.clone()), Value::Int(lease_until)],
+            )
+            .await?;
+        let row = query_one(
+            driver,
+            &format!(
+                "SELECT {} FROM events_outbox WHERE id=?1",
+                model::WEBHOOK_COLS
+            ),
+            vec![Value::Text(id.clone())],
+        )
+        .await?
+        .ok_or_else(|| MetaError::Engine("claimed webhook row vanished".to_owned()))?;
+        claimed.push(model::webhook_from_row(&row)?);
+    }
+    Ok(MutationOutcome::WebhookBatch(claimed))
+}
+
 fn config_aspect_str(a: cairn_types::bucket::ConfigAspect) -> &'static str {
     use cairn_types::bucket::ConfigAspect::*;
     match a {
@@ -1219,6 +1330,7 @@ fn config_aspect_str(a: cairn_types::bucket::ConfigAspect) -> &'static str {
         PublicAccessBlock => "public_access_block",
         Encryption => "encryption",
         ObjectLock => "object_lock",
+        Notification => "notification",
     }
 }
 

@@ -411,6 +411,32 @@ CREATE TABLE object_locks (
 );
 "#,
     },
+    Migration {
+        version: 17,
+        name: "webhook event-notification outbox",
+        sql: r#"
+-- Event-notification (webhook) delivery outbox, mirroring replication_outbox (ARCH 20-style).
+-- One row = one object event matched to one bucket webhook endpoint; the ready-to-POST JSON is
+-- pre-rendered into `payload`. status is 'pending'|'claimed'|'completed'|'failed'; the drain
+-- worker claims under a lease (lease_until) and retries with backoff (next_attempt_at).
+CREATE TABLE events_outbox (
+    id              TEXT PRIMARY KEY,
+    bucket_name     TEXT NOT NULL,
+    key             TEXT NOT NULL,
+    version_id      TEXT NOT NULL,
+    event_type      TEXT NOT NULL,
+    endpoint_id     TEXT NOT NULL,
+    payload         TEXT NOT NULL,
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at INTEGER NOT NULL,
+    status          TEXT NOT NULL,
+    last_error      TEXT,
+    priority        INTEGER NOT NULL DEFAULT 0,
+    lease_until     INTEGER
+);
+CREATE INDEX idx_events_outbox_status_next ON events_outbox (status, next_attempt_at);
+"#,
+    },
 ];
 
 /// Run all pending migrations on the write connection, recording each as applied.

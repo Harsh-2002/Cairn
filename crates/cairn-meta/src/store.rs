@@ -14,7 +14,7 @@ use cairn_types::meta::{
     MetricsRange, MultipartSession, Mutation, MutationOutcome, ObjectSummary, OpCount, OutboxEntry,
     PartRecord, ReplicationStatus, RequestMetricsSeries, ShareRow, StatusCount, StoreCounts,
     TagSummary, TaggedObject, TimePoint, User, UserSigV4Credentials, UserWithBearerHash,
-    latency_quantile_ms,
+    WebhookEntry, latency_quantile_ms,
 };
 use cairn_types::object::ObjectVersionRow;
 use cairn_types::time::Timestamp;
@@ -1071,6 +1071,61 @@ impl MetadataStore for SqliteMetadataStore {
                 )
                 .map_err(engine_err)?;
             stmt.query_map(params![i64::from(limit)], model::outbox_from_row)
+                .map_err(engine_err)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(engine_err)
+        })
+        .await
+    }
+
+    async fn claim_webhook_batch(
+        &self,
+        limit: u32,
+        now: Timestamp,
+    ) -> Result<Vec<WebhookEntry>, MetaError> {
+        let outcome = self
+            .submit(Mutation::ClaimWebhookBatch {
+                limit,
+                now,
+                lease_secs: REPLICATION_LEASE_SECS,
+            })
+            .await?;
+        match outcome {
+            MutationOutcome::WebhookBatch(entries) => Ok(entries),
+            other => Err(MetaError::Engine(format!(
+                "unexpected outcome for ClaimWebhookBatch: {other:?}"
+            ))),
+        }
+    }
+    async fn list_due_webhooks(
+        &self,
+        limit: u32,
+        now: Timestamp,
+    ) -> Result<Vec<WebhookEntry>, MetaError> {
+        self.with_read(move |conn| {
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT * FROM events_outbox \
+                     WHERE next_attempt_at<=?1 \
+                       AND (status='pending' OR (status='claimed' AND lease_until<?1)) \
+                     ORDER BY priority DESC, next_attempt_at LIMIT ?2",
+                )
+                .map_err(engine_err)?;
+            stmt.query_map(params![now.0, i64::from(limit)], model::webhook_from_row)
+                .map_err(engine_err)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(engine_err)
+        })
+        .await
+    }
+    async fn list_failed_webhooks(&self, limit: u32) -> Result<Vec<WebhookEntry>, MetaError> {
+        self.with_read(move |conn| {
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT * FROM events_outbox WHERE status='failed' ORDER BY next_attempt_at DESC LIMIT ?1",
+                )
+                .map_err(engine_err)?;
+            stmt.query_map(params![i64::from(limit)], model::webhook_from_row)
                 .map_err(engine_err)?
                 .collect::<rusqlite::Result<Vec<_>>>()
                 .map_err(engine_err)

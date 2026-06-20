@@ -15,6 +15,9 @@ fuzz tests live next to their sources). Two kinds — keep them distinct:
 - `object_lock.sh` — Object Lock / WORM: COMPLIANCE immutable (no delete/shorten, bypass ignored),
   GOVERNANCE yields only to `s3:BypassGovernanceRetention` + the bypass header, legal hold
   blocks/releases, bucket default retention stamped + echoed on HEAD. (Also folded into `run.sh`.)
+- `notifications.sh` (+`notifications.py`) — webhook event notifications: stands up a local sink,
+  configures a bucket endpoint via the management API (Bearer), drives S3 PUT/DELETE, and asserts
+  the sink receives correctly-shaped, HMAC-signed S3 event records. Needs the UI listener ON.
 
 ## regression / limit (where does it break?)
 - `replication_chaos.sh` (+`.py`) — break replication on purpose (target down, source SIGKILL); assert no loss.

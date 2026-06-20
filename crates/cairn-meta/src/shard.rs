@@ -33,7 +33,7 @@ use cairn_types::meta::{
     ActivityEntry, BucketCounts, ListPage, ListQuery, MetricsRange, MultipartSession, Mutation,
     MutationOutcome, ObjectSummary, OutboxEntry, PartRecord, ReplicationStatus,
     RequestMetricsSeries, ShareRow, StoreCounts, TagSummary, TaggedObject, User,
-    UserSigV4Credentials, UserWithBearerHash,
+    UserSigV4Credentials, UserWithBearerHash, WebhookEntry,
 };
 use cairn_types::object::ObjectVersionRow;
 use cairn_types::time::Timestamp;
@@ -153,6 +153,16 @@ impl MetadataStore for ShardedMetadataStore {
                 self.for_bucket(&bucket).submit(mutation).await
             }
 
+            // --- webhook outbox: one EnqueueWebhooks batch is built for a single object event,
+            //     so all its entries share a bucket; route by the first (empty = no-op). ---
+            Mutation::EnqueueWebhooks(ref entries) => match entries.first() {
+                Some(e) => {
+                    let bucket = e.bucket.as_str().to_owned();
+                    self.for_bucket(&bucket).submit(mutation).await
+                }
+                None => Ok(MutationOutcome::Ack),
+            },
+
             // --- multipart: route by the (shard-encoded) upload id; encode it at creation ---
             Mutation::CreateMultipart(mut s) => {
                 let shard = shard_for_bucket(s.bucket.as_str(), self.n());
@@ -195,10 +205,12 @@ impl MetadataStore for ShardedMetadataStore {
                     .await
             }
 
-            // --- replication marks/retry: idempotent, so fan out; only the owner's row changes ---
+            // --- replication/webhook marks/retry: idempotent, so fan out; only the owner's row changes ---
             Mutation::MarkReplicationDone(_)
             | Mutation::MarkReplicationFailed { .. }
-            | Mutation::RetryFailedReplication { .. } => {
+            | Mutation::RetryFailedReplication { .. }
+            | Mutation::MarkWebhookDone(_)
+            | Mutation::MarkWebhookFailed { .. } => {
                 let mut outcome = MutationOutcome::Ack;
                 for s in &self.shards {
                     outcome = s.submit(mutation.clone()).await?;
@@ -206,8 +218,10 @@ impl MetadataStore for ShardedMetadataStore {
                 Ok(outcome)
             }
             // A claim submitted directly drains shard 0 only; the worker uses the fan-out method
-            // `claim_replication_batch` for the real cross-shard claim.
-            Mutation::ClaimReplicationBatch { .. } => self.global().submit(mutation).await,
+            // `claim_replication_batch` / `claim_webhook_batch` for the real cross-shard claim.
+            Mutation::ClaimReplicationBatch { .. } | Mutation::ClaimWebhookBatch { .. } => {
+                self.global().submit(mutation).await
+            }
 
             // --- account-global mutations: shard 0 ---
             Mutation::SetUserPolicy { .. }
@@ -432,6 +446,44 @@ impl MetadataStore for ShardedMetadataStore {
         let mut all = Vec::new();
         for s in &self.shards {
             all.extend(s.list_failed_replication(limit).await?);
+        }
+        all.truncate(limit as usize);
+        Ok(all)
+    }
+
+    async fn claim_webhook_batch(
+        &self,
+        limit: u32,
+        now: Timestamp,
+    ) -> Result<Vec<WebhookEntry>, MetaError> {
+        let mut claimed = Vec::new();
+        for s in &self.shards {
+            if claimed.len() as u32 >= limit {
+                break;
+            }
+            let remaining = limit - claimed.len() as u32;
+            claimed.extend(s.claim_webhook_batch(remaining, now).await?);
+        }
+        Ok(claimed)
+    }
+
+    async fn list_due_webhooks(
+        &self,
+        limit: u32,
+        now: Timestamp,
+    ) -> Result<Vec<WebhookEntry>, MetaError> {
+        let mut all = Vec::new();
+        for s in &self.shards {
+            all.extend(s.list_due_webhooks(limit, now).await?);
+        }
+        all.truncate(limit as usize);
+        Ok(all)
+    }
+
+    async fn list_failed_webhooks(&self, limit: u32) -> Result<Vec<WebhookEntry>, MetaError> {
+        let mut all = Vec::new();
+        for s in &self.shards {
+            all.extend(s.list_failed_webhooks(limit).await?);
         }
         all.truncate(limit as usize);
         Ok(all)

@@ -1386,3 +1386,68 @@ async fn object_lock_parity() {
         );
     }
 }
+
+#[tokio::test]
+async fn webhook_outbox_parity() {
+    let (a, b) = both().await;
+    for s in [&a as &dyn MetadataStore, &b as &dyn MetadataStore] {
+        let bk = BucketName::parse("bkt").unwrap();
+        let now = Timestamp::from_secs(1_000);
+        let entry = cairn_types::WebhookEntry {
+            id: "wh1".to_owned(),
+            bucket: bk.clone(),
+            key: ObjectKey::parse("k").unwrap(),
+            version_id: VersionId::from_string("v1".into()),
+            event: cairn_types::notification::EventKind::ObjectCreatedPut,
+            endpoint_id: "ep1".to_owned(),
+            payload: r#"{"Records":[]}"#.to_owned(),
+            attempts: 0,
+            next_attempt_at: now,
+            status: cairn_types::WebhookStatus::Pending,
+            last_error: None,
+            priority: 0,
+            lease_until: None,
+        };
+        s.submit(Mutation::EnqueueWebhooks(vec![entry.clone()]))
+            .await
+            .unwrap();
+        // A second enqueue of the same id is idempotent (INSERT OR IGNORE).
+        s.submit(Mutation::EnqueueWebhooks(vec![entry.clone()]))
+            .await
+            .unwrap();
+
+        // Due as of `now`.
+        let due = s.list_due_webhooks(10, now).await.unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].id, "wh1");
+        assert_eq!(due[0].payload, r#"{"Records":[]}"#);
+        assert!(matches!(
+            due[0].event,
+            cairn_types::notification::EventKind::ObjectCreatedPut
+        ));
+
+        // Claim marks it claimed under a lease (no longer due at the same instant).
+        let claimed = s.claim_webhook_batch(10, now).await.unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert!(s.list_due_webhooks(10, now).await.unwrap().is_empty());
+
+        // Mark failed terminally → it lands in the failed list.
+        s.submit(Mutation::MarkWebhookFailed {
+            id: "wh1".to_owned(),
+            error: "boom".to_owned(),
+            next_attempt_at: None,
+        })
+        .await
+        .unwrap();
+        let failed = s.list_failed_webhooks(10).await.unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].attempts, 1);
+        assert_eq!(failed[0].last_error.as_deref(), Some("boom"));
+
+        // Mark done clears it from failed.
+        s.submit(Mutation::MarkWebhookDone("wh1".to_owned()))
+            .await
+            .unwrap();
+        assert!(s.list_failed_webhooks(10).await.unwrap().is_empty());
+    }
+}

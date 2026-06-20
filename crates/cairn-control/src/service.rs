@@ -281,6 +281,15 @@ impl ControlService {
             (&Method::PUT, ["buckets", name, "encryption"]) => {
                 self.set_encryption(name, &body, principal).await
             }
+            (&Method::GET, ["buckets", name, "notifications"]) => {
+                self.get_notifications(name).await
+            }
+            (&Method::PUT, ["buckets", name, "notifications"]) => {
+                self.set_notifications(name, &body, principal).await
+            }
+            (&Method::DELETE, ["buckets", name, "notifications"]) => {
+                self.clear_notifications(name, principal).await
+            }
             (&Method::PUT, ["buckets", name, "policy"]) => {
                 self.set_policy(name, &body, principal).await
             }
@@ -1189,6 +1198,128 @@ impl ControlService {
 
         self.record_activity(
             "SetBucketEncryption",
+            Some(bucket_name.as_str()),
+            None,
+            principal,
+        )
+        .await;
+        ControlResponse::no_content()
+    }
+
+    /// `GET /buckets/{name}/notifications`: the bucket's webhook event-notification configuration
+    /// (the endpoint list). Secrets are returned only as a presence flag, never the value.
+    async fn get_notifications(&self, name: &str) -> ControlResponse {
+        let bucket_name = match self.require_bucket(name).await {
+            Ok(n) => n,
+            Err(resp) => return resp,
+        };
+        let config = match self
+            .meta
+            .get_bucket_config(&bucket_name, ConfigAspect::Notification)
+            .await
+        {
+            Ok(Some(doc)) => {
+                serde_json::from_str::<cairn_types::NotificationConfig>(&doc.0).unwrap_or_default()
+            }
+            Ok(None) => cairn_types::NotificationConfig::default(),
+            Err(e) => return ControlResponse::error_internal(&e.to_string()),
+        };
+        let endpoints: Vec<wire::WebhookEndpointView> = config
+            .endpoints
+            .into_iter()
+            .map(wire::WebhookEndpointView::from)
+            .collect();
+        ControlResponse::json(StatusCode::OK, &wire::NotificationsResp { endpoints })
+    }
+
+    /// `PUT /buckets/{name}/notifications`: replace the bucket's webhook endpoint list. The body is
+    /// a `NotificationConfig` JSON document; each endpoint is validated (non-empty id, http(s) URL,
+    /// at least one event selector) before storing. Secrets are stored as-is (sealed at rest is not
+    /// required — they are HMAC signing keys, not credentials) and never echoed back.
+    async fn set_notifications(
+        &self,
+        name: &str,
+        body: &Bytes,
+        principal: Option<&Principal>,
+    ) -> ControlResponse {
+        let bucket_name = match self.require_bucket(name).await {
+            Ok(n) => n,
+            Err(resp) => return resp,
+        };
+        let config: cairn_types::NotificationConfig = match serde_json::from_slice(body) {
+            Ok(c) => c,
+            Err(e) => return ControlResponse::bad_request(&e.to_string()),
+        };
+        // Validate every endpoint before storing so a bad config is rejected at the edge.
+        let mut seen = std::collections::HashSet::new();
+        for ep in &config.endpoints {
+            if ep.id.trim().is_empty() {
+                return ControlResponse::bad_request("endpoint id must not be empty");
+            }
+            if !seen.insert(ep.id.as_str()) {
+                return ControlResponse::bad_request(&format!("duplicate endpoint id {:?}", ep.id));
+            }
+            if !(ep.url.starts_with("http://") || ep.url.starts_with("https://")) {
+                return ControlResponse::bad_request(&format!(
+                    "endpoint {:?} url must be http(s)",
+                    ep.id
+                ));
+            }
+            if ep.events.is_empty() {
+                return ControlResponse::bad_request(&format!(
+                    "endpoint {:?} must subscribe to at least one event",
+                    ep.id
+                ));
+            }
+        }
+        let doc = match serde_json::to_string(&config) {
+            Ok(s) => ConfigDoc(s),
+            Err(e) => return ControlResponse::error_internal(&e.to_string()),
+        };
+        if let Err(e) = self
+            .meta
+            .submit(Mutation::SetBucketConfig {
+                bucket: bucket_name.clone(),
+                aspect: ConfigAspect::Notification,
+                doc: Some(doc),
+            })
+            .await
+        {
+            return ControlResponse::error_internal(&e.to_string());
+        }
+        self.record_activity(
+            "SetBucketNotifications",
+            Some(bucket_name.as_str()),
+            None,
+            principal,
+        )
+        .await;
+        ControlResponse::no_content()
+    }
+
+    /// `DELETE /buckets/{name}/notifications`: remove all webhook endpoints for the bucket.
+    async fn clear_notifications(
+        &self,
+        name: &str,
+        principal: Option<&Principal>,
+    ) -> ControlResponse {
+        let bucket_name = match self.require_bucket(name).await {
+            Ok(n) => n,
+            Err(resp) => return resp,
+        };
+        if let Err(e) = self
+            .meta
+            .submit(Mutation::SetBucketConfig {
+                bucket: bucket_name.clone(),
+                aspect: ConfigAspect::Notification,
+                doc: None,
+            })
+            .await
+        {
+            return ControlResponse::error_internal(&e.to_string());
+        }
+        self.record_activity(
+            "ClearBucketNotifications",
             Some(bucket_name.as_str()),
             None,
             principal,

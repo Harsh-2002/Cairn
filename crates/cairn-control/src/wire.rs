@@ -693,6 +693,44 @@ pub struct ReplicationTargetListResp {
     pub targets: Vec<ReplicationTargetEntry>,
 }
 
+/// One webhook endpoint as surfaced by the management API: the HMAC secret is reduced to a presence
+/// flag (`has_secret`) so it is never echoed back.
+#[derive(Debug, Serialize)]
+pub struct WebhookEndpointView {
+    /// The endpoint id.
+    pub id: String,
+    /// The destination URL.
+    pub url: String,
+    /// The subscribed event selectors.
+    pub events: Vec<String>,
+    /// The object-key prefix filter, if any.
+    pub prefix: Option<String>,
+    /// The object-key suffix filter, if any.
+    pub suffix: Option<String>,
+    /// Whether an HMAC signing secret is configured (the value is never returned).
+    pub has_secret: bool,
+}
+
+impl From<cairn_types::WebhookEndpoint> for WebhookEndpointView {
+    fn from(e: cairn_types::WebhookEndpoint) -> Self {
+        Self {
+            id: e.id,
+            url: e.url,
+            events: e.events,
+            prefix: e.prefix,
+            suffix: e.suffix,
+            has_secret: e.secret.is_some(),
+        }
+    }
+}
+
+/// `GET /buckets/{name}/notifications` response: the webhook endpoint list (without secrets).
+#[derive(Debug, Serialize)]
+pub struct NotificationsResp {
+    /// The configured webhook endpoints.
+    pub endpoints: Vec<WebhookEndpointView>,
+}
+
 /// `POST /buckets/{name}/replication/retry` response: an acknowledgement carrying the count of
 /// failed entries observed for the bucket just before the requeue was submitted.
 #[derive(Debug, Serialize)]

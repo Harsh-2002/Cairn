@@ -13,8 +13,9 @@ use cairn_types::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, Vers
 use cairn_types::meta::{
     ActivityEntry, MultipartSession, MultipartStatus, ObjectSummary, OutboxEntry, PartRecord,
     ReplicationOp, ReplicationStatus, ShareDisposition, ShareRow, User, UserRecord,
-    UserSigV4Credentials, UserWithBearerHash,
+    UserSigV4Credentials, UserWithBearerHash, WebhookEntry, WebhookStatus,
 };
+use cairn_types::notification::EventKind;
 use cairn_types::object::{
     ChecksumValue, CompressionDescriptor, ETag, ObjectVersionRow, StorageClass, UserMetadata,
 };
@@ -47,6 +48,10 @@ pub const USER_COLS: &str = "id, display_name, access_key_id, secret_hash, sigv4
 
 /// `replication_outbox` columns in mapper order.
 pub const OUTBOX_COLS: &str = "id, bucket_name, key, version_id, operation, rule_id, target_arn, \
+     attempts, next_attempt_at, status, last_error, priority, lease_until";
+
+/// `events_outbox` (webhook) columns in mapper order.
+pub const WEBHOOK_COLS: &str = "id, bucket_name, key, version_id, event_type, endpoint_id, payload, \
      attempts, next_attempt_at, status, last_error, priority, lease_until";
 
 /// `activity` columns in mapper order.
@@ -340,6 +345,56 @@ pub fn outbox_from_row(row: &Row) -> Result<OutboxEntry, MetaError> {
         attempts: row.get_i64(7) as u32,
         next_attempt_at: Timestamp(row.get_i64(8)),
         status: repl_status_from(&row.get_text(9)),
+        last_error: row.get_opt_text(10),
+        priority: row.get_i64(11),
+        lease_until: row.get_opt_i64(12).map(Timestamp),
+    })
+}
+
+// --- webhook event-notification outbox (mirrors the replication helpers) ---
+
+pub fn webhook_status_str(s: WebhookStatus) -> &'static str {
+    match s {
+        WebhookStatus::Pending => "pending",
+        WebhookStatus::Claimed => "claimed",
+        WebhookStatus::Completed => "completed",
+        WebhookStatus::Failed => "failed",
+    }
+}
+pub fn webhook_status_from(s: &str) -> WebhookStatus {
+    match s {
+        "claimed" => WebhookStatus::Claimed,
+        "completed" => WebhookStatus::Completed,
+        "failed" => WebhookStatus::Failed,
+        _ => WebhookStatus::Pending,
+    }
+}
+pub fn event_kind_str(e: EventKind) -> &'static str {
+    e.s3_name()
+}
+pub fn event_kind_from(s: &str) -> EventKind {
+    match s {
+        "s3:ObjectCreated:Copy" => EventKind::ObjectCreatedCopy,
+        "s3:ObjectCreated:CompleteMultipartUpload" => {
+            EventKind::ObjectCreatedCompleteMultipartUpload
+        }
+        "s3:ObjectRemoved:Delete" => EventKind::ObjectRemovedDelete,
+        "s3:ObjectRemoved:DeleteMarkerCreated" => EventKind::ObjectRemovedDeleteMarkerCreated,
+        _ => EventKind::ObjectCreatedPut,
+    }
+}
+pub fn webhook_from_row(row: &Row) -> Result<WebhookEntry, MetaError> {
+    Ok(WebhookEntry {
+        id: row.get_text(0),
+        bucket: BucketName::parse(&row.get_text(1)).unwrap_or_else(|_| unreachable_bucket()),
+        key: ObjectKey::parse(&row.get_text(2)).unwrap_or_else(|_| unreachable_key()),
+        version_id: VersionId::from_string(row.get_text(3)),
+        event: event_kind_from(&row.get_text(4)),
+        endpoint_id: row.get_text(5),
+        payload: row.get_text(6),
+        attempts: row.get_i64(7) as u32,
+        next_attempt_at: Timestamp(row.get_i64(8)),
+        status: webhook_status_from(&row.get_text(9)),
         last_error: row.get_opt_text(10),
         priority: row.get_i64(11),
         lease_until: row.get_opt_i64(12).map(Timestamp),

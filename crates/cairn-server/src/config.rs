@@ -83,6 +83,10 @@ pub struct Config {
     pub allow_insecure: bool,
     /// How often the lifecycle scanner applies each bucket's rules, in seconds.
     pub lifecycle_interval_secs: u64,
+    /// How often the webhook event-notification worker drains the delivery outbox to the configured
+    /// per-bucket endpoints, in seconds (`CAIRN_WEBHOOK_INTERVAL_SECS`, ARCH 20-style). The claim is a
+    /// cheap indexed query, so the loop is a no-op for buckets without notifications; default 15s.
+    pub webhook_interval_secs: u64,
     /// How often the multipart sweeper reclaims stale upload sessions, in seconds.
     pub multipart_sweep_interval_secs: u64,
     /// How often the background integrity scrub re-reads stored blobs and verifies them against the
@@ -252,6 +256,7 @@ impl Default for Config {
             dev_auth: false,
             allow_insecure: false,
             lifecycle_interval_secs: 3600,
+            webhook_interval_secs: 15,
             multipart_sweep_interval_secs: 3600,
             scrub_interval_secs: 0,
             key_rewrap_interval_secs: 300,
@@ -572,6 +577,11 @@ impl Config {
                 "lifecycle_interval_secs must be positive".into(),
             ));
         }
+        if self.webhook_interval_secs == 0 {
+            return Err(ConfigError::Invalid(
+                "webhook_interval_secs must be positive".into(),
+            ));
+        }
         if self.multipart_sweep_interval_secs == 0 {
             return Err(ConfigError::Invalid(
                 "multipart_sweep_interval_secs must be positive".into(),
@@ -824,6 +834,7 @@ mod tests {
     fn rejects_zero_background_intervals() {
         for mutate in [
             (|c: &mut Config| c.lifecycle_interval_secs = 0) as fn(&mut Config),
+            |c: &mut Config| c.webhook_interval_secs = 0,
             |c: &mut Config| c.multipart_sweep_interval_secs = 0,
             |c: &mut Config| c.multipart_upload_lifetime_secs = 0,
             |c: &mut Config| c.wal_checkpoint_interval_secs = 0,

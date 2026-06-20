@@ -21,8 +21,9 @@ use cairn_types::error::Error;
 use cairn_types::id::{BucketName, ObjectKey, UploadId, VersionId};
 use cairn_types::meta::{
     ClaimOutcome, IfNoneMatch, ListQuery, MultipartSession, Mutation, MutationOutcome, OutboxEntry,
-    Precondition, ReplicationOp,
+    Precondition, ReplicationOp, WebhookEntry, WebhookStatus,
 };
+use cairn_types::notification::{EventKind, NotificationConfig};
 use cairn_types::object::{
     ChecksumAlgorithm, ChecksumSet, ChecksumValue, CompressionDescriptor, ETag, ObjectLockMode,
     ObjectRetention, ObjectVersionRow, StorageClass,
@@ -720,6 +721,17 @@ impl S3Service {
                 // Stamp Object Lock retention / legal hold onto the new version (default or header).
                 self.apply_object_lock_on_put(&req, &bucket, &key, &version_id, now)
                     .await?;
+                // Emit an ObjectCreated:Put event notification (best-effort).
+                self.emit_events(
+                    &bucket.name,
+                    &key,
+                    &version_id,
+                    EventKind::ObjectCreatedPut,
+                    Some(staged.size_logical),
+                    Some(staged.etag.as_str()),
+                    now,
+                )
+                .await;
                 let mut resp = S3Response::status(StatusCode::OK)
                     .with_header("etag", quoted(&staged.etag))
                     .with_header("x-amz-request-id", &request_id);
@@ -838,6 +850,8 @@ impl S3Service {
     async fn delete_object(&self, req: &S3Request) -> Result<S3Response> {
         let bucket = self.fetch_bucket(req).await?;
         let key = req.key.clone().expect("key present");
+        // A copy kept for event-notification emission, since `key` is moved into the mutation below.
+        let event_key = key.clone();
         let now = self.clock.now();
         // An inbound replicated delete-marker propagation carries the loop-prevention marker; the
         // marker it creates must NOT itself be re-enqueued for replication (ARCH 20.4), which
@@ -867,6 +881,7 @@ impl S3Service {
             // deleted (a `?versionId` DELETE is the only permanent-removal path for objects).
             self.enforce_unlocked_for_delete(req, &bucket, &key, &version_id, now)
                 .await?;
+            let event_version = version_id.clone();
             let outcome = self
                 .meta
                 .submit(Mutation::DeleteVersion {
@@ -881,6 +896,16 @@ impl S3Service {
             {
                 let _ = self.blob.delete(&path).await;
             }
+            self.emit_events(
+                &bucket.name,
+                &event_key,
+                &event_version,
+                EventKind::ObjectRemovedDelete,
+                None,
+                None,
+                now,
+            )
+            .await;
             return Ok(S3Response::status(StatusCode::NO_CONTENT)
                 .with_header("x-amz-request-id", &req.request_id));
         }
@@ -910,6 +935,16 @@ impl S3Service {
                         replication,
                     })
                     .await?;
+                self.emit_events(
+                    &bucket.name,
+                    &event_key,
+                    &marker_id,
+                    EventKind::ObjectRemovedDeleteMarkerCreated,
+                    None,
+                    None,
+                    now,
+                )
+                .await;
                 // Signal the newly-created delete marker's identity to the client (Medium #4).
                 Ok(S3Response::status(StatusCode::NO_CONTENT)
                     .with_header("x-amz-delete-marker", "true")
@@ -954,6 +989,16 @@ impl S3Service {
                         replication,
                     })
                     .await?;
+                self.emit_events(
+                    &bucket.name,
+                    &event_key,
+                    &VersionId::null(),
+                    EventKind::ObjectRemovedDeleteMarkerCreated,
+                    None,
+                    None,
+                    now,
+                )
+                .await;
                 Ok(S3Response::status(StatusCode::NO_CONTENT)
                     .with_header("x-amz-delete-marker", "true")
                     .with_header("x-amz-request-id", &req.request_id))
@@ -973,6 +1018,16 @@ impl S3Service {
                 {
                     let _ = self.blob.delete(&path).await;
                 }
+                self.emit_events(
+                    &bucket.name,
+                    &event_key,
+                    &VersionId::null(),
+                    EventKind::ObjectRemovedDelete,
+                    None,
+                    None,
+                    now,
+                )
+                .await;
                 Ok(S3Response::status(StatusCode::NO_CONTENT)
                     .with_header("x-amz-request-id", &req.request_id))
             }
@@ -1336,6 +1391,17 @@ impl S3Service {
                     let _ = self.blob.delete(&old).await;
                 }
                 let _ = self.blob.delete_session(&upload_id).await;
+                // Emit an ObjectCreated:CompleteMultipartUpload event (best-effort).
+                self.emit_events(
+                    &bucket.name,
+                    &key,
+                    &version_id,
+                    EventKind::ObjectCreatedCompleteMultipartUpload,
+                    Some(staged.size_logical),
+                    Some(etag.as_str()),
+                    now,
+                )
+                .await;
                 let location = format!("/{}/{}", bucket.name.as_str(), key.as_str());
                 let body = cairn_xml::complete_multipart_result(
                     &location,
@@ -1540,6 +1606,7 @@ impl S3Service {
             VersionId::null()
         };
         let now = self.clock.now();
+        let dest_key_for_event = dest_key.clone();
         let row = ObjectVersionRow {
             id: uuid::Uuid::new_v4().simple().to_string(),
             bucket: dest_bucket.name.clone(),
@@ -1583,6 +1650,17 @@ impl S3Service {
                 if let Some(old) = superseded {
                     let _ = self.blob.delete(&old).await;
                 }
+                // Emit an ObjectCreated:Copy event for the destination (best-effort).
+                self.emit_events(
+                    &dest_bucket.name,
+                    &dest_key_for_event,
+                    &version_id,
+                    EventKind::ObjectCreatedCopy,
+                    Some(staged.size_logical),
+                    Some(staged.etag.as_str()),
+                    now,
+                )
+                .await;
                 let body = cairn_xml::copy_object_result(&staged.etag, now);
                 let mut resp = S3Response::xml(StatusCode::OK, body)
                     .with_header("x-amz-request-id", &req.request_id);
@@ -1674,6 +1752,9 @@ impl S3Service {
                     continue;
                 }
             }
+            // Event-notification context kept before `key`/`version` are moved into the mutation.
+            let event_key = key.clone();
+            let event_version_req = version.clone();
             // Per-key delete semantics by versioning state, mirroring the single-object DELETE:
             //  - a versioned delete (?versionId) permanently removes that version;
             //  - Enabled: insert a delete marker (replicated where the rule calls for it);
@@ -1753,11 +1834,35 @@ impl S3Service {
                     if let Some(p) = freed {
                         let _ = self.blob.delete(&p).await;
                     }
+                    let ev = match &event_version_req {
+                        Some(v) => VersionId::from_string(v.clone()),
+                        None => VersionId::null(),
+                    };
+                    self.emit_events(
+                        &bucket.name,
+                        &event_key,
+                        &ev,
+                        EventKind::ObjectRemovedDelete,
+                        None,
+                        None,
+                        now,
+                    )
+                    .await;
                     if !quiet {
                         deleted.push((key_s, version, false, None));
                     }
                 }
                 Ok(MutationOutcome::DeleteMarker { version_id: mv }) => {
+                    self.emit_events(
+                        &bucket.name,
+                        &event_key,
+                        &mv,
+                        EventKind::ObjectRemovedDeleteMarkerCreated,
+                        None,
+                        None,
+                        now,
+                    )
+                    .await;
                     if !quiet {
                         // S3 surfaces a marker insert with DeleteMarker=true and the marker id in
                         // DeleteMarkerVersionId; the request's VersionId field stays empty here.
@@ -2576,6 +2681,92 @@ impl S3Service {
         ))
     }
 
+    /// Emit event notifications for an object event (ARCH 20-style). Reads the bucket's webhook
+    /// configuration (one cached read; a no-op for buckets without notifications), matches each
+    /// endpoint by event + prefix/suffix, renders the S3-event-record JSON, and enqueues a delivery
+    /// entry per match. Best-effort: a notification failure never fails the object operation.
+    #[allow(clippy::too_many_arguments)]
+    async fn emit_events(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: &VersionId,
+        event: EventKind,
+        size: Option<u64>,
+        etag: Option<&str>,
+        now: cairn_types::Timestamp,
+    ) {
+        if let Err(e) = self
+            .try_emit_events(bucket, key, version_id, event, size, etag, now)
+            .await
+        {
+            tracing::warn!(bucket = %bucket.as_str(), key = %key.as_str(), error = ?e, "event notification enqueue failed (best-effort)");
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn try_emit_events(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: &VersionId,
+        event: EventKind,
+        size: Option<u64>,
+        etag: Option<&str>,
+        now: cairn_types::Timestamp,
+    ) -> Result<()> {
+        let config = match self
+            .meta
+            .get_bucket_config(bucket, ConfigAspect::Notification)
+            .await?
+        {
+            Some(doc) => serde_json::from_str::<NotificationConfig>(&doc.0).unwrap_or_default(),
+            None => return Ok(()),
+        };
+        if config.is_empty() {
+            return Ok(());
+        }
+        let mut entries = Vec::new();
+        for ep in &config.endpoints {
+            if !ep.matches(event, key.as_str()) {
+                continue;
+            }
+            let payload = build_event_payload(
+                &self.region,
+                bucket,
+                key,
+                version_id,
+                event,
+                size,
+                etag,
+                now,
+            );
+            entries.push(WebhookEntry {
+                // A unique id per emitted event: each distinct object event is one at-least-once
+                // delivery. (A version-derived id would collide across keys in an unversioned
+                // bucket, where every object shares the `null` sentinel version.) The endpoint id
+                // prefix keeps the row readable in the outbox.
+                id: format!("{}-{}", ep.id, uuid::Uuid::new_v4().simple()),
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id: version_id.clone(),
+                event,
+                endpoint_id: ep.id.clone(),
+                payload,
+                attempts: 0,
+                next_attempt_at: now,
+                status: WebhookStatus::Pending,
+                last_error: None,
+                priority: 0,
+                lease_until: None,
+            });
+        }
+        if !entries.is_empty() {
+            self.meta.submit(Mutation::EnqueueWebhooks(entries)).await?;
+        }
+        Ok(())
+    }
+
     // --- helpers ---
 
     fn require_principal<'a>(&self, req: &'a S3Request) -> Result<&'a Principal> {
@@ -3073,6 +3264,56 @@ fn bucket_action(req: &S3Request) -> Result<Action> {
         Method::GET => ListBucket,
         _ => return Err(Error::NotImplemented),
     })
+}
+
+/// Render the S3-event-notification record JSON for one object event. The shape mirrors S3's
+/// `Records[].s3` envelope so existing webhook consumers parse it unchanged; `eventSource` is
+/// `aws:s3` for that drop-in compatibility while `awsRegion` carries Cairn's configured region.
+/// `ObjectRemoved:*` events omit size/eTag (as S3 does).
+#[allow(clippy::too_many_arguments)]
+fn build_event_payload(
+    region: &str,
+    bucket: &BucketName,
+    key: &ObjectKey,
+    version_id: &VersionId,
+    event: EventKind,
+    size: Option<u64>,
+    etag: Option<&str>,
+    now: cairn_types::Timestamp,
+) -> String {
+    let mut object = serde_json::Map::new();
+    object.insert("key".to_owned(), serde_json::json!(key.as_str()));
+    if let Some(sz) = size {
+        object.insert("size".to_owned(), serde_json::json!(sz));
+    }
+    if let Some(tag) = etag {
+        object.insert("eTag".to_owned(), serde_json::json!(tag));
+    }
+    object.insert(
+        "versionId".to_owned(),
+        serde_json::json!(version_id.as_str()),
+    );
+    // The sequencer is an opaque monotonic ordering token; the time-ordered version id serves.
+    object.insert(
+        "sequencer".to_owned(),
+        serde_json::json!(version_id.as_str()),
+    );
+    let record = serde_json::json!({
+        "eventVersion": "2.1",
+        "eventSource": "aws:s3",
+        "awsRegion": region,
+        "eventTime": cairn_xml::format_iso8601(now),
+        "eventName": event.s3_name(),
+        "s3": {
+            "s3SchemaVersion": "1.0",
+            "bucket": {
+                "name": bucket.as_str(),
+                "arn": format!("arn:aws:s3:::{}", bucket.as_str()),
+            },
+            "object": serde_json::Value::Object(object),
+        },
+    });
+    serde_json::json!({ "Records": [record] }).to_string()
 }
 
 /// Whether replacing `current` retention with `new` weakens protection — a shorter retain-until

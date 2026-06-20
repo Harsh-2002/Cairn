@@ -607,6 +607,7 @@ dependencies = [
  "cairn-replication",
  "cairn-types",
  "cairn-ui",
+ "cairn-webhook",
  "clap",
  "fail",
  "figment",
@@ -660,6 +661,29 @@ name = "cairn-ui"
 version = "0.1.0"
 dependencies = [
  "rust-embed",
+]
+
+[[package]]
+name = "cairn-webhook"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "cairn-types",
+ "futures-util",
+ "hex",
+ "hmac",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

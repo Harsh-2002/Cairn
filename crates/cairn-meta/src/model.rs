@@ -8,8 +8,9 @@ use cairn_types::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, Vers
 use cairn_types::meta::{
     ActivityEntry, MultipartSession, MultipartStatus, ObjectSummary, OutboxEntry, PartRecord,
     ReplicationOp, ReplicationStatus, ShareDisposition, ShareRow, User, UserRecord,
-    UserSigV4Credentials, UserWithBearerHash,
+    UserSigV4Credentials, UserWithBearerHash, WebhookEntry, WebhookStatus,
 };
+use cairn_types::notification::EventKind;
 use cairn_types::object::{
     ChecksumValue, CompressionDescriptor, ETag, ObjectVersionRow, StorageClass, UserMetadata,
 };
@@ -354,6 +355,58 @@ pub fn outbox_from_row(row: &Row) -> rusqlite::Result<OutboxEntry> {
         attempts: row.get::<_, i64>("attempts")? as u32,
         next_attempt_at: Timestamp(row.get("next_attempt_at")?),
         status: repl_status_from(&row.get::<_, String>("status")?),
+        last_error: row.get("last_error")?,
+        priority: row.get::<_, i64>("priority")?,
+        lease_until: row.get::<_, Option<i64>>("lease_until")?.map(Timestamp),
+    })
+}
+
+// --- webhook event-notification outbox (mirrors the replication helpers) ---
+
+pub fn webhook_status_str(s: WebhookStatus) -> &'static str {
+    match s {
+        WebhookStatus::Pending => "pending",
+        WebhookStatus::Claimed => "claimed",
+        WebhookStatus::Completed => "completed",
+        WebhookStatus::Failed => "failed",
+    }
+}
+pub fn webhook_status_from(s: &str) -> WebhookStatus {
+    match s {
+        "claimed" => WebhookStatus::Claimed,
+        "completed" => WebhookStatus::Completed,
+        "failed" => WebhookStatus::Failed,
+        _ => WebhookStatus::Pending,
+    }
+}
+/// The stored event token is the canonical S3 event name (`s3:ObjectCreated:Put`, …).
+pub fn event_kind_str(e: EventKind) -> &'static str {
+    e.s3_name()
+}
+pub fn event_kind_from(s: &str) -> EventKind {
+    match s {
+        "s3:ObjectCreated:Copy" => EventKind::ObjectCreatedCopy,
+        "s3:ObjectCreated:CompleteMultipartUpload" => {
+            EventKind::ObjectCreatedCompleteMultipartUpload
+        }
+        "s3:ObjectRemoved:Delete" => EventKind::ObjectRemovedDelete,
+        "s3:ObjectRemoved:DeleteMarkerCreated" => EventKind::ObjectRemovedDeleteMarkerCreated,
+        _ => EventKind::ObjectCreatedPut,
+    }
+}
+pub fn webhook_from_row(row: &Row) -> rusqlite::Result<WebhookEntry> {
+    Ok(WebhookEntry {
+        id: row.get("id")?,
+        bucket: BucketName::parse(&row.get::<_, String>("bucket_name")?)
+            .unwrap_or_else(|_| unreachable_bucket()),
+        key: ObjectKey::parse(&row.get::<_, String>("key")?).unwrap_or_else(|_| unreachable_key()),
+        version_id: VersionId::from_string(row.get("version_id")?),
+        event: event_kind_from(&row.get::<_, String>("event_type")?),
+        endpoint_id: row.get("endpoint_id")?,
+        payload: row.get("payload")?,
+        attempts: row.get::<_, i64>("attempts")? as u32,
+        next_attempt_at: Timestamp(row.get("next_attempt_at")?),
+        status: webhook_status_from(&row.get::<_, String>("status")?),
         last_error: row.get("last_error")?,
         priority: row.get::<_, i64>("priority")?,
         lease_until: row.get::<_, Option<i64>>("lease_until")?.map(Timestamp),

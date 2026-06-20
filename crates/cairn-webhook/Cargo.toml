@@ -1,0 +1,35 @@
+[package]
+name = "cairn-webhook"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Outbox-driven webhook event-notification delivery engine for Cairn (ARCH 20-style)."
+
+[lints]
+workspace = true
+
+[dependencies]
+cairn-types.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+bytes.workspace = true
+futures-util = { workspace = true, features = ["std"] }
+hyper = { workspace = true, features = ["client", "http1"] }
+hyper-util = { workspace = true, features = ["client-legacy", "http1", "tokio"] }
+hyper-rustls = { workspace = true }
+rustls = { workspace = true, features = ["aws_lc_rs", "tls12"] }
+http.workspace = true
+http-body-util.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+hex.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+cairn-types = { workspace = true, features = ["testing"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "net", "macros", "time"] }
+hyper = { workspace = true, features = ["server", "http1"] }
+hyper-util = { workspace = true, features = ["server-auto", "tokio"] }
+http-body-util.workspace = true
