@@ -202,6 +202,14 @@ pub struct Config {
     /// The root administrator's secret key (`CAIRN_ROOT_SECRET_KEY`). Paired with
     /// [`root_access_key`](Self::root_access_key); see its docs.
     pub root_secret_key: String,
+
+    /// Minimum response size, in bytes, for the experimental `sendfile` GET fast path
+    /// (`CAIRN_FASTIO_MIN_BYTES`; only consulted in a `fast-io` build). The fast path force-closes
+    /// the connection (no keep-alive), so for small objects the reconnect churn can outweigh the
+    /// zero-copy saving; a GET whose body is below this floor falls back to the normal keep-alive
+    /// streamed path. `0` disables the floor (every eligible GET takes the fast path). Defaults to
+    /// 256 KiB — large enough that the sendfile saving dominates. Has no effect without `fast-io`.
+    pub fastio_min_bytes: u64,
 }
 
 impl Default for Config {
@@ -262,6 +270,7 @@ impl Default for Config {
             request_metrics_retention_days: 31,
             root_access_key: "cairn".to_owned(),
             root_secret_key: "cairnadmin".to_owned(),
+            fastio_min_bytes: 256 * 1024,
         }
     }
 }
@@ -955,6 +964,23 @@ mod tests {
         });
         figment::Jail::expect_with(|_jail| {
             assert_eq!(Config::load().expect("loads").meta_backend, "sqlite");
+            Ok(())
+        });
+    }
+
+    /// The sendfile size floor defaults to 256 KiB and is overridable from the environment,
+    /// including `0` to disable it. It needs no validation — any byte count is valid.
+    #[test]
+    fn load_reads_fastio_min_bytes_from_env() {
+        assert_eq!(Config::default().fastio_min_bytes, 256 * 1024);
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("CAIRN_FASTIO_MIN_BYTES", "0");
+            assert_eq!(Config::load().expect("loads").fastio_min_bytes, 0);
+            Ok(())
+        });
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("CAIRN_FASTIO_MIN_BYTES", "1048576");
+            assert_eq!(Config::load().expect("loads").fastio_min_bytes, 1_048_576);
             Ok(())
         });
     }

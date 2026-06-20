@@ -2,9 +2,10 @@
 //!
 //! Before a plaintext connection is handed to hyper, [`try_sendfile_get`] PEEKS the first request
 //! (via `recv(MSG_PEEK)`, which does not consume it). For a clean `GET` of an uncompressed,
-//! unencrypted object it serves the response head and then the body with a single `sendfile(2)`
-//! (file → socket, no userspace copy) and closes the connection. EVERYTHING else — a non-GET, a
-//! ranged or conditional GET, a compressed/encrypted object, a body, an upgrade, or anything it is
+//! unencrypted object — the full object OR a single byte-range — it serves the response head and
+//! then the body with a single `sendfile(2)` (file → socket, no userspace copy) and closes the
+//! connection. EVERYTHING else — a non-GET, a conditional GET, a compressed/encrypted object, a
+//! multi-range or unsatisfiable range, a body below the size floor, an upgrade, or anything it is
 //! unsure about — is handed back to hyper with the socket UNTOUCHED (peek consumed nothing), so
 //! hyper serves it exactly as if the fast path never ran.
 //!
@@ -65,16 +66,14 @@ struct Head {
 }
 
 /// The single source of truth for header-level fast-path eligibility: a clean, unconditional,
-/// bodyless `GET`. A ranged GET is allowed PAST this header gate, but currently always falls back:
-/// [`cairn_protocol::S3Service::handle`] only produces a `ZeroCopy` body for a FULL-object read
-/// (`service.rs`, `content_range.is_none()`), so a `Range` request is served via the portable
-/// stream. Letting ranges through here (rather than rejecting them) keeps this the single header
-/// gate, so a future `service.rs` change that zero-copies a single sub-range needs no edit here.
-/// Conditional GETs (so a 304/412 short-circuit is never sendfile'd), request bodies, and protocol
-/// upgrades are not eligible. Object/transport/at-rest eligibility (uncompressed, unencrypted,
-/// plaintext, HTTP/1.1) is enforced elsewhere: the body type (`S3Body::ZeroCopy` is only produced
-/// for a full read of an uncompressed+unencrypted object), the plaintext-only call site, and the
-/// HTTP/1.1-only [`parse_head`].
+/// bodyless `GET`. A ranged GET passes this header gate too — [`cairn_protocol::S3Service::handle`]
+/// zero-copies a single resolved byte-range (a 206, `content-range` relayed) exactly like a full
+/// object, while a multi-range/unsatisfiable range or a compressed/encrypted object yields a
+/// non-`ZeroCopy` body that falls back. Conditional GETs (so a 304/412 short-circuit is never
+/// sendfile'd), request bodies, and protocol upgrades are not eligible. Object/transport/at-rest
+/// eligibility (uncompressed, unencrypted, plaintext, HTTP/1.1) is enforced elsewhere: the body type
+/// (`S3Body::ZeroCopy` is only produced for an uncompressed+unencrypted object — full or single
+/// range), the plaintext-only call site, and the HTTP/1.1-only [`parse_head`].
 fn head_eligible(head: &Head) -> bool {
     let has = |n: &str| head.headers.iter().any(|(k, _)| k == n);
     head.is_get
@@ -91,8 +90,8 @@ fn head_eligible(head: &Head) -> bool {
 /// close (no keep-alive on the fast path), so any inbound `connection` header is dropped and our own
 /// `connection: close` appended. `x-amz-request-id` is appended for parity with the hyper path
 /// (which adds it in `server::handle`, a layer the fast path bypasses); any value already present is
-/// replaced. The status's canonical reason phrase is used for a correct status line (today the fast
-/// path only serves a full-object `200`; the reason lookup keeps a future ranged `206` correct too).
+/// replaced. The status's canonical reason phrase is used so the status line is correct for both a
+/// full-object `200` and a single-range `206 Partial Content`.
 fn format_head(
     status: hyper::StatusCode,
     headers: &[(String, String)],
@@ -147,6 +146,7 @@ pub async fn try_sendfile_get(
     stack: &AppStack,
     peer: SocketAddr,
     request_metrics_enabled: bool,
+    min_bytes: u64,
 ) -> Fast {
     // Time the whole fast-path attempt so a fast-pathed GET reports `cairn_request_duration_seconds`
     // exactly like the hyper path (which this path bypasses).
@@ -195,8 +195,8 @@ pub async fn try_sendfile_get(
         return fallback(stream, "parse");
     };
     // See [`head_eligible`] for the single source of truth on header-level eligibility (a clean,
-    // unconditional, bodyless GET; a ranged GET passes here but `handle` serves it via the stream
-    // today — only a full-object read zero-copies).
+    // unconditional, bodyless GET; a ranged GET passes here too and is zero-copied as a 206 when the
+    // object is uncompressed, else `handle` returns a streamed body that falls back below).
     if !head_eligible(&head) {
         return fallback(stream, "ineligible");
     }
@@ -266,6 +266,14 @@ pub async fn try_sendfile_get(
     else {
         return fallback(stream, "not_zerocopy");
     };
+
+    // Size floor (`CAIRN_FASTIO_MIN_BYTES`): the fast path force-closes the connection (no
+    // keep-alive), so for a small body the client's reconnect churn can outweigh the zero-copy
+    // saving. Below the floor, fall back to hyper — the peeked socket is still pristine, so it is
+    // served on the normal keep-alive streamed path. `min_bytes == 0` disables the floor.
+    if length < min_bytes {
+        return fallback(stream, "below_floor");
+    }
 
     // The body is exactly `length` bytes (the full object or one resolved sub-range); record it as
     // the response size for parity with the hyper path's content-length-based `cairn_bytes_sent_total`.

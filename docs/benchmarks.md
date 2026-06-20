@@ -297,17 +297,19 @@ board win would require batching submissions and removing the per-chunk bridge h
 ## sendfile fast path (`--features fast-io`, experimental, Linux-only)
 
 The plaintext HTTP/1.1 object-GET fast path (`crates/cairn-server/src/fast_get.rs`) serves a
-**full read** of a committed, **uncompressed, unencrypted** object directly from the page cache to
-the socket with a single `sendfile(2)`, bypassing hyper's userspace body copy. Any ineligible
-request (compressed/encrypted at rest, HTTP/2, TLS, conditional, **or any ranged GET** — ranges are
-served via the stream today) falls back to the unchanged streamed path byte-for-byte. The win is
-**server CPU per GiB sent**, not latency, so the measurement is an A/B of CPU-seconds/GiB at equal
+committed, **uncompressed, unencrypted** object — the full object or a single byte-range — directly
+from the page cache to the socket with a single `sendfile(2)`, bypassing hyper's userspace body copy.
+Any ineligible request (compressed/encrypted at rest, HTTP/2, TLS, conditional, multi-range, or a
+body below `CAIRN_FASTIO_MIN_BYTES`) falls back to the unchanged streamed path byte-for-byte. The win
+is **server CPU per GiB sent**, not latency, so the measurement is an A/B of CPU-seconds/GiB at equal
 throughput.
 
-Two properties bound the real-world win, both visible in the engage counters: the fast path takes
-over only the **first request of a fresh TCP connection** (a keep-alive client doing many GETs on
-one pooled connection only accelerates the first), and only **full-object** GETs qualify. Measure
-the engage rate before assuming the win generalizes.
+One property still bounds the real-world win, visible in the engage counters: the fast path takes
+over only the **first request of a fresh TCP connection** and then force-closes it, so a keep-alive
+client doing many GETs on one pooled connection accelerates only the first. The size floor
+(`CAIRN_FASTIO_MIN_BYTES`, default 256 KiB) keeps small objects on the keep-alive streamed path,
+where the reconnect churn would otherwise outweigh the zero-copy saving. Measure the engage rate
+before assuming the win generalizes.
 
 ### How to run
 
@@ -327,7 +329,7 @@ BIN=/tmp/cairn-fastio BASELINE_BIN=/tmp/cairn-base OBJ_SIZE=64MiB DURATION=30s \
 
 - **`cairn_sendfile_get_total{result,transport}`** — zero-copy GETs served (ok/error, `transport=plain`).
 - **`cairn_sendfile_fallback_total{reason}`** — why the fast path declined (`head`, `parse`,
-  `ineligible`, `not_object`, `denied`, `not_zerocopy`) — the engage-rate denominator.
+  `ineligible`, `not_object`, `denied`, `not_zerocopy`, `below_floor`) — the engage-rate denominator.
 - The objects must be **uncompressed at rest** to engage; the harness uses incompressible random
   bodies, but if the bucket has compression enabled the engage rate is ~0 and the report says so.
 - A trustworthy absolute number needs real hardware; on a small/shared box the **A/B ratio** and the

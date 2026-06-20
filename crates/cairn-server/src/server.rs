@@ -34,6 +34,10 @@ struct AppState {
     /// Whether the request-metrics usage-analytics subsystem is enabled (`CAIRN_REQUEST_METRICS_*`,
     /// ARCH 26.5). When off, no per-request counters accumulate on the hot path.
     request_metrics_enabled: bool,
+    /// Minimum GET-response size for the `sendfile` fast path (`CAIRN_FASTIO_MIN_BYTES`). Only read
+    /// in a `fast-io` build; allowed to be dead in the default build where the fast path is cfg'd out.
+    #[cfg_attr(not(all(feature = "fast-io", target_os = "linux")), allow(dead_code))]
+    fastio_min_bytes: u64,
     /// The assembled S3/engine stack.
     stack: Arc<AppStack>,
 }
@@ -63,6 +67,7 @@ pub async fn serve(
         request_timeout: Duration::from_secs(config.request_timeout_secs),
         metrics,
         request_metrics_enabled: config.request_metrics_enabled,
+        fastio_min_bytes: config.fastio_min_bytes,
         stack,
     });
 
@@ -265,6 +270,7 @@ async fn serve_plaintext(
             state.stack.as_ref(),
             peer,
             state.request_metrics_enabled,
+            state.fastio_min_bytes,
         )
         .await
         {
