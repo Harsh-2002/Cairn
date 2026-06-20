@@ -3,6 +3,7 @@ import { useNavigate } from "react-router";
 import { Database, MoreHorizontal, Plus } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
   Dialog,
   DialogContent,
@@ -86,6 +87,7 @@ export function Buckets() {
   const errId = useId();
   const [createOpen, setCreateOpen] = useState(false);
   const [name, setName] = useState("");
+  const [objectLock, setObjectLock] = useState(false);
   const [creating, setCreating] = useState(false);
   // Server-side failure (409 duplicate, etc.) shown on the name field.
   const [serverError, setServerError] = useState<string | null>(null);
@@ -98,6 +100,7 @@ export function Buckets() {
     setCreateOpen(open);
     if (open) {
       setName("");
+      setObjectLock(false);
       setServerError(null);
     }
   }
@@ -108,7 +111,7 @@ export function Buckets() {
     setCreating(true);
     setServerError(null);
     try {
-      await api.createBucket(name);
+      await api.createBucket(name, objectLock);
       toast.success(`Bucket "${name}" created.`);
       setCreateOpen(false);
       list.refresh();
@@ -286,6 +289,22 @@ export function Buckets() {
               <div id={errId}>
                 <FieldError>{fieldError}</FieldError>
               </div>
+
+              <label className="mt-2 flex items-start gap-2 rounded-md border p-3 text-sm">
+                <Checkbox
+                  checked={objectLock}
+                  disabled={creating}
+                  onCheckedChange={(v) => setObjectLock(v === true)}
+                  className="mt-0.5"
+                />
+                <span>
+                  Enable Object Lock (WORM)
+                  <span className="mt-0.5 block text-[13px] font-normal text-muted-foreground">
+                    Forces versioning on and lets you set retention &amp; legal
+                    holds. This can only be enabled now, not later.
+                  </span>
+                </span>
+              </label>
             </div>
             <DialogFooter>
               <Button

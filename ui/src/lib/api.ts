@@ -181,8 +181,8 @@ export const api = {
   system: () => request<SystemResp>("GET", "/system"),
 
   listBuckets: () => request<BucketListResp>("GET", "/buckets"),
-  createBucket: (name: string) =>
-    request<{ name: string }>("POST", "/buckets", { name }),
+  createBucket: (name: string, object_lock = false) =>
+    request<{ name: string }>("POST", "/buckets", { name, object_lock }),
   getBucket: (name: string) =>
     request<BucketDetailResp>("GET", `/buckets/${enc(name)}`),
   deleteBucket: (name: string) =>

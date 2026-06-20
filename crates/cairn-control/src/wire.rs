@@ -252,6 +252,9 @@ pub struct BucketListResp {
 pub struct CreateBucketReq {
     /// The desired bucket name.
     pub name: String,
+    /// Enable Object Lock at creation (forces versioning Enabled; cannot be turned on later).
+    #[serde(default)]
+    pub object_lock: bool,
 }
 
 /// `POST /buckets` response body.

@@ -5,7 +5,7 @@
 
 import { useEffect, useId, useState, type ReactNode } from "react";
 import { useParams } from "react-router";
-import { Bell, CircleAlert, Plus, Trash2, X } from "lucide-react";
+import { Bell, CircleAlert, Plus, ShieldCheck, Trash2, X } from "lucide-react";
 import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -33,6 +33,7 @@ import { ErrorAlert } from "@/components/error-alert";
 import { FieldError } from "@/components/field-error";
 import { JsonEditor } from "@/components/json-editor";
 import { NotificationsCard } from "@/components/notifications-card";
+import { ObjectLockCard } from "@/components/object-lock-card";
 import { StatusBadge } from "@/components/status-badge";
 import { ApiError, api, errorMessage } from "@/lib/api";
 import { bytes, count } from "@/lib/format";
@@ -1165,6 +1166,19 @@ export function BucketSettings() {
               endpoints={data.notifications}
               onChanged={res.refresh}
             />
+          </SettingsCard>
+
+          {/* ---- Object Lock (WORM) ---- */}
+          <SettingsCard
+            title={
+              <>
+                <ShieldCheck aria-hidden="true" className="size-4" /> Object Lock
+              </>
+            }
+            description="Write-once-read-many retention. Enabled at bucket creation; the default retention is stamped onto new objects."
+            footer={null}
+          >
+            <ObjectLockCard bucket={name} />
           </SettingsCard>
 
           {/* ---- Configured aspects (read-only: CORS / Lifecycle / ACL) ---- */}

@@ -488,3 +488,154 @@ export async function deleteReplication(bucket: string): Promise<void> {
   if (!res.ok && res.status !== 204)
     throw new ApiError(`clear replication failed (${res.status})`, res.status);
 }
+
+// --- Object Lock / WORM (S3 ?object-lock, ?retention, ?legal-hold; ARCH 16.5) ---
+
+export type LockMode = "GOVERNANCE" | "COMPLIANCE";
+
+export interface BucketObjectLock {
+  enabled: boolean;
+  /** The bucket default retention, when configured. */
+  defaultMode?: LockMode;
+  defaultDays?: number;
+  defaultYears?: number;
+}
+
+export interface ObjectRetention {
+  mode: LockMode;
+  /** ISO-8601 retain-until instant. */
+  retainUntil: string;
+}
+
+/** Read a bucket's Object Lock configuration. Returns `{enabled:false}` when not configured. */
+export async function getObjectLockConfig(
+  bucket: string,
+): Promise<BucketObjectLock> {
+  const res = await fetch(`/${encodeURIComponent(bucket)}?object-lock`, {
+    headers: s3headers(),
+  });
+  if (res.status === 404 || res.status === 400) return { enabled: false };
+  if (!res.ok)
+    throw new ApiError(`load object lock failed (${res.status})`, res.status);
+  const doc = parseXml(await res.text());
+  const text = (tag: string) =>
+    (doc.getElementsByTagName(tag)[0]?.textContent ?? "").trim();
+  const enabled = text("ObjectLockEnabled") === "Enabled";
+  const mode = text("Mode");
+  const days = text("Days");
+  const years = text("Years");
+  return {
+    enabled,
+    defaultMode: mode ? (mode as LockMode) : undefined,
+    defaultDays: days ? Number(days) : undefined,
+    defaultYears: years ? Number(years) : undefined,
+  };
+}
+
+/** Set a bucket's Object Lock default retention (the bucket must already be lock-enabled). */
+export async function putObjectLockConfig(
+  bucket: string,
+  cfg: BucketObjectLock,
+): Promise<void> {
+  let rule = "";
+  if (cfg.defaultMode && (cfg.defaultDays || cfg.defaultYears)) {
+    const period = cfg.defaultYears
+      ? `<Years>${cfg.defaultYears}</Years>`
+      : `<Days>${cfg.defaultDays}</Days>`;
+    rule = `<Rule><DefaultRetention><Mode>${cfg.defaultMode}</Mode>${period}</DefaultRetention></Rule>`;
+  }
+  const xml =
+    `<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled>` +
+    `${rule}</ObjectLockConfiguration>`;
+  const res = await fetch(`/${encodeURIComponent(bucket)}?object-lock`, {
+    method: "PUT",
+    headers: s3headers({ "Content-Type": "application/xml" }),
+    body: xml,
+  });
+  if (!res.ok && res.status !== 204)
+    throw new ApiError(`set object lock failed (${res.status})`, res.status);
+}
+
+function versionQuery(versionId?: string): string {
+  return versionId ? `&versionId=${encodeURIComponent(versionId)}` : "";
+}
+
+export async function getObjectRetention(
+  bucket: string,
+  key: string,
+  versionId?: string,
+): Promise<ObjectRetention | null> {
+  const res = await fetch(
+    `/${encodeURIComponent(bucket)}/${encodeURI(key)}?retention${versionQuery(versionId)}`,
+    { headers: s3headers() },
+  );
+  if (res.status === 404) return null;
+  if (!res.ok)
+    throw new ApiError(`load retention failed (${res.status})`, res.status);
+  const doc = parseXml(await res.text());
+  const mode = (
+    doc.getElementsByTagName("Mode")[0]?.textContent ?? ""
+  ).trim();
+  const until = (
+    doc.getElementsByTagName("RetainUntilDate")[0]?.textContent ?? ""
+  ).trim();
+  if (!mode || !until) return null;
+  return { mode: mode as LockMode, retainUntil: until };
+}
+
+export async function putObjectRetention(
+  bucket: string,
+  key: string,
+  retention: ObjectRetention,
+  opts: { bypassGovernance?: boolean; versionId?: string } = {},
+): Promise<void> {
+  const xml =
+    `<Retention><Mode>${retention.mode}</Mode>` +
+    `<RetainUntilDate>${retention.retainUntil}</RetainUntilDate></Retention>`;
+  const headers: Record<string, string> = { "Content-Type": "application/xml" };
+  if (opts.bypassGovernance)
+    headers["x-amz-bypass-governance-retention"] = "true";
+  const res = await fetch(
+    `/${encodeURIComponent(bucket)}/${encodeURI(key)}?retention${versionQuery(opts.versionId)}`,
+    { method: "PUT", headers: s3headers(headers), body: xml },
+  );
+  if (!res.ok && res.status !== 200)
+    throw new ApiError(`set retention failed (${res.status})`, res.status);
+}
+
+export async function getObjectLegalHold(
+  bucket: string,
+  key: string,
+  versionId?: string,
+): Promise<boolean> {
+  const res = await fetch(
+    `/${encodeURIComponent(bucket)}/${encodeURI(key)}?legal-hold${versionQuery(versionId)}`,
+    { headers: s3headers() },
+  );
+  if (res.status === 404) return false;
+  if (!res.ok)
+    throw new ApiError(`load legal hold failed (${res.status})`, res.status);
+  const doc = parseXml(await res.text());
+  return (
+    (doc.getElementsByTagName("Status")[0]?.textContent ?? "").trim() === "ON"
+  );
+}
+
+export async function putObjectLegalHold(
+  bucket: string,
+  key: string,
+  on: boolean,
+  versionId?: string,
+): Promise<void> {
+  const xml = `<LegalHold><Status>${on ? "ON" : "OFF"}</Status></LegalHold>`;
+  const res = await fetch(
+    `/${encodeURIComponent(bucket)}/${encodeURI(key)}?legal-hold${versionQuery(versionId)}`,
+    {
+      method: "PUT",
+      headers: s3headers({ "Content-Type": "application/xml" }),
+      body: xml,
+    },
+  );
+  if (!res.ok && res.status !== 200)
+    throw new ApiError(`set legal hold failed (${res.status})`, res.status);
+}

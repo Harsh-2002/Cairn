@@ -605,11 +605,17 @@ impl ControlService {
         }
 
         let owner_id = UserId("admin".to_owned());
+        // Object Lock can only be turned on at creation and forces versioning Enabled (a WORM
+        // guarantee is meaningless without it), mirroring the S3 create path.
         let bucket = Bucket {
             name: name.clone(),
             owner_id,
             created_at: self.clock.now(),
-            versioning: VersioningState::Unversioned,
+            versioning: if req.object_lock {
+                VersioningState::Enabled
+            } else {
+                VersioningState::Unversioned
+            },
             ownership_mode: cairn_types::authz::OwnershipMode::BucketOwnerEnforced,
             region: "us-east-1".to_owned(),
             compression: None,
@@ -626,6 +632,23 @@ impl ControlService {
                 return ControlResponse::error(StatusCode::CONFLICT, "bucket already exists");
             }
             Err(e) => return ControlResponse::error_internal(&e.to_string()),
+        }
+
+        if req.object_lock {
+            let config = cairn_types::ObjectLockConfiguration {
+                enabled: true,
+                default_retention: None,
+            };
+            if let Ok(text) = serde_json::to_string(&config) {
+                let _ = self
+                    .meta
+                    .submit(Mutation::SetBucketConfig {
+                        bucket: name.clone(),
+                        aspect: ConfigAspect::ObjectLock,
+                        doc: Some(ConfigDoc(text)),
+                    })
+                    .await;
+            }
         }
 
         self.record_activity("CreateBucket", Some(name.as_str()), None, principal)

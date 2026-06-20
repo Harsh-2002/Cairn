@@ -20,6 +20,7 @@ import {
   Loader2,
   MoreHorizontal,
   Search,
+  ShieldCheck,
   Tag,
   Trash2,
   Upload,
@@ -82,10 +83,12 @@ import {
   createFolder,
   deleteObject,
   getObjectBlob,
+  getObjectLockConfig,
   listObjectVersions,
   putObjectWithProgress,
   type ObjectVersion,
 } from "@/lib/s3";
+import { ObjectLockDialog } from "@/components/object-lock-dialog";
 import type {
   ObjectEntry,
   TagObjectItem,
@@ -450,6 +453,19 @@ export function BucketBrowser() {
   const [shareKey, setShareKey] = useState<string | null>(null);
   const [manageSharesKey, setManageSharesKey] = useState<string | null>(null);
   const [tagsKey, setTagsKey] = useState<string | null>(null);
+  const [lockKey, setLockKey] = useState<string | null>(null);
+  // Whether this bucket has Object Lock enabled, fetched once so the per-object lock action only
+  // appears where it works (the ?retention / ?legal-hold endpoints error on non-lock buckets).
+  const [lockEnabled, setLockEnabled] = useState(false);
+  useEffect(() => {
+    let live = true;
+    getObjectLockConfig(name)
+      .then((c) => live && setLockEnabled(c.enabled))
+      .catch(() => live && setLockEnabled(false));
+    return () => {
+      live = false;
+    };
+  }, [name]);
   const [pendingDelete, setPendingDelete] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
 
@@ -1081,6 +1097,12 @@ export function BucketBrowser() {
                           <Tag aria-hidden="true" />
                           Edit tags
                         </DropdownMenuItem>
+                        {lockEnabled ? (
+                          <DropdownMenuItem onSelect={() => setLockKey(o.key)}>
+                            <ShieldCheck aria-hidden="true" />
+                            Object Lock
+                          </DropdownMenuItem>
+                        ) : null}
                         <DropdownMenuItem onSelect={() => setShareKey(o.key)}>
                           Share
                         </DropdownMenuItem>
@@ -1255,6 +1277,14 @@ export function BucketBrowser() {
                               <Tag aria-hidden="true" />
                               Edit tags
                             </DropdownMenuItem>
+                            {lockEnabled ? (
+                              <DropdownMenuItem
+                                onSelect={() => setLockKey(o.key)}
+                              >
+                                <ShieldCheck aria-hidden="true" />
+                                Object Lock
+                              </DropdownMenuItem>
+                            ) : null}
                             <DropdownMenuItem
                               onSelect={() => {
                                 setCopySource(o.key);
@@ -1478,6 +1508,17 @@ export function BucketBrowser() {
           if (!open) setTagsKey(null);
         }}
       />
+
+      {lockKey !== null ? (
+        <ObjectLockDialog
+          bucket={name}
+          objectKey={lockKey}
+          open={lockKey !== null}
+          onOpenChange={(open) => {
+            if (!open) setLockKey(null);
+          }}
+        />
+      ) : null}
 
       <Dialog
         open={copySource !== null}
