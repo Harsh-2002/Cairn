@@ -5,7 +5,16 @@
 
 import { useEffect, useId, useState, type ReactNode } from "react";
 import { useParams } from "react-router";
-import { Bell, CircleAlert, Plus, ShieldCheck, Trash2, X } from "lucide-react";
+import {
+  Bell,
+  CalendarClock,
+  CircleAlert,
+  Globe,
+  Plus,
+  ShieldCheck,
+  Trash2,
+  X,
+} from "lucide-react";
 import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -29,9 +38,11 @@ import {
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
 import { ConfirmDialog } from "@/components/confirm-dialog";
+import { CorsCard } from "@/components/cors-card";
 import { ErrorAlert } from "@/components/error-alert";
 import { FieldError } from "@/components/field-error";
 import { JsonEditor } from "@/components/json-editor";
+import { LifecycleCard } from "@/components/lifecycle-card";
 import { NotificationsCard } from "@/components/notifications-card";
 import { ObjectLockCard } from "@/components/object-lock-card";
 import { StatusBadge } from "@/components/status-badge";
@@ -72,11 +83,9 @@ function statusFromState(s: string): string {
 
 // CORS / Lifecycle / ACL remain read-only here (set via the S3 API); ownership,
 // public access block, and bucket tags have dedicated editors below.
-const ASPECTS: [keyof AspectsSource, string][] = [
-  ["cors", "CORS"],
-  ["lifecycle", "Lifecycle"],
-  ["acl", "ACL"],
-];
+// CORS and lifecycle now have their own editable cards; ACL stays read-only (it is off by
+// default under the recommended BucketOwnerEnforced ownership, where the policy engine governs).
+const ASPECTS: [keyof AspectsSource, string][] = [["acl", "ACL"]];
 
 const PAB_TOGGLES: {
   key: keyof import("@/lib/s3").PublicAccessBlock;
@@ -1181,10 +1190,36 @@ export function BucketSettings() {
             <ObjectLockCard bucket={name} />
           </SettingsCard>
 
-          {/* ---- Configured aspects (read-only: CORS / Lifecycle / ACL) ---- */}
+          {/* ---- CORS ---- */}
+          <SettingsCard
+            title={
+              <>
+                <Globe aria-hidden="true" className="size-4" /> CORS
+              </>
+            }
+            description="Allow browsers from other origins to call this bucket directly."
+            footer={null}
+          >
+            <CorsCard bucket={name} />
+          </SettingsCard>
+
+          {/* ---- Lifecycle ---- */}
+          <SettingsCard
+            title={
+              <>
+                <CalendarClock aria-hidden="true" className="size-4" /> Lifecycle
+              </>
+            }
+            description="Expire objects and noncurrent versions, and abort stale multipart uploads."
+            footer={null}
+          >
+            <LifecycleCard bucket={name} />
+          </SettingsCard>
+
+          {/* ---- Configured aspects (read-only: ACL) ---- */}
           <SettingsCard
             title="Other S3 aspects"
-            description="CORS, lifecycle, and ACL are configured through the S3 API and shown here for reference."
+            description="ACLs are configured through the S3 API and shown here for reference."
             footer={null}
           >
             <CardContent>

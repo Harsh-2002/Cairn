@@ -639,3 +639,173 @@ export async function putObjectLegalHold(
   if (!res.ok && res.status !== 200)
     throw new ApiError(`set legal hold failed (${res.status})`, res.status);
 }
+
+// --- CORS (S3 ?cors) ---
+
+export interface CorsRule {
+  allowedOrigins: string[];
+  allowedMethods: string[];
+  allowedHeaders: string[];
+  exposeHeaders: string[];
+  maxAgeSeconds?: number;
+}
+
+const textsOf = (parent: Element, tag: string): string[] =>
+  Array.from(parent.getElementsByTagName(tag))
+    .map((e) => (e.textContent ?? "").trim())
+    .filter(Boolean);
+
+export async function getCors(bucket: string): Promise<CorsRule[]> {
+  const res = await fetch(`/${encodeURIComponent(bucket)}?cors`, {
+    headers: s3headers(),
+  });
+  if (res.status === 404) return [];
+  if (!res.ok)
+    throw new ApiError(`load CORS failed (${res.status})`, res.status);
+  const doc = parseXml(await res.text());
+  return Array.from(doc.getElementsByTagName("CORSRule")).map((r) => {
+    const max = (r.getElementsByTagName("MaxAgeSeconds")[0]?.textContent ?? "").trim();
+    return {
+      allowedOrigins: textsOf(r, "AllowedOrigin"),
+      allowedMethods: textsOf(r, "AllowedMethod"),
+      allowedHeaders: textsOf(r, "AllowedHeader"),
+      exposeHeaders: textsOf(r, "ExposeHeader"),
+      maxAgeSeconds: max ? Number(max) : undefined,
+    };
+  });
+}
+
+export async function putCors(bucket: string, rules: CorsRule[]): Promise<void> {
+  const body =
+    `<CORSConfiguration>` +
+    rules
+      .map(
+        (r) =>
+          `<CORSRule>` +
+          r.allowedOrigins
+            .map((o) => `<AllowedOrigin>${xmlEscape(o)}</AllowedOrigin>`)
+            .join("") +
+          r.allowedMethods
+            .map((m) => `<AllowedMethod>${xmlEscape(m)}</AllowedMethod>`)
+            .join("") +
+          r.allowedHeaders
+            .map((h) => `<AllowedHeader>${xmlEscape(h)}</AllowedHeader>`)
+            .join("") +
+          r.exposeHeaders
+            .map((h) => `<ExposeHeader>${xmlEscape(h)}</ExposeHeader>`)
+            .join("") +
+          (r.maxAgeSeconds !== undefined
+            ? `<MaxAgeSeconds>${r.maxAgeSeconds}</MaxAgeSeconds>`
+            : "") +
+          `</CORSRule>`,
+      )
+      .join("") +
+    `</CORSConfiguration>`;
+  const res = await fetch(`/${encodeURIComponent(bucket)}?cors`, {
+    method: "PUT",
+    headers: s3headers({ "Content-Type": "application/xml" }),
+    body,
+  });
+  if (!res.ok && res.status !== 204)
+    throw new ApiError(`set CORS failed (${res.status})`, res.status);
+}
+
+export async function deleteCors(bucket: string): Promise<void> {
+  const res = await fetch(`/${encodeURIComponent(bucket)}?cors`, {
+    method: "DELETE",
+    headers: s3headers(),
+  });
+  if (!res.ok && res.status !== 204)
+    throw new ApiError(`delete CORS failed (${res.status})`, res.status);
+}
+
+// --- Lifecycle (S3 ?lifecycle) — expiration / noncurrent / abort-incomplete only;
+//     storage-class transition is not implemented by Cairn (the server rejects it). ---
+
+export interface LifecycleRule {
+  id: string;
+  enabled: boolean;
+  prefix: string;
+  expirationDays?: number;
+  noncurrentDays?: number;
+  abortDays?: number;
+}
+
+function intOf(parent: Element, path: string[]): number | undefined {
+  let el: Element | undefined = parent;
+  for (const tag of path) {
+    el = el?.getElementsByTagName(tag)[0] ?? undefined;
+    if (!el) return undefined;
+  }
+  const v = (el.textContent ?? "").trim();
+  return v ? Number(v) : undefined;
+}
+
+export async function getLifecycle(bucket: string): Promise<LifecycleRule[]> {
+  const res = await fetch(`/${encodeURIComponent(bucket)}?lifecycle`, {
+    headers: s3headers(),
+  });
+  if (res.status === 404) return [];
+  if (!res.ok)
+    throw new ApiError(`load lifecycle failed (${res.status})`, res.status);
+  const doc = parseXml(await res.text());
+  return Array.from(doc.getElementsByTagName("Rule")).map((r, i) => ({
+    id: (r.getElementsByTagName("ID")[0]?.textContent ?? `rule-${i + 1}`).trim(),
+    enabled:
+      (r.getElementsByTagName("Status")[0]?.textContent ?? "").trim() ===
+      "Enabled",
+    prefix:
+      (
+        r.getElementsByTagName("Prefix")[0]?.textContent ?? ""
+      ).trim(),
+    expirationDays: intOf(r, ["Expiration", "Days"]),
+    noncurrentDays: intOf(r, ["NoncurrentVersionExpiration", "NoncurrentDays"]),
+    abortDays: intOf(r, [
+      "AbortIncompleteMultipartUpload",
+      "DaysAfterInitiation",
+    ]),
+  }));
+}
+
+export async function putLifecycle(
+  bucket: string,
+  rules: LifecycleRule[],
+): Promise<void> {
+  const body =
+    `<LifecycleConfiguration>` +
+    rules
+      .map((r) => {
+        let actions = "";
+        if (r.expirationDays)
+          actions += `<Expiration><Days>${r.expirationDays}</Days></Expiration>`;
+        if (r.noncurrentDays)
+          actions += `<NoncurrentVersionExpiration><NoncurrentDays>${r.noncurrentDays}</NoncurrentDays></NoncurrentVersionExpiration>`;
+        if (r.abortDays)
+          actions += `<AbortIncompleteMultipartUpload><DaysAfterInitiation>${r.abortDays}</DaysAfterInitiation></AbortIncompleteMultipartUpload>`;
+        return (
+          `<Rule><ID>${xmlEscape(r.id)}</ID>` +
+          `<Status>${r.enabled ? "Enabled" : "Disabled"}</Status>` +
+          `<Filter><Prefix>${xmlEscape(r.prefix)}</Prefix></Filter>` +
+          actions +
+          `</Rule>`
+        );
+      })
+      .join("") +
+    `</LifecycleConfiguration>`;
+  const res = await fetch(`/${encodeURIComponent(bucket)}?lifecycle`, {
+    method: "PUT",
+    headers: s3headers({ "Content-Type": "application/xml" }),
+    body,
+  });
+  if (!res.ok && res.status !== 204)
+    throw new ApiError(`set lifecycle failed (${res.status})`, res.status);
+}
+
+export async function deleteLifecycle(bucket: string): Promise<void> {
+  const res = await fetch(`/${encodeURIComponent(bucket)}?lifecycle`, {
+    method: "DELETE",
+    headers: s3headers(),
+  });
+  if (!res.ok && res.status !== 204)
+    throw new ApiError(`delete lifecycle failed (${res.status})`, res.status);
+}
