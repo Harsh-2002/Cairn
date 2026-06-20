@@ -46,9 +46,12 @@ path = "src/main.rs"
 [dependencies]
 fail = { workspace = true, optional = true }
 # Optional, enabled only by `fast-io`. `ktls` drives the kernel-TLS offload; `libc` provides the
-# raw `sendfile(2)` syscall for the live plaintext GET fast path. Both are
-# effective on Linux only; the source gates every use behind `#[cfg(all(feature = "fast-io",
-# target_os = "linux"))]`, so the feature is a harmless no-op if ever built on a non-Linux target.
+# raw `sendfile(2)` syscall for the live plaintext GET fast path. Both are effective on Linux only;
+# the source gates every use behind `#[cfg(all(feature = "fast-io", target_os = "linux"))]`, so the
+# feature is a harmless no-op if ever built on a non-Linux target. NOTE: `ktls` does NOT compile for
+# `aarch64-unknown-linux-musl` (a glibc-vs-musl `cmsghdr`/`msghdr` layout mismatch), so `fast-io` is
+# effectively glibc-Linux-only. The shipped release binaries are default-features (no `fast-io`), so
+# releases (static musl, incl. arm64) are unaffected; build `fast-io` for `*-linux-gnu` to test it.
 ktls = { version = "6", optional = true, default-features = false, features = ["aws_lc_rs", "tls12"] }
 libc = { version = "0.2", optional = true }
 cairn-types.workspace = true
