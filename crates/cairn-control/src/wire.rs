@@ -400,6 +400,29 @@ pub struct UserListResp {
     pub users: Vec<UserListEntry>,
 }
 
+/// `POST /credentials/temporary` request body: mint an STS-style temporary session credential.
+#[derive(Debug, Deserialize)]
+pub struct MintSessionReq {
+    /// The credential lifetime in seconds (bounded 900..=43200 server-side).
+    pub duration_secs: u64,
+    /// The scoped inline policy document (a standard policy JSON object) — required. This is the
+    /// session's entire effective permission set; it carries no implicit access.
+    pub policy: serde_json::Value,
+}
+
+/// `POST /credentials/temporary` response: the temporary credential, shown exactly once.
+#[derive(Debug, Serialize)]
+pub struct MintSessionResp {
+    /// The temporary access-key id (an `CAIRNTMP…` SigV4 key).
+    pub access_key_id: String,
+    /// The temporary secret access key (sealed at rest server-side; shown once).
+    pub secret_access_key: String,
+    /// The opaque session token the SDK presents as `X-Amz-Security-Token` (hashed at rest).
+    pub session_token: String,
+    /// When the credential expires, in epoch seconds.
+    pub expiration_epoch_secs: i64,
+}
+
 /// `POST /users` request body.
 #[derive(Debug, Deserialize)]
 pub struct CreateUserReq {

@@ -22,7 +22,7 @@ use crate::meta::{
     ActivityEntry, BucketCounts, ListPage, ListQuery, MetricsRange, MultipartSession, Mutation,
     MutationOutcome, ObjectSummary, OutboxEntry, PartRecord, ReplicationStatus,
     RequestMetricsSeries, ShareRow, StoreCounts, TagSummary, TaggedObject, User,
-    UserSigV4Credentials, UserWithBearerHash, WebhookEntry,
+    UserSessionCredentials, UserSigV4Credentials, UserWithBearerHash, WebhookEntry,
 };
 use crate::object::{CompressionDescriptor, ObjectVersionRow};
 use crate::replication::ReplicatedObject;
@@ -298,6 +298,13 @@ pub trait MetadataStore: Send + Sync {
         &self,
         access_key_id: &str,
     ) -> Result<Option<UserSigV4Credentials>, MetaError>;
+    /// Look up a temporary STS-style session credential by its access-key id, joining the parent
+    /// user's identity. Returns `None` when the key is not a session credential (the authenticator
+    /// then treats it as an unknown key). The caller validates the token + expiry and fails closed.
+    async fn user_by_session_key(
+        &self,
+        access_key_id: &str,
+    ) -> Result<Option<UserSessionCredentials>, MetaError>;
     /// Count users (for bootstrap gating).
     async fn count_users(&self) -> Result<u64, MetaError>;
     /// List all users.

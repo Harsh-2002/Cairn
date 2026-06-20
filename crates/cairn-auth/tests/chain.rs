@@ -288,3 +288,180 @@ async fn bearer_roundtrip_and_anonymous() {
         AuthOutcome::Denied(_)
     ));
 }
+
+// ===========================================================================================
+// STS-style temporary session credentials (ARCH 14)
+// ===========================================================================================
+
+const SESSION_AKID: &str = "CAIRNTMPEXAMPLE";
+const SESSION_SECRET: &str = "sessionSecretsessionSecretsessionSecret0";
+const SESSION_TOKEN: &str = "opaque-session-token-value-1234567890ABC";
+// The scoped inline policy: a single statement (proves the session uses THIS, not the parent's).
+const SESSION_POLICY: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::scoped/*"}]}"#;
+// The parent's distinct policy has TWO statements, so a session that wrongly inherited it would be
+// observable by statement count.
+const PARENT_POLICY: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:*","Resource":"*"},{"Effect":"Allow","Action":"s3:ListBucket","Resource":"*"}]}"#;
+
+async fn setup_session(expires_at: Timestamp, parent_active: bool) -> AuthChain {
+    use cairn_types::UserId;
+    let meta = Arc::new(InMemoryMetadataStore::new());
+    let crypto = Arc::new(StubCrypto);
+    let clock = Arc::new(TestClock::at_secs(1_440_938_160)); // 2015-08-30T12:36:00Z
+
+    let parent = User {
+        id: UserId("parent".to_owned()),
+        display_name: "parent".to_owned(),
+        access_key_id: "parent-bearer".to_owned(),
+        sigv4_access_key_id: None,
+        role: Role::Administrator, // an ADMIN parent — the session must still be least-privilege.
+        is_active: parent_active,
+        quota_bytes: None,
+        created_at: Timestamp(0),
+        updated_at: Timestamp(0),
+    };
+    meta.submit(Mutation::CreateUser(Box::new(UserRecord {
+        user: parent,
+        bearer_secret_hash: hash_bearer_secret("x"),
+        sigv4_secret_ciphertext: None,
+        sigv4_secret_nonce: None,
+    })))
+    .await
+    .unwrap();
+    meta.submit(Mutation::SetUserPolicy {
+        user_id: UserId("parent".to_owned()),
+        policy: Some(PARENT_POLICY.to_owned()),
+    })
+    .await
+    .unwrap();
+
+    let sealed = crypto.seal(SESSION_SECRET.as_bytes()).unwrap();
+    meta.submit(Mutation::CreateSessionCredential(Box::new(
+        cairn_types::SessionCredentialRecord {
+            access_key_id: SESSION_AKID.to_owned(),
+            parent_user_id: UserId("parent".to_owned()),
+            secret_ciphertext: sealed.ciphertext,
+            secret_nonce: Some(sealed.nonce.0),
+            session_token_hash: cairn_auth::hash_session_token(SESSION_TOKEN),
+            inline_policy: Some(SESSION_POLICY.to_owned()),
+            expires_at,
+            created_at: Timestamp(0),
+        },
+    )))
+    .await
+    .unwrap();
+
+    let cache = Arc::new(AuthCache::new(
+        Duration::from_secs(60),
+        Arc::new(AtomicU64::new(0)),
+    ));
+    AuthChain::new(meta, crypto, clock, cache, false)
+}
+
+/// Build a presigned URL signed with the session secret, folding the security token into the
+/// (signed) canonical query. `token` is the value placed in `X-Amz-Security-Token` (None omits it).
+fn session_presigned_view<'a>(buf: &'a mut String, token: Option<&str>) -> RequestView<'a> {
+    use cairn_auth::{PresignRequest, mint_presigned};
+    let extra_query = match token {
+        Some(t) => vec![("X-Amz-Security-Token".to_owned(), t.to_owned())],
+        None => vec![],
+    };
+    let url = mint_presigned(&PresignRequest {
+        method: "GET",
+        host: "cairn.example.com",
+        bucket: "scoped",
+        key: "obj.txt",
+        access_key_id: SESSION_AKID,
+        secret: SESSION_SECRET,
+        region: "us-east-1",
+        expires_secs: 3600,
+        amz_date: "20150830T123600Z",
+        extra_query,
+        extra_signed_headers: vec![],
+    });
+    *buf = url;
+    let (path, query) = buf.split_once('?').unwrap();
+    RequestView {
+        method: "GET",
+        path,
+        query,
+        headers: &[],
+        host: "cairn.example.com",
+        source: IpAddr::V4(Ipv4Addr::LOCALHOST),
+        secure_transport: true,
+    }
+}
+
+#[tokio::test]
+async fn session_credential_authenticates_least_privilege() {
+    let chain = setup_session(Timestamp::from_secs(9_999_999_999), true).await;
+    let mut buf = String::new();
+    let view = session_presigned_view(&mut buf, Some(SESSION_TOKEN));
+    match chain.authenticate(&view).await {
+        AuthOutcome::Authenticated(p) => {
+            assert!(p.is_session, "marked as a session principal");
+            assert_eq!(
+                p.role,
+                Role::Member,
+                "role capped to Member (never the admin parent's)"
+            );
+            assert_eq!(
+                p.user_id.0, "parent",
+                "carries the parent identity for ownership/audit"
+            );
+            // The session carries its OWN scoped policy (1 statement), not the parent's (2).
+            let pol = p.user_policy.expect("scoped policy attached");
+            assert_eq!(
+                pol.statements.len(),
+                1,
+                "session uses the inline policy, not the parent's"
+            );
+        }
+        other => panic!("expected authenticated session, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn session_credential_denied_without_token() {
+    let chain = setup_session(Timestamp::from_secs(9_999_999_999), true).await;
+    let mut buf = String::new();
+    let view = session_presigned_view(&mut buf, None);
+    assert!(
+        matches!(chain.authenticate(&view).await, AuthOutcome::Denied(_)),
+        "a session key with no security token is denied"
+    );
+}
+
+#[tokio::test]
+async fn session_credential_denied_wrong_token() {
+    let chain = setup_session(Timestamp::from_secs(9_999_999_999), true).await;
+    let mut buf = String::new();
+    // The wrong token is signed into the query (so the signature verifies), but its hash mismatches.
+    let view = session_presigned_view(&mut buf, Some("not-the-real-token"));
+    assert!(
+        matches!(chain.authenticate(&view).await, AuthOutcome::Denied(_)),
+        "a mismatched security token is denied"
+    );
+}
+
+#[tokio::test]
+async fn session_credential_denied_after_expiry() {
+    // Session expired one second before the (fixed) clock; the presign itself is still in-window.
+    let chain = setup_session(Timestamp::from_secs(1_440_938_159), true).await;
+    let mut buf = String::new();
+    let view = session_presigned_view(&mut buf, Some(SESSION_TOKEN));
+    assert!(
+        matches!(chain.authenticate(&view).await, AuthOutcome::Denied(_)),
+        "an expired session credential is denied"
+    );
+}
+
+#[tokio::test]
+async fn session_credential_denied_when_parent_deactivated() {
+    let chain = setup_session(Timestamp::from_secs(9_999_999_999), false).await;
+    let mut buf = String::new();
+    let view = session_presigned_view(&mut buf, Some(SESSION_TOKEN));
+    assert!(
+        matches!(chain.authenticate(&view).await, AuthOutcome::Denied(_)),
+        "a session whose parent account is deactivated is denied"
+    );
+}

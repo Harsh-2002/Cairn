@@ -227,6 +227,13 @@ pub enum Mutation {
     UpdateUser(Box<UserRecord>),
     /// Deactivate a user.
     DeactivateUser(UserId),
+    /// Mint an STS-style temporary session credential scoped to a parent user (ARCH 14).
+    CreateSessionCredential(Box<SessionCredentialRecord>),
+    /// Delete all session credentials that expired before `before` (the background cleanup sweep).
+    DeleteExpiredSessionCredentials {
+        /// The expiry cutoff (epoch ms): rows with `expires_at < before` are removed.
+        before: Timestamp,
+    },
     /// Atomically claim a batch of due replication-outbox entries, routed through the writer so
     /// the select-and-mark is one transaction (no two workers claim the same entry). Marks each
     /// claimed entry `status='claimed'` with `lease_until = now + lease_secs`, and returns them.
@@ -718,6 +725,54 @@ pub struct UserSigV4Credentials {
     pub secret_ciphertext: Vec<u8>,
     /// The ciphertext nonce.
     pub secret_nonce: Vec<u8>,
+}
+
+/// The record persisted when minting an STS-style temporary session credential. The secret is
+/// sealed under the master key exactly like a user's SigV4 secret; the session token is stored as a
+/// hash (never plaintext). The credential is scoped to its parent user and expires at `expires_at`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionCredentialRecord {
+    /// The temporary access-key id (the SigV4 lookup key).
+    pub access_key_id: String,
+    /// The parent user this session derives from (owns the buckets, ties the audit trail).
+    pub parent_user_id: UserId,
+    /// The sealed temporary secret (`CRK1` envelope; `secret_nonce` is `None`).
+    pub secret_ciphertext: Vec<u8>,
+    /// The legacy ciphertext nonce (`None` for a `CRK1` envelope).
+    pub secret_nonce: Option<Vec<u8>>,
+    /// The hash of the opaque session token the SDK must present (`X-Amz-Security-Token`).
+    pub session_token_hash: String,
+    /// An optional inline policy JSON scoping the session below the parent (the session's effective
+    /// identity policy). `None` inherits the parent's attached policy.
+    pub inline_policy: Option<String>,
+    /// When the credential expires (epoch ms); requests after this are denied.
+    pub expires_at: Timestamp,
+    /// When it was minted.
+    pub created_at: Timestamp,
+}
+
+/// A temporary session credential looked up by its access-key id, with everything the authenticator
+/// needs to validate the request (decrypt the secret, check the token + expiry) and build a
+/// least-privilege principal. The parent's identity is joined in for the principal and the
+/// active-account check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserSessionCredentials {
+    /// The parent user id (the principal's identity, for ownership + audit).
+    pub parent_user_id: UserId,
+    /// The parent's display name.
+    pub parent_display_name: String,
+    /// Whether the parent account is still active (a deactivated parent's sessions are denied).
+    pub parent_is_active: bool,
+    /// The sealed temporary secret.
+    pub secret_ciphertext: Vec<u8>,
+    /// The legacy ciphertext nonce (empty for a `CRK1` envelope).
+    pub secret_nonce: Vec<u8>,
+    /// The stored session-token hash to compare (constant-time) against the presented token.
+    pub session_token_hash: String,
+    /// The optional inline policy JSON scoping the session (the effective identity policy).
+    pub inline_policy: Option<String>,
+    /// When the credential expires (epoch ms).
+    pub expires_at: Timestamp,
 }
 
 // ---------------------------------------------------------------------------------------

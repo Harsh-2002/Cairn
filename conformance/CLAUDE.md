@@ -18,6 +18,9 @@ fuzz tests live next to their sources). Two kinds — keep them distinct:
 - `notifications.sh` (+`notifications.py`) — webhook event notifications: stands up a local sink,
   configures a bucket endpoint via the management API (Bearer), drives S3 PUT/DELETE, and asserts
   the sink receives correctly-shaped, HMAC-signed S3 event records. Needs the UI listener ON.
+- `sts.sh` (+`sts.py`) — STS temporary credentials: mints a scoped session via the management API,
+  then proves a standard S3 SDK consumes it (`X-Amz-Security-Token`) with exactly the granted access
+  (scoped GET allowed; ungranted PUT / cross-bucket / tampered / absent-token denied). UI listener ON.
 
 ## regression / limit (where does it break?)
 - `replication_chaos.sh` (+`.py`) — break replication on purpose (target down, source SIGKILL); assert no loss.

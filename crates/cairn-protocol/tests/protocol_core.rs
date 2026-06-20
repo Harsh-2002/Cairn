@@ -19,6 +19,7 @@ fn admin() -> Principal {
         method: AuthMethod::Bearer,
         chunk_signing: None,
         user_policy: None,
+        is_session: false,
     }
 }
 
@@ -32,6 +33,7 @@ fn member(user: &str) -> Principal {
         method: AuthMethod::Bearer,
         chunk_signing: None,
         user_policy: None,
+        is_session: false,
     }
 }
 
@@ -4731,5 +4733,137 @@ async fn no_webhook_config_emits_nothing() {
     assert!(
         due.is_empty(),
         "no notifications configured → no events enqueued"
+    );
+}
+
+// ===========================================================================================
+// STS session credentials: the owner/admin short-circuit is suppressed (ARCH 14)
+// ===========================================================================================
+
+/// A session principal for `user` carrying an optional scoped policy (always least-privilege:
+/// Member role, `is_session = true`).
+fn session_of(user: &str, policy: Option<Box<cairn_types::authz::Policy>>) -> Principal {
+    Principal {
+        user_id: UserId(user.to_owned()),
+        display_name: user.to_owned(),
+        access_key_id: format!("{user}-session"),
+        role: Role::Member,
+        method: AuthMethod::SigV4Header,
+        chunk_signing: None,
+        user_policy: policy,
+        is_session: true,
+    }
+}
+
+/// A session derived from a bucket's owner does NOT inherit the owner short-circuit: with no scoped
+/// grant it is denied, even though a plain (non-session) owner principal is allowed.
+#[tokio::test]
+async fn session_does_not_inherit_owner_bypass() {
+    let h = harness_with_authz(Arc::new(cairn_authz::PolicyEngine)).await;
+    let owner = member("owner");
+
+    // Owner creates a bucket and writes an object (owner short-circuit allows both).
+    drain(
+        send(
+            &h.svc,
+            req_with_principal(
+                Method::PUT,
+                Some("ownerbkt"),
+                None,
+                &[],
+                &[],
+                vec![],
+                owner.clone(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req_with_principal(
+                Method::PUT,
+                Some("ownerbkt"),
+                Some("obj"),
+                &[],
+                &[],
+                b"data".to_vec(),
+                owner.clone(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    // A session for the SAME owner identity, but with no scoped policy, is denied (the owner
+    // short-circuit is suppressed for sessions — least privilege).
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req_with_principal(
+                Method::GET,
+                Some("ownerbkt"),
+                Some("obj"),
+                &[],
+                &[],
+                vec![],
+                session_of("owner", None),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::FORBIDDEN,
+        "session has no implicit owner access"
+    );
+
+    // Control: the plain (non-session) owner principal CAN read it (owner short-circuit applies).
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req_with_principal(
+                Method::GET,
+                Some("ownerbkt"),
+                Some("obj"),
+                &[],
+                &[],
+                vec![],
+                owner.clone(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "the real owner still has access");
+
+    // A session WITH a scoped policy granting the read is allowed — exactly what it was granted.
+    let policy: cairn_types::authz::Policy = cairn_authz::parse_user_policy(
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::ownerbkt/*"}]}"#,
+    )
+    .unwrap();
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req_with_principal(
+                Method::GET,
+                Some("ownerbkt"),
+                Some("obj"),
+                &[],
+                &[],
+                vec![],
+                session_of("owner", Some(Box::new(policy))),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "a session can do exactly what its scoped policy grants"
     );
 }

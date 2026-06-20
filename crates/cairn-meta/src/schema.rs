@@ -437,6 +437,26 @@ CREATE TABLE events_outbox (
 CREATE INDEX idx_events_outbox_status_next ON events_outbox (status, next_attempt_at);
 "#,
     },
+    Migration {
+        version: 18,
+        name: "session credentials (STS)",
+        sql: r#"
+-- STS-style temporary session credentials (ARCH 14). A row is a temporary access-key/secret pair
+-- scoped to a parent user, with a hashed session token, an optional inline policy, and an expiry.
+-- The secret is sealed under the master key exactly like a user's SigV4 secret (CRK1 → NULL nonce).
+CREATE TABLE session_credentials (
+    access_key_id      TEXT PRIMARY KEY,
+    parent_user_id     TEXT NOT NULL,
+    secret_ciphertext  BLOB NOT NULL,
+    secret_nonce       BLOB,
+    session_token_hash TEXT NOT NULL,
+    inline_policy      TEXT,
+    expires_at         INTEGER NOT NULL,
+    created_at         INTEGER NOT NULL
+);
+CREATE INDEX idx_session_creds_expiry ON session_credentials (expires_at);
+"#,
+    },
 ];
 
 /// Run all pending migrations on the write connection, recording each as applied.

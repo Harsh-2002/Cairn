@@ -18,8 +18,8 @@ use cairn_types::meta::{
     ActivityEntry, BucketCounts, BucketRequestCount, LATENCY_BUCKETS, ListPage, ListQuery,
     MetricsRange, MultipartSession, Mutation, MutationOutcome, ObjectSummary, OpCount, OutboxEntry,
     PartRecord, ReplicationStatus, RequestMetricsSeries, ShareRow, StatusCount, StoreCounts,
-    TagSummary, TaggedObject, TimePoint, User, UserSigV4Credentials, UserWithBearerHash,
-    WebhookEntry, latency_quantile_ms,
+    TagSummary, TaggedObject, TimePoint, User, UserSessionCredentials, UserSigV4Credentials,
+    UserWithBearerHash, WebhookEntry, latency_quantile_ms,
 };
 use cairn_types::object::ObjectVersionRow;
 use cairn_types::time::Timestamp;
@@ -797,6 +797,34 @@ impl MetadataStore for AsyncMetadataStore {
             Some(r) => model::user_sigv4_from_row(&r),
             None => Ok(None),
         }
+    }
+
+    async fn user_by_session_key(
+        &self,
+        access_key_id: &str,
+    ) -> Result<Option<UserSessionCredentials>, MetaError> {
+        let row = query_one(
+            &**self.reader().await,
+            "SELECT s.parent_user_id, s.secret_ciphertext, s.secret_nonce, \
+                    s.session_token_hash, s.inline_policy, s.expires_at, \
+                    u.display_name, u.is_active \
+             FROM session_credentials s \
+             LEFT JOIN users u ON u.id = s.parent_user_id \
+             WHERE s.access_key_id = ?1",
+            vec![Value::Text(access_key_id.to_owned())],
+        )
+        .await?;
+        Ok(row.map(|r| UserSessionCredentials {
+            parent_user_id: cairn_types::id::UserId(r.get_text(0)),
+            secret_ciphertext: r.get_opt_blob(1).unwrap_or_default(),
+            secret_nonce: r.get_opt_blob(2).unwrap_or_default(),
+            session_token_hash: r.get_text(3),
+            inline_policy: r.get_opt_text(4),
+            expires_at: Timestamp(r.get_i64(5)),
+            parent_display_name: r.get_opt_text(6).unwrap_or_default(),
+            // A session whose parent row is gone (LEFT JOIN NULL) is treated as inactive.
+            parent_is_active: r.get_opt_i64(7).unwrap_or(0) != 0,
+        }))
     }
 
     async fn count_users(&self) -> Result<u64, MetaError> {

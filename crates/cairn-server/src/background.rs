@@ -756,6 +756,14 @@ async fn sweeper_loop(stack: Arc<AppStack>, interval: Duration, lifetime_secs: i
             }
             Err(e) => tracing::warn!(error = %e, "multipart sweep failed"),
         }
+        // Reclaim expired STS-style session credentials on the same cadence (ARCH 14): an expired
+        // credential is already denied at auth time, but pruning its row keeps the table bounded.
+        let _ = stack
+            .meta
+            .submit(Mutation::DeleteExpiredSessionCredentials {
+                before: clock.now(),
+            })
+            .await;
     }
 }
 

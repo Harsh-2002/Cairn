@@ -83,6 +83,11 @@ pub struct Principal {
     /// authorization, where it is evaluated in union with the bucket policy. Boxed so the common
     /// `None` case keeps [`Principal`] (and thus `AuthOutcome`) small.
     pub user_policy: Option<Box<crate::authz::Policy>>,
+    /// Whether this principal authenticated with an STS-style **temporary session credential**
+    /// (ARCH 14). A session is least-privilege by construction: it NEVER receives the owner or
+    /// administrator short-circuit in authorization (even though `user_id`/`role` carry the parent's
+    /// identity for ownership and audit), so its access is exactly what its scoped policy grants.
+    pub is_session: bool,
 }
 
 /// The class of requester, decided by the pipeline before authorization.

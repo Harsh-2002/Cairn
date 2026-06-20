@@ -2798,6 +2798,9 @@ impl S3Service {
         acl_version: Option<&VersionId>,
     ) -> Result<()> {
         let requester = match req.principal.as_ref() {
+            // A temporary session credential is least-privilege: it never inherits the owner/admin
+            // short-circuit, so its access is exactly what its scoped policy grants (ARCH 14).
+            Some(p) if p.is_session => RequesterClass::AuthenticatedMember(p.user_id.clone()),
             Some(p) if p.role == Role::Administrator || p.user_id == bucket.owner_id => {
                 RequesterClass::OwnerOrAdmin
             }

@@ -23,6 +23,7 @@ fn admin() -> Principal {
         method: AuthMethod::Bearer,
         chunk_signing: None,
         user_policy: None,
+        is_session: false,
     }
 }
 
@@ -35,6 +36,7 @@ fn member() -> Principal {
         method: AuthMethod::Bearer,
         chunk_signing: None,
         user_policy: None,
+        is_session: false,
     }
 }
 

@@ -33,7 +33,7 @@ use cairn_types::meta::{
     ActivityEntry, BucketCounts, ListPage, ListQuery, MetricsRange, MultipartSession, Mutation,
     MutationOutcome, ObjectSummary, OutboxEntry, PartRecord, ReplicationStatus,
     RequestMetricsSeries, ShareRow, StoreCounts, TagSummary, TaggedObject, User,
-    UserSigV4Credentials, UserWithBearerHash, WebhookEntry,
+    UserSessionCredentials, UserSigV4Credentials, UserWithBearerHash, WebhookEntry,
 };
 use cairn_types::object::ObjectVersionRow;
 use cairn_types::time::Timestamp;
@@ -230,6 +230,8 @@ impl MetadataStore for ShardedMetadataStore {
             | Mutation::CreateUser(_)
             | Mutation::UpdateUser(_)
             | Mutation::DeactivateUser(_)
+            | Mutation::CreateSessionCredential(_)
+            | Mutation::DeleteExpiredSessionCredentials { .. }
             | Mutation::RecordActivity(_)
             | Mutation::RecordRequestMetrics { .. }
             | Mutation::CreateShare(_)
@@ -509,6 +511,13 @@ impl MetadataStore for ShardedMetadataStore {
         access_key_id: &str,
     ) -> Result<Option<UserSigV4Credentials>, MetaError> {
         self.global().user_by_sigv4_key(access_key_id).await
+    }
+
+    async fn user_by_session_key(
+        &self,
+        access_key_id: &str,
+    ) -> Result<Option<UserSessionCredentials>, MetaError> {
+        self.global().user_by_session_key(access_key_id).await
     }
 
     async fn count_users(&self) -> Result<u64, MetaError> {

@@ -508,6 +508,36 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
                 .await?;
             Ok(MutationOutcome::Ack)
         }
+        Mutation::CreateSessionCredential(rec) => {
+            driver
+                .execute(
+                    "INSERT INTO session_credentials
+                     (access_key_id, parent_user_id, secret_ciphertext, secret_nonce,
+                      session_token_hash, inline_policy, expires_at, created_at)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                    vec![
+                        Value::Text(rec.access_key_id.clone()),
+                        Value::Text(rec.parent_user_id.0.clone()),
+                        Value::Blob(rec.secret_ciphertext.clone()),
+                        rec.secret_nonce.clone().map_or(Value::Null, Value::Blob),
+                        Value::Text(rec.session_token_hash.clone()),
+                        opt_text(rec.inline_policy.clone()),
+                        Value::Int(rec.expires_at.0),
+                        Value::Int(rec.created_at.0),
+                    ],
+                )
+                .await?;
+            Ok(MutationOutcome::Ack)
+        }
+        Mutation::DeleteExpiredSessionCredentials { before } => {
+            driver
+                .execute(
+                    "DELETE FROM session_credentials WHERE expires_at < ?1",
+                    vec![Value::Int(before.0)],
+                )
+                .await?;
+            Ok(MutationOutcome::Ack)
+        }
         Mutation::ClaimReplicationBatch {
             limit,
             now,

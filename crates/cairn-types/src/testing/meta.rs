@@ -11,9 +11,9 @@ use crate::meta::{
     ActivityEntry, BucketCounts, BucketRequestCount, ClaimOutcome, IfNoneMatch, LATENCY_BUCKETS,
     ListPage, ListQuery, MetricsRange, MultipartSession, MultipartStatus, Mutation,
     MutationOutcome, ObjectSummary, OpCount, OutboxEntry, PartRecord, Precondition,
-    ReplicationStatus, RequestMetricsSeries, ShareRow, StatusCount, StoreCounts, TagSummary,
-    TaggedObject, TimePoint, User, UserRecord, UserSigV4Credentials, UserWithBearerHash,
-    WebhookEntry, WebhookStatus, latency_quantile_ms,
+    ReplicationStatus, RequestMetricsSeries, SessionCredentialRecord, ShareRow, StatusCount,
+    StoreCounts, TagSummary, TaggedObject, TimePoint, User, UserRecord, UserSessionCredentials,
+    UserSigV4Credentials, UserWithBearerHash, WebhookEntry, WebhookStatus, latency_quantile_ms,
 };
 use crate::object::{ETag, ObjectVersionRow};
 use crate::time::Timestamp;
@@ -45,6 +45,7 @@ struct State {
     outbox: Vec<OutboxEntry>,
     webhook_outbox: Vec<WebhookEntry>,
     users: BTreeMap<String, UserRecord>,
+    session_creds: BTreeMap<String, SessionCredentialRecord>,
     /// Per-user identity policy JSON (`users.policy`), keyed by user id. Absent when the user has no
     /// attached policy; mirrors the real stores' nullable `policy` column without touching the
     /// shared `UserRecord` type.
@@ -599,6 +600,14 @@ impl MetadataStore for InMemoryMetadataStore {
                 if let Some(u) = st.users.get_mut(&id.to_string()) {
                     u.user.is_active = false;
                 }
+                Ok(MutationOutcome::Ack)
+            }
+            Mutation::CreateSessionCredential(rec) => {
+                st.session_creds.insert(rec.access_key_id.clone(), *rec);
+                Ok(MutationOutcome::Ack)
+            }
+            Mutation::DeleteExpiredSessionCredentials { before } => {
+                st.session_creds.retain(|_, r| r.expires_at >= before);
                 Ok(MutationOutcome::Ack)
             }
             Mutation::ClaimReplicationBatch {
@@ -1252,6 +1261,29 @@ impl MetadataStore for InMemoryMetadataStore {
                     secret_nonce: r.sigv4_secret_nonce.clone()?,
                 })
             }))
+    }
+
+    async fn user_by_session_key(
+        &self,
+        access_key_id: &str,
+    ) -> Result<Option<UserSessionCredentials>, MetaError> {
+        let st = self.state.lock().unwrap();
+        let Some(rec) = st.session_creds.get(access_key_id) else {
+            return Ok(None);
+        };
+        let parent = st.users.get(&rec.parent_user_id.to_string());
+        Ok(Some(UserSessionCredentials {
+            parent_user_id: rec.parent_user_id.clone(),
+            parent_display_name: parent
+                .map(|p| p.user.display_name.clone())
+                .unwrap_or_default(),
+            parent_is_active: parent.is_none_or(|p| p.user.is_active),
+            secret_ciphertext: rec.secret_ciphertext.clone(),
+            secret_nonce: rec.secret_nonce.clone().unwrap_or_default(),
+            session_token_hash: rec.session_token_hash.clone(),
+            inline_policy: rec.inline_policy.clone(),
+            expires_at: rec.expires_at,
+        }))
     }
 
     async fn count_users(&self) -> Result<u64, MetaError> {

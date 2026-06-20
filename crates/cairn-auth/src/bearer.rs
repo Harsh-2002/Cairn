@@ -21,6 +21,13 @@ pub fn hash_bearer_secret(secret: &str) -> String {
     sha256_hex(secret.as_bytes())
 }
 
+/// The stored hash of an STS session token (`X-Amz-Security-Token`). The token is a high-entropy
+/// machine-minted value, so a fast hash suffices; the comparison is constant-time at verify time.
+#[must_use]
+pub fn hash_session_token(token: &str) -> String {
+    sha256_hex(token.as_bytes())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

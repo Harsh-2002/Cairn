@@ -396,6 +396,24 @@ CREATE TABLE events_outbox (
 CREATE INDEX idx_events_outbox_status_next ON events_outbox (status, next_attempt_at);
 "#,
     },
+    Migration {
+        version: 18,
+        name: "session credentials (STS)",
+        sql: r#"
+-- STS-style temporary session credentials. Mirrors cairn-meta/src/schema.rs v18.
+CREATE TABLE session_credentials (
+    access_key_id      TEXT PRIMARY KEY,
+    parent_user_id     TEXT NOT NULL,
+    secret_ciphertext  BLOB NOT NULL,
+    secret_nonce       BLOB,
+    session_token_hash TEXT NOT NULL,
+    inline_policy      TEXT,
+    expires_at         INTEGER NOT NULL,
+    created_at         INTEGER NOT NULL
+);
+CREATE INDEX idx_session_creds_expiry ON session_credentials (expires_at);
+"#,
+    },
 ];
 
 /// Run all pending migrations on the write driver, recording each as applied. Each migration is

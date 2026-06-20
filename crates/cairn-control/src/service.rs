@@ -316,6 +316,9 @@ impl ControlService {
                 self.replication_status(name).await
             }
 
+            (&Method::POST, ["credentials", "temporary"]) => {
+                self.mint_session_credential(&body, principal).await
+            }
             (&Method::GET, ["users"]) => self.list_users().await,
             (&Method::POST, ["users"]) => self.create_user(&body, principal).await,
             (&Method::GET, ["users", id]) => self.user_detail(id).await,
@@ -1433,6 +1436,84 @@ impl ControlService {
             })
             .collect();
         ControlResponse::json(StatusCode::OK, &wire::UserListResp { users: entries })
+    }
+
+    /// `POST /api/v1/credentials/temporary`: mint an STS-style temporary session credential scoped
+    /// to the calling admin by a required inline policy (ARCH 14). Returns the access key, secret,
+    /// opaque session token, and expiry exactly once. The credential is least-privilege: it carries
+    /// the parent's identity for ownership/audit but never the owner/admin short-circuit, so it can
+    /// do exactly what its policy grants until it expires.
+    async fn mint_session_credential(
+        &self,
+        body: &Bytes,
+        principal: Option<&Principal>,
+    ) -> ControlResponse {
+        let req: wire::MintSessionReq = match serde_json::from_slice(body) {
+            Ok(r) => r,
+            Err(e) => return ControlResponse::bad_request(&e.to_string()),
+        };
+        // Bound the lifetime: 15 minutes .. 12 hours, mirroring AWS STS session limits.
+        if !(900..=43_200).contains(&req.duration_secs) {
+            return ControlResponse::bad_request(
+                "duration_secs must be between 900 (15m) and 43200 (12h)",
+            );
+        }
+        // The scoped policy is required and validated up front (a session has no implicit access).
+        let policy_json = match serde_json::to_string(&req.policy) {
+            Ok(s) => s,
+            Err(e) => return ControlResponse::bad_request(&e.to_string()),
+        };
+        if let Err(e) = cairn_authz::parse_user_policy(&policy_json) {
+            return ControlResponse::bad_request(&format!("invalid policy: {e}"));
+        }
+        let Some(parent) = principal.map(|p| p.user_id.clone()) else {
+            return ControlResponse::forbidden();
+        };
+
+        let now = self.clock.now();
+        let access_key_id = format!(
+            "CAIRNTMP{}",
+            uuid::Uuid::new_v4().simple().to_string().to_uppercase()
+        );
+        let secret = generate_secret();
+        // The opaque session token the SDK must present as `X-Amz-Security-Token`; only its hash is
+        // stored. High-entropy machine token, so a fast hash + constant-time compare suffices.
+        let session_token = generate_secret();
+        let (secret_ciphertext, secret_nonce) = match self.crypto.seal(secret.as_bytes()) {
+            // CRK1 envelope (audit #29): the nonce is inside the ciphertext; store NULL nonce.
+            Ok(sealed) => (sealed.ciphertext, None),
+            Err(e) => return ControlResponse::error_internal(&e.to_string()),
+        };
+        let expires_at = cairn_types::Timestamp(now.0 + (req.duration_secs as i64) * 1000);
+
+        let record = cairn_types::SessionCredentialRecord {
+            access_key_id: access_key_id.clone(),
+            parent_user_id: parent,
+            secret_ciphertext,
+            secret_nonce,
+            session_token_hash: cairn_auth::hash_session_token(&session_token),
+            inline_policy: Some(policy_json),
+            expires_at,
+            created_at: now,
+        };
+        if let Err(e) = self
+            .meta
+            .submit(Mutation::CreateSessionCredential(Box::new(record)))
+            .await
+        {
+            return ControlResponse::error_internal(&e.to_string());
+        }
+        self.record_activity("MintSessionCredential", None, None, principal)
+            .await;
+        ControlResponse::json(
+            StatusCode::OK,
+            &wire::MintSessionResp {
+                access_key_id,
+                secret_access_key: secret,
+                session_token,
+                expiration_epoch_secs: expires_at.as_secs(),
+            },
+        )
     }
 
     async fn create_user(&self, body: &Bytes, principal: Option<&Principal>) -> ControlResponse {

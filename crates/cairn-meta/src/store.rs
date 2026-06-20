@@ -13,8 +13,8 @@ use cairn_types::meta::{
     ActivityEntry, BucketCounts, BucketRequestCount, LATENCY_BUCKETS, ListPage, ListQuery,
     MetricsRange, MultipartSession, Mutation, MutationOutcome, ObjectSummary, OpCount, OutboxEntry,
     PartRecord, ReplicationStatus, RequestMetricsSeries, ShareRow, StatusCount, StoreCounts,
-    TagSummary, TaggedObject, TimePoint, User, UserSigV4Credentials, UserWithBearerHash,
-    WebhookEntry, latency_quantile_ms,
+    TagSummary, TaggedObject, TimePoint, User, UserSessionCredentials, UserSigV4Credentials,
+    UserWithBearerHash, WebhookEntry, latency_quantile_ms,
 };
 use cairn_types::object::ObjectVersionRow;
 use cairn_types::time::Timestamp;
@@ -1164,6 +1164,40 @@ impl MetadataStore for SqliteMetadataStore {
             .optional()
             .map_err(engine_err)
             .map(Option::flatten)
+        })
+        .await
+    }
+
+    async fn user_by_session_key(
+        &self,
+        access_key_id: &str,
+    ) -> Result<Option<UserSessionCredentials>, MetaError> {
+        let id = access_key_id.to_owned();
+        self.with_read(move |conn| {
+            conn.query_row(
+                "SELECT s.parent_user_id, s.secret_ciphertext, s.secret_nonce, \
+                        s.session_token_hash, s.inline_policy, s.expires_at, \
+                        u.display_name, u.is_active \
+                 FROM session_credentials s \
+                 LEFT JOIN users u ON u.id = s.parent_user_id \
+                 WHERE s.access_key_id = ?1",
+                params![id],
+                |r| {
+                    Ok(UserSessionCredentials {
+                        parent_user_id: UserId(r.get::<_, String>(0)?),
+                        secret_ciphertext: r.get::<_, Vec<u8>>(1)?,
+                        secret_nonce: r.get::<_, Option<Vec<u8>>>(2)?.unwrap_or_default(),
+                        session_token_hash: r.get::<_, String>(3)?,
+                        inline_policy: r.get::<_, Option<String>>(4)?,
+                        expires_at: Timestamp(r.get::<_, i64>(5)?),
+                        parent_display_name: r.get::<_, Option<String>>(6)?.unwrap_or_default(),
+                        // A session whose parent row is gone (LEFT JOIN NULL) is treated as inactive.
+                        parent_is_active: r.get::<_, Option<i64>>(7)?.unwrap_or(0) != 0,
+                    })
+                },
+            )
+            .optional()
+            .map_err(engine_err)
         })
         .await
     }

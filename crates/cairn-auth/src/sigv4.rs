@@ -432,7 +432,7 @@ fn check_skew(amzdate: &str, now: Timestamp) -> Result<(), AuthError> {
     Ok(())
 }
 
-fn find_query(query: &str, key: &str) -> Option<String> {
+pub(crate) fn find_query(query: &str, key: &str) -> Option<String> {
     for part in query.split('&') {
         let (k, v) = part.split_once('=').unwrap_or((part, ""));
         if percent_decode(k) == key {
@@ -463,6 +463,7 @@ pub fn principal(
         chunk_signing,
         // Filled in by `AuthChain::attach_policy` at the authenticate() chokepoint.
         user_policy: None,
+        is_session: false,
     }
 }
 

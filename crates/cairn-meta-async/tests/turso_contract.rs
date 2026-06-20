@@ -1451,3 +1451,83 @@ async fn webhook_outbox_parity() {
         assert!(s.list_failed_webhooks(10).await.unwrap().is_empty());
     }
 }
+
+#[tokio::test]
+async fn session_credentials_parity() {
+    let (a, b) = both().await;
+    for s in [&a as &dyn MetadataStore, &b as &dyn MetadataStore] {
+        // The parent user must exist for the join (display_name + is_active).
+        let parent = cairn_types::meta::User {
+            id: cairn_types::UserId("parent".into()),
+            display_name: "Parent User".into(),
+            access_key_id: "pk".into(),
+            sigv4_access_key_id: None,
+            role: cairn_types::auth::Role::Member,
+            is_active: true,
+            quota_bytes: None,
+            created_at: Timestamp::from_secs(0),
+            updated_at: Timestamp::from_secs(0),
+        };
+        s.submit(Mutation::CreateUser(Box::new(
+            cairn_types::meta::UserRecord {
+                user: parent,
+                bearer_secret_hash: "h".into(),
+                sigv4_secret_ciphertext: None,
+                sigv4_secret_nonce: None,
+            },
+        )))
+        .await
+        .unwrap();
+
+        // Absent before minting.
+        assert!(s.user_by_session_key("CAIRNTMP1").await.unwrap().is_none());
+
+        s.submit(Mutation::CreateSessionCredential(Box::new(
+            cairn_types::SessionCredentialRecord {
+                access_key_id: "CAIRNTMP1".into(),
+                parent_user_id: cairn_types::UserId("parent".into()),
+                secret_ciphertext: vec![1, 2, 3, 4],
+                secret_nonce: None,
+                session_token_hash: "tokhash".into(),
+                inline_policy: Some(r#"{"Version":"2012-10-17","Statement":[]}"#.into()),
+                expires_at: Timestamp::from_secs(2_000_000_000),
+                created_at: Timestamp::from_secs(1_000),
+            },
+        )))
+        .await
+        .unwrap();
+
+        let c = s
+            .user_by_session_key("CAIRNTMP1")
+            .await
+            .unwrap()
+            .expect("found");
+        assert_eq!(c.parent_user_id.0, "parent");
+        assert_eq!(c.parent_display_name, "Parent User");
+        assert!(c.parent_is_active);
+        assert_eq!(c.secret_ciphertext, vec![1, 2, 3, 4]);
+        assert_eq!(c.session_token_hash, "tokhash");
+        assert_eq!(c.expires_at, Timestamp::from_secs(2_000_000_000));
+        assert!(c.inline_policy.is_some());
+
+        // The expiry sweep removes credentials that expired before the cutoff, keeps the rest.
+        s.submit(Mutation::DeleteExpiredSessionCredentials {
+            before: Timestamp::from_secs(1_999_999_999),
+        })
+        .await
+        .unwrap();
+        assert!(
+            s.user_by_session_key("CAIRNTMP1").await.unwrap().is_some(),
+            "not yet expired → retained"
+        );
+        s.submit(Mutation::DeleteExpiredSessionCredentials {
+            before: Timestamp::from_secs(2_000_000_001),
+        })
+        .await
+        .unwrap();
+        assert!(
+            s.user_by_session_key("CAIRNTMP1").await.unwrap().is_none(),
+            "past expiry → swept"
+        );
+    }
+}

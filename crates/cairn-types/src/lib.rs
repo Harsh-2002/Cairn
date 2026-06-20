@@ -62,9 +62,9 @@ pub use meta::{
     LATENCY_BUCKET_BOUNDS_MS, LATENCY_BUCKETS, ListPage, ListQuery, MetricsRange, MultipartSession,
     MultipartStatus, Mutation, MutationOutcome, ObjectSummary, OpCount, OutboxEntry, PartRecord,
     Precondition, ReplicationOp, ReplicationStatus, RequestMetricRow, RequestMetricsSeries,
-    ShareDisposition, ShareRow, StatusCount, StoreCounts, TagSummary, TaggedObject, TimePoint,
-    User, UserRecord, UserSigV4Credentials, UserWithBearerHash, WebhookEntry, WebhookStatus,
-    latency_bucket_index, latency_quantile_ms,
+    SessionCredentialRecord, ShareDisposition, ShareRow, StatusCount, StoreCounts, TagSummary,
+    TaggedObject, TimePoint, User, UserRecord, UserSessionCredentials, UserSigV4Credentials,
+    UserWithBearerHash, WebhookEntry, WebhookStatus, latency_bucket_index, latency_quantile_ms,
 };
 pub use notification::{EventKind, NotificationConfig, WebhookEndpoint};
 pub use object::{

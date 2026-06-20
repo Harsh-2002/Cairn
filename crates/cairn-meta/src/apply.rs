@@ -423,6 +423,34 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
                 .map_err(engine_err)?;
             Ok(MutationOutcome::Ack)
         }
+        Mutation::CreateSessionCredential(rec) => {
+            conn.execute(
+                "INSERT INTO session_credentials
+                 (access_key_id, parent_user_id, secret_ciphertext, secret_nonce,
+                  session_token_hash, inline_policy, expires_at, created_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![
+                    rec.access_key_id,
+                    rec.parent_user_id.0,
+                    rec.secret_ciphertext,
+                    rec.secret_nonce,
+                    rec.session_token_hash,
+                    rec.inline_policy,
+                    rec.expires_at.0,
+                    rec.created_at.0,
+                ],
+            )
+            .map_err(engine_err)?;
+            Ok(MutationOutcome::Ack)
+        }
+        Mutation::DeleteExpiredSessionCredentials { before } => {
+            conn.execute(
+                "DELETE FROM session_credentials WHERE expires_at < ?1",
+                params![before.0],
+            )
+            .map_err(engine_err)?;
+            Ok(MutationOutcome::Ack)
+        }
         Mutation::ClaimReplicationBatch {
             limit,
             now,

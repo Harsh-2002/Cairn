@@ -585,6 +585,7 @@ async fn serve_share(
         method: AuthMethod::Bearer,
         chunk_signing: None,
         user_policy: Some(Box::new(policy)),
+        is_session: false,
     };
 
     // Pin the version when the share is version-pinned; forward only safe read-shaping headers.
