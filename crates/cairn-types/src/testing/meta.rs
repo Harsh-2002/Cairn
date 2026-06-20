@@ -723,9 +723,8 @@ impl MetadataStore for InMemoryMetadataStore {
                 Ok(MutationOutcome::WebhookBatch(claimed))
             }
             Mutation::MarkWebhookDone(id) => {
-                if let Some(e) = st.webhook_outbox.iter_mut().find(|e| e.id == id) {
-                    e.status = WebhookStatus::Completed;
-                }
+                // Delete the delivered/dropped entry (mirrors the SQLite stores' bounded outbox).
+                st.webhook_outbox.retain(|e| e.id != id);
                 Ok(MutationOutcome::Ack)
             }
             Mutation::MarkWebhookFailed {

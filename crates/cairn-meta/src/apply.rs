@@ -541,11 +541,11 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             lease_secs,
         } => claim_webhook_batch(conn, limit, now, lease_secs),
         Mutation::MarkWebhookDone(id) => {
-            conn.execute(
-                "UPDATE events_outbox SET status='completed' WHERE id=?1",
-                params![id],
-            )
-            .map_err(engine_err)?;
+            // A delivered (or dropped) entry has no further use — delete it outright rather than
+            // leaving a `completed` row, so the common success path keeps `events_outbox` bounded
+            // (only pending + terminally-failed rows persist).
+            conn.execute("DELETE FROM events_outbox WHERE id=?1", params![id])
+                .map_err(engine_err)?;
             Ok(MutationOutcome::Ack)
         }
         Mutation::MarkWebhookFailed {

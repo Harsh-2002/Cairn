@@ -9,6 +9,11 @@ use http_body_util::{BodyExt, Full};
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
+use std::time::Duration;
+
+/// The default per-request delivery timeout. Bounds a single POST so a hung endpoint cannot stall
+/// the worker; on timeout the delivery is retryable (rescheduled with backoff).
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Why a webhook delivery did not succeed.
 #[derive(Debug, Clone)]
@@ -44,6 +49,7 @@ pub trait WebhookSink: Send + Sync {
 #[derive(Debug)]
 pub struct HttpWebhookSink {
     client: Client<hyper_rustls::HttpsConnector<HttpConnector>, Full<Bytes>>,
+    timeout: Duration,
 }
 
 impl Default for HttpWebhookSink {
@@ -54,16 +60,22 @@ impl Default for HttpWebhookSink {
 
 impl HttpWebhookSink {
     /// Construct a sink with a connector that dials plaintext for `http://` and negotiates rustls
-    /// (webpki roots) for `https://`, speaking HTTP/1.1.
+    /// (webpki roots) for `https://`, speaking HTTP/1.1, with the default per-request timeout.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_timeout(DEFAULT_TIMEOUT)
+    }
+
+    /// As [`new`](Self::new) but with an explicit per-request timeout.
+    #[must_use]
+    pub fn with_timeout(timeout: Duration) -> Self {
         let https = hyper_rustls::HttpsConnectorBuilder::new()
             .with_webpki_roots()
             .https_or_http()
             .enable_http1()
             .build();
         let client = Client::builder(TokioExecutor::new()).build(https);
-        Self { client }
+        Self { client, timeout }
     }
 }
 
@@ -98,11 +110,20 @@ impl WebhookSink for HttpWebhookSink {
             .body(Full::new(Bytes::copy_from_slice(body)))
             .map_err(|e| WebhookError::Terminal(format!("request build failed: {e}")))?;
 
-        let resp = self
-            .client
-            .request(req)
-            .await
-            .map_err(|e| WebhookError::Retryable(format!("connection failed: {e}")))?;
+        // Bound the whole request: a hung endpoint must not pin this future (and, with bounded
+        // engine concurrency, stall the outbox). A timeout is retryable.
+        let resp = match tokio::time::timeout(self.timeout, self.client.request(req)).await {
+            Ok(Ok(resp)) => resp,
+            Ok(Err(e)) => {
+                return Err(WebhookError::Retryable(format!("connection failed: {e}")));
+            }
+            Err(_) => {
+                return Err(WebhookError::Retryable(format!(
+                    "delivery timed out after {}s",
+                    self.timeout.as_secs()
+                )));
+            }
+        };
         let status = resp.status();
         // Drain the body so the connection can be reused; the content is irrelevant to us.
         let _ = resp.into_body().collect().await;

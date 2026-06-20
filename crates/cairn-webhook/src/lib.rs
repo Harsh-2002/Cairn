@@ -36,6 +36,9 @@ pub struct WebhookOpts {
     pub base_backoff_secs: u64,
     /// The retry-delay cap, in seconds.
     pub max_backoff_secs: u64,
+    /// How many deliveries run concurrently within a batch. Combined with the sink's per-request
+    /// timeout, this prevents one slow/hung endpoint from head-of-line-blocking the whole outbox.
+    pub max_concurrency: usize,
 }
 
 impl Default for WebhookOpts {
@@ -45,6 +48,7 @@ impl Default for WebhookOpts {
             max_attempts: 8,
             base_backoff_secs: 5,
             max_backoff_secs: 900,
+            max_concurrency: 8,
         }
     }
 }
@@ -66,6 +70,15 @@ impl WebhookReport {
     pub fn is_idle(&self) -> bool {
         self.delivered == 0 && self.failed == 0 && self.dropped == 0
     }
+}
+
+/// The disposition of a single delivery attempt, folded into the [`WebhookReport`] after a batch
+/// of concurrent deliveries completes.
+#[derive(Debug, Clone, Copy)]
+enum DeliveryOutcome {
+    Delivered,
+    Failed,
+    Dropped,
 }
 
 /// Exponential backoff (pure): `base * 2^(attempts-1)`, clamped to `[base, cap]`. Mirrors the
@@ -114,6 +127,7 @@ impl WebhookEngine {
         S: WebhookSink + ?Sized,
         C: Clock + ?Sized,
     {
+        use futures_util::stream::StreamExt;
         let mut report = WebhookReport::default();
         for _ in 0..max_batches {
             let now = clock.now();
@@ -121,9 +135,20 @@ impl WebhookEngine {
             if batch.is_empty() {
                 break;
             }
-            for entry in batch {
-                self.deliver_one(meta, sink, clock, entry, &mut report)
-                    .await?;
+            // Deliver the batch with bounded concurrency: a single slow endpoint (capped by the
+            // sink's per-request timeout) can no longer stall the entries behind it.
+            let outcomes: Vec<Result<DeliveryOutcome, MetaError>> =
+                futures_util::stream::iter(batch)
+                    .map(|entry| self.deliver_one(meta, sink, clock, entry))
+                    .buffer_unordered(self.opts.max_concurrency.max(1))
+                    .collect()
+                    .await;
+            for outcome in outcomes {
+                match outcome? {
+                    DeliveryOutcome::Delivered => report.delivered += 1,
+                    DeliveryOutcome::Failed => report.failed += 1,
+                    DeliveryOutcome::Dropped => report.dropped += 1,
+                }
             }
         }
         Ok(report)
@@ -135,8 +160,7 @@ impl WebhookEngine {
         sink: &S,
         clock: &C,
         entry: WebhookEntry,
-        report: &mut WebhookReport,
-    ) -> Result<(), MetaError>
+    ) -> Result<DeliveryOutcome, MetaError>
     where
         M: MetadataStore + ?Sized,
         S: WebhookSink + ?Sized,
@@ -149,8 +173,7 @@ impl WebhookEngine {
             None => {
                 meta.submit(Mutation::MarkWebhookDone(entry.id.clone()))
                     .await?;
-                report.dropped += 1;
-                return Ok(());
+                return Ok(DeliveryOutcome::Dropped);
             }
         };
 
@@ -170,7 +193,7 @@ impl WebhookEngine {
             Ok(()) => {
                 meta.submit(Mutation::MarkWebhookDone(entry.id.clone()))
                     .await?;
-                report.delivered += 1;
+                Ok(DeliveryOutcome::Delivered)
             }
             Err(err) => {
                 let terminal = matches!(err, WebhookError::Terminal(_))
@@ -194,10 +217,9 @@ impl WebhookEngine {
                     next_attempt_at: next,
                 })
                 .await?;
-                report.failed += 1;
+                Ok(DeliveryOutcome::Failed)
             }
         }
-        Ok(())
     }
 
     /// Look up the entry's endpoint in its bucket's current notification config.

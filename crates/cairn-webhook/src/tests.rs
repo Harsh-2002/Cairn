@@ -173,6 +173,7 @@ async fn retryable_failure_reschedules_then_parks_failed() {
         base_backoff_secs: 10,
         max_backoff_secs: 100,
         batch_size: 64,
+        max_concurrency: 8,
     };
     let engine = WebhookEngine::new(opts);
 
@@ -229,4 +230,39 @@ fn backoff_is_exponential_and_capped() {
     assert_eq!(next_backoff(2, 5, 900), 10);
     assert_eq!(next_backoff(3, 5, 900), 20);
     assert_eq!(next_backoff(100, 5, 900), 900);
+}
+
+/// A hung endpoint (accepts the connection but never responds) must not pin the delivery: the
+/// per-request timeout converts it into a retryable failure promptly. This is the regression guard
+/// for the head-of-line-blocking blocker — combined with the engine's bounded concurrency, one
+/// slow endpoint can no longer stall the outbox.
+#[tokio::test]
+async fn delivery_times_out_against_a_hung_endpoint() {
+    use std::time::{Duration, Instant};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    // Accept connections and hold them open without ever writing a response.
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        loop {
+            if let Ok((s, _)) = listener.accept().await {
+                held.push(s);
+            }
+        }
+    });
+
+    let sink = HttpWebhookSink::with_timeout(Duration::from_millis(300));
+    let start = Instant::now();
+    let res = sink
+        .deliver(&format!("http://{addr}/hook"), b"{}", None)
+        .await;
+    assert!(
+        matches!(res, Err(WebhookError::Retryable(_))),
+        "a hung endpoint is a retryable failure, not an indefinite hang: {res:?}"
+    );
+    assert!(
+        start.elapsed() < Duration::from_secs(3),
+        "the timeout bounded the request (elapsed {:?})",
+        start.elapsed()
+    );
 }

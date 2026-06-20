@@ -286,7 +286,8 @@ pub enum Mutation {
         /// The claim lease length in seconds.
         lease_secs: i64,
     },
-    /// Mark a webhook-outbox entry delivered (status `completed`).
+    /// Mark a webhook-outbox entry delivered (or dropped): the row is deleted outright, so the
+    /// success path keeps `events_outbox` bounded — only pending and terminally-failed rows persist.
     MarkWebhookDone(String),
     /// Mark a webhook-outbox entry failed/retry: bump attempts, store the error, and either
     /// reschedule (`next_attempt_at = Some`) back to `pending` or give up (`None` = terminal `failed`).

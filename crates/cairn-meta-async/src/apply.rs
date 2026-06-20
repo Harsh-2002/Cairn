@@ -638,9 +638,11 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
             lease_secs,
         } => claim_webhook_batch(driver, limit, now, lease_secs).await,
         Mutation::MarkWebhookDone(id) => {
+            // Delete the delivered/dropped entry outright (see cairn-meta) so the success path keeps
+            // the outbox bounded.
             driver
                 .execute(
-                    "UPDATE events_outbox SET status='completed' WHERE id=?1",
+                    "DELETE FROM events_outbox WHERE id=?1",
                     vec![Value::Text(id)],
                 )
                 .await?;

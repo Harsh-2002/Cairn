@@ -20,6 +20,7 @@ hyper = { workspace = true, features = ["client", "http1"] }
 hyper-util = { workspace = true, features = ["client-legacy", "http1", "tokio"] }
 hyper-rustls = { workspace = true }
 rustls = { workspace = true, features = ["aws_lc_rs", "tls12"] }
+tokio = { workspace = true, features = ["time"] }
 http.workspace = true
 http-body-util.workspace = true
 sha2.workspace = true

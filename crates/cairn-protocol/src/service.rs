@@ -1650,6 +1650,17 @@ impl S3Service {
                 if let Some(old) = superseded {
                     let _ = self.blob.delete(&old).await;
                 }
+                // Object Lock: a copy creates a new version like a PUT, so stamp the bucket default
+                // retention / any explicit `x-amz-object-lock-*` headers onto it too (WORM coverage
+                // at EVERY object-creating path).
+                self.apply_object_lock_on_put(
+                    req,
+                    &dest_bucket,
+                    &dest_key_for_event,
+                    &version_id,
+                    now,
+                )
+                .await?;
                 // Emit an ObjectCreated:Copy event for the destination (best-effort).
                 self.emit_events(
                     &dest_bucket.name,
@@ -2405,9 +2416,16 @@ impl S3Service {
         let row = self.resolve_lock_target(&bucket.name, &key, &req).await?;
         let doc = drain_body(body, 64 * 1024).await?;
         let new = cairn_xml::parse_retention(&doc)?;
+        let now = self.clock.now();
+        // A retain-until in the past would be an immediately-expired no-op "lock" — reject it rather
+        // than store a misleading row.
+        if new.retain_until <= now {
+            return Err(Error::InvalidArgument(
+                "x-amz-object-lock retain-until-date must be in the future".to_owned(),
+            ));
+        }
         // Lowering or removing an active retention is governed: COMPLIANCE is never weakenable;
         // GOVERNANCE requires `s3:BypassGovernanceRetention` + the bypass header.
-        let now = self.clock.now();
         let current = self
             .meta
             .get_object_lock(&bucket.name, &key, &row.version_id)
@@ -2612,6 +2630,11 @@ impl S3Service {
                 let retain_until = cairn_xml::parse_iso8601(d).ok_or_else(|| {
                     Error::InvalidArgument("invalid x-amz-object-lock-retain-until-date".to_owned())
                 })?;
+                if retain_until <= now {
+                    return Err(Error::InvalidArgument(
+                        "x-amz-object-lock-retain-until-date must be in the future".to_owned(),
+                    ));
+                }
                 Some(ObjectRetention { mode, retain_until })
             }
             (None, None) => config.default_retention.map(|d| ObjectRetention {
@@ -3296,10 +3319,12 @@ fn build_event_payload(
         "versionId".to_owned(),
         serde_json::json!(version_id.as_str()),
     );
-    // The sequencer is an opaque monotonic ordering token; the time-ordered version id serves.
+    // The sequencer is an opaque hex ordering token consumers use to collate at-least-once
+    // deliveries. The event time (epoch ms) is monotonic and meaningful even for unversioned /
+    // version-less events, where the version id is the `null` sentinel and orders nothing.
     object.insert(
         "sequencer".to_owned(),
-        serde_json::json!(version_id.as_str()),
+        serde_json::json!(format!("{:016X}", now.0)),
     );
     let record = serde_json::json!({
         "eventVersion": "2.1",
