@@ -8,6 +8,7 @@ import { BucketBrowser } from "@/views/bucket-browser";
 import { BucketDetail } from "@/views/bucket-detail";
 import { BucketSettings } from "@/views/bucket-settings";
 import { Buckets } from "@/views/buckets";
+import { Credentials } from "@/views/credentials";
 import { Login } from "@/views/login";
 import { Overview } from "@/views/overview";
 import { Replication } from "@/views/replication";
@@ -55,6 +56,7 @@ export const router = createHashRouter([
       },
       { path: "users", element: <Users /> },
       { path: "users/:id", element: <UserDetail /> },
+      { path: "credentials", element: <Credentials /> },
       { path: "tags", element: <Tags /> },
       { path: "activity", element: <Activity /> },
       { path: "replication", element: <Replication /> },

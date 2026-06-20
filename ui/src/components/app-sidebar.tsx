@@ -6,6 +6,7 @@ import {
   ChevronRight,
   Database,
   Home,
+  KeyRound,
   RefreshCw,
   Tags,
   Users,
@@ -39,6 +40,7 @@ const NAV = [
   { label: "Buckets", path: "/buckets", icon: Database },
   { label: "Tags", path: "/tags", icon: Tags },
   { label: "Users", path: "/users", icon: Users },
+  { label: "Credentials", path: "/credentials", icon: KeyRound },
   { label: "Activity", path: "/activity", icon: Activity },
   { label: "Replication", path: "/replication", icon: RefreshCw },
 ];

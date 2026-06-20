@@ -1249,10 +1249,39 @@ impl ControlService {
             Ok(n) => n,
             Err(resp) => return resp,
         };
-        let config: cairn_types::NotificationConfig = match serde_json::from_slice(body) {
+        let mut config: cairn_types::NotificationConfig = match serde_json::from_slice(body) {
             Ok(c) => c,
             Err(e) => return ControlResponse::bad_request(&e.to_string()),
         };
+        // Preserve existing signing secrets: since secrets are write-only (GET never returns them)
+        // and a PUT replaces the whole endpoint list, an incoming endpoint that omits its secret
+        // (`null`) inherits the stored secret for the same id — so editing one endpoint's URL does
+        // not silently wipe another's HMAC key. To clear a secret, send an empty string.
+        let existing: Option<cairn_types::NotificationConfig> = match self
+            .meta
+            .get_bucket_config(&bucket_name, ConfigAspect::Notification)
+            .await
+        {
+            Ok(Some(doc)) => serde_json::from_str(&doc.0).ok(),
+            _ => None,
+        };
+        if let Some(prev) = &existing {
+            for ep in &mut config.endpoints {
+                if ep.secret.is_none() {
+                    if let Some(p) = prev.endpoints.iter().find(|p| p.id == ep.id) {
+                        ep.secret = p.secret.clone();
+                    }
+                } else if ep.secret.as_deref() == Some("") {
+                    ep.secret = None; // explicit clear
+                }
+            }
+        } else {
+            for ep in &mut config.endpoints {
+                if ep.secret.as_deref() == Some("") {
+                    ep.secret = None;
+                }
+            }
+        }
         // Validate every endpoint before storing so a bad config is rejected at the edge.
         let mut seen = std::collections::HashSet::new();
         for ep in &config.endpoints {

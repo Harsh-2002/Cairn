@@ -17,6 +17,10 @@ import type {
   DeletePrefixResp,
   FailedReplicationResp,
   ListObjectsResp,
+  MintSessionReq,
+  MintSessionResp,
+  NotificationConfigInput,
+  NotificationsResp,
   OverviewBucketsResp,
   OverviewResp,
   MetricsRange,
@@ -260,6 +264,18 @@ export const api = {
     requestRaw<null>("PUT", `/buckets/${enc(name)}/policy`, rawBody),
   deletePolicy: (name: string) =>
     request<null>("DELETE", `/buckets/${enc(name)}/policy`),
+
+  // --- webhook event notifications (the secret is write-only; GET returns has_secret) ---
+  getNotifications: (name: string) =>
+    request<NotificationsResp>("GET", `/buckets/${enc(name)}/notifications`),
+  setNotifications: (name: string, config: NotificationConfigInput) =>
+    request<null>("PUT", `/buckets/${enc(name)}/notifications`, config),
+  clearNotifications: (name: string) =>
+    request<null>("DELETE", `/buckets/${enc(name)}/notifications`),
+
+  // --- STS temporary session credentials (the secret + token are shown exactly once) ---
+  mintSessionCredential: (req: MintSessionReq) =>
+    request<MintSessionResp>("POST", "/credentials/temporary", req),
 
   listUsers: () => request<UserListResp>("GET", "/users"),
   // Created users are S3-API-only: the response carries their S3 (SigV4) access key + secret,

@@ -5,7 +5,7 @@
 
 import { useEffect, useId, useState, type ReactNode } from "react";
 import { useParams } from "react-router";
-import { CircleAlert, Plus, Trash2, X } from "lucide-react";
+import { Bell, CircleAlert, Plus, Trash2, X } from "lucide-react";
 import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -32,6 +32,7 @@ import { ConfirmDialog } from "@/components/confirm-dialog";
 import { ErrorAlert } from "@/components/error-alert";
 import { FieldError } from "@/components/field-error";
 import { JsonEditor } from "@/components/json-editor";
+import { NotificationsCard } from "@/components/notifications-card";
 import { StatusBadge } from "@/components/status-badge";
 import { ApiError, api, errorMessage } from "@/lib/api";
 import { bytes, count } from "@/lib/format";
@@ -44,6 +45,7 @@ import type {
   ReplicationRule,
   ReplicationStatusResp,
   ReplicationTarget,
+  WebhookEndpointView,
 } from "@/lib/types";
 
 const EXAMPLE_POLICY = pretty({
@@ -193,7 +195,22 @@ export function BucketSettings() {
     } catch {
       /* none */
     }
-    return { config, compression, repl, targets, replStatus, pab, bucketTags };
+    let notifications: WebhookEndpointView[] = [];
+    try {
+      notifications = (await api.getNotifications(name)).endpoints;
+    } catch {
+      /* none / unavailable */
+    }
+    return {
+      config,
+      compression,
+      repl,
+      targets,
+      replStatus,
+      pab,
+      bucketTags,
+      notifications,
+    };
   }, [name]);
 
   // Per-card editable state, seeded from the loaded snapshot.
@@ -1130,6 +1147,24 @@ export function BucketSettings() {
                 Add tag
               </Button>
             </CardContent>
+          </SettingsCard>
+
+          {/* ---- Event notifications (webhooks) ---- */}
+          <SettingsCard
+            title={
+              <>
+                <Bell aria-hidden="true" className="size-4" /> Event
+                notifications
+              </>
+            }
+            description="POST a JSON event record to a webhook when objects are created or removed."
+            footer={null}
+          >
+            <NotificationsCard
+              bucket={name}
+              endpoints={data.notifications}
+              onChanged={res.refresh}
+            />
           </SettingsCard>
 
           {/* ---- Configured aspects (read-only: CORS / Lifecycle / ACL) ---- */}

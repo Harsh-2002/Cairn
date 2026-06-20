@@ -134,6 +134,51 @@ export interface BucketConfigResp {
   encryption: { algorithm?: string } | null;
 }
 
+// --- Webhook event notifications (ARCH 20.6) ---
+
+/** One webhook endpoint as the management API returns it: the secret is reduced to a flag. */
+export interface WebhookEndpointView {
+  id: string;
+  url: string;
+  events: string[];
+  prefix: string | null;
+  suffix: string | null;
+  has_secret: boolean;
+}
+
+export interface NotificationsResp {
+  endpoints: WebhookEndpointView[];
+}
+
+/** One endpoint in the PUT body (the secret, when set, is written but never read back). */
+export interface WebhookEndpointInput {
+  id: string;
+  url: string;
+  events: string[];
+  prefix?: string | null;
+  suffix?: string | null;
+  secret?: string | null;
+}
+
+export interface NotificationConfigInput {
+  endpoints: WebhookEndpointInput[];
+}
+
+// --- STS temporary session credentials (ARCH 14.6) ---
+
+export interface MintSessionReq {
+  duration_secs: number;
+  /** A standard identity-policy JSON object (the session's entire effective permission set). */
+  policy: unknown;
+}
+
+export interface MintSessionResp {
+  access_key_id: string;
+  secret_access_key: string;
+  session_token: string;
+  expiration_epoch_secs: number;
+}
+
 export interface UserSummary {
   id: string;
   display_name: string;
