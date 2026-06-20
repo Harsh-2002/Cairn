@@ -167,6 +167,12 @@ fn main() -> ExitCode {
 
     match command {
         Command::ValidateConfig => {
+            // The fields parsed; also enforce the serve-time deployment guardrail so an operator who
+            // runs `validate-config` before deploying is told about an insecure public bind.
+            if let Err(e) = cfg.refuse_insecure_public_bind() {
+                eprintln!("configuration error: {e}");
+                return ExitCode::from(2);
+            }
             println!("configuration valid");
             ExitCode::SUCCESS
         }
@@ -175,7 +181,13 @@ fn main() -> ExitCode {
         Command::Migrate => migrate(cfg),
         Command::Backup { dir } => backup(cfg, &dir),
         Command::Restore { dir } => restore(cfg, &dir),
-        Command::Serve => run_server(cfg),
+        Command::Serve => {
+            if let Err(e) = cfg.refuse_insecure_public_bind() {
+                eprintln!("configuration error: {e}");
+                return ExitCode::from(2);
+            }
+            run_server(cfg)
+        }
         // The remote-admin variants are handled and returned above.
         Command::Bucket { .. }
         | Command::User { .. }

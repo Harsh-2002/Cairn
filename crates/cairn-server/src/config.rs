@@ -75,6 +75,12 @@ pub struct Config {
     pub log_format: LogFormat,
     /// Enable the development authentication bypass (loopback only; debug builds).
     pub dev_auth: bool,
+    /// Acknowledge running with insecure development defaults on a non-loopback interface
+    /// (`CAIRN_ALLOW_INSECURE`). Off by default: startup refuses to bind a public address while the
+    /// built-in development master key (no `CAIRN_MASTER_KEY`) or the default root secret is in use,
+    /// so a hurried deploy cannot come up fully functional and fully insecure. Set `true` only on a
+    /// trusted/closed network where those defaults are acceptable (e.g. a demo or an internal rig).
+    pub allow_insecure: bool,
     /// How often the lifecycle scanner applies each bucket's rules, in seconds.
     pub lifecycle_interval_secs: u64,
     /// How often the multipart sweeper reclaims stale upload sessions, in seconds.
@@ -244,6 +250,7 @@ impl Default for Config {
             log_level: "info".to_owned(),
             log_format: LogFormat::Text,
             dev_auth: false,
+            allow_insecure: false,
             lifecycle_interval_secs: 3600,
             multipart_sweep_interval_secs: 3600,
             scrub_interval_secs: 0,
@@ -361,6 +368,37 @@ impl Config {
             .map_err(|e| ConfigError::Parse(e.to_string()))?;
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Deployment guardrail (release hardening): refuse to serve on a non-loopback interface while
+    /// the built-in development master key (no `CAIRN_MASTER_KEY`/ring) or the well-known default
+    /// root secret is in use, so a hurried public deploy cannot come up fully functional yet fully
+    /// insecure. Loopback binds and an explicit `CAIRN_ALLOW_INSECURE=true` (a trusted/closed
+    /// network) are allowed. Called by both `serve` and `validate-config`, kept separate from
+    /// `validate` so field validation stays pure and the bare defaults still parse.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError::Invalid`] when an insecure default is in use on a public bind.
+    pub fn refuse_insecure_public_bind(&self) -> Result<(), ConfigError> {
+        if self.listen_addr.ip().is_loopback() || self.allow_insecure {
+            return Ok(());
+        }
+        if self.master_key.is_none() && self.master_key_ring.is_none() {
+            return Err(ConfigError::Invalid(
+                "refusing to serve on a non-loopback address with the built-in development master \
+                 key: set CAIRN_MASTER_KEY (or CAIRN_MASTER_KEY_RING), or CAIRN_ALLOW_INSECURE=true \
+                 to override on a trusted network"
+                    .into(),
+            ));
+        }
+        if self.root_secret_key == "cairnadmin" {
+            return Err(ConfigError::Invalid(
+                "refusing to serve on a non-loopback address with the default root secret: set \
+                 CAIRN_ROOT_SECRET_KEY, or CAIRN_ALLOW_INSECURE=true to override on a trusted network"
+                    .into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Whether built-in TLS is configured.
@@ -1009,6 +1047,40 @@ mod tests {
             assert_eq!(Config::load().expect("loads").scrub_interval_secs, 86_400);
             Ok(())
         });
+    }
+
+    /// The insecure-default deployment guardrail: a public bind is refused while the built-in dev
+    /// master key or the default root secret is in use, unless explicitly overridden.
+    #[test]
+    fn refuses_insecure_defaults_on_public_bind() {
+        assert!(
+            !Config::default().allow_insecure,
+            "override is off by default"
+        );
+        let public = |f: fn(&mut Config)| {
+            let mut c = base();
+            c.listen_addr = "0.0.0.0:7373".parse().unwrap();
+            f(&mut c);
+            c.refuse_insecure_public_bind()
+        };
+        // Loopback is always allowed, even with the bare dev defaults.
+        let mut lo = base();
+        lo.listen_addr = "127.0.0.1:7373".parse().unwrap();
+        assert!(lo.refuse_insecure_public_bind().is_ok());
+        // Public bind with the built-in dev master key (none) -> refused.
+        assert!(public(|_| {}).is_err());
+        // A real master key but the default root secret -> still refused.
+        assert!(public(|c| c.master_key = Some("ab".repeat(32))).is_err());
+        // Real key + a non-default root secret -> allowed.
+        assert!(
+            public(|c| {
+                c.master_key = Some("ab".repeat(32));
+                c.root_secret_key = "a-real-secret".to_owned();
+            })
+            .is_ok()
+        );
+        // The explicit override permits it on a trusted/closed network.
+        assert!(public(|c| c.allow_insecure = true).is_ok());
     }
 
     #[test]

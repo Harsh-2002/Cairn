@@ -10,7 +10,11 @@ database (the single source of truth). Ships as **one static binary**.
   (policy / ACL / public-access-block / ownership).
 - **Durable & crash-consistent** — staged writes with file + directory fsync and rename, hash
   validation, and a metadata transaction as the single linearization point; startup
-  reconciliation reclaims any orphaned blob with no manual intervention.
+  reconciliation reclaims any orphaned blob with no manual intervention. Acknowledged writes are
+  durable by default (`CAIRN_META_SYNCHRONOUS=full`). Encrypted and compressed blobs are
+  integrity-checked on every read; for the default uncompressed path, enable the opt-in scrub
+  (`CAIRN_SCRUB_INTERVAL_SECS`) or run on a checksumming filesystem (ZFS/btrfs) to detect silent
+  bit-rot — Cairn never repairs at the storage layer.
 - **Built in** — transparent per-bucket block compression, native TLS (rustls + aws-lc-rs),
   AES-256-GCM envelope encryption of secrets at rest with master-key rotation, asynchronous
   bucket replication, an embedded React management console, Prometheus metrics, and a CLI.
