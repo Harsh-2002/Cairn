@@ -5,6 +5,7 @@ import {
   BarChart3,
   Database,
   Home,
+  KeyRound,
   Moon,
   RefreshCw,
   Search,
@@ -66,10 +67,10 @@ export function CommandMenu() {
         variant="outline"
         onClick={() => setOpen(true)}
         aria-label="Search"
-        className="h-9 justify-start gap-2 px-3 font-normal text-muted-foreground hover:text-foreground sm:w-60"
+        className="h-9 w-full justify-start gap-2 px-3 font-normal text-muted-foreground hover:text-foreground"
       >
         <Search aria-hidden="true" className="size-4 shrink-0" />
-        <span className="hidden sm:inline">Search…</span>
+        <span>Search…</span>
         <kbd className="pointer-events-none ml-auto hidden h-5 items-center rounded border bg-muted px-1.5 font-mono text-[11px] font-medium sm:inline-flex">
           ⌘K
         </kbd>
@@ -98,6 +99,9 @@ export function CommandMenu() {
             </CommandItem>
             <CommandItem onSelect={() => go("/users")}>
               <Users aria-hidden="true" /> Users
+            </CommandItem>
+            <CommandItem onSelect={() => go("/credentials")}>
+              <KeyRound aria-hidden="true" /> Credentials
             </CommandItem>
             <CommandItem onSelect={() => go("/activity")}>
               <Activity aria-hidden="true" /> Activity

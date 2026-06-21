@@ -146,9 +146,11 @@
     @apply bg-background text-foreground antialiased;
     font-feature-settings: "tnum";
   }
-  /* One focus convention everywhere: a 2px blue ring offset off the control. */
+  /* One focus convention everywhere, and ONLY one: a single calm ring offset off the control —
+     no border-color swap, no inner glow (those stacked into the distracting triple-blue we removed).
+     Softened to 70% so it reads as "active" without shouting; still well past the 3:1 a11y floor. */
   :where(a, button, input, select, textarea, [role="tab"], [tabindex]):focus-visible {
-    @apply ring-2 ring-ring ring-offset-2 ring-offset-background outline-none;
+    @apply ring-2 ring-ring/70 ring-offset-2 ring-offset-background outline-none;
   }
   @media (prefers-reduced-motion: reduce) {
     *,

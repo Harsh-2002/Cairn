@@ -1,14 +1,8 @@
 import { useEffect, useRef } from "react";
-import { Outlet, useLocation, useNavigate } from "react-router";
-import { LogOut } from "lucide-react";
+import { Link, Outlet, useLocation } from "react-router";
 import { AppSidebar } from "@/components/app-sidebar";
-import { CommandMenu } from "@/components/command-menu";
-import { ThemeToggle } from "@/components/theme-toggle";
-import { Button } from "@/components/ui/button";
-import { Separator } from "@/components/ui/separator";
 import { SidebarInset, SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar";
 import { Toaster } from "@/components/ui/sonner";
-import { useAuth } from "@/providers/auth-provider";
 
 /** Per-route document titles so history and tabs read meaningfully. */
 function titleFor(pathname: string): string {
@@ -25,8 +19,6 @@ function titleFor(pathname: string): string {
 }
 
 export function AppShell() {
-  const { logout } = useAuth();
-  const navigate = useNavigate();
   const location = useLocation();
   const mainRef = useRef<HTMLElement>(null);
   const firstRender = useRef(true);
@@ -42,11 +34,6 @@ export function AppShell() {
     mainRef.current?.focus();
   }, [location.pathname]);
 
-  function signOut() {
-    logout();
-    navigate("/login");
-  }
-
   return (
     <SidebarProvider>
       <a
@@ -57,22 +44,19 @@ export function AppShell() {
       </a>
       <AppSidebar />
       <SidebarInset>
-        <header className="sticky top-0 z-10 flex h-14 shrink-0 items-center gap-2 border-b bg-background/95 px-4 backdrop-blur supports-[backdrop-filter]:bg-background/75">
-          <SidebarTrigger aria-label="Toggle sidebar" />
-          <Separator orientation="vertical" className="mr-1 !h-4" />
-          <div className="ml-auto flex items-center gap-1.5">
-            <CommandMenu />
-            <ThemeToggle />
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={signOut}
-              className="gap-1.5 text-muted-foreground"
-            >
-              <LogOut aria-hidden="true" className="size-3.5" />
-              <span className="hidden sm:inline">Sign out</span>
-            </Button>
-          </div>
+        {/* Mobile-only top bar: opens the off-canvas rail and shows the wordmark. On desktop the
+            rail is always present, so there is no top chrome — content fills the height (app shell). */}
+        <header className="sticky top-0 z-10 flex h-14 shrink-0 items-center gap-2 border-b bg-background/95 px-4 backdrop-blur md:hidden supports-[backdrop-filter]:bg-background/75">
+          <SidebarTrigger aria-label="Open navigation" />
+          <Link to="/overview" className="flex items-center gap-2">
+            <span
+              aria-hidden="true"
+              className="inline-block size-4 rounded-[4px] bg-foreground"
+            />
+            <span className="text-[15px] font-semibold tracking-tight">
+              Cairn
+            </span>
+          </Link>
         </header>
         <main
           id="main-content"

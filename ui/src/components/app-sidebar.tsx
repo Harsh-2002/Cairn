@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Link, useLocation } from "react-router";
+import { Link, useLocation, useNavigate } from "react-router";
 import {
   Activity,
   BarChart3,
@@ -7,6 +7,7 @@ import {
   Database,
   Home,
   KeyRound,
+  LogOut,
   RefreshCw,
   Tags,
   Users,
@@ -31,7 +32,11 @@ import {
   SidebarMenuSubItem,
   useSidebar,
 } from "@/components/ui/sidebar";
+import { Button } from "@/components/ui/button";
+import { CommandMenu } from "@/components/command-menu";
+import { ThemeToggle } from "@/components/theme-toggle";
 import { api } from "@/lib/api";
+import { useAuth } from "@/providers/auth-provider";
 import { cn } from "@/lib/utils";
 
 const NAV = [
@@ -53,8 +58,15 @@ function isActive(navPath: string, pathname: string): boolean {
 
 export function AppSidebar() {
   const location = useLocation();
+  const navigate = useNavigate();
+  const { logout } = useAuth();
   const { isMobile, setOpenMobile } = useSidebar();
   const [version, setVersion] = useState<string | null>(null);
+
+  function signOut() {
+    logout();
+    navigate("/login");
+  }
   const [bucketsOpen, setBucketsOpen] = useState(false);
   const [buckets, setBuckets] = useState<string[] | null>(null);
 
@@ -82,7 +94,7 @@ export function AppSidebar() {
 
   return (
     <Sidebar>
-      <SidebarHeader className="px-4 py-4">
+      <SidebarHeader className="gap-3 px-4 py-4">
         <Link to="/overview" className="flex items-center gap-2">
           {/* The wordmark: a quiet filled square + name, Geist 600. */}
           <span
@@ -93,6 +105,8 @@ export function AppSidebar() {
             Cairn
           </span>
         </Link>
+        {/* Search lives in the app rail, not a top chrome bar — the ⌘K palette opens from here. */}
+        <CommandMenu />
       </SidebarHeader>
       <SidebarContent>
         <SidebarGroup>
@@ -215,8 +229,20 @@ export function AppSidebar() {
           </SidebarGroupContent>
         </SidebarGroup>
       </SidebarContent>
-      <SidebarFooter className="px-4 py-3">
-        <p className="text-xs text-muted-foreground">
+      <SidebarFooter className="gap-2 px-3 py-3">
+        {/* Account + appearance controls live at the foot of the rail (webapp shell), not a header. */}
+        <div className="flex items-center gap-1">
+          <Button
+            variant="ghost"
+            onClick={signOut}
+            className="h-8 flex-1 justify-start gap-2 px-2 text-sm font-normal text-muted-foreground hover:text-foreground"
+          >
+            <LogOut aria-hidden="true" className="size-4" />
+            Sign out
+          </Button>
+          <ThemeToggle />
+        </div>
+        <p className="px-2 text-xs text-muted-foreground">
           {version ? `Cairn v${version}` : "Cairn"}
         </p>
       </SidebarFooter>
