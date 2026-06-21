@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link, Outlet, useLocation } from "react-router";
 import { AppSidebar } from "@/components/app-sidebar";
 import { SidebarInset, SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar";
@@ -22,16 +22,20 @@ export function AppShell() {
   const location = useLocation();
   const mainRef = useRef<HTMLElement>(null);
   const firstRender = useRef(true);
+  const [announce, setAnnounce] = useState("");
 
-  // Route-change accessibility: retitle the document and move focus to the
-  // main region so screen readers announce the new page.
+  // Route-change accessibility: retitle the document, move focus to the main
+  // region, and announce the new page through a polite live region so screen
+  // readers always hear where they landed.
   useEffect(() => {
-    document.title = titleFor(location.pathname);
+    const title = titleFor(location.pathname);
+    document.title = title;
     if (firstRender.current) {
       firstRender.current = false;
       return;
     }
     mainRef.current?.focus();
+    setAnnounce(title.replace(/ — Cairn$/, ""));
   }, [location.pathname]);
 
   return (
@@ -64,10 +68,18 @@ export function AppShell() {
           tabIndex={-1}
           className="flex-1 outline-none"
         >
-          <Outlet />
+          {/* A calm fade+rise when moving between top-level sections. Keyed by the first path
+              segment so in-page tab switches (bucket Browser/Settings) don't re-animate. */}
+          <div key={location.pathname.split("/")[1] || "overview"} className="animate-enter">
+            <Outlet />
+          </div>
         </main>
       </SidebarInset>
       <Toaster position="bottom-right" />
+      {/* Polite live region: announces the destination on every client-side navigation. */}
+      <div role="status" aria-live="polite" className="sr-only">
+        {announce}
+      </div>
     </SidebarProvider>
   );
 }

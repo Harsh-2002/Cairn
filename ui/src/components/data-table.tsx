@@ -69,7 +69,7 @@ export function DataTable({
             ))}
           </TableRow>
         </TableHeader>
-        <TableBody>{children}</TableBody>
+        <TableBody className="stagger-children">{children}</TableBody>
       </Table>
     </div>
   );

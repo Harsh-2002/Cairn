@@ -102,8 +102,8 @@ export function AppSidebar() {
       </SidebarHeader>
       <SidebarContent>
         <SidebarGroup>
-          <SidebarGroupContent>
-            <SidebarMenu>
+          <SidebarGroupContent role="navigation" aria-label="Main">
+            <SidebarMenu className="stagger-children">
               {NAV.map((item) => {
                 // One source of truth for "current section": both the visual
                 // highlight and the announced aria-current come from the same
@@ -146,7 +146,7 @@ export function AppSidebar() {
                             <ChevronRight
                               aria-hidden="true"
                               className={cn(
-                                "transition-transform",
+                                "transition-transform duration-150 ease-out",
                                 bucketsOpen && "rotate-90"
                               )}
                             />
