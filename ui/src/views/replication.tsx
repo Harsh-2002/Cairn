@@ -65,24 +65,35 @@ export function Replication() {
         <DataTable columns={COLUMNS} minWidth={760}>
           {entries.map((e, i) => (
             <TableRow key={`${e.bucket}:${e.key}:${e.version_id}:${e.attempts}:${i}`}>
-              <TableCell className="font-mono text-[13px]">{e.bucket}</TableCell>
+              <TableCell data-label="Bucket" className="font-mono text-[13px]">
+                {e.bucket}
+              </TableCell>
               <TableCell className="font-mono text-[13px]">
                 <span title={e.key} className="block max-w-[28ch] truncate">
                   {e.key}
                 </span>
               </TableCell>
-              <TableCell className="font-mono text-[13px]">
+              <TableCell data-label="Version" className="font-mono text-[13px]">
                 <span title={e.version_id} className="block max-w-[12ch] truncate">
                   {e.version_id || "—"}
                 </span>
               </TableCell>
-              <TableCell className="text-right tabular-nums">
+              <TableCell
+                data-label="Attempts"
+                className="text-right tabular-nums"
+              >
                 {e.attempts}
               </TableCell>
-              <TableCell className="text-muted-foreground tabular-nums">
+              <TableCell
+                data-label="Next attempt"
+                className="text-muted-foreground tabular-nums"
+              >
                 {whenMs(e.next_attempt_at_ms)}
               </TableCell>
-              <TableCell className="text-[13px] text-destructive">
+              <TableCell
+                data-label="Error"
+                className="text-[13px] text-destructive"
+              >
                 <Tooltip>
                   <TooltipTrigger asChild>
                     <span

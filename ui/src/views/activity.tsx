@@ -115,11 +115,16 @@ export function Activity() {
             <TableRow
               key={`${e.at_ms}:${e.action}:${e.bucket ?? ""}:${e.key ?? ""}:${i}`}
             >
-              <TableCell className="text-muted-foreground tabular-nums">
+              <TableCell
+                data-label="When"
+                className="text-muted-foreground tabular-nums"
+              >
                 {whenMs(e.at_ms)}
               </TableCell>
-              <TableCell className="text-sm font-medium">{e.action}</TableCell>
-              <TableCell className="font-mono text-[13px]">
+              <TableCell data-label="Action" className="text-sm font-medium">
+                {e.action}
+              </TableCell>
+              <TableCell data-label="Actor" className="font-mono text-[13px]">
                 {e.actor ? (
                   <span title={e.actor} className="block max-w-[20ch] truncate">
                     {e.actor}
@@ -128,7 +133,7 @@ export function Activity() {
                   <span className="text-muted-foreground">—</span>
                 )}
               </TableCell>
-              <TableCell className="font-mono text-[13px]">
+              <TableCell data-label="Bucket" className="font-mono text-[13px]">
                 {e.bucket ? (
                   <TextLink to={`/buckets/${encodeURIComponent(e.bucket)}/browser`}>
                     {e.bucket}
@@ -137,7 +142,7 @@ export function Activity() {
                   <span className="text-muted-foreground">—</span>
                 )}
               </TableCell>
-              <TableCell className="font-mono text-[13px]">
+              <TableCell data-label="Key" className="font-mono text-[13px]">
                 {e.key ? (
                   <span title={e.key} className="block max-w-[28ch] truncate">
                     {e.key}

@@ -132,7 +132,10 @@ export function Tags() {
                           <TagChip tagKey={t.tag_key} value={t.tag_value} />
                         </button>
                       </TableCell>
-                      <TableCell className="text-right text-[13px] tabular-nums">
+                      <TableCell
+                        data-label="Objects"
+                        className="text-right text-[13px] tabular-nums"
+                      >
                         {count(t.object_count)}
                       </TableCell>
                     </TableRow>
@@ -211,7 +214,10 @@ function TagObjects({ sel }: { sel: TagSummaryItem | null }) {
               <DataTable columns={OBJECT_COLUMNS} minWidth={560}>
                 {rows.map((o) => (
                   <TableRow key={`${o.bucket}/${o.key}@${o.version_id}`}>
-                    <TableCell className="font-mono text-[13px]">
+                    <TableCell
+                      data-label="Bucket"
+                      className="font-mono text-[13px]"
+                    >
                       <TextLink
                         to={`/buckets/${encodeURIComponent(o.bucket)}/browser`}
                       >
@@ -227,10 +233,16 @@ function TagObjects({ sel }: { sel: TagSummaryItem | null }) {
                         {o.key}
                       </TextLink>
                     </TableCell>
-                    <TableCell className="text-right text-[13px] tabular-nums">
+                    <TableCell
+                      data-label="Size"
+                      className="text-right text-[13px] tabular-nums"
+                    >
                       {bytes(o.size)}
                     </TableCell>
-                    <TableCell className="text-[13px] text-muted-foreground tabular-nums">
+                    <TableCell
+                      data-label="Modified"
+                      className="text-[13px] text-muted-foreground tabular-nums"
+                    >
                       {whenMs(o.last_modified_ms)}
                     </TableCell>
                   </TableRow>

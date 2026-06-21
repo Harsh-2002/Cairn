@@ -282,13 +282,16 @@ export function Users() {
                   {u.display_name}
                 </TextLink>
               </TableCell>
-              <TableCell className="font-mono text-[13px]">
+              <TableCell
+                data-label="Access key ID"
+                className="font-mono text-[13px]"
+              >
                 {u.access_key_id}
               </TableCell>
-              <TableCell>
+              <TableCell data-label="Role">
                 <Badge variant="outline">{u.role}</Badge>
               </TableCell>
-              <TableCell>
+              <TableCell data-label="Status">
                 <StatusBadge tone={u.is_active ? "positive" : "neutral"}>
                   {u.is_active ? "Active" : "Inactive"}
                 </StatusBadge>

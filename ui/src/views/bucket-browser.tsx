@@ -1068,10 +1068,10 @@ export function BucketBrowser() {
                       {o.key}
                     </span>
                   </TableCell>
-                  <TableCell className="text-right text-[13px] tabular-nums">
+                  <TableCell data-label="Size" className="text-right text-[13px] tabular-nums">
                     {bytes(o.size)}
                   </TableCell>
-                  <TableCell className="whitespace-nowrap text-[13px] text-muted-foreground tabular-nums">
+                  <TableCell data-label="Modified" className="whitespace-nowrap text-[13px] text-muted-foreground tabular-nums">
                     {whenMs(o.last_modified_ms)}
                   </TableCell>
                   <TableCell className="text-right">
@@ -1248,10 +1248,10 @@ export function BucketBrowser() {
                           </span>
                         </span>
                       </TableCell>
-                      <TableCell className="text-right text-[13px] tabular-nums">
+                      <TableCell data-label="Size" className="text-right text-[13px] tabular-nums">
                         {bytes(o.size)}
                       </TableCell>
-                      <TableCell className="whitespace-nowrap text-[13px] text-muted-foreground tabular-nums">
+                      <TableCell data-label="Modified" className="whitespace-nowrap text-[13px] text-muted-foreground tabular-nums">
                         {whenMs(o.last_modified_ms)}
                       </TableCell>
                       <TableCell className="text-right">
@@ -1340,10 +1340,10 @@ export function BucketBrowser() {
                           </span>
                         </span>
                       </TableCell>
-                      <TableCell className="text-right text-[13px] tabular-nums">
+                      <TableCell data-label="Size" className="text-right text-[13px] tabular-nums">
                         {v.isDeleteMarker ? "—" : bytes(v.size)}
                       </TableCell>
-                      <TableCell className="whitespace-nowrap text-[13px] text-muted-foreground tabular-nums">
+                      <TableCell data-label="Modified" className="whitespace-nowrap text-[13px] text-muted-foreground tabular-nums">
                         {whenMs(v.lastModifiedMs)}
                       </TableCell>
                       <TableCell className="text-right">

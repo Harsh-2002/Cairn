@@ -203,18 +203,27 @@ export function Buckets() {
                   {b.name}
                 </TextLink>
               </TableCell>
-              <TableCell className="text-right text-[13px] tabular-nums">
+              <TableCell
+                data-label="Objects"
+                className="text-right text-[13px] tabular-nums"
+              >
                 {count(list.data?.usage.get(b.name)?.objects ?? null)}
               </TableCell>
-              <TableCell className="text-right text-[13px] tabular-nums">
+              <TableCell
+                data-label="Size"
+                className="text-right text-[13px] tabular-nums"
+              >
                 {bytes(list.data?.usage.get(b.name)?.logical_bytes ?? null)}
               </TableCell>
-              <TableCell>
+              <TableCell data-label="Versioning">
                 <StatusBadge tone={versioningTone(b.versioning)}>
                   {b.versioning}
                 </StatusBadge>
               </TableCell>
-              <TableCell className="text-[13px] text-muted-foreground tabular-nums">
+              <TableCell
+                data-label="Created"
+                className="text-[13px] text-muted-foreground tabular-nums"
+              >
                 {whenMs(b.created_at_ms)}
               </TableCell>
               <TableCell className="text-right">

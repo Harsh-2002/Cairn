@@ -29,20 +29,36 @@ export interface Column {
 export function DataTable({
   columns,
   minWidth = 560,
+  stacked = true,
   children,
 }: {
   columns: Column[];
   /**
    * Min table width in px (default 560), applied as an inline style so it survives
-   * the JIT. Guarantees the `overflow-x-auto` shell scrolls on a narrow viewport
-   * instead of letting columns clip — keeping every list table consistent on mobile.
+   * the JIT. On desktop it guarantees the columns don't crush; on mobile the stacked
+   * layout ignores it (cells go full-width), so it never forces a sideways scroll.
    */
   minWidth?: number;
+  /**
+   * Stack rows into cards below `md` (default on). Cells carry a `data-label` so each
+   * value is named in the card; the title/actions cells stay unlabelled. Pass false to
+   * keep a horizontally-scrolling grid on every viewport.
+   */
+  stacked?: boolean;
   children: ReactNode;
 }) {
+  // The inline min-width pins the desktop grid so columns don't crush. In stacked
+  // mode the `.table-stack` CSS neutralises it below md (min-width: 0 !important
+  // beats the inline style) so the cards go full-width instead of overflowing.
   const style: CSSProperties = { minWidth };
   return (
-    <div className="overflow-x-auto rounded-lg border">
+    <div
+      className={cn(
+        "overflow-x-auto rounded-lg border",
+        stacked &&
+          "table-stack max-md:overflow-x-visible max-md:rounded-none max-md:border-0",
+      )}
+    >
       <Table style={style}>
         <TableHeader>
           <TableRow>

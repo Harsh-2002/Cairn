@@ -164,3 +164,51 @@
   }
 }
 
+@layer components {
+  /* Responsive list tables. A DataTable marked `.table-stack` keeps its real
+     <table> markup (and semantics) on desktop, but below md it drops the
+     columnar grid and renders each row as a self-contained card: the header is
+     hidden and every cell sits on its own line, prefixed by its column name via
+     the cell's data-label. This reads natively on a phone instead of forcing a
+     sideways scroll. Cells with no data-label (the title cell, the actions
+     cell) render plain, so the object key / name stays the card's headline. */
+  @media (width < 48rem) {
+    .table-stack table {
+      display: block;
+      width: 100%;
+      min-width: 0 !important;
+    }
+    .table-stack thead {
+      display: none;
+    }
+    .table-stack tbody {
+      display: block;
+    }
+    .table-stack tbody tr {
+      display: block;
+      border: 1px solid var(--border) !important;
+      border-radius: var(--radius);
+      padding: 0.625rem 0.875rem;
+      margin-bottom: 0.5rem;
+    }
+    .table-stack tbody tr:last-child {
+      margin-bottom: 0;
+    }
+    .table-stack tbody td {
+      display: block;
+      width: auto !important;
+      max-width: none !important;
+      white-space: normal !important;
+      text-align: left !important;
+      padding: 0.1875rem 0 !important;
+    }
+    .table-stack tbody td[data-label]::before {
+      content: attr(data-label);
+      margin-right: 0.5rem;
+      font-size: 0.75rem;
+      font-weight: 500;
+      color: var(--muted-foreground);
+    }
+  }
+}
+
