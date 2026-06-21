@@ -61,7 +61,6 @@ export function AppSidebar() {
   const navigate = useNavigate();
   const { logout } = useAuth();
   const { isMobile, setOpenMobile } = useSidebar();
-  const [version, setVersion] = useState<string | null>(null);
 
   function signOut() {
     logout();
@@ -74,13 +73,6 @@ export function AppSidebar() {
   // sub-link can light up alongside the parent "Buckets" section.
   const bucketMatch = location.pathname.match(/^\/buckets\/([^/]+)/);
   const activeBucket = bucketMatch ? decodeURIComponent(bucketMatch[1]) : null;
-
-  useEffect(() => {
-    api
-      .system()
-      .then((s) => setVersion(s.version))
-      .catch(() => setVersion(null));
-  }, []);
 
   // Bucket names load lazily the first time the section is expanded (mirrors
   // the ⌘K palette), so the sidebar costs nothing until someone reaches for it.
@@ -229,8 +221,9 @@ export function AppSidebar() {
           </SidebarGroupContent>
         </SidebarGroup>
       </SidebarContent>
-      <SidebarFooter className="gap-2 px-3 py-3">
-        {/* Account + appearance controls live at the foot of the rail (webapp shell), not a header. */}
+      <SidebarFooter className="px-3 py-3">
+        {/* Account + appearance controls live at the foot of the rail (webapp shell), not a header.
+            The version lives on Overview, so it isn't repeated here. */}
         <div className="flex items-center gap-1">
           <Button
             variant="ghost"
@@ -242,9 +235,6 @@ export function AppSidebar() {
           </Button>
           <ThemeToggle />
         </div>
-        <p className="px-2 text-xs text-muted-foreground">
-          {version ? `Cairn v${version}` : "Cairn"}
-        </p>
       </SidebarFooter>
     </Sidebar>
   );
