@@ -17,10 +17,14 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Checkbox } from "@/components/ui/checkbox";
 import { TableCell, TableRow } from "@/components/ui/table";
+import { BulkBar } from "@/components/bulk-bar";
+import { ConfirmDialog } from "@/components/confirm-dialog";
 import { CredentialsPanel } from "@/components/credentials-panel";
 import { DataTable, SkeletonRows, type Column } from "@/components/data-table";
 import { EmptyState } from "@/components/empty-state";
+import { useBulkSelection } from "@/hooks/use-bulk-selection";
 import { ErrorAlert } from "@/components/error-alert";
 import { FieldError } from "@/components/field-error";
 import { Page, PageHeader } from "@/components/page-header";
@@ -122,6 +126,54 @@ export function Users() {
   }
 
   const list = users.data?.users ?? [];
+
+  // ---- bulk selection ------------------------------------------------------
+  const sel = useBulkSelection();
+  const allIds = list.map((u) => u.id);
+  const allSelected = allIds.length > 0 && allIds.every((id) => sel.has(id));
+  const someSelected = sel.count > 0 && !allSelected;
+  const [bulkBusy, setBulkBusy] = useState(false);
+  const [confirmBulk, setConfirmBulk] = useState(false);
+
+  const columns: Column[] = [
+    {
+      key: "select",
+      className: "w-10",
+      label: (
+        <Checkbox
+          checked={allSelected ? true : someSelected ? "indeterminate" : false}
+          onCheckedChange={(v) => sel.setAll(allIds, v === true)}
+          aria-label="Select all users"
+        />
+      ),
+    },
+    ...COLUMNS,
+  ];
+
+  async function confirmBulkDeactivate() {
+    if (sel.count === 0 || bulkBusy) return;
+    setBulkBusy(true);
+    const targets = [...sel.selected];
+    let ok = 0;
+    let failed = 0;
+    for (const id of targets) {
+      try {
+        await api.patchUser(id, { is_active: false });
+        ok++;
+      } catch {
+        failed++;
+      }
+    }
+    if (failed === 0) {
+      toast.success(`Deactivated ${ok} user${ok === 1 ? "" : "s"}.`);
+    } else {
+      toast.error(`Deactivated ${ok}, ${failed} failed.`);
+    }
+    sel.clear();
+    setConfirmBulk(false);
+    setBulkBusy(false);
+    users.refresh();
+  }
 
   return (
     <Page>
@@ -259,8 +311,11 @@ export function Users() {
       ) : null}
 
       {users.loading ? (
-        <DataTable columns={COLUMNS} minWidth={560}>
-          <SkeletonRows rows={3} widths={["w-32", "w-44", "w-16", "w-14"]} />
+        <DataTable columns={columns} minWidth={600}>
+          <SkeletonRows
+            rows={3}
+            widths={["w-4", "w-32", "w-44", "w-16", "w-14"]}
+          />
         </DataTable>
       ) : list.length === 0 && !users.error ? (
         <EmptyState
@@ -274,14 +329,35 @@ export function Users() {
           }
         />
       ) : list.length > 0 ? (
-        <DataTable columns={COLUMNS} minWidth={560}>
-          {list.map((u) => (
-            <TableRow key={u.id}>
-              <TableCell>
-                <TextLink to={`/users/${encodeURIComponent(u.id)}`}>
-                  {u.display_name}
-                </TextLink>
-              </TableCell>
+        <>
+          <BulkBar count={sel.count} onClear={sel.clear}>
+            <Button
+              variant="destructive-outline"
+              size="sm"
+              disabled={bulkBusy}
+              onClick={() => setConfirmBulk(true)}
+            >
+              Deactivate selected
+            </Button>
+          </BulkBar>
+          <DataTable columns={columns} minWidth={600}>
+            {list.map((u) => (
+              <TableRow
+                key={u.id}
+                data-state={sel.has(u.id) ? "selected" : undefined}
+              >
+                <TableCell>
+                  <Checkbox
+                    checked={sel.has(u.id)}
+                    onCheckedChange={() => sel.toggle(u.id)}
+                    aria-label={`Select ${u.display_name}`}
+                  />
+                </TableCell>
+                <TableCell>
+                  <TextLink to={`/users/${encodeURIComponent(u.id)}`}>
+                    {u.display_name}
+                  </TextLink>
+                </TableCell>
               <TableCell
                 data-label="Access key ID"
                 className="font-mono text-[13px]"
@@ -298,8 +374,22 @@ export function Users() {
               </TableCell>
             </TableRow>
           ))}
-        </DataTable>
+          </DataTable>
+        </>
       ) : null}
+
+      <ConfirmDialog
+        open={confirmBulk}
+        onOpenChange={(open) => {
+          if (!open && !bulkBusy) setConfirmBulk(false);
+        }}
+        title={`Deactivate ${sel.count} user${sel.count === 1 ? "" : "s"}`}
+        description={`This disables ${sel.count === 1 ? "this user's" : "these users'"} S3 access keys. You can reactivate ${sel.count === 1 ? "the user" : "them"} later from their page.`}
+        confirmLabel={bulkBusy ? "Deactivating…" : "Deactivate selected"}
+        cancelLabel="Keep active"
+        busy={bulkBusy}
+        onConfirm={() => void confirmBulkDeactivate()}
+      />
     </Page>
   );
 }

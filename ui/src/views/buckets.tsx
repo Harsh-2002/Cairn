@@ -22,8 +22,10 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { TableCell, TableRow } from "@/components/ui/table";
+import { BulkBar } from "@/components/bulk-bar";
 import { DataTable, SkeletonRows, type Column } from "@/components/data-table";
 import { EmptyState } from "@/components/empty-state";
+import { useBulkSelection } from "@/hooks/use-bulk-selection";
 import { ErrorAlert } from "@/components/error-alert";
 import { FieldError } from "@/components/field-error";
 import { Page, PageHeader } from "@/components/page-header";
@@ -80,6 +82,58 @@ export function Buckets() {
     };
   }, []);
   const buckets = list.data?.buckets ?? [];
+
+  // ---- bulk selection ------------------------------------------------------
+  const sel = useBulkSelection();
+  const allIds = buckets.map((b) => b.name);
+  const allSelected = allIds.length > 0 && allIds.every((id) => sel.has(id));
+  const someSelected = sel.count > 0 && !allSelected;
+  const [bulkDeleting, setBulkDeleting] = useState(false);
+  const [confirmBulk, setConfirmBulk] = useState(false);
+
+  // The leading select column carries a header "select all" checkbox; the rest
+  // are the static data columns.
+  const columns: Column[] = [
+    {
+      key: "select",
+      className: "w-10",
+      label: (
+        <Checkbox
+          checked={allSelected ? true : someSelected ? "indeterminate" : false}
+          onCheckedChange={(v) => sel.setAll(allIds, v === true)}
+          aria-label="Select all buckets"
+        />
+      ),
+    },
+    ...COLUMNS,
+  ];
+
+  async function confirmBulkDelete() {
+    if (sel.count === 0 || bulkDeleting) return;
+    setBulkDeleting(true);
+    const targets = [...sel.selected];
+    let ok = 0;
+    const failed: string[] = [];
+    for (const t of targets) {
+      try {
+        await api.deleteBucket(t);
+        ok++;
+      } catch {
+        failed.push(t);
+      }
+    }
+    if (failed.length === 0) {
+      toast.success(`Deleted ${ok} bucket${ok === 1 ? "" : "s"}.`);
+    } else {
+      toast.error(
+        `Deleted ${ok}, ${failed.length} failed (${failed.join(", ")}). Buckets must be empty or you must own them.`,
+      );
+    }
+    sel.clear();
+    setConfirmBulk(false);
+    setBulkDeleting(false);
+    list.refresh();
+  }
 
   // ---- create dialog -------------------------------------------------------
   const nameId = useId();
@@ -178,10 +232,10 @@ export function Buckets() {
       ) : null}
 
       {list.loading ? (
-        <DataTable columns={COLUMNS} minWidth={720}>
+        <DataTable columns={columns} minWidth={760}>
           <SkeletonRows
             rows={3}
-            widths={["w-32", "w-10", "w-16", "w-20", "w-36", "w-8"]}
+            widths={["w-4", "w-32", "w-10", "w-16", "w-20", "w-36", "w-8"]}
           />
         </DataTable>
       ) : buckets.length === 0 && !list.error ? (
@@ -192,17 +246,38 @@ export function Buckets() {
           action={createButton}
         />
       ) : (
-        <DataTable columns={COLUMNS} minWidth={720}>
-          {buckets.map((b) => (
-            <TableRow key={b.name}>
-              <TableCell>
-                <TextLink
-                  to={`/buckets/${encodeURIComponent(b.name)}/browser`}
-                  className="font-mono text-[13px]"
-                >
-                  {b.name}
-                </TextLink>
-              </TableCell>
+        <>
+          <BulkBar count={sel.count} onClear={sel.clear}>
+            <Button
+              variant="destructive-outline"
+              size="sm"
+              disabled={bulkDeleting}
+              onClick={() => setConfirmBulk(true)}
+            >
+              Delete selected
+            </Button>
+          </BulkBar>
+          <DataTable columns={columns} minWidth={760}>
+            {buckets.map((b) => (
+              <TableRow
+                key={b.name}
+                data-state={sel.has(b.name) ? "selected" : undefined}
+              >
+                <TableCell>
+                  <Checkbox
+                    checked={sel.has(b.name)}
+                    onCheckedChange={() => sel.toggle(b.name)}
+                    aria-label={`Select ${b.name}`}
+                  />
+                </TableCell>
+                <TableCell>
+                  <TextLink
+                    to={`/buckets/${encodeURIComponent(b.name)}/browser`}
+                    className="font-mono text-[13px]"
+                  >
+                    {b.name}
+                  </TextLink>
+                </TableCell>
               <TableCell
                 data-label="Objects"
                 className="text-right text-[13px] tabular-nums"
@@ -264,7 +339,8 @@ export function Buckets() {
               </TableCell>
             </TableRow>
           ))}
-        </DataTable>
+          </DataTable>
+        </>
       )}
 
       <Dialog open={createOpen} onOpenChange={creating ? undefined : openCreate}>
@@ -344,6 +420,20 @@ export function Buckets() {
         cancelLabel="Keep bucket"
         busy={deleting}
         onConfirm={() => void confirmDelete()}
+      />
+
+      <TypedConfirmDialog
+        open={confirmBulk}
+        onOpenChange={(open) => {
+          if (!open && !bulkDeleting) setConfirmBulk(false);
+        }}
+        title={`Delete ${sel.count} bucket${sel.count === 1 ? "" : "s"}`}
+        description={`This permanently deletes ${sel.count} bucket${sel.count === 1 ? "" : "s"} and every object and version inside them. This cannot be undone.`}
+        requireText={`delete ${sel.count} bucket${sel.count === 1 ? "" : "s"}`}
+        confirmLabel={bulkDeleting ? "Deleting…" : "Delete selected"}
+        cancelLabel="Keep buckets"
+        busy={bulkDeleting}
+        onConfirm={() => void confirmBulkDelete()}
       />
     </Page>
   );
