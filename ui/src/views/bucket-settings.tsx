@@ -149,7 +149,7 @@ function SettingsCard({
   return (
     <Card className="gap-4">
       <CardHeader>
-        <CardTitle className="flex items-center gap-2 text-base">
+        <CardTitle as="h3" className="flex items-center gap-2 text-base">
           {title}
         </CardTitle>
         {description ? <CardDescription>{description}</CardDescription> : null}

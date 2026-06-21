@@ -28,9 +28,19 @@ function CardHeader({ className, ...props }: React.ComponentProps<"div">) {
   )
 }
 
-function CardTitle({ className, ...props }: React.ComponentProps<"div">) {
+// A card title is a real section heading so screen-reader users can navigate the page outline by
+// heading. Default level is h2 (a card sits directly under the page's h1); pass `as` to fit a deeper
+// context. Tailwind's preflight resets heading size/weight/margin, so the element swap is purely
+// semantic — it looks identical to the old div.
+function CardTitle({
+  className,
+  as: Comp = "h2",
+  ...props
+}: React.ComponentProps<"h2"> & {
+  as?: "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
+}) {
   return (
-    <div
+    <Comp
       data-slot="card-title"
       className={cn("leading-none font-semibold", className)}
       {...props}
