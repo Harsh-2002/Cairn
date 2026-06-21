@@ -160,7 +160,9 @@ export function Metrics() {
     <Page>
       <PageHeader
         title="Metrics"
-        description="API request volume and usage analytics."
+        description={`API request volume and usage analytics over the last ${
+          RANGES.find((r) => r.value === range)?.label ?? "period"
+        }.`}
         actions={
           <RefreshButton
             loading={loading}
@@ -707,7 +709,7 @@ function StatusDonut({ by_status }: { by_status: MetricStatus[] }) {
   );
   return (
     <div className="flex flex-col items-center gap-4">
-      <div className="h-44 w-full" role="img" aria-label="Response status mix by HTTP status class.">
+      <div className="h-48 w-full" role="img" aria-label="Response status mix by HTTP status class.">
         <ResponsiveContainer width="100%" height="100%">
           <PieChart>
             <Pie
@@ -740,11 +742,11 @@ function StatusDonut({ by_status }: { by_status: MetricStatus[] }) {
           </PieChart>
         </ResponsiveContainer>
       </div>
-      <ul className="grid w-full grid-cols-2 justify-start gap-x-4 gap-y-1.5 text-[13px] sm:flex sm:flex-wrap">
+      <ul className="flex w-full flex-col gap-y-1.5 text-[13px] sm:flex-row sm:flex-wrap sm:gap-x-4">
         {sorted.map((s) => (
           <li
             key={s.status_class}
-            className="flex items-center gap-1.5"
+            className="flex items-center gap-1.5 whitespace-nowrap"
           >
             <span
               aria-hidden="true"
@@ -778,7 +780,7 @@ function ReadsWritesDonut({
   return (
     <div className="flex flex-col items-center gap-4">
       <div
-        className="h-44 w-full"
+        className="h-48 w-full"
         role="img"
         aria-label={`Reads versus writes: ${count(reads)} reads, ${count(writes)} writes.`}
       >
@@ -811,9 +813,9 @@ function ReadsWritesDonut({
           </PieChart>
         </ResponsiveContainer>
       </div>
-      <ul className="grid w-full grid-cols-2 justify-start gap-x-4 gap-y-1.5 text-[13px] sm:flex sm:flex-wrap">
+      <ul className="flex w-full flex-col gap-y-1.5 text-[13px] sm:flex-row sm:flex-wrap sm:gap-x-4">
         {slices.map((s) => (
-          <li key={s.name} className="flex items-center gap-1.5">
+          <li key={s.name} className="flex items-center gap-1.5 whitespace-nowrap">
             <span
               aria-hidden="true"
               className="inline-block size-2.5 rounded-sm"
@@ -933,7 +935,8 @@ const tooltipStyle: React.CSSProperties = {
 };
 
 const tooltipLabelStyle: React.CSSProperties = {
-  color: "var(--color-muted-foreground)",
+  color: "var(--color-foreground)",
+  fontWeight: 500,
   marginBottom: 2,
 };
 

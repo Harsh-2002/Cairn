@@ -819,8 +819,13 @@ export function BucketBrowser() {
         </Select>
 
         <div className="ms-auto flex w-full items-center gap-3 sm:w-auto">
-          <p className="hidden text-[13px] text-muted-foreground sm:block">
-            or drag files anywhere here
+          <p
+            className={cn(
+              "hidden text-[13px] sm:block",
+              dragOver ? "font-medium text-foreground" : "text-muted-foreground",
+            )}
+          >
+            {dragOver ? "Drop files to upload" : "or drag files anywhere here"}
           </p>
           <input
             ref={fileInputRef}
@@ -1530,7 +1535,7 @@ export function BucketBrowser() {
           <form onSubmit={(e) => void submitCopy(e)} noValidate>
             <DialogHeader>
               <DialogTitle>{copyAsMove ? "Move object" : "Copy object"}</DialogTitle>
-              <DialogDescription className="break-all">
+              <DialogDescription className="max-h-20 overflow-y-auto break-all">
                 {copyAsMove ? "Moving" : "Copying"} from{" "}
                 <span className="font-mono">{copySource}</span>
               </DialogDescription>

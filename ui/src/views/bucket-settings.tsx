@@ -1178,18 +1178,25 @@ export function BucketSettings() {
                   </div>
                 ))
               )}
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                disabled={bucketTags.length >= 50}
-                onClick={() =>
-                  setBucketTags((cur) => [...cur, { key: "", value: "" }])
-                }
-              >
-                <Plus aria-hidden="true" />
-                Add tag
-              </Button>
+              <div className="flex items-center gap-3">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  disabled={bucketTags.length >= 50}
+                  onClick={() =>
+                    setBucketTags((cur) => [...cur, { key: "", value: "" }])
+                  }
+                >
+                  <Plus aria-hidden="true" />
+                  Add tag
+                </Button>
+                {bucketTags.length > 0 ? (
+                  <span className="text-[13px] text-muted-foreground tabular-nums">
+                    {bucketTags.length} / 50
+                  </span>
+                ) : null}
+              </div>
             </CardContent>
           </SettingsCard>
           )}

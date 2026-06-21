@@ -210,7 +210,8 @@ export function Overview() {
               <CardContent>
                 {logical === 0 ? (
                   <p className="text-sm text-muted-foreground">
-                    Nothing stored yet.
+                    No data to compress yet — upload objects to a bucket to see
+                    the space compression saves.
                   </p>
                 ) : compressed ? (
                   <div className="space-y-4">
