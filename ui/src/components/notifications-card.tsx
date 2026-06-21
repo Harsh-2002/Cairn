@@ -15,6 +15,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { EmptyState } from "@/components/empty-state";
 import { FieldError } from "@/components/field-error";
+import { InfoHint } from "@/components/info-hint";
 import { api, errorMessage } from "@/lib/api";
 import type { WebhookEndpointInput, WebhookEndpointView } from "@/lib/types";
 
@@ -290,7 +291,19 @@ export function NotificationsCard({
           </div>
 
           <fieldset className="space-y-2">
-            <legend className="text-sm font-medium">Events</legend>
+            <legend className="flex items-center gap-1.5 text-sm font-medium">
+              Events
+              <InfoHint label="About event selectors">
+                <p className="font-medium">Which events fire a delivery</p>
+                <p className="mt-1 text-muted-foreground">
+                  Pick the object changes that POST to your URL. Check{" "}
+                  <span className="font-medium text-foreground">All</span> in a
+                  group to match every event in it (now and any added later), or
+                  pick specific ones. The prefix/suffix filters below narrow it
+                  further by object key.
+                </p>
+              </InfoHint>
+            </legend>
             <div className="grid gap-4 sm:grid-cols-2">
               {EVENT_GROUPS.map((g) => {
                 const wildcardOn = draft.events.includes(g.wildcard);

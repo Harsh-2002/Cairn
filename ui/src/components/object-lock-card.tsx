@@ -19,6 +19,7 @@ import {
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
 import { FieldError } from "@/components/field-error";
+import { InfoHint } from "@/components/info-hint";
 import { StatusBadge } from "@/components/status-badge";
 import { errorMessage } from "@/lib/api";
 import * as s3 from "@/lib/s3";
@@ -132,7 +133,29 @@ export function ObjectLockCard({ bucket }: { bucket: string }) {
         </p>
         <div className="flex flex-wrap items-end gap-3">
           <div className="space-y-1.5">
-            <Label className="text-[13px] text-muted-foreground">Mode</Label>
+            <div className="flex items-center gap-1.5">
+              <Label className="text-[13px] text-muted-foreground">Mode</Label>
+              <InfoHint label="About retention modes">
+                <p className="font-medium">Two retention modes</p>
+                <p className="mt-1 text-muted-foreground">
+                  <span className="font-medium text-foreground">
+                    Governance
+                  </span>{" "}
+                  blocks deletes and overwrites until the date, but a user with{" "}
+                  <code className="font-mono text-[12px]">
+                    s3:BypassGovernanceRetention
+                  </code>{" "}
+                  can lift it early.
+                </p>
+                <p className="mt-1.5 text-muted-foreground">
+                  <span className="font-medium text-foreground">
+                    Compliance
+                  </span>{" "}
+                  is absolute: no one — not even the root account — can shorten
+                  or remove it until it expires.
+                </p>
+              </InfoHint>
+            </div>
             <Select
               value={mode}
               onValueChange={(v) => setMode(v as DefaultKind)}

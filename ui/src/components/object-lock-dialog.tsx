@@ -26,6 +26,7 @@ import {
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
 import { FieldError } from "@/components/field-error";
+import { InfoHint } from "@/components/info-hint";
 import { errorMessage } from "@/lib/api";
 import * as s3 from "@/lib/s3";
 
@@ -152,7 +153,30 @@ export function ObjectLockDialog({
             </label>
 
             <div className="space-y-2">
-              <Label>Retention</Label>
+              <div className="flex items-center gap-1.5">
+                <Label>Retention</Label>
+                <InfoHint label="About retention modes">
+                  <p className="font-medium">Two retention modes</p>
+                  <p className="mt-1 text-muted-foreground">
+                    <span className="font-medium text-foreground">
+                      Governance
+                    </span>{" "}
+                    blocks deletes and overwrites until the date, but a user
+                    holding{" "}
+                    <code className="font-mono text-[12px]">
+                      s3:BypassGovernanceRetention
+                    </code>{" "}
+                    can lift it early.
+                  </p>
+                  <p className="mt-1.5 text-muted-foreground">
+                    <span className="font-medium text-foreground">
+                      Compliance
+                    </span>{" "}
+                    is absolute: no one — not even the root account — can
+                    shorten or remove it until it expires.
+                  </p>
+                </InfoHint>
+              </div>
               <div className="flex flex-wrap items-end gap-3">
                 <Select value={mode} onValueChange={(v) => setMode(v as Mode)}>
                   <SelectTrigger className="w-40">
@@ -173,15 +197,31 @@ export function ObjectLockDialog({
                   />
                 ) : null}
               </div>
+              {mode === "GOVERNANCE" ? (
+                <p className="text-[13px] text-muted-foreground">
+                  Blocks deletes and overwrites until this date. A user with the
+                  bypass permission can still remove it early.
+                </p>
+              ) : null}
               {base.mode === "GOVERNANCE" &&
               (mode !== base.mode || until !== base.until) ? (
-                <label className="flex items-center gap-2 text-[13px]">
+                <label className="flex items-start gap-2 text-[13px]">
                   <Checkbox
                     checked={bypass}
                     onCheckedChange={(v) => setBypass(v === true)}
+                    className="mt-0.5"
                   />
-                  Bypass governance retention (needs
-                  s3:BypassGovernanceRetention)
+                  <span>
+                    Bypass governance retention
+                    <span className="block text-muted-foreground">
+                      Needed to shorten or remove an active Governance hold;
+                      requires the{" "}
+                      <code className="font-mono text-[12px]">
+                        s3:BypassGovernanceRetention
+                      </code>{" "}
+                      permission.
+                    </span>
+                  </span>
                 </label>
               ) : null}
               {mode === "COMPLIANCE" ? (
