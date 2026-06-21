@@ -37,6 +37,11 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
+import {
+  Tabs,
+  TabsList,
+  TabsTrigger,
+} from "@/components/ui/tabs";
 import { ConfirmDialog } from "@/components/confirm-dialog";
 import { CorsCard } from "@/components/cors-card";
 import { ErrorAlert } from "@/components/error-alert";
@@ -235,6 +240,9 @@ export function BucketSettings() {
   const [replPrefix, setReplPrefix] = useState("");
   const [replError, setReplError] = useState("");
   const [busy, setBusy] = useState<string | null>(null); // which card is saving
+  // Settings are grouped into tabs so the operator faces one concern at a time, not a long wall of
+  // cards. Each card is gated by the active tab (the DOM order is preserved; only visibility shifts).
+  const [tab, setTab] = useState("general");
   const [confirmDeletePolicy, setConfirmDeletePolicy] = useState(false);
   const [confirmClearRepl, setConfirmClearRepl] = useState(false);
 
@@ -550,9 +558,17 @@ export function BucketSettings() {
           ))}
         </div>
       ) : data && config ? (
-        <>
+        <Tabs value={tab} onValueChange={setTab}>
+          <TabsList>
+            <TabsTrigger value="general">General</TabsTrigger>
+            <TabsTrigger value="protection">Data protection</TabsTrigger>
+            <TabsTrigger value="access">Access</TabsTrigger>
+            <TabsTrigger value="integrations">Integrations</TabsTrigger>
+          </TabsList>
+          <div className="mt-4 space-y-4">
           {/* ---- Versioning ---- */}
-          <SettingsCard
+          {tab === "general" && (
+            <SettingsCard
             title="Versioning"
             description="Keep previous versions of an object when it is overwritten or deleted, so you can recover them later."
             footer={
@@ -577,9 +593,11 @@ export function BucketSettings() {
               </Select>
             </CardContent>
           </SettingsCard>
+          )}
 
           {/* ---- Quota ---- */}
-          <SettingsCard
+          {tab === "general" && (
+            <SettingsCard
             title="Storage quota"
             description={
               <>
@@ -647,9 +665,11 @@ export function BucketSettings() {
               )}
             </CardContent>
           </SettingsCard>
+          )}
 
           {/* ---- Compression ---- */}
-          <SettingsCard
+          {tab === "general" && (
+            <SettingsCard
             title="Compression"
             description="Compress new uploads at rest to save space. Existing objects are not changed."
             footer={
@@ -677,9 +697,11 @@ export function BucketSettings() {
               </Select>
             </CardContent>
           </SettingsCard>
+          )}
 
           {/* ---- Replication ---- */}
-          <SettingsCard
+          {tab === "integrations" && (
+            <SettingsCard
             title={
               <>
                 Replication
@@ -789,9 +811,11 @@ export function BucketSettings() {
               <FieldError>{replError || null}</FieldError>
             </CardContent>
           </SettingsCard>
+          )}
 
           {/* ---- Replication targets (remote endpoints + sealed credentials) ---- */}
-          <SettingsCard
+          {tab === "integrations" && (
+            <SettingsCard
             title="Replication targets"
             description="Remote destinations this bucket can replicate into. Each holds the endpoint and credentials of a bucket on another Cairn (or S3) node; the secret is sealed on the server and never shown again."
             footer={
@@ -913,9 +937,11 @@ export function BucketSettings() {
               </div>
             </CardContent>
           </SettingsCard>
+          )}
 
           {/* ---- Encryption at rest ---- */}
-          <SettingsCard
+          {tab === "protection" && (
+            <SettingsCard
             title={
               <>
                 Encryption at rest
@@ -946,9 +972,11 @@ export function BucketSettings() {
               </Select>
             </CardContent>
           </SettingsCard>
+          )}
 
           {/* ---- Bucket policy ---- */}
-          <SettingsCard
+          {tab === "access" && (
+            <SettingsCard
             title="Bucket policy"
             description={
               <>
@@ -1016,9 +1044,11 @@ export function BucketSettings() {
               ) : null}
             </CardContent>
           </SettingsCard>
+          )}
 
           {/* ---- Object ownership ---- */}
-          <SettingsCard
+          {tab === "access" && (
+            <SettingsCard
             title="Object ownership"
             description={
               <>
@@ -1053,9 +1083,11 @@ export function BucketSettings() {
               </Select>
             </CardContent>
           </SettingsCard>
+          )}
 
           {/* ---- Public Access Block ---- */}
-          <SettingsCard
+          {tab === "access" && (
+            <SettingsCard
             title="Public Access Block"
             description="Guardrails that neutralise public access regardless of ACLs or policy. Enabling all four is the safe default."
             footer={
@@ -1085,9 +1117,11 @@ export function BucketSettings() {
               ))}
             </CardContent>
           </SettingsCard>
+          )}
 
           {/* ---- Bucket tags ---- */}
-          <SettingsCard
+          {tab === "general" && (
+            <SettingsCard
             title="Bucket tags"
             description="Key-value tags on the bucket, for organisation and policy conditioning."
             footer={
@@ -1158,9 +1192,11 @@ export function BucketSettings() {
               </Button>
             </CardContent>
           </SettingsCard>
+          )}
 
           {/* ---- Event notifications (webhooks) ---- */}
-          <SettingsCard
+          {tab === "integrations" && (
+            <SettingsCard
             title={
               <>
                 <Bell aria-hidden="true" className="size-4" /> Event
@@ -1176,9 +1212,11 @@ export function BucketSettings() {
               onChanged={res.refresh}
             />
           </SettingsCard>
+          )}
 
           {/* ---- Object Lock (WORM) ---- */}
-          <SettingsCard
+          {tab === "protection" && (
+            <SettingsCard
             title={
               <>
                 <ShieldCheck aria-hidden="true" className="size-4" /> Object Lock
@@ -1189,9 +1227,11 @@ export function BucketSettings() {
           >
             <ObjectLockCard bucket={name} />
           </SettingsCard>
+          )}
 
           {/* ---- CORS ---- */}
-          <SettingsCard
+          {tab === "access" && (
+            <SettingsCard
             title={
               <>
                 <Globe aria-hidden="true" className="size-4" /> CORS
@@ -1202,9 +1242,11 @@ export function BucketSettings() {
           >
             <CorsCard bucket={name} />
           </SettingsCard>
+          )}
 
           {/* ---- Lifecycle ---- */}
-          <SettingsCard
+          {tab === "protection" && (
+            <SettingsCard
             title={
               <>
                 <CalendarClock aria-hidden="true" className="size-4" /> Lifecycle
@@ -1215,9 +1257,11 @@ export function BucketSettings() {
           >
             <LifecycleCard bucket={name} />
           </SettingsCard>
+          )}
 
           {/* ---- Configured aspects (read-only: ACL) ---- */}
-          <SettingsCard
+          {tab === "access" && (
+            <SettingsCard
             title="Other S3 aspects"
             description="ACLs are configured through the S3 API and shown here for reference."
             footer={null}
@@ -1241,7 +1285,9 @@ export function BucketSettings() {
               </dl>
             </CardContent>
           </SettingsCard>
-        </>
+          )}
+          </div>
+        </Tabs>
       ) : null}
 
       <ConfirmDialog
