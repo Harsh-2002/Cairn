@@ -199,7 +199,7 @@ export function LifecycleCard({ bucket }: { bucket: string }) {
         </div>
       ))}
 
-      <div className="flex items-center justify-between border-t pt-3">
+      <div className="flex items-center justify-between border-t pt-4">
         <Button
           variant="outline"
           disabled={busy}

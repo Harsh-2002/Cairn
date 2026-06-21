@@ -389,7 +389,7 @@ export function NotificationsCard({
             ) : null}
           </div>
 
-          <div className="flex justify-end gap-2 border-t pt-3">
+          <div className="flex justify-end gap-2 border-t pt-4">
             <Button
               variant="ghost"
               disabled={busy}

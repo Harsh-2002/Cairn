@@ -210,7 +210,7 @@ export function ObjectLockCard({ bucket }: { bucket: string }) {
         ) : null}
       </div>
 
-      <div className="flex justify-end border-t pt-3">
+      <div className="flex justify-end border-t pt-4">
         <Button disabled={busy} onClick={save}>
           {busy ? "Saving…" : "Save default retention"}
         </Button>
