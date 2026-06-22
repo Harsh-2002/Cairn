@@ -236,7 +236,7 @@ export function BucketSettings() {
   const [encryption, setEncryption] = useState("none");
   const [policyText, setPolicyText] = useState("");
   const [policyError, setPolicyError] = useState("");
-  const [replDest, setReplDest] = useState("");
+  const [replTargetArn, setReplTargetArn] = useState("");
   const [replPrefix, setReplPrefix] = useState("");
   const [replError, setReplError] = useState("");
   const [busy, setBusy] = useState<string | null>(null); // which card is saving
@@ -288,7 +288,7 @@ export function BucketSettings() {
     setEncryption(
       d.config.encryption?.algorithm?.toUpperCase() === "AES256" ? "AES256" : "none",
     );
-    setReplDest(d.repl?.dest_bucket ?? "");
+    setReplTargetArn(d.repl?.dest_bucket ?? "");
     setReplPrefix(d.repl?.prefix ?? "");
     setOwnership(OWNERSHIP_TO_S3[d.config.ownership_mode] ?? "BucketOwnerEnforced");
     setPab(d.pab ?? PAB_OFF);
@@ -410,18 +410,23 @@ export function BucketSettings() {
 
   async function saveReplication() {
     setReplError("");
-    if (!replDest.trim()) {
-      setReplError("Enter a destination bucket to replicate into.");
+    if (!replTargetArn) {
+      setReplError("Choose a replication target to ship objects to.");
       return;
     }
+    const dest = data?.targets.find((t) => t.arn === replTargetArn);
     setBusy("replication");
     try {
-      await s3.putReplication(name, replDest.trim(), replPrefix.trim());
-      toast.success(`Replicating to "${replDest.trim()}".`);
+      await s3.putReplication(name, replTargetArn, replPrefix.trim());
+      toast.success(
+        dest
+          ? `Replicating to "${dest.dest_bucket}" @ ${dest.endpoint}.`
+          : "Replication rule saved.",
+      );
       res.refresh();
     } catch (e) {
       setReplError(
-        `${errorMessage(e, "Failed to set replication.")} Replication needs versioning enabled and a matching destination configured on the server.`,
+        `${errorMessage(e, "Failed to set replication.")} Replication needs versioning enabled on this bucket.`,
       );
     } finally {
       setBusy(null);
@@ -433,7 +438,7 @@ export function BucketSettings() {
     void run("replication", async () => {
       await s3.deleteReplication(name);
       toast.success("Replication rule removed.");
-      setReplDest("");
+      setReplTargetArn("");
       setReplPrefix("");
     });
   }
@@ -529,6 +534,11 @@ export function BucketSettings() {
     targets: undefined,
     replStatus: undefined,
   };
+  // The registered target the active rule ships to (its `<Destination><Bucket>` is the target ARN),
+  // for a human-readable "replicating to bucket @ endpoint" instead of the raw ARN.
+  const replActiveTarget = repl
+    ? targets?.find((t) => t.arn === repl.dest_bucket)
+    : undefined;
 
   return (
     <div className="space-y-4">
@@ -712,11 +722,14 @@ export function BucketSettings() {
             }
             description={
               <>
-                Continuously copy new objects to another bucket. Needs
-                versioning enabled and a remote target (below) for the
-                destination.
+                Continuously copy new objects to a remote target (configured
+                below). Needs versioning enabled on this bucket.
                 {repl
-                  ? ` Currently replicating to "${repl.dest_bucket}"${repl.prefix ? ` (prefix "${repl.prefix}")` : ""}.`
+                  ? ` Currently replicating to ${
+                      replActiveTarget
+                        ? `"${replActiveTarget.dest_bucket}" @ ${replActiveTarget.endpoint}`
+                        : repl.dest_bucket
+                    }${repl.prefix ? ` (prefix "${repl.prefix}")` : ""}.`
                   : ""}
               </>
             }
@@ -778,7 +791,7 @@ export function BucketSettings() {
                 ) : null}
                 <Button
                   onClick={() => void saveReplication()}
-                  disabled={busy === "replication"}
+                  disabled={busy === "replication" || !targets?.length}
                 >
                   {busy === "replication" ? "Saving…" : "Save"}
                 </Button>
@@ -786,29 +799,48 @@ export function BucketSettings() {
             }
           >
             <CardContent className="space-y-1.5">
-              <div className="flex flex-wrap gap-2">
-                <Input
-                  value={replDest}
-                  placeholder="Destination bucket"
-                  autoComplete="off"
-                  aria-label="Replication destination bucket"
-                  aria-invalid={replError ? true : undefined}
-                  className="w-full font-mono sm:w-56"
-                  onChange={(e) => {
-                    setReplDest(e.target.value);
-                    setReplError("");
-                  }}
-                />
-                <Input
-                  value={replPrefix}
-                  placeholder="Prefix (optional)"
-                  autoComplete="off"
-                  aria-label="Replication prefix"
-                  className="w-full font-mono sm:w-44"
-                  onChange={(e) => setReplPrefix(e.target.value)}
-                />
-              </div>
-              <FieldError>{replError || null}</FieldError>
+              {targets && targets.length > 0 ? (
+                <>
+                  <div className="flex flex-wrap gap-2">
+                    <Select
+                      value={replTargetArn}
+                      onValueChange={(v) => {
+                        setReplTargetArn(v);
+                        setReplError("");
+                      }}
+                    >
+                      <SelectTrigger
+                        className="w-full sm:w-72"
+                        aria-label="Replication target"
+                        aria-invalid={replError ? true : undefined}
+                      >
+                        <SelectValue placeholder="Choose a target…" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {targets.map((t) => (
+                          <SelectItem key={t.arn} value={t.arn}>
+                            {t.dest_bucket} @ {t.endpoint}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                    <Input
+                      value={replPrefix}
+                      placeholder="Prefix (optional)"
+                      autoComplete="off"
+                      aria-label="Replication prefix"
+                      className="w-full font-mono sm:w-44"
+                      onChange={(e) => setReplPrefix(e.target.value)}
+                    />
+                  </div>
+                  <FieldError>{replError || null}</FieldError>
+                </>
+              ) : (
+                <p className="text-[13px] text-muted-foreground">
+                  Add a replication target below first — the rule ships objects
+                  to a target you configure, not to a bare bucket name.
+                </p>
+              )}
             </CardContent>
           </SettingsCard>
           )}

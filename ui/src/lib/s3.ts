@@ -441,8 +441,10 @@ export async function deleteBucketTagging(bucket: string): Promise<void> {
     throw new ApiError(`clear bucket tags failed (${res.status})`, res.status);
 }
 
-// Per-bucket replication rule via the S3 subresource (?replication). Returns the rule's
-// destination bucket + prefix (or null when no rule is configured).
+// Per-bucket replication rule via the S3 subresource (?replication). `dest_bucket` carries the
+// rule's raw `<Destination><Bucket>` — for a console-set rule this is the remote target ARN
+// (`arn:cairn:replication:…`); a legacy `arn:aws:s3:::name` is returned with the prefix stripped.
+// Match it against the bucket's registered targets to render the destination. Null when unset.
 export async function getReplication(
   bucket: string,
 ): Promise<ReplicationRule | null> {
@@ -461,15 +463,19 @@ export async function getReplication(
   };
 }
 
+// `destination` is the remote **target ARN** (`arn:cairn:replication:…`) the rule ships to, not a
+// bare bucket name: the engine matches each outbox entry to a registered target by that ARN (stamped
+// at enqueue), so a rule naming only a bucket links to no target and every object lands in the failed
+// queue. Register the target first (`addReplicationTarget`), then name its ARN here.
 export async function putReplication(
   bucket: string,
-  destBucket: string,
+  destination: string,
   prefix = "",
 ): Promise<void> {
   const xml =
     `<ReplicationConfiguration><Role>cairn</Role><Rule><ID>cairn-ui</ID>` +
     `<Status>Enabled</Status><Filter><Prefix>${xmlEscape(prefix)}</Prefix></Filter>` +
-    `<Destination><Bucket>arn:aws:s3:::${xmlEscape(destBucket)}</Bucket></Destination></Rule>` +
+    `<Destination><Bucket>${xmlEscape(destination)}</Bucket></Destination></Rule>` +
     `</ReplicationConfiguration>`;
   const res = await fetch(`/${encodeURIComponent(bucket)}?replication`, {
     method: "PUT",

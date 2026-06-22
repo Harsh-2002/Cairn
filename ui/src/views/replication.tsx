@@ -68,7 +68,7 @@ export function Replication() {
               <TableCell data-label="Bucket" className="font-mono text-[13px]">
                 {e.bucket}
               </TableCell>
-              <TableCell className="font-mono text-[13px]">
+              <TableCell data-label="Key" className="font-mono text-[13px]">
                 <span title={e.key} className="block max-w-[28ch] truncate">
                   {e.key}
                 </span>
