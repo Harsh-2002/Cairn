@@ -451,6 +451,14 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             .map_err(engine_err)?;
             Ok(MutationOutcome::Ack)
         }
+        Mutation::DeleteSessionCredential { access_key_id } => {
+            conn.execute(
+                "DELETE FROM session_credentials WHERE access_key_id = ?1",
+                params![access_key_id],
+            )
+            .map_err(engine_err)?;
+            Ok(MutationOutcome::Ack)
+        }
         Mutation::ClaimReplicationBatch {
             limit,
             now,

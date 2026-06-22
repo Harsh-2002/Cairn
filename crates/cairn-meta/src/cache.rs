@@ -37,8 +37,9 @@ use cairn_types::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, Vers
 use cairn_types::meta::{
     ActivityEntry, BucketCounts, ListPage, ListQuery, MetricsRange, MultipartSession, Mutation,
     MutationOutcome, ObjectSummary, OutboxEntry, PartRecord, ReplicationStatus,
-    RequestMetricsSeries, ShareRow, StoreCounts, TagSummary, TaggedObject, User,
-    UserSessionCredentials, UserSigV4Credentials, UserWithBearerHash, WebhookEntry,
+    RequestMetricsSeries, SessionCredentialSummary, ShareRow, StoreCounts, TagSummary,
+    TaggedObject, User, UserSessionCredentials, UserSigV4Credentials, UserWithBearerHash,
+    WebhookEntry,
 };
 use cairn_types::object::ObjectVersionRow;
 use cairn_types::time::Timestamp;
@@ -438,6 +439,7 @@ impl CachedMetadataStore {
             | Mutation::DeactivateUser(_)
             | Mutation::CreateSessionCredential(_)
             | Mutation::DeleteExpiredSessionCredentials { .. }
+            | Mutation::DeleteSessionCredential { .. }
             | Mutation::ClaimReplicationBatch { .. }
             | Mutation::MarkReplicationDone(_)
             | Mutation::MarkReplicationFailed { .. }
@@ -736,6 +738,13 @@ impl MetadataStore for CachedMetadataStore {
         access_key_id: &str,
     ) -> Result<Option<UserSessionCredentials>, MetaError> {
         self.inner.user_by_session_key(access_key_id).await
+    }
+
+    async fn list_session_credentials(
+        &self,
+        now: Timestamp,
+    ) -> Result<Vec<SessionCredentialSummary>, MetaError> {
+        self.inner.list_session_credentials(now).await
     }
 
     async fn count_users(&self) -> Result<u64, MetaError> {
@@ -1105,6 +1114,12 @@ mod tests {
             access_key_id: &str,
         ) -> Result<Option<UserSessionCredentials>, MetaError> {
             self.inner.user_by_session_key(access_key_id).await
+        }
+        async fn list_session_credentials(
+            &self,
+            now: Timestamp,
+        ) -> Result<Vec<SessionCredentialSummary>, MetaError> {
+            self.inner.list_session_credentials(now).await
         }
         async fn count_users(&self) -> Result<u64, MetaError> {
             self.inner.count_users().await

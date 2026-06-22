@@ -12,9 +12,9 @@ use cairn_types::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, Vers
 use cairn_types::meta::{
     ActivityEntry, BucketCounts, BucketRequestCount, LATENCY_BUCKETS, ListPage, ListQuery,
     MetricsRange, MultipartSession, Mutation, MutationOutcome, ObjectSummary, OpCount, OutboxEntry,
-    PartRecord, ReplicationStatus, RequestMetricsSeries, ShareRow, StatusCount, StoreCounts,
-    TagSummary, TaggedObject, TimePoint, User, UserSessionCredentials, UserSigV4Credentials,
-    UserWithBearerHash, WebhookEntry, latency_quantile_ms,
+    PartRecord, ReplicationStatus, RequestMetricsSeries, SessionCredentialSummary, ShareRow,
+    StatusCount, StoreCounts, TagSummary, TaggedObject, TimePoint, User, UserSessionCredentials,
+    UserSigV4Credentials, UserWithBearerHash, WebhookEntry, latency_quantile_ms,
 };
 use cairn_types::object::ObjectVersionRow;
 use cairn_types::time::Timestamp;
@@ -1198,6 +1198,35 @@ impl MetadataStore for SqliteMetadataStore {
             )
             .optional()
             .map_err(engine_err)
+        })
+        .await
+    }
+
+    async fn list_session_credentials(
+        &self,
+        now: Timestamp,
+    ) -> Result<Vec<SessionCredentialSummary>, MetaError> {
+        self.with_read(move |conn| {
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT access_key_id, parent_user_id, inline_policy, created_at, expires_at \
+                     FROM session_credentials WHERE expires_at > ?1 ORDER BY created_at DESC",
+                )
+                .map_err(engine_err)?;
+            let rows = stmt
+                .query_map(params![now.0], |r| {
+                    Ok(SessionCredentialSummary {
+                        access_key_id: r.get::<_, String>(0)?,
+                        parent_user_id: UserId(r.get::<_, String>(1)?),
+                        has_inline_policy: r.get::<_, Option<String>>(2)?.is_some(),
+                        created_at: Timestamp(r.get::<_, i64>(3)?),
+                        expires_at: Timestamp(r.get::<_, i64>(4)?),
+                    })
+                })
+                .map_err(engine_err)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(engine_err)?;
+            Ok(rows)
         })
         .await
     }

@@ -234,6 +234,12 @@ pub enum Mutation {
         /// The expiry cutoff (epoch ms): rows with `expires_at < before` are removed.
         before: Timestamp,
     },
+    /// Revoke a single session credential early by its access-key id (idempotent: a no-op if the
+    /// row is already gone). Deleting the row makes the next request authenticate as unknown.
+    DeleteSessionCredential {
+        /// The temporary access-key id to revoke.
+        access_key_id: String,
+    },
     /// Atomically claim a batch of due replication-outbox entries, routed through the writer so
     /// the select-and-mark is one transaction (no two workers claim the same entry). Marks each
     /// claimed entry `status='claimed'` with `lease_until = now + lease_secs`, and returns them.
@@ -773,6 +779,23 @@ pub struct UserSessionCredentials {
     /// The optional inline policy JSON scoping the session (the effective identity policy).
     pub inline_policy: Option<String>,
     /// When the credential expires (epoch ms).
+    pub expires_at: Timestamp,
+}
+
+/// A non-secret summary of an active session credential, safe to surface in the console's
+/// "active sessions" list. Carries no secret/nonce/token material — only the public identifier and
+/// timing, plus whether an inline policy scopes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionCredentialSummary {
+    /// The temporary access-key id (the public identifier).
+    pub access_key_id: String,
+    /// The parent user this session derives from.
+    pub parent_user_id: UserId,
+    /// Whether an inline policy scopes this session below the parent.
+    pub has_inline_policy: bool,
+    /// When the credential was minted (epoch ms).
+    pub created_at: Timestamp,
+    /// When it expires (epoch ms).
     pub expires_at: Timestamp,
 }
 

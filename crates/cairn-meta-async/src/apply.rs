@@ -538,6 +538,15 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
                 .await?;
             Ok(MutationOutcome::Ack)
         }
+        Mutation::DeleteSessionCredential { access_key_id } => {
+            driver
+                .execute(
+                    "DELETE FROM session_credentials WHERE access_key_id = ?1",
+                    vec![Value::Text(access_key_id.clone())],
+                )
+                .await?;
+            Ok(MutationOutcome::Ack)
+        }
         Mutation::ClaimReplicationBatch {
             limit,
             now,

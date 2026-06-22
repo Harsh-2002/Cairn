@@ -1123,8 +1123,7 @@ async fn request_metrics_upsert_query_prune_parity() {
         assert_eq!(series.top_buckets_by_bytes.len(), 2);
         assert_eq!(series.top_buckets_by_bytes[0].bucket, "beta");
         assert_ne!(
-            series.top_buckets[0].bucket,
-            series.top_buckets_by_bytes[0].bucket,
+            series.top_buckets[0].bucket, series.top_buckets_by_bytes[0].bucket,
             "by-count and by-bytes rankings diverge for this data"
         );
         // status breakdown: one 4xx error out of 11.
@@ -1521,6 +1520,26 @@ async fn session_credentials_parity() {
         assert_eq!(c.expires_at, Timestamp::from_secs(2_000_000_000));
         assert!(c.inline_policy.is_some());
 
+        // list_session_credentials returns the active session as a NON-secret summary, and excludes
+        // sessions already expired as of the `now` cutoff.
+        let active = s
+            .list_session_credentials(Timestamp::from_secs(1_500_000_000))
+            .await
+            .unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].access_key_id, "CAIRNTMP1");
+        assert_eq!(active[0].parent_user_id.0, "parent");
+        assert!(active[0].has_inline_policy);
+        assert_eq!(active[0].created_at, Timestamp::from_secs(1_000));
+        assert_eq!(active[0].expires_at, Timestamp::from_secs(2_000_000_000));
+        assert!(
+            s.list_session_credentials(Timestamp::from_secs(2_000_000_001))
+                .await
+                .unwrap()
+                .is_empty(),
+            "expired sessions are excluded from the active list"
+        );
+
         // The expiry sweep removes credentials that expired before the cutoff, keeps the rest.
         s.submit(Mutation::DeleteExpiredSessionCredentials {
             before: Timestamp::from_secs(1_999_999_999),
@@ -1539,6 +1558,46 @@ async fn session_credentials_parity() {
         assert!(
             s.user_by_session_key("CAIRNTMP1").await.unwrap().is_none(),
             "past expiry → swept"
+        );
+
+        // Explicit early revoke: mint, see it listed, delete it by access-key id, confirm it's gone
+        // from both the active list and the auth lookup (so the next request is denied).
+        s.submit(Mutation::CreateSessionCredential(Box::new(
+            cairn_types::SessionCredentialRecord {
+                access_key_id: "CAIRNTMP3".into(),
+                parent_user_id: cairn_types::UserId("parent".into()),
+                secret_ciphertext: vec![9],
+                secret_nonce: None,
+                session_token_hash: "h3".into(),
+                inline_policy: None,
+                expires_at: Timestamp::from_secs(2_000_000_000),
+                created_at: Timestamp::from_secs(2_000),
+            },
+        )))
+        .await
+        .unwrap();
+        assert_eq!(
+            s.list_session_credentials(Timestamp::from_secs(1_500_000_000))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        s.submit(Mutation::DeleteSessionCredential {
+            access_key_id: "CAIRNTMP3".into(),
+        })
+        .await
+        .unwrap();
+        assert!(
+            s.list_session_credentials(Timestamp::from_secs(1_500_000_000))
+                .await
+                .unwrap()
+                .is_empty(),
+            "revoked session is no longer listed"
+        );
+        assert!(
+            s.user_by_session_key("CAIRNTMP3").await.unwrap().is_none(),
+            "revoked session is denied at auth"
         );
     }
 }

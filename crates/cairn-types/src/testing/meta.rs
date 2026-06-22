@@ -11,9 +11,10 @@ use crate::meta::{
     ActivityEntry, BucketCounts, BucketRequestCount, ClaimOutcome, IfNoneMatch, LATENCY_BUCKETS,
     ListPage, ListQuery, MetricsRange, MultipartSession, MultipartStatus, Mutation,
     MutationOutcome, ObjectSummary, OpCount, OutboxEntry, PartRecord, Precondition,
-    ReplicationStatus, RequestMetricsSeries, SessionCredentialRecord, ShareRow, StatusCount,
-    StoreCounts, TagSummary, TaggedObject, TimePoint, User, UserRecord, UserSessionCredentials,
-    UserSigV4Credentials, UserWithBearerHash, WebhookEntry, WebhookStatus, latency_quantile_ms,
+    ReplicationStatus, RequestMetricsSeries, SessionCredentialRecord, SessionCredentialSummary,
+    ShareRow, StatusCount, StoreCounts, TagSummary, TaggedObject, TimePoint, User, UserRecord,
+    UserSessionCredentials, UserSigV4Credentials, UserWithBearerHash, WebhookEntry, WebhookStatus,
+    latency_quantile_ms,
 };
 use crate::object::{ETag, ObjectVersionRow};
 use crate::time::Timestamp;
@@ -608,6 +609,10 @@ impl MetadataStore for InMemoryMetadataStore {
             }
             Mutation::DeleteExpiredSessionCredentials { before } => {
                 st.session_creds.retain(|_, r| r.expires_at >= before);
+                Ok(MutationOutcome::Ack)
+            }
+            Mutation::DeleteSessionCredential { access_key_id } => {
+                st.session_creds.remove(&access_key_id);
                 Ok(MutationOutcome::Ack)
             }
             Mutation::ClaimReplicationBatch {
@@ -1283,6 +1288,28 @@ impl MetadataStore for InMemoryMetadataStore {
             inline_policy: rec.inline_policy.clone(),
             expires_at: rec.expires_at,
         }))
+    }
+
+    async fn list_session_credentials(
+        &self,
+        now: Timestamp,
+    ) -> Result<Vec<SessionCredentialSummary>, MetaError> {
+        let st = self.state.lock().unwrap();
+        let mut out: Vec<SessionCredentialSummary> = st
+            .session_creds
+            .values()
+            .filter(|r| r.expires_at > now)
+            .map(|r| SessionCredentialSummary {
+                access_key_id: r.access_key_id.clone(),
+                parent_user_id: r.parent_user_id.clone(),
+                has_inline_policy: r.inline_policy.is_some(),
+                created_at: r.created_at,
+                expires_at: r.expires_at,
+            })
+            .collect();
+        // Newest first, mirroring the SQL stores.
+        out.sort_by_key(|s| std::cmp::Reverse(s.created_at.0));
+        Ok(out)
     }
 
     async fn count_users(&self) -> Result<u64, MetaError> {

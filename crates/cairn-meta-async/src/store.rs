@@ -17,9 +17,9 @@ use cairn_types::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, Vers
 use cairn_types::meta::{
     ActivityEntry, BucketCounts, BucketRequestCount, LATENCY_BUCKETS, ListPage, ListQuery,
     MetricsRange, MultipartSession, Mutation, MutationOutcome, ObjectSummary, OpCount, OutboxEntry,
-    PartRecord, ReplicationStatus, RequestMetricsSeries, ShareRow, StatusCount, StoreCounts,
-    TagSummary, TaggedObject, TimePoint, User, UserSessionCredentials, UserSigV4Credentials,
-    UserWithBearerHash, WebhookEntry, latency_quantile_ms,
+    PartRecord, ReplicationStatus, RequestMetricsSeries, SessionCredentialSummary, ShareRow,
+    StatusCount, StoreCounts, TagSummary, TaggedObject, TimePoint, User, UserSessionCredentials,
+    UserSigV4Credentials, UserWithBearerHash, WebhookEntry, latency_quantile_ms,
 };
 use cairn_types::object::ObjectVersionRow;
 use cairn_types::time::Timestamp;
@@ -825,6 +825,31 @@ impl MetadataStore for AsyncMetadataStore {
             // A session whose parent row is gone (LEFT JOIN NULL) is treated as inactive.
             parent_is_active: r.get_opt_i64(7).unwrap_or(0) != 0,
         }))
+    }
+
+    async fn list_session_credentials(
+        &self,
+        now: Timestamp,
+    ) -> Result<Vec<SessionCredentialSummary>, MetaError> {
+        let rows = self
+            .reader()
+            .await
+            .query(
+                "SELECT access_key_id, parent_user_id, inline_policy, created_at, expires_at \
+                 FROM session_credentials WHERE expires_at > ?1 ORDER BY created_at DESC",
+                vec![Value::Int(now.0)],
+            )
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|r| SessionCredentialSummary {
+                access_key_id: r.get_text(0),
+                parent_user_id: cairn_types::id::UserId(r.get_text(1)),
+                has_inline_policy: r.get_opt_text(2).is_some(),
+                created_at: Timestamp(r.get_i64(3)),
+                expires_at: Timestamp(r.get_i64(4)),
+            })
+            .collect())
     }
 
     async fn count_users(&self) -> Result<u64, MetaError> {

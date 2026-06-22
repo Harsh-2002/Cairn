@@ -32,8 +32,9 @@ use cairn_types::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, Vers
 use cairn_types::meta::{
     ActivityEntry, BucketCounts, ListPage, ListQuery, MetricsRange, MultipartSession, Mutation,
     MutationOutcome, ObjectSummary, OutboxEntry, PartRecord, ReplicationStatus,
-    RequestMetricsSeries, ShareRow, StoreCounts, TagSummary, TaggedObject, User,
-    UserSessionCredentials, UserSigV4Credentials, UserWithBearerHash, WebhookEntry,
+    RequestMetricsSeries, SessionCredentialSummary, ShareRow, StoreCounts, TagSummary,
+    TaggedObject, User, UserSessionCredentials, UserSigV4Credentials, UserWithBearerHash,
+    WebhookEntry,
 };
 use cairn_types::object::ObjectVersionRow;
 use cairn_types::time::Timestamp;
@@ -232,6 +233,7 @@ impl MetadataStore for ShardedMetadataStore {
             | Mutation::DeactivateUser(_)
             | Mutation::CreateSessionCredential(_)
             | Mutation::DeleteExpiredSessionCredentials { .. }
+            | Mutation::DeleteSessionCredential { .. }
             | Mutation::RecordActivity(_)
             | Mutation::RecordRequestMetrics { .. }
             | Mutation::CreateShare(_)
@@ -518,6 +520,13 @@ impl MetadataStore for ShardedMetadataStore {
         access_key_id: &str,
     ) -> Result<Option<UserSessionCredentials>, MetaError> {
         self.global().user_by_session_key(access_key_id).await
+    }
+
+    async fn list_session_credentials(
+        &self,
+        now: Timestamp,
+    ) -> Result<Vec<SessionCredentialSummary>, MetaError> {
+        self.global().list_session_credentials(now).await
     }
 
     async fn count_users(&self) -> Result<u64, MetaError> {

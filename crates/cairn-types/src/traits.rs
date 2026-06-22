@@ -21,8 +21,9 @@ use crate::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, VersionId}
 use crate::meta::{
     ActivityEntry, BucketCounts, ListPage, ListQuery, MetricsRange, MultipartSession, Mutation,
     MutationOutcome, ObjectSummary, OutboxEntry, PartRecord, ReplicationStatus,
-    RequestMetricsSeries, ShareRow, StoreCounts, TagSummary, TaggedObject, User,
-    UserSessionCredentials, UserSigV4Credentials, UserWithBearerHash, WebhookEntry,
+    RequestMetricsSeries, SessionCredentialSummary, ShareRow, StoreCounts, TagSummary,
+    TaggedObject, User, UserSessionCredentials, UserSigV4Credentials, UserWithBearerHash,
+    WebhookEntry,
 };
 use crate::object::{CompressionDescriptor, ObjectVersionRow};
 use crate::replication::ReplicatedObject;
@@ -305,6 +306,12 @@ pub trait MetadataStore: Send + Sync {
         &self,
         access_key_id: &str,
     ) -> Result<Option<UserSessionCredentials>, MetaError>;
+    /// List active (not-yet-expired as of `now`) session credentials, newest first, as non-secret
+    /// summaries — for the console's "active sessions" view. Carries no secret/token material.
+    async fn list_session_credentials(
+        &self,
+        now: Timestamp,
+    ) -> Result<Vec<SessionCredentialSummary>, MetaError>;
     /// Count users (for bootstrap gating).
     async fn count_users(&self) -> Result<u64, MetaError>;
     /// List all users.

@@ -429,6 +429,28 @@ pub struct MintSessionResp {
     pub expiration_epoch_secs: i64,
 }
 
+/// `GET /credentials/temporary` response: the active (non-expired) session credentials.
+#[derive(Debug, Serialize)]
+pub struct ListSessionsResp {
+    /// Active session credentials, newest first. No secret/token material.
+    pub sessions: Vec<SessionView>,
+}
+
+/// One active session credential in the list (public summary; never any secret).
+#[derive(Debug, Serialize)]
+pub struct SessionView {
+    /// The temporary access-key id (the public identifier; also the revoke key).
+    pub access_key_id: String,
+    /// The parent user id this session derives from.
+    pub parent_user_id: String,
+    /// Whether an inline policy scopes this session below the parent.
+    pub scoped: bool,
+    /// When it was minted, epoch milliseconds.
+    pub created_at_ms: i64,
+    /// When it expires, epoch milliseconds.
+    pub expires_at_ms: i64,
+}
+
 /// `POST /users` request body.
 #[derive(Debug, Deserialize)]
 pub struct CreateUserReq {

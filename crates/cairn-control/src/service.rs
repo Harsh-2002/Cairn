@@ -319,6 +319,10 @@ impl ControlService {
             (&Method::POST, ["credentials", "temporary"]) => {
                 self.mint_session_credential(&body, principal).await
             }
+            (&Method::GET, ["credentials", "temporary"]) => self.list_session_credentials().await,
+            (&Method::DELETE, ["credentials", "temporary", id]) => {
+                self.revoke_session_credential(id, principal).await
+            }
             (&Method::GET, ["users"]) => self.list_users().await,
             (&Method::POST, ["users"]) => self.create_user(&body, principal).await,
             (&Method::GET, ["users", id]) => self.user_detail(id).await,
@@ -1575,6 +1579,50 @@ impl ControlService {
                 expiration_epoch_secs: expires_at.as_secs(),
             },
         )
+    }
+
+    /// `GET /credentials/temporary`: the active (non-expired) session credentials as a public
+    /// summary (no secret/token material) for the console's "active sessions" view.
+    async fn list_session_credentials(&self) -> ControlResponse {
+        match self.meta.list_session_credentials(self.clock.now()).await {
+            Ok(rows) => ControlResponse::json(
+                StatusCode::OK,
+                &wire::ListSessionsResp {
+                    sessions: rows
+                        .into_iter()
+                        .map(|s| wire::SessionView {
+                            access_key_id: s.access_key_id,
+                            parent_user_id: s.parent_user_id.0,
+                            scoped: s.has_inline_policy,
+                            created_at_ms: s.created_at.0,
+                            expires_at_ms: s.expires_at.0,
+                        })
+                        .collect(),
+                },
+            ),
+            Err(e) => ControlResponse::error_internal(&e.to_string()),
+        }
+    }
+
+    /// `DELETE /credentials/temporary/{id}`: revoke a session credential early by its access-key id.
+    /// Idempotent — revoking an unknown or already-expired id still returns 204.
+    async fn revoke_session_credential(
+        &self,
+        access_key_id: &str,
+        principal: Option<&Principal>,
+    ) -> ControlResponse {
+        if let Err(e) = self
+            .meta
+            .submit(Mutation::DeleteSessionCredential {
+                access_key_id: access_key_id.to_owned(),
+            })
+            .await
+        {
+            return ControlResponse::error_internal(&e.to_string());
+        }
+        self.record_activity("RevokeSessionCredential", None, None, principal)
+            .await;
+        ControlResponse::no_content()
     }
 
     async fn create_user(&self, body: &Bytes, principal: Option<&Principal>) -> ControlResponse {
