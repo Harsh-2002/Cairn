@@ -181,6 +181,11 @@ export const api = {
     request<OverviewBucketsResp>("GET", "/overview/buckets"),
   system: () => request<SystemResp>("GET", "/system"),
 
+  // Mint a short-lived, single-use ticket for the SSE live-update stream. EventSource cannot send
+  // an Authorization header, so the browser POSTs here with its Bearer token, then opens the stream
+  // with `?ticket=`. See lib/live.ts.
+  eventsTicket: () => request<{ ticket: string }>("POST", "/events/ticket"),
+
   listBuckets: () => request<BucketListResp>("GET", "/buckets"),
   createBucket: (name: string, object_lock = false) =>
     request<{ name: string }>("POST", "/buckets", { name, object_lock }),

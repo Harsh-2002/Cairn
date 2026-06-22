@@ -10,6 +10,7 @@ import { api } from "@/lib/api";
 import * as s3 from "@/lib/s3";
 import { whenMs } from "@/lib/format";
 import { useResource } from "@/lib/use-resource";
+import { useLiveTopic } from "@/lib/live";
 import type { FailedReplicationEntry, ReplicationTarget } from "@/lib/types";
 import { DataTable, SkeletonRows, type Column } from "@/components/data-table";
 import { EmptyState } from "@/components/empty-state";
@@ -102,6 +103,8 @@ export function Replication() {
 
   const rules = useMemo(() => res.data?.rules ?? [], [res.data]);
   const failed = useMemo(() => res.data?.failed ?? [], [res.data]);
+  // Live: the server pushes a "replication" summary snapshot; re-fetch the page on each.
+  useLiveTopic("replication", res.refresh);
 
   return (
     <Page>

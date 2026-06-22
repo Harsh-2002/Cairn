@@ -30,6 +30,7 @@ import type {
   RequestMetricsResp,
 } from "@/lib/types";
 import { useResource } from "@/lib/use-resource";
+import { useLiveTopic } from "@/lib/live";
 import { EmptyState } from "@/components/empty-state";
 import { ErrorAlert } from "@/components/error-alert";
 import { Page, PageHeader } from "@/components/page-header";
@@ -145,6 +146,11 @@ export function Metrics() {
   // dashboard stays mounted and never tears down to a skeleton — only the first mount does.
   const metrics = useResource(() => api.metrics(range), []);
   const overview = useResource(() => api.overview(), []);
+  // Live: refresh both resources when the server pushes a "metrics" snapshot.
+  useLiveTopic("metrics", () => {
+    metrics.refresh();
+    overview.refresh();
+  });
 
   const { data, error, loading, refreshing } = metrics;
 

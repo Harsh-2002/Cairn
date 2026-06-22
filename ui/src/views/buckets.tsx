@@ -36,6 +36,7 @@ import { TypedConfirmDialog } from "@/components/typed-confirm-dialog";
 import { api, ApiError, errorMessage } from "@/lib/api";
 import { bytes, count, whenMs } from "@/lib/format";
 import { useResource } from "@/lib/use-resource";
+import { useLiveTopic } from "@/lib/live";
 
 const NAME_RULE =
   "3–63 characters: lowercase letters, digits, hyphens, and dots; must start and end with a letter or digit.";
@@ -82,6 +83,8 @@ export function Buckets() {
     };
   }, []);
   const buckets = list.data?.buckets ?? [];
+  // Live: the server pushes a "buckets" usage snapshot on a cadence; refresh through the list fetch.
+  useLiveTopic("buckets", list.refresh);
 
   // ---- bulk selection ------------------------------------------------------
   const sel = useBulkSelection();

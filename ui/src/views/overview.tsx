@@ -10,6 +10,7 @@ import { actionLabel, isDestructiveAction } from "@/lib/activity";
 import { bytes, count, duration, ratio, relTime, whenMs } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import { useResource } from "@/lib/use-resource";
+import { useLiveTopic } from "@/lib/live";
 import { EmptyState } from "@/components/empty-state";
 import { ErrorAlert } from "@/components/error-alert";
 import { Page, PageHeader } from "@/components/page-header";
@@ -48,6 +49,8 @@ export function Overview() {
       })),
     [],
   );
+  // Live: the server pushes an "overview" snapshot on a cadence; flow it through the normal fetch.
+  useLiveTopic("overview", refresh);
 
   const buckets = useMemo(
     () =>

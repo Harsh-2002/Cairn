@@ -8,6 +8,7 @@ import { api } from "@/lib/api";
 import { actionLabel, isDestructiveAction } from "@/lib/activity";
 import { relTime, whenMs } from "@/lib/format";
 import { useResource } from "@/lib/use-resource";
+import { useLiveTopic } from "@/lib/live";
 import { cn } from "@/lib/utils";
 import { DataTable, SkeletonRows, type Column } from "@/components/data-table";
 import { EmptyState } from "@/components/empty-state";
@@ -42,6 +43,8 @@ const COLUMNS: Column[] = [
 
 export function Activity() {
   const res = useResource(() => api.activity(LIMIT), []);
+  // Live: new audit entries stream in — re-fetch when the server pushes an "activity" snapshot.
+  useLiveTopic("activity", res.refresh);
   const entries = useMemo(() => res.data?.entries ?? [], [res.data]);
 
   // Filters live in the URL so a filtered view is linkable and survives a refresh.
