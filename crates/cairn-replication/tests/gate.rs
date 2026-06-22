@@ -697,7 +697,9 @@ async fn redelivering_completed_version_is_idempotent() {
     .await
     .unwrap();
 
-    // The duplicate is drained without a second Put: idempotent / harmless.
+    // The duplicate re-ships (at-least-once): per-target idempotency is the durable claim's job, not
+    // a version-level skip, so under fan-out a second target is never starved. A re-ship to the same
+    // target is harmless — the destination overwrites identical bytes (ARCH 20.4).
     let report = engine()
         .run_once(&meta, &router, &blobs, &clock)
         .await
@@ -706,8 +708,58 @@ async fn redelivering_completed_version_is_idempotent() {
     assert_eq!(report.completed, 1);
     assert_eq!(
         router.0.intents().len(),
-        1,
-        "completed version is not shipped twice"
+        2,
+        "a re-enqueued duplicate re-ships idempotently (overwrites identical bytes)"
+    );
+}
+
+#[tokio::test]
+async fn fan_out_ships_every_target_for_one_version() {
+    // Regression for the 1→N fan-out bug: a single object version with one outbox entry per distinct
+    // target must ship to ALL of them. The first target to complete stamps the version `Completed`;
+    // a version-level skip (the old behaviour) would wrongly starve the rest.
+    let meta = InMemoryMetadataStore::new();
+    let blobs = Arc::new(InMemoryBlobStore::new());
+    let sink = FakeReplicationSink::new();
+    // SingleSink returns the one fake sink for any ARN, so two distinct-ARN entries both land on it.
+    let router = SingleSink(sink);
+    let clock = TestClock::at_secs(8_000);
+    let now = clock.now();
+
+    // One version; its put_with_outbox entry plus a second entry to a distinct target.
+    let version = put_with_outbox(&meta, &blobs, "ef", "obj/fan", b"data", now, now).await;
+    let to_y = outbox_entry_for(
+        "fan-y",
+        bucket(),
+        ObjectKey::parse("obj/fan").unwrap(),
+        version.clone(),
+        ReplicationOp::ObjectCreate,
+        "rule-y",
+        Some("arn:Y".to_owned()),
+        now,
+        0,
+    );
+    let existing = meta
+        .get_version(&bucket(), &ObjectKey::parse("obj/fan").unwrap(), &version)
+        .await
+        .unwrap()
+        .unwrap();
+    meta.submit(Mutation::PutObjectVersion {
+        row: Box::new(existing),
+        precondition: Precondition::default(),
+        replication: vec![to_y],
+    })
+    .await
+    .unwrap();
+
+    engine()
+        .run_until_idle(&meta, &router, &blobs, &clock, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        router.0.intents().len(),
+        2,
+        "both targets of a fanned-out version receive the object"
     );
 }
 

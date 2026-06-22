@@ -285,16 +285,18 @@ impl ReplicationEngine {
             return Ok(EntryOutcome::Failed);
         };
 
-        // Loop prevention and idempotency drains: never re-replicate a replica, and treat an
-        // already-completed version as a harmless duplicate — drain the entry without
-        // re-contacting the sink.
-        match row.replication_status {
-            Some(ReplicationStatus::Replica) | Some(ReplicationStatus::Completed) => {
-                meta.submit(Mutation::MarkReplicationDone(entry.id.clone()))
-                    .await?;
-                return Ok(EntryOutcome::Completed { bytes: 0 });
-            }
-            _ => {}
+        // Loop prevention: never re-replicate an object that arrived here *via* replication — drain
+        // the entry without contacting the sink (ARCH 20.4). We deliberately do NOT skip on a
+        // version-level `Completed` status: under 1→N fan-out a version carries one entry per target,
+        // and the first target to complete stamps the version `Completed` — skipping on that would
+        // starve every other target. Per-target idempotency is instead the durable claim's job (a
+        // `completed` entry is never re-claimed); a genuinely re-enqueued duplicate to the same
+        // target re-ships, which is harmless because the destination overwrites identical bytes
+        // (at-least-once, ARCH 20.4).
+        if row.replication_status == Some(ReplicationStatus::Replica) {
+            meta.submit(Mutation::MarkReplicationDone(entry.id.clone()))
+                .await?;
+            return Ok(EntryOutcome::Completed { bytes: 0 });
         }
 
         // Per-key ordering across drain batches (audit #9). Within one batch the engine sorts a
