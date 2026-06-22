@@ -179,6 +179,18 @@ export interface MintSessionResp {
   expiration_epoch_secs: number;
 }
 
+export interface SessionView {
+  access_key_id: string;
+  parent_user_id: string;
+  scoped: boolean;
+  created_at_ms: number;
+  expires_at_ms: number;
+}
+
+export interface ListSessionsResp {
+  sessions: SessionView[];
+}
+
 export interface UserSummary {
   id: string;
   display_name: string;

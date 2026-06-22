@@ -17,6 +17,7 @@ import type {
   DeletePrefixResp,
   FailedReplicationResp,
   ListObjectsResp,
+  ListSessionsResp,
   MintSessionReq,
   MintSessionResp,
   NotificationConfigInput,
@@ -276,6 +277,10 @@ export const api = {
   // --- STS temporary session credentials (the secret + token are shown exactly once) ---
   mintSessionCredential: (req: MintSessionReq) =>
     request<MintSessionResp>("POST", "/credentials/temporary", req),
+  listSessions: () =>
+    request<ListSessionsResp>("GET", "/credentials/temporary"),
+  revokeSession: (accessKeyId: string) =>
+    request<null>("DELETE", `/credentials/temporary/${enc(accessKeyId)}`),
 
   listUsers: () => request<UserListResp>("GET", "/users"),
   // Created users are S3-API-only: the response carries their S3 (SigV4) access key + secret,

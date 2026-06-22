@@ -22,12 +22,16 @@ export function CredentialsPanel({
   fields,
   explainer,
   doneLabel = "Done — I saved them",
+  headingLevel: Heading = "h3",
   onDone,
 }: {
   title?: string;
   fields: CredentialField[];
   explainer?: ReactNode;
   doneLabel?: string;
+  /** Heading level for the panel title, so the page outline stays correct (default h3 — it sits
+   *  under a dialog/card h2; pass h2 when the panel is a top-level section under the page h1). */
+  headingLevel?: "h2" | "h3";
   onDone: () => void;
 }) {
   const headingRef = useRef<HTMLHeadingElement>(null);
@@ -41,13 +45,13 @@ export function CredentialsPanel({
   return (
     <section aria-label={title} className="space-y-4">
       <div>
-        <h3
+        <Heading
           ref={headingRef}
           tabIndex={-1}
           className="text-base font-semibold tracking-tight outline-none"
         >
           {title}
-        </h3>
+        </Heading>
       </div>
 
       <Alert role="alert">

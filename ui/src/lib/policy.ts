@@ -233,6 +233,23 @@ export function policyToPreset(doc: PolicyDoc | null | undefined): RecoveredPres
   return fail;
 }
 
+// A one-line human summary of a policy for a confirm/echo, e.g. "Read-only · all buckets" or
+// "Read & write · 3 buckets". Falls back to "Custom policy" for a recognized-but-not-preset doc.
+export function summarizePolicy(doc: PolicyDoc | null | undefined): string {
+  const preset = policyToPreset(doc);
+  if (!preset.recognized) return doc ? "Custom policy" : "No access";
+  const level = LEVELS.find((l) => l.id === preset.level)?.label ?? "Access";
+  const scope =
+    preset.scope === "all"
+      ? "all buckets"
+      : preset.buckets.length === 0
+        ? "no buckets selected"
+        : preset.buckets.length === 1
+          ? "1 bucket"
+          : `${preset.buckets.length} buckets`;
+  return `${level} · ${scope}`;
+}
+
 export type ValidateResult =
   | { ok: true; doc: PolicyDoc }
   | { ok: false; error: string };
