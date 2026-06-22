@@ -64,6 +64,9 @@ pub struct AppStack {
     /// The master-key crypto facility, threaded to the replication drain so it can unseal stored
     /// per-bucket remote replication targets (`ConfigAspect::ReplicationTargets`, ARCH 20.5).
     pub crypto: Arc<SystemCrypto>,
+    /// Pulsed by the S3 write path after a write commits replication outbox entries, so the
+    /// replication worker drains immediately (event-driven) instead of waiting its poll heartbeat.
+    pub replication_notify: Arc<tokio::sync::Notify>,
     /// The base domain for virtual-host-style S3 addressing (`CAIRN_S3_DOMAIN`, ARCH 13.1), e.g.
     /// `s3.example.com`. When set, a request whose `Host` is `<bucket>.<s3_domain>` routes to that
     /// bucket with the whole path as the key; `None` leaves path-style addressing as the only form.
@@ -467,6 +470,7 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
         cfg.dev_auth,
     ));
     let authz: Arc<dyn AuthorizationEngine> = Arc::new(cairn_authz::PolicyEngine);
+    let replication_notify = Arc::new(tokio::sync::Notify::new());
     let s3 = S3Service::new(
         meta.clone(),
         blob.clone(),
@@ -475,7 +479,11 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
         crypto.clone(),
         cfg.region.clone(),
         cfg.max_object_size,
-    );
+    )
+    .with_replication_wake({
+        let n = replication_notify.clone();
+        Arc::new(move || n.notify_one())
+    });
     let control = cairn_control::ControlService::new(
         meta.clone(),
         blob.clone(),
@@ -536,6 +544,7 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
         meta,
         meta_cache,
         crypto: system_crypto,
+        replication_notify,
         blob,
         oracle,
         store,

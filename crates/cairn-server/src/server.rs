@@ -97,12 +97,15 @@ pub async fn serve(
     // Migrations and startup reconciliation already ran while building the stack; ready now.
     state.ready.store(true, Ordering::SeqCst);
 
-    // Background subsystems: multipart sweeper, lifecycle scanner, WAL checkpointer, metrics.
-    crate::background::spawn(state.stack.clone(), &config);
-    tracing::info!(s3_api = %local, web_ui = ?ui_local, tls = tls_rx.is_some(), "cairn listening");
-
+    // The graceful-shutdown signal, created before the background pool so the replication workers
+    // can watch it and stop claiming when shutdown begins.
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     tokio::spawn(wait_for_signal(shutdown_tx));
+
+    // Background subsystems: multipart sweeper, lifecycle scanner, WAL checkpointer, metrics, and
+    // the replication worker pool (which takes the shutdown receiver).
+    crate::background::spawn(state.stack.clone(), &config, shutdown_rx.clone());
+    tracing::info!(s3_api = %local, web_ui = ?ui_local, tls = tls_rx.is_some(), "cairn listening");
 
     // Run the S3-API accept loop and (optionally) the web-UI accept loop concurrently. The UI loop
     // sets `serve_ui = true`, which makes its connections serve the console at the root path.

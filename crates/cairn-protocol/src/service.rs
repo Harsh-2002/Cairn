@@ -46,6 +46,12 @@ pub struct S3Service {
     crypto: Arc<dyn Crypto>,
     region: String,
     max_object_size: u64,
+    /// Invoked after a write commits replication outbox entries, so the replication worker drains
+    /// within milliseconds instead of waiting out its poll interval. A runtime-agnostic wake
+    /// callback (the server wires it to its drain notifier), keeping this crate free of any async
+    /// runtime dependency. Best-effort and optional: when unset (e.g. in unit tests) the worker
+    /// still drains on its heartbeat. See [`with_replication_wake`](Self::with_replication_wake).
+    replication_wake: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl std::fmt::Debug for S3Service {
@@ -75,6 +81,24 @@ impl S3Service {
             crypto,
             region,
             max_object_size,
+            replication_wake: None,
+        }
+    }
+
+    /// Attach a replication-drain wake callback: after a write commits replication outbox entries
+    /// the service invokes it so the worker drains promptly (event-driven) rather than waiting for
+    /// its poll heartbeat. Best-effort — a missed wake is covered by the heartbeat.
+    #[must_use]
+    pub fn with_replication_wake(mut self, wake: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.replication_wake = Some(wake);
+        self
+    }
+
+    /// Wake the replication worker (no-op when no callback is attached). Called after a write that
+    /// enqueued at least one replication outbox entry.
+    fn pulse_replication(&self) {
+        if let Some(w) = &self.replication_wake {
+            w();
         }
     }
 
@@ -687,6 +711,7 @@ impl S3Service {
             )
             .await
         };
+        let enqueued_repl = !replication.is_empty();
         match self
             .meta
             .submit(Mutation::PutObjectVersion {
@@ -700,6 +725,10 @@ impl S3Service {
                 superseded,
                 version_id,
             }) => {
+                // Event-driven drain: wake the replication worker now rather than next heartbeat.
+                if enqueued_repl {
+                    self.pulse_replication();
+                }
                 if let Some(old) = superseded {
                     let _ = self.blob.delete(&old).await;
                 }
@@ -925,6 +954,7 @@ impl S3Service {
                     )
                     .await
                 };
+                let enqueued_repl = !replication.is_empty();
                 self.meta
                     .submit(Mutation::CreateDeleteMarker {
                         bucket: bucket.name.clone(),
@@ -935,6 +965,9 @@ impl S3Service {
                         replication,
                     })
                     .await?;
+                if enqueued_repl {
+                    self.pulse_replication();
+                }
                 self.emit_events(
                     &bucket.name,
                     &event_key,

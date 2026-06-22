@@ -19,8 +19,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Spawn the background tasks, reading their intervals and the multipart lifetime from the
-/// configured 28.2 knobs.
-pub fn spawn(stack: Arc<AppStack>, cfg: &Config) {
+/// configured 28.2 knobs. `shutdown` is the server's graceful-shutdown signal; the replication
+/// worker pool watches it so it stops claiming new work when shutdown begins (an in-flight drain
+/// pass finishes first; an aborted claim is recovered by the outbox lease).
+pub fn spawn(stack: Arc<AppStack>, cfg: &Config, shutdown: tokio::sync::watch::Receiver<bool>) {
     let sweep_interval = Duration::from_secs(cfg.multipart_sweep_interval_secs);
     #[allow(clippy::cast_possible_wrap)]
     let multipart_lifetime_secs = cfg.multipart_upload_lifetime_secs as i64;
@@ -73,46 +75,77 @@ pub fn spawn(stack: Arc<AppStack>, cfg: &Config) {
         );
     }
 
-    // Replication worker. Two shapes, chosen by configuration:
+    // Replication worker POOL. Three shapes, chosen by configuration:
     //
-    //  * MULTI-TARGET — `CAIRN_REPLICATION_TARGETS` names a set of destinations, each with its own
-    //    endpoint, credentials, and TLS trust. Each source bucket is routed to the target whose
-    //    `dest_bucket` (or `name`) matches the bucket's replication rule, and shipped through that
-    //    target's own sink. The single-target `CAIRN_REPLICATION_*` keys, if present, build a
-    //    default sink used for any source bucket that matches no named target.
+    //  * MULTI-TARGET — `CAIRN_REPLICATION_TARGETS` names a set of destinations, each shipped
+    //    through its own sink; the single-target `CAIRN_REPLICATION_*` keys, if present, build a
+    //    default sink for any source bucket matching no named target.
+    //  * SINGLE-TARGET — the original node->node path: one endpoint + credentials, per-source
+    //    destination bucket resolved each drain from each bucket's rule.
+    //  * PER-BUCKET STORED TARGETS (default) — no env sink; destinations come from each bucket's
+    //    sealed `ConfigAspect::ReplicationTargets`, discovered fresh each drain.
     //
-    //  * SINGLE-TARGET (default) — the original node->node path: one endpoint + credentials, with
-    //    the per-source destination *bucket* resolved each drain from each bucket's replication
-    //    rule. Unchanged.
-    //
-    // In both shapes outbox entries accumulate (never silently dropped) until a sink is configured
-    // (ARCH 20).
+    // `replication_worker_concurrency` tasks run the chosen shape concurrently; per-key, per-target
+    // ordering is preserved by the durable claim lease + predecessor check regardless of pool size.
+    // Each worker is event-driven (a write-path pulse on `stack.replication_notify`) with the
+    // interval as a safety-net heartbeat, and stops on the shutdown signal. Outbox entries accumulate
+    // (never silently dropped) until a sink is configured (ARCH 20).
     let interval = Duration::from_secs(cfg.replication_interval_secs);
+    let opts = cairn_replication::ReplicationOpts {
+        batch_size: cfg.replication_batch_size,
+        max_attempts: cfg.replication_max_attempts,
+        base_backoff_secs: cfg.replication_base_backoff_secs,
+        max_backoff_secs: cfg.replication_max_backoff_secs,
+    };
+    let concurrency = cfg.replication_worker_concurrency.max(1);
     let targets = cfg.parse_replication_targets().unwrap_or_default();
-    if !targets.is_empty() {
-        let default_cfg = single_target_sink_cfg(cfg);
-        tokio::spawn(multi_target_replication_loop(
-            stack.clone(),
-            targets,
-            default_cfg,
-            interval,
-        ));
-        tracing::info!("replication worker enabled (multi-target)");
-    } else if let Some(sink_cfg) = single_target_sink_cfg(cfg) {
-        tokio::spawn(replication_loop(stack.clone(), sink_cfg, interval));
-        tracing::info!("replication worker enabled");
+    let single_cfg = single_target_sink_cfg(cfg);
+    let shape = if !targets.is_empty() {
+        "multi-target"
+    } else if single_cfg.is_some() {
+        "single-target"
     } else {
-        // No env-configured sink. The per-bucket STORED remote targets (the primary model, set
-        // through the API/UI/CLI and sealed at rest) are the real source of destinations now, and
-        // they are discovered fresh from bucket config on each drain — so the worker must still run.
-        tokio::spawn(multi_target_replication_loop(
-            stack.clone(),
-            Vec::new(),
-            None,
-            interval,
-        ));
-        tracing::info!("replication worker enabled (per-bucket stored targets)");
+        "per-bucket stored targets"
+    };
+    for _ in 0..concurrency {
+        let notify = stack.replication_notify.clone();
+        let sd = shutdown.clone();
+        if !targets.is_empty() {
+            tokio::spawn(multi_target_replication_loop(
+                stack.clone(),
+                targets.clone(),
+                single_cfg.clone(),
+                interval,
+                notify,
+                sd,
+                opts,
+            ));
+        } else if let Some(sink_cfg) = single_cfg.clone() {
+            tokio::spawn(replication_loop(
+                stack.clone(),
+                sink_cfg,
+                interval,
+                notify,
+                sd,
+                opts,
+            ));
+        } else {
+            tokio::spawn(multi_target_replication_loop(
+                stack.clone(),
+                Vec::new(),
+                None,
+                interval,
+                notify,
+                sd,
+                opts,
+            ));
+        }
     }
+    tracing::info!(
+        workers = concurrency,
+        shape,
+        "replication worker pool enabled"
+    );
     // Request-metrics flush loop (ARCH 26.5). Gated on the subsystem being enabled: when off, the
     // hot path accumulates nothing and there is nothing to flush. Otherwise it periodically drains
     // the in-process aggregator into a batched upsert and prunes rows past the retention horizon.
@@ -196,17 +229,34 @@ fn single_target_sink_cfg(cfg: &Config) -> Option<cairn_replication::S3SinkConfi
 /// falls back to `replication_dest_bucket`. The sink is rebuilt per drain with the fresh map
 /// (its connector is cheap to construct), keeping the node→node single-destination path working
 /// when no per-bucket rule is present.
+/// Block until the next replication drain pass is due: a write-path pulse (`notify`), the heartbeat
+/// `interval`, or the shutdown signal. Returns `true` to drain, `false` to stop the worker.
+async fn wait_for_drain_trigger(
+    interval: Duration,
+    notify: &tokio::sync::Notify,
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+) -> bool {
+    if *shutdown.borrow() {
+        return false;
+    }
+    tokio::select! {
+        () = notify.notified() => true,
+        () = tokio::time::sleep(interval) => true,
+        _ = shutdown.changed() => false,
+    }
+}
+
 async fn replication_loop(
     stack: Arc<AppStack>,
     base_cfg: cairn_replication::S3SinkConfig,
     interval: Duration,
+    notify: Arc<tokio::sync::Notify>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    opts: cairn_replication::ReplicationOpts,
 ) {
-    let engine =
-        cairn_replication::ReplicationEngine::new(cairn_replication::ReplicationOpts::default());
+    let engine = cairn_replication::ReplicationEngine::new(opts);
     let clock = SystemClock::new();
-    loop {
-        tokio::time::sleep(interval).await;
-
+    while wait_for_drain_trigger(interval, &notify, &mut shutdown).await {
         // Resolve the per-source destination map from each bucket's replication rule.
         let dest_buckets = resolve_dest_buckets(&stack).await;
         let mut sink_cfg = base_cfg.clone();
@@ -280,9 +330,11 @@ async fn multi_target_replication_loop(
     targets: Vec<ReplicationTarget>,
     default_cfg: Option<cairn_replication::S3SinkConfig>,
     interval: Duration,
+    notify: Arc<tokio::sync::Notify>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    opts: cairn_replication::ReplicationOpts,
 ) {
-    let engine =
-        cairn_replication::ReplicationEngine::new(cairn_replication::ReplicationOpts::default());
+    let engine = cairn_replication::ReplicationEngine::new(opts);
     let clock = SystemClock::new();
 
     // Build a sink per named target once. A target whose sink fails to construct (a bad endpoint,
@@ -314,9 +366,7 @@ async fn multi_target_replication_loop(
         tracing::debug!("no env replication sinks; serving per-bucket stored targets only");
     }
 
-    loop {
-        tokio::time::sleep(interval).await;
-
+    while wait_for_drain_trigger(interval, &notify, &mut shutdown).await {
         // Resolve `source bucket -> target sink` from the current bucket rules each drain. Stored
         // per-bucket remote targets are layered on top and win over the env-named targets.
         let routes = resolve_target_routes(&stack, &target_sinks).await;
