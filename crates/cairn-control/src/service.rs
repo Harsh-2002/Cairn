@@ -342,6 +342,7 @@ impl ControlService {
             }
 
             (&Method::GET, ["replication", "failed"]) => self.failed_replication(query).await,
+            (&Method::GET, ["replication", "summary"]) => self.replication_summary().await,
 
             (&Method::GET, ["activity"]) => self.activity(query).await,
 
@@ -2359,39 +2360,63 @@ impl ControlService {
         };
 
         let now = self.clock.now();
-        let pending = match self.meta.list_due_replication(PAGE_LIMIT, now).await {
+        // Exact counts + true lag in one indexed pass (not PAGE_LIMIT-bounded).
+        let counts = match self.meta.replication_counts(Some(&bucket_name)).await {
+            Ok(c) => c,
+            Err(e) => return ControlResponse::error_internal(&e.to_string()),
+        };
+        // `recent_errors` is a bounded human-readable sample of this bucket's terminal failures.
+        let recent_errors = match self.meta.list_failed_replication(PAGE_LIMIT).await {
             Ok(entries) => entries
-                .iter()
+                .into_iter()
                 .filter(|e| e.bucket.as_str() == bucket_name.as_str())
-                .count() as u64,
+                .map(|e| wire::ReplicationStatusError {
+                    key: e.key.as_str().to_owned(),
+                    version_id: e.version_id.as_str().to_owned(),
+                    error: e.last_error,
+                })
+                .collect(),
             Err(e) => return ControlResponse::error_internal(&e.to_string()),
         };
-
-        let failed_entries = match self.meta.list_failed_replication(PAGE_LIMIT).await {
-            Ok(entries) => entries,
-            Err(e) => return ControlResponse::error_internal(&e.to_string()),
-        };
-        let bucket_failed: Vec<_> = failed_entries
-            .into_iter()
-            .filter(|e| e.bucket.as_str() == bucket_name.as_str())
-            .collect();
-        let failed = bucket_failed.len() as u64;
-        let recent_errors = bucket_failed
-            .into_iter()
-            .map(|e| wire::ReplicationStatusError {
-                key: e.key.as_str().to_owned(),
-                version_id: e.version_id.as_str().to_owned(),
-                error: e.last_error,
-            })
-            .collect();
 
         ControlResponse::json(
             StatusCode::OK,
             &wire::ReplicationStatusResp {
                 bucket: bucket_name.as_str().to_owned(),
-                pending,
-                failed,
+                pending: counts.pending,
+                failed: counts.failed,
+                lag_seconds: replication_lag_seconds(now, counts.oldest_pending_at_ms),
+                by_target: counts
+                    .by_target
+                    .into_iter()
+                    .map(target_count_wire)
+                    .collect(),
                 recent_errors,
+            },
+        )
+    }
+
+    /// `GET /replication/summary`: store-wide replication health (exact counts, true lag, per-target
+    /// breakdown) in one indexed pass — the console overview's live snapshot.
+    async fn replication_summary(&self) -> ControlResponse {
+        let now = self.clock.now();
+        let counts = match self.meta.replication_counts(None).await {
+            Ok(c) => c,
+            Err(e) => return ControlResponse::error_internal(&e.to_string()),
+        };
+        ControlResponse::json(
+            StatusCode::OK,
+            &wire::ReplicationSummaryResp {
+                pending: counts.pending,
+                claimed: counts.claimed,
+                failed: counts.failed,
+                completed: counts.completed,
+                lag_seconds: replication_lag_seconds(now, counts.oldest_pending_at_ms),
+                by_target: counts
+                    .by_target
+                    .into_iter()
+                    .map(target_count_wire)
+                    .collect(),
             },
         )
     }
@@ -2711,6 +2736,27 @@ fn generate_secret() -> String {
 /// byte transfer is the worker's job), run on a spawned task so a large bucket never blocks a
 /// request. Tag predicates are honoured by loading an object's tags only when the matched rule
 /// actually carries them.
+/// Seconds since the oldest still-pending enqueue (`0` when nothing is pending or the time is
+/// unknown — a pre-migration row). The replication-lag figure for status/summary responses.
+fn replication_lag_seconds(now: cairn_types::time::Timestamp, oldest_pending_at_ms: i64) -> u64 {
+    if oldest_pending_at_ms == 0 {
+        0
+    } else {
+        u64::try_from((now.as_millis() - oldest_pending_at_ms).max(0) / 1000).unwrap_or(0)
+    }
+}
+
+/// Map a store-layer per-target count into its wire DTO.
+fn target_count_wire(
+    t: cairn_types::meta::ReplicationTargetCounts,
+) -> wire::ReplicationTargetCount {
+    wire::ReplicationTargetCount {
+        target_arn: t.target_arn,
+        pending: t.pending,
+        failed: t.failed,
+    }
+}
+
 async fn backfill_replication(
     meta: Arc<dyn MetadataStore>,
     clock: Arc<dyn Clock>,

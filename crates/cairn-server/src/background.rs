@@ -763,23 +763,32 @@ async fn metrics_loop(stack: Arc<AppStack>) {
         metrics::counter!("cairn_meta_cache_hits_total").absolute(hits);
         metrics::counter!("cairn_meta_cache_misses_total").absolute(misses);
 
-        // Replication queue depth + lag (ARCH 20/26). `list_due_replication` is a read-only mirror
-        // of the claim predicate; the oldest due entry's age is the replication lag.
+        // Replication health (ARCH 20/26) from the uncapped aggregate (no 10k probe cap). Lag is
+        // the age of the oldest still-pending *enqueue* (not its backed-off next_attempt_at, which
+        // a retry pushes into the future), so a fresh backlog raises lag immediately. Per-target
+        // gauges let an operator see which destination is lagging/failing (target cardinality is
+        // operator-bounded; per-bucket stays API-only to avoid unbounded label cardinality).
         let now = clock.now();
-        match stack.meta.list_due_replication(10_000, now).await {
-            Ok(due) => {
-                metrics::gauge!("cairn_replication_queue_depth").set(due.len() as f64);
-                // The oldest *due* entry is the one whose `next_attempt_at` is furthest in the past;
-                // its age is the worst-case replication lag right now.
-                let oldest = due
-                    .iter()
-                    .map(|e| e.next_attempt_at.as_millis())
-                    .min()
-                    .unwrap_or_else(|| now.as_millis());
-                let lag_secs = ((now.as_millis() - oldest).max(0) as f64) / 1000.0;
+        match stack.meta.replication_counts(None).await {
+            Ok(c) => {
+                metrics::gauge!("cairn_replication_queue_depth").set(c.pending as f64);
+                metrics::gauge!("cairn_replication_claimed").set(c.claimed as f64);
+                metrics::gauge!("cairn_replication_failed").set(c.failed as f64);
+                let lag_secs = if c.oldest_pending_at_ms == 0 {
+                    0.0
+                } else {
+                    ((now.as_millis() - c.oldest_pending_at_ms).max(0) as f64) / 1000.0
+                };
                 metrics::gauge!("cairn_replication_lag_seconds").set(lag_secs);
+                for t in &c.by_target {
+                    let target = t.target_arn.as_deref().unwrap_or("env-default").to_owned();
+                    metrics::gauge!("cairn_replication_pending", "target" => target.clone())
+                        .set(t.pending as f64);
+                    metrics::gauge!("cairn_replication_failed_by_target", "target" => target)
+                        .set(t.failed as f64);
+                }
             }
-            Err(e) => tracing::debug!(error = %e, "replication lag probe failed"),
+            Err(e) => tracing::debug!(error = %e, "replication counts probe failed"),
         }
     }
 }

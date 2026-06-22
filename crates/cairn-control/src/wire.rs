@@ -808,8 +808,12 @@ pub struct ReplicationStatusResp {
     pub bucket: String,
     /// Count of entries currently due (pending and claimable) for this bucket, bounded.
     pub pending: u64,
-    /// Count of terminally failed entries for this bucket, bounded.
+    /// Count of terminally failed entries for this bucket (exact, not page-bounded).
     pub failed: u64,
+    /// Age of the oldest still-pending enqueue for this bucket, in seconds (true lag, 0 when idle).
+    pub lag_seconds: u64,
+    /// Per-target pending/failed breakdown for this bucket.
+    pub by_target: Vec<ReplicationTargetCount>,
     /// The most recent failed entries' errors for this bucket (bounded), newest first.
     pub recent_errors: Vec<ReplicationStatusError>,
 }
@@ -823,6 +827,34 @@ pub struct ReplicationStatusError {
     pub version_id: String,
     /// The last error recorded, if any.
     pub error: Option<String>,
+}
+
+/// One target's pending/failed counts in a replication status/summary response.
+#[derive(Debug, Serialize)]
+pub struct ReplicationTargetCount {
+    /// The remote-target ARN (`None` = the legacy env single-target path).
+    pub target_arn: Option<String>,
+    /// Entries pending to this target.
+    pub pending: u64,
+    /// Entries terminally failed to this target.
+    pub failed: u64,
+}
+
+/// Store-wide replication summary (`GET /replication/summary`; also the SSE `replication` topic).
+#[derive(Debug, Serialize)]
+pub struct ReplicationSummaryResp {
+    /// Entries awaiting their first/next attempt, store-wide.
+    pub pending: u64,
+    /// Entries leased by a worker.
+    pub claimed: u64,
+    /// Terminally failed entries.
+    pub failed: u64,
+    /// Completed entries (rows retained).
+    pub completed: u64,
+    /// Age of the oldest still-pending enqueue, in seconds (true lag, 0 when idle).
+    pub lag_seconds: u64,
+    /// Per-target pending/failed breakdown.
+    pub by_target: Vec<ReplicationTargetCount>,
 }
 
 // ---------------------------------------------------------------------------------------
