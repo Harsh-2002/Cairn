@@ -30,6 +30,31 @@ export function count(n: number | null | undefined): string {
   return Number(n).toLocaleString();
 }
 
+/** Compact count for tight spots like chart axis ticks: 1234 → "1.2K", 1.2e9 → "1.2B". Keep
+ *  `count()` for tiles and tooltips where the exact figure matters. */
+export function compactNum(n: number | null | undefined): string {
+  if (n === null || n === undefined) return "—";
+  const num = Number(n);
+  if (!Number.isFinite(num)) return "—";
+  if (Math.abs(num) < 1000) return String(Math.round(num));
+  return new Intl.NumberFormat(undefined, {
+    notation: "compact",
+    maximumFractionDigits: 1,
+  }).format(num);
+}
+
+/** A coarse "time since" for a last-updated cue: "just now", "3m ago", "2h ago", "5d ago". */
+export function relTime(ms: number | null | undefined): string {
+  if (ms === null || ms === undefined) return "";
+  const secs = Math.max(0, Math.floor((Date.now() - Number(ms)) / 1000));
+  if (secs < 45) return "just now";
+  const m = Math.round(secs / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.round(m / 60);
+  if (h < 24) return `${h}h ago`;
+  return `${Math.round(h / 24)}d ago`;
+}
+
 export function ratio(f: number | null | undefined): string {
   if (f === null || f === undefined) return "—";
   const v = Number(f);

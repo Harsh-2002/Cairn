@@ -5,7 +5,7 @@
 // overview() for the system stat tiles. The grid collapses 3 → 2 → 1 column
 // from desktop to mobile; the hero "Requests over time" chart spans the row.
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Area,
   AreaChart,
@@ -22,7 +22,7 @@ import {
 } from "recharts";
 import { Activity as ActivityIcon } from "lucide-react";
 import { api } from "@/lib/api";
-import { bytes, count } from "@/lib/format";
+import { bytes, compactNum, count, relTime } from "@/lib/format";
 import type {
   MetricOp,
   MetricStatus,
@@ -44,7 +44,7 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { cn } from "@/lib/utils";
 
 // Seconds in each range window — drives the "avg req/s" derived stat. The
 // 1-month figure is the canonical 31-day month the backend windows on.
@@ -140,10 +140,23 @@ function statusColor(cls: string): string {
 export function Metrics() {
   const [range, setRange] = useState<MetricsRange>("1d");
 
-  const metrics = useResource(() => api.metrics(range), [range]);
+  // `range` stays OUT of the resource deps on purpose: switching it re-fetches through the
+  // stale-while-revalidate `refresh` path (loadRef always closes over the latest range), so the
+  // dashboard stays mounted and never tears down to a skeleton — only the first mount does.
+  const metrics = useResource(() => api.metrics(range), []);
   const overview = useResource(() => api.overview(), []);
 
   const { data, error, loading, refreshing } = metrics;
+
+  const firstRange = useRef(true);
+  useEffect(() => {
+    if (firstRange.current) {
+      firstRange.current = false;
+      return;
+    }
+    metrics.refresh();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [range]);
 
   // A single Refresh button re-fetches both resources; the busy/disabled state
   // tracks the metrics load (the primary content) but kicks both.
@@ -151,6 +164,17 @@ export function Metrics() {
     metrics.refresh();
     overview.refresh();
   };
+
+  // "Updated 3m ago" cue: stamp the time on each successful load and re-tick the label every 30s.
+  const [loadedAt, setLoadedAt] = useState<number | null>(null);
+  useEffect(() => {
+    if (data) setLoadedAt(Date.now());
+  }, [data]);
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => setTick((t) => t + 1), 30_000);
+    return () => clearInterval(id);
+  }, []);
 
   const tickFmt = useMemo(() => tickTime(range), [range]);
 
@@ -162,35 +186,24 @@ export function Metrics() {
           RANGES.find((r) => r.value === range)?.label ?? "period"
         }.`}
         actions={
-          <RefreshButton
-            loading={loading}
-            refreshing={refreshing}
-            onClick={refresh}
-          />
+          <div className="flex items-center gap-3">
+            {loadedAt ? (
+              <span className="hidden text-[13px] text-muted-foreground tabular-nums sm:inline">
+                Updated {relTime(loadedAt)}
+              </span>
+            ) : null}
+            <RefreshButton
+              loading={loading}
+              refreshing={refreshing}
+              onClick={refresh}
+            />
+          </div>
         }
       />
 
-      {/* The range filter: an underline tab row swapping the rolling window. */}
-      <Tabs
-        value={range}
-        onValueChange={(v) => setRange(v as MetricsRange)}
-        className="mb-4"
-      >
-        <TabsList
-          variant="line"
-          className="h-auto! w-full justify-start border-b p-0 pb-1"
-        >
-          {RANGES.map((r) => (
-            <TabsTrigger
-              key={r.value}
-              value={r.value}
-              className="flex-none px-2.5 py-1.5"
-            >
-              {r.label}
-            </TabsTrigger>
-          ))}
-        </TabsList>
-      </Tabs>
+      {/* The range filter swaps the entire view, so it is a single-choice control (radiogroup),
+          not a tablist — keeps the underline-tab look with a real accessible name + arrow-key nav. */}
+      <RangePicker value={range} onChange={setRange} />
 
       {error ? (
         <ErrorAlert
@@ -211,6 +224,62 @@ export function Metrics() {
         />
       ) : null}
     </Page>
+  );
+}
+
+// The range filter as a labelled segmented control. It swaps the whole dashboard, so semantically
+// it's a single-choice radiogroup (the old Radix tablist left a dangling aria-controls and no
+// accessible name). Roving tabindex + arrow keys keep it keyboard-friendly; the underline-active
+// look matches the rest of the console.
+function RangePicker({
+  value,
+  onChange,
+}: {
+  value: MetricsRange;
+  onChange: (v: MetricsRange) => void;
+}) {
+  const idx = RANGES.findIndex((r) => r.value === value);
+  function onKeyDown(e: React.KeyboardEvent) {
+    let next = idx;
+    if (e.key === "ArrowRight" || e.key === "ArrowDown")
+      next = (idx + 1) % RANGES.length;
+    else if (e.key === "ArrowLeft" || e.key === "ArrowUp")
+      next = (idx - 1 + RANGES.length) % RANGES.length;
+    else if (e.key === "Home") next = 0;
+    else if (e.key === "End") next = RANGES.length - 1;
+    else return;
+    e.preventDefault();
+    onChange(RANGES[next].value);
+  }
+  return (
+    <div
+      role="radiogroup"
+      aria-label="Time range"
+      onKeyDown={onKeyDown}
+      className="mb-4 flex w-full gap-1 border-b"
+    >
+      {RANGES.map((r) => {
+        const active = r.value === value;
+        return (
+          <button
+            key={r.value}
+            type="button"
+            role="radio"
+            aria-checked={active}
+            tabIndex={active ? 0 : -1}
+            onClick={() => onChange(r.value)}
+            className={cn(
+              "-mb-px border-b-2 px-2.5 py-1.5 text-sm font-medium transition-colors duration-150 ease-out",
+              active
+                ? "border-foreground text-foreground"
+                : "border-transparent text-muted-foreground hover:text-foreground",
+            )}
+          >
+            {r.label}
+          </button>
+        );
+      })}
+    </div>
   );
 }
 
@@ -249,9 +318,14 @@ function Dashboard({
 
   return (
     <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
-      {/* Request-traffic stat tiles (suppressed when the window is empty). */}
+      {/* Request-traffic stat tiles (suppressed when the window is empty). The section label makes
+          the windowed scope explicit, so these read as distinct from the point-in-time storage tiles. */}
       {!empty ? (
         <>
+          <h2 className="col-span-full text-sm font-medium text-muted-foreground">
+            Activity · last{" "}
+            {RANGES.find((r) => r.value === range)?.label ?? "period"}
+          </h2>
           <StatCard label="Total requests" value={count(total)} />
           <StatCard label="Avg req/s" value={reqPerSec(avgRate)} />
           <StatCard label="Peak req/s" value={reqPerSec(peakRate)} />
@@ -268,9 +342,13 @@ function Dashboard({
         </>
       ) : null}
 
-      {/* System stat tiles from the overview snapshot — always shown. */}
+      {/* System stat tiles from the overview snapshot — current state, NOT windowed; the label
+          keeps that scope clear when the range above changes. */}
       {overview ? (
         <>
+          <h2 className="col-span-full text-sm font-medium text-muted-foreground">
+            Stored data
+          </h2>
           <StatCard label="Objects" value={count(overview.objects)} />
           <StatCard label="Storage used" value={bytes(overview.physical_bytes)} />
           <StatCard
@@ -341,7 +419,7 @@ function Dashboard({
                     tickLine={false}
                     axisLine={false}
                     tick={axisTick}
-                    tickFormatter={(v: number) => count(v)}
+                    tickFormatter={(v: number) => compactNum(v)}
                   />
                   <Tooltip
                     cursor={{ stroke: "var(--color-border)" }}
@@ -357,6 +435,7 @@ function Dashboard({
                     stroke="var(--color-chart-4)"
                     strokeWidth={2}
                     fill="url(#m-requests)"
+                    dot={data.timeline.length < 2}
                     isAnimationActive={false}
                   />
                 </AreaChart>
@@ -412,7 +491,7 @@ function Dashboard({
                     tickLine={false}
                     axisLine={false}
                     tick={axisTick}
-                    tickFormatter={(v: number) => count(v)}
+                    tickFormatter={(v: number) => compactNum(v)}
                   />
                   <Tooltip
                     cursor={{ stroke: "var(--color-border)" }}
@@ -428,6 +507,7 @@ function Dashboard({
                     stroke="var(--color-destructive)"
                     strokeWidth={2}
                     fill="url(#m-errors)"
+                    dot={data.timeline.length < 2}
                     isAnimationActive={false}
                   />
                 </AreaChart>
@@ -502,6 +582,7 @@ function Dashboard({
                     stroke="var(--color-chart-5)"
                     strokeWidth={2}
                     fill="url(#m-throughput)"
+                    dot={data.timeline.length < 2}
                     isAnimationActive={false}
                   />
                 </AreaChart>
@@ -509,19 +590,18 @@ function Dashboard({
             </div>
           </ChartCard>
 
-          {/* Panel D — average latency over time. */}
+          {/* Panel D — average latency over time. The line plots the per-window AVERAGE only; p95 is
+              a single range-wide figure (in the caption + its own stat tile), not a plotted series. */}
           <ChartCard
-            title="Latency over time"
-            description={`${ms(data.latency_avg_ms)} average, ${ms(
+            title="Average latency over time"
+            description={`${ms(data.latency_avg_ms)} average over the window (p95 ${ms(
               data.latency_p95_ms,
-            )} p95.`}
+            )}).`}
           >
             <div
               className="h-56 w-full"
               role="img"
-              aria-label={`Latency over time: ${ms(data.latency_avg_ms)} average, ${ms(
-                data.latency_p95_ms,
-              )} p95.`}
+              aria-label={`Average latency over time, ${ms(data.latency_avg_ms)} average over the window.`}
             >
               <ResponsiveContainer width="100%" height="100%">
                 <LineChart
@@ -540,7 +620,11 @@ function Dashboard({
                     tickLine={false}
                     axisLine={false}
                     tick={axisTick}
-                    tickFormatter={(v: number) => `${Math.round(v)}ms`}
+                    tickFormatter={(v: number) =>
+                      v >= 1000
+                        ? `${(v / 1000).toFixed(v >= 10000 ? 0 : 1)}s`
+                        : `${Math.round(v)}ms`
+                    }
                   />
                   <Tooltip
                     cursor={{ stroke: "var(--color-border)" }}
@@ -555,7 +639,7 @@ function Dashboard({
                     dataKey="latency_avg_ms"
                     stroke="var(--color-chart-4)"
                     strokeWidth={2}
-                    dot={false}
+                    dot={data.timeline.length < 2}
                     isAnimationActive={false}
                   />
                 </LineChart>
@@ -576,6 +660,7 @@ function Dashboard({
               <BucketBars
                 rows={[...data.by_operation]
                   .sort((a, b) => b.count - a.count)
+                  .slice(0, 10)
                   .map((o) => ({
                     bucket: o.operation,
                     value: o.count,
@@ -613,20 +698,20 @@ function Dashboard({
             />
           </ChartCard>
 
-          {/* Panel H — top buckets by data transferred. */}
+          {/* Panel H — top buckets by data transferred. Uses the server's by-bytes ranking, not the
+              by-count cohort re-sorted (which would silently omit a low-traffic bucket that moved the
+              most data — e.g. a backup target). */}
           <ChartCard
             title="Top buckets by data"
             description="Buckets ranked by bytes transferred."
           >
             <BucketBars
-              rows={[...data.top_buckets]
-                .sort((a, b) => b.bytes - a.bytes)
-                .map((b) => ({
-                  bucket: b.bucket,
-                  value: b.bytes,
-                  display: bytes(b.bytes),
-                  aria: `${b.bucket}: ${bytes(b.bytes)} transferred`,
-                }))}
+              rows={data.top_buckets_by_bytes.map((b) => ({
+                bucket: b.bucket,
+                value: b.bytes,
+                display: bytes(b.bytes),
+                aria: `${b.bucket}: ${bytes(b.bytes)} transferred`,
+              }))}
             />
           </ChartCard>
 
@@ -688,15 +773,6 @@ function StatusDonut({ by_status }: { by_status: MetricStatus[] }) {
                 />
               ))}
             </Pie>
-            <Tooltip
-              contentStyle={tooltipStyle}
-              labelStyle={tooltipLabelStyle}
-              itemStyle={tooltipItemStyle}
-              formatter={(value, name) => [
-                `${count(Number(value))} (${pct(Number(value), total)})`,
-                String(name),
-              ]}
-            />
           </PieChart>
         </ResponsiveContainer>
       </div>
@@ -731,9 +807,11 @@ function ReadsWritesDonut({
   writes: number;
 }) {
   const total = reads + writes;
+  // Two clearly-distinct monochrome tones (not the old two near-identical blues), matching the
+  // ranking-bar treatment and keeping blue reserved for links/focus per the design system.
   const slices = [
-    { name: "Reads", value: reads, fill: "var(--color-chart-4)" },
-    { name: "Writes", value: writes, fill: "var(--color-chart-5)" },
+    { name: "Reads", value: reads, fill: "var(--color-chart-1)" },
+    { name: "Writes", value: writes, fill: "var(--color-chart-2)" },
   ];
   return (
     <div className="flex flex-col items-center gap-4">
@@ -759,15 +837,6 @@ function ReadsWritesDonut({
                 <Cell key={s.name} fill={s.fill} />
               ))}
             </Pie>
-            <Tooltip
-              contentStyle={tooltipStyle}
-              labelStyle={tooltipLabelStyle}
-              itemStyle={tooltipItemStyle}
-              formatter={(value, name) => [
-                `${count(Number(value))} (${pct(Number(value), total)})`,
-                String(name),
-              ]}
-            />
           </PieChart>
         </ResponsiveContainer>
       </div>

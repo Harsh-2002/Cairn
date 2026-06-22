@@ -341,6 +341,8 @@ export interface RequestMetricsResp {
   timeline: MetricPoint[];
   by_operation: MetricOp[];
   top_buckets: MetricBucket[];
+  /** Top buckets ranked by bytes transferred — distinct from top_buckets (by count). */
+  top_buckets_by_bytes: MetricBucket[];
   by_status: MetricStatus[];
 }
 
