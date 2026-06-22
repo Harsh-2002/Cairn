@@ -305,7 +305,7 @@ function Dashboard({
             >
               <ResponsiveContainer width="100%" height="100%">
                 <AreaChart
-                  accessibilityLayer
+                  accessibilityLayer={false}
                   data={data.timeline}
                   margin={{ top: 8, right: 8, bottom: 0, left: 0 }}
                 >
@@ -382,7 +382,7 @@ function Dashboard({
             >
               <ResponsiveContainer width="100%" height="100%">
                 <AreaChart
-                  accessibilityLayer
+                  accessibilityLayer={false}
                   data={data.timeline}
                   margin={{ top: 8, right: 8, bottom: 0, left: 0 }}
                 >
@@ -451,7 +451,7 @@ function Dashboard({
             >
               <ResponsiveContainer width="100%" height="100%">
                 <AreaChart
-                  accessibilityLayer
+                  accessibilityLayer={false}
                   data={throughputData}
                   margin={{ top: 8, right: 8, bottom: 0, left: 0 }}
                 >
@@ -525,7 +525,7 @@ function Dashboard({
             >
               <ResponsiveContainer width="100%" height="100%">
                 <LineChart
-                  accessibilityLayer
+                  accessibilityLayer={false}
                   data={data.timeline}
                   margin={{ top: 8, right: 8, bottom: 0, left: 0 }}
                 >
@@ -669,7 +669,7 @@ function StatusDonut({ by_status }: { by_status: MetricStatus[] }) {
     <div className="flex flex-col items-center gap-4">
       <div className="h-48 w-full" role="img" aria-label="Response status mix by HTTP status class.">
         <ResponsiveContainer width="100%" height="100%">
-          <PieChart>
+          <PieChart accessibilityLayer={false}>
             <Pie
               data={sorted}
               dataKey="count"
@@ -743,7 +743,7 @@ function ReadsWritesDonut({
         aria-label={`Reads versus writes: ${count(reads)} reads, ${count(writes)} writes.`}
       >
         <ResponsiveContainer width="100%" height="100%">
-          <PieChart>
+          <PieChart accessibilityLayer={false}>
             <Pie
               data={slices}
               dataKey="value"

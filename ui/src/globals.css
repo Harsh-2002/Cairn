@@ -153,10 +153,13 @@
   :where(a, button, input, select, textarea, [role="tab"], [tabindex]):focus-visible {
     @apply ring-2 ring-ring/70 ring-offset-2 ring-offset-background outline-none;
   }
-  /* recharts marks each chart <svg> focusable (accessibilityLayer) for keyboard data nav, during
-     which it shows its own active-point tooltip — so the global ring above just paints a stray blue
-     box around the plot when a chart is clicked or focused. Suppress it; the chart wrapper already
-     carries role="img" + an aria-label for assistive tech. */
+  /* Charts are presented as labelled images (role="img" + aria-label on the wrapper); we disable
+     recharts' focusable accessibilityLayer, but as a belt-and-suspenders also strip any focus ring
+     from the chart subtree so clicking a plot, bar, or pie sector never paints a stray blue box. */
+  .recharts-wrapper:focus,
+  .recharts-wrapper:focus-visible,
+  .recharts-wrapper :focus,
+  .recharts-wrapper :focus-visible,
   .recharts-surface:focus,
   .recharts-surface:focus-visible {
     box-shadow: none !important;
