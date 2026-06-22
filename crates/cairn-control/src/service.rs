@@ -482,6 +482,15 @@ impl ControlService {
                         bytes: b.bytes,
                     })
                     .collect(),
+                top_buckets_by_bytes: series
+                    .top_buckets_by_bytes
+                    .into_iter()
+                    .map(|b| wire::MetricBucket {
+                        bucket: b.bucket,
+                        count: b.count,
+                        bytes: b.bytes,
+                    })
+                    .collect(),
                 by_status: series
                     .by_status
                     .into_iter()

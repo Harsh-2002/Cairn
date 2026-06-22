@@ -1139,6 +1139,25 @@ impl MetadataStore for AsyncMetadataStore {
             })
             .collect();
 
+        // Top buckets by bytes transferred (in + out) — a different ranking than by count, so the
+        // console's "by data" panel ranks on bytes directly rather than re-sorting the by-count top-N.
+        let top_buckets_by_bytes = driver
+            .query(
+                "SELECT bucket_name, COALESCE(SUM(count),0),
+                    COALESCE(SUM(bytes_in + bytes_out),0) AS b
+                 FROM request_metrics WHERE ts_bucket >= ?1 AND bucket_name <> ''
+                 GROUP BY bucket_name ORDER BY b DESC LIMIT 10",
+                vec![Value::Int(since)],
+            )
+            .await?
+            .iter()
+            .map(|r| BucketRequestCount {
+                bucket: r.get_text(0),
+                count: r.get_i64(1) as u64,
+                bytes: r.get_i64(2) as u64,
+            })
+            .collect();
+
         // Breakdown by HTTP status class.
         let by_status: Vec<StatusCount> = driver
             .query(
@@ -1196,6 +1215,7 @@ impl MetadataStore for AsyncMetadataStore {
             timeline,
             by_operation,
             top_buckets,
+            top_buckets_by_bytes,
             by_status,
             total,
             total_errors,

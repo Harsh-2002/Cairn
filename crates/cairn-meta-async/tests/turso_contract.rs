@@ -1116,6 +1116,17 @@ async fn request_metrics_upsert_query_prune_parity() {
         assert_eq!(series.top_buckets.len(), 2);
         assert_eq!(series.top_buckets[0].bucket, "alpha");
         assert_eq!(series.active_buckets, 2);
+        // top_buckets_by_bytes is a genuinely different ranking: beta moved (200+0)*5 = 1000 bytes
+        // vs alpha's (10+100)*5 = 550, so beta leads by data even though it had fewer requests.
+        // Regression guard for the console's "Top buckets by data" panel (it must NOT just re-sort
+        // the by-count cohort, which would omit a low-traffic bucket that moved the most data).
+        assert_eq!(series.top_buckets_by_bytes.len(), 2);
+        assert_eq!(series.top_buckets_by_bytes[0].bucket, "beta");
+        assert_ne!(
+            series.top_buckets[0].bucket,
+            series.top_buckets_by_bytes[0].bucket,
+            "by-count and by-bytes rankings diverge for this data"
+        );
         // status breakdown: one 4xx error out of 11.
         assert_eq!(series.total_errors, 1);
         assert_eq!(series.by_status.iter().map(|s| s.count).sum::<u64>(), 11);

@@ -1538,7 +1538,7 @@ impl MetadataStore for InMemoryMetadataStore {
             .collect();
         by_operation.sort_by(|a, b| b.count.cmp(&a.count).then(a.operation.cmp(&b.operation)));
 
-        let mut top_buckets: Vec<BucketRequestCount> = by_bkt
+        let all_buckets: Vec<BucketRequestCount> = by_bkt
             .into_iter()
             .map(|(bucket, (count, bytes))| BucketRequestCount {
                 bucket,
@@ -1546,9 +1546,14 @@ impl MetadataStore for InMemoryMetadataStore {
                 bytes,
             })
             .collect();
+        let active_buckets = all_buckets.len() as u64;
+        let mut top_buckets = all_buckets.clone();
         top_buckets.sort_by(|a, b| b.count.cmp(&a.count).then(a.bucket.cmp(&b.bucket)));
-        let active_buckets = top_buckets.len() as u64;
         top_buckets.truncate(10);
+        // A genuinely different ranking: by bytes transferred, not by count.
+        let mut top_buckets_by_bytes = all_buckets;
+        top_buckets_by_bytes.sort_by(|a, b| b.bytes.cmp(&a.bytes).then(a.bucket.cmp(&b.bucket)));
+        top_buckets_by_bytes.truncate(10);
 
         let mut by_status: Vec<StatusCount> = by_st
             .into_iter()
@@ -1570,6 +1575,7 @@ impl MetadataStore for InMemoryMetadataStore {
             timeline,
             by_operation,
             top_buckets,
+            top_buckets_by_bytes,
             by_status,
             total,
             total_errors,

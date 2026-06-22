@@ -1529,6 +1529,29 @@ impl MetadataStore for SqliteMetadataStore {
                 .collect::<rusqlite::Result<Vec<_>>>()
                 .map_err(engine_err)?;
 
+            // Top buckets by bytes transferred (in + out) — a different ranking than by count: a
+            // backup target with one huge PUT outranks a chatty metadata bucket, so the "by data"
+            // panel must rank on bytes directly rather than re-sorting the by-count top-N.
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT bucket_name, COALESCE(SUM(count),0),
+                        COALESCE(SUM(bytes_in + bytes_out),0) AS b
+                     FROM request_metrics WHERE ts_bucket >= ?1 AND bucket_name <> ''
+                     GROUP BY bucket_name ORDER BY b DESC LIMIT 10",
+                )
+                .map_err(engine_err)?;
+            let top_buckets_by_bytes = stmt
+                .query_map(params![since], |r| {
+                    Ok(BucketRequestCount {
+                        bucket: r.get(0)?,
+                        count: r.get::<_, i64>(1)? as u64,
+                        bytes: r.get::<_, i64>(2)? as u64,
+                    })
+                })
+                .map_err(engine_err)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(engine_err)?;
+
             // Breakdown by HTTP status class.
             let mut stmt = conn
                 .prepare_cached(
@@ -1594,6 +1617,7 @@ impl MetadataStore for SqliteMetadataStore {
                 timeline,
                 by_operation,
                 top_buckets,
+                top_buckets_by_bytes,
                 by_status,
                 total,
                 total_errors,

@@ -1026,6 +1026,10 @@ pub struct RequestMetricsSeries {
     pub by_operation: Vec<OpCount>,
     /// The most-active buckets, descending by count (capped to a small N).
     pub top_buckets: Vec<BucketRequestCount>,
+    /// The top buckets by bytes transferred (in + out), descending (capped to a small N). A genuinely
+    /// different ranking than `top_buckets`: a backup target with one huge transfer outranks a chatty
+    /// metadata bucket, so the console's "by data" panel must not reuse the by-count cohort.
+    pub top_buckets_by_bytes: Vec<BucketRequestCount>,
     /// Requests broken down by HTTP status class.
     pub by_status: Vec<StatusCount>,
     /// Grand total requests in range.

@@ -169,6 +169,9 @@ pub struct RequestMetricsResp {
     pub by_operation: Vec<MetricOp>,
     /// The most-active buckets, descending by count.
     pub top_buckets: Vec<MetricBucket>,
+    /// The top buckets by bytes transferred (in + out), descending — a different ranking than
+    /// `top_buckets`, so the console's "by data" panel is honest about what it shows.
+    pub top_buckets_by_bytes: Vec<MetricBucket>,
     /// Requests broken down by HTTP status class.
     pub by_status: Vec<MetricStatus>,
 }
