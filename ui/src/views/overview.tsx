@@ -6,6 +6,7 @@ import { useMemo } from "react";
 import { useNavigate } from "react-router";
 import { Database } from "lucide-react";
 import { api } from "@/lib/api";
+import { actionLabel, isDestructiveAction } from "@/lib/activity";
 import { bytes, count, duration, ratio, relTime, whenMs } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import { useResource } from "@/lib/use-resource";
@@ -370,7 +371,15 @@ export function Overview() {
                       key={`${e.at_ms}:${e.action}:${i}`}
                       className="flex flex-wrap items-baseline gap-x-3 gap-y-0.5 py-2 first:pt-0 last:pb-0"
                     >
-                      <span className="text-sm font-medium">{e.action}</span>
+                      <span
+                        className={cn(
+                          "text-sm font-medium",
+                          isDestructiveAction(e.action) && "text-destructive",
+                        )}
+                        title={e.action}
+                      >
+                        {actionLabel(e.action)}
+                      </span>
                       {e.bucket ? (
                         <TextLink
                           to={`/buckets/${encodeURIComponent(e.bucket)}/browser`}

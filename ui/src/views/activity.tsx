@@ -1,14 +1,18 @@
 // Activity log: a read-only audit trail of recent administrative changes
 // (bucket, user, and policy operations) recorded by this node.
 
-import { useMemo, useState } from "react";
+import { useMemo } from "react";
+import { useSearchParams } from "react-router";
 import { History } from "lucide-react";
 import { api } from "@/lib/api";
-import { whenMs } from "@/lib/format";
+import { actionLabel, isDestructiveAction } from "@/lib/activity";
+import { relTime, whenMs } from "@/lib/format";
 import { useResource } from "@/lib/use-resource";
+import { cn } from "@/lib/utils";
 import { DataTable, SkeletonRows, type Column } from "@/components/data-table";
 import { EmptyState } from "@/components/empty-state";
 import { ErrorAlert } from "@/components/error-alert";
+import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Page, PageHeader } from "@/components/page-header";
 import { RefreshButton } from "@/components/refresh-button";
@@ -24,6 +28,10 @@ import { TableCell, TableRow } from "@/components/ui/table";
 
 const SKELETON_ROWS = 8;
 
+// We load (and filter client-side over) the most recent slice; the page is honest
+// about the ceiling so an operator knows older history exists beyond the window.
+const LIMIT = 500;
+
 const COLUMNS: Column[] = [
   { key: "when", label: "When" },
   { key: "action", label: "Action" },
@@ -33,12 +41,36 @@ const COLUMNS: Column[] = [
 ];
 
 export function Activity() {
-  const res = useResource(() => api.activity(500), []);
+  const res = useResource(() => api.activity(LIMIT), []);
   const entries = useMemo(() => res.data?.entries ?? [], [res.data]);
 
-  // Client-side filters over the loaded page.
-  const [action, setAction] = useState("all");
-  const [bucketFilter, setBucketFilter] = useState("");
+  // Filters live in the URL so a filtered view is linkable and survives a refresh.
+  const [params, setParams] = useSearchParams();
+  const action = params.get("action") ?? "all";
+  const bucketFilter = params.get("bucket") ?? "";
+
+  const setParam = (key: string, value: string) =>
+    setParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        if (value === "") next.delete(key);
+        else next.set(key, value);
+        return next;
+      },
+      { replace: true },
+    );
+  const setAction = (v: string) => setParam("action", v === "all" ? "" : v);
+  const setBucketFilter = (v: string) => setParam("bucket", v.trim());
+  const clearFilters = () =>
+    setParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        next.delete("action");
+        next.delete("bucket");
+        return next;
+      },
+      { replace: true },
+    );
 
   const actions = useMemo(
     () => [...new Set(entries.map((e) => e.action))].sort(),
@@ -53,6 +85,15 @@ export function Activity() {
         (bf === "" || (e.bucket ?? "").toLowerCase().includes(bf)),
     );
   }, [entries, action, bucketFilter]);
+
+  const filtering = action !== "all" || bucketFilter.trim() !== "";
+  const atCap = entries.length >= LIMIT;
+  // "500 most recent events" / "12 events" / "Showing 3 of 500 (500 most recent)".
+  const summary = filtering
+    ? `Showing ${filtered.length} of ${entries.length}${atCap ? " (500 most recent)" : ""}`
+    : atCap
+      ? "500 most recent events"
+      : `${entries.length} event${entries.length === 1 ? "" : "s"}`;
 
   return (
     <Page>
@@ -86,7 +127,7 @@ export function Activity() {
               <SelectItem value="all">All actions</SelectItem>
               {actions.map((a) => (
                 <SelectItem key={a} value={a}>
-                  {a}
+                  {actionLabel(a)}
                 </SelectItem>
               ))}
             </SelectContent>
@@ -99,6 +140,17 @@ export function Activity() {
             onChange={(e) => setBucketFilter(e.target.value)}
             aria-label="Filter by bucket"
           />
+          {filtering ? (
+            <Button variant="ghost" size="sm" onClick={clearFilters}>
+              Clear filters
+            </Button>
+          ) : null}
+          <p
+            className="text-muted-foreground w-full text-sm tabular-nums sm:ms-auto sm:w-auto"
+            aria-live="polite"
+          >
+            {summary}
+          </p>
         </div>
       ) : null}
 
@@ -119,10 +171,16 @@ export function Activity() {
                 data-label="When"
                 className="text-muted-foreground tabular-nums"
               >
-                {whenMs(e.at_ms)}
+                <span title={whenMs(e.at_ms)}>{relTime(e.at_ms)}</span>
               </TableCell>
-              <TableCell data-label="Action" className="text-sm font-medium">
-                {e.action}
+              <TableCell
+                data-label="Action"
+                className={cn(
+                  "text-sm font-medium",
+                  isDestructiveAction(e.action) && "text-destructive",
+                )}
+              >
+                <span title={e.action}>{actionLabel(e.action)}</span>
               </TableCell>
               <TableCell data-label="Actor" className="font-mono text-[13px]">
                 {e.actor ? (
@@ -160,8 +218,15 @@ export function Activity() {
           title={entries.length > 0 ? "Nothing matches" : "No activity yet"}
           body={
             entries.length > 0
-              ? "Clear the filters to see all recorded activity."
+              ? "No recorded activity matches these filters."
               : "Administrative actions (bucket, user, and policy changes) will appear here."
+          }
+          action={
+            entries.length > 0 ? (
+              <Button variant="outline" size="sm" onClick={clearFilters}>
+                Clear filters
+              </Button>
+            ) : undefined
           }
         />
       ) : null}
