@@ -67,6 +67,11 @@ pub struct AppStack {
     /// Pulsed by the S3 write path after a write commits replication outbox entries, so the
     /// replication worker drains immediately (event-driven) instead of waiting its poll heartbeat.
     pub replication_notify: Arc<tokio::sync::Notify>,
+    /// Short-lived, single-use tickets for the SSE live-update stream (`hash -> (expiry_ms,
+    /// minting principal)`). EventSource cannot send an Authorization header, so the browser mints
+    /// a ticket with its Bearer token then opens the stream with `?ticket=`. In-process and
+    /// node-local; nothing durable.
+    pub sse_tickets: crate::sse::SseTicketStore,
     /// The base domain for virtual-host-style S3 addressing (`CAIRN_S3_DOMAIN`, ARCH 13.1), e.g.
     /// `s3.example.com`. When set, a request whose `Host` is `<bucket>.<s3_domain>` routes to that
     /// bucket with the whole path as the key; `None` leaves path-style addressing as the only form.
@@ -545,6 +550,7 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
         meta_cache,
         crypto: system_crypto,
         replication_notify,
+        sse_tickets: crate::sse::SseTicketStore::default(),
         blob,
         oracle,
         store,

@@ -22,6 +22,7 @@ mod key_rewrap;
 mod metrics_agg;
 mod observability;
 mod server;
+mod sse;
 // Linux-only zero-copy syscall helpers for the `fast-io` perf path (kTLS probe + sendfile(2)).
 // Gated to the feature *and* Linux so it is absent (and cannot warn) in every other build.
 #[cfg(all(feature = "fast-io", target_os = "linux"))]

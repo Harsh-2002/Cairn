@@ -381,7 +381,7 @@ async fn handle(
                 route_infra(&state, &path).await
             } else {
                 adapter::handle(
-                    &state.stack,
+                    state.stack.clone(),
                     req,
                     peer.ip(),
                     secure,

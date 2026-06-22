@@ -41,7 +41,7 @@ pub(crate) fn full_body(bytes: Bytes) -> ResponseBody {
 
 /// Handle an S3 (or anonymous) HTTP request end to end.
 pub async fn handle(
-    stack: &AppStack,
+    stack: std::sync::Arc<AppStack>,
     req: Request<Incoming>,
     peer: IpAddr,
     secure: bool,
@@ -123,7 +123,7 @@ pub async fn handle(
         // Master-key rotation status (audit #29, Phase E): an admin-only operator surface served
         // from the server stack because it reads the concrete per-shard handles + the key ring.
         if method == Method::GET && subpath == "/system/crypto-status" {
-            return crypto_status_response(stack, principal.as_ref(), &request_id).await;
+            return crypto_status_response(&stack, principal.as_ref(), &request_id).await;
         }
         // Minting a persistent public-read ("share") URL is handled here, not in cairn-control,
         // because it streams object bytes through the server stack on redemption:
@@ -133,7 +133,7 @@ pub async fn handle(
                 .strip_prefix("/buckets/")
                 .and_then(|r| r.strip_suffix("/objects/share"))
             {
-                return create_share(stack, bucket, &body_bytes, principal.as_ref()).await;
+                return create_share(&stack, bucket, &body_bytes, principal.as_ref()).await;
             }
             // Mint an interoperable S3 presigned URL (GET download / PUT upload). Lives here
             // because it opens the requester's sealed SigV4 secret from the server stack.
@@ -142,7 +142,7 @@ pub async fn handle(
                 .and_then(|r| r.strip_suffix("/objects/presign"))
             {
                 return presign(
-                    stack,
+                    &stack,
                     bucket,
                     &body_bytes,
                     principal.as_ref(),
@@ -151,6 +151,25 @@ pub async fn handle(
                 )
                 .await;
             }
+        }
+        // Live-update channel (SSE): a single-use ticket mint (the browser's EventSource cannot
+        // send an Authorization header, so it POSTs with its Bearer token for a short-lived ticket)
+        // and the multiplexed event stream. Both live here because the stream is a long-lived
+        // streaming body the buffered control plane cannot produce.
+        if method == Method::POST && subpath == "/events/ticket" {
+            return crate::sse::mint_ticket(&stack, principal.as_ref());
+        }
+        if method == Method::GET && subpath == "/events/stream" {
+            let ticket = query
+                .iter()
+                .find(|(k, _)| k == "ticket")
+                .map(|(_, v)| v.as_str());
+            let topics = query
+                .iter()
+                .find(|(k, _)| k == "topics")
+                .map(|(_, v)| v.as_str())
+                .unwrap_or("");
+            return crate::sse::events_stream(stack.clone(), ticket, topics);
         }
         let resp = stack
             .control
@@ -199,7 +218,7 @@ pub async fn handle(
         if token.is_empty() || token.contains('/') {
             return json_status(404, r#"{"error":"not found"}"#);
         }
-        return serve_share(stack, token, method, &headers, peer, secure, request_id).await;
+        return serve_share(&stack, token, method, &headers, peer, secure, request_id).await;
     }
 
     // Virtual-host-style addressing (ARCH 13.1): when `CAIRN_S3_DOMAIN` is configured and the
