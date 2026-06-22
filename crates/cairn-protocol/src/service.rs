@@ -675,7 +675,7 @@ impl S3Service {
         // a normal create enqueues when an enabled rule matches the key and the object's inline
         // tags (the `x-amz-tagging` header tag set, applied to this version below).
         let replication = if is_replica {
-            None
+            Vec::new()
         } else {
             let inline_tags = parse_tagging_header(req.header("x-amz-tagging"));
             self.replication_outbox(
@@ -914,7 +914,7 @@ impl S3Service {
             VersioningState::Enabled => {
                 let marker_id = VersionId::generate();
                 let replication = if is_replica {
-                    None
+                    Vec::new()
                 } else {
                     self.replication_outbox(
                         &bucket,
@@ -1382,7 +1382,7 @@ impl S3Service {
                 upload_id: upload_id.clone(),
                 row: Box::new(row),
                 precondition: Precondition::default(),
-                replication: None,
+                replication: Vec::new(),
             })
             .await
         {
@@ -1642,7 +1642,7 @@ impl S3Service {
             .submit(Mutation::PutObjectVersion {
                 row: Box::new(row),
                 precondition: Precondition::default(),
-                replication: None,
+                replication: Vec::new(),
             })
             .await
         {
@@ -1707,6 +1707,18 @@ impl S3Service {
             return Err(Error::MalformedXml);
         }
         let now = self.clock.now();
+
+        // Request-level replica gate (audit #16), mirroring the single-object DELETE: an
+        // Administrator carrying `x-amz-meta-cairn-replica` is propagating a replicated delete, so
+        // its delete markers must NOT be re-enqueued (loop prevention, ARCH 20.4) — and under
+        // fan-out would otherwise re-ship to every target. A normal member's header is ignored.
+        let is_replica = req
+            .header("x-amz-meta-cairn-replica")
+            .is_some_and(|v| v.eq_ignore_ascii_case("true"))
+            && req
+                .principal
+                .as_ref()
+                .is_some_and(|p| p.role == Role::Administrator);
 
         // Each entry is (key, version_id, is_delete_marker, delete_marker_version_id) so the
         // result can surface `<DeleteMarker>`/`<DeleteMarkerVersionId>` for a marker insert.
@@ -1784,15 +1796,18 @@ impl S3Service {
                 match bucket.versioning {
                     VersioningState::Enabled => {
                         let mid = VersionId::generate();
-                        let replication = self
-                            .replication_outbox(
+                        let replication = if is_replica {
+                            Vec::new()
+                        } else {
+                            self.replication_outbox(
                                 &bucket,
                                 &key,
                                 &mid,
                                 ReplicationOp::DeleteMarker,
                                 &[],
                             )
-                            .await;
+                            .await
+                        };
                         self.meta
                             .submit(Mutation::CreateDeleteMarker {
                                 bucket: bucket.name.clone(),
@@ -1825,7 +1840,7 @@ impl S3Service {
                                 version_id: VersionId::null(),
                                 owner_id: bucket.owner_id.clone(),
                                 now,
-                                replication: None,
+                                replication: Vec::new(),
                             })
                             .await
                     }
@@ -2941,40 +2956,43 @@ impl S3Service {
         version_id: &VersionId,
         op: ReplicationOp,
         tags: &[(String, String)],
-    ) -> Option<OutboxEntry> {
+    ) -> Vec<OutboxEntry> {
         if bucket.versioning != VersioningState::Enabled {
-            return None;
+            return Vec::new();
         }
-        let doc = self
+        let Some(doc) = self
             .meta
             .get_bucket_config(&bucket.name, ConfigAspect::Replication)
             .await
-            .ok()??;
-        let cfg = cairn_replication::parse_replication(doc.0.as_bytes()).ok()?;
+            .ok()
+            .flatten()
+        else {
+            return Vec::new();
+        };
+        let Ok(cfg) = cairn_replication::parse_replication(doc.0.as_bytes()) else {
+            return Vec::new();
+        };
         let is_marker = op == ReplicationOp::DeleteMarker;
-        // Among all rules whose filter matches, the highest-priority one wins (ties → document
-        // order), matching S3/MinIO rule-priority semantics; `find` would wrongly take the first
-        // document-order match regardless of `<Priority>` (ARCH 20.2).
-        let rule = cfg
-            .rules
-            .iter()
-            .filter(|r| {
-                r.enabled
-                    && r.filter.matches(key.as_str(), tags)
-                    && (!is_marker || r.delete_marker_replication)
+        // Fan-out (ARCH 20.2): one outbox entry per distinct destination target whose
+        // highest-priority rule matches. A single matching target — or keyspace-partitioned rules
+        // with disjoint prefixes — yields exactly one entry (the prior single-winner behaviour).
+        let now = self.clock.now();
+        cfg.matching_rules_for_all(key.as_str(), tags, is_marker)
+            .into_iter()
+            .map(|rule| {
+                cairn_replication::outbox_entry_for(
+                    uuid::Uuid::new_v4().simple().to_string(),
+                    bucket.name.clone(),
+                    key.clone(),
+                    version_id.clone(),
+                    op,
+                    rule.id.clone(),
+                    rule.target_arn.clone(),
+                    now,
+                    rule.priority,
+                )
             })
-            .reduce(|best, r| if r.priority > best.priority { r } else { best })?;
-        Some(cairn_replication::outbox_entry_for(
-            uuid::Uuid::new_v4().simple().to_string(),
-            bucket.name.clone(),
-            key.clone(),
-            version_id.clone(),
-            op,
-            rule.id.clone(),
-            rule.target_arn.clone(),
-            self.clock.now(),
-            rule.priority,
-        ))
+            .collect()
     }
 
     /// Resolve the current (or hidden-by-delete-marker) object version for a read.

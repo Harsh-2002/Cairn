@@ -54,8 +54,9 @@ pub enum Mutation {
         row: Box<ObjectVersionRow>,
         /// The conditional precondition.
         precondition: Precondition,
-        /// A replication outbox entry to enqueue in the same transaction, if applicable.
-        replication: Option<OutboxEntry>,
+        /// Replication outbox entries to enqueue in the same transaction — one per matching
+        /// destination target (fan-out); empty when the write does not replicate (ARCH 20).
+        replication: Vec<OutboxEntry>,
     },
     /// Insert a delete marker (a versioned plain delete).
     CreateDeleteMarker {
@@ -69,8 +70,8 @@ pub enum Mutation {
         owner_id: UserId,
         /// Creation time.
         now: Timestamp,
-        /// Replication of the marker, if applicable.
-        replication: Option<OutboxEntry>,
+        /// Replication of the marker — one entry per matching target; empty when not replicated.
+        replication: Vec<OutboxEntry>,
     },
     /// Permanently delete a specific version. Returns its freed blob path.
     DeleteVersion {
@@ -100,8 +101,8 @@ pub enum Mutation {
         row: Box<ObjectVersionRow>,
         /// The conditional precondition.
         precondition: Precondition,
-        /// Replication enqueue, if applicable.
-        replication: Option<OutboxEntry>,
+        /// Replication enqueue — one entry per matching target; empty when not replicated.
+        replication: Vec<OutboxEntry>,
     },
     /// Abort a multipart session.
     AbortMultipart(UploadId),

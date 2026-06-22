@@ -58,7 +58,7 @@ fn put(row: ObjectVersionRow) -> Mutation {
     Mutation::PutObjectVersion {
         row: Box::new(row),
         precondition: Precondition::default(),
-        replication: None,
+        replication: Vec::new(),
     }
 }
 

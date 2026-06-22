@@ -59,6 +59,78 @@ impl ReplicationConfig {
             .reduce(|best, r| if r.priority > best.priority { r } else { best })
     }
 
+    /// All enabled rules that apply to `key` carrying `tags`, **de-duplicated by destination
+    /// target** — the selection for 1→N fan-out (ARCH 20.2). The same object is enqueued once per
+    /// distinct `target_arn`; when several rules name the same target the highest
+    /// [`priority`](ReplicationRule::priority) wins (ties → document order), exactly as the
+    /// single-winner [`matching_rule_for`](Self::matching_rule_for) does, but across every distinct
+    /// target rather than collapsing to one. Keyspace-partitioned rules (disjoint targets) each
+    /// yield one entry; the degenerate single-match case reproduces the prior single-winner
+    /// behaviour. `is_marker` additionally requires `delete_marker_replication` (delete markers
+    /// carry no tags, so pass an empty tag set).
+    #[must_use]
+    pub fn matching_rules_for_all(
+        &self,
+        key: &str,
+        tags: &[(String, String)],
+        is_marker: bool,
+    ) -> Vec<&ReplicationRule> {
+        // Document order is preserved, which also makes the tie-break correct: a later
+        // equal-priority rule never displaces an earlier one for the same target.
+        let mut chosen: Vec<&ReplicationRule> = Vec::new();
+        for r in &self.rules {
+            if !(r.enabled
+                && r.filter.matches(key, tags)
+                && (!is_marker || r.delete_marker_replication))
+            {
+                continue;
+            }
+            if let Some(slot) = chosen.iter_mut().find(|c| c.target_arn == r.target_arn) {
+                if r.priority > slot.priority {
+                    *slot = r;
+                }
+            } else {
+                chosen.push(r);
+            }
+        }
+        chosen
+    }
+
+    /// All enabled **existing-object-replication** rules that apply to `key` carrying `tags`,
+    /// de-duplicated by destination target (highest priority per target) — the backfill/resync
+    /// analogue of [`matching_rules_for_all`](Self::matching_rules_for_all), additionally requiring
+    /// `existing_object_replication` so only rules opted into backfill enqueue existing objects.
+    #[must_use]
+    pub fn backfill_rules_for_all(
+        &self,
+        key: &str,
+        tags: &[(String, String)],
+    ) -> Vec<&ReplicationRule> {
+        let mut chosen: Vec<&ReplicationRule> = Vec::new();
+        for r in &self.rules {
+            if !(r.enabled && r.existing_object_replication && r.filter.matches(key, tags)) {
+                continue;
+            }
+            if let Some(slot) = chosen.iter_mut().find(|c| c.target_arn == r.target_arn) {
+                if r.priority > slot.priority {
+                    *slot = r;
+                }
+            } else {
+                chosen.push(r);
+            }
+        }
+        chosen
+    }
+
+    /// Whether any enabled existing-object-replication rule has a tag predicate, so a backfill pass
+    /// can skip the per-object tag load when no rule needs tags.
+    #[must_use]
+    pub fn backfill_needs_tags(&self) -> bool {
+        self.rules
+            .iter()
+            .any(|r| r.enabled && r.existing_object_replication && !r.filter.tags.is_empty())
+    }
+
     /// Whether a write to `key` should enqueue a replication entry under this configuration: it
     /// matches an enabled rule's prefix filter.
     #[must_use]
@@ -452,6 +524,47 @@ mod tests {
         );
         assert!(!cfg.replicates("archive/2026/old.tar"));
         assert!(!cfg.replicates("photos/cat.jpg"));
+    }
+
+    #[test]
+    fn matching_rules_for_all_fans_out_per_target_deduped() {
+        let rule = |id: &str, target: &str, priority: i64, dmr: bool| ReplicationRule {
+            id: id.to_owned(),
+            enabled: true,
+            target_arn: Some(target.to_owned()),
+            priority,
+            delete_marker_replication: dmr,
+            ..Default::default()
+        };
+        let cfg = ReplicationConfig {
+            role: "r".to_owned(),
+            rules: vec![
+                rule("a", "arn:X", 0, false),
+                rule("b", "arn:Y", 0, true),
+                // Same target as `a` but higher priority — must win for X (de-dup by target).
+                rule("c", "arn:X", 5, false),
+                // Disabled — never selected.
+                ReplicationRule {
+                    id: "d".to_owned(),
+                    enabled: false,
+                    target_arn: Some("arn:Z".to_owned()),
+                    ..Default::default()
+                },
+            ],
+        };
+        // Object create: exactly one entry per distinct target; X resolves to the higher-priority c.
+        let mut got: Vec<(&str, &str)> = cfg
+            .matching_rules_for_all("any/key", &[], false)
+            .iter()
+            .map(|r| (r.target_arn.as_deref().unwrap(), r.id.as_str()))
+            .collect();
+        got.sort_unstable();
+        assert_eq!(got, vec![("arn:X", "c"), ("arn:Y", "b")]);
+
+        // Delete markers: only rules with delete-marker replication participate (here just b/Y).
+        let markers = cfg.matching_rules_for_all("any/key", &[], true);
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].id, "b");
     }
 
     #[test]

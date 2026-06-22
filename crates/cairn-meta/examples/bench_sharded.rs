@@ -96,7 +96,7 @@ async fn bench(shards: usize, buckets: usize, conc: usize, secs: f64) -> f64 {
                     .submit(Mutation::PutObjectVersion {
                         row: Box::new(row(&b, &k, i)),
                         precondition: Precondition::default(),
-                        replication: None,
+                        replication: Vec::new(),
                     })
                     .await
                     .is_ok()

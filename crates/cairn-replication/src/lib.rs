@@ -163,15 +163,19 @@ impl ReplicationEngine {
             ..RunReport::default()
         };
 
-        // Group by key so a key's versions are processed strictly oldest-first, and so a
-        // stalled earlier version blocks the later ones (per-key ordering). Version ids are
-        // time-sortable (uuid v7), so ascending string order is chronological order.
-        let mut by_key: BTreeMap<(String, String), Vec<OutboxEntry>> = BTreeMap::new();
+        // Group by (key, target) so a key's versions to a given target are processed strictly
+        // oldest-first, and a stalled earlier version blocks the later ones for THAT target only
+        // (per-key, per-target ordering — a slow target never holds up a healthy one under
+        // fan-out). Version ids are time-sortable (uuid v7), so ascending string order is
+        // chronological order.
+        let mut by_key: BTreeMap<(String, String, Option<String>), Vec<OutboxEntry>> =
+            BTreeMap::new();
         for entry in batch {
             by_key
                 .entry((
                     entry.bucket.as_str().to_owned(),
                     entry.key.as_str().to_owned(),
+                    entry.target_arn.clone(),
                 ))
                 .or_default()
                 .push(entry);
@@ -302,7 +306,12 @@ impl ReplicationEngine {
         // a later drain once the predecessor ships. Applies to both object ships and delete
         // markers, mirroring the within-batch block which is operation-agnostic.
         if meta
-            .has_unreplicated_predecessor(&entry.bucket, &entry.key, &entry.version_id)
+            .has_unreplicated_predecessor(
+                &entry.bucket,
+                &entry.key,
+                &entry.version_id,
+                entry_target_arn(entry),
+            )
             .await?
         {
             return Ok(EntryOutcome::Deferred);
@@ -544,7 +553,7 @@ where
     meta.submit(Mutation::PutObjectVersion {
         row: Box::new(updated),
         precondition: cairn_types::meta::Precondition::default(),
-        replication: None,
+        replication: Vec::new(),
     })
     .await?;
     Ok(())

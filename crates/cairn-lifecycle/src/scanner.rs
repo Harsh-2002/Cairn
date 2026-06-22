@@ -541,46 +541,53 @@ impl LifecycleScanner {
         .map(|_| ())
     }
 
-    /// Build a replication-outbox entry for a lifecycle-created delete marker when the bucket has an
-    /// enabled replication rule (with delete-marker replication) whose prefix matches the key, so
-    /// expirations propagate to the replica the same way a client delete does (ARCH 20.3/20.4).
-    /// Replication requires versioning-enabled, so a non-enabled bucket yields `None`.
+    /// Build the replication-outbox entries for a lifecycle-created delete marker — one per distinct
+    /// destination target whose delete-marker-replication rule matches the key (1→N fan-out), so
+    /// expirations propagate to every replica the same way a client delete does (ARCH 20.2/20.3/20.4).
+    /// Rule matching mirrors the protocol's delete path (`matches` against an empty tag set).
+    /// Replication requires versioning-enabled, so a non-enabled bucket yields an empty vec.
     async fn marker_replication<M>(
         meta: &M,
         bucket: &Bucket,
         key: &ObjectKey,
         marker_id: &VersionId,
         now: Timestamp,
-    ) -> Option<cairn_types::meta::OutboxEntry>
+    ) -> Vec<cairn_types::meta::OutboxEntry>
     where
         M: MetadataStore + ?Sized,
     {
         if bucket.versioning != VersioningState::Enabled {
-            return None;
+            return Vec::new();
         }
-        let doc = meta
+        let Some(doc) = meta
             .get_bucket_config(&bucket.name, cairn_types::bucket::ConfigAspect::Replication)
             .await
-            .ok()??;
-        let cfg = cairn_replication::parse_replication(doc.0.as_bytes()).ok()?;
-        let rule = cfg
-            .rules
-            .iter()
-            .filter(|r| {
-                r.enabled && r.delete_marker_replication && r.filter.matches_prefix(key.as_str())
+            .ok()
+            .flatten()
+        else {
+            return Vec::new();
+        };
+        let Ok(cfg) = cairn_replication::parse_replication(doc.0.as_bytes()) else {
+            return Vec::new();
+        };
+        // The entry id is scoped by rule (`dmrepl:{rule}:{marker}`) so N targets never collide on
+        // one primary key — a fan-out delete marker enqueues one durable row per target.
+        cfg.matching_rules_for_all(key.as_str(), &[], true)
+            .into_iter()
+            .map(|rule| {
+                cairn_replication::outbox_entry_for(
+                    format!("dmrepl:{}:{}", rule.id, marker_id.as_str()),
+                    bucket.name.clone(),
+                    key.clone(),
+                    marker_id.clone(),
+                    cairn_types::meta::ReplicationOp::DeleteMarker,
+                    rule.id.clone(),
+                    rule.target_arn.clone(),
+                    now,
+                    rule.priority,
+                )
             })
-            .reduce(|best, r| if r.priority > best.priority { r } else { best })?;
-        Some(cairn_replication::outbox_entry_for(
-            format!("dmrepl:{}", marker_id.as_str()),
-            bucket.name.clone(),
-            key.clone(),
-            marker_id.clone(),
-            cairn_types::meta::ReplicationOp::DeleteMarker,
-            rule.id.clone(),
-            rule.target_arn.clone(),
-            now,
-            rule.priority,
-        ))
+            .collect()
     }
 
     /// Permanently delete a version and reclaim its freed blob (idempotent: a missing version

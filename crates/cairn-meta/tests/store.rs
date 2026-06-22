@@ -48,7 +48,7 @@ fn put(row: ObjectVersionRow, pc: Precondition) -> Mutation {
     Mutation::PutObjectVersion {
         row: Box::new(row),
         precondition: pc,
-        replication: None,
+        replication: Vec::new(),
     }
 }
 
@@ -570,7 +570,7 @@ async fn plant_outbox(
         .submit(Mutation::PutObjectVersion {
             row: Box::new(row(b, key, version, "e", true)),
             precondition: Precondition::default(),
-            replication: Some(entry),
+            replication: vec![entry],
         })
         .await
         .unwrap();

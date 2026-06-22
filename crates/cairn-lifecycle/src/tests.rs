@@ -100,7 +100,7 @@ async fn put_object(
     meta.submit(Mutation::PutObjectVersion {
         row: Box::new(row),
         precondition: cairn_types::Precondition::default(),
-        replication: None,
+        replication: Vec::new(),
     })
     .await
     .unwrap();
@@ -474,7 +474,7 @@ async fn expired_object_delete_marker_removed_when_sole_version() {
         version_id: VersionId::generate(),
         owner_id: owner(),
         now: Timestamp::from_secs(0),
-        replication: None,
+        replication: Vec::new(),
     })
     .await
     .unwrap();
@@ -513,7 +513,7 @@ async fn expired_object_delete_marker_kept_when_other_versions_exist() {
         version_id: VersionId::generate(),
         owner_id: owner(),
         now: Timestamp::from_secs(0),
-        replication: None,
+        replication: Vec::new(),
     })
     .await
     .unwrap();

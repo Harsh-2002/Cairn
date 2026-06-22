@@ -139,7 +139,7 @@ async fn put_object(h: &Harness, bucket: &str, key: &str, data: &'static [u8]) {
         .submit(Mutation::PutObjectVersion {
             row: Box::new(row),
             precondition: Precondition::default(),
-            replication: None,
+            replication: Vec::new(),
         })
         .await
         .unwrap();
@@ -1215,7 +1215,7 @@ async fn failed_replication_reflects_a_planted_terminal_entry() {
         .submit(Mutation::PutObjectVersion {
             row: Box::new(row),
             precondition: Precondition::default(),
-            replication: Some(entry),
+            replication: vec![entry],
         })
         .await
         .unwrap();
@@ -1745,7 +1745,7 @@ async fn replication_retry_endpoint_requeues_failed_for_bucket() {
         .submit(Mutation::PutObjectVersion {
             row: Box::new(row),
             precondition: Precondition::default(),
-            replication: Some(entry),
+            replication: vec![entry],
         })
         .await
         .unwrap();

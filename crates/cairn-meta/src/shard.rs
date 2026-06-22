@@ -410,10 +410,11 @@ impl MetadataStore for ShardedMetadataStore {
         bucket: &BucketName,
         key: &ObjectKey,
         before: &VersionId,
+        target: Option<&str>,
     ) -> Result<bool, MetaError> {
         // The outbox is a per-bucket table, so this key's predecessors live in the same shard.
         self.for_bucket(bucket.as_str())
-            .has_unreplicated_predecessor(bucket, key, before)
+            .has_unreplicated_predecessor(bucket, key, before, target)
             .await
     }
 

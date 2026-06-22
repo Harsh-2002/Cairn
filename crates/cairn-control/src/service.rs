@@ -2736,57 +2736,49 @@ async fn backfill_replication(
                 return;
             }
         };
+        // Load tags only when some enabled backfill rule actually filters on them.
+        let needs_tags = cfg.backfill_needs_tags();
         for summary in &page.items {
             let key = &summary.key;
-            // Highest-priority enabled backfill rule whose prefix matches this key.
-            let Some(rule) = cfg
-                .rules
-                .iter()
-                .filter(|r| {
-                    r.enabled
-                        && r.existing_object_replication
-                        && r.filter.matches_prefix(key.as_str())
-                })
-                .reduce(|best, r| if r.priority > best.priority { r } else { best })
-            else {
-                continue;
-            };
-            // Honour tag predicates, loading the object's tags only when the rule has any.
-            if !rule.filter.tags.is_empty() {
-                let tags = meta
-                    .get_object_tags(&bucket, key, &summary.version_id)
+            let tags = if needs_tags {
+                meta.get_object_tags(&bucket, key, &summary.version_id)
                     .await
-                    .unwrap_or_default();
-                if !rule.filter.matches(key.as_str(), &tags) {
-                    continue;
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            // Fan-out: one entry per distinct target whose highest-priority enabled
+            // existing-object-replication rule matches this key+tags. The id is scoped by rule so
+            // N targets never collide on one primary key, and `INSERT OR IGNORE` keeps resync
+            // idempotent per target.
+            for rule in cfg.backfill_rules_for_all(key.as_str(), &tags) {
+                let id = format!(
+                    "backfill:{}:{}:{}",
+                    rule.id,
+                    key.as_str(),
+                    summary.version_id.as_str()
+                );
+                let entry = cairn_replication::outbox_entry_for(
+                    id,
+                    bucket.clone(),
+                    key.clone(),
+                    summary.version_id.clone(),
+                    cairn_types::meta::ReplicationOp::ObjectCreate,
+                    rule.id.clone(),
+                    rule.target_arn.clone(),
+                    clock.now(),
+                    rule.priority,
+                );
+                if let Err(e) = meta
+                    .submit(Mutation::EnqueueReplication(Box::new(entry)))
+                    .await
+                {
+                    tracing::warn!(bucket = %bucket.as_str(), error = %e,
+                        "replication backfill: enqueue failed");
+                    return;
                 }
+                enqueued += 1;
             }
-            let id = format!(
-                "backfill:{}:{}:{}",
-                rule.id,
-                key.as_str(),
-                summary.version_id.as_str()
-            );
-            let entry = cairn_replication::outbox_entry_for(
-                id,
-                bucket.clone(),
-                key.clone(),
-                summary.version_id.clone(),
-                cairn_types::meta::ReplicationOp::ObjectCreate,
-                rule.id.clone(),
-                rule.target_arn.clone(),
-                clock.now(),
-                rule.priority,
-            );
-            if let Err(e) = meta
-                .submit(Mutation::EnqueueReplication(Box::new(entry)))
-                .await
-            {
-                tracing::warn!(bucket = %bucket.as_str(), error = %e,
-                    "replication backfill: enqueue failed");
-                return;
-            }
-            enqueued += 1;
         }
         match page.next_cursor {
             Some(c) => cursor = Some(c),

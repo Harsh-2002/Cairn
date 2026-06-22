@@ -65,7 +65,7 @@ fn put(row: ObjectVersionRow, pc: Precondition) -> Mutation {
     Mutation::PutObjectVersion {
         row: Box::new(row),
         precondition: pc,
-        replication: None,
+        replication: Vec::new(),
     }
 }
 
@@ -300,7 +300,7 @@ async fn delete_marker_hides_current_parity() {
             version_id: VersionId::from_string("v2".into()),
             owner_id: UserId("owner".to_owned()),
             now: Timestamp(2),
-            replication: None,
+            replication: Vec::new(),
         })
         .await
         .unwrap();
@@ -618,7 +618,7 @@ async fn multipart_lifecycle_parity() {
                 upload_id: upload.clone(),
                 row: Box::new(assembled),
                 precondition: Precondition::default(),
-                replication: None,
+                replication: Vec::new(),
             })
             .await
             .unwrap();
@@ -784,7 +784,7 @@ async fn replication_outbox_parity() {
         s.submit(Mutation::PutObjectVersion {
             row: Box::new(row(&bk, "k", v.clone(), "e", 3)),
             precondition: Precondition::default(),
-            replication: Some(entry),
+            replication: vec![entry],
         })
         .await
         .unwrap();
@@ -822,7 +822,7 @@ async fn replication_outbox_parity() {
         s.submit(Mutation::PutObjectVersion {
             row: Box::new(row(&bk, "k2", v2.clone(), "e", 3)),
             precondition: Precondition::default(),
-            replication: Some(e2),
+            replication: vec![e2],
         })
         .await
         .unwrap();

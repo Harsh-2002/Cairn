@@ -60,8 +60,8 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             };
             demote_latest(conn, &row.bucket, &row.key)?;
             insert_version(conn, &row)?;
-            if let Some(e) = replication {
-                enqueue(conn, &e)?;
+            for e in &replication {
+                enqueue(conn, e)?;
             }
             Ok(MutationOutcome::DeleteMarker { version_id })
         }
@@ -138,8 +138,8 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
                 params![upload_id.as_str()],
             )
             .map_err(engine_err)?;
-            if let Some(e) = replication {
-                enqueue(conn, &e)?;
+            for e in &replication {
+                enqueue(conn, e)?;
             }
             Ok(MutationOutcome::MultipartCompleted {
                 superseded,
@@ -680,15 +680,15 @@ fn put_version(
     conn: &Connection,
     row: ObjectVersionRow,
     precondition: &Precondition,
-    replication: Option<OutboxEntry>,
+    replication: Vec<OutboxEntry>,
 ) -> R<MutationOutcome> {
     check_precondition(conn, &row.bucket, &row.key, precondition)?;
     enforce_bucket_quota(conn, &row)?;
     enforce_user_quota(conn, &row)?;
     let version_id = row.version_id.clone();
     let superseded = upsert_version(conn, row)?;
-    if let Some(e) = replication {
-        enqueue(conn, &e)?;
+    for e in &replication {
+        enqueue(conn, e)?;
     }
     Ok(MutationOutcome::Put {
         superseded,
@@ -1340,7 +1340,7 @@ mod tests {
         Mutation::PutObjectVersion {
             row: Box::new(row),
             precondition: Precondition::default(),
-            replication: None,
+            replication: Vec::new(),
         }
     }
 
@@ -1465,7 +1465,7 @@ mod tests {
                 version_id: VersionId::from_string("v3".to_owned()),
                 owner_id: UserId("alice".to_owned()),
                 now: Timestamp(2),
-                replication: None,
+                replication: Vec::new(),
             },
         )
         .unwrap();
@@ -1593,7 +1593,7 @@ mod tests {
                 version_id: VersionId::from_string("v2".to_owned()),
                 owner_id: UserId("owner".to_owned()),
                 now: Timestamp(2),
-                replication: None,
+                replication: Vec::new(),
             },
         )
         .unwrap();

@@ -283,7 +283,7 @@ impl MetadataStore for InMemoryMetadataStore {
                 st.check_precondition(row.bucket.as_str(), row.key.as_str(), &precondition)?;
                 let version_id = row.version_id.clone();
                 let superseded = st.upsert_version(*row);
-                if let Some(entry) = replication {
+                for entry in replication {
                     st.outbox.push(entry);
                 }
                 Ok(MutationOutcome::Put {
@@ -335,7 +335,7 @@ impl MetadataStore for InMemoryMetadataStore {
                     version_id.as_str().to_owned(),
                 );
                 st.versions.insert(vk, row);
-                if let Some(entry) = replication {
+                for entry in replication {
                     st.outbox.push(entry);
                 }
                 Ok(MutationOutcome::DeleteMarker { version_id })
@@ -407,7 +407,7 @@ impl MetadataStore for InMemoryMetadataStore {
                 let superseded = st.upsert_version(*row);
                 st.multipart.remove(upload_id.as_str());
                 st.parts.retain(|(u, _), _| u != upload_id.as_str());
-                if let Some(entry) = replication {
+                for entry in replication {
                     st.outbox.push(entry);
                 }
                 Ok(MutationOutcome::MultipartCompleted {
@@ -1100,13 +1100,16 @@ impl MetadataStore for InMemoryMetadataStore {
         bucket: &BucketName,
         key: &ObjectKey,
         before: &VersionId,
+        target: Option<&str>,
     ) -> Result<bool, MetaError> {
         // version_id is uuidv7 (time-ordered); a strictly-lower id is an earlier write that has
-        // not shipped unless its outbox row is `Completed` (audit #9).
+        // not shipped unless its outbox row is `Completed` (audit #9). Scoped per target so a
+        // later version to target X only waits on earlier versions to the same X (fan-out).
         let st = self.state.lock().unwrap();
         Ok(st.outbox.iter().any(|e| {
             e.bucket.as_str() == bucket.as_str()
                 && e.key.as_str() == key.as_str()
+                && e.target_arn.as_deref() == target
                 && e.version_id.as_str() < before.as_str()
                 && e.status != ReplicationStatus::Completed
         }))

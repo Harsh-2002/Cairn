@@ -62,8 +62,8 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
             };
             demote_latest(driver, &row.bucket, &row.key).await?;
             insert_version(driver, &row).await?;
-            if let Some(e) = replication {
-                enqueue(driver, &e).await?;
+            for e in &replication {
+                enqueue(driver, e).await?;
             }
             Ok(MutationOutcome::DeleteMarker { version_id })
         }
@@ -145,8 +145,8 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
                     vec![Value::Text(upload_id.as_str().to_owned())],
                 )
                 .await?;
-            if let Some(e) = replication {
-                enqueue(driver, &e).await?;
+            for e in &replication {
+                enqueue(driver, e).await?;
             }
             Ok(MutationOutcome::MultipartCompleted {
                 superseded,
@@ -791,15 +791,15 @@ async fn put_version(
     driver: &dyn AsyncSqlDriver,
     row: ObjectVersionRow,
     precondition: &Precondition,
-    replication: Option<OutboxEntry>,
+    replication: Vec<OutboxEntry>,
 ) -> R<MutationOutcome> {
     check_precondition(driver, &row.bucket, &row.key, precondition).await?;
     enforce_bucket_quota(driver, &row).await?;
     enforce_user_quota(driver, &row).await?;
     let version_id = row.version_id.clone();
     let superseded = upsert_version(driver, row).await?;
-    if let Some(e) = replication {
-        enqueue(driver, &e).await?;
+    for e in &replication {
+        enqueue(driver, e).await?;
     }
     Ok(MutationOutcome::Put {
         superseded,

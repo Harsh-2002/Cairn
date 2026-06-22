@@ -142,7 +142,7 @@ async fn put_with_outbox(
     meta.submit(Mutation::PutObjectVersion {
         row: Box::new(row),
         precondition: Precondition::default(),
-        replication: Some(entry),
+        replication: vec![entry],
     })
     .await
     .unwrap();
@@ -185,7 +185,7 @@ async fn enqueue_versioned(
     meta.submit(Mutation::PutObjectVersion {
         row: Box::new(row),
         precondition: Precondition::default(),
-        replication: Some(entry),
+        replication: vec![entry],
     })
     .await
     .unwrap();
@@ -557,7 +557,7 @@ async fn delete_marker_entry_drives_sink_delete_marker() {
     meta.submit(Mutation::PutObjectVersion {
         row: Box::new(row),
         precondition: Precondition::default(),
-        replication: Some(entry),
+        replication: vec![entry],
     })
     .await
     .unwrap();
@@ -621,7 +621,7 @@ async fn replica_status_is_never_re_replicated() {
     meta.submit(Mutation::PutObjectVersion {
         row: Box::new(row),
         precondition: Precondition::default(),
-        replication: Some(entry),
+        replication: vec![entry],
     })
     .await
     .unwrap();
@@ -692,7 +692,7 @@ async fn redelivering_completed_version_is_idempotent() {
     meta.submit(Mutation::PutObjectVersion {
         row: Box::new(existing),
         precondition: Precondition::default(),
-        replication: Some(dup),
+        replication: vec![dup],
     })
     .await
     .unwrap();
@@ -788,7 +788,7 @@ async fn run_until_idle_drains_independent_keys() {
         meta.submit(Mutation::PutObjectVersion {
             row: Box::new(row),
             precondition: Precondition::default(),
-            replication: Some(entry),
+            replication: vec![entry],
         })
         .await
         .unwrap();

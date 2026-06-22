@@ -669,9 +669,10 @@ impl MetadataStore for CachedMetadataStore {
         bucket: &BucketName,
         key: &ObjectKey,
         before: &VersionId,
+        target: Option<&str>,
     ) -> Result<bool, MetaError> {
         self.inner
-            .has_unreplicated_predecessor(bucket, key, before)
+            .has_unreplicated_predecessor(bucket, key, before, target)
             .await
     }
 
@@ -1055,9 +1056,10 @@ mod tests {
             bucket: &BucketName,
             key: &ObjectKey,
             before: &VersionId,
+            target: Option<&str>,
         ) -> Result<bool, MetaError> {
             self.inner
-                .has_unreplicated_predecessor(bucket, key, before)
+                .has_unreplicated_predecessor(bucket, key, before, target)
                 .await
         }
         async fn claim_replication_batch(

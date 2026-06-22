@@ -102,7 +102,7 @@ async fn put_get_list_delete_roundtrip() {
             .submit(Mutation::PutObjectVersion {
                 row: Box::new(row),
                 precondition: Precondition::default(),
-                replication: None,
+                replication: Vec::new(),
             })
             .await
             .unwrap();
@@ -184,7 +184,7 @@ async fn conditional_write_if_none_match_is_atomic() {
     meta.submit(Mutation::PutObjectVersion {
         row: Box::new(row.clone()),
         precondition: Precondition::default(),
-        replication: None,
+        replication: Vec::new(),
     })
     .await
     .unwrap();
@@ -197,7 +197,7 @@ async fn conditional_write_if_none_match_is_atomic() {
                 if_match: None,
                 if_none_match: Some(IfNoneMatch::Any),
             },
-            replication: None,
+            replication: Vec::new(),
         })
         .await
         .unwrap_err();
@@ -232,7 +232,7 @@ async fn versioning_keeps_history_and_promotes_latest() {
         meta.submit(Mutation::PutObjectVersion {
             row: Box::new(row),
             precondition: Precondition::default(),
-            replication: None,
+            replication: Vec::new(),
         })
         .await
         .unwrap();
@@ -296,7 +296,7 @@ async fn reconcile_reclaims_orphan_blobs() {
     meta.submit(Mutation::PutObjectVersion {
         row: Box::new(row),
         precondition: Precondition::default(),
-        replication: None,
+        replication: Vec::new(),
     })
     .await
     .unwrap();
@@ -383,7 +383,7 @@ async fn plant_outbox_entry(
     meta.submit(Mutation::PutObjectVersion {
         row: Box::new(row),
         precondition: Precondition::default(),
-        replication: Some(entry),
+        replication: vec![entry],
     })
     .await
     .unwrap();
@@ -496,7 +496,7 @@ async fn set_object_acl_replaces_the_version_acl() {
     meta.submit(Mutation::PutObjectVersion {
         row: Box::new(row),
         precondition: Precondition::default(),
-        replication: None,
+        replication: Vec::new(),
     })
     .await
     .unwrap();
