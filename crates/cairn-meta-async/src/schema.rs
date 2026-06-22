@@ -414,6 +414,15 @@ CREATE TABLE session_credentials (
 CREATE INDEX idx_session_creds_expiry ON session_credentials (expires_at);
 "#,
     },
+    Migration {
+        version: 19,
+        name: "replication outbox enqueue timestamp (true lag)",
+        sql: r#"
+-- Enqueue-time millis for true replication lag. Mirrors cairn-meta/src/schema.rs v19.
+ALTER TABLE replication_outbox ADD COLUMN enqueued_at INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX idx_outbox_status_enqueued ON replication_outbox (status, enqueued_at);
+"#,
+    },
 ];
 
 /// Run all pending migrations on the write driver, recording each as applied. Each migration is

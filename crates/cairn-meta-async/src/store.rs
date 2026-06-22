@@ -17,9 +17,10 @@ use cairn_types::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, Vers
 use cairn_types::meta::{
     ActivityEntry, BucketCounts, BucketRequestCount, LATENCY_BUCKETS, ListPage, ListQuery,
     MetricsRange, MultipartSession, Mutation, MutationOutcome, ObjectSummary, OpCount, OutboxEntry,
-    PartRecord, ReplicationStatus, RequestMetricsSeries, SessionCredentialSummary, ShareRow,
-    StatusCount, StoreCounts, TagSummary, TaggedObject, TimePoint, User, UserSessionCredentials,
-    UserSigV4Credentials, UserWithBearerHash, WebhookEntry, latency_quantile_ms,
+    PartRecord, ReplicationCounts, ReplicationStatus, ReplicationTargetCounts,
+    RequestMetricsSeries, SessionCredentialSummary, ShareRow, StatusCount, StoreCounts, TagSummary,
+    TaggedObject, TimePoint, User, UserSessionCredentials, UserSigV4Credentials,
+    UserWithBearerHash, WebhookEntry, latency_quantile_ms,
 };
 use cairn_types::object::ObjectVersionRow;
 use cairn_types::time::Timestamp;
@@ -717,6 +718,69 @@ impl MetadataStore for AsyncMetadataStore {
             )
             .await?;
         rows.iter().map(model::outbox_from_row).collect()
+    }
+
+    async fn replication_counts(
+        &self,
+        bucket: Option<&BucketName>,
+    ) -> Result<ReplicationCounts, MetaError> {
+        let b = bucket.map_or(Value::Null, |x| Value::Text(x.as_str().to_owned()));
+        let mut counts = ReplicationCounts::default();
+        // Totals by status (`?1 IS NULL` makes the bucket filter optional).
+        let rows = self
+            .reader()
+            .await
+            .query(
+                "SELECT status, COUNT(*) FROM replication_outbox \
+                 WHERE (?1 IS NULL OR bucket_name = ?1) GROUP BY status",
+                vec![b.clone()],
+            )
+            .await?;
+        for row in &rows {
+            let n = row.get_i64(1) as u64;
+            match row.get_text(0).as_str() {
+                "pending" => counts.pending = n,
+                "claimed" => counts.claimed = n,
+                "failed" => counts.failed = n,
+                "completed" => counts.completed = n,
+                _ => {}
+            }
+        }
+        // Per-target pending/failed breakdown.
+        let rows = self
+            .reader()
+            .await
+            .query(
+                "SELECT target_arn, \
+                 SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END), \
+                 SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) \
+                 FROM replication_outbox WHERE (?1 IS NULL OR bucket_name = ?1) GROUP BY target_arn",
+                vec![b.clone()],
+            )
+            .await?;
+        for row in &rows {
+            let pending = row.get_i64(1) as u64;
+            let failed = row.get_i64(2) as u64;
+            if pending > 0 || failed > 0 {
+                counts.by_target.push(ReplicationTargetCounts {
+                    target_arn: row.get_opt_text(0),
+                    pending,
+                    failed,
+                });
+            }
+        }
+        // Oldest still-pending enqueue time (0 = none / pre-migration unknowns).
+        let rows = self
+            .reader()
+            .await
+            .query(
+                "SELECT COALESCE(MIN(NULLIF(enqueued_at, 0)), 0) FROM replication_outbox \
+                 WHERE status='pending' AND (?1 IS NULL OR bucket_name = ?1)",
+                vec![b],
+            )
+            .await?;
+        counts.oldest_pending_at_ms = rows.first().map_or(0, |r| r.get_i64(0));
+        Ok(counts)
     }
 
     async fn claim_webhook_batch(

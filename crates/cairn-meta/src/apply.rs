@@ -516,8 +516,8 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             // same deterministic entry id — is a no-op rather than a duplicate or a PK error.
             conn.execute(
                 "INSERT OR IGNORE INTO replication_outbox
-                 (id, bucket_name, key, version_id, operation, rule_id, target_arn, attempts, next_attempt_at, status, last_error, priority, lease_until)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                 (id, bucket_name, key, version_id, operation, rule_id, target_arn, attempts, next_attempt_at, status, last_error, priority, lease_until, enqueued_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
                 params![
                     e.id,
                     e.bucket.as_str(),
@@ -532,6 +532,7 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
                     e.last_error,
                     e.priority,
                     e.lease_until.map(|t| t.0),
+                    e.enqueued_at.0,
                 ],
             )
             .map_err(engine_err)?;
@@ -1092,8 +1093,8 @@ fn check_precondition(
 fn enqueue(conn: &Connection, e: &OutboxEntry) -> R<()> {
     conn.prepare_cached(
         "INSERT INTO replication_outbox
-         (id, bucket_name, key, version_id, operation, rule_id, target_arn, attempts, next_attempt_at, status, last_error, priority, lease_until)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+         (id, bucket_name, key, version_id, operation, rule_id, target_arn, attempts, next_attempt_at, status, last_error, priority, lease_until, enqueued_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
     )
     .map_err(engine_err)?
     .execute(params![
@@ -1110,6 +1111,7 @@ fn enqueue(conn: &Connection, e: &OutboxEntry) -> R<()> {
             e.last_error,
             e.priority,
             e.lease_until.map(|t| t.0),
+            e.enqueued_at.0,
         ])
     .map_err(engine_err)?;
     Ok(())

@@ -12,9 +12,10 @@ use cairn_types::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, Vers
 use cairn_types::meta::{
     ActivityEntry, BucketCounts, BucketRequestCount, LATENCY_BUCKETS, ListPage, ListQuery,
     MetricsRange, MultipartSession, Mutation, MutationOutcome, ObjectSummary, OpCount, OutboxEntry,
-    PartRecord, ReplicationStatus, RequestMetricsSeries, SessionCredentialSummary, ShareRow,
-    StatusCount, StoreCounts, TagSummary, TaggedObject, TimePoint, User, UserSessionCredentials,
-    UserSigV4Credentials, UserWithBearerHash, WebhookEntry, latency_quantile_ms,
+    PartRecord, ReplicationCounts, ReplicationStatus, ReplicationTargetCounts,
+    RequestMetricsSeries, SessionCredentialSummary, ShareRow, StatusCount, StoreCounts, TagSummary,
+    TaggedObject, TimePoint, User, UserSessionCredentials, UserSigV4Credentials,
+    UserWithBearerHash, WebhookEntry, latency_quantile_ms,
 };
 use cairn_types::object::ObjectVersionRow;
 use cairn_types::time::Timestamp;
@@ -1080,6 +1081,78 @@ impl MetadataStore for SqliteMetadataStore {
                 .map_err(engine_err)?
                 .collect::<rusqlite::Result<Vec<_>>>()
                 .map_err(engine_err)
+        })
+        .await
+    }
+
+    async fn replication_counts(
+        &self,
+        bucket: Option<&BucketName>,
+    ) -> Result<ReplicationCounts, MetaError> {
+        let b = bucket.map(|x| x.as_str().to_owned());
+        self.with_read(move |conn| {
+            let mut counts = ReplicationCounts::default();
+            // Totals by status — one indexed GROUP BY. `?1 IS NULL` makes the bucket filter optional.
+            let mut stmt = conn
+                .prepare(
+                    "SELECT status, COUNT(*) FROM replication_outbox \
+                     WHERE (?1 IS NULL OR bucket_name = ?1) GROUP BY status",
+                )
+                .map_err(engine_err)?;
+            let rows = stmt
+                .query_map(params![b], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
+                })
+                .map_err(engine_err)?;
+            for row in rows {
+                let (status, n) = row.map_err(engine_err)?;
+                match status.as_str() {
+                    "pending" => counts.pending = n,
+                    "claimed" => counts.claimed = n,
+                    "failed" => counts.failed = n,
+                    "completed" => counts.completed = n,
+                    _ => {}
+                }
+            }
+            // Per-target pending/failed breakdown (targets with neither are dropped below).
+            let mut stmt = conn
+                .prepare(
+                    "SELECT target_arn, \
+                     SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END), \
+                     SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) \
+                     FROM replication_outbox WHERE (?1 IS NULL OR bucket_name = ?1) \
+                     GROUP BY target_arn",
+                )
+                .map_err(engine_err)?;
+            let rows = stmt
+                .query_map(params![b], |r| {
+                    Ok((
+                        r.get::<_, Option<String>>(0)?,
+                        r.get::<_, i64>(1)? as u64,
+                        r.get::<_, i64>(2)? as u64,
+                    ))
+                })
+                .map_err(engine_err)?;
+            for row in rows {
+                let (target_arn, pending, failed) = row.map_err(engine_err)?;
+                if pending > 0 || failed > 0 {
+                    counts.by_target.push(ReplicationTargetCounts {
+                        target_arn,
+                        pending,
+                        failed,
+                    });
+                }
+            }
+            // Oldest still-pending enqueue time (0 = none / all pre-migration unknowns).
+            counts.oldest_pending_at_ms = conn
+                .query_row(
+                    "SELECT COALESCE(MIN(NULLIF(enqueued_at, 0)), 0) FROM replication_outbox \
+                     WHERE status='pending' AND (?1 IS NULL OR bucket_name = ?1)",
+                    params![b],
+                    |r| r.get(0),
+                )
+                .map_err(engine_err)?;
+            Ok(counts)
         })
         .await
     }

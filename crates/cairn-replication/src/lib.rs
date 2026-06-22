@@ -612,6 +612,8 @@ pub fn outbox_entry_for(
         last_error: None,
         priority,
         lease_until: None,
+        // First-enqueue time == the initial due time; a retry moves next_attempt_at but never this.
+        enqueued_at: due_at,
     }
 }
 

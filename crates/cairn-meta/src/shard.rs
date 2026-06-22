@@ -31,10 +31,10 @@ use cairn_types::bucket::{Bucket, ConfigAspect, ConfigDoc};
 use cairn_types::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
 use cairn_types::meta::{
     ActivityEntry, BucketCounts, ListPage, ListQuery, MetricsRange, MultipartSession, Mutation,
-    MutationOutcome, ObjectSummary, OutboxEntry, PartRecord, ReplicationStatus,
-    RequestMetricsSeries, SessionCredentialSummary, ShareRow, StoreCounts, TagSummary,
-    TaggedObject, User, UserSessionCredentials, UserSigV4Credentials, UserWithBearerHash,
-    WebhookEntry,
+    MutationOutcome, ObjectSummary, OutboxEntry, PartRecord, ReplicationCounts, ReplicationStatus,
+    ReplicationTargetCounts, RequestMetricsSeries, SessionCredentialSummary, ShareRow, StoreCounts,
+    TagSummary, TaggedObject, User, UserSessionCredentials, UserSigV4Credentials,
+    UserWithBearerHash, WebhookEntry,
 };
 use cairn_types::object::ObjectVersionRow;
 use cairn_types::time::Timestamp;
@@ -454,6 +454,44 @@ impl MetadataStore for ShardedMetadataStore {
         }
         all.truncate(limit as usize);
         Ok(all)
+    }
+
+    async fn replication_counts(
+        &self,
+        bucket: Option<&BucketName>,
+    ) -> Result<ReplicationCounts, MetaError> {
+        let mut acc = ReplicationCounts::default();
+        let mut by_target: std::collections::HashMap<Option<String>, (u64, u64)> =
+            std::collections::HashMap::new();
+        for s in &self.shards {
+            let c = s.replication_counts(bucket).await?;
+            acc.pending += c.pending;
+            acc.claimed += c.claimed;
+            acc.failed += c.failed;
+            acc.completed += c.completed;
+            // The oldest pending across all shards is the min of the per-shard non-zero values.
+            if c.oldest_pending_at_ms != 0
+                && (acc.oldest_pending_at_ms == 0
+                    || c.oldest_pending_at_ms < acc.oldest_pending_at_ms)
+            {
+                acc.oldest_pending_at_ms = c.oldest_pending_at_ms;
+            }
+            for t in c.by_target {
+                let e = by_target.entry(t.target_arn).or_default();
+                e.0 += t.pending;
+                e.1 += t.failed;
+            }
+        }
+        acc.by_target = by_target
+            .into_iter()
+            .filter(|(_, (p, f))| *p > 0 || *f > 0)
+            .map(|(target_arn, (pending, failed))| ReplicationTargetCounts {
+                target_arn,
+                pending,
+                failed,
+            })
+            .collect();
+        Ok(acc)
     }
 
     async fn claim_webhook_batch(

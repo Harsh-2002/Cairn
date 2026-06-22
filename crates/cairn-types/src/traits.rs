@@ -20,7 +20,7 @@ use crate::error::{BlobError, CryptoError, MetaError, ReplicationError};
 use crate::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
 use crate::meta::{
     ActivityEntry, BucketCounts, ListPage, ListQuery, MetricsRange, MultipartSession, Mutation,
-    MutationOutcome, ObjectSummary, OutboxEntry, PartRecord, ReplicationStatus,
+    MutationOutcome, ObjectSummary, OutboxEntry, PartRecord, ReplicationCounts, ReplicationStatus,
     RequestMetricsSeries, SessionCredentialSummary, ShareRow, StoreCounts, TagSummary,
     TaggedObject, User, UserSessionCredentials, UserSigV4Credentials, UserWithBearerHash,
     WebhookEntry,
@@ -266,6 +266,14 @@ pub trait MetadataStore: Send + Sync {
     /// i.e. retries exhausted with no further attempt scheduled), most recently due first, up to
     /// `limit`. The control plane surfaces these for operator attention (ARCH 20.5/22.2).
     async fn list_failed_replication(&self, limit: u32) -> Result<Vec<OutboxEntry>, MetaError>;
+    /// Aggregate replication-outbox counts in a single indexed pass — totals by status, a per-target
+    /// pending/failed breakdown, and the oldest still-pending entry's enqueue time (for true lag).
+    /// Unlike counting a `list_*` result this is never bounded by a page limit, so it does not
+    /// under-report on a busy node. `bucket` scopes to one source bucket; `None` is store-wide.
+    async fn replication_counts(
+        &self,
+        bucket: Option<&BucketName>,
+    ) -> Result<ReplicationCounts, MetaError>;
 
     // --- webhook event-notification outbox (mirrors the replication outbox) ---
     /// Atomically claim a batch of due webhook-notification entries (a write routed through the

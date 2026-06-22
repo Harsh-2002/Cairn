@@ -1165,6 +1165,7 @@ async fn failed_replication_reflects_a_planted_terminal_entry() {
     let key = ObjectKey::parse("photo.jpg").unwrap();
     let version = VersionId::from_string("00000001".to_owned());
     let entry = cairn_types::meta::OutboxEntry {
+        enqueued_at: cairn_types::time::Timestamp(0),
         id: "outbox-1".to_owned(),
         bucket: bucket.clone(),
         key: key.clone(),
@@ -1695,6 +1696,7 @@ async fn replication_retry_endpoint_requeues_failed_for_bucket() {
     let key = ObjectKey::parse("photo.jpg").unwrap();
     let version = VersionId::from_string("00000001".to_owned());
     let entry = cairn_types::meta::OutboxEntry {
+        enqueued_at: cairn_types::time::Timestamp(0),
         id: "outbox-1".to_owned(),
         bucket: bucket.clone(),
         key: key.clone(),

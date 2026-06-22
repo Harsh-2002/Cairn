@@ -333,6 +333,7 @@ async fn plant_outbox_entry(
     id: &str,
 ) {
     let entry = cairn_types::meta::OutboxEntry {
+        enqueued_at: Timestamp::EPOCH,
         id: id.to_owned(),
         bucket: bucket.clone(),
         key: key.clone(),

@@ -36,7 +36,7 @@ use cairn_types::error::MetaError;
 use cairn_types::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
 use cairn_types::meta::{
     ActivityEntry, BucketCounts, ListPage, ListQuery, MetricsRange, MultipartSession, Mutation,
-    MutationOutcome, ObjectSummary, OutboxEntry, PartRecord, ReplicationStatus,
+    MutationOutcome, ObjectSummary, OutboxEntry, PartRecord, ReplicationCounts, ReplicationStatus,
     RequestMetricsSeries, SessionCredentialSummary, ShareRow, StoreCounts, TagSummary,
     TaggedObject, User, UserSessionCredentials, UserSigV4Credentials, UserWithBearerHash,
     WebhookEntry,
@@ -696,6 +696,13 @@ impl MetadataStore for CachedMetadataStore {
         self.inner.list_failed_replication(limit).await
     }
 
+    async fn replication_counts(
+        &self,
+        bucket: Option<&BucketName>,
+    ) -> Result<ReplicationCounts, MetaError> {
+        self.inner.replication_counts(bucket).await
+    }
+
     async fn claim_webhook_batch(
         &self,
         limit: u32,
@@ -1078,6 +1085,12 @@ mod tests {
         }
         async fn list_failed_replication(&self, limit: u32) -> Result<Vec<OutboxEntry>, MetaError> {
             self.inner.list_failed_replication(limit).await
+        }
+        async fn replication_counts(
+            &self,
+            bucket: Option<&BucketName>,
+        ) -> Result<ReplicationCounts, MetaError> {
+            self.inner.replication_counts(bucket).await
         }
         async fn claim_webhook_batch(
             &self,

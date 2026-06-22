@@ -48,7 +48,7 @@ pub const USER_COLS: &str = "id, display_name, access_key_id, secret_hash, sigv4
 
 /// `replication_outbox` columns in mapper order.
 pub const OUTBOX_COLS: &str = "id, bucket_name, key, version_id, operation, rule_id, target_arn, \
-     attempts, next_attempt_at, status, last_error, priority, lease_until";
+     attempts, next_attempt_at, status, last_error, priority, lease_until, enqueued_at";
 
 /// `events_outbox` (webhook) columns in mapper order.
 pub const WEBHOOK_COLS: &str = "id, bucket_name, key, version_id, event_type, endpoint_id, payload, \
@@ -348,6 +348,7 @@ pub fn outbox_from_row(row: &Row) -> Result<OutboxEntry, MetaError> {
         last_error: row.get_opt_text(10),
         priority: row.get_i64(11),
         lease_until: row.get_opt_i64(12).map(Timestamp),
+        enqueued_at: Timestamp(row.get_i64(13)),
     })
 }
 

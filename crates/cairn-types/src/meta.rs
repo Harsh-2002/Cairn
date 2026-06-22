@@ -624,6 +624,44 @@ pub struct OutboxEntry {
     /// When the current claim lease expires; `None` when the entry is not claimed. A claimed
     /// entry whose lease has elapsed is eligible to be re-claimed.
     pub lease_until: Option<Timestamp>,
+    /// Wall-clock millis the entry was first enqueued, fixed at enqueue and never moved by a retry
+    /// (unlike [`next_attempt_at`](Self::next_attempt_at)). Drives the true replication-lag gauge
+    /// (age of the oldest still-pending enqueue). Rows migrated from before this column read `0`,
+    /// which lag treats as "unknown".
+    pub enqueued_at: Timestamp,
+}
+
+/// Aggregate replication-outbox counts, computed in a single indexed pass (never `PAGE_LIMIT`
+/// bounded) for metrics and the control-plane status/summary. `bucket`-scoped or store-wide.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReplicationCounts {
+    /// Entries awaiting their first/next attempt.
+    pub pending: u64,
+    /// Entries leased by a worker for the current pass.
+    pub claimed: u64,
+    /// Terminally failed entries (retries exhausted or a terminal error).
+    pub failed: u64,
+    /// Entries that completed replication (their outbox row is retained).
+    pub completed: u64,
+    /// The oldest still-`pending` entry's enqueue time in ms (`0` when nothing is pending, or when
+    /// every pending row predates the `enqueued_at` column). The caller, which holds a [`Clock`],
+    /// derives lag as `max(0, now - oldest_pending_at_ms)`.
+    ///
+    /// [`Clock`]: crate::traits::Clock
+    pub oldest_pending_at_ms: i64,
+    /// Per-target pending/failed breakdown; targets with neither are omitted.
+    pub by_target: Vec<ReplicationTargetCounts>,
+}
+
+/// One target's pending/failed replication counts (part of [`ReplicationCounts`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReplicationTargetCounts {
+    /// The remote-target ARN (`None` = the legacy env single-target path).
+    pub target_arn: Option<String>,
+    /// Entries pending to this target.
+    pub pending: u64,
+    /// Entries terminally failed to this target.
+    pub failed: u64,
 }
 
 /// The delivery status of a webhook event-notification outbox entry. Mirrors

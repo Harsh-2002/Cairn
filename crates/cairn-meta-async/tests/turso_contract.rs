@@ -767,6 +767,7 @@ async fn replication_outbox_parity() {
         .unwrap();
         let v = VersionId::from_string("v1".into());
         let entry = OutboxEntry {
+            enqueued_at: Timestamp(0),
             id: "out-1".to_owned(),
             bucket: bk.clone(),
             key: ObjectKey::parse("k").unwrap(),
@@ -805,6 +806,7 @@ async fn replication_outbox_parity() {
 
         let v2 = VersionId::from_string("v2".into());
         let e2 = OutboxEntry {
+            enqueued_at: Timestamp(0),
             id: "out-2".to_owned(),
             bucket: bk.clone(),
             key: ObjectKey::parse("k2").unwrap(),

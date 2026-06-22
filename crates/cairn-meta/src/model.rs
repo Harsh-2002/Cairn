@@ -358,6 +358,7 @@ pub fn outbox_from_row(row: &Row) -> rusqlite::Result<OutboxEntry> {
         last_error: row.get("last_error")?,
         priority: row.get::<_, i64>("priority")?,
         lease_until: row.get::<_, Option<i64>>("lease_until")?.map(Timestamp),
+        enqueued_at: Timestamp(row.get("enqueued_at")?),
     })
 }
 

@@ -614,8 +614,8 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
             driver
                 .execute(
                     "INSERT OR IGNORE INTO replication_outbox
-                     (id, bucket_name, key, version_id, operation, rule_id, target_arn, attempts, next_attempt_at, status, last_error, priority, lease_until)
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                     (id, bucket_name, key, version_id, operation, rule_id, target_arn, attempts, next_attempt_at, status, last_error, priority, lease_until, enqueued_at)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
                     vec![
                         Value::Text(e.id.clone()),
                         Value::Text(e.bucket.as_str().to_owned()),
@@ -630,6 +630,7 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
                         opt_text(e.last_error.clone()),
                         Value::Int(e.priority),
                         e.lease_until.map_or(Value::Null, |t| Value::Int(t.0)),
+                        Value::Int(e.enqueued_at.0),
                     ],
                 )
                 .await?;
@@ -1226,8 +1227,8 @@ async fn enqueue(driver: &dyn AsyncSqlDriver, e: &OutboxEntry) -> R<()> {
     driver
         .execute(
             "INSERT INTO replication_outbox
-             (id, bucket_name, key, version_id, operation, rule_id, target_arn, attempts, next_attempt_at, status, last_error, priority, lease_until)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+             (id, bucket_name, key, version_id, operation, rule_id, target_arn, attempts, next_attempt_at, status, last_error, priority, lease_until, enqueued_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
             vec![
                 Value::Text(e.id.clone()),
                 Value::Text(e.bucket.as_str().to_owned()),
@@ -1242,6 +1243,7 @@ async fn enqueue(driver: &dyn AsyncSqlDriver, e: &OutboxEntry) -> R<()> {
                 opt_text(e.last_error.clone()),
                 Value::Int(e.priority),
                 e.lease_until.map_or(Value::Null, |t| Value::Int(t.0)),
+                Value::Int(e.enqueued_at.0),
             ],
         )
         .await?;

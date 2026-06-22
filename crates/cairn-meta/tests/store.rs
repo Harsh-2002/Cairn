@@ -552,6 +552,7 @@ async fn plant_outbox(
     id: &str,
 ) {
     let entry = OutboxEntry {
+        enqueued_at: Timestamp(0),
         id: id.to_owned(),
         bucket: b.clone(),
         key: ObjectKey::parse(key).unwrap(),
@@ -628,6 +629,77 @@ async fn list_failed_replication_reports_terminal_entries_only() {
 
     // The limit is honoured.
     assert!(store.list_failed_replication(0).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn replication_counts_aggregates_by_status_and_target() {
+    let store = cairn_meta::open_in_memory().unwrap();
+    let b = BucketName::parse("rcbkt").unwrap();
+    store
+        .submit(Mutation::CreateBucket(Box::new(bucket("rcbkt"))))
+        .await
+        .unwrap();
+
+    // (id, key, version, target, enqueued_at): three pending (X@300, X@100, Y@200) and one to X
+    // that we then fail (@400). The fan-out routing key is the target ARN.
+    for (id, key, vid, target, enq) in [
+        ("x1", "k1", "00000001", "arn:X", 300_i64),
+        ("x2", "k2", "00000002", "arn:X", 100),
+        ("y1", "k3", "00000003", "arn:Y", 200),
+        ("xf", "k4", "00000004", "arn:X", 400),
+    ] {
+        let v = VersionId::from_string(vid.to_owned());
+        let entry = OutboxEntry {
+            enqueued_at: Timestamp(enq),
+            id: id.to_owned(),
+            bucket: b.clone(),
+            key: ObjectKey::parse(key).unwrap(),
+            version_id: v.clone(),
+            operation: ReplicationOp::ObjectCreate,
+            rule_id: "r".to_owned(),
+            target_arn: Some(target.to_owned()),
+            attempts: 0,
+            next_attempt_at: Timestamp(0),
+            status: ReplicationStatus::Pending,
+            last_error: None,
+            priority: 0,
+            lease_until: None,
+        };
+        store
+            .submit(Mutation::PutObjectVersion {
+                row: Box::new(row(&b, key, v, "e", true)),
+                precondition: Precondition::default(),
+                replication: vec![entry],
+            })
+            .await
+            .unwrap();
+    }
+    store
+        .submit(Mutation::MarkReplicationFailed {
+            id: "xf".to_owned(),
+            error: "x".to_owned(),
+            next_attempt_at: None,
+        })
+        .await
+        .unwrap();
+
+    let c = store.replication_counts(Some(&b)).await.unwrap();
+    assert_eq!(c.pending, 3);
+    assert_eq!(c.failed, 1);
+    assert_eq!(c.completed, 0);
+    // Oldest still-pending enqueue time: min over pending (100), ignoring the failed entry (400).
+    assert_eq!(c.oldest_pending_at_ms, 100);
+    let mut by: Vec<(Option<&str>, u64, u64)> = c
+        .by_target
+        .iter()
+        .map(|t| (t.target_arn.as_deref(), t.pending, t.failed))
+        .collect();
+    by.sort();
+    assert_eq!(by, vec![(Some("arn:X"), 2, 1), (Some("arn:Y"), 1, 0)]);
+
+    // Store-wide (None) matches here since there is a single bucket.
+    let all = store.replication_counts(None).await.unwrap();
+    assert_eq!((all.pending, all.failed), (3, 1));
 }
 
 #[tokio::test]

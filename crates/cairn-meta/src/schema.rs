@@ -457,6 +457,19 @@ CREATE TABLE session_credentials (
 CREATE INDEX idx_session_creds_expiry ON session_credentials (expires_at);
 "#,
     },
+    Migration {
+        version: 19,
+        name: "replication outbox enqueue timestamp (true lag)",
+        sql: r#"
+-- The wall-clock millis an entry was first enqueued, so replication lag is the age of the oldest
+-- still-unreplicated entry's ENQUEUE time, not its backed-off next_attempt_at (which a retry moves
+-- into the future and would under-report a fresh backlog). Rows predating this column default to 0;
+-- the lag query treats 0 as "unknown" (MIN over NULLIF(enqueued_at,0)) so a one-time upgrade never
+-- spikes lag to epoch-age. The (status, enqueued_at) index backs the per-status aggregate + lag.
+ALTER TABLE replication_outbox ADD COLUMN enqueued_at INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX idx_outbox_status_enqueued ON replication_outbox (status, enqueued_at);
+"#,
+    },
 ];
 
 /// Run all pending migrations on the write connection, recording each as applied.

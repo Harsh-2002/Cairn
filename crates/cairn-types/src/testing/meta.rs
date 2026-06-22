@@ -11,10 +11,10 @@ use crate::meta::{
     ActivityEntry, BucketCounts, BucketRequestCount, ClaimOutcome, IfNoneMatch, LATENCY_BUCKETS,
     ListPage, ListQuery, MetricsRange, MultipartSession, MultipartStatus, Mutation,
     MutationOutcome, ObjectSummary, OpCount, OutboxEntry, PartRecord, Precondition,
-    ReplicationStatus, RequestMetricsSeries, SessionCredentialRecord, SessionCredentialSummary,
-    ShareRow, StatusCount, StoreCounts, TagSummary, TaggedObject, TimePoint, User, UserRecord,
-    UserSessionCredentials, UserSigV4Credentials, UserWithBearerHash, WebhookEntry, WebhookStatus,
-    latency_quantile_ms,
+    ReplicationCounts, ReplicationStatus, ReplicationTargetCounts, RequestMetricsSeries,
+    SessionCredentialRecord, SessionCredentialSummary, ShareRow, StatusCount, StoreCounts,
+    TagSummary, TaggedObject, TimePoint, User, UserRecord, UserSessionCredentials,
+    UserSigV4Credentials, UserWithBearerHash, WebhookEntry, WebhookStatus, latency_quantile_ms,
 };
 use crate::object::{ETag, ObjectVersionRow};
 use crate::time::Timestamp;
@@ -1176,6 +1176,50 @@ impl MetadataStore for InMemoryMetadataStore {
         failed.sort_by_key(|e| std::cmp::Reverse(e.next_attempt_at));
         failed.truncate(limit as usize);
         Ok(failed)
+    }
+
+    async fn replication_counts(
+        &self,
+        bucket: Option<&BucketName>,
+    ) -> Result<ReplicationCounts, MetaError> {
+        let st = self.state.lock().unwrap();
+        let mut counts = ReplicationCounts::default();
+        let mut by_target: std::collections::HashMap<Option<String>, (u64, u64)> =
+            std::collections::HashMap::new();
+        for e in st
+            .outbox
+            .iter()
+            .filter(|e| bucket.is_none_or(|b| e.bucket.as_str() == b.as_str()))
+        {
+            match e.status {
+                ReplicationStatus::Pending => counts.pending += 1,
+                ReplicationStatus::Claimed => counts.claimed += 1,
+                ReplicationStatus::Failed => counts.failed += 1,
+                ReplicationStatus::Completed => counts.completed += 1,
+                ReplicationStatus::Replica => {}
+            }
+            if e.status == ReplicationStatus::Pending {
+                if e.enqueued_at.0 != 0
+                    && (counts.oldest_pending_at_ms == 0
+                        || e.enqueued_at.0 < counts.oldest_pending_at_ms)
+                {
+                    counts.oldest_pending_at_ms = e.enqueued_at.0;
+                }
+                by_target.entry(e.target_arn.clone()).or_default().0 += 1;
+            } else if e.status == ReplicationStatus::Failed {
+                by_target.entry(e.target_arn.clone()).or_default().1 += 1;
+            }
+        }
+        counts.by_target = by_target
+            .into_iter()
+            .filter(|(_, (p, f))| *p > 0 || *f > 0)
+            .map(|(target_arn, (pending, failed))| ReplicationTargetCounts {
+                target_arn,
+                pending,
+                failed,
+            })
+            .collect();
+        Ok(counts)
     }
 
     async fn claim_webhook_batch(
