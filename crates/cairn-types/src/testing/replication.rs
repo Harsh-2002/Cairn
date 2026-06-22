@@ -14,6 +14,8 @@ pub enum SinkBehavior {
     Succeed,
     /// Fail retryably.
     Retryable,
+    /// The target is unreachable (does not consume the attempt budget).
+    Unavailable,
     /// Fail terminally.
     Terminal,
 }
@@ -68,6 +70,9 @@ impl FakeReplicationSink {
         match *self.behavior.lock().unwrap() {
             SinkBehavior::Succeed => Ok(()),
             SinkBehavior::Retryable => Err(ReplicationError::Retryable("simulated".to_owned())),
+            SinkBehavior::Unavailable => {
+                Err(ReplicationError::Unavailable("simulated down".to_owned()))
+            }
             SinkBehavior::Terminal => Err(ReplicationError::Terminal("simulated".to_owned())),
         }
     }

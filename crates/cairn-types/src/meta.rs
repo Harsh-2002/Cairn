@@ -277,6 +277,33 @@ pub enum Mutation {
     /// `PutObjectVersion`, this stands alone for objects written before replication was configured;
     /// the deterministic backfill id makes a repeated resync a no-op for already-queued versions.
     EnqueueReplication(Box<OutboxEntry>),
+    /// Reclaim terminal replication-outbox rows: delete `completed` and `failed` entries whose
+    /// `enqueued_at` is older than `before_ms`. The outbox is a durable WORK queue, not a permanent
+    /// per-object ledger — completed rows carry no further information (the object version row holds
+    /// the replication status) and unbounded retention would grow the table with every replicated
+    /// object. Pending/claimed entries (outstanding work) are never pruned. Bounds the table and
+    /// auto-clears genuinely-stale failures (ARCH 20.3).
+    PruneReplicationOutbox {
+        /// Delete completed/failed entries enqueued before this wall-clock millis.
+        before_ms: i64,
+    },
+    /// Release a *claimed* replication-outbox entry back to `pending` so it is promptly
+    /// re-claimable, **without** consuming the terminal attempt budget. Used for two non-failure
+    /// reschedules: (1) an entry deferred to preserve per-key ordering (an earlier version is still
+    /// in flight) — re-checked after a short delay instead of waiting out the 300 s claim lease; and
+    /// (2) an entry whose destination target is *unavailable* (transport error / 5xx) — re-tried at
+    /// a bounded cadence so a target that is down for hours auto-resumes when it returns rather than
+    /// exhausting to a terminal failure. Leaves `attempts` untouched; clears the lease and sets
+    /// `next_attempt_at`. `last_error` records the reason when `Some` (an ordering defer passes
+    /// `None`, leaving the prior error intact).
+    DeferReplication {
+        /// The entry id.
+        id: String,
+        /// When the entry next becomes due (claimable).
+        next_attempt_at: Timestamp,
+        /// Optional last-error string to record (None leaves the existing value).
+        last_error: Option<String>,
+    },
     /// Enqueue a batch of event-notification (webhook) outbox entries idempotently (INSERT OR
     /// IGNORE on the deterministic entry id). Emitted by the protocol layer right after an object
     /// commit succeeds; delivery is best-effort at-least-once (a crash in the gap drops the

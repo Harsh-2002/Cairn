@@ -279,7 +279,7 @@ async fn delete_marker_issues_signed_delete() {
 }
 
 #[tokio::test]
-async fn server_5xx_is_retryable() {
+async fn server_5xx_is_unavailable() {
     let captured = Arc::new(Mutex::new(Vec::new()));
     let authority = spawn_server(captured, Reply { status: 503 }).await;
     let sink = sink_for(&authority, 1_440_938_160);
@@ -297,8 +297,8 @@ async fn server_5xx_is_retryable() {
     };
     let err = sink.put_object(&src(), object).await.unwrap_err();
     assert!(
-        matches!(err, cairn_types::error::ReplicationError::Retryable(_)),
-        "503 should be retryable, got {err:?}"
+        matches!(err, cairn_types::error::ReplicationError::Unavailable(_)),
+        "503 means the destination is unavailable (retry without burning the budget), got {err:?}"
     );
 }
 
@@ -435,11 +435,11 @@ async fn https_endpoint_negotiates_tls_not_plaintext() {
         acl: None,
         body: body_stream(b"x"),
     };
-    // The handshake fails (server presents no certificate), so the call errors retryably.
+    // The handshake fails (server presents no certificate), so the call errors as unavailable.
     let err = sink.put_object(&src(), object).await.unwrap_err();
     assert!(
-        matches!(err, cairn_types::error::ReplicationError::Retryable(_)),
-        "a failed TLS handshake is a transport error (retryable), got {err:?}"
+        matches!(err, cairn_types::error::ReplicationError::Unavailable(_)),
+        "a failed TLS handshake is a transport error (target unavailable), got {err:?}"
     );
 
     // The byte the client first put on the wire is a TLS handshake record (0x16), proving the

@@ -636,6 +636,41 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
                 .await?;
             Ok(MutationOutcome::Ack)
         }
+        Mutation::DeferReplication {
+            id,
+            next_attempt_at,
+            last_error,
+        } => {
+            // Mirrors cairn-meta: release the claim and re-schedule without touching `attempts`
+            // (a deferral/unavailability is not a failure). COALESCE keeps the prior error when no
+            // new one is supplied.
+            driver
+                .execute(
+                    "UPDATE replication_outbox \
+                     SET status='pending', lease_until=NULL, next_attempt_at=?2, \
+                         last_error=COALESCE(?3, last_error) \
+                     WHERE id=?1",
+                    vec![
+                        Value::Text(id),
+                        Value::Int(next_attempt_at.0),
+                        opt_text(last_error),
+                    ],
+                )
+                .await?;
+            Ok(MutationOutcome::Ack)
+        }
+        Mutation::PruneReplicationOutbox { before_ms } => {
+            // Mirrors cairn-meta: reclaim terminal (completed/failed) rows older than the horizon;
+            // pending/claimed are never pruned.
+            driver
+                .execute(
+                    "DELETE FROM replication_outbox \
+                     WHERE status IN ('completed','failed') AND enqueued_at < ?1",
+                    vec![Value::Int(before_ms)],
+                )
+                .await?;
+            Ok(MutationOutcome::Ack)
+        }
         Mutation::EnqueueWebhooks(entries) => {
             for e in &entries {
                 enqueue_webhook(driver, e).await?;

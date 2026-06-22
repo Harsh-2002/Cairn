@@ -206,9 +206,6 @@ pub struct Config {
     /// (`CAIRN_REPLICATION_WORKER_CONCURRENCY`). Per-key, per-target ordering is preserved by the
     /// durable claim lease and the predecessor check regardless of pool size.
     pub replication_worker_concurrency: usize,
-    /// Ceiling on concurrent replication drain passes across the pool
-    /// (`CAIRN_REPLICATION_MAX_IN_FLIGHT`); must be `>=` the worker concurrency.
-    pub replication_max_in_flight: usize,
     /// Max delivery attempts before a retryable replication failure becomes terminal
     /// (`CAIRN_REPLICATION_MAX_ATTEMPTS`).
     pub replication_max_attempts: u32,
@@ -217,6 +214,11 @@ pub struct Config {
     /// Ceiling on the exponential retry backoff in seconds (`CAIRN_REPLICATION_MAX_BACKOFF_SECS`);
     /// must be `>=` the base backoff.
     pub replication_max_backoff_secs: u64,
+    /// Retention for terminal replication-outbox rows in seconds
+    /// (`CAIRN_REPLICATION_RETENTION_SECS`): completed and failed entries older than this are
+    /// periodically reclaimed so the outbox stays a bounded work queue rather than a permanent
+    /// per-object ledger. Pending/claimed entries (outstanding work) are never pruned.
+    pub replication_retention_secs: u64,
 
     /// Whether the request-metrics usage-analytics subsystem is enabled
     /// (`CAIRN_REQUEST_METRICS_ENABLED`). When off, no per-request counters accumulate and the
@@ -308,10 +310,10 @@ impl Default for Config {
             replication_targets: None,
             replication_batch_size: 64,
             replication_worker_concurrency: 4,
-            replication_max_in_flight: 8,
             replication_max_attempts: 8,
             replication_base_backoff_secs: 5,
             replication_max_backoff_secs: 900,
+            replication_retention_secs: 86_400,
             request_metrics_enabled: true,
             request_metrics_flush_secs: 15,
             request_metrics_bucket_secs: 60,
@@ -637,11 +639,6 @@ impl Config {
                 "replication_worker_concurrency must be between 1 and 64".into(),
             ));
         }
-        if self.replication_max_in_flight < self.replication_worker_concurrency {
-            return Err(ConfigError::Invalid(
-                "replication_max_in_flight must be >= replication_worker_concurrency".into(),
-            ));
-        }
         if self.replication_max_attempts == 0 {
             return Err(ConfigError::Invalid(
                 "replication_max_attempts must be positive".into(),
@@ -655,6 +652,11 @@ impl Config {
         if self.replication_max_backoff_secs < self.replication_base_backoff_secs {
             return Err(ConfigError::Invalid(
                 "replication_max_backoff_secs must be >= replication_base_backoff_secs".into(),
+            ));
+        }
+        if self.replication_retention_secs == 0 {
+            return Err(ConfigError::Invalid(
+                "replication_retention_secs must be positive".into(),
             ));
         }
         // Request-metrics cadences must be positive when the subsystem is enabled, else the flush

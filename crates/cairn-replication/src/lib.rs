@@ -81,6 +81,17 @@ impl Default for ReplicationOpts {
     }
 }
 
+/// How soon a successor entry deferred for per-key ordering is re-checked. Short enough that an
+/// ordered version ships promptly once its predecessor clears (rather than waiting out the 300 s
+/// claim lease), but non-zero so the entry is not re-claimed within the same drain loop (no spin).
+const ORDERING_DEFER_RECHECK_SECS: u64 = 1;
+
+/// How often an entry whose destination target is unavailable is re-tried. A target that is down
+/// for an extended period is polled at this steady cadence (each poll is a cheap failed connect),
+/// so it auto-resumes within roughly this window of returning — without ever consuming the attempt
+/// budget that would otherwise turn it terminal.
+const UNAVAILABLE_RETRY_SECS: u64 = 30;
+
 /// A summary of what one [`ReplicationEngine::run_once`] pass did, for observability and to
 /// let a run loop decide whether the queue was drained.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -186,8 +197,10 @@ impl ReplicationEngine {
             let mut blocked = false;
             for entry in entries.iter() {
                 if blocked {
-                    // An earlier version of this key did not complete this pass; defer the
-                    // rest so writes never reorder at the destination.
+                    // An earlier version of this key has not yet shipped this pass; defer the rest
+                    // so writes never reorder at the destination. Release the claim (short re-check)
+                    // rather than holding it under the 300 s lease.
+                    self.defer_for_ordering(meta, entry, now).await?;
                     report.deferred += 1;
                     continue;
                 }
@@ -197,16 +210,21 @@ impl ReplicationEngine {
                         report.bytes += bytes;
                     }
                     EntryOutcome::Retried => {
+                        // A retry/unavailable reschedule for THIS version: a later version of the
+                        // same key+target must wait for it, so block the rest of the group.
                         report.retried += 1;
                         blocked = true;
                     }
                     EntryOutcome::Failed => {
+                        // A *terminal* failure is settled — it will not ship without an operator
+                        // retry — so it must NOT freeze the key+target forever. Let later versions
+                        // proceed (best-effort/at-least-once, ARCH 20.4); the cross-batch predecessor
+                        // guard agrees (it skips `failed`).
                         report.failed += 1;
-                        blocked = true;
                     }
                     EntryOutcome::Deferred => {
-                        // A predecessor in another batch is still in flight: block the rest of
-                        // this key's versions too, exactly as Retried/Failed would.
+                        // A predecessor in another batch is still in flight (process_entry already
+                        // released this entry's claim): block the rest of this key's versions too.
                         report.deferred += 1;
                         blocked = true;
                     }
@@ -316,6 +334,10 @@ impl ReplicationEngine {
             )
             .await?
         {
+            // Hand the claim back (status='pending', short re-check) instead of holding it under
+            // the 300 s lease, so this version ships promptly once its predecessor clears rather
+            // than waiting out the lease (no attempt is burned — deferral is not a failure).
+            self.defer_for_ordering(meta, entry, now).await?;
             return Ok(EntryOutcome::Deferred);
         }
 
@@ -374,8 +396,13 @@ impl ReplicationEngine {
                 Ok(EntryOutcome::Completed { bytes })
             }
             Err(ReplicationError::Retryable(msg)) => {
-                // Exhausting the attempt budget turns a retryable failure terminal.
+                // A per-object transient failure: exhausting the attempt budget turns it terminal.
                 self.retry_or_exhaust(meta, entry, now, &msg).await
+            }
+            Err(ReplicationError::Unavailable(msg)) => {
+                // The destination target is down: retry at a bounded cadence WITHOUT consuming the
+                // attempt budget, so the queue survives an extended outage and auto-resumes.
+                self.reschedule_unavailable(meta, entry, now, &msg).await
             }
             Err(ReplicationError::Terminal(msg)) => {
                 self.mark_failed(meta, entry, &msg, None).await?;
@@ -519,6 +546,61 @@ impl ReplicationEngine {
             Ok(EntryOutcome::Retried)
         }
     }
+
+    /// Release an entry deferred to preserve per-key ordering: hand the claim back
+    /// (`status='pending'`, a short re-check delay) so a later drain re-claims it promptly once its
+    /// predecessor clears, **without** burning an attempt (a deferral is not a failure). Leaves the
+    /// existing `last_error` intact.
+    async fn defer_for_ordering<M>(
+        &self,
+        meta: &M,
+        entry: &OutboxEntry,
+        now: Timestamp,
+    ) -> Result<(), MetaError>
+    where
+        M: MetadataStore + ?Sized,
+    {
+        meta.submit(Mutation::DeferReplication {
+            id: entry.id.clone(),
+            next_attempt_at: now.plus_secs(ORDERING_DEFER_RECHECK_SECS as i64),
+            last_error: None,
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// Reschedule an entry whose destination target is unavailable: retry at a bounded cadence
+    /// ([`UNAVAILABLE_RETRY_SECS`], clamped to the configured max backoff) **without** consuming the
+    /// attempt budget, so a target that is down for an extended period keeps its queued work and
+    /// auto-resumes when it returns instead of exhausting to a terminal failure (which would need an
+    /// operator retry). Records the reason on the entry for observability.
+    async fn reschedule_unavailable<M>(
+        &self,
+        meta: &M,
+        entry: &OutboxEntry,
+        now: Timestamp,
+        msg: &str,
+    ) -> Result<EntryOutcome, MetaError>
+    where
+        M: MetadataStore + ?Sized,
+    {
+        let delay = UNAVAILABLE_RETRY_SECS
+            .min(self.opts.max_backoff_secs)
+            .max(1);
+        tracing::warn!(
+            bucket = %entry.bucket.as_str(),
+            key = %entry.key.as_str(),
+            error = msg,
+            "replication target unavailable; retrying without consuming the attempt budget"
+        );
+        meta.submit(Mutation::DeferReplication {
+            id: entry.id.clone(),
+            next_attempt_at: now.plus_secs(delay as i64),
+            last_error: Some(format!("target unavailable: {msg}")),
+        })
+        .await?;
+        Ok(EntryOutcome::Retried)
+    }
 }
 
 /// The disposition of a single processed entry, used to preserve per-key ordering. A completed
@@ -561,13 +643,13 @@ where
     Ok(())
 }
 
-/// The remote-target ARN to route an outbox entry by. The durable [`OutboxEntry`] keys on
-/// `(bucket, key, version)` and does not itself carry a target ARN; the rule -> target binding is
-/// owned by the [`SinkRouter`] (the per-bucket target table). This indirection point returns
-/// `None`, so the router resolves the target from the entry's bucket — a [`SingleSink`] router
-/// ignores the ARN entirely (the legacy fixed-destination path), and a multi-target router keys off
-/// the source bucket it already knows. Centralising it here keeps the routing seam in one place if
-/// the entry later grows an explicit target field.
+/// The remote-target ARN to route an outbox entry by. Under 1→N fan-out the durable [`OutboxEntry`]
+/// carries an explicit `target_arn`, fixed at enqueue from the matching rule, so routing and
+/// per-target ordering are a pure per-entry lookup and a later rule edit never misroutes already
+/// queued work — that `Some(arn)` is the normal case, resolved via the router's `by_arn` table.
+/// `None` is the legacy/env single-sink path (a [`SingleSink`] router that ignores the ARN and
+/// resolves the destination from the source bucket). Centralising the accessor here keeps the
+/// routing seam in one place.
 #[inline]
 fn entry_target_arn(entry: &OutboxEntry) -> Option<&str> {
     entry.target_arn.as_deref()

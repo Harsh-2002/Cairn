@@ -1002,16 +1002,20 @@ impl MetadataStore for SqliteMetadataStore {
         let t = target.map(str::to_owned);
         self.with_read(move |conn| {
             // version_id is uuidv7 (time-ordered), so a strictly-lower id is an earlier write.
-            // A completed entry keeps its row with status='completed'; anything else
-            // (pending/claimed/failed) is still owed to the destination and must ship first.
-            // Scoped to the entry's own target (`target_arn IS ?4` is null-safe so the legacy
-            // unstamped/env path matches NULL), so under fan-out a slow target never blocks a
-            // healthy one for the same key.
+            // An earlier version still `pending`/`claimed` is owed to the destination and must ship
+            // first (preserve write order). A `failed` predecessor is *settled* — it is terminal and
+            // will not ship without an operator retry — so it must NOT block newer versions forever:
+            // we treat it like a completed one here and let successors proceed (best-effort /
+            // at-least-once, ARCH 20.4). The destination may then carry a newer version while an
+            // older one is permanently missing, which is the documented eventual-consistency
+            // contract; the alternative (a terminal failure silently freezing a key+target forever)
+            // is worse. Scoped to the entry's own target (`target_arn IS ?4` is null-safe so the
+            // legacy unstamped/env path matches NULL), so a slow target never blocks a healthy one.
             let exists: bool = conn
                 .query_row(
                     "SELECT EXISTS(SELECT 1 FROM replication_outbox \
                      WHERE bucket_name=?1 AND key=?2 AND version_id<?3 AND target_arn IS ?4 \
-                     AND status!='completed')",
+                     AND status NOT IN ('completed','failed'))",
                     params![b, k, v, t],
                     |r| r.get(0),
                 )

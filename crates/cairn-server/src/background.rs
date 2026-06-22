@@ -20,8 +20,11 @@ use std::time::Duration;
 
 /// Spawn the background tasks, reading their intervals and the multipart lifetime from the
 /// configured 28.2 knobs. `shutdown` is the server's graceful-shutdown signal; the replication
-/// worker pool watches it so it stops claiming new work when shutdown begins (an in-flight drain
-/// pass finishes first; an aborted claim is recovered by the outbox lease).
+/// worker pool watches it *between* drain passes, so a worker stops claiming NEW work as soon as
+/// shutdown begins. A pass already in flight is not joined on shutdown — the runtime drop may
+/// cancel it mid-ship — but that is safe: an aborted claim is recovered by the outbox lease and the
+/// object re-ships at-least-once on the next start (durability rests on the durable outbox, not on a
+/// clean worker join).
 pub fn spawn(stack: Arc<AppStack>, cfg: &Config, shutdown: tokio::sync::watch::Receiver<bool>) {
     let sweep_interval = Duration::from_secs(cfg.multipart_sweep_interval_secs);
     #[allow(clippy::cast_possible_wrap)]
@@ -146,6 +149,13 @@ pub fn spawn(stack: Arc<AppStack>, cfg: &Config, shutdown: tokio::sync::watch::R
         shape,
         "replication worker pool enabled"
     );
+    // Reclaim terminal outbox rows so the table stays a bounded work queue (ARCH 20.3): completed
+    // rows carry no further information and would otherwise accumulate one-per-replicated-object
+    // forever, and genuinely-stale failures are auto-cleared.
+    tokio::spawn(replication_prune_loop(
+        stack.clone(),
+        cfg.replication_retention_secs,
+    ));
     // Request-metrics flush loop (ARCH 26.5). Gated on the subsystem being enabled: when off, the
     // hot path accumulates nothing and there is nothing to flush. Otherwise it periodically drains
     // the in-process aggregator into a batched upsert and prunes rows past the retention horizon.
@@ -188,6 +198,28 @@ async fn request_metrics_flush_loop(stack: Arc<AppStack>, interval: Duration, re
             .await
         {
             tracing::warn!(error = %e, "request metrics flush failed");
+        }
+    }
+}
+
+/// Periodically reclaim terminal replication-outbox rows (completed/failed) older than the retention
+/// horizon, so the durable work queue stays bounded instead of growing one row per replicated object
+/// forever (ARCH 20.3). Pending/claimed entries are never pruned. Runs on a calm cadence — the table
+/// only needs to stay bounded, not be trimmed instantly — and pruning is idempotent, so a tick missed
+/// on shutdown is harmless.
+async fn replication_prune_loop(stack: Arc<AppStack>, retention_secs: u64) {
+    let clock = SystemClock::new();
+    let interval = Duration::from_secs(retention_secs.clamp(60, 3600));
+    let retention_ms = (retention_secs as i64).saturating_mul(1000);
+    loop {
+        tokio::time::sleep(interval).await;
+        let before_ms = clock.now().as_millis().saturating_sub(retention_ms);
+        if let Err(e) = stack
+            .meta
+            .submit(Mutation::PruneReplicationOutbox { before_ms })
+            .await
+        {
+            tracing::warn!(error = %e, "replication outbox prune failed");
         }
     }
 }
@@ -732,6 +764,11 @@ async fn checkpoint_loop(stack: Arc<AppStack>, interval: Duration, size_threshol
 /// aggregate on a short interval, so `/metrics` reflects live state.
 async fn metrics_loop(stack: Arc<AppStack>) {
     let clock = SystemClock::new();
+    // The per-target label set emitted last tick. A target that drains to zero falls out of the
+    // aggregate's `by_target`, so we must explicitly zero its gauges this tick — otherwise the
+    // registry keeps its last (non-zero) value forever and a caught-up destination reads as
+    // permanently lagging/failing (audit: stale per-target gauges).
+    let mut prev_targets: std::collections::HashSet<String> = std::collections::HashSet::new();
     loop {
         tokio::time::sleep(Duration::from_secs(15)).await;
         if let Ok(c) = stack.meta.aggregate_counts().await {
@@ -774,19 +811,37 @@ async fn metrics_loop(stack: Arc<AppStack>) {
                 metrics::gauge!("cairn_replication_queue_depth").set(c.pending as f64);
                 metrics::gauge!("cairn_replication_claimed").set(c.claimed as f64);
                 metrics::gauge!("cairn_replication_failed").set(c.failed as f64);
+                // The honest "anything owed or stuck" signal: pending + in-flight + terminally
+                // failed. Unlike queue_depth/lag (which fall to 0 once a down target's backlog
+                // exhausts to `failed`), this is non-zero whenever ANY object is un-replicated, so a
+                // dashboard never reads "healthy" while objects are permanently un-shipped (audit:
+                // metrics read 0 once entries reach terminal failed).
+                metrics::gauge!("cairn_replication_unreplicated")
+                    .set((c.pending + c.claimed + c.failed) as f64);
                 let lag_secs = if c.oldest_pending_at_ms == 0 {
                     0.0
                 } else {
                     ((now.as_millis() - c.oldest_pending_at_ms).max(0) as f64) / 1000.0
                 };
                 metrics::gauge!("cairn_replication_lag_seconds").set(lag_secs);
+                let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
                 for t in &c.by_target {
                     let target = t.target_arn.as_deref().unwrap_or("env-default").to_owned();
+                    seen.insert(target.clone());
                     metrics::gauge!("cairn_replication_pending", "target" => target.clone())
                         .set(t.pending as f64);
                     metrics::gauge!("cairn_replication_failed_by_target", "target" => target)
                         .set(t.failed as f64);
                 }
+                // Zero any target that was present last tick but has now fully drained out of the
+                // aggregate, so its gauges do not stick at their last non-zero value.
+                for stale in prev_targets.difference(&seen) {
+                    metrics::gauge!("cairn_replication_pending", "target" => stale.clone())
+                        .set(0.0);
+                    metrics::gauge!("cairn_replication_failed_by_target", "target" => stale.clone())
+                        .set(0.0);
+                }
+                prev_targets = seen;
             }
             Err(e) => tracing::debug!(error = %e, "replication counts probe failed"),
         }

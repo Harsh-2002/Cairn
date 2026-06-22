@@ -3876,6 +3876,169 @@ async fn delete_marker_replication_enqueues_when_enabled() {
     );
 }
 
+/// A multipart-completed object on a replication-enabled bucket must enqueue replication exactly
+/// like a single PUT (audit: CompleteMultipart previously hard-coded `replication: Vec::new()`, so
+/// large multipart uploads — the objects you most want replicated — silently never shipped).
+#[tokio::test]
+async fn multipart_complete_enqueues_replication() {
+    let h = harness().await;
+    versioned_bucket(&h, "mprepl").await;
+    set_replication(&h, "mprepl", "", false).await;
+    let now = cairn_types::Timestamp::from_secs(4_000_000_000);
+
+    // Initiate.
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::POST,
+                Some("mprepl"),
+                Some("big.bin"),
+                &[("uploads", "")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let upload_id = between(
+        &String::from_utf8(body).unwrap(),
+        "<UploadId>",
+        "</UploadId>",
+    );
+
+    // Two parts (part 1 must be >= 5 MiB).
+    let part1 = vec![b'a'; 5 * 1024 * 1024];
+    let part2 = b"tail".to_vec();
+    let (_, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("mprepl"),
+                Some("big.bin"),
+                &[("uploadId", upload_id.as_str()), ("partNumber", "1")],
+                &[],
+                part1,
+            ),
+        )
+        .await,
+    )
+    .await;
+    let etag1 = header(&hdrs, "etag").unwrap().to_owned();
+    let (_, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("mprepl"),
+                Some("big.bin"),
+                &[("uploadId", upload_id.as_str()), ("partNumber", "2")],
+                &[],
+                part2,
+            ),
+        )
+        .await,
+    )
+    .await;
+    let etag2 = header(&hdrs, "etag").unwrap().to_owned();
+
+    // Nothing is owed yet — only the completion enqueues.
+    assert_eq!(
+        h.meta.list_due_replication(100, now).await.unwrap().len(),
+        0
+    );
+
+    let complete = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag1}</ETag></Part>\
+         <Part><PartNumber>2</PartNumber><ETag>{etag2}</ETag></Part></CompleteMultipartUpload>"
+    );
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::POST,
+                Some("mprepl"),
+                Some("big.bin"),
+                &[("uploadId", upload_id.as_str())],
+                &[],
+                complete.into_bytes(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let due = h.meta.list_due_replication(100, now).await.unwrap();
+    assert_eq!(due.len(), 1, "multipart completion enqueues replication");
+    assert_eq!(due[0].key.as_str(), "big.bin");
+    assert_eq!(
+        due[0].operation,
+        cairn_types::meta::ReplicationOp::ObjectCreate
+    );
+}
+
+/// A server-side copy into a replication-enabled bucket must enqueue replication for the new
+/// destination version (audit: CopyObject previously hard-coded `replication: Vec::new()`, so
+/// copied objects silently never propagated).
+#[tokio::test]
+async fn copy_object_enqueues_replication() {
+    let h = harness().await;
+    versioned_bucket(&h, "cprepl").await;
+    set_replication(&h, "cprepl", "", false).await;
+    let now = cairn_types::Timestamp::from_secs(4_000_000_000);
+
+    // Source PUT enqueues one entry.
+    drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("cprepl"),
+                Some("src.txt"),
+                &[],
+                &[("content-type", "text/plain")],
+                b"original".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        h.meta.list_due_replication(100, now).await.unwrap().len(),
+        1
+    );
+
+    // Copy src -> dst within the replicated bucket.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("cprepl"),
+                Some("dst.txt"),
+                &[],
+                &[("x-amz-copy-source", "/cprepl/src.txt")],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let due = h.meta.list_due_replication(100, now).await.unwrap();
+    assert_eq!(due.len(), 2, "the copy enqueues a second replication entry");
+    assert!(
+        due.iter().any(|e| e.key.as_str() == "dst.txt"
+            && e.operation == cairn_types::meta::ReplicationOp::ObjectCreate),
+        "the copied destination object is enqueued, got {due:?}"
+    );
+}
+
 #[tokio::test]
 async fn bulk_delete_reports_marker_and_rejects_oversize() {
     let h = harness().await;

@@ -538,6 +538,38 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             .map_err(engine_err)?;
             Ok(MutationOutcome::Ack)
         }
+        Mutation::DeferReplication {
+            id,
+            next_attempt_at,
+            last_error,
+        } => {
+            // Release the claim (lease_until=NULL, status='pending') and re-schedule WITHOUT
+            // touching `attempts` — a deferral/unavailability is not a failure, so it must never
+            // push the entry toward terminal. `COALESCE(?3, last_error)` keeps the prior error when
+            // no new one is supplied (an ordering defer).
+            conn.execute(
+                "UPDATE replication_outbox \
+                 SET status='pending', lease_until=NULL, next_attempt_at=?2, \
+                     last_error=COALESCE(?3, last_error) \
+                 WHERE id=?1",
+                params![id, next_attempt_at.0, last_error],
+            )
+            .map_err(engine_err)?;
+            Ok(MutationOutcome::Ack)
+        }
+        Mutation::PruneReplicationOutbox { before_ms } => {
+            // Reclaim terminal rows (completed/failed) older than the horizon; never touch
+            // pending/claimed (outstanding work). Keeps the outbox bounded and auto-clears stale
+            // failures. The per-key ordering check treats an absent row exactly like a completed
+            // one, so dropping completed rows is safe.
+            conn.execute(
+                "DELETE FROM replication_outbox \
+                 WHERE status IN ('completed','failed') AND enqueued_at < ?1",
+                params![before_ms],
+            )
+            .map_err(engine_err)?;
+            Ok(MutationOutcome::Ack)
+        }
         Mutation::EnqueueWebhooks(entries) => {
             for e in &entries {
                 enqueue_webhook(conn, e)?;

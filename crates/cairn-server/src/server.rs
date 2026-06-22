@@ -298,7 +298,17 @@ async fn serve_io<S>(
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let io = TokioIo::new(stream);
-    let svc = service_fn(move |req| handle(state.clone(), peer, secure, serve_ui, req));
+    let svc_shutdown = conn_shutdown.clone();
+    let svc = service_fn(move |req| {
+        handle(
+            state.clone(),
+            peer,
+            secure,
+            serve_ui,
+            req,
+            svc_shutdown.clone(),
+        )
+    });
     let builder = auto::Builder::new(TokioExecutor::new());
     let conn = builder.serve_connection(io, svc);
     tokio::pin!(conn);
@@ -339,6 +349,7 @@ async fn handle(
     secure: bool,
     serve_ui: bool,
     req: Request<Incoming>,
+    shutdown: watch::Receiver<bool>,
 ) -> Result<Response<ResponseBody>, Infallible> {
     let request_id = next_request_id();
     let method = req.method().clone();
@@ -387,6 +398,7 @@ async fn handle(
                     secure,
                     serve_ui,
                     request_id.clone(),
+                    shutdown.clone(),
                 )
                 .await
             }

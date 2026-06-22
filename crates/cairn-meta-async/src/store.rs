@@ -643,15 +643,16 @@ impl MetadataStore for AsyncMetadataStore {
         target: Option<&str>,
     ) -> Result<bool, MetaError> {
         // version_id is uuidv7 (time-ordered): a strictly-lower id is an earlier write. A
-        // completed entry keeps its row with status='completed'; anything else is still owed to
-        // the destination and must ship before this later version (per-key ordering, audit #9).
-        // Scoped per target (`target_arn IS ?4` is null-safe, matching the legacy/env NULL path)
-        // so under fan-out a slow target never blocks a healthy one for the same key.
+        // pending/claimed predecessor is still owed and must ship before this later version
+        // (per-key ordering, audit #9). A `failed` predecessor is settled/terminal and must NOT
+        // block successors forever — treat it like completed here so newer versions proceed
+        // (best-effort/at-least-once, ARCH 20.4); mirrors cairn-meta. Scoped per target
+        // (`target_arn IS ?4` is null-safe) so a slow target never blocks a healthy one.
         let row = query_one(
             &**self.reader().await,
             "SELECT EXISTS(SELECT 1 FROM replication_outbox \
              WHERE bucket_name=?1 AND key=?2 AND version_id<?3 AND target_arn IS ?4 \
-             AND status!='completed')",
+             AND status NOT IN ('completed','failed'))",
             vec![
                 Value::Text(bucket.as_str().to_owned()),
                 Value::Text(key.as_str().to_owned()),

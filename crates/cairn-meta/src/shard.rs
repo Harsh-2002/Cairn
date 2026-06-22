@@ -210,6 +210,8 @@ impl MetadataStore for ShardedMetadataStore {
             Mutation::MarkReplicationDone(_)
             | Mutation::MarkReplicationFailed { .. }
             | Mutation::RetryFailedReplication { .. }
+            | Mutation::PruneReplicationOutbox { .. }
+            | Mutation::DeferReplication { .. }
             | Mutation::MarkWebhookDone(_)
             | Mutation::MarkWebhookFailed { .. } => {
                 let mut outcome = MutationOutcome::Ack;

@@ -703,6 +703,120 @@ async fn replication_counts_aggregates_by_status_and_target() {
 }
 
 #[tokio::test]
+async fn prune_reclaims_old_terminal_entries_only() {
+    let store = cairn_meta::open_in_memory().unwrap();
+    let b = BucketName::parse("prunebkt").unwrap();
+    store
+        .submit(Mutation::CreateBucket(Box::new(bucket("prunebkt"))))
+        .await
+        .unwrap();
+    let mk = |id: &str, status: ReplicationStatus, enq: i64| OutboxEntry {
+        enqueued_at: Timestamp(enq),
+        id: id.to_owned(),
+        bucket: b.clone(),
+        key: ObjectKey::parse("k").unwrap(),
+        version_id: VersionId::from_string(id.to_owned()),
+        operation: ReplicationOp::ObjectCreate,
+        rule_id: "r".to_owned(),
+        target_arn: None,
+        attempts: 0,
+        next_attempt_at: Timestamp(0),
+        status,
+        last_error: None,
+        priority: 0,
+        lease_until: None,
+    };
+    for e in [
+        mk("old-done", ReplicationStatus::Completed, 1000),
+        mk("old-fail", ReplicationStatus::Failed, 1000),
+        mk("new-fail", ReplicationStatus::Failed, 9000),
+        mk("old-pending", ReplicationStatus::Pending, 1000),
+    ] {
+        store
+            .submit(Mutation::EnqueueReplication(Box::new(e)))
+            .await
+            .unwrap();
+    }
+    // Reclaim terminal rows enqueued before t=5000.
+    store
+        .submit(Mutation::PruneReplicationOutbox { before_ms: 5000 })
+        .await
+        .unwrap();
+
+    let counts = store.replication_counts(Some(&b)).await.unwrap();
+    assert_eq!(counts.completed, 0, "old completed pruned");
+    assert_eq!(counts.failed, 1, "old failed pruned; recent failed kept");
+    assert_eq!(
+        counts.pending, 1,
+        "pending is outstanding work and never pruned"
+    );
+    let failed = store.list_failed_replication(10).await.unwrap();
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].id, "new-fail");
+}
+
+#[tokio::test]
+async fn defer_releases_claim_without_consuming_attempts() {
+    let store = cairn_meta::open_in_memory().unwrap();
+    let b = BucketName::parse("deferbkt").unwrap();
+    store
+        .submit(Mutation::CreateBucket(Box::new(bucket("deferbkt"))))
+        .await
+        .unwrap();
+    let v = VersionId::from_string("00000001".into());
+    plant_outbox(&store, &b, "k", v.clone(), "d1").await;
+
+    // Claim the entry: it goes `claimed` under a lease, so it leaves the due (pending) set.
+    let claimed = store
+        .claim_replication_batch(10, Timestamp(1_000))
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 1);
+    assert!(
+        store
+            .list_due_replication(10, Timestamp(1_000))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // Defer it: released back to pending, re-scheduled, attempts untouched, error recorded.
+    store
+        .submit(Mutation::DeferReplication {
+            id: "d1".to_owned(),
+            next_attempt_at: Timestamp(5_000),
+            last_error: Some("target unavailable: down".to_owned()),
+        })
+        .await
+        .unwrap();
+
+    // Not due yet at its re-check time minus one, then due at the scheduled time.
+    assert!(
+        store
+            .list_due_replication(10, Timestamp(4_999))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let due = store
+        .list_due_replication(10, Timestamp(5_000))
+        .await
+        .unwrap();
+    assert_eq!(due.len(), 1, "the deferred entry is promptly re-claimable");
+    assert_eq!(due[0].id, "d1");
+    assert_eq!(due[0].status, ReplicationStatus::Pending);
+    assert_eq!(
+        due[0].attempts, 0,
+        "a deferral never consumes the attempt budget"
+    );
+    assert_eq!(due[0].lease_until, None, "the claim lease was cleared");
+    assert_eq!(
+        due[0].last_error.as_deref(),
+        Some("target unavailable: down")
+    );
+}
+
+#[tokio::test]
 async fn get_bucket_quota_reads_the_column() {
     let store = cairn_meta::open_in_memory().unwrap();
     let b = BucketName::parse("quotab").unwrap();

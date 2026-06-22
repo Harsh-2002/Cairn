@@ -17,6 +17,7 @@ import {
   onUnauthorized,
   setToken,
 } from "@/lib/api";
+import { stopLive } from "@/lib/live";
 
 interface AuthContextValue {
   authed: boolean;
@@ -38,6 +39,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   authedRef.current = authed;
 
   const logout = useCallback(() => {
+    // Tear down the live SSE stream explicitly so it doesn't keep minting tickets / reconnecting
+    // after the session is gone (views unmount too, but don't rely on that ordering).
+    stopLive();
     clearToken();
     setAuthed(false);
   }, []);

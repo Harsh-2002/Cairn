@@ -295,12 +295,14 @@ impl HttpS3Sink {
             .body(Full::new(body))
             .map_err(|e| ReplicationError::Terminal(format!("failed to build request: {e}")))?;
 
-        // A connection/transport failure is transient: classify retryable.
+        // A connection/transport failure means the destination node is unreachable: classify it
+        // `Unavailable` so the entry retries without burning the terminal attempt budget (a target
+        // that is down for hours then returns must auto-resume, not exhaust to terminal).
         let response = self
             .client
             .request(request)
             .await
-            .map_err(|e| ReplicationError::Retryable(format!("transport error: {e}")))?;
+            .map_err(|e| ReplicationError::Unavailable(format!("transport error: {e}")))?;
 
         let status = response.status();
         if status.is_success() {
@@ -473,8 +475,9 @@ impl ServerCertVerifier for NoVerification {
     }
 }
 
-/// Classify a non-2xx HTTP status into the sink error taxonomy: 5xx and the transient 408/429
-/// are retryable; every other 4xx is terminal.
+/// Classify a non-2xx HTTP status into the sink error taxonomy: `5xx` and the transient `408`/`429`
+/// mean the destination is unavailable/overloaded (retry without consuming the attempt budget);
+/// every other `4xx` is a per-request rejection and is terminal.
 fn classify_status(code: u16, detail: &str) -> ReplicationError {
     let msg = if detail.trim().is_empty() {
         format!("destination returned HTTP {code}")
@@ -482,7 +485,7 @@ fn classify_status(code: u16, detail: &str) -> ReplicationError {
         format!("destination returned HTTP {code}: {}", detail.trim())
     };
     if code >= 500 || code == 408 || code == 429 {
-        ReplicationError::Retryable(msg)
+        ReplicationError::Unavailable(msg)
     } else {
         ReplicationError::Terminal(msg)
     }
@@ -698,22 +701,24 @@ mod tests {
     }
 
     #[test]
-    fn classify_status_partitions_retryable_and_terminal() {
+    fn classify_status_partitions_unavailable_and_terminal() {
+        // 5xx and the transient 408/429 mean the destination is unavailable/overloaded — retried
+        // without consuming the terminal attempt budget.
         assert!(matches!(
             classify_status(500, ""),
-            ReplicationError::Retryable(_)
+            ReplicationError::Unavailable(_)
         ));
         assert!(matches!(
             classify_status(503, "slow down"),
-            ReplicationError::Retryable(_)
+            ReplicationError::Unavailable(_)
         ));
         assert!(matches!(
             classify_status(429, ""),
-            ReplicationError::Retryable(_)
+            ReplicationError::Unavailable(_)
         ));
         assert!(matches!(
             classify_status(408, ""),
-            ReplicationError::Retryable(_)
+            ReplicationError::Unavailable(_)
         ));
         assert!(matches!(
             classify_status(403, "AccessDenied"),

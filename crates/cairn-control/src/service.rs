@@ -164,6 +164,11 @@ pub struct ControlService {
     crypto: Arc<dyn Crypto>,
     clock: Arc<dyn Clock>,
     system: Arc<SystemInfo>,
+    /// Optional runtime-agnostic callback that wakes the replication worker pool. Operator actions
+    /// that enqueue or requeue outbox work (resync/backfill, retry-failed) call it so the drain
+    /// happens promptly rather than waiting out the heartbeat. `None` (e.g. headless) just falls
+    /// back to the heartbeat. Kept as a plain `Fn` so this crate stays runtime-agnostic.
+    replication_wake: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl std::fmt::Debug for ControlService {
@@ -188,6 +193,23 @@ impl ControlService {
             crypto,
             clock,
             system: Arc::new(system),
+            replication_wake: None,
+        }
+    }
+
+    /// Attach a callback that wakes the replication worker pool (mirrors `S3Service`). Set by the
+    /// server so operator-triggered resync/backfill and retry-failed actions drain immediately
+    /// instead of waiting out the worker heartbeat.
+    #[must_use]
+    pub fn with_replication_wake(mut self, wake: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.replication_wake = Some(wake);
+        self
+    }
+
+    /// Pulse the replication worker pool if a wake callback is wired; a no-op otherwise.
+    fn pulse_replication(&self) {
+        if let Some(w) = &self.replication_wake {
+            w();
         }
     }
 
@@ -2271,6 +2293,9 @@ impl ControlService {
         {
             return ControlResponse::error_internal(&e.to_string());
         }
+        // The entries are now `pending` and due: wake the worker so the retry drains immediately
+        // rather than on the next heartbeat.
+        self.pulse_replication();
 
         self.record_activity(
             "RetryFailedReplication",
@@ -2333,8 +2358,9 @@ impl ControlService {
         let meta = self.meta.clone();
         let clock = self.clock.clone();
         let bucket = bucket_name.clone();
+        let wake = self.replication_wake.clone();
         tokio::spawn(async move {
-            backfill_replication(meta, clock, bucket, cfg).await;
+            backfill_replication(meta, clock, bucket, cfg, wake).await;
         });
 
         self.record_activity(
@@ -2762,6 +2788,7 @@ async fn backfill_replication(
     clock: Arc<dyn Clock>,
     bucket: BucketName,
     cfg: cairn_replication::ReplicationConfig,
+    wake: Option<Arc<dyn Fn() + Send + Sync>>,
 ) {
     let mut cursor: Option<String> = None;
     let mut enqueued: u64 = 0;
@@ -2824,6 +2851,14 @@ async fn backfill_replication(
                     return;
                 }
                 enqueued += 1;
+            }
+        }
+        // Wake the worker as each page lands so a large backfill starts draining while it is still
+        // enumerating, rather than waiting out the heartbeat (best-effort; the heartbeat is the
+        // safety net).
+        if enqueued > 0 {
+            if let Some(w) = &wake {
+                w();
             }
         }
         match page.next_cursor {

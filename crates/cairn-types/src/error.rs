@@ -112,9 +112,18 @@ pub enum CryptoError {
 /// Failures driving a replication sink.
 #[derive(Debug, Error)]
 pub enum ReplicationError {
-    /// A transient failure; the entry should be retried with backoff.
+    /// A transient *per-object* failure (e.g. a momentary source-read hiccup); the entry is
+    /// retried with backoff and **consumes the attempt budget**, turning terminal once exhausted.
     #[error("retryable replication failure: {0}")]
     Retryable(String),
+    /// The destination *target* is unreachable — a connection failure, request timeout, `5xx`, or
+    /// throttle (`408`/`429`). The entry is rescheduled with backoff but does **not** consume the
+    /// attempt budget, so a target that is down for an extended period keeps its queued work and
+    /// auto-resumes when it returns, instead of exhausting to a terminal failure that needs an
+    /// operator retry. (A genuinely-removed target still terminates via the no-sink path, which
+    /// does consume the budget.)
+    #[error("replication target unavailable: {0}")]
+    Unavailable(String),
     /// A permanent failure; the entry should be marked failed for operator attention.
     #[error("terminal replication failure: {0}")]
     Terminal(String),

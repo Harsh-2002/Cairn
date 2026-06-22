@@ -502,7 +502,11 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
             data_dir: cfg.data_dir.clone(),
             started_at: std::time::Instant::now(),
         },
-    );
+    )
+    .with_replication_wake({
+        let n = replication_notify.clone();
+        Arc::new(move || n.notify_one())
+    });
 
     // Ensure the root administrator exists so the deployment is usable immediately: the same access
     // key + secret log into the web UI, authenticate the management API, and sign S3 requests.

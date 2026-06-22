@@ -1409,17 +1409,31 @@ impl S3Service {
             updated_at: now,
         };
 
+        // A multipart completion writes a brand-new object version, so it must enqueue replication
+        // exactly like a single PUT (ARCH 20.2): one outbox entry per distinct matching target.
+        // Multipart uploads are never themselves an inbound replica (replicas always arrive as
+        // plain PUTs carrying `x-amz-meta-cairn-replica`), so no replica gate is needed here. The
+        // assembled object carries no inline `x-amz-tagging`, so tag-filtered rules see an empty
+        // tag set (prefix/whole-bucket rules still match).
+        let replication = self
+            .replication_outbox(&bucket, &key, &version_id, ReplicationOp::ObjectCreate, &[])
+            .await;
+        let enqueued_repl = !replication.is_empty();
         match self
             .meta
             .submit(Mutation::CompleteMultipart {
                 upload_id: upload_id.clone(),
                 row: Box::new(row),
                 precondition: Precondition::default(),
-                replication: Vec::new(),
+                replication,
             })
             .await
         {
             Ok(MutationOutcome::MultipartCompleted { superseded, .. }) => {
+                // Event-driven drain: wake the replication worker now rather than next heartbeat.
+                if enqueued_repl {
+                    self.pulse_replication();
+                }
                 if let Some(old) = superseded {
                     let _ = self.blob.delete(&old).await;
                 }
@@ -1670,16 +1684,36 @@ impl S3Service {
             created_at: now,
             updated_at: now,
         };
+        // A server-side copy writes a brand-new object version on the destination, so it enqueues
+        // replication like a PUT (ARCH 20.2). A copy is never itself an inbound replica (replicas
+        // arrive as plain PUTs), so no replica gate is needed. Tag-filtered rules match against the
+        // destination's inline `x-amz-tagging` (the REPLACE-directive tag set); prefix rules match
+        // regardless.
+        let dest_tags = parse_tagging_header(req.header("x-amz-tagging"));
+        let replication = self
+            .replication_outbox(
+                &dest_bucket,
+                &dest_key_for_event,
+                &version_id,
+                ReplicationOp::ObjectCreate,
+                &dest_tags,
+            )
+            .await;
+        let enqueued_repl = !replication.is_empty();
         match self
             .meta
             .submit(Mutation::PutObjectVersion {
                 row: Box::new(row),
                 precondition: Precondition::default(),
-                replication: Vec::new(),
+                replication,
             })
             .await
         {
             Ok(MutationOutcome::Put { superseded, .. }) => {
+                // Event-driven drain: wake the replication worker now rather than next heartbeat.
+                if enqueued_repl {
+                    self.pulse_replication();
+                }
                 if let Some(old) = superseded {
                     let _ = self.blob.delete(&old).await;
                 }
@@ -1757,6 +1791,9 @@ impl S3Service {
         // result can surface `<DeleteMarker>`/`<DeleteMarkerVersionId>` for a marker insert.
         let mut deleted: Vec<(String, Option<String>, bool, Option<String>)> = Vec::new();
         let mut errors: Vec<(String, String, String)> = Vec::new();
+        // Whether any key in this batch enqueued a delete-marker replication entry; if so we pulse
+        // the worker once after the loop, mirroring the single-object DELETE's event-driven wake.
+        let mut any_repl_enqueued = false;
         for (key_s, version) in keys {
             let Ok(key) = ObjectKey::parse(&key_s) else {
                 errors.push((
@@ -1841,6 +1878,7 @@ impl S3Service {
                             )
                             .await
                         };
+                        any_repl_enqueued |= !replication.is_empty();
                         self.meta
                             .submit(Mutation::CreateDeleteMarker {
                                 bucket: bucket.name.clone(),
@@ -1942,6 +1980,10 @@ impl S3Service {
                     errors.push((key_s, code.to_owned(), err.to_string()));
                 }
             }
+        }
+        // Event-driven drain: a single wake covers every delete marker enqueued in this batch.
+        if any_repl_enqueued {
+            self.pulse_replication();
         }
         let body = cairn_xml::delete_result(&deleted, &errors);
         Ok(S3Response::xml(StatusCode::OK, body).with_header("x-amz-request-id", &req.request_id))

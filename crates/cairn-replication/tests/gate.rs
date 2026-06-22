@@ -458,6 +458,146 @@ async fn unresolved_target_is_retried_not_terminally_failed() {
     assert_eq!(later[0].attempts, 1);
 }
 
+/// A target that is *unavailable* (transport error / 5xx) must keep its queued work indefinitely
+/// WITHOUT consuming the attempt budget, so an extended outage never turns an owed object terminal
+/// and the queue auto-resumes once the target returns. This is the crash/outage-recovery contract.
+#[tokio::test]
+async fn unavailable_target_retries_without_consuming_budget_then_resumes() {
+    let meta = InMemoryMetadataStore::new();
+    let blobs = Arc::new(InMemoryBlobStore::new());
+    let sink = FakeReplicationSink::new();
+    let router = SingleSink(sink);
+    let clock = TestClock::at_secs(2_000);
+    let now = clock.now();
+    let eng = engine(); // max_attempts = 3
+
+    let version = put_with_outbox(&meta, &blobs, "e-down", "obj/down", b"data", now, now).await;
+    router.0.set_behavior(SinkBehavior::Unavailable);
+
+    // Drain far more times than max_attempts: the target is down on every pass, advancing the clock
+    // past each unavailable re-check. NOT ONE attempt is consumed, so it never goes terminal.
+    for _ in 0..8 {
+        let r = eng.run_once(&meta, &router, &blobs, &clock).await.unwrap();
+        assert_eq!(r.retried, 1, "an unavailable target reschedules");
+        assert_eq!(r.failed, 0, "and is NEVER terminally failed");
+        clock.advance_secs(60); // past UNAVAILABLE_RETRY_SECS so it is due again
+    }
+    // Still pending with a zero attempt count, and the version is NOT stamped Failed.
+    let pending = due_entries(&meta, clock.now().plus_secs(60)).await;
+    assert_eq!(pending.len(), 1, "the entry is still owed (pending)");
+    assert_eq!(pending[0].attempts, 0, "no attempt was ever consumed");
+    assert_eq!(
+        version_status(&meta, "obj/down", &version).await,
+        Some(ReplicationStatus::Pending),
+    );
+
+    // The target returns: the very next drain ships the backlog.
+    router.0.set_behavior(SinkBehavior::Succeed);
+    clock.advance_secs(60);
+    let r = eng.run_once(&meta, &router, &blobs, &clock).await.unwrap();
+    assert_eq!(
+        r.completed, 1,
+        "the queue auto-resumes when the target returns"
+    );
+    assert_eq!(
+        version_status(&meta, "obj/down", &version).await,
+        Some(ReplicationStatus::Completed),
+    );
+    assert_eq!(router.0.intents().len(), 1, "shipped exactly once");
+}
+
+/// A *terminally-failed* predecessor must NOT freeze newer versions of the same key+target forever.
+/// Once v1 is settled `failed`, a later v2 is free to ship (best-effort / at-least-once, ARCH 20.4)
+/// — the alternative (a silent permanent head-of-line stall) is worse.
+#[tokio::test]
+async fn terminally_failed_predecessor_does_not_block_successor() {
+    let meta = InMemoryMetadataStore::new();
+    let blobs = Arc::new(InMemoryBlobStore::new());
+    let sink = FakeReplicationSink::new();
+    let router = SingleSink(sink);
+    let clock = TestClock::at_secs(1_500);
+    let now = clock.now();
+
+    let key = "obj/stalled";
+    let v1 = VersionId::from_string("v1".into());
+    let v2 = VersionId::from_string("v2".into());
+
+    // v1 fails terminally on the first attempt.
+    enqueue_versioned(&meta, &blobs, "s-v1", key, &v1, b"first", now).await;
+    router.0.set_behavior(SinkBehavior::Terminal);
+    let r = engine()
+        .run_once(&meta, &router, &blobs, &clock)
+        .await
+        .unwrap();
+    assert_eq!(r.failed, 1);
+    assert_eq!(
+        version_status(&meta, key, &v1).await,
+        Some(ReplicationStatus::Failed)
+    );
+
+    // v2 arrives with a healthy sink: it must ship despite v1 being terminally failed.
+    enqueue_versioned(&meta, &blobs, "s-v2", key, &v2, b"second", now).await;
+    router.0.set_behavior(SinkBehavior::Succeed);
+    let r = engine()
+        .run_once(&meta, &router, &blobs, &clock)
+        .await
+        .unwrap();
+    assert_eq!(r.completed, 1, "v2 is not blocked by the terminal v1");
+    assert_eq!(r.deferred, 0);
+    assert_eq!(
+        version_status(&meta, key, &v2).await,
+        Some(ReplicationStatus::Completed)
+    );
+    let intents = router.0.intents();
+    assert_eq!(
+        intents.len(),
+        1,
+        "only v2 shipped (v1 stays terminally failed)"
+    );
+}
+
+/// A successor deferred to preserve per-key ordering must *release its claim* (back to pending,
+/// short re-check) rather than sit under the 300 s lease — so it ships within seconds of its
+/// predecessor clearing, not minutes later. Proves the event-driven drain is not defeated.
+#[tokio::test]
+async fn deferred_successor_releases_claim_for_prompt_recheck() {
+    let meta = InMemoryMetadataStore::new();
+    let blobs = Arc::new(InMemoryBlobStore::new());
+    let sink = FakeReplicationSink::new();
+    let router = SingleSink(sink);
+    let clock = TestClock::at_secs(1_000);
+    let now = clock.now();
+
+    let key = "obj/defer";
+    let v1 = VersionId::from_string("v1".into());
+    let v2 = VersionId::from_string("v2".into());
+
+    // v1 backs off into a future batch; v2 then arrives as the only due entry and must defer.
+    enqueue_versioned(&meta, &blobs, "d-v1", key, &v1, b"first", now).await;
+    router.0.set_behavior(SinkBehavior::Retryable);
+    engine()
+        .run_once(&meta, &router, &blobs, &clock)
+        .await
+        .unwrap();
+
+    enqueue_versioned(&meta, &blobs, "d-v2", key, &v2, b"second", now).await;
+    router.0.set_behavior(SinkBehavior::Succeed);
+    let r = engine()
+        .run_once(&meta, &router, &blobs, &clock)
+        .await
+        .unwrap();
+    assert_eq!(r.deferred, 1, "v2 defers behind the un-replicated v1");
+
+    // The claim was RELEASED: v2 is pending and becomes due again within a couple of seconds (the
+    // ordering re-check), not locked under the multi-minute claim lease. Without the release it
+    // would be `claimed` and absent from the due (pending) set here.
+    let soon = due_entries(&meta, now.plus_secs(2)).await;
+    assert!(
+        soon.iter().any(|e| e.id == "d-v2"),
+        "the deferred v2 is promptly re-claimable (claim released), got {soon:?}"
+    );
+}
+
 #[tokio::test]
 async fn exceeding_max_attempts_marks_failed() {
     let meta = InMemoryMetadataStore::new();

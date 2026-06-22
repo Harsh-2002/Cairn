@@ -47,6 +47,7 @@ pub async fn handle(
     secure: bool,
     serve_ui: bool,
     request_id: String,
+    shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Response<ResponseBody> {
     let method = req.method().clone();
     let raw_path = req.uri().path().to_owned();
@@ -169,7 +170,7 @@ pub async fn handle(
                 .find(|(k, _)| k == "topics")
                 .map(|(_, v)| v.as_str())
                 .unwrap_or("");
-            return crate::sse::events_stream(stack.clone(), ticket, topics);
+            return crate::sse::events_stream(stack.clone(), ticket, topics, shutdown);
         }
         let resp = stack
             .control

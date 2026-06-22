@@ -685,6 +685,33 @@ impl MetadataStore for InMemoryMetadataStore {
                 }
                 Ok(MutationOutcome::Ack)
             }
+            Mutation::DeferReplication {
+                id,
+                next_attempt_at,
+                last_error,
+            } => {
+                // Release the claim and re-schedule WITHOUT touching `attempts` (mirrors the SQL
+                // DeferReplication). COALESCE: a None last_error leaves the prior value intact.
+                if let Some(e) = st.outbox.iter_mut().find(|e| e.id == id) {
+                    e.status = ReplicationStatus::Pending;
+                    e.lease_until = None;
+                    e.next_attempt_at = next_attempt_at;
+                    if last_error.is_some() {
+                        e.last_error = last_error;
+                    }
+                }
+                Ok(MutationOutcome::Ack)
+            }
+            Mutation::PruneReplicationOutbox { before_ms } => {
+                // Drop terminal (completed/failed) rows older than the horizon; keep outstanding work.
+                st.outbox.retain(|e| {
+                    !(matches!(
+                        e.status,
+                        ReplicationStatus::Completed | ReplicationStatus::Failed
+                    ) && e.enqueued_at.0 < before_ms)
+                });
+                Ok(MutationOutcome::Ack)
+            }
             Mutation::EnqueueWebhooks(entries) => {
                 for entry in entries {
                     if !st.webhook_outbox.iter().any(|e| e.id == entry.id) {
@@ -1102,16 +1129,22 @@ impl MetadataStore for InMemoryMetadataStore {
         before: &VersionId,
         target: Option<&str>,
     ) -> Result<bool, MetaError> {
-        // version_id is uuidv7 (time-ordered); a strictly-lower id is an earlier write that has
-        // not shipped unless its outbox row is `Completed` (audit #9). Scoped per target so a
-        // later version to target X only waits on earlier versions to the same X (fan-out).
+        // version_id is uuidv7 (time-ordered); a strictly-lower id is an earlier write. A
+        // pending/claimed predecessor is still owed and blocks; a `Completed` or terminal `Failed`
+        // one is settled and does NOT block (a terminal failure must not freeze newer versions
+        // forever — best-effort/at-least-once, ARCH 20.4). Mirrors the SQL `NOT IN
+        // ('completed','failed')`. Scoped per target so a later version to target X only waits on
+        // earlier versions to the same X (fan-out).
         let st = self.state.lock().unwrap();
         Ok(st.outbox.iter().any(|e| {
             e.bucket.as_str() == bucket.as_str()
                 && e.key.as_str() == key.as_str()
                 && e.target_arn.as_deref() == target
                 && e.version_id.as_str() < before.as_str()
-                && e.status != ReplicationStatus::Completed
+                && !matches!(
+                    e.status,
+                    ReplicationStatus::Completed | ReplicationStatus::Failed
+                )
         }))
     }
 

@@ -103,8 +103,10 @@ export function Replication() {
 
   const rules = useMemo(() => res.data?.rules ?? [], [res.data]);
   const failed = useMemo(() => res.data?.failed ?? [], [res.data]);
-  // Live: the server pushes a "replication" summary snapshot; re-fetch the page on each.
-  useLiveTopic("replication", res.refresh);
+  // Live: the server pulses the "replication" topic; re-fetch the page on each. This view's
+  // refresh is a per-bucket fan-out (listBuckets + 3 calls/bucket), so throttle it to at most once
+  // every 12 s rather than re-running that storm on every 3 s pulse.
+  useLiveTopic("replication", res.refresh, 12_000);
 
   return (
     <Page>
