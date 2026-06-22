@@ -6,7 +6,8 @@ import { useMemo } from "react";
 import { useNavigate } from "react-router";
 import { Database } from "lucide-react";
 import { api } from "@/lib/api";
-import { bytes, count, duration, ratio, whenMs } from "@/lib/format";
+import { bytes, count, duration, ratio, relTime, whenMs } from "@/lib/format";
+import { cn } from "@/lib/utils";
 import { useResource } from "@/lib/use-resource";
 import { EmptyState } from "@/components/empty-state";
 import { ErrorAlert } from "@/components/error-alert";
@@ -69,8 +70,6 @@ export function Overview() {
   const physical = o?.physical_bytes ?? 0;
   const saved = Math.max(0, logical - physical);
   const savedPct = logical > 0 ? Math.round((saved / logical) * 100) : 0;
-  const storedPct =
-    logical > 0 ? Math.round(Math.min(1, physical / logical) * 100) : 100;
   const compressed = logical > 0 && physical <= logical;
 
   return (
@@ -111,7 +110,9 @@ export function Overview() {
             />
           </div>
 
-          <div className="grid gap-4 lg:grid-cols-2">
+          {/* items-start so each card sizes to its own content — the Compression card is much
+              shorter than Node, and stretching it to match left a large empty void. */}
+          <div className="grid items-start gap-4 lg:grid-cols-2">
             {/* Node card: identity and health facts for this instance. */}
             <Card className="gap-4">
               <CardHeader className="gap-1">
@@ -174,16 +175,28 @@ export function Overview() {
                 sys.disk_free_bytes != null ? (
                   <div className="mt-5 space-y-1.5">
                     <p className="text-sm text-muted-foreground">Disk</p>
-                    <UsageBar
-                      percent={
+                    {(() => {
+                      const usedPct =
                         ((sys.disk_total_bytes - sys.disk_free_bytes) /
                           sys.disk_total_bytes) *
-                        100
-                      }
-                      label={`Disk: ${bytes(
-                        sys.disk_total_bytes - sys.disk_free_bytes,
-                      )} used of ${bytes(sys.disk_total_bytes)}`}
-                    />
+                        100;
+                      return (
+                        <UsageBar
+                          percent={usedPct}
+                          // A near-full disk is exactly when an operator wants a signal.
+                          fillClassName={cn(
+                            usedPct >= 95
+                              ? "bg-destructive"
+                              : usedPct >= 85
+                                ? "bg-warning"
+                                : undefined,
+                          )}
+                          label={`Disk: ${bytes(
+                            sys.disk_total_bytes - sys.disk_free_bytes,
+                          )} used of ${bytes(sys.disk_total_bytes)}`}
+                        />
+                      );
+                    })()}
                     <p className="text-xs text-muted-foreground">
                       {bytes(sys.disk_free_bytes)} free of{" "}
                       {bytes(sys.disk_total_bytes)}
@@ -197,14 +210,14 @@ export function Overview() {
               </CardContent>
             </Card>
 
-            {/* Compression card: how much disk space compression saves. */}
+            {/* Compression card: how much disk space compression saves. Leads with the ratio (the
+                number that matters), and the bar fills to the SAVED proportion — so a high ratio
+                reads as a full bar, not the near-empty 'stored' bar that contradicted the headline. */}
             <Card className="gap-4">
               <CardHeader className="gap-1">
                 <CardTitle>Compression</CardTitle>
                 <CardDescription>
-                  {compressed
-                    ? `${savedPct}% smaller · ${ratio(o.compression_ratio)}`
-                    : "How much disk space compression saves."}
+                  How much disk space compression saves.
                 </CardDescription>
               </CardHeader>
               <CardContent>
@@ -215,11 +228,19 @@ export function Overview() {
                   </p>
                 ) : compressed ? (
                   <div className="space-y-4">
+                    <div className="flex items-baseline gap-2">
+                      <span className="text-3xl font-semibold tracking-tight tabular-nums">
+                        {ratio(o.compression_ratio)}
+                      </span>
+                      <span className="text-sm text-muted-foreground">
+                        smaller — {savedPct}% saved
+                      </span>
+                    </div>
                     <UsageBar
-                      percent={storedPct}
-                      label={`Stored ${bytes(physical)} of ${bytes(
+                      percent={savedPct}
+                      label={`${savedPct}% saved: ${bytes(saved)} of ${bytes(
                         logical,
-                      )} original (${savedPct}% saved)`}
+                      )} original`}
                     />
                     <dl className="space-y-2 text-sm">
                       <div className="flex items-baseline justify-between gap-4">
@@ -277,7 +298,7 @@ export function Overview() {
                 />
               ) : (
                 <ul className="space-y-3">
-                  {buckets.map((b) => {
+                  {buckets.slice(0, 8).map((b) => {
                     const pct = Math.round(
                       (b.logical_bytes / Math.max(1, totalLogical)) * 100,
                     );
@@ -315,6 +336,13 @@ export function Overview() {
                       </li>
                     );
                   })}
+                  {buckets.length > 8 ? (
+                    <li className="pt-1">
+                      <TextLink to="/buckets" className="text-[13px]">
+                        and {count(buckets.length - 8)} more →
+                      </TextLink>
+                    </li>
+                  ) : null}
                 </ul>
               )}
             </CardContent>
@@ -359,8 +387,11 @@ export function Overview() {
                           {e.key}
                         </span>
                       ) : null}
-                      <span className="ms-auto text-[13px] text-muted-foreground">
-                        {whenMs(e.at_ms)}
+                      <span
+                        className="ms-auto text-[13px] text-muted-foreground tabular-nums"
+                        title={whenMs(e.at_ms)}
+                      >
+                        {relTime(e.at_ms)}
                       </span>
                     </li>
                   ))}
