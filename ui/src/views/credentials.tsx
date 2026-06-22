@@ -6,7 +6,7 @@
 import { useEffect, useState } from "react";
 import { KeyRound } from "lucide-react";
 import { toast } from "sonner";
-import { api, errorMessage } from "@/lib/api";
+import { api, ApiError, errorMessage } from "@/lib/api";
 import { count, relTime, whenMs } from "@/lib/format";
 import { summarizePolicy, type PolicyDoc } from "@/lib/policy";
 import { useResource } from "@/lib/use-resource";
@@ -66,13 +66,66 @@ function expiresIn(ms: number): string {
   return `in ${Math.round(h / 24)}d`;
 }
 
+/**
+ * A mint failure, classified by cause so the operator knows what to do next. A
+ * rejected policy (4xx) needs an edit, not a retry of the same document; a
+ * network blip or a server fault (status 0 / 5xx) is transient and worth retrying.
+ * In every case the draft below is left untouched, so "adjust and mint again" works.
+ */
+type MintError = { title: string; message: string; retryable: boolean };
+
+function classifyMintError(e: unknown): MintError {
+  if (e instanceof ApiError) {
+    // status 0: fetch never reached the server. Retrying the same request can succeed.
+    if (e.status === 0) {
+      return {
+        title: "Couldn't reach the server",
+        message:
+          "The mint request didn't get through. Check your connection, then retry — your policy below is unchanged.",
+        retryable: true,
+      };
+    }
+    // 5xx: the server faulted. Usually transient.
+    if (e.status >= 500) {
+      return {
+        title: "Server error",
+        message: `The server couldn't mint the credential (${e.status}). This is usually transient — retry in a moment. Your policy below is unchanged.`,
+        retryable: true,
+      };
+    }
+    // 403: the account isn't permitted to mint. Retrying won't change that.
+    if (e.status === 403) {
+      return {
+        title: "Not allowed to mint",
+        message:
+          e.message ||
+          "Your account can't mint temporary credentials. Ask an administrator.",
+        retryable: false,
+      };
+    }
+    // Any other 4xx (typically 400): the policy itself was rejected. Surface the
+    // server's reason and point at the editor — retrying the same document fails again.
+    const reason = e.message.replace(/[.\s]+$/, "");
+    return {
+      title: "This policy can't be minted",
+      message: `${reason} — adjust the scoped policy below, then mint again.`,
+      retryable: false,
+    };
+  }
+  return {
+    title: "Mint failed",
+    message: errorMessage(e, "Could not mint credential"),
+    retryable: true,
+  };
+}
+
 export function Credentials() {
   const [buckets, setBuckets] = useState<string[]>([]);
   const [bucketsLoading, setBucketsLoading] = useState(true);
   const [duration, setDuration] = useState("3600");
   const [doc, setDoc] = useState<PolicyDoc | null>(null);
   const [minting, setMinting] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<MintError | null>(null);
   const [minted, setMinted] = useState<MintSessionResp | null>(null);
 
   const durationLabel =
@@ -120,7 +173,7 @@ export function Credentials() {
       sessions.refresh();
       toast.success("Temporary credential minted");
     } catch (e) {
-      setError(errorMessage(e, "Could not mint credential"));
+      setError(classifyMintError(e));
     } finally {
       setMinting(false);
     }
@@ -134,7 +187,11 @@ export function Credentials() {
       />
 
       {error ? (
-        <ErrorAlert title="Mint failed" message={error} onRetry={() => mint()} />
+        <ErrorAlert
+          title={error.title}
+          message={error.message}
+          onRetry={error.retryable ? () => mint() : undefined}
+        />
       ) : null}
 
       {minted ? (
