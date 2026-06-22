@@ -9,8 +9,6 @@ import { useMemo, useState } from "react";
 import {
   Area,
   AreaChart,
-  Bar,
-  BarChart,
   CartesianGrid,
   Cell,
   Line,
@@ -565,7 +563,9 @@ function Dashboard({
             </div>
           </ChartCard>
 
-          {/* Panel E — request mix by operation. */}
+          {/* Panel E — request mix by operation, ranked. Rendered as full-width ranking bars
+              (the same affordance as the bucket panels below) rather than a recharts horizontal
+              bar chart, whose category axis ate most of the narrow grid cell. */}
           <ChartCard
             title="By operation"
             description="Requests broken down by S3 operation."
@@ -573,58 +573,16 @@ function Dashboard({
             {data.by_operation.length === 0 ? (
               <PanelEmpty>No operations recorded in this window.</PanelEmpty>
             ) : (
-              <div
-                className="w-full"
-                role="img"
-                aria-label="Requests broken down by S3 operation."
-                style={{
-                  height: Math.max(160, data.by_operation.length * 34 + 16),
-                }}
-              >
-                <ResponsiveContainer width="100%" height="100%">
-                  <BarChart
-                    accessibilityLayer
-                    layout="vertical"
-                    data={data.by_operation}
-                    margin={{ top: 0, right: 16, bottom: 0, left: 0 }}
-                  >
-                    <CartesianGrid
-                      strokeDasharray="3 3"
-                      stroke="var(--color-border)"
-                      horizontal={false}
-                    />
-                    <XAxis
-                      type="number"
-                      allowDecimals={false}
-                      tickLine={false}
-                      axisLine={{ stroke: "var(--color-border)" }}
-                      tick={axisTick}
-                      tickFormatter={(v: number) => count(v)}
-                    />
-                    <YAxis
-                      type="category"
-                      dataKey="operation"
-                      width={160}
-                      tickLine={false}
-                      axisLine={false}
-                      tick={axisTick}
-                    />
-                    <Tooltip
-                      cursor={{ fill: "var(--color-muted)" }}
-                      contentStyle={tooltipStyle}
-                      labelStyle={tooltipLabelStyle}
-                      itemStyle={tooltipItemStyle}
-                      formatter={(value) => [count(Number(value)), "Requests"]}
-                    />
-                    <Bar
-                      dataKey="count"
-                      fill="var(--color-chart-4)"
-                      radius={[0, 4, 4, 0]}
-                      isAnimationActive={false}
-                    />
-                  </BarChart>
-                </ResponsiveContainer>
-              </div>
+              <BucketBars
+                rows={[...data.by_operation]
+                  .sort((a, b) => b.count - a.count)
+                  .map((o) => ({
+                    bucket: o.operation,
+                    value: o.count,
+                    display: count(o.count),
+                    aria: `${o.operation}: ${count(o.count)} requests`,
+                  }))}
+              />
             )}
           </ChartCard>
 
