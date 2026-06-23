@@ -29,6 +29,7 @@ import {
 } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Textarea } from "@/components/ui/textarea";
 import {
   Select,
   SelectContent,
@@ -256,6 +257,8 @@ export function BucketSettings() {
     dest_bucket: "",
     access_key: "",
     secret: "",
+    ca_cert: "",
+    insecure_skip_verify: false,
   };
   const [targetForm, setTargetForm] = useState(blankTarget);
   const [addingTarget, setAddingTarget] = useState(false);
@@ -482,6 +485,11 @@ export function BucketSettings() {
       );
       return;
     }
+    const caCert = (f.ca_cert ?? "").trim();
+    if (caCert && f.insecure_skip_verify) {
+      toast.error("Trust a CA certificate or skip TLS verification — not both.");
+      return;
+    }
     setAddingTarget(true);
     try {
       await api.addReplicationTarget(name, {
@@ -490,6 +498,8 @@ export function BucketSettings() {
         dest_bucket: f.dest_bucket.trim(),
         access_key: f.access_key.trim(),
         secret: f.secret,
+        ca_cert: caCert || undefined,
+        insecure_skip_verify: f.insecure_skip_verify,
       });
       toast.success("Remote target added");
       setTargetForm(blankTarget);
@@ -976,6 +986,8 @@ export function BucketSettings() {
                         </p>
                         <p className="text-xs text-muted-foreground">
                           {t.region} · key {t.access_key_id}
+                          {t.has_ca_cert ? " · custom CA" : ""}
+                          {t.insecure_skip_verify ? " · TLS verify off" : ""}
                         </p>
                       </div>
                       <Button
@@ -1066,6 +1078,57 @@ export function BucketSettings() {
                     }
                   />
                 </div>
+                {/* TLS trust — only relevant for an https:// endpoint with a private/self-signed CA. */}
+                <div className="grid gap-1.5 md:col-span-2">
+                  <Label htmlFor={`${quotaId}-ca`}>
+                    CA certificate (PEM){" "}
+                    <span className="font-normal text-muted-foreground">
+                      — optional
+                    </span>
+                  </Label>
+                  <Textarea
+                    id={`${quotaId}-ca`}
+                    value={targetForm.ca_cert ?? ""}
+                    placeholder={
+                      "-----BEGIN CERTIFICATE-----\n…paste the peer's CA / self-signed cert to trust over HTTPS…\n-----END CERTIFICATE-----"
+                    }
+                    rows={3}
+                    spellCheck={false}
+                    disabled={targetForm.insecure_skip_verify}
+                    className="font-mono text-xs"
+                    onChange={(e) =>
+                      setTargetForm({ ...targetForm, ca_cert: e.target.value })
+                    }
+                  />
+                  <p className="text-[13px] text-muted-foreground">
+                    Needed only when the destination uses HTTPS with a private or
+                    self-signed certificate. Leave empty for a public CA or an
+                    http:// endpoint.
+                  </p>
+                </div>
+                <label className="flex items-start gap-3 md:col-span-2">
+                  <Checkbox
+                    checked={targetForm.insecure_skip_verify ?? false}
+                    onCheckedChange={(v) =>
+                      setTargetForm({
+                        ...targetForm,
+                        insecure_skip_verify: v === true,
+                      })
+                    }
+                    aria-label="Skip TLS certificate verification"
+                    className="mt-0.5"
+                  />
+                  <span>
+                    <span className="block text-sm">
+                      Skip TLS certificate verification
+                    </span>
+                    <span className="block text-[13px] text-muted-foreground">
+                      Accepts any certificate from the destination — for testing
+                      a self-signed endpoint only. Prefer pasting the CA
+                      certificate above.
+                    </span>
+                  </span>
+                </label>
               </div>
             </CardContent>
           </SettingsCard>

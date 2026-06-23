@@ -711,6 +711,14 @@ pub struct CreateReplicationTargetReq {
     pub access_key: String,
     /// The destination secret access key (plaintext; sealed at rest, never returned).
     pub secret: String,
+    /// Optional CA certificate (PEM) to trust for an `https://` endpoint signed by a private or
+    /// self-signed CA, instead of the public root set. Public material, stored in the clear.
+    #[serde(default)]
+    pub ca_cert: Option<String>,
+    /// Skip TLS certificate verification for the destination — testing only (a self-signed
+    /// endpoint). Mutually exclusive with `ca_cert`.
+    #[serde(default)]
+    pub insecure_skip_verify: bool,
 }
 
 /// `POST /buckets/{name}/replication/targets` response body: just the minted ARN. The secret is
@@ -735,6 +743,10 @@ pub struct ReplicationTargetEntry {
     pub dest_bucket: String,
     /// The destination access-key id (the secret is never returned).
     pub access_key_id: String,
+    /// Whether TLS certificate verification is skipped for this destination (testing only).
+    pub insecure_skip_verify: bool,
+    /// Whether a custom CA certificate is trusted for this destination's TLS.
+    pub has_ca_cert: bool,
 }
 
 /// `GET /buckets/{name}/replication/targets` response. Secrets are never included.

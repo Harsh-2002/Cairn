@@ -107,6 +107,11 @@ pub struct S3SinkConfig {
     /// signed by a private CA. Ignored for `http://` endpoints. Mutually exclusive with
     /// [`insecure_skip_verify`](Self::insecure_skip_verify).
     pub ca_cert_path: Option<PathBuf>,
+    /// An optional CA certificate **as PEM text** (rather than a file path) to trust for a
+    /// `https://` endpoint. Used by per-bucket replication targets configured through the console,
+    /// where the operator pastes the peer's CA/self-signed certificate. Takes precedence over
+    /// [`ca_cert_path`](Self::ca_cert_path); mutually exclusive with `insecure_skip_verify`.
+    pub ca_cert_pem: Option<String>,
     /// When true, the server certificate of a `https://` endpoint is **not** verified: any
     /// certificate is accepted. This is dangerous and defeats TLS authentication; it exists only
     /// for testing against a self-signed endpoint and emits a loud warning when used.
@@ -332,11 +337,7 @@ impl HttpS3Sink {
 /// # Errors
 /// Returns [`ReplicationError::Terminal`] if the endpoint URL is malformed or the TLS knobs
 /// conflict (see [`HttpS3Sink::new`]).
-pub fn sink_for_target(
-    open: &crate::OpenTarget,
-    ca_path: Option<&Path>,
-    insecure_skip_verify: bool,
-) -> Result<HttpS3Sink, ReplicationError> {
+pub fn sink_for_target(open: &crate::OpenTarget) -> Result<HttpS3Sink, ReplicationError> {
     HttpS3Sink::new(S3SinkConfig {
         endpoint: open.endpoint.clone(),
         dest_bucket: open.dest_bucket.clone(),
@@ -344,8 +345,9 @@ pub fn sink_for_target(
         region: open.region.clone(),
         access_key_id: open.access_key_id.clone(),
         secret_access_key: open.secret.as_str().to_owned(),
-        ca_cert_path: ca_path.map(Path::to_path_buf),
-        insecure_skip_verify,
+        ca_cert_path: None,
+        ca_cert_pem: open.ca_cert_pem.clone(),
+        insecure_skip_verify: open.insecure_skip_verify,
     })
 }
 
@@ -367,32 +369,45 @@ fn build_tls_connector_builder(
     ReplicationError,
 > {
     let base = hyper_rustls::HttpsConnectorBuilder::new();
-    match (&config.ca_cert_path, config.insecure_skip_verify) {
-        (Some(_), true) => Err(ReplicationError::Terminal(
-            "ca_cert_path and insecure_skip_verify are mutually exclusive".to_owned(),
-        )),
-        (Some(ca_path), false) => {
-            let roots = load_root_store(ca_path)?;
+    let custom_ca = config.ca_cert_pem.is_some() || config.ca_cert_path.is_some();
+    if custom_ca && config.insecure_skip_verify {
+        return Err(ReplicationError::Terminal(
+            "a CA certificate and insecure_skip_verify are mutually exclusive".to_owned(),
+        ));
+    }
+    if config.insecure_skip_verify {
+        // A loud, operator-visible warning: skip-verify defeats TLS authentication entirely.
+        tracing::warn!(
+            endpoint = %config.endpoint,
+            "replication TLS certificate verification DISABLED (insecure_skip_verify); the \
+             destination's identity is NOT authenticated — use only for testing"
+        );
+        let verifier = Arc::new(NoVerification::new());
+        let tls = ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
+            .with_no_client_auth();
+        return Ok(base.with_tls_config(tls));
+    }
+    // A pasted PEM certificate takes precedence over a file path; otherwise trust the built-in roots.
+    let roots = if let Some(pem) = &config.ca_cert_pem {
+        Some(load_roots_from_pem(
+            pem.as_bytes(),
+            "configured CA certificate",
+        )?)
+    } else if let Some(ca_path) = &config.ca_cert_path {
+        Some(load_root_store(ca_path)?)
+    } else {
+        None
+    };
+    match roots {
+        Some(roots) => {
             let tls = ClientConfig::builder()
                 .with_root_certificates(roots)
                 .with_no_client_auth();
             Ok(base.with_tls_config(tls))
         }
-        (None, true) => {
-            // A loud, operator-visible warning: skip-verify defeats TLS authentication entirely.
-            tracing::warn!(
-                endpoint = %config.endpoint,
-                "replication TLS certificate verification DISABLED (insecure_skip_verify); the \
-                 destination's identity is NOT authenticated — use only for testing"
-            );
-            let verifier = Arc::new(NoVerification::new());
-            let tls = ClientConfig::builder()
-                .dangerous()
-                .with_custom_certificate_verifier(verifier)
-                .with_no_client_auth();
-            Ok(base.with_tls_config(tls))
-        }
-        (None, false) => Ok(base.with_webpki_roots()),
+        None => Ok(base.with_webpki_roots()),
     }
 }
 
@@ -403,22 +418,26 @@ fn load_root_store(path: &Path) -> Result<RootCertStore, ReplicationError> {
     let pem = std::fs::read(path).map_err(|e| {
         ReplicationError::Terminal(format!("reading CA bundle {}: {e}", path.display()))
     })?;
-    let mut reader = std::io::BufReader::new(pem.as_slice());
+    load_roots_from_pem(&pem, &format!("CA bundle {}", path.display()))
+}
+
+/// Build a [`RootCertStore`] from PEM certificate text. `source` is a human-readable label used in
+/// error messages (a file path or "configured CA certificate").
+fn load_roots_from_pem(pem: &[u8], source: &str) -> Result<RootCertStore, ReplicationError> {
+    let mut reader = std::io::BufReader::new(pem);
     let mut roots = RootCertStore::empty();
     let mut added = 0usize;
     for cert in rustls_pemfile::certs(&mut reader) {
-        let cert = cert.map_err(|e| {
-            ReplicationError::Terminal(format!("parsing CA bundle {}: {e}", path.display()))
-        })?;
-        roots.add(cert).map_err(|e| {
-            ReplicationError::Terminal(format!("adding CA from {}: {e}", path.display()))
-        })?;
+        let cert =
+            cert.map_err(|e| ReplicationError::Terminal(format!("parsing {source}: {e}")))?;
+        roots
+            .add(cert)
+            .map_err(|e| ReplicationError::Terminal(format!("adding CA from {source}: {e}")))?;
         added += 1;
     }
     if added == 0 {
         return Err(ReplicationError::Terminal(format!(
-            "CA bundle {} contained no certificates",
-            path.display()
+            "{source} contained no certificates"
         )));
     }
     Ok(roots)
@@ -762,6 +781,7 @@ mod tests {
             access_key_id: "AKID".to_owned(),
             secret_access_key: "secret".to_owned(),
             ca_cert_path: None,
+            ca_cert_pem: None,
             insecure_skip_verify: false,
         }
     }
@@ -808,6 +828,7 @@ mod tests {
             access_key_id: "AKID".to_owned(),
             secret_access_key: "secret".to_owned(),
             ca_cert_path: None,
+            ca_cert_pem: None,
             insecure_skip_verify: false,
         };
         let sink = HttpS3Sink::new(cfg).unwrap();

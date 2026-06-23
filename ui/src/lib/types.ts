@@ -273,6 +273,10 @@ export interface ReplicationTarget {
   region: string;
   dest_bucket: string;
   access_key_id: string;
+  /** TLS certificate verification is skipped for this destination (testing only). */
+  insecure_skip_verify: boolean;
+  /** A custom CA certificate is trusted for this destination's TLS. */
+  has_ca_cert: boolean;
 }
 
 export interface ReplicationTargetListResp {
@@ -286,6 +290,10 @@ export interface CreateReplicationTargetReq {
   dest_bucket: string;
   access_key: string;
   secret: string;
+  /** CA certificate (PEM) to trust for an https:// endpoint with a private/self-signed CA. */
+  ca_cert?: string;
+  /** Skip TLS certificate verification (testing only; mutually exclusive with ca_cert). */
+  insecure_skip_verify?: boolean;
 }
 
 export interface ReplicationStatusError {

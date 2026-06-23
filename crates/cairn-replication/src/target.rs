@@ -44,6 +44,15 @@ pub struct RemoteTarget {
     pub secret_ciphertext: Vec<u8>,
     /// The AEAD nonce the secret was sealed under.
     pub nonce: Vec<u8>,
+    /// An optional PEM CA certificate to trust for an `https://` endpoint whose certificate is
+    /// signed by a private/self-signed CA (instead of the built-in public roots). Public material,
+    /// stored in the clear. `#[serde(default)]` keeps targets persisted before this field readable.
+    #[serde(default)]
+    pub ca_cert_pem: Option<String>,
+    /// When true, the destination's TLS certificate is NOT verified (any certificate is accepted).
+    /// Dangerous — for testing against a self-signed endpoint only; emits a loud warning when used.
+    #[serde(default)]
+    pub insecure_skip_verify: bool,
 }
 
 /// The plaintext creation input for a remote target: what an operator supplies when registering a
@@ -60,6 +69,12 @@ pub struct RemoteTargetInput {
     pub access_key_id: String,
     /// The destination secret access key, in plaintext. Sealed at rest by [`seal_target`].
     pub secret: String,
+    /// Optional PEM CA certificate to trust for an `https://` endpoint with a private/self-signed CA.
+    #[serde(default)]
+    pub ca_cert_pem: Option<String>,
+    /// Skip TLS certificate verification (testing only).
+    #[serde(default)]
+    pub insecure_skip_verify: bool,
 }
 
 /// An **opened** remote target: the same connection parameters as [`RemoteTarget`] but with the
@@ -77,6 +92,10 @@ pub struct OpenTarget {
     pub access_key_id: String,
     /// The unsealed destination secret access key (scrubbed on drop).
     pub secret: Zeroizing<String>,
+    /// Optional PEM CA certificate to trust for the destination's `https://` endpoint.
+    pub ca_cert_pem: Option<String>,
+    /// Skip TLS certificate verification (testing only).
+    pub insecure_skip_verify: bool,
 }
 
 /// Seal a [`RemoteTargetInput`] into a storable [`RemoteTarget`]: encrypt the secret under the
@@ -107,6 +126,8 @@ pub fn seal_target(
         // CRK1 envelope (audit #29): the nonce is inside the ciphertext; store an empty nonce.
         secret_ciphertext: sealed.ciphertext,
         nonce: Vec::new(),
+        ca_cert_pem: input.ca_cert_pem,
+        insecure_skip_verify: input.insecure_skip_verify,
     })
 }
 
@@ -172,6 +193,8 @@ pub fn open_target(
         dest_bucket: t.dest_bucket.clone(),
         access_key_id: t.access_key_id.clone(),
         secret: Zeroizing::new(secret),
+        ca_cert_pem: t.ca_cert_pem.clone(),
+        insecure_skip_verify: t.insecure_skip_verify,
     })
 }
 
@@ -190,6 +213,8 @@ mod tests {
             dest_bucket: "mirror".to_owned(),
             access_key_id: "AKIDPEER".to_owned(),
             secret: "super-secret-key".to_owned(),
+            ca_cert_pem: None,
+            insecure_skip_verify: false,
         }
     }
 
@@ -212,6 +237,27 @@ mod tests {
         assert_eq!(open.region, "us-west-2");
         assert_eq!(open.dest_bucket, "mirror");
         assert_eq!(open.access_key_id, "AKIDPEER");
+    }
+
+    #[test]
+    fn seal_open_preserves_tls_trust_settings() {
+        let c = crypto();
+        // A target that trusts a pasted CA certificate.
+        let mut with_ca = input();
+        with_ca.ca_cert_pem = Some("-----BEGIN CERTIFICATE-----\nMII…\n-----END CERTIFICATE-----".to_owned());
+        let open = open_target(&c, &seal_target(&c, with_ca).expect("seal")).expect("open");
+        assert_eq!(
+            open.ca_cert_pem.as_deref(),
+            Some("-----BEGIN CERTIFICATE-----\nMII…\n-----END CERTIFICATE-----")
+        );
+        assert!(!open.insecure_skip_verify);
+
+        // A target that skips verification.
+        let mut insecure = input();
+        insecure.insecure_skip_verify = true;
+        let open = open_target(&c, &seal_target(&c, insecure).expect("seal")).expect("open");
+        assert!(open.insecure_skip_verify);
+        assert!(open.ca_cert_pem.is_none());
     }
 
     #[test]

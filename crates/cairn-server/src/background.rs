@@ -245,6 +245,7 @@ fn single_target_sink_cfg(cfg: &Config) -> Option<cairn_replication::S3SinkConfi
             access_key_id: access,
             secret_access_key: secret,
             ca_cert_path: None,
+            ca_cert_pem: None,
             insecure_skip_verify: false,
         }),
         _ => None,
@@ -493,7 +494,7 @@ async fn resolve_stored_target_sinks(stack: &Arc<AppStack>) -> HashMap<String, A
                     continue;
                 }
             };
-            match cairn_replication::sink_for_target(&open, None, false) {
+            match cairn_replication::sink_for_target(&open) {
                 Ok(sink) => {
                     by_arn.insert(target.arn.clone(), Arc::new(sink));
                 }
@@ -535,6 +536,7 @@ fn target_sink_cfg(target: &ReplicationTarget) -> cairn_replication::S3SinkConfi
         access_key_id: target.access_key.clone(),
         secret_access_key: target.secret.clone(),
         ca_cert_path: target.ca_path.clone(),
+        ca_cert_pem: None,
         insecure_skip_verify: target.insecure_skip_verify,
     }
 }
@@ -1159,6 +1161,7 @@ mod tests {
                 access_key_id: "AKID".to_owned(),
                 secret_access_key: "secret".to_owned(),
                 ca_cert_path: None,
+                ca_cert_pem: None,
                 insecure_skip_verify: false,
             })
             .unwrap(),
@@ -1202,6 +1205,7 @@ mod tests {
                 access_key_id: "AKID".to_owned(),
                 secret_access_key: "secret".to_owned(),
                 ca_cert_path: None,
+                ca_cert_pem: None,
                 insecure_skip_verify: false,
             })
             .unwrap(),

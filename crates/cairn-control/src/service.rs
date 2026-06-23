@@ -2161,6 +2161,12 @@ impl ControlService {
                 "endpoint, region, dest_bucket, access_key, and secret are all required",
             );
         }
+        let ca_cert_pem = req.ca_cert.filter(|s| !s.trim().is_empty());
+        if ca_cert_pem.is_some() && req.insecure_skip_verify {
+            return ControlResponse::bad_request(
+                "Trust a CA certificate or skip TLS verification — not both.",
+            );
+        }
 
         let input = RemoteTargetInput {
             endpoint: req.endpoint,
@@ -2168,6 +2174,8 @@ impl ControlService {
             dest_bucket: req.dest_bucket,
             access_key_id: req.access_key,
             secret: req.secret,
+            ca_cert_pem,
+            insecure_skip_verify: req.insecure_skip_verify,
         };
         // Seal the destination secret under the master key via the Crypto trait spine and mint the
         // stable ARN, exactly as `cairn_replication::seal_target` does (it needs the concrete
@@ -2219,6 +2227,8 @@ impl ControlService {
                 region: t.region,
                 dest_bucket: t.dest_bucket,
                 access_key_id: t.access_key_id,
+                insecure_skip_verify: t.insecure_skip_verify,
+                has_ca_cert: t.ca_cert_pem.is_some(),
             })
             .collect();
         ControlResponse::json(StatusCode::OK, &wire::ReplicationTargetListResp { targets })
@@ -2487,6 +2497,8 @@ impl ControlService {
             // CRK1 envelope (audit #29): the nonce is inside the ciphertext; store an empty nonce.
             secret_ciphertext: sealed.ciphertext,
             nonce: Vec::new(),
+            ca_cert_pem: input.ca_cert_pem,
+            insecure_skip_verify: input.insecure_skip_verify,
         })
     }
 
