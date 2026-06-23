@@ -22,7 +22,7 @@ import {
 } from "recharts";
 import { Activity as ActivityIcon } from "lucide-react";
 import { api } from "@/lib/api";
-import { bytes, compactNum, count, relTime } from "@/lib/format";
+import { bytes, compactNum, count } from "@/lib/format";
 import type {
   MetricOp,
   MetricStatus,
@@ -195,17 +195,6 @@ export function Metrics() {
     overview.refresh();
   };
 
-  // "Updated 3m ago" cue: stamp the time on each successful load and re-tick the label every 30s.
-  const [loadedAt, setLoadedAt] = useState<number | null>(null);
-  useEffect(() => {
-    if (data) setLoadedAt(Date.now());
-  }, [data]);
-  const [, setTick] = useState(0);
-  useEffect(() => {
-    const id = setInterval(() => setTick((t) => t + 1), 30_000);
-    return () => clearInterval(id);
-  }, []);
-
   const tickFmt = useMemo(() => tickTime(range), [range]);
 
   return (
@@ -215,15 +204,6 @@ export function Metrics() {
         description={`API request volume and usage analytics over the last ${
           RANGES.find((r) => r.value === range)?.label ?? "period"
         }.`}
-        actions={
-          <div className="flex items-center gap-3">
-            {loadedAt ? (
-              <span className="hidden text-[13px] text-muted-foreground tabular-nums sm:inline">
-                Updated {relTime(loadedAt)}
-              </span>
-            ) : null}
-          </div>
-        }
       />
 
       {/* The range filter swaps the entire view, so it is a single-choice control (radiogroup),
