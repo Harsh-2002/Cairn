@@ -418,6 +418,14 @@ export function BucketSettings() {
       setReplError("Choose a replication target to ship objects to.");
       return;
     }
+    if (versioning !== "Enabled") {
+      // Replication only works on versioned buckets — catch it before the request so the fix is
+      // obvious, rather than letting the rule save and silently replicate nothing.
+      setReplError(
+        "Turn on versioning for this bucket first (in the General tab) — replication only copies versioned objects.",
+      );
+      return;
+    }
     const dest = data?.targets.find((t) => t.arn === replTargetArn);
     setBusy("replication");
     try {
@@ -432,9 +440,7 @@ export function BucketSettings() {
       );
       res.refresh();
     } catch (e) {
-      setReplError(
-        `${errorMessage(e, "Failed to set replication.")} Replication needs versioning enabled on this bucket.`,
-      );
+      setReplError(errorMessage(e, "Couldn't save the replication rule."));
     } finally {
       setBusy(null);
     }

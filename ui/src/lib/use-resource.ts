@@ -57,7 +57,7 @@ export function useResource<T>(
       setData(next);
     } catch (e) {
       if (ticket !== seq.current) return;
-      setError(errorMessage(e, "Request failed."));
+      setError(errorMessage(e, "Couldn't load this. Refresh to try again."));
     } finally {
       if (ticket === seq.current) {
         setLoading(false);

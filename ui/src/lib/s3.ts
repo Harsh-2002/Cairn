@@ -12,6 +12,25 @@ function s3headers(extra?: Record<string, string>): Record<string, string> {
   return h;
 }
 
+/**
+ * Build an {@link ApiError} from a failed S3 response, preserving the server's `<Code>` and
+ * `<Message>` from the XML error body so the shared error humanizer can explain it. `action` is a
+ * short fallback description used only when the body carries no message. Reading the body here is
+ * safe because callers throw this on the not-ok branch before consuming it elsewhere.
+ */
+async function s3Error(res: Response, action: string): Promise<ApiError> {
+  let code: string | undefined;
+  let message: string | undefined;
+  try {
+    const xml = await res.text();
+    code = /<Code>([^<]+)<\/Code>/.exec(xml)?.[1];
+    message = /<Message>([^<]+)<\/Message>/.exec(xml)?.[1]?.trim() || undefined;
+  } catch {
+    /* no/!XML body — fall back to the action + status */
+  }
+  return new ApiError(message ?? `${action} failed (${res.status})`, res.status, code);
+}
+
 export function objectPath(bucket: string, key: string): string {
   const k = String(key)
     .split("/")
@@ -40,7 +59,7 @@ export async function putObject(
     headers,
     body: file,
   });
-  if (!res.ok) throw new ApiError(`upload failed (${res.status})`, res.status);
+  if (!res.ok) throw await s3Error(res, "upload");
 }
 
 export interface UploadProgress {
@@ -88,11 +107,28 @@ export function putObjectWithProgress(
     };
     xhr.onload = () => {
       if (xhr.status >= 200 && xhr.status < 300) resolve();
-      else reject(new ApiError(`upload failed (${xhr.status})`, xhr.status));
+      else {
+        // Pull the S3 <Code>/<Message> out of the error body so the humanizer can explain it.
+        const xml = xhr.responseText || "";
+        const code = /<Code>([^<]+)<\/Code>/.exec(xml)?.[1];
+        const message = /<Message>([^<]+)<\/Message>/.exec(xml)?.[1]?.trim();
+        reject(
+          new ApiError(
+            message || `upload failed (${xhr.status})`,
+            xhr.status,
+            code,
+          ),
+        );
+      }
     };
     xhr.onerror = () =>
-      reject(new ApiError("network error during upload", 0));
-    xhr.onabort = () => reject(new ApiError("upload cancelled", 0));
+      reject(
+        new ApiError(
+          "The upload couldn't reach the server. Check your connection and try again.",
+          0,
+        ),
+      );
+    xhr.onabort = () => reject(new ApiError("Upload cancelled.", 0));
     if (signal) {
       if (signal.aborted) {
         xhr.abort();
@@ -112,7 +148,7 @@ export async function getObjectBlob(
   const q = versionId ? `?versionId=${encodeURIComponent(versionId)}` : "";
   const res = await fetch(objectPath(bucket, key) + q, { headers: s3headers() });
   if (!res.ok)
-    throw new ApiError(`download failed (${res.status})`, res.status);
+    throw await s3Error(res, "download");
   return await res.blob();
 }
 
@@ -127,7 +163,7 @@ export async function deleteObject(
     headers: s3headers(),
   });
   if (!res.ok && res.status !== 204)
-    throw new ApiError(`delete failed (${res.status})`, res.status);
+    throw await s3Error(res, "delete");
 }
 
 // Create an empty "folder" marker: a zero-byte object whose key ends in "/".
@@ -143,7 +179,7 @@ export async function createFolder(
     body: new Blob([]),
   });
   if (!res.ok)
-    throw new ApiError(`create folder failed (${res.status})`, res.status);
+    throw await s3Error(res, "create folder");
 }
 
 // Server-side copy (used for copy/move/rename): PUT the destination with an
@@ -159,7 +195,7 @@ export async function copyObject(
     headers: s3headers({ "x-amz-copy-source": source }),
   });
   if (!res.ok)
-    throw new ApiError(`copy failed (${res.status})`, res.status);
+    throw await s3Error(res, "copy");
 }
 
 // --- XML helpers ----------------------------------------------------------------
@@ -207,7 +243,7 @@ export async function listObjectVersions(
   if (delimiter) url += `&delimiter=${encodeURIComponent(delimiter)}`;
   const res = await fetch(url, { headers: s3headers() });
   if (!res.ok)
-    throw new ApiError(`list versions failed (${res.status})`, res.status);
+    throw await s3Error(res, "list versions");
   const doc = parseXml(await res.text());
 
   const read = (el: Element, isMarker: boolean): ObjectVersion => ({
@@ -254,7 +290,7 @@ export async function getObjectTagging(
   });
   if (res.status === 404) return [];
   if (!res.ok)
-    throw new ApiError(`load tags failed (${res.status})`, res.status);
+    throw await s3Error(res, "load tags");
   const doc = parseXml(await res.text());
   return Array.from(doc.getElementsByTagName("Tag")).map((el) => ({
     key: childText(el, "Key"),
@@ -282,7 +318,7 @@ export async function putObjectTagging(
     body,
   });
   if (!res.ok && res.status !== 204)
-    throw new ApiError(`save tags failed (${res.status})`, res.status);
+    throw await s3Error(res, "save tags");
 }
 
 export async function deleteObjectTagging(
@@ -294,7 +330,7 @@ export async function deleteObjectTagging(
     headers: s3headers(),
   });
   if (!res.ok && res.status !== 204)
-    throw new ApiError(`clear tags failed (${res.status})`, res.status);
+    throw await s3Error(res, "clear tags");
 }
 
 // --- Bulk delete (?delete) ------------------------------------------------------
@@ -318,7 +354,7 @@ export async function bulkDelete(
     body,
   });
   if (!res.ok)
-    throw new ApiError(`bulk delete failed (${res.status})`, res.status);
+    throw await s3Error(res, "bulk delete");
   const doc = parseXml(await res.text());
   const deleted = doc.getElementsByTagName("Deleted").length;
   const errors = Array.from(doc.getElementsByTagName("Error")).map((el) => ({
@@ -345,7 +381,7 @@ export async function getPublicAccessBlock(
   });
   if (res.status === 404) return null;
   if (!res.ok)
-    throw new ApiError(`load access block failed (${res.status})`, res.status);
+    throw await s3Error(res, "load access block");
   const doc = parseXml(await res.text());
   const flag = (tag: string) =>
     (doc.getElementsByTagName(tag)[0]?.textContent ?? "").trim() === "true";
@@ -374,7 +410,7 @@ export async function putPublicAccessBlock(
     body,
   });
   if (!res.ok && res.status !== 204)
-    throw new ApiError(`save access block failed (${res.status})`, res.status);
+    throw await s3Error(res, "save access block");
 }
 
 // --- Object Ownership (?ownershipControls) --------------------------------------
@@ -391,7 +427,7 @@ export async function putOwnershipControls(
     body,
   });
   if (!res.ok && res.status !== 204)
-    throw new ApiError(`save ownership failed (${res.status})`, res.status);
+    throw await s3Error(res, "save ownership");
 }
 
 // --- Bucket tagging (?tagging on the bucket) ------------------------------------
@@ -402,7 +438,7 @@ export async function getBucketTagging(bucket: string): Promise<ObjectTag[]> {
   });
   if (res.status === 404) return [];
   if (!res.ok)
-    throw new ApiError(`load bucket tags failed (${res.status})`, res.status);
+    throw await s3Error(res, "load bucket tags");
   const doc = parseXml(await res.text());
   return Array.from(doc.getElementsByTagName("Tag")).map((el) => ({
     key: childText(el, "Key"),
@@ -429,7 +465,7 @@ export async function putBucketTagging(
     body,
   });
   if (!res.ok && res.status !== 204)
-    throw new ApiError(`save bucket tags failed (${res.status})`, res.status);
+    throw await s3Error(res, "save bucket tags");
 }
 
 export async function deleteBucketTagging(bucket: string): Promise<void> {
@@ -438,7 +474,7 @@ export async function deleteBucketTagging(bucket: string): Promise<void> {
     headers: s3headers(),
   });
   if (!res.ok && res.status !== 204)
-    throw new ApiError(`clear bucket tags failed (${res.status})`, res.status);
+    throw await s3Error(res, "clear bucket tags");
 }
 
 // Per-bucket replication rule via the S3 subresource (?replication). `dest_bucket` carries the
@@ -453,7 +489,7 @@ export async function getReplication(
   });
   if (res.status === 404) return null;
   if (!res.ok)
-    throw new ApiError(`load replication failed (${res.status})`, res.status);
+    throw await s3Error(res, "load replication");
   const xml = await res.text();
   const dest = /<Bucket>(?:arn:aws:s3:::)?([^<]+)<\/Bucket>/.exec(xml);
   const prefix = /<Prefix>([^<]*)<\/Prefix>/.exec(xml);
@@ -495,7 +531,7 @@ export async function putReplication(
     body: xml,
   });
   if (!res.ok && res.status !== 204)
-    throw new ApiError(`set replication failed (${res.status})`, res.status);
+    throw await s3Error(res, "set replication");
 }
 
 export async function deleteReplication(bucket: string): Promise<void> {
@@ -504,7 +540,7 @@ export async function deleteReplication(bucket: string): Promise<void> {
     headers: s3headers(),
   });
   if (!res.ok && res.status !== 204)
-    throw new ApiError(`clear replication failed (${res.status})`, res.status);
+    throw await s3Error(res, "clear replication");
 }
 
 // --- Object Lock / WORM (S3 ?object-lock, ?retention, ?legal-hold; ARCH 16.5) ---
@@ -534,7 +570,7 @@ export async function getObjectLockConfig(
   });
   if (res.status === 404 || res.status === 400) return { enabled: false };
   if (!res.ok)
-    throw new ApiError(`load object lock failed (${res.status})`, res.status);
+    throw await s3Error(res, "load object lock");
   const doc = parseXml(await res.text());
   const text = (tag: string) =>
     (doc.getElementsByTagName(tag)[0]?.textContent ?? "").trim();
@@ -571,7 +607,7 @@ export async function putObjectLockConfig(
     body: xml,
   });
   if (!res.ok && res.status !== 204)
-    throw new ApiError(`set object lock failed (${res.status})`, res.status);
+    throw await s3Error(res, "set object lock");
 }
 
 function versionQuery(versionId?: string): string {
@@ -589,7 +625,7 @@ export async function getObjectRetention(
   );
   if (res.status === 404) return null;
   if (!res.ok)
-    throw new ApiError(`load retention failed (${res.status})`, res.status);
+    throw await s3Error(res, "load retention");
   const doc = parseXml(await res.text());
   const mode = (
     doc.getElementsByTagName("Mode")[0]?.textContent ?? ""
@@ -618,7 +654,7 @@ export async function putObjectRetention(
     { method: "PUT", headers: s3headers(headers), body: xml },
   );
   if (!res.ok && res.status !== 200)
-    throw new ApiError(`set retention failed (${res.status})`, res.status);
+    throw await s3Error(res, "set retention");
 }
 
 export async function getObjectLegalHold(
@@ -632,7 +668,7 @@ export async function getObjectLegalHold(
   );
   if (res.status === 404) return false;
   if (!res.ok)
-    throw new ApiError(`load legal hold failed (${res.status})`, res.status);
+    throw await s3Error(res, "load legal hold");
   const doc = parseXml(await res.text());
   return (
     (doc.getElementsByTagName("Status")[0]?.textContent ?? "").trim() === "ON"
@@ -655,7 +691,7 @@ export async function putObjectLegalHold(
     },
   );
   if (!res.ok && res.status !== 200)
-    throw new ApiError(`set legal hold failed (${res.status})`, res.status);
+    throw await s3Error(res, "set legal hold");
 }
 
 // --- CORS (S3 ?cors) ---
@@ -679,7 +715,7 @@ export async function getCors(bucket: string): Promise<CorsRule[]> {
   });
   if (res.status === 404) return [];
   if (!res.ok)
-    throw new ApiError(`load CORS failed (${res.status})`, res.status);
+    throw await s3Error(res, "load CORS");
   const doc = parseXml(await res.text());
   return Array.from(doc.getElementsByTagName("CORSRule")).map((r) => {
     const max = (r.getElementsByTagName("MaxAgeSeconds")[0]?.textContent ?? "").trim();
@@ -725,7 +761,7 @@ export async function putCors(bucket: string, rules: CorsRule[]): Promise<void> 
     body,
   });
   if (!res.ok && res.status !== 204)
-    throw new ApiError(`set CORS failed (${res.status})`, res.status);
+    throw await s3Error(res, "set CORS");
 }
 
 export async function deleteCors(bucket: string): Promise<void> {
@@ -734,7 +770,7 @@ export async function deleteCors(bucket: string): Promise<void> {
     headers: s3headers(),
   });
   if (!res.ok && res.status !== 204)
-    throw new ApiError(`delete CORS failed (${res.status})`, res.status);
+    throw await s3Error(res, "delete CORS");
 }
 
 // --- Lifecycle (S3 ?lifecycle) — expiration / noncurrent / abort-incomplete only;
@@ -765,7 +801,7 @@ export async function getLifecycle(bucket: string): Promise<LifecycleRule[]> {
   });
   if (res.status === 404) return [];
   if (!res.ok)
-    throw new ApiError(`load lifecycle failed (${res.status})`, res.status);
+    throw await s3Error(res, "load lifecycle");
   const doc = parseXml(await res.text());
   return Array.from(doc.getElementsByTagName("Rule")).map((r, i) => ({
     id: (r.getElementsByTagName("ID")[0]?.textContent ?? `rule-${i + 1}`).trim(),
@@ -816,7 +852,7 @@ export async function putLifecycle(
     body,
   });
   if (!res.ok && res.status !== 204)
-    throw new ApiError(`set lifecycle failed (${res.status})`, res.status);
+    throw await s3Error(res, "set lifecycle");
 }
 
 export async function deleteLifecycle(bucket: string): Promise<void> {
@@ -825,5 +861,5 @@ export async function deleteLifecycle(bucket: string): Promise<void> {
     headers: s3headers(),
   });
   if (!res.ok && res.status !== 204)
-    throw new ApiError(`delete lifecycle failed (${res.status})`, res.status);
+    throw await s3Error(res, "delete lifecycle");
 }

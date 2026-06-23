@@ -84,20 +84,149 @@ export function onUnauthorized(handler: (() => void) | null): void {
   unauthorizedHandler = handler;
 }
 
-/** An error carrying the HTTP status so callers (e.g. login) can react to 401/403. */
+/** An error carrying the HTTP status (and an error code, when the server gives one) so callers can
+ * react to 401/403 and the humanizer can map a precise cause. */
 export class ApiError extends Error {
   status: number;
+  /** A stable machine code when the server provides one (an S3 `<Code>` or a control error code). */
+  code?: string;
 
-  constructor(message: string, status: number) {
+  constructor(message: string, status: number, code?: string) {
     super(message);
     this.name = "ApiError";
     this.status = status;
+    this.code = code;
   }
 }
 
+/**
+ * Turn any thrown error into a sentence a non-expert operator can act on. `fallback` is the
+ * caller's plain-language description of what was being attempted (e.g. "Couldn't save the rule.");
+ * it's used as the lead when the server's own message is generic or missing.
+ *
+ * Order: a connection failure → a recognised cause (mapped from the server's code/message) → a
+ * status-based hint built on the fallback → the server's own message if it already reads cleanly.
+ */
 export function errorMessage(e: unknown, fallback: string): string {
-  if (e instanceof Error && e.message) return e.message;
+  if (e instanceof ApiError) return humanizeApiError(e, fallback);
+  if (e instanceof Error && e.message) return sentence(e.message);
   return fallback;
+}
+
+function humanizeApiError(e: ApiError, fallback: string): string {
+  // Couldn't reach the server at all (status 0 is set on a fetch/network failure).
+  if (e.status === 0) {
+    return "Couldn't reach the server. Check that it's running and that your connection is up, then try again.";
+  }
+  const raw = (e.message ?? "").trim();
+  const known = knownCause(e.code, raw);
+  if (known) return known;
+  // A generic "X failed (404)" / "request failed (500)" / empty message carries no real cause, so
+  // lead with the caller's description and add what the status implies.
+  const generic = !raw || /failed \(\d+\)\s*$/i.test(raw) || /^request failed/i.test(raw);
+  if (generic) return statusHint(e.status, fallback);
+  // The server gave a real, human message — surface it as a clean sentence.
+  return sentence(raw);
+}
+
+/** Map a known server cause (by S3/control code, else by message text) to plain, actionable copy. */
+function knownCause(code: string | undefined, raw: string): string | null {
+  const has = (re: RegExp) => re.test(raw);
+  const is = (c: string) => code === c;
+
+  // --- Replication / versioning (the configuration paths) ---
+  if (has(/existing[- ]object replication/i) || is("InvalidExistingObjectReplication")) {
+    return 'This bucket has no rule set to copy objects that already exist. Open the replication rule, turn on "Replicate existing objects", and save — then run "Resync existing".';
+  }
+  if (has(/versioning/i) && has(/enabl|requir|must|need/i)) {
+    return "Replication needs versioning turned on for this bucket. Enable versioning first, then add the rule.";
+  }
+  // --- Bucket lifecycle conflicts ---
+  if (is("BucketNotEmpty") || has(/bucket .*not empty|not empty/i)) {
+    return "This bucket still has objects in it. Empty it first, then delete the bucket.";
+  }
+  if (is("BucketAlreadyExists") || has(/already exists/i)) {
+    return "A bucket with that name already exists on this server. Bucket names are global — pick a different name.";
+  }
+  if (is("BucketAlreadyOwnedByYou") || has(/already owned by you/i)) {
+    return "You already have a bucket with that name.";
+  }
+  if (is("InvalidBucketName") || has(/invalid bucket name|bucket name/i)) {
+    return "That bucket name isn't allowed. Use 3–63 characters: lowercase letters, numbers, dots and hyphens, starting and ending with a letter or number.";
+  }
+  // --- Not found (often a stale view) ---
+  if (is("NoSuchBucket")) {
+    return "That bucket no longer exists — it may have been deleted. Refresh the page.";
+  }
+  if (is("NoSuchKey") || is("NoSuchVersion")) {
+    return "That object no longer exists — it may have been deleted. Refresh the list.";
+  }
+  if (is("NoSuchUpload")) {
+    return "This upload has expired or was cancelled. Start the upload again.";
+  }
+  // --- Quotas / size ---
+  if (is("QuotaExceeded") || has(/quota/i)) {
+    return "This would put the bucket over its storage quota. Raise the quota or free up space first.";
+  }
+  if (is("EntityTooLarge") || has(/entity too large|too large/i)) {
+    return "That's larger than the server allows.";
+  }
+  if (is("InsufficientStorage") || has(/insufficient storage|no space/i)) {
+    return "The server is out of disk space. Free up space and try again.";
+  }
+  // --- Validation: policy / JSON / XML ---
+  if (
+    is("MalformedPolicy") ||
+    is("MalformedXML") ||
+    has(/malformed|invalid (json|policy|xml|configuration)|parse|could not parse/i)
+  ) {
+    return "That couldn't be parsed. Check the syntax — a missing comma, quote or bracket is the usual cause — and try again.";
+  }
+  // --- Auth / permission / lock ---
+  if (is("AccessDenied") || is("SignatureDoesNotMatch")) {
+    return "That was refused. These credentials may not have permission, or a key/secret is wrong.";
+  }
+  if (is("InvalidAccessKeyId")) {
+    return "That access key isn't recognised by the destination. Check the key and secret on the replication target.";
+  }
+  if (
+    is("ObjectLockConfigurationNotFoundError") ||
+    has(/object lock|retention|legal hold|worm/i)
+  ) {
+    return "Object Lock is protecting this object. It can't be deleted or changed until its retention period ends or its legal hold is removed.";
+  }
+  if (is("PreconditionFailed") || has(/precondition/i)) {
+    return "Something changed since you loaded this. Refresh and try again.";
+  }
+  return null;
+}
+
+/** Build a message from the HTTP status, led by the caller's plain description of the action. */
+function statusHint(status: number, fallback: string): string {
+  const lead = fallback.replace(/\s*$/, "");
+  const join = (hint: string) => `${lead.replace(/\.?$/, ".")} ${hint}`;
+  if (status === 400 || status === 422)
+    return join("The values weren't accepted — check them and try again.");
+  if (status === 403)
+    return join("These credentials may not have permission for this.");
+  if (status === 404)
+    return join("It may have already been removed — refresh and try again.");
+  if (status === 409)
+    return join("It conflicts with the current state — refresh and try again.");
+  if (status === 413) return join("The value is too large.");
+  if (status === 429)
+    return join("The server is busy — wait a moment and try again.");
+  if (status >= 500)
+    return join("Something went wrong on the server — wait a moment and try again.");
+  return lead;
+}
+
+/** Capitalise the first letter and ensure a single trailing period, so any message reads as a sentence. */
+function sentence(s: string): string {
+  const t = s.trim().replace(/\s+/g, " ");
+  if (!t) return t;
+  const cap = t.charAt(0).toUpperCase() + t.slice(1);
+  return /[.!?)]$/.test(cap) ? cap : `${cap}.`;
 }
 
 function authHeaders(extra?: Record<string, string>): Record<string, string> {

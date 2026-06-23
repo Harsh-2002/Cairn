@@ -106,10 +106,10 @@ export function Users() {
         await api.setUserPolicy(res.id, JSON.stringify(doc));
       } catch (pe) {
         toast.error(
-          `The user was created, but attaching the policy failed: ${errorMessage(pe, "unknown error")}. Attach it from the user's page.`,
+          `${dn} was created, but the policy didn't attach: ${errorMessage(pe, "the request was rejected.")} You can add it from the user's page.`,
         );
       }
-      toast.success(`Created ${dn}`);
+      toast.success(`Created ${dn}.`);
       setCreated(res);
       users.refresh();
     } catch (err) {
