@@ -2136,6 +2136,24 @@ impl S3Service {
                     return Err(Error::NotImplemented);
                 }
             }
+            ConfigAspect::Replication => {
+                // Replication ships *versions*: a versioned object has a stable, time-ordered
+                // version id that lets the destination preserve identity, order concurrent writes,
+                // and make re-delivery idempotent. A write to an unversioned bucket is the `null`
+                // version with no such identity, so reliable async replication is not possible —
+                // which is exactly why a non-versioned bucket replicated nothing on new writes even
+                // though a backfill could be triggered. Require versioning up front (matching S3's
+                // PutBucketReplication), so a rule can only ever exist on a versioned bucket and the
+                // behaviour is consistent across new writes and resync.
+                cairn_replication::parse_replication(&doc).map_err(|_| Error::MalformedXml)?;
+                if bucket.versioning != VersioningState::Enabled {
+                    return Err(Error::InvalidRequest(
+                        "Enable versioning on this bucket before configuring replication — \
+                         replication only works on versioned buckets."
+                            .to_owned(),
+                    ));
+                }
+            }
             _ => {}
         }
         self.meta

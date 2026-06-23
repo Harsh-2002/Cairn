@@ -417,7 +417,12 @@ export function Buckets() {
           if (!open) setPendingDelete(null);
         }}
         title="Delete bucket"
-        description="This permanently deletes the bucket and every object and version in it. This cannot be undone."
+        description={((n) =>
+          n && n > 0
+            ? `This bucket holds ${n.toLocaleString()} object${n === 1 ? "" : "s"} — deleting it permanently removes the bucket and every object and version in it, not just the bucket. This can't be undone.`
+            : "This permanently deletes the bucket and every object and version in it. This can't be undone.")(
+          pendingDelete ? (list.data?.usage.get(pendingDelete)?.objects ?? null) : null,
+        )}
         requireText={pendingDelete ?? ""}
         confirmLabel={deleting ? "Deleting…" : "Delete bucket"}
         cancelLabel="Keep bucket"

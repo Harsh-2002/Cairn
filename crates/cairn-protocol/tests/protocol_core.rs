@@ -3937,6 +3937,81 @@ async fn inbound_replica_preserves_version_id_idempotently() {
 }
 
 #[tokio::test]
+async fn replication_config_requires_versioning() {
+    let h = harness().await;
+    // A plain, unversioned bucket.
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("rcv"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+
+    // Configuring replication on an unversioned bucket is refused (replication ships versions).
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("rcv"),
+                None,
+                &[("replication", "")],
+                &[],
+                replication_config_xml("", false),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::BAD_REQUEST,
+        "replication config must require versioning"
+    );
+
+    // Enable versioning, and the same config is now accepted — so a rule can only exist on a
+    // versioned bucket, keeping new-write replication and resync consistent.
+    drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("rcv"),
+                None,
+                &[("versioning", "")],
+                &[],
+                b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>"
+                    .to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("rcv"),
+                None,
+                &[("replication", "")],
+                &[],
+                replication_config_xml("", false),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::NO_CONTENT,
+        "replication config is accepted once the bucket is versioned"
+    );
+}
+
+#[tokio::test]
 async fn delete_marker_replication_enqueues_when_enabled() {
     let h = harness().await;
     versioned_bucket(&h, "dmr").await;

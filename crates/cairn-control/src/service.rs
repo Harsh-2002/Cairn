@@ -2327,6 +2327,18 @@ impl ControlService {
             Ok(n) => n,
             Err(resp) => return resp,
         };
+        // Replication requires versioning for new writes, so resync (existing-object backfill) must
+        // require it too — otherwise a backfill could ship existing objects while new writes never
+        // replicate, which reads as broken. Refuse on an unversioned bucket with the same guidance.
+        match self.meta.get_bucket(&bucket_name).await {
+            Ok(Some(b)) if b.versioning != VersioningState::Enabled => {
+                return ControlResponse::bad_request(
+                    "Enable versioning on this bucket before resyncing — replication only works on versioned buckets.",
+                );
+            }
+            Ok(_) => {}
+            Err(e) => return ControlResponse::error_internal(&e.to_string()),
+        }
         let doc = match self
             .meta
             .get_bucket_config(&bucket_name, ConfigAspect::Replication)

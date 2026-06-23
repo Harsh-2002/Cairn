@@ -44,6 +44,7 @@ import {
 } from "@/components/ui/tabs";
 import { ConfirmDialog } from "@/components/confirm-dialog";
 import { CorsCard } from "@/components/cors-card";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { ErrorAlert } from "@/components/error-alert";
 import { FieldError } from "@/components/field-error";
 import { JsonEditor } from "@/components/json-editor";
@@ -328,6 +329,15 @@ export function BucketSettings() {
     void run("versioning", async () => {
       await api.setVersioning(name, versioning);
       toast.success(`Versioning set to ${versioning.toLowerCase()}.`);
+    });
+  }
+
+  // One-click enable from the replication section, where versioning is a prerequisite.
+  function enableVersioning() {
+    void run("versioning", async () => {
+      await api.setVersioning(name, "Enabled");
+      setVersioning("Enabled");
+      toast.success("Versioning enabled — you can configure replication now.");
     });
   }
 
@@ -810,14 +820,47 @@ export function BucketSettings() {
                 ) : null}
                 <Button
                   onClick={() => void saveReplication()}
-                  disabled={busy === "replication" || !targets?.length}
+                  disabled={
+                    busy === "replication" ||
+                    !targets?.length ||
+                    versioning !== "Enabled"
+                  }
+                  title={
+                    versioning !== "Enabled"
+                      ? "Enable versioning first — replication only works on versioned buckets"
+                      : undefined
+                  }
                 >
                   {busy === "replication" ? "Saving…" : "Save"}
                 </Button>
               </>
             }
           >
-            <CardContent className="space-y-1.5">
+            <CardContent className="space-y-3">
+              {versioning !== "Enabled" ? (
+                <Alert>
+                  <CircleAlert aria-hidden="true" />
+                  <AlertTitle>Versioning is required for replication</AlertTitle>
+                  <AlertDescription>
+                    <p>
+                      Replication copies object <em>versions</em>, so it only
+                      works on a versioned bucket — this applies to both new
+                      writes and "Resync existing". Turn on versioning here,
+                      then add a rule.
+                    </p>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="mt-1"
+                      onClick={enableVersioning}
+                      disabled={busy === "versioning"}
+                      aria-busy={busy === "versioning" || undefined}
+                    >
+                      {busy === "versioning" ? "Enabling…" : "Enable versioning"}
+                    </Button>
+                  </AlertDescription>
+                </Alert>
+              ) : null}
               {targets && targets.length > 0 ? (
                 <>
                   <div className="flex flex-wrap gap-2">
