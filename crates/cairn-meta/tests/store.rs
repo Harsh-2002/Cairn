@@ -1239,3 +1239,73 @@ async fn deleting_a_bucket_drops_its_request_metrics() {
     assert_eq!(last.total, 3, "only the non-bucket roll-up remains");
     assert!(names(&last).is_empty());
 }
+
+// Deleting a user removes the user record and cascades its session credentials, so the user can no
+// longer authenticate by any path (instant access revocation). Other users and their sessions are
+// untouched. (The control-plane guards — root / last-admin / self / owns-buckets — live in
+// cairn-control; this is the storage-level cascade the mutation guarantees.)
+#[tokio::test]
+async fn deleting_a_user_cascades_its_sessions() {
+    let store = cairn_meta::open_in_memory().unwrap();
+
+    let mk_user = |id: &str, key: &str| {
+        Mutation::CreateUser(Box::new(UserRecord {
+            user: User {
+                id: UserId(id.to_owned()),
+                display_name: id.to_owned(),
+                access_key_id: key.to_owned(),
+                sigv4_access_key_id: Some(key.to_owned()),
+                role: Role::Member,
+                is_active: true,
+                quota_bytes: None,
+                created_at: Timestamp(1),
+                updated_at: Timestamp(1),
+            },
+            bearer_secret_hash: "h".to_owned(),
+            sigv4_secret_ciphertext: None,
+            sigv4_secret_nonce: None,
+        }))
+    };
+    let mk_session = |akid: &str, parent: &str| {
+        Mutation::CreateSessionCredential(Box::new(SessionCredentialRecord {
+            access_key_id: akid.to_owned(),
+            parent_user_id: UserId(parent.to_owned()),
+            secret_ciphertext: vec![1, 2, 3],
+            secret_nonce: None,
+            session_token_hash: "th".to_owned(),
+            inline_policy: None,
+            expires_at: Timestamp(9_000_000_000_000),
+            created_at: Timestamp(1),
+        }))
+    };
+
+    store.submit(mk_user("alice", "cairn_alice")).await.unwrap();
+    store.submit(mk_user("bob", "cairn_bob")).await.unwrap();
+    store.submit(mk_session("sess-a", "alice")).await.unwrap();
+    store.submit(mk_session("sess-b", "bob")).await.unwrap();
+
+    // Before: both users exist and alice's session resolves.
+    let ids = |us: &[User]| us.iter().map(|u| u.id.0.clone()).collect::<Vec<_>>();
+    let before = store.list_users().await.unwrap();
+    assert!(ids(&before).contains(&"alice".to_owned()));
+    assert!(ids(&before).contains(&"bob".to_owned()));
+    assert!(store.user_by_session_key("sess-a").await.unwrap().is_some());
+
+    // Delete alice → her record and her session are gone; bob and his session are untouched.
+    store
+        .submit(Mutation::DeleteUser(UserId("alice".to_owned())))
+        .await
+        .unwrap();
+
+    let after = store.list_users().await.unwrap();
+    assert!(!ids(&after).contains(&"alice".to_owned()), "alice is gone");
+    assert!(ids(&after).contains(&"bob".to_owned()), "bob is untouched");
+    assert!(
+        store.user_by_session_key("sess-a").await.unwrap().is_none(),
+        "alice's session no longer authenticates"
+    );
+    assert!(
+        store.user_by_session_key("sess-b").await.unwrap().is_some(),
+        "bob's session is untouched"
+    );
+}

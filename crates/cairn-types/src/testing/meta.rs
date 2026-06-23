@@ -628,6 +628,13 @@ impl MetadataStore for InMemoryMetadataStore {
                 }
                 Ok(MutationOutcome::Ack)
             }
+            Mutation::DeleteUser(id) => {
+                // Mirror the SQL backends: drop the user record (carrying its policy) and every
+                // session credential scoped to it. (user_stats is not modelled in the double.)
+                st.users.remove(&id.to_string());
+                st.session_creds.retain(|_, r| r.parent_user_id != id);
+                Ok(MutationOutcome::Ack)
+            }
             Mutation::CreateSessionCredential(rec) => {
                 st.session_creds.insert(rec.access_key_id.clone(), *rec);
                 Ok(MutationOutcome::Ack)

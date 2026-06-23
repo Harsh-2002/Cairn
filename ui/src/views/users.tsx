@@ -134,6 +134,7 @@ export function Users() {
   const someSelected = sel.count > 0 && !allSelected;
   const [bulkBusy, setBulkBusy] = useState(false);
   const [confirmBulk, setConfirmBulk] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
 
   const columns: Column[] = [
     {
@@ -171,6 +172,37 @@ export function Users() {
     }
     sel.clear();
     setConfirmBulk(false);
+    setBulkBusy(false);
+    users.refresh();
+  }
+
+  async function confirmBulkDelete() {
+    if (sel.count === 0 || bulkBusy) return;
+    setBulkBusy(true);
+    const targets = [...sel.selected];
+    let ok = 0;
+    const failures: string[] = [];
+    for (const id of targets) {
+      try {
+        await api.deleteUser(id);
+        ok++;
+      } catch (e) {
+        // Each guard (root / last admin / yourself / owns buckets) returns a plain-language reason.
+        failures.push(errorMessage(e, "This user couldn't be deleted."));
+      }
+    }
+    if (failures.length === 0) {
+      toast.success(`Deleted ${ok} user${ok === 1 ? "" : "s"}.`);
+    } else if (ok === 0) {
+      // Nothing deleted — surface the reason so a blocked delete is actionable.
+      toast.error(failures[0]);
+    } else {
+      toast.error(
+        `Deleted ${ok}. ${failures.length} couldn't be deleted: ${failures[0]}`,
+      );
+    }
+    sel.clear();
+    setConfirmDelete(false);
     setBulkBusy(false);
     users.refresh();
   }
@@ -339,6 +371,14 @@ export function Users() {
             >
               Deactivate selected
             </Button>
+            <Button
+              variant="destructive"
+              size="sm"
+              disabled={bulkBusy}
+              onClick={() => setConfirmDelete(true)}
+            >
+              Delete selected
+            </Button>
           </BulkBar>
           <DataTable columns={columns} minWidth={600}>
             {list.map((u) => (
@@ -389,6 +429,28 @@ export function Users() {
         cancelLabel="Keep active"
         busy={bulkBusy}
         onConfirm={() => void confirmBulkDeactivate()}
+      />
+
+      <ConfirmDialog
+        open={confirmDelete}
+        onOpenChange={(open) => {
+          if (!open && !bulkBusy) setConfirmDelete(false);
+        }}
+        title={`Delete ${sel.count} user${sel.count === 1 ? "" : "s"}`}
+        description={
+          <>
+            This permanently deletes {sel.count === 1 ? "this user" : "these users"} and{" "}
+            <strong>immediately revokes</strong>{" "}
+            {sel.count === 1 ? "its" : "their"} access keys, sessions, and policy. It can't be
+            undone. The root administrator, the last administrator, the user you're signed in as, and
+            anyone who still owns buckets can't be deleted — those are skipped with a reason.
+          </>
+        }
+        confirmLabel={bulkBusy ? "Deleting…" : "Delete permanently"}
+        cancelLabel="Cancel"
+        destructive
+        busy={bulkBusy}
+        onConfirm={() => void confirmBulkDelete()}
       />
     </Page>
   );

@@ -234,6 +234,7 @@ impl MetadataStore for ShardedMetadataStore {
             | Mutation::CreateUser(_)
             | Mutation::UpdateUser(_)
             | Mutation::DeactivateUser(_)
+            | Mutation::DeleteUser(_)
             | Mutation::CreateSessionCredential(_)
             | Mutation::DeleteExpiredSessionCredentials { .. }
             | Mutation::DeleteSessionCredential { .. }

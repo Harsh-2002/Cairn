@@ -425,6 +425,10 @@ export const api = {
   getUser: (id: string) => request<UserDetailResp>("GET", `/users/${enc(id)}`),
   patchUser: (id: string, fields: { is_active?: boolean }) =>
     request<UserDetailResp>("PATCH", `/users/${enc(id)}`, fields),
+  // Permanently delete a user. Server-side this revokes the user's access immediately and cascades
+  // its credentials, sessions, and identity policy. The server refuses (400) for the root admin, the
+  // last administrator, the signed-in user, or a user that still owns buckets.
+  deleteUser: (id: string) => request<null>("DELETE", `/users/${enc(id)}`),
   rotateCredentials: (id: string) =>
     request<RotateCredentialsResp>(
       "POST",

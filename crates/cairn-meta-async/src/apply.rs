@@ -518,6 +518,27 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
                 .await?;
             Ok(MutationOutcome::Ack)
         }
+        Mutation::DeleteUser(id) => {
+            // Remove everything that lets the user act, in one commit: session credentials, usage
+            // accounting, then the user row (which carries the identity policy column). Mirrors
+            // cairn-meta. Bucket ownership is checked by the caller (a bucket cannot be orphaned).
+            driver
+                .execute(
+                    "DELETE FROM session_credentials WHERE parent_user_id=?1",
+                    vec![Value::Text(id.0.clone())],
+                )
+                .await?;
+            driver
+                .execute(
+                    "DELETE FROM user_stats WHERE owner_id=?1",
+                    vec![Value::Text(id.0.clone())],
+                )
+                .await?;
+            driver
+                .execute("DELETE FROM users WHERE id=?1", vec![Value::Text(id.0)])
+                .await?;
+            Ok(MutationOutcome::Ack)
+        }
         Mutation::CreateSessionCredential(rec) => {
             driver
                 .execute(

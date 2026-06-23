@@ -432,6 +432,23 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
                 .map_err(engine_err)?;
             Ok(MutationOutcome::Ack)
         }
+        Mutation::DeleteUser(id) => {
+            // Remove everything that lets the user act, in one commit: their session credentials,
+            // their usage accounting, then the user row itself (which carries the identity policy
+            // column). The authenticator's cached principal is keyed off the now-gone record, so
+            // access is denied as soon as its epoch is bumped. Bucket ownership is checked by the
+            // caller (a bucket cannot be orphaned), so no bucket rows are touched here.
+            conn.execute(
+                "DELETE FROM session_credentials WHERE parent_user_id=?1",
+                params![id.0],
+            )
+            .map_err(engine_err)?;
+            conn.execute("DELETE FROM user_stats WHERE owner_id=?1", params![id.0])
+                .map_err(engine_err)?;
+            conn.execute("DELETE FROM users WHERE id=?1", params![id.0])
+                .map_err(engine_err)?;
+            Ok(MutationOutcome::Ack)
+        }
         Mutation::CreateSessionCredential(rec) => {
             conn.execute(
                 "INSERT INTO session_credentials

@@ -506,7 +506,8 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
     .with_replication_wake({
         let n = replication_notify.clone();
         Arc::new(move || n.notify_one())
-    });
+    })
+    .with_root_access_key(cfg.root_access_key.clone());
 
     // Ensure the root administrator exists so the deployment is usable immediately: the same access
     // key + secret log into the web UI, authenticate the management API, and sign S3 requests.
@@ -584,7 +585,7 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
 /// for the web UI login, the management API (as a Bearer token `access.secret`), and the S3 API
 /// (SigV4 — the access key is registered as the SigV4 key id too). Idempotent: created when absent,
 /// secret/role refreshed when the env changed, left untouched when already in sync.
-async fn ensure_root_admin(
+pub(crate) async fn ensure_root_admin(
     meta: &Arc<dyn MetadataStore>,
     crypto: &Arc<dyn Crypto>,
     clock: &Arc<dyn Clock>,

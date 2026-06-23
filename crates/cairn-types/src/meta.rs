@@ -228,6 +228,11 @@ pub enum Mutation {
     UpdateUser(Box<UserRecord>),
     /// Deactivate a user.
     DeactivateUser(UserId),
+    /// Permanently delete a user and everything that lets them act: their record (with its identity
+    /// policy), their session credentials, and their usage accounting. Removing the record evicts the
+    /// authenticator's cached principal, so access is denied immediately. Callers must first ensure
+    /// the user owns no buckets (buckets cannot be orphaned) and is not the last administrator.
+    DeleteUser(UserId),
     /// Mint an STS-style temporary session credential scoped to a parent user (ARCH 14).
     CreateSessionCredential(Box<SessionCredentialRecord>),
     /// Delete all session credentials that expired before `before` (the background cleanup sweep).

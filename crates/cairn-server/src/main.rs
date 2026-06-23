@@ -55,7 +55,8 @@ enum Command {
     Serve,
     /// Validate the configuration and exit.
     ValidateConfig,
-    /// Create the first administrator into an empty store and print its credentials once.
+    /// Ensure the single root administrator exists and print its credentials. Idempotent, and the
+    /// same identity `serve` seeds — so a node always has exactly one default admin (root).
     Bootstrap,
     /// Run reconciliation on demand (reclaim orphaned blobs); a node-local integrity check.
     ///
@@ -662,10 +663,8 @@ fn run_server(cfg: Config) -> ExitCode {
 }
 
 fn bootstrap(cfg: Config) -> ExitCode {
-    use cairn_types::auth::Role;
-    use cairn_types::id::UserId;
-    use cairn_types::meta::{Mutation, User, UserRecord};
     use cairn_types::traits::{Clock, Crypto};
+    use std::sync::Arc;
 
     let rt = match runtime(&cfg) {
         Ok(rt) => rt,
@@ -690,82 +689,43 @@ fn bootstrap(cfg: Config) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        match store.count_users().await {
-            Ok(0) => {}
-            Ok(_) => {
-                eprintln!("a user already exists; refusing to bootstrap again");
-                return ExitCode::from(1);
-            }
-            Err(e) => {
-                eprintln!("failed to query users: {e}");
-                return ExitCode::FAILURE;
-            }
-        }
-
-        let crypto = match stack::build_crypto(&cfg) {
-            Ok(c) => c,
+        let crypto: Arc<dyn Crypto> = match stack::build_crypto(&cfg) {
+            Ok(c) => Arc::new(c),
             Err(e) => {
                 eprintln!("{e}");
                 return ExitCode::FAILURE;
             }
         };
-        let clock = cairn_crypto::SystemClock::new();
-        let now = clock.now();
+        let clock: Arc<dyn Clock> = Arc::new(cairn_crypto::SystemClock::new());
 
-        let bearer_akid = format!("cairn_{}", uuid::Uuid::new_v4().simple());
-        let bearer_secret = format!(
-            "{}{}",
-            uuid::Uuid::new_v4().simple(),
-            uuid::Uuid::new_v4().simple()
-        );
-        let sigv4_akid = format!(
-            "AKIA{}",
-            &uuid::Uuid::new_v4().simple().to_string()[..16].to_uppercase()
-        );
-        let sigv4_secret = format!(
-            "{}{}",
-            uuid::Uuid::new_v4().simple(),
-            uuid::Uuid::new_v4().simple()
-        );
-
-        let sealed = match crypto.seal(sigv4_secret.as_bytes()) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("failed to seal SigV4 secret: {e}");
-                return ExitCode::FAILURE;
-            }
-        };
-
-        let record = UserRecord {
-            user: User {
-                id: UserId::generate(),
-                display_name: "administrator".to_owned(),
-                access_key_id: bearer_akid.clone(),
-                sigv4_access_key_id: Some(sigv4_akid.clone()),
-                role: Role::Administrator,
-                is_active: true,
-                quota_bytes: None,
-                created_at: now,
-                updated_at: now,
-            },
-            bearer_secret_hash: cairn_auth::hash_bearer_secret(&bearer_secret),
-            // CRK1 envelope (audit #29): the nonce is inside the ciphertext; store NULL nonce.
-            sigv4_secret_ciphertext: Some(sealed.ciphertext),
-            sigv4_secret_nonce: None,
-        };
-
-        if let Err(e) = store.submit(Mutation::CreateUser(Box::new(record))).await {
-            eprintln!("failed to create administrator: {e}");
+        // Seed exactly one default administrator — the root identity (CAIRN_ROOT_ACCESS_KEY /
+        // CAIRN_ROOT_SECRET_KEY) that `serve` also ensures on every startup. Bootstrapping the SAME
+        // identity (rather than minting a separate random "administrator") means `bootstrap` + `serve`
+        // converge on a single "root" admin instead of leaving the node with two default admins.
+        // Idempotent: re-running just re-affirms the root admin.
+        if let Err(e) = stack::ensure_root_admin(&store, &crypto, &clock, &cfg).await {
+            eprintln!("failed to seed the root administrator: {e}");
             return ExitCode::FAILURE;
         }
 
-        println!("Administrator created. Save these credentials now — they are shown only once.\n");
-        println!("  Bearer:");
-        println!("    Authorization: Bearer {bearer_akid}.{bearer_secret}\n");
-        println!("  SigV4 (S3 SDKs / aws-cli):");
-        println!("    Access Key Id:     {sigv4_akid}");
-        println!("    Secret Access Key: {sigv4_secret}");
-        println!("    Region:            {}", cfg.region);
+        let insecure_defaults =
+            cfg.root_access_key == "cairn" && cfg.root_secret_key == "cairnadmin";
+        println!("Root administrator ready — the single default admin for this node.\n");
+        println!("  Access key:  {}", cfg.root_access_key);
+        println!("  Secret key:  {}", cfg.root_secret_key);
+        println!("  Region:      {}", cfg.region);
+        println!(
+            "\n  These credentials log into the web console, sign S3 requests (SigV4), and\n  \
+             authenticate the management API (Bearer {}.{}). Create further users from the\n  \
+             console or `cairn remote user create`.",
+            cfg.root_access_key, cfg.root_secret_key
+        );
+        if insecure_defaults {
+            println!(
+                "\n  WARNING: these are the INSECURE defaults (cairn / cairnadmin). Set\n  \
+                 CAIRN_ROOT_ACCESS_KEY and CAIRN_ROOT_SECRET_KEY before exposing this node."
+            );
+        }
         ExitCode::SUCCESS
     })
 }

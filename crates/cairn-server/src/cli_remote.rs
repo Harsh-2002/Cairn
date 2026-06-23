@@ -210,6 +210,12 @@ pub enum UserCmd {
         /// The user id.
         id: String,
     },
+    /// Permanently delete a user, revoking all of its access immediately. Refused for the root
+    /// administrator, the last administrator, yourself, and a user that still owns buckets.
+    Rm {
+        /// The user id.
+        id: String,
+    },
     /// Set or clear a user's byte quota.
     Quota {
         /// The user id.
@@ -887,6 +893,20 @@ async fn user(client: &HttpClient, cfg: &ClientConfig, cmd: UserCmd) -> Result<(
                     Some(n) => println!("set quota for user {id} to {n} bytes"),
                     None => println!("removed quota for user {id}"),
                 }
+            }
+            Ok(())
+        }
+        UserCmd::Rm { id } => {
+            let subpath = format!("/users/{}", pct_encode_segment(&id));
+            let resp = api_send(client, cfg, Method::DELETE, &subpath, None).await?;
+            if cfg.json {
+                print_json_body(if resp.body.is_empty() {
+                    br#"{"deleted":true}"#
+                } else {
+                    &resp.body
+                });
+            } else {
+                println!("deleted user {id}");
             }
             Ok(())
         }

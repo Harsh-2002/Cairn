@@ -310,6 +310,7 @@ impl CachedMetadataStore {
             Mutation::CreateUser(_)
                 | Mutation::UpdateUser(_)
                 | Mutation::DeactivateUser(_)
+                | Mutation::DeleteUser(_)
                 | Mutation::SetUserPolicy { .. }
         ) {
             self.auth_epoch.fetch_add(1, Ordering::Release);
@@ -437,6 +438,7 @@ impl CachedMetadataStore {
             | Mutation::CreateUser(_)
             | Mutation::UpdateUser(_)
             | Mutation::DeactivateUser(_)
+            | Mutation::DeleteUser(_)
             | Mutation::CreateSessionCredential(_)
             | Mutation::DeleteExpiredSessionCredentials { .. }
             | Mutation::DeleteSessionCredential { .. }

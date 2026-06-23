@@ -169,6 +169,10 @@ pub struct ControlService {
     /// happens promptly rather than waiting out the heartbeat. `None` (e.g. headless) just falls
     /// back to the heartbeat. Kept as a plain `Fn` so this crate stays runtime-agnostic.
     replication_wake: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// The configured root administrator's access key (`CAIRN_ROOT_ACCESS_KEY`), if known. The root
+    /// admin is re-seeded on every startup and is the deployment's break-glass identity, so it is
+    /// protected from deletion. `None` (e.g. in tests) disables only that one guard.
+    root_access_key: Option<String>,
 }
 
 impl std::fmt::Debug for ControlService {
@@ -194,7 +198,16 @@ impl ControlService {
             clock,
             system: Arc::new(system),
             replication_wake: None,
+            root_access_key: None,
         }
+    }
+
+    /// Record the configured root administrator's access key so it is protected from deletion. Set by
+    /// the server from `CAIRN_ROOT_ACCESS_KEY`; unset deployments simply skip that one delete guard.
+    #[must_use]
+    pub fn with_root_access_key(mut self, access_key: impl Into<String>) -> Self {
+        self.root_access_key = Some(access_key.into());
+        self
     }
 
     /// Attach a callback that wakes the replication worker pool (mirrors `S3Service`). Set by the
@@ -349,6 +362,7 @@ impl ControlService {
             (&Method::POST, ["users"]) => self.create_user(&body, principal).await,
             (&Method::GET, ["users", id]) => self.user_detail(id).await,
             (&Method::PATCH, ["users", id]) => self.patch_user(id, &body, principal).await,
+            (&Method::DELETE, ["users", id]) => self.delete_user(id, principal).await,
             (&Method::POST, ["users", id, "rotate-credentials"]) => {
                 self.rotate_credentials(id, principal).await
             }
@@ -1824,6 +1838,86 @@ impl ControlService {
                 is_active: record.user.is_active,
             },
         )
+    }
+
+    /// `DELETE /users/{id}`: permanently delete a user — its record (and identity policy), its
+    /// session credentials, and its usage accounting — so all of its access is denied immediately
+    /// (the authenticator's cached principal is evicted on the same commit). Guarded against the four
+    /// ways a delete could strand the system: the caller themselves, the root administrator, the last
+    /// remaining administrator, and a user that still owns buckets (which cannot be left ownerless).
+    async fn delete_user(&self, id: &str, principal: Option<&Principal>) -> ControlResponse {
+        let user_id = UserId(id.to_owned());
+        let record = match self.load_user_record(&user_id).await {
+            Ok(Some(r)) => r,
+            Ok(None) => return ControlResponse::not_found(),
+            Err(resp) => return resp,
+        };
+
+        // Guard 1: you can't delete the identity you're signed in as (don't lock yourself out).
+        if principal.is_some_and(|p| p.user_id == user_id) {
+            return ControlResponse::bad_request(
+                "You can't delete the user you're signed in as. Sign in as another administrator to remove this one.",
+            );
+        }
+
+        // Guard 2: the root administrator is the deployment's break-glass identity (re-seeded on
+        // every startup), so it's protected.
+        if self
+            .root_access_key
+            .as_deref()
+            .is_some_and(|root| root == record.user.access_key_id.as_str())
+        {
+            return ControlResponse::bad_request(
+                "The root administrator can't be deleted — it's the built-in break-glass account for this deployment.",
+            );
+        }
+
+        // Guard 3: never remove the last administrator — the node must always have one.
+        if record.user.role == Role::Administrator && record.user.is_active {
+            let users = match self.meta.list_users().await {
+                Ok(u) => u,
+                Err(e) => return ControlResponse::error_internal(&e.to_string()),
+            };
+            let other_active_admins = users
+                .iter()
+                .filter(|u| u.role == Role::Administrator && u.is_active && u.id != user_id)
+                .count();
+            if other_active_admins == 0 {
+                return ControlResponse::bad_request(
+                    "This is the last active administrator. Create or promote another administrator before deleting it.",
+                );
+            }
+        }
+
+        // Guard 4: a user that still owns buckets can't be deleted — a bucket can't be left
+        // ownerless. The operator must delete or transfer those buckets first.
+        let buckets = match self.meta.list_buckets(None).await {
+            Ok(b) => b,
+            Err(e) => return ControlResponse::error_internal(&e.to_string()),
+        };
+        let owned: Vec<String> = buckets
+            .iter()
+            .filter(|b| b.owner_id == user_id)
+            .map(|b| b.name.to_string())
+            .collect();
+        if !owned.is_empty() {
+            let (n, plural, it) = (
+                owned.len(),
+                if owned.len() == 1 { "" } else { "s" },
+                if owned.len() == 1 { "it" } else { "them" },
+            );
+            return ControlResponse::bad_request(&format!(
+                "This user still owns {n} bucket{plural} ({}). Delete or transfer {it} before deleting the user.",
+                owned.join(", "),
+            ));
+        }
+
+        if let Err(e) = self.meta.submit(Mutation::DeleteUser(user_id)).await {
+            return ControlResponse::error_internal(&e.to_string());
+        }
+        self.record_activity("DeleteUser", None, None, principal)
+            .await;
+        ControlResponse::no_content()
     }
 
     /// `POST /users/{id}/rotate-credentials`: mint a fresh Bearer secret for the existing user,
