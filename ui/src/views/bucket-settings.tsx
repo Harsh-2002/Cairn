@@ -238,6 +238,8 @@ export function BucketSettings() {
   const [policyError, setPolicyError] = useState("");
   const [replTargetArn, setReplTargetArn] = useState("");
   const [replPrefix, setReplPrefix] = useState("");
+  const [replExisting, setReplExisting] = useState(false);
+  const [replDeleteMarkers, setReplDeleteMarkers] = useState(false);
   const [replError, setReplError] = useState("");
   const [busy, setBusy] = useState<string | null>(null); // which card is saving
   // Settings are grouped into tabs so the operator faces one concern at a time, not a long wall of
@@ -290,6 +292,8 @@ export function BucketSettings() {
     );
     setReplTargetArn(d.repl?.dest_bucket ?? "");
     setReplPrefix(d.repl?.prefix ?? "");
+    setReplExisting(d.repl?.existing_objects ?? false);
+    setReplDeleteMarkers(d.repl?.delete_markers ?? false);
     setOwnership(OWNERSHIP_TO_S3[d.config.ownership_mode] ?? "BucketOwnerEnforced");
     setPab(d.pab ?? PAB_OFF);
     setBucketTags(d.bucketTags);
@@ -417,7 +421,10 @@ export function BucketSettings() {
     const dest = data?.targets.find((t) => t.arn === replTargetArn);
     setBusy("replication");
     try {
-      await s3.putReplication(name, replTargetArn, replPrefix.trim());
+      await s3.putReplication(name, replTargetArn, replPrefix.trim(), {
+        existingObjects: replExisting,
+        deleteMarkers: replDeleteMarkers,
+      });
       toast.success(
         dest
           ? `Replicating to "${dest.dest_bucket}" @ ${dest.endpoint}.`
@@ -440,6 +447,8 @@ export function BucketSettings() {
       toast.success("Replication rule removed.");
       setReplTargetArn("");
       setReplPrefix("");
+      setReplExisting(false);
+      setReplDeleteMarkers(false);
     });
   }
 
@@ -774,9 +783,13 @@ export function BucketSettings() {
                 <Button
                   variant="outline"
                   onClick={resyncReplication}
-                  disabled={busy === "resync"}
+                  disabled={busy === "resync" || !repl?.existing_objects}
                   aria-busy={busy === "resync" || undefined}
-                  title="Enqueue existing objects for replication (needs ExistingObjectReplication enabled)"
+                  title={
+                    repl?.existing_objects
+                      ? "Enqueue the objects already in this bucket for replication"
+                      : "Enable “Replicate existing objects” on the rule and save first"
+                  }
                 >
                   {busy === "resync" ? "Starting…" : "Resync existing"}
                 </Button>
@@ -832,6 +845,44 @@ export function BucketSettings() {
                       className="w-full font-mono sm:w-44"
                       onChange={(e) => setReplPrefix(e.target.value)}
                     />
+                  </div>
+                  <div className="flex flex-col gap-2 pt-0.5">
+                    <label className="flex items-start gap-3">
+                      <Checkbox
+                        checked={replExisting}
+                        onCheckedChange={(v) => setReplExisting(v === true)}
+                        aria-label="Replicate existing objects"
+                        className="mt-0.5"
+                      />
+                      <span>
+                        <span className="block text-sm">
+                          Replicate existing objects
+                        </span>
+                        <span className="block text-[13px] text-muted-foreground">
+                          Backfill objects already in this bucket — required
+                          before "Resync existing" can run. New writes always
+                          replicate regardless.
+                        </span>
+                      </span>
+                    </label>
+                    <label className="flex items-start gap-3">
+                      <Checkbox
+                        checked={replDeleteMarkers}
+                        onCheckedChange={(v) => setReplDeleteMarkers(v === true)}
+                        aria-label="Replicate delete markers"
+                        className="mt-0.5"
+                      />
+                      <span>
+                        <span className="block text-sm">
+                          Replicate delete markers
+                        </span>
+                        <span className="block text-[13px] text-muted-foreground">
+                          Propagate deletes to the destination. Off by default —
+                          a delete on this bucket then leaves the target copy
+                          intact.
+                        </span>
+                      </span>
+                    </label>
                   </div>
                   <FieldError>{replError || null}</FieldError>
                 </>

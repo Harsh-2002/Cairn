@@ -457,9 +457,13 @@ export async function getReplication(
   const xml = await res.text();
   const dest = /<Bucket>(?:arn:aws:s3:::)?([^<]+)<\/Bucket>/.exec(xml);
   const prefix = /<Prefix>([^<]*)<\/Prefix>/.exec(xml);
+  const enabled = (tag: string) =>
+    new RegExp(`<${tag}>\\s*<Status>\\s*Enabled\\s*</Status>`, "i").test(xml);
   return {
     dest_bucket: dest ? dest[1]! : "",
     prefix: prefix ? prefix[1]! : "",
+    existing_objects: enabled("ExistingObjectReplication"),
+    delete_markers: enabled("DeleteMarkerReplication"),
   };
 }
 
@@ -471,10 +475,18 @@ export async function putReplication(
   bucket: string,
   destination: string,
   prefix = "",
+  opts: { existingObjects?: boolean; deleteMarkers?: boolean } = {},
 ): Promise<void> {
+  // Opt-in toggles: existing-object backfill (required for "Resync existing") and delete-marker
+  // propagation. Each is an `<X><Status>Enabled|Disabled</Status></X>` element on the rule.
+  const toggle = (tag: string, on: boolean | undefined) =>
+    `<${tag}><Status>${on ? "Enabled" : "Disabled"}</Status></${tag}>`;
   const xml =
     `<ReplicationConfiguration><Role>cairn</Role><Rule><ID>cairn-ui</ID>` +
-    `<Status>Enabled</Status><Filter><Prefix>${xmlEscape(prefix)}</Prefix></Filter>` +
+    `<Status>Enabled</Status>` +
+    toggle("DeleteMarkerReplication", opts.deleteMarkers) +
+    toggle("ExistingObjectReplication", opts.existingObjects) +
+    `<Filter><Prefix>${xmlEscape(prefix)}</Prefix></Filter>` +
     `<Destination><Bucket>${xmlEscape(destination)}</Bucket></Destination></Rule>` +
     `</ReplicationConfiguration>`;
   const res = await fetch(`/${encodeURIComponent(bucket)}?replication`, {

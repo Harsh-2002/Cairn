@@ -260,6 +260,10 @@ export interface FailedReplicationResp {
 export interface ReplicationRule {
   dest_bucket: string;
   prefix: string;
+  /** Replicate objects that already existed when the rule was created (enables "Resync existing"). */
+  existing_objects: boolean;
+  /** Propagate delete markers to the destination. */
+  delete_markers: boolean;
 }
 
 /** A per-bucket remote replication target (the secret is never returned). */
