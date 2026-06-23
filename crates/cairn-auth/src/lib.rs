@@ -132,9 +132,9 @@ impl AuthChain {
                 .crypto
                 .open(&creds.secret_ciphertext, &Nonce(creds.secret_nonce.clone()))
             {
-                // Keep the plaintext secret in a zeroizing buffer for both the bytes and the derived
-                // String, so it is scrubbed promptly (F-15) rather than lingering in freed heap.
-                Ok(s) => Zeroizing::new(s),
+                // `open` hands back the plaintext already in a zeroizing buffer; wrap the derived
+                // String too so the secret is scrubbed promptly (F-15), never lingering in freed heap.
+                Ok(s) => s,
                 Err(_) => return AuthOutcome::Denied(AuthError::UnknownKey),
             };
             let secret = Zeroizing::new(String::from_utf8_lossy(&secret).into_owned());
@@ -180,7 +180,7 @@ impl AuthChain {
                 .crypto
                 .open(&creds.secret_ciphertext, &Nonce(creds.secret_nonce.clone()))
             {
-                Ok(s) => Zeroizing::new(s),
+                Ok(s) => s,
                 Err(_) => return AuthOutcome::Denied(AuthError::UnknownKey),
             };
             let secret = Zeroizing::new(String::from_utf8_lossy(&secret).into_owned());
@@ -255,11 +255,8 @@ impl AuthChain {
             .crypto
             .open(&creds.secret_ciphertext, &Nonce(creds.secret_nonce.clone()))
         {
-            // Scrub both the decrypted bytes and the derived String (F-15).
-            Ok(s) => {
-                let s = Zeroizing::new(s);
-                Zeroizing::new(String::from_utf8_lossy(&s).into_owned())
-            }
+            // `open` already returns a zeroizing buffer; scrub the derived String too (F-15).
+            Ok(s) => Zeroizing::new(String::from_utf8_lossy(&s).into_owned()),
             Err(_) => return Some(AuthOutcome::Denied(AuthError::UnknownKey)),
         };
         let (method, chunk_signing) = match verify(&secret) {

@@ -17,6 +17,7 @@ futures-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
+zeroize.workspace = true
 
 # Only pulled in for the in-memory doubles.
 futures-util = { workspace = true, optional = true }

@@ -452,12 +452,9 @@ async fn presign(
         .crypto
         .open(&creds.secret_ciphertext, &Nonce(creds.secret_nonce.clone()))
     {
-        // Hold the plaintext secret in a zeroizing buffer (bytes + derived String) so it is scrubbed
-        // promptly rather than lingering in freed heap (F-15).
-        Ok(b) => {
-            let b = Zeroizing::new(b);
-            Zeroizing::new(String::from_utf8_lossy(&b).into_owned())
-        }
+        // `open` returns the plaintext already in a zeroizing buffer; wrap the derived String too so
+        // it is scrubbed promptly rather than lingering in freed heap (F-15).
+        Ok(b) => Zeroizing::new(String::from_utf8_lossy(&b).into_owned()),
         Err(_) => return json_status(500, r#"{"error":"internal error"}"#),
     };
 

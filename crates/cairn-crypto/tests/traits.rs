@@ -15,7 +15,7 @@ fn crypto_is_object_safe_and_round_trips_via_dyn() {
     let opened = crypto
         .open(&sealed.ciphertext, &sealed.nonce)
         .expect("open");
-    assert_eq!(opened, secret);
+    assert_eq!(opened.as_slice(), secret);
 }
 
 #[test]

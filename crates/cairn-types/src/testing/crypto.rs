@@ -22,8 +22,14 @@ impl Crypto for StubCrypto {
         })
     }
 
-    fn open(&self, ciphertext: &[u8], _nonce: &Nonce) -> Result<Vec<u8>, CryptoError> {
-        Ok(ciphertext.iter().map(|b| b ^ XOR_BYTE).collect())
+    fn open(
+        &self,
+        ciphertext: &[u8],
+        _nonce: &Nonce,
+    ) -> Result<zeroize::Zeroizing<Vec<u8>>, CryptoError> {
+        Ok(zeroize::Zeroizing::new(
+            ciphertext.iter().map(|b| b ^ XOR_BYTE).collect(),
+        ))
     }
 
     fn ct_eq(&self, a: &[u8], b: &[u8]) -> bool {

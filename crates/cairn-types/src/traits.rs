@@ -29,6 +29,7 @@ use crate::object::{CompressionDescriptor, ObjectVersionRow};
 use crate::replication::ReplicatedObject;
 use crate::time::Timestamp;
 use async_trait::async_trait;
+use zeroize::Zeroizing;
 
 /// The blob store owns object bytes on some medium and knows nothing of S3, identity, or
 /// metadata. The local-filesystem implementation lives in `cairn-blob` and is the only place
@@ -421,7 +422,7 @@ pub trait Crypto: Send + Sync {
     /// `CRK1`-magic `ciphertext` parses its own key_id + nonce and ignores `nonce`; a legacy blob
     /// (no magic) decrypts under the legacy key using the separate `nonce`. A missing key id or any
     /// tag/AAD failure is a hard error (fail-closed), never a fallback.
-    fn open(&self, ciphertext: &[u8], nonce: &Nonce) -> Result<Vec<u8>, CryptoError>;
+    fn open(&self, ciphertext: &[u8], nonce: &Nonce) -> Result<Zeroizing<Vec<u8>>, CryptoError>;
     /// Constant-time byte comparison.
     fn ct_eq(&self, a: &[u8], b: &[u8]) -> bool;
     /// The ring id new seals use. Defaulted to `1` so test doubles need no change (audit #29).

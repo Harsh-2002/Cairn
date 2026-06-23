@@ -247,11 +247,14 @@ impl SystemCrypto {
         ct: &[u8],
         nonce_bytes: &[u8],
         aad: Option<&[u8]>,
-    ) -> Result<Vec<u8>, CryptoError> {
+    ) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
         if nonce_bytes.len() != NONCE_LEN {
             return Err(CryptoError::Decrypt);
         }
         let gcm_nonce = GcmNonce::from_slice(nonce_bytes);
+        // Return the plaintext in its zeroizing container rather than copying it out via `to_vec`
+        // (which would defeat the scrubbing): callers receive the secret already scoped to scrub on
+        // drop. The `Crypto::open` trait return type carries the `Zeroizing` end to end.
         let plaintext = Zeroizing::new(
             match aad {
                 Some(aad) => cipher.decrypt(gcm_nonce, Payload { msg: ct, aad }),
@@ -259,7 +262,7 @@ impl SystemCrypto {
             }
             .map_err(|_| CryptoError::Decrypt)?,
         );
-        Ok(plaintext.to_vec())
+        Ok(plaintext)
     }
 }
 
@@ -324,7 +327,7 @@ impl Crypto for SystemCrypto {
         })
     }
 
-    fn open(&self, ciphertext: &[u8], nonce: &Nonce) -> Result<Vec<u8>, CryptoError> {
+    fn open(&self, ciphertext: &[u8], nonce: &Nonce) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
         // Versioned (CRK1) envelope: self-describing — parse key_id + nonce, verify AAD, decrypt
         // under the named ring key. A missing key id or any tag/AAD failure is hard (no fallback).
         if ciphertext.len() >= VERSIONED_PREFIX && ciphertext[..MAGIC.len()] == MAGIC {
@@ -383,7 +386,7 @@ mod tests {
             VERSIONED_PREFIX + plaintext.len() + 16
         );
         let opened = c.open(&sealed.ciphertext, &sealed.nonce).expect("open");
-        assert_eq!(opened, plaintext);
+        assert_eq!(opened.as_slice(), plaintext);
     }
 
     #[test]
@@ -408,8 +411,8 @@ mod tests {
             s1.ciphertext, s2.ciphertext,
             "fresh nonce -> distinct envelopes"
         );
-        assert_eq!(c.open(&s1.ciphertext, &s1.nonce).expect("open 1"), p);
-        assert_eq!(c.open(&s2.ciphertext, &s2.nonce).expect("open 2"), p);
+        assert_eq!(c.open(&s1.ciphertext, &s1.nonce).expect("open 1").as_slice(), p);
+        assert_eq!(c.open(&s2.ciphertext, &s2.nonce).expect("open 2").as_slice(), p);
     }
 
     #[test]
@@ -421,7 +424,7 @@ mod tests {
         let ct = legacy_blob(key, nonce, b"legacy secret");
         let c = SystemCrypto::new(key); // legacy_id = 1; key 1 == this key
         let opened = c.open(&ct, &Nonce(nonce.to_vec())).expect("legacy open");
-        assert_eq!(opened, b"legacy secret");
+        assert_eq!(opened.as_slice(), b"legacy secret");
     }
 
     #[test]
@@ -545,7 +548,7 @@ mod tests {
         let nonce = [1u8; NONCE_LEN];
         let ct = legacy_blob(key, nonce, b"still readable");
         assert_eq!(
-            c.open(&ct, &Nonce(nonce.to_vec())).expect("open"),
+            c.open(&ct, &Nonce(nonce.to_vec())).expect("open").as_slice(),
             b"still readable"
         );
     }
@@ -600,13 +603,13 @@ mod tests {
         let sealed = c.seal(b"new").expect("seal");
         assert_eq!(sealed.ciphertext[5], 2, "sealed under active id 2");
         assert_eq!(
-            c.open(&sealed.ciphertext, &sealed.nonce).expect("open"),
+            c.open(&sealed.ciphertext, &sealed.nonce).expect("open").as_slice(),
             b"new"
         );
         let nonce = [5u8; NONCE_LEN];
         let legacy = legacy_blob(key1, nonce, b"old");
         assert_eq!(
-            c.open(&legacy, &Nonce(nonce.to_vec())).expect("legacy"),
+            c.open(&legacy, &Nonce(nonce.to_vec())).expect("legacy").as_slice(),
             b"old"
         );
     }
@@ -639,7 +642,7 @@ mod tests {
         let reference = SystemCrypto::new(key);
         let sealed = reference.seal(b"hk").expect("seal");
         assert_eq!(
-            c.open(&sealed.ciphertext, &sealed.nonce).expect("open"),
+            c.open(&sealed.ciphertext, &sealed.nonce).expect("open").as_slice(),
             b"hk"
         );
         assert_eq!(
