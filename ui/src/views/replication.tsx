@@ -16,7 +16,6 @@ import { DataTable, SkeletonRows, type Column } from "@/components/data-table";
 import { EmptyState } from "@/components/empty-state";
 import { ErrorAlert } from "@/components/error-alert";
 import { Page, PageHeader } from "@/components/page-header";
-import { LiveStatus } from "@/components/live-status";
 import { StatusBadge, type StatusTone } from "@/components/status-badge";
 import { TextLink } from "@/components/text-link";
 import { TableCell, TableRow } from "@/components/ui/table";
@@ -113,13 +112,6 @@ export function Replication() {
       <PageHeader
         title="Replication"
         description="Where each bucket replicates, and the health of every copy."
-        actions={
-          <LiveStatus
-            loading={res.loading}
-            refreshing={res.refreshing}
-            onClick={res.refresh}
-          />
-        }
       />
 
       {res.error ? (

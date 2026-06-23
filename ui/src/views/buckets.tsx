@@ -29,7 +29,6 @@ import { useBulkSelection } from "@/hooks/use-bulk-selection";
 import { ErrorAlert } from "@/components/error-alert";
 import { FieldError } from "@/components/field-error";
 import { Page, PageHeader } from "@/components/page-header";
-import { LiveStatus } from "@/components/live-status";
 import { StatusBadge, type StatusTone } from "@/components/status-badge";
 import { TextLink } from "@/components/text-link";
 import { TypedConfirmDialog } from "@/components/typed-confirm-dialog";
@@ -214,16 +213,7 @@ export function Buckets() {
       <PageHeader
         title="Buckets"
         description="Top-level containers for your objects."
-        actions={
-          <>
-            <LiveStatus
-              loading={list.loading}
-              refreshing={list.refreshing}
-              onClick={list.refresh}
-            />
-            {createButton}
-          </>
-        }
+        actions={createButton}
       />
 
       {list.error ? (

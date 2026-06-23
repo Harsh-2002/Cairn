@@ -16,7 +16,6 @@ import { ErrorAlert } from "@/components/error-alert";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Page, PageHeader } from "@/components/page-header";
-import { LiveStatus } from "@/components/live-status";
 import { TextLink } from "@/components/text-link";
 import {
   Select,
@@ -103,13 +102,6 @@ export function Activity() {
       <PageHeader
         title="Activity"
         description="Recent administrative changes on this node."
-        actions={
-          <LiveStatus
-            loading={res.loading}
-            refreshing={res.refreshing}
-            onClick={res.refresh}
-          />
-        }
       />
 
       {res.error ? (

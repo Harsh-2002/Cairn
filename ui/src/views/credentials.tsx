@@ -19,11 +19,9 @@ import { EmptyState } from "@/components/empty-state";
 import { ErrorAlert } from "@/components/error-alert";
 import { Page, PageHeader } from "@/components/page-header";
 import { PermissionBuilder } from "@/components/permission-builder";
-import { LiveStatus } from "@/components/live-status";
 import { StatusBadge } from "@/components/status-badge";
 import {
   Card,
-  CardAction,
   CardContent,
   CardDescription,
   CardHeader,
@@ -307,13 +305,6 @@ export function Credentials() {
                 } currently valid.`
               : "Temporary credentials currently valid."}
           </CardDescription>
-          <CardAction>
-            <LiveStatus
-              loading={sessions.loading}
-              refreshing={sessions.refreshing}
-              onClick={sessions.refresh}
-            />
-          </CardAction>
         </CardHeader>
         <CardContent>
           {sessions.error ? (

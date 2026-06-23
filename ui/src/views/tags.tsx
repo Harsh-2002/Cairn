@@ -12,7 +12,6 @@ import { useLiveTopic } from "@/lib/live";
 import { EmptyState } from "@/components/empty-state";
 import { ErrorAlert } from "@/components/error-alert";
 import { Page, PageHeader } from "@/components/page-header";
-import { LiveStatus } from "@/components/live-status";
 import { TextLink } from "@/components/text-link";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -68,13 +67,6 @@ export function Tags() {
               ? "No object tags in use yet."
               : `${count(total)} distinct ${total === 1 ? "tag" : "tags"} in use across your buckets.`
             : "Every object tag in use across your buckets."
-        }
-        actions={
-          <LiveStatus
-            loading={tags.loading}
-            refreshing={tags.refreshing}
-            onClick={tags.refresh}
-          />
         }
       />
 
