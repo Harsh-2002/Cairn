@@ -411,8 +411,18 @@ mod tests {
             s1.ciphertext, s2.ciphertext,
             "fresh nonce -> distinct envelopes"
         );
-        assert_eq!(c.open(&s1.ciphertext, &s1.nonce).expect("open 1").as_slice(), p);
-        assert_eq!(c.open(&s2.ciphertext, &s2.nonce).expect("open 2").as_slice(), p);
+        assert_eq!(
+            c.open(&s1.ciphertext, &s1.nonce)
+                .expect("open 1")
+                .as_slice(),
+            p
+        );
+        assert_eq!(
+            c.open(&s2.ciphertext, &s2.nonce)
+                .expect("open 2")
+                .as_slice(),
+            p
+        );
     }
 
     #[test]
@@ -548,7 +558,9 @@ mod tests {
         let nonce = [1u8; NONCE_LEN];
         let ct = legacy_blob(key, nonce, b"still readable");
         assert_eq!(
-            c.open(&ct, &Nonce(nonce.to_vec())).expect("open").as_slice(),
+            c.open(&ct, &Nonce(nonce.to_vec()))
+                .expect("open")
+                .as_slice(),
             b"still readable"
         );
     }
@@ -603,13 +615,17 @@ mod tests {
         let sealed = c.seal(b"new").expect("seal");
         assert_eq!(sealed.ciphertext[5], 2, "sealed under active id 2");
         assert_eq!(
-            c.open(&sealed.ciphertext, &sealed.nonce).expect("open").as_slice(),
+            c.open(&sealed.ciphertext, &sealed.nonce)
+                .expect("open")
+                .as_slice(),
             b"new"
         );
         let nonce = [5u8; NONCE_LEN];
         let legacy = legacy_blob(key1, nonce, b"old");
         assert_eq!(
-            c.open(&legacy, &Nonce(nonce.to_vec())).expect("legacy").as_slice(),
+            c.open(&legacy, &Nonce(nonce.to_vec()))
+                .expect("legacy")
+                .as_slice(),
             b"old"
         );
     }
@@ -642,7 +658,9 @@ mod tests {
         let reference = SystemCrypto::new(key);
         let sealed = reference.seal(b"hk").expect("seal");
         assert_eq!(
-            c.open(&sealed.ciphertext, &sealed.nonce).expect("open").as_slice(),
+            c.open(&sealed.ciphertext, &sealed.nonce)
+                .expect("open")
+                .as_slice(),
             b"hk"
         );
         assert_eq!(
