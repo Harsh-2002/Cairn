@@ -100,6 +100,7 @@ uuid.workspace = true
 hex.workspace = true
 base64.workspace = true
 sha2.workspace = true
+zeroize.workspace = true
 # The integrity scrub re-derives the plaintext MD5 ETag to verify uncompressed blobs.
 md-5.workspace = true
 # Used only by the node-local `migrate` CLI command to read the applied schema version after

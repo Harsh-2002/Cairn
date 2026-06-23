@@ -24,6 +24,7 @@ sha1.workspace = true
 hmac.workspace = true
 hex.workspace = true
 subtle.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 cairn-types = { workspace = true, features = ["testing"] }

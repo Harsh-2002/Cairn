@@ -401,6 +401,7 @@ dependencies = [
  "subtle",
  "tokio",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]
@@ -636,6 +637,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

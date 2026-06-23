@@ -618,6 +618,10 @@ pub(crate) async fn ensure_root_admin(
         .as_ref()
         .map(|u| u.user.id.clone())
         .unwrap_or_else(UserId::generate);
+    // Preserve the original creation time when re-affirming an existing root (e.g. a secret/role
+    // refresh on restart); only a brand-new root is stamped `now`. `created_at` means "when created",
+    // not "when last touched" — `updated_at` carries that.
+    let created_at = existing.as_ref().map_or(now, |u| u.user.created_at);
     let record = UserRecord {
         user: User {
             id,
@@ -627,7 +631,7 @@ pub(crate) async fn ensure_root_admin(
             role: Role::Administrator,
             is_active: true,
             quota_bytes: None,
-            created_at: now,
+            created_at,
             updated_at: now,
         },
         bearer_secret_hash: want_hash,

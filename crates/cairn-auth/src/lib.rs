@@ -31,6 +31,7 @@ use cairn_types::id::UserId;
 use cairn_types::time::Timestamp;
 use cairn_types::traits::{Authenticator, Clock, Crypto, MetadataStore};
 use std::sync::Arc;
+use zeroize::Zeroizing;
 
 /// The composed authenticator chain. Holds the metadata store (for credential lookup), the
 /// crypto facility (to decrypt SigV4 secrets), the clock (for skew validation), and the
@@ -131,10 +132,12 @@ impl AuthChain {
                 .crypto
                 .open(&creds.secret_ciphertext, &Nonce(creds.secret_nonce.clone()))
             {
-                Ok(s) => s,
+                // Keep the plaintext secret in a zeroizing buffer for both the bytes and the derived
+                // String, so it is scrubbed promptly (F-15) rather than lingering in freed heap.
+                Ok(s) => Zeroizing::new(s),
                 Err(_) => return AuthOutcome::Denied(AuthError::UnknownKey),
             };
-            let secret = String::from_utf8_lossy(&secret).into_owned();
+            let secret = Zeroizing::new(String::from_utf8_lossy(&secret).into_owned());
             return match sigv4::verify_header(view, &parsed, &secret, self.clock.now()) {
                 Ok(auth) => AuthOutcome::Authenticated(sigv4::principal(
                     creds.user_id,
@@ -177,10 +180,10 @@ impl AuthChain {
                 .crypto
                 .open(&creds.secret_ciphertext, &Nonce(creds.secret_nonce.clone()))
             {
-                Ok(s) => s,
+                Ok(s) => Zeroizing::new(s),
                 Err(_) => return AuthOutcome::Denied(AuthError::UnknownKey),
             };
-            let secret = String::from_utf8_lossy(&secret).into_owned();
+            let secret = Zeroizing::new(String::from_utf8_lossy(&secret).into_owned());
             return match sigv4::verify_presigned(view, &parsed, expires, &secret, self.clock.now())
             {
                 // Presigned requests sign a fixed payload hash (`UNSIGNED-PAYLOAD`); they never
@@ -252,7 +255,11 @@ impl AuthChain {
             .crypto
             .open(&creds.secret_ciphertext, &Nonce(creds.secret_nonce.clone()))
         {
-            Ok(s) => String::from_utf8_lossy(&s).into_owned(),
+            // Scrub both the decrypted bytes and the derived String (F-15).
+            Ok(s) => {
+                let s = Zeroizing::new(s);
+                Zeroizing::new(String::from_utf8_lossy(&s).into_owned())
+            }
             Err(_) => return Some(AuthOutcome::Denied(AuthError::UnknownKey)),
         };
         let (method, chunk_signing) = match verify(&secret) {

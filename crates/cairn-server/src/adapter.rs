@@ -23,6 +23,7 @@ use http_body_util::{BodyExt, BodyStream, Full, StreamBody};
 use hyper::body::{Frame, Incoming};
 use hyper::{Method, Request, Response};
 use std::net::IpAddr;
+use zeroize::Zeroizing;
 
 /// The unified HTTP response body: either a fully-buffered in-memory body (empty, XML, errors,
 /// UI assets, management JSON) or a blob stream forwarded frame-by-frame from the blob store.
@@ -451,7 +452,12 @@ async fn presign(
         .crypto
         .open(&creds.secret_ciphertext, &Nonce(creds.secret_nonce.clone()))
     {
-        Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+        // Hold the plaintext secret in a zeroizing buffer (bytes + derived String) so it is scrubbed
+        // promptly rather than lingering in freed heap (F-15).
+        Ok(b) => {
+            let b = Zeroizing::new(b);
+            Zeroizing::new(String::from_utf8_lossy(&b).into_owned())
+        }
         Err(_) => return json_status(500, r#"{"error":"internal error"}"#),
     };
 

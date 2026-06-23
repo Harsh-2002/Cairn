@@ -450,8 +450,10 @@ impl MetadataStore for InMemoryMetadataStore {
             }
             Mutation::DeleteBucket(name) => {
                 st.buckets.remove(name.as_str());
-                // Mirror the SQL backends: drop the bucket's per-bucket usage-analytics rows so
-                // deleting a bucket takes its analytics with it (non-bucket rows, keyed "", stay).
+                // Mirror the SQL backends, where `DELETE FROM buckets` takes the quota column with
+                // it: drop the bucket's quota, and its per-bucket usage-analytics rows, so deleting a
+                // bucket takes both with it (non-bucket analytics rows, keyed "", stay).
+                st.bucket_quotas.remove(name.as_str());
                 st.request_metrics
                     .retain(|(_, _, bucket, _), _| bucket.as_str() != name.as_str());
                 Ok(MutationOutcome::Ack)
@@ -629,9 +631,12 @@ impl MetadataStore for InMemoryMetadataStore {
                 Ok(MutationOutcome::Ack)
             }
             Mutation::DeleteUser(id) => {
-                // Mirror the SQL backends: drop the user record (carrying its policy) and every
-                // session credential scoped to it. (user_stats is not modelled in the double.)
+                // Mirror the SQL backends, where `DELETE FROM users` takes the policy column with it:
+                // drop the user record, its identity policy, and every session credential scoped to
+                // it. (user_stats is deliberately preserved by the SQL backends and not modelled
+                // here.)
                 st.users.remove(&id.to_string());
+                st.user_policies.remove(id.0.as_str());
                 st.session_creds.retain(|_, r| r.parent_user_id != id);
                 Ok(MutationOutcome::Ack)
             }
@@ -1763,5 +1768,60 @@ impl ReconcileOracle for SetReconcileOracle {
 
     async fn live_session(&self, upload: &UploadId) -> Result<bool, MetaError> {
         Ok(self.live_uploads.contains(upload.as_str()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The in-memory double must mirror the SQL backends, where `DELETE FROM users` /
+    // `DELETE FROM buckets` take the row's policy / quota columns with it. These guard against the
+    // double silently diverging — returning a stale `Some(..)` where the real store returns `None`,
+    // which would quietly weaken every downstream crate's tests that run against the double.
+    #[tokio::test]
+    async fn delete_user_clears_identity_policy() {
+        let store = InMemoryMetadataStore::new();
+        let id = UserId("alice".to_owned());
+        store
+            .submit(Mutation::SetUserPolicy {
+                user_id: id.clone(),
+                policy: Some("{\"Version\":\"2012-10-17\"}".to_owned()),
+            })
+            .await
+            .unwrap();
+        assert!(store.get_user_policy(&id).await.unwrap().is_some());
+        store
+            .submit(Mutation::DeleteUser(id.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_user_policy(&id).await.unwrap(),
+            None,
+            "deleting a user must take its identity policy with it (mirrors DELETE FROM users)"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_bucket_clears_quota() {
+        let store = InMemoryMetadataStore::new();
+        let bucket = BucketName::parse("photos").unwrap();
+        store
+            .submit(Mutation::SetBucketQuota {
+                bucket: bucket.clone(),
+                quota_bytes: Some(4096),
+            })
+            .await
+            .unwrap();
+        assert_eq!(store.get_bucket_quota(&bucket).await.unwrap(), Some(4096));
+        store
+            .submit(Mutation::DeleteBucket(bucket.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_bucket_quota(&bucket).await.unwrap(),
+            None,
+            "deleting a bucket must take its quota with it (mirrors DELETE FROM buckets)"
+        );
     }
 }
