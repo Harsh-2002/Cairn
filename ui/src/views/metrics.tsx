@@ -782,7 +782,7 @@ function StatusDonut({ by_status }: { by_status: MetricStatus[] }) {
           </PieChart>
         </ResponsiveContainer>
       </div>
-      <ul className="flex w-full flex-col gap-y-1.5 text-[13px] sm:flex-row sm:flex-wrap sm:gap-x-4">
+      <ul className="flex w-full flex-col items-center gap-y-1.5 text-[13px] sm:flex-row sm:flex-wrap sm:justify-center sm:gap-x-4 sm:gap-y-2">
         {sorted.map((s) => (
           <li
             key={s.status_class}
@@ -846,7 +846,7 @@ function ReadsWritesDonut({
           </PieChart>
         </ResponsiveContainer>
       </div>
-      <ul className="flex w-full flex-col gap-y-1.5 text-[13px] sm:flex-row sm:flex-wrap sm:gap-x-4">
+      <ul className="flex w-full flex-col items-center gap-y-1.5 text-[13px] sm:flex-row sm:flex-wrap sm:justify-center sm:gap-x-4 sm:gap-y-2">
         {slices.map((s) => (
           <li key={s.name} className="flex items-center gap-1.5 whitespace-nowrap">
             <span
