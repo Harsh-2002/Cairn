@@ -4,6 +4,15 @@ import { AppSidebar } from "@/components/app-sidebar";
 import { SidebarInset, SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar";
 import { Toaster } from "@/components/ui/sonner";
 
+/** The sidebar's persisted open/closed state (the framework stores it in the `sidebar_state`
+ * cookie). Seeding `defaultOpen` from it on first paint avoids an expanded→collapsed flash for a
+ * user who left the rail collapsed. Defaults to open when the cookie is absent. */
+function sidebarDefaultOpen(): boolean {
+  if (typeof document === "undefined") return true;
+  const m = document.cookie.match(/(?:^|;\s*)sidebar_state=([^;]+)/);
+  return m ? m[1] === "true" : true;
+}
+
 /** Per-route document titles so history and tabs read meaningfully. */
 function titleFor(pathname: string): string {
   const seg = pathname.split("/").filter(Boolean);
@@ -39,7 +48,7 @@ export function AppShell() {
   }, [location.pathname]);
 
   return (
-    <SidebarProvider>
+    <SidebarProvider defaultOpen={sidebarDefaultOpen()}>
       <a
         href="#main-content"
         className="fixed top-2 left-2 z-50 -translate-y-16 rounded-md border bg-background px-3 py-2 text-sm shadow-md transition-transform focus:translate-y-0"

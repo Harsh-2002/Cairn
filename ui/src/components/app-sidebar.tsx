@@ -8,6 +8,7 @@ import {
   Home,
   KeyRound,
   LogOut,
+  PanelLeft,
   RefreshCw,
   Tags,
   Users,
@@ -33,7 +34,6 @@ import {
   useSidebar,
 } from "@/components/ui/sidebar";
 import { Button } from "@/components/ui/button";
-import { CommandMenu } from "@/components/command-menu";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { api } from "@/lib/api";
 import { useAuth } from "@/providers/auth-provider";
@@ -60,7 +60,7 @@ export function AppSidebar() {
   const location = useLocation();
   const navigate = useNavigate();
   const { logout } = useAuth();
-  const { isMobile, setOpenMobile } = useSidebar();
+  const { isMobile, setOpenMobile, state, toggleSidebar } = useSidebar();
 
   function signOut() {
     logout();
@@ -74,8 +74,8 @@ export function AppSidebar() {
   const bucketMatch = location.pathname.match(/^\/buckets\/([^/]+)/);
   const activeBucket = bucketMatch ? decodeURIComponent(bucketMatch[1]) : null;
 
-  // Bucket names load lazily the first time the section is expanded (mirrors
-  // the ⌘K palette), so the sidebar costs nothing until someone reaches for it.
+  // Bucket names load lazily the first time the section is expanded, so the
+  // sidebar costs nothing until someone reaches for it.
   useEffect(() => {
     if (!bucketsOpen || buckets !== null) return;
     api
@@ -85,20 +85,36 @@ export function AppSidebar() {
   }, [bucketsOpen, buckets]);
 
   return (
-    <Sidebar>
-      <SidebarHeader className="gap-3 px-4 py-4">
-        <Link to="/overview" className="flex items-center gap-2">
-          {/* The wordmark: a quiet filled square + name, Geist 600. */}
-          <span
-            aria-hidden="true"
-            className="inline-block size-4 rounded-[4px] bg-foreground"
-          />
-          <span className="text-[15px] font-semibold tracking-tight text-foreground">
-            Cairn
-          </span>
-        </Link>
-        {/* Search lives in the app rail, not a top chrome bar — the ⌘K palette opens from here. */}
-        <CommandMenu />
+    <Sidebar collapsible="icon">
+      <SidebarHeader className="px-3 py-4 group-data-[collapsible=icon]:px-2">
+        <div className="flex items-center justify-between gap-2">
+          {/* The wordmark: a quiet filled square + name (Geist 600). The name hides in the
+              collapsed icon rail, leaving the square; the collapse toggle is always reachable. */}
+          <Link
+            to="/overview"
+            className="flex items-center gap-2 group-data-[collapsible=icon]:hidden"
+          >
+            <span
+              aria-hidden="true"
+              className="inline-block size-4 rounded-[4px] bg-foreground"
+            />
+            <span className="text-[15px] font-semibold tracking-tight text-foreground">
+              Cairn
+            </span>
+          </Link>
+          {/* Desktop collapse toggle (mobile uses the SidebarTrigger in the top bar). Drives the
+              framework's own open/close + cookie persistence — no parallel state. */}
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            onClick={toggleSidebar}
+            aria-label={state === "collapsed" ? "Expand sidebar" : "Collapse sidebar"}
+            aria-expanded={state === "expanded"}
+            className="hidden shrink-0 md:flex"
+          >
+            <PanelLeft aria-hidden="true" />
+          </Button>
+        </div>
       </SidebarHeader>
       <SidebarContent>
         <SidebarGroup>
@@ -123,7 +139,7 @@ export function AppSidebar() {
                       asChild
                     >
                       <SidebarMenuItem>
-                        <SidebarMenuButton asChild isActive={active}>
+                        <SidebarMenuButton asChild isActive={active} tooltip={item.label}>
                           <Link
                             to={item.path}
                             aria-current={active ? "page" : undefined}
@@ -141,7 +157,7 @@ export function AppSidebar() {
                             aria-label={
                               bucketsOpen ? "Collapse buckets" : "Expand buckets"
                             }
-                            className="absolute top-1.5 right-1 flex aspect-square w-5 items-center justify-center rounded-md text-sidebar-foreground/70 ring-sidebar-ring outline-hidden transition-transform hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:ring-2"
+                            className="absolute top-1.5 right-1 flex aspect-square w-5 items-center justify-center rounded-md text-sidebar-foreground/70 ring-sidebar-ring outline-hidden transition-transform hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:ring-2 group-data-[collapsible=icon]:hidden"
                           >
                             <ChevronRight
                               aria-hidden="true"
@@ -202,7 +218,7 @@ export function AppSidebar() {
 
                 return (
                   <SidebarMenuItem key={item.path}>
-                    <SidebarMenuButton asChild isActive={active}>
+                    <SidebarMenuButton asChild isActive={active} tooltip={item.label}>
                       <Link
                         to={item.path}
                         aria-current={active ? "page" : undefined}
@@ -221,17 +237,19 @@ export function AppSidebar() {
           </SidebarGroupContent>
         </SidebarGroup>
       </SidebarContent>
-      <SidebarFooter className="px-3 py-3">
+      <SidebarFooter className="px-3 py-3 group-data-[collapsible=icon]:px-2">
         {/* Account + appearance controls live at the foot of the rail (webapp shell), not a header.
-            The version lives on Overview, so it isn't repeated here. */}
-        <div className="flex items-center gap-1">
+            The version lives on Overview, so it isn't repeated here. In the collapsed icon rail the
+            controls stack as icons and the "Sign out" label is dropped. */}
+        <div className="flex items-center gap-1 group-data-[collapsible=icon]:flex-col group-data-[collapsible=icon]:gap-1.5">
           <Button
             variant="ghost"
             onClick={signOut}
-            className="h-8 flex-1 justify-start gap-2 px-2 text-sm font-normal text-muted-foreground hover:text-foreground"
+            aria-label="Sign out"
+            className="h-8 flex-1 justify-start gap-2 px-2 text-sm font-normal text-muted-foreground hover:text-foreground group-data-[collapsible=icon]:size-8 group-data-[collapsible=icon]:flex-none group-data-[collapsible=icon]:justify-center group-data-[collapsible=icon]:px-0"
           >
-            <LogOut aria-hidden="true" className="size-4" />
-            Sign out
+            <LogOut aria-hidden="true" className="size-4 shrink-0" />
+            <span className="group-data-[collapsible=icon]:hidden">Sign out</span>
           </Button>
           <ThemeToggle />
         </div>
