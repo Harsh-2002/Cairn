@@ -557,6 +557,16 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             .map_err(engine_err)?;
             Ok(MutationOutcome::Ack)
         }
+        Mutation::RecoverClaimedReplication => {
+            // Startup recovery: every `claimed` row is orphaned (no live worker holds it), so release
+            // them to `pending` for immediate re-claim instead of waiting out the 300s lease.
+            conn.execute(
+                "UPDATE replication_outbox SET status='pending', lease_until=NULL WHERE status='claimed'",
+                [],
+            )
+            .map_err(engine_err)?;
+            Ok(MutationOutcome::Ack)
+        }
         Mutation::PruneReplicationOutbox { before_ms } => {
             // Reclaim terminal rows (completed/failed) older than the horizon; never touch
             // pending/claimed (outstanding work). Keeps the outbox bounded and auto-clears stale
@@ -840,7 +850,7 @@ fn enforce_user_quota(conn: &Connection, row: &ObjectVersionRow) -> R<()> {
 
 /// Replace any existing row at (bucket,key,version_id) — capturing its blob for reclamation —
 /// demote the key's other versions, and insert the new latest row.
-fn upsert_version(conn: &Connection, row: ObjectVersionRow) -> R<Option<StoragePath>> {
+fn upsert_version(conn: &Connection, mut row: ObjectVersionRow) -> R<Option<StoragePath>> {
     // Read the row this upsert replaces (if any): its blob to reclaim, plus its owner and byte
     // sizes so the roll-up counters can be decremented for it before the replacement is inserted.
     let existing: Option<(Option<String>, String, i64, i64)> = conn
@@ -877,7 +887,33 @@ fn upsert_version(conn: &Connection, row: ObjectVersionRow) -> R<Option<StorageP
         }
         None => None,
     };
-    demote_latest(conn, &row.bucket, &row.key)?;
+    // A replicated write carries the SOURCE's (uuidv7, time-ordered) version id, which may be OLDER
+    // than a version already present here (a local write, or an out-of-order / re-delivered replica).
+    // It becomes the latest only if its id is the maximum for the key, so an older replica never
+    // demotes a newer version (AWS S3 CRR-style version-id ordering, ARCH 20.4). A normal write
+    // always carries a fresh (max) id, so it keeps the unconditional last-write-is-latest behaviour.
+    // Replicas only occur in versioned buckets, so every id compared here is a uuidv7 hex (the
+    // unversioned `null` sentinel is never a replica), and `MAX(version_id)` runs AFTER the same-id
+    // delete above, so it reflects the other versions a re-delivery must not jump ahead of.
+    let becomes_latest =
+        if row.replication_status == Some(cairn_types::meta::ReplicationStatus::Replica) {
+            let max_other: Option<String> = conn
+                .prepare_cached(
+                    "SELECT MAX(version_id) FROM object_versions WHERE bucket_name=?1 AND key=?2",
+                )
+                .map_err(engine_err)?
+                .query_row(params![row.bucket.as_str(), row.key.as_str()], |r| r.get(0))
+                .optional()
+                .map_err(engine_err)?
+                .flatten();
+            max_other.is_none_or(|m| row.version_id.as_str() >= m.as_str())
+        } else {
+            true
+        };
+    if becomes_latest {
+        demote_latest(conn, &row.bucket, &row.key)?;
+    }
+    row.is_latest = becomes_latest;
     insert_version(conn, &row)?;
     Ok(superseded.map(StoragePath::from_string))
 }

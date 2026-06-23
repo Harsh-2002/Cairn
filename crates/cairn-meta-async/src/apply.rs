@@ -659,6 +659,16 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
                 .await?;
             Ok(MutationOutcome::Ack)
         }
+        Mutation::RecoverClaimedReplication => {
+            // Mirrors cairn-meta: release orphaned `claimed` rows to `pending` at startup.
+            driver
+                .execute(
+                    "UPDATE replication_outbox SET status='pending', lease_until=NULL WHERE status='claimed'",
+                    vec![],
+                )
+                .await?;
+            Ok(MutationOutcome::Ack)
+        }
         Mutation::PruneReplicationOutbox { before_ms } => {
             // Mirrors cairn-meta: reclaim terminal (completed/failed) rows older than the horizon;
             // pending/claimed are never pruned.
@@ -983,7 +993,7 @@ async fn adjust_stats(
 
 async fn upsert_version(
     driver: &dyn AsyncSqlDriver,
-    row: ObjectVersionRow,
+    mut row: ObjectVersionRow,
 ) -> R<Option<StoragePath>> {
     // Read the row this upsert replaces (if any): its blob plus owner/byte sizes so the counters
     // can be decremented for it before the replacement is inserted.
@@ -1024,7 +1034,31 @@ async fn upsert_version(
         }
         None => None,
     };
-    demote_latest(driver, &row.bucket, &row.key).await?;
+    // Mirrors cairn-meta: a replica carries the source's (uuidv7-ordered) version id and is latest
+    // only if its id is the max for the key, so an older/re-delivered replica never demotes a newer
+    // version. A normal write keeps last-write-is-latest. MAX runs AFTER the same-id delete above.
+    let becomes_latest =
+        if row.replication_status == Some(cairn_types::meta::ReplicationStatus::Replica) {
+            let m = query_one(
+                driver,
+                "SELECT MAX(version_id) FROM object_versions WHERE bucket_name=?1 AND key=?2",
+                vec![
+                    Value::Text(row.bucket.as_str().to_owned()),
+                    Value::Text(row.key.as_str().to_owned()),
+                ],
+            )
+            .await?;
+            match m.and_then(|r| r.get_opt_text(0)) {
+                Some(maxv) => row.version_id.as_str() >= maxv.as_str(),
+                None => true,
+            }
+        } else {
+            true
+        };
+    if becomes_latest {
+        demote_latest(driver, &row.bucket, &row.key).await?;
+    }
+    row.is_latest = becomes_latest;
     insert_version(driver, &row).await?;
     Ok(superseded.map(StoragePath::from_string))
 }

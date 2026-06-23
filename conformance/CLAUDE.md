@@ -8,6 +8,10 @@ fuzz tests live next to their sources). Two kinds — keep them distinct:
 - `share.sh` — object sharing (share tokens + SigV4 presigned URLs).
 - `rotation.sh` (+`rotation.py`) — master-key rotation lifecycle (#29), sharded.
 - `soak.sh` (+`soak.py`) — two-node replication, byte-identical verify + RSS leak check.
+- `mesh.sh` (+`mesh.py`) — **5-node FULL mesh** replication (stdlib only, no boto3): convergence,
+  fan-out latency, version-id identity, concurrent same-key, crash resiliency, delete-marker mesh,
+  throughput/bottleneck, no-cascade, integrity. The Python driver owns all five node processes
+  (own ports/data dirs/master keys) and self-tears-down. `conformance/mesh.sh [scenario-ids...]`.
 - `warp.sh` — the MinIO warp macro benchmark (get/put/mixed).
 - `crash_consistency.sh` — the F-4 durability property at one crash seam.
 - `scrub.sh` — integrity scrub: corrupt a stored blob on disk, assert the background scrub

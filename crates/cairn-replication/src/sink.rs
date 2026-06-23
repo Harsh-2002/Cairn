@@ -76,6 +76,10 @@ use std::sync::Arc;
 const SERVICE: &str = "s3";
 /// The loop-prevention metadata key (sent as `x-amz-meta-cairn-replica`).
 const REPLICA_MARKER_KEY: &str = "cairn-replica";
+/// The source version-id metadata key (sent as `x-amz-meta-cairn-replica-version-id`). The
+/// destination preserves this exact version id so a version has the same identity on every node and
+/// re-delivery is an idempotent upsert (AWS S3 CRR semantics, ARCH 20.4).
+const REPLICA_VERSION_ID_KEY: &str = "cairn-replica-version-id";
 
 /// Connection parameters for a remote S3-compatible replication destination.
 #[derive(Debug, Clone)]
@@ -514,6 +518,12 @@ impl HttpS3Sink {
             format!("x-amz-meta-{REPLICA_MARKER_KEY}"),
             "true".to_owned(),
         ));
+        // Carry the source version id so the destination preserves it (version-id identity +
+        // idempotent re-delivery).
+        user_headers.push((
+            format!("x-amz-meta-{REPLICA_VERSION_ID_KEY}"),
+            object.version_id.as_str().to_owned(),
+        ));
 
         // Replicate the object's tag set via the standard `x-amz-tagging` header (form-urlencoded
         // `k=v&k=v`), so the destination version carries the same tags the source rule filtered on.
@@ -545,15 +555,23 @@ impl HttpS3Sink {
         &self,
         source_bucket: &str,
         key: &ObjectKey,
+        version: &VersionId,
     ) -> Result<(), ReplicationError> {
         let dest_bucket = self.dest_for(source_bucket).to_owned();
         // Stamp the loop-prevention marker so the destination (a) authorizes this as a
         // `ReplicateDelete` for a dedicated replication user and (b) records the propagated marker
-        // as a replica rather than re-replicating it (ARCH 20.4), mirroring the PUT path.
-        let headers = [(
-            format!("x-amz-meta-{REPLICA_MARKER_KEY}"),
-            "true".to_owned(),
-        )];
+        // as a replica rather than re-replicating it (ARCH 20.4), mirroring the PUT path. The
+        // source version id is carried so the destination preserves the marker's identity.
+        let headers = [
+            (
+                format!("x-amz-meta-{REPLICA_MARKER_KEY}"),
+                "true".to_owned(),
+            ),
+            (
+                format!("x-amz-meta-{REPLICA_VERSION_ID_KEY}"),
+                version.as_str().to_owned(),
+            ),
+        ];
         self.send_signed(
             &Method::DELETE,
             &dest_bucket,
@@ -580,9 +598,10 @@ impl crate::route::BucketRoutedSink for HttpS3Sink {
         &self,
         source_bucket: &BucketName,
         key: &ObjectKey,
-        _version: &VersionId,
+        version: &VersionId,
     ) -> Result<(), ReplicationError> {
-        self.delete_marker_routed(source_bucket.as_str(), key).await
+        self.delete_marker_routed(source_bucket.as_str(), key, version)
+            .await
     }
 }
 

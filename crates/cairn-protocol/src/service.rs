@@ -632,11 +632,6 @@ impl S3Service {
         }
 
         let versioned = bucket.versioning == VersioningState::Enabled;
-        let version_id = if versioned {
-            VersionId::generate()
-        } else {
-            VersionId::null()
-        };
         let now = self.clock.now();
         // Honor a canned x-amz-acl when the bucket's ownership mode keeps ACLs in force.
         let acl = match req.header("x-amz-acl") {
@@ -663,6 +658,15 @@ impl S3Service {
                 .is_some_and(|p| p.role == Role::Administrator);
         let replication_status =
             is_replica.then_some(cairn_types::meta::ReplicationStatus::Replica);
+        // Preserve the SOURCE version id for an inbound replica (AWS S3 CRR semantics, ARCH 20.4):
+        // a version then has the same identity on every node, and re-delivery is an idempotent
+        // upsert on (bucket, key, version_id) rather than a duplicate version. Gated on the same
+        // admin-only replica classification, so a normal client can never pin an arbitrary id.
+        let version_id = if !versioned {
+            VersionId::null()
+        } else {
+            replica_version_id(&req, is_replica).unwrap_or_else(VersionId::generate)
+        };
         // The system response headers (ARCH 13.4) are stored verbatim from the request.
         let header_owned = |name: &str| req.header(name).map(str::to_owned);
         let row = ObjectVersionRow {
@@ -941,32 +945,45 @@ impl S3Service {
 
         match bucket.versioning {
             VersioningState::Enabled => {
-                let marker_id = VersionId::generate();
-                let replication = if is_replica {
-                    Vec::new()
+                // Preserve the source marker id for an inbound replica (AWS-CRR); else mint a fresh
+                // one.
+                let marker_id =
+                    replica_version_id(req, is_replica).unwrap_or_else(VersionId::generate);
+                if is_replica {
+                    // A replicated delete marker: apply it through the idempotent, version-id-
+                    // preserving upsert (re-delivery is a no-op; an older marker never demotes a
+                    // newer version), enqueueing nothing (loop prevention).
+                    self.meta
+                        .submit(Mutation::PutObjectVersion {
+                            row: Box::new(replica_marker_row(&bucket, &key, &marker_id, now)),
+                            precondition: Precondition::default(),
+                            replication: Vec::new(),
+                        })
+                        .await?;
                 } else {
-                    self.replication_outbox(
-                        &bucket,
-                        &key,
-                        &marker_id,
-                        ReplicationOp::DeleteMarker,
-                        &[],
-                    )
-                    .await
-                };
-                let enqueued_repl = !replication.is_empty();
-                self.meta
-                    .submit(Mutation::CreateDeleteMarker {
-                        bucket: bucket.name.clone(),
-                        key,
-                        version_id: marker_id.clone(),
-                        owner_id: bucket.owner_id.clone(),
-                        now,
-                        replication,
-                    })
-                    .await?;
-                if enqueued_repl {
-                    self.pulse_replication();
+                    let replication = self
+                        .replication_outbox(
+                            &bucket,
+                            &key,
+                            &marker_id,
+                            ReplicationOp::DeleteMarker,
+                            &[],
+                        )
+                        .await;
+                    let enqueued_repl = !replication.is_empty();
+                    self.meta
+                        .submit(Mutation::CreateDeleteMarker {
+                            bucket: bucket.name.clone(),
+                            key,
+                            version_id: marker_id.clone(),
+                            owner_id: bucket.owner_id.clone(),
+                            now,
+                            replication,
+                        })
+                        .await?;
+                    if enqueued_repl {
+                        self.pulse_replication();
+                    }
                 }
                 self.emit_events(
                     &bucket.name,
@@ -4021,9 +4038,67 @@ fn user_metadata(req: &S3Request) -> Vec<(String, String)> {
         .iter()
         .filter_map(|(k, v)| {
             k.strip_prefix("x-amz-meta-")
+                // The `cairn-replica*` keys are internal replication control headers (loop-prevention
+                // marker + preserved source version id), never the object's own user metadata.
+                .filter(|n| !n.starts_with("cairn-replica"))
                 .map(|n| (n.to_owned(), v.clone()))
         })
         .collect()
+}
+
+/// The preserved source version id for an inbound replica PUT/marker: the
+/// `x-amz-meta-cairn-replica-version-id` header, but ONLY when this write is an authenticated
+/// replica (`is_replica`, admin-gated). Returns `None` for a normal write or an absent/empty header,
+/// so the caller mints a fresh id. A normal client can never pin a version id this way.
+fn replica_version_id(req: &S3Request, is_replica: bool) -> Option<VersionId> {
+    if !is_replica {
+        return None;
+    }
+    req.header("x-amz-meta-cairn-replica-version-id")
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(|v| VersionId::from_string(v.to_owned()))
+}
+
+/// Build a delete-marker version row for an inbound *replica* delete (ARCH 20.4). Stamped
+/// `ReplicationStatus::Replica` and carrying the preserved source `version_id`, it is applied via
+/// the idempotent `PutObjectVersion` upsert: re-delivery is a no-op, and an older marker never
+/// demotes a newer version (the upsert orders replica writes by version id).
+fn replica_marker_row(
+    bucket: &Bucket,
+    key: &ObjectKey,
+    version_id: &VersionId,
+    now: cairn_types::time::Timestamp,
+) -> ObjectVersionRow {
+    ObjectVersionRow {
+        id: uuid::Uuid::new_v4().simple().to_string(),
+        bucket: bucket.name.clone(),
+        key: key.clone(),
+        version_id: version_id.clone(),
+        is_latest: true,
+        is_delete_marker: true,
+        size_logical: 0,
+        size_physical: 0,
+        etag: ETag::from_string(String::new()),
+        content_type: String::new(),
+        content_encoding: None,
+        cache_control: None,
+        content_disposition: None,
+        content_language: None,
+        expires: None,
+        storage_path: None,
+        compression: cairn_types::object::CompressionDescriptor::Uncompressed,
+        storage_class: StorageClass::Standard,
+        cold_locator: None,
+        owner_id: bucket.owner_id.clone(),
+        user_metadata: Vec::new(),
+        acl: None,
+        checksums: Vec::new(),
+        sse_descriptor: None,
+        replication_status: Some(cairn_types::meta::ReplicationStatus::Replica),
+        created_at: now,
+        updated_at: now,
+    }
 }
 
 /// Parse the inline `x-amz-tagging` header, a URL-encoded `Key=Value&Key2=Value2` tag set as used

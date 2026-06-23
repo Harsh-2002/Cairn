@@ -817,6 +817,166 @@ async fn defer_releases_claim_without_consuming_attempts() {
 }
 
 #[tokio::test]
+async fn replica_preserves_id_and_orders_by_version_id() {
+    let store = cairn_meta::open_in_memory().unwrap();
+    let b = BucketName::parse("rvbkt").unwrap();
+    store
+        .submit(Mutation::CreateBucket(Box::new(bucket("rvbkt"))))
+        .await
+        .unwrap();
+    let k = ObjectKey::parse("k").unwrap();
+    let replica = |bk: &BucketName, key, vid: VersionId, etag| {
+        let mut r = row(bk, key, vid, etag, true);
+        r.replication_status = Some(ReplicationStatus::Replica);
+        r
+    };
+    async fn version_count(store: &cairn_meta::SqliteMetadataStore, b: &BucketName) -> usize {
+        store
+            .list_versions(
+                b,
+                &ListQuery {
+                    limit: 100,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .items
+            .len()
+    }
+    let v1 = VersionId::from_string("00000001".into());
+    let v2 = VersionId::from_string("00000002".into());
+    let v3 = VersionId::from_string("00000003".into());
+
+    // A normal local write of v2 is the latest.
+    store
+        .submit(put(
+            row(&b, "k", v2.clone(), "e2", true),
+            Precondition::default(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .current_version(&b, &k)
+            .await
+            .unwrap()
+            .unwrap()
+            .version_id,
+        v2
+    );
+
+    // A replica carrying an OLDER id is preserved as a version but does NOT demote the newer latest.
+    store
+        .submit(put(
+            replica(&b, "k", v1.clone(), "e1"),
+            Precondition::default(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .current_version(&b, &k)
+            .await
+            .unwrap()
+            .unwrap()
+            .version_id,
+        v2,
+        "an older replica must not become latest"
+    );
+    assert!(
+        store.get_version(&b, &k, &v1).await.unwrap().is_some(),
+        "v1 is stored"
+    );
+
+    // A replica carrying a NEWER id becomes the latest.
+    store
+        .submit(put(
+            replica(&b, "k", v3.clone(), "e3"),
+            Precondition::default(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .current_version(&b, &k)
+            .await
+            .unwrap()
+            .unwrap()
+            .version_id,
+        v3,
+        "a newer replica becomes latest"
+    );
+    assert_eq!(
+        version_count(&store, &b).await,
+        3,
+        "three distinct versions"
+    );
+
+    // Re-delivering v3 (the SAME id) is an idempotent upsert — no duplicate version.
+    store
+        .submit(put(
+            replica(&b, "k", v3.clone(), "e3"),
+            Precondition::default(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        version_count(&store, &b).await,
+        3,
+        "re-delivery did not duplicate"
+    );
+    assert_eq!(
+        store
+            .current_version(&b, &k)
+            .await
+            .unwrap()
+            .unwrap()
+            .version_id,
+        v3
+    );
+}
+
+#[tokio::test]
+async fn recover_claimed_resets_to_pending() {
+    let store = cairn_meta::open_in_memory().unwrap();
+    let b = BucketName::parse("recbkt").unwrap();
+    store
+        .submit(Mutation::CreateBucket(Box::new(bucket("recbkt"))))
+        .await
+        .unwrap();
+    let v = VersionId::from_string("00000001".into());
+    plant_outbox(&store, &b, "k", v, "r1").await;
+
+    // Claim it: now `claimed` under a 300s lease, so it leaves the due (pending) set.
+    store
+        .claim_replication_batch(10, Timestamp(1_000))
+        .await
+        .unwrap();
+    assert!(
+        store
+            .list_due_replication(10, Timestamp(2_000))
+            .await
+            .unwrap()
+            .is_empty(),
+        "a claimed entry is not in the due set before its lease expires"
+    );
+
+    // Startup recovery releases it immediately, without waiting out the lease.
+    store
+        .submit(Mutation::RecoverClaimedReplication)
+        .await
+        .unwrap();
+    let due = store
+        .list_due_replication(10, Timestamp(2_000))
+        .await
+        .unwrap();
+    assert_eq!(due.len(), 1, "the orphaned claim was reclaimed to pending");
+    assert_eq!(due[0].id, "r1");
+    assert_eq!(due[0].status, ReplicationStatus::Pending);
+}
+
+#[tokio::test]
 async fn get_bucket_quota_reads_the_column() {
     let store = cairn_meta::open_in_memory().unwrap();
     let b = BucketName::parse("quotab").unwrap();

@@ -3836,6 +3836,107 @@ async fn inbound_replica_marks_status_and_skips_outbox() {
 }
 
 #[tokio::test]
+async fn inbound_replica_preserves_version_id_idempotently() {
+    let h = harness().await;
+    versioned_bucket(&h, "rvp").await;
+    let bkt = BucketName::parse("rvp").unwrap();
+    let key = ObjectKey::parse("k").unwrap();
+    let pinned = "00000000000000000000000000000abc";
+
+    // An admin replica PUT carrying the preserved version id stores the version under THAT id.
+    let do_replica = || async {
+        drain(
+            send(
+                &h.svc,
+                req(
+                    Method::PUT,
+                    Some("rvp"),
+                    Some("k"),
+                    &[],
+                    &[
+                        ("x-amz-meta-cairn-replica", "true"),
+                        ("x-amz-meta-cairn-replica-version-id", pinned),
+                    ],
+                    b"replicated-bytes".to_vec(),
+                ),
+            )
+            .await,
+        )
+        .await
+    };
+    let (st, _, _) = do_replica().await;
+    assert_eq!(st, StatusCode::OK);
+    let cur = h.meta.current_version(&bkt, &key).await.unwrap().unwrap();
+    assert_eq!(
+        cur.version_id.as_str(),
+        pinned,
+        "the source version id is preserved"
+    );
+    assert_eq!(
+        cur.replication_status,
+        Some(cairn_types::meta::ReplicationStatus::Replica)
+    );
+
+    // Re-delivery of the same (key, version id) is an idempotent upsert — still exactly one version.
+    let (st, _, _) = do_replica().await;
+    assert_eq!(st, StatusCode::OK);
+    let versions = h
+        .meta
+        .list_versions(
+            &bkt,
+            &cairn_types::meta::ListQuery {
+                limit: 100,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        versions.items.len(),
+        1,
+        "re-delivery did not create a duplicate version"
+    );
+
+    // A NON-admin member cannot pin a version id (audit #16): the header is ignored and a fresh id
+    // is minted, so the write is a normal (non-replica) version, not the pinned one.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req_with_principal(
+                Method::PUT,
+                Some("rvp"),
+                Some("k2"),
+                &[],
+                &[
+                    ("x-amz-meta-cairn-replica", "true"),
+                    ("x-amz-meta-cairn-replica-version-id", pinned),
+                ],
+                b"forged".to_vec(),
+                member("intruder"),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let cur2 = h
+        .meta
+        .current_version(&bkt, &ObjectKey::parse("k2").unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(
+        cur2.version_id.as_str(),
+        pinned,
+        "a member must not be able to pin an arbitrary version id"
+    );
+    assert_ne!(
+        cur2.replication_status,
+        Some(cairn_types::meta::ReplicationStatus::Replica)
+    );
+}
+
+#[tokio::test]
 async fn delete_marker_replication_enqueues_when_enabled() {
     let h = harness().await;
     versioned_bucket(&h, "dmr").await;

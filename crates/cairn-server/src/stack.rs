@@ -535,6 +535,18 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
         Err(e) => tracing::warn!(error = %e, "startup reconciliation failed"),
     }
 
+    // Replication crash-recovery: release any `claimed` outbox entries left leased by a worker that
+    // crashed mid-ship. A freshly-started process has no live workers, so every claimed row is an
+    // orphan — reclaim them to `pending` now so they re-ship immediately, instead of waiting out the
+    // 300s claim lease. Runs before the listener binds and the workers start, so it never races a
+    // live claim.
+    if let Err(e) = meta
+        .submit(cairn_types::meta::Mutation::RecoverClaimedReplication)
+        .await
+    {
+        tracing::warn!(error = %e, "replication claim recovery failed");
+    }
+
     // Master-key rotation state (audit #29, Phase E): seed each sqlite shard's key_ring_state for
     // the env ring keys and prime the in-process seal counter from durable state so the seal-count
     // bound survives a restart. No-op for the async backends (no concrete shard handles).

@@ -126,8 +126,29 @@ impl State {
             row.version_id.as_str().to_owned(),
         );
         let superseded = self.versions.get(&vk).and_then(|r| r.storage_path.clone());
-        self.demote_all(row.bucket.as_str(), row.key.as_str());
-        row.is_latest = true;
+        // A replica carries the source's (uuidv7-ordered) version id, which may be older than a
+        // version already here; it is latest only if its id is the max for the key (mirrors the SQL
+        // store's replica-scoped ordering). A normal write keeps last-write-is-latest.
+        let becomes_latest =
+            if row.replication_status == Some(crate::meta::ReplicationStatus::Replica) {
+                let max_other = self
+                    .versions
+                    .keys()
+                    .filter(|(b, k, v)| {
+                        b == row.bucket.as_str()
+                            && k == row.key.as_str()
+                            && v.as_str() != row.version_id.as_str()
+                    })
+                    .map(|(_, _, v)| v.as_str())
+                    .max();
+                max_other.is_none_or(|m| row.version_id.as_str() >= m)
+            } else {
+                true
+            };
+        if becomes_latest {
+            self.demote_all(row.bucket.as_str(), row.key.as_str());
+        }
+        row.is_latest = becomes_latest;
         self.versions.insert(vk, row);
         superseded
     }
@@ -698,6 +719,16 @@ impl MetadataStore for InMemoryMetadataStore {
                     e.next_attempt_at = next_attempt_at;
                     if last_error.is_some() {
                         e.last_error = last_error;
+                    }
+                }
+                Ok(MutationOutcome::Ack)
+            }
+            Mutation::RecoverClaimedReplication => {
+                // Startup recovery: release every orphaned `claimed` row back to `pending`.
+                for e in st.outbox.iter_mut() {
+                    if e.status == ReplicationStatus::Claimed {
+                        e.status = ReplicationStatus::Pending;
+                        e.lease_until = None;
                     }
                 }
                 Ok(MutationOutcome::Ack)

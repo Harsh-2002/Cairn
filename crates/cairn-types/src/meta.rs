@@ -304,6 +304,13 @@ pub enum Mutation {
         /// Optional last-error string to record (None leaves the existing value).
         last_error: Option<String>,
     },
+    /// Reclaim ALL `claimed` replication-outbox entries back to `pending` (clearing the lease). Run
+    /// ONCE at startup: a freshly-started process has no live workers, so every `claimed` row is an
+    /// orphan left by a worker that crashed mid-ship. Without this, those entries would wait out the
+    /// full 300 s claim lease before any worker could re-claim them — so a node that crashes
+    /// mid-drain would take minutes to resume the objects it was actively shipping. Idempotent and
+    /// safe because each node owns its own metadata store. Does not touch `attempts`.
+    RecoverClaimedReplication,
     /// Enqueue a batch of event-notification (webhook) outbox entries idempotently (INSERT OR
     /// IGNORE on the deterministic entry id). Emitted by the protocol layer right after an object
     /// commit succeeds; delivery is best-effort at-least-once (a crash in the gap drops the

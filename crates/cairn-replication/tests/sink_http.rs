@@ -175,6 +175,11 @@ async fn put_object_issues_well_formed_signed_request() {
     assert_eq!(req.header("x-amz-meta-owner"), Some("alice"));
     // The loop-prevention marker is always present.
     assert_eq!(req.header("x-amz-meta-cairn-replica"), Some("true"));
+    // The source version id is carried so the destination preserves it (version-id identity).
+    assert_eq!(
+        req.header("x-amz-meta-cairn-replica-version-id"),
+        Some("v1")
+    );
 
     // SigV4 date and payload hash.
     assert_eq!(req.header("x-amz-date"), Some("20150830T123600Z"));
