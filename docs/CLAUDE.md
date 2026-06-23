@@ -28,6 +28,10 @@ straight to the document that covers it.
 | Document | Covers |
 |---|---|
 | [operations.md](./operations.md) | Configuring, deploying, and running a node: the one-filesystem invariant, the configuration table, bootstrapping, deployment shapes, day-two signals, the durability guarantee, and the **master-key rotation runbook** |
+| [upgrade-rollback.md](./upgrade-rollback.md) | Upgrading the binary, version compatibility, rollback (restore-from-snapshot), and the decisions fixed at first init (backend, shard count) |
+| [scaling-limits.md](./scaling-limits.md) | Capacity planning: the single-writer write ceiling, object/bucket limits, when to shard vs replicate, replication lag, and the sizing cheat-sheet |
+| [troubleshooting.md](./troubleshooting.md) | Symptom → cause → `/metrics` signal → fix; the diagnostic commands and when to restore from backup |
+| [deployment-kubernetes.md](./deployment-kubernetes.md) | Container + Kubernetes deployment (single-replica StatefulSet, PVC, probes, ConfigMap/Secret, TLS, backups) |
 | [backup-restore.md](./backup-restore.md) | The backup procedure (database-first snapshot + blob copy), its consistency argument, and restore |
 | [s3-api-matrix.md](./s3-api-matrix.md) | The S3 API support matrix — which operations are supported, partial, or out of scope |
 | [benchmarks.md](./benchmarks.md) | The benchmarking methodology and the harnesses under `conformance/` |

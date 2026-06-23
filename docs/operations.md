@@ -130,6 +130,16 @@ Prometheus metrics `/metrics`. Signals to watch:
 - **out-of-space (507) rate** vs capacity.
 - **replication lag and failures** — the health of redundancy.
 
+On **shutdown** (SIGTERM), the server drains in-flight HTTP requests within the grace period; the
+replication workers stop *claiming* new outbox work but do not block shutdown waiting for in-flight
+transfers to finish. This is safe, not lossy: a claimed-but-unfinished entry is leased in the durable
+outbox, and on restart the node releases its own stale claims back to pending and resumes them — so a
+sudden stop loses no replication work (it ships when the node is back). Drain to a peer (watch
+replication lag) before a planned stop if you want the peer fully current. See
+[`upgrade-rollback.md`](./upgrade-rollback.md) for the upgrade/rollback procedure,
+[`scaling-limits.md`](./scaling-limits.md) for capacity planning, and
+[`troubleshooting.md`](./troubleshooting.md) for symptom→fix.
+
 ## 6. Durability guarantee
 
 Cairn guarantees that after any crash it converges, with no manual intervention, to a state
