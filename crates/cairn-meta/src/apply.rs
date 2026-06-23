@@ -188,6 +188,15 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
                 params![name.as_str()],
             )
             .map_err(engine_err)?;
+            // Take the bucket's usage-analytics with it: every per-bucket request_metrics row
+            // (ARCH 26.5) keyed to this bucket is dropped in the same commit, so its history does not
+            // linger and a recreated bucket of the same name never inherits the old series. Rows for
+            // non-bucket operations (bucket_name '') are untouched.
+            conn.execute(
+                "DELETE FROM request_metrics WHERE bucket_name=?1",
+                params![name.as_str()],
+            )
+            .map_err(engine_err)?;
             Ok(MutationOutcome::Ack)
         }
         Mutation::SetBucketConfig {

@@ -203,6 +203,16 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
                     vec![Value::Text(name.as_str().to_owned())],
                 )
                 .await?;
+            // Take the bucket's usage-analytics with it: every per-bucket request_metrics row
+            // (ARCH 26.5) keyed to this bucket is dropped in the same commit, so its history does not
+            // linger and a recreated bucket of the same name never inherits the old series. Rows for
+            // non-bucket operations (bucket_name '') are untouched.
+            driver
+                .execute(
+                    "DELETE FROM request_metrics WHERE bucket_name=?1",
+                    vec![Value::Text(name.as_str().to_owned())],
+                )
+                .await?;
             Ok(MutationOutcome::Ack)
         }
         Mutation::SetBucketConfig {

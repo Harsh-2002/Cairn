@@ -1149,3 +1149,93 @@ async fn rewrap_completion_is_not_inferred_from_a_cleared_cursor() {
         "a pass with failures is not complete"
     );
 }
+
+// Deleting a bucket must take its usage-analytics with it: the per-bucket request_metrics rows are
+// dropped in the same commit as the bucket, so its history never lingers and a recreated bucket of
+// the same name can't inherit the old series. Non-bucket roll-up rows (bucket_name "") survive, and
+// because the delete is per-bucket it covers one, two, or N buckets the same way.
+#[tokio::test]
+async fn deleting_a_bucket_drops_its_request_metrics() {
+    let store = cairn_meta::open_in_memory().unwrap();
+    store
+        .submit(Mutation::CreateBucket(Box::new(bucket("alpha"))))
+        .await
+        .unwrap();
+    store
+        .submit(Mutation::CreateBucket(Box::new(bucket("beta"))))
+        .await
+        .unwrap();
+
+    let now = 100_000i64;
+    let ts = now - 60;
+    let metric = |b: &str, n: u64| RequestMetricRow {
+        ts_bucket: ts,
+        operation: if b.is_empty() {
+            "Management".to_owned() // a non-bucket op (e.g. ListBuckets), keyed bucket_name ""
+        } else {
+            "GetObject".to_owned()
+        },
+        bucket: b.to_owned(),
+        status_class: "2xx".to_owned(),
+        count: n,
+        bytes_in: 0,
+        bytes_out: 0,
+        lat_sum_ms: 0,
+        lat_hist: [0u64; LATENCY_BUCKETS],
+    };
+    store
+        .submit(Mutation::RecordRequestMetrics {
+            rows: vec![metric("alpha", 10), metric("beta", 5), metric("", 3)],
+            prune_before: None,
+        })
+        .await
+        .unwrap();
+
+    let names = |s: &RequestMetricsSeries| {
+        s.top_buckets
+            .iter()
+            .map(|b| b.bucket.clone())
+            .collect::<Vec<_>>()
+    };
+
+    // Before: both buckets appear in the analytics; the grand total counts every row.
+    let before = store
+        .query_request_metrics(MetricsRange::OneDay, now)
+        .await
+        .unwrap();
+    assert_eq!(before.total, 18);
+    assert!(names(&before).contains(&"alpha".to_owned()));
+    assert!(names(&before).contains(&"beta".to_owned()));
+
+    // Delete alpha → its per-bucket analytics go with it; beta and the non-bucket row remain.
+    store
+        .submit(Mutation::DeleteBucket(BucketName::parse("alpha").unwrap()))
+        .await
+        .unwrap();
+    let after = store
+        .query_request_metrics(MetricsRange::OneDay, now)
+        .await
+        .unwrap();
+    assert_eq!(
+        after.total, 8,
+        "alpha's 10 are gone; beta (5) + non-bucket (3) remain"
+    );
+    assert!(
+        !names(&after).contains(&"alpha".to_owned()),
+        "alpha must not linger in the analytics after its bucket is deleted"
+    );
+    assert!(names(&after).contains(&"beta".to_owned()));
+
+    // Deleting the rest clears their analytics too (the same per-bucket delete covers N buckets);
+    // only the non-bucket ("") roll-up survives.
+    store
+        .submit(Mutation::DeleteBucket(BucketName::parse("beta").unwrap()))
+        .await
+        .unwrap();
+    let last = store
+        .query_request_metrics(MetricsRange::OneDay, now)
+        .await
+        .unwrap();
+    assert_eq!(last.total, 3, "only the non-bucket roll-up remains");
+    assert!(names(&last).is_empty());
+}

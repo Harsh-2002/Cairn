@@ -450,6 +450,10 @@ impl MetadataStore for InMemoryMetadataStore {
             }
             Mutation::DeleteBucket(name) => {
                 st.buckets.remove(name.as_str());
+                // Mirror the SQL backends: drop the bucket's per-bucket usage-analytics rows so
+                // deleting a bucket takes its analytics with it (non-bucket rows, keyed "", stay).
+                st.request_metrics
+                    .retain(|(_, _, bucket, _), _| bucket.as_str() != name.as_str());
                 Ok(MutationOutcome::Ack)
             }
             Mutation::SetBucketConfig {
