@@ -710,16 +710,20 @@ fn bootstrap(cfg: Config) -> ExitCode {
 
         let insecure_defaults =
             cfg.root_access_key == "cairn" && cfg.root_secret_key == "cairnadmin";
+        // Print both credential forms with their canonical labels so tooling and the conformance
+        // harnesses parse them: the Bearer token off the "Authorization: Bearer" line, and the SigV4
+        // pair off the "Access Key Id:" / "Secret Access Key:" lines (last field).
         println!("Root administrator ready — the single default admin for this node.\n");
-        println!("  Access key:  {}", cfg.root_access_key);
-        println!("  Secret key:  {}", cfg.root_secret_key);
-        println!("  Region:      {}", cfg.region);
+        println!("  Bearer (web console + management API):");
         println!(
-            "\n  These credentials log into the web console, sign S3 requests (SigV4), and\n  \
-             authenticate the management API (Bearer {}.{}). Create further users from the\n  \
-             console or `cairn remote user create`.",
+            "    Authorization: Bearer {}.{}",
             cfg.root_access_key, cfg.root_secret_key
         );
+        println!("\n  SigV4 (S3 SDKs / aws-cli):");
+        println!("    Access Key Id:     {}", cfg.root_access_key);
+        println!("    Secret Access Key: {}", cfg.root_secret_key);
+        println!("    Region:            {}", cfg.region);
+        println!("\n  Create further users from the console or `cairn remote user create`.",);
         if insecure_defaults {
             println!(
                 "\n  WARNING: these are the INSECURE defaults (cairn / cairnadmin). Set\n  \

@@ -103,7 +103,9 @@ try:
 except ClientError:
     check("legal hold blocks delete", True)
 s3.put_object_legal_hold(Bucket="wormb", Key="h", VersionId=hv, LegalHold={"Status": "OFF"})
-s3.delete_object(Bucket="wormb", Key="h", VersionId=hv)
+# "h" also inherited the bucket's default GOVERNANCE retention (1 day), so releasing the legal hold
+# alone is not enough to delete it — governance must be bypassed too (matches S3 semantics).
+s3.delete_object(Bucket="wormb", Key="h", VersionId=hv, BypassGovernanceRetention=True)
 check("delete after legal-hold release", True)
 
 # GOVERNANCE yields to the bypass.

@@ -23,6 +23,12 @@ env:
   CARGO_NET_RETRY: "10"
   CARGO_HTTP_MULTIPLEXING: "false"
 
+# Least-privilege default for every job: CI only reads the repository (checkout) and writes nothing
+# back. Individual jobs override this if they ever need more. Closes the CodeQL
+# `actions/missing-workflow-permissions` alerts across all jobs.
+permissions:
+  contents: read
+
 jobs:
   lint:
     name: fmt + clippy
@@ -95,6 +101,66 @@ jobs:
       - run: cargo build --bin cairn
       - name: Drive Cairn with the AWS SDK (real SigV4 + aws-chunked streaming, the F-5 path)
         run: BIN=target/debug/cairn PY=python3 bash conformance/run.sh
+
+  scrub:
+    name: integrity scrub (bit-rot detection)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - run: pip install boto3
+      - run: cargo build --bin cairn
+      - name: Corrupt a stored blob on disk; assert the background scrub detects the ETag mismatch
+        run: BIN=target/debug/cairn PY=python3 bash conformance/scrub.sh
+
+  object-lock:
+    name: object lock / WORM
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - run: pip install boto3
+      - run: cargo build --bin cairn
+      - name: COMPLIANCE/GOVERNANCE retention + legal hold enforced via the AWS SDK
+        run: BIN=target/debug/cairn PY=python3 bash conformance/object_lock.sh
+
+  notifications:
+    name: webhook event notifications
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - run: pip install boto3
+      - run: cargo build --bin cairn
+      - name: Event-notification delivery + HMAC signing (management UI listener on)
+        run: BIN=target/debug/cairn PY=python3 bash conformance/notifications.sh
+
+  sts:
+    name: STS temporary credentials
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - run: pip install boto3
+      - run: cargo build --bin cairn
+      - name: Mint + enforce scoped session credentials over a real SDK (management UI listener on)
+        run: BIN=target/debug/cairn PY=python3 bash conformance/sts.sh
+
+  # conformance/mesh.sh (5-node full-mesh replication) is intentionally NOT gated here: it needs the
+  # dev sandbox disabled and stands up five node processes on dedicated ports — too heavy and
+  # environment-specific for the shared runner. Run it manually: `bash conformance/mesh.sh`.
 
   rotation:
     name: master-key rotation e2e (#29)
