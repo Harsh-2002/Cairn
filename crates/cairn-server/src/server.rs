@@ -452,7 +452,7 @@ async fn handle(
                     state.stack.request_metrics.forget_bucket(deleted);
                 }
             }
-            if let Some((op, mut bucket)) = classify_operation(&method, &path, &query) {
+            if let Some((op, mut bucket)) = classify_operation(serve_ui, &method, &path, &query) {
                 // The raw S3 DeleteBucket request itself: attribute it to the non-bucket sentinel so
                 // it does not re-create a per-bucket row for the bucket just deleted. (The management
                 // delete is already classified as Management/"".)
@@ -534,7 +534,13 @@ pub(crate) fn classify_route(path: &str) -> &'static str {
 /// addressing: the first path segment is the bucket and the method + sub-resource query select the
 /// S3 operation name. Virtual-host attribution is out of scope, so a request whose bucket cannot be
 /// read from the path falls back to an empty bucket string.
+///
+/// `serve_ui` is the listener role: on the web-console listener everything that is not `/api/v1` is
+/// the SPA shell or a root-served static asset (e.g. `/favicon.svg`), not S3 traffic (which uses the
+/// data-plane listener), so it is not charted — otherwise a console asset shows up as a phantom
+/// path-style bucket.
 pub(crate) fn classify_operation(
+    serve_ui: bool,
     method: &Method,
     path: &str,
     query: &str,
@@ -553,6 +559,14 @@ pub(crate) fn classify_operation(
     }
     if path.starts_with("/api/v1") {
         return Some(("Management".to_owned(), String::new()));
+    }
+    // On the web-console listener, anything that is not the management API is the SPA shell or a
+    // static asset served at the root (e.g. `/favicon.svg`) — not an S3 operation. Real S3
+    // data-plane traffic uses the S3 listener, so don't misclassify a console asset as a phantom
+    // path-style bucket — which is exactly how `/favicon.svg` surfaced as a bucket named
+    // "favicon.svg" in the usage analytics.
+    if serve_ui {
+        return None;
     }
 
     // Path-style S3 addressing: `/{bucket}` or `/{bucket}/{key}`. Take the first segment as the
@@ -996,6 +1010,26 @@ mod delete_label_tests {
         assert_eq!(
             deleted_bucket_label(&Method::PUT, "/api/v1/buckets/photos"),
             None
+        );
+    }
+
+    #[test]
+    fn console_assets_are_not_classified_as_s3_buckets() {
+        let get = Method::GET;
+        // On the web-console listener, a root-served asset like the favicon must NOT be charted as a
+        // path-style S3 bucket named "favicon.svg" (the bug a fresh node made obvious).
+        assert_eq!(classify_operation(true, &get, "/favicon.svg", ""), None);
+        // The SPA shell / any other root path on the console listener is likewise not S3.
+        assert_eq!(classify_operation(true, &get, "/anything", ""), None);
+        // Management calls are still charted on the console listener.
+        assert_eq!(
+            classify_operation(true, &get, "/api/v1/buckets", ""),
+            Some(("Management".to_owned(), String::new()))
+        );
+        // On the S3 data-plane listener the same path is a real path-style S3 op, unchanged.
+        assert_eq!(
+            classify_operation(false, &get, "/photos", ""),
+            Some(("ListObjects".to_owned(), "photos".to_owned()))
         );
     }
 }

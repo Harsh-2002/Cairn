@@ -356,7 +356,8 @@ pub async fn try_sendfile_get(
     }
     if request_metrics_enabled {
         if let Some((op, bucket)) =
-            crate::server::classify_operation(&hyper::Method::GET, &path, &query)
+            // The sendfile fast path is data-plane only (S3 object GET), never the console listener.
+            crate::server::classify_operation(false, &hyper::Method::GET, &path, &query)
         {
             let now_secs = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
