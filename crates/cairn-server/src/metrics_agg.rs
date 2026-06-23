@@ -146,6 +146,31 @@ impl RequestMetricsAgg {
         cell.lat_hist[cairn_types::latency_bucket_index(latency_ms)] += 1;
     }
 
+    /// Drop every pending (not-yet-flushed) count for one bucket across all shards. Called when a
+    /// bucket is deleted: its persisted rows are cleared in the delete's own metadata commit, and
+    /// this clears the in-memory counts that would otherwise flush *after* the delete and resurrect
+    /// a per-bucket series for a bucket that no longer exists (the empty-then-delete flow leaves
+    /// `DeleteObject`/`ListObjects` counts pending). Keys for other buckets and the non-bucket
+    /// sentinel (`""`) are untouched; forgetting `""` is a deliberate no-op.
+    ///
+    /// Two bounded, self-limiting artifacts are accepted by design rather than over-engineered away:
+    /// (1) this eviction is not atomic with the metadata delete, so a flush firing in the brief
+    /// window between the delete's commit and this call could re-persist a snapshot of the bucket's
+    /// then-pending counts (a stale, non-growing residual that ages out via the retention prune);
+    /// (2) counts that had already folded into [`OVERFLOW_BUCKET`] under shard saturation are keyed
+    /// under that sentinel, not the bucket, so they are not selectively removable here (they were
+    /// already anonymized and unattributable to the bucket). Both require either a flush in a
+    /// sub-millisecond window or >`MAX_KEYS_PER_SHARD` distinct keys, and neither grows after delete.
+    pub fn forget_bucket(&self, bucket: &str) {
+        if bucket.is_empty() {
+            return;
+        }
+        for shard in &self.shards {
+            let mut guard = shard.lock().unwrap();
+            guard.retain(|(_, _, b, _), _| b.as_str() != bucket);
+        }
+    }
+
     /// Atomically swap every shard's map out and flatten the accumulated counts into rows for a
     /// batched upsert. Returns an empty vector when no traffic has been recorded since the last
     /// drain.
@@ -273,6 +298,31 @@ mod tests {
             .map(|r| r.count)
             .sum();
         assert!(overflow > 0, "overflow keys folded into the sentinel");
+    }
+
+    #[test]
+    fn forget_bucket_evicts_only_that_bucket() {
+        // Deleting a bucket evicts its pending counts so they cannot flush after the delete and
+        // resurrect a per-bucket series; other buckets and the non-bucket sentinel survive.
+        let agg = RequestMetricsAgg::new(60);
+        agg.record("DeleteObject", "foo", 204, 1, 0, 0, 0);
+        agg.record("ListObjects", "foo", 200, 1, 0, 0, 0);
+        agg.record("GetObject", "bar", 200, 1, 0, 0, 0);
+        agg.record("Management", "", 200, 1, 0, 0, 0); // non-bucket op, keyed ""
+
+        agg.forget_bucket("foo");
+        agg.forget_bucket(""); // forgetting the sentinel is a no-op
+
+        let rows = agg.drain();
+        assert!(rows.iter().all(|r| r.bucket != "foo"), "foo fully evicted");
+        assert!(
+            rows.iter().any(|r| r.bucket == "bar"),
+            "other buckets are untouched"
+        );
+        assert!(
+            rows.iter().any(|r| r.bucket.is_empty()),
+            "the non-bucket sentinel is untouched"
+        );
     }
 
     #[test]

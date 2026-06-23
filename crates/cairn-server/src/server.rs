@@ -440,7 +440,25 @@ async fn handle(
         // background flush loop drains it periodically. Gated on the subsystem being enabled, and
         // skipped for infra/UI/share/root paths the classifier returns `None` for.
         if state.request_metrics_enabled {
-            if let Some((op, bucket)) = classify_operation(&method, &path, &query) {
+            // A successful bucket deletion — whether through the raw S3 path (`DELETE /{bucket}`) or
+            // the management console/CLI (`DELETE /api/v1/buckets/{name}`) — removes the bucket and
+            // its persisted analytics (cleared in the delete's own metadata commit). Evict the
+            // bucket's not-yet-flushed in-memory counts too, or pending per-bucket counts from prior
+            // S3 traffic (reads, the deletes that emptied it) would flush after the delete and
+            // resurrect a per-bucket series. Both delete paths reach this shared handler, so one
+            // check here covers console, CLI, bulk, and S3 uniformly.
+            if status.is_success() {
+                if let Some(deleted) = deleted_bucket_label(&method, &path) {
+                    state.stack.request_metrics.forget_bucket(deleted);
+                }
+            }
+            if let Some((op, mut bucket)) = classify_operation(&method, &path, &query) {
+                // The raw S3 DeleteBucket request itself: attribute it to the non-bucket sentinel so
+                // it does not re-create a per-bucket row for the bucket just deleted. (The management
+                // delete is already classified as Management/"".)
+                if op == "DeleteBucket" && status.is_success() {
+                    bucket.clear();
+                }
                 let now_secs = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0, |d| d.as_secs() as i64);
@@ -600,6 +618,34 @@ pub(crate) fn classify_operation(
         }
     };
     Some((op.to_owned(), bucket))
+}
+
+/// The bucket a request would delete, recognised on either listener so a bucket's in-process
+/// request-metrics can be evicted when it is removed (see [`RequestMetricsAgg::forget_bucket`]).
+/// Both the raw S3 path-style delete (`DELETE /{bucket}`, no key) and the management console/CLI
+/// delete (`DELETE /api/v1/buckets/{name}`, no sub-resource) funnel through the same `DeleteBucket`
+/// mutation; this recognises both and returns the (raw, undecoded) bucket label, which matches what
+/// [`classify_operation`] records per-bucket S3 traffic under. Returns `None` for object deletes,
+/// sub-resource deletes, list endpoints, and infra paths. The caller must additionally require a
+/// successful (2xx) response — a failed delete leaves the bucket and its metrics intact.
+fn deleted_bucket_label<'a>(method: &Method, path: &'a str) -> Option<&'a str> {
+    if *method != Method::DELETE {
+        return None;
+    }
+    // Management console / CLI: `/api/v1/buckets/{name}` — the bucket itself, not `/objects`,
+    // `/policy`, `/replication/...`, etc. (which carry a further `/`).
+    if let Some(name) = path.strip_prefix("/api/v1/buckets/") {
+        return (!name.is_empty() && !name.contains('/')).then_some(name);
+    }
+    // Raw S3 path-style: `/{bucket}` with no key segment. Exclude the infra endpoints.
+    let seg = path.strip_prefix('/').unwrap_or(path);
+    if seg.is_empty() || seg.contains('/') {
+        return None;
+    }
+    match seg {
+        "healthz" | "readyz" | "metrics" => None,
+        _ => Some(seg),
+    }
 }
 
 /// Liveness, readiness, and metrics endpoints (the S3 and management families are dispatched
@@ -913,5 +959,43 @@ mod fast_io_tests {
         let body = full_body(Bytes::from_static(b"ok"));
         let collected = body.collect().await.unwrap().to_bytes();
         assert_eq!(&collected[..], b"ok");
+    }
+}
+
+#[cfg(test)]
+mod delete_label_tests {
+    use super::*;
+
+    #[test]
+    fn deleted_bucket_label_recognises_both_delete_paths() {
+        let del = Method::DELETE;
+        // Raw S3 path-style bucket delete.
+        assert_eq!(deleted_bucket_label(&del, "/photos"), Some("photos"));
+        // Management console / CLI bucket delete.
+        assert_eq!(
+            deleted_bucket_label(&del, "/api/v1/buckets/photos"),
+            Some("photos")
+        );
+
+        // Not a bucket delete: object deletes, sub-resource deletes, listings, infra.
+        assert_eq!(deleted_bucket_label(&del, "/photos/a/b.jpg"), None);
+        assert_eq!(
+            deleted_bucket_label(&del, "/api/v1/buckets/photos/objects"),
+            None
+        );
+        assert_eq!(
+            deleted_bucket_label(&del, "/api/v1/buckets/photos/policy"),
+            None
+        );
+        assert_eq!(deleted_bucket_label(&del, "/api/v1/buckets"), None);
+        assert_eq!(deleted_bucket_label(&del, "/"), None);
+        assert_eq!(deleted_bucket_label(&del, "/healthz"), None);
+
+        // Only DELETE counts — a GET/PUT to the same path is not a deletion.
+        assert_eq!(deleted_bucket_label(&Method::GET, "/photos"), None);
+        assert_eq!(
+            deleted_bucket_label(&Method::PUT, "/api/v1/buckets/photos"),
+            None
+        );
     }
 }
