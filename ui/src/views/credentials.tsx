@@ -10,6 +10,7 @@ import { api, ApiError, errorMessage } from "@/lib/api";
 import { count, relTime, whenMs } from "@/lib/format";
 import { summarizePolicy, type PolicyDoc } from "@/lib/policy";
 import { useResource } from "@/lib/use-resource";
+import { useLiveTopic } from "@/lib/live";
 import type { MintSessionResp } from "@/lib/types";
 import { ConfirmDialog } from "@/components/confirm-dialog";
 import { CredentialsPanel } from "@/components/credentials-panel";
@@ -18,7 +19,7 @@ import { EmptyState } from "@/components/empty-state";
 import { ErrorAlert } from "@/components/error-alert";
 import { Page, PageHeader } from "@/components/page-header";
 import { PermissionBuilder } from "@/components/permission-builder";
-import { RefreshButton } from "@/components/refresh-button";
+import { LiveStatus } from "@/components/live-status";
 import { StatusBadge } from "@/components/status-badge";
 import {
   Card,
@@ -133,6 +134,9 @@ export function Credentials() {
 
   // Active (non-expired) sessions, so an operator can see and revoke what's outstanding.
   const sessions = useResource(() => api.listSessions(), []);
+  // Live: sessions expire on their own, so a "credentials" pulse keeps the list current without a
+  // manual refresh (e.g. an expired session drops off, a freshly minted one appears).
+  useLiveTopic("credentials", sessions.refresh);
   const [revoking, setRevoking] = useState<string | null>(null);
   const [revokeBusy, setRevokeBusy] = useState(false);
 
@@ -304,7 +308,7 @@ export function Credentials() {
               : "Temporary credentials currently valid."}
           </CardDescription>
           <CardAction>
-            <RefreshButton
+            <LiveStatus
               loading={sessions.loading}
               refreshing={sessions.refreshing}
               onClick={sessions.refresh}

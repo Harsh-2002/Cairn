@@ -244,7 +244,8 @@ mod tests {
         let c = crypto();
         // A target that trusts a pasted CA certificate.
         let mut with_ca = input();
-        with_ca.ca_cert_pem = Some("-----BEGIN CERTIFICATE-----\nMII…\n-----END CERTIFICATE-----".to_owned());
+        with_ca.ca_cert_pem =
+            Some("-----BEGIN CERTIFICATE-----\nMII…\n-----END CERTIFICATE-----".to_owned());
         let open = open_target(&c, &seal_target(&c, with_ca).expect("seal")).expect("open");
         assert_eq!(
             open.ca_cert_pem.as_deref(),

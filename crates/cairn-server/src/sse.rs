@@ -96,7 +96,7 @@ pub fn mint_ticket(stack: &AppStack, principal: Option<&Principal>) -> Response<
 fn is_known_topic(topic: &str) -> bool {
     matches!(
         topic,
-        "overview" | "buckets" | "replication" | "activity" | "metrics"
+        "overview" | "buckets" | "replication" | "activity" | "metrics" | "credentials" | "tags"
     )
 }
 
@@ -192,6 +192,25 @@ mod tests {
             user_policy: None,
             is_session: false,
         }
+    }
+
+    #[test]
+    fn known_topics_are_the_console_set() {
+        // Every topic the console subscribes to (see ui/src/views/*: useLiveTopic) must be accepted,
+        // or its pulses are silently dropped. A typo'd / unknown topic must be rejected.
+        for t in [
+            "overview",
+            "buckets",
+            "replication",
+            "activity",
+            "metrics",
+            "credentials",
+            "tags",
+        ] {
+            assert!(is_known_topic(t), "{t} should be a known live topic");
+        }
+        assert!(!is_known_topic("nope"));
+        assert!(!is_known_topic(""));
     }
 
     #[test]

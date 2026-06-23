@@ -16,7 +16,7 @@ import { ErrorAlert } from "@/components/error-alert";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Page, PageHeader } from "@/components/page-header";
-import { RefreshButton } from "@/components/refresh-button";
+import { LiveStatus } from "@/components/live-status";
 import { TextLink } from "@/components/text-link";
 import {
   Select,
@@ -104,7 +104,7 @@ export function Activity() {
         title="Activity"
         description="Recent administrative changes on this node."
         actions={
-          <RefreshButton
+          <LiveStatus
             loading={res.loading}
             refreshing={res.refreshing}
             onClick={res.refresh}

@@ -14,7 +14,7 @@ import { useLiveTopic } from "@/lib/live";
 import { EmptyState } from "@/components/empty-state";
 import { ErrorAlert } from "@/components/error-alert";
 import { Page, PageHeader } from "@/components/page-header";
-import { RefreshButton } from "@/components/refresh-button";
+import { LiveStatus } from "@/components/live-status";
 import { StatCard } from "@/components/stat-card";
 import { StatusBadge } from "@/components/status-badge";
 import { TextLink } from "@/components/text-link";
@@ -82,7 +82,7 @@ export function Overview() {
         title="Overview"
         description="Storage, compression, and per-bucket usage across this node."
         actions={
-          <RefreshButton
+          <LiveStatus
             loading={loading}
             refreshing={refreshing}
             onClick={refresh}

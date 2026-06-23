@@ -8,10 +8,11 @@ import { Search, Tags as TagsIcon } from "lucide-react";
 import { api } from "@/lib/api";
 import { bytes, count, whenMs } from "@/lib/format";
 import { useResource } from "@/lib/use-resource";
+import { useLiveTopic } from "@/lib/live";
 import { EmptyState } from "@/components/empty-state";
 import { ErrorAlert } from "@/components/error-alert";
 import { Page, PageHeader } from "@/components/page-header";
-import { RefreshButton } from "@/components/refresh-button";
+import { LiveStatus } from "@/components/live-status";
 import { TextLink } from "@/components/text-link";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -41,6 +42,8 @@ function TagChip({ tagKey, value }: { tagKey: string; value: string }) {
 
 export function Tags() {
   const tags = useResource(() => api.listTags(), []);
+  // Live: the server pulses "tags" on its cadence; re-fetch through the normal authenticated path.
+  useLiveTopic("tags", tags.refresh);
   const [sel, setSel] = useState<TagSummaryItem | null>(null);
   const [filter, setFilter] = useState("");
 
@@ -67,7 +70,7 @@ export function Tags() {
             : "Every object tag in use across your buckets."
         }
         actions={
-          <RefreshButton
+          <LiveStatus
             loading={tags.loading}
             refreshing={tags.refreshing}
             onClick={tags.refresh}

@@ -5,7 +5,7 @@
 // or the server's periodic stream close it reconnects with backoff. Falls back silently to each
 // view's existing Refresh button when the stream can't be established.
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useSyncExternalStore } from "react";
 import { api } from "@/lib/api";
 
 type Listener = (data: unknown) => void;
@@ -20,6 +20,27 @@ let coalesceTimer: ReturnType<typeof setTimeout> | null = null;
 let failures = 0;
 // Set true while the tab is hidden so a backgrounded console stops driving the refresh cadence.
 let paused = false;
+
+// Connection-state store, exposed to views via `useLiveStatus` so they can render a live/▸reconnecting
+// indicator in place of a manual refresh button. `opened` tracks whether the EventSource is actually
+// open (set on `onopen`, cleared on every close); `failures` is the consecutive-failure count above.
+// The snapshot's identity changes only on a real transition, so it is safe for `useSyncExternalStore`.
+let opened = false;
+type LiveConnState = { connected: boolean; failures: number };
+let statusSnapshot: LiveConnState = { connected: false, failures: 0 };
+const statusListeners = new Set<() => void>();
+function publishStatus() {
+  if (opened === statusSnapshot.connected && failures === statusSnapshot.failures) return;
+  statusSnapshot = { connected: opened, failures };
+  statusListeners.forEach((fn) => fn());
+}
+function subscribeStatus(cb: () => void): () => void {
+  statusListeners.add(cb);
+  return () => {
+    statusListeners.delete(cb);
+  };
+}
+const getStatusSnapshot = (): LiveConnState => statusSnapshot;
 
 /** Backoff for the Nth consecutive failure: 1s, 2s, 4s, … capped at 30s, with ±20% jitter. */
 function backoffMs(n: number): number {
@@ -41,6 +62,8 @@ function closeStream() {
     source = null;
   }
   openTopics = "";
+  opened = false;
+  publishStatus();
 }
 
 function scheduleReopen(delayMs: number) {
@@ -67,8 +90,9 @@ async function openStream() {
     ticket = (await api.eventsTicket()).ticket;
   } catch {
     // Not authed yet, or the server has no SSE — retry with backoff; views keep working via their
-    // Refresh button in the meantime.
+    // refresh fallback in the meantime.
     failures += 1;
+    publishStatus();
     scheduleReopen(backoffMs(failures));
     return;
   }
@@ -82,7 +106,11 @@ async function openStream() {
   openTopics = want;
   // A clean open clears the failure count so a normal reconnect doesn't inherit a long backoff.
   src.onopen = () => {
-    if (source === src) failures = 0;
+    if (source === src) {
+      failures = 0;
+      opened = true;
+      publishStatus();
+    }
   };
   for (const topic of want.split(",")) {
     src.addEventListener(topic, (e: MessageEvent) => {
@@ -102,6 +130,7 @@ async function openStream() {
     if (source === src) {
       closeStream();
       failures += 1;
+      publishStatus();
       scheduleReopen(backoffMs(failures));
     }
   };
@@ -123,6 +152,31 @@ export function stopLive() {
     coalesceTimer = null;
   }
   failures = 0;
+  publishStatus();
+}
+
+/**
+ * Force an immediate reconnect: clear the pending backoff timer and the failure count, then reopen
+ * the stream now. Used by the live-status control's manual retry so a user need not wait out the
+ * exponential backoff. A no-op while the tab is hidden (the stream stays closed until it is shown).
+ */
+export function reconnectNow() {
+  if (reopenTimer != null) {
+    clearTimeout(reopenTimer);
+    reopenTimer = null;
+  }
+  failures = 0;
+  publishStatus();
+  void openStream();
+}
+
+/**
+ * Subscribe a component to the live connection state — `{ connected, failures }`: `connected` is true
+ * while the SSE stream is open, `failures` is the consecutive-reconnect-failure count (0 when
+ * healthy). Backed by a stable snapshot, so it is safe to drive `useSyncExternalStore`.
+ */
+export function useLiveStatus(): LiveConnState {
+  return useSyncExternalStore(subscribeStatus, getStatusSnapshot, getStatusSnapshot);
 }
 
 // Pause the stream while the tab is hidden (no user is watching, so don't drive the refresh

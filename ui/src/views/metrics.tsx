@@ -34,7 +34,7 @@ import { useLiveTopic } from "@/lib/live";
 import { EmptyState } from "@/components/empty-state";
 import { ErrorAlert } from "@/components/error-alert";
 import { Page, PageHeader } from "@/components/page-header";
-import { RefreshButton } from "@/components/refresh-button";
+import { LiveStatus } from "@/components/live-status";
 import { StatCard } from "@/components/stat-card";
 import { UsageBar } from "@/components/usage-bar";
 import {
@@ -198,7 +198,7 @@ export function Metrics() {
                 Updated {relTime(loadedAt)}
               </span>
             ) : null}
-            <RefreshButton
+            <LiveStatus
               loading={loading}
               refreshing={refreshing}
               onClick={refresh}
