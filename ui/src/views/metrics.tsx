@@ -104,6 +104,31 @@ function pct(part: number, whole: number): string {
   return `${Math.round(p)}%`;
 }
 
+/**
+ * Percentage labels for the parts of a whole that always sum to exactly 100%. Rounding each share
+ * on its own (e.g. "98%" + "1.8%" = 99.8%) leaves a donut's labels short of the full ring they draw;
+ * this distributes the rounding remainder by the largest-fractional-part rule, at one-decimal
+ * precision, so the legend agrees with the chart. Returns "0%" for every slice when the whole is 0.
+ */
+function shareLabels(values: number[]): string[] {
+  const whole = values.reduce((s, v) => s + v, 0);
+  if (whole <= 0) return values.map(() => "0%");
+  // Work in tenths of a percent so labels carry one decimal and sum to exactly 1000 (= 100.0%).
+  const tenths = values.map((v) => (v / whole) * 1000);
+  const floor = tenths.map(Math.floor);
+  let leftover = 1000 - floor.reduce((s, v) => s + v, 0);
+  const byFrac = tenths
+    .map((v, i) => ({ i, frac: v - Math.floor(v) }))
+    .sort((a, b) => b.frac - a.frac);
+  for (let k = 0; leftover > 0 && k < byFrac.length; k++, leftover--) {
+    floor[byFrac[k].i] += 1;
+  }
+  return floor.map((t) => {
+    const p = t / 10;
+    return Number.isInteger(p) ? `${p}%` : `${p.toFixed(1)}%`;
+  });
+}
+
 // On a 1-day window the x-axis reads as wall-clock time; over longer windows a
 // month/day label keeps ticks legible. The tooltip always shows the full
 // timestamp so a hovered point is never ambiguous.
@@ -750,9 +775,14 @@ function StatusDonut({ by_status }: { by_status: MetricStatus[] }) {
   const sorted = [...by_status].sort((a, b) =>
     a.status_class.localeCompare(b.status_class),
   );
+  const shares = shareLabels(sorted.map((s) => s.count));
   return (
     <div className="flex flex-col items-center gap-4">
-      <div className="h-48 w-full" role="img" aria-label="Response status mix by HTTP status class.">
+      <div
+        className="relative h-48 w-full"
+        role="img"
+        aria-label={`Response status mix across ${count(total)} responses by HTTP status class.`}
+      >
         <ResponsiveContainer width="100%" height="100%">
           <PieChart accessibilityLayer={false}>
             <Pie
@@ -775,9 +805,16 @@ function StatusDonut({ by_status }: { by_status: MetricStatus[] }) {
             </Pie>
           </PieChart>
         </ResponsiveContainer>
+        {/* The whole the slices divide, anchored in the hole — the focal value the empty centre wasted. */}
+        <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center gap-0.5">
+          <span className="text-xl font-semibold leading-none tabular-nums">
+            {compactNum(total)}
+          </span>
+          <span className="text-[11px] text-muted-foreground">responses</span>
+        </div>
       </div>
       <ul className="flex w-full flex-col items-center gap-y-1.5 text-[13px] sm:flex-row sm:flex-wrap sm:justify-center sm:gap-x-4 sm:gap-y-2">
-        {sorted.map((s) => (
+        {sorted.map((s, i) => (
           <li
             key={s.status_class}
             className="flex items-center gap-1.5 whitespace-nowrap"
@@ -789,7 +826,7 @@ function StatusDonut({ by_status }: { by_status: MetricStatus[] }) {
             />
             <span className="font-medium">{s.status_class}</span>
             <span className="text-muted-foreground">
-              {count(s.count)} · {pct(s.count, total)}
+              {count(s.count)} · {shares[i]}
             </span>
           </li>
         ))}
@@ -813,12 +850,13 @@ function ReadsWritesDonut({
     { name: "Reads", value: reads, fill: "var(--color-chart-1)" },
     { name: "Writes", value: writes, fill: "var(--color-chart-2)" },
   ];
+  const shares = shareLabels(slices.map((s) => s.value));
   return (
     <div className="flex flex-col items-center gap-4">
       <div
-        className="h-48 w-full"
+        className="relative h-48 w-full"
         role="img"
-        aria-label={`Reads versus writes: ${count(reads)} reads, ${count(writes)} writes.`}
+        aria-label={`Reads versus writes across ${count(total)} operations: ${count(reads)} reads, ${count(writes)} writes.`}
       >
         <ResponsiveContainer width="100%" height="100%">
           <PieChart accessibilityLayer={false}>
@@ -839,9 +877,16 @@ function ReadsWritesDonut({
             </Pie>
           </PieChart>
         </ResponsiveContainer>
+        {/* The whole the slices divide, anchored in the hole — the focal value the empty centre wasted. */}
+        <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center gap-0.5">
+          <span className="text-xl font-semibold leading-none tabular-nums">
+            {compactNum(total)}
+          </span>
+          <span className="text-[11px] text-muted-foreground">operations</span>
+        </div>
       </div>
       <ul className="flex w-full flex-col items-center gap-y-1.5 text-[13px] sm:flex-row sm:flex-wrap sm:justify-center sm:gap-x-4 sm:gap-y-2">
-        {slices.map((s) => (
+        {slices.map((s, i) => (
           <li key={s.name} className="flex items-center gap-1.5 whitespace-nowrap">
             <span
               aria-hidden="true"
@@ -850,7 +895,7 @@ function ReadsWritesDonut({
             />
             <span className="font-medium">{s.name}</span>
             <span className="text-muted-foreground">
-              {count(s.value)} · {pct(s.value, total)}
+              {count(s.value)} · {shares[i]}
             </span>
           </li>
         ))}
