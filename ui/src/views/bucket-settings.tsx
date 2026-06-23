@@ -1078,57 +1078,66 @@ export function BucketSettings() {
                     }
                   />
                 </div>
-                {/* TLS trust — only relevant for an https:// endpoint with a private/self-signed CA. */}
-                <div className="grid gap-1.5 md:col-span-2">
-                  <Label htmlFor={`${quotaId}-ca`}>
-                    CA certificate (PEM){" "}
-                    <span className="font-normal text-muted-foreground">
-                      — optional
-                    </span>
-                  </Label>
-                  <Textarea
-                    id={`${quotaId}-ca`}
-                    value={targetForm.ca_cert ?? ""}
-                    placeholder={
-                      "-----BEGIN CERTIFICATE-----\n…paste the peer's CA / self-signed cert to trust over HTTPS…\n-----END CERTIFICATE-----"
-                    }
-                    rows={3}
-                    spellCheck={false}
-                    disabled={targetForm.insecure_skip_verify}
-                    className="font-mono text-xs"
-                    onChange={(e) =>
-                      setTargetForm({ ...targetForm, ca_cert: e.target.value })
-                    }
-                  />
-                  <p className="text-[13px] text-muted-foreground">
-                    Needed only when the destination uses HTTPS with a private or
-                    self-signed certificate. Leave empty for a public CA or an
-                    http:// endpoint.
-                  </p>
-                </div>
-                <label className="flex items-start gap-3 md:col-span-2">
-                  <Checkbox
-                    checked={targetForm.insecure_skip_verify ?? false}
-                    onCheckedChange={(v) =>
-                      setTargetForm({
-                        ...targetForm,
-                        insecure_skip_verify: v === true,
-                      })
-                    }
-                    aria-label="Skip TLS certificate verification"
-                    className="mt-0.5"
-                  />
-                  <span>
-                    <span className="block text-sm">
-                      Skip TLS certificate verification
-                    </span>
-                    <span className="block text-[13px] text-muted-foreground">
-                      Accepts any certificate from the destination — for testing
-                      a self-signed endpoint only. Prefer pasting the CA
-                      certificate above.
-                    </span>
-                  </span>
-                </label>
+                {/* TLS trust is only meaningful for an https:// destination, so it stays hidden
+                    until the endpoint is one — keeping the common (http / not-yet-typed) form clean.
+                    Grouped under its own hairline-separated section, not lumped with the credentials. */}
+                {targetForm.endpoint.trim().toLowerCase().startsWith("https") && (
+                  <div className="mt-1 grid gap-3 border-t pt-4 md:col-span-2">
+                    <p className="text-[13px] font-medium text-foreground">
+                      Transport security
+                      <span className="ml-1.5 font-normal text-muted-foreground">
+                        — this endpoint is HTTPS
+                      </span>
+                    </p>
+                    <div className="grid gap-1.5">
+                      <Label htmlFor={`${quotaId}-ca`}>
+                        CA certificate{" "}
+                        <span className="font-normal text-muted-foreground">
+                          — optional
+                        </span>
+                      </Label>
+                      <Textarea
+                        id={`${quotaId}-ca`}
+                        value={targetForm.ca_cert ?? ""}
+                        placeholder="-----BEGIN CERTIFICATE-----"
+                        rows={4}
+                        spellCheck={false}
+                        disabled={targetForm.insecure_skip_verify}
+                        className="resize-y font-mono text-[13px] leading-relaxed disabled:opacity-50"
+                        onChange={(e) =>
+                          setTargetForm({ ...targetForm, ca_cert: e.target.value })
+                        }
+                      />
+                      <p className="text-[13px] text-muted-foreground">
+                        Paste the peer's certificate (PEM) when it's signed by a
+                        private or self-signed CA. Leave empty to trust the public
+                        certificate authorities.
+                      </p>
+                    </div>
+                    <label className="flex items-start gap-3">
+                      <Checkbox
+                        checked={targetForm.insecure_skip_verify ?? false}
+                        onCheckedChange={(v) =>
+                          setTargetForm({
+                            ...targetForm,
+                            insecure_skip_verify: v === true,
+                          })
+                        }
+                        aria-label="Skip TLS certificate verification"
+                        className="mt-0.5"
+                      />
+                      <span>
+                        <span className="block text-sm">
+                          Skip certificate verification
+                        </span>
+                        <span className="block text-[13px] text-muted-foreground">
+                          Accepts any certificate — for testing a self-signed
+                          endpoint only. Prefer pasting the CA above.
+                        </span>
+                      </span>
+                    </label>
+                  </div>
+                )}
               </div>
             </CardContent>
           </SettingsCard>
