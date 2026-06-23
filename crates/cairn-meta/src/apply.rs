@@ -433,18 +433,21 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             Ok(MutationOutcome::Ack)
         }
         Mutation::DeleteUser(id) => {
-            // Remove everything that lets the user act, in one commit: their session credentials,
-            // their usage accounting, then the user row itself (which carries the identity policy
-            // column). The authenticator's cached principal is keyed off the now-gone record, so
-            // access is denied as soon as its epoch is bumped. Bucket ownership is checked by the
-            // caller (a bucket cannot be orphaned), so no bucket rows are touched here.
+            // Remove everything that lets the user act, in one commit: their session credentials and
+            // the user row itself (which carries the identity policy column). The authenticator's
+            // cached principal is keyed off the now-gone record, so access is denied as soon as its
+            // epoch is bumped. Bucket ownership is checked by the caller (a bucket cannot be
+            // orphaned). We deliberately do NOT touch user_stats: objects the user uploaded into
+            // other owners' buckets stay (their owner_id becomes a historical dangling id, which is
+            // harmless), and `user_stats.logical_bytes` must stay equal to the sum of those
+            // still-owned object sizes — an enforced integrity invariant — so deleting one of those
+            // objects later decrements the existing row toward zero instead of re-creating it with a
+            // negative balance.
             conn.execute(
                 "DELETE FROM session_credentials WHERE parent_user_id=?1",
                 params![id.0],
             )
             .map_err(engine_err)?;
-            conn.execute("DELETE FROM user_stats WHERE owner_id=?1", params![id.0])
-                .map_err(engine_err)?;
             conn.execute("DELETE FROM users WHERE id=?1", params![id.0])
                 .map_err(engine_err)?;
             Ok(MutationOutcome::Ack)
@@ -1586,6 +1589,37 @@ mod tests {
                 bucket: BucketName::parse("bkt").unwrap(),
                 key: ObjectKey::parse("k1").unwrap(),
                 version_id: VersionId::from_string("v3".to_owned()),
+            },
+        )
+        .unwrap();
+        assert_counters_match_scan(&conn);
+    }
+
+    #[test]
+    fn deleting_an_owner_keeps_user_stats_consistent() {
+        // Regression: DeleteUser must NOT drop an owner's user_stats while that owner still has
+        // object rows. If it did, a later deletion of one of those objects would decrement a missing
+        // row and re-create it with a NEGATIVE balance, breaking the enforced
+        // `user_stats sum == object scan` invariant (and corrupting quota accounting). The presence
+        // of an actual users row is irrelevant here — the bug is purely the stats/object interaction.
+        let conn = conn_with_schema();
+        seed_bucket(&conn, "bkt", None);
+        apply(&conn, put(obj_row_owned("bkt", "k1", "v1", 10, "alice"))).unwrap();
+        apply(&conn, put(obj_row_owned("bkt", "k2", "v1", 20, "bob"))).unwrap();
+        assert_counters_match_scan(&conn);
+
+        // Delete alice while she still owns "k1": her objects — and so her stats — must survive.
+        apply(&conn, Mutation::DeleteUser(UserId("alice".to_owned()))).unwrap();
+        assert_counters_match_scan(&conn);
+
+        // Removing alice's object now decrements her surviving stats row toward zero, rather than
+        // resurrecting a negative one.
+        apply(
+            &conn,
+            Mutation::DeleteVersion {
+                bucket: BucketName::parse("bkt").unwrap(),
+                key: ObjectKey::parse("k1").unwrap(),
+                version_id: VersionId::from_string("v1".to_owned()),
             },
         )
         .unwrap();

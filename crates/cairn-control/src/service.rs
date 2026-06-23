@@ -1872,7 +1872,11 @@ impl ControlService {
             );
         }
 
-        // Guard 3: never remove the last administrator — the node must always have one.
+        // Guard 3: never remove the last administrator — the node must always have one. This is a
+        // best-effort pre-check (read outside the writer transaction), so two simultaneous deletes
+        // of the last two admins could in principle both pass; that is acceptable because the root
+        // admin (Guard 2, re-seeded on every startup) is itself an undeletable active administrator,
+        // so a node can never actually be left with zero admins.
         if record.user.role == Role::Administrator && record.user.is_active {
             let users = match self.meta.list_users().await {
                 Ok(u) => u,

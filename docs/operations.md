@@ -72,14 +72,28 @@ The replication worker ships outbox entries to one or more S3-compatible destina
 
 ## 3. Bootstrapping
 
-On a fresh store, create the first administrator (one-time, loopback-local):
+Bootstrapping is automatic: every `serve` start ensures a single **root** administrator from
+`CAIRN_ROOT_ACCESS_KEY` / `CAIRN_ROOT_SECRET_KEY` (default `cairn` / `cairnadmin`) exists, so a fresh
+node is usable immediately. There is exactly one default admin; create further users from the console
+or `cairn remote user create`.
+
+`cairn bootstrap` is an optional convenience that ensures that same root admin and prints its
+credentials:
 
 ```sh
-cairn bootstrap        # prints Bearer + SigV4 credentials ONCE — save them
+cairn bootstrap        # ensures the root admin and prints its credentials
 ```
 
-It refuses to run once any user exists. The credentials are shown only once; afterward only the
-Bearer hash and the encrypted SigV4 secret remain.
+It is **idempotent** — it seeds the same `root` identity `serve` would, so running it before `serve`
+(or repeatedly) never produces a second default admin. Set `CAIRN_ROOT_ACCESS_KEY` /
+`CAIRN_ROOT_SECRET_KEY` before exposing a node; the stored form is only the Bearer hash and the
+encrypted SigV4 secret.
+
+A user can be permanently deleted (console, `cairn remote user rm <id>`, or `DELETE
+/api/v1/users/{id}`), which revokes all of its access immediately. The root administrator, the last
+administrator, the signed-in user, and any user that still owns buckets are refused. Deleting a user
+leaves objects it had uploaded into other owners' buckets in place (their owner becomes a historical
+id); only its credentials, sessions, and identity policy are removed.
 
 ## 4. Deployment shapes
 
