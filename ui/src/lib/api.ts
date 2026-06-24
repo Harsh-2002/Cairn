@@ -1,9 +1,11 @@
 // Thin client of the Cairn management API (ARCH 22, 23).
 //
-// Every request is admin-gated via a Bearer token of the form
-// `cairn_<id>.<secret>`. The token is held in memory and mirrored to
-// localStorage so a reload keeps the session. The UI carries no privileged
-// logic of its own: it is a pure presentation layer over the control plane.
+// Authentication is an httpOnly session cookie set by the server at sign-in
+// (`POST /session`) and cleared at sign-out (`DELETE /session`). The browser
+// attaches it automatically to these same-origin requests, so the credential is
+// never held in JS-readable storage (no localStorage token to steal via XSS).
+// The UI carries no privileged logic of its own: it is a pure presentation layer
+// over the control plane.
 
 import type {
   ActivityResp,
@@ -43,37 +45,12 @@ import type {
 } from "./types";
 
 const BASE = "/api/v1";
-const TOKEN_KEY = "cairn.token";
 
-let token: string | null = null;
-
-export function loadToken(): string {
-  if (token === null) {
-    try {
-      token = localStorage.getItem(TOKEN_KEY) ?? "";
-    } catch {
-      token = "";
-    }
-  }
-  return token;
-}
-
-export function setToken(value: string): void {
-  token = value || "";
-  try {
-    if (token) localStorage.setItem(TOKEN_KEY, token);
-    else localStorage.removeItem(TOKEN_KEY);
-  } catch {
-    /* storage may be unavailable; in-memory token still works */
-  }
-}
-
-export function clearToken(): void {
-  setToken("");
-}
-
-export function hasToken(): boolean {
-  return !!loadToken();
+/** The non-sensitive identity the server reports for the current session. */
+export interface SessionInfo {
+  access_key_id: string;
+  display_name: string;
+  role: "administrator" | "member";
 }
 
 // A session-expiry hook: the auth provider registers a callback that clears
@@ -230,10 +207,9 @@ function sentence(s: string): string {
 }
 
 function authHeaders(extra?: Record<string, string>): Record<string, string> {
-  const headers: Record<string, string> = { Accept: "application/json", ...extra };
-  const tok = loadToken();
-  if (tok) headers.Authorization = `Bearer ${tok}`;
-  return headers;
+  // No Authorization header: the httpOnly session cookie carries auth and the browser sends it
+  // automatically on these same-origin requests (see `credentials: "same-origin"` below).
+  return { Accept: "application/json", ...extra };
 }
 
 async function handleResponse<T>(res: Response): Promise<T> {
@@ -264,7 +240,11 @@ async function request<T>(
   path: string,
   body?: unknown,
 ): Promise<T> {
-  const init: RequestInit = { method, headers: authHeaders() };
+  const init: RequestInit = {
+    method,
+    headers: authHeaders(),
+    credentials: "same-origin",
+  };
   if (body !== undefined) {
     (init.headers as Record<string, string>)["Content-Type"] =
       "application/json";
@@ -293,6 +273,7 @@ async function requestRaw<T>(
     res = await fetch(BASE + path, {
       method,
       headers: authHeaders({ "Content-Type": "application/json" }),
+      credentials: "same-origin",
       body: rawBody,
     });
   } catch (e) {
@@ -305,6 +286,21 @@ const enc = encodeURIComponent;
 
 export const api = {
   health: () => request<{ status: string; ready: boolean }>("GET", "/health"),
+
+  // --- Session (httpOnly cookie auth) ---
+  // Sign in: the server validates the credential and sets the httpOnly session cookie. The secret
+  // is sent once in this request body and never stored in JS afterwards.
+  createSession: (accessKey: string, secretKey: string) =>
+    request<SessionInfo>("POST", "/session", {
+      access_key: accessKey,
+      secret_key: secretKey,
+    }),
+  // Who am I: 200 with the current identity if the cookie authenticates, else 401. Lets the SPA
+  // decide between the console and the login screen without ever reading the cookie.
+  session: () => request<SessionInfo>("GET", "/session"),
+  // Sign out: expire the cookie server-side.
+  endSession: () => request<{ ok: boolean }>("DELETE", "/session"),
+
   overview: () => request<OverviewResp>("GET", "/overview"),
   overviewBuckets: () =>
     request<OverviewBucketsResp>("GET", "/overview/buckets"),

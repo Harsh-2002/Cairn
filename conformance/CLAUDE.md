@@ -25,6 +25,10 @@ fuzz tests live next to their sources). Two kinds — keep them distinct:
 - `sts.sh` (+`sts.py`) — STS temporary credentials: mints a scoped session via the management API,
   then proves a standard S3 SDK consumes it (`X-Amz-Security-Token`) with exactly the granted access
   (scoped GET allowed; ungranted PUT / cross-bucket / tampered / absent-token denied). UI listener ON.
+- `console_session.sh` — console httpOnly session-cookie auth (pure curl, no SDK): `POST /session`
+  sets the `cairn_session` cookie; the cookie alone authenticates the management API and the S3 data
+  plane on the UI port; it is REJECTED on the S3 data-plane port (cookies aren't port-isolated); wrong
+  secret → 401; `DELETE /session` clears it. UI listener ON.
 
 ## regression / limit (where does it break?)
 - `replication_chaos.sh` (+`.py`) — break replication on purpose (target down, source SIGKILL); assert no loss.

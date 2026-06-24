@@ -1,15 +1,13 @@
-// Object data plane. The S3 API (served at the root, path-style) accepts the same
-// Bearer credential as the management API, so the browser can upload, download,
-// preview, and delete object bytes directly — no separate SDK or signing needed.
+// Object data plane. The S3 API (served at the root, path-style) shares the console's auth, so the
+// browser can upload, download, preview, and delete object bytes directly — no separate SDK or
+// signing needed. Auth rides the httpOnly session cookie, which the browser attaches automatically
+// to these same-origin requests (the web-UI listener accepts the cookie as a Bearer credential).
 
-import { ApiError, loadToken } from "./api";
+import { ApiError } from "./api";
 import type { ReplicationRule } from "./types";
 
 function s3headers(extra?: Record<string, string>): Record<string, string> {
-  const h: Record<string, string> = { ...extra };
-  const tok = loadToken();
-  if (tok) h.Authorization = `Bearer ${tok}`;
-  return h;
+  return { ...extra };
 }
 
 /**
@@ -82,8 +80,7 @@ export function putObjectWithProgress(
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhr.open("PUT", objectPath(bucket, key));
-    const tok = loadToken();
-    if (tok) xhr.setRequestHeader("Authorization", `Bearer ${tok}`);
+    // Same-origin XHR sends the httpOnly session cookie automatically; no Authorization header.
     xhr.setRequestHeader(
       "Content-Type",
       file.type || "application/octet-stream",

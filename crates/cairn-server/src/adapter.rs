@@ -8,6 +8,8 @@
 //! [`incoming_to_stream`].
 
 use crate::stack::AppStack;
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
 use bytes::Bytes;
 use cairn_crypto::{SystemClock, SystemCrypto};
 use cairn_protocol::{S3Body, S3Request, S3Response, error_response};
@@ -53,7 +55,7 @@ pub async fn handle(
     let method = req.method().clone();
     let raw_path = req.uri().path().to_owned();
     let query_str = req.uri().query().unwrap_or("").to_owned();
-    let headers: Vec<(String, String)> = req
+    let mut headers: Vec<(String, String)> = req
         .headers()
         .iter()
         .map(|(k, v)| {
@@ -68,6 +70,20 @@ pub async fn handle(
         .find(|(k, _)| k == "host")
         .map(|(_, v)| v.clone())
         .unwrap_or_default();
+
+    // Console session cookie → Bearer. On the web-UI listener only, a request carrying the
+    // `cairn_session` httpOnly cookie (and no explicit Authorization header) is authenticated as if
+    // it sent the Bearer token the cookie holds — so the console never has to keep the credential in
+    // JS-readable storage. Gated on `serve_ui` because cookies are NOT port-isolated: a cookie set by
+    // the console on :7374 is also sent to the S3 data plane on :7373, which must keep ignoring it.
+    // The login endpoint (POST /api/v1/session) is exempt so a stale/invalid cookie cannot turn a
+    // fresh sign-in into a 401 before the body credentials are even checked.
+    let is_login = method == Method::POST && raw_path == "/api/v1/session";
+    if serve_ui && !is_login && !headers.iter().any(|(k, _)| k == "authorization") {
+        if let Some(token) = session_cookie_token(&headers) {
+            headers.push(("authorization".to_owned(), format!("Bearer {token}")));
+        }
+    }
 
     // Authenticate against a borrowed, library-neutral view.
     let principal = {
@@ -173,6 +189,21 @@ pub async fn handle(
                 .unwrap_or("");
             return crate::sse::events_stream(stack.clone(), ticket, topics, shutdown);
         }
+        // Console session: login (POST), whoami (GET), and logout (DELETE). Lives here, not in
+        // cairn-control, because it sets/clears the httpOnly `Set-Cookie` and validates login against
+        // the server auth chain — both transport concerns the JSON control plane does not own.
+        if subpath == "/session" {
+            return session_endpoint(
+                &stack,
+                &method,
+                &body_bytes,
+                principal.as_ref(),
+                &host,
+                peer,
+                secure,
+            )
+            .await;
+        }
         let resp = stack
             .control
             .handle(&method, subpath, &query, principal.as_ref(), body_bytes)
@@ -269,6 +300,161 @@ fn json_status(status: u16, body: &str) -> Response<ResponseBody> {
         .header("content-type", "application/json")
         .body(full_body(Bytes::from(body.to_owned())))
         .unwrap_or_else(|_| Response::new(full_body(Bytes::new())))
+}
+
+/// Build a JSON response with the given status, body, and extra response headers (e.g. `Set-Cookie`).
+fn json_status_with_headers(
+    status: u16,
+    body: &str,
+    extra: &[(&str, String)],
+) -> Response<ResponseBody> {
+    let mut builder = Response::builder()
+        .status(status)
+        .header("content-type", "application/json");
+    for (k, v) in extra {
+        builder = builder.header(*k, v.as_str());
+    }
+    builder
+        .body(full_body(Bytes::from(body.to_owned())))
+        .unwrap_or_else(|_| Response::new(full_body(Bytes::new())))
+}
+
+/// Name of the console's httpOnly session cookie (set on the web-UI listener only).
+const SESSION_COOKIE: &str = "cairn_session";
+/// How long the browser keeps the session cookie before it must sign in again.
+const SESSION_COOKIE_MAX_AGE_SECS: u64 = 43_200; // 12 hours
+
+/// Extract the Bearer token carried by the console session cookie, if present and well-formed.
+fn session_cookie_token(headers: &[(String, String)]) -> Option<String> {
+    let cookie = headers
+        .iter()
+        .find(|(k, _)| k == "cookie")
+        .map(|(_, v)| v.as_str())?;
+    let b64 = cookie_value(cookie, SESSION_COOKIE)?;
+    let bytes = B64URL.decode(b64).ok()?;
+    String::from_utf8(bytes).ok()
+}
+
+/// Read a single named cookie's value out of a `Cookie:` request-header string.
+fn cookie_value(cookie_header: &str, name: &str) -> Option<String> {
+    cookie_header.split(';').find_map(|pair| {
+        let (k, v) = pair.trim().split_once('=')?;
+        (k.trim() == name).then(|| v.trim().to_owned())
+    })
+}
+
+/// `Set-Cookie` value that stores `token` in the httpOnly session cookie. `Secure` is added only on
+/// a secure transport (so a plaintext dev listener can still store it); `SameSite=Strict` keeps the
+/// cookie off every cross-site request, which is the CSRF defense for the cookie-authenticated API.
+fn set_session_cookie(token: &str, secure: bool) -> String {
+    let value = B64URL.encode(token.as_bytes());
+    let mut c = format!(
+        "{SESSION_COOKIE}={value}; HttpOnly; SameSite=Strict; Path=/; Max-Age={SESSION_COOKIE_MAX_AGE_SECS}"
+    );
+    if secure {
+        c.push_str("; Secure");
+    }
+    c
+}
+
+/// `Set-Cookie` value that immediately expires the session cookie (logout).
+fn clear_session_cookie(secure: bool) -> String {
+    let mut c = format!("{SESSION_COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0");
+    if secure {
+        c.push_str("; Secure");
+    }
+    c
+}
+
+/// The console session endpoint: `POST` signs in (validates `{access_key, secret_key}` via the auth
+/// chain and sets the httpOnly cookie), `GET` reports the current session (so the SPA can decide
+/// whether to show the console or the login screen without ever reading the token), and `DELETE`
+/// signs out (expires the cookie). Admin-only sign-in: the console is an administrator surface.
+async fn session_endpoint(
+    stack: &AppStack,
+    method: &Method,
+    body: &Bytes,
+    principal: Option<&Principal>,
+    host: &str,
+    peer: IpAddr,
+    secure: bool,
+) -> Response<ResponseBody> {
+    match *method {
+        Method::POST => {
+            #[derive(serde::Deserialize)]
+            struct LoginReq {
+                access_key: String,
+                secret_key: String,
+            }
+            let req: LoginReq = match serde_json::from_slice(body) {
+                Ok(r) => r,
+                Err(_) => return json_status(400, r#"{"error":"invalid request body"}"#),
+            };
+            if req.access_key.is_empty() || req.secret_key.is_empty() {
+                return json_status(400, r#"{"error":"access_key and secret_key are required"}"#);
+            }
+            // The console credential IS the Bearer token `<access_key>.<secret_key>`; validate it
+            // through the same auth chain the API uses by synthesizing the header it expects.
+            let token = format!("{}.{}", req.access_key, req.secret_key);
+            let auth_headers = vec![
+                ("authorization".to_owned(), format!("Bearer {token}")),
+                ("host".to_owned(), host.to_owned()),
+            ];
+            let view = RequestView {
+                method: "POST",
+                path: "/api/v1/session",
+                query: "",
+                headers: &auth_headers,
+                host,
+                source: peer,
+                secure_transport: secure,
+            };
+            match stack.auth.authenticate(&view).await {
+                AuthOutcome::Authenticated(p) if p.role == Role::Administrator => {
+                    // The body never carries the secret — only the cookie (httpOnly) does.
+                    let body = serde_json::json!({
+                        "access_key_id": p.access_key_id,
+                        "display_name": p.display_name,
+                        "role": "administrator",
+                    })
+                    .to_string();
+                    json_status_with_headers(
+                        200,
+                        &body,
+                        &[("set-cookie", set_session_cookie(&token, secure))],
+                    )
+                }
+                AuthOutcome::Authenticated(_) => json_status(
+                    403,
+                    r#"{"error":"That credential is not an administrator. Only an admin can use the console."}"#,
+                ),
+                _ => json_status(401, r#"{"error":"Access key or secret key is incorrect."}"#),
+            }
+        }
+        Method::GET => match principal {
+            Some(p) => {
+                let role = if p.role == Role::Administrator {
+                    "administrator"
+                } else {
+                    "member"
+                };
+                let body = serde_json::json!({
+                    "access_key_id": p.access_key_id,
+                    "display_name": p.display_name,
+                    "role": role,
+                })
+                .to_string();
+                json_status(200, &body)
+            }
+            None => json_status(401, r#"{"error":"not authenticated"}"#),
+        },
+        Method::DELETE => json_status_with_headers(
+            200,
+            r#"{"ok":true}"#,
+            &[("set-cookie", clear_session_cookie(secure))],
+        ),
+        _ => json_status(405, r#"{"error":"method not allowed"}"#),
+    }
 }
 
 /// Strip header-injection and quoting characters from a download filename before it goes into
@@ -930,6 +1116,56 @@ mod tests {
         // Three source chunks must surface as three distinct data frames: proof the body streams
         // rather than collecting everything into a single buffer first.
         assert_eq!(frames, 3, "each source chunk must be its own frame");
+    }
+
+    /// The session cookie round-trips a Bearer token through base64url, and a missing/garbled cookie
+    /// yields `None` (never a panic) so a hostile `Cookie:` header degrades to "unauthenticated".
+    #[test]
+    fn session_cookie_round_trips_and_rejects_garbage() {
+        let token = "cairn_abc123.s3cr3t-value_with.dots";
+        let set = set_session_cookie(token, true);
+        assert!(set.contains("HttpOnly"));
+        assert!(set.contains("SameSite=Strict"));
+        assert!(set.contains("Secure"));
+        assert!(set.contains("Path=/"));
+        // Pull the cookie value back out of the Set-Cookie string and decode it.
+        let cookie_val = set
+            .split(';')
+            .next()
+            .unwrap()
+            .strip_prefix("cairn_session=")
+            .unwrap();
+        let headers = vec![("cookie".to_owned(), format!("cairn_session={cookie_val}"))];
+        assert_eq!(session_cookie_token(&headers).as_deref(), Some(token));
+
+        // Other cookies alongside ours are ignored; ours is found regardless of position/spacing.
+        let headers = vec![(
+            "cookie".to_owned(),
+            format!("theme=dark; cairn_session={cookie_val} ; other=1"),
+        )];
+        assert_eq!(session_cookie_token(&headers).as_deref(), Some(token));
+
+        // No cookie header, wrong name, and non-base64 garbage all yield None (no panic).
+        assert_eq!(session_cookie_token(&[]), None);
+        assert_eq!(
+            session_cookie_token(&[("cookie".to_owned(), "theme=dark".to_owned())]),
+            None
+        );
+        assert_eq!(
+            session_cookie_token(&[("cookie".to_owned(), "cairn_session=!!!not_b64".to_owned())]),
+            None
+        );
+    }
+
+    /// `Secure` is omitted on a plaintext transport (so a dev HTTP listener can still store the
+    /// cookie) and the clear variant expires it immediately.
+    #[test]
+    fn session_cookie_secure_flag_and_clear() {
+        assert!(!set_session_cookie("t", false).contains("Secure"));
+        assert!(set_session_cookie("t", true).contains("Secure"));
+        let cleared = clear_session_cookie(false);
+        assert!(cleared.contains("Max-Age=0"));
+        assert!(cleared.starts_with("cairn_session=;"));
     }
 
     /// Virtual-host addressing: with `CAIRN_S3_DOMAIN` set and a `<bucket>.<domain>` Host, the

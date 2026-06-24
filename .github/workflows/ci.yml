@@ -158,6 +158,17 @@ jobs:
       - name: Mint + enforce scoped session credentials over a real SDK (management UI listener on)
         run: BIN=target/debug/cairn PY=python3 bash conformance/sts.sh
 
+  console-session:
+    name: console session-cookie auth
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+      - run: cargo build --bin cairn
+      # Pure curl (no SDK): the httpOnly cookie flow is plain HTTP. Management UI listener on.
+      - name: httpOnly session-cookie auth + S3 data-plane port isolation (management UI listener on)
+        run: BIN=target/debug/cairn bash conformance/console_session.sh
+
   # conformance/mesh.sh (5-node full-mesh replication) is intentionally NOT gated here: it needs the
   # dev sandbox disabled and stands up five node processes on dedicated ports — too heavy and
   # environment-specific for the shared runner. Run it manually: `bash conformance/mesh.sh`.
