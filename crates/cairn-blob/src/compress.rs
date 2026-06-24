@@ -338,8 +338,24 @@ impl<R: Read + Seek> CompressedReader<R> {
         let index_offset = u64::from_le_bytes(t[22..30].try_into().unwrap());
         let index_len = u32::from_le_bytes(t[30..34].try_into().unwrap()) as usize;
 
-        if index_len != block_count * INDEX_ENTRY_LEN {
+        // `block_count` and `index_len` come straight from the (possibly bit-rotted or otherwise
+        // corrupt) trailer, so validate them BEFORE allocating: a `checked_mul` avoids a usize
+        // overflow, and bounding the index against the actual file size stops a trailer claiming a
+        // gigabyte index on a tiny file from forcing a multi-GB `vec![0u8; index_len]` allocation
+        // (an out-of-memory DoS the `read_exact` below would only catch after the allocation).
+        let expected_index_len = block_count
+            .checked_mul(INDEX_ENTRY_LEN)
+            .ok_or_else(|| BlobError::Corruption("block count overflows index length".into()))?;
+        if index_len != expected_index_len {
             return Err(BlobError::Corruption("index length mismatch".into()));
+        }
+        // The index is written within the file, ahead of the fixed-size trailer, so it must fit in
+        // `[index_offset, total - TRAILER_LEN)`. This caps the allocation below at the file size.
+        let body_len = total - TRAILER_LEN;
+        if index_offset > body_len || index_len as u64 > body_len - index_offset {
+            return Err(BlobError::Corruption(
+                "index does not fit within the file".into(),
+            ));
         }
         inner.seek(SeekFrom::Start(index_offset)).map_err(io)?;
         let mut idx = vec![0u8; index_len];
@@ -359,6 +375,37 @@ impl<R: Read + Seek> CompressedReader<R> {
                 logical_len: logical,
                 compressed,
             });
+        }
+        // Cross-validate the trailer's `logical_len` against the index BEFORE serving reads:
+        // `read_range` maps a logical offset to a block via `logical_len`/`block_size`, so a trailer
+        // claiming a logical length the index does not actually cover (e.g. `logical_len > 0` with
+        // `block_count == 0`) would index past `self.index` and panic. A non-empty blob must have a
+        // positive block size, exactly `ceil(logical_len / block_size)` blocks, and per-block logical
+        // lengths that sum to `logical_len`; an empty blob must have no blocks. Reject any mismatch as
+        // corruption so every value the reader trusts on read is established here.
+        if logical_len == 0 {
+            if block_count != 0 {
+                return Err(BlobError::Corruption(
+                    "empty blob with a non-zero block count".into(),
+                ));
+            }
+        } else {
+            if block_size == 0 {
+                return Err(BlobError::Corruption(
+                    "non-empty blob with a zero block size".into(),
+                ));
+            }
+            if logical_len.div_ceil(block_size) != block_count as u64 {
+                return Err(BlobError::Corruption(
+                    "block count does not cover the logical length".into(),
+                ));
+            }
+        }
+        let index_logical_sum: u64 = index.iter().map(|e| u64::from(e.logical_len)).sum();
+        if index_logical_sum != logical_len {
+            return Err(BlobError::Corruption(
+                "index logical lengths do not sum to the logical length".into(),
+            ));
         }
         Ok(Self {
             inner,
@@ -449,6 +496,71 @@ mod tests {
         let mut out = enc.feed(data);
         out.extend_from_slice(&enc.finish().unwrap());
         out
+    }
+
+    /// Build a raw 34-byte CRNB trailer with the given fields, for malformed-input tests.
+    fn trailer(
+        version: u8,
+        algo: u8,
+        block_size: u32,
+        logical_len: u64,
+        block_count: u32,
+        index_offset: u64,
+        index_len: u32,
+    ) -> Vec<u8> {
+        let mut t = Vec::with_capacity(TRAILER_LEN as usize);
+        t.extend_from_slice(MAGIC);
+        t.push(version);
+        t.push(algo);
+        t.extend_from_slice(&block_size.to_le_bytes());
+        t.extend_from_slice(&logical_len.to_le_bytes());
+        t.extend_from_slice(&block_count.to_le_bytes());
+        t.extend_from_slice(&index_offset.to_le_bytes());
+        t.extend_from_slice(&index_len.to_le_bytes());
+        assert_eq!(t.len(), TRAILER_LEN as usize);
+        t
+    }
+
+    /// Regression (fuzz-found, `compress_reader`): a trailer claiming a positive `logical_len` that
+    /// the index does not cover (here zero blocks) must be rejected at OPEN, rather than panicking
+    /// on a read that maps an offset to a block index past the (empty) index.
+    #[test]
+    fn open_rejects_logical_len_not_covered_by_index() {
+        let blob = trailer(VERSION_PLAIN, 1, 100, 1000, 0, 0, 0);
+        let err = CompressedReader::open_with_dek(Cursor::new(blob), None);
+        assert!(
+            err.is_err(),
+            "logical_len uncovered by the index must be rejected"
+        );
+    }
+
+    /// Regression: a corrupt trailer claiming a gigantic index on a tiny file must be rejected
+    /// before the index allocation — bounding it by the file size prevents an out-of-memory DoS.
+    #[test]
+    fn open_rejects_oversized_index_without_allocating() {
+        let block_count: u32 = 100_000_000; // index_len = 900 MB, but the file is 34 bytes
+        let blob = trailer(
+            VERSION_PLAIN,
+            1,
+            4096,
+            4096,
+            block_count,
+            0,
+            block_count * 9,
+        );
+        let err = CompressedReader::open_with_dek(Cursor::new(blob), None);
+        assert!(
+            err.is_err(),
+            "an index larger than the file must be rejected"
+        );
+    }
+
+    /// An empty blob with a non-zero block count, and a too-short file, are both rejected cleanly.
+    #[test]
+    fn open_rejects_inconsistent_empty_and_short() {
+        let blob = trailer(VERSION_PLAIN, 1, 4096, 0, 3, 0, 27);
+        assert!(CompressedReader::open_with_dek(Cursor::new(blob), None).is_err());
+        assert!(CompressedReader::open_with_dek(Cursor::new(vec![0u8; 10]), None).is_err());
     }
 
     #[test]

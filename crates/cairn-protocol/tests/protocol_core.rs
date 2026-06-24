@@ -4009,6 +4009,55 @@ async fn mandatory_sse_denies_plaintext_but_exempts_replicas() {
     );
 }
 
+/// Resource regression (ARCH 7.5, audit #11): a PUT declaring a `content-length` above the
+/// configured object-size ceiling is refused on the HEADER alone — before any body is staged — so a
+/// client cannot pin server memory or disk by declaring a huge object. The harness ceiling is 5 GiB.
+#[tokio::test]
+async fn oversize_content_length_is_refused_before_staging() {
+    let h = harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("big"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    // ~10 GB declared, a tiny actual body: the declared length alone must trip EntityTooLarge.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("big"),
+                Some("k"),
+                &[],
+                &[("content-length", "9999999999")],
+                b"tiny".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::BAD_REQUEST,
+        "a content-length above the object-size ceiling must be refused (EntityTooLarge)"
+    );
+    // The object must not have been created.
+    assert!(
+        h.meta
+            .current_version(
+                &BucketName::parse("big").unwrap(),
+                &ObjectKey::parse("k").unwrap(),
+            )
+            .await
+            .unwrap()
+            .is_none(),
+        "the over-ceiling PUT must not have staged or committed any object"
+    );
+}
+
 /// ACL replication, inbound side (ARCH 20.4): an admin-gated replica PUT applies the SOURCE ACL
 /// carried as a base64(JSON) `x-amz-meta-cairn-replica-acl` header; a malformed header fails OPEN
 /// (no ACL, no 4xx — a 4xx would be terminal at the source and stall that key's outbox); a non-admin

@@ -8,7 +8,14 @@
 #![forbid(unsafe_code)]
 
 mod commit;
-mod compress;
+// Public only so the fuzz target (an external crate under `fuzz/`) can drive `CompressedReader`
+// against arbitrary bytes; `#[doc(hidden)]` keeps it out of the published API surface. Not part of
+// the supported interface — internal callers still go through the re-exports below. The reader /
+// encoder deliberately do NOT implement `Debug`: they hold a raw DEK that must never be printed, so
+// the `missing_debug_implementations` lint (now that the module is public) is suppressed here.
+#[doc(hidden)]
+#[allow(missing_debug_implementations)]
+pub mod compress;
 mod hash;
 // Safe file-placement hints (preallocation + access advice) for the write fast path (ARCH 7.5).
 mod raw_io;

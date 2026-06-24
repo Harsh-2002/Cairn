@@ -1,0 +1,22 @@
+[package]
+name = "cairn-types-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+cairn-types = { path = ".." }
+
+[[bin]]
+name = "parse_ids"
+path = "fuzz_targets/parse_ids.rs"
+test = false
+doc = false
+bench = false
+
+# Detach from the parent workspace; cargo-fuzz builds this with a nightly toolchain.
+[workspace]

@@ -306,7 +306,7 @@ jobs:
         run: BIN=target/debug/cairn PY=python3 bash conformance/blob_limits.sh
 
   fuzz-smoke:
-    name: fuzz smoke (decoder, xml, policy)
+    name: fuzz smoke (decoder, xml, policy, compress, ids)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -325,6 +325,8 @@ jobs:
           (cd crates/cairn-protocol   && cargo fuzz run chunked_decoder  -- -max_total_time=45)
           (cd crates/cairn-xml  && cargo fuzz run request_parsers  -- -max_total_time=30)
           (cd crates/cairn-authz && cargo fuzz run parse_policy    -- -max_total_time=30)
+          (cd crates/cairn-blob  && cargo fuzz run compress_reader -- -max_total_time=45)
+          (cd crates/cairn-types && cargo fuzz run parse_ids       -- -max_total_time=30)
 
   benches:
     name: benchmarks compile

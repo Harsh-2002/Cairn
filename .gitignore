@@ -13,6 +13,10 @@ crates/cairn-xml/fuzz/corpus/
 crates/cairn-xml/fuzz/artifacts/
 crates/cairn-authz/fuzz/corpus/
 crates/cairn-authz/fuzz/artifacts/
+crates/cairn-blob/fuzz/corpus/
+crates/cairn-blob/fuzz/artifacts/
+crates/cairn-types/fuzz/corpus/
+crates/cairn-types/fuzz/artifacts/
 
 # --- Web UI (built bundle + deps + TS build cache) ---
 /ui/node_modules
