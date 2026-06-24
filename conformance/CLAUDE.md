@@ -29,6 +29,11 @@ fuzz tests live next to their sources). Two kinds — keep them distinct:
   sets the `cairn_session` cookie; the cookie alone authenticates the management API and the S3 data
   plane on the UI port; it is REJECTED on the S3 data-plane port (cookies aren't port-isolated); wrong
   secret → 401; `DELETE /session` clears it. UI listener ON.
+- `backup_restore.sh` — backup/restore/integrity (pure curl, Bearer auth, no SDK): populate varied
+  sizes/compressibility, `cairn integrity` clean baseline (errors=0), `cairn backup`, corrupt the
+  primary's largest blob, `cairn restore` into a FRESH data dir → every object byte-identical, then
+  delete a blob and assert `cairn integrity --repair` drops exactly the one dangling row (it 404s; the
+  others survive). Parses each synchronous CLI's stdout counts; never sleeps.
 
 ## regression / limit (where does it break?)
 - `replication_chaos.sh` (+`.py`) — break replication on purpose (target down, source SIGKILL); assert no loss.
