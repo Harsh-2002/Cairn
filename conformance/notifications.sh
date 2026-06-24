@@ -29,7 +29,7 @@ trap cleanup EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 
 [ -x "$BIN" ] || fail "binary not found or not executable: $BIN"
-[ -x "$PY" ] || fail "python interpreter not found: $PY (needs boto3)"
+command -v "$PY" >/dev/null 2>&1 || fail "python interpreter not found: $PY (needs boto3)"
 "$PY" -c "import boto3" 2>/dev/null || fail "boto3 not importable by $PY"
 
 BOOT="$("$BIN" bootstrap)" || fail "bootstrap failed"
