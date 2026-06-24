@@ -19,15 +19,25 @@ fuzz_target!(|data: &[u8]| {
             continue;
         };
         let ll = reader.logical_len();
-        // Full read, a boundary-crossing read, a mid read, and a just-past-the-end read — each must
-        // either decode or return a typed error, never panic. Bounds stay within a sane range so we
-        // test the reader's own arithmetic, not a contrived caller-impossible u64 overflow.
-        let _ = reader.read_range(0, ll);
+        let bs = reader.block_size().max(1);
+        // Read block-by-block exactly as the production read path does — it only ever calls
+        // `read_range` with a length within one block (`hi - lo <= block_size`), never the whole
+        // object in one allocation. We mirror that so the fuzzer exercises the real usage pattern;
+        // each call must decode or return a typed error, never panic. The loop is bounded so a
+        // many-block trailer cannot make a single fuzz unit run unbounded.
+        let mut off = 0u64;
+        let mut scanned = 0u64;
+        while off < ll && scanned < 8192 {
+            let len = bs.min(ll - off);
+            let _ = reader.read_range(off, len);
+            off = off.saturating_add(len.max(1));
+            scanned += 1;
+        }
+        // A few boundary reads (each within a block): just past the end, the last byte, the start.
+        let _ = reader.read_range(0, 1);
         if ll > 0 {
             let _ = reader.read_range(ll - 1, 4);
-            let _ = reader.read_range(ll / 2, ll / 2 + 1);
             let _ = reader.read_range(ll, 1);
         }
-        let _ = reader.read_range(0, 1);
     }
 });

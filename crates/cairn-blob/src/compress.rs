@@ -35,6 +35,10 @@ const VERSION_PLAIN: u8 = 1;
 const VERSION_ENCRYPTED: u8 = 2;
 const TRAILER_LEN: u64 = 34;
 const INDEX_ENTRY_LEN: usize = 9;
+/// Upper bound on a trailer's `block_size`, enforced at open. The writer uses ≤256 KiB; this cap is
+/// far above that yet bounds the per-block `read_range`/decompression allocation a corrupt or
+/// bit-rotted trailer could otherwise demand (the read path works one block at a time).
+const MAX_BLOCK_SIZE: u64 = 16 * 1024 * 1024;
 /// The AES-GCM nonce length (96 bits — the recommended GCM nonce size).
 const GCM_NONCE_LEN: usize = 12;
 
@@ -395,6 +399,15 @@ impl<R: Read + Seek> CompressedReader<R> {
                     "non-empty blob with a zero block size".into(),
                 ));
             }
+            // Cap the block size: the read path calls `read_range` (and `zstd`/`lz4` decompression)
+            // with a length bounded by ONE block, so a corrupt trailer claiming a multi-gigabyte
+            // block size would make the *server* allocate that per read. The writer uses ≤256 KiB;
+            // this cap is generously above that and bounds every per-block allocation.
+            if block_size > MAX_BLOCK_SIZE {
+                return Err(BlobError::Corruption(
+                    "block size exceeds the maximum".into(),
+                ));
+            }
             if logical_len.div_ceil(block_size) != block_count as u64 {
                 return Err(BlobError::Corruption(
                     "block count does not cover the logical length".into(),
@@ -405,6 +418,14 @@ impl<R: Read + Seek> CompressedReader<R> {
         if index_logical_sum != logical_len {
             return Err(BlobError::Corruption(
                 "index logical lengths do not sum to the logical length".into(),
+            ));
+        }
+        // A block holds at most `block_size` logical bytes (the format invariant). Enforcing it bounds
+        // each block's decompression target to the capped block size, so a corrupt per-block logical
+        // length cannot drive an outsized `zstd::decompress` buffer.
+        if index.iter().any(|e| u64::from(e.logical_len) > block_size) {
+            return Err(BlobError::Corruption(
+                "a block's logical length exceeds the block size".into(),
             ));
         }
         Ok(Self {
@@ -552,6 +573,25 @@ mod tests {
         assert!(
             err.is_err(),
             "an index larger than the file must be rejected"
+        );
+    }
+
+    /// Regression (fuzz-found, OOM): a trailer claiming a block size above the cap must be rejected
+    /// at open, so the per-block read path cannot be driven to allocate an outsized buffer.
+    #[test]
+    fn open_rejects_block_size_over_the_cap() {
+        // A minimal valid 1-block blob: [1 raw byte][index entry][trailer], but with a block size
+        // just over MAX_BLOCK_SIZE. Every other field is internally consistent, so only the cap
+        // rejects it.
+        let mut blob = vec![0u8]; // one raw block byte
+        blob.extend_from_slice(&1u32.to_le_bytes()); // index: phys_len = 1
+        blob.extend_from_slice(&1u32.to_le_bytes()); // index: logical_len = 1
+        blob.push(0); // index: compressed = false
+        let over_cap = (MAX_BLOCK_SIZE + 1) as u32;
+        blob.extend_from_slice(&trailer(VERSION_PLAIN, 0, over_cap, 1, 1, 1, 9));
+        assert!(
+            CompressedReader::open_with_dek(Cursor::new(blob), None).is_err(),
+            "a block size over the cap must be rejected"
         );
     }
 
