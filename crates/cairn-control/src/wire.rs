@@ -605,6 +605,12 @@ pub struct BucketConfigResp {
 pub struct SetEncryptionReq {
     /// `"AES256"` to encrypt new uploads by default (SSE-S3), `"none"` to turn the default off.
     pub algorithm: String,
+    /// When true, the bucket *mandates* encryption: a client PUT whose resolved encryption is "none"
+    /// is refused (an inbound replica is transparently encrypted instead). Defaults to false. Pairing
+    /// it with `algorithm: "AES256"` makes header-less client uploads encrypt by default *and*
+    /// guarantees no plaintext object can be stored.
+    #[serde(default)]
+    pub required: bool,
 }
 
 /// `PUT /buckets/{name}/versioning` request body.

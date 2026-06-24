@@ -236,6 +236,7 @@ export function BucketSettings() {
   const [quotaError, setQuotaError] = useState("");
   const [compression, setCompression] = useState("none");
   const [encryption, setEncryption] = useState("none");
+  const [sseRequired, setSseRequired] = useState(false);
   const [policyText, setPolicyText] = useState("");
   const [policyError, setPolicyError] = useState("");
   const [replTargetArn, setReplTargetArn] = useState("");
@@ -294,6 +295,7 @@ export function BucketSettings() {
     setEncryption(
       d.config.encryption?.algorithm?.toUpperCase() === "AES256" ? "AES256" : "none",
     );
+    setSseRequired(d.config.encryption?.required ?? false);
     setReplTargetArn(d.repl?.dest_bucket ?? "");
     setReplPrefix(d.repl?.prefix ?? "");
     setReplExisting(d.repl?.existing_objects ?? false);
@@ -379,11 +381,15 @@ export function BucketSettings() {
 
   function saveEncryption() {
     void run("encryption", async () => {
-      await api.setEncryption(name, encryption);
+      await api.setEncryption(name, encryption, sseRequired);
       toast.success(
-        encryption === "none"
-          ? "New uploads are stored unencrypted."
-          : "New uploads will be encrypted (AES-256).",
+        sseRequired
+          ? encryption === "none"
+            ? "Encryption required: uploads must request SSE-S3 or they're refused."
+            : "Encryption required: every upload is encrypted (AES-256)."
+          : encryption === "none"
+            ? "New uploads are stored unencrypted."
+            : "New uploads will be encrypted (AES-256).",
       );
     });
   }
@@ -1158,7 +1164,7 @@ export function BucketSettings() {
               </Button>
             }
           >
-            <CardContent>
+            <CardContent className="space-y-4">
               <Select value={encryption} onValueChange={setEncryption}>
                 <SelectTrigger
                   className="w-full sm:w-56"
@@ -1171,6 +1177,22 @@ export function BucketSettings() {
                   <SelectItem value="none">Off</SelectItem>
                 </SelectContent>
               </Select>
+              <label className="flex items-start gap-3">
+                <Checkbox
+                  checked={sseRequired}
+                  onCheckedChange={(v) => setSseRequired(v === true)}
+                  aria-label="Require encryption"
+                />
+                <span className="text-sm">
+                  <span className="font-medium">Require encryption</span>
+                  <span className="block text-muted-foreground">
+                    Refuse any upload that would store a plaintext object. With AES-256 selected,
+                    header-less uploads are encrypted automatically; with encryption Off, clients
+                    must send their own SSE header or the upload is rejected. Replicated objects are
+                    always encrypted, never refused.
+                  </span>
+                </span>
+              </label>
             </CardContent>
           </SettingsCard>
           )}

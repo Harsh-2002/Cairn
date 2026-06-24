@@ -550,6 +550,23 @@ impl S3Service {
         let request_id = req.request_id.clone();
         let body = streaming_body(&req, raw_body, self.max_object_size)?;
 
+        // An inbound replica is a PUT carrying `x-amz-meta-cairn-replica: true` (ARCH 20.4): mark
+        // the version a `Replica` so it is never re-replicated, and skip the outbox entirely (loop
+        // prevention). The marker is matched case-insensitively on the value. Only a privileged
+        // replication principal may classify a write as an inbound replica (audit #16): honoring the
+        // bare client header would let any writer mark their write a `Replica` to suppress its own
+        // replication or otherwise downgrade how it is handled. Replication ships under the
+        // destination's Administrator-role credential, so gate the marker on that role; a normal
+        // member's header is ignored and the write replicates normally. Computed up here because the
+        // mandatory-encryption decision below treats a replica differently from a client write.
+        let is_replica = req
+            .header("x-amz-meta-cairn-replica")
+            .is_some_and(|v| v.eq_ignore_ascii_case("true"))
+            && req
+                .principal
+                .as_ref()
+                .is_some_and(|p| p.role == Role::Administrator);
+
         // SSE-S3 (ARCH 27): when the client requests AES256 server-side encryption, mint a fresh
         // random DEK, hand it to the blob store (which compress-then-encrypts each block), and seal
         // it under the master key for the metadata row. The plaintext-MD5 ETag is unaffected
@@ -559,6 +576,24 @@ impl S3Service {
             Some(Ok(())) => true,
             Some(Err(e)) => return Err(e),
             None => self.bucket_default_sse(&bucket.name).await?,
+        };
+        // Mandatory encryption (the `encryption` aspect's `required` flag): the bucket must hold no
+        // plaintext object. A client PUT whose resolved encryption is "none" is refused; an inbound
+        // replica is instead transparently force-encrypted (never refused), so turning on
+        // mandatory-SSE can never break replication into the bucket — the replica arrives without an
+        // SSE header but is still stored encrypted, honouring the policy.
+        let want_sse = if !want_sse && self.bucket_sse_required(&bucket.name).await? {
+            if is_replica {
+                true
+            } else {
+                return Err(Error::InvalidRequest(
+                    "this bucket requires server-side encryption: send \
+                     `x-amz-server-side-encryption: AES256` or configure a default"
+                        .to_owned(),
+                ));
+            }
+        } else {
+            want_sse
         };
         let (sse_dek, sse_descriptor) = if want_sse {
             let (dek, descriptor) = self.new_sse_dek()?;
@@ -641,14 +676,8 @@ impl S3Service {
         // `Replica` to suppress its own replication (skip the outbox) or otherwise downgrade how
         // it is handled. Replication ships under the destination's Administrator-role credential,
         // so gate the marker on that role; a normal member's header is ignored and the write
-        // replicates normally.
-        let is_replica = req
-            .header("x-amz-meta-cairn-replica")
-            .is_some_and(|v| v.eq_ignore_ascii_case("true"))
-            && req
-                .principal
-                .as_ref()
-                .is_some_and(|p| p.role == Role::Administrator);
+        // `is_replica` was resolved before the SSE decision above (mandatory encryption treats a
+        // replica differently); reuse it here for the replication status + version-id handling.
         let replication_status =
             is_replica.then_some(cairn_types::meta::ReplicationStatus::Replica);
         // Resolve the object ACL. A normal client PUT honors a canned `x-amz-acl`; an inbound replica
@@ -3599,6 +3628,25 @@ impl S3Service {
                         .and_then(|a| a.as_str())
                         .map(|a| a.eq_ignore_ascii_case(SSE_AES256))
                 })
+                .unwrap_or(false)
+        }))
+    }
+
+    /// Whether the bucket *mandates* server-side encryption — the `encryption` config aspect with a
+    /// `"required": true` flag. When set, a PUT whose resolved encryption is "none" is refused for a
+    /// client write and force-encrypted for an inbound replica (so the bucket never holds a plaintext
+    /// object yet replication cannot be broken by enabling the policy). Fail-safe: a malformed
+    /// document counts as "not required" — the same lenient reading as `bucket_default_sse`, and the
+    /// setting is validated by the management API on write.
+    async fn bucket_sse_required(&self, bucket: &BucketName) -> Result<bool> {
+        let doc = self
+            .meta
+            .get_bucket_config(bucket, ConfigAspect::Encryption)
+            .await?;
+        Ok(doc.is_some_and(|d| {
+            serde_json::from_str::<serde_json::Value>(&d.0)
+                .ok()
+                .and_then(|v| v.get("required").and_then(serde_json::Value::as_bool))
                 .unwrap_or(false)
         }))
     }

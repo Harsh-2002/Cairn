@@ -3835,6 +3835,180 @@ async fn inbound_replica_marks_status_and_skips_outbox() {
     );
 }
 
+/// Mandatory bucket encryption (the `encryption` aspect's `required` flag, ARCH 27): a client PUT
+/// whose resolved encryption is "none" is refused (400); an explicit SSE-S3 PUT is accepted; an
+/// inbound replica is transparently force-encrypted rather than refused (so enabling the policy can
+/// never break replication); and a bucket that pairs `required` with a default algorithm encrypts
+/// header-less client uploads instead of refusing them.
+#[tokio::test]
+async fn mandatory_sse_denies_plaintext_but_exempts_replicas() {
+    use cairn_types::bucket::{ConfigAspect, ConfigDoc};
+    use cairn_types::meta::Mutation;
+    let h = harness().await;
+
+    // A bucket that REQUIRES encryption but sets no default algorithm.
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("must"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    h.meta
+        .submit(Mutation::SetBucketConfig {
+            bucket: BucketName::parse("must").unwrap(),
+            aspect: ConfigAspect::Encryption,
+            doc: Some(ConfigDoc(r#"{"required":true}"#.to_owned())),
+        })
+        .await
+        .unwrap();
+
+    // (1) A header-less client PUT would land plaintext → refused with 400.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("must"),
+                Some("plain"),
+                &[],
+                &[],
+                b"x".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::BAD_REQUEST,
+        "an unencrypted client PUT to a mandatory-SSE bucket must be refused"
+    );
+
+    // (2) An explicit SSE-S3 PUT is accepted and stored encrypted.
+    let (st, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("must"),
+                Some("enc"),
+                &[],
+                &[("x-amz-server-side-encryption", "AES256")],
+                b"x".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        header(&hdrs, "x-amz-server-side-encryption"),
+        Some("AES256")
+    );
+
+    // (3) SSE-KMS stays rejected (unsupported) — mandatory does not change that path.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("must"),
+                Some("kms"),
+                &[],
+                &[("x-amz-server-side-encryption", "aws:kms")],
+                b"x".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "SSE-KMS remains unsupported");
+
+    // (4) An inbound replica (admin + marker) without an SSE header is force-encrypted, NOT refused.
+    let (st, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("must"),
+                Some("rep"),
+                &[],
+                &[("x-amz-meta-cairn-replica", "true")],
+                b"x".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "a replica PUT into a mandatory-SSE bucket must succeed (force-encrypted, not refused)"
+    );
+    assert_eq!(
+        header(&hdrs, "x-amz-server-side-encryption"),
+        Some("AES256"),
+        "the replica is transparently encrypted"
+    );
+    let rep_row = h
+        .meta
+        .current_version(
+            &BucketName::parse("must").unwrap(),
+            &ObjectKey::parse("rep").unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        rep_row.sse_descriptor.is_some(),
+        "the replicated object is stored encrypted"
+    );
+
+    // (5) A bucket pairing `required` with a default algorithm encrypts a header-less client PUT
+    //     (the default applies) rather than refusing it.
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("mustdef"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    h.meta
+        .submit(Mutation::SetBucketConfig {
+            bucket: BucketName::parse("mustdef").unwrap(),
+            aspect: ConfigAspect::Encryption,
+            doc: Some(ConfigDoc(
+                r#"{"algorithm":"AES256","required":true}"#.to_owned(),
+            )),
+        })
+        .await
+        .unwrap();
+    let (st, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("mustdef"),
+                Some("k"),
+                &[],
+                &[],
+                b"x".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        header(&hdrs, "x-amz-server-side-encryption"),
+        Some("AES256"),
+        "with a default algorithm, a header-less PUT is encrypted, not refused"
+    );
+}
+
 /// ACL replication, inbound side (ARCH 20.4): an admin-gated replica PUT applies the SOURCE ACL
 /// carried as a base64(JSON) `x-amz-meta-cairn-replica-acl` header; a malformed header fails OPEN
 /// (no ACL, no 4xx — a 4xx would be terminal at the source and stall that key's outbox); a non-admin

@@ -1251,7 +1251,19 @@ impl ControlService {
             Err(e) => return ControlResponse::bad_request(&e.to_string()),
         };
         let doc = match req.algorithm.to_ascii_uppercase().as_str() {
-            "NONE" | "OFF" | "" => None,
+            "NONE" | "OFF" | "" => {
+                // No default algorithm. With `required`, the bucket still mandates encryption — a
+                // header-less client PUT is refused (must carry an explicit SSE header); without it,
+                // the encryption setting is off entirely.
+                if req.required {
+                    Some(ConfigDoc(r#"{"required":true}"#.to_owned()))
+                } else {
+                    None
+                }
+            }
+            "AES256" if req.required => Some(ConfigDoc(
+                r#"{"algorithm":"AES256","required":true}"#.to_owned(),
+            )),
             "AES256" => Some(ConfigDoc(r#"{"algorithm":"AES256"}"#.to_owned())),
             other => {
                 return ControlResponse::bad_request(&format!(

@@ -130,8 +130,9 @@ export interface BucketConfigResp {
   lifecycle: unknown | null;
   acl: unknown | null;
   public_access_block: unknown | null;
-  /** Default SSE document ({"algorithm":"AES256"}) or null when off. */
-  encryption: { algorithm?: string } | null;
+  /** SSE document ({"algorithm":"AES256","required":true}) or null when off. `required` mandates
+   * encryption: a client PUT that would store a plaintext object is refused. */
+  encryption: { algorithm?: string; required?: boolean } | null;
 }
 
 // --- Webhook event notifications (ARCH 20.6) ---
