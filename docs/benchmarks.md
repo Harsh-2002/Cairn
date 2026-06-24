@@ -304,31 +304,34 @@ body below `CAIRN_FASTIO_MIN_BYTES`) falls back to the unchanged streamed path b
 is **server CPU per GiB sent**, not latency, so the measurement is an A/B of CPU-seconds/GiB at equal
 throughput.
 
-One property still bounds the real-world win, visible in the engage counters: the fast path takes
-over only the **first request of a fresh TCP connection** and then force-closes it, so a keep-alive
-client doing many GETs on one pooled connection accelerates only the first. The size floor
-(`CAIRN_FASTIO_MIN_BYTES`, default 256 KiB) keeps small objects on the keep-alive streamed path,
-where the reconnect churn would otherwise outweigh the zero-copy saving. Measure the engage rate
-before assuming the win generalizes.
+The fast path is now a small Cairn-owned **HTTP/1.1 keep-alive loop** on the plaintext data-plane
+listener: per connection it serves each eligible large GET with one `sendfile(2)` and keeps the
+connection open for the next request, handing the connection to hyper (with the already-read bytes
+replayed) only when it hits a request it cannot serve. So a connection-pooled client engages the
+zero-copy path on **every** eligible GET on a connection, not just the first. The size floor
+(`CAIRN_FASTIO_MIN_BYTES`, default 256 KiB) still keeps small objects on the streamed path, where the
+per-request `sendfile` setup would outweigh the zero-copy saving.
 
-### Measured: engage rate under realistic load is ~0 (2026-06)
+### Engagement: before vs after the keep-alive rewrite
 
-Measured on both x86_64 and a real aarch64 Pi (kernel 7.0), driving `warp get --concurrent 4`:
+The earlier design **peeked only the first request** of a fresh TCP connection and then force-closed
+or handed the socket to hyper, so a pooled client accelerated only its first request. Measured then on
+both x86_64 and a real aarch64 Pi (kernel 7.0) under `warp get --concurrent 4`:
 
 | run | GETs served | served via `sendfile` | engage |
 |---|---:|---:|---:|
-| x86_64, fast-io | 1703 | 0 | **0%** |
-| aarch64, fast-io | 800 | 0 | **0%** |
+| x86_64, fast-io (peek-first, old) | 1703 | 0 | **0%** |
+| aarch64, fast-io (peek-first, old) | 800 | 0 | **0%** |
 
-`warp` (like every pooled S3 SDK — boto3, aws-sdk, etc.) opens a few keep-alive connections and the
-**first request on each is a prepare/PUT**, so the peek sees a non-GET → `ineligible` → hyper owns the
-connection → every subsequent GET bypasses the fast path. The only counters that move are a handful of
-`ineligible`/`not_object` fall-backs. A fresh-connection-per-GET client (verified separately: boto3
-with a new client per GET) *does* engage and is byte-identical (full + single range), but that pattern
-is rare in practice. **Conclusion: the sendfile fast path, as architected (peek-first-request →
-hand to hyper), delivers essentially zero benefit under realistic pooled-connection load.** Making it
-matter broadly requires preserving keep-alive — i.e. owning the HTTP/1.1 data-plane connection loop so
-every eligible GET can zero-copy without closing — which is a substantial change, not done here.
+Because `warp` (like every pooled S3 SDK — boto3, aws-sdk, etc.) opens a few keep-alive connections
+whose first request is a prepare/PUT, the peek saw a non-GET → `ineligible` → hyper owned the
+connection → every subsequent GET bypassed the fast path. The keep-alive rewrite removes that ceiling:
+the loop consumes each request and serves eligible GETs back-to-back without closing. This is now a
+**deterministic regression gate** — `conformance/sendfile_keepalive.sh` issues N GETs of a large
+object over one keep-alive connection and asserts `cairn_sendfile_get_total{result=ok}` rose by N (it
+rose by 1 under the old design); the gated `fast-io-conformance` CI job also runs the full boto3
+lifecycle through the fast path. The warp A/B above remains the way to measure the **CPU-per-GiB** win
+itself once engagement is non-zero.
 
 > **Build note:** `fast-io` is **glibc-Linux-only**. The `ktls` dependency does not cross-compile to
 > `aarch64-unknown-linux-musl` (a `cmsghdr`/`msghdr` struct-layout mismatch), so build the fast-io

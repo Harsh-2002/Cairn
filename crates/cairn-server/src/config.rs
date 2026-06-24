@@ -245,11 +245,13 @@ pub struct Config {
     pub root_secret_key: String,
 
     /// Minimum response size, in bytes, for the experimental `sendfile` GET fast path
-    /// (`CAIRN_FASTIO_MIN_BYTES`; only consulted in a `fast-io` build). The fast path force-closes
-    /// the connection (no keep-alive), so for small objects the reconnect churn can outweigh the
-    /// zero-copy saving; a GET whose body is below this floor falls back to the normal keep-alive
-    /// streamed path. `0` disables the floor (every eligible GET takes the fast path). Defaults to
-    /// 256 KiB — large enough that the sendfile saving dominates. Has no effect without `fast-io`.
+    /// (`CAIRN_FASTIO_MIN_BYTES`; only consulted in a `fast-io` build). The fast path now keeps the
+    /// connection alive across requests, but each fast-pathed GET still hands the socket to a
+    /// blocking thread for `sendfile` (with two non-blocking-mode toggles); for a tiny body that
+    /// per-request overhead can outweigh the zero-copy saving over the normal streamed path, so a GET
+    /// whose body is below this floor falls back to hyper instead. `0` disables the floor (every
+    /// eligible GET takes the fast path). Defaults to 256 KiB — large enough that the sendfile saving
+    /// dominates. Has no effect without `fast-io`.
     pub fastio_min_bytes: u64,
 }
 

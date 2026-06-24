@@ -180,6 +180,26 @@ jobs:
       - name: Snapshot fidelity + reconcile baseline + surgical integrity --repair
         run: BIN=target/debug/cairn bash conformance/backup_restore.sh
 
+  fast-io-conformance:
+    name: fast-io sendfile conformance + keep-alive engagement
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - run: pip install boto3
+      # Build the experimental zero-copy GET fast path (off by default) and prove the full S3
+      # lifecycle is correct through it with the fast path maximally engaged (FASTIO_MIN_BYTES=0)...
+      - run: cargo build --bin cairn --features fast-io
+      - name: Full boto3 lifecycle through the sendfile fast path
+        run: CAIRN_FASTIO_MIN_BYTES=0 BIN=target/debug/cairn PY=python3 bash conformance/run.sh
+      # ...and that a pooled client engages the zero-copy path on EVERY request on a connection, not
+      # just the first (the keep-alive rewrite's reason for being).
+      - name: Sendfile keep-alive engagement
+        run: BIN=target/debug/cairn bash conformance/sendfile_keepalive.sh
+
   # conformance/mesh.sh (5-node full-mesh replication) is intentionally NOT gated here: it needs the
   # dev sandbox disabled and stands up five node processes on dedicated ports — too heavy and
   # environment-specific for the shared runner. Run it manually: `bash conformance/mesh.sh`.

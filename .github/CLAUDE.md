@@ -8,7 +8,7 @@ CI and release automation.
   `doc` tests, the conformance/regression e2e jobs (`conformance`, `rotation`, `share`, `concurrency`,
   `crash-consistency`, `crash-multipoint`, `soak`, `replication-chaos`, `warp`, `warp-escalate`,
   `blob-limits`, `scrub`, `object-lock`, `notifications`, `sts`, `console-session`,
-  `backup-restore`), `fuzz-smoke`, `benches` (compile), `coverage`.
+  `backup-restore`, `fast-io-conformance`), `fuzz-smoke`, `benches` (compile), `coverage`.
 - `workflows/release.yml` — release artifacts. `actions/setup/` — the shared toolchain setup.
 
 ## Notes
