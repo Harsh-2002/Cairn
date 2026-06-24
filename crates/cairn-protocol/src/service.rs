@@ -633,13 +633,6 @@ impl S3Service {
 
         let versioned = bucket.versioning == VersioningState::Enabled;
         let now = self.clock.now();
-        // Honor a canned x-amz-acl when the bucket's ownership mode keeps ACLs in force.
-        let acl = match req.header("x-amz-acl") {
-            Some(canned) if bucket.ownership_mode != OwnershipMode::BucketOwnerEnforced => {
-                cairn_authz::expand_canned_acl(canned, &bucket.owner_id)
-            }
-            _ => None,
-        };
         // An inbound replica is a PUT carrying `x-amz-meta-cairn-replica: true` (ARCH 20.4): mark
         // the version a `Replica` so it is never re-replicated, and skip the outbox entirely (loop
         // prevention). The marker is matched case-insensitively on the value.
@@ -658,6 +651,20 @@ impl S3Service {
                 .is_some_and(|p| p.role == Role::Administrator);
         let replication_status =
             is_replica.then_some(cairn_types::meta::ReplicationStatus::Replica);
+        // Resolve the object ACL. A normal client PUT honors a canned `x-amz-acl`; an inbound replica
+        // instead reproduces the SOURCE grants carried as a base64(JSON) header (ARCH 20.4). Either
+        // way `BucketOwnerEnforced` disables object ACLs, so any ACL — client or replicated — is
+        // dropped under it. Block-Public-Access is enforced at read time uniformly (cairn-authz), so a
+        // replicated public-read ACL is subject to the destination's BPA exactly like a client one;
+        // nothing extra is needed here.
+        let acl = if bucket.ownership_mode == OwnershipMode::BucketOwnerEnforced {
+            None
+        } else if is_replica {
+            replica_acl(&req)
+        } else {
+            req.header("x-amz-acl")
+                .and_then(|canned| cairn_authz::expand_canned_acl(canned, &bucket.owner_id))
+        };
         // Preserve the SOURCE version id for an inbound replica (AWS S3 CRR semantics, ARCH 20.4):
         // a version then has the same identity on every node, and re-delivery is an idempotent
         // upsert on (bucket, key, version_id) rather than a duplicate version. Gated on the same
@@ -4076,6 +4083,33 @@ fn replica_version_id(req: &S3Request, is_replica: bool) -> Option<VersionId> {
         .map(str::trim)
         .filter(|v| !v.is_empty())
         .map(|v| VersionId::from_string(v.to_owned()))
+}
+
+/// The ACL a destination applies to an inbound replica, read from the `x-amz-meta-cairn-replica-acl`
+/// header (base64 of the JSON `Acl`) the source sink emits (ARCH 20.4). The caller invokes this only
+/// on the admin-gated replica path. It is deliberately **fail-open**: an absent header, or ANY
+/// base64/JSON decode failure, yields `None` (no ACL) plus a warning — never an error. A 4xx here
+/// would be classified terminal by the source sink and would permanently stall that key's outbox, so
+/// a malformed ACL must degrade to "default ownership" rather than block replication.
+fn replica_acl(req: &S3Request) -> Option<Acl> {
+    let raw = req
+        .header("x-amz-meta-cairn-replica-acl")
+        .map(str::trim)
+        .filter(|v| !v.is_empty())?;
+    let bytes = match base64::engine::general_purpose::STANDARD.decode(raw) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "inbound replica ACL header is not valid base64; ignoring (fail-open)");
+            return None;
+        }
+    };
+    match serde_json::from_slice::<Acl>(&bytes) {
+        Ok(acl) => Some(acl),
+        Err(e) => {
+            tracing::warn!(error = %e, "inbound replica ACL header is not valid JSON; ignoring (fail-open)");
+            None
+        }
+    }
 }
 
 /// Build a delete-marker version row for an inbound *replica* delete (ARCH 20.4). Stamped

@@ -3835,6 +3835,167 @@ async fn inbound_replica_marks_status_and_skips_outbox() {
     );
 }
 
+/// ACL replication, inbound side (ARCH 20.4): an admin-gated replica PUT applies the SOURCE ACL
+/// carried as a base64(JSON) `x-amz-meta-cairn-replica-acl` header; a malformed header fails OPEN
+/// (no ACL, no 4xx — a 4xx would be terminal at the source and stall that key's outbox); a non-admin
+/// cannot apply one (the replica marker is ignored); and `BucketOwnerEnforced` drops it entirely,
+/// exactly as it drops a client `x-amz-acl`.
+#[tokio::test]
+async fn inbound_replica_applies_acl_fail_open_and_respects_ownership() {
+    use base64::Engine as _;
+    use cairn_types::authz::{Acl, Grant, Grantee, Permission};
+
+    let h = harness().await;
+    acl_enabled_bucket(&h, "racl").await;
+
+    let acl = Acl {
+        owner: UserId("admin".to_owned()),
+        grants: vec![Grant {
+            grantee: Grantee::AllUsers,
+            permission: Permission::Read,
+        }],
+    };
+    let acl_b64 =
+        base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&acl).unwrap());
+    let racl = BucketName::parse("racl").unwrap();
+
+    // (1) A valid ACL header on an admin replica PUT is applied verbatim.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("racl"),
+                Some("ok"),
+                &[],
+                &[
+                    ("x-amz-meta-cairn-replica", "true"),
+                    ("x-amz-meta-cairn-replica-acl", acl_b64.as_str()),
+                ],
+                b"x".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let ok_row = h
+        .meta
+        .current_version(&racl, &ObjectKey::parse("ok").unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        ok_row.acl.as_ref(),
+        Some(&acl),
+        "a valid replica ACL header is applied verbatim"
+    );
+
+    // (2) A malformed ACL header fails OPEN: 2xx and no ACL stored (never a 4xx that stalls the outbox).
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("racl"),
+                Some("bad"),
+                &[],
+                &[
+                    ("x-amz-meta-cairn-replica", "true"),
+                    ("x-amz-meta-cairn-replica-acl", "!!!not-base64!!!"),
+                ],
+                b"x".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "a malformed replica ACL must fail open, not error"
+    );
+    let bad_row = h
+        .meta
+        .current_version(&racl, &ObjectKey::parse("bad").unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        bad_row.acl.is_none(),
+        "a malformed replica ACL header stores no ACL (fail-open)"
+    );
+
+    // (3) A non-admin cannot apply a replica ACL: the marker is ignored, and with no x-amz-acl the
+    //     object gets no ACL.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req_with_principal(
+                Method::PUT,
+                Some("racl"),
+                Some("mem"),
+                &[],
+                &[
+                    ("x-amz-meta-cairn-replica", "true"),
+                    ("x-amz-meta-cairn-replica-acl", acl_b64.as_str()),
+                ],
+                b"x".to_vec(),
+                member("intruder"),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let mem_row = h
+        .meta
+        .current_version(&racl, &ObjectKey::parse("mem").unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        mem_row.acl.is_none(),
+        "a member's replica ACL header is ignored"
+    );
+
+    // (4) Under BucketOwnerEnforced (the default ownership) a replica ACL is dropped, just like a
+    //     client x-amz-acl.
+    versioned_bucket(&h, "boe").await;
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("boe"),
+                Some("k"),
+                &[],
+                &[
+                    ("x-amz-meta-cairn-replica", "true"),
+                    ("x-amz-meta-cairn-replica-acl", acl_b64.as_str()),
+                ],
+                b"x".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let boe_row = h
+        .meta
+        .current_version(
+            &BucketName::parse("boe").unwrap(),
+            &ObjectKey::parse("k").unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        boe_row.acl.is_none(),
+        "BucketOwnerEnforced drops the replicated ACL"
+    );
+}
+
 #[tokio::test]
 async fn inbound_replica_preserves_version_id_idempotently() {
     let h = harness().await;

@@ -227,6 +227,81 @@ async fn put_object_issues_well_formed_signed_request() {
     assert!(signature.bytes().all(|b| b.is_ascii_hexdigit()));
 }
 
+/// The object ACL is replicated as a base64(JSON) `x-amz-meta-cairn-replica-acl` header when (and
+/// only when) the replicated object carries one; it round-trips back to the same `Acl`.
+#[tokio::test]
+async fn put_object_emits_acl_header_only_when_present() {
+    use base64::Engine as _;
+    use cairn_types::authz::{Acl, Grant, Grantee, Permission};
+    use cairn_types::id::UserId;
+
+    let acl = Acl {
+        owner: UserId("owner-1".to_owned()),
+        grants: vec![
+            Grant {
+                grantee: Grantee::User(UserId("owner-1".to_owned())),
+                permission: Permission::FullControl,
+            },
+            Grant {
+                grantee: Grantee::AllUsers,
+                permission: Permission::Read,
+            },
+        ],
+    };
+
+    // (a) With an ACL: the header is present and decodes back to the exact same Acl.
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let authority = spawn_server(captured.clone(), Reply { status: 200 }).await;
+    let sink = sink_for(&authority, 1_440_938_160);
+    let object = ReplicatedObject {
+        key: ObjectKey::parse("acl/obj").unwrap(),
+        version_id: VersionId::from_string("v9".to_owned()),
+        content_type: "application/octet-stream".to_owned(),
+        user_metadata: Vec::new(),
+        etag: ETag::from_string("\"e\"".to_owned()),
+        size: 3,
+        tags: Vec::new(),
+        acl: Some(acl.clone()),
+        body: body_stream(b"abc"),
+    };
+    sink.put_object(&src(), object).await.unwrap();
+    let reqs = captured.lock().unwrap().clone();
+    let hdr = reqs[0]
+        .header("x-amz-meta-cairn-replica-acl")
+        .expect("ACL header must be present when the object has an ACL");
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(hdr)
+        .expect("ACL header is valid base64");
+    let decoded: Acl = serde_json::from_slice(&bytes).expect("ACL header is valid JSON");
+    assert_eq!(
+        decoded, acl,
+        "the replicated ACL round-trips through the header"
+    );
+
+    // (b) Without an ACL: no header at all.
+    let captured2 = Arc::new(Mutex::new(Vec::new()));
+    let authority2 = spawn_server(captured2.clone(), Reply { status: 200 }).await;
+    let sink2 = sink_for(&authority2, 1_440_938_160);
+    let object2 = ReplicatedObject {
+        key: ObjectKey::parse("noacl/obj").unwrap(),
+        version_id: VersionId::from_string("v10".to_owned()),
+        content_type: "application/octet-stream".to_owned(),
+        user_metadata: Vec::new(),
+        etag: ETag::from_string("\"e\"".to_owned()),
+        size: 0,
+        tags: Vec::new(),
+        acl: None,
+        body: body_stream(b""),
+    };
+    sink2.put_object(&src(), object2).await.unwrap();
+    let reqs2 = captured2.lock().unwrap().clone();
+    assert_eq!(
+        reqs2[0].header("x-amz-meta-cairn-replica-acl"),
+        None,
+        "no ACL on the object → no ACL header"
+    );
+}
+
 #[tokio::test]
 async fn put_object_recomputes_signature_when_a_header_changes() {
     // The signature must actually depend on the request: a different key produces a different

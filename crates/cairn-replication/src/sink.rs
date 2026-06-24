@@ -50,6 +50,7 @@
 //! [`HttpsConnector`]: hyper_rustls::HttpsConnector
 //! [`BucketRoutedSink`]: crate::BucketRoutedSink
 
+use base64::Engine as _;
 use cairn_auth::{canonical_request, compute_signature, sha256_hex, signing_key, string_to_sign};
 use cairn_types::error::ReplicationError;
 use cairn_types::id::{BucketName, ObjectKey, VersionId};
@@ -80,6 +81,11 @@ const REPLICA_MARKER_KEY: &str = "cairn-replica";
 /// destination preserves this exact version id so a version has the same identity on every node and
 /// re-delivery is an idempotent upsert (AWS S3 CRR semantics, ARCH 20.4).
 const REPLICA_VERSION_ID_KEY: &str = "cairn-replica-version-id";
+/// The source ACL metadata key (sent as `x-amz-meta-cairn-replica-acl`), carrying the object's ACL
+/// as base64 of its JSON so the destination version reproduces the source's grants (ARCH 20.4). Sent
+/// only when the rule replicates an ACL; base64 keeps the JSON's structural characters out of the
+/// header value. The destination applies it fail-open (a malformed value is ignored, never a 4xx).
+const REPLICA_ACL_KEY: &str = "cairn-replica-acl";
 
 /// Connection parameters for a remote S3-compatible replication destination.
 #[derive(Debug, Clone)]
@@ -543,6 +549,18 @@ impl HttpS3Sink {
             format!("x-amz-meta-{REPLICA_VERSION_ID_KEY}"),
             object.version_id.as_str().to_owned(),
         ));
+        // Carry the object's ACL (base64 of its JSON) when the rule replicates one, so the
+        // destination reproduces the source's grants. Absent when there is no ACL (and never on the
+        // delete-marker path). Serialization cannot realistically fail for an `Acl`; if it somehow
+        // did we simply omit the header (the destination then keeps its default ownership).
+        if let Some(acl) = &object.acl {
+            if let Ok(json) = serde_json::to_vec(acl) {
+                user_headers.push((
+                    format!("x-amz-meta-{REPLICA_ACL_KEY}"),
+                    base64::engine::general_purpose::STANDARD.encode(json),
+                ));
+            }
+        }
 
         // Replicate the object's tag set via the standard `x-amz-tagging` header (form-urlencoded
         // `k=v&k=v`), so the destination version carries the same tags the source rule filtered on.
