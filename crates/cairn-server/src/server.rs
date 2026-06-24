@@ -17,6 +17,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, watch};
 use tracing::Instrument;
@@ -203,6 +204,45 @@ async fn serve_tls(
     serve_ui: bool,
     conn_shutdown: watch::Receiver<bool>,
 ) {
+    // Console courtesy: on the web-UI listener, a browser that connects in plaintext to the TLS port
+    // gets a `308` to the `https://` URL rather than an opaque handshake failure. Peek the first byte
+    // WITHOUT consuming it — a TLS ClientHello is a handshake record (`0x16`); any other first byte is
+    // a plaintext HTTP request (`G`/`P`/… are all != 0x16). The S3 data-plane listener
+    // (`serve_ui == false`) deliberately skips this and stays TLS-only: redirecting a SigV4 request
+    // would require first accepting its `Authorization`/presigned credentials over cleartext.
+    if serve_ui {
+        // Bound the wait for the first byte: a client that connects and never sends one must not pin
+        // this task (an unauthenticated slow-loris). A genuine TLS or HTTP client sends immediately,
+        // so a short cap is invisible to real traffic and drops idle/hostile sockets.
+        let mut first = [0u8; 1];
+        match tokio::time::timeout(
+            Duration::from_secs(PEEK_TIMEOUT_SECS),
+            stream.peek(&mut first),
+        )
+        .await
+        {
+            Ok(Ok(n)) if n >= 1 && first[0] != TLS_HANDSHAKE_RECORD => {
+                let fallback_host = stream
+                    .local_addr()
+                    .map(|a| a.to_string())
+                    .unwrap_or_default();
+                redirect_plaintext_to_https(stream, fallback_host).await;
+                return;
+            }
+            // A TLS ClientHello (0x16) or EOF — the peek consumed nothing, so the handshake sees it
+            // whole. Fall through to the acceptor.
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                tracing::debug!(%peer, error = %e, "console listener peek failed");
+                return;
+            }
+            Err(_) => {
+                tracing::debug!(%peer, "console listener peek timed out; dropping idle connection");
+                return;
+            }
+        }
+    }
+
     let acceptor = tokio_rustls::TlsAcceptor::from(cfg);
 
     #[cfg(all(feature = "fast-io", target_os = "linux"))]
@@ -231,6 +271,111 @@ async fn serve_tls(
         Ok(tls) => serve_io(tls, state, peer, true, serve_ui, conn_shutdown).await,
         Err(e) => tracing::debug!(error = %e, "TLS handshake failed"),
     }
+}
+
+/// TLS record ContentType for a handshake record — the first byte of a ClientHello. Any other first
+/// byte on the console listener is a plaintext HTTP request we redirect to `https://`.
+const TLS_HANDSHAKE_RECORD: u8 = 0x16;
+
+/// How long to wait for the first byte on a console connection before giving up. A real TLS or HTTP
+/// client sends immediately; a connection that sends nothing is idle or hostile and is dropped so it
+/// cannot pin the accept task (an unauthenticated slow-loris vector).
+const PEEK_TIMEOUT_SECS: u64 = 5;
+
+/// Total deadline for reading the plaintext request head before we answer with the redirect. A bound
+/// on the *whole* read — not per-read — so a client dribbling one byte at a time cannot hold the task
+/// open indefinitely. We redirect from whatever head arrived before the deadline.
+const REDIRECT_HEAD_TIMEOUT_SECS: u64 = 5;
+
+/// Read the plaintext HTTP request head off a console connection that reached the TLS port and reply
+/// with `308 Permanent Redirect` to the `https://` equivalent, then close. Bounded by size and a
+/// total read deadline so a slow or hostile client cannot pin the task; `308` (not `301`) preserves
+/// the method + body so a non-GET retries correctly over TLS.
+async fn redirect_plaintext_to_https<S>(mut stream: S, fallback_host: String)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let mut head = Vec::with_capacity(1024);
+    // One deadline for the entire head read, so a byte-at-a-time dribble cannot extend it: a per-read
+    // timeout would reset on every trickled byte and never fire. We redirect from whatever arrived.
+    let read_head = async {
+        let mut chunk = [0u8; 1024];
+        loop {
+            match stream.read(&mut chunk).await {
+                Ok(0) => break, // EOF
+                Ok(n) => {
+                    head.extend_from_slice(&chunk[..n]);
+                    // Stop once the head is complete, or it grows past anything a request line + Host
+                    // needs — we never read the body (we are redirecting, not serving the request).
+                    if head.windows(4).any(|w| w == b"\r\n\r\n") || head.len() >= 8192 {
+                        break;
+                    }
+                }
+                Err(_) => break, // read error: respond with whatever we have (likely a "/" redirect)
+            }
+        }
+    };
+    // Timeout is non-fatal: on expiry we still answer from the partial head we collected.
+    let _ = tokio::time::timeout(Duration::from_secs(REDIRECT_HEAD_TIMEOUT_SECS), read_head).await;
+    let resp = build_https_redirect(&head, &fallback_host);
+    let _ = stream.write_all(resp.as_bytes()).await;
+    let _ = stream.flush().await;
+}
+
+/// Build the response for a plaintext request that hit the TLS console port. Parses the request target
+/// and `Host` from the (possibly partial) head: when a usable host resolves (the request's `Host` or,
+/// failing that, `fallback_host`) it is a `308 Permanent Redirect` to the `https://` equivalent; with
+/// no usable host at all it is a `400 Bad Request` rather than a malformed `https:///` Location. Target
+/// and host are sanitised so a hostile request cannot inject header lines or a non-`https` scheme.
+fn build_https_redirect(head: &[u8], fallback_host: &str) -> String {
+    let text = String::from_utf8_lossy(head);
+    let mut lines = text.split("\r\n");
+    let request_line = lines.next().unwrap_or("");
+    // Request target = the second token of "METHOD target HTTP/x"; must be an absolute path.
+    let target = request_line
+        .split(' ')
+        .nth(1)
+        .filter(|t| is_safe_target(t))
+        .unwrap_or("/");
+    // First sane `Host:` header value, else the fallback (local socket addr) when it too is sane.
+    let host = lines
+        .find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            if k.trim().eq_ignore_ascii_case("host") {
+                Some(v.trim())
+            } else {
+                None
+            }
+        })
+        .filter(|h| is_safe_host(h))
+        .or_else(|| is_safe_host(fallback_host).then_some(fallback_host));
+    match host {
+        Some(host) => format!(
+            "HTTP/1.1 308 Permanent Redirect\r\n\
+             Location: https://{host}{target}\r\n\
+             Content-Length: 0\r\n\
+             Connection: close\r\n\r\n"
+        ),
+        // No host we can trust to build an absolute `https://` URL — fail rather than emit `https:///`.
+        None => {
+            "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+        }
+    }
+}
+
+/// A request target safe to echo into a `Location` header: an absolute path of printable, non-space
+/// ASCII — so it cannot contain CR/LF, spaces, or control bytes that would split the header.
+fn is_safe_target(t: &str) -> bool {
+    t.starts_with('/') && t.bytes().all(|b| b.is_ascii_graphic())
+}
+
+/// A `Host` value safe to echo into a `Location` header: a non-empty hostname/IP[:port] of the
+/// permitted charset only (alphanumerics, `.`, `-`, `:`, and `[` `]` for IPv6 literals).
+fn is_safe_host(h: &str) -> bool {
+    !h.is_empty()
+        && h.len() <= 255
+        && h.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':' | b'[' | b']'))
 }
 
 /// One-time probe of whether the kernel can offload TLS record crypto (feature `fast-io`, Linux).
@@ -1031,5 +1176,94 @@ mod delete_label_tests {
             classify_operation(false, &get, "/photos", ""),
             Some(("ListObjects".to_owned(), "photos".to_owned()))
         );
+    }
+}
+
+#[cfg(test)]
+mod redirect_tests {
+    use super::*;
+
+    fn location(head: &str, fallback: &str) -> String {
+        build_https_redirect(head.as_bytes(), fallback)
+            .lines()
+            .find_map(|l| l.strip_prefix("Location: "))
+            .unwrap()
+            .to_owned()
+    }
+
+    #[test]
+    fn redirect_preserves_host_and_target() {
+        let resp = build_https_redirect(
+            b"GET /console/metrics?range=1d HTTP/1.1\r\nHost: cairn.example:7374\r\n\r\n",
+            "127.0.0.1:7374",
+        );
+        assert!(resp.starts_with("HTTP/1.1 308 "));
+        assert!(resp.contains("Connection: close"));
+        assert!(resp.contains("Location: https://cairn.example:7374/console/metrics?range=1d\r\n"));
+    }
+
+    #[test]
+    fn redirect_falls_back_when_host_absent_or_unsafe() {
+        // No Host header → use the local socket address.
+        assert_eq!(
+            location("GET / HTTP/1.1\r\n\r\n", "127.0.0.1:7374"),
+            "https://127.0.0.1:7374/"
+        );
+        // A Host carrying anything outside the host charset is rejected → fallback.
+        assert_eq!(
+            location(
+                "GET /x HTTP/1.1\r\nHost: ev il/path\r\n\r\n",
+                "10.0.0.1:7374"
+            ),
+            "https://10.0.0.1:7374/x"
+        );
+    }
+
+    #[test]
+    fn redirect_sanitises_target_and_host_against_header_injection() {
+        // A target that is not a clean absolute path falls back to "/".
+        assert_eq!(
+            location("GET nonsense HTTP/1.1\r\nHost: h\r\n\r\n", "fb:1"),
+            "https://h/"
+        );
+        // is_safe_* reject CR/LF, spaces, and control bytes that could split the Location header.
+        assert!(!is_safe_target("/ok\r\nSet-Cookie: x"));
+        assert!(!is_safe_target("/has space"));
+        assert!(is_safe_target("/ok/path?q=1&r=2"));
+        assert!(!is_safe_host("h\r\nX: y"));
+        assert!(!is_safe_host("has space"));
+        assert!(is_safe_host("cairn.example:7374"));
+        assert!(is_safe_host("[::1]:7374"));
+    }
+
+    #[test]
+    fn redirect_returns_400_when_no_usable_host() {
+        // No Host header AND an unusable fallback (e.g. local_addr() failed → empty string): there is
+        // no host to build an absolute https:// URL from, so answer 400 rather than emit https:///.
+        let resp = build_https_redirect(b"GET /x HTTP/1.1\r\n\r\n", "");
+        assert!(resp.starts_with("HTTP/1.1 400 "), "got: {resp}");
+        assert!(!resp.contains("Location:"), "got: {resp}");
+        // An unsafe fallback is treated the same as no fallback.
+        let resp = build_https_redirect(b"GET / HTTP/1.1\r\n\r\n", "bad host/with space");
+        assert!(resp.starts_with("HTTP/1.1 400 "), "got: {resp}");
+    }
+
+    #[tokio::test]
+    async fn redirect_reads_request_and_writes_308_over_a_stream() {
+        let (mut client, server) = tokio::io::duplex(4096);
+        let task = tokio::spawn(redirect_plaintext_to_https(
+            server,
+            "fallback:7374".to_owned(),
+        ));
+        client
+            .write_all(b"GET /buckets HTTP/1.1\r\nHost: ui.local:7374\r\nUser-Agent: x\r\n\r\n")
+            .await
+            .unwrap();
+        let mut resp = Vec::new();
+        client.read_to_end(&mut resp).await.unwrap();
+        task.await.unwrap();
+        let resp = String::from_utf8(resp).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 308 "), "got: {resp}");
+        assert!(resp.contains("Location: https://ui.local:7374/buckets\r\n"));
     }
 }
