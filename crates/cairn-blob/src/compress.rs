@@ -373,12 +373,22 @@ impl<R: Read + Seek> CompressedReader<R> {
             let logical = u32::from_le_bytes(chunk[4..8].try_into().unwrap());
             let compressed = chunk[8] != 0;
             block_offsets.push(offset);
-            offset += u64::from(phys_len);
+            offset = offset.saturating_add(u64::from(phys_len));
             index.push(IndexEntry {
                 phys_len,
                 logical_len: logical,
                 compressed,
             });
+        }
+        // The blocks occupy exactly `[0, index_offset)` on disk, so the per-block physical lengths
+        // must sum to where the index begins. Enforcing it rejects an index whose `phys_len` entries
+        // point outside the block region AND bounds every `phys_len` by the file size — so a read
+        // can never be asked to allocate a multi-gigabyte `phys` buffer for a corrupt block (OOM
+        // guard; `phys_len` is a `u32` up to ~4 GiB and is otherwise unbounded).
+        if offset != index_offset {
+            return Err(BlobError::Corruption(
+                "block physical lengths do not fill the block region".into(),
+            ));
         }
         // Cross-validate the trailer's `logical_len` against the index BEFORE serving reads:
         // `read_range` maps a logical offset to a block via `logical_len`/`block_size`, so a trailer
@@ -592,6 +602,24 @@ mod tests {
         assert!(
             CompressedReader::open_with_dek(Cursor::new(blob), None).is_err(),
             "a block size over the cap must be rejected"
+        );
+    }
+
+    /// Regression (fuzz-found, OOM): an index entry claiming a huge physical length (`phys_len` is a
+    /// u32, up to ~4 GiB) must be rejected at open — the per-block physical lengths must sum to the
+    /// index offset — so a read never allocates a multi-gigabyte `phys` buffer for a corrupt block.
+    #[test]
+    fn open_rejects_oversized_phys_len() {
+        // [1 raw byte][index entry claiming phys_len = ~3 GiB][trailer]. The block region is really 1
+        // byte, so the claimed phys_len cannot sum to index_offset (1) — rejected before any read.
+        let mut blob = vec![0u8]; // one real block byte
+        blob.extend_from_slice(&3_000_000_000u32.to_le_bytes()); // index: phys_len = ~3 GiB (a lie)
+        blob.extend_from_slice(&1u32.to_le_bytes()); // index: logical_len = 1
+        blob.push(0); // index: compressed = false
+        blob.extend_from_slice(&trailer(VERSION_PLAIN, 0, 4096, 1, 1, 1, 9));
+        assert!(
+            CompressedReader::open_with_dek(Cursor::new(blob), None).is_err(),
+            "a block phys_len that overruns the block region must be rejected"
         );
     }
 
