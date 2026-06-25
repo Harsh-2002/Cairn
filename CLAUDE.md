@@ -55,7 +55,7 @@ cargo nextest run --workspace                                # + cargo test --wo
 
 ## Workspace layout (`crates/`)
 
-- `cairn-types` — the 8 traits (the spine), domain types, the error tree, in-memory doubles
+- `cairn-types` — the 9 traits (the spine), domain types, the error tree, in-memory doubles
   (`feature = "testing"`); depends on no engine.
 - `cairn-meta` — the default SQLite `MetadataStore`: one group-committing **Writer** + a WAL read
   pool + a read-through cache. Schema/migrations in `schema.rs`; mutation SQL in `apply.rs`.

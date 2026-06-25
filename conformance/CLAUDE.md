@@ -1,57 +1,63 @@
 # conformance
 
-End-to-end verification harnesses that drive a **real `cairn` binary** (the in-crate unit/property/
-fuzz tests live next to their sources). Two kinds — keep them distinct:
+End-to-end harnesses that drive a **real `cairn` binary** — bash launcher + (usually) a Python
+driver. Unit/property/fuzz tests live next to their sources in each crate; these are the black-box
+"does the whole binary behave?" layer. **Almost all of these are CI gates** (`.github/workflows/ci.yml`,
+mirrored job-per-script) — editing a script, its asserts, or the behavior it pins can turn the gate
+red, so treat a passing local run as load-bearing. Two kinds — keep them distinct.
 
 ## e2e / feature (does it work as specified?)
-- `run.sh` (+`conformance.py`) — boto3 / real AWS SDK full object lifecycle.
-- `share.sh` — object sharing (share tokens + SigV4 presigned URLs).
-- `rotation.sh` (+`rotation.py`) — master-key rotation lifecycle (#29), sharded.
-- `soak.sh` (+`soak.py`) — two-node replication, byte-identical verify + RSS leak check.
-- `mesh.sh` (+`mesh.py`) — **5-node FULL mesh** replication (stdlib only, no boto3): convergence,
-  fan-out latency, version-id identity, concurrent same-key, crash resiliency, delete-marker mesh,
-  throughput/bottleneck, no-cascade, integrity. The Python driver owns all five node processes
-  (own ports/data dirs/master keys) and self-tears-down. `conformance/mesh.sh [scenario-ids...]`.
-- `warp.sh` — the MinIO warp macro benchmark (get/put/mixed).
-- `crash_consistency.sh` — the F-4 durability property at one crash seam.
+- `run.sh` (+`conformance.py`) — boto3 / real AWS SDK full object lifecycle; the broad smoke gate.
+- `share.sh` — object sharing (revocable share tokens + interoperable SigV4 presigned URLs), pure curl.
+- `rotation.sh` (+`.py`) — master-key rotation lifecycle (#29), sharded.
+- `soak.sh` (+`.py`) — two-node replication, byte-identical verify + RSS leak check (boto3).
+- `mesh.sh` (+`.py`) — **5-node FULL mesh** replication (stdlib only): convergence, fan-out latency,
+  version-id identity, concurrent same-key, crash resiliency, delete-marker mesh, no-cascade,
+  integrity. The driver owns all five node processes and self-tears-down. `mesh.sh [scenario-ids...]`.
+- `crash_consistency.sh` — the F-4 durability property at one crash seam (orphan-blob reclaim).
 - `scrub.sh` — integrity scrub: corrupt a stored blob on disk, assert the background scrub
-  (`CAIRN_SCRUB_INTERVAL_SECS`) detects the ETag mismatch (`cairn_scrub_corruption_total`).
-- `object_lock.sh` — Object Lock / WORM: COMPLIANCE immutable (no delete/shorten, bypass ignored),
-  GOVERNANCE yields only to `s3:BypassGovernanceRetention` + the bypass header, legal hold
-  blocks/releases, bucket default retention stamped + echoed on HEAD. (Also folded into `run.sh`.)
-- `notifications.sh` (+`notifications.py`) — webhook event notifications: stands up a local sink,
-  configures a bucket endpoint via the management API (Bearer), drives S3 PUT/DELETE, and asserts
-  the sink receives correctly-shaped, HMAC-signed S3 event records. Needs the UI listener ON.
-- `sts.sh` (+`sts.py`) — STS temporary credentials: mints a scoped session via the management API,
-  then proves a standard S3 SDK consumes it (`X-Amz-Security-Token`) with exactly the granted access
-  (scoped GET allowed; ungranted PUT / cross-bucket / tampered / absent-token denied). UI listener ON.
-- `console_session.sh` — console httpOnly session-cookie auth (pure curl, no SDK): `POST /session`
-  sets the `cairn_session` cookie; the cookie alone authenticates the management API and the S3 data
-  plane on the UI port; it is REJECTED on the S3 data-plane port (cookies aren't port-isolated); wrong
-  secret → 401; `DELETE /session` clears it. UI listener ON.
-- `backup_restore.sh` — backup/restore/integrity (pure curl, Bearer auth, no SDK): populate varied
-  sizes/compressibility, `cairn integrity` clean baseline (errors=0), `cairn backup`, corrupt the
-  primary's largest blob, `cairn restore` into a FRESH data dir → every object byte-identical, then
-  delete a blob and assert `cairn integrity --repair` drops exactly the one dangling row (it 404s; the
-  others survive). Parses each synchronous CLI's stdout counts; never sleeps.
+  (`CAIRN_SCRUB_INTERVAL_SECS`) flags the ETag mismatch (`cairn_scrub_corruption_total`).
+- `object_lock.sh` — Object Lock / WORM: COMPLIANCE immutable, GOVERNANCE yields only to
+  `s3:BypassGovernanceRetention` + bypass header, legal hold, bucket default retention echoed on HEAD.
+- `notifications.sh` (+`.py`) — webhook event notifications: local sink, bucket endpoint via the
+  management API, assert HMAC-signed S3 event records arrive correctly shaped. **UI listener ON.**
+- `sts.sh` (+`.py`) — STS temp creds: mint a scoped session, prove an S3 SDK consumes it
+  (`X-Amz-Security-Token`) with exactly the granted access, all else denied. **UI listener ON.**
+- `console_session.sh` — console httpOnly session-cookie auth (pure curl): `cairn_session` from
+  `POST /session` authenticates management API + S3 on the UI port, REJECTED on the S3 port, cleared
+  by `DELETE /session`. **UI listener ON.**
+- `backup_restore.sh` — backup/restore/integrity (pure curl, Bearer): `cairn backup`, corrupt then
+  `cairn restore` into a FRESH dir → byte-identical, `cairn integrity --repair` drops exactly the
+  dangling row. Parses each synchronous CLI's stdout counts — **never sleeps.**
 
 ## regression / limit (where does it break?)
-- `replication_chaos.sh` (+`.py`) — break replication on purpose (target down, source SIGKILL); assert no loss.
+- `replication_chaos.sh` (+`.py`) — break replication on purpose (target down, source SIGKILL); no loss.
 - `crash_multipoint.sh` (+`.py`) — crash at every blob-commit seam (PUT + multipart); reconcile reclaims.
 - `concurrency.sh` (+`.py`) — N clients race one key (create / CAS / last-writer); atomic, no corruption.
+- `warp.sh` — the MinIO `warp` macro benchmark (get/put/mixed); downloads `warp` once. Gates on errors.
 - `warp_escalate.sh` — ramp warp concurrency to the single-writer ceiling; alive + zero errors.
-- `blob_limits.sh` (+`.py`) — out-of-space 507, huge object, many objects paginated.
-- `load_profile.sh` (+`.py`) — throughput methodology (not a gate; see `../docs/benchmarks.md`).
-- `sendfile_keepalive.sh` — `fast-io` keep-alive engagement (pure curl, no warp; SKIPs on a non-fast-io
-  build): N GETs of a large object over ONE keep-alive connection must all engage the zero-copy path
-  (`cairn_sendfile_get_total{result=ok}` += N, byte-identical) — was += 1 under the old peek-first design.
-- `sendfile_bench.sh` — `fast-io` plaintext sendfile A/B: server CPU/GiB + zero-copy engage rate
-  (needs a `--features fast-io` binary; optional non-`fast-io` `BASELINE_BIN`; not a gate).
+- `blob_limits.sh` (+`.py`) — out-of-space 507 on a small tmpfs, huge object, many objects paginated.
+- `load_profile.sh` (+`.py`) — throughput methodology, **NOT a gate**; see `../docs/benchmarks.md`.
+- `sendfile_keepalive.sh` — `fast-io` keep-alive engagement (pure curl): N GETs over ONE keep-alive
+  conn must all engage zero-copy (`cairn_sendfile_get_total{result=ok}` += N). SKIPs on non-`fast-io`.
+- `sendfile_bench.sh` — `fast-io` plaintext sendfile A/B (CPU/GiB + engage rate); **NOT a gate.**
 
-## Conventions
-- Invoke as `BIN=target/debug/cairn PY=python3 bash conformance/<name>.sh`. Each makes a `mktemp -d`
-  data dir, bootstraps, serves, waits on `/healthz`, and cleans up via a trap.
-- Python drivers that **restart** the server (rotation, replication_chaos, crash_multipoint, blob_limits)
-  own the process lifecycle themselves.
-- Needs: boto3 (`soak`, `replication_chaos`); passwordless sudo (`blob_limits`, for a tmpfs); a
-  `--features failpoints` build (`crash_*`). Running a server needs the dev sandbox disabled.
+## Notes
+- Invoke as `BIN=target/debug/cairn PY=python3 bash conformance/<name>.sh` (the CI form). Most
+  default `BIN` to `$ROOT/target/debug/cairn`, so they run from any cwd; a few (`run`, `share`,
+  `rotation`, `concurrency`, `warp*`) want `target/debug/cairn` relative to the repo root.
+- The bash launcher is thin: `mktemp -d` data dir, `CAIRN_UI_ADDR=off` unless the script needs the
+  console, `bootstrap`, `serve`, poll `/healthz`, cleanup via `trap`. **A running server needs the
+  dev sandbox disabled** (it binds listen sockets). Default config is env-only (ARCH 28) — these set
+  `CAIRN_*` directly; mirror that, never invent a config file.
+- Python drivers that **restart** the server (rotation, replication_chaos, crash_multipoint,
+  blob_limits, mesh) own the process lifecycle themselves; the bash launcher just hands them the env.
+- Needs: boto3 (`run`, `soak`, `replication_chaos`); passwordless sudo (`blob_limits`, for a tmpfs —
+  CI runners have it); a `--features failpoints` build for the `crash_*` seams (`FAILPOINTS=...`); a
+  `--features fast-io` Linux build for `sendfile_*` (else they SKIP); `warp`/`go` for `warp*`.
+- Prefer asserting on synchronous CLI stdout or a metric/poll loop over `sleep` — the no-sleep
+  harnesses are deliberately deterministic; don't add timing flake.
+- `mesh.sh` is intentionally **NOT CI-gated** (5 nodes is too heavy/flaky for the shared runner) —
+  run it by hand. Same for the two non-gate benchmarks above.
+- Spec: replication ARCH 20, durability/storage `docs/storage-durability.md` 8–10, blob limits ARCH 9,
+  testing/conformance/perf `docs/testing-performance.md` 29–30. Build/gate: root `../CLAUDE.md`.

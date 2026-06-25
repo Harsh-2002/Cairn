@@ -1,46 +1,57 @@
-# Cairn documentation
+# docs
 
-This is the single source of truth for Cairn. The engineering specification is split here into focused, section-numbered reference documents; alongside them are the
-operator guides. The **section numbers are stable identifiers** used throughout the codebase
-(comments say e.g. "ARCH 28") and across these docs — find the number in the table below to jump
-straight to the document that covers it.
+The engineering specification — **the single source of truth** for Cairn. Split into
+section-numbered reference documents (`## N.` headings, sections `0`–`34`, contiguous), plus operator
+runbooks and design/product docs. Code comments cite sections as **"ARCH N"** (e.g. `ARCH 11.6`);
+~460 such references across `crates/` resolve through this folder. Read the relevant doc *before* a
+non-trivial change, and update it *with* any change to the behaviour it specifies.
 
-## Reference (the engineering specification)
+## Layout — the section → document map
 
-| Document | Sections | Covers |
+The spec (sections are **stable identifiers** — every `ARCH N` in the code points here):
+
+| Doc | Sections | Covers |
 |---|---|---|
-| [overview.md](./overview.md) | 0–5 | How to read; executive summary; positioning, scope, and non-goals; why a Rust rewrite; baseline storage architecture; gap analysis and the delta to Cairn |
-| [data-plane.md](./data-plane.md) | 6–7 | System overview (data plane, control plane, node model); concurrency, runtime, and the I/O model |
-| [storage-durability.md](./storage-durability.md) | 8–10 | Durability and crash consistency; on-disk storage model and layout; transparent compression at rest |
-| [metadata.md](./metadata.md) | 11–12 | Metadata store (topology, schema, the group-committing writer, WAL read pool, cache); the internal trait abstraction layer |
-| [s3-api.md](./s3-api.md) | 13, 16–19, 21 | S3 protocol layer and operation catalogue; object versioning; tagging; CORS; lifecycle management; server-side request lifecycles |
-| [auth.md](./auth.md) | 14–15 | Authentication (SigV4 header/presigned + Bearer); the authorization model (policy / ACL / public-access-block / ownership) |
-| [replication.md](./replication.md) | 20 | Bucket replication (the outbox engine and SigV4-signing sink) |
-| [control-plane.md](./control-plane.md) | 22–24 | Management API; the embedded web console; the command-line interface |
-| [configuration.md](./configuration.md) | 28 | The full `CAIRN_*` configuration reference |
-| [security-errors.md](./security-errors.md) | 25, 27 | The error model and S3 error mapping; the security and threat model |
-| [observability.md](./observability.md) | 26 | Metrics, logging, and audit |
-| [testing-performance.md](./testing-performance.md) | 29–30 | Testing and S3 conformance; performance engineering and targets |
-| [delivery.md](./delivery.md) | 31–34 | Build, packaging, deployment, and operations; the phased roadmap; the architecture decision log; appendices |
+| `overview.md` | 0–5 | how-to-read, exec summary, scope/non-goals, why-Rust, baseline arch, gap analysis |
+| `data-plane.md` | 6–7 | node model, data/control plane; concurrency, runtime, I/O model |
+| `storage-durability.md` | 8–10 | durability & crash consistency; on-disk layout; compression at rest |
+| `metadata.md` | 11–12 | metadata store (writer/WAL/cache, schema); the 8-trait abstraction layer |
+| `s3-api.md` | 13, 16–19, 21 | S3 protocol & op catalogue; versioning + Object Lock; tagging; CORS; lifecycle; request lifecycles |
+| `auth.md` | 14–15 | authentication (SigV4/Bearer); authorization (policy/ACL/BPA/ownership) |
+| `replication.md` | 20 | bucket replication (outbox engine, SigV4-signing sink) |
+| `control-plane.md` | 22–24 | management API; web console; CLI |
+| `security-errors.md` | 25, 27 | error model & S3 error mapping; security/threat model |
+| `observability.md` | 26 | metrics, logging, audit |
+| `configuration.md` | 28 | the full `CAIRN_*` reference |
+| `testing-performance.md` | 29–30 | testing/conformance; performance targets, sharding |
+| `delivery.md` | 31–34 | build/deploy/ops; roadmap; ADR log; **appendices** (34.1 schema, 34.3 API matrix, 34.4 actions, 34.5 condition keys) |
 
-## Operator guides
+Operator runbooks (NOT spec — these number their own local `## 1/2/3` headings; never cite them as
+"ARCH N"): `operations.md` (deploy + **master-key rotation runbook**), `upgrade-rollback.md`,
+`scaling-limits.md`, `troubleshooting.md`, `deployment-kubernetes.md`, `backup-restore.md`,
+`s3-api-matrix.md`, `benchmarks.md`. Design/product: `design.md` (UI visual system),
+`product.md` (positioning/brand).
 
-| Document | Covers |
-|---|---|
-| [operations.md](./operations.md) | Configuring, deploying, and running a node: the one-filesystem invariant, the configuration table, bootstrapping, deployment shapes, day-two signals, the durability guarantee, and the **master-key rotation runbook** |
-| [upgrade-rollback.md](./upgrade-rollback.md) | Upgrading the binary, version compatibility, rollback (restore-from-snapshot), and the decisions fixed at first init (backend, shard count) |
-| [scaling-limits.md](./scaling-limits.md) | Capacity planning: the single-writer write ceiling, object/bucket limits, when to shard vs replicate, replication lag, and the sizing cheat-sheet |
-| [troubleshooting.md](./troubleshooting.md) | Symptom → cause → `/metrics` signal → fix; the diagnostic commands and when to restore from backup |
-| [deployment-kubernetes.md](./deployment-kubernetes.md) | Container + Kubernetes deployment (single-replica StatefulSet, PVC, probes, ConfigMap/Secret, TLS, backups) |
-| [backup-restore.md](./backup-restore.md) | The backup procedure (database-first snapshot + blob copy), its consistency argument, and restore |
-| [s3-api-matrix.md](./s3-api-matrix.md) | The S3 API support matrix — which operations are supported, partial, or out of scope |
-| [benchmarks.md](./benchmarks.md) | The benchmarking methodology and the harnesses under `conformance/` |
+## Notes
 
-## Design & product
+- **Never renumber a section.** The `## N.` / `### N.M` numbers are an external contract — `ARCH N`
+  citations in code, docs, and tests resolve to them positionally. Append new sections; don't reorder
+  or reuse. Renumbering silently breaks every reference that points at the old number.
+- **Spec and code move together.** This is the source of truth, so a behavioural change MUST land its
+  doc edit in the same change — never let the spec describe something the code no longer does. When
+  they disagree the spec is authoritative; reconcile, don't ignore.
+- **One section → one document.** Sections `0`–`34` partition across the reference docs above with no
+  gaps and no overlap. A new section goes in exactly one doc; keep this map and the root
+  `../CLAUDE.md` doc table in sync when the partition changes.
+- The appendices in `delivery.md` (34.x) are reference tables that **must track the code**: 34.1 the
+  metadata schema (mirror with `cairn-meta/src/schema.rs` migrations), 34.3 the API matrix, 34.4 the
+  policy-action catalogue, 34.5 the condition-key catalogue. Stale appendix tables are a common trap.
+- These are reference documents, not a tutorial — terse, declarative, cross-referenced by number.
+  Match that voice; don't add narrative prose or duplicate content between docs (point by section
+  number instead — duplication goes stale).
 
-| Document | Covers |
-|---|---|
-| [design.md](./design.md) | The management console's visual design system (read for UI work) |
-| [product.md](./product.md) | Product positioning, users, brand, and design principles |
+## Pointers
 
-The end-to-end verification harnesses themselves live in [`../conformance/`](../conformance).
+- Per-folder agent briefs live in `crates/*/CLAUDE.md`; the workspace brief, gate, and conventions
+  are the root `../CLAUDE.md` — start there. End-to-end verification harnesses: `../conformance/`.
+- `CLAUDE.md` files (this one included) are agent briefs, **not** part of the numbered spec.
