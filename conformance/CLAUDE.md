@@ -37,6 +37,12 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
 - `replication_chaos.sh` (+`.py`) — break replication on purpose (target down, source SIGKILL); no loss.
 - `crash_multipoint.sh` (+`.py`) — crash at every blob-commit seam (PUT + multipart); reconcile reclaims.
 - `concurrency.sh` (+`.py`) — N clients race one key (create / CAS / last-writer); atomic, no corruption.
+- `stress.sh` (+`warp`) — the unified **"is it still fast AND stable?"** check to run after a change.
+  Parses warp's throughput into a table (peak write/read/mixed obj/s + MiB/s), ramps concurrency to
+  prove the server bends-not-breaks past the single-writer ceiling, and samples the **server process**
+  — RSS over the run (steady-state leak check, last-third vs middle-third, + a 1 GiB ceiling) and peak
+  `cairn_writer_queue_depth`. Emits a PASS/FAIL verdict; `STRESS_OUT=`/`BASELINE=` write/compare a
+  results JSON for regression tracking. Supersedes `warp.sh`+`warp_escalate.sh` (kept as focused tools).
 - `warp.sh` — the MinIO `warp` macro benchmark (get/put/mixed); downloads `warp` once. Gates on errors.
 - `warp_escalate.sh` — ramp warp concurrency to the single-writer ceiling; alive + zero errors.
 - `blob_limits.sh` (+`.py`) — out-of-space 507 on a small tmpfs, huge object, many objects paginated.

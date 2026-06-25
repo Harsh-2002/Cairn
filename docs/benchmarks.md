@@ -315,6 +315,55 @@ shards than you have cores**, and shard only when load actually spreads across m
 on your hardware before committing — sharding is init-locked and cannot be changed without a rebuild
 ([`upgrade-rollback.md`](./upgrade-rollback.md) §4).
 
+## 6. Stress + stability harness (`conformance/stress.sh`)
+
+The single **"is it still fast AND stable?"** check to run after a change. It drives `warp` against a
+throwaway Cairn and, in one pass, reports peak write/read/mixed throughput, ramps concurrency to prove
+the server bends-not-breaks past the single-writer ceiling, and samples the **server process** for a
+leak/stability verdict. Unlike `warp.sh` (which only gates on the error count) it parses warp's
+throughput numbers and watches RSS + the writer queue, so the output is a benchmark *and* an assertion.
+
+### How to run
+
+```sh
+cargo build --release --bin cairn
+BIN=target/release/cairn conformance/stress.sh                 # default profile (~4 min)
+CONCURRENT=16 OBJ_SIZE=4MiB DURATION=15s conformance/stress.sh  # tune the load
+STRESS_OUT=/tmp/base.json conformance/stress.sh                 # write a results JSON
+BASELINE=/tmp/base.json   conformance/stress.sh                 # compare vs a prior run (regression warn)
+```
+
+### What it asserts (the PASS/FAIL verdict)
+
+- **Zero operation errors** across every warp phase (put/get/mixed) and every escalation level.
+- **Liveness** — the server answers `/healthz` after the full concurrency ramp.
+- **No memory leak** — steady-state RSS (mean of the run's last third vs its middle third) grows less
+  than `LEAK_PCT` (default 25%), and peak RSS stays under `RSS_CEILING_KIB` (default 1 GiB). The
+  cold-start sample is deliberately excluded so normal cache warm-up is not mistaken for a leak.
+
+### Observed results (this host — **2 cores**, indicative only)
+
+| phase | obj/s | MiB/s |
+|-------|------:|------:|
+| WRITE (PUT, 1 MiB, conc 8) | ~55 | ~55 |
+| READ (GET, 1 MiB, conc 8) | ~50 | ~50 |
+| MIXED (get/put/stat/delete, 1 MiB, conc 8) | ~211 | ~126 |
+
+Escalation (64 KiB writes, concurrency 4→64): alive with **zero errors at every level**; throughput
+stays in the ~240–700 obj/s band (noisy, not a clean monotonic plateau, because `warp` and `cairn`
+contend for the same 2 cores). RSS peaked at **~63 MiB** and settled lower (no leak); the writer queue
+depth peaked in the single-to-low-double digits — i.e. on this box the bottleneck is **CPU contention
+with the load generator, not Cairn's single writer**. Read the **shape and the zero-error/RSS-stability
+signals**, not the absolute obj/s: warp eats a core here, so these are a floor. Re-measure on real,
+dedicated hardware (e.g. the arm64 testbed) for representative throughput.
+
+> **On the `BASELINE` regression check:** run-to-run variance on a shared/contended box is large
+> (≈±30% observed here — e.g. READ swung 50→38 obj/s between back-to-back runs with no code change), so
+> the default 20% regression threshold (`REGRESS_PCT`) will false-positive on this hardware. The check
+> is only trustworthy on a **dedicated** machine, or when averaging several runs; on a noisy box raise
+> `REGRESS_PCT` or treat single-run swings as noise. The error-count / liveness / RSS-leak assertions
+> are robust regardless and are what the PASS/FAIL verdict hinges on.
+
 ## io_uring blob path (`--features io-uring`, experimental, Linux-only)
 
 The staging write path can run through a dedicated `tokio-uring` reactor (off by default). Measured
