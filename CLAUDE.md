@@ -30,6 +30,7 @@ TLS, async bucket replication, an embedded React console, and a CLI.
 
 Operator runbooks (not the spec): [`docs/operations.md`](./docs/operations.md) (deploy + master-key
 rotation), [`docs/backup-restore.md`](./docs/backup-restore.md),
+[`docs/disaster-recovery.md`](./docs/disaster-recovery.md),
 [`docs/s3-api-matrix.md`](./docs/s3-api-matrix.md), [`docs/benchmarks.md`](./docs/benchmarks.md).
 UI visual system: [`docs/design.md`](./docs/design.md). Doc index: [`docs/CLAUDE.md`](./docs/CLAUDE.md).
 

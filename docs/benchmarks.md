@@ -277,6 +277,44 @@ source's resident set stayed essentially flat across ~5k PUTs (the small rise is
 not a monotonic climb). At the CI default `DURATION=120` the PUT and verified counts roughly double
 while the RSS picture is unchanged.
 
+## 5. Metadata sharding (the write-throughput escape valve)
+
+A single Cairn store commits through **one** group-committing writer (ARCH 8.3 / 30.2) — the binding
+ceiling for small-object, write-heavy load. `CAIRN_META_SHARDS=N` partitions the metadata across N
+databases by bucket name (`shard.rs`), so writes to **disjoint buckets** commit through N parallel
+single-writers. It is an init-locked, one-time decision with a real trade-off (user quota becomes
+eventually-consistent; a single hot bucket still lands on one shard). The decision guide is
+[`scaling-limits.md`](./scaling-limits.md) §3; this is the supporting measurement.
+
+### How to run
+
+```sh
+# from the repo root (an ext4 working dir, NOT a tmpfs) — release mode
+BENCH_SECS=4 BENCH_SHARDS="1,2,4,8" cargo run --release --example bench_sharded -p cairn-meta
+```
+
+The example spreads concurrent `PutObjectVersion`s across many buckets through the
+`ShardedMetadataStore` and exercises the full write path (routing → quota check → upsert → roll-up
+counters), reporting puts/s and the speedup vs the single-shard baseline.
+
+### Observed results (this host — **2 cores**, indicative only)
+
+| shards | puts/s | speedup |
+|-------:|-------:|--------:|
+| 1 | 7488 | 1.00× |
+| 2 | 9853 | 1.32× |
+| 4 | 10474 | 1.40× |
+| 8 | 8170 | 1.09× |
+
+Read the **shape**, not the absolute multiplier: sharding lifts write throughput because disjoint
+buckets no longer serialize on one writer, but the parallelism is bounded by **CPU cores** — on this
+2-core box it saturates near 2× and then *regresses at 8 shards* (more writer threads than cores =
+contention). On a real multi-core host the curve scales much further (toward near-linear up to the
+core count for disjoint-bucket load); the operational lesson that travels is **do not configure more
+shards than you have cores**, and shard only when load actually spreads across many buckets. Re-measure
+on your hardware before committing — sharding is init-locked and cannot be changed without a rebuild
+([`upgrade-rollback.md`](./upgrade-rollback.md) §4).
+
 ## io_uring blob path (`--features io-uring`, experimental, Linux-only)
 
 The staging write path can run through a dedicated `tokio-uring` reactor (off by default). Measured

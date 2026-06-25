@@ -29,7 +29,7 @@ The spec (sections are **stable identifiers** — every `ARCH N` in the code poi
 Operator runbooks (NOT spec — these number their own local `## 1/2/3` headings; never cite them as
 "ARCH N"): `operations.md` (deploy + **master-key rotation runbook**), `upgrade-rollback.md`,
 `scaling-limits.md`, `troubleshooting.md`, `deployment-kubernetes.md`, `backup-restore.md`,
-`s3-api-matrix.md`, `benchmarks.md`. Design/product: `design.md` (UI visual system),
+`disaster-recovery.md`, `s3-api-matrix.md`, `benchmarks.md`. Design/product: `design.md` (UI visual system),
 `product.md` (positioning/brand).
 
 ## Notes
