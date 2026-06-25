@@ -8,7 +8,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
-repository = "https://github.com/cairn-storage/cairn"
+repository = "https://github.com/Harsh-2002/Cairn"
 authors = ["The Cairn authors"]
 
 [workspace.dependencies]
