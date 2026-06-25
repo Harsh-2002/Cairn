@@ -16,6 +16,7 @@ mod commit;
 #[doc(hidden)]
 #[allow(missing_debug_implementations)]
 pub mod compress;
+mod crc64nvme;
 mod hash;
 // Safe file-placement hints (preallocation + access advice) for the write fast path (ARCH 7.5).
 mod raw_io;

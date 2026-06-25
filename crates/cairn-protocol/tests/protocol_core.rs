@@ -898,6 +898,145 @@ async fn put_with_mismatching_checksum_is_bad_digest_and_not_stored() {
     assert_eq!(st, StatusCode::NOT_FOUND);
 }
 
+// A modern SDK (boto3 >=1.36, aws-cli v2, JS/Go/Java v2) sends a checksum by default and validates
+// the round-trip by reading `x-amz-checksum-{algo}` off the response. Cairn must echo the stored
+// checksum on the PUT response, and on GET/HEAD when the client opts in with
+// `x-amz-checksum-mode: ENABLED` — but never on a partial (Range/206) GET, and never unprompted.
+#[tokio::test]
+async fn stored_checksum_is_echoed_on_put_get_head_but_not_on_range_or_unprompted() {
+    let h = harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("ckecho"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+
+    let payload = b"the quick brown fox jumps over the lazy dog".to_vec();
+    let want_sha = sha256_b64(&payload);
+
+    // PUT carrying a SHA-256 checksum: the response echoes it + the checksum type.
+    let put = req(
+        Method::PUT,
+        Some("ckecho"),
+        Some("obj"),
+        &[],
+        &[("x-amz-checksum-sha256", want_sha.as_str())],
+        payload.clone(),
+    );
+    let (st, hdrs, _) = drain(send(&h.svc, put).await).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        header(&hdrs, "x-amz-checksum-sha256"),
+        Some(want_sha.as_str()),
+        "PUT response must echo the computed checksum"
+    );
+    assert_eq!(header(&hdrs, "x-amz-checksum-type"), Some("FULL_OBJECT"));
+
+    // GET with checksum mode enabled echoes the stored checksum.
+    let get = req(
+        Method::GET,
+        Some("ckecho"),
+        Some("obj"),
+        &[],
+        &[("x-amz-checksum-mode", "ENABLED")],
+        vec![],
+    );
+    let (st, hdrs, body) = drain(send(&h.svc, get).await).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(body, payload);
+    assert_eq!(
+        header(&hdrs, "x-amz-checksum-sha256"),
+        Some(want_sha.as_str())
+    );
+    assert_eq!(header(&hdrs, "x-amz-checksum-type"), Some("FULL_OBJECT"));
+
+    // GET without the mode header must NOT leak the checksum (S3 only echoes on opt-in).
+    let get_plain = req(Method::GET, Some("ckecho"), Some("obj"), &[], &[], vec![]);
+    let (_, hdrs, _) = drain(send(&h.svc, get_plain).await).await;
+    assert_eq!(header(&hdrs, "x-amz-checksum-sha256"), None);
+
+    // HEAD with the mode header echoes it.
+    let head = req(
+        Method::HEAD,
+        Some("ckecho"),
+        Some("obj"),
+        &[],
+        &[("x-amz-checksum-mode", "ENABLED")],
+        vec![],
+    );
+    let (st, hdrs, _) = drain(send(&h.svc, head).await).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        header(&hdrs, "x-amz-checksum-sha256"),
+        Some(want_sha.as_str())
+    );
+
+    // A Range GET (206) must NOT echo a whole-object checksum — it would not match the slice.
+    let ranged = req(
+        Method::GET,
+        Some("ckecho"),
+        Some("obj"),
+        &[],
+        &[("x-amz-checksum-mode", "ENABLED"), ("range", "bytes=0-3")],
+        vec![],
+    );
+    let (st, hdrs, _) = drain(send(&h.svc, ranged).await).await;
+    assert_eq!(st, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(header(&hdrs, "x-amz-checksum-sha256"), None);
+}
+
+// CRC-64/NVME is the AWS CLI v2 / CRT default flexible checksum. Cairn must recognize it, compute it
+// server-side when requested, and echo it consistently across PUT and GET.
+#[tokio::test]
+async fn crc64nvme_checksum_is_computed_and_echoed() {
+    let h = harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("ck64"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+
+    let payload = b"123456789".to_vec(); // canonical CRC-64/NVME check-vector input
+    // The SDK asks the server to compute the checksum via the selector header (no value to verify).
+    let put = req(
+        Method::PUT,
+        Some("ck64"),
+        Some("obj"),
+        &[],
+        &[("x-amz-sdk-checksum-algorithm", "CRC64NVME")],
+        payload.clone(),
+    );
+    let (st, hdrs, _) = drain(send(&h.svc, put).await).await;
+    assert_eq!(st, StatusCode::OK);
+    // 0xAE8B14860A799888 big-endian, base64-encoded.
+    let put_crc = header(&hdrs, "x-amz-checksum-crc64nvme")
+        .expect("CRC64NVME echoed on PUT")
+        .to_owned();
+    assert_eq!(put_crc, "rosUhgp5mIg=");
+
+    let get = req(
+        Method::GET,
+        Some("ck64"),
+        Some("obj"),
+        &[],
+        &[("x-amz-checksum-mode", "ENABLED")],
+        vec![],
+    );
+    let (st, hdrs, body) = drain(send(&h.svc, get).await).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(body, payload);
+    assert_eq!(
+        header(&hdrs, "x-amz-checksum-crc64nvme"),
+        Some(put_crc.as_str())
+    );
+}
+
 fn md5_hex(data: &[u8]) -> String {
     use md5::{Digest, Md5};
     let mut h = Md5::new();

@@ -811,6 +811,8 @@ impl S3Service {
                 if sse_descriptor.is_some() {
                     resp = resp.with_header("x-amz-server-side-encryption", SSE_AES256);
                 }
+                // Echo any computed checksum so a modern SDK can verify the upload (ARCH 21.1).
+                resp = append_checksum_headers(resp, &staged.checksums);
                 Ok(resp)
             }
             Ok(_) => {
@@ -886,6 +888,11 @@ impl S3Service {
                 format!("bytes {}-{}/{}", cr.start, cr.end, cr.total),
             );
         }
+        // Echo the stored checksum on a whole-object GET when the client opted in (ARCH 21.1). Never
+        // on a Range/206 — the stored digest covers the whole object, not the returned slice.
+        if content_range.is_none() && checksum_mode_enabled(req) {
+            resp = append_checksum_headers(resp, &row.checksums);
+        }
         let bucket_name = req.bucket.clone().expect("bucket present");
         let key = req.key.clone().expect("key present");
         resp = self
@@ -908,6 +915,13 @@ impl S3Service {
             .with_header("x-amz-request-id", &req.request_id);
         // S3 applies the `response-*` header overrides to HEAD as well as GET.
         let resp = apply_response_overrides(resp, req);
+        // Echo the stored checksum when the client opted in (ARCH 21.1). HEAD reports whole-object
+        // metadata (Cairn does not partial-HEAD), so the digest always matches.
+        let resp = if checksum_mode_enabled(req) {
+            append_checksum_headers(resp, &row.checksums)
+        } else {
+            resp
+        };
         let bucket_name = req.bucket.clone().expect("bucket present");
         let key = req.key.clone().expect("key present");
         let resp = self
@@ -4100,10 +4114,46 @@ fn checksum_algo(name: &str) -> Option<ChecksumAlgorithm> {
     match name.to_ascii_lowercase().as_str() {
         "crc32" => Some(ChecksumAlgorithm::Crc32),
         "crc32c" => Some(ChecksumAlgorithm::Crc32c),
+        "crc64nvme" => Some(ChecksumAlgorithm::Crc64Nvme),
         "sha1" => Some(ChecksumAlgorithm::Sha1),
         "sha256" => Some(ChecksumAlgorithm::Sha256),
         _ => None,
     }
+}
+
+/// The `x-amz-checksum-{algo}` response-header name for a stored checksum algorithm — the inverse of
+/// [`checksum_algo`]. Modern SDKs read these (when they sent a checksum, or asked for one with
+/// `x-amz-checksum-mode: ENABLED`) to validate the transfer end-to-end (ARCH 21.1).
+fn checksum_header_name(algo: ChecksumAlgorithm) -> &'static str {
+    match algo {
+        ChecksumAlgorithm::Crc32 => "x-amz-checksum-crc32",
+        ChecksumAlgorithm::Crc32c => "x-amz-checksum-crc32c",
+        ChecksumAlgorithm::Crc64Nvme => "x-amz-checksum-crc64nvme",
+        ChecksumAlgorithm::Sha1 => "x-amz-checksum-sha1",
+        ChecksumAlgorithm::Sha256 => "x-amz-checksum-sha256",
+    }
+}
+
+/// Echo any stored checksums as `x-amz-checksum-{algo}` headers plus `x-amz-checksum-type:
+/// FULL_OBJECT` (Cairn computes each in a single pass over the whole plaintext), so a modern SDK with
+/// default response-integrity protection can verify the round-trip (ARCH 21.1). A no-op when the
+/// object carries no supplementary checksum. Never call this for a partial (Range/206) response — the
+/// stored value is the whole-object digest and would not match the returned bytes.
+fn append_checksum_headers(mut resp: S3Response, checksums: &[ChecksumValue]) -> S3Response {
+    if checksums.is_empty() {
+        return resp;
+    }
+    for c in checksums {
+        resp = resp.with_header(checksum_header_name(c.algorithm), c.value.clone());
+    }
+    resp.with_header("x-amz-checksum-type", "FULL_OBJECT")
+}
+
+/// Whether a GET/HEAD asked for its checksum to be echoed (`x-amz-checksum-mode: ENABLED`). S3 only
+/// returns the stored checksum when the client opts in this way.
+fn checksum_mode_enabled(req: &S3Request) -> bool {
+    req.header("x-amz-checksum-mode")
+        .is_some_and(|v| v.eq_ignore_ascii_case("ENABLED"))
 }
 
 fn user_metadata(req: &S3Request) -> Vec<(String, String)> {

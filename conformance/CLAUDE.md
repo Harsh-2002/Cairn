@@ -8,6 +8,9 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
 
 ## e2e / feature (does it work as specified?)
 - `run.sh` (+`conformance.py`) — boto3 / real AWS SDK full object lifecycle; the broad smoke gate.
+- `checksums.sh` (+`.py`) — modern-SDK flexible-checksum round-trip (ARCH 21.1): PUT/GET/HEAD echo the
+  stored `x-amz-checksum-<algo>` (+ `x-amz-checksum-type`) so default-on SDKs validate the transfer;
+  CRC32/SHA256 always, CRC32C/CRC64NVME when `botocore[crt]` is installed; Range never echoes.
 - `share.sh` — object sharing (revocable share tokens + interoperable SigV4 presigned URLs), pure curl.
 - `rotation.sh` (+`.py`) — master-key rotation lifecycle (#29), sharded.
 - `soak.sh` (+`.py`) — two-node replication, byte-identical verify + RSS leak check (boto3).

@@ -19,8 +19,8 @@ authorizes.
 | ListObjectsV2 / ListObjects (v1) | ✅ | Prefix, delimiter, pagination (opaque tokens), start-after / marker. |
 | ListObjectVersions | ✅ | Distinguishes versions from delete markers. |
 | ListMultipartUploads | ✅ | |
-| PutObject | ✅ | Plain, unsigned-payload, and **SigV4 streaming-chunked** bodies; conditional writes (If-Match / If-None-Match); inline metadata; requested checksums; Content-MD5 verification. |
-| GetObject / HeadObject | ✅ | Byte ranges (206), conditionals (304/412), version selection. |
+| PutObject | ✅ | Plain, unsigned-payload, and **SigV4 streaming-chunked** bodies; conditional writes (If-Match / If-None-Match); inline metadata; Content-MD5 verification. **Flexible checksums** (CRC32, CRC32C, **CRC-64/NVME**, SHA-1, SHA-256): the default-on checksum every modern SDK sends is computed, verified (`BadDigest` on header mismatch), stored, and **echoed** on the response with `x-amz-checksum-type: FULL_OBJECT`. |
+| GetObject / HeadObject | ✅ | Byte ranges (206), conditionals (304/412), version selection. **Echoes the stored `x-amz-checksum-<algo>`** on a whole-object read when the request sends `x-amz-checksum-mode: ENABLED` (never on a Range read). |
 | DeleteObject | ✅ | Delete marker in a versioned bucket; permanent with a version id. |
 | DeleteObjects (bulk) | ✅ | Quiet mode; up to the request cap. |
 | CopyObject | ✅ | COPY/REPLACE metadata directive; same-key metadata change; versioned source. |
@@ -33,6 +33,15 @@ authorizes.
 | Temporary security credentials (STS) | ◑ | **Cairn-native minting**, SDK-compatible consumption. Mint via the management API (`POST /api/v1/credentials/temporary`, scoped inline policy + 15m–12h lifetime); consume with any S3 SDK that sends `X-Amz-Security-Token` (header or presigned query). Least-privilege: a session never inherits the parent's owner/admin bypass. The AWS-STS `AssumeRole`/`GetSessionToken` XML surface is not implemented. |
 | Event notifications (webhooks) | ◑ | **Webhook-native**, not SNS/SQS/Lambda. Per-bucket endpoints (URL + event selectors + prefix/suffix filter + optional HMAC secret) are configured via the **management API** (`PUT /api/v1/buckets/{name}/notifications`); object events (`s3:ObjectCreated:*`, `s3:ObjectRemoved:*`) enqueue a durable delivery row that a background worker POSTs as S3-event-record JSON with retry/backoff and an optional `X-Cairn-Signature` (HMAC-SHA256). The S3 `?notification` subresource (SNS/SQS ARNs) stays `NotImplemented`. |
 | SSE config, website / accelerate / analytics / inventory / requester-pays | ✖ | Out of scope; answered as NotImplemented. |
+
+**Checksum scope.** Single-object checksums are full-object and round-trip end to end. Two related
+features are deliberately out of scope for now: (1) **multipart composite checksums** — a multipart
+object stores and returns its `-N` multipart ETag, but Cairn does not assemble a composite
+`checksum-of-part-checksums`, so `GetObjectAttributes` on a multipart object returns no checksum;
+(2) **server-side verification of the *trailing* checksum value** in `aws-chunked` streaming uploads —
+the checksum is still computed and stored server-side from the selected algorithm, and the
+non-streaming header-checksum path is verified and `BadDigest`-rejected on mismatch (see `s3-api.md`
+§21.7).
 
 **Management API** (`/api/v1`, admin-gated JSON) and the **embedded React console** (its own listener, port 7374) provide
 control-plane operations (overview, bucket/user/activity management) consumed by both the web UI

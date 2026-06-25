@@ -58,6 +58,8 @@ pub enum ChecksumAlgorithm {
     Crc32,
     /// CRC32C (Castagnoli).
     Crc32c,
+    /// CRC-64/NVME — the default flexible checksum of the AWS CLI v2 and CRT-based SDKs.
+    Crc64Nvme,
     /// SHA-1.
     Sha1,
     /// SHA-256.

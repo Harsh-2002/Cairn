@@ -1,6 +1,7 @@
 //! Streaming content hashing: always the MD5 that becomes the ETag, plus any client-requested
 //! checksum algorithms, computed once over the plaintext.
 
+use crate::crc64nvme::Crc64Nvme;
 use base64::Engine;
 use cairn_types::object::{ChecksumAlgorithm, ChecksumSet, ChecksumValue};
 use md5::{Digest, Md5};
@@ -12,6 +13,7 @@ pub struct Hashers {
     md5: Md5,
     crc32: Option<crc32fast::Hasher>,
     crc32c: Option<u32>,
+    crc64nvme: Option<Crc64Nvme>,
     sha1: Option<Sha1>,
     sha256: Option<Sha256>,
 }
@@ -25,6 +27,7 @@ impl Hashers {
             md5: Md5::new(),
             crc32: has(ChecksumAlgorithm::Crc32).then(crc32fast::Hasher::new),
             crc32c: has(ChecksumAlgorithm::Crc32c).then_some(0),
+            crc64nvme: has(ChecksumAlgorithm::Crc64Nvme).then(Crc64Nvme::new),
             sha1: has(ChecksumAlgorithm::Sha1).then(Sha1::new),
             sha256: has(ChecksumAlgorithm::Sha256).then(Sha256::new),
         }
@@ -38,6 +41,9 @@ impl Hashers {
         }
         if let Some(c) = &mut self.crc32c {
             *c = crc32c::crc32c_append(*c, data);
+        }
+        if let Some(h) = &mut self.crc64nvme {
+            h.update(data);
         }
         if let Some(h) = &mut self.sha1 {
             h.update(data);
@@ -64,6 +70,12 @@ impl Hashers {
             checksums.push(ChecksumValue {
                 algorithm: ChecksumAlgorithm::Crc32c,
                 value: b64.encode(c.to_be_bytes()),
+            });
+        }
+        if let Some(h) = self.crc64nvme {
+            checksums.push(ChecksumValue {
+                algorithm: ChecksumAlgorithm::Crc64Nvme,
+                value: b64.encode(h.finalize()),
             });
         }
         if let Some(h) = self.sha1 {

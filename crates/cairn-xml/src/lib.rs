@@ -499,6 +499,7 @@ fn checksum_element(alg: ChecksumAlgorithm) -> &'static str {
     match alg {
         ChecksumAlgorithm::Crc32 => "ChecksumCRC32",
         ChecksumAlgorithm::Crc32c => "ChecksumCRC32C",
+        ChecksumAlgorithm::Crc64Nvme => "ChecksumCRC64NVME",
         ChecksumAlgorithm::Sha1 => "ChecksumSHA1",
         ChecksumAlgorithm::Sha256 => "ChecksumSHA256",
     }
