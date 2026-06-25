@@ -3,7 +3,7 @@ name: Release
 # Date-based release policy. A release is a deliberate act (run this workflow from the Actions tab)
 # that is gated on a green CI for the exact commit being released. It then:
 #   * builds static linux/amd64 + linux/arm64 binaries (musl, real UI embedded);
-#   * publishes a multi-arch image to GHCR built from those exact binaries (:<ddmmyy> and :latest);
+#   * publishes a multi-arch image to GHCR built from those exact binaries (:latest, one active image);
 #   * publishes ONE GitHub Release named by date (ddmmyy, not a version) and retires the previous
 #     one — so exactly one release is ever active.
 on:

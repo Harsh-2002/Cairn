@@ -128,5 +128,12 @@ lists exactly which S3 operations are supported, partial, or out of scope.
 
 ## License & policies
 
-Apache-2.0 ([`LICENSE`](./LICENSE)). Security policy: [`SECURITY.md`](./SECURITY.md). Contributing and
-the developer build/test workflow: [`CONTRIBUTING.md`](./CONTRIBUTING.md).
+Apache-2.0 ([`LICENSE`](./LICENSE)) — permanent and irrevocable; there is no enterprise edition and
+no open-core split. What the project is, how it is maintained, and the no-rug-pull commitments are in
+[`GOVERNANCE.md`](./GOVERNANCE.md). Security policy: [`SECURITY.md`](./SECURITY.md). Community
+expectations: [`CODE_OF_CONDUCT.md`](./CODE_OF_CONDUCT.md). Contributing and the developer build/test
+workflow: [`CONTRIBUTING.md`](./CONTRIBUTING.md).
+
+Releases are CI-gated and ship static `linux/amd64`+`linux/arm64` binaries (with a `SHA256SUMS`
+manifest) plus a multi-arch image on GHCR the project controls — `ghcr.io/harsh-2002/cairn:latest`.
+Verify a download with `sha256sum -c SHA256SUMS`; see [`GOVERNANCE.md`](./GOVERNANCE.md#releases--verification).
