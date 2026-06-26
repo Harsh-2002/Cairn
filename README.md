@@ -32,7 +32,23 @@ production node, with the S3 API and a console but without operating a distribut
   bucket replication to another node or S3 endpoint, webhook event notifications, and a CLI for
   bootstrap, config validation, integrity checks, and backup and restore.
 
+## Install
+
+The install script sets Cairn up on a host or with Docker, and updates an existing installation when
+you run it again:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Harsh-2002/Cairn/main/install.sh | sudo sh
+```
+
+It detects Docker and offers it (or installs the binary with a systemd or OpenRC service), generates
+the master key and admin credentials, can enable TLS, and stores data in a Docker named volume or
+under `/var/lib/cairn`. The Docker setup lives in `/opt/cairn` so you can edit the compose file. Run
+`sh install.sh --help` for options such as `--docker`, `--host`, `--update`, and `--uninstall`.
+
 ## Quickstart
+
+To set it up by hand with Docker instead:
 
 ```sh
 docker build -t cairn .
