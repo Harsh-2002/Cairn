@@ -3,8 +3,15 @@ name: CI
 # Runs the complete test methodology on every commit (any branch) and every pull request:
 # formatting + lint, unit/integration tests (gnu + musl, default and all-features), doc tests,
 # the boto3 S3 conformance suite, the crash-consistency (durability) harness, a two-node
-# replication soak, the MinIO warp macro benchmark, fuzz smoke tests, a benchmark compile check,
-# and coverage. Release artifacts are built by release.yml, not here. No caching anywhere.
+# replication soak, the warp-based stress harness, fuzz smoke tests, a benchmark compile check,
+# and coverage. Release artifacts are built by release.yml, not here.
+#
+# Build-once: the `build` job compiles the `cairn` binary a single time and uploads it as a
+# temporary artifact (retention-days: 1); every conformance job that just drives a prebuilt binary
+# `needs: build` and downloads it instead of recompiling — so the binary is compiled once, not ~15
+# times. The compile jobs that genuinely need their own build (lint/test/coverage, the `--features
+# fast-io` path, and the `--features failpoints` crash harnesses) keep building, but are now warmed by
+# a shared cargo cache (Swatinem/rust-cache, wired into ./.github/actions/setup).
 on:
   push:
     branches: ["**"]
@@ -30,6 +37,25 @@ permissions:
   contents: read
 
 jobs:
+  # Compile the plain debug `cairn` binary ONCE and publish it as a temporary artifact. Every
+  # conformance job below that only drives a prebuilt binary downloads this instead of recompiling.
+  build:
+    name: build cairn (shared binary)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup   # builds ui/dist (embedded into the binary) + toolchain + cache
+      - run: cargo build --bin cairn
+      # Conformance asserts behaviour, not Rust-level state, so it does not need debug symbols.
+      # Stripping shrinks the artifact from ~260 MB to ~25 MB — far faster to upload once + download many.
+      - run: strip target/debug/cairn
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cairn-bin
+          path: target/debug/cairn
+          retention-days: 1          # temporary: only an intra-run handoff, auto-cleaned within a day
+          if-no-files-found: error
+
   lint:
     name: fmt + clippy
     runs-on: ubuntu-latest
@@ -88,109 +114,143 @@ jobs:
       # Exercises the optional backends (libSQL + Turso) and the fast-io (io_uring + kTLS) paths.
       - run: cargo nextest run --workspace --all-features
 
+  # ---- conformance jobs: download the shared binary, drive it, no recompile -------------------
+
   conformance:
     name: boto3 conformance
+    needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: ./.github/actions/setup
+      - uses: actions/download-artifact@v4
+        with:
+          name: cairn-bin
+          path: target/debug
+      - run: chmod +x target/debug/cairn
       - uses: actions/setup-python@v5
         with:
           python-version: "3.x"
       - run: pip install boto3
-      - run: cargo build --bin cairn
       - name: Drive Cairn with the AWS SDK (real SigV4 + aws-chunked streaming, the F-5 path)
         run: BIN=target/debug/cairn PY=python3 bash conformance/run.sh
 
   checksums:
     name: modern-SDK flexible checksums
+    needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: ./.github/actions/setup
+      - uses: actions/download-artifact@v4
+        with:
+          name: cairn-bin
+          path: target/debug
+      - run: chmod +x target/debug/cairn
       - uses: actions/setup-python@v5
         with:
           python-version: "3.x"
       # botocore[crt] lets boto3 emit CRC32C + CRC64NVME so the harness exercises every algorithm.
       - run: pip install 'boto3' 'botocore[crt]'
-      - run: cargo build --bin cairn
       - name: Assert checksums are computed, stored, and echoed on PUT/GET/HEAD (ARCH 21.1)
         run: BIN=target/debug/cairn PY=python3 bash conformance/checksums.sh
 
   scrub:
     name: integrity scrub (bit-rot detection)
+    needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: ./.github/actions/setup
+      - uses: actions/download-artifact@v4
+        with:
+          name: cairn-bin
+          path: target/debug
+      - run: chmod +x target/debug/cairn
       - uses: actions/setup-python@v5
         with:
           python-version: "3.x"
       - run: pip install boto3
-      - run: cargo build --bin cairn
       - name: Corrupt a stored blob on disk; assert the background scrub detects the ETag mismatch
         run: BIN=target/debug/cairn PY=python3 bash conformance/scrub.sh
 
   object-lock:
     name: object lock / WORM
+    needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: ./.github/actions/setup
+      - uses: actions/download-artifact@v4
+        with:
+          name: cairn-bin
+          path: target/debug
+      - run: chmod +x target/debug/cairn
       - uses: actions/setup-python@v5
         with:
           python-version: "3.x"
       - run: pip install boto3
-      - run: cargo build --bin cairn
       - name: COMPLIANCE/GOVERNANCE retention + legal hold enforced via the AWS SDK
         run: BIN=target/debug/cairn PY=python3 bash conformance/object_lock.sh
 
   notifications:
     name: webhook event notifications
+    needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: ./.github/actions/setup
+      - uses: actions/download-artifact@v4
+        with:
+          name: cairn-bin
+          path: target/debug
+      - run: chmod +x target/debug/cairn
       - uses: actions/setup-python@v5
         with:
           python-version: "3.x"
       - run: pip install boto3
-      - run: cargo build --bin cairn
       - name: Event-notification delivery + HMAC signing (management UI listener on)
         run: BIN=target/debug/cairn PY=python3 bash conformance/notifications.sh
 
   sts:
     name: STS temporary credentials
+    needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: ./.github/actions/setup
+      - uses: actions/download-artifact@v4
+        with:
+          name: cairn-bin
+          path: target/debug
+      - run: chmod +x target/debug/cairn
       - uses: actions/setup-python@v5
         with:
           python-version: "3.x"
       - run: pip install boto3
-      - run: cargo build --bin cairn
       - name: Mint + enforce scoped session credentials over a real SDK (management UI listener on)
         run: BIN=target/debug/cairn PY=python3 bash conformance/sts.sh
 
   console-session:
     name: console session-cookie auth
+    needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: ./.github/actions/setup
-      - run: cargo build --bin cairn
+      - uses: actions/download-artifact@v4
+        with:
+          name: cairn-bin
+          path: target/debug
+      - run: chmod +x target/debug/cairn
       # Pure curl (no SDK): the httpOnly cookie flow is plain HTTP. Management UI listener on.
       - name: httpOnly session-cookie auth + S3 data-plane port isolation (management UI listener on)
         run: BIN=target/debug/cairn bash conformance/console_session.sh
 
   backup-restore:
     name: backup / restore / integrity e2e
+    needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: ./.github/actions/setup
-      - run: cargo build --bin cairn
+      - uses: actions/download-artifact@v4
+        with:
+          name: cairn-bin
+          path: target/debug
+      - run: chmod +x target/debug/cairn
       # Pure curl (Bearer auth, no SDK): backup -> corrupt -> restore-to-fresh-dir -> integrity --repair.
       - name: Snapshot fidelity + reconcile baseline + surgical integrity --repair
         run: BIN=target/debug/cairn bash conformance/backup_restore.sh
@@ -205,8 +265,9 @@ jobs:
         with:
           python-version: "3.x"
       - run: pip install boto3
-      # Build the experimental zero-copy GET fast path (off by default) and prove the full S3
-      # lifecycle is correct through it with the fast path maximally engaged (FASTIO_MIN_BYTES=0)...
+      # The fast path is a build-time feature (off by default), so this job needs its own binary and
+      # cannot reuse the shared artifact. Build the experimental zero-copy GET fast path and prove the
+      # full S3 lifecycle is correct through it with the fast path maximally engaged (FASTIO_MIN_BYTES=0)...
       - run: cargo build --bin cairn --features fast-io
       - name: Full boto3 lifecycle through the sendfile fast path
         run: CAIRN_FASTIO_MIN_BYTES=0 BIN=target/debug/cairn PY=python3 bash conformance/run.sh
@@ -221,34 +282,49 @@ jobs:
 
   rotation:
     name: master-key rotation e2e (#29)
+    needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: ./.github/actions/setup
+      - uses: actions/download-artifact@v4
+        with:
+          name: cairn-bin
+          path: target/debug
+      - run: chmod +x target/debug/cairn
       - uses: actions/setup-python@v5
         with:
           python-version: "3.x"
-      - run: cargo build --bin cairn
       - name: Add a key, re-wrap stored secrets onto it, retire the old key (sharded); assert the fail-closed retire-gate
         run: BIN=target/debug/cairn PY=python3 bash conformance/rotation.sh
 
   share:
     name: object sharing e2e
+    needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: ./.github/actions/setup
-      - run: cargo build --bin cairn
+      - uses: actions/download-artifact@v4
+        with:
+          name: cairn-bin
+          path: target/debug
+      - run: chmod +x target/debug/cairn
       - name: Persistent share tokens + SigV4 presigned URLs, end to end
         run: BIN=target/debug/cairn bash conformance/share.sh
 
   concurrency:
     name: concurrency contention (single-key races)
+    needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: ./.github/actions/setup
-      - run: cargo build --bin cairn
+      - uses: actions/download-artifact@v4
+        with:
+          name: cairn-bin
+          path: target/debug
+      - run: chmod +x target/debug/cairn
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
       - name: Race N clients on one key (create / CAS / last-writer); assert atomic, no corruption
         run: BIN=target/debug/cairn PY=python3 N=32 bash conformance/concurrency.sh
 
@@ -258,6 +334,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup
+      # Self-builds `cairn --features failpoints` (the durability fault seams) — a different binary
+      # from the shared artifact, so this job keeps its own compile (warmed by the shared cache).
       - name: Arm the durability fault seam, crash in the window, assert reconcile reclaims
         run: bash conformance/crash_consistency.sh
 
@@ -271,47 +349,60 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.x"
+      # Self-builds `cairn --features failpoints` (see crash_multipoint.sh) — keeps its own compile.
       - name: Crash at every blob-commit seam (PutObject + multipart); assert reconcile reclaims each orphan
         run: BIN=target/debug/cairn PY=python3 bash conformance/crash_multipoint.sh
 
   soak:
     name: replication soak (multi-host)
+    needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - uses: ./.github/actions/setup
+      - uses: actions/download-artifact@v4
+        with:
+          name: cairn-bin
+          path: target/debug
+      - run: chmod +x target/debug/cairn
       - uses: actions/setup-python@v5
         with:
           python-version: "3.x"
       - run: pip install boto3
-      - run: cargo build --bin cairn
       - name: Two-node replication soak — sustained PUTs, byte-identical verify, RSS leak check
         run: BIN=target/debug/cairn PY=python3 DURATION=90 bash conformance/soak.sh
 
   replication-chaos:
     name: replication chaos (fault injection)
+    needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - uses: ./.github/actions/setup
+      - uses: actions/download-artifact@v4
+        with:
+          name: cairn-bin
+          path: target/debug
+      - run: chmod +x target/debug/cairn
       - uses: actions/setup-python@v5
         with:
           python-version: "3.x"
       - run: pip install boto3
-      - run: cargo build --bin cairn
       - name: Break replication on purpose (target down, source SIGKILL, rapid overwrite); assert no data loss
         run: BIN=target/debug/cairn PY=python3 bash conformance/replication_chaos.sh
 
   stress:
     name: stress + stability (throughput, escalation, leak)
+    needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - uses: ./.github/actions/setup
-      - run: cargo build --bin cairn
+      - uses: actions/download-artifact@v4
+        with:
+          name: cairn-bin
+          path: target/debug
+      - run: chmod +x target/debug/cairn
       # warp put/get/mixed + a concurrency ramp + RSS/queue sampling, asserting zero op-errors, a live
       # server after the ramp, and no memory leak. The unified successor to warp.sh + warp_escalate.sh
       # (a strict superset). Runs the debug binary (fast); the stability assertions hold on debug —
@@ -322,15 +413,19 @@ jobs:
 
   blob-limits:
     name: blob store limits (out-of-space, huge, many)
+    needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - uses: ./.github/actions/setup
+      - uses: actions/download-artifact@v4
+        with:
+          name: cairn-bin
+          path: target/debug
+      - run: chmod +x target/debug/cairn
       - uses: actions/setup-python@v5
         with:
           python-version: "3.x"
-      - run: cargo build --bin cairn
       - name: Out-of-space 507 on a constrained FS, huge-object round-trip, many objects paginated
         run: BIN=target/debug/cairn PY=python3 bash conformance/blob_limits.sh
 
