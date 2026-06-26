@@ -50,7 +50,7 @@ jobs:
           - { arch: amd64, target: x86_64-unknown-linux-musl }
           - { arch: arm64, target: aarch64-unknown-linux-musl }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup   # builds the real UI bundle + the Rust toolchain
         with:
           targets: ${{ matrix.target }}
@@ -64,7 +64,7 @@ jobs:
           cp "target/${{ matrix.target }}/release/cairn" "dist/cairn-linux-${{ matrix.arch }}"
           file "dist/cairn-linux-${{ matrix.arch }}" | grep -qiE "statically linked|static-pie linked" \
             || { echo "binary is not statically linked"; exit 1; }
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: cairn-${{ matrix.arch }}
           path: dist/cairn-linux-${{ matrix.arch }}
@@ -74,7 +74,7 @@ jobs:
     needs: binaries
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: cairn-*
           path: artifacts
@@ -116,7 +116,7 @@ jobs:
     needs: [binaries, image]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: cairn-*
           path: artifacts

@@ -15,7 +15,7 @@ runs:
   using: composite
   steps:
     - name: Set up Node
-      uses: actions/setup-node@v4
+      uses: actions/setup-node@v6
       with:
         # Vite 8 requires Node >= 20.19; 22 LTS gives headroom.
         node-version: "22"
