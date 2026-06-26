@@ -26,10 +26,15 @@ WORKDIR /src
 COPY . .
 COPY --from=ui /ui/dist ./ui/dist
 RUN cargo zigbuild --release --bin cairn --target "$(cat /tmp/triple)" \
-    && cp "target/$(cat /tmp/triple)/release/cairn" /cairn
+    && cp "target/$(cat /tmp/triple)/release/cairn" /cairn \
+    && mkdir -p /seed-data
 
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /cairn /usr/local/bin/cairn
+# Ship a /data owned by the nonroot user (uid 65532) so a fresh Docker volume mounted here inherits
+# that ownership; the container runs as nonroot and must be able to create its database and blobs.
+COPY --from=build --chown=65532:65532 /seed-data /data
+ENV CAIRN_DATA_DIR=/data CAIRN_DB_PATH=/data/cairn.db
 EXPOSE 7373 7374
 USER nonroot
 ENTRYPOINT ["/usr/local/bin/cairn"]

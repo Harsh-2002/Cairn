@@ -55,8 +55,7 @@ docker build -t cairn .
 
 docker run -d --name cairn \
   -p 7373:7373 -p 7374:7374 \
-  -v /srv/cairn:/data \
-  -e CAIRN_DATA_DIR=/data -e CAIRN_DB_PATH=/data/cairn.db \
+  -v cairn-data:/data \
   -e CAIRN_MASTER_KEY="$(openssl rand -hex 32)" \
   cairn serve
 ```

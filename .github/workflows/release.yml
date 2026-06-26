@@ -80,7 +80,7 @@ jobs:
           path: artifacts
       - name: Assemble the runtime build context (the exact release binaries)
         run: |
-          mkdir -p ctx
+          mkdir -p ctx/data
           cp artifacts/cairn-amd64/cairn-linux-amd64 ctx/
           cp artifacts/cairn-arm64/cairn-linux-arm64 ctx/
           chmod +x ctx/cairn-linux-*
@@ -88,6 +88,11 @@ jobs:
           FROM gcr.io/distroless/static-debian12:nonroot
           ARG TARGETARCH
           COPY cairn-linux-${TARGETARCH} /usr/local/bin/cairn
+          # /data owned by the nonroot user (65532): a fresh Docker volume mounted here inherits that
+          # ownership, so the nonroot server can create its database and object files. COPY (not RUN)
+          # keeps the multi-arch build emulation-free.
+          COPY --chown=65532:65532 data /data
+          ENV CAIRN_DATA_DIR=/data CAIRN_DB_PATH=/data/cairn.db
           EXPOSE 7373 7374
           USER nonroot
           ENTRYPOINT ["/usr/local/bin/cairn"]
