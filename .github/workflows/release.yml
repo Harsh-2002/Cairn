@@ -1,10 +1,10 @@
 name: Release
 
-# Date-based release policy. A release is a deliberate act (run this workflow from the Actions tab)
+# Calendar-versioned (CalVer) release policy. A release is a deliberate act (run from the Actions tab)
 # that is gated on a green CI for the exact commit being released. It then:
 #   * builds static linux/amd64 + linux/arm64 binaries (musl, real UI embedded);
 #   * publishes a multi-arch image to GHCR built from those exact binaries (:latest, one active image);
-#   * publishes ONE GitHub Release named by date (ddmmyy, not a version) and retires the previous
+#   * publishes ONE GitHub Release tagged vYYYY.MM.DD (a calendar version) and retires the previous
 #     one — so exactly one release is ever active.
 on:
   workflow_dispatch:
@@ -131,19 +131,19 @@ jobs:
           cp artifacts/cairn-amd64/cairn-linux-amd64 rel/
           cp artifacts/cairn-arm64/cairn-linux-arm64 rel/
           ( cd rel && sha256sum cairn-linux-* > SHA256SUMS )
-      - name: Publish the ddmmyy release and retire the previous one
+      - name: Publish the calendar-versioned release and retire the previous one
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          TAG="$(date -u +%d%m%y)"
+          TAG="$(date -u +v%Y.%m.%d)"
           REPO="${{ github.repository }}"
           IMG="ghcr.io/$(echo "$REPO" | tr '[:upper:]' '[:lower:]')"
           # recreate cleanly if a release for today already exists
           gh release delete "$TAG" --repo "$REPO" --yes --cleanup-tag 2>/dev/null || true
           gh release create "$TAG" --repo "$REPO" --target "${{ github.sha }}" \
             --title "$TAG" --latest \
-            --notes "Date-based release \`$TAG\` (ddmmyy). Static linux binaries (amd64 + arm64) attached below; the multi-arch container image is \`$IMG:latest\` (always current)." \
+            --notes "Calendar-versioned release \`$TAG\` (vYYYY.MM.DD). Static linux binaries (amd64 + arm64) attached below; the multi-arch container image is \`$IMG:latest\` (always current)." \
             rel/cairn-linux-amd64 rel/cairn-linux-arm64 rel/SHA256SUMS
           # one active release: delete every OTHER release and its tag
           gh release list --repo "$REPO" --limit 200 --json tagName --jq '.[].tagName' \

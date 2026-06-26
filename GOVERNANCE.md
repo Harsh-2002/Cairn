@@ -23,7 +23,7 @@ is, how it is maintained, and the commitments that make it safe to build on.
   [GitHub](https://github.com/Harsh-2002/Cairn); `main` is always the source of truth.
 - Every change must pass the full CI gate before merge (see [`CONTRIBUTING.md`](./CONTRIBUTING.md)
   and [`docs/delivery.md`](./docs/delivery.md) §31). Security and data-durability fixes take priority.
-- Releases are **date-based** (`ddmmyy`) and CI-gated: a release is only cut from a commit whose CI is
+- Releases are **calendar-versioned** (`vYYYY.MM.DD`) and CI-gated: a release is only cut from a commit whose CI is
   green, and exactly one release is active at a time. See [Releases & verification](#releases--verification).
 - Decisions, bugs, and feature requests are tracked as GitHub issues. There is no private roadmap that
   overrides the public one.
