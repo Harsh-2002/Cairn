@@ -18,7 +18,7 @@ Requires boto3 (same as soak.py).
 import os, signal, subprocess, sys, time
 import boto3
 from botocore.config import Config
-from botocore.exceptions import ClientError, EndpointConnectionError
+from botocore.exceptions import BotoCoreError, ClientError
 
 BIN = os.environ.get("BIN", "target/debug/cairn")
 ROOT = os.environ["DATA"]
@@ -115,7 +115,13 @@ def setup_replication(src):
 def get_body(cl, key):
     try:
         return cl.get_object(Bucket=BUCKET, Key=key)["Body"].read()
-    except (ClientError, EndpointConnectionError):
+    except ClientError:
+        return None
+    except BotoCoreError:
+        # A server that is down, being SIGKILLed, or mid-restart raises the BotoCoreError family
+        # (ConnectionError, ResponseStreamingError, ReadTimeoutError, EndpointConnectionError). In a
+        # fault-injection test that is expected: treat it as "not available yet" so the convergence
+        # poll keeps trying instead of crashing the run.
         return None
 
 def converged(tgt, expected, timeout=90):
