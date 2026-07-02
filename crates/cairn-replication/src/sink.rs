@@ -87,6 +87,16 @@ const REPLICA_VERSION_ID_KEY: &str = "cairn-replica-version-id";
 /// header value. The destination applies it fail-open (a malformed value is ignored, never a 4xx).
 const REPLICA_ACL_KEY: &str = "cairn-replica-acl";
 
+/// The most of a single object's logical body the buffered signed-payload PUT will hold in memory.
+/// `HttpS3Sink` buffers the whole body to hash it for SigV4 signed-payload, so without a bound one
+/// very large object (up to `CAIRN_MAX_OBJECT_SIZE`, default 5 TiB) times the worker concurrency
+/// exhausts memory and OOM-kills the node — and, because the claimed outbox entry is re-leased on
+/// restart, it re-buffers and OOMs again in a permanent crash loop (audit 2026-07). An object past
+/// this cap fails replication terminally (parked, not retried). A future streaming
+/// `UNSIGNED-PAYLOAD` PUT would remove the buffer entirely; until then this is a fixed bound rather
+/// than an operator knob (mirrors the webhook response-body cap).
+const MAX_BUFFERED_BODY_BYTES: usize = 2 * 1024 * 1024 * 1024; // 2 GiB
+
 /// Connection parameters for a remote S3-compatible replication destination.
 #[derive(Debug, Clone)]
 pub struct S3SinkConfig {
@@ -529,8 +539,9 @@ impl HttpS3Sink {
     ) -> Result<(), ReplicationError> {
         let dest_bucket = self.dest_for(source_bucket).to_owned();
 
-        // Buffer the logical body so the payload can be hashed for the signed-payload PUT.
-        let body = collect_body(object.body).await?;
+        // Buffer the logical body so the payload can be hashed for the signed-payload PUT, bounded so
+        // one oversized object cannot OOM the node in a crash loop (audit 2026-07).
+        let body = collect_body(object.body, MAX_BUFFERED_BODY_BYTES).await?;
 
         // User metadata becomes `x-amz-meta-*`, plus the loop-prevention marker. The marker is
         // appended unconditionally so a destination that mirrors back recognizes the replica.
@@ -642,15 +653,27 @@ impl crate::route::BucketRoutedSink for HttpS3Sink {
     }
 }
 
-/// Read a logical-byte blob stream fully into a contiguous buffer. A read error mid-stream is
-/// transient (the source blob may be momentarily unavailable), so it is retryable.
+/// Read a logical-byte blob stream fully into a contiguous buffer, bounded by `max_bytes`. A read
+/// error mid-stream is transient (the source blob may be momentarily unavailable), so it is
+/// retryable. Exceeding `max_bytes` is a *terminal* failure: the signed-payload PUT buffers the whole
+/// body in memory, so an oversized object would OOM the node — and because a claimed outbox entry is
+/// re-leased on restart, a retryable failure would re-buffer and OOM again in a permanent crash loop
+/// (audit 2026-07). Terminal parks the entry for operator attention instead.
 async fn collect_body(
     mut stream: cairn_types::BlobStream,
+    max_bytes: usize,
 ) -> Result<bytes::Bytes, ReplicationError> {
     let mut buf = bytes::BytesMut::new();
     while let Some(chunk) = stream.next().await {
         let chunk =
             chunk.map_err(|e| ReplicationError::Retryable(format!("reading source body: {e}")))?;
+        if buf.len().saturating_add(chunk.len()) > max_bytes {
+            return Err(ReplicationError::Terminal(format!(
+                "object body exceeds the {max_bytes}-byte replication buffer cap; the signed-payload \
+                 PUT buffers the whole body in memory. This object will not replicate until streaming \
+                 uploads land (audit 2026-07)."
+            )));
+        }
         buf.extend_from_slice(&chunk);
     }
     Ok(buf.freeze())
@@ -788,6 +811,33 @@ mod tests {
             classify_status(400, ""),
             ReplicationError::Terminal(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn collect_body_caps_oversize_terminally() {
+        use bytes::Bytes;
+        type Chunk = Result<Bytes, cairn_types::error::BlobError>;
+
+        // A body over the cap fails TERMINAL (not Retryable) so the entry parks instead of
+        // re-leasing on restart and OOM-looping (audit 2026-07).
+        let over: Vec<Chunk> = vec![
+            Ok(Bytes::from_static(&[0u8; 8])),
+            Ok(Bytes::from_static(&[0u8; 8])),
+        ];
+        let stream = Box::pin(futures_util::stream::iter(over));
+        let err = collect_body(stream, 10)
+            .await
+            .expect_err("a body over the cap must error");
+        assert!(
+            matches!(err, ReplicationError::Terminal(_)),
+            "over-cap must be Terminal, got {err:?}"
+        );
+
+        // A body within the cap collects fine.
+        let under: Vec<Chunk> = vec![Ok(Bytes::from_static(b"hello"))];
+        let stream = Box::pin(futures_util::stream::iter(under));
+        let body = collect_body(stream, 10).await.expect("within cap collects");
+        assert_eq!(&body[..], b"hello");
     }
 
     fn cfg_for(endpoint: &str) -> S3SinkConfig {
