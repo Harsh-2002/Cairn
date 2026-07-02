@@ -614,6 +614,7 @@ impl LifecycleScanner {
     /// deleted, `false` when it was preserved because Object Lock (retention or legal hold) still
     /// protects it — lifecycle silently skips a locked version (the WORM guarantee outranks the
     /// expiry rule) and the rule applies once protection lapses.
+    #[allow(clippy::too_many_arguments)]
     async fn delete_version<M, B>(
         &self,
         meta: &M,
