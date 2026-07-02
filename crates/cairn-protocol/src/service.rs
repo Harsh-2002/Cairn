@@ -470,8 +470,14 @@ impl S3Service {
             limit: max_keys,
         };
         let mut page = self.meta.list_current(&bucket.name, &query).await?;
-        // Re-encode the next cursor opaquely.
-        page.next_cursor = page.next_cursor.map(|c| encode_token(&c));
+        // v2 uses an opaque base64 continuation token (symmetric with the decode_token applied to the
+        // incoming continuation-token above). v1's NextMarker is a plain object key, echoed back by
+        // the client verbatim as `marker` and consumed raw above — so it must NOT be base64-encoded
+        // here, or the resume seeks to the base64 string and pagination loops or skips keys (audit
+        // 2026-07).
+        if !v1 {
+            page.next_cursor = page.next_cursor.map(|c| encode_token(&c));
+        }
 
         let body = if v1 {
             cairn_xml::list_objects_v1(

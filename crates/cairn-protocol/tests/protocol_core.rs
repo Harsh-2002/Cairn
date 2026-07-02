@@ -1323,6 +1323,65 @@ async fn complete_multipart_against_wrong_key_is_no_such_upload() {
     );
 }
 
+/// Audit 2026-07: v1 ListObjects must emit a plain-key NextMarker that, echoed back as `marker`,
+/// advances the listing. Pre-fix the NextMarker was base64-encoded but the incoming marker consumed
+/// raw, so pagination looped (re-returned page 1) or skipped keys.
+#[tokio::test]
+async fn list_objects_v1_pagination_round_trips() {
+    let h = harness().await;
+    drain(send(&h.svc, req(Method::PUT, Some("listbkt"), None, &[], &[], vec![])).await).await;
+    for k in ["file1", "file2", "file3", "file4"] {
+        drain(send(&h.svc, req(Method::PUT, Some("listbkt"), Some(k), &[], &[], b"x".to_vec())).await)
+            .await;
+    }
+
+    // Page 1: v1 (no list-type), max-keys=2.
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(Method::GET, Some("listbkt"), None, &[("max-keys", "2")], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let body1 = String::from_utf8(body).unwrap();
+    assert!(
+        body1.contains("<Key>file1</Key>") && body1.contains("<Key>file2</Key>"),
+        "page 1 has the first two keys"
+    );
+    assert!(body1.contains("<IsTruncated>true</IsTruncated>"));
+    let next = between(&body1, "<NextMarker>", "</NextMarker>");
+    assert!(!next.is_empty(), "a truncated v1 listing emits a NextMarker");
+
+    // Page 2: resume with marker = the emitted NextMarker.
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("listbkt"),
+                None,
+                &[("max-keys", "2"), ("marker", next.as_str())],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let body2 = String::from_utf8(body).unwrap();
+    assert!(
+        body2.contains("<Key>file3</Key>") && body2.contains("<Key>file4</Key>"),
+        "page 2 advances to the next keys, got: {body2}"
+    );
+    assert!(
+        !body2.contains("<Key>file1</Key>") && !body2.contains("<Key>file2</Key>"),
+        "page 2 must not repeat page 1 (no loop)"
+    );
+}
+
 /// A part-validation failure on CompleteMultipartUpload must leave the upload retryable rather than
 /// bricking it in `completing` (audit #14): a first complete carrying a wrong ETag fails, and a
 /// second complete with the correct ETags then succeeds.
