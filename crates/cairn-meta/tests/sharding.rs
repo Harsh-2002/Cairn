@@ -208,3 +208,57 @@ async fn n3_multipart_rides_the_bucket_shard_via_encoded_id() {
         );
     }
 }
+
+// A pending replication outbox entry with the source shard encoded in its id, for the fairness test.
+fn outbox(shard: usize, j: usize) -> OutboxEntry {
+    OutboxEntry {
+        id: format!("s{shard}-{j}"),
+        bucket: BucketName::parse("obx").unwrap(),
+        key: ObjectKey::parse("k").unwrap(),
+        version_id: VersionId::from_string(format!("v{j}")),
+        operation: ReplicationOp::ObjectCreate,
+        rule_id: "r".to_owned(),
+        target_arn: None,
+        attempts: 0,
+        next_attempt_at: Timestamp(0),
+        status: ReplicationStatus::Pending,
+        last_error: None,
+        priority: 0,
+        lease_until: None,
+        enqueued_at: Timestamp(0),
+    }
+}
+
+// M4: the router's cross-shard replication claim must not start at shard 0 every pass. With every
+// shard over-saturated with pending entries, repeated claims through the router must eventually draw
+// from every shard, not just the lowest-indexed one (which today, pre-fix, yields [24, 0, 0]).
+#[tokio::test]
+async fn claim_replication_batch_round_robins_across_shards() {
+    let (store, inner) = shards(3);
+    let batch: u32 = 4;
+    let passes = 2 * 3; // each shard is the start twice
+    let per_shard = batch as usize * passes + 4; // over-saturate so no shard ever empties
+
+    for (si, shard) in inner.iter().enumerate() {
+        for j in 0..per_shard {
+            shard
+                .submit(Mutation::EnqueueReplication(Box::new(outbox(si, j))))
+                .await
+                .unwrap();
+        }
+    }
+
+    // A fixed `now`: claimed entries hold a live lease across passes, so each pass draws only fresh
+    // pending entries and no shard is re-claimed within the run.
+    let now = Timestamp(1_000);
+    let mut hits = [0usize; 3];
+    for _ in 0..passes {
+        for e in store.claim_replication_batch(batch, now).await.unwrap() {
+            let si: usize = e.id[1..e.id.find('-').unwrap()].parse().unwrap();
+            hits[si] += 1;
+        }
+    }
+    for si in 0..3 {
+        assert!(hits[si] > 0, "shard {si} was starved: {hits:?}");
+    }
+}

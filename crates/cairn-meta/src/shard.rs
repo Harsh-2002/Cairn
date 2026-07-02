@@ -41,6 +41,7 @@ use cairn_types::time::Timestamp;
 use cairn_types::traits::{MetadataStore, ReconcileOracle};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Map a bucket name to its shard index with a stable FNV-1a hash. Stable across processes and
 /// releases (NOT `std`'s `DefaultHasher`, whose internals may change), so a bucket always maps to
@@ -85,6 +86,13 @@ fn decode_upload_shard(id: &str, shards: usize) -> usize {
 /// module docs for the per-bucket / global / cross-shard partitioning.
 pub struct ShardedMetadataStore {
     shards: Vec<Arc<dyn MetadataStore>>,
+    /// Round-robin start cursor for the cross-shard replication claim fan-out, so a saturated
+    /// low-index shard cannot starve higher shards. `Relaxed`: fairness/liveness only, not a
+    /// correctness barrier (per-shard claiming is enforced by the SQL lease).
+    replication_claim_cursor: AtomicUsize,
+    /// The same, for the webhook claim fan-out. A separate cursor from replication on purpose: a
+    /// single shared cursor degenerates when the two callers alternate against an even shard count.
+    webhook_claim_cursor: AtomicUsize,
 }
 
 impl std::fmt::Debug for ShardedMetadataStore {
@@ -106,11 +114,25 @@ impl ShardedMetadataStore {
             !shards.is_empty(),
             "a sharded store needs at least one shard"
         );
-        Self { shards }
+        Self {
+            shards,
+            replication_claim_cursor: AtomicUsize::new(0),
+            webhook_claim_cursor: AtomicUsize::new(0),
+        }
     }
 
     fn n(&self) -> usize {
         self.shards.len()
+    }
+
+    /// The shard index to start the next cross-shard claim fan-out from, advancing `cursor`. Returns
+    /// 0 for a single-shard store, so N=1 (pass-through) is byte-for-byte unchanged. Rotating the
+    /// start point stops a perpetually-saturated low-index shard from starving higher shards.
+    fn rotate_start(&self, cursor: &AtomicUsize) -> usize {
+        if self.shards.len() <= 1 {
+            return 0;
+        }
+        cursor.fetch_add(1, Ordering::Relaxed) % self.shards.len()
     }
 
     /// The shard owning `bucket`.
@@ -427,13 +449,19 @@ impl MetadataStore for ShardedMetadataStore {
         limit: u32,
         now: Timestamp,
     ) -> Result<Vec<OutboxEntry>, MetaError> {
+        let n = self.shards.len();
+        let start = self.rotate_start(&self.replication_claim_cursor);
         let mut claimed = Vec::new();
-        for s in &self.shards {
+        for off in 0..n {
             if claimed.len() as u32 >= limit {
                 break;
             }
             let remaining = limit - claimed.len() as u32;
-            claimed.extend(s.claim_replication_batch(remaining, now).await?);
+            claimed.extend(
+                self.shards[(start + off) % n]
+                    .claim_replication_batch(remaining, now)
+                    .await?,
+            );
         }
         Ok(claimed)
     }
@@ -503,13 +531,19 @@ impl MetadataStore for ShardedMetadataStore {
         limit: u32,
         now: Timestamp,
     ) -> Result<Vec<WebhookEntry>, MetaError> {
+        let n = self.shards.len();
+        let start = self.rotate_start(&self.webhook_claim_cursor);
         let mut claimed = Vec::new();
-        for s in &self.shards {
+        for off in 0..n {
             if claimed.len() as u32 >= limit {
                 break;
             }
             let remaining = limit - claimed.len() as u32;
-            claimed.extend(s.claim_webhook_batch(remaining, now).await?);
+            claimed.extend(
+                self.shards[(start + off) % n]
+                    .claim_webhook_batch(remaining, now)
+                    .await?,
+            );
         }
         Ok(claimed)
     }
