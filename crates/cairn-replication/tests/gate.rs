@@ -1068,5 +1068,8 @@ async fn completing_replication_does_not_demote_a_newer_version() {
         "a newer version must not be demoted by replication completion"
     );
     // v1's replication status is stamped Completed (targeted update).
-    assert_eq!(version_status(&meta, "k", &v1).await, Some(ReplicationStatus::Completed));
+    assert_eq!(
+        version_status(&meta, "k", &v1).await,
+        Some(ReplicationStatus::Completed)
+    );
 }

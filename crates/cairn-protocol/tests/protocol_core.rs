@@ -1237,7 +1237,14 @@ async fn multipart_lifecycle() {
 #[tokio::test]
 async fn complete_multipart_against_wrong_key_is_no_such_upload() {
     let h = harness().await;
-    drain(send(&h.svc, req(Method::PUT, Some("mpb"), None, &[], &[], vec![])).await).await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("mpb"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
     // Initiate for key "right.bin".
     let (st, _, body) = drain(
         send(
@@ -1255,7 +1262,11 @@ async fn complete_multipart_against_wrong_key_is_no_such_upload() {
     )
     .await;
     assert_eq!(st, StatusCode::OK);
-    let upload_id = between(&String::from_utf8(body).unwrap(), "<UploadId>", "</UploadId>");
+    let upload_id = between(
+        &String::from_utf8(body).unwrap(),
+        "<UploadId>",
+        "</UploadId>",
+    );
     // Upload a single part (the last part may be under 5 MiB).
     let (st, hdrs, _) = drain(
         send(
@@ -1329,17 +1340,44 @@ async fn complete_multipart_against_wrong_key_is_no_such_upload() {
 #[tokio::test]
 async fn list_objects_v1_pagination_round_trips() {
     let h = harness().await;
-    drain(send(&h.svc, req(Method::PUT, Some("listbkt"), None, &[], &[], vec![])).await).await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("listbkt"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
     for k in ["file1", "file2", "file3", "file4"] {
-        drain(send(&h.svc, req(Method::PUT, Some("listbkt"), Some(k), &[], &[], b"x".to_vec())).await)
-            .await;
+        drain(
+            send(
+                &h.svc,
+                req(
+                    Method::PUT,
+                    Some("listbkt"),
+                    Some(k),
+                    &[],
+                    &[],
+                    b"x".to_vec(),
+                ),
+            )
+            .await,
+        )
+        .await;
     }
 
     // Page 1: v1 (no list-type), max-keys=2.
     let (st, _, body) = drain(
         send(
             &h.svc,
-            req(Method::GET, Some("listbkt"), None, &[("max-keys", "2")], &[], vec![]),
+            req(
+                Method::GET,
+                Some("listbkt"),
+                None,
+                &[("max-keys", "2")],
+                &[],
+                vec![],
+            ),
         )
         .await,
     )
@@ -1352,7 +1390,10 @@ async fn list_objects_v1_pagination_round_trips() {
     );
     assert!(body1.contains("<IsTruncated>true</IsTruncated>"));
     let next = between(&body1, "<NextMarker>", "</NextMarker>");
-    assert!(!next.is_empty(), "a truncated v1 listing emits a NextMarker");
+    assert!(
+        !next.is_empty(),
+        "a truncated v1 listing emits a NextMarker"
+    );
 
     // Page 2: resume with marker = the emitted NextMarker.
     let (st, _, body) = drain(

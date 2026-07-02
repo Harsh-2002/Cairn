@@ -822,7 +822,10 @@ async fn delete_version_clears_object_tags() {
     let k = ObjectKey::parse("k").unwrap();
     let v = VersionId::from_string("v1".into());
     store
-        .submit(put(row(&b, "k", v.clone(), "e1", true), Precondition::default()))
+        .submit(put(
+            row(&b, "k", v.clone(), "e1", true),
+            Precondition::default(),
+        ))
         .await
         .unwrap();
     store
@@ -850,7 +853,10 @@ async fn delete_version_clears_object_tags() {
         .await
         .unwrap();
     store
-        .submit(put(row(&b, "k", v.clone(), "e2", true), Precondition::default()))
+        .submit(put(
+            row(&b, "k", v.clone(), "e2", true),
+            Precondition::default(),
+        ))
         .await
         .unwrap();
     let tags = store.get_object_tags(&b, &k, &v).await.unwrap();
@@ -874,7 +880,10 @@ async fn delete_bucket_rejects_nonempty_inside_the_savepoint() {
     // (1) A bucket holding an object cannot be deleted.
     let v = VersionId::from_string("v1".into());
     store
-        .submit(put(row(&b, "k", v.clone(), "e1", true), Precondition::default()))
+        .submit(put(
+            row(&b, "k", v.clone(), "e1", true),
+            Precondition::default(),
+        ))
         .await
         .unwrap();
     assert!(
@@ -915,7 +924,10 @@ async fn delete_bucket_rejects_nonempty_inside_the_savepoint() {
         MutationOutcome::MultipartCreated(id) => id,
         other => panic!("expected MultipartCreated, got {other:?}"),
     };
-    assert!(!store.is_bucket_empty(&b).await.unwrap(), "MPU keeps it non-empty");
+    assert!(
+        !store.is_bucket_empty(&b).await.unwrap(),
+        "MPU keeps it non-empty"
+    );
     assert!(
         matches!(
             store.submit(Mutation::DeleteBucket(b.clone())).await,
