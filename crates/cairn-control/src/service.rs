@@ -1811,6 +1811,48 @@ impl ControlService {
             Err(resp) => return resp,
         };
 
+        // Break-glass guards (mirroring delete_user): a PATCH that DEACTIVATES or DEMOTES an admin
+        // strands the control plane exactly like a delete, and a user-identity mutation bumps the
+        // auth epoch so it takes effect on the next request. Evaluate on the CURRENT record state,
+        // before the in-place edits below. (Audit 2026-07: patch_user had none of these, so any
+        // secondary admin could neutralize root or the last admin.)
+        let removes_admin_access = req.is_active == Some(false) || new_role == Some(Role::Member);
+        if removes_admin_access {
+            // Guard 1: don't deactivate/demote the identity you're signed in as.
+            if principal.is_some_and(|p| p.user_id == user_id) {
+                return ControlResponse::bad_request(
+                    "You can't deactivate or demote the user you're signed in as. Sign in as another administrator to change this one.",
+                );
+            }
+            // Guard 2: the root administrator is the deployment's break-glass identity.
+            if self
+                .root_access_key
+                .as_deref()
+                .is_some_and(|root| root == record.user.access_key_id.as_str())
+            {
+                return ControlResponse::bad_request(
+                    "The root administrator can't be deactivated or demoted — it's the built-in break-glass account for this deployment.",
+                );
+            }
+            // Guard 3: never remove the last active administrator (best-effort pre-check, as in
+            // delete_user; the undeletable root admin guarantees a node can't reach zero admins).
+            if record.user.role == Role::Administrator && record.user.is_active {
+                let users = match self.meta.list_users().await {
+                    Ok(u) => u,
+                    Err(e) => return ControlResponse::error_internal(&e.to_string()),
+                };
+                let other_active_admins = users
+                    .iter()
+                    .filter(|u| u.role == Role::Administrator && u.is_active && u.id != user_id)
+                    .count();
+                if other_active_admins == 0 {
+                    return ControlResponse::bad_request(
+                        "This is the last active administrator. Create or promote another administrator before deactivating or demoting it.",
+                    );
+                }
+            }
+        }
+
         if let Some(role) = new_role {
             record.user.role = role;
         }

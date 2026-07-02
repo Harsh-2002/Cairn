@@ -991,6 +991,21 @@ async fn patch_user_changes_role_and_deactivates() {
     let stored = h.meta.user_by_bearer_key(&key_id).await.unwrap().unwrap();
     assert_eq!(stored.user.role, Role::Administrator);
 
+    // Seed a second active administrator so deactivating `id` below isn't blocked by the
+    // last-active-admin break-glass guard (which now also covers PATCH).
+    let (id2, _) = create_member(&h, &a).await;
+    let resp = h
+        .svc
+        .handle(
+            &Method::PATCH,
+            &format!("/users/{id2}"),
+            &[],
+            Some(&a),
+            Bytes::from_static(br#"{"role":"administrator"}"#),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::OK);
+
     // Deactivate.
     let resp = h
         .svc
@@ -1059,6 +1074,73 @@ async fn patch_user_changes_role_and_deactivates() {
         )
         .await;
     assert_eq!(resp.status, StatusCode::FORBIDDEN);
+}
+
+/// Audit 2026-07: PATCH /users must enforce the same break-glass guards as DELETE — a deactivation
+/// or demotion can strand the control plane exactly like a delete. Before the fix patch_user had
+/// none of these guards.
+#[tokio::test]
+async fn patch_user_cannot_strand_the_control_plane() {
+    let h = harness();
+    let a = admin();
+
+    // Promote a member so it is the only active administrator in the store.
+    let (id, _) = create_member(&h, &a).await;
+    let path = format!("/users/{id}");
+    let patch = |body: &'static [u8]| {
+        h.svc
+            .handle(&Method::PATCH, &path, &[], Some(&a), Bytes::from_static(body))
+    };
+    assert_eq!(patch(br#"{"role":"administrator"}"#).await.status, StatusCode::OK);
+
+    // Deactivating the last active administrator is refused.
+    assert_eq!(
+        patch(br#"{"is_active":false}"#).await.status,
+        StatusCode::BAD_REQUEST,
+        "deactivating the last admin must be blocked"
+    );
+    // Demoting the last active administrator to member is refused.
+    assert_eq!(
+        patch(br#"{"role":"member"}"#).await.status,
+        StatusCode::BAD_REQUEST,
+        "demoting the last admin must be blocked"
+    );
+
+    // A self-patch that removes the caller's own admin access is refused (self-lockout). Build a
+    // principal whose user_id matches the target and drive a self-deactivation.
+    let self_principal = Principal {
+        user_id: UserId(id.clone()),
+        display_name: "self".to_owned(),
+        access_key_id: "cairn_self".to_owned(),
+        role: Role::Administrator,
+        method: AuthMethod::Bearer,
+        chunk_signing: None,
+        user_policy: None,
+        is_session: false,
+    };
+    let resp = h
+        .svc
+        .handle(
+            &Method::PATCH,
+            &format!("/users/{id}"),
+            &[],
+            Some(&self_principal),
+            Bytes::from_static(br#"{"is_active":false}"#),
+        )
+        .await;
+    assert_eq!(
+        resp.status,
+        StatusCode::BAD_REQUEST,
+        "self-deactivation must be blocked"
+    );
+
+    // The target is still an active administrator — none of the rejected patches took effect.
+    let users = h.meta.list_users().await.unwrap();
+    let target = users
+        .iter()
+        .find(|u| u.id == UserId(id.clone()))
+        .expect("target user still present");
+    assert!(target.is_active && target.role == Role::Administrator);
 }
 
 #[tokio::test]
