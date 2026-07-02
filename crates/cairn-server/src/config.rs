@@ -442,8 +442,13 @@ impl Config {
 
     /// The minimum blocking-pool size the metadata read pool + blob I/O pool require so neither
     /// starves the other's `spawn_blocking` work, plus headroom for incidental blocking calls.
+    ///
+    /// Under `CAIRN_META_SHARDS>1` each shard opens its own read pool of `meta_read_pool_size` WAL
+    /// connections, and every metadata read runs inside its own `spawn_blocking` task, so the real
+    /// read-side demand is `meta_read_pool_size × meta_shards` (audit 2026-07: the floor undercounted
+    /// it by a factor of `meta_shards`).
     fn blocking_pool_floor(&self) -> usize {
-        self.blob_io_pool_size + self.meta_read_pool_size as usize + 64
+        self.blob_io_pool_size + self.meta_read_pool_size as usize * self.meta_shards + 64
     }
 
     /// The blocking-thread cap to configure the runtime with: the explicit value, or a derived safe
@@ -538,16 +543,19 @@ impl Config {
         }
         // Cache-budget clamp (R3 guardrail): the writer connection plus every reader each provision
         // `cache_bytes_per_conn`, so a large pool can silently OOM the host. Refuse at startup.
-        let total_cache = self
-            .meta_cache_bytes_per_conn
-            .saturating_mul(u64::from(self.meta_read_pool_size) + 1);
+        // Under sharding every shard opens an independent writer + read pool with the same sizing, so
+        // the true footprint is `(read_pool_size + 1) × meta_shards` connections (audit 2026-07: the
+        // clamp ignored `meta_shards`, so a sharded node could provision N× the budget and OOM).
+        let conns = (u64::from(self.meta_read_pool_size) + 1).saturating_mul(self.meta_shards as u64);
+        let total_cache = self.meta_cache_bytes_per_conn.saturating_mul(conns);
         if total_cache > self.meta_cache_total_budget_bytes {
             return Err(ConfigError::Invalid(format!(
-                "metadata cache budget exceeded: {} bytes/conn × {} conns = {} > total budget {} \
-                 (lower CAIRN_META_CACHE_BYTES_PER_CONN / CAIRN_META_READ_POOL_SIZE or raise \
-                 CAIRN_META_CACHE_TOTAL_BUDGET_BYTES)",
+                "metadata cache budget exceeded: {} bytes/conn × {} conns ({} shards) = {} > total \
+                 budget {} (lower CAIRN_META_CACHE_BYTES_PER_CONN / CAIRN_META_READ_POOL_SIZE / \
+                 CAIRN_META_SHARDS or raise CAIRN_META_CACHE_TOTAL_BUDGET_BYTES)",
                 self.meta_cache_bytes_per_conn,
-                self.meta_read_pool_size + 1,
+                conns,
+                self.meta_shards,
                 total_cache,
                 self.meta_cache_total_budget_bytes
             )));
@@ -956,10 +964,13 @@ mod tests {
 
     #[test]
     fn meta_shards_bounds_and_backend() {
-        // 1 (default) and any value up to 64 validate on sqlite.
+        // 1 (default) and any value up to 64 validate on sqlite. Give the cache budget ample
+        // headroom so this exercises the shard-count bound, not the (separate, shard-scaled) cache
+        // clamp — at 64 shards the default per-conn cache legitimately exceeds the default budget.
         for n in [1usize, 2, 16, 64] {
             let mut c = base();
             c.meta_shards = n;
+            c.meta_cache_total_budget_bytes = 256 * 1024 * 1024 * 1024;
             assert!(c.validate().is_ok(), "shards {n} on sqlite must validate");
         }
         // 0 and >64 are rejected.
@@ -1030,6 +1041,24 @@ mod tests {
         // Raising the budget (or shrinking per-conn cache) makes it valid again.
         c.meta_cache_total_budget_bytes = 8 * 1024 * 1024 * 1024;
         assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn cache_budget_accounts_for_shards() {
+        // Regression (audit 2026-07): each shard opens its own writer + read pool, so the budget
+        // clamp must scale with CAIRN_META_SHARDS. These settings are within budget at 1 shard but
+        // provision N× as much page cache when sharded — the clamp must reject the sharded case.
+        let mut c = base();
+        c.meta_backend = "sqlite".to_owned();
+        c.meta_read_pool_size = 8; // 9 conns/shard
+        c.meta_cache_bytes_per_conn = 64 * 1024 * 1024; // 9 × 64 MiB = 576 MiB < 2 GiB at 1 shard
+        c.meta_shards = 1;
+        assert!(c.validate().is_ok(), "single shard is within budget");
+        c.meta_shards = 8; // 72 conns × 64 MiB ≈ 4.6 GiB > 2 GiB
+        assert!(
+            c.validate().is_err(),
+            "8 shards must exceed the cache budget (pre-fix this passed)"
+        );
     }
 
     #[test]
