@@ -146,6 +146,10 @@ pub struct Config {
     /// decision fixed at first init**: changing it on populated data would route a bucket to a shard
     /// that does not hold its rows. Supported on the `sqlite` backend only; capped at 64. User-quota
     /// enforcement becomes eventually-consistent under sharding (it cannot be atomic across shards).
+    /// Each shard opens its **own** writer + read pool, so the SQLite page-cache and blocking-thread
+    /// footprint scale by `N`: with `N > 1` you will likely need to raise
+    /// `CAIRN_META_CACHE_TOTAL_BUDGET_BYTES` (or lower `CAIRN_META_CACHE_BYTES_PER_CONN`), since the
+    /// startup budget check now accounts for the shard multiplier and refuses an over-provisioned ring.
     pub meta_shards: usize,
     /// The base domain for **virtual-host-style** S3 addressing (`CAIRN_S3_DOMAIN`), e.g.
     /// `s3.example.com`. When set, a request whose `Host` is `<bucket>.<domain>` is routed to that

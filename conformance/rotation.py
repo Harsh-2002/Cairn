@@ -93,6 +93,11 @@ def base_env(extra):
         "CAIRN_DATA_DIR": RDATA, "CAIRN_DB_PATH": os.path.join(RDATA, "cairn.db"),
         "CAIRN_REGION": REGION, "CAIRN_ROOT_ACCESS_KEY": AK, "CAIRN_ROOT_SECRET_KEY": SK,
         "CAIRN_META_SHARDS": str(SHARDS), "CAIRN_META_BACKEND": "sqlite",
+        # Sharding provisions the per-connection page cache PER SHARD, so the total footprint is
+        # (read_pool+1) x shards x cache_bytes_per_conn. With SHARDS=4 and the 64 MiB default per-conn
+        # cache that exceeds the 2 GiB default budget on a many-core runner, so size the budget up for
+        # the sharded test (this harness exercises key rotation, not cache sizing).
+        "CAIRN_META_CACHE_TOTAL_BUDGET_BYTES": str(8 * 1024 ** 3),
         "CAIRN_LOG_LEVEL": os.environ.get("CAIRN_LOG_LEVEL", "warn"),
         "CAIRN_KEY_REWRAP_INTERVAL_SECS": "0", "CAIRN_KEY_COUNTER_SYNC_SECS": "0",
     })
