@@ -790,3 +790,14 @@ fn object_lock_configuration_codec_round_trips() {
         enabled_only
     );
 }
+
+#[test]
+fn xml_safe_neutralizes_illegal_chars() {
+    // Audit 2026-07: XML-1.0-illegal characters must be replaced at the codec boundary so a
+    // generator can never emit a non-well-formed document (e.g. a rejected key echoed in DeleteResult).
+    assert_eq!(xml_safe("hello/world"), "hello/world"); // unchanged (borrowed)
+    assert_eq!(xml_safe("a\u{1}b"), "a\u{FFFD}b"); // C0 control -> replacement char
+    assert_eq!(xml_safe("a\u{FFFF}b"), "a\u{FFFD}b"); // U+FFFF -> replacement char
+    assert_eq!(xml_safe("a\u{FFFE}b"), "a\u{FFFD}b");
+    assert_eq!(xml_safe("a\tb\nc\rd"), "a\tb\nc\rd"); // legal whitespace controls pass through
+}

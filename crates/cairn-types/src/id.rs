@@ -114,6 +114,13 @@ impl ObjectKey {
         {
             return Err(InvalidName::Charset);
         }
+        // Also reject U+FFFE and U+FFFF: valid UTF-8 but excluded by the XML 1.0 Char production, so a
+        // ListObjects/ListVersions response emitting such a key would not be well-formed and no
+        // encoding-type=url fallback exists — one writer could otherwise wedge listing for a whole
+        // shared prefix (audit 2026-07; the audit-#32 guard above was incomplete).
+        if s.chars().any(|c| matches!(c, '\u{FFFE}' | '\u{FFFF}')) {
+            return Err(InvalidName::Charset);
+        }
         Ok(Self(s.to_owned()))
     }
 
@@ -317,6 +324,9 @@ mod tests {
         assert_eq!(ObjectKey::parse("a\u{8}b"), Err(InvalidName::Charset));
         // ...but tab, LF and CR (the XML-legal whitespace controls) are allowed.
         assert!(ObjectKey::parse("a\tb\nc\rd").is_ok());
+        // Audit 2026-07: U+FFFE and U+FFFF are valid UTF-8 but XML-1.0-illegal, so also rejected.
+        assert_eq!(ObjectKey::parse("a\u{FFFE}b"), Err(InvalidName::Charset));
+        assert_eq!(ObjectKey::parse("a\u{FFFF}b"), Err(InvalidName::Charset));
     }
 
     #[test]

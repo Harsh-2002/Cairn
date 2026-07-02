@@ -59,9 +59,30 @@ fn finish(w: Writer<Cursor<Vec<u8>>>) -> String {
 }
 
 /// Write a leaf element `<name>escaped-text</name>`.
+/// Replace characters the XML 1.0 Char production forbids — C0 controls except tab/LF/CR, and
+/// U+FFFE/U+FFFF — with the Unicode replacement character, so a generator can NEVER emit a
+/// non-well-formed document regardless of input. Stored object keys are rejected at parse time, but a
+/// *rejected* key echoed back in a `DeleteResult <Error><Key>` (decoded from e.g. `&#x1;` in the
+/// request) reaches the writer raw (audit 2026-07). Borrows when nothing needs changing (the common
+/// case), so normal output pays only a scan.
+fn xml_safe(text: &str) -> std::borrow::Cow<'_, str> {
+    let illegal = |c: char| {
+        ((c as u32) < 0x20 && !matches!(c, '\t' | '\n' | '\r')) || matches!(c, '\u{FFFE}' | '\u{FFFF}')
+    };
+    if text.chars().any(illegal) {
+        std::borrow::Cow::Owned(
+            text.chars()
+                .map(|c| if illegal(c) { '\u{FFFD}' } else { c })
+                .collect(),
+        )
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    }
+}
+
 fn leaf(w: &mut Writer<Cursor<Vec<u8>>>, name: &str, text: &str) {
     w.create_element(name)
-        .write_text_content(BytesText::new(text))
+        .write_text_content(BytesText::new(&xml_safe(text)))
         .expect("writing to an in-memory buffer is infallible");
 }
 
