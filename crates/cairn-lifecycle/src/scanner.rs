@@ -255,13 +255,15 @@ impl LifecycleScanner {
             }
         }
 
-        // Group noncurrent, non-delete-marker versions by key, newest-first.
+        // Group ALL versions by key — including the current version and delete markers — so that for
+        // each noncurrent version we can find the version that SUPERSEDED it (the immediately-newer
+        // one). A version becomes noncurrent exactly when that next version is written, so its
+        // superseding version's creation time is its became-noncurrent time. Ageing from the
+        // version's OWN creation time instead would delete a long-lived version the instant it is
+        // superseded, destroying the recovery window the operator configured (audit 2026-07).
         let mut by_key: std::collections::BTreeMap<String, Vec<ObjectSummary>> =
             std::collections::BTreeMap::new();
         for obj in all {
-            if obj.is_latest || obj.is_delete_marker {
-                continue;
-            }
             by_key
                 .entry(obj.key.as_str().to_owned())
                 .or_default()
@@ -269,20 +271,32 @@ impl LifecycleScanner {
         }
 
         for (_key, mut versions) in by_key {
-            // Newest noncurrent version first (version ids sort by creation time).
+            // Newest version first (version ids sort by creation time), so index 0 is the current
+            // version / newest delete marker and every noncurrent version sits at index >= 1.
             versions.sort_by(|a, b| b.version_id.as_str().cmp(a.version_id.as_str()));
-            for (idx, obj) in versions.iter().enumerate() {
+            // Rank among the noncurrent, non-delete-marker versions (for the "keep newest N" rule).
+            let mut noncurrent_rank = 0u32;
+            for idx in 0..versions.len() {
+                let obj = &versions[idx];
+                if obj.is_latest || obj.is_delete_marker {
+                    continue; // only noncurrent object versions expire here
+                }
+                let this_rank = noncurrent_rank;
+                noncurrent_rank += 1;
                 let tags = self.tags_for(meta, bucket, obj).await;
                 let Some((days, keep)) = self.matching_noncurrent_rule(rules, obj, &tags) else {
                     continue;
                 };
                 // Preserve the configured number of newest noncurrent versions.
                 if let Some(keep) = keep {
-                    if (idx as u32) < keep {
+                    if this_rank < keep {
                         continue;
                     }
                 }
-                if now.secs_since(obj.last_modified) < i64::from(days) * 86_400 {
+                // Became noncurrent when the immediately-newer version (idx-1) was created. idx >= 1
+                // is guaranteed: the newest version is always the current one or a delete marker.
+                let became_noncurrent = versions[idx - 1].last_modified;
+                if now.secs_since(became_noncurrent) < i64::from(days) * 86_400 {
                     continue;
                 }
                 match self

@@ -377,6 +377,60 @@ async fn noncurrent_expiration_keeps_newest_and_deletes_old() {
     assert_eq!(blob.blob_count(), 2, "two blobs reclaimed");
 }
 
+/// Audit 2026-07: NoncurrentVersionExpiration must age from when a version BECAME noncurrent, not
+/// from when it was created. A long-lived version superseded only recently must survive until
+/// NoncurrentDays after its supersession.
+#[tokio::test]
+async fn noncurrent_expiration_ages_from_becoming_noncurrent_not_creation() {
+    let meta = InMemoryMetadataStore::new();
+    let blob = InMemoryBlobStore::new();
+    let clock = TestClock::at_secs(0);
+    make_bucket(&meta, VersioningState::Enabled).await;
+
+    // V1 created on day 0, stays current until day 100 when V2 supersedes it.
+    let v1 = VersionId::generate();
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    put_object(&meta, &blob, "k", b"one", 0, v1).await;
+    let v2 = VersionId::generate();
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    put_object(&meta, &blob, "k", b"two", 100 * DAY, v2).await;
+
+    let rule = LifecycleRule {
+        id: "ncv".to_owned(),
+        enabled: true,
+        filter: Filter::default(),
+        actions: vec![Action::NoncurrentVersionExpiration {
+            days: 30,
+            newer_noncurrent_versions: None,
+        }],
+    };
+    let scanner = LifecycleScanner::new();
+
+    // Day 110: V1 has been noncurrent only 10 days (< 30). Pre-fix it aged from creation
+    // (now - day0 = 110 days) and would be wrongly deleted; it must survive.
+    clock.set(Timestamp::from_secs(110 * DAY));
+    let report = scanner
+        .run_once(&meta, &blob, &clock, &cfg(vec![rule.clone()]))
+        .await
+        .unwrap();
+    assert_eq!(
+        report.versions_expired, 0,
+        "a version noncurrent for less than NoncurrentDays must survive"
+    );
+    assert_eq!(count_versions(&meta).await, 2);
+
+    // Day 140: V1 has been noncurrent 40 days (> 30) -> now it expires.
+    clock.set(Timestamp::from_secs(140 * DAY));
+    let report = scanner
+        .run_once(&meta, &blob, &clock, &cfg(vec![rule]))
+        .await
+        .unwrap();
+    assert_eq!(
+        report.versions_expired, 1,
+        "a version noncurrent longer than NoncurrentDays expires"
+    );
+}
+
 #[tokio::test]
 async fn abort_incomplete_multipart_removes_session_and_parts() {
     let meta = InMemoryMetadataStore::new();
