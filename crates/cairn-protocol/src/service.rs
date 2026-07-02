@@ -616,10 +616,17 @@ impl S3Service {
         // the client sends the real payload length in `x-amz-decoded-content-length` (the
         // `content-length` is the larger framed size), so prefer it; a plain PUT uses
         // `content-length`. An absent/unparseable value simply skips preallocation.
-        let content_length = req
-            .header("x-amz-decoded-content-length")
-            .or_else(|| req.header("content-length"))
-            .and_then(|v| v.parse::<u64>().ok());
+        // Clamp the declared length to the size ceiling: it is an untrusted client header that only
+        // drives `fallocate` preallocation, and the actual written bytes are separately capped at
+        // `size_ceiling` during staging. Without the clamp a 1-byte body declaring an enormous
+        // `x-amz-decoded-content-length` reserves that many real blocks on disk (quota-invisible) —
+        // a single-request disk-exhaustion vector (audit 2026-07 finding).
+        let content_length = clamp_prealloc_len(
+            req.header("x-amz-decoded-content-length")
+                .or_else(|| req.header("content-length"))
+                .and_then(|v| v.parse::<u64>().ok()),
+            self.max_object_size,
+        );
         let opts = StageOptions {
             compression: bucket.compression,
             extra_checksums: stage_checksums,
@@ -4321,6 +4328,15 @@ fn decode_token(token: &str) -> Option<String> {
         .and_then(|b| String::from_utf8(b).ok())
 }
 
+/// Clamp the client-declared payload length (used only as a `fallocate` preallocation hint) to the
+/// configured object-size ceiling. The value comes from the untrusted `x-amz-decoded-content-length`
+/// / `content-length` header and never bounds the real write (staging enforces `size_ceiling` on the
+/// bytes actually received), so an over-declared length must not be able to reserve more disk than a
+/// legitimately-sized object ever could (audit 2026-07: single-request disk-exhaustion).
+fn clamp_prealloc_len(declared: Option<u64>, ceiling: u64) -> Option<u64> {
+    declared.map(|n| n.min(ceiling))
+}
+
 /// Buffer a (small, XML) request body up to `limit` bytes.
 async fn drain_body(body: cairn_types::BodyStream, limit: usize) -> Result<Vec<u8>> {
     use futures_util::StreamExt;
@@ -4385,4 +4401,21 @@ fn copy_pct_decode(s: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(test)]
+mod prealloc_clamp_tests {
+    use super::clamp_prealloc_len;
+
+    #[test]
+    fn clamps_over_declared_length_to_ceiling() {
+        // Regression (audit 2026-07): a tiny body declaring an enormous length must not preallocate
+        // beyond the size ceiling. Pre-fix the header value flowed straight to `fallocate`.
+        assert_eq!(clamp_prealloc_len(Some(500_000_000_000), 5 * 1024 * 1024), Some(5 * 1024 * 1024));
+        // A legitimate length within the ceiling is preserved exactly.
+        assert_eq!(clamp_prealloc_len(Some(1_024), 5 * 1024 * 1024), Some(1_024));
+        // Exactly at the ceiling is preserved; absent header stays absent (no preallocation).
+        assert_eq!(clamp_prealloc_len(Some(4096), 4096), Some(4096));
+        assert_eq!(clamp_prealloc_len(None, 4096), None);
+    }
 }
