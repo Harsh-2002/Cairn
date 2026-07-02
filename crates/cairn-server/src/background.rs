@@ -156,6 +156,12 @@ pub fn spawn(stack: Arc<AppStack>, cfg: &Config, shutdown: tokio::sync::watch::R
         stack.clone(),
         cfg.replication_retention_secs,
     ));
+    // Reclaim terminally-failed webhook-outbox rows so a dead/misconfigured sink can't bloat the
+    // metadata DB without bound (audit 2026-07; ARCH 20.3 bounded-work-queue contract).
+    tokio::spawn(events_outbox_prune_loop(
+        stack.clone(),
+        cfg.events_outbox_retention_secs,
+    ));
     // Request-metrics flush loop (ARCH 26.5). Gated on the subsystem being enabled: when off, the
     // hot path accumulates nothing and there is nothing to flush. Otherwise it periodically drains
     // the in-process aggregator into a batched upsert and prunes rows past the retention horizon.
@@ -220,6 +226,28 @@ async fn replication_prune_loop(stack: Arc<AppStack>, retention_secs: u64) {
             .await
         {
             tracing::warn!(error = %e, "replication outbox prune failed");
+        }
+    }
+}
+
+/// Periodically reclaim terminally-failed webhook-outbox (`events_outbox`) rows older than the
+/// retention horizon, so a misconfigured or decommissioned webhook sink cannot grow the metadata DB
+/// one permanent failed-event row at a time (audit 2026-07; ARCH 20.3). Delivered rows are removed on
+/// delivery and pending/claimed work is never pruned; the same calm-cadence, idempotent design as
+/// [`replication_prune_loop`].
+async fn events_outbox_prune_loop(stack: Arc<AppStack>, retention_secs: u64) {
+    let clock = SystemClock::new();
+    let interval = Duration::from_secs(retention_secs.clamp(60, 3600));
+    let retention_ms = (retention_secs as i64).saturating_mul(1000);
+    loop {
+        tokio::time::sleep(interval).await;
+        let before_ms = clock.now().as_millis().saturating_sub(retention_ms);
+        if let Err(e) = stack
+            .meta
+            .submit(Mutation::PruneEventsOutbox { before_ms })
+            .await
+        {
+            tracing::warn!(error = %e, "events outbox prune failed");
         }
     }
 }

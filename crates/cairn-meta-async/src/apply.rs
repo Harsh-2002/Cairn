@@ -708,6 +708,17 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
                 .await?;
             Ok(MutationOutcome::Ack)
         }
+        Mutation::PruneEventsOutbox { before_ms } => {
+            // Mirrors cairn-meta: reclaim terminal ('failed') webhook rows older than the horizon;
+            // events_outbox has no enqueued_at, so age off next_attempt_at.
+            driver
+                .execute(
+                    "DELETE FROM events_outbox WHERE status='failed' AND next_attempt_at < ?1",
+                    vec![Value::Int(before_ms)],
+                )
+                .await?;
+            Ok(MutationOutcome::Ack)
+        }
         Mutation::EnqueueWebhooks(entries) => {
             for e in &entries {
                 enqueue_webhook(driver, e).await?;

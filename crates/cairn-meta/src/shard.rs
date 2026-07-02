@@ -233,6 +233,7 @@ impl MetadataStore for ShardedMetadataStore {
             | Mutation::MarkReplicationFailed { .. }
             | Mutation::RetryFailedReplication { .. }
             | Mutation::PruneReplicationOutbox { .. }
+            | Mutation::PruneEventsOutbox { .. }
             | Mutation::DeferReplication { .. }
             | Mutation::RecoverClaimedReplication
             | Mutation::MarkWebhookDone(_)
@@ -769,6 +770,7 @@ fn mutation_bucket(m: &Mutation) -> Option<String> {
         | Mutation::MarkReplicationFailed { .. }
         | Mutation::RetryFailedReplication { .. }
         | Mutation::PruneReplicationOutbox { .. }
+        | Mutation::PruneEventsOutbox { .. }
         | Mutation::DeferReplication { .. }
         | Mutation::RecoverClaimedReplication
         | Mutation::EnqueueWebhooks(_)

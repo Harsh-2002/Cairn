@@ -756,6 +756,59 @@ async fn prune_reclaims_old_terminal_entries_only() {
 }
 
 #[tokio::test]
+async fn prune_events_outbox_reclaims_old_failed_only() {
+    // Audit 2026-07: terminally-failed webhook rows must be reclaimable so a dead sink can't grow the
+    // metadata DB without bound. Only 'failed' rows past the horizon are pruned; pending (outstanding
+    // work) is never touched, and a recent failure survives.
+    let store = cairn_meta::open_in_memory().unwrap();
+    let b = BucketName::parse("whprune").unwrap();
+    store
+        .submit(Mutation::CreateBucket(Box::new(bucket("whprune"))))
+        .await
+        .unwrap();
+    let mk = |id: &str, status: WebhookStatus, next: i64| WebhookEntry {
+        id: id.to_owned(),
+        bucket: b.clone(),
+        key: ObjectKey::parse("k").unwrap(),
+        version_id: VersionId::from_string(id.to_owned()),
+        event: cairn_types::notification::EventKind::ObjectCreatedPut,
+        endpoint_id: "ep".to_owned(),
+        payload: "{}".to_owned(),
+        attempts: 0,
+        next_attempt_at: Timestamp(next),
+        status,
+        last_error: None,
+        priority: 0,
+        lease_until: None,
+    };
+    for e in [
+        mk("old-fail", WebhookStatus::Failed, 1000),
+        mk("new-fail", WebhookStatus::Failed, 9000),
+        mk("old-pending", WebhookStatus::Pending, 1000),
+    ] {
+        store
+            .submit(Mutation::EnqueueWebhooks(vec![e]))
+            .await
+            .unwrap();
+    }
+    // Reclaim failed rows whose next_attempt_at is before t=5000.
+    store
+        .submit(Mutation::PruneEventsOutbox { before_ms: 5000 })
+        .await
+        .unwrap();
+
+    let failed = store.list_failed_webhooks(10).await.unwrap();
+    assert_eq!(failed.len(), 1, "old failed pruned; recent failed kept");
+    assert_eq!(failed[0].id, "new-fail");
+    // The pending entry (outstanding work) is never pruned — still due.
+    let due = store.list_due_webhooks(10, Timestamp(2000)).await.unwrap();
+    assert!(
+        due.iter().any(|e| e.id == "old-pending"),
+        "pending webhook must survive the prune"
+    );
+}
+
+#[tokio::test]
 async fn defer_releases_claim_without_consuming_attempts() {
     let store = cairn_meta::open_in_memory().unwrap();
     let b = BucketName::parse("deferbkt").unwrap();

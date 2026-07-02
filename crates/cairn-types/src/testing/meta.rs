@@ -759,6 +759,13 @@ impl MetadataStore for InMemoryMetadataStore {
                 });
                 Ok(MutationOutcome::Ack)
             }
+            Mutation::PruneEventsOutbox { before_ms } => {
+                // Drop terminally-failed webhook rows older than the horizon; keep outstanding work.
+                st.webhook_outbox.retain(|e| {
+                    !(e.status == WebhookStatus::Failed && e.next_attempt_at.0 < before_ms)
+                });
+                Ok(MutationOutcome::Ack)
+            }
             Mutation::EnqueueWebhooks(entries) => {
                 for entry in entries {
                     if !st.webhook_outbox.iter().any(|e| e.id == entry.id) {

@@ -447,6 +447,7 @@ impl CachedMetadataStore {
             | Mutation::MarkReplicationFailed { .. }
             | Mutation::RetryFailedReplication { .. }
             | Mutation::PruneReplicationOutbox { .. }
+            | Mutation::PruneEventsOutbox { .. }
             | Mutation::DeferReplication { .. }
             | Mutation::RecoverClaimedReplication
             | Mutation::EnqueueReplication(_)

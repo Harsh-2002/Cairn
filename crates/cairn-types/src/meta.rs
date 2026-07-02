@@ -295,6 +295,16 @@ pub enum Mutation {
         /// Delete completed/failed entries enqueued before this wall-clock millis.
         before_ms: i64,
     },
+    /// Reclaim terminally-`failed` webhook-outbox (`events_outbox`) rows older than `before_ms` (by
+    /// `next_attempt_at`). Delivered/dropped entries are removed on `MarkWebhookDone`, so only
+    /// `failed` rows accumulate; without this the table grows one permanent JSON-payload row per
+    /// failed object event, bloating the metadata DB (the single source of truth) — an availability
+    /// DoS reachable by a misconfigured sink over time. Mirrors [`PruneReplicationOutbox`] for the
+    /// webhook engine (ARCH 20.3 bounded-work-queue contract).
+    PruneEventsOutbox {
+        /// Delete failed entries whose `next_attempt_at` is before this wall-clock millis.
+        before_ms: i64,
+    },
     /// Release a *claimed* replication-outbox entry back to `pending` so it is promptly
     /// re-claimable, **without** consuming the terminal attempt budget. Used for two non-failure
     /// reschedules: (1) an entry deferred to preserve per-key ordering (an earlier version is still

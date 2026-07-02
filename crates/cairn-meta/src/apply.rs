@@ -609,6 +609,18 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             .map_err(engine_err)?;
             Ok(MutationOutcome::Ack)
         }
+        Mutation::PruneEventsOutbox { before_ms } => {
+            // Reclaim terminal webhook rows (delivered rows are deleted on MarkWebhookDone, so only
+            // 'failed' rows persist) older than the horizon; never touch pending/claimed work. Keeps
+            // events_outbox bounded so a dead sink can't bloat the metadata DB (audit 2026-07).
+            // events_outbox has no enqueued_at column, so age off the indexed next_attempt_at.
+            conn.execute(
+                "DELETE FROM events_outbox WHERE status='failed' AND next_attempt_at < ?1",
+                params![before_ms],
+            )
+            .map_err(engine_err)?;
+            Ok(MutationOutcome::Ack)
+        }
         Mutation::EnqueueWebhooks(entries) => {
             for e in &entries {
                 enqueue_webhook(conn, e)?;

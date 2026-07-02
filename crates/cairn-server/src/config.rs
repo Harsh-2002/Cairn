@@ -234,6 +234,12 @@ pub struct Config {
     /// periodically reclaimed so the outbox stays a bounded work queue rather than a permanent
     /// per-object ledger. Pending/claimed entries (outstanding work) are never pruned.
     pub replication_retention_secs: u64,
+    /// Retention for terminally-failed webhook-outbox (`events_outbox`) rows in seconds
+    /// (`CAIRN_EVENTS_OUTBOX_RETENTION_SECS`): failed entries older than this are periodically
+    /// reclaimed so a misconfigured/decommissioned webhook sink cannot grow the metadata DB (the
+    /// single source of truth) without bound. Pending/claimed entries (outstanding work) are never
+    /// pruned; delivered entries are removed on delivery.
+    pub events_outbox_retention_secs: u64,
 
     /// Whether the request-metrics usage-analytics subsystem is enabled
     /// (`CAIRN_REQUEST_METRICS_ENABLED`). When off, no per-request counters accumulate and the
@@ -333,6 +339,7 @@ impl Default for Config {
             replication_base_backoff_secs: 5,
             replication_max_backoff_secs: 900,
             replication_retention_secs: 86_400,
+            events_outbox_retention_secs: 86_400,
             request_metrics_enabled: true,
             request_metrics_flush_secs: 15,
             request_metrics_bucket_secs: 60,
@@ -695,6 +702,11 @@ impl Config {
         if self.replication_retention_secs == 0 {
             return Err(ConfigError::Invalid(
                 "replication_retention_secs must be positive".into(),
+            ));
+        }
+        if self.events_outbox_retention_secs == 0 {
+            return Err(ConfigError::Invalid(
+                "events_outbox_retention_secs must be positive".into(),
             ));
         }
         // Request-metrics cadences must be positive when the subsystem is enabled, else the flush
