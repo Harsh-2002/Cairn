@@ -5,7 +5,7 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use http::{Method, Request, Uri};
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
@@ -14,6 +14,13 @@ use std::time::Duration;
 /// The default per-request delivery timeout. Bounds a single POST so a hung endpoint cannot stall
 /// the worker; on timeout the delivery is retryable (rescheduled with backoff).
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The most of a webhook response body we will read before dropping the connection. The content is
+/// irrelevant to us (we only need the status), so this only exists to bound memory — and, together
+/// with the timeout now covering the drain, to stop a receiver that sends `200` headers then
+/// trickles/never-ends the body from pinning the delivery future and wedging the whole outbox tick
+/// (audit 2026-07). Mirrors `cairn-server`'s `MAX_API_BODY` posture: a fixed, generous cap.
+const MAX_RESPONSE_BODY: usize = 64 * 1024;
 
 /// Why a webhook delivery did not succeed.
 #[derive(Debug, Clone)]
@@ -110,13 +117,26 @@ impl WebhookSink for HttpWebhookSink {
             .body(Full::new(Bytes::copy_from_slice(body)))
             .map_err(|e| WebhookError::Terminal(format!("request build failed: {e}")))?;
 
-        // Bound the whole request: a hung endpoint must not pin this future (and, with bounded
-        // engine concurrency, stall the outbox). A timeout is retryable.
-        let resp = match tokio::time::timeout(self.timeout, self.client.request(req)).await {
-            Ok(Ok(resp)) => resp,
-            Ok(Err(e)) => {
-                return Err(WebhookError::Retryable(format!("connection failed: {e}")));
-            }
+        // Bound the WHOLE delivery — sending the request, receiving the head, AND draining the body
+        // — under one timeout so a hung endpoint cannot pin this future and (with bounded engine
+        // concurrency) stall the outbox. The body drain must be inside the timeout: a receiver that
+        // returns `200` headers then trickles or never-ends the body would otherwise hang forever
+        // (audit 2026-07). The drain is also byte-capped so a large finite body can't OOM us.
+        let deliver = async {
+            let resp = self
+                .client
+                .request(req)
+                .await
+                .map_err(|e| WebhookError::Retryable(format!("connection failed: {e}")))?;
+            let status = resp.status();
+            // Drain (capped) so the connection can be reused; the content is irrelevant to us, and
+            // an over-cap or errored drain is fine — we already have the status.
+            let _ = Limited::new(resp.into_body(), MAX_RESPONSE_BODY).collect().await;
+            Ok::<http::StatusCode, WebhookError>(status)
+        };
+        let status = match tokio::time::timeout(self.timeout, deliver).await {
+            Ok(Ok(status)) => status,
+            Ok(Err(e)) => return Err(e),
             Err(_) => {
                 return Err(WebhookError::Retryable(format!(
                     "delivery timed out after {}s",
@@ -124,9 +144,6 @@ impl WebhookSink for HttpWebhookSink {
                 )));
             }
         };
-        let status = resp.status();
-        // Drain the body so the connection can be reused; the content is irrelevant to us.
-        let _ = resp.into_body().collect().await;
 
         if status.is_success() {
             Ok(())
@@ -142,5 +159,48 @@ impl WebhookSink for HttpWebhookSink {
                 "endpoint returned {status}"
             )))
         }
+    }
+}
+
+#[cfg(test)]
+mod sink_timeout_tests {
+    use super::{HttpWebhookSink, WebhookError, WebhookSink};
+    use std::io::{Read, Write};
+    use std::time::Duration;
+
+    /// Regression (audit 2026-07): a receiver that returns `200` headers then stalls the response
+    /// body must NOT pin the delivery future — the timeout has to cover the body drain, not just the
+    /// request head. Pre-fix the drain ran outside the timeout and `deliver` hung forever (the outer
+    /// 5s guard would fire and fail the `.expect` below); post-fix it returns Retryable within the
+    /// sink's 500ms timeout.
+    #[tokio::test]
+    async fn stalled_response_body_times_out_instead_of_hanging() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        // A blocking server thread: send a 200 with a large Content-Length, a few body bytes, then
+        // hold the connection open without ever finishing the body.
+        std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf);
+                let _ =
+                    sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\nabc");
+                let _ = sock.flush();
+                std::thread::sleep(Duration::from_secs(10));
+            }
+        });
+
+        let sink = HttpWebhookSink::with_timeout(Duration::from_millis(500));
+        let url = format!("http://{addr}/");
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            sink.deliver(&url, b"{}", None),
+        )
+        .await
+        .expect("deliver must return within 5s — pre-fix it hangs on the stalled response body");
+        assert!(
+            matches!(outcome, Err(WebhookError::Retryable(_))),
+            "a stalled response body should time out as Retryable, got {outcome:?}"
+        );
     }
 }
