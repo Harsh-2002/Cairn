@@ -22,7 +22,9 @@ pub fn conditions_match(
 }
 
 /// A single condition's outcome. Resolves the key's value(s) from the context, then applies
-/// the operator. An unrecognised key yields `false`. `if_exists` makes an absent key pass.
+/// the operator. An unrecognised key yields `false`. For an absent (but recognised) key the
+/// condition passes with `if_exists`, or when the operator is *negated* (AWS evaluates negated
+/// operators as TRUE against a missing key).
 #[must_use]
 fn condition_matches(c: &Condition, ctx: &RequestContext, requester: &RequesterClass) -> bool {
     // `Null` is the existence operator and is evaluated specially against key presence.
@@ -32,12 +34,28 @@ fn condition_matches(c: &Condition, ctx: &RequestContext, requester: &RequesterC
 
     let actual: Vec<String> = match resolve_key(&c.key, ctx, requester) {
         KeyValue::Unknown => return false, // unknown key => statement does not match
-        // Absent recognised key: passes only with the IfExists qualifier.
-        KeyValue::Absent => return c.if_exists,
+        // Absent recognised key: IfExists passes unconditionally; otherwise a *negated* operator
+        // matches (AWS evaluates negated operators as TRUE against a missing key — the absent value
+        // vacuously "does not equal" / "is not in range"), so a Deny built on a negated operator
+        // stays effective when the request omits the key. Affirmative operators do not match.
+        KeyValue::Absent => return c.if_exists || operator_is_negated(c.operator),
         KeyValue::Single(s) => vec![s],
     };
 
     apply_operator(c.operator, &actual, &c.values)
+}
+
+/// Whether `op` is a *negated* match operator — one satisfied by the ABSENCE of any matching value.
+/// AWS evaluates these as TRUE when the key is missing from the request context; affirmative
+/// operators evaluate FALSE. Keep in sync with the negated arms of [`apply_operator`].
+fn operator_is_negated(op: ConditionOperator) -> bool {
+    matches!(
+        op,
+        ConditionOperator::StringNotEquals
+            | ConditionOperator::NotIpAddress
+            | ConditionOperator::Numeric(NumericOp::NotEquals)
+            | ConditionOperator::Date(NumericOp::NotEquals)
+    )
 }
 
 /// The resolution of a condition key against the request context.
@@ -541,5 +559,27 @@ mod tests {
         // Absent + IfExists => pass.
         c.if_exists = true;
         assert!(condition_matches(&c, &base, &anon()));
+    }
+
+    #[test]
+    fn absent_key_matches_only_negated_operators() {
+        // M1: an absent recognised key makes a *negated* operator match (AWS semantics), so a Deny
+        // built on one stays effective; affirmative operators still do not match. `if_exists` is off.
+        let mut base = ctx();
+        base.referer = None; // aws:Referer now Absent
+        let cases = [
+            (ConditionOperator::StringEquals, false),
+            (ConditionOperator::StringLike, false),
+            (ConditionOperator::IpAddress, false),
+            (ConditionOperator::Numeric(NumericOp::Equals), false),
+            (ConditionOperator::StringNotEquals, true), // was false pre-fix
+            (ConditionOperator::NotIpAddress, true),    // was false pre-fix
+            (ConditionOperator::Numeric(NumericOp::NotEquals), true),
+            (ConditionOperator::Date(NumericOp::NotEquals), true),
+        ];
+        for (op, want) in cases {
+            let c = cond(op, "aws:Referer", &["x"]);
+            assert_eq!(condition_matches(&c, &base, &anon()), want, "op={op:?}");
+        }
     }
 }

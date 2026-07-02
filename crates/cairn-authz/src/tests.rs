@@ -191,6 +191,35 @@ fn non_session_member_is_still_widened_by_parent_named_bucket_policy() {
     assert_eq!(evaluate(&i), Decision::Allow);
 }
 
+// --- Absent-key condition semantics (M1): a negated-operator Deny fires on a missing key ----------
+
+#[test]
+fn deny_with_string_not_equals_on_absent_key_denies() {
+    // A Deny built to block requests whose aws:Referer is not the trusted value must fire when the
+    // request omits Referer entirely (AWS semantics). base_input's context has referer = None.
+    let mut input = base_input();
+    input.object_acl = Some(public_read_object_acl()); // an ACL that would otherwise Allow.
+    input.policy = Some(policy(vec![Statement {
+        sid: None,
+        effect: Effect::Deny,
+        principals: PrincipalSpec::Any,
+        actions: ActionMatch::In(vec![ActionPattern::All]),
+        resources: ResourceMatch::In(vec!["arn:aws:s3:::my-bucket/*".to_owned()]),
+        conditions: vec![Condition {
+            operator: ConditionOperator::StringNotEquals,
+            key: "aws:Referer".to_owned(),
+            values: vec!["https://trusted.example/".to_owned()],
+            if_exists: false,
+        }],
+    }]));
+    // Pre-fix: the Deny condition was false on the absent key -> ACL Allow won -> Allow (the bug).
+    // Post-fix: the negated operator matches the absent key -> the Deny fires.
+    assert_eq!(
+        evaluate(&input),
+        Decision::Deny(DenyReason::ExplicitPolicyDeny)
+    );
+}
+
 // --- Identity (per-user) policy: ARCH 15 / user-centric authz --------------------------
 
 #[test]

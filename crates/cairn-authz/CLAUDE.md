@@ -22,7 +22,9 @@ network**. Depends only on `cairn-types`; the caller assembles the `AuthzInput`.
   own identity policy — an identity Deny binds even the owner); (b) BPA gate; (c) explicit Deny
   anywhere → Deny; (d) any Allow (bucket policy, identity policy, or ACL); (e) default Deny.
 - **Fail-closed by default.** An unrecognised condition key or operator makes the statement
-  **not match** — an unknown condition can never broaden access. Default outcome is Deny.
+  **not match** — an unknown condition can never broaden access. Default outcome is Deny. An
+  *absent* (recognised) key makes a **negated** operator match (AWS semantics, `operator_is_negated`
+  in `condition.rs`), so a Deny built on one stays effective; affirmative operators still don't match.
 - **An object with no ACL is private** — it does NOT fall back to the bucket ACL (audit #2).
   Object actions consult `object_acl`; bucket actions consult `bucket_acl`; never cross them.
 - **`BucketOwnerEnforced` disables ACLs entirely** — `acl_allows_scoped` returns false; only
