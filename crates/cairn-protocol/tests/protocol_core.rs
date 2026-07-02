@@ -6045,3 +6045,75 @@ async fn session_does_not_inherit_owner_bypass() {
         "a session can do exactly what its scoped policy grants"
     );
 }
+
+/// Audit 2026-07: a real (non-preflight) cross-origin request carrying an Origin header must get
+/// Access-Control-Allow-Origin/Expose-Headers/Vary on the RESPONSE, not just the OPTIONS preflight —
+/// otherwise the browser blocks the response body even though the request succeeded.
+#[tokio::test]
+async fn cors_actual_request_gets_response_headers() {
+    let h = harness().await;
+    drain(send(&h.svc, req(Method::PUT, Some("corsc"), None, &[], &[], vec![])).await).await;
+    let cors = b"<CORSConfiguration><CORSRule>\
+        <AllowedOrigin>https://app.example</AllowedOrigin>\
+        <AllowedMethod>GET</AllowedMethod>\
+        <ExposeHeader>ETag</ExposeHeader>\
+        </CORSRule></CORSConfiguration>"
+        .to_vec();
+    let (st, _, _) = drain(
+        send(&h.svc, req(Method::PUT, Some("corsc"), None, &[("cors", "")], &[], cors)).await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    // Store an object.
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("corsc"), Some("k"), &[], &[], b"hi".to_vec()),
+        )
+        .await,
+    )
+    .await;
+
+    // A real cross-origin GET must carry the CORS response headers.
+    let (st, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("corsc"),
+                Some("k"),
+                &[],
+                &[("origin", "https://app.example")],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        header(&hdrs, "access-control-allow-origin"),
+        Some("https://app.example"),
+        "actual cross-origin GET echoes the allowed origin"
+    );
+    assert_eq!(header(&hdrs, "vary"), Some("Origin"));
+    assert_eq!(header(&hdrs, "access-control-expose-headers"), Some("ETag"));
+
+    // A cross-origin request from a DISALLOWED origin gets no CORS headers.
+    let (_, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("corsc"),
+                Some("k"),
+                &[],
+                &[("origin", "https://evil.example")],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(header(&hdrs, "access-control-allow-origin"), None);
+}

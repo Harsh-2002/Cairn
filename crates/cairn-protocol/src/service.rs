@@ -108,10 +108,46 @@ impl S3Service {
     pub async fn handle(&self, req: S3Request, body: cairn_types::BodyStream) -> S3Response {
         let request_id = req.request_id.clone();
         let resource = resource_path(&req);
-        match self.dispatch(req, body).await {
+        // Capture the actual-request CORS inputs (origin, method, bucket) before `dispatch` consumes
+        // `req`. A real cross-origin GET/PUT/POST carrying an `Origin` header must receive
+        // Access-Control-Allow-Origin/Expose-Headers/Vary on the RESPONSE — the preflight (OPTIONS)
+        // path alone is not enough, or the browser blocks the response body even though the request
+        // succeeded server-side (audit 2026-07). OPTIONS is handled by the preflight path already.
+        let cors_ctx = if req.method != Method::OPTIONS {
+            match (req.header("origin"), req.bucket.clone()) {
+                (Some(origin), Some(bucket)) => {
+                    Some((origin.to_owned(), req.method.to_string(), bucket))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let mut resp = match self.dispatch(req, body).await {
             Ok(resp) => resp,
             Err(e) => error_response(&e, &resource, &request_id),
+        };
+        if let Some((origin, method, bucket)) = cors_ctx {
+            if let Ok(Some(doc)) = self
+                .meta
+                .get_bucket_config(&bucket, ConfigAspect::Cors)
+                .await
+            {
+                if let Ok(rules) = cairn_xml::parse_cors_configuration(doc.0.as_bytes()) {
+                    if let Some((allow_origin, expose)) =
+                        cors_actual_headers(&rules, &origin, &method)
+                    {
+                        resp = resp
+                            .with_header("access-control-allow-origin", allow_origin)
+                            .with_header("vary", "Origin");
+                        if let Some(expose) = expose {
+                            resp = resp.with_header("access-control-expose-headers", expose);
+                        }
+                    }
+                }
+            }
         }
+        resp
     }
 
     async fn dispatch(&self, req: S3Request, body: cairn_types::BodyStream) -> Result<S3Response> {
@@ -4066,6 +4102,33 @@ fn verify_client_checksums(req: &S3Request, computed: &[ChecksumValue]) -> Resul
 /// Evaluate a CORS preflight against the bucket's rules (ARCH 18.2). Returns the 200 preflight
 /// response (with `Access-Control-Allow-*` and `Vary: Origin`) for the first rule that allows the
 /// `origin` + `method` + every requested header, or `None` if no rule matches.
+/// For an ACTUAL (non-preflight) cross-origin request, the CORS response headers to append when a
+/// rule matches on (origin, method): the echoed `Access-Control-Allow-Origin` and any
+/// `Access-Control-Expose-Headers` (the caller also adds `Vary: Origin`). Unlike the preflight path
+/// this does NOT consult `Access-Control-Request-Headers` (a preflight-only concept). Shares the
+/// origin/method matching with `cors_match` (audit 2026-07).
+fn cors_actual_headers(
+    rules: &[cairn_xml::CorsRule],
+    origin: &str,
+    method: &str,
+) -> Option<(String, Option<String>)> {
+    for rule in rules {
+        let Some(allow_origin) = rule
+            .allowed_origins
+            .iter()
+            .find_map(|pat| cors_origin_match(pat, origin))
+        else {
+            continue;
+        };
+        if !rule.allowed_methods.iter().any(|m| m == method) {
+            continue;
+        }
+        let expose = (!rule.expose_headers.is_empty()).then(|| rule.expose_headers.join(", "));
+        return Some((allow_origin, expose));
+    }
+    None
+}
+
 fn cors_match(
     rules: &[cairn_xml::CorsRule],
     origin: &str,
