@@ -45,6 +45,7 @@ fn ctx() -> RequestContext {
 fn base_input() -> AuthzInput {
     AuthzInput {
         requester: RequesterClass::Anonymous,
+        is_session: false,
         action: Action::GetObject,
         resource: object_resource(),
         bucket_owner: uid("owner"),
@@ -125,6 +126,69 @@ fn user_stmt(effect: Effect, action: &str) -> Statement {
         resources: ResourceMatch::In(vec!["arn:aws:s3:::my-bucket/*".to_owned()]),
         conditions: vec![],
     }
+}
+
+// --- STS session scoping (ARCH 14 / M2): a session is governed SOLELY by its own scoped policy ----
+
+/// A request from a temporary session credential whose parent is `parent`.
+fn session_input() -> AuthzInput {
+    let mut i = base_input();
+    i.requester = RequesterClass::AuthenticatedMember(uid("parent"));
+    i.is_session = true;
+    i
+}
+
+#[test]
+fn session_not_widened_by_parent_named_bucket_policy() {
+    let mut i = session_input();
+    // A bucket policy Allowing the parent user widens a normal member (see the control below), but
+    // must NOT widen a session — the session carries no such grant of its own.
+    i.policy = Some(policy(vec![allow_get_statement(
+        PrincipalSpec::Users(vec![uid("parent")]),
+        vec![],
+    )]));
+    assert_eq!(evaluate(&i), Decision::Deny(DenyReason::DefaultDeny));
+}
+
+#[test]
+fn session_not_widened_by_parent_user_acl() {
+    let mut i = session_input(); // ownership_mode ObjectWriter -> ACLs in force
+    i.object_acl = Some(Acl {
+        owner: uid("owner"),
+        grants: vec![Grant {
+            grantee: Grantee::User(uid("parent")),
+            permission: Permission::Read,
+        }],
+    });
+    assert_eq!(evaluate(&i), Decision::Deny(DenyReason::DefaultDeny));
+}
+
+#[test]
+fn session_governed_by_its_own_policy_and_explicit_deny_still_binds() {
+    // (a) The session's own scoped policy grants -> Allow (guards against over-restricting).
+    let mut i = session_input();
+    i.user_policy = Some(policy(vec![user_stmt(Effect::Allow, "s3:GetObject")]));
+    assert_eq!(evaluate(&i), Decision::Allow);
+    // (b) An explicit bucket-policy Deny naming the parent still binds the session even though its
+    //     own policy grants — fail-closed is intact for sessions.
+    i.policy = Some(policy(vec![deny_get_statement(PrincipalSpec::Users(
+        vec![uid("parent")],
+    ))]));
+    assert_eq!(evaluate(&i), Decision::Deny(DenyReason::ExplicitPolicyDeny));
+}
+
+#[test]
+fn non_session_member_is_still_widened_by_parent_named_bucket_policy() {
+    // Control: a real (non-session) member IS allowed by the same parent-named bucket policy, so the
+    // gating above is specific to sessions, not a blanket restriction.
+    let mut i = base_input();
+    i.requester = RequesterClass::AuthenticatedMember(uid("parent"));
+    i.is_session = false;
+    i.policy = Some(policy(vec![allow_get_statement(
+        PrincipalSpec::Users(vec![uid("parent")]),
+        vec![],
+    )]));
+    assert_eq!(evaluate(&i), Decision::Allow);
 }
 
 // --- Identity (per-user) policy: ARCH 15 / user-centric authz --------------------------
@@ -748,6 +812,7 @@ mod props {
             .prop_map(
                 |(requester, action, account_bpa, bucket_bpa, policy, ownership_mode)| AuthzInput {
                     requester,
+                    is_session: false,
                     action,
                     resource: object_resource(),
                     bucket_owner: uid("owner"),

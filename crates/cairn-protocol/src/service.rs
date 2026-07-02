@@ -3091,6 +3091,9 @@ impl S3Service {
             .and_then(|p| p.user_policy.as_deref().cloned());
         let input = AuthzInput {
             requester,
+            // A session credential is governed solely by its own scoped policy (ARCH 14): the authz
+            // engine must not widen it via a bucket policy / ACL that names the parent user.
+            is_session: req.principal.as_ref().is_some_and(|p| p.is_session),
             action,
             resource,
             bucket_owner: bucket.owner_id.clone(),

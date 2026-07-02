@@ -392,6 +392,12 @@ pub struct RequestContext {
 pub struct AuthzInput {
     /// The requester class.
     pub requester: RequesterClass,
+    /// Whether the requester authenticated with an STS-style temporary **session** credential
+    /// (ARCH 14). A session is governed SOLELY by its own scoped inline policy (`user_policy`): a
+    /// bucket-policy statement naming the parent user id, or an ACL grant to the parent, must NOT
+    /// widen it. Explicit Deny from any source still binds. `false` for ordinary and anonymous
+    /// requesters.
+    pub is_session: bool,
     /// The action requested.
     pub action: Action,
     /// The resource targeted.

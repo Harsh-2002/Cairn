@@ -63,12 +63,20 @@ pub fn evaluate(input: &AuthzInput) -> Decision {
         return Decision::Deny(DenyReason::ExplicitPolicyDeny);
     }
 
-    // (d) Any Allow: a matching bucket-policy Allow, a matching identity-policy Allow, or (ACLs in
-    //     force) a matching ACL grant. This is the AWS union of resource- and identity-based grants.
-    if policy_allow_matches_scoped(input, true, true)
-        || user_policy_allow_matches(input)
-        || acl_allows_scoped(input, true)
-    {
+    // (d) Any Allow. Normally the AWS union of resource- and identity-based grants: a matching
+    //     bucket-policy Allow, a matching identity-policy Allow, or (ACLs in force) a matching ACL
+    //     grant. For an STS-style SESSION credential (ARCH 14) the Allow must come SOLELY from the
+    //     session's own scoped inline policy — a bucket-policy statement or ACL grant naming the
+    //     parent user must not widen the session. (Deny arms (a)/(c) above still evaluate against the
+    //     real parent requester, so an explicit Deny from any source still binds a session.)
+    let allowed = if input.is_session {
+        user_policy_allow_matches(input)
+    } else {
+        policy_allow_matches_scoped(input, true, true)
+            || user_policy_allow_matches(input)
+            || acl_allows_scoped(input, true)
+    };
+    if allowed {
         return Decision::Allow;
     }
 
