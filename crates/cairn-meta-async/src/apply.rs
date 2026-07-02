@@ -183,6 +183,22 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
             Ok(MutationOutcome::Ack)
         }
         Mutation::DeleteBucket(name) => {
+            // Re-check emptiness inside the savepoint so the check and the delete are atomic
+            // (mirrors cairn-meta): objects OR in-progress multipart uploads keep a bucket non-empty
+            // (audit 2026-07).
+            let non_empty = query_one(
+                driver,
+                "SELECT EXISTS(SELECT 1 FROM object_versions WHERE bucket_name=?1) \
+                      OR EXISTS(SELECT 1 FROM multipart_uploads WHERE bucket_name=?1)",
+                vec![Value::Text(name.as_str().to_owned())],
+            )
+            .await?
+            .map(|r| r.get_i64(0))
+            .unwrap_or(0)
+                != 0;
+            if non_empty {
+                return Err(MetaError::NotEmpty);
+            }
             driver
                 .execute(
                     "DELETE FROM bucket_config WHERE bucket_name=?1",

@@ -665,11 +665,13 @@ impl MetadataStore for SqliteMetadataStore {
         self.with_read(move |conn| {
             let exists: bool = conn
                 .query_row(
-                    // Empty means NO object_versions rows at all — including non-current versions
-                    // and delete markers — so S3 DeleteBucket correctly refuses a bucket that still
-                    // holds version history (audit #3). A bucket with only old versions / delete
-                    // markers is NOT deletable in S3, and deleting it would orphan those rows.
-                    "SELECT EXISTS(SELECT 1 FROM object_versions WHERE bucket_name=?1)",
+                    // Empty means NO object_versions rows (any version or delete marker) AND no
+                    // in-progress multipart uploads — so S3 DeleteBucket correctly refuses a bucket
+                    // that still holds version history OR a live upload (audit #3; multipart added
+                    // 2026-07: a bucket with staged-but-uncompleted parts must not be deletable, or
+                    // the session rows and their part blobs leak).
+                    "SELECT EXISTS(SELECT 1 FROM object_versions WHERE bucket_name=?1) \
+                          OR EXISTS(SELECT 1 FROM multipart_uploads WHERE bucket_name=?1)",
                     params![name],
                     |r| r.get::<_, i64>(0),
                 )

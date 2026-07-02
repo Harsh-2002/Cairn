@@ -861,6 +861,82 @@ async fn delete_version_clears_object_tags() {
 }
 
 #[tokio::test]
+async fn delete_bucket_rejects_nonempty_inside_the_savepoint() {
+    // Audit 2026-07: DeleteBucket must re-check emptiness INSIDE its savepoint (atomic with the
+    // delete), and both objects AND in-progress multipart uploads keep a bucket non-empty.
+    let store = cairn_meta::open_in_memory().unwrap();
+    let b = BucketName::parse("delbkt").unwrap();
+    store
+        .submit(Mutation::CreateBucket(Box::new(bucket("delbkt"))))
+        .await
+        .unwrap();
+
+    // (1) A bucket holding an object cannot be deleted.
+    let v = VersionId::from_string("v1".into());
+    store
+        .submit(put(row(&b, "k", v.clone(), "e1", true), Precondition::default()))
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            store.submit(Mutation::DeleteBucket(b.clone())).await,
+            Err(MetaError::NotEmpty)
+        ),
+        "bucket with an object must not be deletable"
+    );
+
+    // Remove the object; now only an in-progress multipart upload remains.
+    store
+        .submit(Mutation::DeleteVersion {
+            bucket: b.clone(),
+            key: ObjectKey::parse("k").unwrap(),
+            version_id: v,
+        })
+        .await
+        .unwrap();
+    let session = MultipartSession {
+        upload_id: UploadId::generate(),
+        bucket: b.clone(),
+        key: ObjectKey::parse("big").unwrap(),
+        content_type: "application/octet-stream".to_owned(),
+        status: cairn_types::meta::MultipartStatus::Active,
+        owner_id: UserId("owner".to_owned()),
+        intended_acl: None,
+        user_metadata: Vec::new(),
+        sse_requested: false,
+        created_at: Timestamp(1),
+        updated_at: Timestamp(1),
+    };
+    let outcome = store
+        .submit(Mutation::CreateMultipart(Box::new(session)))
+        .await
+        .unwrap();
+    let upload_id = match outcome {
+        MutationOutcome::MultipartCreated(id) => id,
+        other => panic!("expected MultipartCreated, got {other:?}"),
+    };
+    assert!(!store.is_bucket_empty(&b).await.unwrap(), "MPU keeps it non-empty");
+    assert!(
+        matches!(
+            store.submit(Mutation::DeleteBucket(b.clone())).await,
+            Err(MetaError::NotEmpty)
+        ),
+        "bucket with an in-progress multipart upload must not be deletable"
+    );
+
+    // (2) Once the upload is aborted and no objects remain, the bucket is empty and deletable.
+    store
+        .submit(Mutation::AbortMultipart(upload_id))
+        .await
+        .unwrap();
+    assert!(store.is_bucket_empty(&b).await.unwrap());
+    store
+        .submit(Mutation::DeleteBucket(b.clone()))
+        .await
+        .expect("empty bucket deletes");
+}
+
+#[tokio::test]
 async fn defer_releases_claim_without_consuming_attempts() {
     let store = cairn_meta::open_in_memory().unwrap();
     let b = BucketName::parse("deferbkt").unwrap();

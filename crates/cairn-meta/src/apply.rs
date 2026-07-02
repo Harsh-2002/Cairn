@@ -174,6 +174,23 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             Ok(MutationOutcome::Ack)
         }
         Mutation::DeleteBucket(name) => {
+            // Re-check emptiness INSIDE the savepoint so the check and the delete are atomic. The
+            // protocol layer pre-checks too, but that read races a concurrent write (a PUT or
+            // multipart initiate committing between the check and this delete would be orphaned:
+            // stranded object_versions/multipart rows, corrupted counters, a leaked blob, and — since
+            // rows are keyed by bucket name — cross-tenant exposure to a recreated same-name bucket).
+            // Objects AND in-progress multipart uploads both keep a bucket non-empty (audit 2026-07).
+            let non_empty: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM object_versions WHERE bucket_name=?1) \
+                          OR EXISTS(SELECT 1 FROM multipart_uploads WHERE bucket_name=?1)",
+                    params![name.as_str()],
+                    |r| r.get(0),
+                )
+                .map_err(engine_err)?;
+            if non_empty {
+                return Err(MetaError::NotEmpty);
+            }
             conn.execute(
                 "DELETE FROM bucket_config WHERE bucket_name=?1",
                 params![name.as_str()],

@@ -66,6 +66,11 @@ pub enum MetaError {
     /// A configured byte quota would be exceeded by this mutation.
     #[error("quota exceeded")]
     QuotaExceeded,
+    /// A container still holds rows and cannot be deleted (e.g. a bucket with objects or in-progress
+    /// multipart uploads), enforced *inside* the commit transaction so the check is atomic with the
+    /// delete.
+    #[error("container not empty")]
+    NotEmpty,
 }
 
 /// Failures of authentication.
@@ -262,6 +267,7 @@ impl From<MetaError> for Error {
             // call site.
             MetaError::PreconditionFailed => Error::PreconditionFailed,
             MetaError::QuotaExceeded => Error::InsufficientStorage,
+            MetaError::NotEmpty => Error::BucketNotEmpty,
             other => Error::Internal(other.to_string()),
         }
     }

@@ -449,6 +449,19 @@ impl MetadataStore for InMemoryMetadataStore {
                 Ok(MutationOutcome::Ack)
             }
             Mutation::DeleteBucket(name) => {
+                // Reject atomically if the bucket still holds objects OR in-progress multipart
+                // uploads (mirrors the SQL engines' in-savepoint guard, audit 2026-07).
+                let has_versions = st
+                    .versions
+                    .values()
+                    .any(|r| r.bucket.as_str() == name.as_str());
+                let has_multipart = st
+                    .multipart
+                    .values()
+                    .any(|s| s.bucket.as_str() == name.as_str());
+                if has_versions || has_multipart {
+                    return Err(MetaError::NotEmpty);
+                }
                 st.buckets.remove(name.as_str());
                 // Mirror the SQL backends, where `DELETE FROM buckets` takes the quota column with
                 // it: drop the bucket's quota, and its per-bucket usage-analytics rows, so deleting a
@@ -919,13 +932,18 @@ impl MetadataStore for InMemoryMetadataStore {
     }
 
     async fn is_bucket_empty(&self, name: &BucketName) -> Result<bool, MetaError> {
-        // Empty means NO versions at all (any version or delete marker), matching S3 DeleteBucket
-        // semantics (audit #3).
+        // Empty means NO versions (any version or delete marker) AND no in-progress multipart uploads,
+        // matching S3 DeleteBucket semantics (audit #3; multipart added 2026-07).
         let st = self.state.lock().unwrap();
-        Ok(!st
+        let has_versions = st
             .versions
             .values()
-            .any(|r| r.bucket.as_str() == name.as_str()))
+            .any(|r| r.bucket.as_str() == name.as_str());
+        let has_multipart = st
+            .multipart
+            .values()
+            .any(|s| s.bucket.as_str() == name.as_str());
+        Ok(!has_versions && !has_multipart)
     }
 
     async fn current_version(
