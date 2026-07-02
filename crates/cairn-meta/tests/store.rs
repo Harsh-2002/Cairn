@@ -809,6 +809,58 @@ async fn prune_events_outbox_reclaims_old_failed_only() {
 }
 
 #[tokio::test]
+async fn delete_version_clears_object_tags() {
+    // Audit 2026-07: DeleteVersion must delete the version's object_tags. There is no FK cascade, and
+    // an unversioned bucket reuses the version id, so without this a re-created object at the same key
+    // silently inherits the deleted object's tags — mis-firing tag lifecycle/replication rules.
+    let store = cairn_meta::open_in_memory().unwrap();
+    let b = BucketName::parse("tagbkt").unwrap();
+    store
+        .submit(Mutation::CreateBucket(Box::new(bucket("tagbkt"))))
+        .await
+        .unwrap();
+    let k = ObjectKey::parse("k").unwrap();
+    let v = VersionId::from_string("v1".into());
+    store
+        .submit(put(row(&b, "k", v.clone(), "e1", true), Precondition::default()))
+        .await
+        .unwrap();
+    store
+        .submit(Mutation::PutObjectTags {
+            bucket: b.clone(),
+            key: k.clone(),
+            version_id: v.clone(),
+            tags: vec![("team".to_owned(), "blue".to_owned())],
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get_object_tags(&b, &k, &v).await.unwrap().len(),
+        1,
+        "tag is set before delete"
+    );
+
+    // Delete, then re-create at the same key + reused version id (an unversioned overwrite).
+    store
+        .submit(Mutation::DeleteVersion {
+            bucket: b.clone(),
+            key: k.clone(),
+            version_id: v.clone(),
+        })
+        .await
+        .unwrap();
+    store
+        .submit(put(row(&b, "k", v.clone(), "e2", true), Precondition::default()))
+        .await
+        .unwrap();
+    let tags = store.get_object_tags(&b, &k, &v).await.unwrap();
+    assert!(
+        tags.is_empty(),
+        "tags must not outlive the deleted version, got {tags:?}"
+    );
+}
+
+#[tokio::test]
 async fn defer_releases_claim_without_consuming_attempts() {
     let store = cairn_meta::open_in_memory().unwrap();
     let b = BucketName::parse("deferbkt").unwrap();

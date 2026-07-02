@@ -1215,6 +1215,18 @@ async fn delete_version(
             ],
         )
         .await?;
+    // Drop the version's tags too (mirrors cairn-meta; no FK cascade exists, and the in-memory
+    // double clears them, so both SQL engines must delete them explicitly — audit 2026-07).
+    driver
+        .execute(
+            "DELETE FROM object_tags WHERE bucket_name=?1 AND key=?2 AND version_id=?3",
+            vec![
+                Value::Text(bucket.as_str().to_owned()),
+                Value::Text(key.as_str().to_owned()),
+                Value::Text(version_id.as_str().to_owned()),
+            ],
+        )
+        .await?;
     if let Some((owner, sl, sp_bytes)) = removed {
         // The deleted row leaves the table: subtract its version and bytes from the counters.
         adjust_stats(driver, bucket.as_str(), &owner, -1, -sl, -sp_bytes).await?;

@@ -1097,6 +1097,17 @@ fn delete_version(
     .map_err(engine_err)?
     .execute(params![bucket.as_str(), key.as_str(), version_id.as_str()])
     .map_err(engine_err)?;
+    // Drop the version's tags too. object_tags has no FK/ON DELETE CASCADE to object_versions
+    // (schema.rs), so without this the tags outlive the version and, since an unversioned bucket
+    // reuses the `null` version id, a later object re-created at the same key silently inherits the
+    // dead object's tags — mis-firing tag lifecycle/replication rules. The in-memory reference double
+    // already clears them; this brings both SQL engines into agreement (audit 2026-07).
+    conn.prepare_cached(
+        "DELETE FROM object_tags WHERE bucket_name=?1 AND key=?2 AND version_id=?3",
+    )
+    .map_err(engine_err)?
+    .execute(params![bucket.as_str(), key.as_str(), version_id.as_str()])
+    .map_err(engine_err)?;
     if let Some((owner, sl, sp_bytes)) = removed {
         // The deleted row leaves the table: subtract its version and bytes from the counters.
         adjust_stats(conn, bucket.as_str(), &owner, -1, -sl, -sp_bytes)?;
