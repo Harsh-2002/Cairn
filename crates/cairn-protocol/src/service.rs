@@ -1419,20 +1419,19 @@ impl S3Service {
         let mut part_md5s = Vec::with_capacity(requested.len());
         let mut last_pn = 0u16;
         for (i, (pn, etag)) in requested.iter().enumerate() {
+            // AWS-correct S3 error codes (audit 2026-07): out-of-order -> InvalidPartOrder, a missing
+            // or ETag-mismatched part -> InvalidPart (not NoSuchUpload, which falsely tells the client
+            // the whole upload vanished), an undersized non-final part -> EntityTooSmall. All 400.
             if *pn <= last_pn {
-                return Err(Error::InvalidArgument(
-                    "parts not in ascending order".to_owned(),
-                ));
+                return Err(Error::InvalidPartOrder);
             }
             last_pn = *pn;
-            let rec = stored.get(pn).ok_or(Error::NoSuchUpload)?;
+            let rec = stored.get(pn).ok_or(Error::InvalidPart)?;
             if strip_quotes(etag) != rec.etag {
-                return Err(Error::InvalidArgument(format!("part {pn} etag mismatch")));
+                return Err(Error::InvalidPart);
             }
             if i + 1 < requested.len() && rec.size < 5 * 1024 * 1024 {
-                return Err(Error::InvalidArgument(format!(
-                    "part {pn} smaller than 5 MiB"
-                )));
+                return Err(Error::EntityTooSmall);
             }
             refs.push(PartRef {
                 part_number: *pn,

@@ -217,6 +217,15 @@ pub enum Error {
     /// An ACL was supplied for a bucket whose Object Ownership disables ACLs.
     #[error("The bucket does not allow ACLs")]
     AclNotSupported,
+    /// A CompleteMultipartUpload named a part that was never uploaded, or whose ETag did not match.
+    #[error("invalid part")]
+    InvalidPart,
+    /// A CompleteMultipartUpload listed its parts out of ascending part-number order.
+    #[error("invalid part order")]
+    InvalidPartOrder,
+    /// A non-final multipart part was smaller than the 5 MiB minimum.
+    #[error("entity too small")]
+    EntityTooSmall,
     /// An unexpected internal failure.
     #[error("internal error: {0}")]
     Internal(String),

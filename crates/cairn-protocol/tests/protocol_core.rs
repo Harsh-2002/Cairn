@@ -1334,6 +1334,63 @@ async fn complete_multipart_against_wrong_key_is_no_such_upload() {
     );
 }
 
+/// Audit 2026-07: a CompleteMultipartUpload naming a part that was never uploaded must be
+/// 400 InvalidPart, not 404 NoSuchUpload (which falsely tells the client the whole upload vanished).
+#[tokio::test]
+async fn complete_multipart_missing_part_is_invalid_part() {
+    let h = harness().await;
+    drain(send(&h.svc, req(Method::PUT, Some("mpb"), None, &[], &[], vec![])).await).await;
+    let (_, _, body) = drain(
+        send(
+            &h.svc,
+            req(Method::POST, Some("mpb"), Some("k"), &[("uploads", "")], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    let upload_id = between(&String::from_utf8(body).unwrap(), "<UploadId>", "</UploadId>");
+    let (_, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("mpb"),
+                Some("k"),
+                &[("uploadId", upload_id.as_str()), ("partNumber", "1")],
+                &[],
+                b"hello".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    let etag1 = header(&hdrs, "etag").unwrap().to_owned();
+    // Complete requesting part 2 (never uploaded).
+    let complete = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>2</PartNumber><ETag>{etag1}</ETag></Part></CompleteMultipartUpload>"
+    );
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::POST,
+                Some("mpb"),
+                Some("k"),
+                &[("uploadId", upload_id.as_str())],
+                &[],
+                complete.into_bytes(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "missing part is 400, not 404");
+    assert!(
+        String::from_utf8(body).unwrap().contains("InvalidPart"),
+        "error code is InvalidPart"
+    );
+}
+
 /// Audit 2026-07: v1 ListObjects must emit a plain-key NextMarker that, echoed back as `marker`,
 /// advances the listing. Pre-fix the NextMarker was base64-encoded but the incoming marker consumed
 /// raw, so pagination looped (re-returned page 1) or skipped keys.

@@ -34,6 +34,9 @@ pub fn map(err: &Error) -> (StatusCode, &'static str) {
         InvalidRange => (StatusCode::RANGE_NOT_SATISFIABLE, "InvalidRange"),
         NotImplemented => (StatusCode::NOT_IMPLEMENTED, "NotImplemented"),
         AclNotSupported => (StatusCode::BAD_REQUEST, "AccessControlListNotSupported"),
+        InvalidPart => (StatusCode::BAD_REQUEST, "InvalidPart"),
+        InvalidPartOrder => (StatusCode::BAD_REQUEST, "InvalidPartOrder"),
+        EntityTooSmall => (StatusCode::BAD_REQUEST, "EntityTooSmall"),
         Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "InternalError"),
     }
 }
