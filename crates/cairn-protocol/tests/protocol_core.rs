@@ -1232,6 +1232,97 @@ async fn multipart_lifecycle() {
     assert_eq!(got, expected);
 }
 
+/// Audit 2026-07: an uploadId is scoped to its (bucket, key). Completing it against a different key
+/// must be NoSuchUpload — never a silent write to the wrong path — and must not brick the upload.
+#[tokio::test]
+async fn complete_multipart_against_wrong_key_is_no_such_upload() {
+    let h = harness().await;
+    drain(send(&h.svc, req(Method::PUT, Some("mpb"), None, &[], &[], vec![])).await).await;
+    // Initiate for key "right.bin".
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::POST,
+                Some("mpb"),
+                Some("right.bin"),
+                &[("uploads", "")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let upload_id = between(&String::from_utf8(body).unwrap(), "<UploadId>", "</UploadId>");
+    // Upload a single part (the last part may be under 5 MiB).
+    let (st, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("mpb"),
+                Some("right.bin"),
+                &[("uploadId", upload_id.as_str()), ("partNumber", "1")],
+                &[],
+                b"hello".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let etag1 = header(&hdrs, "etag").unwrap().to_owned();
+    let complete = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag1}</ETag></Part></CompleteMultipartUpload>"
+    );
+
+    // Complete against a DIFFERENT key with the same uploadId -> NoSuchUpload (404).
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::POST,
+                Some("mpb"),
+                Some("wrong.bin"),
+                &[("uploadId", upload_id.as_str())],
+                &[],
+                complete.clone().into_bytes(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::NOT_FOUND,
+        "completing against the wrong key must be NoSuchUpload"
+    );
+
+    // The upload is NOT bricked: completing against the RIGHT key still succeeds.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::POST,
+                Some("mpb"),
+                Some("right.bin"),
+                &[("uploadId", upload_id.as_str())],
+                &[],
+                complete.into_bytes(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "the upload stays completable against its real key"
+    );
+}
+
 /// A part-validation failure on CompleteMultipartUpload must leave the upload retryable rather than
 /// bricking it in `completing` (audit #14): a first complete carrying a wrong ETag fails, and a
 /// second complete with the correct ETags then succeeds.

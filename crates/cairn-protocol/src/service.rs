@@ -1379,6 +1379,18 @@ impl S3Service {
             return Err(Error::InvalidArgument("no parts specified".to_owned()));
         }
 
+        // An uploadId is scoped to the (bucket, key) it was initiated for; completing it against any
+        // other path must be NoSuchUpload (AWS parity). Verify BEFORE claiming/assembling so a
+        // wrong-path completion leaves the (still valid) upload retryable against its real path.
+        // Without this the object silently lands at the request path (200 OK instead of
+        // NoSuchUpload), and under CAIRN_META_SHARDS>1 the CompleteMultipart mutation routes by the
+        // SESSION's shard while every read for the path bucket routes elsewhere — an unreadable,
+        // ultimately GC'd object: a silently-lost acknowledged write (audit 2026-07).
+        match self.meta.get_multipart(&upload_id).await? {
+            Some(s) if s.bucket == bucket.name && s.key == key => {}
+            _ => return Err(Error::NoSuchUpload),
+        }
+
         // Validate the requested parts against what was uploaded BEFORE claiming the session, so a
         // part-validation failure (the common client error: wrong ETag, gap, out-of-order, or an
         // undersized part) leaves the upload `active` and retryable rather than bricking it in
