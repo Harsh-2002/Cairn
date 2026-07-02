@@ -710,6 +710,20 @@ impl Config {
                         "CAIRN_MASTER_KEY_ACTIVE_ID {active} is not present in CAIRN_MASTER_KEY_RING"
                     )));
                 }
+                // Forward-only rotation (audit #29 / 2026-07): the active key must be the NEWEST
+                // (highest id) in the ring. The retire-gate assumes ids increase and `active` is the
+                // newest, so it only flags a removed key with `id < active`; rolling `active` BACK
+                // below a higher-id ring key would let that newer key (id > active) be retired while
+                // it still seals data — silent, unrecoverable loss. Rotate forward by adding a
+                // higher-id key, never by lowering the active id.
+                let max_id = keys.iter().map(|(id, _)| *id).max().unwrap_or(active);
+                if active != max_id {
+                    return Err(ConfigError::Invalid(format!(
+                        "CAIRN_MASTER_KEY_ACTIVE_ID {active} must be the highest id in \
+                         CAIRN_MASTER_KEY_RING (found {max_id}); rotate forward by adding a \
+                         higher-id key, never by lowering the active id (audit #29)"
+                    )));
+                }
             }
         } else if let Some(mk) = &self.master_key {
             if mk.len() != 64 || !mk.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -825,6 +839,34 @@ mod tests {
         assert_eq!(keys[0].0, 1);
         assert_eq!(keys[1].0, 2);
         assert_eq!(keys[0].1, [0xabu8; 32]);
+    }
+
+    #[test]
+    fn active_key_id_must_be_the_highest_ring_id() {
+        // Audit #29 / 2026-07: rotation is forward-only. The active key must be the newest (highest
+        // id) in the ring — otherwise a ring key with id > active could be retired while it still
+        // seals data (the retire-gate only flags id < active), an unrecoverable loss.
+        let ring = format!(
+            r#"[{{"id":1,"key":"{}"}},{{"id":2,"key":"{}"}},{{"id":3,"key":"{}"}}]"#,
+            hex64(1),
+            hex64(2),
+            hex64(3)
+        );
+        let mut c = base();
+        c.master_key = None;
+        c.master_key_ring = Some(ring);
+        // active = the highest id validates.
+        c.master_key_active_id = Some(3);
+        assert!(c.validate().is_ok(), "active == max ring id is valid");
+        // active rolled back below a higher-id ring key is refused.
+        c.master_key_active_id = Some(2);
+        assert!(
+            c.validate().is_err(),
+            "active below the highest ring id must be rejected (pre-fix this was accepted)"
+        );
+        // Omitting active (defaults to the highest id) is valid.
+        c.master_key_active_id = None;
+        assert!(c.validate().is_ok(), "defaulting active to the max id is valid");
     }
 
     #[test]
