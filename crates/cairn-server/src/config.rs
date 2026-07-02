@@ -53,6 +53,17 @@ pub struct Config {
     pub concurrency_limit: usize,
     /// Per-request timeout, in seconds.
     pub request_timeout_secs: u64,
+    /// Maximum time a connection may take to send its complete request head
+    /// (`CAIRN_HEADER_READ_TIMEOUT_SECS`), before the connection is dropped. Bounds a slowloris that
+    /// dribbles or never finishes the request line/headers — the per-request timeout only starts
+    /// once the head is fully parsed, so without this a partial-head connection is held forever
+    /// (audit 2026-07). Applies to both listeners.
+    pub header_read_timeout_secs: u64,
+    /// Maximum number of concurrent TCP connections accepted per listener
+    /// (`CAIRN_MAX_CONNECTIONS`). A connection past the cap is dropped immediately (counted as
+    /// `cairn_connections_rejected_total`), so a flood of idle/slow sockets can't exhaust file
+    /// descriptors and memory ahead of the per-request concurrency limiter (audit 2026-07).
+    pub max_connections: usize,
     /// Hard per-object size ceiling, in bytes.
     pub max_object_size: u64,
     /// The region label returned by the location operation and used in SigV4 scope checks.
@@ -272,6 +283,8 @@ impl Default for Config {
             tls_key_path: None,
             concurrency_limit: 1024,
             request_timeout_secs: 300,
+            header_read_timeout_secs: 15,
+            max_connections: 8192,
             max_object_size: 5 * 1024 * 1024 * 1024 * 1024, // 5 TiB
             region: "us-east-1".to_owned(),
             master_key: None,
@@ -601,6 +614,16 @@ impl Config {
         if self.concurrency_limit == 0 {
             return Err(ConfigError::Invalid(
                 "concurrency_limit must be positive".into(),
+            ));
+        }
+        if self.header_read_timeout_secs == 0 {
+            return Err(ConfigError::Invalid(
+                "header_read_timeout_secs must be positive".into(),
+            ));
+        }
+        if self.max_connections == 0 {
+            return Err(ConfigError::Invalid(
+                "max_connections must be positive".into(),
             ));
         }
         if self.max_object_size == 0 {
@@ -934,6 +957,18 @@ mod tests {
         assert!(c.validate().is_err());
         let mut c = base();
         c.concurrency_limit = 0;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_zero_slowloris_guards() {
+        // Audit 2026-07: the header-read timeout (slowloris) and the connection cap must be positive
+        // — a zero would disable the very guard, so it is a misconfiguration, not "unlimited".
+        let mut c = base();
+        c.header_read_timeout_secs = 0;
+        assert!(c.validate().is_err());
+        let mut c = base();
+        c.max_connections = 0;
         assert!(c.validate().is_err());
     }
 

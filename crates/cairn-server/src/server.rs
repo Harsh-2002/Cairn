@@ -10,7 +10,7 @@ use bytes::Bytes;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
 use metrics_exporter_prometheus::PrometheusHandle;
 use std::convert::Infallible;
@@ -30,6 +30,11 @@ struct AppState {
     concurrency: Semaphore,
     /// Per-request timeout.
     request_timeout: Duration,
+    /// Maximum time allowed to read a connection's complete request head (slowloris guard).
+    header_read_timeout: Duration,
+    /// Caps the number of concurrent TCP connections per listener; a connection past the cap is
+    /// dropped so idle/slow sockets can't exhaust FDs ahead of the concurrency limiter.
+    connection_limiter: Arc<Semaphore>,
     /// The Prometheus render handle.
     metrics: PrometheusHandle,
     /// Whether the request-metrics usage-analytics subsystem is enabled (`CAIRN_REQUEST_METRICS_*`,
@@ -66,6 +71,8 @@ pub async fn serve(
         ready: AtomicBool::new(false),
         concurrency: Semaphore::new(config.concurrency_limit),
         request_timeout: Duration::from_secs(config.request_timeout_secs),
+        header_read_timeout: Duration::from_secs(config.header_read_timeout_secs),
+        connection_limiter: Arc::new(Semaphore::new(config.max_connections)),
         metrics,
         request_metrics_enabled: config.request_metrics_enabled,
         fastio_min_bytes: config.fastio_min_bytes,
@@ -150,12 +157,25 @@ async fn accept_loop(
                     Ok(v) => v,
                     Err(e) => { tracing::warn!(error = %e, "accept failed"); continue; }
                 };
+                // Cap concurrent connections: acquire a permit held for the connection's lifetime, or
+                // drop the connection immediately if we're at the cap. This bounds FD/memory use
+                // against a flood of idle/slow sockets ahead of the per-request limiter (audit
+                // 2026-07). A drop is counted, never silent.
+                let permit = match state.connection_limiter.clone().try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        metrics::counter!("cairn_connections_rejected_total").increment(1);
+                        tracing::debug!(%peer, "connection limit reached; dropping connection");
+                        continue;
+                    }
+                };
                 let st = state.clone();
                 let conn_shutdown = shutdown_rx.clone();
                 // Snapshot the *current* TLS config for this connection; a concurrent reload
                 // affects only subsequently-accepted connections.
                 let tls = tls_rx.as_ref().map(|rx| rx.borrow().clone());
                 conns.spawn(async move {
+                    let _permit = permit; // released when the connection task ends
                     match tls {
                         Some(cfg) => serve_tls(stream, cfg, ktls_ready, st, peer, serve_ui, conn_shutdown).await,
                         None => serve_plaintext(stream, st, peer, serve_ui, conn_shutdown).await,
@@ -444,6 +464,8 @@ async fn serve_io<S>(
 {
     let io = TokioIo::new(stream);
     let svc_shutdown = conn_shutdown.clone();
+    // Capture before `state` is moved into the service closure (Duration is Copy).
+    let header_read_timeout = state.header_read_timeout;
     let svc = service_fn(move |req| {
         handle(
             state.clone(),
@@ -454,7 +476,15 @@ async fn serve_io<S>(
             svc_shutdown.clone(),
         )
     });
-    let builder = auto::Builder::new(TokioExecutor::new());
+    let mut builder = auto::Builder::new(TokioExecutor::new());
+    // Install a timer and a header-read timeout so a connection that dribbles or never finishes its
+    // request head is dropped instead of pinning a task/FD forever (slowloris; audit 2026-07). The
+    // per-request timeout only starts after the head is parsed, so this is the only bound on the
+    // head-read phase. `header_read_timeout` requires the timer to be set (else it panics).
+    builder
+        .http1()
+        .timer(TokioTimer::new())
+        .header_read_timeout(header_read_timeout);
     let conn = builder.serve_connection(io, svc);
     tokio::pin!(conn);
     tokio::select! {
