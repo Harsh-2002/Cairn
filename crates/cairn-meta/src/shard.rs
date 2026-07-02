@@ -743,7 +743,42 @@ fn mutation_bucket(m: &Mutation) -> Option<String> {
         Mutation::SetObjectRetention { bucket, .. } => bucket.as_str(),
         Mutation::SetObjectLegalHold { bucket, .. } => bucket.as_str(),
         Mutation::EnqueueReplication(e) => e.bucket.as_str(),
-        _ => return None,
+        // Not per-bucket, so no single target bucket to route by: multipart routes by upload id,
+        // webhooks by their first entry, replication/webhook marks & batch claims fan out or hit
+        // shard 0, and every account-global table (users, sessions, activity, shares, metrics,
+        // account BPA) lands on shard 0. Listed EXPLICITLY (no wildcard) so a new per-bucket
+        // Mutation fails to compile here until it is classified — matching `submit`'s exhaustive
+        // routing match, which is the other half of the +routing site (see the root CLAUDE.md).
+        Mutation::CreateMultipart(_)
+        | Mutation::RecordPart { .. }
+        | Mutation::ClaimMultipart(_)
+        | Mutation::CompleteMultipart { .. }
+        | Mutation::AbortMultipart(_)
+        | Mutation::SetUserPolicy { .. }
+        | Mutation::SetUserQuota { .. }
+        | Mutation::SetAccountPublicAccessBlock(_)
+        | Mutation::CreateUser(_)
+        | Mutation::UpdateUser(_)
+        | Mutation::DeactivateUser(_)
+        | Mutation::DeleteUser(_)
+        | Mutation::CreateSessionCredential(_)
+        | Mutation::DeleteExpiredSessionCredentials { .. }
+        | Mutation::DeleteSessionCredential { .. }
+        | Mutation::ClaimReplicationBatch { .. }
+        | Mutation::MarkReplicationDone(_)
+        | Mutation::MarkReplicationFailed { .. }
+        | Mutation::RetryFailedReplication { .. }
+        | Mutation::PruneReplicationOutbox { .. }
+        | Mutation::DeferReplication { .. }
+        | Mutation::RecoverClaimedReplication
+        | Mutation::EnqueueWebhooks(_)
+        | Mutation::ClaimWebhookBatch { .. }
+        | Mutation::MarkWebhookDone(_)
+        | Mutation::MarkWebhookFailed { .. }
+        | Mutation::RecordActivity(_)
+        | Mutation::CreateShare(_)
+        | Mutation::RevokeShare { .. }
+        | Mutation::RecordRequestMetrics { .. } => return None,
     };
     Some(b.to_owned())
 }
@@ -836,6 +871,22 @@ mod tests {
         assert_eq!(shard_for_bucket("anything", 1), 0);
         assert_eq!(encode_upload_shard(0, "abc", 1), "abc");
         assert_eq!(decode_upload_shard("abc", 1), 0);
+    }
+
+    #[test]
+    fn mutation_bucket_classifies_per_bucket_and_global() {
+        // L1: a per-bucket mutation must resolve to its target bucket so `submit` routes it (rather
+        // than panicking on `.expect`), and an account-global one must be None. The `mutation_bucket`
+        // match is now exhaustive (no wildcard), so a new Mutation variant fails to compile until it
+        // is classified here — this asserts the classification itself is right for both kinds.
+        let per_bucket = Mutation::SetObjectLegalHold {
+            bucket: BucketName::parse("charlie").unwrap(),
+            key: ObjectKey::parse("k").unwrap(),
+            version_id: VersionId::null(),
+            on: true,
+        };
+        assert_eq!(mutation_bucket(&per_bucket).as_deref(), Some("charlie"));
+        assert!(mutation_bucket(&Mutation::RecoverClaimedReplication).is_none());
     }
 
     #[test]

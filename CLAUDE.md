@@ -86,8 +86,10 @@ cargo nextest run --workspace                                # + cargo test --wo
   `cairn-meta`; reads use the WAL read pool. Never open ad-hoc write connections.
 - **The 4(+1)-site rule.** A new `Mutation` or shared read must be mirrored in
   `crates/cairn-meta/src/apply.rs` **and** `crates/cairn-meta-async/src/apply.rs`, plus the
-  in-memory double in `cairn-types`. Schema changes are **append-only** migrations in
-  `cairn-meta/src/schema.rs` (never edit an applied migration).
+  in-memory double in `cairn-types`. A new **per-bucket** `Mutation` must also be classified in
+  `cairn-meta/src/shard.rs` — both `ShardedMetadataStore::submit`'s routing match and
+  `mutation_bucket` (both now exhaustive, so the compiler forces this). Schema changes are
+  **append-only** migrations in `cairn-meta/src/schema.rs` (never edit an applied migration).
 - **Crypto fails closed.** A missing/wrong key or tampered envelope must return an error — never
   plaintext, zeros, or partial data. Secrets are sealed at rest and are never logged, echoed, or
   returned by any endpoint. Master key via `CAIRN_MASTER_KEY` (or a `CAIRN_MASTER_KEY_RING`;
