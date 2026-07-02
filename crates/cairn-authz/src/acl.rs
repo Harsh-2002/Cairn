@@ -83,7 +83,24 @@ pub fn expand_canned_acl(name: &str, owner: &UserId) -> Option<Acl> {
 pub fn permission_satisfies(permission: Permission, action: Action, resource: &Resource) -> bool {
     let on_object = matches!(resource, Resource::Object { .. });
     match permission {
-        Permission::FullControl => true,
+        // FULL_CONTROL is the union of the four sub-permissions it implies — READ + WRITE +
+        // READ_ACP + WRITE_ACP — and nothing more. It must NOT be a blanket `true`: an ACL grant
+        // can never confer bucket-configuration/policy actions (PutBucketPolicy, DeleteBucket,
+        // Put*PublicAccessBlock, Put*OwnershipControls, lifecycle/versioning/replication config),
+        // BypassGovernanceRetention, or the internal Replicate* actions — those are grantable only
+        // by a bucket policy or the owner/admin (AWS parity: FULL_CONTROL never grants
+        // s3:PutBucketPolicy et al.). Because none of the helper predicates below name those
+        // actions, the union excludes them by construction.
+        Permission::FullControl => {
+            is_read_acp(action)
+                || is_write_acp(action)
+                || is_object_write(action)
+                || if on_object {
+                    is_object_read(action)
+                } else {
+                    is_bucket_read(action)
+                }
+        }
         Permission::ReadAcp => is_read_acp(action),
         Permission::WriteAcp => is_write_acp(action),
         Permission::Read => {
@@ -277,11 +294,53 @@ mod tests {
             Action::GetObject,
             &obj()
         ));
-        // FullControl -> everything.
+        // FullControl -> the union of READ+WRITE+READ_ACP+WRITE_ACP (object data + ACL), but not
+        // bucket administration (see full_control_is_not_bucket_admin).
         assert!(permission_satisfies(
             Permission::FullControl,
             Action::DeleteObjectVersion,
             &obj()
         ));
+    }
+
+    #[test]
+    fn full_control_is_not_bucket_admin() {
+        // Regression: an ACL FULL_CONTROL grant must NOT confer bucket-configuration/policy
+        // administration, DeleteBucket, or governance-retention bypass. Before the fix
+        // `FullControl => true` granted every Action, so a normal "let Bob manage this bucket"
+        // ACL grant (or an AllUsers/AuthenticatedUsers grant) escalated to full bucket admin.
+        for action in [
+            Action::PutBucketPolicy,
+            Action::DeleteBucket,
+            Action::PutBucketPublicAccessBlock,
+            Action::PutReplicationConfiguration,
+            Action::PutBucketOwnershipControls,
+            Action::PutBucketObjectLockConfiguration,
+            Action::PutLifecycleConfiguration,
+            Action::PutBucketVersioning,
+            Action::BypassGovernanceRetention,
+        ] {
+            assert!(
+                !permission_satisfies(Permission::FullControl, action, &buck()),
+                "FULL_CONTROL must not grant {action:?}"
+            );
+        }
+
+        // But it DOES grant the object/bucket read+write+ACL actions it is documented to imply.
+        for (action, res) in [
+            (Action::GetObject, obj()),
+            (Action::PutObject, obj()),
+            (Action::DeleteObject, obj()),
+            (Action::GetObjectAcl, obj()),
+            (Action::PutObjectAcl, obj()),
+            (Action::ListBucket, buck()),
+            (Action::GetBucketAcl, buck()),
+            (Action::PutBucketAcl, buck()),
+        ] {
+            assert!(
+                permission_satisfies(Permission::FullControl, action, &res),
+                "FULL_CONTROL should grant {action:?}"
+            );
+        }
     }
 }
