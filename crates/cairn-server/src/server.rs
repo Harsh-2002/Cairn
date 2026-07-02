@@ -516,6 +516,18 @@ fn next_request_id() -> String {
     format!("{salt:016x}{seq:016x}")
 }
 
+/// Redact the object-share token from a path before it is logged. `GET /p/{token}` carries a 256-bit
+/// revocable capability in the path, and the request span is recorded at info level — anyone with
+/// access-log access (a broader, less-trusted audience than DB/filesystem access) could otherwise
+/// extract and replay it until revoked (audit 2026-07). Correlation is preserved via the request_id.
+fn redact_log_path(path: &str) -> &str {
+    if path.starts_with("/p/") {
+        "/p/<redacted>"
+    } else {
+        path
+    }
+}
+
 /// The outer middleware: request id, tracing span, concurrency limit, timeout, and the
 /// request/latency metrics, wrapping the router.
 async fn handle(
@@ -535,11 +547,13 @@ async fn handle(
     // Approximate inbound payload size from the declared content-length (the body itself is streamed
     // and never fully buffered here, so the header is the cheapest available proxy).
     let req_bytes = content_length(req.headers());
+    // Redact the share token from logs (see `redact_log_path`).
+    let log_path = redact_log_path(&path);
     let span = tracing::info_span!(
         "request",
         request_id = %request_id,
         method = %method,
-        path = %path,
+        path = %log_path,
         %peer,
     );
 
@@ -1295,5 +1309,20 @@ mod redirect_tests {
         let resp = String::from_utf8(resp).unwrap();
         assert!(resp.starts_with("HTTP/1.1 308 "), "got: {resp}");
         assert!(resp.contains("Location: https://ui.local:7374/buckets\r\n"));
+    }
+}
+
+#[cfg(test)]
+mod redact_tests {
+    use super::redact_log_path;
+
+    #[test]
+    fn share_token_is_redacted() {
+        // Audit 2026-07: the share capability must never reach the access log.
+        assert_eq!(redact_log_path("/p/abc123deadbeef"), "/p/<redacted>");
+        assert_eq!(redact_log_path("/p/"), "/p/<redacted>");
+        // Other paths pass through unchanged.
+        assert_eq!(redact_log_path("/bucket/key"), "/bucket/key");
+        assert_eq!(redact_log_path("/healthz"), "/healthz");
     }
 }
