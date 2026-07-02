@@ -274,16 +274,47 @@ async fn rewrap_targets(
             {
                 Ok(true) => {}
                 Ok(false) => {
-                    tracing::debug!(bucket = %b.name, "target re-wrap CAS miss; retrying next pass");
+                    // A CAS miss means a concurrent target edit landed between our read and our
+                    // write, so THIS bucket was not re-sealed this pass. Treat it exactly like an
+                    // open failure (which already bumps `pass_failed`): the pass is incomplete and
+                    // must NOT record completion under the active id. Audit 2026-07: recording the
+                    // targets stream "done" after a CAS miss let the retire-gate delete a master key
+                    // still sealing a sibling target's secret — silent, unrecoverable loss. The next
+                    // pass re-attempts.
+                    pass_failed += 1;
+                    tracing::debug!(bucket = %b.name, "target re-wrap CAS miss; deferring completion to next pass");
                 }
                 Err(e) => return Err(e),
             }
         }
     }
-    // Targets have no resume cursor (each pass scans every bucket), so any pass with zero failures
-    // is a complete pass under the active key (audit #29).
-    let done_id = if pass_failed == 0 { active } else { 0 };
+    // Targets have no resume cursor (each pass scans every bucket), so only a pass with zero
+    // failures AND zero CAS misses is a complete pass under the active key (audit #29).
+    let done_id = targets_pass_done_id(active, pass_failed);
     store
         .rewrap_finish_pass(TARGETS_STREAM.to_owned(), done_id, now_ms())
         .await
+}
+
+/// The `done_active_id` a targets re-wrap pass records: the active id only if the pass re-sealed
+/// every bucket with zero failures and zero CAS misses (`pass_failed == 0`); otherwise 0, so the
+/// retire-gate stays closed until a genuinely clean pass (audit #29 / 2026-07).
+fn targets_pass_done_id(active: u16, pass_failed: u64) -> u16 {
+    if pass_failed == 0 { active } else { 0 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::targets_pass_done_id;
+
+    #[test]
+    fn incomplete_targets_pass_does_not_record_completion() {
+        // A clean pass records the active id.
+        assert_eq!(targets_pass_done_id(3, 0), 3);
+        // Any failure OR CAS miss (both feed pass_failed) records 0, keeping the retire-gate closed
+        // (audit 2026-07: pre-fix a CAS miss still recorded `active`, so a key still sealing a
+        // target secret could be retired).
+        assert_eq!(targets_pass_done_id(3, 1), 0);
+        assert_eq!(targets_pass_done_id(3, 5), 0);
+    }
 }
