@@ -441,6 +441,7 @@ impl LocalBlobStore {
         enc: &mut Option<BlockEncoder>,
         logical: &mut u64,
         physical: &mut u64,
+        size_ceiling: u64,
     ) -> Result<(), BlobError> {
         use md5::Digest;
         use tokio::io::AsyncReadExt;
@@ -456,6 +457,11 @@ impl LocalBlobStore {
                     break;
                 }
                 *logical += n as u64;
+                // Enforce the ceiling on the actual bytes read, so a part whose on-disk size exceeds
+                // its recorded size can't inflate the object past the limit (audit 2026-07).
+                if *logical > size_ceiling {
+                    return Err(BlobError::SizeExceeded);
+                }
                 hasher.update(&buf[..n]);
                 match enc {
                     Some(e) => {
@@ -659,6 +665,13 @@ impl BlobStore for LocalBlobStore {
             }
         };
         sink.fsync_in_place().await?;
+        // fsync the session directory so the new part's directory entry is durable. Without this, a
+        // part that was acknowledged 200 OK could lose its dirent on power loss even though its bytes
+        // were fdatasync'd, so a later CompleteMultipartUpload fails NoSuchUpload — a durability-
+        // contract violation (ARCH 8.1) the single-part path already guards against by fsyncing the
+        // bucket dir after rename (F-1). Routed through the coalescer so concurrent part uploads into
+        // the same session share one fsync (audit 2026-07).
+        self.dir_sync.sync_dir(&dir).await?;
         Ok(StagedPart {
             storage_path: StoragePath::from_string(format!(
                 "{}/multipart/{}/{}",
@@ -703,6 +716,14 @@ impl BlobStore for LocalBlobStore {
         // The assembled object's size is the sum of the parts' plaintext sizes — known up front, so
         // preallocate the staging file to place it contiguously (ARCH 7.5).
         let assembled_len: u64 = parts.iter().map(|p| p.size).sum();
+        // Enforce the object-size ceiling on the multipart total, exactly as the single-PUT path does
+        // on its streamed bytes (write_staged). Without this a multipart upload of up to ~10000 parts
+        // each near the per-part cap bypasses CAIRN_MAX_OBJECT_SIZE — a limit-bypass / disk+memory DoS
+        // (audit 2026-07). Checked up front on the recorded sizes; assemble_into also enforces on the
+        // running sum in case a part's on-disk size disagrees with its record.
+        if assembled_len > opts.size_ceiling {
+            return Err(BlobError::SizeExceeded);
+        }
         let mut sink = Staging::create(staging, self.use_uring, Some(assembled_len)).await?;
         use md5::Digest;
         let mut hasher = md5::Md5::new();
@@ -724,6 +745,7 @@ impl BlobStore for LocalBlobStore {
                 &mut enc,
                 &mut logical,
                 &mut physical,
+                opts.size_ceiling,
             )
             .await;
         if let Err(e) = assembled {

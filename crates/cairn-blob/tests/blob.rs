@@ -510,6 +510,48 @@ async fn multipart_assembly_roundtrip() {
 }
 
 #[tokio::test]
+async fn assemble_enforces_size_ceiling() {
+    // Audit 2026-07: the multipart total must be bounded by size_ceiling, exactly as a single PUT is.
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let b = BucketName::parse("bkt").unwrap();
+    let upload = UploadId::generate();
+    let p1 = store
+        .stage_part(&upload, 1, body(b"part-one-".to_vec()), 1 << 20)
+        .await
+        .unwrap();
+    let p2 = store
+        .stage_part(&upload, 2, body(b"part-two".to_vec()), 1 << 20)
+        .await
+        .unwrap();
+    let refs = vec![
+        PartRef {
+            part_number: 1,
+            storage_path: p1.storage_path.clone(),
+            size: p1.size,
+        },
+        PartRef {
+            part_number: 2,
+            storage_path: p2.storage_path.clone(),
+            size: p2.size,
+        },
+    ];
+    // The parts total 17 bytes; a 10-byte ceiling must reject the assembly.
+    let tight = StageOptions {
+        size_ceiling: 10,
+        content_type: "text/plain".to_owned(),
+        ..StageOptions::default()
+    };
+    assert!(matches!(
+        store.assemble(&b, &refs, tight).await,
+        Err(BlobError::SizeExceeded)
+    ));
+    // A generous ceiling assembles fine.
+    assert!(store.assemble(&b, &refs, opts(None, "text/plain")).await.is_ok());
+    store.delete_session(&upload).await.unwrap();
+}
+
+#[tokio::test]
 async fn reconcile_reclaims_orphans_only() {
     let dir = tempfile::tempdir().unwrap();
     let store = LocalBlobStore::open(dir.path()).await.unwrap();
