@@ -1523,11 +1523,17 @@ async fn delete_version_compare_and_delete_skips_overwritten_object() {
     // v1 committed with updated_at=100 (what a scan would capture).
     let mut r1 = row(&b, "k", v.clone(), "e1", true);
     r1.updated_at = Timestamp(100);
-    store.submit(put(r1, Precondition::default())).await.unwrap();
+    store
+        .submit(put(r1, Precondition::default()))
+        .await
+        .unwrap();
     // Client overwrites the object between the scan and the delete -> updated_at=200.
     let mut r2 = row(&b, "k", v.clone(), "e2", true);
     r2.updated_at = Timestamp(200);
-    store.submit(put(r2, Precondition::default())).await.unwrap();
+    store
+        .submit(put(r2, Precondition::default()))
+        .await
+        .unwrap();
 
     // Delete with the STALE captured updated_at -> no-op; the fresh object survives.
     store
