@@ -328,6 +328,14 @@ impl Authenticator for AuthChain {
     }
 }
 
+/// Whether the raw query string carries `name` as an actual parameter (exact key match on a
+/// `&`-separated `key[=value]` list), as opposed to `name` merely appearing as a substring.
+fn query_has_param(query: &str, name: &str) -> bool {
+    query
+        .split('&')
+        .any(|kv| kv.split('=').next().unwrap_or("") == name)
+}
+
 impl AuthChain {
     /// Decide the auth outcome by method, without loading the identity policy (that is done once by
     /// [`Authenticator::authenticate`]). Preserves the original dispatch precedence.
@@ -340,7 +348,11 @@ impl AuthChain {
                 return self.verify_bearer(header).await;
             }
         }
-        if view.query.contains("X-Amz-Algorithm") {
+        // Route to the presigned verifier only when `X-Amz-Algorithm` is an actual query PARAMETER,
+        // not merely a substring of the raw query. Otherwise an anonymous request whose query happens
+        // to contain the text (e.g. `?label=X-Amz-Algorithm-v4`) was routed here and denied Malformed
+        // instead of falling through to anonymous authorization (audit 2026-07).
+        if query_has_param(view.query, "X-Amz-Algorithm") {
             return self.verify_sigv4_presigned(view).await;
         }
         // The development bypass: compiled in only with `dev-auth`, and only on loopback.
@@ -410,5 +422,21 @@ fn dev_principal() -> Principal {
         chunk_signing: None,
         user_policy: None,
         is_session: false,
+    }
+}
+
+#[cfg(test)]
+mod query_param_tests {
+    use super::query_has_param;
+
+    #[test]
+    fn exact_param_match_not_substring() {
+        // Audit 2026-07: the presigned dispatch must key on an actual X-Amz-Algorithm parameter.
+        assert!(query_has_param("X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=...", "X-Amz-Algorithm"));
+        assert!(query_has_param("prefix=a&X-Amz-Algorithm=AWS4-HMAC-SHA256", "X-Amz-Algorithm"));
+        // A mere substring in a value or another key must NOT match.
+        assert!(!query_has_param("label=X-Amz-Algorithm-v4", "X-Amz-Algorithm"));
+        assert!(!query_has_param("prefix=X-Amz-Algorithm", "X-Amz-Algorithm"));
+        assert!(!query_has_param("", "X-Amz-Algorithm"));
     }
 }
