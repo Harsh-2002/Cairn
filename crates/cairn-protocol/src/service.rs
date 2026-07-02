@@ -520,7 +520,17 @@ impl S3Service {
         let extra = requested_checksums(&req);
         let precond = precondition(&req);
         let user_metadata = user_metadata(&req);
-        let content_md5 = req.header("content-md5").map(str::to_owned);
+        // Decode any client Content-MD5 up front, BEFORE staging: a syntactically invalid header must
+        // be rejected before a blob is written, so a malformed digest can never leave an orphaned
+        // staged blob (mirrors the inline-tag validation below). Byte-compared after staging.
+        let content_md5 = match req.header("content-md5") {
+            Some(cm) => Some(
+                base64::engine::general_purpose::STANDARD
+                    .decode(cm.trim())
+                    .map_err(|_| Error::InvalidDigest)?,
+            ),
+            None => None,
+        };
         // audit #25: when the client SIGNED a concrete payload hash (a real hex digest, not
         // UNSIGNED-PAYLOAD or a STREAMING-* sentinel), the body must actually hash to it — the hash
         // is part of the SigV4 signature, so an unverified body is not truly authenticated. Compute
@@ -624,12 +634,10 @@ impl S3Service {
             .await
             .map_err(map_stage_err)?;
 
-        // Verify any client-supplied Content-MD5 against the computed plaintext MD5.
-        if let Some(cm) = content_md5 {
-            let want = base64::engine::general_purpose::STANDARD
-                .decode(cm.trim())
-                .map_err(|_| Error::InvalidDigest)?;
-            if hex::decode(staged.md5_hex.as_bytes()).ok().as_deref() != Some(&want) {
+        // Verify any client-supplied Content-MD5 (decoded above, before staging) against the computed
+        // plaintext MD5. A genuine mismatch is a post-stage failure, so delete the staged blob first.
+        if let Some(want) = &content_md5 {
+            if hex::decode(staged.md5_hex.as_bytes()).ok().as_deref() != Some(want.as_slice()) {
                 let _ = self.blob.delete(&staged.storage_path).await;
                 return Err(Error::BadDigest);
             }

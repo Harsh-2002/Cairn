@@ -1037,6 +1037,74 @@ async fn crc64nvme_checksum_is_computed_and_echoed() {
     );
 }
 
+// Count regular files under the blob-store root, skipping the `.staging` area. Metadata is
+// in-memory in these tests, so every remaining file is an object blob — used to prove a rejected
+// PUT leaves no orphan.
+fn blob_file_count(root: &std::path::Path) -> usize {
+    fn walk(dir: &std::path::Path, n: &mut usize) {
+        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                if e.file_name() != ".staging" {
+                    walk(&p, n);
+                }
+            } else {
+                *n += 1;
+            }
+        }
+    }
+    let mut n = 0;
+    walk(root, &mut n);
+    n
+}
+
+// H1: a syntactically invalid Content-MD5 must be rejected (InvalidDigest / 400) BEFORE anything is
+// staged, so it can never leave an orphaned durable blob. The status is 400 even with the bug; the
+// discriminating assertion is that no blob file remains on disk.
+#[tokio::test]
+async fn put_with_invalid_content_md5_is_invalid_digest_and_leaks_no_blob() {
+    let h = harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("md5b"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+
+    // "!!not-valid-base64!!" contains characters outside the standard base64 alphabet.
+    let put = req(
+        Method::PUT,
+        Some("md5b"),
+        Some("obj"),
+        &[],
+        &[("content-md5", "!!not-valid-base64!!")],
+        b"some payload".to_vec(),
+    );
+    let (st, _, _) = drain(send(&h.svc, put).await).await;
+    assert_eq!(
+        st,
+        StatusCode::BAD_REQUEST,
+        "invalid Content-MD5 must be InvalidDigest (400)"
+    );
+    assert_eq!(
+        blob_file_count(h._dir.path()),
+        0,
+        "invalid Content-MD5 leaked a staged blob (H1)"
+    );
+
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(Method::GET, Some("md5b"), Some("obj"), &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+}
+
 fn md5_hex(data: &[u8]) -> String {
     use md5::{Digest, Md5};
     let mut h = Md5::new();
