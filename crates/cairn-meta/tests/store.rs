@@ -319,6 +319,7 @@ async fn versioning_history_and_promotion() {
             bucket: b.clone(),
             key: k.clone(),
             version_id: v3.clone(),
+            expected_updated_at: None,
         })
         .await
         .unwrap();
@@ -849,6 +850,7 @@ async fn delete_version_clears_object_tags() {
             bucket: b.clone(),
             key: k.clone(),
             version_id: v.clone(),
+            expected_updated_at: None,
         })
         .await
         .unwrap();
@@ -900,6 +902,7 @@ async fn delete_bucket_rejects_nonempty_inside_the_savepoint() {
             bucket: b.clone(),
             key: ObjectKey::parse("k").unwrap(),
             version_id: v,
+            expected_updated_at: None,
         })
         .await
         .unwrap();
@@ -1500,5 +1503,61 @@ async fn deleting_a_user_cascades_its_sessions() {
     assert!(
         store.user_by_session_key("sess-b").await.unwrap().is_some(),
         "bob's session is untouched"
+    );
+}
+
+#[tokio::test]
+async fn delete_version_compare_and_delete_skips_overwritten_object() {
+    // Audit 2026-07: a lifecycle current-object expiration must not delete an object that was
+    // overwritten since the scan. DeleteVersion carries the updated_at captured at enumeration and
+    // no-ops when the stored value has moved on.
+    let store = cairn_meta::open_in_memory().unwrap();
+    let b = BucketName::parse("cadbkt").unwrap();
+    store
+        .submit(Mutation::CreateBucket(Box::new(bucket("cadbkt"))))
+        .await
+        .unwrap();
+    let k = ObjectKey::parse("k").unwrap();
+    let v = VersionId::null();
+
+    // v1 committed with updated_at=100 (what a scan would capture).
+    let mut r1 = row(&b, "k", v.clone(), "e1", true);
+    r1.updated_at = Timestamp(100);
+    store.submit(put(r1, Precondition::default())).await.unwrap();
+    // Client overwrites the object between the scan and the delete -> updated_at=200.
+    let mut r2 = row(&b, "k", v.clone(), "e2", true);
+    r2.updated_at = Timestamp(200);
+    store.submit(put(r2, Precondition::default())).await.unwrap();
+
+    // Delete with the STALE captured updated_at -> no-op; the fresh object survives.
+    store
+        .submit(Mutation::DeleteVersion {
+            bucket: b.clone(),
+            key: k.clone(),
+            version_id: v.clone(),
+            expected_updated_at: Some(Timestamp(100)),
+        })
+        .await
+        .unwrap();
+    let cur = store.current_version(&b, &k).await.unwrap();
+    assert_eq!(
+        cur.map(|r| r.etag.as_str().to_owned()),
+        Some("e2".to_owned()),
+        "the overwritten object must survive a stale-marker lifecycle delete"
+    );
+
+    // Delete with the CURRENT updated_at -> actually deletes.
+    store
+        .submit(Mutation::DeleteVersion {
+            bucket: b.clone(),
+            key: k.clone(),
+            version_id: v.clone(),
+            expected_updated_at: Some(Timestamp(200)),
+        })
+        .await
+        .unwrap();
+    assert!(
+        store.current_version(&b, &k).await.unwrap().is_none(),
+        "a matching updated_at deletes"
     );
 }

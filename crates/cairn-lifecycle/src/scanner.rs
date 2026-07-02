@@ -192,11 +192,20 @@ impl LifecycleScanner {
                     }
                 } else {
                     match self
-                        .delete_version(meta, blob, &bucket.name, &obj.key, &obj.version_id, now)
+                        .delete_version(
+                            meta,
+                            blob,
+                            &bucket.name,
+                            &obj.key,
+                            &obj.version_id,
+                            now,
+                            Some(obj.last_modified),
+                        )
                         .await
                     {
                         Ok(true) => report.objects_expired += 1,
-                        // Ok(false): preserved by Object Lock — neither expired nor an error.
+                        // Ok(false): preserved by Object Lock or overwritten since the scan — neither
+                        // expired nor an error.
                         Ok(false) => {}
                         Err(_) => report.errors += 1,
                     }
@@ -277,11 +286,19 @@ impl LifecycleScanner {
                     continue;
                 }
                 match self
-                    .delete_version(meta, blob, &bucket.name, &obj.key, &obj.version_id, now)
+                    .delete_version(
+                        meta,
+                        blob,
+                        &bucket.name,
+                        &obj.key,
+                        &obj.version_id,
+                        now,
+                        Some(obj.last_modified),
+                    )
                     .await
                 {
                     Ok(true) => report.versions_expired += 1,
-                    // Ok(false): preserved by Object Lock — neither expired nor an error.
+                    // Ok(false): preserved by Object Lock or overwritten since the scan.
                     Ok(false) => {}
                     Err(_) => report.errors += 1,
                 }
@@ -344,6 +361,7 @@ impl LifecycleScanner {
                     bucket: bucket.name.clone(),
                     key: obj.key.clone(),
                     version_id: obj.version_id.clone(),
+                    expected_updated_at: None,
                 })
                 .await
             {
@@ -604,6 +622,7 @@ impl LifecycleScanner {
         key: &ObjectKey,
         version_id: &VersionId,
         now: Timestamp,
+        expected_updated_at: Option<Timestamp>,
     ) -> Result<bool, MetaError>
     where
         M: MetadataStore + ?Sized,
@@ -616,11 +635,16 @@ impl LifecycleScanner {
         {
             return Ok(false);
         }
+        // Compare-and-delete on the version's updated_at captured at enumeration: a client overwrite
+        // landing between the scan and here bumps updated_at, so the delete becomes a no-op instead
+        // of destroying the fresh, non-expired object (the current-object-expiration TOCTOU; audit
+        // 2026-07). `expected_updated_at` is threaded from the enumerated object's last_modified.
         let outcome = meta
             .submit(Mutation::DeleteVersion {
                 bucket: bucket.clone(),
                 key: key.clone(),
                 version_id: version_id.clone(),
+                expected_updated_at,
             })
             .await?;
         if let cairn_types::MutationOutcome::Deleted {

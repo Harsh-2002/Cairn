@@ -249,6 +249,7 @@ async fn versioning_history_and_promotion_parity() {
                 bucket: bk.clone(),
                 key: k.clone(),
                 version_id: vs[2].clone(),
+                expected_updated_at: None,
             })
             .await
             .unwrap();
@@ -1388,6 +1389,7 @@ async fn object_lock_parity() {
             bucket: bk.clone(),
             key: k.clone(),
             version_id: v.clone(),
+            expected_updated_at: None,
         })
         .await
         .unwrap();

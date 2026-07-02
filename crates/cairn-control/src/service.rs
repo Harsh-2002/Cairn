@@ -818,6 +818,7 @@ impl ControlService {
                         bucket: bucket_name.clone(),
                         key,
                         version_id,
+                        expected_updated_at: None,
                     })
                     .await
                 {
@@ -899,6 +900,7 @@ impl ControlService {
                         bucket: bucket_name.clone(),
                         key: item.key.clone(),
                         version_id: item.version_id.clone(),
+                        expected_updated_at: None,
                     })
                     .await
                 {

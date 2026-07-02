@@ -365,12 +365,23 @@ impl MetadataStore for InMemoryMetadataStore {
                 bucket,
                 key,
                 version_id,
+                expected_updated_at,
             } => {
                 let vk = (
                     bucket.as_str().to_owned(),
                     key.as_str().to_owned(),
                     version_id.as_str().to_owned(),
                 );
+                // Compare-and-delete guard (mirrors the SQL engines): skip if the stored updated_at
+                // no longer matches the value the caller captured (overwritten since — audit 2026-07).
+                if let Some(expected) = expected_updated_at {
+                    if st.versions.get(&vk).map(|r| r.updated_at) != Some(expected) {
+                        return Ok(MutationOutcome::Deleted {
+                            freed: None,
+                            promoted_latest: false,
+                        });
+                    }
+                }
                 let removed = st.versions.remove(&vk);
                 st.tags.remove(&vk);
                 st.locks.remove(&vk);

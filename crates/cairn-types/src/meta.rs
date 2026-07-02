@@ -81,6 +81,13 @@ pub enum Mutation {
         key: ObjectKey,
         /// The version to remove (sentinel for unversioned).
         version_id: VersionId,
+        /// Optional compare-and-delete guard: only delete if the stored version's `updated_at` still
+        /// equals this value. `None` = unconditional (client `DeleteObject`). The lifecycle scanner
+        /// captures a version's `updated_at` at enumeration and passes it here so a concurrent
+        /// overwrite landing between the scan and the delete is a NO-OP rather than destroying the
+        /// fresh object — the current-object-expiration TOCTOU (audit 2026-07). Evaluated inside the
+        /// delete's savepoint, so the check and the delete are atomic.
+        expected_updated_at: Option<Timestamp>,
     },
     /// Create a multipart session.
     CreateMultipart(Box<MultipartSession>),

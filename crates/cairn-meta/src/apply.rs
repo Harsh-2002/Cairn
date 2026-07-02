@@ -69,7 +69,8 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             bucket,
             key,
             version_id,
-        } => delete_version(conn, &bucket, &key, &version_id),
+            expected_updated_at,
+        } => delete_version(conn, &bucket, &key, &version_id, expected_updated_at),
         Mutation::CreateMultipart(s) => {
             conn.execute(
                 "INSERT INTO multipart_uploads
@@ -1111,7 +1112,29 @@ fn delete_version(
     bucket: &BucketName,
     key: &ObjectKey,
     version_id: &VersionId,
+    expected_updated_at: Option<Timestamp>,
 ) -> R<MutationOutcome> {
+    // Compare-and-delete guard: if the caller (the lifecycle scanner) captured the version's
+    // updated_at at enumeration, only proceed when the stored value still matches. A concurrent
+    // overwrite (which bumps updated_at) means the object was rewritten since the scan, so deleting
+    // it would destroy fresh, non-expired data — skip it as a no-op (audit 2026-07). Runs inside the
+    // savepoint, so the check and the delete are atomic.
+    if let Some(expected) = expected_updated_at {
+        let stored: Option<i64> = conn
+            .query_row(
+                "SELECT updated_at FROM object_versions WHERE bucket_name=?1 AND key=?2 AND version_id=?3",
+                params![bucket.as_str(), key.as_str(), version_id.as_str()],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(engine_err)?;
+        if stored != Some(expected.0) {
+            return Ok(MutationOutcome::Deleted {
+                freed: None,
+                promoted_latest: false,
+            });
+        }
+    }
     // Read the row's blob, latest flag, and owner/byte sizes before deleting it, so we can both
     // promote a successor and decrement the roll-up counters for the removed version.
     let existing: Option<(Option<String>, i64, String, i64, i64)> = conn
@@ -1651,6 +1674,7 @@ mod tests {
                 bucket: BucketName::parse("bkt").unwrap(),
                 key: ObjectKey::parse("k1").unwrap(),
                 version_id: VersionId::from_string("v1".to_owned()),
+                expected_updated_at: None,
             },
         )
         .unwrap();
@@ -1663,6 +1687,7 @@ mod tests {
                 bucket: BucketName::parse("bkt").unwrap(),
                 key: ObjectKey::parse("k1").unwrap(),
                 version_id: VersionId::from_string("v3".to_owned()),
+                expected_updated_at: None,
             },
         )
         .unwrap();
@@ -1694,6 +1719,7 @@ mod tests {
                 bucket: BucketName::parse("bkt").unwrap(),
                 key: ObjectKey::parse("k1").unwrap(),
                 version_id: VersionId::from_string("v1".to_owned()),
+                expected_updated_at: None,
             },
         )
         .unwrap();

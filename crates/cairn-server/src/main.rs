@@ -343,6 +343,7 @@ async fn repair_dangling_rows(
                                 bucket: bucket.name.clone(),
                                 key: item.key.clone(),
                                 version_id: item.version_id.clone(),
+                                expected_updated_at: None,
                             })
                             .await
                         {

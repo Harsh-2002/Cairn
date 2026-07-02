@@ -71,7 +71,8 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
             bucket,
             key,
             version_id,
-        } => delete_version(driver, &bucket, &key, &version_id).await,
+            expected_updated_at,
+        } => delete_version(driver, &bucket, &key, &version_id, expected_updated_at).await,
         Mutation::CreateMultipart(s) => {
             driver
                 .execute(
@@ -1210,7 +1211,30 @@ async fn delete_version(
     bucket: &BucketName,
     key: &ObjectKey,
     version_id: &VersionId,
+    expected_updated_at: Option<Timestamp>,
 ) -> R<MutationOutcome> {
+    // Compare-and-delete guard (mirrors cairn-meta): skip the delete when the version's stored
+    // updated_at no longer matches the value captured at enumeration — it was overwritten since, so
+    // deleting it would destroy fresh data (audit 2026-07).
+    if let Some(expected) = expected_updated_at {
+        let stored = query_one(
+            driver,
+            "SELECT updated_at FROM object_versions WHERE bucket_name=?1 AND key=?2 AND version_id=?3",
+            vec![
+                Value::Text(bucket.as_str().to_owned()),
+                Value::Text(key.as_str().to_owned()),
+                Value::Text(version_id.as_str().to_owned()),
+            ],
+        )
+        .await?
+        .map(|r| r.get_i64(0));
+        if stored != Some(expected.0) {
+            return Ok(MutationOutcome::Deleted {
+                freed: None,
+                promoted_latest: false,
+            });
+        }
+    }
     // Read the row's blob, latest flag, and owner/byte sizes before deleting, so we can promote a
     // successor and decrement the roll-up counters for the removed version.
     let existing = query_one(

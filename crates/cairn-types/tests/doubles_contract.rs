@@ -155,6 +155,7 @@ async fn put_get_list_delete_roundtrip() {
             bucket: bucket.clone(),
             key: key2.clone(),
             version_id: VersionId::null(),
+            expected_updated_at: None,
         })
         .await
         .unwrap();
@@ -261,6 +262,7 @@ async fn versioning_keeps_history_and_promotes_latest() {
             bucket: bucket.clone(),
             key: key.clone(),
             version_id: versions[2].clone(),
+            expected_updated_at: None,
         })
         .await
         .unwrap();

@@ -992,6 +992,7 @@ impl S3Service {
                     bucket: bucket.name.clone(),
                     key,
                     version_id,
+                    expected_updated_at: None,
                 })
                 .await?;
             if let MutationOutcome::Deleted {
@@ -1084,6 +1085,7 @@ impl S3Service {
                         bucket: bucket.name.clone(),
                         key: key.clone(),
                         version_id: VersionId::null(),
+                        expected_updated_at: None,
                     })
                     .await
                 {
@@ -1131,6 +1133,7 @@ impl S3Service {
                         bucket: bucket.name.clone(),
                         key,
                         version_id: VersionId::null(),
+                        expected_updated_at: None,
                     })
                     .await?;
                 if let MutationOutcome::Deleted {
@@ -1960,6 +1963,7 @@ impl S3Service {
                         bucket: bucket.name.clone(),
                         key,
                         version_id: VersionId::from_string(v.clone()),
+                        expected_updated_at: None,
                     })
                     .await
             } else {
@@ -1999,6 +2003,7 @@ impl S3Service {
                                 bucket: bucket.name.clone(),
                                 key: key.clone(),
                                 version_id: VersionId::null(),
+                                expected_updated_at: None,
                             })
                             .await
                         {
@@ -2021,6 +2026,7 @@ impl S3Service {
                                 bucket: bucket.name.clone(),
                                 key,
                                 version_id: VersionId::null(),
+                                expected_updated_at: None,
                             })
                             .await
                     }

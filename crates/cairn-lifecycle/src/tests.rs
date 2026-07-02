@@ -465,6 +465,7 @@ async fn expired_object_delete_marker_removed_when_sole_version() {
         bucket: bucket_name(),
         key: ObjectKey::parse("ghost.txt").unwrap(),
         version_id: v,
+        expected_updated_at: None,
     })
     .await
     .unwrap();
