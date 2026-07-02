@@ -526,8 +526,12 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
                 .optional()
                 .map_err(engine_err)?
             {
+                // Preserve a `replica` marker: a version that arrived here via replication must keep
+                // that status for loop prevention (ARCH 20.4) even when a stray outbox entry for it is
+                // drained. `IS NOT` is NULL-safe (a NULL/other status is stamped Completed).
                 conn.execute(
-                    "UPDATE object_versions SET replication_status=?4 WHERE bucket_name=?1 AND key=?2 AND version_id=?3",
+                    "UPDATE object_versions SET replication_status=?4 \
+                     WHERE bucket_name=?1 AND key=?2 AND version_id=?3 AND replication_status IS NOT 'replica'",
                     params![bucket, key, version, repl_status_str(cairn_types::meta::ReplicationStatus::Completed)],
                 )
                 .map_err(engine_err)?;
@@ -555,6 +559,36 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
                 ),
             }
             .map_err(engine_err)?;
+            // On a TERMINAL failure, stamp the version's replication_status=failed for operator
+            // visibility — via a SURGICAL update keyed to the outbox row's (bucket,key,version),
+            // exactly like MarkReplicationDone. The replication engine must NOT re-upsert the whole
+            // version row for this (the old stamp_version_status did), because that forces is_latest
+            // and would demote a newer version written during the ship window or resurrect one
+            // deleted meanwhile (audit 2026-07).
+            if next_attempt_at.is_none() {
+                if let Some((bucket, key, version)) = conn
+                    .query_row(
+                        "SELECT bucket_name, key, version_id FROM replication_outbox WHERE id=?1",
+                        params![id],
+                        |r| {
+                            Ok((
+                                r.get::<_, String>(0)?,
+                                r.get::<_, String>(1)?,
+                                r.get::<_, String>(2)?,
+                            ))
+                        },
+                    )
+                    .optional()
+                    .map_err(engine_err)?
+                {
+                    conn.execute(
+                        "UPDATE object_versions SET replication_status=?4 \
+                         WHERE bucket_name=?1 AND key=?2 AND version_id=?3 AND replication_status IS NOT 'replica'",
+                        params![bucket, key, version, repl_status_str(cairn_types::meta::ReplicationStatus::Failed)],
+                    )
+                    .map_err(engine_err)?;
+                }
+            }
             Ok(MutationOutcome::Ack)
         }
         Mutation::EnqueueReplication(e) => {

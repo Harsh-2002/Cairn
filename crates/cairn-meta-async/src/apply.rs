@@ -606,7 +606,7 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
                 let (bucket, key, version) = (row.get_text(0), row.get_text(1), row.get_text(2));
                 driver
                     .execute(
-                        "UPDATE object_versions SET replication_status=?4 WHERE bucket_name=?1 AND key=?2 AND version_id=?3",
+                        "UPDATE object_versions SET replication_status=?4 WHERE bucket_name=?1 AND key=?2 AND version_id=?3 AND replication_status IS NOT 'replica'",
                         vec![
                             Value::Text(bucket),
                             Value::Text(key),
@@ -645,9 +645,31 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
                     driver
                         .execute(
                             "UPDATE replication_outbox SET attempts=attempts+1, last_error=?2, status='failed' WHERE id=?1",
-                            vec![Value::Text(id), Value::Text(error)],
+                            vec![Value::Text(id.clone()), Value::Text(error)],
                         )
                         .await?;
+                    // Terminal: stamp the version failed via a SURGICAL update keyed to the outbox
+                    // row's (bucket,key,version) — never a whole-row re-upsert (mirrors cairn-meta;
+                    // audit 2026-07).
+                    if let Some(r) = query_one(
+                        driver,
+                        "SELECT bucket_name, key, version_id FROM replication_outbox WHERE id=?1",
+                        vec![Value::Text(id)],
+                    )
+                    .await?
+                    {
+                        driver
+                            .execute(
+                                "UPDATE object_versions SET replication_status=?4 WHERE bucket_name=?1 AND key=?2 AND version_id=?3 AND replication_status IS NOT 'replica'",
+                                vec![
+                                    Value::Text(r.get_text(0)),
+                                    Value::Text(r.get_text(1)),
+                                    Value::Text(r.get_text(2)),
+                                    Value::Text(repl_status_str(cairn_types::meta::ReplicationStatus::Failed).to_owned()),
+                                ],
+                            )
+                            .await?;
+                    }
                 }
             }
             Ok(MutationOutcome::Ack)

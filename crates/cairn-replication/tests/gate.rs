@@ -1011,3 +1011,62 @@ fn next_backoff_helper_is_exponential_and_capped() {
     assert_eq!(next_backoff(6, 5, 100), 100); // capped (160 -> 100)
     assert_eq!(next_backoff(100, 5, 100), 100);
 }
+
+#[tokio::test]
+async fn completing_replication_does_not_demote_a_newer_version() {
+    // Audit 2026-07: marking v1's replication done must NOT re-upsert v1's (pre-ship) row, which
+    // would force is_latest and demote a v2 written during the ship window. mark_done now only stamps
+    // the version's replication_status via a targeted update — never a whole-row PutObjectVersion.
+    let meta = InMemoryMetadataStore::new();
+    let blobs = Arc::new(InMemoryBlobStore::new());
+    let sink = FakeReplicationSink::new();
+    let router = SingleSink(sink);
+    let clock = TestClock::at_secs(1_000);
+    let now = clock.now();
+    let key = ObjectKey::parse("k").unwrap();
+
+    // v1: pending replication, latest at commit.
+    let v1 = put_with_outbox(&meta, &blobs, "e1", "k", b"one", now, now).await;
+    // v2: a newer version written with NO outbox entry — becomes latest, demoting v1. Stands in for a
+    // client write landing during v1's ship window.
+    let (path, etag, size) = stage_blob(&blobs, b"two").await;
+    let v2 = VersionId::generate();
+    meta.submit(Mutation::PutObjectVersion {
+        row: Box::new(version_row(
+            "k",
+            &v2,
+            Some(path),
+            etag,
+            size,
+            false,
+            ReplicationStatus::Completed,
+            now,
+        )),
+        precondition: Precondition::default(),
+        replication: vec![],
+    })
+    .await
+    .unwrap();
+    let before = meta.current_version(&bucket(), &key).await.unwrap();
+    assert_eq!(
+        before.map(|r| r.version_id),
+        Some(v2.clone()),
+        "v2 is latest before replication runs"
+    );
+
+    // Ship v1 and mark it done.
+    engine()
+        .run_once(&meta, &router, &blobs, &clock)
+        .await
+        .unwrap();
+
+    // v2 must STILL be latest — replication completion must not demote it.
+    let after = meta.current_version(&bucket(), &key).await.unwrap();
+    assert_eq!(
+        after.map(|r| r.version_id),
+        Some(v2),
+        "a newer version must not be demoted by replication completion"
+    );
+    // v1's replication status is stamped Completed (targeted update).
+    assert_eq!(version_status(&meta, "k", &v1).await, Some(ReplicationStatus::Completed));
+}

@@ -392,7 +392,7 @@ impl ReplicationEngine {
 
         match sink_result {
             Ok(bytes) => {
-                self.mark_done(meta, entry, &row).await?;
+                self.mark_done(meta, entry).await?;
                 Ok(EntryOutcome::Completed { bytes })
             }
             Err(ReplicationError::Retryable(msg)) => {
@@ -466,18 +466,16 @@ impl ReplicationEngine {
     /// Mark the entry done and stamp the version [`ReplicationStatus::Completed`]. The
     /// version re-upsert carries `replication: None`, so it enqueues no new outbox entry and
     /// cannot cause a replication loop.
-    async fn mark_done<M>(
-        &self,
-        meta: &M,
-        entry: &OutboxEntry,
-        row: &ObjectVersionRow,
-    ) -> Result<(), MetaError>
+    async fn mark_done<M>(&self, meta: &M, entry: &OutboxEntry) -> Result<(), MetaError>
     where
         M: MetadataStore + ?Sized,
     {
+        // MarkReplicationDone itself stamps the version's replication_status=Completed via a targeted
+        // UPDATE keyed to (bucket,key,version). We must NOT additionally re-`PutObjectVersion` the
+        // whole (pre-ship) row: that forces is_latest and would demote a newer version written during
+        // the ship window, or resurrect one deleted meanwhile (audit 2026-07).
         meta.submit(Mutation::MarkReplicationDone(entry.id.clone()))
             .await?;
-        stamp_version_status(meta, row, ReplicationStatus::Completed).await?;
         Ok(())
     }
 
@@ -501,20 +499,15 @@ impl ReplicationEngine {
             error,
             "replication delivery failed"
         );
+        // MarkReplicationFailed stamps the version's replication_status=Failed itself (via a targeted
+        // UPDATE) when the failure is terminal (next_attempt_at is None) — no whole-row re-upsert
+        // here, which would force is_latest (audit 2026-07).
         meta.submit(Mutation::MarkReplicationFailed {
             id: entry.id.clone(),
             error: error.to_owned(),
             next_attempt_at,
         })
         .await?;
-        if next_attempt_at.is_none() {
-            if let Some(row) = meta
-                .get_version(&entry.bucket, &entry.key, &entry.version_id)
-                .await?
-            {
-                stamp_version_status(meta, &row, ReplicationStatus::Failed).await?;
-            }
-        }
         Ok(())
     }
 
@@ -617,30 +610,6 @@ enum EntryOutcome {
     /// re-claims and re-tries it once the predecessor completes, without contacting the sink or
     /// burning a retry attempt. This preserves per-key write order across batches (audit #9).
     Deferred,
-}
-
-/// Re-upsert a version row with a new replication status, enqueueing no replication.
-async fn stamp_version_status<M>(
-    meta: &M,
-    row: &ObjectVersionRow,
-    status: ReplicationStatus,
-) -> Result<(), MetaError>
-where
-    M: MetadataStore + ?Sized,
-{
-    // Idempotent: skip the write if the row already carries the target status.
-    if row.replication_status == Some(status) {
-        return Ok(());
-    }
-    let mut updated = row.clone();
-    updated.replication_status = Some(status);
-    meta.submit(Mutation::PutObjectVersion {
-        row: Box::new(updated),
-        precondition: cairn_types::meta::Precondition::default(),
-        replication: Vec::new(),
-    })
-    .await?;
-    Ok(())
 }
 
 /// The remote-target ARN to route an outbox entry by. Under 1→N fan-out the durable [`OutboxEntry`]

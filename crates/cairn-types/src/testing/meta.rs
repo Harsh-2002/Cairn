@@ -702,8 +702,26 @@ impl MetadataStore for InMemoryMetadataStore {
                 Ok(MutationOutcome::ReplicationBatch(claimed))
             }
             Mutation::MarkReplicationDone(id) => {
+                let mut coords = None;
                 if let Some(e) = st.outbox.iter_mut().find(|e| e.id == id) {
                     e.status = ReplicationStatus::Completed;
+                    coords = Some((e.bucket.clone(), e.key.clone(), e.version_id.clone()));
+                }
+                // Stamp the version's replication_status too, mirroring the SQL engines' targeted
+                // UPDATE inside MarkReplicationDone (audit 2026-07: the double previously updated only
+                // the outbox entry, so object_replication_status diverged from the reference engine).
+                if let Some((b, k, v)) = coords {
+                    if let Some(r) = st
+                        .versions
+                        .values_mut()
+                        .find(|r| r.bucket == b && r.key == k && r.version_id == v)
+                    {
+                        // Preserve a Replica marker for loop prevention (mirrors the SQL engines'
+                        // `replication_status IS NOT 'replica'` guard).
+                        if r.replication_status != Some(ReplicationStatus::Replica) {
+                            r.replication_status = Some(ReplicationStatus::Completed);
+                        }
+                    }
                 }
                 Ok(MutationOutcome::Ack)
             }
@@ -712,6 +730,7 @@ impl MetadataStore for InMemoryMetadataStore {
                 error,
                 next_attempt_at,
             } => {
+                let mut terminal_coords = None;
                 if let Some(e) = st.outbox.iter_mut().find(|e| e.id == id) {
                     e.attempts += 1;
                     e.last_error = Some(error);
@@ -723,7 +742,24 @@ impl MetadataStore for InMemoryMetadataStore {
                             e.status = ReplicationStatus::Pending;
                             e.lease_until = None;
                         }
-                        None => e.status = ReplicationStatus::Failed,
+                        None => {
+                            e.status = ReplicationStatus::Failed;
+                            terminal_coords =
+                                Some((e.bucket.clone(), e.key.clone(), e.version_id.clone()));
+                        }
+                    }
+                }
+                // On a terminal failure, stamp the version failed via a targeted update (mirrors the
+                // SQL engines; audit 2026-07).
+                if let Some((b, k, v)) = terminal_coords {
+                    if let Some(r) = st
+                        .versions
+                        .values_mut()
+                        .find(|r| r.bucket == b && r.key == k && r.version_id == v)
+                    {
+                        if r.replication_status != Some(ReplicationStatus::Replica) {
+                            r.replication_status = Some(ReplicationStatus::Failed);
+                        }
                     }
                 }
                 Ok(MutationOutcome::Ack)
