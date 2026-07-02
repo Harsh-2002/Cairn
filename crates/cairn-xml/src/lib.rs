@@ -67,7 +67,8 @@ fn finish(w: Writer<Cursor<Vec<u8>>>) -> String {
 /// case), so normal output pays only a scan.
 fn xml_safe(text: &str) -> std::borrow::Cow<'_, str> {
     let illegal = |c: char| {
-        ((c as u32) < 0x20 && !matches!(c, '\t' | '\n' | '\r')) || matches!(c, '\u{FFFE}' | '\u{FFFF}')
+        ((c as u32) < 0x20 && !matches!(c, '\t' | '\n' | '\r'))
+            || matches!(c, '\u{FFFE}' | '\u{FFFF}')
     };
     if text.chars().any(illegal) {
         std::borrow::Cow::Owned(

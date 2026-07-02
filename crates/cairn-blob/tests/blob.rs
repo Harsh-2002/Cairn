@@ -547,7 +547,12 @@ async fn assemble_enforces_size_ceiling() {
         Err(BlobError::SizeExceeded)
     ));
     // A generous ceiling assembles fine.
-    assert!(store.assemble(&b, &refs, opts(None, "text/plain")).await.is_ok());
+    assert!(
+        store
+            .assemble(&b, &refs, opts(None, "text/plain"))
+            .await
+            .is_ok()
+    );
     store.delete_session(&upload).await.unwrap();
 }
 

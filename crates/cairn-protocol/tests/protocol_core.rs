@@ -1339,16 +1339,34 @@ async fn complete_multipart_against_wrong_key_is_no_such_upload() {
 #[tokio::test]
 async fn complete_multipart_missing_part_is_invalid_part() {
     let h = harness().await;
-    drain(send(&h.svc, req(Method::PUT, Some("mpb"), None, &[], &[], vec![])).await).await;
-    let (_, _, body) = drain(
+    drain(
         send(
             &h.svc,
-            req(Method::POST, Some("mpb"), Some("k"), &[("uploads", "")], &[], vec![]),
+            req(Method::PUT, Some("mpb"), None, &[], &[], vec![]),
         )
         .await,
     )
     .await;
-    let upload_id = between(&String::from_utf8(body).unwrap(), "<UploadId>", "</UploadId>");
+    let (_, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::POST,
+                Some("mpb"),
+                Some("k"),
+                &[("uploads", "")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    let upload_id = between(
+        &String::from_utf8(body).unwrap(),
+        "<UploadId>",
+        "</UploadId>",
+    );
     let (_, hdrs, _) = drain(
         send(
             &h.svc,
@@ -6052,7 +6070,14 @@ async fn session_does_not_inherit_owner_bypass() {
 #[tokio::test]
 async fn cors_actual_request_gets_response_headers() {
     let h = harness().await;
-    drain(send(&h.svc, req(Method::PUT, Some("corsc"), None, &[], &[], vec![])).await).await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("corsc"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
     let cors = b"<CORSConfiguration><CORSRule>\
         <AllowedOrigin>https://app.example</AllowedOrigin>\
         <AllowedMethod>GET</AllowedMethod>\
@@ -6060,7 +6085,11 @@ async fn cors_actual_request_gets_response_headers() {
         </CORSRule></CORSConfiguration>"
         .to_vec();
     let (st, _, _) = drain(
-        send(&h.svc, req(Method::PUT, Some("corsc"), None, &[("cors", "")], &[], cors)).await,
+        send(
+            &h.svc,
+            req(Method::PUT, Some("corsc"), None, &[("cors", "")], &[], cors),
+        )
+        .await,
     )
     .await;
     assert_eq!(st, StatusCode::NO_CONTENT);
@@ -6068,7 +6097,14 @@ async fn cors_actual_request_gets_response_headers() {
     drain(
         send(
             &h.svc,
-            req(Method::PUT, Some("corsc"), Some("k"), &[], &[], b"hi".to_vec()),
+            req(
+                Method::PUT,
+                Some("corsc"),
+                Some("k"),
+                &[],
+                &[],
+                b"hi".to_vec(),
+            ),
         )
         .await,
     )

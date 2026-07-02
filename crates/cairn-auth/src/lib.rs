@@ -432,11 +432,23 @@ mod query_param_tests {
     #[test]
     fn exact_param_match_not_substring() {
         // Audit 2026-07: the presigned dispatch must key on an actual X-Amz-Algorithm parameter.
-        assert!(query_has_param("X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=...", "X-Amz-Algorithm"));
-        assert!(query_has_param("prefix=a&X-Amz-Algorithm=AWS4-HMAC-SHA256", "X-Amz-Algorithm"));
+        assert!(query_has_param(
+            "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=...",
+            "X-Amz-Algorithm"
+        ));
+        assert!(query_has_param(
+            "prefix=a&X-Amz-Algorithm=AWS4-HMAC-SHA256",
+            "X-Amz-Algorithm"
+        ));
         // A mere substring in a value or another key must NOT match.
-        assert!(!query_has_param("label=X-Amz-Algorithm-v4", "X-Amz-Algorithm"));
-        assert!(!query_has_param("prefix=X-Amz-Algorithm", "X-Amz-Algorithm"));
+        assert!(!query_has_param(
+            "label=X-Amz-Algorithm-v4",
+            "X-Amz-Algorithm"
+        ));
+        assert!(!query_has_param(
+            "prefix=X-Amz-Algorithm",
+            "X-Amz-Algorithm"
+        ));
         assert!(!query_has_param("", "X-Amz-Algorithm"));
     }
 }
