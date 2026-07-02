@@ -252,7 +252,14 @@ impl From<BlobError> for Error {
 impl From<MetaError> for Error {
     fn from(e: MetaError) -> Self {
         match e {
-            MetaError::Conflict => Error::BucketAlreadyExists,
+            // NOTE: `MetaError::Conflict` is intentionally NOT mapped to a specific S3 error here. It
+            // is a generic uniqueness/constraint violation (`engine_err` folds every SQLite constraint
+            // into it), and only bucket creation should surface it as `BucketAlreadyExists` — the two
+            // bucket-create paths (cairn-protocol `create_bucket`, cairn-control) intercept `Conflict`
+            // explicitly BEFORE this `From` runs. Any other `Conflict` reaching here is an unexpected
+            // constraint surprise, so it becomes an opaque `Internal` (5xx) rather than a misleading
+            // 409 `BucketAlreadyExists`; a new user-collidable constraint must be mapped at its own
+            // call site.
             MetaError::PreconditionFailed => Error::PreconditionFailed,
             MetaError::QuotaExceeded => Error::InsufficientStorage,
             other => Error::Internal(other.to_string()),
@@ -278,3 +285,18 @@ impl From<AuthError> for Error {
 
 /// The crate-wide result alias over the canonical [`Error`].
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn conflict_is_not_bucket_already_exists() {
+        // M3: a stray metadata Conflict must surface as an opaque Internal (5xx), not a misleading
+        // 409 BucketAlreadyExists. Only the bucket-create call sites map Conflict, before this From.
+        assert!(matches!(
+            Error::from(MetaError::Conflict),
+            Error::Internal(_)
+        ));
+    }
+}
