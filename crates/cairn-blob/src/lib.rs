@@ -71,11 +71,17 @@ pub struct LocalBlobStore {
     /// unconditionally so the struct shape is feature-independent, but it can only be set `true`
     /// under the feature (see [`LocalBlobStore::with_io_uring`]).
     use_uring: bool,
-    /// Bounds the number of concurrent blob transfers (ARCH 7.4). Each stage/read/assemble holds a
-    /// permit for the duration of its file I/O, so a flood of large transfers can occupy at most
-    /// this many of the runtime's blocking-pool threads and cannot starve the threads the reactor
-    /// and metadata reads need. Sized to the device's useful I/O concurrency.
-    io_permits: Arc<tokio::sync::Semaphore>,
+    /// Bounds concurrent blob READ transfers (ARCH 7.4). A read holds its permit inside the
+    /// spawn_blocking task feeding the response body, so a **slow client** that reads the download
+    /// slowly (or not at all) pins the permit for the entire client-paced transfer. This pool is
+    /// SEPARATE from `write_permits` on purpose: with a single shared pool, a flood of idle readers
+    /// could exhaust it and starve writes (PUT/copy/assemble) too — a read-side slow-loris that
+    /// stalled the whole data plane (audit 2026-07). Now slow readers can only bound other reads.
+    read_permits: Arc<tokio::sync::Semaphore>,
+    /// Bounds concurrent blob WRITE transfers — stage / stage_part / assemble (ARCH 7.4). Held only
+    /// for the server-paced write to disk, never for a client read, so it is insulated from slow
+    /// readers by living in its own pool (see `read_permits`).
+    write_permits: Arc<tokio::sync::Semaphore>,
     /// Coalesces the per-bucket-directory fsync of the commit sequence: concurrent PUTs into the
     /// same bucket share one directory fsync instead of issuing one each (ARCH 8.2). Shared across
     /// clones of the store, so every writer feeds the same coordinator.
@@ -104,7 +110,8 @@ impl LocalBlobStore {
         Ok(Self {
             data_root: Arc::new(data_root),
             use_uring: cfg!(feature = "io-uring"),
-            io_permits: Arc::new(tokio::sync::Semaphore::new(DEFAULT_BLOB_IO_CONCURRENCY)),
+            read_permits: Arc::new(tokio::sync::Semaphore::new(DEFAULT_BLOB_IO_CONCURRENCY)),
+            write_permits: Arc::new(tokio::sync::Semaphore::new(DEFAULT_BLOB_IO_CONCURRENCY)),
             dir_sync: Arc::new(commit::DirSyncCoalescer::spawn()),
         })
     }
@@ -119,11 +126,23 @@ impl LocalBlobStore {
         self
     }
 
-    /// Set the bound on concurrent blob transfers (ARCH 7.4). A value of `0` is treated as `1` so
-    /// the store always makes progress. Defaults to [`DEFAULT_BLOB_IO_CONCURRENCY`].
+    /// Set the bound on concurrent blob **write** transfers — stage/part/assemble (ARCH 7.4). A
+    /// value of `0` is treated as `1` so the store always makes progress. Defaults to
+    /// [`DEFAULT_BLOB_IO_CONCURRENCY`]. See [`with_read_io_pool_size`](Self::with_read_io_pool_size)
+    /// for the separate read pool.
     #[must_use]
     pub fn with_io_pool_size(mut self, permits: usize) -> Self {
-        self.io_permits = Arc::new(tokio::sync::Semaphore::new(permits.max(1)));
+        self.write_permits = Arc::new(tokio::sync::Semaphore::new(permits.max(1)));
+        self
+    }
+
+    /// Set the bound on concurrent blob **read** transfers (ARCH 7.4). Separate from the write pool
+    /// so slow-reading clients (which hold a read permit for the whole client-paced download) can
+    /// never starve writes (audit 2026-07). A value of `0` is treated as `1`. Defaults to
+    /// [`DEFAULT_BLOB_IO_CONCURRENCY`].
+    #[must_use]
+    pub fn with_read_io_pool_size(mut self, permits: usize) -> Self {
+        self.read_permits = Arc::new(tokio::sync::Semaphore::new(permits.max(1)));
         self
     }
 
@@ -131,21 +150,21 @@ impl LocalBlobStore {
     /// for the duration of its file I/O. The semaphore is never closed, so this never errors in
     /// practice; the `Result` is for forward-compatibility with a shutdown that closes it.
     async fn acquire_io(&self) -> Result<tokio::sync::SemaphorePermit<'_>, BlobError> {
-        self.io_permits
+        self.write_permits
             .acquire()
             .await
-            .map_err(|_| BlobError::Io("blob I/O pool closed".to_owned()))
+            .map_err(|_| BlobError::Io("blob write I/O pool closed".to_owned()))
     }
 
     /// Acquire an owned blob-I/O permit that can be moved into a spawned read task and dropped when
     /// the transfer finishes (the read body is streamed after the call returns, so the permit must
     /// outlive this function — hence the owned form keyed on the shared `Arc<Semaphore>`).
     async fn acquire_io_owned(&self) -> Result<tokio::sync::OwnedSemaphorePermit, BlobError> {
-        self.io_permits
+        self.read_permits
             .clone()
             .acquire_owned()
             .await
-            .map_err(|_| BlobError::Io("blob I/O pool closed".to_owned()))
+            .map_err(|_| BlobError::Io("blob read I/O pool closed".to_owned()))
     }
 
     fn resolve(&self, sp: &StoragePath) -> Result<PathBuf, BlobError> {
@@ -1020,6 +1039,34 @@ async fn staging_artifact_expired(
 mod tests {
     use super::*;
     use cairn_types::testing::SetReconcileOracle;
+
+    /// Audit 2026-07: reads and writes draw from SEPARATE I/O pools, so a flood of slow-reading
+    /// clients (which hold a read permit for the whole client-paced download) can exhaust the read
+    /// pool without starving writes. Pre-split, a single shared pool meant idle readers stalled the
+    /// entire data plane, PUTs included.
+    #[tokio::test]
+    async fn read_and_write_io_pools_are_independent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalBlobStore::open(dir.path())
+            .await
+            .unwrap()
+            .with_io_pool_size(3)
+            .with_read_io_pool_size(5);
+        assert_eq!(store.write_permits.available_permits(), 3);
+        assert_eq!(store.read_permits.available_permits(), 5);
+
+        // Exhaust the read pool (as a wall of stalled downloads would) — writes stay fully available.
+        let held: Vec<_> = (0..5)
+            .map(|_| store.read_permits.clone().try_acquire_owned().unwrap())
+            .collect();
+        assert_eq!(store.read_permits.available_permits(), 0);
+        assert_eq!(
+            store.write_permits.available_permits(),
+            3,
+            "an exhausted read pool must not consume write permits"
+        );
+        drop(held);
+    }
 
     /// The mtime of a freshly created file, as whole epoch seconds.
     async fn file_mtime_secs(path: &Path) -> i64 {

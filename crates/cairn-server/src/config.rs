@@ -185,6 +185,11 @@ pub struct Config {
     /// cannot exhaust the runtime's blocking-pool threads. Tune to the device's useful I/O
     /// concurrency: lower for a single spinning disk, higher for a fast NVMe array. Default 64.
     pub blob_io_pool_size: usize,
+    /// Bound on concurrent blob **read** transfers (`CAIRN_BLOB_IO_READ_POOL_SIZE`), separate from
+    /// the (write) `blob_io_pool_size`. A read holds its permit for the whole client-paced download,
+    /// so a flood of slow readers can exhaust this pool — keeping it distinct means they starve only
+    /// other reads, never writes (audit 2026-07). Default 64.
+    pub blob_io_read_pool_size: usize,
     /// Tokio runtime worker (compute) threads (`CAIRN_RUNTIME_WORKER_THREADS`, ARCH 30). `0` lets
     /// the runtime pick the CPU count (the default). Set it to pin compute parallelism explicitly.
     pub runtime_worker_threads: usize,
@@ -324,6 +329,7 @@ impl Default for Config {
             meta_cache_bytes: 64 * 1024 * 1024,
             auth_cache_ttl_secs: 30,
             blob_io_pool_size: 64,
+            blob_io_read_pool_size: 64,
             runtime_worker_threads: 0,
             runtime_max_blocking_threads: 0,
             replication_endpoint: None,
@@ -472,7 +478,10 @@ impl Config {
     /// read-side demand is `meta_read_pool_size × meta_shards` (audit 2026-07: the floor undercounted
     /// it by a factor of `meta_shards`).
     fn blocking_pool_floor(&self) -> usize {
-        self.blob_io_pool_size + self.meta_read_pool_size as usize * self.meta_shards + 64
+        self.blob_io_pool_size
+            + self.blob_io_read_pool_size
+            + self.meta_read_pool_size as usize * self.meta_shards
+            + 64
     }
 
     /// The blocking-thread cap to configure the runtime with: the explicit value, or a derived safe
@@ -1090,10 +1099,12 @@ mod tests {
     fn runtime_blocking_pool_floor_is_enforced() {
         let mut c = base();
         c.blob_io_pool_size = 64;
+        c.blob_io_read_pool_size = 32;
         c.meta_read_pool_size = 16;
-        // floor = 64 + 16 + 64 = 144.
+        c.meta_shards = 1;
+        // floor = blob_write(64) + blob_read(32) + meta_read(16)*shards(1) + 64 = 176.
         let floor = c.blocking_pool_floor();
-        assert_eq!(floor, 144);
+        assert_eq!(floor, 176);
         // 0 auto-derives max(512, floor) and validates.
         c.runtime_max_blocking_threads = 0;
         assert!(c.validate().is_ok());
