@@ -1088,10 +1088,18 @@ async fn patch_user_cannot_strand_the_control_plane() {
     let (id, _) = create_member(&h, &a).await;
     let path = format!("/users/{id}");
     let patch = |body: &'static [u8]| {
-        h.svc
-            .handle(&Method::PATCH, &path, &[], Some(&a), Bytes::from_static(body))
+        h.svc.handle(
+            &Method::PATCH,
+            &path,
+            &[],
+            Some(&a),
+            Bytes::from_static(body),
+        )
     };
-    assert_eq!(patch(br#"{"role":"administrator"}"#).await.status, StatusCode::OK);
+    assert_eq!(
+        patch(br#"{"role":"administrator"}"#).await.status,
+        StatusCode::OK
+    );
 
     // Deactivating the last active administrator is refused.
     assert_eq!(

@@ -4411,9 +4411,15 @@ mod prealloc_clamp_tests {
     fn clamps_over_declared_length_to_ceiling() {
         // Regression (audit 2026-07): a tiny body declaring an enormous length must not preallocate
         // beyond the size ceiling. Pre-fix the header value flowed straight to `fallocate`.
-        assert_eq!(clamp_prealloc_len(Some(500_000_000_000), 5 * 1024 * 1024), Some(5 * 1024 * 1024));
+        assert_eq!(
+            clamp_prealloc_len(Some(500_000_000_000), 5 * 1024 * 1024),
+            Some(5 * 1024 * 1024)
+        );
         // A legitimate length within the ceiling is preserved exactly.
-        assert_eq!(clamp_prealloc_len(Some(1_024), 5 * 1024 * 1024), Some(1_024));
+        assert_eq!(
+            clamp_prealloc_len(Some(1_024), 5 * 1024 * 1024),
+            Some(1_024)
+        );
         // Exactly at the ceiling is preserved; absent header stays absent (no preallocation).
         assert_eq!(clamp_prealloc_len(Some(4096), 4096), Some(4096));
         assert_eq!(clamp_prealloc_len(None, 4096), None);

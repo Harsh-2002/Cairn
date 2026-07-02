@@ -546,7 +546,8 @@ impl Config {
         // Under sharding every shard opens an independent writer + read pool with the same sizing, so
         // the true footprint is `(read_pool_size + 1) × meta_shards` connections (audit 2026-07: the
         // clamp ignored `meta_shards`, so a sharded node could provision N× the budget and OOM).
-        let conns = (u64::from(self.meta_read_pool_size) + 1).saturating_mul(self.meta_shards as u64);
+        let conns =
+            (u64::from(self.meta_read_pool_size) + 1).saturating_mul(self.meta_shards as u64);
         let total_cache = self.meta_cache_bytes_per_conn.saturating_mul(conns);
         if total_cache > self.meta_cache_total_budget_bytes {
             return Err(ConfigError::Invalid(format!(
@@ -866,7 +867,10 @@ mod tests {
         );
         // Omitting active (defaults to the highest id) is valid.
         c.master_key_active_id = None;
-        assert!(c.validate().is_ok(), "defaulting active to the max id is valid");
+        assert!(
+            c.validate().is_ok(),
+            "defaulting active to the max id is valid"
+        );
     }
 
     #[test]

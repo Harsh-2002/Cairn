@@ -131,7 +131,9 @@ impl WebhookSink for HttpWebhookSink {
             let status = resp.status();
             // Drain (capped) so the connection can be reused; the content is irrelevant to us, and
             // an over-cap or errored drain is fine — we already have the status.
-            let _ = Limited::new(resp.into_body(), MAX_RESPONSE_BODY).collect().await;
+            let _ = Limited::new(resp.into_body(), MAX_RESPONSE_BODY)
+                .collect()
+                .await;
             Ok::<http::StatusCode, WebhookError>(status)
         };
         let status = match tokio::time::timeout(self.timeout, deliver).await {
@@ -183,8 +185,7 @@ mod sink_timeout_tests {
             if let Ok((mut sock, _)) = listener.accept() {
                 let mut buf = [0u8; 1024];
                 let _ = sock.read(&mut buf);
-                let _ =
-                    sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\nabc");
+                let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\nabc");
                 let _ = sock.flush();
                 std::thread::sleep(Duration::from_secs(10));
             }
@@ -192,12 +193,11 @@ mod sink_timeout_tests {
 
         let sink = HttpWebhookSink::with_timeout(Duration::from_millis(500));
         let url = format!("http://{addr}/");
-        let outcome = tokio::time::timeout(
-            Duration::from_secs(5),
-            sink.deliver(&url, b"{}", None),
-        )
-        .await
-        .expect("deliver must return within 5s — pre-fix it hangs on the stalled response body");
+        let outcome = tokio::time::timeout(Duration::from_secs(5), sink.deliver(&url, b"{}", None))
+            .await
+            .expect(
+                "deliver must return within 5s — pre-fix it hangs on the stalled response body",
+            );
         assert!(
             matches!(outcome, Err(WebhookError::Retryable(_))),
             "a stalled response body should time out as Retryable, got {outcome:?}"
