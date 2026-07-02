@@ -155,12 +155,27 @@ impl ShardedMetadataStore {
 impl MetadataStore for ShardedMetadataStore {
     async fn submit(&self, mutation: Mutation) -> Result<MutationOutcome, MetaError> {
         match mutation {
+            // DeleteBucket is per-bucket, but its apply also purges the ACCOUNT-GLOBAL request_metrics
+            // table, which lives only on shard 0. If the bucket routes to a non-zero shard, that
+            // purge misses — so run the delete on shard 0 too. The extra submit is a no-op for the
+            // bucket/config/stats rows (none on shard 0 for this bucket) and only clears the metrics
+            // (audit 2026-07). Sequenced after the authoritative per-bucket delete so an emptiness
+            // rejection there short-circuits before we touch shard 0.
+            Mutation::DeleteBucket(name) => {
+                let idx = shard_for_bucket(name.as_str(), self.n());
+                let m = Mutation::DeleteBucket(name);
+                let outcome = self.shards[idx].submit(m.clone()).await?;
+                if idx != 0 {
+                    self.global().submit(m).await?;
+                }
+                Ok(outcome)
+            }
+
             // --- per-bucket object/config mutations: route by the target bucket ---
             Mutation::PutObjectVersion { .. }
             | Mutation::CreateDeleteMarker { .. }
             | Mutation::DeleteVersion { .. }
             | Mutation::CreateBucket(_)
-            | Mutation::DeleteBucket(_)
             | Mutation::SetBucketConfig { .. }
             | Mutation::SetVersioning { .. }
             | Mutation::SetOwnership { .. }

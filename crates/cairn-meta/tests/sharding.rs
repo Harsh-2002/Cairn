@@ -262,3 +262,47 @@ async fn claim_replication_batch_round_robins_across_shards() {
         assert!(hits[si] > 0, "shard {si} was starved: {hits:?}");
     }
 }
+
+#[tokio::test]
+async fn delete_bucket_purges_request_metrics_on_shard_zero() {
+    // Audit 2026-07: request_metrics is an account-global table on shard 0, but DeleteBucket routes
+    // by bucket. When a bucket lives on a non-zero shard, deleting it must still purge its analytics
+    // from shard 0 — otherwise a recreated same-name bucket inherits the old series.
+    use cairn_types::meta::{MetricsRange, RequestMetricRow, LATENCY_BUCKETS};
+    let (store, _inner) = shards(4);
+    // Pick a bucket that hashes to a non-zero shard (the failing case).
+    let name = *NAMES
+        .iter()
+        .find(|n| cairn_meta::shard_for_bucket(n, 4) != 0)
+        .expect("some name hashes off shard 0");
+
+    store.submit(bucket(name)).await.unwrap();
+    let now = 1_000_000i64;
+    store
+        .submit(Mutation::RecordRequestMetrics {
+            rows: vec![RequestMetricRow {
+                ts_bucket: now,
+                operation: "GetObject".to_owned(),
+                bucket: name.to_owned(),
+                status_class: "2xx".to_owned(),
+                count: 5,
+                bytes_in: 100,
+                bytes_out: 200,
+                lat_sum_ms: 50,
+                lat_hist: [0u64; LATENCY_BUCKETS],
+            }],
+            prune_before: None,
+        })
+        .await
+        .unwrap();
+    let before = store.query_request_metrics(MetricsRange::OneDay, now).await.unwrap();
+    assert_eq!(before.total, 5, "metrics recorded on shard 0");
+
+    // Delete the bucket; its request_metrics must be gone from shard 0 too.
+    store
+        .submit(Mutation::DeleteBucket(BucketName::parse(name).unwrap()))
+        .await
+        .unwrap();
+    let after = store.query_request_metrics(MetricsRange::OneDay, now).await.unwrap();
+    assert_eq!(after.total, 0, "deleted bucket's analytics purged from shard 0");
+}
