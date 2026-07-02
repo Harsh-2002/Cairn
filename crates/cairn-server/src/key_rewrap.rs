@@ -8,7 +8,7 @@
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use cairn_crypto::SystemCrypto;
-use cairn_meta::SqliteMetadataStore;
+use cairn_meta::{CachedMetadataStore, SqliteMetadataStore};
 use cairn_types::bucket::ConfigAspect;
 use cairn_types::crypto::Nonce;
 use cairn_types::error::MetaError;
@@ -39,7 +39,12 @@ struct SseDesc {
 
 /// Spawn the per-shard re-wrap loop. `interval_secs == 0` disables it. The worker shares one
 /// `Arc<SystemCrypto>` (the ring) with the rest of the stack.
-pub fn spawn(store: Arc<SqliteMetadataStore>, crypto: Arc<SystemCrypto>, interval_secs: u64) {
+pub fn spawn(
+    store: Arc<SqliteMetadataStore>,
+    crypto: Arc<SystemCrypto>,
+    cache: Arc<CachedMetadataStore>,
+    interval_secs: u64,
+) {
     if interval_secs == 0 {
         return;
     }
@@ -47,7 +52,7 @@ pub fn spawn(store: Arc<SqliteMetadataStore>, crypto: Arc<SystemCrypto>, interva
         let interval = Duration::from_secs(interval_secs);
         loop {
             tokio::time::sleep(interval).await;
-            if let Err(e) = run_once(&store, &crypto).await {
+            if let Err(e) = run_once(&store, &crypto, &cache).await {
                 tracing::warn!(error = %e, "master-key re-wrap pass failed");
             }
         }
@@ -79,10 +84,14 @@ pub fn spawn_counter_sync(
     });
 }
 
-async fn run_once(store: &SqliteMetadataStore, crypto: &SystemCrypto) -> Result<(), MetaError> {
+async fn run_once(
+    store: &SqliteMetadataStore,
+    crypto: &SystemCrypto,
+    cache: &CachedMetadataStore,
+) -> Result<(), MetaError> {
     rewrap_sse(store, crypto).await?;
     rewrap_users(store, crypto).await?;
-    rewrap_targets(store, crypto).await?;
+    rewrap_targets(store, crypto, cache).await?;
     Ok(())
 }
 
@@ -225,6 +234,7 @@ async fn rewrap_users(store: &SqliteMetadataStore, crypto: &SystemCrypto) -> Res
 async fn rewrap_targets(
     store: &SqliteMetadataStore,
     crypto: &SystemCrypto,
+    cache: &CachedMetadataStore,
 ) -> Result<(), MetaError> {
     let active = crypto.active_key_id();
     let mut pass_failed = 0u64;
@@ -272,7 +282,13 @@ async fn rewrap_targets(
                 )
                 .await
             {
-                Ok(true) => {}
+                Ok(true) => {
+                    // The re-seal committed on the RAW store, bypassing the read-through cache's
+                    // decorator, so evict the now-stale cached targets doc — otherwise the control
+                    // plane keeps serving (and can re-persist) the pre-rewrap old-key doc after the
+                    // pass "finished" (audit 2026-07).
+                    cache.invalidate_config_aspect(&b.name, ConfigAspect::ReplicationTargets);
+                }
                 Ok(false) => {
                     // A CAS miss means a concurrent target edit landed between our read and our
                     // write, so THIS bucket was not re-sealed this pass. Treat it exactly like an

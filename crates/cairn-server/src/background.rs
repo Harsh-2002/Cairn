@@ -64,6 +64,7 @@ pub fn spawn(stack: Arc<AppStack>, cfg: &Config, shutdown: tokio::sync::watch::R
             crate::key_rewrap::spawn(
                 store.clone(),
                 stack.crypto.clone(),
+                stack.meta_cache.clone(),
                 cfg.key_rewrap_interval_secs,
             );
             crate::key_rewrap::spawn_counter_sync(

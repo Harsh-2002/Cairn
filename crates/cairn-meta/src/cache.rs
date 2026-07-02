@@ -378,6 +378,17 @@ impl CachedMetadataStore {
         self.config.invalidate(&(bucket.clone(), aspect));
     }
 
+    /// Public evict for an out-of-band writer that bypasses [`submit`](Self::submit): the #29
+    /// key-rewrap worker re-seals a bucket's replication targets via a direct compare-and-swap on the
+    /// raw store (to preserve the lost-update witness), so the decorator never sees it. Without this
+    /// the cache keeps serving the pre-rewrap (old-key) targets doc, which the control plane can then
+    /// re-persist — leaving old-key ciphertext in the DB after re-wrap "finished" (audit 2026-07).
+    pub fn invalidate_config_aspect(&self, bucket: &BucketName, aspect: ConfigAspect) {
+        if self.enabled {
+            self.invalidate_bucket_aspect(bucket, aspect);
+        }
+    }
+
     /// Drop the cached account-wide public-access-block. Bumps the dedicated `account_bpa_gen`
     /// first, then clears the slot: a read-install that snapshotted the old generation will carry it
     /// in the packed value and so be rejected on the next hit, even if its `store` lands after this
@@ -1273,6 +1284,48 @@ mod tests {
         let _ = cache.get_account_public_access_block().await.unwrap();
         let _ = cache.get_account_public_access_block().await.unwrap();
         assert_eq!(counting.get_bpa.load(Ordering::Relaxed), 1);
+    }
+
+    /// The public out-of-band evict (used by the #29 key-rewrap worker, which re-seals replication
+    /// targets via a raw-store CAS that bypasses `submit`) drops the cached aspect so the next read
+    /// re-fetches the freshly-re-sealed doc (audit 2026-07).
+    #[tokio::test]
+    async fn invalidate_config_aspect_evicts_out_of_band() {
+        let counting = Arc::new(CountingStore::new());
+        let name = bucket_name("rewrap-bucket");
+        seed_bucket(&counting, &name).await;
+        counting
+            .submit(Mutation::SetBucketConfig {
+                bucket: name.clone(),
+                aspect: ConfigAspect::ReplicationTargets,
+                doc: Some(ConfigDoc("old-key-doc".into())),
+            })
+            .await
+            .expect("set config");
+
+        let cache = CachedMetadataStore::new(counting.clone(), 64 * 1024);
+        // Prime the cache: first read misses (reaches the store), second is served from cache.
+        let _ = cache
+            .get_bucket_config(&name, ConfigAspect::ReplicationTargets)
+            .await
+            .unwrap();
+        let _ = cache
+            .get_bucket_config(&name, ConfigAspect::ReplicationTargets)
+            .await
+            .unwrap();
+        assert_eq!(counting.get_config.load(Ordering::Relaxed), 1);
+
+        // Out-of-band evict — the next read must reach the inner store again.
+        cache.invalidate_config_aspect(&name, ConfigAspect::ReplicationTargets);
+        let _ = cache
+            .get_bucket_config(&name, ConfigAspect::ReplicationTargets)
+            .await
+            .unwrap();
+        assert_eq!(
+            counting.get_config.load(Ordering::Relaxed),
+            2,
+            "after eviction the read re-fetches from the store"
+        );
     }
 
     /// (b) A submit that changes a bucket's policy invalidates it so the next read re-fetches.
