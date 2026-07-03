@@ -5,9 +5,16 @@
 // never returned. See ARCH 27.7.
 
 import { useId, useMemo, useState } from "react";
-import { ArrowRight, CircleAlert, DownloadCloud } from "lucide-react";
+import {
+  ArrowRight,
+  Check,
+  CircleAlert,
+  Copy,
+  DownloadCloud,
+} from "lucide-react";
 import { toast } from "sonner";
 import { api, errorMessage } from "@/lib/api";
+import { copyText } from "@/components/copy-field";
 import { bytes } from "@/lib/format";
 import { useResource } from "@/lib/use-resource";
 import { useLiveTopic } from "@/lib/live";
@@ -84,9 +91,10 @@ function parseBuckets(text: string): ImportBucketMap[] {
     .map((l) => l.trim())
     .filter(Boolean)
     .map((l) => {
-      const [src, dst] = l.split(":");
-      const source = src.trim();
-      const dest = (dst ?? "").trim() || source;
+      // Split on the FIRST colon only, so a stray second colon isn't silently dropped.
+      const i = l.indexOf(":");
+      const source = (i === -1 ? l : l.slice(0, i)).trim();
+      const dest = (i === -1 ? "" : l.slice(i + 1)).trim() || source;
       return { source, dest };
     });
 }
@@ -119,13 +127,20 @@ export function Imports() {
   const [form, setForm] = useState(BLANK);
   const [busy, setBusy] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
+  // Set once the form has been submitted, so required fields only turn `aria-invalid`
+  // after an attempt — never on a pristine form.
+  const [submitted, setSubmitted] = useState(false);
   const [confirmAll, setConfirmAll] = useState(false);
   // The "Fetch buckets" probe: the source's bucket names (null = not yet fetched).
   const [sourceBuckets, setSourceBuckets] = useState<string[] | null>(null);
   const [probing, setProbing] = useState(false);
   const [probeError, setProbeError] = useState<string | null>(null);
+  // The job id most recently copied to the clipboard (drives the row's copy icon).
+  const [copiedId, setCopiedId] = useState<string | null>(null);
   const set = <K extends keyof typeof form>(k: K, v: (typeof form)[K]) =>
     setForm((f) => ({ ...f, [k]: v }));
+  // A required field is invalid only once submitted and still empty; typing clears it live.
+  const invalid = (v: string) => (submitted && !v.trim() ? true : undefined);
 
   const endpointId = useId();
   const regionId = useId();
@@ -135,6 +150,9 @@ export function Imports() {
   const bucketsHelpId = useId();
   const workersId = useId();
   const caId = useId();
+  const formErrorId = useId();
+  // Point the required fields at the form-level error message when it's showing.
+  const errDesc = formError ? formErrorId : undefined;
 
   // The textarea is canonical; parse it once for the picker's checked/rename state.
   const maps = useMemo(() => parseBuckets(form.buckets), [form.buckets]);
@@ -236,6 +254,7 @@ export function Imports() {
 
   function onSubmit(e: React.FormEvent) {
     e.preventDefault();
+    setSubmitted(true);
     const err = validate();
     setFormError(err);
     if (err) return;
@@ -245,6 +264,16 @@ export function Imports() {
       return;
     }
     void doCreate();
+  }
+
+  async function copyId(id: string) {
+    if (!(await copyText(id))) return;
+    setCopiedId(id);
+    toast.success("Job id copied to the clipboard.");
+    window.setTimeout(
+      () => setCopiedId((c) => (c === id ? null : c)),
+      1500,
+    );
   }
 
   async function doCreate() {
@@ -269,6 +298,8 @@ export function Imports() {
       setForm((f) => ({ ...f, secret: "", ca_cert: "", buckets: "" }));
       setSourceBuckets(null);
       setProbeError(null);
+      setSubmitted(false);
+      setFormError(null);
       res.refresh();
     } catch (err) {
       setFormError(errorMessage(err, "Could not start the import."));
@@ -319,7 +350,7 @@ export function Imports() {
           <form onSubmit={onSubmit} className="grid gap-4 md:grid-cols-2" noValidate>
             {formError ? (
               <div className="md:col-span-2">
-                <FieldError>{formError}</FieldError>
+                <FieldError id={formErrorId}>{formError}</FieldError>
               </div>
             ) : null}
 
@@ -331,6 +362,8 @@ export function Imports() {
                 onChange={(e) => set("source_endpoint", e.target.value)}
                 placeholder="https://s3.source.example:9000"
                 autoComplete="off"
+                aria-invalid={invalid(form.source_endpoint)}
+                aria-describedby={errDesc}
                 className="font-mono"
               />
             </div>
@@ -341,6 +374,8 @@ export function Imports() {
                 value={form.source_region}
                 onChange={(e) => set("source_region", e.target.value)}
                 autoComplete="off"
+                aria-invalid={invalid(form.source_region)}
+                aria-describedby={errDesc}
                 className="font-mono"
               />
             </div>
@@ -351,6 +386,8 @@ export function Imports() {
                 value={form.access_key}
                 onChange={(e) => set("access_key", e.target.value)}
                 autoComplete="off"
+                aria-invalid={invalid(form.access_key)}
+                aria-describedby={errDesc}
                 className="font-mono"
               />
             </div>
@@ -362,6 +399,8 @@ export function Imports() {
                 value={form.secret}
                 onChange={(e) => set("secret", e.target.value)}
                 autoComplete="off"
+                aria-invalid={invalid(form.secret)}
+                aria-describedby={errDesc}
                 className="font-mono"
               />
             </div>
@@ -593,9 +632,34 @@ export function Imports() {
                     >
                       {j.source_endpoint}
                     </span>
-                    <span title={j.id} className="text-muted-foreground">
-                      {j.id.slice(0, 8)}
-                    </span>
+                    {/* The full id is long; show a short prefix, reveal the rest on
+                        hover, and copy the whole thing on click. */}
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <button
+                          type="button"
+                          onClick={() => void copyId(j.id)}
+                          aria-label={`Copy job id ${j.id}`}
+                          className="inline-flex items-center gap-1 rounded text-muted-foreground transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+                        >
+                          {j.id.slice(0, 8)}
+                          {copiedId === j.id ? (
+                            <Check
+                              aria-hidden="true"
+                              className="size-3 text-success"
+                            />
+                          ) : (
+                            <Copy
+                              aria-hidden="true"
+                              className="size-3 opacity-60"
+                            />
+                          )}
+                        </button>
+                      </TooltipTrigger>
+                      <TooltipContent className="font-mono text-xs">
+                        {j.id}
+                      </TooltipContent>
+                    </Tooltip>
                   </TableCell>
                   <TableCell data-label="Status">
                     <div className="flex flex-col items-start gap-1">

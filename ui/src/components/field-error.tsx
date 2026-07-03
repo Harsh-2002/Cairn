@@ -9,13 +9,20 @@ import { cn } from "@/lib/utils";
 export function FieldError({
   children,
   className,
+  id,
 }: {
   children?: ReactNode;
   className?: string;
+  /** Optional id so an input can point at this message via `aria-describedby`. */
+  id?: string;
 }) {
   if (!children) return null;
   return (
-    <p role="alert" className={cn("text-[13px] text-destructive", className)}>
+    <p
+      id={id}
+      role="alert"
+      className={cn("text-[13px] text-destructive", className)}
+    >
       {children}
     </p>
   );
