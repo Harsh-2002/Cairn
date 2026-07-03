@@ -23,7 +23,15 @@ jobs:
   verify-ci:
     name: require green CI
     runs-on: ubuntu-latest
+    outputs:
+      # The calendar version, computed ONCE here and threaded into both the binaries (baked in as
+      # CAIRN_VERSION) and the release tag below, so `cairn --version` and the release it ships in can
+      # never disagree (and there is no date-rollover race between the two jobs).
+      version: ${{ steps.ver.outputs.version }}
     steps:
+      - name: Compute the calendar version (vYYYY.MM.DD)
+        id: ver
+        run: echo "version=$(date -u +v%Y.%m.%d)" >> "$GITHUB_OUTPUT"
       - name: Require a successful CI run for this commit
         env:
           GH_TOKEN: ${{ github.token }}
@@ -57,6 +65,10 @@ jobs:
       - run: pip install ziglang
       - uses: taiki-e/install-action@cargo-zigbuild
       - name: Cross-compile the static release binary (no QEMU)
+        # Bake the calendar version into the binary so `cairn --version` and `GET /system` report the
+        # release, not the crate's CARGO_PKG_VERSION.
+        env:
+          CAIRN_RELEASE_VERSION: ${{ needs.verify-ci.outputs.version }}
         run: cargo zigbuild --release --bin cairn --target ${{ matrix.target }}
       - name: Stage + verify it is fully static
         run: |
@@ -64,6 +76,17 @@ jobs:
           cp "target/${{ matrix.target }}/release/cairn" "dist/cairn-linux-${{ matrix.arch }}"
           file "dist/cairn-linux-${{ matrix.arch }}" | grep -qiE "statically linked|static-pie linked" \
             || { echo "binary is not statically linked"; exit 1; }
+      - name: Verify the baked-in version matches the release tag
+        # The amd64 binary runs natively on the runner; arm64 shares the same build.rs injection, so
+        # verifying one proves the wiring. This is the automated guard against shipping a binary whose
+        # `cairn --version` disagrees with the release it's published under (ARCH 31.6).
+        if: matrix.arch == 'amd64'
+        env:
+          WANT: ${{ needs.verify-ci.outputs.version }}
+        run: |
+          got="$(./dist/cairn-linux-amd64 --version | awk '{print $NF}')"
+          echo "cairn --version -> $got (expected $WANT)"
+          [ "$got" = "$WANT" ] || { echo "::error::baked-in version '$got' != release tag '$WANT'"; exit 1; }
       - uses: actions/upload-artifact@v7
         with:
           name: cairn-${{ matrix.arch }}
@@ -118,7 +141,7 @@ jobs:
 
   release:
     name: publish dated release (one active)
-    needs: [binaries, image]
+    needs: [verify-ci, binaries, image]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v8
@@ -136,7 +159,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          TAG="$(date -u +v%Y.%m.%d)"
+          # The SAME calendar version baked into the binaries (see verify-ci), so the tag and the
+          # binaries' `cairn --version` always match.
+          TAG="${{ needs.verify-ci.outputs.version }}"
           REPO="${{ github.repository }}"
           IMG="ghcr.io/$(echo "$REPO" | tr '[:upper:]' '[:lower:]')"
           # recreate cleanly if a release for today already exists

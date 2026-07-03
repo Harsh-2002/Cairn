@@ -512,7 +512,9 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
         crypto.clone(),
         clock.clone(),
         cairn_control::SystemInfo {
-            version: env!("CARGO_PKG_VERSION").to_owned(),
+            // The build-injected release/dev version (see `build.rs::emit_version`), so `GET /system`
+            // and the console footer report the same string as `cairn --version`.
+            version: crate::CAIRN_VERSION.to_owned(),
             s3_addr: cfg.listen_addr.to_string(),
             ui_addr: cfg.ui_addr.clone(),
             tls: cfg.tls_enabled(),

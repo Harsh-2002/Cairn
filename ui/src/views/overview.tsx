@@ -119,9 +119,9 @@ export function Overview() {
                 <dl className="space-y-3 text-sm">
                   <div className="flex items-baseline justify-between gap-4">
                     <dt className="shrink-0 text-muted-foreground">Version</dt>
-                    <dd className="font-mono text-[13px]">
-                      v{sys.version}
-                    </dd>
+                    {/* The version already carries its own form — `vYYYY.MM.DD` for a release,
+                        `x.y.z-dev+gSHA` for a dev build — so render it verbatim (no prepended `v`). */}
+                    <dd className="font-mono text-[13px]">{sys.version}</dd>
                   </div>
                   <div className="flex items-baseline justify-between gap-4">
                     <dt className="shrink-0 text-muted-foreground">Uptime</dt>

@@ -41,10 +41,17 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
+/// The user-facing version, baked in at build time (`build.rs::emit_version` → `$OUT_DIR/version.txt`):
+/// the calendar release (`vYYYY.MM.DD`) for a release build, or `x.y.z-dev+gSHA` for a local build.
+/// Surfaced by `cairn --version` and by `SystemInfo` (`GET /system`, the console footer).
+pub(crate) const CAIRN_VERSION: &str = include_str!(concat!(env!("OUT_DIR"), "/version.txt"));
+
 /// Cairn — a production-grade, S3-compatible object storage server. Configuration is
 /// environment-only: set `CAIRN_*` variables (there is no configuration file).
 #[derive(Debug, Parser)]
-#[command(name = "cairn", version, about)]
+// `version` is the build-injected `CAIRN_VERSION` (the calendar release, or a `-dev` marker for a
+// local build) — never the bare crate `CARGO_PKG_VERSION`. See `build.rs::emit_version`.
+#[command(name = "cairn", version = CAIRN_VERSION, about)]
 struct Cli {
     /// The subcommand to run (defaults to `serve`).
     #[command(subcommand)]

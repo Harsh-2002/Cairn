@@ -98,7 +98,7 @@ pub struct OverviewResp {
 /// `GET /system` response: node identity for the console's node card.
 #[derive(Debug, Serialize)]
 pub struct SystemResp {
-    /// The server version (workspace `CARGO_PKG_VERSION`).
+    /// The server version — the build-injected `CAIRN_VERSION` (calendar release or `-dev` marker).
     pub version: String,
     /// Seconds since this process started.
     pub uptime_secs: u64,

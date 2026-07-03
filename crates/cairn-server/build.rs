@@ -23,4 +23,56 @@ fn main() {
     if std::env::var_os("CARGO_FEATURE_META_ASYNC").is_some() {
         println!("cargo:rustc-link-arg-bin=cairn=-Wl,-z,muldefs");
     }
+
+    emit_version();
+}
+
+/// Bake the user-facing version into the binary via an `OUT_DIR` file, `include_str!`'d as the
+/// `CAIRN_VERSION` const (see `main.rs`), consumed by clap (`cairn --version`) and by `SystemInfo`
+/// (`GET /system`, the console footer).
+///
+/// A **release** build injects the calendar version (`vYYYY.MM.DD`) via `CAIRN_RELEASE_VERSION`; the
+/// release workflow computes that once and threads it into both the binaries and the git tag, so the
+/// binary and the release it ships in always agree. A **local/dev** build has no such env, so it
+/// reports the crate version with a `-dev` marker plus the short git commit for traceability — a dev
+/// build is never mistaken for a release. The crate's own `CARGO_PKG_VERSION` (`0.1.0`) is never the
+/// user-facing string on its own.
+///
+/// Deliberately a file, **not** `cargo:rustc-env`: a `rustc-env` named `CAIRN_VERSION` also lands in
+/// the runtime environment of `cargo run`/`cargo test`, where the server's strict `CAIRN_*` config
+/// parser (`deny_unknown_fields`) would reject it as an unknown key. The file keeps the version out
+/// of the environment entirely.
+fn emit_version() {
+    println!("cargo:rerun-if-env-changed=CAIRN_RELEASE_VERSION");
+    let version = match std::env::var("CAIRN_RELEASE_VERSION") {
+        Ok(v) if !v.trim().is_empty() => v.trim().to_owned(),
+        _ => {
+            let base = std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".to_owned());
+            match git_short_sha() {
+                Some(sha) => format!("{base}-dev+g{sha}"),
+                None => format!("{base}-dev"),
+            }
+        }
+    };
+    let out = std::path::Path::new(&std::env::var("OUT_DIR").expect("OUT_DIR set by cargo"))
+        .join("version.txt");
+    std::fs::write(&out, &version).expect("write version.txt");
+}
+
+/// The short HEAD commit for a dev build, best-effort. A build from a source tarball (no git) or
+/// without `git` on PATH simply omits the suffix. Rerun the script when HEAD moves so an incremental
+/// dev rebuild picks up the new commit.
+fn git_short_sha() -> Option<String> {
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git").args(args).output().ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+            .filter(|s| !s.is_empty())
+    };
+    // `--git-path HEAD` resolves correctly even from a worktree or a non-root package dir.
+    if let Some(head) = git(&["rev-parse", "--git-path", "HEAD"]) {
+        println!("cargo:rerun-if-changed={head}");
+    }
+    git(&["rev-parse", "--short=8", "HEAD"])
 }

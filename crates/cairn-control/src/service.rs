@@ -142,7 +142,7 @@ impl ControlResponse {
 /// Assembled once at startup from the server config; the service never re-reads config.
 #[derive(Debug, Clone)]
 pub struct SystemInfo {
-    /// The server version (workspace `CARGO_PKG_VERSION`).
+    /// The server version — the build-injected `CAIRN_VERSION` (calendar release or `-dev` marker).
     pub version: String,
     /// The S3 API listener address as configured.
     pub s3_addr: String,
