@@ -22,6 +22,10 @@ export CAIRN_MASTER_KEY; CAIRN_MASTER_KEY="$(openssl rand -hex 32)"
 export CAIRN_LOG_LEVEL="${CAIRN_LOG_LEVEL:-warn}"
 # Drain the outbox every 2s so the test sees deliveries promptly.
 export CAIRN_WEBHOOK_INTERVAL_SECS=2
+# This harness points a webhook at a loopback sink (127.0.0.1). The SSRF guard blocks internal
+# endpoints by default at both registration (management API) and delivery (connect time), so opt into
+# the escape hatch — the same knob an operator sets for an on-prem/internal event collector (ARCH 27).
+export CAIRN_ALLOW_INTERNAL_ENDPOINTS=true
 
 SRV=""
 cleanup() { [ -n "$SRV" ] && kill "$SRV" 2>/dev/null || true; [ -n "$SRV" ] && wait "$SRV" 2>/dev/null || true; rm -rf "$DATA"; }
