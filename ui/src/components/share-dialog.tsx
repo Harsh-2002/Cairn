@@ -114,10 +114,11 @@ export function ShareDialog({
         method: sMethod,
         expires_in_secs: Number(sExpiry),
         version_id: versionId ?? null,
-        response_content_disposition:
-          sMethod === "GET" && pDisposition === "attachment"
-            ? "attachment"
-            : null,
+        // The S3-link tab has no disposition control of its own, so it must NOT read the separate
+        // persistent-share tab's Delivery selector (that made the presigned link's inline-vs-download
+        // behavior depend, invisibly, on an unrelated tab — audit 2026-07). Use the default
+        // (inline) disposition.
+        response_content_disposition: null,
         content_type:
           sMethod === "PUT" && sContentType.trim() ? sContentType.trim() : null,
       });

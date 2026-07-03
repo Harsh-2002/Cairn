@@ -610,7 +610,9 @@ export function BucketSettings() {
         </div>
       ) : data && config ? (
         <Tabs value={tab} onValueChange={setTab}>
-          <TabsList>
+          {/* Scroll the tab row within itself on narrow phones (<=360px) instead of leaking overflow
+              to the document and forcing a horizontal page scroll (audit 2026-07). */}
+          <TabsList className="w-full max-w-full justify-start overflow-x-auto">
             <TabsTrigger value="general">General</TabsTrigger>
             <TabsTrigger value="protection">Data protection</TabsTrigger>
             <TabsTrigger value="access">Access</TabsTrigger>
@@ -1104,10 +1106,18 @@ export function BucketSettings() {
                     <Textarea
                       id={`${quotaId}-ca`}
                       value={targetForm.ca_cert ?? ""}
-                      rows={4}
+                      rows={6}
                       spellCheck={false}
                       disabled={targetForm.insecure_skip_verify}
-                      className="resize-y font-mono text-[13px] leading-relaxed disabled:opacity-50"
+                      placeholder={
+                        "-----BEGIN CERTIFICATE-----\n" +
+                        "…paste the peer's PEM-encoded CA (or self-signed) certificate…\n" +
+                        "-----END CERTIFICATE-----"
+                      }
+                      // Cap the height so pasting a full PEM chain scrolls inside the box instead of
+                      // ballooning the card and pushing the Add-target action off-screen (audit
+                      // 2026-07). field-sizing-fixed keeps rows authoritative over auto-grow.
+                      className="field-sizing-fixed max-h-56 resize-y overflow-auto font-mono text-[13px] leading-relaxed disabled:opacity-50"
                       onChange={(e) =>
                         setTargetForm({ ...targetForm, ca_cert: e.target.value })
                       }

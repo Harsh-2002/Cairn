@@ -617,7 +617,7 @@ export async function getObjectRetention(
   versionId?: string,
 ): Promise<ObjectRetention | null> {
   const res = await fetch(
-    `/${encodeURIComponent(bucket)}/${encodeURI(key)}?retention${versionQuery(versionId)}`,
+    objectPath(bucket, key) + `?retention${versionQuery(versionId)}`,
     { headers: s3headers() },
   );
   if (res.status === 404) return null;
@@ -647,7 +647,7 @@ export async function putObjectRetention(
   if (opts.bypassGovernance)
     headers["x-amz-bypass-governance-retention"] = "true";
   const res = await fetch(
-    `/${encodeURIComponent(bucket)}/${encodeURI(key)}?retention${versionQuery(opts.versionId)}`,
+    objectPath(bucket, key) + `?retention${versionQuery(opts.versionId)}`,
     { method: "PUT", headers: s3headers(headers), body: xml },
   );
   if (!res.ok && res.status !== 200)
@@ -660,7 +660,7 @@ export async function getObjectLegalHold(
   versionId?: string,
 ): Promise<boolean> {
   const res = await fetch(
-    `/${encodeURIComponent(bucket)}/${encodeURI(key)}?legal-hold${versionQuery(versionId)}`,
+    objectPath(bucket, key) + `?legal-hold${versionQuery(versionId)}`,
     { headers: s3headers() },
   );
   if (res.status === 404) return false;
@@ -680,7 +680,7 @@ export async function putObjectLegalHold(
 ): Promise<void> {
   const xml = `<LegalHold><Status>${on ? "ON" : "OFF"}</Status></LegalHold>`;
   const res = await fetch(
-    `/${encodeURIComponent(bucket)}/${encodeURI(key)}?legal-hold${versionQuery(versionId)}`,
+    objectPath(bucket, key) + `?legal-hold${versionQuery(versionId)}`,
     {
       method: "PUT",
       headers: s3headers({ "Content-Type": "application/xml" }),
