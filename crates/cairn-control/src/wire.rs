@@ -986,13 +986,15 @@ pub struct ImportJobEntry {
     pub bytes_done: u64,
     /// Aggregate bytes seen.
     pub bytes_total: u64,
+    /// A job-level error/status message, if any (surfaced inline in the job list).
+    pub last_error: Option<String>,
     /// Creation time (epoch millis).
     pub created_at_ms: i64,
     /// Last-update time (epoch millis).
     pub updated_at_ms: i64,
 }
 
-/// An import job detail: the summary plus per-bucket progress and any job-level error.
+/// An import job detail: the summary (which carries `last_error`) plus per-bucket progress.
 #[derive(Debug, Clone, Serialize)]
 pub struct ImportJobDetail {
     /// The summary fields.
@@ -1000,8 +1002,6 @@ pub struct ImportJobDetail {
     pub entry: ImportJobEntry,
     /// Per-bucket progress.
     pub buckets: Vec<ImportBucketProgressWire>,
-    /// A job-level error/status message, if any.
-    pub last_error: Option<String>,
 }
 
 /// The import-job list response.
@@ -1039,6 +1039,7 @@ impl From<&cairn_types::meta::ImportJob> for ImportJobEntry {
             objects_total: j.objects_total,
             bytes_done: j.bytes_done,
             bytes_total: j.bytes_total,
+            last_error: j.last_error.clone(),
             created_at_ms: j.created_at.0,
             updated_at_ms: j.updated_at.0,
         }
@@ -1063,7 +1064,6 @@ impl From<&cairn_types::meta::ImportJob> for ImportJobDetail {
                     last_error: b.last_error.clone(),
                 })
                 .collect(),
-            last_error: j.last_error.clone(),
         }
     }
 }

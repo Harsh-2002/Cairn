@@ -1,10 +1,11 @@
 // Import view: bring buckets + objects in from another S3-compatible store
 // (MinIO / Garage / R2 / AWS / another Cairn). A connection form starts a job;
-// the table below shows every job with live progress and per-row cancel/resume.
-// The source secret is sealed server-side and never returned. See ARCH 27.7.
+// the table below shows every job with live progress, per-row cancel/resume, and
+// the reason a failed job failed. The source secret is sealed server-side and
+// never returned. See ARCH 27.7.
 
-import { useId, useState } from "react";
-import { DownloadCloud } from "lucide-react";
+import { useId, useMemo, useState } from "react";
+import { CircleAlert, DownloadCloud } from "lucide-react";
 import { toast } from "sonner";
 import { api, errorMessage } from "@/lib/api";
 import { bytes } from "@/lib/format";
@@ -16,9 +17,11 @@ import type {
   ImportJobEntry,
   ImportState,
 } from "@/lib/types";
+import { ConfirmDialog } from "@/components/confirm-dialog";
 import { DataTable, SkeletonRows, type Column } from "@/components/data-table";
 import { EmptyState } from "@/components/empty-state";
 import { ErrorAlert } from "@/components/error-alert";
+import { FieldError } from "@/components/field-error";
 import { Page, PageHeader } from "@/components/page-header";
 import { StatusBadge, type StatusTone } from "@/components/status-badge";
 import { Button } from "@/components/ui/button";
@@ -27,21 +30,28 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Progress } from "@/components/ui/progress";
-import { Textarea } from "@/components/ui/textarea";
 import { TableCell, TableRow } from "@/components/ui/table";
+import { Textarea } from "@/components/ui/textarea";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 
 const JOB_COLUMNS: Column[] = [
   { key: "source", label: "Source" },
   { key: "state", label: "Status" },
   { key: "progress", label: "Progress" },
   { key: "objects", label: "Objects", className: "text-right" },
-  { key: "actions", label: "", className: "text-right" },
+  { key: "actions", label: "Actions", srOnly: true, className: "text-right" },
 ];
 
+// A running import is not a warning: keep semantic color for genuine problems.
+// Progress is conveyed by the bar and the object counts, not by an amber badge.
 function stateBadge(s: ImportState): { tone: StatusTone; label: string } {
   switch (s) {
     case "running":
-      return { tone: "warning", label: "Importing" };
+      return { tone: "neutral", label: "Importing" };
     case "completed":
       return { tone: "positive", label: "Completed" };
     case "failed":
@@ -53,10 +63,18 @@ function stateBadge(s: ImportState): { tone: StatusTone; label: string } {
   }
 }
 
-function pct(j: ImportJobEntry): number {
+// Percent complete, or `null` when it can't be known yet (a running job still
+// enumerating the source has no total) — the caller renders an indeterminate bar
+// rather than a misleading static 0%.
+function pct(j: ImportJobEntry): number | null {
   if (j.state === "completed") return 100;
-  if (j.objects_total <= 0) return 0;
-  return Math.min(100, Math.round((j.objects_done / j.objects_total) * 100));
+  if (j.objects_total > 0) {
+    return Math.min(100, Math.round((j.objects_done / j.objects_total) * 100));
+  }
+  if (j.bytes_total > 0) {
+    return Math.min(100, Math.round((j.bytes_done / j.bytes_total) * 100));
+  }
+  return j.state === "running" ? null : 0;
 }
 
 /** Parse the buckets textarea: one `SRC` or `SRC:DEST` per line; blank = import all. */
@@ -92,6 +110,8 @@ export function Imports() {
 
   const [form, setForm] = useState(BLANK);
   const [busy, setBusy] = useState(false);
+  const [formError, setFormError] = useState<string | null>(null);
+  const [confirmAll, setConfirmAll] = useState(false);
   const set = <K extends keyof typeof form>(k: K, v: (typeof form)[K]) =>
     setForm((f) => ({ ...f, [k]: v }));
 
@@ -100,25 +120,46 @@ export function Imports() {
   const keyId = useId();
   const secretId = useId();
   const bucketsId = useId();
+  const bucketsHelpId = useId();
   const workersId = useId();
   const caId = useId();
 
-  async function onSubmit(e: React.FormEvent) {
-    e.preventDefault();
+  const importsAll = useMemo(
+    () => parseBuckets(form.buckets).length === 0,
+    [form.buckets],
+  );
+
+  function validate(): string | null {
     if (
       !form.source_endpoint.trim() ||
       !form.source_region.trim() ||
       !form.access_key.trim() ||
       !form.secret
     ) {
-      toast.error("Endpoint, region, access key, and secret are all required.");
+      return "Endpoint, region, access key, and secret are all required.";
+    }
+    if (form.ca_cert.trim() && form.insecure_skip_verify) {
+      return "Trust a CA certificate or skip TLS verification — not both.";
+    }
+    return null;
+  }
+
+  function onSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    const err = validate();
+    setFormError(err);
+    if (err) return;
+    // Importing every bucket is a big, unconfirmed action — confirm it first.
+    if (importsAll) {
+      setConfirmAll(true);
       return;
     }
+    void doCreate();
+  }
+
+  async function doCreate() {
+    setConfirmAll(false);
     const ca = form.ca_cert.trim();
-    if (ca && form.insecure_skip_verify) {
-      toast.error("Trust a CA certificate or skip TLS verification — not both.");
-      return;
-    }
     const body: CreateImportReq = {
       source_endpoint: form.source_endpoint.trim(),
       source_region: form.source_region.trim(),
@@ -137,7 +178,7 @@ export function Imports() {
       setForm((f) => ({ ...f, secret: "", ca_cert: "" }));
       res.refresh();
     } catch (err) {
-      toast.error(errorMessage(err, "Could not start the import."));
+      setFormError(errorMessage(err, "Could not start the import."));
     } finally {
       setBusy(false);
     }
@@ -154,6 +195,8 @@ export function Imports() {
   }
 
   const jobs = res.data?.jobs ?? [];
+  const running = jobs.filter((j) => j.state === "running").length;
+  const failed = jobs.filter((j) => j.state === "failed").length;
 
   return (
     <Page>
@@ -180,7 +223,13 @@ export function Imports() {
           </p>
         </CardHeader>
         <CardContent>
-          <form onSubmit={onSubmit} className="grid gap-4 md:grid-cols-2">
+          <form onSubmit={onSubmit} className="grid gap-4 md:grid-cols-2" noValidate>
+            {formError ? (
+              <div className="md:col-span-2">
+                <FieldError>{formError}</FieldError>
+              </div>
+            ) : null}
+
             <div className="grid gap-1.5">
               <Label htmlFor={endpointId}>Source endpoint</Label>
               <Input
@@ -225,22 +274,21 @@ export function Imports() {
             </div>
 
             <div className="grid gap-1.5 md:col-span-2">
-              <Label htmlFor={bucketsId}>
-                Buckets{" "}
-                <span className="font-normal text-muted-foreground">
-                  — one per line, as <code className="font-mono">source</code> or{" "}
-                  <code className="font-mono">source:destination</code>; leave
-                  empty to import every bucket
-                </span>
-              </Label>
+              <Label htmlFor={bucketsId}>Buckets</Label>
               <Textarea
                 id={bucketsId}
                 value={form.buckets}
                 onChange={(e) => set("buckets", e.target.value)}
                 rows={3}
                 spellCheck={false}
+                aria-describedby={bucketsHelpId}
                 className="resize-y font-mono text-[13px] leading-relaxed"
               />
+              <p id={bucketsHelpId} className="text-[13px] text-muted-foreground">
+                One per line, as <code className="font-mono">source</code> or{" "}
+                <code className="font-mono">source:destination</code>. Leave empty
+                to import every bucket the source credentials can see.
+              </p>
             </div>
 
             <div className="grid gap-1.5">
@@ -316,7 +364,11 @@ export function Imports() {
 
             <div className="md:col-span-2">
               <Button type="submit" disabled={busy} aria-busy={busy}>
-                {busy ? "Starting…" : "Start import"}
+                {busy
+                  ? "Starting…"
+                  : importsAll
+                    ? "Import all buckets"
+                    : "Start import"}
               </Button>
             </div>
           </form>
@@ -326,6 +378,11 @@ export function Imports() {
       {/* ---- Jobs ---- */}
       <section className="mt-8 space-y-3">
         <h2 className="text-base font-semibold tracking-tight">Import jobs</h2>
+        {/* Announce state changes to assistive tech without reading the whole table. */}
+        <p className="sr-only" role="status" aria-live="polite">
+          {jobs.length} import {jobs.length === 1 ? "job" : "jobs"}; {running}{" "}
+          running, {failed} failed.
+        </p>
         {res.loading ? (
           <DataTable columns={JOB_COLUMNS} minWidth={760}>
             <SkeletonRows
@@ -337,6 +394,7 @@ export function Imports() {
           <DataTable columns={JOB_COLUMNS} minWidth={760}>
             {jobs.map((j) => {
               const { tone, label } = stateBadge(j.state);
+              const p = pct(j);
               const active = j.state === "pending" || j.state === "running";
               const resumable = j.state === "failed" || j.state === "cancelled";
               return (
@@ -348,14 +406,44 @@ export function Imports() {
                     >
                       {j.source_endpoint}
                     </span>
-                    <span className="text-muted-foreground">{j.id.slice(0, 8)}</span>
+                    <span title={j.id} className="text-muted-foreground">
+                      {j.id.slice(0, 8)}
+                    </span>
                   </TableCell>
                   <TableCell data-label="Status">
-                    <StatusBadge tone={tone}>{label}</StatusBadge>
+                    <div className="flex flex-col items-start gap-1">
+                      <StatusBadge tone={tone}>{label}</StatusBadge>
+                      {j.state === "failed" && j.last_error ? (
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <span className="flex max-w-[30ch] items-center gap-1 text-[13px] text-destructive">
+                              <CircleAlert
+                                aria-hidden="true"
+                                className="size-3.5 shrink-0"
+                              />
+                              <span className="truncate">{j.last_error}</span>
+                            </span>
+                          </TooltipTrigger>
+                          <TooltipContent className="max-w-sm break-words">
+                            {j.last_error}
+                          </TooltipContent>
+                        </Tooltip>
+                      ) : null}
+                    </div>
                   </TableCell>
                   <TableCell data-label="Progress">
                     <div className="flex items-center gap-2">
-                      <Progress value={pct(j)} className="h-1.5 w-28" />
+                      {p === null ? (
+                        <div
+                          role="progressbar"
+                          aria-label="Importing; total not yet known"
+                          className="h-1.5 w-28 overflow-hidden rounded-full bg-primary/20"
+                        >
+                          <div className="h-full w-3/5 rounded-full bg-primary/70 animate-pulse motion-reduce:animate-none" />
+                        </div>
+                      ) : (
+                        <Progress value={p} className="h-1.5 w-28" />
+                      )}
                       <span className="tabular-nums text-[13px] text-muted-foreground">
                         {bytes(j.bytes_done)}
                       </span>
@@ -411,6 +499,16 @@ export function Imports() {
           />
         ) : null}
       </section>
+
+      <ConfirmDialog
+        open={confirmAll}
+        onOpenChange={setConfirmAll}
+        title="Import every bucket?"
+        description="You didn't name any buckets, so this will import every bucket the source credentials can see into this node. Destination buckets are created if they don't exist; objects with a colliding key are overwritten."
+        confirmLabel="Import all buckets"
+        busy={busy}
+        onConfirm={() => void doCreate()}
+      />
     </Page>
   );
 }

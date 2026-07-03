@@ -377,13 +377,14 @@ export interface ImportJobEntry {
   objects_total: number;
   bytes_done: number;
   bytes_total: number;
+  /** A job-level error/status message, if any (shown inline in the job list). */
+  last_error: string | null;
   created_at_ms: number;
   updated_at_ms: number;
 }
 
 export interface ImportJobDetail extends ImportJobEntry {
   buckets: ImportBucketProgress[];
-  last_error: string | null;
 }
 
 export interface ImportListResp {
