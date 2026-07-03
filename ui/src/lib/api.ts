@@ -18,6 +18,10 @@ import type {
   CreateUserResp,
   DeletePrefixResp,
   FailedReplicationResp,
+  CreateImportReq,
+  CreateImportResp,
+  ImportJobDetail,
+  ImportListResp,
   ListObjectsResp,
   ListSessionsResp,
   MintSessionReq,
@@ -482,6 +486,16 @@ export const api = {
 
   failedReplication: (limit = 100) =>
     request<FailedReplicationResp>("GET", `/replication/failed?limit=${limit}`),
+
+  // --- S3 import jobs (ARCH 27.7): import buckets + objects from another S3 store ---
+  listImports: () => request<ImportListResp>("GET", "/imports"),
+  getImport: (id: string) =>
+    request<ImportJobDetail>("GET", `/imports/${enc(id)}`),
+  createImport: (body: CreateImportReq) =>
+    request<CreateImportResp>("POST", "/imports", body),
+  cancelImport: (id: string) => request<null>("DELETE", `/imports/${enc(id)}`),
+  resumeImport: (id: string) =>
+    request<CreateImportResp>("POST", `/imports/${enc(id)}/resume`),
 
   activity: (limit = 50) =>
     request<ActivityResp>("GET", `/activity?limit=${limit}`),

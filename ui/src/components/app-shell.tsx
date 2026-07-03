@@ -23,6 +23,7 @@ function titleFor(pathname: string): string {
     users: seg[1] ? "User" : "Users",
     activity: "Activity",
     replication: "Replication",
+    imports: "Import",
   };
   return `${map[name] ?? "Overview"} — Cairn`;
 }

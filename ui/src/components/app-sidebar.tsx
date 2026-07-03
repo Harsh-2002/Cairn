@@ -5,6 +5,7 @@ import {
   BarChart3,
   ChevronRight,
   Database,
+  DownloadCloud,
   Home,
   KeyRound,
   LogOut,
@@ -48,6 +49,7 @@ const NAV = [
   { label: "Credentials", path: "/credentials", icon: KeyRound },
   { label: "Activity", path: "/activity", icon: Activity },
   { label: "Replication", path: "/replication", icon: RefreshCw },
+  { label: "Import", path: "/imports", icon: DownloadCloud },
 ];
 
 /** Which nav section a path belongs to (bucket subroutes light up Buckets, etc.). */

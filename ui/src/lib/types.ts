@@ -319,6 +319,77 @@ export interface ReplicationResyncResp {
   started: boolean;
 }
 
+// --- S3 import jobs (ARCH 27.7): migrate buckets + objects in from another S3 store ---
+
+/** One source→destination bucket mapping in a create-import request. */
+export interface ImportBucketMap {
+  source: string;
+  dest: string;
+}
+
+/** Create an import job. The secret is sealed server-side and never returned. */
+export interface CreateImportReq {
+  source_endpoint: string;
+  source_region: string;
+  access_key: string;
+  secret: string;
+  /** Buckets to import; empty = every bucket the source credentials can see. */
+  buckets: ImportBucketMap[];
+  workers?: number;
+  /** CA certificate (PEM) to trust for an https:// source with a private/self-signed CA. */
+  ca_cert?: string;
+  /** Skip TLS verification (testing only; mutually exclusive with ca_cert). */
+  insecure_skip_verify?: boolean;
+}
+
+export interface CreateImportResp {
+  id: string;
+}
+
+export type ImportState =
+  | "pending"
+  | "running"
+  | "completed"
+  | "failed"
+  | "cancelled";
+
+export interface ImportBucketProgress {
+  source_bucket: string;
+  dest_bucket: string;
+  state: ImportState;
+  objects_done: number;
+  objects_total: number;
+  bytes_done: number;
+  bytes_total: number;
+  last_error: string | null;
+}
+
+export interface ImportJobEntry {
+  id: string;
+  source_endpoint: string;
+  source_region: string;
+  access_key_id: string;
+  has_ca_cert: boolean;
+  insecure_skip_verify: boolean;
+  workers: number;
+  state: ImportState;
+  objects_done: number;
+  objects_total: number;
+  bytes_done: number;
+  bytes_total: number;
+  created_at_ms: number;
+  updated_at_ms: number;
+}
+
+export interface ImportJobDetail extends ImportJobEntry {
+  buckets: ImportBucketProgress[];
+  last_error: string | null;
+}
+
+export interface ImportListResp {
+  jobs: ImportJobEntry[];
+}
+
 // Usage-analytics metrics (the Metrics view). Mirrors the management API's
 // /metrics/requests aggregation and the bulk prefix-delete response.
 

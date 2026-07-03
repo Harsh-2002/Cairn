@@ -13,6 +13,7 @@ import { Credentials } from "@/views/credentials";
 import { Login } from "@/views/login";
 import { Overview } from "@/views/overview";
 import { Replication } from "@/views/replication";
+import { Imports } from "@/views/imports";
 import { Tags } from "@/views/tags";
 import { UserDetail } from "@/views/user-detail";
 import { Users } from "@/views/users";
@@ -83,6 +84,7 @@ export const router = createHashRouter([
       { path: "tags", element: <Tags /> },
       { path: "activity", element: <Activity /> },
       { path: "replication", element: <Replication /> },
+      { path: "imports", element: <Imports /> },
       // Parity with the old router: anything unknown lands on the overview.
       { path: "*", element: <Navigate to="/overview" replace /> },
     ],
