@@ -54,6 +54,7 @@ use base64::Engine as _;
 use cairn_auth::{canonical_request, compute_signature, sha256_hex, signing_key, string_to_sign};
 use cairn_types::error::ReplicationError;
 use cairn_types::id::{BucketName, ObjectKey, VersionId};
+use cairn_types::object::{ChecksumAlgorithm, StorageClass};
 use cairn_types::replication::ReplicatedObject;
 use cairn_types::time::Timestamp;
 use cairn_types::traits::Clock;
@@ -573,6 +574,33 @@ impl HttpS3Sink {
             }
         }
 
+        // Replicate the stored system response headers so the destination serves identical headers —
+        // most sharply Content-Encoding: a gzip'd object replicated without it returns raw gzip bytes
+        // that a client won't auto-decompress (audit 2026-07; AWS CRR preserves these).
+        for (name, val) in [
+            ("content-encoding", &object.content_encoding),
+            ("cache-control", &object.cache_control),
+            ("content-disposition", &object.content_disposition),
+            ("content-language", &object.content_language),
+            ("expires", &object.expires),
+        ] {
+            if let Some(v) = val {
+                user_headers.push((name.to_owned(), v.clone()));
+            }
+        }
+        // Storage class (STANDARD is the default and is omitted, matching AWS).
+        if !matches!(object.storage_class, StorageClass::Standard) {
+            user_headers.push((
+                "x-amz-storage-class".to_owned(),
+                storage_class_token(object.storage_class).to_owned(),
+            ));
+        }
+        // Supplementary flexible checksums, re-emitted so a checksum-mode GET of the replica matches
+        // the source (audit 2026-07; AWS CRR preserves additional checksums).
+        for c in &object.checksums {
+            user_headers.push((checksum_header_name(c.algorithm).to_owned(), c.value.clone()));
+        }
+
         // Replicate the object's tag set via the standard `x-amz-tagging` header (form-urlencoded
         // `k=v&k=v`), so the destination version carries the same tags the source rule filtered on.
         // `uri_encode_path` percent-encodes the structural `&`/`=` which the destination's
@@ -677,6 +705,25 @@ async fn collect_body(
         buf.extend_from_slice(&chunk);
     }
     Ok(buf.freeze())
+}
+
+/// The S3 storage-class token for a stored class (mirrors the codec's `storage_class_str`).
+fn storage_class_token(sc: StorageClass) -> &'static str {
+    match sc {
+        StorageClass::Standard => "STANDARD",
+        StorageClass::ColdTier => "GLACIER",
+    }
+}
+
+/// The `x-amz-checksum-{algo}` header name for a supplementary checksum (mirrors the protocol layer).
+fn checksum_header_name(algo: ChecksumAlgorithm) -> &'static str {
+    match algo {
+        ChecksumAlgorithm::Crc32 => "x-amz-checksum-crc32",
+        ChecksumAlgorithm::Crc32c => "x-amz-checksum-crc32c",
+        ChecksumAlgorithm::Crc64Nvme => "x-amz-checksum-crc64nvme",
+        ChecksumAlgorithm::Sha1 => "x-amz-checksum-sha1",
+        ChecksumAlgorithm::Sha256 => "x-amz-checksum-sha256",
+    }
 }
 
 /// Percent-encode a path segment per SigV4 canonical-URI rules: unreserved characters and `/`

@@ -456,6 +456,13 @@ impl ReplicationEngine {
             size,
             tags,
             acl: row.acl.clone(),
+            content_encoding: row.content_encoding.clone(),
+            cache_control: row.cache_control.clone(),
+            content_disposition: row.content_disposition.clone(),
+            content_language: row.content_language.clone(),
+            expires: row.expires.clone(),
+            storage_class: row.storage_class,
+            checksums: row.checksums.clone(),
             body: handle.body,
         };
 

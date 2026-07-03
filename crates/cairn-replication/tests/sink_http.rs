@@ -155,6 +155,13 @@ async fn put_object_issues_well_formed_signed_request() {
         size: 5,
         tags: Vec::new(),
         acl: None,
+        content_encoding: None,
+        cache_control: None,
+        content_disposition: None,
+        content_language: None,
+        expires: None,
+        storage_class: cairn_types::object::StorageClass::Standard,
+        checksums: Vec::new(),
         body: body_stream(b"hello"),
     };
 
@@ -262,6 +269,13 @@ async fn put_object_emits_acl_header_only_when_present() {
         size: 3,
         tags: Vec::new(),
         acl: Some(acl.clone()),
+        content_encoding: None,
+        cache_control: None,
+        content_disposition: None,
+        content_language: None,
+        expires: None,
+        storage_class: cairn_types::object::StorageClass::Standard,
+        checksums: Vec::new(),
         body: body_stream(b"abc"),
     };
     sink.put_object(&src(), object).await.unwrap();
@@ -291,6 +305,13 @@ async fn put_object_emits_acl_header_only_when_present() {
         size: 0,
         tags: Vec::new(),
         acl: None,
+        content_encoding: None,
+        cache_control: None,
+        content_disposition: None,
+        content_language: None,
+        expires: None,
+        storage_class: cairn_types::object::StorageClass::Standard,
+        checksums: Vec::new(),
         body: body_stream(b""),
     };
     sink2.put_object(&src(), object2).await.unwrap();
@@ -319,6 +340,13 @@ async fn put_object_recomputes_signature_when_a_header_changes() {
         size: 5,
         tags: Vec::new(),
         acl: None,
+        content_encoding: None,
+        cache_control: None,
+        content_disposition: None,
+        content_language: None,
+        expires: None,
+        storage_class: cairn_types::object::StorageClass::Standard,
+        checksums: Vec::new(),
         body: body_stream(b"hello"),
     };
 
@@ -374,6 +402,13 @@ async fn server_5xx_is_unavailable() {
         size: 1,
         tags: Vec::new(),
         acl: None,
+        content_encoding: None,
+        cache_control: None,
+        content_disposition: None,
+        content_language: None,
+        expires: None,
+        storage_class: cairn_types::object::StorageClass::Standard,
+        checksums: Vec::new(),
         body: body_stream(b"x"),
     };
     let err = sink.put_object(&src(), object).await.unwrap_err();
@@ -438,6 +473,13 @@ async fn put_object_routes_to_per_source_destination_bucket() {
         size: 1,
         tags: Vec::new(),
         acl: None,
+        content_encoding: None,
+        cache_control: None,
+        content_disposition: None,
+        content_language: None,
+        expires: None,
+        storage_class: cairn_types::object::StorageClass::Standard,
+        checksums: Vec::new(),
         body: body_stream(b"x"),
     };
 
@@ -516,6 +558,13 @@ async fn https_endpoint_negotiates_tls_not_plaintext() {
         size: 1,
         tags: Vec::new(),
         acl: None,
+        content_encoding: None,
+        cache_control: None,
+        content_disposition: None,
+        content_language: None,
+        expires: None,
+        storage_class: cairn_types::object::StorageClass::Standard,
+        checksums: Vec::new(),
         body: body_stream(b"x"),
     };
     // The handshake fails (server presents no certificate), so the call errors as unavailable.
@@ -533,4 +582,44 @@ async fn https_endpoint_negotiates_tls_not_plaintext() {
         Some(0x16),
         "https endpoint must open with a TLS ClientHello (0x16), got {observed:?}"
     );
+}
+
+/// Audit 2026-07: the replica must carry the source's system response headers, storage class, and
+/// supplementary checksums (AWS CRR preserves these) — most sharply Content-Encoding.
+#[tokio::test]
+async fn put_object_replicates_system_headers_and_checksums() {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let authority = spawn_server(captured.clone(), Reply { status: 200 }).await;
+    let sink = sink_for(&authority, 1_440_938_160);
+    let object = ReplicatedObject {
+        key: ObjectKey::parse("k").unwrap(),
+        version_id: VersionId::from_string("v1".to_owned()),
+        content_type: "text/plain".to_owned(),
+        user_metadata: Vec::new(),
+        etag: ETag::from_string("\"abc\"".to_owned()),
+        size: 5,
+        tags: Vec::new(),
+        acl: None,
+        content_encoding: Some("gzip".to_owned()),
+        cache_control: Some("max-age=60".to_owned()),
+        content_disposition: Some("attachment".to_owned()),
+        content_language: Some("en".to_owned()),
+        expires: Some("Wed, 21 Oct 2026 07:28:00 GMT".to_owned()),
+        storage_class: cairn_types::object::StorageClass::ColdTier,
+        checksums: vec![cairn_types::object::ChecksumValue {
+            algorithm: cairn_types::object::ChecksumAlgorithm::Sha256,
+            value: "aGFzaA==".to_owned(),
+        }],
+        body: body_stream(b"hello"),
+    };
+    sink.put_object(&src(), object).await.unwrap();
+    let reqs = captured.lock().unwrap().clone();
+    let req = &reqs[0];
+    assert_eq!(req.header("content-encoding"), Some("gzip"));
+    assert_eq!(req.header("cache-control"), Some("max-age=60"));
+    assert_eq!(req.header("content-disposition"), Some("attachment"));
+    assert_eq!(req.header("content-language"), Some("en"));
+    assert_eq!(req.header("expires"), Some("Wed, 21 Oct 2026 07:28:00 GMT"));
+    assert_eq!(req.header("x-amz-storage-class"), Some("GLACIER"));
+    assert_eq!(req.header("x-amz-checksum-sha256"), Some("aGFzaA=="));
 }
