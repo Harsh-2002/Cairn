@@ -123,6 +123,13 @@ enum Command {
         #[command(subcommand)]
         cmd: cli_remote::ShareCmd,
     },
+    /// Import buckets + objects from another S3-compatible store into a running server.
+    Import {
+        #[command(flatten)]
+        opts: cli_remote::RemoteOpts,
+        #[command(subcommand)]
+        cmd: cli_remote::ImportCmd,
+    },
     /// Print a running server's store overview.
     Overview {
         #[command(flatten)]
@@ -153,6 +160,9 @@ fn main() -> ExitCode {
         }
         Command::Share { opts, cmd } => {
             return cli_remote::run(&opts, cli_remote::RemoteCommand::Share { cmd });
+        }
+        Command::Import { opts, cmd } => {
+            return cli_remote::run(&opts, cli_remote::RemoteCommand::Import { cmd });
         }
         Command::Overview { opts } => {
             return cli_remote::run(&opts, cli_remote::RemoteCommand::Overview);
@@ -198,6 +208,7 @@ fn main() -> ExitCode {
         | Command::Replication { .. }
         | Command::Object { .. }
         | Command::Share { .. }
+        | Command::Import { .. }
         | Command::Overview { .. } => unreachable!("remote commands dispatched above"),
     }
 }

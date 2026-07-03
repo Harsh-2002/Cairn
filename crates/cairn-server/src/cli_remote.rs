@@ -84,8 +84,67 @@ pub enum RemoteCommand {
         #[command(subcommand)]
         cmd: ShareCmd,
     },
+    /// Import buckets + objects from another S3-compatible store into this node (ARCH 27.7).
+    Import {
+        #[command(subcommand)]
+        cmd: ImportCmd,
+    },
     /// Print the store overview (`GET /api/v1/overview`).
     Overview,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ImportCmd {
+    /// Start an import job from a remote S3 source, then tail its progress.
+    Run {
+        /// The source S3 endpoint base URL.
+        #[arg(long)]
+        source_endpoint: String,
+        /// The SigV4 signing region for the source.
+        #[arg(long, default_value = "us-east-1")]
+        region: String,
+        /// The source admin access-key id.
+        #[arg(long)]
+        source_key: String,
+        /// The source admin secret (or set `CAIRN_IMPORT_SOURCE_SECRET`).
+        #[arg(long, env = "CAIRN_IMPORT_SOURCE_SECRET")]
+        source_secret: String,
+        /// A bucket to import, as `SRC` or `SRC:DEST` (repeatable). Omit to import every source bucket.
+        #[arg(long = "bucket", value_name = "SRC[:DEST]")]
+        buckets: Vec<String>,
+        /// Object-copy concurrency (defaults to the server's setting).
+        #[arg(long)]
+        workers: Option<u32>,
+        /// Path to a PEM CA bundle to trust for an `https` source.
+        #[arg(long)]
+        ca_cert: Option<std::path::PathBuf>,
+        /// Accept any TLS certificate from the source (testing only).
+        #[arg(long)]
+        insecure_skip_verify: bool,
+        /// Print the request that would be sent without creating a job.
+        #[arg(long)]
+        dry_run: bool,
+        /// Create the job and return immediately instead of tailing progress.
+        #[arg(long)]
+        detach: bool,
+    },
+    /// List import jobs.
+    Ls,
+    /// Show one import job's status.
+    Status {
+        /// The job id.
+        id: String,
+    },
+    /// Cancel an import job.
+    Cancel {
+        /// The job id.
+        id: String,
+    },
+    /// Resume a failed or cancelled import job.
+    Resume {
+        /// The job id.
+        id: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -478,6 +537,57 @@ fn authorization_value(token: &str) -> String {
 
 /// Percent-encode one path segment (a bucket or key component), keeping the unreserved set; `/` is
 /// encoded so a single segment cannot inject a path separator.
+// --- import-job response mirrors (a subset of the server DTOs; serde ignores extra fields) ---
+
+#[derive(Debug, Deserialize)]
+struct CreateImportResp {
+    id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ImportJobEntry {
+    id: String,
+    source_endpoint: String,
+    state: String,
+    objects_done: u64,
+    objects_total: u64,
+    bytes_done: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ImportListResp {
+    jobs: Vec<ImportJobEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ImportBucketProgressWire {
+    source_bucket: String,
+    dest_bucket: String,
+    state: String,
+    objects_done: u64,
+    objects_total: u64,
+    last_error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ImportJobDetail {
+    #[serde(flatten)]
+    entry: ImportJobEntry,
+    buckets: Vec<ImportBucketProgressWire>,
+    last_error: Option<String>,
+}
+
+/// Parse a `--bucket` value: `SRC` or `SRC:DEST`. An empty or missing dest defaults to the source.
+fn parse_bucket_map(s: &str) -> (String, String) {
+    match s.split_once(':') {
+        Some((src, dst)) if !dst.is_empty() => (src.to_owned(), dst.to_owned()),
+        _ => {
+            let src = s.trim_end_matches(':').to_owned();
+            (src.clone(), src)
+        }
+    }
+}
+
 fn pct_encode_segment(s: &str) -> String {
     pct_encode(s, false)
 }
@@ -673,6 +783,7 @@ async fn dispatch(
         RemoteCommand::Replication { cmd } => replication(client, cfg, cmd).await,
         RemoteCommand::Object { cmd } => object(client, cfg, cmd).await,
         RemoteCommand::Share { cmd } => share(client, cfg, cmd).await,
+        RemoteCommand::Import { cmd } => import(client, cfg, cmd).await,
         RemoteCommand::Overview => overview(client, cfg).await,
     }
 }
@@ -927,6 +1038,206 @@ fn parse_quota(value: &str) -> Result<Option<u64>, String> {
 // ---------------------------------------------------------------------------------------
 // Replication commands
 // ---------------------------------------------------------------------------------------
+
+/// Render a byte count in a compact human form.
+fn human_bytes(n: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut v = n as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u < UNITS.len() - 1 {
+        v /= 1024.0;
+        u += 1;
+    }
+    if u == 0 {
+        format!("{n} B")
+    } else {
+        format!("{v:.1} {}", UNITS[u])
+    }
+}
+
+async fn import(client: &HttpClient, cfg: &ClientConfig, cmd: ImportCmd) -> Result<(), String> {
+    match cmd {
+        ImportCmd::Run {
+            source_endpoint,
+            region,
+            source_key,
+            source_secret,
+            buckets,
+            workers,
+            ca_cert,
+            insecure_skip_verify,
+            dry_run,
+            detach,
+        } => {
+            let bucket_maps: Vec<serde_json::Value> = buckets
+                .iter()
+                .map(|b| {
+                    let (s, d) = parse_bucket_map(b);
+                    serde_json::json!({ "source": s, "dest": d })
+                })
+                .collect();
+            let ca_cert_pem = match &ca_cert {
+                Some(p) => Some(
+                    std::fs::read_to_string(p)
+                        .map_err(|e| format!("reading CA certificate {}: {e}", p.display()))?,
+                ),
+                None => None,
+            };
+            let mut body = serde_json::json!({
+                "source_endpoint": source_endpoint,
+                "source_region": region,
+                "access_key": source_key,
+                "secret": source_secret,
+                "buckets": bucket_maps,
+                "insecure_skip_verify": insecure_skip_verify,
+            });
+            if let Some(w) = workers {
+                body["workers"] = serde_json::json!(w);
+            }
+            if let Some(pem) = ca_cert_pem {
+                body["ca_cert"] = serde_json::json!(pem);
+            }
+            if dry_run {
+                // Redact the secret in the printed request.
+                let mut shown = body.clone();
+                shown["secret"] = serde_json::json!("<redacted>");
+                println!("dry run — would POST /api/v1/imports:");
+                print_json_body(shown.to_string().as_bytes());
+                return Ok(());
+            }
+            let resp = api_send(
+                client,
+                cfg,
+                Method::POST,
+                "/imports",
+                Some(Bytes::from(body.to_string())),
+            )
+            .await?;
+            let created: CreateImportResp = decode(&resp)?;
+            if cfg.json {
+                print_json_body(&resp.body);
+            } else {
+                println!("started import job {}", created.id);
+            }
+            if detach {
+                return Ok(());
+            }
+            poll_import(client, cfg, &created.id).await
+        }
+        ImportCmd::Ls => {
+            let resp = api_get(client, cfg, "/imports").await?;
+            if cfg.json {
+                print_json_body(&resp.body);
+                return Ok(());
+            }
+            let list: ImportListResp = decode(&resp)?;
+            if list.jobs.is_empty() {
+                println!("no import jobs");
+            }
+            for j in &list.jobs {
+                println!(
+                    "{}  {:<10} {}  {}/{} objects  {}",
+                    j.id,
+                    j.state,
+                    j.source_endpoint,
+                    j.objects_done,
+                    j.objects_total,
+                    human_bytes(j.bytes_done)
+                );
+            }
+            Ok(())
+        }
+        ImportCmd::Status { id } => {
+            let resp = api_get(
+                client,
+                cfg,
+                &format!("/imports/{}", pct_encode_segment(&id)),
+            )
+            .await?;
+            if cfg.json {
+                print_json_body(&resp.body);
+                return Ok(());
+            }
+            let d: ImportJobDetail = decode(&resp)?;
+            println!(
+                "job {}  state={}  {}/{} objects  {}",
+                d.entry.id,
+                d.entry.state,
+                d.entry.objects_done,
+                d.entry.objects_total,
+                human_bytes(d.entry.bytes_done)
+            );
+            for b in &d.buckets {
+                println!(
+                    "  {} -> {}  {:<10} {}/{} objects{}",
+                    b.source_bucket,
+                    b.dest_bucket,
+                    b.state,
+                    b.objects_done,
+                    b.objects_total,
+                    b.last_error
+                        .as_deref()
+                        .map(|e| format!("  (error: {e})"))
+                        .unwrap_or_default()
+                );
+            }
+            if let Some(e) = &d.last_error {
+                println!("  error: {e}");
+            }
+            Ok(())
+        }
+        ImportCmd::Cancel { id } => {
+            api_send(
+                client,
+                cfg,
+                Method::DELETE,
+                &format!("/imports/{}", pct_encode_segment(&id)),
+                None,
+            )
+            .await?;
+            println!("cancelled import job {id}");
+            Ok(())
+        }
+        ImportCmd::Resume { id } => {
+            api_send(
+                client,
+                cfg,
+                Method::POST,
+                &format!("/imports/{}/resume", pct_encode_segment(&id)),
+                None,
+            )
+            .await?;
+            println!("resumed import job {id}");
+            Ok(())
+        }
+    }
+}
+
+/// Poll a job's status every couple of seconds, printing a progress line, until it reaches a
+/// terminal state. A failed job is surfaced as an error.
+async fn poll_import(client: &HttpClient, cfg: &ClientConfig, id: &str) -> Result<(), String> {
+    loop {
+        let resp = api_get(client, cfg, &format!("/imports/{}", pct_encode_segment(id))).await?;
+        let d: ImportJobDetail = decode(&resp)?;
+        println!(
+            "  {:<10} {}/{} objects  {}",
+            d.entry.state,
+            d.entry.objects_done,
+            d.entry.objects_total,
+            human_bytes(d.entry.bytes_done)
+        );
+        match d.entry.state.as_str() {
+            "completed" | "cancelled" => return Ok(()),
+            "failed" => {
+                return Err(format!(
+                    "import failed: {}",
+                    d.last_error.as_deref().unwrap_or("(no error recorded)")
+                ));
+            }
+            _ => tokio::time::sleep(std::time::Duration::from_secs(2)).await,
+        }
+    }
+}
 
 async fn replication(
     client: &HttpClient,
@@ -1474,5 +1785,29 @@ mod tests {
         let msg = format_api_error(&resp);
         assert!(msg.contains("502"));
         assert!(msg.contains("upstream boom"));
+    }
+
+    #[test]
+    fn parse_bucket_map_handles_src_and_src_dest() {
+        assert_eq!(
+            parse_bucket_map("photos"),
+            ("photos".to_owned(), "photos".to_owned())
+        );
+        assert_eq!(
+            parse_bucket_map("photos:gallery"),
+            ("photos".to_owned(), "gallery".to_owned())
+        );
+        // A trailing colon with no dest falls back to the source name.
+        assert_eq!(
+            parse_bucket_map("photos:"),
+            ("photos".to_owned(), "photos".to_owned())
+        );
+    }
+
+    #[test]
+    fn human_bytes_scales_units() {
+        assert_eq!(human_bytes(512), "512 B");
+        assert_eq!(human_bytes(1024), "1.0 KiB");
+        assert_eq!(human_bytes(1024 * 1024 * 5), "5.0 MiB");
     }
 }
