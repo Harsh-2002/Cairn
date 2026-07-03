@@ -346,6 +346,23 @@ export interface CreateImportResp {
   id: string;
 }
 
+/** Probe a source's credentials to list its buckets (the "Fetch buckets" step).
+ * Carries the same connection fields as CreateImportReq minus the selection; the
+ * secret is used transiently server-side and never stored or echoed. */
+export interface ProbeSourceReq {
+  source_endpoint: string;
+  source_region: string;
+  access_key: string;
+  secret: string;
+  ca_cert?: string;
+  insecure_skip_verify?: boolean;
+}
+
+export interface ProbeSourceResp {
+  /** The source bucket names, in the order the source returned them. */
+  buckets: string[];
+}
+
 export type ImportState =
   | "pending"
   | "running"

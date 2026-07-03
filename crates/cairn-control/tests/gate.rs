@@ -1747,6 +1747,85 @@ async fn import_job_lifecycle_and_secret_never_echoed() {
 }
 
 #[tokio::test]
+async fn probe_source_buckets_validates_and_guards() {
+    // The "Fetch buckets" probe reuses the create-import connection validation: it rejects missing
+    // fields, the CA-⊕-skip-verify conflict, and an internal endpoint (SSRF) — all before any
+    // outbound dial — and never leaks the transient secret in the rejection body.
+    let h = harness();
+    let a = admin();
+    let leaked = |body: &[u8]| body.windows(b"leak-me".len()).any(|w| w == b"leak-me");
+
+    // Missing required fields → 400.
+    let resp = h
+        .svc
+        .handle(
+            &Method::POST,
+            "/imports/source/buckets",
+            &[],
+            Some(&a),
+            Bytes::from_static(
+                br#"{"source_endpoint":"","source_region":"us-east-1","access_key":"AK","secret":"leak-me"}"#,
+            ),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::BAD_REQUEST);
+    assert!(!leaked(&resp.body), "probe validation leaked the secret");
+
+    // CA certificate and skip-verify are mutually exclusive → 400.
+    let resp = h
+        .svc
+        .handle(
+            &Method::POST,
+            "/imports/source/buckets",
+            &[],
+            Some(&a),
+            Bytes::from_static(
+                br#"{"source_endpoint":"https://s3.example:9000","source_region":"us-east-1","access_key":"AK","secret":"leak-me","ca_cert":"-----BEGIN CERTIFICATE-----\nx\n-----END CERTIFICATE-----","insecure_skip_verify":true}"#,
+            ),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::BAD_REQUEST);
+    assert!(
+        !leaked(&resp.body),
+        "probe conflict check leaked the secret"
+    );
+
+    // An internal endpoint literal is refused by the SSRF guard, before any dial.
+    let resp = h
+        .svc
+        .handle(
+            &Method::POST,
+            "/imports/source/buckets",
+            &[],
+            Some(&a),
+            Bytes::from_static(
+                br#"{"source_endpoint":"http://169.254.169.254","source_region":"us-east-1","access_key":"AK","secret":"leak-me"}"#,
+            ),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::BAD_REQUEST);
+    assert!(
+        !leaked(&resp.body),
+        "probe SSRF rejection leaked the secret"
+    );
+
+    // The probe is admin-gated for free: an anonymous caller is refused.
+    let resp = h
+        .svc
+        .handle(
+            &Method::POST,
+            "/imports/source/buckets",
+            &[],
+            None,
+            Bytes::from_static(
+                br#"{"source_endpoint":"https://s3.example:9000","source_region":"us-east-1","access_key":"AK","secret":"leak-me"}"#,
+            ),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
 async fn replication_target_rejects_internal_endpoint() {
     // The SSRF guard (enforcing by default) must refuse a target whose endpoint is an internal IP
     // literal — otherwise it could be pointed at the node's own loopback or the cloud-metadata

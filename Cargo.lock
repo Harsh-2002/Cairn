@@ -448,6 +448,7 @@ dependencies = [
  "bytes",
  "cairn-auth",
  "cairn-authz",
+ "cairn-import",
  "cairn-net",
  "cairn-replication",
  "cairn-types",

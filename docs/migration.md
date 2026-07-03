@@ -39,6 +39,23 @@ both remote) and per-object checksum-verification ledgers are future work.
 The endpoints live on the console/API listener (`CAIRN_UI_ADDR`, default `:7374`), under `/api/v1`,
 and require an administrator Bearer token (`<access-key>.<secret>`).
 
+Optionally, list the buckets a set of source credentials can see before committing to a job — this is
+what the console's **Fetch buckets** step calls. The secret signs a single `ListBuckets` and is never
+sealed, stored, logged, or echoed:
+
+```sh
+curl -s -X POST http://127.0.0.1:7374/api/v1/imports/source/buckets \
+  -H 'Authorization: Bearer cairn.cairnadmin' \
+  -H 'content-type: application/json' \
+  -d '{
+        "source_endpoint": "https://minio.internal:9000",
+        "source_region":   "us-east-1",
+        "access_key":      "SRC_ADMIN_KEY",
+        "secret":          "SRC_ADMIN_SECRET"
+      }'
+# -> {"buckets":["media","backups","logs"]}
+```
+
 Create a job (an empty `buckets` list means "every bucket the source credentials can see"; an entry's
 `dest` defaults to its `source` name):
 

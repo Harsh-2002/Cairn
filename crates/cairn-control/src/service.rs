@@ -6,6 +6,7 @@
 
 use crate::wire;
 use bytes::Bytes;
+use cairn_import::SourceReader;
 use cairn_replication::{
     RemoteTarget, RemoteTargetInput, parse_targets, resolve_target, serialize_targets,
 };
@@ -392,6 +393,9 @@ impl ControlService {
             }
             // --- S3 import jobs (ARCH 27) ---
             (&Method::POST, ["imports"]) => self.create_import(&body, principal).await,
+            (&Method::POST, ["imports", "source", "buckets"]) => {
+                self.probe_source_buckets(&body).await
+            }
             (&Method::GET, ["imports"]) => self.list_imports().await,
             (&Method::GET, ["imports", id]) => self.import_detail(id).await,
             (&Method::POST, ["imports", id, "resume"]) => self.resume_import(id, principal).await,
@@ -2419,6 +2423,56 @@ impl ControlService {
             .await;
         self.pulse_import();
         ControlResponse::json(StatusCode::CREATED, &wire::CreateImportResp { id })
+    }
+
+    /// `POST /imports/source/buckets`: probe a source's credentials and return the bucket names they
+    /// can enumerate — the console's "Fetch buckets" step. The secret signs one `ListBuckets` and is
+    /// never sealed, persisted, logged, or echoed; nothing about this call is recorded.
+    async fn probe_source_buckets(&self, body: &Bytes) -> ControlResponse {
+        let req: wire::ProbeSourceReq = match serde_json::from_slice(body) {
+            Ok(r) => r,
+            Err(e) => return ControlResponse::bad_request(&e.to_string()),
+        };
+        if req.source_endpoint.trim().is_empty()
+            || req.source_region.trim().is_empty()
+            || req.access_key.trim().is_empty()
+            || req.secret.is_empty()
+        {
+            return ControlResponse::bad_request(
+                "source_endpoint, source_region, access_key, and secret are all required",
+            );
+        }
+        let ca_cert_pem = req.ca_cert.filter(|s| !s.trim().is_empty());
+        if ca_cert_pem.is_some() && req.insecure_skip_verify {
+            return ControlResponse::bad_request(
+                "Trust a CA certificate or skip TLS verification — not both.",
+            );
+        }
+        // Fast validate-time SSRF check (IP-literal only); the connector re-checks every resolved
+        // address, so a DNS-rebinding host is still refused at connect time.
+        if let Err(e) = cairn_net::validate_endpoint(&req.source_endpoint, &self.ssrf_guard) {
+            return ControlResponse::bad_request(&e.to_string());
+        }
+        let source = match cairn_import::HttpS3Source::new(cairn_import::SourceConfig {
+            endpoint: req.source_endpoint,
+            region: req.source_region,
+            access_key_id: req.access_key,
+            secret_access_key: req.secret,
+            ca_cert_pem,
+            insecure_skip_verify: req.insecure_skip_verify,
+            allow_internal_endpoints: self.ssrf_guard.allow_internal,
+        }) {
+            Ok(s) => s,
+            Err(e) => return ControlResponse::bad_request(&e.to_string()),
+        };
+        match source.list_buckets().await {
+            Ok(buckets) => {
+                ControlResponse::json(StatusCode::OK, &wire::ProbeSourceResp { buckets })
+            }
+            // A probe failure is the operator's connection/credentials problem, not ours: surface it
+            // as a 400 with the source's own message (which never contains the secret).
+            Err(e) => ControlResponse::bad_request(&e.to_string()),
+        }
     }
 
     /// `GET /imports`: list all import jobs (secret-free), newest first.

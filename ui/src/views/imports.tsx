@@ -5,7 +5,7 @@
 // never returned. See ARCH 27.7.
 
 import { useId, useMemo, useState } from "react";
-import { CircleAlert, DownloadCloud } from "lucide-react";
+import { ArrowRight, CircleAlert, DownloadCloud } from "lucide-react";
 import { toast } from "sonner";
 import { api, errorMessage } from "@/lib/api";
 import { bytes } from "@/lib/format";
@@ -91,6 +91,14 @@ function parseBuckets(text: string): ImportBucketMap[] {
     });
 }
 
+/** Render bucket mappings back to the textarea's `SRC` / `SRC:DEST` line form. The textarea stays
+ * the single source of truth; the picker is a live editor over it. */
+function serialize(maps: ImportBucketMap[]): string {
+  return maps
+    .map((m) => (m.dest && m.dest !== m.source ? `${m.source}:${m.dest}` : m.source))
+    .join("\n");
+}
+
 const BLANK = {
   source_endpoint: "",
   source_region: "us-east-1",
@@ -112,6 +120,10 @@ export function Imports() {
   const [busy, setBusy] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
   const [confirmAll, setConfirmAll] = useState(false);
+  // The "Fetch buckets" probe: the source's bucket names (null = not yet fetched).
+  const [sourceBuckets, setSourceBuckets] = useState<string[] | null>(null);
+  const [probing, setProbing] = useState(false);
+  const [probeError, setProbeError] = useState<string | null>(null);
   const set = <K extends keyof typeof form>(k: K, v: (typeof form)[K]) =>
     setForm((f) => ({ ...f, [k]: v }));
 
@@ -124,10 +136,88 @@ export function Imports() {
   const workersId = useId();
   const caId = useId();
 
-  const importsAll = useMemo(
-    () => parseBuckets(form.buckets).length === 0,
-    [form.buckets],
+  // The textarea is canonical; parse it once for the picker's checked/rename state.
+  const maps = useMemo(() => parseBuckets(form.buckets), [form.buckets]);
+  const selected = useMemo(
+    () => new Map(maps.map((m) => [m.source, m.dest])),
+    [maps],
   );
+  const importsAll = maps.length === 0;
+  const selectedCount = sourceBuckets
+    ? sourceBuckets.filter((s) => selected.has(s)).length
+    : 0;
+
+  // Picker edits, all routed through the textarea so the two stay in lockstep.
+  const toggleSource = (src: string, on: boolean) =>
+    set(
+      "buckets",
+      serialize(
+        on
+          ? [...maps.filter((m) => m.source !== src), { source: src, dest: src }]
+          : maps.filter((m) => m.source !== src),
+      ),
+    );
+  const renameSource = (src: string, dest: string) =>
+    set(
+      "buckets",
+      serialize(
+        maps.map((m) =>
+          m.source === src ? { source: src, dest: dest.trim() || src } : m,
+        ),
+      ),
+    );
+  const selectAllSources = (on: boolean) => {
+    if (!sourceBuckets) return;
+    if (on) {
+      const have = new Set(maps.map((m) => m.source));
+      const added = sourceBuckets
+        .filter((s) => !have.has(s))
+        .map((s) => ({ source: s, dest: s }));
+      set("buckets", serialize([...maps, ...added]));
+    } else {
+      const drop = new Set(sourceBuckets);
+      set("buckets", serialize(maps.filter((m) => !drop.has(m.source))));
+    }
+  };
+
+  async function fetchBuckets() {
+    // The probe needs the connection fields, not the bucket selection.
+    if (
+      !form.source_endpoint.trim() ||
+      !form.source_region.trim() ||
+      !form.access_key.trim() ||
+      !form.secret
+    ) {
+      setProbeError("Fill in the endpoint, region, access key, and secret first.");
+      return;
+    }
+    if (form.ca_cert.trim() && form.insecure_skip_verify) {
+      setProbeError("Trust a CA certificate or skip TLS verification — not both.");
+      return;
+    }
+    setProbeError(null);
+    setProbing(true);
+    try {
+      const ca = form.ca_cert.trim();
+      const { buckets } = await api.probeSourceBuckets({
+        source_endpoint: form.source_endpoint.trim(),
+        source_region: form.source_region.trim(),
+        access_key: form.access_key.trim(),
+        secret: form.secret,
+        insecure_skip_verify: form.insecure_skip_verify,
+        ...(ca ? { ca_cert: ca } : {}),
+      });
+      setSourceBuckets(buckets);
+      if (buckets.length === 0) {
+        setProbeError("These credentials can't see any buckets on the source.");
+      }
+    } catch (err) {
+      setSourceBuckets(null);
+      setProbeError(errorMessage(err, "Could not list the source's buckets."));
+    } finally {
+      setProbing(false);
+    }
+  }
 
   function validate(): string | null {
     if (
@@ -174,8 +264,11 @@ export function Imports() {
     try {
       const { id } = await api.createImport(body);
       toast.success(`Started import ${id.slice(0, 8)}…`);
-      // Clear the secret material; keep the connection fields for a follow-up job.
-      setForm((f) => ({ ...f, secret: "", ca_cert: "" }));
+      // Clear the secret material and the selection; keep the connection host/key
+      // for a follow-up job.
+      setForm((f) => ({ ...f, secret: "", ca_cert: "", buckets: "" }));
+      setSourceBuckets(null);
+      setProbeError(null);
       res.refresh();
     } catch (err) {
       setFormError(errorMessage(err, "Could not start the import."));
@@ -273,8 +366,100 @@ export function Imports() {
               />
             </div>
 
-            <div className="grid gap-1.5 md:col-span-2">
-              <Label htmlFor={bucketsId}>Buckets</Label>
+            <div className="grid gap-2 md:col-span-2">
+              <div className="flex items-end justify-between gap-3">
+                <Label htmlFor={bucketsId}>Buckets</Label>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={fetchBuckets}
+                  disabled={probing}
+                  aria-busy={probing}
+                >
+                  {probing
+                    ? "Fetching…"
+                    : sourceBuckets
+                      ? "Refresh buckets"
+                      : "Fetch buckets"}
+                </Button>
+              </div>
+
+              {/* Picker: check the buckets to import and optionally rename each on
+                  the way in. Every edit flows through the textarea below, which is
+                  the canonical value and always shows exactly what will be sent. */}
+              {sourceBuckets && sourceBuckets.length > 0 ? (
+                <div className="overflow-hidden rounded-md border">
+                  <div className="flex items-center justify-between gap-3 border-b bg-muted/40 px-3 py-2 text-[13px]">
+                    <span className="text-muted-foreground">
+                      {selectedCount} of {sourceBuckets.length} selected
+                    </span>
+                    <div className="flex items-center gap-1">
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        className="h-7 px-2"
+                        onClick={() => selectAllSources(true)}
+                        disabled={selectedCount === sourceBuckets.length}
+                      >
+                        Select all
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        className="h-7 px-2"
+                        onClick={() => selectAllSources(false)}
+                        disabled={selectedCount === 0}
+                      >
+                        Clear
+                      </Button>
+                    </div>
+                  </div>
+                  <ul className="max-h-64 divide-y overflow-auto">
+                    {sourceBuckets.map((src) => {
+                      const on = selected.has(src);
+                      const dest = selected.get(src);
+                      return (
+                        <li
+                          key={src}
+                          className="flex items-center gap-3 px-3 py-2"
+                        >
+                          <Checkbox
+                            checked={on}
+                            onCheckedChange={(v) => toggleSource(src, v === true)}
+                            aria-label={`Import ${src}`}
+                          />
+                          <span className="min-w-0 flex-1 truncate font-mono text-[13px]">
+                            {src}
+                          </span>
+                          {on ? (
+                            <>
+                              <ArrowRight
+                                aria-hidden="true"
+                                className="size-3.5 shrink-0 text-muted-foreground"
+                              />
+                              <Input
+                                value={dest === src ? "" : (dest ?? "")}
+                                onChange={(e) =>
+                                  renameSource(src, e.target.value)
+                                }
+                                placeholder={src}
+                                aria-label={`Destination bucket for ${src}`}
+                                className="h-8 w-44 font-mono text-[13px]"
+                              />
+                            </>
+                          ) : null}
+                        </li>
+                      );
+                    })}
+                  </ul>
+                </div>
+              ) : null}
+
+              {probeError ? <FieldError>{probeError}</FieldError> : null}
+
               <Textarea
                 id={bucketsId}
                 value={form.buckets}
@@ -286,8 +471,10 @@ export function Imports() {
               />
               <p id={bucketsHelpId} className="text-[13px] text-muted-foreground">
                 One per line, as <code className="font-mono">source</code> or{" "}
-                <code className="font-mono">source:destination</code>. Leave empty
-                to import every bucket the source credentials can see.
+                <code className="font-mono">source:destination</code>.{" "}
+                <span className="font-medium text-foreground">Fetch buckets</span>{" "}
+                lists what the credentials can see; or type names here. Leave empty
+                to import every bucket.
               </p>
             </div>
 

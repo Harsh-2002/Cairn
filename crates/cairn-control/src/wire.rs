@@ -938,6 +938,34 @@ pub struct CreateImportResp {
     pub id: String,
 }
 
+/// Probe a source's credentials and list the buckets they can see. Carries the same connection
+/// fields as [`CreateImportReq`] minus the bucket selection; the secret is used transiently to sign
+/// one `ListBuckets` and is never sealed, persisted, or echoed.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProbeSourceReq {
+    /// The remote S3 endpoint base URL.
+    pub source_endpoint: String,
+    /// The SigV4 signing region for the source.
+    pub source_region: String,
+    /// The source admin access key.
+    pub access_key: String,
+    /// The source admin secret (used to sign the probe, never stored).
+    pub secret: String,
+    /// An optional PEM CA bundle to trust for an https source.
+    #[serde(default)]
+    pub ca_cert: Option<String>,
+    /// Skip TLS verification for the source (testing only).
+    #[serde(default)]
+    pub insecure_skip_verify: bool,
+}
+
+/// The probe response: the bucket names the source credentials can enumerate.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProbeSourceResp {
+    /// The source bucket names, in the order the source returned them.
+    pub buckets: Vec<String>,
+}
+
 /// Per-bucket progress in an import-job detail response.
 #[derive(Debug, Clone, Serialize)]
 pub struct ImportBucketProgressWire {

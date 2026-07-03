@@ -22,6 +22,8 @@ import type {
   CreateImportResp,
   ImportJobDetail,
   ImportListResp,
+  ProbeSourceReq,
+  ProbeSourceResp,
   ListObjectsResp,
   ListSessionsResp,
   MintSessionReq,
@@ -493,6 +495,8 @@ export const api = {
     request<ImportJobDetail>("GET", `/imports/${enc(id)}`),
   createImport: (body: CreateImportReq) =>
     request<CreateImportResp>("POST", "/imports", body),
+  probeSourceBuckets: (body: ProbeSourceReq) =>
+    request<ProbeSourceResp>("POST", "/imports/source/buckets", body),
   cancelImport: (id: string) => request<null>("DELETE", `/imports/${enc(id)}`),
   resumeImport: (id: string) =>
     request<CreateImportResp>("POST", `/imports/${enc(id)}/resume`),
