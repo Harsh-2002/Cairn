@@ -42,6 +42,19 @@ pub fn spawn(stack: Arc<AppStack>, cfg: &Config, shutdown: tokio::sync::watch::R
         stack.clone(),
         Duration::from_secs(cfg.webhook_interval_secs),
     ));
+    // The S3-import worker: claims pending import jobs and runs them into this node.
+    tokio::spawn(crate::import_run::import_loop(
+        stack.clone(),
+        crate::import_run::ImportLoopConfig {
+            poll_interval_secs: cfg.import_poll_interval_secs,
+            default_workers: cfg.import_default_workers,
+            max_workers: cfg.import_max_workers,
+            global_max_inflight: cfg.import_global_max_inflight,
+            root_access_key: cfg.root_access_key.clone(),
+        },
+        stack.import_notify.clone(),
+        shutdown.clone(),
+    ));
     // The integrity scrub is opt-in (I/O-heavy): only spawned when an interval is configured.
     if cfg.scrub_interval_secs > 0 {
         tokio::spawn(scrub_loop(

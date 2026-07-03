@@ -1649,6 +1649,104 @@ async fn create_user_with_replication_policy_attaches_it() {
 }
 
 #[tokio::test]
+async fn import_job_lifecycle_and_secret_never_echoed() {
+    let h = harness();
+    let a = admin();
+
+    // Create an import job — the source secret is sealed and must never appear in any response.
+    let resp = h
+        .svc
+        .handle(
+            &Method::POST,
+            "/imports",
+            &[],
+            Some(&a),
+            Bytes::from_static(
+                br#"{"source_endpoint":"https://minio.example:9000","source_region":"us-east-1","access_key":"AKSRC","secret":"super-secret-import","buckets":[{"source":"photos","dest":"gallery"}],"workers":8}"#,
+            ),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::CREATED);
+    let id = json(&resp)["id"].as_str().unwrap().to_owned();
+    let leaked = |body: &[u8]| {
+        body.windows(b"super-secret-import".len())
+            .any(|w| w == b"super-secret-import")
+    };
+    assert!(!leaked(&resp.body), "create response leaked the secret");
+
+    // List: secret-free, shows the source access key + pending state.
+    let resp = h
+        .svc
+        .handle(&Method::GET, "/imports", &[], Some(&a), Bytes::new())
+        .await;
+    assert_eq!(resp.status, StatusCode::OK);
+    let v = json(&resp);
+    let jobs = v["jobs"].as_array().unwrap();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0]["id"], id.as_str());
+    assert_eq!(jobs[0]["access_key_id"], "AKSRC");
+    assert_eq!(jobs[0]["state"], "pending");
+    assert!(!leaked(&resp.body), "list response leaked the secret");
+
+    // Detail: per-bucket mapping present (dest override honoured).
+    let resp = h
+        .svc
+        .handle(
+            &Method::GET,
+            &format!("/imports/{id}"),
+            &[],
+            Some(&a),
+            Bytes::new(),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::OK);
+    let v = json(&resp);
+    let buckets = v["buckets"].as_array().unwrap();
+    assert_eq!(buckets.len(), 1);
+    assert_eq!(buckets[0]["source_bucket"], "photos");
+    assert_eq!(buckets[0]["dest_bucket"], "gallery");
+
+    // Cancel → the job moves to cancelled.
+    let resp = h
+        .svc
+        .handle(
+            &Method::DELETE,
+            &format!("/imports/{id}"),
+            &[],
+            Some(&a),
+            Bytes::new(),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::NO_CONTENT);
+    let resp = h
+        .svc
+        .handle(
+            &Method::GET,
+            &format!("/imports/{id}"),
+            &[],
+            Some(&a),
+            Bytes::new(),
+        )
+        .await;
+    assert_eq!(json(&resp)["state"], "cancelled");
+
+    // An internal source endpoint is refused up front (SSRF guard).
+    let resp = h
+        .svc
+        .handle(
+            &Method::POST,
+            "/imports",
+            &[],
+            Some(&a),
+            Bytes::from_static(
+                br#"{"source_endpoint":"http://169.254.169.254","source_region":"us-east-1","access_key":"AK","secret":"x","buckets":[]}"#,
+            ),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn replication_target_rejects_internal_endpoint() {
     // The SSRF guard (enforcing by default) must refuse a target whose endpoint is an internal IP
     // literal — otherwise it could be pointed at the node's own loopback or the cloud-metadata

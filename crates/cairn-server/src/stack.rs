@@ -67,6 +67,9 @@ pub struct AppStack {
     /// Pulsed by the S3 write path after a write commits replication outbox entries, so the
     /// replication worker drains immediately (event-driven) instead of waiting its poll heartbeat.
     pub replication_notify: Arc<tokio::sync::Notify>,
+    /// Pulsed by the control plane when an import job is created/resumed, so the import worker claims
+    /// it immediately instead of waiting its poll heartbeat (mirrors `replication_notify`).
+    pub import_notify: Arc<tokio::sync::Notify>,
     /// Short-lived, single-use tickets for the SSE live-update stream (`hash -> (expiry_ms,
     /// minting principal)`). EventSource cannot send an Authorization header, so the browser mints
     /// a ticket with its Bearer token then opens the stream with `?ticket=`. In-process and
@@ -489,6 +492,7 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
     ));
     let authz: Arc<dyn AuthorizationEngine> = Arc::new(cairn_authz::PolicyEngine);
     let replication_notify = Arc::new(tokio::sync::Notify::new());
+    let import_notify = Arc::new(tokio::sync::Notify::new());
     let s3 = S3Service::new(
         meta.clone(),
         blob.clone(),
@@ -521,7 +525,11 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
         Arc::new(move || n.notify_one())
     })
     .with_root_access_key(cfg.root_access_key.clone())
-    .with_allow_internal_endpoints(cfg.allow_internal_endpoints);
+    .with_allow_internal_endpoints(cfg.allow_internal_endpoints)
+    .with_import_wake({
+        let n = import_notify.clone();
+        Arc::new(move || n.notify_one())
+    });
 
     // Ensure the root administrator exists so the deployment is usable immediately: the same access
     // key + secret log into the web UI, authenticate the management API, and sign S3 requests.
@@ -581,6 +589,7 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
         meta_cache,
         crypto: system_crypto,
         replication_notify,
+        import_notify,
         sse_tickets: crate::sse::SseTicketStore::default(),
         blob,
         oracle,

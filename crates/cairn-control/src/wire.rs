@@ -889,3 +889,181 @@ pub struct ErrorResp {
     /// The per-request id, also emitted as the `x-amz-request-id` response header.
     pub request_id: String,
 }
+
+// ---------------------------------------------------------------------------------------
+// S3 import jobs (ARCH 27)
+// ---------------------------------------------------------------------------------------
+
+/// One source→destination bucket mapping in a create-import request. An empty `dest` means "same
+/// name as the source".
+#[derive(Debug, Clone, Deserialize)]
+pub struct ImportBucketMap {
+    /// The source bucket name.
+    pub source: String,
+    /// The destination bucket name (defaults to `source` when empty).
+    #[serde(default)]
+    pub dest: String,
+}
+
+/// Create an import job. The `secret` is sealed server-side and never returned. An empty `buckets`
+/// list means "import every bucket the source credentials can see".
+#[derive(Debug, Clone, Deserialize)]
+pub struct CreateImportReq {
+    /// The remote S3 endpoint base URL.
+    pub source_endpoint: String,
+    /// The SigV4 signing region for the source.
+    pub source_region: String,
+    /// The source admin access key.
+    pub access_key: String,
+    /// The source admin secret (sealed at rest, never echoed).
+    pub secret: String,
+    /// The buckets to import; empty = all.
+    #[serde(default)]
+    pub buckets: Vec<ImportBucketMap>,
+    /// The object-worker count; `None` uses the server default (clamped to the server max).
+    #[serde(default)]
+    pub workers: Option<u32>,
+    /// An optional PEM CA bundle to trust for an https source.
+    #[serde(default)]
+    pub ca_cert: Option<String>,
+    /// Skip TLS verification for the source (testing only).
+    #[serde(default)]
+    pub insecure_skip_verify: bool,
+}
+
+/// The create-import response: the job id only (the secret is never echoed).
+#[derive(Debug, Clone, Serialize)]
+pub struct CreateImportResp {
+    /// The new job id.
+    pub id: String,
+}
+
+/// Per-bucket progress in an import-job detail response.
+#[derive(Debug, Clone, Serialize)]
+pub struct ImportBucketProgressWire {
+    /// The source bucket.
+    pub source_bucket: String,
+    /// The destination bucket.
+    pub dest_bucket: String,
+    /// This bucket's state.
+    pub state: String,
+    /// Objects copied.
+    pub objects_done: u64,
+    /// Objects seen.
+    pub objects_total: u64,
+    /// Bytes copied.
+    pub bytes_done: u64,
+    /// Bytes seen.
+    pub bytes_total: u64,
+    /// The most recent per-object error, if any.
+    pub last_error: Option<String>,
+}
+
+/// An import job summary (secret-free) for the list view.
+#[derive(Debug, Clone, Serialize)]
+pub struct ImportJobEntry {
+    /// The job id.
+    pub id: String,
+    /// The source endpoint.
+    pub source_endpoint: String,
+    /// The source region.
+    pub source_region: String,
+    /// The source access-key id (identifier, not a secret).
+    pub access_key_id: String,
+    /// Whether a custom CA certificate is configured (presence flag).
+    pub has_ca_cert: bool,
+    /// Whether TLS verification is skipped for the source.
+    pub insecure_skip_verify: bool,
+    /// The requested worker count (0 = server default).
+    pub workers: u32,
+    /// The job state.
+    pub state: String,
+    /// Aggregate objects copied.
+    pub objects_done: u64,
+    /// Aggregate objects seen.
+    pub objects_total: u64,
+    /// Aggregate bytes copied.
+    pub bytes_done: u64,
+    /// Aggregate bytes seen.
+    pub bytes_total: u64,
+    /// Creation time (epoch millis).
+    pub created_at_ms: i64,
+    /// Last-update time (epoch millis).
+    pub updated_at_ms: i64,
+}
+
+/// An import job detail: the summary plus per-bucket progress and any job-level error.
+#[derive(Debug, Clone, Serialize)]
+pub struct ImportJobDetail {
+    /// The summary fields.
+    #[serde(flatten)]
+    pub entry: ImportJobEntry,
+    /// Per-bucket progress.
+    pub buckets: Vec<ImportBucketProgressWire>,
+    /// A job-level error/status message, if any.
+    pub last_error: Option<String>,
+}
+
+/// The import-job list response.
+#[derive(Debug, Clone, Serialize)]
+pub struct ImportListResp {
+    /// The jobs, newest first.
+    pub jobs: Vec<ImportJobEntry>,
+}
+
+/// The contract string for an import state.
+#[must_use]
+pub fn import_state_str(s: cairn_types::meta::ImportState) -> &'static str {
+    use cairn_types::meta::ImportState;
+    match s {
+        ImportState::Pending => "pending",
+        ImportState::Running => "running",
+        ImportState::Completed => "completed",
+        ImportState::Failed => "failed",
+        ImportState::Cancelled => "cancelled",
+    }
+}
+
+impl From<&cairn_types::meta::ImportJob> for ImportJobEntry {
+    fn from(j: &cairn_types::meta::ImportJob) -> Self {
+        Self {
+            id: j.id.clone(),
+            source_endpoint: j.source_endpoint.clone(),
+            source_region: j.source_region.clone(),
+            access_key_id: j.access_key_id.clone(),
+            has_ca_cert: j.has_ca_cert,
+            insecure_skip_verify: j.insecure_skip_verify,
+            workers: j.workers,
+            state: import_state_str(j.state).to_owned(),
+            objects_done: j.objects_done,
+            objects_total: j.objects_total,
+            bytes_done: j.bytes_done,
+            bytes_total: j.bytes_total,
+            created_at_ms: j.created_at.0,
+            updated_at_ms: j.updated_at.0,
+        }
+    }
+}
+
+impl From<&cairn_types::meta::ImportJob> for ImportJobDetail {
+    fn from(j: &cairn_types::meta::ImportJob) -> Self {
+        Self {
+            entry: ImportJobEntry::from(j),
+            buckets: j
+                .buckets
+                .iter()
+                .map(|b| ImportBucketProgressWire {
+                    source_bucket: b.source_bucket.clone(),
+                    dest_bucket: b.dest_bucket.clone(),
+                    state: import_state_str(b.state).to_owned(),
+                    objects_done: b.objects_done,
+                    objects_total: b.objects_total,
+                    bytes_done: b.bytes_done,
+                    bytes_total: b.bytes_total,
+                    last_error: b.last_error.clone(),
+                })
+                .collect(),
+            last_error: j.last_error.clone(),
+        }
+    }
+}

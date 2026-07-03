@@ -640,6 +640,7 @@ dependencies = [
  "cairn-blob",
  "cairn-control",
  "cairn-crypto",
+ "cairn-import",
  "cairn-lifecycle",
  "cairn-meta",
  "cairn-meta-async",

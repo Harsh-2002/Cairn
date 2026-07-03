@@ -254,6 +254,23 @@ pub struct Config {
     /// private network (e.g. an on-prem MinIO on `10.x`); it emits a loud startup warning.
     pub allow_internal_endpoints: bool,
 
+    /// Default object-worker count for a new S3 import job when the request does not specify one
+    /// (`CAIRN_IMPORT_DEFAULT_WORKERS`, ARCH 27).
+    pub import_default_workers: usize,
+    /// Hard cap on an import job's object-worker count (`CAIRN_IMPORT_MAX_WORKERS`); a request asking
+    /// for more is clamped. Must be ≥ `import_default_workers`.
+    pub import_max_workers: usize,
+    /// The authoritative ceiling on total in-flight object copies across an import job
+    /// (`CAIRN_IMPORT_GLOBAL_MAX_INFLIGHT`). Held **below** the blob-I/O permit pool so a bulk import
+    /// cannot starve the node's live GET/PUT traffic. Validated `< 64`.
+    pub import_global_max_inflight: usize,
+    /// How often the import worker wakes to claim a pending/stale job, in seconds
+    /// (`CAIRN_IMPORT_POLL_INTERVAL_SECS`).
+    pub import_poll_interval_secs: u64,
+    /// Retention for finished (completed/failed/cancelled) import-job rows in seconds
+    /// (`CAIRN_IMPORT_RETENTION_SECS`); older rows are pruned so the table stays bounded.
+    pub import_retention_secs: u64,
+
     /// Whether the request-metrics usage-analytics subsystem is enabled
     /// (`CAIRN_REQUEST_METRICS_ENABLED`). When off, no per-request counters accumulate and the
     /// flush loop is not spawned; the `/api/v1/metrics/requests` endpoint then returns empty series
@@ -355,6 +372,11 @@ impl Default for Config {
             replication_retention_secs: 86_400,
             events_outbox_retention_secs: 86_400,
             allow_internal_endpoints: false,
+            import_default_workers: 8,
+            import_max_workers: 32,
+            import_global_max_inflight: 24,
+            import_poll_interval_secs: 30,
+            import_retention_secs: 604_800,
             request_metrics_enabled: true,
             request_metrics_flush_secs: 15,
             request_metrics_bucket_secs: 60,
@@ -725,6 +747,34 @@ impl Config {
         if self.events_outbox_retention_secs == 0 {
             return Err(ConfigError::Invalid(
                 "events_outbox_retention_secs must be positive".into(),
+            ));
+        }
+        // Import knobs: workers positive & default ≤ max, the global in-flight cap held below the
+        // blob-I/O permit pool (so an import can't starve live traffic), and cadences positive.
+        if self.import_default_workers == 0 || self.import_max_workers == 0 {
+            return Err(ConfigError::Invalid(
+                "import_default_workers and import_max_workers must be positive".into(),
+            ));
+        }
+        if self.import_default_workers > self.import_max_workers {
+            return Err(ConfigError::Invalid(
+                "import_default_workers must not exceed import_max_workers".into(),
+            ));
+        }
+        if !(1..64).contains(&self.import_global_max_inflight) {
+            return Err(ConfigError::Invalid(
+                "import_global_max_inflight must be between 1 and 63 (below the blob-I/O pool)"
+                    .into(),
+            ));
+        }
+        if self.import_poll_interval_secs == 0 {
+            return Err(ConfigError::Invalid(
+                "import_poll_interval_secs must be positive".into(),
+            ));
+        }
+        if self.import_retention_secs == 0 {
+            return Err(ConfigError::Invalid(
+                "import_retention_secs must be positive".into(),
             ));
         }
         // Request-metrics cadences must be positive when the subsystem is enabled, else the flush

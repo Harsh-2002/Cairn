@@ -30,11 +30,11 @@ use cairn_types::authz::PublicAccessBlock;
 use cairn_types::bucket::{Bucket, ConfigAspect, ConfigDoc};
 use cairn_types::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
 use cairn_types::meta::{
-    ActivityEntry, BucketCounts, ImportJob, ListPage, ListQuery, MetricsRange, MultipartSession,
-    Mutation, MutationOutcome, ObjectSummary, OutboxEntry, PartRecord, ReplicationCounts,
-    ReplicationStatus, ReplicationTargetCounts, RequestMetricsSeries, SessionCredentialSummary,
-    ShareRow, StoreCounts, TagSummary, TaggedObject, User, UserSessionCredentials,
-    UserSigV4Credentials, UserWithBearerHash, WebhookEntry,
+    ActivityEntry, BucketCounts, ImportJob, ImportJobRecord, ListPage, ListQuery, MetricsRange,
+    MultipartSession, Mutation, MutationOutcome, ObjectSummary, OutboxEntry, PartRecord,
+    ReplicationCounts, ReplicationStatus, ReplicationTargetCounts, RequestMetricsSeries,
+    SessionCredentialSummary, ShareRow, StoreCounts, TagSummary, TaggedObject, User,
+    UserSessionCredentials, UserSigV4Credentials, UserWithBearerHash, WebhookEntry,
 };
 use cairn_types::object::ObjectVersionRow;
 use cairn_types::time::Timestamp;
@@ -645,6 +645,10 @@ impl MetadataStore for ShardedMetadataStore {
 
     async fn get_import_job(&self, id: &str) -> Result<Option<ImportJob>, MetaError> {
         self.global().get_import_job(id).await
+    }
+
+    async fn get_import_job_record(&self, id: &str) -> Result<Option<ImportJobRecord>, MetaError> {
+        self.global().get_import_job_record(id).await
     }
 
     // --- object shares (global, shard 0) ---

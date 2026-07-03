@@ -11,9 +11,10 @@ use cairn_types::authz::{Acl, OwnershipMode};
 use cairn_types::bucket::{Bucket, CompressionPolicy, VersioningState};
 use cairn_types::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
 use cairn_types::meta::{
-    ActivityEntry, ImportJob, ImportState, MultipartSession, MultipartStatus, ObjectSummary,
-    OutboxEntry, PartRecord, ReplicationOp, ReplicationStatus, ShareDisposition, ShareRow, User,
-    UserRecord, UserSigV4Credentials, UserWithBearerHash, WebhookEntry, WebhookStatus,
+    ActivityEntry, ImportJob, ImportJobRecord, ImportState, MultipartSession, MultipartStatus,
+    ObjectSummary, OutboxEntry, PartRecord, ReplicationOp, ReplicationStatus, ShareDisposition,
+    ShareRow, User, UserRecord, UserSigV4Credentials, UserWithBearerHash, WebhookEntry,
+    WebhookStatus,
 };
 use cairn_types::notification::EventKind;
 use cairn_types::object::{
@@ -359,6 +360,38 @@ pub fn import_state_from(s: &str) -> ImportState {
         "cancelled" => ImportState::Cancelled,
         _ => ImportState::Pending,
     }
+}
+
+/// The FULL column list for an `import_jobs` record read (includes the sealed secret), positional.
+pub const IMPORT_JOB_RECORD_COLS: &str = "id, source_endpoint, source_region, access_key_id, \
+     secret_ciphertext, secret_nonce, ca_cert_pem, insecure_skip_verify, workers, state, \
+     buckets_json, objects_done, objects_total, bytes_done, bytes_total, last_error, lease_until, \
+     created_at, updated_at";
+
+/// Map a full `import_jobs` row (selected via [`IMPORT_JOB_RECORD_COLS`]) to the [`ImportJobRecord`],
+/// **including** the sealed secret. For the server-internal import worker only.
+pub fn import_job_record_from_row(row: &Row) -> Result<ImportJobRecord, MetaError> {
+    Ok(ImportJobRecord {
+        id: row.get_text(0),
+        source_endpoint: row.get_text(1),
+        source_region: row.get_text(2),
+        access_key_id: row.get_text(3),
+        secret_ciphertext: row.get_opt_blob(4).unwrap_or_default(),
+        secret_nonce: row.get_opt_blob(5),
+        ca_cert_pem: row.get_opt_text(6),
+        insecure_skip_verify: row.get_i64(7) != 0,
+        workers: row.get_i64(8) as u32,
+        state: import_state_from(&row.get_text(9)),
+        buckets: json_col(&row.get_text(10))?,
+        objects_done: row.get_i64(11) as u64,
+        objects_total: row.get_i64(12) as u64,
+        bytes_done: row.get_i64(13) as u64,
+        bytes_total: row.get_i64(14) as u64,
+        last_error: row.get_opt_text(15),
+        lease_until: row.get_opt_i64(16).map(Timestamp),
+        created_at: Timestamp(row.get_i64(17)),
+        updated_at: Timestamp(row.get_i64(18)),
+    })
 }
 
 /// Map an `import_jobs` row (selected via [`IMPORT_JOB_COLS`]) to the secret-free [`ImportJob`].

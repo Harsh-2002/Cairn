@@ -5,8 +5,8 @@
 
 use crate::driver::{AsyncSqlDriver, Row, Value, query_one};
 use crate::model::{
-    self, ACTIVITY_COLS, BUCKET_COLS, IMPORT_JOB_COLS, MULTIPART_COLS, OBJECT_VERSION_COLS,
-    OUTBOX_COLS, PART_COLS, SHARE_COLS, SUMMARY_COLS, USER_COLS, WEBHOOK_COLS,
+    self, ACTIVITY_COLS, BUCKET_COLS, IMPORT_JOB_COLS, IMPORT_JOB_RECORD_COLS, MULTIPART_COLS,
+    OBJECT_VERSION_COLS, OUTBOX_COLS, PART_COLS, SHARE_COLS, SUMMARY_COLS, USER_COLS, WEBHOOK_COLS,
 };
 use crate::range::{prefix_upper_bound, successor};
 use crate::writer::Writer;
@@ -15,12 +15,12 @@ use cairn_types::authz::PublicAccessBlock;
 use cairn_types::bucket::{Bucket, ConfigAspect, ConfigDoc};
 use cairn_types::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
 use cairn_types::meta::{
-    ActivityEntry, BucketCounts, BucketRequestCount, ImportJob, LATENCY_BUCKETS, ListPage,
-    ListQuery, MetricsRange, MultipartSession, Mutation, MutationOutcome, ObjectSummary, OpCount,
-    OutboxEntry, PartRecord, ReplicationCounts, ReplicationStatus, ReplicationTargetCounts,
-    RequestMetricsSeries, SessionCredentialSummary, ShareRow, StatusCount, StoreCounts, TagSummary,
-    TaggedObject, TimePoint, User, UserSessionCredentials, UserSigV4Credentials,
-    UserWithBearerHash, WebhookEntry, latency_quantile_ms,
+    ActivityEntry, BucketCounts, BucketRequestCount, ImportJob, ImportJobRecord, LATENCY_BUCKETS,
+    ListPage, ListQuery, MetricsRange, MultipartSession, Mutation, MutationOutcome, ObjectSummary,
+    OpCount, OutboxEntry, PartRecord, ReplicationCounts, ReplicationStatus,
+    ReplicationTargetCounts, RequestMetricsSeries, SessionCredentialSummary, ShareRow, StatusCount,
+    StoreCounts, TagSummary, TaggedObject, TimePoint, User, UserSessionCredentials,
+    UserSigV4Credentials, UserWithBearerHash, WebhookEntry, latency_quantile_ms,
 };
 use cairn_types::object::ObjectVersionRow;
 use cairn_types::time::Timestamp;
@@ -975,6 +975,17 @@ impl MetadataStore for AsyncMetadataStore {
         )
         .await?;
         row.map(|r| model::import_job_from_row(&r)).transpose()
+    }
+
+    async fn get_import_job_record(&self, id: &str) -> Result<Option<ImportJobRecord>, MetaError> {
+        let row = query_one(
+            &**self.reader().await,
+            &format!("SELECT {IMPORT_JOB_RECORD_COLS} FROM import_jobs WHERE id=?1"),
+            vec![Value::Text(id.to_owned())],
+        )
+        .await?;
+        row.map(|r| model::import_job_record_from_row(&r))
+            .transpose()
     }
 
     async fn list_activity(&self, limit: u32) -> Result<Vec<ActivityEntry>, MetaError> {

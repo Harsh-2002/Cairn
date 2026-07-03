@@ -169,6 +169,10 @@ pub struct ControlService {
     /// happens promptly rather than waiting out the heartbeat. `None` (e.g. headless) just falls
     /// back to the heartbeat. Kept as a plain `Fn` so this crate stays runtime-agnostic.
     replication_wake: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Wakes the background import worker after a job is created/resumed so it drains promptly
+    /// instead of waiting its poll heartbeat (mirrors `replication_wake`). `None` falls back to the
+    /// heartbeat.
+    import_wake: Option<Arc<dyn Fn() + Send + Sync>>,
     /// The configured root administrator's access key (`CAIRN_ROOT_ACCESS_KEY`), if known. The root
     /// admin is re-seeded on every startup and is the deployment's break-glass identity, so it is
     /// protected from deletion. `None` (e.g. in tests) disables only that one guard.
@@ -203,8 +207,23 @@ impl ControlService {
             clock,
             system: Arc::new(system),
             replication_wake: None,
+            import_wake: None,
             root_access_key: None,
             ssrf_guard: cairn_net::GuardConfig::default(),
+        }
+    }
+
+    /// Attach a callback that wakes the background import worker (mirrors `with_replication_wake`).
+    #[must_use]
+    pub fn with_import_wake(mut self, wake: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.import_wake = Some(wake);
+        self
+    }
+
+    /// Pulse the import worker if a wake callback is wired; a no-op otherwise.
+    fn pulse_import(&self) {
+        if let Some(w) = &self.import_wake {
+            w();
         }
     }
 
@@ -371,6 +390,13 @@ impl ControlService {
             (&Method::DELETE, ["credentials", "temporary", id]) => {
                 self.revoke_session_credential(id, principal).await
             }
+            // --- S3 import jobs (ARCH 27) ---
+            (&Method::POST, ["imports"]) => self.create_import(&body, principal).await,
+            (&Method::GET, ["imports"]) => self.list_imports().await,
+            (&Method::GET, ["imports", id]) => self.import_detail(id).await,
+            (&Method::POST, ["imports", id, "resume"]) => self.resume_import(id, principal).await,
+            (&Method::DELETE, ["imports", id]) => self.cancel_import(id, principal).await,
+
             (&Method::GET, ["users"]) => self.list_users().await,
             (&Method::POST, ["users"]) => self.create_user(&body, principal).await,
             (&Method::GET, ["users", id]) => self.user_detail(id).await,
@@ -2304,6 +2330,173 @@ impl ControlService {
             .await
             .map_err(|e| ControlResponse::error_internal(&e.to_string()))?;
         Ok(())
+    }
+
+    /// `POST /imports`: create an S3 import job. The source secret is sealed under the master key and
+    /// never echoed; the response returns only the job id. Rejects an internal source endpoint (SSRF
+    /// guard) and the CA ⊕ skip-verify conflict. The background worker claims and runs it.
+    async fn create_import(&self, body: &Bytes, principal: Option<&Principal>) -> ControlResponse {
+        let req: wire::CreateImportReq = match serde_json::from_slice(body) {
+            Ok(r) => r,
+            Err(e) => return ControlResponse::bad_request(&e.to_string()),
+        };
+        if req.source_endpoint.trim().is_empty()
+            || req.source_region.trim().is_empty()
+            || req.access_key.trim().is_empty()
+            || req.secret.is_empty()
+        {
+            return ControlResponse::bad_request(
+                "source_endpoint, source_region, access_key, and secret are all required",
+            );
+        }
+        let ca_cert_pem = req.ca_cert.filter(|s| !s.trim().is_empty());
+        if ca_cert_pem.is_some() && req.insecure_skip_verify {
+            return ControlResponse::bad_request(
+                "Trust a CA certificate or skip TLS verification — not both.",
+            );
+        }
+        if let Err(e) = cairn_net::validate_endpoint(&req.source_endpoint, &self.ssrf_guard) {
+            return ControlResponse::bad_request(&e.to_string());
+        }
+        // Seal the source secret under the master key (CRK1 envelope, NULL nonce); never persisted
+        // or returned in plaintext.
+        let sealed = match self.crypto.seal(req.secret.as_bytes()) {
+            Ok(s) => s,
+            Err(e) => return ControlResponse::error_internal(&e.to_string()),
+        };
+
+        let now = self.clock.now();
+        let buckets: Vec<cairn_types::meta::ImportBucketProgress> = req
+            .buckets
+            .iter()
+            .map(|m| cairn_types::meta::ImportBucketProgress {
+                source_bucket: m.source.clone(),
+                dest_bucket: if m.dest.trim().is_empty() {
+                    m.source.clone()
+                } else {
+                    m.dest.clone()
+                },
+                objects_done: 0,
+                objects_total: 0,
+                bytes_done: 0,
+                bytes_total: 0,
+                cursor: None,
+                state: cairn_types::meta::ImportState::Pending,
+                last_error: None,
+            })
+            .collect();
+        let id = Uuid::new_v4().simple().to_string();
+        let record = cairn_types::meta::ImportJobRecord {
+            id: id.clone(),
+            source_endpoint: req.source_endpoint,
+            source_region: req.source_region,
+            access_key_id: req.access_key,
+            secret_ciphertext: sealed.ciphertext,
+            secret_nonce: None,
+            ca_cert_pem,
+            insecure_skip_verify: req.insecure_skip_verify,
+            // 0 means "use the server default"; the worker clamps to the configured max.
+            workers: req.workers.unwrap_or(0),
+            state: cairn_types::meta::ImportState::Pending,
+            buckets,
+            objects_done: 0,
+            objects_total: 0,
+            bytes_done: 0,
+            bytes_total: 0,
+            last_error: None,
+            lease_until: None,
+            created_at: now,
+            updated_at: now,
+        };
+        if let Err(e) = self
+            .meta
+            .submit(Mutation::CreateImportJob(Box::new(record)))
+            .await
+        {
+            return ControlResponse::error_internal(&e.to_string());
+        }
+        self.record_activity("CreateImportJob", None, None, principal)
+            .await;
+        self.pulse_import();
+        ControlResponse::json(StatusCode::CREATED, &wire::CreateImportResp { id })
+    }
+
+    /// `GET /imports`: list all import jobs (secret-free), newest first.
+    async fn list_imports(&self) -> ControlResponse {
+        match self.meta.list_import_jobs().await {
+            Ok(jobs) => ControlResponse::json(
+                StatusCode::OK,
+                &wire::ImportListResp {
+                    jobs: jobs.iter().map(wire::ImportJobEntry::from).collect(),
+                },
+            ),
+            Err(e) => ControlResponse::error_internal(&e.to_string()),
+        }
+    }
+
+    /// `GET /imports/{id}`: one import job with per-bucket progress (secret-free).
+    async fn import_detail(&self, id: &str) -> ControlResponse {
+        match self.meta.get_import_job(id).await {
+            Ok(Some(job)) => {
+                ControlResponse::json(StatusCode::OK, &wire::ImportJobDetail::from(&job))
+            }
+            Ok(None) => ControlResponse::not_found(),
+            Err(e) => ControlResponse::error_internal(&e.to_string()),
+        }
+    }
+
+    /// `DELETE /imports/{id}`: request cancellation. The worker observes it at the next page boundary.
+    async fn cancel_import(&self, id: &str, principal: Option<&Principal>) -> ControlResponse {
+        match self.meta.get_import_job(id).await {
+            Ok(Some(_)) => {}
+            Ok(None) => return ControlResponse::not_found(),
+            Err(e) => return ControlResponse::error_internal(&e.to_string()),
+        }
+        if let Err(e) = self
+            .meta
+            .submit(Mutation::SetImportJobState {
+                id: id.to_owned(),
+                state: cairn_types::meta::ImportState::Cancelled,
+                last_error: None,
+                lease_until: None,
+                updated_at: self.clock.now(),
+            })
+            .await
+        {
+            return ControlResponse::error_internal(&e.to_string());
+        }
+        self.record_activity("CancelImportJob", None, None, principal)
+            .await;
+        ControlResponse::no_content()
+    }
+
+    /// `POST /imports/{id}/resume`: move a failed/cancelled job back to pending and wake the worker.
+    async fn resume_import(&self, id: &str, principal: Option<&Principal>) -> ControlResponse {
+        match self.meta.get_import_job(id).await {
+            Ok(Some(_)) => {}
+            Ok(None) => return ControlResponse::not_found(),
+            Err(e) => return ControlResponse::error_internal(&e.to_string()),
+        }
+        if let Err(e) = self
+            .meta
+            .submit(Mutation::SetImportJobState {
+                id: id.to_owned(),
+                state: cairn_types::meta::ImportState::Pending,
+                last_error: None,
+                lease_until: None,
+                updated_at: self.clock.now(),
+            })
+            .await
+        {
+            return ControlResponse::error_internal(&e.to_string());
+        }
+        self.record_activity("ResumeImportJob", None, None, principal)
+            .await;
+        self.pulse_import();
+        ControlResponse::json(
+            StatusCode::ACCEPTED,
+            &wire::CreateImportResp { id: id.to_owned() },
+        )
     }
 
     /// `POST /buckets/{name}/replication/targets`: seal the destination secret under the master

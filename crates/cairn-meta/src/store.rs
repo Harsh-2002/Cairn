@@ -10,12 +10,12 @@ use cairn_types::authz::PublicAccessBlock;
 use cairn_types::bucket::{Bucket, ConfigAspect, ConfigDoc};
 use cairn_types::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
 use cairn_types::meta::{
-    ActivityEntry, BucketCounts, BucketRequestCount, ImportJob, LATENCY_BUCKETS, ListPage,
-    ListQuery, MetricsRange, MultipartSession, Mutation, MutationOutcome, ObjectSummary, OpCount,
-    OutboxEntry, PartRecord, ReplicationCounts, ReplicationStatus, ReplicationTargetCounts,
-    RequestMetricsSeries, SessionCredentialSummary, ShareRow, StatusCount, StoreCounts, TagSummary,
-    TaggedObject, TimePoint, User, UserSessionCredentials, UserSigV4Credentials,
-    UserWithBearerHash, WebhookEntry, latency_quantile_ms,
+    ActivityEntry, BucketCounts, BucketRequestCount, ImportJob, ImportJobRecord, LATENCY_BUCKETS,
+    ListPage, ListQuery, MetricsRange, MultipartSession, Mutation, MutationOutcome, ObjectSummary,
+    OpCount, OutboxEntry, PartRecord, ReplicationCounts, ReplicationStatus,
+    ReplicationTargetCounts, RequestMetricsSeries, SessionCredentialSummary, ShareRow, StatusCount,
+    StoreCounts, TagSummary, TaggedObject, TimePoint, User, UserSessionCredentials,
+    UserSigV4Credentials, UserWithBearerHash, WebhookEntry, latency_quantile_ms,
 };
 use cairn_types::object::ObjectVersionRow;
 use cairn_types::time::Timestamp;
@@ -1389,6 +1389,20 @@ impl MetadataStore for SqliteMetadataStore {
                  FROM import_jobs WHERE id=?1",
                 params![id],
                 model::import_job_from_row,
+            )
+            .optional()
+            .map_err(engine_err)
+        })
+        .await
+    }
+
+    async fn get_import_job_record(&self, id: &str) -> Result<Option<ImportJobRecord>, MetaError> {
+        let id = id.to_owned();
+        self.with_read(move |conn| {
+            conn.query_row(
+                "SELECT * FROM import_jobs WHERE id=?1",
+                params![id],
+                model::import_job_record_from_row,
             )
             .optional()
             .map_err(engine_err)

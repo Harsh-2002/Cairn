@@ -35,10 +35,10 @@ use cairn_types::bucket::{Bucket, ConfigAspect, ConfigDoc};
 use cairn_types::error::MetaError;
 use cairn_types::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
 use cairn_types::meta::{
-    ActivityEntry, BucketCounts, ImportJob, ListPage, ListQuery, MetricsRange, MultipartSession,
-    Mutation, MutationOutcome, ObjectSummary, OutboxEntry, PartRecord, ReplicationCounts,
-    ReplicationStatus, RequestMetricsSeries, SessionCredentialSummary, ShareRow, StoreCounts,
-    TagSummary, TaggedObject, User, UserSessionCredentials, UserSigV4Credentials,
+    ActivityEntry, BucketCounts, ImportJob, ImportJobRecord, ListPage, ListQuery, MetricsRange,
+    MultipartSession, Mutation, MutationOutcome, ObjectSummary, OutboxEntry, PartRecord,
+    ReplicationCounts, ReplicationStatus, RequestMetricsSeries, SessionCredentialSummary, ShareRow,
+    StoreCounts, TagSummary, TaggedObject, User, UserSessionCredentials, UserSigV4Credentials,
     UserWithBearerHash, WebhookEntry,
 };
 use cairn_types::object::ObjectVersionRow;
@@ -796,6 +796,10 @@ impl MetadataStore for CachedMetadataStore {
         self.inner.get_import_job(id).await
     }
 
+    async fn get_import_job_record(&self, id: &str) -> Result<Option<ImportJobRecord>, MetaError> {
+        self.inner.get_import_job_record(id).await
+    }
+
     async fn list_activity(&self, limit: u32) -> Result<Vec<ActivityEntry>, MetaError> {
         self.inner.list_activity(limit).await
     }
@@ -1179,6 +1183,12 @@ mod tests {
         }
         async fn get_import_job(&self, id: &str) -> Result<Option<ImportJob>, MetaError> {
             self.inner.get_import_job(id).await
+        }
+        async fn get_import_job_record(
+            &self,
+            id: &str,
+        ) -> Result<Option<ImportJobRecord>, MetaError> {
+            self.inner.get_import_job_record(id).await
         }
         async fn list_activity(&self, limit: u32) -> Result<Vec<ActivityEntry>, MetaError> {
             self.inner.list_activity(limit).await

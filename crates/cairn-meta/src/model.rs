@@ -6,9 +6,10 @@ use cairn_types::authz::{Acl, OwnershipMode};
 use cairn_types::bucket::{Bucket, CompressionPolicy, VersioningState};
 use cairn_types::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
 use cairn_types::meta::{
-    ActivityEntry, ImportJob, ImportState, MultipartSession, MultipartStatus, ObjectSummary,
-    OutboxEntry, PartRecord, ReplicationOp, ReplicationStatus, ShareDisposition, ShareRow, User,
-    UserRecord, UserSigV4Credentials, UserWithBearerHash, WebhookEntry, WebhookStatus,
+    ActivityEntry, ImportJob, ImportJobRecord, ImportState, MultipartSession, MultipartStatus,
+    ObjectSummary, OutboxEntry, PartRecord, ReplicationOp, ReplicationStatus, ShareDisposition,
+    ShareRow, User, UserRecord, UserSigV4Credentials, UserWithBearerHash, WebhookEntry,
+    WebhookStatus,
 };
 use cairn_types::notification::EventKind;
 use cairn_types::object::{
@@ -362,6 +363,32 @@ pub fn import_state_from(s: &str) -> ImportState {
         "cancelled" => ImportState::Cancelled,
         _ => ImportState::Pending,
     }
+}
+
+/// Map a full `import_jobs` row (`SELECT *`) to the [`ImportJobRecord`], **including** the sealed
+/// secret and per-bucket cursors. For the server-internal import worker only.
+pub fn import_job_record_from_row(row: &Row) -> rusqlite::Result<ImportJobRecord> {
+    Ok(ImportJobRecord {
+        id: row.get("id")?,
+        source_endpoint: row.get("source_endpoint")?,
+        source_region: row.get("source_region")?,
+        access_key_id: row.get("access_key_id")?,
+        secret_ciphertext: row.get("secret_ciphertext")?,
+        secret_nonce: row.get("secret_nonce")?,
+        ca_cert_pem: row.get("ca_cert_pem")?,
+        insecure_skip_verify: row.get::<_, i64>("insecure_skip_verify")? != 0,
+        workers: row.get::<_, i64>("workers")? as u32,
+        state: import_state_from(&row.get::<_, String>("state")?),
+        buckets: json_col(&row.get::<_, String>("buckets_json")?)?,
+        objects_done: row.get::<_, i64>("objects_done")? as u64,
+        objects_total: row.get::<_, i64>("objects_total")? as u64,
+        bytes_done: row.get::<_, i64>("bytes_done")? as u64,
+        bytes_total: row.get::<_, i64>("bytes_total")? as u64,
+        last_error: row.get("last_error")?,
+        lease_until: row.get::<_, Option<i64>>("lease_until")?.map(Timestamp),
+        created_at: Timestamp(row.get("created_at")?),
+        updated_at: Timestamp(row.get("updated_at")?),
+    })
 }
 
 /// Map an `import_jobs` row to the secret-free [`ImportJob`]. The read path selects every column

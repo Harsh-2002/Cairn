@@ -96,7 +96,14 @@ pub fn mint_ticket(stack: &AppStack, principal: Option<&Principal>) -> Response<
 fn is_known_topic(topic: &str) -> bool {
     matches!(
         topic,
-        "overview" | "buckets" | "replication" | "activity" | "metrics" | "credentials" | "tags"
+        "overview"
+            | "buckets"
+            | "replication"
+            | "activity"
+            | "metrics"
+            | "credentials"
+            | "tags"
+            | "imports"
     )
 }
 

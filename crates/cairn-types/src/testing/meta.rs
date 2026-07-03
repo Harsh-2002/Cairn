@@ -1612,6 +1612,10 @@ impl MetadataStore for InMemoryMetadataStore {
             .map(ImportJobRecord::to_view))
     }
 
+    async fn get_import_job_record(&self, id: &str) -> Result<Option<ImportJobRecord>, MetaError> {
+        Ok(self.state.lock().unwrap().import_jobs.get(id).cloned())
+    }
+
     async fn list_activity(&self, limit: u32) -> Result<Vec<ActivityEntry>, MetaError> {
         let st = self.state.lock().unwrap();
         Ok(st

@@ -18,6 +18,8 @@ mod adapter;
 mod background;
 mod cli_remote;
 mod config;
+mod import_dest;
+mod import_run;
 mod key_rewrap;
 mod metrics_agg;
 mod observability;

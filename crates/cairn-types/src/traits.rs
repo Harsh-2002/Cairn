@@ -19,10 +19,10 @@ use crate::crypto::{Nonce, Sealed, Signature};
 use crate::error::{BlobError, CryptoError, MetaError, ReplicationError};
 use crate::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
 use crate::meta::{
-    ActivityEntry, BucketCounts, ImportJob, ListPage, ListQuery, MetricsRange, MultipartSession,
-    Mutation, MutationOutcome, ObjectSummary, OutboxEntry, PartRecord, ReplicationCounts,
-    ReplicationStatus, RequestMetricsSeries, SessionCredentialSummary, ShareRow, StoreCounts,
-    TagSummary, TaggedObject, User, UserSessionCredentials, UserSigV4Credentials,
+    ActivityEntry, BucketCounts, ImportJob, ImportJobRecord, ListPage, ListQuery, MetricsRange,
+    MultipartSession, Mutation, MutationOutcome, ObjectSummary, OutboxEntry, PartRecord,
+    ReplicationCounts, ReplicationStatus, RequestMetricsSeries, SessionCredentialSummary, ShareRow,
+    StoreCounts, TagSummary, TaggedObject, User, UserSessionCredentials, UserSigV4Credentials,
     UserWithBearerHash, WebhookEntry,
 };
 use crate::object::{CompressionDescriptor, ObjectVersionRow};
@@ -338,6 +338,11 @@ pub trait MetadataStore: Send + Sync {
     async fn list_import_jobs(&self) -> Result<Vec<ImportJob>, MetaError>;
     /// Fetch a single import job by id (secret-free), or `None` if no such job exists.
     async fn get_import_job(&self, id: &str) -> Result<Option<ImportJob>, MetaError>;
+    /// Fetch a single import job's **full record**, including the sealed source secret and per-bucket
+    /// resume cursors. For the trusted, server-internal import worker ONLY (it opens the secret to
+    /// dial the source and resumes from the cursors) — never reachable through the management API,
+    /// which uses the secret-free [`get_import_job`](Self::get_import_job).
+    async fn get_import_job_record(&self, id: &str) -> Result<Option<ImportJobRecord>, MetaError>;
 
     // --- object shares (ARCH 15.8) ---
     /// Fetch a share by its token, or `None` if no such token exists. The caller checks
