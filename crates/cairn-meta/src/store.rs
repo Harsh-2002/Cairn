@@ -634,8 +634,17 @@ impl MetadataStore for SqliteMetadataStore {
                 )
                 .optional()
                 .map_err(engine_err)?;
-            Ok(v.and_then(|s| serde_json::from_str(&s).ok())
-                .unwrap_or_default())
+            // Fail CLOSED on a present-but-unparseable value: the all-false default disables every
+            // account-wide public-access restriction, so silently returning it on a corrupt row would
+            // quietly turn the guardrail OFF (audit 2026-07). A row that is absent (no BPA configured)
+            // still returns the default; only a corrupt stored value errors, so authorization denies
+            // rather than opens.
+            match v {
+                None => Ok(PublicAccessBlock::default()),
+                Some(s) => serde_json::from_str(&s).map_err(|e| {
+                    MetaError::Engine(format!("corrupt account public_access_block: {e}"))
+                }),
+            }
         })
         .await
     }

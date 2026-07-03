@@ -316,9 +316,14 @@ impl MetadataStore for AsyncMetadataStore {
             vec![],
         )
         .await?;
-        let v = row.and_then(|r| r.get_opt_text(0));
-        Ok(v.and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default())
+        // Fail closed on a corrupt value (mirrors cairn-meta): the all-false default disables the
+        // account-wide public-access guardrail, so only an absent row returns it (audit 2026-07).
+        match row.and_then(|r| r.get_opt_text(0)) {
+            None => Ok(PublicAccessBlock::default()),
+            Some(s) => serde_json::from_str(&s).map_err(|e| {
+                MetaError::Engine(format!("corrupt account public_access_block: {e}"))
+            }),
+        }
     }
 
     async fn get_bucket_quota(&self, bucket: &BucketName) -> Result<Option<u64>, MetaError> {
