@@ -292,7 +292,21 @@ pub fn verify_presigned(
     if parsed.service != "s3" {
         return Err(AuthError::Malformed);
     }
+    // `host` MUST be among the signed headers, so the URL is bound to the authority it was minted
+    // for and can't be redeemed against any other front-end reaching the same backend (spec 14.1/14.2;
+    // audit 2026-07 — the header form already enforces this, the presigned path did not).
+    if !parsed
+        .signed_headers
+        .iter()
+        .any(|h| h.eq_ignore_ascii_case("host"))
+    {
+        return Err(AuthError::Malformed);
+    }
     let amzdate = find_query(view.query, "X-Amz-Date").ok_or(AuthError::Malformed)?;
+    // The signing date must match the credential-scope date (mirrors the header form).
+    if !amzdate.starts_with(&parsed.scope_date) {
+        return Err(AuthError::Malformed);
+    }
     let start = parse_amz_date(&amzdate).ok_or(AuthError::Malformed)?;
     let expiry = start + expires.clamp(1, 604_800) * 1000;
     if now.as_millis() > expiry {
@@ -546,6 +560,47 @@ mod tests {
             secure_transport: true,
         };
         assert!(verify_presigned(&tampered, &parsed, expires, secret, now).is_err());
+    }
+
+    #[test]
+    fn presigned_without_signed_host_is_malformed() {
+        // Audit 2026-07: a presigned URL MUST sign `host`, binding it to the authority it was minted
+        // for. A ParsedSig whose SignedHeaders omits host is rejected as Malformed (before the
+        // signature math), matching the header form.
+        use std::net::{IpAddr, Ipv4Addr};
+        let amz = "20250101T000000Z";
+        let secret = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
+        let req = PresignRequest {
+            method: "GET",
+            host: "cairn.example.com",
+            bucket: "my-bucket",
+            key: "k",
+            access_key_id: "AKIDEXAMPLE",
+            secret,
+            region: "us-east-1",
+            expires_secs: 3600,
+            amz_date: amz,
+            extra_query: vec![],
+            extra_signed_headers: vec![],
+        };
+        let url = mint_presigned(&req);
+        let (path, query) = url.split_once('?').unwrap();
+        let view = RequestView {
+            method: "GET",
+            path,
+            query,
+            headers: &[],
+            host: "cairn.example.com",
+            source: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            secure_transport: true,
+        };
+        let (mut parsed, expires) = parse_presigned(view.query).expect("parses");
+        let now = Timestamp(parse_amz_date(amz).unwrap() + 1000);
+        parsed.signed_headers.retain(|h| !h.eq_ignore_ascii_case("host"));
+        assert!(matches!(
+            verify_presigned(&view, &parsed, expires, secret, now),
+            Err(AuthError::Malformed)
+        ));
     }
 
     #[test]
