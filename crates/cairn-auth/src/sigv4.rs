@@ -596,7 +596,9 @@ mod tests {
         };
         let (mut parsed, expires) = parse_presigned(view.query).expect("parses");
         let now = Timestamp(parse_amz_date(amz).unwrap() + 1000);
-        parsed.signed_headers.retain(|h| !h.eq_ignore_ascii_case("host"));
+        parsed
+            .signed_headers
+            .retain(|h| !h.eq_ignore_ascii_case("host"));
         assert!(matches!(
             verify_presigned(&view, &parsed, expires, secret, now),
             Err(AuthError::Malformed)
