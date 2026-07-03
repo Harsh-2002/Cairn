@@ -79,6 +79,10 @@ pub struct AppStack {
     /// The SigV4 signing region (`CAIRN_REGION`), used when minting presigned URLs so the
     /// credential scope matches what the verifier derives.
     pub region: String,
+    /// Whether operator-configured outbound dialers may reach internal addresses
+    /// (`CAIRN_ALLOW_INTERNAL_ENDPOINTS`). Threaded into every replication/webhook/import sink so the
+    /// SSRF guard's connect-time policy is server-global and consistent. Default `false` (enforcing).
+    pub allow_internal_endpoints: bool,
     /// The public base URL (`CAIRN_PUBLIC_BASE_URL`) shares/presigned links are built against; when
     /// `None`, the minting request's own scheme + Host is used.
     pub public_base_url: Option<String>,
@@ -422,6 +426,14 @@ pub(crate) async fn open_meta_store(
 /// # Errors
 /// Returns a message if any store cannot be opened or the master key is invalid.
 pub async fn build(cfg: &Config) -> Result<AppStack, String> {
+    if cfg.allow_internal_endpoints {
+        // Loud, operator-visible warning: the SSRF guard is off, so a replication target / webhook /
+        // import source may be pointed at loopback, a private network, or the cloud-metadata service.
+        tracing::warn!(
+            "CAIRN_ALLOW_INTERNAL_ENDPOINTS is set: outbound dialers (replication, webhook, import) \
+             may connect to internal/loopback/link-local addresses — the SSRF guard is DISABLED"
+        );
+    }
     tokio::fs::create_dir_all(&cfg.data_dir)
         .await
         .map_err(|e| format!("create data_dir: {e}"))?;
@@ -508,7 +520,8 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
         let n = replication_notify.clone();
         Arc::new(move || n.notify_one())
     })
-    .with_root_access_key(cfg.root_access_key.clone());
+    .with_root_access_key(cfg.root_access_key.clone())
+    .with_allow_internal_endpoints(cfg.allow_internal_endpoints);
 
     // Ensure the root administrator exists so the deployment is usable immediately: the same access
     // key + secret log into the web UI, authenticate the management API, and sign S3 requests.
@@ -574,6 +587,7 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
         store,
         s3_domain: cfg.s3_domain.clone(),
         region: cfg.region.clone(),
+        allow_internal_endpoints: cfg.allow_internal_endpoints,
         public_base_url: cfg.public_base_url.clone(),
         request_metrics: Arc::new(crate::metrics_agg::RequestMetricsAgg::new(
             cfg.request_metrics_bucket_secs,

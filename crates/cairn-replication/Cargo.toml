@@ -13,6 +13,7 @@ workspace = true
 cairn-types.workspace = true
 cairn-auth.workspace = true
 cairn-crypto.workspace = true
+cairn-net.workspace = true
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true

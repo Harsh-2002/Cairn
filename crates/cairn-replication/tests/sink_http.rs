@@ -126,6 +126,8 @@ fn sink_for(authority: &str, clock_secs: i64) -> HttpS3Sink {
             ca_cert_path: None,
             ca_cert_pem: None,
             insecure_skip_verify: false,
+            // The mock S3 server runs on loopback, so opt out of the SSRF guard for these tests.
+            allow_internal_endpoints: true,
         },
         Arc::new(FixedClock(clock_secs)),
     )
@@ -459,6 +461,8 @@ async fn put_object_routes_to_per_source_destination_bucket() {
             ca_cert_path: None,
             ca_cert_pem: None,
             insecure_skip_verify: false,
+            // The mock S3 server runs on loopback, so opt out of the SSRF guard for these tests.
+            allow_internal_endpoints: true,
         },
         Arc::new(FixedClock(1_440_938_160)),
     )
@@ -544,6 +548,8 @@ async fn https_endpoint_negotiates_tls_not_plaintext() {
             ca_cert_path: None,
             ca_cert_pem: None,
             insecure_skip_verify: false,
+            // The mock S3 server runs on loopback, so opt out of the SSRF guard for these tests.
+            allow_internal_endpoints: true,
         },
         Arc::new(FixedClock(1_440_938_160)),
     )

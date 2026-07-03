@@ -1649,6 +1649,35 @@ async fn create_user_with_replication_policy_attaches_it() {
 }
 
 #[tokio::test]
+async fn replication_target_rejects_internal_endpoint() {
+    // The SSRF guard (enforcing by default) must refuse a target whose endpoint is an internal IP
+    // literal — otherwise it could be pointed at the node's own loopback or the cloud-metadata
+    // service (ARCH 27). The secret must not leak in the rejection.
+    let h = harness();
+    let a = admin();
+    make_bucket(&h, &a, "src").await;
+    let resp = h
+        .svc
+        .handle(
+            &Method::POST,
+            "/buckets/src/replication/targets",
+            &[],
+            Some(&a),
+            Bytes::from_static(
+                br#"{"endpoint":"http://169.254.169.254","region":"us-east-1","dest_bucket":"mirror","access_key":"AK","secret":"sekret-cred"}"#,
+            ),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::BAD_REQUEST);
+    assert!(
+        !resp
+            .body
+            .windows(b"sekret-cred".len())
+            .any(|w| w == b"sekret-cred")
+    );
+}
+
+#[tokio::test]
 async fn replication_target_add_list_hides_secret_and_delete_round_trip() {
     let h = harness();
     let a = admin();

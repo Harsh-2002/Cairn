@@ -173,6 +173,11 @@ pub struct ControlService {
     /// admin is re-seeded on every startup and is the deployment's break-glass identity, so it is
     /// protected from deletion. `None` (e.g. in tests) disables only that one guard.
     root_access_key: Option<String>,
+    /// The SSRF guard policy (`CAIRN_ALLOW_INTERNAL_ENDPOINTS`), used to reject an operator-supplied
+    /// outbound endpoint (replication target, webhook, import source) that resolves to an internal
+    /// address at *configuration* time — clear, immediate feedback on top of the connect-time
+    /// guarantee in the sinks. Default is enforcing.
+    ssrf_guard: cairn_net::GuardConfig,
 }
 
 impl std::fmt::Debug for ControlService {
@@ -199,7 +204,15 @@ impl ControlService {
             system: Arc::new(system),
             replication_wake: None,
             root_access_key: None,
+            ssrf_guard: cairn_net::GuardConfig::default(),
         }
+    }
+
+    /// Set the SSRF guard policy from `CAIRN_ALLOW_INTERNAL_ENDPOINTS`. Unset deployments enforce.
+    #[must_use]
+    pub fn with_allow_internal_endpoints(mut self, allow_internal: bool) -> Self {
+        self.ssrf_guard = cairn_net::GuardConfig::new(allow_internal);
+        self
     }
 
     /// Record the configured root administrator's access key so it is protected from deletion. Set by
@@ -1390,6 +1403,11 @@ impl ControlService {
                     ep.id
                 ));
             }
+            // SSRF guard (ARCH 27): reject a webhook URL that is an internal IP literal; the webhook
+            // sink's resolver enforces this again at delivery time, including for hostnames.
+            if let Err(e) = cairn_net::validate_endpoint(&ep.url, &self.ssrf_guard) {
+                return ControlResponse::bad_request(&format!("endpoint {:?}: {e}", ep.id));
+            }
         }
         let doc = match serde_json::to_string(&config) {
             Ok(s) => ConfigDoc(s),
@@ -2320,6 +2338,11 @@ impl ControlService {
             return ControlResponse::bad_request(
                 "Trust a CA certificate or skip TLS verification — not both.",
             );
+        }
+        // Reject an internal IP-literal endpoint up front (SSRF guard, ARCH 27); the replication
+        // sink's resolver enforces this again at connect time, including for hostnames.
+        if let Err(e) = cairn_net::validate_endpoint(&req.endpoint, &self.ssrf_guard) {
+            return ControlResponse::bad_request(&e.to_string());
         }
 
         let input = RemoteTargetInput {

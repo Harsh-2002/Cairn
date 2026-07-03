@@ -251,7 +251,11 @@ async fn delivery_times_out_against_a_hung_endpoint() {
         }
     });
 
-    let sink = HttpWebhookSink::with_timeout(Duration::from_millis(300));
+    // Loopback test server — opt out of the SSRF guard.
+    let sink = HttpWebhookSink::with_timeout(
+        Duration::from_millis(300),
+        cairn_net::GuardConfig::new(true),
+    );
     let start = Instant::now();
     let res = sink
         .deliver(&format!("http://{addr}/hook"), b"{}", None)

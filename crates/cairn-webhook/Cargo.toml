@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 cairn-types.workspace = true
+cairn-net.workspace = true
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true

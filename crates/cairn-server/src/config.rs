@@ -246,6 +246,14 @@ pub struct Config {
     /// pruned; delivered entries are removed on delivery.
     pub events_outbox_retention_secs: u64,
 
+    /// Whether operator-configured outbound dialers (replication targets, webhook endpoints, S3
+    /// import sources) may connect to an internal address (`CAIRN_ALLOW_INTERNAL_ENDPOINTS`).
+    /// Default `false`: the SSRF guard refuses a destination that resolves to a loopback, private
+    /// (RFC1918), link-local (incl. the cloud-metadata `169.254.169.254`), ULA, or unspecified
+    /// address, at connect time (ARCH 27). Set `true` only when Cairn must reach storage on a
+    /// private network (e.g. an on-prem MinIO on `10.x`); it emits a loud startup warning.
+    pub allow_internal_endpoints: bool,
+
     /// Whether the request-metrics usage-analytics subsystem is enabled
     /// (`CAIRN_REQUEST_METRICS_ENABLED`). When off, no per-request counters accumulate and the
     /// flush loop is not spawned; the `/api/v1/metrics/requests` endpoint then returns empty series
@@ -346,6 +354,7 @@ impl Default for Config {
             replication_max_backoff_secs: 900,
             replication_retention_secs: 86_400,
             events_outbox_retention_secs: 86_400,
+            allow_internal_endpoints: false,
             request_metrics_enabled: true,
             request_metrics_flush_secs: 15,
             request_metrics_bucket_secs: 60,

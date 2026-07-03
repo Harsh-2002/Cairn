@@ -52,35 +52,40 @@ pub trait WebhookSink: Send + Sync {
     ) -> Result<(), WebhookError>;
 }
 
-/// An HTTP(S) webhook sink built on the same hyper/rustls client stack as the replication sink.
+/// An HTTP(S) webhook sink built on the same hyper/rustls client stack as the replication sink,
+/// dialing through the SSRF-guarded resolver.
 #[derive(Debug)]
 pub struct HttpWebhookSink {
-    client: Client<hyper_rustls::HttpsConnector<HttpConnector>, Full<Bytes>>,
+    client: Client<
+        hyper_rustls::HttpsConnector<HttpConnector<cairn_net::GuardedResolver>>,
+        Full<Bytes>,
+    >,
     timeout: Duration,
 }
 
 impl Default for HttpWebhookSink {
     fn default() -> Self {
-        Self::new()
+        Self::new(cairn_net::GuardConfig::default())
     }
 }
 
 impl HttpWebhookSink {
     /// Construct a sink with a connector that dials plaintext for `http://` and negotiates rustls
     /// (webpki roots) for `https://`, speaking HTTP/1.1, with the default per-request timeout.
+    /// `guard` refuses a webhook endpoint that resolves to an internal address (ARCH 27).
     #[must_use]
-    pub fn new() -> Self {
-        Self::with_timeout(DEFAULT_TIMEOUT)
+    pub fn new(guard: cairn_net::GuardConfig) -> Self {
+        Self::with_timeout(DEFAULT_TIMEOUT, guard)
     }
 
     /// As [`new`](Self::new) but with an explicit per-request timeout.
     #[must_use]
-    pub fn with_timeout(timeout: Duration) -> Self {
+    pub fn with_timeout(timeout: Duration, guard: cairn_net::GuardConfig) -> Self {
         let https = hyper_rustls::HttpsConnectorBuilder::new()
             .with_webpki_roots()
             .https_or_http()
             .enable_http1()
-            .build();
+            .wrap_connector(cairn_net::guarded_http_connector(guard));
         let client = Client::builder(TokioExecutor::new()).build(https);
         Self { client, timeout }
     }
@@ -191,7 +196,11 @@ mod sink_timeout_tests {
             }
         });
 
-        let sink = HttpWebhookSink::with_timeout(Duration::from_millis(500));
+        // The stall server runs on loopback, so opt out of the SSRF guard for this test.
+        let sink = HttpWebhookSink::with_timeout(
+            Duration::from_millis(500),
+            cairn_net::GuardConfig::new(true),
+        );
         let url = format!("http://{addr}/");
         let outcome = tokio::time::timeout(Duration::from_secs(5), sink.deliver(&url, b"{}", None))
             .await

@@ -1,0 +1,17 @@
+[package]
+name = "cairn-net"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Shared outbound-network safety for Cairn: the SSRF guard (an internal-address predicate + a connect-time resolver) used by every operator-configured outbound dialer."
+
+[lints]
+workspace = true
+
+[dependencies]
+hyper-util = { workspace = true, features = ["client-legacy", "tokio"] }
+tower-service.workspace = true
+http.workspace = true
+tracing.workspace = true
+thiserror.workspace = true

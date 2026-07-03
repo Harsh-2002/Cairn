@@ -276,6 +276,7 @@ fn single_target_sink_cfg(cfg: &Config) -> Option<cairn_replication::S3SinkConfi
             ca_cert_path: None,
             ca_cert_pem: None,
             insecure_skip_verify: false,
+            allow_internal_endpoints: cfg.allow_internal_endpoints,
         }),
         _ => None,
     }
@@ -403,7 +404,7 @@ async fn multi_target_replication_loop(
     // an unreadable CA bundle, conflicting trust knobs) is logged and dropped; the rest still run.
     let mut target_sinks: Vec<(ReplicationTarget, Arc<HttpS3Sink>)> = Vec::new();
     for target in targets {
-        match HttpS3Sink::new(target_sink_cfg(&target)) {
+        match HttpS3Sink::new(target_sink_cfg(&target, stack.allow_internal_endpoints)) {
             Ok(sink) => target_sinks.push((target, Arc::new(sink))),
             Err(e) => {
                 tracing::error!(target = %target.name, error = %e,
@@ -523,7 +524,7 @@ async fn resolve_stored_target_sinks(stack: &Arc<AppStack>) -> HashMap<String, A
                     continue;
                 }
             };
-            match cairn_replication::sink_for_target(&open) {
+            match cairn_replication::sink_for_target(&open, stack.allow_internal_endpoints) {
                 Ok(sink) => {
                     by_arn.insert(target.arn.clone(), Arc::new(sink));
                 }
@@ -556,7 +557,10 @@ fn build_router(
 /// Convert a configured [`ReplicationTarget`] into the sink configuration for its dedicated
 /// [`HttpS3Sink`]. The target is a single fixed destination, so `dest_buckets` stays empty and the
 /// target's `dest_bucket` is the one destination; its TLS trust knobs are carried through.
-fn target_sink_cfg(target: &ReplicationTarget) -> cairn_replication::S3SinkConfig {
+fn target_sink_cfg(
+    target: &ReplicationTarget,
+    allow_internal_endpoints: bool,
+) -> cairn_replication::S3SinkConfig {
     cairn_replication::S3SinkConfig {
         endpoint: target.endpoint.clone(),
         dest_bucket: target.dest_bucket.clone(),
@@ -567,6 +571,7 @@ fn target_sink_cfg(target: &ReplicationTarget) -> cairn_replication::S3SinkConfi
         ca_cert_path: target.ca_path.clone(),
         ca_cert_pem: None,
         insecure_skip_verify: target.insecure_skip_verify,
+        allow_internal_endpoints,
     }
 }
 
@@ -1081,7 +1086,9 @@ async fn lifecycle_loop(stack: Arc<AppStack>, interval: Duration) {
 /// the loop is harmless when no bucket has notifications configured (it claims nothing and sleeps).
 async fn webhook_loop(stack: Arc<AppStack>, interval: Duration) {
     let engine = cairn_webhook::WebhookEngine::new(cairn_webhook::WebhookOpts::default());
-    let sink = cairn_webhook::HttpWebhookSink::new();
+    let sink = cairn_webhook::HttpWebhookSink::new(cairn_net::GuardConfig::new(
+        stack.allow_internal_endpoints,
+    ));
     let clock = SystemClock::new();
     loop {
         tokio::time::sleep(interval).await;
@@ -1124,7 +1131,7 @@ mod tests {
         targets
             .iter()
             .map(|t| {
-                let sink = HttpS3Sink::new(target_sink_cfg(t)).expect("target sink builds");
+                let sink = HttpS3Sink::new(target_sink_cfg(t, false)).expect("target sink builds");
                 (t.clone(), Arc::new(sink))
             })
             .collect()
@@ -1157,7 +1164,7 @@ mod tests {
     fn target_sink_cfg_carries_trust_knobs() {
         let mut t = target("secure", "mirror", "https://s3.secure.example");
         t.insecure_skip_verify = true;
-        let cfg = target_sink_cfg(&t);
+        let cfg = target_sink_cfg(&t, false);
         assert_eq!(cfg.endpoint, "https://s3.secure.example");
         assert_eq!(cfg.dest_bucket, "mirror");
         assert!(cfg.dest_buckets.is_empty());
@@ -1166,7 +1173,7 @@ mod tests {
 
         let mut t = target("ca", "mirror", "https://s3.ca.example");
         t.ca_path = Some(std::path::PathBuf::from("/etc/ca.pem"));
-        let cfg = target_sink_cfg(&t);
+        let cfg = target_sink_cfg(&t, false);
         assert_eq!(
             cfg.ca_cert_path,
             Some(std::path::PathBuf::from("/etc/ca.pem"))
@@ -1192,6 +1199,7 @@ mod tests {
                 ca_cert_path: None,
                 ca_cert_pem: None,
                 insecure_skip_verify: false,
+                allow_internal_endpoints: false,
             })
             .unwrap(),
         );
@@ -1236,6 +1244,7 @@ mod tests {
                 ca_cert_path: None,
                 ca_cert_pem: None,
                 insecure_skip_verify: false,
+                allow_internal_endpoints: false,
             })
             .unwrap(),
         )

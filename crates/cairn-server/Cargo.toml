@@ -71,6 +71,7 @@ cairn-authz.workspace = true
 cairn-lifecycle.workspace = true
 cairn-replication.workspace = true
 cairn-webhook.workspace = true
+cairn-net.workspace = true
 cairn-control.workspace = true
 cairn-ui.workspace = true
 

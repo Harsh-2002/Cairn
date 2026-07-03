@@ -133,6 +133,12 @@ pub struct S3SinkConfig {
     /// certificate is accepted. This is dangerous and defeats TLS authentication; it exists only
     /// for testing against a self-signed endpoint and emits a loud warning when used.
     pub insecure_skip_verify: bool,
+    /// When true, the SSRF guard is disabled for this sink — the endpoint may resolve to a loopback,
+    /// private, or link-local address. Sourced from the server-global `CAIRN_ALLOW_INTERNAL_ENDPOINTS`
+    /// and needed to replicate to an on-prem peer on a private network. Default (`false`) refuses
+    /// internal addresses so a target can't be pointed at the node's own loopback or the metadata
+    /// service. See [`cairn_net`].
+    pub allow_internal_endpoints: bool,
 }
 
 /// A production replication sink issuing SigV4-signed S3 requests to a remote endpoint over
@@ -145,8 +151,9 @@ pub struct HttpS3Sink {
     scheme: String,
     /// The scheme/authority of the endpoint, parsed once at construction (e.g. `s3.example.com:9000`).
     authority: String,
-    /// The HTTP(S) client. The TLS-or-plaintext connector serves both schemes.
-    client: Client<HttpsConnector<HttpConnector>, Full<bytes::Bytes>>,
+    /// The HTTP(S) client. The TLS-or-plaintext connector serves both schemes, and its HTTP layer
+    /// resolves through the SSRF-guarded resolver.
+    client: Client<HttpsConnector<HttpConnector<cairn_net::GuardedResolver>>, Full<bytes::Bytes>>,
     /// The clock supplying the SigV4 request time; injected so signing is deterministic in tests.
     clock: Arc<dyn Clock>,
 }
@@ -205,9 +212,15 @@ impl HttpS3Sink {
         // One connector serves both transports: `.https_or_http()` dials plaintext for `http://`
         // and negotiates rustls for `https://`. `enable_http1()` matches the HTTP/1.1 protocol the
         // legacy client speaks. The TLS trust source is per-target (CA path / skip-verify /
-        // webpki); see `build_tls_connector`.
+        // webpki); see `build_tls_connector`. The HTTP layer dials through the SSRF-guarded resolver
+        // so a target that resolves to a loopback/private/metadata address is refused at connect
+        // time (ARCH 27), unless the operator set `allow_internal_endpoints`.
         let builder = build_tls_connector_builder(&config)?;
-        let https = builder.https_or_http().enable_http1().build();
+        let guard = cairn_net::GuardConfig::new(config.allow_internal_endpoints);
+        let https = builder
+            .https_or_http()
+            .enable_http1()
+            .wrap_connector(cairn_net::guarded_http_connector(guard));
         let client = Client::builder(TokioExecutor::new()).build(https);
 
         Ok(Self {
@@ -354,7 +367,10 @@ impl HttpS3Sink {
 /// # Errors
 /// Returns [`ReplicationError::Terminal`] if the endpoint URL is malformed or the TLS knobs
 /// conflict (see [`HttpS3Sink::new`]).
-pub fn sink_for_target(open: &crate::OpenTarget) -> Result<HttpS3Sink, ReplicationError> {
+pub fn sink_for_target(
+    open: &crate::OpenTarget,
+    allow_internal_endpoints: bool,
+) -> Result<HttpS3Sink, ReplicationError> {
     HttpS3Sink::new(S3SinkConfig {
         endpoint: open.endpoint.clone(),
         dest_bucket: open.dest_bucket.clone(),
@@ -365,6 +381,7 @@ pub fn sink_for_target(open: &crate::OpenTarget) -> Result<HttpS3Sink, Replicati
         ca_cert_path: None,
         ca_cert_pem: open.ca_cert_pem.clone(),
         insecure_skip_verify: open.insecure_skip_verify,
+        allow_internal_endpoints,
     })
 }
 
@@ -901,6 +918,7 @@ mod tests {
             ca_cert_path: None,
             ca_cert_pem: None,
             insecure_skip_verify: false,
+            allow_internal_endpoints: false,
         }
     }
 
@@ -948,6 +966,7 @@ mod tests {
             ca_cert_path: None,
             ca_cert_pem: None,
             insecure_skip_verify: false,
+            allow_internal_endpoints: false,
         };
         let sink = HttpS3Sink::new(cfg).unwrap();
         // Mapped sources resolve to their explicit destinations.
