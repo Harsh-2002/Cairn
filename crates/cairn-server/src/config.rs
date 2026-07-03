@@ -1494,6 +1494,25 @@ mod tests {
     }
 
     #[test]
+    fn rejects_bad_import_knobs() {
+        let mut c = base();
+        assert!(c.validate().is_ok());
+        // The global in-flight cap must stay below the blob-I/O pool (64) so it can't starve live I/O.
+        c.import_global_max_inflight = 64;
+        assert!(c.validate().is_err(), "global cap must be < 64");
+        c.import_global_max_inflight = 24;
+        // Default workers must not exceed the hard cap.
+        c.import_default_workers = 40;
+        c.import_max_workers = 32;
+        assert!(c.validate().is_err(), "default must be <= max");
+        c.import_default_workers = 8;
+        assert!(c.validate().is_ok());
+        // Cadences must be positive.
+        c.import_poll_interval_secs = 0;
+        assert!(c.validate().is_err(), "a zero poll interval busy-spins");
+    }
+
+    #[test]
     fn rejects_malformed_master_key() {
         let mut c = base();
         c.master_key = Some("not-hex".to_owned());

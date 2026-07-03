@@ -205,6 +205,8 @@ The schema below is the reference for the SQLite store. Types are given in the e
 | last_error | text | Nullable. |
 | Index | | Over status and next-attempt time, for due-entry claiming. |
 
+**S3 import jobs (migration v20).** The `import_jobs` table (Section 27.7) holds one account-global row per import: an identifier; the source endpoint, region, and access-key id; the **sealed** source secret (ciphertext under the master key, CRK1 envelope with a null nonce, exactly like a user's SigV4 secret) which is never returned by any read; an optional CA-certificate PEM and a TLS skip-verify flag; the requested worker count; the lifecycle state (`pending`/`running`/`completed`/`failed`/`cancelled`); the per-bucket progress and resume cursors serialized as a JSON column; denormalized aggregate object/byte counters; a nullable last-error and a nullable running-job lease; and creation and update timestamps. It is indexed over state and creation time for claiming. The full record (including the sealed secret and cursors) is read only by the server-internal import worker; the management API uses a secret-free view.
+
 **Activity and audit, and migrations.** The activity log records an identifier, an action, the bucket and key where applicable, the size and ETag where applicable, the actor, and a timestamp, indexed by time. The migrations table records each applied schema version and when it was applied.
 
 ### 34.2 Indexes summary
