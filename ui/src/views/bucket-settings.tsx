@@ -1109,9 +1109,15 @@ export function BucketSettings() {
                       rows={6}
                       spellCheck={false}
                       disabled={targetForm.insecure_skip_verify}
+                      // A truncated-but-real-shaped PEM sample — reads instantly as
+                      // "a certificate goes here" and teaches the expected armored
+                      // form (a common mistake is pasting the base64 without the
+                      // BEGIN/END lines). The instruction proper lives in the helper
+                      // text below, so the placeholder stays an example, not a sentence.
+                      // Kept to three short lines so it never wraps and loses its shape.
                       placeholder={
                         "-----BEGIN CERTIFICATE-----\n" +
-                        "…paste the peer's PEM-encoded CA (or self-signed) certificate…\n" +
+                        "MIIDkTCCAnmgAwIBAgIU…\n" +
                         "-----END CERTIFICATE-----"
                       }
                       // Cap the height so pasting a full PEM chain scrolls inside the box instead of
