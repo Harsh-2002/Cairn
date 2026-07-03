@@ -24,6 +24,7 @@ cairn-authz = { path = "crates/cairn-authz" }
 cairn-xml = { path = "crates/cairn-xml" }
 cairn-protocol = { path = "crates/cairn-protocol" }
 cairn-replication = { path = "crates/cairn-replication" }
+cairn-import = { path = "crates/cairn-import" }
 cairn-webhook = { path = "crates/cairn-webhook" }
 cairn-lifecycle = { path = "crates/cairn-lifecycle" }
 cairn-control = { path = "crates/cairn-control" }

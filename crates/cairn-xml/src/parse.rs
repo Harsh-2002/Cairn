@@ -166,6 +166,120 @@ pub fn parse_complete_multipart(body: &[u8]) -> Result<Vec<(u16, String)>, Error
 }
 
 // ===========================================================================================
+// S3 RESPONSE parsers (used by the import engine to read a remote store's listings, ARCH 27)
+// ===========================================================================================
+
+/// Parse a `ListBucketResult` (`GET /{bucket}?list-type=2`) response into
+/// `(objects, next_continuation_token, is_truncated)`, where each object is `(key, size, etag?)` in
+/// document order. Nested `<Owner>`/`<StorageClass>` and other fields are ignored.
+///
+/// # Errors
+/// Returns [`Error::MalformedXml`] if the body is not well-formed or a `<Size>` is not a valid `u64`.
+#[allow(clippy::type_complexity)]
+pub fn parse_list_objects_v2(
+    body: &[u8],
+) -> Result<(Vec<(String, u64, Option<String>)>, Option<String>, bool), Error> {
+    let mut objects = Vec::new();
+    let mut is_truncated = false;
+    let mut next_token: Option<String> = None;
+    let mut in_contents = false;
+    let mut cur_field: Option<Vec<u8>> = None;
+    let mut key: Option<String> = None;
+    let mut size: u64 = 0;
+    let mut etag: Option<String> = None;
+
+    drive(body, |ev| {
+        match ev {
+            Sax::Open(name) => {
+                if name == b"Contents" {
+                    in_contents = true;
+                    key = None;
+                    size = 0;
+                    etag = None;
+                    cur_field = None;
+                } else {
+                    cur_field = Some(name);
+                }
+            }
+            Sax::Text(text) => {
+                if let Some(field) = &cur_field {
+                    if in_contents {
+                        if field == b"Key" {
+                            key = Some(text.into_owned());
+                        } else if field == b"Size" {
+                            size = text.trim().parse::<u64>().map_err(|_| malformed())?;
+                        } else if field == b"ETag" {
+                            etag = Some(unquote(text.trim()));
+                        }
+                    } else if field == b"IsTruncated" {
+                        is_truncated = text.trim().eq_ignore_ascii_case("true");
+                    } else if field == b"NextContinuationToken" {
+                        next_token = Some(text.into_owned());
+                    }
+                }
+            }
+            Sax::Close(name) => {
+                if name == b"Contents" {
+                    if let Some(k) = key.take() {
+                        objects.push((k, size, etag.take()));
+                    }
+                    in_contents = false;
+                }
+                cur_field = None;
+            }
+        }
+        Ok(())
+    })?;
+    Ok((objects, next_token, is_truncated))
+}
+
+/// Parse a `ListAllMyBucketsResult` (`GET /`) response into the list of bucket names, in document
+/// order.
+///
+/// # Errors
+/// Returns [`Error::MalformedXml`] if the body is not well-formed.
+pub fn parse_list_all_my_buckets(body: &[u8]) -> Result<Vec<String>, Error> {
+    let mut names = Vec::new();
+    let mut in_bucket = false;
+    let mut cur_field: Option<Vec<u8>> = None;
+    let mut name: Option<String> = None;
+
+    drive(body, |ev| {
+        match ev {
+            Sax::Open(n) => {
+                if n == b"Bucket" {
+                    in_bucket = true;
+                    name = None;
+                    cur_field = None;
+                } else if in_bucket {
+                    cur_field = Some(n);
+                }
+            }
+            Sax::Text(text) => {
+                if in_bucket {
+                    if let Some(f) = &cur_field {
+                        if f == b"Name" {
+                            name = Some(text.into_owned());
+                        }
+                    }
+                }
+            }
+            Sax::Close(n) => {
+                if n == b"Bucket" {
+                    if let Some(nm) = name.take() {
+                        names.push(nm);
+                    }
+                    in_bucket = false;
+                }
+                cur_field = None;
+            }
+        }
+        Ok(())
+    })?;
+    Ok(names)
+}
+
+// ===========================================================================================
 // Delete (multi-object delete request)
 // ===========================================================================================
 

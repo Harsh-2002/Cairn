@@ -478,6 +478,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "cairn-import"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "cairn-auth",
+ "cairn-net",
+ "cairn-types",
+ "cairn-xml",
+ "futures-core",
+ "futures-util",
+ "hex",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "rustls",
+ "rustls-pemfile",
+ "sha2",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "cairn-lifecycle"
 version = "0.1.0"
 dependencies = [

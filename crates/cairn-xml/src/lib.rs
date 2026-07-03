@@ -36,6 +36,7 @@ pub use parse::{
 pub use parse::{
     parse_legal_hold, parse_lock_mode, parse_object_lock_configuration, parse_retention,
 };
+pub use parse::{parse_list_all_my_buckets, parse_list_objects_v2};
 pub use timefmt::{format_iso8601, parse_iso8601};
 
 // ===========================================================================================

@@ -1,0 +1,35 @@
+[package]
+name = "cairn-import"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Streaming, bounded-concurrency engine that imports buckets + objects from a remote S3-compatible store into Cairn (ARCH 27)."
+
+[lints]
+workspace = true
+
+[dependencies]
+cairn-types.workspace = true
+cairn-auth.workspace = true
+cairn-net.workspace = true
+cairn-xml.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+futures-core.workspace = true
+futures-util = { workspace = true, features = ["std"] }
+hyper = { workspace = true, features = ["client", "http1"] }
+hyper-util = { workspace = true, features = ["client-legacy", "http1", "tokio"] }
+hyper-rustls = { workspace = true }
+rustls = { workspace = true, features = ["aws_lc_rs", "tls12"] }
+rustls-pemfile.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
+tracing.workspace = true
+sha2.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+cairn-types = { workspace = true, features = ["testing"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
