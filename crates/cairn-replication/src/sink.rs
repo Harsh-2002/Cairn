@@ -598,7 +598,10 @@ impl HttpS3Sink {
         // Supplementary flexible checksums, re-emitted so a checksum-mode GET of the replica matches
         // the source (audit 2026-07; AWS CRR preserves additional checksums).
         for c in &object.checksums {
-            user_headers.push((checksum_header_name(c.algorithm).to_owned(), c.value.clone()));
+            user_headers.push((
+                checksum_header_name(c.algorithm).to_owned(),
+                c.value.clone(),
+            ));
         }
 
         // Replicate the object's tag set via the standard `x-amz-tagging` header (form-urlencoded
