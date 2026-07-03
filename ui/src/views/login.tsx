@@ -17,7 +17,7 @@ import { errorMessage } from "@/lib/api";
 import { useAuth } from "@/providers/auth-provider";
 import { FieldError } from "@/components/field-error";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardFooter, CardHeader } from "@/components/ui/card";
+import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 
@@ -169,12 +169,6 @@ export function Login() {
             </Button>
           </form>
         </CardContent>
-        <CardFooter>
-          <p className="text-xs leading-relaxed text-muted-foreground">
-            Use the root administrator access key and secret (the{" "}
-            <code className="font-mono">CAIRN_ROOT_*</code> credentials).
-          </p>
-        </CardFooter>
       </Card>
     </main>
   );
