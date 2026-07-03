@@ -1123,7 +1123,12 @@ export function BucketSettings() {
                       // Cap the height so pasting a full PEM chain scrolls inside the box instead of
                       // ballooning the card and pushing the Add-target action off-screen (audit
                       // 2026-07). field-sizing-fixed keeps rows authoritative over auto-grow.
-                      className="field-sizing-fixed max-h-56 resize-y overflow-auto font-mono text-[13px] leading-relaxed disabled:opacity-50"
+                      // tracking-wider: Geist Mono's hyphen sits mid-cap-height, so the "-----"
+                      // PEM armor runs blur into the adjacent letters at 13–14px and read as a
+                      // strikethrough (and throw the base64 lines out of left-alignment). A hair
+                      // of letter-spacing separates the glyphs — armor renders crisp and aligned,
+                      // for both the placeholder and a real pasted certificate.
+                      className="field-sizing-fixed max-h-56 resize-y overflow-auto font-mono text-[13px] leading-relaxed tracking-wider disabled:opacity-50"
                       onChange={(e) =>
                         setTargetForm({ ...targetForm, ca_cert: e.target.value })
                       }
