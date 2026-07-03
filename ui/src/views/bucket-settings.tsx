@@ -1109,25 +1109,17 @@ export function BucketSettings() {
                       rows={6}
                       spellCheck={false}
                       disabled={targetForm.insecure_skip_verify}
-                      // A truncated-but-real-shaped PEM sample — reads instantly as
-                      // "a certificate goes here" and teaches the expected armored
-                      // form (a common mistake is pasting the base64 without the
-                      // BEGIN/END lines). The instruction proper lives in the helper
-                      // text below, so the placeholder stays an example, not a sentence.
-                      // Kept to three short lines so it never wraps and loses its shape.
-                      placeholder={
-                        "-----BEGIN CERTIFICATE-----\n" +
-                        "MIIDkTCCAnmgAwIBAgIU…\n" +
-                        "-----END CERTIFICATE-----"
-                      }
+                      // No placeholder: the label ("CA certificate — optional") and the
+                      // helper text below already say what goes here, and an empty field
+                      // reads cleaner than sample armor. Guidance lives in the helper text.
                       // Cap the height so pasting a full PEM chain scrolls inside the box instead of
                       // ballooning the card and pushing the Add-target action off-screen (audit
                       // 2026-07). field-sizing-fixed keeps rows authoritative over auto-grow.
                       // tracking-wider: Geist Mono's hyphen sits mid-cap-height, so the "-----"
                       // PEM armor runs blur into the adjacent letters at 13–14px and read as a
                       // strikethrough (and throw the base64 lines out of left-alignment). A hair
-                      // of letter-spacing separates the glyphs — armor renders crisp and aligned,
-                      // for both the placeholder and a real pasted certificate.
+                      // of letter-spacing separates the glyphs so a pasted certificate renders
+                      // crisp and left-aligned.
                       className="field-sizing-fixed max-h-56 resize-y overflow-auto font-mono text-[13px] leading-relaxed tracking-wider disabled:opacity-50"
                       onChange={(e) =>
                         setTargetForm({ ...targetForm, ca_cert: e.target.value })
