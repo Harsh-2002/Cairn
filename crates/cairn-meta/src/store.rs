@@ -10,9 +10,9 @@ use cairn_types::authz::PublicAccessBlock;
 use cairn_types::bucket::{Bucket, ConfigAspect, ConfigDoc};
 use cairn_types::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
 use cairn_types::meta::{
-    ActivityEntry, BucketCounts, BucketRequestCount, LATENCY_BUCKETS, ListPage, ListQuery,
-    MetricsRange, MultipartSession, Mutation, MutationOutcome, ObjectSummary, OpCount, OutboxEntry,
-    PartRecord, ReplicationCounts, ReplicationStatus, ReplicationTargetCounts,
+    ActivityEntry, BucketCounts, BucketRequestCount, ImportJob, LATENCY_BUCKETS, ListPage,
+    ListQuery, MetricsRange, MultipartSession, Mutation, MutationOutcome, ObjectSummary, OpCount,
+    OutboxEntry, PartRecord, ReplicationCounts, ReplicationStatus, ReplicationTargetCounts,
     RequestMetricsSeries, SessionCredentialSummary, ShareRow, StatusCount, StoreCounts, TagSummary,
     TaggedObject, TimePoint, User, UserSessionCredentials, UserSigV4Credentials,
     UserWithBearerHash, WebhookEntry, latency_quantile_ms,
@@ -1355,6 +1355,42 @@ impl MetadataStore for SqliteMetadataStore {
             })
             .optional()
             .map(Option::flatten)
+            .map_err(engine_err)
+        })
+        .await
+    }
+
+    async fn list_import_jobs(&self) -> Result<Vec<ImportJob>, MetaError> {
+        self.with_read(move |conn| {
+            // Explicitly excludes secret_ciphertext/secret_nonce so a secret can never be read back.
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, source_endpoint, source_region, access_key_id, ca_cert_pem, \
+                     insecure_skip_verify, workers, state, buckets_json, objects_done, \
+                     objects_total, bytes_done, bytes_total, last_error, created_at, updated_at \
+                     FROM import_jobs ORDER BY created_at DESC",
+                )
+                .map_err(engine_err)?;
+            stmt.query_map([], model::import_job_from_row)
+                .map_err(engine_err)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(engine_err)
+        })
+        .await
+    }
+
+    async fn get_import_job(&self, id: &str) -> Result<Option<ImportJob>, MetaError> {
+        let id = id.to_owned();
+        self.with_read(move |conn| {
+            conn.query_row(
+                "SELECT id, source_endpoint, source_region, access_key_id, ca_cert_pem, \
+                 insecure_skip_verify, workers, state, buckets_json, objects_done, objects_total, \
+                 bytes_done, bytes_total, last_error, created_at, updated_at \
+                 FROM import_jobs WHERE id=?1",
+                params![id],
+                model::import_job_from_row,
+            )
+            .optional()
             .map_err(engine_err)
         })
         .await

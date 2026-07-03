@@ -423,6 +423,35 @@ ALTER TABLE replication_outbox ADD COLUMN enqueued_at INTEGER NOT NULL DEFAULT 0
 CREATE INDEX idx_outbox_status_enqueued ON replication_outbox (status, enqueued_at);
 "#,
     },
+    Migration {
+        version: 20,
+        name: "import jobs (S3 -> Cairn migration)",
+        sql: r#"
+-- S3 import jobs (ARCH 27). Mirrors cairn-meta/src/schema.rs v20 byte-for-byte (same version).
+CREATE TABLE import_jobs (
+    id                   TEXT PRIMARY KEY,
+    source_endpoint      TEXT NOT NULL,
+    source_region        TEXT NOT NULL,
+    access_key_id        TEXT NOT NULL,
+    secret_ciphertext    BLOB NOT NULL,
+    secret_nonce         BLOB,
+    ca_cert_pem          TEXT,
+    insecure_skip_verify INTEGER NOT NULL DEFAULT 0,
+    workers              INTEGER NOT NULL,
+    state                TEXT NOT NULL,
+    buckets_json         TEXT NOT NULL,
+    objects_done         INTEGER NOT NULL DEFAULT 0,
+    objects_total        INTEGER NOT NULL DEFAULT 0,
+    bytes_done           INTEGER NOT NULL DEFAULT 0,
+    bytes_total          INTEGER NOT NULL DEFAULT 0,
+    last_error           TEXT,
+    lease_until          INTEGER,
+    created_at           INTEGER NOT NULL,
+    updated_at           INTEGER NOT NULL
+);
+CREATE INDEX idx_import_jobs_state ON import_jobs (state, created_at);
+"#,
+    },
 ];
 
 /// Run all pending migrations on the write driver, recording each as applied. Each migration is

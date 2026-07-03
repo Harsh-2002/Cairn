@@ -59,9 +59,10 @@ pub use error::{
 pub use id::{BucketName, InvalidName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
 pub use meta::{
     ActivityEntry, BucketCounts, BucketRequestCount, ClaimOutcome, IfNoneMatch,
-    LATENCY_BUCKET_BOUNDS_MS, LATENCY_BUCKETS, ListPage, ListQuery, MetricsRange, MultipartSession,
-    MultipartStatus, Mutation, MutationOutcome, ObjectSummary, OpCount, OutboxEntry, PartRecord,
-    Precondition, ReplicationOp, ReplicationStatus, RequestMetricRow, RequestMetricsSeries,
+    ImportBucketProgress, ImportJob, ImportJobRecord, ImportState, LATENCY_BUCKET_BOUNDS_MS,
+    LATENCY_BUCKETS, ListPage, ListQuery, MetricsRange, MultipartSession, MultipartStatus,
+    Mutation, MutationOutcome, ObjectSummary, OpCount, OutboxEntry, PartRecord, Precondition,
+    ReplicationOp, ReplicationStatus, RequestMetricRow, RequestMetricsSeries,
     SessionCredentialRecord, SessionCredentialSummary, ShareDisposition, ShareRow, StatusCount,
     StoreCounts, TagSummary, TaggedObject, TimePoint, User, UserRecord, UserSessionCredentials,
     UserSigV4Credentials, UserWithBearerHash, WebhookEntry, WebhookStatus, latency_bucket_index,

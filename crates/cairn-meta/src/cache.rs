@@ -35,11 +35,11 @@ use cairn_types::bucket::{Bucket, ConfigAspect, ConfigDoc};
 use cairn_types::error::MetaError;
 use cairn_types::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
 use cairn_types::meta::{
-    ActivityEntry, BucketCounts, ListPage, ListQuery, MetricsRange, MultipartSession, Mutation,
-    MutationOutcome, ObjectSummary, OutboxEntry, PartRecord, ReplicationCounts, ReplicationStatus,
-    RequestMetricsSeries, SessionCredentialSummary, ShareRow, StoreCounts, TagSummary,
-    TaggedObject, User, UserSessionCredentials, UserSigV4Credentials, UserWithBearerHash,
-    WebhookEntry,
+    ActivityEntry, BucketCounts, ImportJob, ListPage, ListQuery, MetricsRange, MultipartSession,
+    Mutation, MutationOutcome, ObjectSummary, OutboxEntry, PartRecord, ReplicationCounts,
+    ReplicationStatus, RequestMetricsSeries, SessionCredentialSummary, ShareRow, StoreCounts,
+    TagSummary, TaggedObject, User, UserSessionCredentials, UserSigV4Credentials,
+    UserWithBearerHash, WebhookEntry,
 };
 use cairn_types::object::ObjectVersionRow;
 use cairn_types::time::Timestamp;
@@ -471,7 +471,11 @@ impl CachedMetadataStore {
             | Mutation::RevokeShare { .. }
             | Mutation::SetObjectRetention { .. }
             | Mutation::SetObjectLegalHold { .. }
-            | Mutation::RecordRequestMetrics { .. } => {}
+            | Mutation::RecordRequestMetrics { .. }
+            | Mutation::CreateImportJob(_)
+            | Mutation::UpdateImportJobProgress { .. }
+            | Mutation::SetImportJobState { .. }
+            | Mutation::PruneImportJobs { .. } => {}
         }
     }
 }
@@ -782,6 +786,14 @@ impl MetadataStore for CachedMetadataStore {
 
     async fn get_user_policy(&self, user_id: &UserId) -> Result<Option<String>, MetaError> {
         self.inner.get_user_policy(user_id).await
+    }
+
+    async fn list_import_jobs(&self) -> Result<Vec<ImportJob>, MetaError> {
+        self.inner.list_import_jobs().await
+    }
+
+    async fn get_import_job(&self, id: &str) -> Result<Option<ImportJob>, MetaError> {
+        self.inner.get_import_job(id).await
     }
 
     async fn list_activity(&self, limit: u32) -> Result<Vec<ActivityEntry>, MetaError> {
@@ -1161,6 +1173,12 @@ mod tests {
         }
         async fn get_user_policy(&self, user_id: &UserId) -> Result<Option<String>, MetaError> {
             self.inner.get_user_policy(user_id).await
+        }
+        async fn list_import_jobs(&self) -> Result<Vec<ImportJob>, MetaError> {
+            self.inner.list_import_jobs().await
+        }
+        async fn get_import_job(&self, id: &str) -> Result<Option<ImportJob>, MetaError> {
+            self.inner.get_import_job(id).await
         }
         async fn list_activity(&self, limit: u32) -> Result<Vec<ActivityEntry>, MetaError> {
             self.inner.list_activity(limit).await

@@ -912,6 +912,99 @@ async fn users_parity() {
 }
 
 #[tokio::test]
+async fn import_jobs_parity() {
+    use cairn_types::meta::{ImportBucketProgress, ImportJobRecord, ImportState};
+    use cairn_types::time::Timestamp;
+    let (a, b) = both().await;
+    for s in [&a as &dyn MetadataStore, &b as &dyn MetadataStore] {
+        assert!(s.list_import_jobs().await.unwrap().is_empty());
+        let bucket = |done: u64, cursor: Option<&str>, st: ImportState| ImportBucketProgress {
+            source_bucket: "src".to_owned(),
+            dest_bucket: "dst".to_owned(),
+            objects_done: done,
+            objects_total: 10,
+            bytes_done: done * 10,
+            bytes_total: 100,
+            cursor: cursor.map(str::to_owned),
+            state: st,
+            last_error: None,
+        };
+        let rec = ImportJobRecord {
+            id: "job1".to_owned(),
+            source_endpoint: "https://peer.example.com:9000".to_owned(),
+            source_region: "us-east-1".to_owned(),
+            access_key_id: "AKSRC".to_owned(),
+            secret_ciphertext: vec![1, 2, 3, 4],
+            secret_nonce: None,
+            ca_cert_pem: Some("-----BEGIN CERTIFICATE-----".to_owned()),
+            insecure_skip_verify: false,
+            workers: 8,
+            state: ImportState::Pending,
+            buckets: vec![bucket(0, None, ImportState::Pending)],
+            objects_done: 0,
+            objects_total: 10,
+            bytes_done: 0,
+            bytes_total: 100,
+            last_error: None,
+            lease_until: None,
+            created_at: Timestamp(1000),
+            updated_at: Timestamp(1000),
+        };
+        s.submit(Mutation::CreateImportJob(Box::new(rec)))
+            .await
+            .unwrap();
+
+        // list + get are secret-free (has_ca_cert flag, no ciphertext).
+        let jobs = s.list_import_jobs().await.unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, "job1");
+        assert!(jobs[0].has_ca_cert);
+        assert_eq!(jobs[0].access_key_id, "AKSRC");
+        let got = s.get_import_job("job1").await.unwrap().unwrap();
+        assert_eq!(got.state, ImportState::Pending);
+        assert_eq!(got.objects_total, 10);
+        assert_eq!(got.buckets.len(), 1);
+
+        // Progress checkpoint (per-bucket cursor + counters + lease).
+        s.submit(Mutation::UpdateImportJobProgress {
+            id: "job1".to_owned(),
+            buckets: vec![bucket(5, Some("tok"), ImportState::Running)],
+            objects_done: 5,
+            objects_total: 10,
+            bytes_done: 50,
+            bytes_total: 100,
+            last_error: None,
+            lease_until: Some(Timestamp(2000)),
+            updated_at: Timestamp(1500),
+        })
+        .await
+        .unwrap();
+        let got = s.get_import_job("job1").await.unwrap().unwrap();
+        assert_eq!(got.objects_done, 5);
+        assert_eq!(got.buckets[0].cursor.as_deref(), Some("tok"));
+
+        // Terminal state, then prune finished jobs past the horizon.
+        s.submit(Mutation::SetImportJobState {
+            id: "job1".to_owned(),
+            state: ImportState::Completed,
+            last_error: None,
+            lease_until: None,
+            updated_at: Timestamp(3000),
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            s.get_import_job("job1").await.unwrap().unwrap().state,
+            ImportState::Completed
+        );
+        s.submit(Mutation::PruneImportJobs { before_ms: 4000 })
+            .await
+            .unwrap();
+        assert!(s.get_import_job("job1").await.unwrap().is_none());
+    }
+}
+
+#[tokio::test]
 async fn aggregate_counts_parity() {
     let (a, b) = both().await;
     for s in [&a as &dyn MetadataStore, &b as &dyn MetadataStore] {

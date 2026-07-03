@@ -19,11 +19,11 @@ use crate::crypto::{Nonce, Sealed, Signature};
 use crate::error::{BlobError, CryptoError, MetaError, ReplicationError};
 use crate::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
 use crate::meta::{
-    ActivityEntry, BucketCounts, ListPage, ListQuery, MetricsRange, MultipartSession, Mutation,
-    MutationOutcome, ObjectSummary, OutboxEntry, PartRecord, ReplicationCounts, ReplicationStatus,
-    RequestMetricsSeries, SessionCredentialSummary, ShareRow, StoreCounts, TagSummary,
-    TaggedObject, User, UserSessionCredentials, UserSigV4Credentials, UserWithBearerHash,
-    WebhookEntry,
+    ActivityEntry, BucketCounts, ImportJob, ListPage, ListQuery, MetricsRange, MultipartSession,
+    Mutation, MutationOutcome, ObjectSummary, OutboxEntry, PartRecord, ReplicationCounts,
+    ReplicationStatus, RequestMetricsSeries, SessionCredentialSummary, ShareRow, StoreCounts,
+    TagSummary, TaggedObject, User, UserSessionCredentials, UserSigV4Credentials,
+    UserWithBearerHash, WebhookEntry,
 };
 use crate::object::{CompressionDescriptor, ObjectVersionRow};
 use crate::replication::ReplicatedObject;
@@ -331,6 +331,13 @@ pub trait MetadataStore: Send + Sync {
     /// Fetch a user's attached identity-policy JSON document, or `None` if the user has none (or
     /// does not exist). The raw stored JSON is returned; the caller parses/validates it.
     async fn get_user_policy(&self, user_id: &UserId) -> Result<Option<String>, MetaError>;
+
+    // --- import jobs (ARCH 27) ---
+    /// List all S3 import jobs, newest first, as secret-free [`ImportJob`] views — the source secret
+    /// (ciphertext/nonce) is never returned. For the console's import view and the CLI status list.
+    async fn list_import_jobs(&self) -> Result<Vec<ImportJob>, MetaError>;
+    /// Fetch a single import job by id (secret-free), or `None` if no such job exists.
+    async fn get_import_job(&self, id: &str) -> Result<Option<ImportJob>, MetaError>;
 
     // --- object shares (ARCH 15.8) ---
     /// Fetch a share by its token, or `None` if no such token exists. The caller checks

@@ -6,9 +6,9 @@ use cairn_types::authz::{Acl, OwnershipMode};
 use cairn_types::bucket::{Bucket, CompressionPolicy, VersioningState};
 use cairn_types::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
 use cairn_types::meta::{
-    ActivityEntry, MultipartSession, MultipartStatus, ObjectSummary, OutboxEntry, PartRecord,
-    ReplicationOp, ReplicationStatus, ShareDisposition, ShareRow, User, UserRecord,
-    UserSigV4Credentials, UserWithBearerHash, WebhookEntry, WebhookStatus,
+    ActivityEntry, ImportJob, ImportState, MultipartSession, MultipartStatus, ObjectSummary,
+    OutboxEntry, PartRecord, ReplicationOp, ReplicationStatus, ShareDisposition, ShareRow, User,
+    UserRecord, UserSigV4Credentials, UserWithBearerHash, WebhookEntry, WebhookStatus,
 };
 use cairn_types::notification::EventKind;
 use cairn_types::object::{
@@ -340,6 +340,51 @@ pub fn user_sigv4_from_row(row: &Row) -> rusqlite::Result<Option<UserSigV4Creden
         })),
         None => Ok(None),
     }
+}
+
+// --- import jobs (ARCH 27) ---
+
+pub fn import_state_str(s: ImportState) -> &'static str {
+    match s {
+        ImportState::Pending => "pending",
+        ImportState::Running => "running",
+        ImportState::Completed => "completed",
+        ImportState::Failed => "failed",
+        ImportState::Cancelled => "cancelled",
+    }
+}
+
+pub fn import_state_from(s: &str) -> ImportState {
+    match s {
+        "running" => ImportState::Running,
+        "completed" => ImportState::Completed,
+        "failed" => ImportState::Failed,
+        "cancelled" => ImportState::Cancelled,
+        _ => ImportState::Pending,
+    }
+}
+
+/// Map an `import_jobs` row to the secret-free [`ImportJob`]. The read path selects every column
+/// **except** the sealed secret, so the secret can never reach the API.
+pub fn import_job_from_row(row: &Row) -> rusqlite::Result<ImportJob> {
+    Ok(ImportJob {
+        id: row.get("id")?,
+        source_endpoint: row.get("source_endpoint")?,
+        source_region: row.get("source_region")?,
+        access_key_id: row.get("access_key_id")?,
+        has_ca_cert: row.get::<_, Option<String>>("ca_cert_pem")?.is_some(),
+        insecure_skip_verify: row.get::<_, i64>("insecure_skip_verify")? != 0,
+        workers: row.get::<_, i64>("workers")? as u32,
+        state: import_state_from(&row.get::<_, String>("state")?),
+        buckets: json_col(&row.get::<_, String>("buckets_json")?)?,
+        objects_done: row.get::<_, i64>("objects_done")? as u64,
+        objects_total: row.get::<_, i64>("objects_total")? as u64,
+        bytes_done: row.get::<_, i64>("bytes_done")? as u64,
+        bytes_total: row.get::<_, i64>("bytes_total")? as u64,
+        last_error: row.get("last_error")?,
+        created_at: Timestamp(row.get("created_at")?),
+        updated_at: Timestamp(row.get("updated_at")?),
+    })
 }
 
 pub fn outbox_from_row(row: &Row) -> rusqlite::Result<OutboxEntry> {

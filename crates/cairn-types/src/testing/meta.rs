@@ -8,13 +8,14 @@ use crate::bucket::{Bucket, ConfigAspect, ConfigDoc};
 use crate::error::MetaError;
 use crate::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
 use crate::meta::{
-    ActivityEntry, BucketCounts, BucketRequestCount, ClaimOutcome, IfNoneMatch, LATENCY_BUCKETS,
-    ListPage, ListQuery, MetricsRange, MultipartSession, MultipartStatus, Mutation,
-    MutationOutcome, ObjectSummary, OpCount, OutboxEntry, PartRecord, Precondition,
-    ReplicationCounts, ReplicationStatus, ReplicationTargetCounts, RequestMetricsSeries,
-    SessionCredentialRecord, SessionCredentialSummary, ShareRow, StatusCount, StoreCounts,
-    TagSummary, TaggedObject, TimePoint, User, UserRecord, UserSessionCredentials,
-    UserSigV4Credentials, UserWithBearerHash, WebhookEntry, WebhookStatus, latency_quantile_ms,
+    ActivityEntry, BucketCounts, BucketRequestCount, ClaimOutcome, IfNoneMatch, ImportJob,
+    ImportJobRecord, ImportState, LATENCY_BUCKETS, ListPage, ListQuery, MetricsRange,
+    MultipartSession, MultipartStatus, Mutation, MutationOutcome, ObjectSummary, OpCount,
+    OutboxEntry, PartRecord, Precondition, ReplicationCounts, ReplicationStatus,
+    ReplicationTargetCounts, RequestMetricsSeries, SessionCredentialRecord,
+    SessionCredentialSummary, ShareRow, StatusCount, StoreCounts, TagSummary, TaggedObject,
+    TimePoint, User, UserRecord, UserSessionCredentials, UserSigV4Credentials, UserWithBearerHash,
+    WebhookEntry, WebhookStatus, latency_quantile_ms,
 };
 use crate::object::{ETag, ObjectVersionRow};
 use crate::time::Timestamp;
@@ -56,6 +57,8 @@ struct State {
     shares: BTreeMap<String, ShareRow>,
     /// Request-metrics rollup (ARCH 26.5), keyed by (ts_bucket, operation, bucket, status_class).
     request_metrics: BTreeMap<(i64, String, String, String), MetricCell>,
+    /// S3 import jobs (ARCH 27), keyed by job id.
+    import_jobs: BTreeMap<String, ImportJobRecord>,
 }
 
 /// The accumulated metrics for one rollup key in the in-memory double (mirrors the SQL columns).
@@ -666,6 +669,57 @@ impl MetadataStore for InMemoryMetadataStore {
             }
             Mutation::CreateSessionCredential(rec) => {
                 st.session_creds.insert(rec.access_key_id.clone(), *rec);
+                Ok(MutationOutcome::Ack)
+            }
+            Mutation::CreateImportJob(rec) => {
+                st.import_jobs.insert(rec.id.clone(), *rec);
+                Ok(MutationOutcome::Ack)
+            }
+            Mutation::UpdateImportJobProgress {
+                id,
+                buckets,
+                objects_done,
+                objects_total,
+                bytes_done,
+                bytes_total,
+                last_error,
+                lease_until,
+                updated_at,
+            } => {
+                if let Some(j) = st.import_jobs.get_mut(&id) {
+                    j.buckets = buckets;
+                    j.objects_done = objects_done;
+                    j.objects_total = objects_total;
+                    j.bytes_done = bytes_done;
+                    j.bytes_total = bytes_total;
+                    j.last_error = last_error;
+                    j.lease_until = lease_until;
+                    j.updated_at = updated_at;
+                }
+                Ok(MutationOutcome::Ack)
+            }
+            Mutation::SetImportJobState {
+                id,
+                state,
+                last_error,
+                lease_until,
+                updated_at,
+            } => {
+                if let Some(j) = st.import_jobs.get_mut(&id) {
+                    j.state = state;
+                    j.last_error = last_error;
+                    j.lease_until = lease_until;
+                    j.updated_at = updated_at;
+                }
+                Ok(MutationOutcome::Ack)
+            }
+            Mutation::PruneImportJobs { before_ms } => {
+                st.import_jobs.retain(|_, j| {
+                    !(matches!(
+                        j.state,
+                        ImportState::Completed | ImportState::Failed | ImportState::Cancelled
+                    ) && j.updated_at.0 < before_ms)
+                });
                 Ok(MutationOutcome::Ack)
             }
             Mutation::DeleteExpiredSessionCredentials { before } => {
@@ -1534,6 +1588,28 @@ impl MetadataStore for InMemoryMetadataStore {
             .user_policies
             .get(user_id.0.as_str())
             .cloned())
+    }
+
+    async fn list_import_jobs(&self) -> Result<Vec<ImportJob>, MetaError> {
+        let st = self.state.lock().unwrap();
+        let mut jobs: Vec<ImportJob> = st
+            .import_jobs
+            .values()
+            .map(ImportJobRecord::to_view)
+            .collect();
+        // Newest first (by creation), matching the SQL stores' `ORDER BY created_at DESC`.
+        jobs.sort_by_key(|j| std::cmp::Reverse(j.created_at.0));
+        Ok(jobs)
+    }
+
+    async fn get_import_job(&self, id: &str) -> Result<Option<ImportJob>, MetaError> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .import_jobs
+            .get(id)
+            .map(ImportJobRecord::to_view))
     }
 
     async fn list_activity(&self, limit: u32) -> Result<Vec<ActivityEntry>, MetaError> {

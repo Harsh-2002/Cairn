@@ -591,6 +591,103 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
                 .await?;
             Ok(MutationOutcome::Ack)
         }
+        Mutation::CreateImportJob(rec) => {
+            driver
+                .execute(
+                    "INSERT INTO import_jobs
+                     (id, source_endpoint, source_region, access_key_id, secret_ciphertext, secret_nonce,
+                      ca_cert_pem, insecure_skip_verify, workers, state, buckets_json, objects_done,
+                      objects_total, bytes_done, bytes_total, last_error, lease_until, created_at, updated_at)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
+                    vec![
+                        Value::Text(rec.id.clone()),
+                        Value::Text(rec.source_endpoint.clone()),
+                        Value::Text(rec.source_region.clone()),
+                        Value::Text(rec.access_key_id.clone()),
+                        Value::Blob(rec.secret_ciphertext.clone()),
+                        rec.secret_nonce.clone().map_or(Value::Null, Value::Blob),
+                        opt_text(rec.ca_cert_pem.clone()),
+                        Value::Int(i64::from(rec.insecure_skip_verify)),
+                        Value::Int(i64::from(rec.workers)),
+                        Value::Text(model::import_state_str(rec.state).to_owned()),
+                        Value::Text(model::to_json(&rec.buckets)),
+                        Value::Int(rec.objects_done as i64),
+                        Value::Int(rec.objects_total as i64),
+                        Value::Int(rec.bytes_done as i64),
+                        Value::Int(rec.bytes_total as i64),
+                        opt_text(rec.last_error.clone()),
+                        rec.lease_until.map_or(Value::Null, |t| Value::Int(t.0)),
+                        Value::Int(rec.created_at.0),
+                        Value::Int(rec.updated_at.0),
+                    ],
+                )
+                .await?;
+            Ok(MutationOutcome::Ack)
+        }
+        Mutation::UpdateImportJobProgress {
+            id,
+            buckets,
+            objects_done,
+            objects_total,
+            bytes_done,
+            bytes_total,
+            last_error,
+            lease_until,
+            updated_at,
+        } => {
+            driver
+                .execute(
+                    "UPDATE import_jobs SET
+                       buckets_json=?2, objects_done=?3, objects_total=?4, bytes_done=?5, bytes_total=?6,
+                       last_error=?7, lease_until=?8, updated_at=?9
+                     WHERE id=?1",
+                    vec![
+                        Value::Text(id.clone()),
+                        Value::Text(model::to_json(&buckets)),
+                        Value::Int(objects_done as i64),
+                        Value::Int(objects_total as i64),
+                        Value::Int(bytes_done as i64),
+                        Value::Int(bytes_total as i64),
+                        opt_text(last_error.clone()),
+                        lease_until.map_or(Value::Null, |t| Value::Int(t.0)),
+                        Value::Int(updated_at.0),
+                    ],
+                )
+                .await?;
+            Ok(MutationOutcome::Ack)
+        }
+        Mutation::SetImportJobState {
+            id,
+            state,
+            last_error,
+            lease_until,
+            updated_at,
+        } => {
+            driver
+                .execute(
+                    "UPDATE import_jobs SET state=?2, last_error=?3, lease_until=?4, updated_at=?5
+                     WHERE id=?1",
+                    vec![
+                        Value::Text(id.clone()),
+                        Value::Text(model::import_state_str(state).to_owned()),
+                        opt_text(last_error.clone()),
+                        lease_until.map_or(Value::Null, |t| Value::Int(t.0)),
+                        Value::Int(updated_at.0),
+                    ],
+                )
+                .await?;
+            Ok(MutationOutcome::Ack)
+        }
+        Mutation::PruneImportJobs { before_ms } => {
+            driver
+                .execute(
+                    "DELETE FROM import_jobs
+                     WHERE state IN ('completed','failed','cancelled') AND updated_at < ?1",
+                    vec![Value::Int(before_ms)],
+                )
+                .await?;
+            Ok(MutationOutcome::Ack)
+        }
         Mutation::ClaimReplicationBatch {
             limit,
             now,

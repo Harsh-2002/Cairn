@@ -11,9 +11,9 @@ use cairn_types::authz::{Acl, OwnershipMode};
 use cairn_types::bucket::{Bucket, CompressionPolicy, VersioningState};
 use cairn_types::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
 use cairn_types::meta::{
-    ActivityEntry, MultipartSession, MultipartStatus, ObjectSummary, OutboxEntry, PartRecord,
-    ReplicationOp, ReplicationStatus, ShareDisposition, ShareRow, User, UserRecord,
-    UserSigV4Credentials, UserWithBearerHash, WebhookEntry, WebhookStatus,
+    ActivityEntry, ImportJob, ImportState, MultipartSession, MultipartStatus, ObjectSummary,
+    OutboxEntry, PartRecord, ReplicationOp, ReplicationStatus, ShareDisposition, ShareRow, User,
+    UserRecord, UserSigV4Credentials, UserWithBearerHash, WebhookEntry, WebhookStatus,
 };
 use cairn_types::notification::EventKind;
 use cairn_types::object::{
@@ -331,6 +331,56 @@ pub fn user_sigv4_from_row(row: &Row) -> Result<Option<UserSigV4Credentials>, Me
         })),
         _ => Ok(None),
     }
+}
+
+// --- import jobs (ARCH 27) ---
+
+/// The secret-free column list for `import_jobs` reads (excludes secret_ciphertext/secret_nonce), in
+/// the positional order [`import_job_from_row`] expects.
+pub const IMPORT_JOB_COLS: &str = "id, source_endpoint, source_region, access_key_id, ca_cert_pem, \
+     insecure_skip_verify, workers, state, buckets_json, objects_done, objects_total, bytes_done, \
+     bytes_total, last_error, created_at, updated_at";
+
+pub fn import_state_str(s: ImportState) -> &'static str {
+    match s {
+        ImportState::Pending => "pending",
+        ImportState::Running => "running",
+        ImportState::Completed => "completed",
+        ImportState::Failed => "failed",
+        ImportState::Cancelled => "cancelled",
+    }
+}
+
+pub fn import_state_from(s: &str) -> ImportState {
+    match s {
+        "running" => ImportState::Running,
+        "completed" => ImportState::Completed,
+        "failed" => ImportState::Failed,
+        "cancelled" => ImportState::Cancelled,
+        _ => ImportState::Pending,
+    }
+}
+
+/// Map an `import_jobs` row (selected via [`IMPORT_JOB_COLS`]) to the secret-free [`ImportJob`].
+pub fn import_job_from_row(row: &Row) -> Result<ImportJob, MetaError> {
+    Ok(ImportJob {
+        id: row.get_text(0),
+        source_endpoint: row.get_text(1),
+        source_region: row.get_text(2),
+        access_key_id: row.get_text(3),
+        has_ca_cert: row.get_opt_text(4).is_some(),
+        insecure_skip_verify: row.get_i64(5) != 0,
+        workers: row.get_i64(6) as u32,
+        state: import_state_from(&row.get_text(7)),
+        buckets: json_col(&row.get_text(8))?,
+        objects_done: row.get_i64(9) as u64,
+        objects_total: row.get_i64(10) as u64,
+        bytes_done: row.get_i64(11) as u64,
+        bytes_total: row.get_i64(12) as u64,
+        last_error: row.get_opt_text(13),
+        created_at: Timestamp(row.get_i64(14)),
+        updated_at: Timestamp(row.get_i64(15)),
+    })
 }
 
 pub fn outbox_from_row(row: &Row) -> Result<OutboxEntry, MetaError> {

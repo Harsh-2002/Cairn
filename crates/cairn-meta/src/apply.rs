@@ -506,6 +506,100 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             .map_err(engine_err)?;
             Ok(MutationOutcome::Ack)
         }
+        Mutation::CreateImportJob(rec) => {
+            conn.execute(
+                "INSERT INTO import_jobs
+                 (id, source_endpoint, source_region, access_key_id, secret_ciphertext, secret_nonce,
+                  ca_cert_pem, insecure_skip_verify, workers, state, buckets_json, objects_done,
+                  objects_total, bytes_done, bytes_total, last_error, lease_until, created_at, updated_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
+                params![
+                    rec.id,
+                    rec.source_endpoint,
+                    rec.source_region,
+                    rec.access_key_id,
+                    rec.secret_ciphertext,
+                    rec.secret_nonce,
+                    rec.ca_cert_pem,
+                    rec.insecure_skip_verify,
+                    rec.workers as i64,
+                    model::import_state_str(rec.state),
+                    model::to_json(&rec.buckets),
+                    rec.objects_done as i64,
+                    rec.objects_total as i64,
+                    rec.bytes_done as i64,
+                    rec.bytes_total as i64,
+                    rec.last_error,
+                    rec.lease_until.map(|t| t.0),
+                    rec.created_at.0,
+                    rec.updated_at.0,
+                ],
+            )
+            .map_err(engine_err)?;
+            Ok(MutationOutcome::Ack)
+        }
+        Mutation::UpdateImportJobProgress {
+            id,
+            buckets,
+            objects_done,
+            objects_total,
+            bytes_done,
+            bytes_total,
+            last_error,
+            lease_until,
+            updated_at,
+        } => {
+            // Column-scoped UPDATE (never touches `state`), mirroring the `UpdateUser` posture.
+            conn.execute(
+                "UPDATE import_jobs SET
+                   buckets_json=?2, objects_done=?3, objects_total=?4, bytes_done=?5, bytes_total=?6,
+                   last_error=?7, lease_until=?8, updated_at=?9
+                 WHERE id=?1",
+                params![
+                    id,
+                    model::to_json(&buckets),
+                    objects_done as i64,
+                    objects_total as i64,
+                    bytes_done as i64,
+                    bytes_total as i64,
+                    last_error,
+                    lease_until.map(|t| t.0),
+                    updated_at.0,
+                ],
+            )
+            .map_err(engine_err)?;
+            Ok(MutationOutcome::Ack)
+        }
+        Mutation::SetImportJobState {
+            id,
+            state,
+            last_error,
+            lease_until,
+            updated_at,
+        } => {
+            conn.execute(
+                "UPDATE import_jobs SET state=?2, last_error=?3, lease_until=?4, updated_at=?5
+                 WHERE id=?1",
+                params![
+                    id,
+                    model::import_state_str(state),
+                    last_error,
+                    lease_until.map(|t| t.0),
+                    updated_at.0,
+                ],
+            )
+            .map_err(engine_err)?;
+            Ok(MutationOutcome::Ack)
+        }
+        Mutation::PruneImportJobs { before_ms } => {
+            conn.execute(
+                "DELETE FROM import_jobs
+                 WHERE state IN ('completed','failed','cancelled') AND updated_at < ?1",
+                params![before_ms],
+            )
+            .map_err(engine_err)?;
+            Ok(MutationOutcome::Ack)
+        }
         Mutation::ClaimReplicationBatch {
             limit,
             now,

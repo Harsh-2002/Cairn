@@ -386,6 +386,54 @@ pub enum Mutation {
         /// When set, delete rows whose `ts_bucket` is strictly less than this epoch-seconds bound.
         prune_before: Option<i64>,
     },
+    /// Create an S3 import job (its source secret already sealed under the master key), in state
+    /// `Pending`. The background import loop claims and runs it. Returns [`MutationOutcome::Ack`]
+    /// (the id is minted by the control handler, mirroring the replication-target ARN).
+    CreateImportJob(Box<ImportJobRecord>),
+    /// Persist an import job's progress: the per-bucket cursors/counters (`buckets`), the denormalized
+    /// aggregate counters, and a renewed running lease. Emitted by the engine's throttled checkpoint
+    /// callback while a job runs. Column-scoped `UPDATE ... WHERE id = ?` (never touches `state`).
+    UpdateImportJobProgress {
+        /// The job id.
+        id: String,
+        /// The per-bucket progress (serialized to the `buckets_json` column).
+        buckets: Vec<ImportBucketProgress>,
+        /// Denormalized total objects copied so far.
+        objects_done: u64,
+        /// Denormalized total objects to copy (best-effort; may grow as enumeration proceeds).
+        objects_total: u64,
+        /// Denormalized total bytes copied so far.
+        bytes_done: u64,
+        /// Denormalized total bytes to copy (best-effort).
+        bytes_total: u64,
+        /// The most recent per-object error sample, if any.
+        last_error: Option<String>,
+        /// Renewed claim lease (`None` clears it).
+        lease_until: Option<Timestamp>,
+        /// The update time.
+        updated_at: Timestamp,
+    },
+    /// Transition an import job's lifecycle state: `Pending -> Running` (claim, stamps the lease),
+    /// `-> Completed`/`Failed` (terminal), or `-> Cancelled`/back to `Pending` (operator resume).
+    /// Column-scoped `UPDATE ... WHERE id = ?`.
+    SetImportJobState {
+        /// The job id.
+        id: String,
+        /// The new state.
+        state: ImportState,
+        /// An optional error/status message to record.
+        last_error: Option<String>,
+        /// The claim lease (`Some` when moving to `Running`, `None` otherwise).
+        lease_until: Option<Timestamp>,
+        /// The update time.
+        updated_at: Timestamp,
+    },
+    /// Reclaim finished (`completed`/`failed`/`cancelled`) import jobs whose `updated_at` is before
+    /// `before_ms`, keeping the table bounded. Running/pending jobs are never pruned.
+    PruneImportJobs {
+        /// Delete finished jobs updated before this wall-clock millis.
+        before_ms: i64,
+    },
 }
 
 /// The typed result of applying a [`Mutation`].
@@ -434,6 +482,159 @@ pub enum MutationOutcome {
     UserCreated(UserId),
     /// A generic acknowledgement for mutations with no specific return value.
     Ack,
+}
+
+// ---------------------------------------------------------------------------------------
+// Import (migrating buckets in from another S3-compatible store)
+// ---------------------------------------------------------------------------------------
+
+/// The lifecycle state of an import job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ImportState {
+    /// Created, awaiting a worker.
+    Pending,
+    /// Claimed and actively copying.
+    Running,
+    /// Finished; every selected bucket was enumerated and its objects copied (possibly with a
+    /// non-zero per-object failed count — see [`ImportBucketProgress::last_error`]).
+    Completed,
+    /// Terminally failed (e.g. the source became unreachable past the retry budget).
+    Failed,
+    /// Cancelled by an operator; resumable back to `Pending`.
+    Cancelled,
+}
+
+/// Per-bucket progress within an import job, serialized as an element of the job's `buckets_json`
+/// column. `cursor` is the source `ListObjectsV2` continuation token to resume from, so a restart
+/// picks up mid-bucket instead of re-scanning.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportBucketProgress {
+    /// The source bucket name.
+    pub source_bucket: String,
+    /// The destination bucket on this node.
+    pub dest_bucket: String,
+    /// Objects copied so far in this bucket.
+    pub objects_done: u64,
+    /// Objects seen so far (grows as enumeration proceeds; a running best-effort total).
+    pub objects_total: u64,
+    /// Bytes copied so far in this bucket.
+    pub bytes_done: u64,
+    /// Bytes seen so far.
+    pub bytes_total: u64,
+    /// The `ListObjectsV2` continuation token to resume enumeration from; `None` = not started or
+    /// fully enumerated.
+    pub cursor: Option<String>,
+    /// This bucket's state.
+    pub state: ImportState,
+    /// A bounded sample of the most recent per-object error, if any.
+    pub last_error: Option<String>,
+}
+
+/// A full import-job record including the sealed source secret, for the create/update mutations.
+/// Mirrors the sealed-secret shape of [`SessionCredentialRecord`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportJobRecord {
+    /// The job id (a uuid minted by the control plane).
+    pub id: String,
+    /// The remote S3 endpoint base URL.
+    pub source_endpoint: String,
+    /// The SigV4 signing region for the source.
+    pub source_region: String,
+    /// The source admin access-key id (public; not a secret).
+    pub access_key_id: String,
+    /// The sealed source secret (`CRK1` envelope; `secret_nonce` is `None`).
+    pub secret_ciphertext: Vec<u8>,
+    /// The legacy ciphertext nonce (`None` for a `CRK1` envelope).
+    pub secret_nonce: Option<Vec<u8>>,
+    /// An optional PEM CA bundle to trust for an `https://` source.
+    pub ca_cert_pem: Option<String>,
+    /// Whether to skip TLS verification for the source (testing only).
+    pub insecure_skip_verify: bool,
+    /// The requested object-worker count.
+    pub workers: u32,
+    /// The job state.
+    pub state: ImportState,
+    /// Per-bucket progress + cursors.
+    pub buckets: Vec<ImportBucketProgress>,
+    /// Denormalized aggregate: objects copied across all buckets (cheap list rendering).
+    pub objects_done: u64,
+    /// Denormalized aggregate: objects seen across all buckets.
+    pub objects_total: u64,
+    /// Denormalized aggregate: bytes copied.
+    pub bytes_done: u64,
+    /// Denormalized aggregate: bytes seen.
+    pub bytes_total: u64,
+    /// A job-level error/status message, if any.
+    pub last_error: Option<String>,
+    /// The running-job claim lease (`None` when not claimed); a stale lease is reclaimable at startup.
+    pub lease_until: Option<Timestamp>,
+    /// When the job was created.
+    pub created_at: Timestamp,
+    /// When the job was last updated.
+    pub updated_at: Timestamp,
+}
+
+/// An import job as returned to the control plane — the **secret-free** view (no ciphertext/nonce).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportJob {
+    /// The job id.
+    pub id: String,
+    /// The remote S3 endpoint base URL.
+    pub source_endpoint: String,
+    /// The SigV4 signing region for the source.
+    pub source_region: String,
+    /// The source admin access-key id.
+    pub access_key_id: String,
+    /// Whether a custom CA certificate is configured (presence flag; the PEM is not returned).
+    pub has_ca_cert: bool,
+    /// Whether TLS verification is skipped for the source.
+    pub insecure_skip_verify: bool,
+    /// The object-worker count.
+    pub workers: u32,
+    /// The job state.
+    pub state: ImportState,
+    /// Per-bucket progress.
+    pub buckets: Vec<ImportBucketProgress>,
+    /// Aggregate objects copied.
+    pub objects_done: u64,
+    /// Aggregate objects seen.
+    pub objects_total: u64,
+    /// Aggregate bytes copied.
+    pub bytes_done: u64,
+    /// Aggregate bytes seen.
+    pub bytes_total: u64,
+    /// A job-level error/status message, if any.
+    pub last_error: Option<String>,
+    /// When the job was created.
+    pub created_at: Timestamp,
+    /// When the job was last updated.
+    pub updated_at: Timestamp,
+}
+
+impl ImportJobRecord {
+    /// The secret-free [`ImportJob`] view: drops the sealed secret material and exposes only a
+    /// `has_ca_cert` presence flag. Used by every read path so a secret can never leak to the API.
+    #[must_use]
+    pub fn to_view(&self) -> ImportJob {
+        ImportJob {
+            id: self.id.clone(),
+            source_endpoint: self.source_endpoint.clone(),
+            source_region: self.source_region.clone(),
+            access_key_id: self.access_key_id.clone(),
+            has_ca_cert: self.ca_cert_pem.is_some(),
+            insecure_skip_verify: self.insecure_skip_verify,
+            workers: self.workers,
+            state: self.state,
+            buckets: self.buckets.clone(),
+            objects_done: self.objects_done,
+            objects_total: self.objects_total,
+            bytes_done: self.bytes_done,
+            bytes_total: self.bytes_total,
+            last_error: self.last_error.clone(),
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------

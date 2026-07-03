@@ -30,11 +30,11 @@ use cairn_types::authz::PublicAccessBlock;
 use cairn_types::bucket::{Bucket, ConfigAspect, ConfigDoc};
 use cairn_types::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
 use cairn_types::meta::{
-    ActivityEntry, BucketCounts, ListPage, ListQuery, MetricsRange, MultipartSession, Mutation,
-    MutationOutcome, ObjectSummary, OutboxEntry, PartRecord, ReplicationCounts, ReplicationStatus,
-    ReplicationTargetCounts, RequestMetricsSeries, SessionCredentialSummary, ShareRow, StoreCounts,
-    TagSummary, TaggedObject, User, UserSessionCredentials, UserSigV4Credentials,
-    UserWithBearerHash, WebhookEntry,
+    ActivityEntry, BucketCounts, ImportJob, ListPage, ListQuery, MetricsRange, MultipartSession,
+    Mutation, MutationOutcome, ObjectSummary, OutboxEntry, PartRecord, ReplicationCounts,
+    ReplicationStatus, ReplicationTargetCounts, RequestMetricsSeries, SessionCredentialSummary,
+    ShareRow, StoreCounts, TagSummary, TaggedObject, User, UserSessionCredentials,
+    UserSigV4Credentials, UserWithBearerHash, WebhookEntry,
 };
 use cairn_types::object::ObjectVersionRow;
 use cairn_types::time::Timestamp;
@@ -279,7 +279,11 @@ impl MetadataStore for ShardedMetadataStore {
             | Mutation::RecordActivity(_)
             | Mutation::RecordRequestMetrics { .. }
             | Mutation::CreateShare(_)
-            | Mutation::RevokeShare { .. } => self.global().submit(mutation).await,
+            | Mutation::RevokeShare { .. }
+            | Mutation::CreateImportJob(_)
+            | Mutation::UpdateImportJobProgress { .. }
+            | Mutation::SetImportJobState { .. }
+            | Mutation::PruneImportJobs { .. } => self.global().submit(mutation).await,
         }
     }
 
@@ -634,6 +638,15 @@ impl MetadataStore for ShardedMetadataStore {
         self.global().get_user_policy(user_id).await
     }
 
+    // --- import jobs (global, shard 0) ---
+    async fn list_import_jobs(&self) -> Result<Vec<ImportJob>, MetaError> {
+        self.global().list_import_jobs().await
+    }
+
+    async fn get_import_job(&self, id: &str) -> Result<Option<ImportJob>, MetaError> {
+        self.global().get_import_job(id).await
+    }
+
     // --- object shares (global, shard 0) ---
     async fn get_share(&self, token: &str) -> Result<Option<ShareRow>, MetaError> {
         self.global().get_share(token).await
@@ -795,7 +808,11 @@ fn mutation_bucket(m: &Mutation) -> Option<String> {
         | Mutation::RecordActivity(_)
         | Mutation::CreateShare(_)
         | Mutation::RevokeShare { .. }
-        | Mutation::RecordRequestMetrics { .. } => return None,
+        | Mutation::RecordRequestMetrics { .. }
+        | Mutation::CreateImportJob(_)
+        | Mutation::UpdateImportJobProgress { .. }
+        | Mutation::SetImportJobState { .. }
+        | Mutation::PruneImportJobs { .. } => return None,
     };
     Some(b.to_owned())
 }
