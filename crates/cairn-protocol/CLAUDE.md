@@ -63,6 +63,11 @@ Clock/Crypto>`) — never a concrete engine.
   it credential-less (ARCH 18.2).
 - `S3Body::ZeroCopy` always carries the portable `stream` too; non-fast paths (TLS, musl, the
   default build) serve byte-identical output. Don't assume the sendfile path engaged.
+- **`DeleteObjects` runs its keys bounded-concurrent** (`buffered`), not serially, so the single
+  group-committing writer batches the independent per-key mutations into far fewer fsync barriers.
+  Each key keeps its own authorize + Object-Lock check + delete-marker/replication logic, and results
+  stay in request order. `authorize` loads the object ACL + tags **only** when a bucket/identity
+  policy or an enabled ACL can consult them — a default-bucket GET/HEAD/DELETE skips those reads.
 - Tests: `tests/protocol_core.rs` (end-to-end against the real SQLite + filesystem backends);
   decoder bench `benches/decode.rs`. service.rs has no inline `#[test]`s.
 - Spec: `docs/s3-api.md` (13, 16–19, 21; decoder = 21.7); auth `docs/auth.md` (14–15); errors

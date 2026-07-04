@@ -43,10 +43,19 @@ plain files under opaque IDs; metadata is someone else's job (`cairn-meta`).
   reclaimed even if the oracle reports it not-live (it may be an in-flight PUT whose row hasn't
   committed — audit #7). Margin `0` reclaims immediately (the legacy behavior; what tests and on-demand
   reconcile use). Per-bucket reconciles run concurrently; the staging area is reconciled inline.
-- Every transfer holds one of `io_permits` (default `DEFAULT_BLOB_IO_CONCURRENCY = 64`, `with_io_pool_size`
-  to tune) for the duration of its file I/O — bounds blocking-pool occupancy (ARCH 7.4). Reads use an
-  *owned* permit and defer the file open until the body is first polled, so a kernel zero-copy GET that
-  drops the body unpolled opens no file and releases the permit immediately (Phase 2.5).
+- Blob transfers are bounded by **two SEPARATE permit pools** (both default `DEFAULT_BLOB_IO_CONCURRENCY
+  = 64`; `with_read_pool_size` / `with_io_pool_size` to tune) — `read_permits` for GETs and `write_permits`
+  for stage/stage_part/assemble (ARCH 7.4). The split is deliberate: a read permit is held for the whole
+  *client-paced* transfer, so a flood of slow readers pins only read permits and can never starve writes
+  (a read-side slow-loris that once stalled the data plane, audit 2026-07). Reads use an *owned* permit
+  and defer the file open until the body is first polled, so a kernel zero-copy GET that drops the body
+  unpolled opens no file and releases the permit immediately (Phase 2.5).
+- **Small-object GET fast path.** An uncompressed blob at or below `small_read_max` (default `SMALL_READ_MAX
+  = 256 KiB`, below the sendfile floor; `with_small_read_max` overrides, `0` forces the streamed path for
+  an A/B) is read WHOLE in the single probe `open` and served as one `Bytes` with the range sliced from
+  that buffer — no second open, no read permit, no per-chunk `mpsc` streaming channel. Larger objects take
+  the streamed read (+ zero-copy hint). Measured ~1.3–2.6× faster in-process for tiny GETs; isolated by
+  `cargo run --release --example bench_small_get -p cairn-blob`.
 
 ## Contract & pointers
 - Depends only on `cairn-types` (the trait spine + domain types) — no other engine crate. Implements

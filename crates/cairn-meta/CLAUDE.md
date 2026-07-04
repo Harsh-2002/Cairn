@@ -22,6 +22,10 @@ metadata commit is **the single linearization point of every mutation** (ARCH 11
   user-metadata) are JSON columns. `engine_err` maps constraint violations → `MetaError::Conflict`.
 - `range.rs` — `successor`/`prefix_upper_bound` for the listing range seek (UTF-8 byte order);
   unit-tested against empty/maximal/multibyte — their correctness *is* listing's correctness.
+  The scan guards an **empty delimiter** to no-delimiter (`.filter(|d| !d.is_empty())`): `"".find`
+  is `Some(0)`, so an unguarded empty delimiter would collapse every key into one common prefix and
+  return zero objects — the bug that made warp/minio-go's recursive list (always `delimiter=`) fail.
+  Normalise it at the S3 handler too; keep both backends' scans identical (async `contract.rs`).
 - `cache.rs` — `CachedMetadataStore`, a decorator that memoises exactly three auth-path reads
   (`get_bucket`, `get_bucket_config`, `get_account_public_access_block`; F-10). Sharded, byte-budgeted,
   caches negatives; `submit` invalidates affected entries (when unsure, the whole bucket).
