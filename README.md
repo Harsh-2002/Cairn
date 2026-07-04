@@ -135,9 +135,10 @@ Throughput (higher is better; `obj/s` for small objects, `MiB/s` for large):
 | PUT   | 8 MiB | 115 MiB/s       | **128 MiB/s** | MinIO 1.12× |
 | GET   | 4 KiB | **3431 obj/s**  | 1815 obj/s  | Cairn 1.89× |
 | GET   | 8 MiB | **1463 MiB/s**  | 801 MiB/s   | Cairn 1.83× |
-| STAT  | 4 KiB | **3494 obj/s**  | 1824 obj/s  | Cairn 1.92× |
-| LIST  | 4 KiB | **21183 obj/s** | 10288 obj/s | Cairn 2.06× |
-| MIXED | 1 MiB | **285 MiB/s**   | 271 MiB/s   | Cairn 1.05× |
+| STAT   | 4 KiB | **3494 obj/s**  | 1824 obj/s  | Cairn 1.92× |
+| DELETE | 4 KiB | **7442 obj/s**  | 5236 obj/s  | Cairn 1.42× |
+| LIST   | 4 KiB | **21183 obj/s** | 10288 obj/s | Cairn 2.06× |
+| MIXED  | 1 MiB | **285 MiB/s**   | 271 MiB/s   | Cairn 1.05× |
 
 Resource use while serving the same workload (lower is better):
 
@@ -146,11 +147,11 @@ Resource use while serving the same workload (lower is better):
 | **Cairn** | 76% | **106 MB** |
 | MinIO | 88% | 1072 MB |
 
-On this hardware Cairn matches or beats MinIO on most operations while holding a roughly **10× smaller
-memory footprint** (~106 MB vs ~1 GB). The ratio between the two is the meaningful signal: the absolute
-numbers are modest because a 2-core box shares its cores with the benchmark client and vary run to run,
-which is why the figures are medians and why the comparison — not the raw rate — is what to read. (DELETE
-is omitted: on this hardware it completes too quickly for warp to sample reliably.)
+On this hardware Cairn beats MinIO on seven of these eight operations — losing only large-object PUT,
+and by a small margin — while holding a roughly **10× smaller memory footprint** (~106 MB vs ~1 GB).
+The ratio between the two is the meaningful signal: the absolute numbers are modest because a 2-core box
+shares its cores with the benchmark client and vary run to run, which is why the figures are medians and
+why the comparison — not the raw rate — is what to read.
 
 Reproduce it yourself — the harness stands up both servers and runs the matrix side by side, and the
 same comparison runs on every push in CI (the `bench-compare` job), so it tracks the code over time:
