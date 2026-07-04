@@ -422,6 +422,47 @@ async fn listing_prefix_delimiter_and_pagination() {
     assert_eq!(all, vec!["a/1", "a/2", "a/3", "b/1", "c"]);
 }
 
+// Regression: an empty-but-present delimiter ("") must behave as "no delimiter" (S3 semantics),
+// not as a zero-width separator. `str::find("")` is `Some(0)`, so an unguarded scan would collapse
+// every key into one CommonPrefix and return zero objects — which is exactly what made warp's
+// (minio-go) recursive list, always sent with `delimiter=`, error against Cairn on every op.
+#[tokio::test]
+async fn listing_empty_delimiter_lists_all_objects() {
+    let store = cairn_meta::open_in_memory().unwrap();
+    let b = BucketName::parse("bkt").unwrap();
+    for k in ["a/1", "a/2", "b/1", "c"] {
+        store
+            .submit(put(
+                row(&b, k, VersionId::null(), "e", true),
+                Precondition::default(),
+            ))
+            .await
+            .unwrap();
+    }
+
+    let page = store
+        .list_current(
+            &b,
+            &ListQuery {
+                delimiter: Some("".into()),
+                limit: 100,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // Same as no delimiter: every key is a direct object, no common prefixes.
+    assert!(page.common_prefixes.is_empty());
+    assert_eq!(
+        page.items
+            .iter()
+            .map(|i| i.key.as_str().to_owned())
+            .collect::<Vec<_>>(),
+        vec!["a/1", "a/2", "b/1", "c"],
+    );
+}
+
 #[tokio::test]
 async fn reconcile_oracle_reports_membership() {
     let store = cairn_meta::open_in_memory().unwrap();

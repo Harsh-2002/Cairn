@@ -482,7 +482,14 @@ impl S3Service {
         let bucket = self.fetch_bucket(req).await?;
         let v1 = req.query("list-type").map(|v| v != "2").unwrap_or(true);
         let prefix = req.query("prefix").map(str::to_owned);
-        let delimiter = req.query("delimiter").map(str::to_owned);
+        // An empty but PRESENT `delimiter=` means "no delimiter" (S3 semantics): normalize it to
+        // None so the range scan doesn't treat "" as a zero-width separator (`str::find("")` ==
+        // `Some(0)`), which would collapse every key into one CommonPrefix and return zero
+        // Contents. minio-go (hence warp's recursive list) sends `delimiter=` unconditionally.
+        let delimiter = req
+            .query("delimiter")
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
         let max_keys = req
             .query("max-keys")
             .and_then(|s| s.parse().ok())
@@ -1925,201 +1932,233 @@ impl S3Service {
                 .as_ref()
                 .is_some_and(|p| p.role == Role::Administrator);
 
-        // Each entry is (key, version_id, is_delete_marker, delete_marker_version_id) so the
-        // result can surface `<DeleteMarker>`/`<DeleteMarkerVersionId>` for a marker insert.
-        let mut deleted: Vec<(String, Option<String>, bool, Option<String>)> = Vec::new();
-        let mut errors: Vec<(String, String, String)> = Vec::new();
-        // Whether any key in this batch enqueued a delete-marker replication entry; if so we pulse
-        // the worker once after the loop, mirroring the single-object DELETE's event-driven wake.
-        let mut any_repl_enqueued = false;
-        for (key_s, version) in keys {
-            let Ok(key) = ObjectKey::parse(&key_s) else {
-                errors.push((
-                    key_s,
-                    "InvalidArgument".to_owned(),
-                    "invalid key".to_owned(),
-                ));
-                continue;
-            };
-            // Authorize each key individually (Medium #7): a bulk delete is N independent
-            // DeleteObject (or DeleteObjectVersion, for a versioned entry) decisions, not one
-            // bucket-level grant. A per-key denial becomes a per-key error, not a whole-request
-            // failure, so the remaining keys still proceed.
-            let action = if version.is_some() {
-                Action::DeleteObjectVersion
-            } else {
-                Action::DeleteObject
-            };
-            // Evaluate version-scoped policy conditions against the named version (audit #33).
-            let acl_version = version.as_ref().map(|v| VersionId::from_string(v.clone()));
-            if let Err(e) = self
-                .authorize(
-                    req,
-                    &bucket,
-                    action,
-                    Resource::Object {
-                        bucket: bucket.name.clone(),
-                        key: key.clone(),
-                    },
-                    acl_version.as_ref(),
-                )
-                .await
-            {
-                let (_, code) = crate::error_map::map(&e);
-                errors.push((key_s, code.to_owned(), e.to_string()));
-                continue;
-            }
-            // Object Lock: a permanent version delete (?versionId) of a still-protected version is
-            // denied per-key (the rest of the batch proceeds). A plain delete-marker insert (no
-            // versionId) creates a NEW version and never destroys a locked one, so it is unaffected.
-            if let Some(v) = &version {
-                let version_id = VersionId::from_string(v.clone());
-                if let Err(e) = self
-                    .enforce_unlocked_for_delete(req, &bucket, &key, &version_id, now)
-                    .await
-                {
-                    let (_, code) = crate::error_map::map(&e);
-                    errors.push((key_s, code.to_owned(), e.to_string()));
-                    continue;
-                }
-            }
-            // Event-notification context kept before `key`/`version` are moved into the mutation.
-            let event_key = key.clone();
-            let event_version_req = version.clone();
-            // Per-key delete semantics by versioning state, mirroring the single-object DELETE:
-            //  - a versioned delete (?versionId) permanently removes that version;
-            //  - Enabled: insert a delete marker (replicated where the rule calls for it);
-            //  - Suspended: replace any existing null version with a null-version delete marker
-            //    (NOT a permanent removal — Medium #4 applied to the bulk path);
-            //  - Unversioned: remove the sentinel version outright.
-            let result = if let Some(v) = &version {
-                self.meta
-                    .submit(Mutation::DeleteVersion {
-                        bucket: bucket.name.clone(),
-                        key,
-                        version_id: VersionId::from_string(v.clone()),
-                        expected_updated_at: None,
-                    })
-                    .await
-            } else {
-                match bucket.versioning {
-                    VersioningState::Enabled => {
-                        let mid = VersionId::generate();
-                        let replication = if is_replica {
-                            Vec::new()
-                        } else {
-                            self.replication_outbox(
-                                &bucket,
-                                &key,
-                                &mid,
-                                ReplicationOp::DeleteMarker,
-                                &[],
-                            )
-                            .await
-                        };
-                        any_repl_enqueued |= !replication.is_empty();
-                        self.meta
-                            .submit(Mutation::CreateDeleteMarker {
-                                bucket: bucket.name.clone(),
-                                key,
-                                version_id: mid,
-                                owner_id: bucket.owner_id.clone(),
-                                now,
-                                replication,
-                            })
-                            .await
-                    }
-                    VersioningState::Suspended => {
-                        // Remove any existing null version (reclaiming its blob), then insert a
-                        // null-version delete marker that replaces it.
-                        if let Ok(MutationOutcome::Deleted { freed: Some(p), .. }) = self
-                            .meta
-                            .submit(Mutation::DeleteVersion {
+        // Each result entry is (key, version_id, is_delete_marker, delete_marker_version_id) so the
+        // response can surface `<DeleteMarker>`/`<DeleteMarkerVersionId>` for a marker insert.
+        //
+        // Keys are independent DeleteObject/DeleteObjectVersion decisions (Medium #7), so run them
+        // CONCURRENTLY (bounded): the single group-committing writer then batches the independent
+        // per-key mutations into far fewer fsync barriers than one awaited commit per key — the
+        // delete-heavy path that lost ~3x to MinIO's parallel unlinks. Ordering *within* a key is
+        // preserved (the Suspended two-step awaits in sequence); across keys there is no dependency.
+        // `buffered` yields in input order, so the `<Deleted>`/`<Error>` sequence is unchanged.
+        use futures_util::StreamExt as _;
+        struct KeyOutcome {
+            deleted: Option<(String, Option<String>, bool, Option<String>)>,
+            error: Option<(String, String, String)>,
+            repl_enqueued: bool,
+        }
+        let outcomes: Vec<KeyOutcome> = futures_util::stream::iter(keys)
+            .map(|(key_s, version)| {
+                let bucket = &bucket;
+                async move {
+                    let mut out = KeyOutcome {
+                        deleted: None,
+                        error: None,
+                        repl_enqueued: false,
+                    };
+                    let Ok(key) = ObjectKey::parse(&key_s) else {
+                        out.error = Some((
+                            key_s,
+                            "InvalidArgument".to_owned(),
+                            "invalid key".to_owned(),
+                        ));
+                        return out;
+                    };
+                    // Authorize each key individually (Medium #7): a per-key denial is a per-key
+                    // error, not a whole-request failure.
+                    let action = if version.is_some() {
+                        Action::DeleteObjectVersion
+                    } else {
+                        Action::DeleteObject
+                    };
+                    // Evaluate version-scoped policy conditions against the named version (audit #33).
+                    let acl_version = version.as_ref().map(|v| VersionId::from_string(v.clone()));
+                    if let Err(e) = self
+                        .authorize(
+                            req,
+                            bucket,
+                            action,
+                            Resource::Object {
                                 bucket: bucket.name.clone(),
                                 key: key.clone(),
-                                version_id: VersionId::null(),
-                                expected_updated_at: None,
-                            })
+                            },
+                            acl_version.as_ref(),
+                        )
+                        .await
+                    {
+                        let (_, code) = crate::error_map::map(&e);
+                        out.error = Some((key_s, code.to_owned(), e.to_string()));
+                        return out;
+                    }
+                    // Object Lock: a permanent version delete of a still-protected version is denied
+                    // per-key. A plain delete-marker insert never destroys a locked version.
+                    if let Some(v) = &version {
+                        let version_id = VersionId::from_string(v.clone());
+                        if let Err(e) = self
+                            .enforce_unlocked_for_delete(req, bucket, &key, &version_id, now)
                             .await
                         {
-                            let _ = self.blob.delete(&p).await;
+                            let (_, code) = crate::error_map::map(&e);
+                            out.error = Some((key_s, code.to_owned(), e.to_string()));
+                            return out;
                         }
-                        self.meta
-                            .submit(Mutation::CreateDeleteMarker {
-                                bucket: bucket.name.clone(),
-                                key,
-                                version_id: VersionId::null(),
-                                owner_id: bucket.owner_id.clone(),
-                                now,
-                                replication: Vec::new(),
-                            })
-                            .await
                     }
-                    VersioningState::Unversioned => {
+                    // Event context kept before `key`/`version` are moved into the mutation.
+                    let event_key = key.clone();
+                    let event_version_req = version.clone();
+                    // Per-key delete semantics by versioning state, mirroring the single-object DELETE:
+                    //  - a versioned delete (?versionId) permanently removes that version;
+                    //  - Enabled: insert a delete marker (replicated where the rule calls for it);
+                    //  - Suspended: replace any existing null version with a null-version marker
+                    //    (NOT a permanent removal — Medium #4 applied to the bulk path);
+                    //  - Unversioned: remove the sentinel version outright.
+                    let result = if let Some(v) = &version {
                         self.meta
                             .submit(Mutation::DeleteVersion {
                                 bucket: bucket.name.clone(),
                                 key,
-                                version_id: VersionId::null(),
+                                version_id: VersionId::from_string(v.clone()),
                                 expected_updated_at: None,
                             })
                             .await
-                    }
-                }
-            };
-            match result {
-                Ok(MutationOutcome::Deleted { freed, .. }) => {
-                    if let Some(p) = freed {
-                        let _ = self.blob.delete(&p).await;
-                    }
-                    let ev = match &event_version_req {
-                        Some(v) => VersionId::from_string(v.clone()),
-                        None => VersionId::null(),
+                    } else {
+                        match bucket.versioning {
+                            VersioningState::Enabled => {
+                                let mid = VersionId::generate();
+                                let replication = if is_replica {
+                                    Vec::new()
+                                } else {
+                                    self.replication_outbox(
+                                        bucket,
+                                        &key,
+                                        &mid,
+                                        ReplicationOp::DeleteMarker,
+                                        &[],
+                                    )
+                                    .await
+                                };
+                                out.repl_enqueued |= !replication.is_empty();
+                                self.meta
+                                    .submit(Mutation::CreateDeleteMarker {
+                                        bucket: bucket.name.clone(),
+                                        key,
+                                        version_id: mid,
+                                        owner_id: bucket.owner_id.clone(),
+                                        now,
+                                        replication,
+                                    })
+                                    .await
+                            }
+                            VersioningState::Suspended => {
+                                // Remove any existing null version (reclaiming its blob), then insert
+                                // a null-version delete marker that replaces it.
+                                if let Ok(MutationOutcome::Deleted { freed: Some(p), .. }) = self
+                                    .meta
+                                    .submit(Mutation::DeleteVersion {
+                                        bucket: bucket.name.clone(),
+                                        key: key.clone(),
+                                        version_id: VersionId::null(),
+                                        expected_updated_at: None,
+                                    })
+                                    .await
+                                {
+                                    let _ = self.blob.delete(&p).await;
+                                }
+                                self.meta
+                                    .submit(Mutation::CreateDeleteMarker {
+                                        bucket: bucket.name.clone(),
+                                        key,
+                                        version_id: VersionId::null(),
+                                        owner_id: bucket.owner_id.clone(),
+                                        now,
+                                        replication: Vec::new(),
+                                    })
+                                    .await
+                            }
+                            VersioningState::Unversioned => {
+                                self.meta
+                                    .submit(Mutation::DeleteVersion {
+                                        bucket: bucket.name.clone(),
+                                        key,
+                                        version_id: VersionId::null(),
+                                        expected_updated_at: None,
+                                    })
+                                    .await
+                            }
+                        }
                     };
-                    self.emit_events(
-                        &bucket.name,
-                        &event_key,
-                        &ev,
-                        EventKind::ObjectRemovedDelete,
-                        None,
-                        None,
-                        now,
-                    )
-                    .await;
-                    if !quiet {
-                        deleted.push((key_s, version, false, None));
+                    match result {
+                        Ok(MutationOutcome::Deleted { freed, .. }) => {
+                            if let Some(p) = freed {
+                                let _ = self.blob.delete(&p).await;
+                            }
+                            let ev = match &event_version_req {
+                                Some(v) => VersionId::from_string(v.clone()),
+                                None => VersionId::null(),
+                            };
+                            self.emit_events(
+                                &bucket.name,
+                                &event_key,
+                                &ev,
+                                EventKind::ObjectRemovedDelete,
+                                None,
+                                None,
+                                now,
+                            )
+                            .await;
+                            if !quiet {
+                                out.deleted = Some((key_s, version, false, None));
+                            }
+                        }
+                        Ok(MutationOutcome::DeleteMarker { version_id: mv }) => {
+                            self.emit_events(
+                                &bucket.name,
+                                &event_key,
+                                &mv,
+                                EventKind::ObjectRemovedDeleteMarkerCreated,
+                                None,
+                                None,
+                                now,
+                            )
+                            .await;
+                            if !quiet {
+                                // S3 surfaces a marker insert with DeleteMarker=true and the marker
+                                // id in DeleteMarkerVersionId; the request's VersionId stays empty.
+                                let dmv = (!mv.is_null()).then(|| mv.as_str().to_owned());
+                                out.deleted = Some((key_s, None, true, dmv));
+                            }
+                        }
+                        Ok(_) => {
+                            if !quiet {
+                                out.deleted = Some((key_s, version, false, None));
+                            }
+                        }
+                        // Map each per-key failure to its TRUE S3 code (Medium #7).
+                        Err(e) => {
+                            let err: Error = e.into();
+                            let (_, code) = crate::error_map::map(&err);
+                            out.error = Some((key_s, code.to_owned(), err.to_string()));
+                        }
                     }
+                    out
                 }
-                Ok(MutationOutcome::DeleteMarker { version_id: mv }) => {
-                    self.emit_events(
-                        &bucket.name,
-                        &event_key,
-                        &mv,
-                        EventKind::ObjectRemovedDeleteMarkerCreated,
-                        None,
-                        None,
-                        now,
-                    )
-                    .await;
-                    if !quiet {
-                        // S3 surfaces a marker insert with DeleteMarker=true and the marker id in
-                        // DeleteMarkerVersionId; the request's VersionId field stays empty here.
-                        let dmv = (!mv.is_null()).then(|| mv.as_str().to_owned());
-                        deleted.push((key_s, None, true, dmv));
-                    }
-                }
-                Ok(_) => {
-                    if !quiet {
-                        deleted.push((key_s, version, false, None));
-                    }
-                }
-                // Map each per-key failure to its TRUE S3 code via the total error map, rather
-                // than collapsing every failure to InternalError (Medium #7).
-                Err(e) => {
-                    let err: Error = e.into();
-                    let (_, code) = crate::error_map::map(&err);
-                    errors.push((key_s, code.to_owned(), err.to_string()));
-                }
+            })
+            .buffered(32)
+            .collect()
+            .await;
+
+        let mut deleted: Vec<(String, Option<String>, bool, Option<String>)> = Vec::new();
+        let mut errors: Vec<(String, String, String)> = Vec::new();
+        // Whether any key enqueued a delete-marker replication entry; if so we pulse the worker once
+        // after the batch, mirroring the single-object DELETE's event-driven wake.
+        let mut any_repl_enqueued = false;
+        for out in outcomes {
+            any_repl_enqueued |= out.repl_enqueued;
+            if let Some(d) = out.deleted {
+                deleted.push(d);
+            }
+            if let Some(e) = out.error {
+                errors.push(e);
             }
         }
         // Event-driven drain: a single wake covers every delete marker enqueued in this batch.
@@ -2171,7 +2210,11 @@ impl S3Service {
     async fn list_object_versions(&self, req: &S3Request) -> Result<S3Response> {
         let bucket = self.fetch_bucket(req).await?;
         let prefix = req.query("prefix").map(str::to_owned);
-        let delimiter = req.query("delimiter").map(str::to_owned);
+        // Empty delimiter == no grouping (S3 semantics); normalize to None. See `list_objects`.
+        let delimiter = req
+            .query("delimiter")
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
         let max = req
             .query("max-keys")
             .and_then(|s| s.parse().ok())
@@ -3103,17 +3146,31 @@ impl S3Service {
             ),
             None => None,
         };
-        // Resolve the version whose ACL + tags the policy conditions evaluate against (audit #33):
-        // the specific version when one is named (a `?versionId` read, or a versioned copy source),
-        // otherwise the current version. Evaluating against the current version when a *different*
-        // version is being acted on would gate `s3:ExistingObjectTag` / object-ACL conditions on
-        // the wrong version's metadata. Loaded once and shared by the ACL and tag paths below.
-        let acl_row = match &resource {
-            Resource::Object { key, .. } => match acl_version {
-                Some(vid) => self.meta.get_version(&bucket.name, key, vid).await?,
-                None => self.meta.current_version(&bucket.name, key).await?,
-            },
-            Resource::Bucket(_) => None,
+        // The object's ACL row + tags feed ONLY policy/ACL conditions, so resolve (and read) them
+        // only when something can consult them: a bucket policy, an identity policy, or enabled ACLs
+        // (ownership != BucketOwnerEnforced). For a default bucket with no policy this skips two
+        // uncached object_versions/tags reads per op entirely — the hot-path win for GET/HEAD/DELETE,
+        // whose decision is then fixed by requester class + BPA (already loaded), which the ACL row
+        // and tags never influence. When they ARE needed, resolve the version the conditions evaluate
+        // against (audit #33): the named version for a `?versionId` read / versioned copy source,
+        // otherwise the current version. Shared by the ACL and tag paths below.
+        let needs_object_meta = policy.is_some()
+            || req
+                .principal
+                .as_ref()
+                .and_then(|p| p.user_policy.as_deref())
+                .is_some()
+            || bucket.ownership_mode != cairn_types::authz::OwnershipMode::BucketOwnerEnforced;
+        let acl_row = if needs_object_meta {
+            match &resource {
+                Resource::Object { key, .. } => match acl_version {
+                    Some(vid) => self.meta.get_version(&bucket.name, key, vid).await?,
+                    None => self.meta.current_version(&bucket.name, key).await?,
+                },
+                Resource::Bucket(_) => None,
+            }
+        } else {
+            None
         };
         // Load ACLs only when ownership mode keeps them enabled; under BucketOwnerEnforced
         // (the default) ACLs are disabled, so this stays a no-op on the hot path.
@@ -3353,7 +3410,10 @@ fn build_context(req: &S3Request, now: cairn_types::Timestamp) -> RequestContext
         user_agent: req.header("user-agent").map(str::to_owned),
         now,
         prefix: req.query("prefix").map(str::to_owned),
-        delimiter: req.query("delimiter").map(str::to_owned),
+        delimiter: req
+            .query("delimiter")
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned),
         max_keys: req.query("max-keys").and_then(|s| s.parse().ok()),
         canned_acl: req.header("x-amz-acl").map(str::to_owned),
         content_sha256: req.header("x-amz-content-sha256").map(str::to_owned),

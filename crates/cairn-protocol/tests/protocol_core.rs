@@ -1498,6 +1498,69 @@ async fn list_objects_v1_pagination_round_trips() {
     );
 }
 
+/// Regression: a ListObjectsV2 with an empty-but-present `delimiter=` (exactly what minio-go — and
+/// therefore warp's recursive-list benchmark — sends on every request) must behave as "no
+/// delimiter" and return the objects, not collapse them into a single CommonPrefix. Before the fix,
+/// `str::find("")` matched at offset 0 for every key, so this returned zero `<Contents>` and warp
+/// flagged every LIST op as an error.
+#[tokio::test]
+async fn list_objects_v2_empty_delimiter_lists_all() {
+    let h = harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("delimbkt"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    for k in ["a/1", "a/2", "c"] {
+        drain(
+            send(
+                &h.svc,
+                req(
+                    Method::PUT,
+                    Some("delimbkt"),
+                    Some(k),
+                    &[],
+                    &[],
+                    b"x".to_vec(),
+                ),
+            )
+            .await,
+        )
+        .await;
+    }
+
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("delimbkt"),
+                None,
+                &[("list-type", "2"), ("delimiter", "")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let body = String::from_utf8(body).unwrap();
+    assert!(
+        body.contains("<Key>a/1</Key>")
+            && body.contains("<Key>a/2</Key>")
+            && body.contains("<Key>c</Key>"),
+        "empty delimiter must list every object, got: {body}"
+    );
+    assert!(
+        !body.contains("<CommonPrefixes>"),
+        "empty delimiter must not synthesize a common prefix, got: {body}"
+    );
+}
+
 /// A part-validation failure on CompleteMultipartUpload must leave the upload retryable rather than
 /// bricking it in `completing` (audit #14): a first complete carrying a wrong ETag fails, and a
 /// second complete with the correct ETags then succeeds.

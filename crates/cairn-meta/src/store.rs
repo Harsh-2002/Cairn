@@ -499,7 +499,8 @@ fn list_impl(
                 break 'outer;
             }
             let key = summary.key.as_str().to_owned();
-            if let Some(delim) = query.delimiter.as_deref() {
+            // An empty delimiter is "no delimiter" (S3): guard against `"".find` matching at 0.
+            if let Some(delim) = query.delimiter.as_deref().filter(|d| !d.is_empty()) {
                 let rest = &key[prefix.len()..];
                 if let Some(idx) = rest.find(delim) {
                     let cp = format!("{}{}{}", prefix, &rest[..idx], delim);
