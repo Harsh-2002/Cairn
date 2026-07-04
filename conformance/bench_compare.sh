@@ -155,13 +155,46 @@ measure_once() {  # $1=host $2=ak $3=sk $4=op $5=size ; extra args after
 # median of REPEATS numeric values (NA-safe: NA if all NA)
 median() { printf '%s\n' "$@" | grep -vx NA | sort -g | awk '{a[NR]=$1} END{if(NR==0){print "NA"} else {print a[int((NR+1)/2)]}}'; }
 
+# --- resource sampling: the server's CPU% + RSS while it is actually under load ------------------
+# A great benchmark reports the COST, not just the rate. We sample each server process only during
+# its own warp runs (not while idle), so the averages reflect "resources used while serving", and
+# report per-engine mean CPU% + mean/peak RSS alongside throughput.
+CLK=$(getconf CLK_TCK 2>/dev/null || echo 100)
+PGK=$(( $(getconf PAGESIZE 2>/dev/null || echo 4096) / 1024 ))   # page size in KiB
+RES_C="$DATA/res_cairn"; RES_M="$DATA/res_minio"; : >"$RES_C"; : >"$RES_M"
+# Append "cpu_pct rss_kb" for $1 to $2 every ~1s (instantaneous CPU from utime+stime deltas) until
+# killed. Includes the process's threads (cairn/minio are multi-threaded) via /proc/<pid>/stat.
+mon() {  # pid outfile
+  local pid="$1" out="$2" prev=0 cur u s rss
+  while kill -0 "$pid" 2>/dev/null; do
+    read -r u s < <(awk '{print $14, $15}' "/proc/$pid/stat" 2>/dev/null) || break
+    [ -z "${u:-}" ] && break
+    cur=$((u + s))
+    if [ "$prev" -ne 0 ]; then
+      rss=$(awk -v k="$PGK" '{printf "%d", $2*k}' "/proc/$pid/statm" 2>/dev/null)
+      awk -v d=$((cur - prev)) -v h="$CLK" -v r="${rss:-0}" 'BEGIN{printf "%.1f %d\n", d/h*100, r}' >>"$out"
+    fi
+    prev=$cur
+    sleep 1
+  done
+}
+# per-engine "mean_cpu% peak_mb mean_mb" over all its samples
+res_stats() { awk '{c+=$1;n++; if($2>pk)pk=$2; r+=$2} END{ if(n==0){print "n/a n/a n/a"} else printf "%.0f %.0f %.0f\n", c/n, pk/1024, (r/n)/1024 }' "$1"; }
+
 # run a cell against a target REPEATS times, echo "median_obj,median_mib,total_errors"
 run_target() {  # $1=host $2=ak $3=sk $4=op $5=size ; extra
-  local os=() ms=() etot=0 out o m e
+  local host="$1" pid resfile
+  case "$host" in
+    *":$CPORT") pid="$CSRV"; resfile="$RES_C" ;;
+    *) pid="$MSRV"; resfile="$RES_M" ;;
+  esac
+  local os=() ms=() etot=0 out o m e monpid
+  mon "$pid" "$resfile" & monpid=$!
   for _ in $(seq 1 "$REPEATS"); do
     out="$(measure_once "$@")"; o="${out%%,*}"; m="$(printf '%s' "$out" | cut -d, -f2)"; e="${out##*,}"
     os+=("$o"); ms+=("$m"); etot=$((etot + e))
   done
+  kill "$monpid" 2>/dev/null; wait "$monpid" 2>/dev/null
   printf '%s,%s,%s\n' "$(median "${os[@]}")" "$(median "${ms[@]}")" "$etot"
 }
 
@@ -215,22 +248,37 @@ for cell in "${CELLS[@]}"; do
 done
 JSON="${JSON%,}]"
 
+# per-engine resource usage while serving (mean CPU%, peak & mean RSS in MB)
+read -r C_CPU C_PKMB C_AVGMB <<<"$(res_stats "$RES_C")"
+read -r M_CPU M_PKMB M_AVGMB <<<"$(res_stats "$RES_M")"
+NCPU=$(nproc 2>/dev/null || echo '?')
+MEMGB=$(awk '/MemTotal/{printf "%.0f", $2/1024/1024}' /proc/meminfo 2>/dev/null || echo '?')
+
 # --- 5. emit CSV / JSON / markdown ---------------------------------------------------------------
 if [ -n "$BENCH_CSV" ]; then
   { echo "op,obj_size,cairn_obj_s,minio_obj_s,cairn_mib_s,minio_mib_s,errors"
-    printf '%s\n' "${CSV_ROWS[@]}"; } > "$BENCH_CSV"
+    printf '%s\n' "${CSV_ROWS[@]}"
+    echo "# resources: cairn cpu_pct=$C_CPU peak_rss_mb=$C_PKMB mean_rss_mb=$C_AVGMB"
+    echo "# resources: minio cpu_pct=$M_CPU peak_rss_mb=$M_PKMB mean_rss_mb=$M_AVGMB"; } > "$BENCH_CSV"
 fi
 [ -n "$BENCH_JSON" ] && printf '%s\n' "$JSON" > "$BENCH_JSON"
 
 emit_md() {
   echo "## Cairn vs MinIO — warp head-to-head"
   echo ""
-  echo "Same runner, single-node/single-drive, plaintext HTTP, warp v${WARP_VERSION} vs MinIO ${MINIO_VERSION}."
+  echo "Host: ${NCPU} vCPU / ${MEMGB} GB. Both single-node/single-drive, plaintext HTTP, warp v${WARP_VERSION} vs MinIO ${MINIO_VERSION}."
   echo "\`concurrent=${CONCURRENT} duration=${DURATION} repeats=${REPEATS}\`. **Ratio, not absolutes, is the signal** (contended runner)."
   echo ""
   echo "| op | size | Cairn obj/s | MinIO obj/s | MiB/s (C/M) | verdict |"
   echo "|---|---|--:|--:|--:|---|"
   printf '%s\n' "${ROWS[@]}"
+  echo ""
+  echo "**Resource cost while serving** (server process, sampled ~1 Hz during its own runs):"
+  echo ""
+  echo "| engine | mean CPU | peak RSS | mean RSS |"
+  echo "|---|--:|--:|--:|"
+  echo "| Cairn | ${C_CPU}% | ${C_PKMB} MB | ${C_AVGMB} MB |"
+  echo "| MinIO | ${M_CPU}% | ${M_PKMB} MB | ${M_AVGMB} MB |"
 }
 emit_md
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then emit_md >> "$GITHUB_STEP_SUMMARY"; fi
