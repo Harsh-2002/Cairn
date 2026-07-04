@@ -86,7 +86,20 @@ pub struct LocalBlobStore {
     /// same bucket share one directory fsync instead of issuing one each (ARCH 8.2). Shared across
     /// clones of the store, so every writer feeds the same coordinator.
     dir_sync: Arc<commit::DirSyncCoalescer>,
+    /// Upper size bound (bytes) for the small-object GET fast path: an uncompressed blob at or below
+    /// this size is read whole in the single probe open and served as one `Bytes`, skipping the
+    /// second file open, the I/O permit, and the per-chunk streaming channel (such a blob is below
+    /// the kernel sendfile floor anyway). Defaults to [`SMALL_READ_MAX`]; [`with_small_read_max`]
+    /// overrides it (a bench sets it to `0` to force the streaming path for an A/B on one size).
+    ///
+    /// [`with_small_read_max`]: LocalBlobStore::with_small_read_max
+    small_read_max: u64,
 }
+
+/// Default upper bound (bytes) for the small-object GET fast path — see [`LocalBlobStore`]'s
+/// `small_read_max` field. 256 KiB sits below the kernel sendfile floor, so a blob this small would
+/// never take the zero-copy path; reading it whole avoids the streaming channel's per-GET overhead.
+pub const SMALL_READ_MAX: u64 = 256 * 1024;
 
 /// The default bound on concurrent blob transfers when not overridden (ARCH 7.4). A reasonable
 /// general value for SSD/NVMe-backed storage; tune down for spinning disks, up for fast arrays.
@@ -113,7 +126,19 @@ impl LocalBlobStore {
             read_permits: Arc::new(tokio::sync::Semaphore::new(DEFAULT_BLOB_IO_CONCURRENCY)),
             write_permits: Arc::new(tokio::sync::Semaphore::new(DEFAULT_BLOB_IO_CONCURRENCY)),
             dir_sync: Arc::new(commit::DirSyncCoalescer::spawn()),
+            small_read_max: SMALL_READ_MAX,
         })
+    }
+
+    /// Override the small-object GET fast-path size bound (see the `small_read_max` field). An
+    /// uncompressed blob at or below `bytes` is read whole in the probe open and served inline;
+    /// above it, the streamed read (with the zero-copy hint) is used. Defaults to [`SMALL_READ_MAX`].
+    /// Primarily for benchmarks and tests: setting it to `0` forces the streaming path so the two
+    /// read paths can be A/B-compared on the same object size.
+    #[must_use]
+    pub fn with_small_read_max(mut self, bytes: u64) -> Self {
+        self.small_read_max = bytes;
+        self
     }
 
     /// Override whether the io_uring staging write path is used. Has effect only when the
@@ -554,10 +579,15 @@ impl BlobStore for LocalBlobStore {
         // replacing the prior try_exists + two metadata stats + a separate compression-probe open
         // (Phase 2.5). On the common uncompressed branch the opened fd is handed back to serve the
         // zero-copy sendfile path, so an uncompressed GET no longer reopens the same file.
+        // At or below `small_read_max` an uncompressed object is read WHOLE in the single probe open
+        // and served as one `Bytes` — skipping the second file open and the per-chunk `mpsc` streaming
+        // channel that otherwise dominate a tiny GET (such an object is below the kernel sendfile floor
+        // anyway, so it would never take the zero-copy path). This is the small-object GET fast path.
+        let small_read_max = self.small_read_max;
         let probe_path = file_path.clone();
-        let (compressed, logical_len, reuse_file) = tokio::task::spawn_blocking(
-            move || -> Result<(bool, u64, Option<std::fs::File>), BlobError> {
-                use std::io::{Seek, SeekFrom};
+        let (compressed, logical_len, reuse_file, whole) = tokio::task::spawn_blocking(
+            move || -> Result<(bool, u64, Option<std::fs::File>, Option<Bytes>), BlobError> {
+                use std::io::{Read, Seek, SeekFrom};
                 let mut f = match std::fs::File::open(&probe_path) {
                     Ok(f) => f,
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -575,11 +605,17 @@ impl BlobStore for LocalBlobStore {
                     // not reused (compressed/encrypted blobs never take the kernel fast path).
                     f.seek(SeekFrom::Start(0)).map_err(io_err)?;
                     let logical = CompressedReader::open_with_dek(f, dek)?.logical_len();
-                    Ok((true, logical, None))
+                    Ok((true, logical, None, None))
+                } else if file_len <= small_read_max {
+                    // Small uncompressed object: read it whole here (one open, one read). The range
+                    // is sliced from this buffer below — no second open, no streaming channel.
+                    let mut buf = Vec::with_capacity(file_len as usize);
+                    f.read_to_end(&mut buf).map_err(io_err)?;
+                    Ok((false, file_len, None, Some(Bytes::from(buf))))
                 } else {
-                    // Uncompressed: the file length is the logical length, and the open fd is reused
-                    // as the zero-copy source below.
-                    Ok((false, file_len, Some(f)))
+                    // Larger uncompressed object: the file length is the logical length, and the open
+                    // fd is reused as the zero-copy source below.
+                    Ok((false, file_len, Some(f), None))
                 }
             },
         )
@@ -600,18 +636,29 @@ impl BlobStore for LocalBlobStore {
             None => (0, logical_len, None),
         };
 
-        // Hold a blob-I/O permit for the streamed transfer (ARCH 7.4); released when the read
-        // task finishes. (The kernel sendfile fast path below is bounded separately by the server.)
-        let permit = self.acquire_io_owned().await?;
-        let body = read_stream(file_path.clone(), compressed, dek, offset, len, permit);
-        // Uncompressed, plaintext blobs may take the kernel file-to-socket fast path, reusing the fd
-        // the probe already opened. Encrypted blobs are always block-formatted (so `compressed` is
-        // true), so `reuse_file` is `None` for them and the kernel never sees ciphertext.
-        let zero_copy = reuse_file.map(|f| ZeroCopyRead {
-            file: Arc::new(f),
-            offset,
-            len,
-        });
+        // Small uncompressed object already read in the probe: serve it as a single `Bytes` (the
+        // requested range sliced from the in-memory buffer), with no I/O permit, no second open, and
+        // no streaming channel. Otherwise fall back to the streamed read.
+        let (body, zero_copy) = if let Some(bytes) = whole {
+            let slice = bytes.slice(offset as usize..(offset + len) as usize);
+            let body: cairn_types::BlobStream =
+                Box::pin(futures_util::stream::once(async move { Ok(slice) }));
+            (body, None)
+        } else {
+            // Hold a blob-I/O permit for the streamed transfer (ARCH 7.4); released when the read
+            // task finishes. (The kernel sendfile fast path below is bounded separately by the server.)
+            let permit = self.acquire_io_owned().await?;
+            let body = read_stream(file_path.clone(), compressed, dek, offset, len, permit);
+            // Uncompressed, plaintext blobs may take the kernel file-to-socket fast path, reusing the
+            // fd the probe opened. Encrypted blobs are always block-formatted (so `compressed` is
+            // true), so `reuse_file` is `None` for them and the kernel never sees ciphertext.
+            let zero_copy = reuse_file.map(|f| ZeroCopyRead {
+                file: Arc::new(f),
+                offset,
+                len,
+            });
+            (body, zero_copy)
+        };
 
         Ok(BlobReadHandle {
             logical_len: len,

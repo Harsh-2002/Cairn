@@ -82,12 +82,47 @@ async fn uncompressed_roundtrip_and_etag() {
         read_all(&store, &staged.storage_path, None, &staged.compression).await,
         b"hello world"
     );
-    // The uncompressed path exposes a zero-copy hint.
+    // A small uncompressed object is served inline by the small-object fast path (read whole in the
+    // single probe open, no second open and no streaming channel), so it exposes NO zero-copy hint —
+    // and its body still reads back byte-exact (verified above via `read_all`).
     let handle = store
         .open(&staged.storage_path, None, &staged.compression)
         .await
         .unwrap();
-    assert!(handle.zero_copy.is_some());
+    assert!(
+        handle.zero_copy.is_none(),
+        "a below-floor object takes the small-object fast path, not the zero-copy path"
+    );
+
+    // A larger uncompressed object (above the small-read floor) still exposes the zero-copy hint and
+    // reads back byte-exact.
+    let big = vec![7u8; 300 * 1024];
+    let staged_big = store
+        .stage(
+            &b,
+            body(big.clone()),
+            opts(None, "application/octet-stream"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        read_all(
+            &store,
+            &staged_big.storage_path,
+            None,
+            &staged_big.compression
+        )
+        .await,
+        big
+    );
+    let handle_big = store
+        .open(&staged_big.storage_path, None, &staged_big.compression)
+        .await
+        .unwrap();
+    assert!(
+        handle_big.zero_copy.is_some(),
+        "an above-floor uncompressed object still exposes the zero-copy hint"
+    );
 }
 
 #[tokio::test]
