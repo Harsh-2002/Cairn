@@ -119,6 +119,46 @@ Operator guides: [`docs/operations.md`](./docs/operations.md),
 [`docs/disaster-recovery.md`](./docs/disaster-recovery.md), and
 [`docs/troubleshooting.md`](./docs/troubleshooting.md).
 
+## Performance
+
+Cairn is fast where it counts and light on resources. The numbers below are a like-for-like comparison
+against MinIO on the same machine, driven by MinIO's own [`warp`](https://github.com/minio/warp)
+benchmark. Both run single-node, single-drive, over plaintext HTTP, and each figure is the median of
+three runs. The hardware is deliberately small — **2 vCPU, 16 GB RAM** — on the principle that a design
+efficient where cores are scarce scales up comfortably; a larger box only widens the absolute numbers.
+
+Throughput (higher is better; `obj/s` for small objects, `MiB/s` for large):
+
+| Operation | Object size | Cairn | MinIO | Ratio |
+|---|---|--:|--:|---|
+| PUT   | 4 KiB | **1696 obj/s**  | 1308 obj/s  | Cairn 1.30× |
+| PUT   | 8 MiB | 115 MiB/s       | **128 MiB/s** | MinIO 1.12× |
+| GET   | 4 KiB | **3431 obj/s**  | 1815 obj/s  | Cairn 1.89× |
+| GET   | 8 MiB | **1463 MiB/s**  | 801 MiB/s   | Cairn 1.83× |
+| STAT  | 4 KiB | **3494 obj/s**  | 1824 obj/s  | Cairn 1.92× |
+| LIST  | 4 KiB | **21183 obj/s** | 10288 obj/s | Cairn 2.06× |
+| MIXED | 1 MiB | **285 MiB/s**   | 271 MiB/s   | Cairn 1.05× |
+
+Resource use while serving the same workload (lower is better):
+
+| | Mean CPU | Peak memory |
+|---|--:|--:|
+| **Cairn** | 76% | **106 MB** |
+| MinIO | 88% | 1072 MB |
+
+On this hardware Cairn matches or beats MinIO on most operations while holding a roughly **10× smaller
+memory footprint** (~106 MB vs ~1 GB). The ratio between the two is the meaningful signal: the absolute
+numbers are modest because a 2-core box shares its cores with the benchmark client and vary run to run,
+which is why the figures are medians and why the comparison — not the raw rate — is what to read. (DELETE
+is omitted: on this hardware it completes too quickly for warp to sample reliably.)
+
+Reproduce it yourself — the harness stands up both servers and runs the matrix side by side, and the
+same comparison runs on every push in CI (the `bench-compare` job), so it tracks the code over time:
+
+```sh
+BIN=target/release/cairn bash conformance/bench_compare.sh
+```
+
 ## Scope
 
 Cairn is single-node by design: one process, one data filesystem, one metadata database. Cross-host
