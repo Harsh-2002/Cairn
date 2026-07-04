@@ -2,10 +2,10 @@
 //! HTTP/auth/network layer. For each object size it stages one uncompressed blob, then serves it
 //! repeatedly under concurrency two ways against the SAME file on disk:
 //!
-//!   * FAST  — the small-object fast path: one probe `open` reads the whole blob and serves it as a
-//!             single `Bytes` (no second open, no I/O permit, no per-chunk streaming channel).
-//!   * STREAM — the general streamed read: probe `open` + a second `open` inside the spawned read
-//!             task feeding an `mpsc`-backed body, holding a read I/O permit for the transfer.
+//! * FAST — the small-object fast path: one probe `open` reads the whole blob and serves it as a
+//!   single `Bytes` (no second open, no I/O permit, no per-chunk streaming channel).
+//! * STREAM — the general streamed read: probe `open` + a second `open` inside the spawned read
+//!   task feeding an `mpsc`-backed body, holding a read I/O permit for the transfer.
 //!
 //! The STREAM leg is forced on every size via `with_small_read_max(0)`, so the two legs differ only
 //! by the read path — same bytes, same page cache, same disk — which is exactly the cost the fast
