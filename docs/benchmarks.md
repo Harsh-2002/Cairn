@@ -373,6 +373,34 @@ dedicated hardware (e.g. the arm64 testbed) for representative throughput.
 > `REGRESS_PCT` or treat single-run swings as noise. The error-count / liveness / RSS-leak assertions
 > are robust regardless and are what the PASS/FAIL verdict hinges on.
 
+## 7. Head-to-head vs MinIO (`conformance/bench_compare.sh`, per-push CI)
+
+Runs on **every push** (the `bench-compare` CI job) to answer one question continuously: *for each S3
+operation, how does Cairn compare to MinIO on the same machine?* The harness boots **both** servers on
+one host — Cairn from the built binary, MinIO from a **pinned** release binary
+(`RELEASE.2025-09-07T16-13-09Z`, `dl.min.io`) — single-node/single-drive, plaintext HTTP, and drives
+an identical `warp` v1.0.0 matrix against each **sequentially** (only one server under load at a time;
+`warp` itself burns ~1 core). Matrix (CI-sized, ~15-20 min): `PUT`/`GET` at 4 KiB + 8 MiB, and
+`STAT`/`DELETE`/`LIST`/`MIXED` at one representative size. Env-tunable (`DURATION`,
+`CONCURRENT`, `REPEATS`, and `CELLS_ENV` to replace the whole matrix); a manual/nightly run uses
+`REPEATS=3` for a median.
+
+Output: a **job-summary markdown table** plus `bench.csv` / `bench.json` uploaded as an artifact for
+over-time tracking. The parser reads the **measured** operation, not warp's prepare-PUT (a subtle trap:
+`get`/`stat`/`delete` upload first, so the first `* Average:` line is the prepare, not the result).
+
+**Report, not gate.** The meaningful signal is the **Cairn/MinIO ratio per op**, not the absolute
+obj/s — a shared GitHub runner has the same ≈±30% run-to-run variance documented in §6, so a throughput
+gate would false-positive constantly. The job therefore **fails only on warp operation errors** (a
+correctness/liveness signal robust to noise); it emits a non-fatal ⚠️ if Cairn is >2.5× slower on an
+op (far outside the noise band), and never fails on who is faster. Absolute numbers differ from the
+local 2-core baseline because the runner is ~4 vCPU — compare ratios across runs, not obj/s.
+
+> **Baseline (local 2-core VM, 2026-07):** reproducible signals were MinIO faster at reads/STAT,
+> DELETE (~3×), and LIST; Cairn faster at small PUT; mixed/medium within noise. The LIST result was
+> initially a warp interop failure (empty `delimiter=` handled as a real delimiter) — since fixed;
+> `bench_compare.sh` now measures LIST on both.
+
 ## io_uring blob path (`--features io-uring`, experimental, Linux-only)
 
 The staging write path can run through a dedicated `tokio-uring` reactor (off by default). Measured

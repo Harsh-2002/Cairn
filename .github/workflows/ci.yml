@@ -486,6 +486,32 @@ jobs:
   # lingers after the run. `if: always()` runs it even if a consumer failed (or the build failed and
   # the consumers were skipped — then there is nothing to delete and it no-ops). Uses the built-in
   # token via `gh api`, no third-party action. NOTE: keep `needs` in sync with the artifact consumers.
+  bench-compare:
+    name: warp head-to-head vs MinIO
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup   # ui/dist (embedded) + toolchain + cache
+      # A throughput comparison needs an OPTIMIZED build. The shared `cairn-bin` artifact is an
+      # unstripped DEBUG binary (correct behaviour, but many× slower on hot loops) — benchmarking it
+      # against a release MinIO would be meaningless, so this job builds cairn in RELEASE itself.
+      - run: cargo build --release --bin cairn
+      # Boots Cairn AND a pinned MinIO server on this runner and drives warp against each side by side.
+      # This is a REPORTED comparison (the Cairn/MinIO ratio per op), surfaced in the job summary and
+      # an artifact; it fails ONLY on warp operation errors (a correctness signal), never on who is
+      # faster — a contended runner has large run-to-run throughput variance (docs/benchmarks.md §7).
+      - name: Cairn vs MinIO side-by-side (warp)
+        run: BIN=target/release/cairn BENCH_CSV=bench.csv BENCH_JSON=bench.json bash conformance/bench_compare.sh
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: bench-compare-results
+          path: |
+            bench.csv
+            bench.json
+          retention-days: 14
+          if-no-files-found: warn
+
   cleanup:
     name: delete shared binary artifact
     needs:

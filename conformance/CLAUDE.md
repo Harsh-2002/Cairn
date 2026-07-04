@@ -44,6 +44,11 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   `cairn_writer_queue_depth`. Emits a PASS/FAIL verdict; `STRESS_OUT=`/`BASELINE=` write/compare a
   results JSON for regression tracking. Supersedes `warp.sh`+`warp_escalate.sh` (kept as focused tools).
 - `warp.sh` — the MinIO `warp` macro benchmark (get/put/mixed); downloads `warp` once. Gates on errors.
+- `bench_compare.sh` — **Cairn vs MinIO head-to-head**: boots Cairn AND a pinned MinIO server on one
+  host and drives warp against each side-by-side (PUT/GET/STAT/DELETE/LIST/MIXED). Runs per push
+  (`bench-compare` CI job → job-summary table + CSV/JSON artifact). **Report-not-gate**: the signal is
+  the Cairn/MinIO ratio, and it fails ONLY on warp operation errors (not on who is faster), because a
+  contended runner has large throughput variance. Parses the MEASURED op, not warp's prepare-PUT.
 - `warp_escalate.sh` — ramp warp concurrency to the single-writer ceiling; alive + zero errors.
 - `blob_limits.sh` (+`.py`) — out-of-space 507 on a small tmpfs, huge object, many objects paginated.
 - `load_profile.sh` (+`.py`) — throughput methodology, **NOT a gate**; see `../docs/benchmarks.md`.
