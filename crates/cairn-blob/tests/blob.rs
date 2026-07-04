@@ -125,6 +125,70 @@ async fn uncompressed_roundtrip_and_etag() {
     );
 }
 
+/// Ranged reads served by the small-object fast path (the `Bytes::slice` of the whole-file buffer)
+/// must return exactly the same bytes and `Content-Range` as the streamed path — including the edge
+/// cases the slice arithmetic can get wrong: a range flush to EOF, a length clamped past the end, a
+/// zero-length range, and a range whose offset sits at the very end.
+#[tokio::test]
+async fn small_object_fast_path_ranged_reads_are_exact() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let b = BucketName::parse("bkt").unwrap();
+    // A distinct byte pattern so a mis-sliced range would produce visibly wrong bytes.
+    let data: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+    let staged = store
+        .stage(
+            &b,
+            body(data.clone()),
+            opts(None, "application/octet-stream"),
+        )
+        .await
+        .unwrap();
+
+    // The whole read is byte-exact and offers no zero-copy hint (fast path, not sendfile).
+    let full = store
+        .open(&staged.storage_path, None, &staged.compression)
+        .await
+        .unwrap();
+    assert!(full.zero_copy.is_none());
+    assert!(full.content_range.is_none());
+
+    // (offset, requested length, expected served length): mid-object, flush-to-EOF, over-long length
+    // clamped to the remaining bytes, a single byte at the very end, and a zero-length range.
+    let cases = [
+        (100u64, 200u64, 200u64),
+        (4000, 96, 96),     // exactly to EOF
+        (4000, 10_000, 96), // length clamped to what remains
+        (4095, 1, 1),       // last byte
+        (500, 0, 0),        // empty range
+    ];
+    for (offset, length, want_len) in cases {
+        let range = ByteRange { offset, length };
+        let got = read_all(
+            &store,
+            &staged.storage_path,
+            Some(range),
+            &staged.compression,
+        )
+        .await;
+        assert_eq!(
+            got,
+            &data[offset as usize..(offset + want_len) as usize],
+            "fast-path range offset={offset} length={length} returned wrong bytes"
+        );
+        let cr = store
+            .open(&staged.storage_path, Some(range), &staged.compression)
+            .await
+            .unwrap()
+            .content_range
+            .expect("a ranged read reports a Content-Range");
+        assert_eq!(cr.start, offset);
+        assert_eq!(cr.total, data.len() as u64);
+        // `end` is inclusive and never precedes `start` (an empty range collapses to start..start).
+        assert_eq!(cr.end, offset + want_len.saturating_sub(1));
+    }
+}
+
 #[tokio::test]
 async fn uncompressed_blob_ending_in_crnb_magic_is_not_misdetected() {
     // Audit #18: an uncompressed object whose trailing bytes collide with the 34-byte CRNB

@@ -640,7 +640,14 @@ impl BlobStore for LocalBlobStore {
         // requested range sliced from the in-memory buffer), with no I/O permit, no second open, and
         // no streaming channel. Otherwise fall back to the streamed read.
         let (body, zero_copy) = if let Some(bytes) = whole {
-            let slice = bytes.slice(offset as usize..(offset + len) as usize);
+            // Clamp the range to the bytes ACTUALLY read: for a normal immutable blob this is exactly
+            // [offset, offset+len), but a truncated/corrupted on-disk blob (shorter than its fstat
+            // length — fs corruption or a bit-rotted file) must NOT panic the read path. Serve what is
+            // present, as the streamed path does; the integrity scrub is what flags the corruption.
+            let avail = bytes.len() as u64;
+            let start = offset.min(avail) as usize;
+            let end = (offset + len).min(avail) as usize;
+            let slice = bytes.slice(start..end);
             let body: cairn_types::BlobStream =
                 Box::pin(futures_util::stream::once(async move { Ok(slice) }));
             (body, None)
