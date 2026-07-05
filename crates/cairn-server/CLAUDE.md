@@ -29,6 +29,12 @@ CLI. This is the **only crate that names concrete impls** — everything else is
   pulse channel + ticket mint. `tls.rs` — TLS load + SIGHUP reload.
 - `fast_get.rs` / `sendfile.rs` — the plaintext `sendfile(2)` GET fast path; **`#[cfg(all(feature =
   "fast-io", target_os = "linux"))]` only** (modules absent otherwise).
+- `import_run.rs` — the background S3-import worker: a single claimer reclaims orphaned (crashed,
+  stale-lease) jobs at startup, then drains pending jobs, running the `cairn-import` engine and
+  persisting per-bucket progress/cursors as the resumable checkpoint. `import_dest.rs` —
+  `LocalDestWriter`: lands imported objects through the real `S3Service::handle` (a trusted
+  root-admin principal, replaying metadata/tags as request headers) so encryption, compression,
+  quota, versioning, and events all apply exactly as a normal upload.
 
 ## Notes
 - **Two listeners.** S3 + `/p/…` shares + `/healthz` `/readyz` `/metrics` on `CAIRN_LISTEN_ADDR`

@@ -9,8 +9,10 @@ in-memory doubles).
 - `service.rs` — `ControlService` and every handler. `handle()` stamps an `x-amz-request-id` then
   delegates to `route()`, a single `(Method, &[segment])` match over the whole `/api/v1` surface
   (overview/system/metrics, buckets + per-bucket config aspects, replication targets, users,
-  temporary STS credentials, object-share list/revoke, tag browsing, activity). Also `ControlResponse`
-  (status + JSON body) and `SystemInfo` (config snapshot taken once at startup).
+  temporary STS credentials, object-share list/revoke, tag browsing, activity, **S3 import jobs**:
+  create/list/detail/resume/cancel plus a `POST imports/source/buckets` probe that lists a candidate
+  source's buckets without persisting anything). Also `ControlResponse` (status + JSON body) and
+  `SystemInfo` (config snapshot taken once at startup).
 - `wire.rs` — the serde request/response DTOs and small parsers (`parse_role`, `parse_versioning`, …);
   the JSON contract lives here, not in `service.rs`.
 

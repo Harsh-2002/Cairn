@@ -66,11 +66,17 @@ cargo nextest run --workspace                                # + cargo test --wo
   The only crate doing filesystem syscalls.
 - `cairn-crypto` — `Crypto` (AES-256-GCM envelope + zeroize), `Clock`, `PublicUrl`.
 - `cairn-auth` / `cairn-authz` — SigV4 + Bearer authenticator chain; pure policy/ACL/BPA/ownership engine.
+- `cairn-net` — the SSRF guard: `validate_endpoint` (validate-time) + `GuardedResolver`/
+  `guarded_http_connector` (connect-time, closes the DNS-rebinding gap). Every outbound dialer
+  (replication, webhooks, import) goes through this.
 - `cairn-xml` — the S3 request/response XML codec (quick-xml).
 - `cairn-protocol` — S3 handlers, the request lifecycles, the streaming chunked decoder. The S3
   surface lives in `service.rs`.
 - `cairn-replication` / `cairn-lifecycle` — outbox-driven replication engine; lifecycle scanner.
 - `cairn-webhook` — outbox-driven webhook event-notification delivery engine (mirrors `cairn-replication`).
+- `cairn-import` — streaming, bounded-concurrency engine that imports buckets + objects from a
+  remote S3-compatible store (MinIO/Garage/R2/AWS/another Cairn) into this node; trait-generic like
+  `cairn-replication`, wired to a concrete `SourceReader`/`DestWriter` by `cairn-server`.
 - `cairn-control` / `cairn-ui` — management JSON API (`/api/v1`); embedded React console (source in `ui/`).
 - `cairn-server` — the binary: wires the concrete stack (`stack.rs`), the hyper/rustls server,
   background loops (`background.rs`), config (`config.rs`), and the CLI subcommands (`main.rs`).
