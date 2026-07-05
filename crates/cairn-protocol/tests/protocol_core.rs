@@ -3386,6 +3386,146 @@ async fn acl_enabled_bucket(h: &Harness, bucket: &str) {
     assert_eq!(st, StatusCode::OK, "ownership controls set");
 }
 
+/// Regression: authorize()'s object-metadata fast path (crates/cairn-protocol/src/service.rs,
+/// `needs_object_meta`) must still load the object ACL — and let it actually decide the request —
+/// for an ACL-enabled bucket evaluated by the REAL policy engine. Every other ACL test in this file
+/// runs under the default `AllowAll` double, so none of them exercise a real Allow/Deny decision
+/// driven by an ACL grant; this is that missing case.
+#[tokio::test]
+async fn acl_grant_is_enforced_by_the_real_policy_engine_under_the_fastpath_guard() {
+    let h = harness_with_authz(Arc::new(cairn_authz::PolicyEngine)).await;
+    let stranger = member("stranger");
+
+    acl_enabled_bucket(&h, "aclfp").await;
+    drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("aclfp"),
+                Some("k"),
+                &[],
+                &[],
+                b"secret".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+
+    // No ACL grant beyond the owner yet: a non-owner member is denied.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req_with_principal(
+                Method::GET,
+                Some("aclfp"),
+                Some("k"),
+                &[],
+                &[],
+                vec![],
+                stranger.clone(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::FORBIDDEN,
+        "no ACL grant yet: a non-owner must be denied"
+    );
+
+    // The owner grants public-read (AllUsers READ) via a canned ACL.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("aclfp"),
+                Some("k"),
+                &[("acl", "")],
+                &[("x-amz-acl", "public-read")],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "owner sets a public-read canned ACL");
+
+    // The SAME non-owner request now succeeds — proving the object ACL genuinely flows from
+    // authorize() into a real Allow decision, not merely that the ACL document round-trips.
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req_with_principal(
+                Method::GET,
+                Some("aclfp"),
+                Some("k"),
+                &[],
+                &[],
+                vec![],
+                stranger.clone(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "the AllUsers READ grant must let a non-owner through"
+    );
+    assert_eq!(body, b"secret");
+
+    // Revert to a private ACL (owner-only) and confirm enforcement flips back — the grant is truly
+    // load-bearing, not a one-way fallback.
+    let private_acl = b"<AccessControlPolicy>\
+        <Owner><ID>admin</ID></Owner>\
+        <AccessControlList>\
+            <Grant><Grantee xsi:type=\"CanonicalUser\"><ID>admin</ID></Grantee><Permission>FULL_CONTROL</Permission></Grant>\
+        </AccessControlList>\
+        </AccessControlPolicy>"
+        .to_vec();
+    drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("aclfp"),
+                Some("k"),
+                &[("acl", "")],
+                &[],
+                private_acl,
+            ),
+        )
+        .await,
+    )
+    .await;
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req_with_principal(
+                Method::GET,
+                Some("aclfp"),
+                Some("k"),
+                &[],
+                &[],
+                vec![],
+                stranger,
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::FORBIDDEN,
+        "revoking the grant must deny the non-owner again"
+    );
+}
+
 #[tokio::test]
 async fn upload_part_copy_roundtrip() {
     let h = harness().await;
@@ -5280,6 +5420,81 @@ async fn bulk_delete_suspended_inserts_null_marker_not_permanent() {
     assert!(
         vxml.contains("<Version>"),
         "identified version retained under Suspended bulk delete: {vxml}"
+    );
+}
+
+/// Regression: a DUPLICATE key (the same key listed twice) in one bulk delete against a
+/// Suspended-versioning bucket must NOT race itself. Bulk-delete entries run concurrently across
+/// DISTINCT keys for throughput, but a Suspended bare-key delete is a DeleteVersion-then-
+/// CreateDeleteMarker two-step, and CreateDeleteMarker is a bare INSERT with no upsert — two
+/// duplicate entries both running that two-step concurrently could have both DeleteVersion calls
+/// land before either CreateDeleteMarker, so the second insert collides on the
+/// (bucket, key, version_id) UNIQUE constraint and surfaces a spurious InternalError. Both entries
+/// for the duplicate key must succeed with no error.
+#[tokio::test]
+async fn bulk_delete_duplicate_key_in_suspended_bucket_does_not_race() {
+    let h = harness().await;
+    versioned_bucket(&h, "bddup").await;
+    drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("bddup"),
+                Some("k"),
+                &[],
+                &[],
+                b"v1".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    let vcfg =
+        b"<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>".to_vec();
+    drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("bddup"),
+                None,
+                &[("versioning", "")],
+                &[],
+                vcfg,
+            ),
+        )
+        .await,
+    )
+    .await;
+
+    // The SAME key listed twice in one request — permitted by the API.
+    let del = "<Delete><Object><Key>k</Key></Object><Object><Key>k</Key></Object></Delete>";
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::POST,
+                Some("bddup"),
+                None,
+                &[("delete", "")],
+                &[],
+                del.as_bytes().to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let xml = String::from_utf8(body).unwrap();
+    assert!(
+        !xml.contains("<Error>"),
+        "a duplicate key must not race itself into a spurious error: {xml}"
+    );
+    assert_eq!(
+        xml.matches("<DeleteMarker>true</DeleteMarker>").count(),
+        2,
+        "both duplicate entries must succeed with a delete-marker insert: {xml}"
     );
 }
 
