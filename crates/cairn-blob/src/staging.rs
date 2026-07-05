@@ -11,6 +11,17 @@ use cairn_types::error::BlobError;
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncWriteExt, BufWriter};
 
+/// The staging writer's internal buffer size. `tokio::io::BufWriter::new` defaults to 8 KiB
+/// (`tokio::io::util::DEFAULT_BUF_SIZE`), tuned for small, interactive writes: for a large object it
+/// flushes to the file roughly every 8 KiB regardless of how large the incoming HTTP chunks are —
+/// about a thousand `write()` syscalls for an 8 MiB PUT, versus a few dozen at this size. 256 KiB
+/// (matching the small-object GET fast-path floor, `SMALL_READ_MAX`) measured a modest, real
+/// improvement in isolation (~138 -> ~142 MiB/s for a bare 8 MiB `stage()`, no HTTP/auth) — most of an
+/// 8 MiB PUT's cost is the durability barrier (fdatasync + rename), not the streaming writes, so this
+/// is a small, free, zero-risk win rather than the whole story. The extra one-time allocation is
+/// bounded by `write_permits` and negligible even for many concurrent small PUTs.
+const STAGING_WRITE_BUF: usize = 256 * 1024;
+
 /// A staging file open for writing, dispatching to the selected I/O backend. Construct with
 /// [`Staging::create`], feed it with [`Staging::write_all`], then finish with either
 /// [`Staging::commit`] (durable) or [`Staging::abort`] (discard).
@@ -65,7 +76,7 @@ impl Staging {
         .await
         .map_err(|e| BlobError::Io(e.to_string()))??;
         Ok(Staging::Tokio {
-            writer: BufWriter::new(tokio::fs::File::from_std(file)),
+            writer: BufWriter::with_capacity(STAGING_WRITE_BUF, tokio::fs::File::from_std(file)),
             staging_path,
             release_len,
         })
