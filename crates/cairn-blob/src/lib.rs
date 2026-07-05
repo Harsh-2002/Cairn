@@ -637,8 +637,10 @@ impl BlobStore for LocalBlobStore {
         };
 
         // Small uncompressed object already read in the probe: serve it as a single `Bytes` (the
-        // requested range sliced from the in-memory buffer), with no I/O permit, no second open, and
-        // no streaming channel. Otherwise fall back to the streamed read.
+        // requested range sliced from the in-memory buffer), with no second open and no streaming
+        // channel. It still holds a read permit — see below — so a flood of slow readers requesting
+        // small objects is bounded exactly like the streamed path (audit 2026-07). Otherwise fall
+        // back to the streamed read.
         let (body, zero_copy) = if let Some(bytes) = whole {
             // Clamp the range to the bytes ACTUALLY read: for a normal immutable blob this is exactly
             // [offset, offset+len), but a truncated/corrupted on-disk blob (shorter than its fstat
@@ -648,8 +650,27 @@ impl BlobStore for LocalBlobStore {
             let start = offset.min(avail) as usize;
             let end = (offset + len).min(avail) as usize;
             let slice = bytes.slice(start..end);
-            let body: cairn_types::BlobStream =
-                Box::pin(futures_util::stream::once(async move { Ok(slice) }));
+            // Hold a read permit across BOTH polls of this two-state stream: the first poll yields
+            // the bytes while still holding the permit in the next state, and only the SECOND poll
+            // (the caller checking for end-of-stream, which on a slow/stalled connection may not
+            // happen until the first chunk has actually drained to the socket) drops it. Without
+            // this, a small-object GET fast path is unbounded — a flood of slow readers of
+            // below-floor objects could hold far more transient memory than `read_permits` was
+            // sized to allow (a read-side slow-loris, the exact class this pool exists to bound).
+            let permit = self.acquire_io_owned().await?;
+            enum SmallState {
+                Item(Bytes, tokio::sync::OwnedSemaphorePermit),
+                Held(tokio::sync::OwnedSemaphorePermit),
+            }
+            let body: cairn_types::BlobStream = Box::pin(futures_util::stream::unfold(
+                SmallState::Item(slice, permit),
+                |state| async move {
+                    match state {
+                        SmallState::Item(b, permit) => Some((Ok(b), SmallState::Held(permit))),
+                        SmallState::Held(_permit) => None,
+                    }
+                },
+            ));
             (body, None)
         } else {
             // Hold a blob-I/O permit for the streamed transfer (ARCH 7.4); released when the read
@@ -1142,6 +1163,68 @@ mod tests {
             "an exhausted read pool must not consume write permits"
         );
         drop(held);
+    }
+
+    /// The small-object GET fast path (an uncompressed blob at or below `small_read_max`, served
+    /// inline from the probe's single read) must hold a read permit for as long as the streamed path
+    /// does — otherwise a flood of slow readers requesting small objects bypasses the exact pool this
+    /// audit exists to bound (see `read_and_write_io_pools_are_independent` above). The permit must
+    /// still be held after the one chunk is yielded (a slow client that has the bytes queued but
+    /// hasn't drained the connection must not free up the pool) and released only once the stream is
+    /// fully exhausted.
+    #[tokio::test]
+    async fn small_object_fast_path_holds_a_read_permit_across_both_polls() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalBlobStore::open(dir.path())
+            .await
+            .unwrap()
+            .with_read_io_pool_size(1);
+        let b = BucketName::parse("bkt").unwrap();
+        let staged = store
+            .stage(
+                &b,
+                Box::pin(futures_util::stream::once(async move {
+                    Ok(Bytes::from(vec![7u8; 128]))
+                })),
+                cairn_types::blob::StageOptions {
+                    compression: None,
+                    size_ceiling: 8 * 1024 * 1024,
+                    content_type: "application/octet-stream".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.read_permits.available_permits(), 1);
+
+        let mut handle = store
+            .open(&staged.storage_path, None, &staged.compression)
+            .await
+            .unwrap();
+        assert!(
+            handle.zero_copy.is_none(),
+            "a 128-byte object takes the small-object fast path, not zero-copy"
+        );
+        assert_eq!(
+            store.read_permits.available_permits(),
+            0,
+            "the fast path must acquire a read permit"
+        );
+
+        let first = handle.body.next().await.unwrap().unwrap();
+        assert_eq!(first.as_ref(), &[7u8; 128][..]);
+        assert_eq!(
+            store.read_permits.available_permits(),
+            0,
+            "the permit must still be held after the one chunk is yielded"
+        );
+
+        assert!(handle.body.next().await.is_none());
+        assert_eq!(
+            store.read_permits.available_permits(),
+            1,
+            "the permit is released once the stream is exhausted"
+        );
     }
 
     /// The mtime of a freshly created file, as whole epoch seconds.
