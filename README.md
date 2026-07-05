@@ -10,6 +10,10 @@ binary, and a distroless container image is also published.
 Cairn is for people who want to host their own object storage on a homelab machine, a VPS, or a small
 production node, with the S3 API and a console but without operating a distributed system.
 
+Releases are CI-gated and publish static `linux/amd64` and `linux/arm64` binaries with a `SHA256SUMS`
+manifest, plus a multi-arch image at `ghcr.io/harsh-2002/cairn`. Verify a download with
+`sha256sum -c SHA256SUMS`.
+
 ## Features
 
 - S3 API: buckets and objects, byte-range and conditional reads, checksums (CRC32, CRC32C,
@@ -121,11 +125,9 @@ Operator guides: [`docs/operations.md`](./docs/operations.md),
 
 ## Performance
 
-Cairn is fast where it counts and light on resources. The numbers below are a like-for-like comparison
-against MinIO on the same machine, driven by MinIO's own [`warp`](https://github.com/minio/warp)
-benchmark. Both run single-node, single-drive, over plaintext HTTP, and each figure is the median of
-three runs. The hardware is deliberately small — **2 vCPU, 16 GB RAM** — on the principle that a design
-efficient where cores are scarce scales up comfortably; a larger box only widens the absolute numbers.
+A like-for-like comparison against MinIO, both on the same 2 vCPU / 16 GB host, using MinIO's own
+[`warp`](https://github.com/minio/warp) benchmark. Both run single-node, single-drive, over plaintext
+HTTP; each figure is the median of three runs.
 
 Throughput (higher is better; `obj/s` for small objects, `MiB/s` for large):
 
@@ -147,14 +149,8 @@ Resource use while serving the same workload (lower is better):
 | **Cairn** | 76% | **106 MB** |
 | MinIO | 88% | 1072 MB |
 
-On this hardware Cairn beats MinIO on seven of these eight operations — losing only large-object PUT,
-and by a small margin — while holding a roughly **10× smaller memory footprint** (~106 MB vs ~1 GB).
-The ratio between the two is the meaningful signal: the absolute numbers are modest because a 2-core box
-shares its cores with the benchmark client and vary run to run, which is why the figures are medians and
-why the comparison — not the raw rate — is what to read.
-
-Reproduce it yourself — the harness stands up both servers and runs the matrix side by side, and the
-same comparison runs on every push in CI (the `bench-compare` job), so it tracks the code over time:
+Absolute numbers depend on the host and vary between runs; the ratio is what to read. Reproduce it
+with the harness CI runs on every push (`bench-compare`):
 
 ```sh
 BIN=target/release/cairn bash conformance/bench_compare.sh
@@ -190,7 +186,3 @@ Apache-2.0 ([`LICENSE`](./LICENSE)). The license is permanent; there is no enter
 open-core split. Governance and maintenance are described in [`GOVERNANCE.md`](./GOVERNANCE.md). See
 [`SECURITY.md`](./SECURITY.md) for the security policy, [`CODE_OF_CONDUCT.md`](./CODE_OF_CONDUCT.md)
 for community expectations, and [`CONTRIBUTING.md`](./CONTRIBUTING.md) for the developer workflow.
-
-Releases are CI-gated and publish static `linux/amd64` and `linux/arm64` binaries with a `SHA256SUMS`
-manifest, plus a multi-arch image at `ghcr.io/harsh-2002/cairn`. Verify a download with
-`sha256sum -c SHA256SUMS`.
