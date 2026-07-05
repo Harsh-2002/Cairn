@@ -102,6 +102,10 @@ pub struct SourceObject {
     pub content_disposition: Option<String>,
     /// `Content-Language`, if present.
     pub content_language: Option<String>,
+    /// The object's tag set, preserved on import. Empty when the source reported no tags (via
+    /// `x-amz-tagging-count`) or does not support tagging at all — never fetched speculatively, so an
+    /// untagged object costs no extra round-trip.
+    pub tags: Vec<(String, String)>,
     /// The lazily-streamed object body.
     pub body: cairn_types::BlobStream,
 }

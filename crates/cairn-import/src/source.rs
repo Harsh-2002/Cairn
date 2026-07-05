@@ -180,6 +180,20 @@ impl HttpS3Source {
         }
         Ok(bytes)
     }
+
+    /// Fetch an object's tag set via `GET ?tagging`. An untagged object returns `200` with an empty
+    /// `<TagSet/>` per the S3 spec, which parses to an empty `Vec` — the common, cheap case.
+    async fn get_object_tags(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Vec<(String, String)>, ImportError> {
+        let path = format!("/{}/{}", uri_encode(bucket, false), uri_encode(key, false));
+        let resp = self.signed_get(&path, "tagging=").await?;
+        let body = Self::read_list_body(resp).await?;
+        cairn_xml::parse_tagging(&body)
+            .map_err(|e| ImportError::Terminal(format!("parsing GetObjectTagging response: {e}")))
+    }
 }
 
 #[async_trait]
@@ -272,6 +286,22 @@ impl SourceReader for HttpS3Source {
             .map(|r| r.map_err(|e| cairn_types::error::BlobError::Io(e.to_string())));
         let body: cairn_types::BlobStream = Box::pin(body);
 
+        // The tag set needs a second call (GetObjectTagging) — S3 does not return tags on a plain
+        // GetObject. Not gated on any "does this object have tags" hint from the response: AWS S3
+        // exposes `x-amz-tagging-count` for that, but it's not something every S3-compatible source
+        // is guaranteed to send (Cairn's own GetObject does not emit it today), and silently skipping
+        // the fetch on an absent hint would silently drop tags from exactly the sources — Cairn,
+        // possibly others — that don't set it. Fetching is cheap (a small, bounded response) relative
+        // to a background migration job, so correctness wins the trade. A failure here is NON-FATAL:
+        // it must never fail an otherwise-successful object copy over a secondary metadata call.
+        let tags = match self.get_object_tags(bucket, key).await {
+            Ok(tags) => tags,
+            Err(e) => {
+                tracing::warn!(bucket, key, error = %e, "import: could not fetch object tags; continuing with no tags");
+                Vec::new()
+            }
+        };
+
         Ok(SourceObject {
             key: key.to_owned(),
             size,
@@ -282,6 +312,7 @@ impl SourceReader for HttpS3Source {
             cache_control,
             content_disposition,
             content_language,
+            tags,
             body,
         })
     }

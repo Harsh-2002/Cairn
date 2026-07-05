@@ -32,4 +32,6 @@ hex.workspace = true
 
 [dev-dependencies]
 cairn-types = { workspace = true, features = ["testing"] }
-tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "net", "macros", "sync", "time"] }
+hyper = { workspace = true, features = ["server", "http1"] }
+hyper-util = { workspace = true, features = ["server-auto", "tokio"] }

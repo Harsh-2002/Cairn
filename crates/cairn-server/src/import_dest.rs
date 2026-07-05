@@ -111,6 +111,25 @@ impl DestWriter for LocalDestWriter {
         for (k, v) in &obj.user_metadata {
             headers.push((format!("x-amz-meta-{k}"), v.clone()));
         }
+        // The inline `x-amz-tagging` header (form-urlencoded `k=v&k=v`) is what a normal PUT-with-
+        // tags uses, so the real put path persists this as the object's initial tag set with no
+        // further plumbing (`put_object`, cairn-protocol/service.rs). `uri_encode` percent-encodes
+        // the structural `&`/`=` inside a key or value, mirroring the replication sink's same need.
+        if !obj.tags.is_empty() {
+            let tagging = obj
+                .tags
+                .iter()
+                .map(|(k, v)| {
+                    format!(
+                        "{}={}",
+                        cairn_auth::uri_encode(k, true),
+                        cairn_auth::uri_encode(v, true)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("&");
+            headers.push(("x-amz-tagging".to_owned(), tagging));
+        }
 
         let req = self.request(Method::PUT, bn, Some(key), headers);
         // Adapt the source body stream (BlobError) to the request body stream (BodyError).

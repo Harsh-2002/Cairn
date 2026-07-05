@@ -98,6 +98,7 @@ impl SourceReader for FakeSource {
             cache_control: None,
             content_disposition: None,
             content_language: None,
+            tags: vec![],
             body: body_of(bytes.clone()),
         })
     }
