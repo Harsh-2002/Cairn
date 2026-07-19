@@ -118,9 +118,27 @@ impl AsyncMetadataStore {
     }
 }
 
-/// The efficient listing implementation: half-open range seek with delimiter skip-scan. The
-/// continuation cursor is an inclusive lower bound (the first key NOT yet returned). Ported from
-/// `cairn-meta/src/store.rs::list_impl`.
+/// Turn an EXCLUSIVE resume marker into the inclusive lower bound to seek from: a marker that names
+/// a rolled-up CommonPrefix resumes PAST the whole group. Ported from
+/// `cairn-meta/src/store.rs::seek_after` — read the rationale there.
+fn seek_after(prefix: &str, delimiter: Option<&str>, marker: &str) -> Option<String> {
+    if let Some(delim) = delimiter.filter(|d| !d.is_empty()) {
+        if let Some(rest) = marker.strip_prefix(prefix) {
+            if let Some(idx) = rest.find(delim) {
+                let cp = format!("{}{}{}", prefix, &rest[..idx], delim);
+                if cp == marker {
+                    return prefix_upper_bound(marker);
+                }
+            }
+        }
+    }
+    Some(successor(marker))
+}
+
+/// The efficient listing implementation: half-open range seek with delimiter skip-scan. `cursor` is
+/// an INCLUSIVE lower bound (the first key not yet returned); `start_after` is EXCLUSIVE (the last
+/// entry the client saw). Ported from `cairn-meta/src/store.rs::list_impl` — read the rationale
+/// there.
 async fn list_impl(
     driver: &dyn AsyncSqlDriver,
     bucket: &str,
@@ -131,7 +149,7 @@ async fn list_impl(
     let upper = prefix_upper_bound(&prefix);
     let limit = query.limit.max(1) as usize;
 
-    // Inclusive lower bound = max(prefix, cursor, successor(start_after)).
+    // Inclusive lower bound = max(prefix, cursor, exclusive-start(start_after)).
     let mut seek = prefix.clone();
     if let Some(c) = &query.cursor {
         if c.as_str() > seek.as_str() {
@@ -139,9 +157,10 @@ async fn list_impl(
         }
     }
     if let Some(sa) = &query.start_after {
-        let s = successor(sa);
-        if s > seek {
-            seek = s;
+        match seek_after(&prefix, query.delimiter.as_deref(), sa) {
+            Some(s) if s > seek => seek = s,
+            Some(_) => {}
+            None => return Ok(ListPage::default()),
         }
     }
 
@@ -188,13 +207,28 @@ async fn list_impl(
                 page.truncated = true;
                 if latest_only {
                     page.next_cursor = Some(summary.key.as_str().to_owned());
-                } else if let Some(last) = page.items.last() {
-                    // Version listing resumes at the last returned (key, version_id); see the sync
-                    // store for the rationale.
-                    page.next_cursor = Some(last.key.as_str().to_owned());
-                    page.next_version_id_marker = Some(last.version_id.as_str().to_owned());
                 } else {
-                    page.next_cursor = Some(summary.key.as_str().to_owned());
+                    // Version listing resumes at the last ENTRY returned — a bare (exclusive)
+                    // prefix marker when the page ended on a rolled-up group, else the last
+                    // returned (key, version_id) pair. See the sync store for the rationale.
+                    let last_item = page
+                        .items
+                        .last()
+                        .map(|i| (i.key.as_str().to_owned(), i.version_id.as_str().to_owned()));
+                    let last_cp = page.common_prefixes.last().cloned();
+                    let cp_ended_the_page = match (&last_item, &last_cp) {
+                        (Some((k, _)), Some(cp)) => cp.as_str() > k.as_str(),
+                        (None, Some(_)) => true,
+                        _ => false,
+                    };
+                    if cp_ended_the_page {
+                        page.next_cursor = last_cp;
+                    } else if let Some((key, version)) = last_item {
+                        page.next_cursor = Some(key);
+                        page.next_version_id_marker = Some(version);
+                    } else {
+                        page.next_cursor = Some(summary.key.as_str().to_owned());
+                    }
                 }
                 break 'outer;
             }

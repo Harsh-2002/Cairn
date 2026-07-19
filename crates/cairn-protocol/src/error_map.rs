@@ -31,6 +31,7 @@ pub fn map(err: &Error) -> (StatusCode, &'static str) {
         AccessDenied => (StatusCode::FORBIDDEN, "AccessDenied"),
         InvalidAccessKeyId => (StatusCode::FORBIDDEN, "InvalidAccessKeyId"),
         SignatureDoesNotMatch => (StatusCode::FORBIDDEN, "SignatureDoesNotMatch"),
+        RequestTimeTooSkewed => (StatusCode::FORBIDDEN, "RequestTimeTooSkewed"),
         InvalidRange => (StatusCode::RANGE_NOT_SATISFIABLE, "InvalidRange"),
         NotImplemented => (StatusCode::NOT_IMPLEMENTED, "NotImplemented"),
         AclNotSupported => (StatusCode::BAD_REQUEST, "AccessControlListNotSupported"),
@@ -49,7 +50,15 @@ pub fn error_response(err: &Error, resource: &str, request_id: &str) -> S3Respon
     // `<Message>` (audit #28): a 5xx logs the real cause server-side and returns a generic message,
     // matching AWS's opaque InternalError. Client (4xx) errors keep their descriptive, S3-standard
     // message.
-    let message = if status.is_server_error() {
+    //
+    // 501 is the one status in the 5xx class that is NOT an internal fault: `NotImplemented` is a
+    // deterministic, permanent capability answer ("this node does not implement that operation")
+    // carrying no internal detail, and it is reached on ordinary client input (any unhandled
+    // `?subresource`). Generalizing it told the caller to retry something that can never succeed
+    // and emitted a remotely-triggerable ERROR log line into real 5xx alerting, so it is excluded
+    // here — the audit-#28 guarantee still covers every genuine 5xx.
+    let internal_fault = status.is_server_error() && status != StatusCode::NOT_IMPLEMENTED;
+    let message = if internal_fault {
         tracing::error!(error = %err, request_id, resource, "internal error serving request");
         "We encountered an internal error. Please try again.".to_owned()
     } else {
@@ -113,5 +122,42 @@ mod tests {
         assert!(!s.contains("sekret"), "internal detail leaked: {s}");
         assert!(s.contains("InternalError"), "keeps the generic S3 code");
         assert!(s.contains("req-9"));
+    }
+
+    #[test]
+    fn not_implemented_keeps_its_descriptive_message() {
+        // Bug J: 501 is in the 5xx class, so the audit-#28 generalization used to swallow the
+        // descriptive `NotImplemented` message (and log it at ERROR) — telling a caller to retry a
+        // permanent, deterministic rejection. The generalization must skip 501 only.
+        let r = error_response(&Error::NotImplemented, "/b?website", "req-501");
+        assert_eq!(r.status, StatusCode::NOT_IMPLEMENTED);
+        let crate::request::S3Body::Bytes(b) = r.body else {
+            panic!("expected bytes body")
+        };
+        let s = String::from_utf8(b.to_vec()).unwrap();
+        assert!(
+            !s.contains("We encountered an internal error"),
+            "501 was generalized as an internal fault: {s}"
+        );
+        assert!(s.contains("NotImplemented"));
+        assert!(s.contains("not implemented"), "descriptive message: {s}");
+    }
+
+    #[test]
+    fn skewed_clock_is_forbidden_request_time_too_skewed() {
+        // Bug K: clock skew is S3's 403 RequestTimeTooSkewed, not a 400 InvalidArgument — SDKs
+        // resync and retry off that exact code. Folded here from `AuthError::SkewedClock`.
+        let err = Error::from(cairn_types::error::AuthError::SkewedClock);
+        assert_eq!(
+            map(&err),
+            (StatusCode::FORBIDDEN, "RequestTimeTooSkewed"),
+            "clock skew must not render as 400 InvalidArgument"
+        );
+        let r = error_response(&err, "/b/k", "req-skew");
+        let crate::request::S3Body::Bytes(b) = r.body else {
+            panic!("expected bytes body")
+        };
+        let s = String::from_utf8(b.to_vec()).unwrap();
+        assert!(s.contains("RequestTimeTooSkewed"), "{s}");
     }
 }

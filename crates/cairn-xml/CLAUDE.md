@@ -31,6 +31,13 @@ domain types to and from the XML wire shapes S3 clients expect. Pure: depends on
   in-memory so writes are infallible. All character data is escaped via quick-xml — never hand-format
   XML text. ETags render **quoted** (the one quoting point S3 requires); `StorageClass::ColdTier`
   renders as the S3 token `GLACIER`.
+- **`encoding-type=url` is all-or-nothing.** Every listing writer takes `encoding:
+  Option<EncodingType>`; when it is `Some`, the writer emits `<EncodingType>url</EncodingType>`
+  **and** percent-encodes the key-derived fields (`Key`, `Prefix` incl. `CommonPrefixes`,
+  `Delimiter`, `Marker`/`KeyMarker`, `NextMarker`/`NextKeyMarker`, `StartAfter`) via `leaf_enc`.
+  Never emit the echo without encoding or vice versa: botocore only URL-decodes a response that
+  echoes the element, so a mismatched half silently corrupts keys. Opaque values (continuation
+  tokens, version ids, upload ids) are NOT encoded — a client echoes them back verbatim.
 
 ## Pointers
 - Spec: `docs/s3-api.md` (ARCH 13, plus 21.4 for the request-lifecycle XML). See the root

@@ -154,6 +154,116 @@ jobs:
       - name: An unparseable bucket/key must never re-route to the bucket or root handler
         run: BIN=target/debug/cairn PY=python3 bash conformance/routing.sh
 
+  listing:
+    name: listing / pagination / versioning semantics
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: cairn-bin
+          path: target/debug
+      - run: chmod +x target/debug/cairn
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.x"
+      - run: pip install boto3
+      - name: Delimiter/CommonPrefixes, real token-fed pagination loops, delete markers + undelete
+        run: BIN=target/debug/cairn PY=python3 bash conformance/listing.sh
+
+  multipart:
+    name: multipart session-state error codes
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: cairn-bin
+          path: target/debug
+      - run: chmod +x target/debug/cairn
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.x"
+      - run: pip install boto3
+      - name: Low-level create/upload-part/complete — exact NoSuchUpload/InvalidPart/InvalidPartOrder/EntityTooSmall, and a terminating ListMultipartUploads loop
+        run: BIN=target/debug/cairn PY=python3 bash conformance/multipart.sh
+
+  objects:
+    name: object payload / headers / range
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: cairn-bin
+          path: target/debug
+      - run: chmod +x target/debug/cairn
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.x"
+      - run: pip install boto3
+      - name: System headers + aws-chunked normalization, copy directives, exact 206/416 ranges, encoded keys, DeleteObjects
+        run: BIN=target/debug/cairn PY=python3 bash conformance/objects.sh
+
+  buckets:
+    name: bucket surface + config subresources
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: cairn-bin
+          path: target/debug
+      - run: chmod +x target/debug/cairn
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.x"
+      - run: pip install boto3
+      - name: Name validation, DeleteBucket 204/409/404, every subresource PUT->GET->DELETE (bucket survives), real CORS preflight
+        run: BIN=target/debug/cairn PY=python3 bash conformance/buckets.sh
+
+  authz:
+    name: tenant isolation + SigV4 / presigned / anonymous auth
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: cairn-bin
+          path: target/debug
+      - run: chmod +x target/debug/cairn
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.x"
+      - run: pip install boto3
+      # Mints a second, non-admin identity via `POST /api/v1/users`, so this harness turns the
+      # management listener ON itself (UIPORT) — unlike the pure data-plane harnesses above.
+      - name: Cross-tenant AccessDenied (before NoSuchKey), SigV4 failure modes, presigned expiry, Block Public Access
+        run: BIN=target/debug/cairn PY=python3 bash conformance/authz.sh
+
+  lifecycle:
+    name: lifecycle scanner enforcement
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: cairn-bin
+          path: target/debug
+      - run: chmod +x target/debug/cairn
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.x"
+      - run: pip install boto3
+      - name: Prove the scanner ACTS — expires only matching keys, stays in its bucket, ignores Disabled, delete-marker on versioned
+        run: BIN=target/debug/cairn PY=python3 bash conformance/lifecycle.sh
+
   checksums:
     name: modern-SDK flexible checksums
     needs: build
@@ -535,6 +645,12 @@ jobs:
     needs:
       - conformance
       - routing
+      - listing
+      - multipart
+      - objects
+      - buckets
+      - authz
+      - lifecycle
       - checksums
       - scrub
       - object-lock

@@ -1762,3 +1762,155 @@ async fn delete_version_compare_and_delete_skips_overwritten_object() {
         "a matching updated_at deletes"
     );
 }
+
+// Marker semantics (conformance/listing.py). The store has two resume channels and they mean
+// different things: `cursor` is an INCLUSIVE lower bound (the opaque v2 token, and the S3
+// key-marker when PAIRED with a version-id-marker, which must resume *within* a multi-version
+// key), while `start_after` is EXCLUSIVE — it names the last entry the client already saw, which
+// is what S3's `start-after`, v1 `marker`, and a bare `key-marker` all mean. Conflating them
+// re-reads one key per page boundary.
+#[tokio::test]
+async fn start_after_is_exclusive_and_a_prefix_marker_skips_its_whole_group() {
+    let store = cairn_meta::open_in_memory().unwrap();
+    // 3 chars minimum — "mk" is not a legal S3 bucket name and `parse` rejects it as `Length`.
+    let b = BucketName::parse("mkr").unwrap();
+    for k in ["a/1", "a/2", "b/1", "m::n", "m::o"] {
+        store
+            .submit(put(
+                row(&b, k, VersionId::null(), "e", true),
+                Precondition::default(),
+            ))
+            .await
+            .unwrap();
+    }
+
+    // Plain key marker: strictly after, and the named key itself is NOT returned.
+    let page = store
+        .list_current(
+            &b,
+            &ListQuery {
+                start_after: Some("a/1".into()),
+                limit: 100,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        page.items
+            .iter()
+            .map(|i| i.key.as_str())
+            .collect::<Vec<_>>(),
+        ["a/2", "b/1", "m::n", "m::o"]
+    );
+
+    // A marker naming a rolled-up CommonPrefix excludes the WHOLE group: the group was already
+    // returned in full, so resuming at its first member would re-emit it on every page.
+    let page = store
+        .list_current(
+            &b,
+            &ListQuery {
+                delimiter: Some("/".into()),
+                start_after: Some("b/".into()),
+                limit: 100,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        page.common_prefixes.is_empty(),
+        "the grouped prefix must not repeat: {:?}",
+        page.common_prefixes
+    );
+    assert_eq!(
+        page.items
+            .iter()
+            .map(|i| i.key.as_str())
+            .collect::<Vec<_>>(),
+        ["m::n", "m::o"]
+    );
+
+    // ...but only when the marker really is a group. Under `prefix=a/` nothing rolls up, so a
+    // marker of "a/" is an ordinary exclusive key marker and must not swallow a/1 and a/2.
+    let page = store
+        .list_current(
+            &b,
+            &ListQuery {
+                prefix: Some("a/".into()),
+                delimiter: Some("/".into()),
+                start_after: Some("a/".into()),
+                limit: 100,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        page.items
+            .iter()
+            .map(|i| i.key.as_str())
+            .collect::<Vec<_>>(),
+        ["a/1", "a/2"],
+        "a key marker that merely ends in the delimiter is not a group"
+    );
+}
+
+#[tokio::test]
+async fn version_listing_page_ending_on_a_group_resumes_past_it() {
+    let store = cairn_meta::open_in_memory().unwrap();
+    let b = BucketName::parse("vmk").unwrap();
+    for k in ["a/1", "b/1", "m::n", "m::o"] {
+        store
+            .submit(put(
+                row(&b, k, VersionId::null(), "e", true),
+                Precondition::default(),
+            ))
+            .await
+            .unwrap();
+    }
+
+    // A page made entirely of CommonPrefixes must hand back a marker that ADVANCES. The bare
+    // (unpaired) next_cursor names the last group; a first-unreturned-key marker would be
+    // re-consumed as an exclusive marker and silently skip that key.
+    let page = store
+        .list_versions(
+            &b,
+            &ListQuery {
+                delimiter: Some("/".into()),
+                limit: 2,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(page.truncated);
+    assert_eq!(page.common_prefixes, vec!["a/".to_owned(), "b/".to_owned()]);
+    assert_eq!(page.next_cursor.as_deref(), Some("b/"));
+    assert_eq!(
+        page.next_version_id_marker, None,
+        "a group marker is unpaired: it is exclusive on its own"
+    );
+
+    let page2 = store
+        .list_versions(
+            &b,
+            &ListQuery {
+                delimiter: Some("/".into()),
+                start_after: page.next_cursor.clone(),
+                limit: 2,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        page2
+            .items
+            .iter()
+            .map(|i| i.key.as_str())
+            .collect::<Vec<_>>(),
+        ["m::n", "m::o"],
+        "the second page advances past the grouped prefixes"
+    );
+}
