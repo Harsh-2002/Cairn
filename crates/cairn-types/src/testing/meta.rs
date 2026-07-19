@@ -1228,11 +1228,12 @@ impl MetadataStore for InMemoryMetadataStore {
         let prefix = query.prefix.clone().unwrap_or_default();
         // S3 pages this listing on the (key-marker, upload-id-marker) PAIR — mirror the SQL
         // engines exactly: key-marker alone skips that key, the pair resumes mid-key. The
-        // `> prefix` filter is load-bearing parity: both SQL engines seek from
-        // `key_marker.unwrap_or(prefix)`, so a marker at or below the prefix must be ignored
-        // rather than narrow the page (a marker EQUAL to the prefix would otherwise drop an
-        // upload whose key is exactly the prefix here but keep it in production).
-        let key_marker = query.cursor.as_deref().filter(|c| *c > prefix.as_str());
+        // `>= prefix` filter is load-bearing parity: both SQL engines seek from
+        // `key_marker.unwrap_or(prefix)` and leave the exclusion to the tuple predicate, so only a
+        // marker strictly BELOW the prefix may be ignored. A marker EQUAL to the prefix is a real
+        // resume point and must be kept — discarding it discarded the upload-id-marker with it and
+        // re-served page 1 forever (issue #2).
+        let key_marker = query.cursor.as_deref().filter(|c| *c >= prefix.as_str());
         let upload_marker = key_marker.and(query.version_id_marker.as_deref());
         let mut items: Vec<MultipartSession> = st
             .multipart

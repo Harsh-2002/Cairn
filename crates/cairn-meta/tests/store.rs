@@ -488,10 +488,12 @@ fn multipart(bucket: &BucketName, key: &str, id: &str) -> Mutation {
 /// `cairn-meta-async` parity gate is glibc-only and scoped to libSQL-vs-rusqlite — so the one place
 /// that can hold BOTH the double and the real engine, and that always compiles, is here.
 ///
-/// Audit 2026-07: both SQL engines filter the key-marker with `> prefix`, because they seek from
-/// `key_marker.unwrap_or(prefix)` and leave the exclusion to the tuple predicate. The double
-/// excluded on the raw cursor instead, so for the exact case `key-marker == prefix` it dropped an
-/// upload whose key IS the prefix while SQLite listed it.
+/// Issue #2 flipped this test's expectation on purpose — it is a deliberate behaviour change, not a
+/// weakened assertion. All three engines used to filter the key-marker with `> prefix`, so a marker
+/// EQUAL to the prefix was discarded and the key that IS the prefix was listed. Per S3, `key-marker`
+/// alone means "begin AFTER that key", so an equal marker must be RETAINED and must then exclude its
+/// own key: the filter is now `>= prefix` and the assertion below expects "p" to be skipped. Keeping
+/// the marker is also what stops the pagination loop the corrected-boundary test pins.
 #[tokio::test]
 async fn list_multipart_uploads_key_marker_equal_to_prefix_matches_the_double() {
     let sqlite = cairn_meta::open_in_memory().unwrap();
@@ -509,7 +511,7 @@ async fn list_multipart_uploads_key_marker_equal_to_prefix_matches_the_double() 
 
     let query = ListQuery {
         prefix: Some("p".into()),
-        // The degenerate marker: equal to the prefix, i.e. "resume at the start of the prefix".
+        // The boundary marker: equal to the prefix, i.e. "resume after the key 'p'".
         cursor: Some("p".into()),
         limit: 100,
         ..Default::default()
@@ -530,8 +532,8 @@ async fn list_multipart_uploads_key_marker_equal_to_prefix_matches_the_double() 
     );
     assert_eq!(
         listed[0],
-        vec!["p", "pa"],
-        "a marker at the prefix must not hide the upload whose key IS the prefix"
+        vec!["pa"],
+        "a key-marker skips its own key, even when that key is also the prefix"
     );
 
     // Not over-tight: a marker strictly ABOVE the prefix still skips that key, in both engines.
@@ -548,6 +550,71 @@ async fn list_multipart_uploads_key_marker_equal_to_prefix_matches_the_double() 
     }
     assert_eq!(listed[0], listed[1]);
     assert_eq!(listed[0], 0, "key-marker 'pa' consumes both 'p' and 'pa'");
+}
+
+/// Issue #2, the actual bug: a truncation boundary landing on a key EQUAL to the prefix must
+/// ADVANCE the listing, not restart it. Both SQL engines and the double used to drop a key-marker
+/// equal to the prefix, and the upload-id-marker is gated on the key-marker being present — so the
+/// pair that resumes mid-key was thrown away and every page was page 1. A client paging a key with
+/// more concurrent sessions than `max-uploads` looped forever.
+///
+/// Driven as a real pagination loop (page N's markers feed page N+1) against BOTH the engine and
+/// the double, because the loop is the failure: asserting on one page in isolation cannot see it.
+#[tokio::test]
+async fn list_multipart_uploads_paginates_past_a_key_equal_to_the_prefix() {
+    let sqlite = cairn_meta::open_in_memory().unwrap();
+    let double = cairn_types::testing::InMemoryMetadataStore::new();
+    let b = BucketName::parse("bkt").unwrap();
+
+    for s in [&sqlite as &dyn MetadataStore, &double as &dyn MetadataStore] {
+        s.submit(Mutation::CreateBucket(Box::new(bucket("bkt"))))
+            .await
+            .unwrap();
+        // One key holding 5 concurrent sessions, and the key is exactly the prefix below.
+        for i in 1..=5 {
+            s.submit(multipart(&b, "video.mp4", &format!("u-{i}")))
+                .await
+                .unwrap();
+        }
+    }
+
+    for s in [&sqlite as &dyn MetadataStore, &double as &dyn MetadataStore] {
+        let mut pages: Vec<Vec<String>> = Vec::new();
+        let (mut cursor, mut upload_marker) = (None, None);
+        loop {
+            let query = ListQuery {
+                prefix: Some("video.mp4".into()),
+                cursor: cursor.clone(),
+                version_id_marker: upload_marker.clone(),
+                limit: 2,
+                ..Default::default()
+            };
+            let page = s.list_multipart_uploads(&b, &query).await.unwrap();
+            pages.push(
+                page.items
+                    .iter()
+                    .map(|u| u.upload_id.as_str().to_owned())
+                    .collect(),
+            );
+            if !page.truncated {
+                break;
+            }
+            // A truncated page that fails to advance its markers would spin here forever; bound the
+            // loop so the regression fails as an assertion rather than hanging the suite.
+            assert!(
+                pages.len() <= 4,
+                "listing never terminated — pages so far: {pages:?}"
+            );
+            (cursor, upload_marker) = (page.next_cursor, page.next_version_id_marker);
+        }
+
+        // 5 sessions at 2 per page: three pages, strictly advancing, no duplicates, no gaps.
+        assert_eq!(
+            pages,
+            vec![vec!["u-1", "u-2"], vec!["u-3", "u-4"], vec!["u-5"]],
+            "paging did not advance past the key that is also the prefix"
+        );
+    }
 }
 
 #[tokio::test]
