@@ -136,6 +136,24 @@ jobs:
       - name: Drive Cairn with the AWS SDK (real SigV4 + aws-chunked streaming, the F-5 path)
         run: BIN=target/debug/cairn PY=python3 bash conformance/run.sh
 
+  routing:
+    name: routing fall-through guard
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: cairn-bin
+          path: target/debug
+      - run: chmod +x target/debug/cairn
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.x"
+      - run: pip install boto3
+      - name: An unparseable bucket/key must never re-route to the bucket or root handler
+        run: BIN=target/debug/cairn PY=python3 bash conformance/routing.sh
+
   checksums:
     name: modern-SDK flexible checksums
     needs: build
