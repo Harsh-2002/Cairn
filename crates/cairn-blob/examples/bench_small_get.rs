@@ -13,7 +13,9 @@
 //! the RESULT column means the fast path serves that size that many times faster in-process.
 //!
 //! Run: `cargo run --release --example bench_small_get -p cairn-blob`
-//! Knobs: `BENCH_CONC` (concurrent readers, default 32), `BENCH_SECS` (seconds/leg, default 3).
+//! Knobs: `BENCH_CONC` (concurrent readers, default 32), `BENCH_SECS` (seconds/rep, default 1),
+//! `BENCH_REPS` (reps/leg, median reported, default 5). The two legs are interleaved rep-by-rep so
+//! both see the same background contention, and the median tames a contended runner's variance.
 
 use bytes::Bytes;
 use cairn_blob::LocalBlobStore;
@@ -68,6 +70,11 @@ async fn bench_reads(
     count.load(Ordering::Relaxed) as f64 / t0.elapsed().as_secs_f64()
 }
 
+fn median(mut xs: Vec<f64>) -> f64 {
+    xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    xs[xs.len() / 2]
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
     let conc: usize = std::env::var("BENCH_CONC")
@@ -77,7 +84,11 @@ async fn main() {
     let secs: f64 = std::env::var("BENCH_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(3.0);
+        .unwrap_or(1.0);
+    let reps: usize = std::env::var("BENCH_REPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5);
 
     // tempdir on the cwd's filesystem (run from the repo on real disk, not /tmp tmpfs).
     let dir = tempfile::tempdir_in(".").unwrap();
@@ -93,7 +104,7 @@ async fn main() {
     let bkt = BucketName::parse("bench").unwrap();
 
     println!(
-        "small-object GET fast path: {conc} concurrent readers, {secs}s/leg, on {:?}\n",
+        "small-object GET fast path: {conc} concurrent readers, {reps}×{secs}s/leg (median), on {:?}\n",
         std::env::current_dir().unwrap()
     );
     println!(
@@ -121,22 +132,31 @@ async fn main() {
             CompressionDescriptor::Uncompressed
         ));
 
-        let f = bench_reads(
-            fast.clone(),
-            staged.storage_path.clone(),
-            staged.compression.clone(),
-            conc,
-            secs,
-        )
-        .await;
-        let s = bench_reads(
-            slow.clone(),
-            staged.storage_path.clone(),
-            staged.compression.clone(),
-            conc,
-            secs,
-        )
-        .await;
+        // Interleave the legs rep-by-rep so a transient load spike hits both, not just one.
+        let (mut fs, mut ss) = (Vec::new(), Vec::new());
+        for _ in 0..reps {
+            fs.push(
+                bench_reads(
+                    fast.clone(),
+                    staged.storage_path.clone(),
+                    staged.compression.clone(),
+                    conc,
+                    secs,
+                )
+                .await,
+            );
+            ss.push(
+                bench_reads(
+                    slow.clone(),
+                    staged.storage_path.clone(),
+                    staged.compression.clone(),
+                    conc,
+                    secs,
+                )
+                .await,
+            );
+        }
+        let (f, s) = (median(fs), median(ss));
         println!(
             "  {:>7} KiB   {f:>13.0}   {s:>13.0}   {:>6.2}x",
             size,
