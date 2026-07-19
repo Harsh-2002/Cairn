@@ -504,7 +504,7 @@ impl S3Service {
             .query("delimiter")
             .filter(|s| !s.is_empty())
             .map(str::to_owned);
-        let max_keys = max_keys(req)?;
+        let max_keys = page_size(req, "max-keys")?;
 
         // The continuation token / marker is the opaque base64 of the store cursor.
         let cursor = if v1 {
@@ -1730,11 +1730,9 @@ impl S3Service {
                 .filter(|s| !s.is_empty())
                 .map(str::to_owned)
         });
-        let max: u32 = req
-            .query("max-uploads")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1000)
-            .min(1000);
+        // `max-uploads` is the same page-size parameter as `max-keys`, only spelled differently, so
+        // it gets the same strict parse: a non-integer is a 400, not a silent 1000-upload page.
+        let max = page_size(req, "max-uploads")?;
         let query = ListQuery {
             prefix: prefix.clone(),
             cursor: key_marker.clone(),
@@ -1742,10 +1740,14 @@ impl S3Service {
             limit: max,
             ..Default::default()
         };
-        let page = self
-            .meta
-            .list_multipart_uploads(&bucket.name, &query)
-            .await?;
+        // `max-uploads=0` short-circuits against an empty page — see `list_objects`.
+        let page = if max == 0 {
+            ListPage::default()
+        } else {
+            self.meta
+                .list_multipart_uploads(&bucket.name, &query)
+                .await?
+        };
         let body = cairn_xml::list_multipart_uploads_result(
             bucket.name.as_str(),
             prefix.as_deref(),
@@ -2378,7 +2380,7 @@ impl S3Service {
             .query("delimiter")
             .filter(|s| !s.is_empty())
             .map(str::to_owned);
-        let max = max_keys(req)?;
+        let max = page_size(req, "max-keys")?;
         // `key-marker`/`version-id-marker` are PLAIN values in S3 — the marker is a real object key
         // and a real version id, not an opaque token, and a client is entitled to synthesize either
         // one rather than echo ours. Consume them raw and emit them raw (see `next_cursor` below):
@@ -4691,26 +4693,28 @@ fn form_pct_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Parse the S3 `max-keys` page-size parameter (ARCH 16.1). AWS semantics, all four cases:
+/// Parse an S3 page-size query parameter (ARCH 16.1) — `max-keys` for the object and version
+/// listings, `max-uploads` for ListMultipartUploads. `param` names the one being parsed so the
+/// error quotes the parameter the client actually sent. AWS semantics, all four cases:
 ///   * absent (or present-but-empty)  -> the 1000 default;
 ///   * `> 1000`                       -> silently capped at 1000; AWS caps, it does not error;
 ///   * non-integer or negative        -> `InvalidArgument` 400. Swallowing the parse error into
 ///     the 1000 default (the old `.parse().ok().unwrap_or(1000)`) hands a client that asked for
-///     something it believed was small a full 1000-key page instead — a silent, unbounded
+///     something it believed was small a full 1000-entry page instead — a silent, unbounded
 ///     response, not a harmless default;
-///   * `0`                            -> VALID, and means literally zero keys. It must NOT reach
+///   * `0`                            -> VALID, and means literally zero entries. It must NOT reach
 ///     the store: `list_impl` clamps `limit` to `>= 1` (a 0 page size can never make progress),
-///     so a 0 came back as a one-key page with `IsTruncated=false`. Callers short-circuit the 0
+///     so a 0 came back as a one-entry page with `IsTruncated=false`. Callers short-circuit the 0
 ///     case against an empty `ListPage` instead of clamping here.
-fn max_keys(req: &S3Request) -> Result<u32> {
-    match req.query("max-keys") {
+fn page_size(req: &S3Request, param: &str) -> Result<u32> {
+    match req.query(param) {
         // A present-but-empty value is treated as absent, mirroring the `delimiter=` leniency in
         // `list_objects`: no client sends it, and rejecting it buys nothing but a compat risk.
         None | Some("") => Ok(1000),
         Some(raw) => raw.parse::<u32>().map(|n| n.min(1000)).map_err(|_| {
-            Error::InvalidArgument(
-                "Provided max-keys not an integer or within integer range".to_owned(),
-            )
+            Error::InvalidArgument(format!(
+                "Provided {param} not an integer or within integer range"
+            ))
         }),
     }
 }
