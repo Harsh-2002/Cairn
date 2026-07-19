@@ -916,10 +916,17 @@ impl MetadataStore for SqliteMetadataStore {
             // ("only keys lexicographically greater than the marker are listed"); paired with an
             // upload-id-marker it resumes mid-key, which is the only way past a key holding more
             // than `max-uploads` concurrent sessions.
+            //
+            // The filter is `>=`, not `>`: a marker EQUAL to the prefix is a legitimate resume
+            // point (the truncation boundary landed on the key that IS the prefix) and must be
+            // kept. Dropping it discarded the upload-id-marker with it — gated on the key-marker
+            // below — so a prefix-matching key holding more than `max-uploads` sessions re-served
+            // page 1 forever (issue #2). Only a marker strictly BELOW the prefix is a no-op: the
+            // seek starts at the prefix regardless.
             let key_marker = q
                 .cursor
                 .as_deref()
-                .filter(|c| *c > prefix.as_str())
+                .filter(|c| *c >= prefix.as_str())
                 .map(str::to_owned);
             let upload_marker = key_marker.as_ref().and(q.version_id_marker.clone());
             // Inclusive lower bound for the index seek; the tuple predicate below does the exclusion.

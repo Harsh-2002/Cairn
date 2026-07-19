@@ -565,10 +565,14 @@ impl MetadataStore for AsyncMetadataStore {
         // paired with an upload-id-marker it resumes mid-key, the only way past a key holding more
         // than `max-uploads` concurrent sessions. Byte-for-byte the rusqlite store's logic —
         // parity is the contract.
+        //
+        // `>=`, not `>`: a marker equal to the prefix is a real resume point, and dropping it
+        // dropped the upload-id-marker with it, re-serving page 1 forever (issue #2). Only a
+        // marker strictly below the prefix is a no-op — the seek starts at the prefix anyway.
         let key_marker = query
             .cursor
             .as_deref()
-            .filter(|c| *c > prefix.as_str())
+            .filter(|c| *c >= prefix.as_str())
             .map(str::to_owned);
         let upload_marker = key_marker.as_ref().and(query.version_id_marker.clone());
         // Inclusive lower bound for the index seek; the tuple predicate below does the exclusion.
