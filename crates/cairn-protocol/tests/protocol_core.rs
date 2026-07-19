@@ -1935,6 +1935,150 @@ async fn list_multipart_uploads_pages_within_one_key() {
     );
 }
 
+/// Issue #3: `max-uploads` was left on the lenient `.parse().ok().unwrap_or(1000)` when `max-keys`
+/// was tightened. Both halves of that defect:
+///   * `max-uploads=0` is legal S3 and means literally zero uploads, but the store's `limit.max(1)`
+///     progress guard rounded it up to a one-upload page;
+///   * an unparseable `max-uploads` silently became the 1000 default — a silent, unbounded response
+///     where the client asked for something it believed was small.
+#[tokio::test]
+async fn list_multipart_uploads_max_uploads_zero_and_non_integer() {
+    let h = harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("lmumax"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    for k in ["a.bin", "b.bin", "c.bin"] {
+        start_upload(&h, "lmumax", k).await;
+    }
+
+    // `max-uploads=0`: zero uploads, not one, and a terminal page.
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("lmumax"),
+                None,
+                &[("uploads", ""), ("max-uploads", "0")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "max-uploads=0 is valid, not a 400");
+    let body = String::from_utf8(body).unwrap();
+    assert!(body.contains("<MaxUploads>0</MaxUploads>"), "{body}");
+    assert!(body.contains("<IsTruncated>false</IsTruncated>"), "{body}");
+    assert!(!body.contains("<Upload>"), "no uploads at all: {body}");
+    assert!(!body.contains("<NextKeyMarker>"), "{body}");
+
+    // A non-integer / negative `max-uploads` is a 400 InvalidArgument naming `max-uploads` — not a
+    // full 1000-upload page, and not an error text about `max-keys`.
+    for bad in ["abc", "-1", "1e3", "1.5"] {
+        let (st, _, body) = drain(
+            send(
+                &h.svc,
+                req(
+                    Method::GET,
+                    Some("lmumax"),
+                    None,
+                    &[("uploads", ""), ("max-uploads", bad)],
+                    &[],
+                    vec![],
+                ),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::BAD_REQUEST,
+            "max-uploads={bad} must be a 400"
+        );
+        let body = String::from_utf8(body).unwrap();
+        assert!(body.contains("<Code>InvalidArgument</Code>"), "{body}");
+        assert!(
+            body.contains("max-uploads") && !body.contains("max-keys"),
+            "the message must name the parameter the client sent: {body}"
+        );
+        assert!(
+            !body.contains("<Upload>"),
+            "must not fall through to a 1000-upload page: {body}"
+        );
+    }
+}
+
+/// Guard against over-correcting the strict parse: an ordinary `max-uploads` must still bound the
+/// page and truncate, and one over the ceiling is silently CAPPED (AWS caps, it does not error).
+#[tokio::test]
+async fn list_multipart_uploads_max_uploads_still_paginates() {
+    let h = harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("lmupage"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    for k in ["a.bin", "b.bin", "c.bin"] {
+        start_upload(&h, "lmupage", k).await;
+    }
+
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("lmupage"),
+                None,
+                &[("uploads", ""), ("max-uploads", "2")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let body = String::from_utf8(body).unwrap();
+    assert_eq!(body.matches("<Upload>").count(), 2, "{body}");
+    assert!(body.contains("<MaxUploads>2</MaxUploads>"), "{body}");
+    assert!(body.contains("<IsTruncated>true</IsTruncated>"), "{body}");
+    assert_eq!(
+        between(&body, "<NextKeyMarker>", "</NextKeyMarker>"),
+        "b.bin",
+        "{body}"
+    );
+
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("lmupage"),
+                None,
+                &[("uploads", ""), ("max-uploads", "5000")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let body = String::from_utf8(body).unwrap();
+    assert!(body.contains("<MaxUploads>1000</MaxUploads>"), "{body}");
+    assert_eq!(body.matches("<Upload>").count(), 3, "{body}");
+}
+
 /// Audit 2026-07: a CompleteMultipartUpload naming a part that was never uploaded must be
 /// 400 InvalidPart, not 404 NoSuchUpload (which falsely tells the client the whole upload vanished).
 #[tokio::test]
