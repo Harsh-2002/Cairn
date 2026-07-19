@@ -463,6 +463,93 @@ async fn listing_empty_delimiter_lists_all_objects() {
     );
 }
 
+/// An ACTIVE multipart session on `bucket`/`key` with upload id `id`. Only the fields the listing
+/// reads (bucket, key, status, upload id) matter; the rest are placeholders.
+fn multipart(bucket: &BucketName, key: &str, id: &str) -> Mutation {
+    Mutation::CreateMultipart(Box::new(MultipartSession {
+        upload_id: UploadId::from_string(id.to_owned()),
+        bucket: bucket.clone(),
+        key: ObjectKey::parse(key).unwrap(),
+        content_type: "application/octet-stream".to_owned(),
+        status: MultipartStatus::Active,
+        owner_id: UserId("owner".to_owned()),
+        intended_acl: None,
+        user_metadata: Vec::new(),
+        sse_requested: false,
+        created_at: Timestamp(1),
+        updated_at: Timestamp(1),
+    }))
+}
+
+/// Double-vs-engine parity for `list_multipart_uploads`. `cairn-types`' in-memory double is the
+/// reference engine every other crate unit-tests against, so a divergence from this store is a bug
+/// in its own right: downstream tests pin behaviour production does not have. `cairn-types` cannot
+/// depend on `cairn-meta` (that is the dependency direction of the whole workspace), and the
+/// `cairn-meta-async` parity gate is glibc-only and scoped to libSQL-vs-rusqlite — so the one place
+/// that can hold BOTH the double and the real engine, and that always compiles, is here.
+///
+/// Audit 2026-07: both SQL engines filter the key-marker with `> prefix`, because they seek from
+/// `key_marker.unwrap_or(prefix)` and leave the exclusion to the tuple predicate. The double
+/// excluded on the raw cursor instead, so for the exact case `key-marker == prefix` it dropped an
+/// upload whose key IS the prefix while SQLite listed it.
+#[tokio::test]
+async fn list_multipart_uploads_key_marker_equal_to_prefix_matches_the_double() {
+    let sqlite = cairn_meta::open_in_memory().unwrap();
+    let double = cairn_types::testing::InMemoryMetadataStore::new();
+    let b = BucketName::parse("bkt").unwrap();
+
+    for s in [&sqlite as &dyn MetadataStore, &double as &dyn MetadataStore] {
+        s.submit(Mutation::CreateBucket(Box::new(bucket("bkt"))))
+            .await
+            .unwrap();
+        // "p" is BOTH the prefix and a real key; "pa" sorts after it.
+        s.submit(multipart(&b, "p", "u-1")).await.unwrap();
+        s.submit(multipart(&b, "pa", "u-2")).await.unwrap();
+    }
+
+    let query = ListQuery {
+        prefix: Some("p".into()),
+        // The degenerate marker: equal to the prefix, i.e. "resume at the start of the prefix".
+        cursor: Some("p".into()),
+        limit: 100,
+        ..Default::default()
+    };
+    let mut listed = Vec::new();
+    for s in [&sqlite as &dyn MetadataStore, &double as &dyn MetadataStore] {
+        let page = s.list_multipart_uploads(&b, &query).await.unwrap();
+        listed.push(
+            page.items
+                .iter()
+                .map(|u| u.key.as_str().to_owned())
+                .collect::<Vec<_>>(),
+        );
+    }
+    assert_eq!(
+        listed[0], listed[1],
+        "the double diverged from the SQLite engine on key-marker == prefix"
+    );
+    assert_eq!(
+        listed[0],
+        vec!["p", "pa"],
+        "a marker at the prefix must not hide the upload whose key IS the prefix"
+    );
+
+    // Not over-tight: a marker strictly ABOVE the prefix still skips that key, in both engines.
+    let query = ListQuery {
+        prefix: Some("p".into()),
+        cursor: Some("pa".into()),
+        limit: 100,
+        ..Default::default()
+    };
+    let mut listed = Vec::new();
+    for s in [&sqlite as &dyn MetadataStore, &double as &dyn MetadataStore] {
+        let page = s.list_multipart_uploads(&b, &query).await.unwrap();
+        listed.push(page.items.len());
+    }
+    assert_eq!(listed[0], listed[1]);
+    assert_eq!(listed[0], 0, "key-marker 'pa' consumes both 'p' and 'pa'");
+}
+
 #[tokio::test]
 async fn reconcile_oracle_reports_membership() {
     let store = cairn_meta::open_in_memory().unwrap();

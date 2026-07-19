@@ -213,6 +213,55 @@ fn list_multipart_uploads_shape() {
     assert!(xml.contains("<Initiated>2025-"));
 }
 
+/// Audit 2026-07: a truncated multipart listing must emit BOTH halves of the resume pair. With
+/// only `NextKeyMarker` a key holding more uploads than `max-uploads` can never be paged past.
+#[test]
+fn list_multipart_uploads_truncated_emits_both_markers() {
+    let session = MultipartSession {
+        upload_id: UploadId::from_string("up-9".to_owned()),
+        bucket: BucketName::parse("my-bucket").unwrap(),
+        key: ObjectKey::parse("big.bin").unwrap(),
+        content_type: "application/octet-stream".to_owned(),
+        status: MultipartStatus::Active,
+        owner_id: UserId("o".to_owned()),
+        intended_acl: None,
+        user_metadata: vec![],
+        sse_requested: false,
+        created_at: Timestamp(1_750_000_000_000),
+        updated_at: Timestamp(1_750_000_000_000),
+    };
+    let page = ListPage {
+        items: vec![session],
+        common_prefixes: vec![],
+        next_cursor: Some("big.bin".to_owned()),
+        next_version_id_marker: Some("up-9".to_owned()),
+        truncated: true,
+    };
+    let xml = list_multipart_uploads_result(
+        "my-bucket",
+        None,
+        None,
+        &page,
+        Some("prev.bin"),
+        Some("up-1"),
+        1,
+    );
+    assert!(xml.contains("<KeyMarker>prev.bin</KeyMarker>"), "{xml}");
+    assert!(
+        xml.contains("<UploadIdMarker>up-1</UploadIdMarker>"),
+        "{xml}"
+    );
+    assert!(
+        xml.contains("<NextKeyMarker>big.bin</NextKeyMarker>"),
+        "{xml}"
+    );
+    assert!(
+        xml.contains("<NextUploadIdMarker>up-9</NextUploadIdMarker>"),
+        "{xml}"
+    );
+    assert!(xml.contains("<IsTruncated>true</IsTruncated>"), "{xml}");
+}
+
 #[test]
 fn copy_object_result_shape() {
     let etag = ETag::from_md5_hex("cafe".to_owned());

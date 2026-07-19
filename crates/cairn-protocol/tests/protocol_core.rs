@@ -401,6 +401,79 @@ async fn streaming_chunked_put_is_deframed() {
     );
 }
 
+/// `aws-chunked` is a TRANSFER coding describing the request-body framing, not a content coding of
+/// the stored object. AWS strips it before storing; Cairn used to persist it verbatim, so every
+/// GET advertised a framing the response body does not use — and the replication sink forwarded
+/// the lie downstream (audit 2026-07).
+#[tokio::test]
+async fn aws_chunked_is_stripped_from_stored_content_encoding() {
+    let h = harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("cencode"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+
+    // A one-chunk aws-chunked framing of `payload`, reused by every streaming case below.
+    let payload = b"the quick brown fox";
+    let framed = || {
+        let mut c = Vec::new();
+        c.extend_from_slice(format!("{:x}\r\n", payload.len()).as_bytes());
+        c.extend_from_slice(payload);
+        c.extend_from_slice(b"\r\n0\r\n\r\n");
+        c
+    };
+
+    // (key, sent content-encoding, expected stored/echoed value, streaming?)
+    let cases: [(&str, &str, Option<&str>, bool); 4] = [
+        // The exact boto3 flexible-checksum shape: the real coding survives, the token does not.
+        ("mixed", "gzip,aws-chunked", Some("gzip"), true),
+        // aws-chunked alone leaves NOTHING to store: the header must be absent, not empty.
+        ("only", "aws-chunked", None, true),
+        // Case-insensitive token match; the other codings keep their order.
+        ("multi", "gzip, AWS-Chunked, br", Some("gzip, br"), true),
+        // The verbatim fast path must not regress.
+        ("plain", "gzip", Some("gzip"), false),
+    ];
+    for (key, sent, want, streaming) in cases {
+        let mut headers: Vec<(&str, &str)> = vec![("content-encoding", sent)];
+        let body = if streaming {
+            headers.push(("x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD"));
+            framed()
+        } else {
+            payload.to_vec()
+        };
+        let (st, _, _) = drain(
+            send(
+                &h.svc,
+                req(Method::PUT, Some("cencode"), Some(key), &[], &headers, body),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "PUT {key} must still succeed");
+        let (st, hdrs, got) = drain(
+            send(
+                &h.svc,
+                req(Method::GET, Some("cencode"), Some(key), &[], &[], vec![]),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(
+            header(&hdrs, "content-encoding"),
+            want,
+            "stored content-encoding for {key} (sent {sent:?})"
+        );
+        // Normalizing the header must not disturb the F-5 de-framing of the body.
+        assert_eq!(got, payload, "body round-trip for {key}");
+    }
+}
+
 /// Build a SigV4 signed `aws-chunked` body for `payloads` and the matching signed-streaming
 /// context, using cairn-auth's signing primitives the way a real client would. The returned
 /// context seeds the decoder's per-chunk chain; `tamper` flips a payload byte AFTER signing so
@@ -1334,6 +1407,534 @@ async fn complete_multipart_against_wrong_key_is_no_such_upload() {
     );
 }
 
+/// Initiate a multipart upload on `bucket`/`key` with one 1-part body, returning
+/// `(upload_id, part_etag)`. Shared by the uploadId-scoping regressions below.
+async fn start_upload_with_part(h: &Harness, bucket: &str, key: &str) -> (String, String) {
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some(bucket), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::POST,
+                Some(bucket),
+                Some(key),
+                &[("uploads", "")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let upload_id = between(
+        &String::from_utf8(body).unwrap(),
+        "<UploadId>",
+        "</UploadId>",
+    );
+    let (st, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some(bucket),
+                Some(key),
+                &[("uploadId", upload_id.as_str()), ("partNumber", "1")],
+                &[],
+                b"hello".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let etag = header(&hdrs, "etag").unwrap().to_owned();
+    (upload_id, etag)
+}
+
+/// Audit 2026-07 (critical): `abort_multipart` never checked that the uploadId belonged to the
+/// request path. Any principal who could write SOME path of their own could destroy another
+/// tenant's in-flight upload — session row AND staged part bytes — by id alone.
+#[tokio::test]
+async fn abort_multipart_against_wrong_key_is_no_such_upload() {
+    let h = harness().await;
+    let (upload_id, etag1) = start_upload_with_part(&h, "mpb2", "right.bin").await;
+
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::DELETE,
+                Some("mpb2"),
+                Some("wrong.bin"),
+                &[("uploadId", upload_id.as_str())],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::NOT_FOUND,
+        "aborting against the wrong key must be NoSuchUpload"
+    );
+
+    // The victim's upload SURVIVED — the real security assertion. A fix that 404s but still
+    // deletes the session and its staged bytes fails here.
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("mpb2"),
+                Some("right.bin"),
+                &[("uploadId", upload_id.as_str())],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let body = String::from_utf8(body).unwrap();
+    assert!(body.contains("<PartNumber>1</PartNumber>"), "{body}");
+    let complete = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag1}</ETag></Part></CompleteMultipartUpload>"
+    );
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::POST,
+                Some("mpb2"),
+                Some("right.bin"),
+                &[("uploadId", upload_id.as_str())],
+                &[],
+                complete.into_bytes(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "the staged part must still be there");
+}
+
+/// Aborting an unknown uploadId used to return 204: `Mutation::AbortMultipart` is an unconditional
+/// DELETE that cannot distinguish "removed" from "never existed". AWS answers NoSuchUpload.
+#[tokio::test]
+async fn abort_multipart_with_unknown_upload_id_is_no_such_upload() {
+    let h = harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("mpb3"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::DELETE,
+                Some("mpb3"),
+                Some("some.bin"),
+                &[("uploadId", "does-not-exist")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::NOT_FOUND,
+        "an unknown uploadId must be NoSuchUpload, not a silent 204"
+    );
+}
+
+/// `list_parts` checked existence but not ownership, so an unscoped id rendered another key's part
+/// numbers, sizes and ETags (= per-part content MD5s) under the caller's own path.
+#[tokio::test]
+async fn list_parts_against_wrong_key_is_no_such_upload() {
+    let h = harness().await;
+    let (upload_id, _) = start_upload_with_part(&h, "mpb4", "right.bin").await;
+
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("mpb4"),
+                Some("wrong.bin"),
+                &[("uploadId", upload_id.as_str())],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let body = String::from_utf8(body).unwrap();
+    assert!(
+        !body.contains("<PartNumber>"),
+        "no part metadata may leak even in the error body: {body}"
+    );
+
+    // Not over-tight: the real path still lists.
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("mpb4"),
+                Some("right.bin"),
+                &[("uploadId", upload_id.as_str())],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(
+        String::from_utf8(body)
+            .unwrap()
+            .contains("<PartNumber>1</PartNumber>")
+    );
+}
+
+/// `upload_part` (and `upload_part_copy`) checked existence but not ownership, and
+/// `Mutation::RecordPart` SUPERSEDES the part at that number — so an unscoped id let a caller
+/// corrupt another key's in-flight upload with bytes of their choosing.
+#[tokio::test]
+async fn upload_part_against_wrong_key_is_no_such_upload() {
+    let h = harness().await;
+    let (upload_id, etag1) = start_upload_with_part(&h, "mpb5", "right.bin").await;
+
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("mpb5"),
+                Some("wrong.bin"),
+                &[("uploadId", upload_id.as_str()), ("partNumber", "1")],
+                &[],
+                b"evil".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+
+    // The victim's part was NOT superseded — a 404-but-still-recorded fix fails here.
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("mpb5"),
+                Some("right.bin"),
+                &[("uploadId", upload_id.as_str())],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let body = String::from_utf8(body).unwrap();
+    // The listing renders the part ETag quoted (XML-escaped); compare the bare hex.
+    let want = etag1.trim_matches('"').to_owned();
+    assert!(
+        body.contains(&want),
+        "part 1 was overwritten by the cross-key upload (want {want}): {body}"
+    );
+}
+
+/// `upload_part_copy` is a SECOND, distinct call site of the same `Mutation::RecordPart` supersede
+/// — and the more dangerous one, because it needs no request body at all: the attacker names bytes
+/// that already exist. The copy source below is real and readable, so the ONLY thing that can stop
+/// this request is the uploadId scope check; without it the copy resolves, stages, and supersedes
+/// the victim's part 1.
+#[tokio::test]
+async fn upload_part_copy_against_wrong_key_is_no_such_upload() {
+    let h = harness().await;
+    let (upload_id, etag1) = start_upload_with_part(&h, "mpb6", "right.bin").await;
+
+    // The attacker's own object, used as the copy source — a legitimate read for them.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("mpb6"),
+                Some("evil-source.bin"),
+                &[],
+                &[],
+                b"attacker-chosen-bytes".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("mpb6"),
+                Some("wrong.bin"),
+                &[("uploadId", upload_id.as_str()), ("partNumber", "1")],
+                &[("x-amz-copy-source", "/mpb6/evil-source.bin")],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::NOT_FOUND,
+        "UploadPartCopy against the wrong key must be NoSuchUpload"
+    );
+
+    // The victim's part was NOT superseded — a 404-that-still-records fails here. The source bytes
+    // differ from the staged `hello`, so a successful splice would change part 1's ETag.
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("mpb6"),
+                Some("right.bin"),
+                &[("uploadId", upload_id.as_str())],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let body = String::from_utf8(body).unwrap();
+    let want = etag1.trim_matches('"').to_owned();
+    assert!(
+        body.contains(&want),
+        "part 1 was spliced by the cross-key UploadPartCopy (want {want}): {body}"
+    );
+
+    // Not over-tight: the same copy against the upload's REAL key still records.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("mpb6"),
+                Some("right.bin"),
+                &[("uploadId", upload_id.as_str()), ("partNumber", "2")],
+                &[("x-amz-copy-source", "/mpb6/evil-source.bin")],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+}
+
+/// Initiate a multipart upload and return its id (no parts).
+async fn start_upload(h: &Harness, bucket: &str, key: &str) -> String {
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::POST,
+                Some(bucket),
+                Some(key),
+                &[("uploads", "")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    between(
+        &String::from_utf8(body).unwrap(),
+        "<UploadId>",
+        "</UploadId>",
+    )
+}
+
+/// Audit 2026-07: `list_multipart_uploads` advertised a NextKeyMarker on a truncated page but
+/// never READ `key-marker`, so a paginating client (rclone's multipart cleanup) got page 1 back
+/// forever.
+#[tokio::test]
+async fn list_multipart_uploads_honours_key_marker() {
+    let h = harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("lmub"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    for k in ["a.bin", "b.bin", "c.bin"] {
+        start_upload(&h, "lmub", k).await;
+    }
+
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("lmub"),
+                None,
+                &[("uploads", ""), ("max-uploads", "2")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let body1 = String::from_utf8(body).unwrap();
+    assert!(body1.contains("<IsTruncated>true</IsTruncated>"), "{body1}");
+    assert!(body1.contains("<Key>a.bin</Key>"), "{body1}");
+    assert!(body1.contains("<Key>b.bin</Key>"), "{body1}");
+    assert!(!body1.contains("<Key>c.bin</Key>"), "{body1}");
+    let next_key = between(&body1, "<NextKeyMarker>", "</NextKeyMarker>");
+    assert_eq!(next_key, "b.bin", "{body1}");
+    let next_upload = between(&body1, "<NextUploadIdMarker>", "</NextUploadIdMarker>");
+    assert!(!next_upload.is_empty(), "{body1}");
+
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("lmub"),
+                None,
+                &[
+                    ("uploads", ""),
+                    ("max-uploads", "2"),
+                    ("key-marker", next_key.as_str()),
+                    ("upload-id-marker", next_upload.as_str()),
+                ],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let body2 = String::from_utf8(body).unwrap();
+    assert!(body2.contains("<Key>c.bin</Key>"), "{body2}");
+    assert!(
+        !body2.contains("<Key>a.bin</Key>") && !body2.contains("<Key>b.bin</Key>"),
+        "page 2 must advance, not re-serve page 1: {body2}"
+    );
+    assert!(
+        body2.contains("<IsTruncated>false</IsTruncated>"),
+        "{body2}"
+    );
+    // The markers we sent are echoed back.
+    assert!(body2.contains("<KeyMarker>b.bin</KeyMarker>"), "{body2}");
+    assert!(
+        body2.contains(&format!("<UploadIdMarker>{next_upload}</UploadIdMarker>")),
+        "{body2}"
+    );
+}
+
+/// The upload-id half of the marker: one key can hold many concurrent uploads, and without a
+/// `(key, upload id)` pair such a key can never be paged past — every page is that same key, so
+/// the NextKeyMarker never advances.
+#[tokio::test]
+async fn list_multipart_uploads_pages_within_one_key() {
+    let h = harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("lmuk"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    let mut initiated = Vec::new();
+    for _ in 0..3 {
+        initiated.push(start_upload(&h, "lmuk", "same.bin").await);
+    }
+    initiated.sort();
+
+    let mut seen: Vec<String> = Vec::new();
+    let mut key_marker = String::new();
+    let mut upload_marker = String::new();
+    for page in 0..3 {
+        let mut query: Vec<(&str, &str)> = vec![("uploads", ""), ("max-uploads", "1")];
+        if page > 0 {
+            query.push(("key-marker", key_marker.as_str()));
+            query.push(("upload-id-marker", upload_marker.as_str()));
+        }
+        let (st, _, body) = drain(
+            send(
+                &h.svc,
+                req(Method::GET, Some("lmuk"), None, &query, &[], vec![]),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        let body = String::from_utf8(body).unwrap();
+        let id = between(&body, "<UploadId>", "</UploadId>");
+        assert!(
+            !seen.contains(&id),
+            "page {page} repeated upload {id}: {body}"
+        );
+        seen.push(id);
+        if page < 2 {
+            assert!(
+                body.contains("<IsTruncated>true</IsTruncated>"),
+                "page {page}: {body}"
+            );
+            key_marker = between(&body, "<NextKeyMarker>", "</NextKeyMarker>");
+            upload_marker = between(&body, "<NextUploadIdMarker>", "</NextUploadIdMarker>");
+        } else {
+            assert!(
+                body.contains("<IsTruncated>false</IsTruncated>"),
+                "the last page must terminate: {body}"
+            );
+        }
+    }
+    seen.sort();
+    assert_eq!(
+        seen, initiated,
+        "every initiated upload listed exactly once"
+    );
+}
+
 /// Audit 2026-07: a CompleteMultipartUpload naming a part that was never uploaded must be
 /// 400 InvalidPart, not 404 NoSuchUpload (which falsely tells the client the whole upload vanished).
 #[tokio::test]
@@ -1496,6 +2097,334 @@ async fn list_objects_v1_pagination_round_trips() {
         !body2.contains("<Key>file1</Key>") && !body2.contains("<Key>file2</Key>"),
         "page 2 must not repeat page 1 (no loop)"
     );
+}
+
+/// Audit 2026-07: ListObjectVersions must emit a PLAIN-key NextKeyMarker (paired with a plain
+/// NextVersionIdMarker) that, echoed back as `key-marker`/`version-id-marker`, advances the
+/// listing. Pre-fix the NextKeyMarker was base64-encoded and the incoming key-marker
+/// base64-decoded, so a client passing a literal key had it silently dropped — which also dropped
+/// the paired version-id marker — and pagination looped on page 1 forever.
+#[tokio::test]
+async fn list_object_versions_pagination_round_trips() {
+    let h = harness().await;
+    versioned_bucket(&h, "verbkt").await;
+    for k in ["vk1", "vk2"] {
+        for _ in 0..2 {
+            drain(
+                send(
+                    &h.svc,
+                    req(
+                        Method::PUT,
+                        Some("verbkt"),
+                        Some(k),
+                        &[],
+                        &[],
+                        b"x".to_vec(),
+                    ),
+                )
+                .await,
+            )
+            .await;
+        }
+    }
+
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("verbkt"),
+                None,
+                &[("versions", ""), ("max-keys", "2")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let body1 = String::from_utf8(body).unwrap();
+    assert!(body1.contains("<IsTruncated>true</IsTruncated>"), "{body1}");
+    let next_key = between(&body1, "<NextKeyMarker>", "</NextKeyMarker>");
+    assert_eq!(
+        next_key, "vk1",
+        "NextKeyMarker must be the plain object key, not a base64 token: {body1}"
+    );
+    let next_vid = between(&body1, "<NextVersionIdMarker>", "</NextVersionIdMarker>");
+    assert!(!next_vid.is_empty(), "{body1}");
+    // Collect page 1's version ids so page 2 can be checked for repeats.
+    let page1_vids: Vec<String> = body1
+        .match_indices("<VersionId>")
+        .map(|(i, _)| {
+            let s = &body1[i + "<VersionId>".len()..];
+            s[..s.find("</VersionId>").unwrap()].to_owned()
+        })
+        .collect();
+    assert_eq!(page1_vids.len(), 2, "{body1}");
+    assert_eq!(
+        page1_vids.last().unwrap(),
+        &next_vid,
+        "the version-id half must name page 1's last version"
+    );
+
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("verbkt"),
+                None,
+                &[
+                    ("versions", ""),
+                    ("max-keys", "2"),
+                    ("key-marker", next_key.as_str()),
+                    ("version-id-marker", next_vid.as_str()),
+                ],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let body2 = String::from_utf8(body).unwrap();
+    // Compare the RETURNED versions, not the raw body: page 2 legitimately echoes the
+    // `<VersionIdMarker>` we sent, which is by definition page 1's last version id. A naive
+    // `body2.contains(..)` therefore reports a pagination loop that isn't there.
+    let page2_vids: Vec<String> = body2
+        .match_indices("<Version><Key>")
+        .map(|(i, _)| {
+            let s = &body2[i..];
+            let v = &s[s.find("<VersionId>").unwrap() + "<VersionId>".len()..];
+            v[..v.find("</VersionId>").unwrap()].to_owned()
+        })
+        .collect();
+    assert_eq!(page2_vids.len(), 2, "{body2}");
+    assert!(
+        !page1_vids.iter().any(|v| page2_vids.contains(v)),
+        "page 2 must not repeat page 1 (no pagination loop), got: {body2}"
+    );
+    assert!(body2.contains("<Key>vk2</Key>"), "{body2}");
+    assert!(
+        body2.contains("<IsTruncated>false</IsTruncated>"),
+        "{body2}"
+    );
+
+    // A marker the CLIENT synthesized (no version-id half) must be honored too. The store's seek
+    // is inclusive on the key, so vk2's own versions are returned by design — assert only that
+    // vk1 is skipped.
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("verbkt"),
+                None,
+                &[("versions", ""), ("key-marker", "vk2")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let body3 = String::from_utf8(body).unwrap();
+    assert!(body3.contains("<Key>vk2</Key>"), "{body3}");
+    assert!(
+        !body3.contains("<Key>vk1</Key>"),
+        "a client-synthesized key-marker must be honored, got: {body3}"
+    );
+}
+
+/// Audit 2026-07: `max-keys=0` is legal S3 and means literally zero keys. It used to reach the
+/// store, whose `limit.max(1)` progress guard rounded it up, so a client asking for no keys got one
+/// (KeyCount=1, IsTruncated=false).
+#[tokio::test]
+async fn list_objects_max_keys_zero_returns_no_keys() {
+    let h = harness().await;
+    versioned_bucket(&h, "maxkeys0").await;
+    for k in ["a", "b", "c"] {
+        drain(
+            send(
+                &h.svc,
+                req(
+                    Method::PUT,
+                    Some("maxkeys0"),
+                    Some(k),
+                    &[],
+                    &[],
+                    b"x".to_vec(),
+                ),
+            )
+            .await,
+        )
+        .await;
+    }
+
+    // v2.
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("maxkeys0"),
+                None,
+                &[("list-type", "2"), ("max-keys", "0")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "max-keys=0 is valid, not a 400");
+    let body = String::from_utf8(body).unwrap();
+    assert!(body.contains("<KeyCount>0</KeyCount>"), "{body}");
+    assert!(body.contains("<IsTruncated>false</IsTruncated>"), "{body}");
+    assert!(body.contains("<MaxKeys>0</MaxKeys>"), "{body}");
+    assert!(!body.contains("<Key>"), "no Contents at all: {body}");
+    assert!(!body.contains("<NextContinuationToken>"), "{body}");
+
+    // v1.
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("maxkeys0"),
+                None,
+                &[("max-keys", "0")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let body = String::from_utf8(body).unwrap();
+    assert!(body.contains("<IsTruncated>false</IsTruncated>"), "{body}");
+    assert!(!body.contains("<Key>"), "{body}");
+    assert!(!body.contains("<NextMarker>"), "{body}");
+
+    // ListObjectVersions shares the parameter and the same store clamp.
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("maxkeys0"),
+                None,
+                &[("versions", ""), ("max-keys", "0")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let body = String::from_utf8(body).unwrap();
+    assert!(body.contains("<IsTruncated>false</IsTruncated>"), "{body}");
+    assert!(!body.contains("<Version>"), "{body}");
+    assert!(!body.contains("<Key>"), "{body}");
+}
+
+/// A non-integer or negative `max-keys` is a 400 InvalidArgument (AWS parity). Swallowing the parse
+/// error into the 1000 default handed a client that asked for something small a full 1000-key page.
+#[tokio::test]
+async fn list_objects_rejects_non_integer_max_keys() {
+    let h = harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("maxkeysbad"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("maxkeysbad"),
+                Some("only"),
+                &[],
+                &[],
+                b"x".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+
+    for bad in ["abc", "-1", "1e3", "1.5"] {
+        let (st, _, body) = drain(
+            send(
+                &h.svc,
+                req(
+                    Method::GET,
+                    Some("maxkeysbad"),
+                    None,
+                    &[("list-type", "2"), ("max-keys", bad)],
+                    &[],
+                    vec![],
+                ),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "max-keys={bad} must be a 400");
+        let body = String::from_utf8(body).unwrap();
+        assert!(body.contains("<Code>InvalidArgument</Code>"), "{body}");
+        assert!(
+            !body.contains("<Key>"),
+            "must not fall through to a 1000-key page: {body}"
+        );
+    }
+
+    // Over the ceiling is silently CAPPED, not rejected.
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("maxkeysbad"),
+                None,
+                &[("list-type", "2"), ("max-keys", "5000")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let body = String::from_utf8(body).unwrap();
+    assert!(body.contains("<MaxKeys>1000</MaxKeys>"), "{body}");
+
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("maxkeysbad"),
+                None,
+                &[("list-type", "2"), ("max-keys", "1")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let body = String::from_utf8(body).unwrap();
+    assert_eq!(body.matches("<Key>").count(), 1, "{body}");
 }
 
 /// Regression: a ListObjectsV2 with an empty-but-present `delimiter=` (exactly what minio-go — and
@@ -1879,6 +2808,371 @@ async fn copy_object_works() {
     .await;
     assert_eq!(st, StatusCode::OK);
     assert_eq!(body, b"original");
+}
+
+/// The six system response headers of a copy source (ARCH 13.4 / 21.6). Under the default COPY
+/// metadata directive they must all be carried onto the destination — audit 2026-07 found five of
+/// them hard-coded `None` in `copy_object`'s row literal, so every copy silently lost them.
+#[tokio::test]
+async fn copy_object_preserves_system_headers_under_default_directive() {
+    let h = harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("cphdr"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    let src_headers = [
+        ("content-type", "text/plain"),
+        ("content-encoding", "gzip"),
+        ("cache-control", "max-age=99"),
+        ("content-disposition", "attachment; filename=\"a.txt\""),
+        ("content-language", "en-GB"),
+        ("expires", "Thu, 01 Jan 2032 00:00:00 GMT"),
+        ("x-amz-meta-foo", "bar"),
+    ];
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("cphdr"),
+                Some("src.txt"),
+                &[],
+                &src_headers,
+                b"original".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("cphdr"),
+                Some("dst.txt"),
+                &[],
+                &[("x-amz-copy-source", "/cphdr/src.txt")],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::HEAD,
+                Some("cphdr"),
+                Some("dst.txt"),
+                &[],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    for (name, want) in src_headers {
+        assert_eq!(header(&hdrs, name), Some(want), "copy lost {name}");
+    }
+}
+
+/// REPLACE takes every system header from the copy REQUEST and drops the source's — a header the
+/// request omits must be ABSENT on the destination, not inherited.
+#[tokio::test]
+async fn copy_object_replace_directive_replaces_system_headers() {
+    let h = harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("cprep"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("cprep"),
+                Some("src.txt"),
+                &[],
+                &[
+                    ("content-type", "text/plain"),
+                    ("content-encoding", "gzip"),
+                    ("cache-control", "max-age=99"),
+                    ("content-disposition", "attachment; filename=\"a.txt\""),
+                    ("content-language", "en-GB"),
+                    ("expires", "Thu, 01 Jan 2032 00:00:00 GMT"),
+                    ("x-amz-meta-foo", "bar"),
+                ],
+                b"original".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("cprep"),
+                Some("dst.txt"),
+                &[],
+                &[
+                    ("x-amz-copy-source", "/cprep/src.txt"),
+                    ("x-amz-metadata-directive", "REPLACE"),
+                    ("content-type", "application/json"),
+                    ("cache-control", "no-store"),
+                    ("x-amz-meta-new", "1"),
+                ],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("cprep"),
+                Some("dst.txt"),
+                &[],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(header(&hdrs, "content-type"), Some("application/json"));
+    assert_eq!(header(&hdrs, "cache-control"), Some("no-store"));
+    for absent in [
+        "content-encoding",
+        "content-disposition",
+        "content-language",
+        "expires",
+        "x-amz-meta-foo",
+    ] {
+        assert_eq!(
+            header(&hdrs, absent),
+            None,
+            "{absent} must not be inherited"
+        );
+    }
+    assert_eq!(header(&hdrs, "x-amz-meta-new"), Some("1"));
+}
+
+/// `x-amz-tagging-directive` is independent of the metadata directive: COPY (the default) carries
+/// the SOURCE version's stored tags, REPLACE takes the inline `x-amz-tagging`. Before audit
+/// 2026-07 a copy persisted NO tags under either directive.
+#[tokio::test]
+async fn copy_object_tagging_directive() {
+    let h = harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("cptag"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("cptag"),
+                Some("src.txt"),
+                &[],
+                &[("x-amz-tagging", "a=1&b=2")],
+                b"original".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    // (a) default directive: the source's tags come along.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("cptag"),
+                Some("dst.txt"),
+                &[],
+                &[("x-amz-copy-source", "/cptag/src.txt")],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("cptag"),
+                Some("dst.txt"),
+                &[("tagging", "")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let body = String::from_utf8(body).unwrap();
+    assert!(
+        body.contains("<Key>a</Key>") && body.contains("<Value>1</Value>"),
+        "{body}"
+    );
+    assert!(
+        body.contains("<Key>b</Key>") && body.contains("<Value>2</Value>"),
+        "{body}"
+    );
+
+    // (b) REPLACE: exactly the inline tag set, and none of the source's.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("cptag"),
+                Some("dst2.txt"),
+                &[],
+                &[
+                    ("x-amz-copy-source", "/cptag/src.txt"),
+                    ("x-amz-tagging-directive", "REPLACE"),
+                    ("x-amz-tagging", "c=3"),
+                ],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("cptag"),
+                Some("dst2.txt"),
+                &[("tagging", "")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let body = String::from_utf8(body).unwrap();
+    assert!(
+        body.contains("<Key>c</Key>") && body.contains("<Value>3</Value>"),
+        "{body}"
+    );
+    assert!(
+        !body.contains("<Key>a</Key>"),
+        "source tags must not survive REPLACE: {body}"
+    );
+}
+
+/// An unrecognized directive is `InvalidArgument`, not a silent degrade to COPY — the caller
+/// believes a replace succeeded when it did not.
+#[tokio::test]
+async fn copy_object_rejects_unknown_directives() {
+    let h = harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("cpbad"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("cpbad"),
+                Some("src.txt"),
+                &[],
+                &[],
+                b"original".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    for (name, value) in [
+        ("x-amz-metadata-directive", "BOGUS"),
+        ("x-amz-tagging-directive", "BOGUS"),
+    ] {
+        let (st, _, body) = drain(
+            send(
+                &h.svc,
+                req(
+                    Method::PUT,
+                    Some("cpbad"),
+                    Some("dst.txt"),
+                    &[],
+                    &[("x-amz-copy-source", "/cpbad/src.txt"), (name, value)],
+                    vec![],
+                ),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{name} must be validated");
+        let body = String::from_utf8(body).unwrap();
+        assert!(body.contains("<Code>InvalidArgument</Code>"), "{body}");
+    }
+    // An invalid inline tag set on a REPLACE copy is rejected before the blob is staged.
+    let dup = "d=1&d=2";
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("cpbad"),
+                Some("dst.txt"),
+                &[],
+                &[
+                    ("x-amz-copy-source", "/cpbad/src.txt"),
+                    ("x-amz-tagging-directive", "REPLACE"),
+                    ("x-amz-tagging", dup),
+                ],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let body = String::from_utf8(body).unwrap();
+    assert!(body.contains("<Code>InvalidTag</Code>"), "{body}");
 }
 
 /// A non-admin who owns a destination bucket must NOT be able to copy another tenant's object via
@@ -2763,6 +4057,562 @@ async fn unknown_subresource_is_not_implemented_not_misrouted() {
     )
     .await;
     assert_eq!(st, StatusCode::NOT_IMPLEMENTED);
+}
+
+/// Audit 2026-07: a RECOGNIZED bucket subresource on a method we do not serve used to skip every
+/// subresource arm and land on the bare verb — `DELETE /b?ownershipControls` ran `delete_bucket`
+/// and destroyed the bucket. The guard's keyword list must cover partially-served keywords too.
+#[tokio::test]
+async fn unhandled_bucket_subresource_method_does_not_execute_bare_verb() {
+    let h = harness().await;
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("subguard"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    // Every one of these reached `delete_bucket` before the fix.
+    for kw in [
+        "ownershipControls",
+        "acl",
+        "location",
+        "uploads",
+        "versions",
+        "versioning",
+    ] {
+        let (st, _, _) = drain(
+            send(
+                &h.svc,
+                req(
+                    Method::DELETE,
+                    Some("subguard"),
+                    None,
+                    &[(kw, "")],
+                    &[],
+                    vec![],
+                ),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_IMPLEMENTED, "DELETE ?{kw} must be 501");
+        // The load-bearing assertion: the bucket survived, i.e. `delete_bucket` did not run.
+        let (st, _, _) = drain(
+            send(
+                &h.svc,
+                req(Method::HEAD, Some("subguard"), None, &[], &[], vec![]),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "bucket destroyed by DELETE ?{kw}");
+    }
+
+    // The mutating half: a GET-only keyword on PUT must not reach `create_bucket`.
+    for kw in ["location", "uploads", "versions"] {
+        let (st, _, _) = drain(
+            send(
+                &h.svc,
+                req(
+                    Method::PUT,
+                    Some("subguard"),
+                    None,
+                    &[(kw, "")],
+                    &[],
+                    vec![],
+                ),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_IMPLEMENTED, "PUT ?{kw} must be 501");
+    }
+
+    // Guard against an over-broad list: every served method/selector pair still works.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("subguard"),
+                None,
+                &[("ownershipControls", "")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("subguard"),
+                None,
+                &[("acl", "")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("subguard"),
+                None,
+                &[("versioning", "")],
+                &[],
+                b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>"
+                    .to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::DELETE,
+                Some("subguard"),
+                None,
+                &[("tagging", "")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    // `delete` IS in the guard list, so its one served pair (`POST ?delete`) has to be matched
+    // ABOVE the guard — assert the arm move kept it routing.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::POST,
+                Some("subguard"),
+                None,
+                &[("delete", "")],
+                &[],
+                b"<Delete><Object><Key>k</Key></Object></Delete>".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+}
+
+/// Audit 2026-07: the object-side twin. `PUT key?attributes` used to fall through to `put_object`
+/// and overwrite the object body; `DELETE key?uploads` fell through to `delete_object`.
+#[tokio::test]
+async fn unhandled_object_subresource_does_not_overwrite_or_delete() {
+    let h = harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("objguard"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("objguard"),
+                Some("k"),
+                &[],
+                &[],
+                b"original".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    for kw in ["attributes", "uploads"] {
+        let (st, _, _) = drain(
+            send(
+                &h.svc,
+                req(
+                    Method::PUT,
+                    Some("objguard"),
+                    Some("k"),
+                    &[(kw, "")],
+                    &[],
+                    b"clobbered".to_vec(),
+                ),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_IMPLEMENTED, "PUT key?{kw} must be 501");
+        let (st, _, body) = drain(
+            send(
+                &h.svc,
+                req(Method::GET, Some("objguard"), Some("k"), &[], &[], vec![]),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "object deleted by PUT key?{kw}");
+        assert_eq!(body, b"original", "object body clobbered by PUT key?{kw}");
+
+        let (st, _, _) = drain(
+            send(
+                &h.svc,
+                req(
+                    Method::DELETE,
+                    Some("objguard"),
+                    Some("k"),
+                    &[(kw, "")],
+                    &[],
+                    vec![],
+                ),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::NOT_IMPLEMENTED,
+            "DELETE key?{kw} must be 501"
+        );
+        let (st, _, _) = drain(
+            send(
+                &h.svc,
+                req(Method::GET, Some("objguard"), Some("k"), &[], &[], vec![]),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "object deleted by DELETE key?{kw}");
+    }
+
+    // The served multipart pairs must still route after the arm move.
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::POST,
+                Some("objguard"),
+                Some("mk"),
+                &[("uploads", "")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let upload_id = between(
+        &String::from_utf8(body).unwrap(),
+        "<UploadId>",
+        "</UploadId>",
+    );
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("objguard"),
+                Some("mk"),
+                &[("uploadId", upload_id.as_str())],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::DELETE,
+                Some("objguard"),
+                Some("mk"),
+                &[("uploadId", upload_id.as_str())],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+}
+
+/// Audit 2026-07: `?delete` names the DeleteObjects POST body, not the bucket. Before the fix the
+/// keyword was absent from the guard list, so `DELETE /b?delete` — a plausible client typo, and the
+/// shape rclone/boto3 produce if the method is wrong — skipped every subresource arm and ran
+/// `delete_bucket`, silently destroying an empty bucket the caller never asked to remove.
+#[tokio::test]
+async fn delete_verb_on_the_delete_subresource_does_not_destroy_the_bucket() {
+    let h = harness().await;
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("delsub"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    // The bucket is deliberately EMPTY here: `delete_bucket` refuses a non-empty bucket, so only an
+    // empty one exposes the fall-through.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::DELETE,
+                Some("delsub"),
+                None,
+                &[("delete", "")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::NOT_IMPLEMENTED,
+        "DELETE ?delete must be 501"
+    );
+
+    // The load-bearing assertion: the bucket survived, i.e. `delete_bucket` did not run.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(Method::HEAD, Some("delsub"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "bucket destroyed by DELETE ?delete");
+
+    // The regression risk of the fix: listing `delete` in the guard forced the real DeleteObjects
+    // arm to move ABOVE the guard. Prove it still routes AND still deletes.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("delsub"),
+                Some("gone.txt"),
+                &[],
+                &[],
+                b"bye".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::POST,
+                Some("delsub"),
+                None,
+                &[("delete", "")],
+                &[],
+                b"<Delete><Object><Key>gone.txt</Key></Object></Delete>".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "POST ?delete must still be DeleteObjects"
+    );
+    let xml = String::from_utf8(body).unwrap();
+    assert!(xml.contains("<Deleted>"), "DeleteResult body: {xml}");
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("delsub"),
+                Some("gone.txt"),
+                &[],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "the key was really deleted");
+}
+
+/// Audit 2026-07: HEAD sits ABOVE both subresource guards. Widening the keyword lists to cover
+/// partially-served selectors would otherwise have 501'd `HEAD /b?versioning`, `HEAD /b?acl` and
+/// `HEAD key?attributes` — a gratuitous deviation, since HEAD writes nothing and S3 answers
+/// HeadBucket/HeadObject whatever `?subresource` rides along. The second half checks the exemption
+/// did not punch a hole in the guard: the MUTATING verbs on those same keywords still 501.
+#[tokio::test]
+async fn head_is_exempt_from_the_subresource_guards() {
+    let h = harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("headsub"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("headsub"),
+                Some("k"),
+                &[],
+                &[],
+                b"original".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    // HeadBucket answers regardless of the selector riding along.
+    for kw in ["versioning", "acl"] {
+        let (st, _, _) = drain(
+            send(
+                &h.svc,
+                req(
+                    Method::HEAD,
+                    Some("headsub"),
+                    None,
+                    &[(kw, "")],
+                    &[],
+                    vec![],
+                ),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "HEAD /b?{kw} must not be 501");
+    }
+
+    // HeadObject likewise — and it is a real HeadObject, not an empty 200: the content-length is
+    // the object's.
+    let (st, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::HEAD,
+                Some("headsub"),
+                Some("k"),
+                &[("attributes", "")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "HEAD key?attributes must not be 501");
+    assert_eq!(
+        header(&hdrs, "content-length"),
+        Some("8"),
+        "HEAD key?attributes must answer for the object itself"
+    );
+
+    // The guard still fires for the mutating verbs on the very same keywords.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::DELETE,
+                Some("headsub"),
+                None,
+                &[("versioning", "")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::NOT_IMPLEMENTED,
+        "DELETE ?versioning must be 501"
+    );
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(Method::HEAD, Some("headsub"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "bucket destroyed by DELETE ?versioning");
+
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("headsub"),
+                Some("k"),
+                &[("attributes", "")],
+                &[],
+                b"clobbered".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::NOT_IMPLEMENTED,
+        "PUT key?attributes must be 501"
+    );
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(Method::GET, Some("headsub"), Some("k"), &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        body, b"original",
+        "object body clobbered by PUT key?attributes"
+    );
 }
 
 #[tokio::test]

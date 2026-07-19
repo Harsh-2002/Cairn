@@ -461,6 +461,12 @@ pub fn list_multipart_uploads_result(
                 if let Some(next) = &page.next_cursor {
                     leaf(w, "NextKeyMarker", next);
                 }
+                // The upload-id half of the resume pair: S3 pages on (key, upload id), so a key
+                // whose uploads span the boundary continues mid-key only if BOTH markers
+                // round-trip. Emitting only the key half made such a key unpageable.
+                if let Some(next) = &page.next_version_id_marker {
+                    leaf(w, "NextUploadIdMarker", next);
+                }
             }
             if let Some(p) = prefix {
                 leaf(w, "Prefix", p);

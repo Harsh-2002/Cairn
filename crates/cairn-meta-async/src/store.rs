@@ -560,28 +560,46 @@ impl MetadataStore for AsyncMetadataStore {
     ) -> Result<ListPage<MultipartSession>, MetaError> {
         let prefix = query.prefix.clone().unwrap_or_default();
         let upper = prefix_upper_bound(&prefix);
-        // Resume strictly after the cursor key when one is supplied; otherwise seek to the
-        // half-open prefix lower bound.
-        let seek = match &query.cursor {
-            Some(c) if c.as_str() > prefix.as_str() => c.clone(),
-            _ => prefix.clone(),
-        };
+        // S3 pages this listing on the (key-marker, upload-id-marker) PAIR, and rows sort by
+        // (key, upload id) — `id` IS the upload id. A key-marker alone skips that key entirely;
+        // paired with an upload-id-marker it resumes mid-key, the only way past a key holding more
+        // than `max-uploads` concurrent sessions. Byte-for-byte the rusqlite store's logic —
+        // parity is the contract.
+        let key_marker = query
+            .cursor
+            .as_deref()
+            .filter(|c| *c > prefix.as_str())
+            .map(str::to_owned);
+        let upload_marker = key_marker.as_ref().and(query.version_id_marker.clone());
+        // Inclusive lower bound for the index seek; the tuple predicate below does the exclusion.
+        let seek = key_marker.clone().unwrap_or_else(|| prefix.clone());
         let limit = query.limit.max(1) as usize;
         // Half-open `prefix_upper_bound` seek like the other listings, fetching one extra row to
         // detect truncation.
         let mut sql = format!(
             "SELECT {MULTIPART_COLS} FROM multipart_uploads WHERE bucket_name=?1 AND status='active' AND key>=?2"
         );
-        if upper.is_some() {
-            sql.push_str(" AND key<?3");
+        let mut params = vec![Value::Text(bucket.as_str().to_owned()), Value::Text(seek)];
+        if let Some(ub) = upper {
+            params.push(Value::Text(ub));
+            sql.push_str(&format!(" AND key<?{}", params.len()));
         }
-        sql.push_str(" ORDER BY key, id LIMIT ?4");
-        let params = vec![
-            Value::Text(bucket.as_str().to_owned()),
-            Value::Text(seek),
-            upper.map_or(Value::Null, Value::Text),
-            Value::Int((limit + 1) as i64),
-        ];
+        match (&key_marker, &upload_marker) {
+            (Some(km), Some(uim)) => {
+                params.push(Value::Text(km.clone()));
+                let i = params.len();
+                params.push(Value::Text(uim.clone()));
+                let j = params.len();
+                sql.push_str(&format!(" AND (key>?{i} OR (key=?{i} AND id>?{j}))"));
+            }
+            (Some(km), None) => {
+                params.push(Value::Text(km.clone()));
+                sql.push_str(&format!(" AND key>?{}", params.len()));
+            }
+            (None, _) => {}
+        }
+        params.push(Value::Int((limit + 1) as i64));
+        sql.push_str(&format!(" ORDER BY key, id LIMIT ?{}", params.len()));
         let rows = self.reader().await.query(&sql, params).await?;
         let mut items: Vec<MultipartSession> = rows
             .iter()
@@ -589,16 +607,19 @@ impl MetadataStore for AsyncMetadataStore {
             .collect::<Result<Vec<_>, _>>()?;
         let truncated = items.len() > limit;
         items.truncate(limit);
-        let next_cursor = if truncated {
-            items.last().map(|s| s.key.as_str().to_owned())
-        } else {
-            None
+        // The next page resumes strictly after the last returned (key, upload id).
+        let (next_cursor, next_upload_marker) = match (truncated, items.last()) {
+            (true, Some(s)) => (
+                Some(s.key.as_str().to_owned()),
+                Some(s.upload_id.as_str().to_owned()),
+            ),
+            _ => (None, None),
         };
         Ok(ListPage {
             items,
             common_prefixes: Vec::new(),
             next_cursor,
-            next_version_id_marker: None,
+            next_version_id_marker: next_upload_marker,
             truncated,
         })
     }

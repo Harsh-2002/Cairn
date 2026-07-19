@@ -20,8 +20,8 @@ use cairn_types::crypto::Nonce;
 use cairn_types::error::Error;
 use cairn_types::id::{BucketName, ObjectKey, UploadId, VersionId};
 use cairn_types::meta::{
-    ClaimOutcome, IfNoneMatch, ListQuery, MultipartSession, Mutation, MutationOutcome, OutboxEntry,
-    Precondition, ReplicationOp, WebhookEntry, WebhookStatus,
+    ClaimOutcome, IfNoneMatch, ListPage, ListQuery, MultipartSession, Mutation, MutationOutcome,
+    OutboxEntry, Precondition, ReplicationOp, WebhookEntry, WebhookStatus,
 };
 use cairn_types::notification::{EventKind, NotificationConfig};
 use cairn_types::object::{
@@ -315,12 +315,19 @@ impl S3Service {
             Method::PUT if req.has_query("object-lock") => {
                 self.put_bucket_object_lock(req, body).await
             }
-            // An UNRECOGNIZED bucket subresource must not fall through to list/create/delete.
+            Method::POST if req.has_query("delete") => self.delete_objects(&req, body).await,
+            // HEAD is exempt from the guard below: it mutates nothing, and S3 answers HeadBucket
+            // regardless of any `?subresource` selector on the request. 501-ing it would be a
+            // gratuitous deviation — the guard exists to stop a *bare verb* from acting, and a
+            // HEAD has no action to suppress.
+            Method::HEAD => self.head_bucket(&req).await,
+            // An UNRECOGNIZED bucket subresource — including a recognized keyword on a method we do
+            // not serve — must not fall through to the bare verb (`DELETE /b?ownershipControls`
+            // must not delete the bucket). ARCH 13: answer NotImplemented. Add new `?subresource`
+            // arms ABOVE this.
             _ if unhandled_bucket_subresource(&req) => Err(Error::NotImplemented),
             Method::PUT => self.create_bucket(&req).await,
             Method::DELETE => self.delete_bucket(&req).await,
-            Method::HEAD => self.head_bucket(&req).await,
-            Method::POST if req.has_query("delete") => self.delete_objects(&req, body).await,
             Method::GET => self.list_objects(&req).await,
             _ => Err(Error::NotImplemented),
         }
@@ -375,16 +382,23 @@ impl S3Service {
                 self.put_object_legal_hold(req, body).await
             }
             Method::GET if req.has_query("attributes") => self.get_object_attributes(&req).await,
-            // An UNRECOGNIZED object subresource must never fall through to a data-plane handler
-            // (a PUT object?acl must not overwrite the object body). Answer NotImplemented.
-            _ if unhandled_object_subresource(&req) => Err(Error::NotImplemented),
-            Method::PUT => self.put_object(req, body).await,
+            // The multipart arms MUST sit above the guard: `uploads`/`uploadId` are listed as
+            // guarded keywords so the method/selector pairs we do NOT serve (`PUT key?uploads`,
+            // `DELETE key?attributes`, …) cannot reach `put_object`/`delete_object` and clobber
+            // the object — which means the pairs we DO serve have to be matched first.
             Method::POST if req.has_query("uploads") => self.create_multipart(&req).await,
             Method::POST if req.has_query("uploadId") => self.complete_multipart(req, body).await,
             Method::GET if req.has_query("uploadId") => self.list_parts(&req).await,
-            Method::GET => self.get_object(&req).await,
-            Method::HEAD => self.head_object(&req).await,
             Method::DELETE if req.has_query("uploadId") => self.abort_multipart(&req).await,
+            // HEAD is exempt from the guard below for the same reason as in `bucket_op`: it writes
+            // nothing, and S3 answers HeadObject whatever `?subresource` rides along.
+            Method::HEAD => self.head_object(&req).await,
+            // An UNRECOGNIZED object subresource — including a recognized keyword on a method we do
+            // not serve — must never fall through to a data-plane handler (a `PUT object?acl` or
+            // `PUT object?attributes` must not overwrite the object body). Answer NotImplemented.
+            _ if unhandled_object_subresource(&req) => Err(Error::NotImplemented),
+            Method::PUT => self.put_object(req, body).await,
+            Method::GET => self.get_object(&req).await,
             Method::DELETE => self.delete_object(&req).await,
             _ => Err(Error::NotImplemented),
         }
@@ -490,11 +504,7 @@ impl S3Service {
             .query("delimiter")
             .filter(|s| !s.is_empty())
             .map(str::to_owned);
-        let max_keys = req
-            .query("max-keys")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1000u32)
-            .min(1000);
+        let max_keys = max_keys(req)?;
 
         // The continuation token / marker is the opaque base64 of the store cursor.
         let cursor = if v1 {
@@ -512,7 +522,14 @@ impl S3Service {
             start_after,
             limit: max_keys,
         };
-        let mut page = self.meta.list_current(&bucket.name, &query).await?;
+        // `max-keys=0` is legal S3 and means zero keys: KeyCount=0, IsTruncated=false, and no
+        // NextContinuationToken. Answer it from an empty page rather than from the store, whose
+        // `limit.max(1)` progress guard would round the request up to a single key.
+        let mut page = if max_keys == 0 {
+            ListPage::default()
+        } else {
+            self.meta.list_current(&bucket.name, &query).await?
+        };
         // v2 uses an opaque base64 continuation token (symmetric with the decode_token applied to the
         // incoming continuation-token above). v1's NextMarker is a plain object key, echoed back by
         // the client verbatim as `marker` and consumed raw above — so it must NOT be base64-encoded
@@ -767,7 +784,8 @@ impl S3Service {
         } else {
             replica_version_id(&req, is_replica).unwrap_or_else(VersionId::generate)
         };
-        // The system response headers (ARCH 13.4) are stored verbatim from the request.
+        // The system response headers (ARCH 13.4) are stored verbatim from the request — except
+        // `content-encoding`, which is normalized to strip the `aws-chunked` transfer coding.
         let header_owned = |name: &str| req.header(name).map(str::to_owned);
         let row = ObjectVersionRow {
             id: uuid::Uuid::new_v4().simple().to_string(),
@@ -780,7 +798,7 @@ impl S3Service {
             size_physical: staged.size_physical,
             etag: staged.etag.clone(),
             content_type,
-            content_encoding: header_owned("content-encoding"),
+            content_encoding: stored_content_encoding(&req),
             cache_control: header_owned("cache-control"),
             content_disposition: header_owned("content-disposition"),
             content_language: header_owned("content-language"),
@@ -1203,6 +1221,26 @@ impl S3Service {
 
     // --- multipart ---
 
+    /// An uploadId is an opaque row id, NOT an unforgeable capability: `authorize` gates the
+    /// REQUEST's (bucket, key), so any principal with rights to some path of their own could
+    /// otherwise reach another tenant's session by id alone. Every multipart operation must
+    /// therefore re-scope the session to the path it was initiated for and answer NoSuchUpload
+    /// when it does not match (AWS parity). `complete_multipart` has done this since audit
+    /// 2026-07; abort / list-parts / upload-part / upload-part-copy did not (audit 2026-07,
+    /// critical) — an unscoped abort destroyed a victim's staged bytes, and an unscoped
+    /// `upload_part` SUPERSEDED a victim's part at that part number.
+    async fn scoped_multipart(
+        &self,
+        upload_id: &UploadId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<MultipartSession> {
+        match self.meta.get_multipart(upload_id).await? {
+            Some(s) if s.bucket == *bucket && s.key == *key => Ok(s),
+            _ => Err(Error::NoSuchUpload),
+        }
+    }
+
     async fn create_multipart(&self, req: &S3Request) -> Result<S3Response> {
         let bucket = self.fetch_bucket(req).await?;
         let key = req.key.clone().expect("key present");
@@ -1258,16 +1296,19 @@ impl S3Service {
         req: S3Request,
         raw_body: cairn_types::BodyStream,
     ) -> Result<S3Response> {
-        let _bucket = self.fetch_bucket(&req).await?;
+        let bucket = self.fetch_bucket(&req).await?;
+        let key = req.key.clone().expect("key present");
         let upload_id = UploadId::from_string(req.query("uploadId").unwrap_or_default().to_owned());
         let part_number: u16 = req
             .query("partNumber")
             .and_then(|s| s.parse().ok())
             .filter(|n| (1..=10_000).contains(n))
             .ok_or_else(|| Error::InvalidArgument("partNumber out of range".to_owned()))?;
-        if self.meta.get_multipart(&upload_id).await?.is_none() {
-            return Err(Error::NoSuchUpload);
-        }
+        // Scope BEFORE staging: `Mutation::RecordPart` SUPERSEDES any existing part at this number,
+        // so an unscoped id lets a caller overwrite a part of another key's live upload. Staying
+        // ahead of `stage_part` also means a rejected request stages nothing to reclaim.
+        self.scoped_multipart(&upload_id, &bucket.name, &key)
+            .await?;
         let body = streaming_body(&req, raw_body, self.max_object_size)?;
         let staged = self
             .blob
@@ -1301,16 +1342,19 @@ impl S3Service {
     /// store (logical coordinates), restaged as a part, recorded, and a `CopyPartResult` carrying
     /// the part ETag and last-modified time is returned.
     async fn upload_part_copy(&self, req: &S3Request) -> Result<S3Response> {
-        let _dest_bucket = self.fetch_bucket(req).await?;
+        let dest_bucket = self.fetch_bucket(req).await?;
+        let key = req.key.clone().expect("key present");
         let upload_id = UploadId::from_string(req.query("uploadId").unwrap_or_default().to_owned());
         let part_number: u16 = req
             .query("partNumber")
             .and_then(|s| s.parse().ok())
             .filter(|n| (1..=10_000).contains(n))
             .ok_or_else(|| Error::InvalidArgument("partNumber out of range".to_owned()))?;
-        if self.meta.get_multipart(&upload_id).await?.is_none() {
-            return Err(Error::NoSuchUpload);
-        }
+        // Same scoping rule as `upload_part`, and for the same reason: the recorded part supersedes
+        // whatever sat at this number, so an unscoped id splices attacker-chosen bytes into another
+        // key's upload. Must stay ahead of the `stage_part` below.
+        self.scoped_multipart(&upload_id, &dest_bucket.name, &key)
+            .await?;
 
         // Resolve the copy source object version (reusing the copy-source parser and the
         // copy-source-if-* precondition checks shared with CopyObject).
@@ -1438,10 +1482,8 @@ impl S3Service {
         // NoSuchUpload), and under CAIRN_META_SHARDS>1 the CompleteMultipart mutation routes by the
         // SESSION's shard while every read for the path bucket routes elsewhere — an unreadable,
         // ultimately GC'd object: a silently-lost acknowledged write (audit 2026-07).
-        match self.meta.get_multipart(&upload_id).await? {
-            Some(s) if s.bucket == bucket.name && s.key == key => {}
-            _ => return Err(Error::NoSuchUpload),
-        }
+        self.scoped_multipart(&upload_id, &bucket.name, &key)
+            .await?;
 
         // Validate the requested parts against what was uploaded BEFORE claiming the session, so a
         // part-validation failure (the common client error: wrong ETag, gap, out-of-order, or an
@@ -1620,8 +1662,16 @@ impl S3Service {
     }
 
     async fn abort_multipart(&self, req: &S3Request) -> Result<S3Response> {
-        let _bucket = self.fetch_bucket(req).await?;
+        let bucket = self.fetch_bucket(req).await?;
+        let key = req.key.clone().expect("key present");
         let upload_id = UploadId::from_string(req.query("uploadId").unwrap_or_default().to_owned());
+        // Scope-check BEFORE the destructive submit: `Mutation::AbortMultipart` is an unconditional
+        // `DELETE ... WHERE id=?` that returns `Ack` whether or not a row matched, and
+        // `delete_session` then reclaims the staged part bytes — both irreversible, so a mismatched
+        // or unknown id must be rejected here rather than silently 204'd. This also gives an
+        // unknown uploadId the AWS-correct NoSuchUpload 404 instead of a false success.
+        self.scoped_multipart(&upload_id, &bucket.name, &key)
+            .await?;
         self.meta
             .submit(Mutation::AbortMultipart(upload_id.clone()))
             .await?;
@@ -1634,9 +1684,11 @@ impl S3Service {
         let bucket = self.fetch_bucket(req).await?;
         let key = req.key.clone().expect("key present");
         let upload_id = UploadId::from_string(req.query("uploadId").unwrap_or_default().to_owned());
-        if self.meta.get_multipart(&upload_id).await?.is_none() {
-            return Err(Error::NoSuchUpload);
-        }
+        // Existence alone is not enough: the response renders the parts of whatever session the id
+        // names, so an unscoped id leaks another key's part numbers, sizes and ETags (= per-part
+        // content MD5s) under the caller's own path.
+        self.scoped_multipart(&upload_id, &bucket.name, &key)
+            .await?;
         let marker: u16 = req
             .query("part-number-marker")
             .and_then(|s| s.parse().ok())
@@ -1662,6 +1714,22 @@ impl S3Service {
     async fn list_multipart_uploads(&self, req: &S3Request) -> Result<S3Response> {
         let bucket = self.fetch_bucket(req).await?;
         let prefix = req.query("prefix").map(str::to_owned);
+        // We advertise NextKeyMarker/NextUploadIdMarker on a truncated page, so we MUST honour both
+        // on the way back in — ignoring them re-serves page 1 and a paginating client (rclone's
+        // multipart cleanup) never terminates. Markers are opaque strings: an unparseable one is
+        // not an error to S3, and validating it would silently degrade to "no marker" = page 1
+        // again (audit 2026-07).
+        let key_marker = req
+            .query("key-marker")
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        // S3 ignores an upload-id-marker that is not paired with the key it belongs to; this
+        // mirrors ListQuery's "ignored unless `cursor` is set" contract.
+        let upload_id_marker = key_marker.as_ref().and_then(|_| {
+            req.query("upload-id-marker")
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+        });
         let max: u32 = req
             .query("max-uploads")
             .and_then(|s| s.parse().ok())
@@ -1669,6 +1737,8 @@ impl S3Service {
             .min(1000);
         let query = ListQuery {
             prefix: prefix.clone(),
+            cursor: key_marker.clone(),
+            version_id_marker: upload_id_marker.clone(),
             limit: max,
             ..Default::default()
         };
@@ -1681,8 +1751,8 @@ impl S3Service {
             prefix.as_deref(),
             None,
             &page,
-            None,
-            None,
+            key_marker.as_deref(),
+            upload_id_marker.as_deref(),
             max,
         );
         Ok(S3Response::xml(StatusCode::OK, body).with_header("x-amz-request-id", &req.request_id))
@@ -1746,10 +1816,44 @@ impl S3Service {
         .await?;
         let src_path = src_row.storage_path.clone().ok_or(Error::NoSuchKey)?;
 
-        let replace = req
-            .header("x-amz-metadata-directive")
-            .map(|d| d.eq_ignore_ascii_case("REPLACE"))
-            .unwrap_or(false);
+        // `x-amz-metadata-directive` (ARCH 21.6): COPY (the default) carries the SOURCE's system
+        // headers and user metadata onto the destination verbatim; REPLACE takes them from THIS
+        // request and drops the source's. Any other value is a client error — silently treating a
+        // typo'd directive as COPY hides a metadata replace the caller believes succeeded.
+        let replace = match req.header("x-amz-metadata-directive") {
+            None => false,
+            Some(d) if d.eq_ignore_ascii_case("COPY") => false,
+            Some(d) if d.eq_ignore_ascii_case("REPLACE") => true,
+            Some(d) => {
+                return Err(Error::InvalidArgument(format!(
+                    "invalid x-amz-metadata-directive: {d}"
+                )));
+            }
+        };
+        // `x-amz-tagging-directive` is independent of the metadata directive (AWS semantics): COPY
+        // (default) carries the SOURCE version's tag set; REPLACE takes the inline `x-amz-tagging`.
+        let tag_replace = match req.header("x-amz-tagging-directive") {
+            None => false,
+            Some(d) if d.eq_ignore_ascii_case("COPY") => false,
+            Some(d) if d.eq_ignore_ascii_case("REPLACE") => true,
+            Some(d) => {
+                return Err(Error::InvalidArgument(format!(
+                    "invalid x-amz-tagging-directive: {d}"
+                )));
+            }
+        };
+        let dest_tags = if tag_replace {
+            let t = parse_tagging_header(req.header("x-amz-tagging"));
+            // Reject a bad inline tag set before a blob is staged, exactly as `put_object` does,
+            // so `InvalidTag` never leaves an orphaned staged blob (ARCH 17.1).
+            cairn_xml::validate_tags(&t, cairn_xml::MAX_TAGS_OBJECT)?;
+            t
+        } else {
+            // COPY: the destination inherits the source version's stored tags.
+            self.meta
+                .get_object_tags(&src_bucket, &src_key, &src_row.version_id)
+                .await?
+        };
         let content_type = if replace {
             req.header("content-type")
                 .unwrap_or("application/octet-stream")
@@ -1799,6 +1903,16 @@ impl S3Service {
         };
         let now = self.clock.now();
         let dest_key_for_event = dest_key.clone();
+        // The five optional system response headers (ARCH 13.4) follow the metadata directive too:
+        // under COPY they are the source version's stored values, under REPLACE this request's.
+        // They were hard-coded `None` before audit 2026-07, so every copy silently lost them.
+        let sys = |name: &str, src: &Option<String>| -> Option<String> {
+            if replace {
+                req.header(name).map(str::to_owned)
+            } else {
+                src.clone()
+            }
+        };
         let row = ObjectVersionRow {
             id: uuid::Uuid::new_v4().simple().to_string(),
             bucket: dest_bucket.name.clone(),
@@ -1810,11 +1924,11 @@ impl S3Service {
             size_physical: staged.size_physical,
             etag: staged.etag.clone(),
             content_type,
-            content_encoding: None,
-            cache_control: None,
-            content_disposition: None,
-            content_language: None,
-            expires: None,
+            content_encoding: sys("content-encoding", &src_row.content_encoding),
+            cache_control: sys("cache-control", &src_row.cache_control),
+            content_disposition: sys("content-disposition", &src_row.content_disposition),
+            content_language: sys("content-language", &src_row.content_language),
+            expires: sys("expires", &src_row.expires),
             storage_path: Some(staged.storage_path.clone()),
             compression: staged.compression.clone(),
             storage_class: StorageClass::Standard,
@@ -1832,9 +1946,8 @@ impl S3Service {
         // A server-side copy writes a brand-new object version on the destination, so it enqueues
         // replication like a PUT (ARCH 20.2). A copy is never itself an inbound replica (replicas
         // arrive as plain PUTs), so no replica gate is needed. Tag-filtered rules match against the
-        // destination's inline `x-amz-tagging` (the REPLACE-directive tag set); prefix rules match
-        // regardless.
-        let dest_tags = parse_tagging_header(req.header("x-amz-tagging"));
+        // EFFECTIVE destination tag set — the source version's tags under the COPY directive, the
+        // inline `x-amz-tagging` under REPLACE; prefix rules match regardless.
         let replication = self
             .replication_outbox(
                 &dest_bucket,
@@ -1861,6 +1974,20 @@ impl S3Service {
                 }
                 if let Some(old) = superseded {
                     let _ = self.blob.delete(&old).await;
+                }
+                // Attach the effective tag set to the just-written destination version (ARCH 17.1).
+                // Tags are a separate mutation, committed after the version row exists. Before
+                // audit 2026-07 a copy dropped them entirely under BOTH directives.
+                if !dest_tags.is_empty() {
+                    let _ = self
+                        .meta
+                        .submit(Mutation::PutObjectTags {
+                            bucket: dest_bucket.name.clone(),
+                            key: dest_key_for_event.clone(),
+                            version_id: version_id.clone(),
+                            tags: dest_tags,
+                        })
+                        .await;
                 }
                 // Object Lock: a copy creates a new version like a PUT, so stamp the bucket default
                 // retention / any explicit `x-amz-object-lock-*` headers onto it too (WORM coverage
@@ -2251,13 +2378,24 @@ impl S3Service {
             .query("delimiter")
             .filter(|s| !s.is_empty())
             .map(str::to_owned);
-        let max = req
-            .query("max-keys")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1000u32)
-            .min(1000);
-        let cursor = req.query("key-marker").and_then(decode_token);
-        let version_id_marker = req.query("version-id-marker").map(str::to_owned);
+        let max = max_keys(req)?;
+        // `key-marker`/`version-id-marker` are PLAIN values in S3 — the marker is a real object key
+        // and a real version id, not an opaque token, and a client is entitled to synthesize either
+        // one rather than echo ours. Consume them raw and emit them raw (see `next_cursor` below):
+        // a base64 round-trip made a literal KeyMarker fail to decode, which silently dropped BOTH
+        // the cursor AND the paired version-id marker (`store.rs` zips them) and restarted the
+        // listing — an infinite page-1 loop with duplicate versions — or, for a key that happens to
+        // be valid base64, seeked to garbage and skipped versions. Same defect, same fix as v1
+        // ListObjects' NextMarker (audit 2026-07). An empty-but-present marker means "from the
+        // beginning".
+        let cursor = req
+            .query("key-marker")
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        let version_id_marker = req
+            .query("version-id-marker")
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
         let query = ListQuery {
             prefix: prefix.clone(),
             delimiter: delimiter.clone(),
@@ -2266,8 +2404,12 @@ impl S3Service {
             start_after: None,
             limit: max,
         };
-        let mut page = self.meta.list_versions(&bucket.name, &query).await?;
-        page.next_cursor = page.next_cursor.map(|c| encode_token(&c));
+        // `max-keys=0` short-circuits here too — see `list_objects`.
+        let page = if max == 0 {
+            ListPage::default()
+        } else {
+            self.meta.list_versions(&bucket.name, &query).await?
+        };
         let body = cairn_xml::list_object_versions(
             bucket.name.as_str(),
             prefix.as_deref(),
@@ -3461,32 +3603,56 @@ fn build_context(req: &S3Request, now: cairn_types::Timestamp) -> RequestContext
     }
 }
 
-/// Known S3 object subresource selectors that we do NOT serve via a handler; their presence must
+/// Known S3 object subresource selectors that must never be silently ignored; their presence must
 /// route to NotImplemented rather than fall through to a data-plane handler (which would let
-/// `PUT key?acl` overwrite the object body). `acl` (GET/PUT) and `attributes` (GET) are handled
-/// earlier; an `acl` DELETE — which S3 has no operation for — lands here.
+/// `PUT key?acl` overwrite the object body). A keyword belongs here even when Cairn DOES serve it
+/// for some methods — every handled arm sits above the guard in `object_op`, so listing the keyword
+/// only catches the method/selector pairs with no handler: `PUT key?attributes` (would overwrite
+/// the body), `DELETE key?uploads` (would delete the object), an `acl` DELETE — which S3 has no
+/// operation for — and so on.
 const UNHANDLED_OBJECT_SUBRESOURCES: &[&str] = &[
     "acl",
-    "retention",
+    "attributes",
     "legal-hold",
-    "torrent",
     "restore",
+    "retention",
     "select",
+    "torrent",
+    "uploadId",
+    "uploads",
 ];
 
-/// Known S3 bucket subresource selectors we do not serve (handled ones are matched earlier).
+/// Known S3 bucket subresource selectors that must never be silently ignored. A keyword belongs
+/// here even when Cairn DOES serve it for some methods — the handled arms sit above the guard in
+/// `bucket_op`, so listing the keyword only catches the method/selector pairs with no handler
+/// (e.g. `DELETE ?ownershipControls`, which would otherwise execute the bare verb and destroy the
+/// bucket). `delete` is listed too: its one served pair (`POST ?delete`) now sits above the guard,
+/// so listing it stops `DELETE /b?delete` — a plausible client typo — from destroying the bucket.
 const UNHANDLED_BUCKET_SUBRESOURCES: &[&str] = &[
     "accelerate",
+    "acl",
     "analytics",
+    "cors",
+    "delete",
     "encryption",
     "intelligent-tiering",
     "inventory",
+    "lifecycle",
+    "location",
     "logging",
     "metrics",
     "notification",
     "object-lock",
+    "ownershipControls",
+    "policy",
     "policyStatus",
+    "publicAccessBlock",
+    "replication",
     "requestPayment",
+    "tagging",
+    "uploads",
+    "versioning",
+    "versions",
     "website",
 ];
 
@@ -4369,6 +4535,32 @@ fn user_metadata(req: &S3Request) -> Vec<(String, String)> {
         .collect()
 }
 
+/// The `Content-Encoding` to PERSIST for a PUT (ARCH 13.4). `aws-chunked` is a *transfer* coding
+/// describing the framing of the request body — it is consumed by `streaming_body` / the F-5
+/// decoder and says nothing about the stored bytes. SDKs that stream a SigV4 `aws-chunked` body
+/// (boto3's default flexible-checksum path) append the token to any real content coding, sending
+/// e.g. `gzip,aws-chunked`; AWS S3 strips it before storing. Storing it verbatim would make every
+/// GET advertise a framing the response does not use (`object_headers`) and would propagate the lie
+/// to replicas (cairn-replication's sink). Returns `None` when `aws-chunked` was the ONLY value, so
+/// the header is ABSENT on read rather than present-and-empty.
+fn stored_content_encoding(req: &S3Request) -> Option<String> {
+    let raw = req.header("content-encoding")?;
+    // Fast path: the overwhelmingly common value carries no transfer coding — store it
+    // byte-for-byte so a client's exact spelling round-trips.
+    if !raw
+        .split(',')
+        .any(|t| t.trim().eq_ignore_ascii_case("aws-chunked"))
+    {
+        return (!raw.trim().is_empty()).then(|| raw.to_owned());
+    }
+    let kept: Vec<&str> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty() && !t.eq_ignore_ascii_case("aws-chunked"))
+        .collect();
+    (!kept.is_empty()).then(|| kept.join(", "))
+}
+
 /// The preserved source version id for an inbound replica PUT/marker: the
 /// `x-amz-meta-cairn-replica-version-id` header, but ONLY when this write is an authenticated
 /// replica (`is_replica`, admin-gated). Returns `None` for a normal write or an absent/empty header,
@@ -4497,6 +4689,30 @@ fn form_pct_decode(s: &str) -> String {
         }
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Parse the S3 `max-keys` page-size parameter (ARCH 16.1). AWS semantics, all four cases:
+///   * absent (or present-but-empty)  -> the 1000 default;
+///   * `> 1000`                       -> silently capped at 1000; AWS caps, it does not error;
+///   * non-integer or negative        -> `InvalidArgument` 400. Swallowing the parse error into
+///     the 1000 default (the old `.parse().ok().unwrap_or(1000)`) hands a client that asked for
+///     something it believed was small a full 1000-key page instead — a silent, unbounded
+///     response, not a harmless default;
+///   * `0`                            -> VALID, and means literally zero keys. It must NOT reach
+///     the store: `list_impl` clamps `limit` to `>= 1` (a 0 page size can never make progress),
+///     so a 0 came back as a one-key page with `IsTruncated=false`. Callers short-circuit the 0
+///     case against an empty `ListPage` instead of clamping here.
+fn max_keys(req: &S3Request) -> Result<u32> {
+    match req.query("max-keys") {
+        // A present-but-empty value is treated as absent, mirroring the `delimiter=` leniency in
+        // `list_objects`: no client sends it, and rejecting it buys nothing but a compat risk.
+        None | Some("") => Ok(1000),
+        Some(raw) => raw.parse::<u32>().map(|n| n.min(1000)).map_err(|_| {
+            Error::InvalidArgument(
+                "Provided max-keys not an integer or within integer range".to_owned(),
+            )
+        }),
+    }
 }
 
 fn encode_token(cursor: &str) -> String {
