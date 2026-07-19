@@ -21,7 +21,7 @@ use cairn_types::error::Error;
 use cairn_types::id::{BucketName, ObjectKey, UploadId, VersionId};
 use cairn_types::meta::{
     ClaimOutcome, IfNoneMatch, ListPage, ListQuery, MultipartSession, Mutation, MutationOutcome,
-    OutboxEntry, Precondition, ReplicationOp, WebhookEntry, WebhookStatus,
+    ObjectSummary, OutboxEntry, Precondition, ReplicationOp, WebhookEntry, WebhookStatus,
 };
 use cairn_types::notification::{EventKind, NotificationConfig};
 use cairn_types::object::{
@@ -505,21 +505,34 @@ impl S3Service {
             .filter(|s| !s.is_empty())
             .map(str::to_owned);
         let max_keys = page_size(req, "max-keys")?;
+        let encoding = encoding_type(req)?;
 
-        // The continuation token / marker is the opaque base64 of the store cursor.
-        let cursor = if v1 {
-            req.query("marker").map(str::to_owned)
+        // v1's `marker` and v2's `start-after` are the same S3 parameter under two names, and S3
+        // defines both as EXCLUSIVE — "Amazon S3 starts listing AFTER this specified key". Both
+        // therefore ride the store's exclusive `start_after` channel. Only v2's continuation token
+        // is an inclusive resume cursor, and that is legitimate: it is opaque, it is OUR value
+        // round-tripped, and no client synthesizes it.
+        let (cursor, start_after) = if v1 {
+            (None, req.query("marker").filter(|s| !s.is_empty()))
         } else {
-            req.query("continuation-token").and_then(decode_token)
+            let token = match req.query("continuation-token").filter(|s| !s.is_empty()) {
+                Some(t) => Some(decode_token(t)?),
+                None => None,
+            };
+            // S3 ignores `start-after` once a continuation token is in play.
+            let start_after = match token {
+                Some(_) => None,
+                None => req.query("start-after").filter(|s| !s.is_empty()),
+            };
+            (token, start_after)
         };
-        let start_after = req.query("start-after").map(str::to_owned);
 
         let query = ListQuery {
             prefix: prefix.clone(),
             delimiter: delimiter.clone(),
             cursor,
             version_id_marker: None,
-            start_after,
+            start_after: start_after.map(str::to_owned),
             limit: max_keys,
         };
         // `max-keys=0` is legal S3 and means zero keys: KeyCount=0, IsTruncated=false, and no
@@ -530,12 +543,23 @@ impl S3Service {
         } else {
             self.meta.list_current(&bucket.name, &query).await?
         };
-        // v2 uses an opaque base64 continuation token (symmetric with the decode_token applied to the
-        // incoming continuation-token above). v1's NextMarker is a plain object key, echoed back by
-        // the client verbatim as `marker` and consumed raw above — so it must NOT be base64-encoded
-        // here, or the resume seeks to the base64 string and pagination loops or skips keys (audit
-        // 2026-07).
-        if !v1 {
+        if v1 {
+            // S3's `NextMarker` is the LAST ENTRY THIS PAGE RETURNED — the client resumes strictly
+            // after it — not the store's inclusive "first key not yet returned". The two halves
+            // move together with the exclusive `marker` above: emit the last entry, resume after
+            // it. (Emitting the first unreturned key while treating `marker` as inclusive is also
+            // self-consistent, which is how the pair stayed wrong for so long — but a client
+            // following the AWS contract and resuming from the last key IT saw then re-reads one
+            // key per page boundary.) NextMarker is a plain key, echoed back verbatim as `marker`
+            // and consumed raw above — never base64 (audit 2026-07).
+            let next = if page.truncated {
+                last_entry(&page)
+            } else {
+                None
+            };
+            page.next_cursor = next;
+        } else {
+            // v2's token is opaque: base64 out here, decoded back to a store cursor on the way in.
             page.next_cursor = page.next_cursor.map(|c| encode_token(&c));
         }
 
@@ -547,6 +571,7 @@ impl S3Service {
                 max_keys,
                 &page,
                 req.query("marker"),
+                encoding,
             )
         } else {
             cairn_xml::list_objects_v2(
@@ -556,6 +581,8 @@ impl S3Service {
                 max_keys,
                 &page,
                 req.query("continuation-token"),
+                start_after,
+                encoding,
             )
         };
         Ok(S3Response::xml(StatusCode::OK, body).with_header("x-amz-request-id", &req.request_id))
@@ -1046,6 +1073,16 @@ impl S3Service {
             // deleted (a `?versionId` DELETE is the only permanent-removal path for objects).
             self.enforce_unlocked_for_delete(req, &bucket, &key, &version_id, now)
                 .await?;
+            // S3 reports on a version-scoped DELETE whether the version it permanently removed was
+            // itself a delete marker (`x-amz-delete-marker`). Read that BEFORE the mutation — the
+            // row is gone afterwards. Without the header a client cannot tell an undelete (the
+            // canonical "DELETE the delete marker and the object comes back") from the permanent
+            // removal of a real data version.
+            let deleted_a_marker = self
+                .meta
+                .get_version(&bucket.name, &key, &version_id)
+                .await?
+                .is_some_and(|row| row.is_delete_marker);
             let event_version = version_id.clone();
             let outcome = self
                 .meta
@@ -1072,8 +1109,12 @@ impl S3Service {
                 now,
             )
             .await;
+            // Mirror the delete-marker-CREATING branch below: name the version acted on, and say
+            // whether it was a marker.
             return Ok(S3Response::status(StatusCode::NO_CONTENT)
-                .with_header("x-amz-request-id", &req.request_id));
+                .with_header("x-amz-request-id", &req.request_id)
+                .with_header("x-amz-version-id", event_version.as_str())
+                .with_header("x-amz-delete-marker", deleted_a_marker.to_string()));
         }
 
         match bucket.versioning {
@@ -1500,17 +1541,26 @@ impl S3Service {
             .map(|p| (p.part_number, p))
             .collect();
 
-        let mut refs = Vec::with_capacity(requested.len());
-        let mut part_md5s = Vec::with_capacity(requested.len());
+        // Ordering is a property of the REQUEST DOCUMENT alone, so validate it in a pass of its own,
+        // ahead of every per-part check. S3 answers an out-of-order part list with InvalidPartOrder
+        // no matter what else is wrong with it; interleaving the checks let an earlier part's size
+        // pre-empt the verdict — parts [(2, small), (1, small)] pass the ordering test at entry 0,
+        // trip the undersized test there, and report EntityTooSmall for a request whose actual
+        // defect is the ordering the client must fix first.
         let mut last_pn = 0u16;
-        for (i, (pn, etag)) in requested.iter().enumerate() {
-            // AWS-correct S3 error codes (audit 2026-07): out-of-order -> InvalidPartOrder, a missing
-            // or ETag-mismatched part -> InvalidPart (not NoSuchUpload, which falsely tells the client
-            // the whole upload vanished), an undersized non-final part -> EntityTooSmall. All 400.
+        for (pn, _) in &requested {
             if *pn <= last_pn {
                 return Err(Error::InvalidPartOrder);
             }
             last_pn = *pn;
+        }
+
+        let mut refs = Vec::with_capacity(requested.len());
+        let mut part_md5s = Vec::with_capacity(requested.len());
+        for (i, (pn, etag)) in requested.iter().enumerate() {
+            // AWS-correct S3 error codes (audit 2026-07): a missing or ETag-mismatched part ->
+            // InvalidPart (not NoSuchUpload, which falsely tells the client the whole upload
+            // vanished), an undersized non-final part -> EntityTooSmall. All 400.
             let rec = stored.get(pn).ok_or(Error::InvalidPart)?;
             if strip_quotes(etag) != rec.etag {
                 return Err(Error::InvalidPart);
@@ -1693,12 +1743,18 @@ impl S3Service {
             .query("part-number-marker")
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
-        let max: u32 = req
-            .query("max-parts")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1000)
-            .min(1000);
-        let page = self.meta.list_parts(&upload_id, marker, max).await?;
+        // `max-parts` is the same page-size parameter as `max-keys`/`max-uploads`, only spelled
+        // differently, so it gets the same strict parse: a non-integer is a 400, not a silent
+        // 1000-part page.
+        let max = page_size(req, "max-parts")?;
+        // `max-parts=0` short-circuits against an empty page — see `list_objects`. Without it the
+        // store's `LIMIT 0+1` probe marks the page truncated while the page itself is emptied, so
+        // the response is "truncated" with no NextPartNumberMarker and the client can never advance.
+        let page = if max == 0 {
+            ListPage::default()
+        } else {
+            self.meta.list_parts(&upload_id, marker, max).await?
+        };
         let body = cairn_xml::list_parts_result(
             bucket.name.as_str(),
             key.as_str(),
@@ -1733,6 +1789,7 @@ impl S3Service {
         // `max-uploads` is the same page-size parameter as `max-keys`, only spelled differently, so
         // it gets the same strict parse: a non-integer is a 400, not a silent 1000-upload page.
         let max = page_size(req, "max-uploads")?;
+        let encoding = encoding_type(req)?;
         let query = ListQuery {
             prefix: prefix.clone(),
             cursor: key_marker.clone(),
@@ -1756,6 +1813,7 @@ impl S3Service {
             key_marker.as_deref(),
             upload_id_marker.as_deref(),
             max,
+            encoding,
         );
         Ok(S3Response::xml(StatusCode::OK, body).with_header("x-amz-request-id", &req.request_id))
     }
@@ -1926,7 +1984,15 @@ impl S3Service {
             size_physical: staged.size_physical,
             etag: staged.etag.clone(),
             content_type,
-            content_encoding: sys("content-encoding", &src_row.content_encoding),
+            // `content-encoding` needs the same normalizer the PUT path uses: under REPLACE the
+            // header may carry the `aws-chunked` TRANSFER coding, which describes how this request's
+            // body was framed on the wire and is not a property of the stored object. Storing it
+            // makes every later GET advertise a coding the response does not use.
+            content_encoding: if replace {
+                stored_content_encoding(req)
+            } else {
+                src_row.content_encoding.clone()
+            },
             cache_control: sys("cache-control", &src_row.cache_control),
             content_disposition: sys("content-disposition", &src_row.content_disposition),
             content_language: sys("content-language", &src_row.content_language),
@@ -2381,6 +2447,7 @@ impl S3Service {
             .filter(|s| !s.is_empty())
             .map(str::to_owned);
         let max = page_size(req, "max-keys")?;
+        let encoding = encoding_type(req)?;
         // `key-marker`/`version-id-marker` are PLAIN values in S3 — the marker is a real object key
         // and a real version id, not an opaque token, and a client is entitled to synthesize either
         // one rather than echo ours. Consume them raw and emit them raw (see `next_cursor` below):
@@ -2390,20 +2457,26 @@ impl S3Service {
         // be valid base64, seeked to garbage and skipped versions. Same defect, same fix as v1
         // ListObjects' NextMarker (audit 2026-07). An empty-but-present marker means "from the
         // beginning".
-        let cursor = req
-            .query("key-marker")
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned);
-        let version_id_marker = req
-            .query("version-id-marker")
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned);
+        let key_marker = req.query("key-marker").filter(|s| !s.is_empty());
+        let version_id_marker = req.query("version-id-marker").filter(|s| !s.is_empty());
+        // Which channel the key marker rides depends on whether it is PAIRED with a version-id
+        // marker, because S3 gives the two forms different semantics:
+        //  * paired — resume WITHIN the marker key, after the named version. The key itself is
+        //    inclusive (its remaining versions are still owed), so this is the store's inclusive
+        //    `cursor` + `version_id_marker`.
+        //  * bare — "results begin AFTER that key". Exclusive, so it rides `start_after`, exactly
+        //    like v1's `marker`. Seeking `key >= marker` here re-returned every version of the
+        //    marker key on the next page.
+        let (cursor, start_after) = match version_id_marker {
+            Some(_) => (key_marker, None),
+            None => (None, key_marker),
+        };
         let query = ListQuery {
             prefix: prefix.clone(),
             delimiter: delimiter.clone(),
-            cursor,
-            version_id_marker,
-            start_after: None,
+            cursor: cursor.map(str::to_owned),
+            version_id_marker: version_id_marker.map(str::to_owned),
+            start_after: start_after.map(str::to_owned),
             limit: max,
         };
         // `max-keys=0` short-circuits here too — see `list_objects`.
@@ -2420,6 +2493,7 @@ impl S3Service {
             &page,
             req.query("key-marker"),
             req.query("version-id-marker"),
+            encoding,
         );
         Ok(S3Response::xml(StatusCode::OK, body).with_header("x-amz-request-id", &req.request_id))
     }
@@ -4216,6 +4290,13 @@ fn parse_range(header: Option<&str>, total: u64) -> Result<Option<ByteRange>> {
         ("", "") => return Err(Error::InvalidRange),
         ("", suffix) => {
             let n: u64 = suffix.parse().map_err(|_| Error::InvalidRange)?;
+            // A suffix range must select at least one byte, so `bytes=-0` is unsatisfiable — and so
+            // is ANY suffix against a zero-byte object. Both are 416 InvalidRange, mirroring the
+            // `s >= total` rejection the open-ended arm below already does; without it they yielded
+            // an empty 206 Partial Content, which claims a satisfiable range was served.
+            if n == 0 || total == 0 {
+                return Err(Error::InvalidRange);
+            }
             let n = n.min(total);
             (total - n, n)
         }
@@ -4723,11 +4804,43 @@ fn encode_token(cursor: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(cursor)
 }
 
-fn decode_token(token: &str) -> Option<String> {
+/// Decode an opaque continuation token back into a store cursor.
+///
+/// An UNDECODABLE token is an ERROR, never "no token". Collapsing invalid to absent silently
+/// restarts the listing at page 1 — the same invalid-collapses-to-absent class as the routing fix
+/// in 401cd53 — and the failure mode is unbounded re-processing: a paginating deleter whose token
+/// got truncated loops over the bucket forever instead of failing. S3 answers 400 InvalidArgument.
+fn decode_token(token: &str) -> Result<String> {
     base64::engine::general_purpose::STANDARD
         .decode(token)
         .ok()
         .and_then(|b| String::from_utf8(b).ok())
+        .ok_or_else(|| {
+            Error::InvalidArgument("The continuation token provided is incorrect".into())
+        })
+}
+
+/// The last entry a listing page returned, in result order.
+///
+/// Keys and CommonPrefixes interleave in ONE ascending sequence — a group sorts at the position of
+/// its first member, and every entry after the group is greater than the group's own prefix — so
+/// the greater of the two tails is the later-emitted one. This is S3's v1 `NextMarker`: the entry
+/// the next request resumes strictly after (a CommonPrefix marker skips the whole group).
+fn last_entry(page: &ListPage<ObjectSummary>) -> Option<String> {
+    let key = page.items.last().map(|s| s.key.as_str());
+    let prefix = page.common_prefixes.last().map(String::as_str);
+    key.max(prefix).map(str::to_owned)
+}
+
+/// Parse `encoding-type`. S3 defines exactly one value, `url`; anything else is `InvalidArgument`.
+/// A present-but-empty value is treated as absent (the same leniency as `delimiter=`/`max-keys=`).
+fn encoding_type(req: &S3Request) -> Result<Option<cairn_xml::EncodingType>> {
+    match req.query("encoding-type") {
+        None | Some("") => Ok(None),
+        Some(v) => cairn_xml::EncodingType::parse(v)
+            .map(Some)
+            .ok_or_else(|| Error::InvalidArgument("Invalid Encoding Method specified".into())),
+    }
 }
 
 /// Clamp the client-declared payload length (used only as a `fallocate` preallocation hint) to the

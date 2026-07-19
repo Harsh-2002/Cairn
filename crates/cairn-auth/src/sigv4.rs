@@ -606,6 +606,26 @@ mod tests {
     }
 
     #[test]
+    fn clock_skew_maps_to_request_time_too_skewed() {
+        // Both directions of skew are the same condition, and it must reach the wire as S3's
+        // 403 RequestTimeTooSkewed — a client library keys its clock-resync retry off that code,
+        // so folding it into a generic InvalidArgument (as it once was) breaks that recovery.
+        let now = Timestamp(parse_amz_date("20250101T120000Z").unwrap());
+        for stale in ["20250101T100000Z", "20250101T140000Z"] {
+            assert!(matches!(
+                check_skew(stale, now),
+                Err(AuthError::SkewedClock)
+            ));
+            assert!(matches!(
+                cairn_types::error::Error::from(AuthError::SkewedClock),
+                cairn_types::error::Error::RequestTimeTooSkewed
+            ));
+        }
+        // A timestamp inside the window still passes.
+        assert!(check_skew("20250101T120100Z", now).is_ok());
+    }
+
+    #[test]
     fn parse_authorization_header_works() {
         let h = "AWS4-HMAC-SHA256 Credential=AKID/20150830/us-east-1/s3/aws4_request, \
                  SignedHeaders=host;x-amz-date, Signature=abc123";

@@ -61,7 +61,16 @@ fn list_objects_v2_shape() {
         next_version_id_marker: None,
         truncated: true,
     };
-    let xml = list_objects_v2("mybucket", Some("a/"), Some("/"), 1000, &page, None);
+    let xml = list_objects_v2(
+        "mybucket",
+        Some("a/"),
+        Some("/"),
+        1000,
+        &page,
+        None,
+        None,
+        None,
+    );
 
     assert!(xml.contains("<Name>mybucket</Name>"));
     assert!(xml.contains("<Key>a/b.txt</Key>"));
@@ -89,7 +98,7 @@ fn list_objects_v1_marker_form() {
         next_version_id_marker: None,
         truncated: true,
     };
-    let xml = list_objects_v1("b", None, None, 100, &page, Some("k0"));
+    let xml = list_objects_v1("b", None, None, 100, &page, Some("k0"), None);
     assert!(xml.contains("<Marker>k0</Marker>"));
     assert!(xml.contains("<NextMarker>k1</NextMarker>"));
     assert!(xml.contains("<IsTruncated>true</IsTruncated>"));
@@ -114,7 +123,7 @@ fn list_versions_distinguishes_markers() {
         next_version_id_marker: None,
         truncated: false,
     };
-    let xml = list_object_versions("b", None, None, 1000, &page, None, None);
+    let xml = list_object_versions("b", None, None, 1000, &page, None, None, None);
     assert!(xml.contains("<Version>"));
     assert!(xml.contains("<DeleteMarker>"));
     assert!(xml.contains("<VersionId>v-100</VersionId>"));
@@ -129,6 +138,182 @@ fn list_versions_distinguishes_markers() {
     let v_end = xml[v_start..].find("</Version>").unwrap() + v_start;
     assert!(xml[v_start..v_end].contains("<Size>9</Size>"));
     assert!(xml[v_start..v_end].contains("&quot;ff&quot;"));
+}
+
+/// S3 echoes the request's `start-after` back in the V2 listing; a client uses it to confirm which
+/// resume point the page answered. Cairn's writer never received the value (2026-07 conformance,
+/// finding E).
+#[test]
+fn list_objects_v2_echoes_start_after() {
+    let page = ListPage {
+        items: vec![summary("k05", "aa", 1)],
+        common_prefixes: vec![],
+        next_cursor: None,
+        next_version_id_marker: None,
+        truncated: false,
+    };
+    let xml = list_objects_v2("b", None, None, 1000, &page, None, Some("k04"), None);
+    assert!(xml.contains("<StartAfter>k04</StartAfter>"), "{xml}");
+
+    // Absent means absent: S3 emits no empty <StartAfter/> when the request omitted it.
+    let xml = list_objects_v2("b", None, None, 1000, &page, None, None, None);
+    assert!(!xml.contains("StartAfter"), "{xml}");
+}
+
+/// The `encoding-type=url` echo and the encoding itself are ONE decision: botocore only URL-decodes
+/// a response that echoes `<EncodingType>`, so a listing must emit both halves or neither.
+#[test]
+fn encoding_type_is_absent_and_fields_raw_without_the_parameter() {
+    let page = ListPage {
+        items: vec![summary("enc/sp ace.txt", "aa", 1)],
+        common_prefixes: vec!["enc/x y/".to_owned()],
+        next_cursor: None,
+        next_version_id_marker: None,
+        truncated: false,
+    };
+    let xml = list_objects_v2("b", Some("enc/"), None, 1000, &page, None, None, None);
+    assert!(!xml.contains("EncodingType"), "{xml}");
+    assert!(xml.contains("<Key>enc/sp ace.txt</Key>"), "{xml}");
+    assert!(xml.contains("<Prefix>enc/x y/</Prefix>"), "{xml}");
+}
+
+#[test]
+fn list_objects_v2_url_encoding_encodes_every_key_field() {
+    let page = ListPage {
+        items: vec![summary("enc/été/sp ace+&.txt", "aa", 1)],
+        common_prefixes: vec!["enc/été/x y/".to_owned()],
+        next_cursor: Some("dG9rZW4=".to_owned()),
+        next_version_id_marker: None,
+        truncated: true,
+    };
+    let xml = list_objects_v2(
+        "b",
+        Some("enc/été/"),
+        Some("|"),
+        1000,
+        &page,
+        Some("cHJldg=="),
+        Some("enc/a b"),
+        Some(EncodingType::Url),
+    );
+    assert!(xml.contains("<EncodingType>url</EncodingType>"), "{xml}");
+    assert!(
+        xml.contains("<Key>enc/%C3%A9t%C3%A9/sp%20ace%2B%26.txt</Key>"),
+        "{xml}"
+    );
+    assert!(xml.contains("<Prefix>enc/%C3%A9t%C3%A9/</Prefix>"), "{xml}");
+    assert!(xml.contains("<Delimiter>%7C</Delimiter>"), "{xml}");
+    assert!(
+        xml.contains("<CommonPrefixes><Prefix>enc/%C3%A9t%C3%A9/x%20y/</Prefix></CommonPrefixes>"),
+        "{xml}"
+    );
+    assert!(xml.contains("<StartAfter>enc/a%20b</StartAfter>"), "{xml}");
+    // The continuation tokens are opaque, not key-derived: S3 leaves them alone, and encoding the
+    // `=` padding would break a client that echoes the value back verbatim.
+    assert!(
+        xml.contains("<ContinuationToken>cHJldg==</ContinuationToken>"),
+        "{xml}"
+    );
+    assert!(
+        xml.contains("<NextContinuationToken>dG9rZW4=</NextContinuationToken>"),
+        "{xml}"
+    );
+}
+
+#[test]
+fn list_objects_v1_url_encoding_encodes_marker_and_next_marker() {
+    let page = ListPage {
+        items: vec![summary("sp ace.txt", "aa", 1)],
+        common_prefixes: vec![],
+        next_cursor: Some("sp ace.txt".to_owned()),
+        next_version_id_marker: None,
+        truncated: true,
+    };
+    let xml = list_objects_v1(
+        "b",
+        Some("é/"),
+        None,
+        100,
+        &page,
+        Some("k 0"),
+        Some(EncodingType::Url),
+    );
+    assert!(xml.contains("<EncodingType>url</EncodingType>"), "{xml}");
+    assert!(xml.contains("<Prefix>%C3%A9/</Prefix>"), "{xml}");
+    assert!(xml.contains("<Marker>k%200</Marker>"), "{xml}");
+    assert!(
+        xml.contains("<NextMarker>sp%20ace.txt</NextMarker>"),
+        "{xml}"
+    );
+    assert!(xml.contains("<Key>sp%20ace.txt</Key>"), "{xml}");
+}
+
+#[test]
+fn list_object_versions_url_encoding_leaves_version_ids_alone() {
+    let mut version = summary("sp ace.txt", "ff", 9);
+    version.version_id = VersionId::from_string("v=100".to_owned());
+    let page = ListPage {
+        items: vec![version],
+        common_prefixes: vec![],
+        next_cursor: Some("sp ace.txt".to_owned()),
+        next_version_id_marker: Some("v=100".to_owned()),
+        truncated: true,
+    };
+    let xml = list_object_versions(
+        "b",
+        None,
+        None,
+        1000,
+        &page,
+        Some("k 0"),
+        Some("v=099"),
+        Some(EncodingType::Url),
+    );
+    assert!(xml.contains("<EncodingType>url</EncodingType>"), "{xml}");
+    assert!(xml.contains("<KeyMarker>k%200</KeyMarker>"), "{xml}");
+    assert!(
+        xml.contains("<NextKeyMarker>sp%20ace.txt</NextKeyMarker>"),
+        "{xml}"
+    );
+    assert!(xml.contains("<Key>sp%20ace.txt</Key>"), "{xml}");
+    // Version ids are opaque, like the continuation token.
+    assert!(
+        xml.contains("<VersionIdMarker>v=099</VersionIdMarker>"),
+        "{xml}"
+    );
+    assert!(xml.contains("<VersionId>v=100</VersionId>"), "{xml}");
+    assert!(
+        xml.contains("<NextVersionIdMarker>v=100</NextVersionIdMarker>"),
+        "{xml}"
+    );
+}
+
+/// The literal set is the RFC 3986 unreserved characters plus `/` — matching what S3 returns
+/// (`enc/%C3%A9t%C3%A9/`), so an encoded key still reads as a path.
+#[test]
+fn percent_encode_matches_the_s3_safe_set() {
+    assert_eq!(
+        percent_encode("abcXYZ019-_.~/"),
+        "abcXYZ019-_.~/",
+        "unreserved + the key separator stay literal"
+    );
+    // A space is %20, never `+`: clients decode with `unquote`, not `unquote_plus`.
+    assert_eq!(percent_encode("a b"), "a%20b");
+    assert_eq!(percent_encode("a+b%c&d=e"), "a%2Bb%25c%26d%3De");
+    // Non-ASCII encodes byte-wise over the UTF-8 form, uppercase hex.
+    assert_eq!(percent_encode("日本"), "%E6%97%A5%E6%9C%AC");
+    // The characters XML 1.0 cannot carry survive an encoded listing — this is the fallback
+    // `ObjectKey::parse`'s comment says does not exist for the unencoded form.
+    assert_eq!(percent_encode("a\u{1}b"), "a%01b");
+}
+
+#[test]
+fn encoding_type_parses_only_url() {
+    assert_eq!(EncodingType::parse("url"), Some(EncodingType::Url));
+    assert_eq!(EncodingType::parse("URL"), Some(EncodingType::Url));
+    assert_eq!(EncodingType::Url.as_str(), "url");
+    assert_eq!(EncodingType::parse(""), None);
+    assert_eq!(EncodingType::parse("base64"), None);
 }
 
 #[test]
@@ -205,8 +390,16 @@ fn list_multipart_uploads_shape() {
         next_version_id_marker: None,
         truncated: false,
     };
-    let xml =
-        list_multipart_uploads_result("my-bucket", Some("b"), Some("/"), &page, None, None, 1000);
+    let xml = list_multipart_uploads_result(
+        "my-bucket",
+        Some("b"),
+        Some("/"),
+        &page,
+        None,
+        None,
+        1000,
+        None,
+    );
     assert!(xml.contains("<Key>big.bin</Key>"));
     assert!(xml.contains("<UploadId>up-9</UploadId>"));
     assert!(xml.contains("<CommonPrefixes><Prefix>pre/</Prefix></CommonPrefixes>"));
@@ -245,6 +438,7 @@ fn list_multipart_uploads_truncated_emits_both_markers() {
         Some("prev.bin"),
         Some("up-1"),
         1,
+        None,
     );
     assert!(xml.contains("<KeyMarker>prev.bin</KeyMarker>"), "{xml}");
     assert!(
@@ -260,6 +454,56 @@ fn list_multipart_uploads_truncated_emits_both_markers() {
         "{xml}"
     );
     assert!(xml.contains("<IsTruncated>true</IsTruncated>"), "{xml}");
+}
+
+/// ListMultipartUploads carries `encoding-type` like the object listings do; the upload-id markers
+/// are opaque and stay raw.
+#[test]
+fn list_multipart_uploads_url_encoding_encodes_key_fields() {
+    let session = MultipartSession {
+        upload_id: UploadId::from_string("up=9".to_owned()),
+        bucket: BucketName::parse("my-bucket").unwrap(),
+        key: ObjectKey::parse("big file.bin").unwrap(),
+        content_type: "application/octet-stream".to_owned(),
+        status: MultipartStatus::Active,
+        owner_id: UserId("o".to_owned()),
+        intended_acl: None,
+        user_metadata: vec![],
+        sse_requested: false,
+        created_at: Timestamp(1_750_000_000_000),
+        updated_at: Timestamp(1_750_000_000_000),
+    };
+    let page = ListPage {
+        items: vec![session],
+        common_prefixes: vec!["pre fix/".to_owned()],
+        next_cursor: None,
+        next_version_id_marker: None,
+        truncated: false,
+    };
+    let xml = list_multipart_uploads_result(
+        "my-bucket",
+        Some("big "),
+        Some("/"),
+        &page,
+        Some("k 0"),
+        Some("up=1"),
+        1000,
+        Some(EncodingType::Url),
+    );
+    assert!(xml.contains("<EncodingType>url</EncodingType>"), "{xml}");
+    assert!(xml.contains("<Key>big%20file.bin</Key>"), "{xml}");
+    assert!(xml.contains("<Prefix>big%20</Prefix>"), "{xml}");
+    assert!(xml.contains("<KeyMarker>k%200</KeyMarker>"), "{xml}");
+    assert!(
+        xml.contains("<CommonPrefixes><Prefix>pre%20fix/</Prefix></CommonPrefixes>"),
+        "{xml}"
+    );
+    // Opaque: not key-derived, so not encoded.
+    assert!(
+        xml.contains("<UploadIdMarker>up=1</UploadIdMarker>"),
+        "{xml}"
+    );
+    assert!(xml.contains("<UploadId>up=9</UploadId>"), "{xml}");
 }
 
 #[test]

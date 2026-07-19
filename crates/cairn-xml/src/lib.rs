@@ -88,6 +88,81 @@ fn leaf(w: &mut Writer<Cursor<Vec<u8>>>, name: &str, text: &str) {
         .expect("writing to an in-memory buffer is infallible");
 }
 
+/// The `encoding-type` a listing request asked for.
+///
+/// S3 defines exactly one value. A listing that carries it MUST do both halves together: echo
+/// `<EncodingType>url</EncodingType>` **and** percent-encode every key-derived field. Clients key
+/// off the echo — botocore only URL-decodes a response that echoes the element — so emitting one
+/// half without the other corrupts keys in whichever direction is missing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EncodingType {
+    /// `encoding-type=url` — percent-encoded key-derived fields.
+    Url,
+}
+
+impl EncodingType {
+    /// Parse an `encoding-type` query value. S3 accepts only `url`, case-insensitively; `None`
+    /// means the value is not one S3 defines (the caller's `InvalidArgument`), NOT that the
+    /// parameter was absent — an absent parameter never reaches here.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        value.eq_ignore_ascii_case("url").then_some(Self::Url)
+    }
+
+    /// The wire spelling echoed back in `<EncodingType>`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Url => "url",
+        }
+    }
+}
+
+/// Percent-encode one key-derived field for an `encoding-type=url` listing.
+///
+/// The literal set is the RFC 3986 unreserved characters plus `/`: S3 leaves the key separator
+/// alone, so an encoded key still reads as a path (`enc/%C3%A9t%C3%A9/`). Everything else — space,
+/// `+`, `%`, `&`, and every non-ASCII byte of the UTF-8 form — is percent-encoded with uppercase
+/// hex. This is also the escape hatch for characters XML cannot carry: once encoded, `xml_safe`
+/// has nothing left to replace.
+fn percent_encode(text: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(text.len());
+    for &b in text.as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~' | b'/') {
+            out.push(char::from(b));
+        } else {
+            out.push('%');
+            out.push(char::from(HEX[(b >> 4) as usize]));
+            out.push(char::from(HEX[(b & 0x0f) as usize]));
+        }
+    }
+    out
+}
+
+/// Write a key-derived leaf, percent-encoded when the request asked for `encoding-type=url`.
+/// Use this for exactly the fields S3 documents as encoded — `Key`, `Prefix` (including a
+/// `CommonPrefixes` entry), `Delimiter`, `Marker`/`KeyMarker`, `NextMarker`/`NextKeyMarker`,
+/// `StartAfter` — and plain [`leaf`] for opaque values (continuation tokens, version ids).
+fn leaf_enc(
+    w: &mut Writer<Cursor<Vec<u8>>>,
+    name: &str,
+    text: &str,
+    encoding: Option<EncodingType>,
+) {
+    match encoding {
+        Some(EncodingType::Url) => leaf(w, name, &percent_encode(text)),
+        None => leaf(w, name, text),
+    }
+}
+
+/// Echo `<EncodingType>` when — and only when — the listing's fields were encoded.
+fn encoding_type_leaf(w: &mut Writer<Cursor<Vec<u8>>>, encoding: Option<EncodingType>) {
+    if let Some(e) = encoding {
+        leaf(w, "EncodingType", e.as_str());
+    }
+}
+
 /// Write a quoted-ETag leaf: `<name>"value"</name>` (quotes are part of the text content,
 /// escaped along with the rest).
 fn etag_leaf(w: &mut Writer<Cursor<Vec<u8>>>, name: &str, etag: &ETag) {
@@ -140,6 +215,12 @@ pub fn error_document(code: &str, message: &str, resource: &str, request_id: &st
 // ===========================================================================================
 
 /// `ListBucketResult` in the V2 (continuation-token) form.
+///
+/// `start_after` is the request's `start-after` value, which S3 echoes verbatim; the continuation
+/// token is opaque and is never encoded, even under `encoding-type=url`.
+// The listing writers mirror the S3 request parameters one-for-one; a params struct would only
+// move the same list one level out.
+#[allow(clippy::too_many_arguments)]
 #[must_use]
 pub fn list_objects_v2(
     bucket: &str,
@@ -148,17 +229,20 @@ pub fn list_objects_v2(
     max_keys: u32,
     page: &ListPage<ObjectSummary>,
     continuation_token: Option<&str>,
+    start_after: Option<&str>,
+    encoding: Option<EncodingType>,
 ) -> String {
     let mut w = new_doc();
     w.create_element("ListBucketResult")
         .with_attribute(("xmlns", "http://s3.amazonaws.com/doc/2006-03-01/"))
         .write_inner_content(|w| {
             leaf(w, "Name", bucket);
-            leaf(w, "Prefix", prefix.unwrap_or(""));
+            leaf_enc(w, "Prefix", prefix.unwrap_or(""), encoding);
             if let Some(d) = delimiter {
-                leaf(w, "Delimiter", d);
+                leaf_enc(w, "Delimiter", d, encoding);
             }
             leaf(w, "MaxKeys", &max_keys.to_string());
+            encoding_type_leaf(w, encoding);
             // KeyCount is the number of Contents + CommonPrefixes returned.
             let key_count = page.items.len() + page.common_prefixes.len();
             leaf(w, "KeyCount", &key_count.to_string());
@@ -173,10 +257,14 @@ pub fn list_objects_v2(
             if let Some(next) = &page.next_cursor {
                 leaf(w, "NextContinuationToken", next);
             }
-            for item in &page.items {
-                write_contents(w, item);
+            // S3 echoes StartAfter so a client can see which resume point the page answered.
+            if let Some(sa) = start_after {
+                leaf_enc(w, "StartAfter", sa, encoding);
             }
-            write_common_prefixes(w, &page.common_prefixes);
+            for item in &page.items {
+                write_contents(w, item, encoding);
+            }
+            write_common_prefixes(w, &page.common_prefixes, encoding);
             Ok(())
         })
         .expect("infallible");
@@ -192,34 +280,37 @@ pub fn list_objects_v1(
     max_keys: u32,
     page: &ListPage<ObjectSummary>,
     marker: Option<&str>,
+    encoding: Option<EncodingType>,
 ) -> String {
     let mut w = new_doc();
     w.create_element("ListBucketResult")
         .with_attribute(("xmlns", "http://s3.amazonaws.com/doc/2006-03-01/"))
         .write_inner_content(|w| {
             leaf(w, "Name", bucket);
-            leaf(w, "Prefix", prefix.unwrap_or(""));
-            leaf(w, "Marker", marker.unwrap_or(""));
+            leaf_enc(w, "Prefix", prefix.unwrap_or(""), encoding);
+            leaf_enc(w, "Marker", marker.unwrap_or(""), encoding);
             if let Some(d) = delimiter {
-                leaf(w, "Delimiter", d);
+                leaf_enc(w, "Delimiter", d, encoding);
             }
             leaf(w, "MaxKeys", &max_keys.to_string());
+            encoding_type_leaf(w, encoding);
             leaf(
                 w,
                 "IsTruncated",
                 if page.truncated { "true" } else { "false" },
             );
             // In the V1 form, NextMarker is only meaningful when a delimiter is present, but
-            // S3 emits it whenever the result is truncated; mirror that.
+            // S3 emits it whenever the result is truncated; mirror that. It is a plain object
+            // key (not an opaque token), so it is encoded along with the other key fields.
             if page.truncated {
                 if let Some(next) = &page.next_cursor {
-                    leaf(w, "NextMarker", next);
+                    leaf_enc(w, "NextMarker", next, encoding);
                 }
             }
             for item in &page.items {
-                write_contents(w, item);
+                write_contents(w, item, encoding);
             }
-            write_common_prefixes(w, &page.common_prefixes);
+            write_common_prefixes(w, &page.common_prefixes, encoding);
             Ok(())
         })
         .expect("infallible");
@@ -227,6 +318,8 @@ pub fn list_objects_v1(
 }
 
 /// `ListVersionsResult`, distinguishing `Version` from `DeleteMarker` entries.
+// See `list_objects_v2` on the argument count.
+#[allow(clippy::too_many_arguments)]
 #[must_use]
 pub fn list_object_versions(
     bucket: &str,
@@ -236,19 +329,22 @@ pub fn list_object_versions(
     page: &ListPage<ObjectSummary>,
     key_marker: Option<&str>,
     version_id_marker: Option<&str>,
+    encoding: Option<EncodingType>,
 ) -> String {
     let mut w = new_doc();
     w.create_element("ListVersionsResult")
         .with_attribute(("xmlns", "http://s3.amazonaws.com/doc/2006-03-01/"))
         .write_inner_content(|w| {
             leaf(w, "Name", bucket);
-            leaf(w, "Prefix", prefix.unwrap_or(""));
-            leaf(w, "KeyMarker", key_marker.unwrap_or(""));
+            leaf_enc(w, "Prefix", prefix.unwrap_or(""), encoding);
+            leaf_enc(w, "KeyMarker", key_marker.unwrap_or(""), encoding);
+            // The version-id markers are opaque ids, not keys: S3 does not encode them.
             leaf(w, "VersionIdMarker", version_id_marker.unwrap_or(""));
             if let Some(d) = delimiter {
-                leaf(w, "Delimiter", d);
+                leaf_enc(w, "Delimiter", d, encoding);
             }
             leaf(w, "MaxKeys", &max_keys.to_string());
+            encoding_type_leaf(w, encoding);
             leaf(
                 w,
                 "IsTruncated",
@@ -256,16 +352,16 @@ pub fn list_object_versions(
             );
             if page.truncated {
                 if let Some(next) = &page.next_cursor {
-                    leaf(w, "NextKeyMarker", next);
+                    leaf_enc(w, "NextKeyMarker", next, encoding);
                 }
                 if let Some(nvid) = &page.next_version_id_marker {
                     leaf(w, "NextVersionIdMarker", nvid);
                 }
             }
             for item in &page.items {
-                write_version_entry(w, item);
+                write_version_entry(w, item, encoding);
             }
-            write_common_prefixes(w, &page.common_prefixes);
+            write_common_prefixes(w, &page.common_prefixes, encoding);
             Ok(())
         })
         .expect("infallible");
@@ -273,11 +369,15 @@ pub fn list_object_versions(
 }
 
 /// `<Contents>` entry for a plain object listing.
-fn write_contents(w: &mut Writer<Cursor<Vec<u8>>>, item: &ObjectSummary) {
+fn write_contents(
+    w: &mut Writer<Cursor<Vec<u8>>>,
+    item: &ObjectSummary,
+    encoding: Option<EncodingType>,
+) {
     let owner_id = item.owner_id.to_string();
     w.create_element("Contents")
         .write_inner_content(|w| {
-            leaf(w, "Key", item.key.as_str());
+            leaf_enc(w, "Key", item.key.as_str(), encoding);
             leaf(w, "LastModified", &format_iso8601(item.last_modified));
             etag_leaf(w, "ETag", &item.etag);
             leaf(w, "Size", &item.size.to_string());
@@ -289,7 +389,11 @@ fn write_contents(w: &mut Writer<Cursor<Vec<u8>>>, item: &ObjectSummary) {
 }
 
 /// A `<Version>` or `<DeleteMarker>` entry for a versions listing.
-fn write_version_entry(w: &mut Writer<Cursor<Vec<u8>>>, item: &ObjectSummary) {
+fn write_version_entry(
+    w: &mut Writer<Cursor<Vec<u8>>>,
+    item: &ObjectSummary,
+    encoding: Option<EncodingType>,
+) {
     let owner_id = item.owner_id.to_string();
     let tag = if item.is_delete_marker {
         "DeleteMarker"
@@ -302,7 +406,7 @@ fn write_version_entry(w: &mut Writer<Cursor<Vec<u8>>>, item: &ObjectSummary) {
     let size = item.size;
     w.create_element(tag)
         .write_inner_content(|w| {
-            leaf(w, "Key", item.key.as_str());
+            leaf_enc(w, "Key", item.key.as_str(), encoding);
             leaf(w, "VersionId", item.version_id.as_str());
             leaf(w, "IsLatest", if item.is_latest { "true" } else { "false" });
             leaf(w, "LastModified", &format_iso8601(item.last_modified));
@@ -318,11 +422,15 @@ fn write_version_entry(w: &mut Writer<Cursor<Vec<u8>>>, item: &ObjectSummary) {
 }
 
 /// `<CommonPrefixes><Prefix/></CommonPrefixes>` for each grouped prefix.
-fn write_common_prefixes(w: &mut Writer<Cursor<Vec<u8>>>, prefixes: &[String]) {
+fn write_common_prefixes(
+    w: &mut Writer<Cursor<Vec<u8>>>,
+    prefixes: &[String],
+    encoding: Option<EncodingType>,
+) {
     for p in prefixes {
         w.create_element("CommonPrefixes")
             .write_inner_content(|w| {
-                leaf(w, "Prefix", p);
+                leaf_enc(w, "Prefix", p, encoding);
                 Ok(())
             })
             .expect("infallible");
@@ -440,6 +548,8 @@ pub fn list_parts_result(
 }
 
 /// `ListMultipartUploadsResult`.
+// See `list_objects_v2` on the argument count.
+#[allow(clippy::too_many_arguments)]
 #[must_use]
 pub fn list_multipart_uploads_result(
     bucket: &str,
@@ -449,17 +559,19 @@ pub fn list_multipart_uploads_result(
     key_marker: Option<&str>,
     upload_id_marker: Option<&str>,
     max_uploads: u32,
+    encoding: Option<EncodingType>,
 ) -> String {
     let mut w = new_doc();
     w.create_element("ListMultipartUploadsResult")
         .with_attribute(("xmlns", "http://s3.amazonaws.com/doc/2006-03-01/"))
         .write_inner_content(|w| {
             leaf(w, "Bucket", bucket);
-            leaf(w, "KeyMarker", key_marker.unwrap_or(""));
+            leaf_enc(w, "KeyMarker", key_marker.unwrap_or(""), encoding);
+            // The upload-id markers are opaque ids, not keys: S3 does not encode them.
             leaf(w, "UploadIdMarker", upload_id_marker.unwrap_or(""));
             if page.truncated {
                 if let Some(next) = &page.next_cursor {
-                    leaf(w, "NextKeyMarker", next);
+                    leaf_enc(w, "NextKeyMarker", next, encoding);
                 }
                 // The upload-id half of the resume pair: S3 pages on (key, upload id), so a key
                 // whose uploads span the boundary continues mid-key only if BOTH markers
@@ -469,12 +581,13 @@ pub fn list_multipart_uploads_result(
                 }
             }
             if let Some(p) = prefix {
-                leaf(w, "Prefix", p);
+                leaf_enc(w, "Prefix", p, encoding);
             }
             if let Some(d) = delimiter {
-                leaf(w, "Delimiter", d);
+                leaf_enc(w, "Delimiter", d, encoding);
             }
             leaf(w, "MaxUploads", &max_uploads.to_string());
+            encoding_type_leaf(w, encoding);
             leaf(
                 w,
                 "IsTruncated",
@@ -483,7 +596,7 @@ pub fn list_multipart_uploads_result(
             for s in &page.items {
                 let owner_id = s.owner_id.to_string();
                 w.create_element("Upload").write_inner_content(|w| {
-                    leaf(w, "Key", s.key.as_str());
+                    leaf_enc(w, "Key", s.key.as_str(), encoding);
                     leaf(w, "UploadId", s.upload_id.as_str());
                     owner(w, &owner_id, &owner_id);
                     // S3 also nests an Initiator block mirroring the owner.
@@ -497,7 +610,7 @@ pub fn list_multipart_uploads_result(
                     Ok(())
                 })?;
             }
-            write_common_prefixes(w, &page.common_prefixes);
+            write_common_prefixes(w, &page.common_prefixes, encoding);
             Ok(())
         })
         .expect("infallible");

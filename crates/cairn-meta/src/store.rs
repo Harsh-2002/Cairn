@@ -417,8 +417,41 @@ fn wal_sidecar_path(db_path: &std::path::Path) -> std::path::PathBuf {
     std::path::PathBuf::from(name)
 }
 
-/// The efficient listing implementation: half-open range seek with delimiter skip-scan. The
-/// continuation cursor is an inclusive lower bound (the first key NOT yet returned).
+/// Turn an EXCLUSIVE resume marker into the inclusive lower bound to seek from.
+///
+/// The marker names the last *entry* the client saw. Under a delimiter that entry may be a
+/// rolled-up CommonPrefix rather than a key, and the whole group was then already returned — so the
+/// resume must jump PAST the group instead of landing on its first member, or every page boundary
+/// re-emits the group and pagination cannot advance.
+///
+/// The marker names a group exactly when it equals the CommonPrefix its own key would roll up to.
+/// Testing that (rather than "ends with the delimiter") keeps a legitimate *key* that happens to end
+/// in the delimiter — the classic `photos/` folder-marker object, listed under `prefix=photos/`
+/// where nothing rolls up — an ordinary exclusive key marker. Returns `None` when no finite bound
+/// exists above the group, meaning nothing can follow it.
+fn seek_after(prefix: &str, delimiter: Option<&str>, marker: &str) -> Option<String> {
+    if let Some(delim) = delimiter.filter(|d| !d.is_empty()) {
+        if let Some(rest) = marker.strip_prefix(prefix) {
+            if let Some(idx) = rest.find(delim) {
+                let cp = format!("{}{}{}", prefix, &rest[..idx], delim);
+                if cp == marker {
+                    return prefix_upper_bound(marker);
+                }
+            }
+        }
+    }
+    Some(successor(marker))
+}
+
+/// The efficient listing implementation: half-open range seek with delimiter skip-scan.
+///
+/// Two resume channels, with deliberately different semantics:
+/// * `cursor` is an INCLUSIVE lower bound (the first key not yet returned). It carries the opaque
+///   v2 continuation token and every internal paging loop, and — paired with `version_id_marker` —
+///   the S3 `key-marker`+`version-id-marker` pair, which resumes *within* a multi-version key.
+/// * `start_after` is EXCLUSIVE: it names the last entry the client already saw. It carries S3's
+///   `start-after` and `marker` (v1) and the unpaired `key-marker`, all of which S3 defines as
+///   "start listing AFTER this specified key".
 fn list_impl(
     conn: &Connection,
     bucket: &str,
@@ -429,7 +462,7 @@ fn list_impl(
     let upper = prefix_upper_bound(&prefix);
     let limit = query.limit.max(1) as usize;
 
-    // Inclusive lower bound = max(prefix, cursor, successor(start_after)).
+    // Inclusive lower bound = max(prefix, cursor, seek_after(start_after)).
     let mut seek = prefix.clone();
     if let Some(c) = &query.cursor {
         if c.as_str() > seek.as_str() {
@@ -437,9 +470,11 @@ fn list_impl(
         }
     }
     if let Some(sa) = &query.start_after {
-        let s = successor(sa);
-        if s > seek {
-            seek = s;
+        match seek_after(&prefix, query.delimiter.as_deref(), sa) {
+            Some(s) if s > seek => seek = s,
+            Some(_) => {}
+            // No finite bound above the marker's group: nothing can follow it.
+            None => return Ok(ListPage::default()),
         }
     }
 
@@ -486,15 +521,35 @@ fn list_impl(
                 if latest_only {
                     // Current-object listing (one row per key): resume at the first unreturned key.
                     page.next_cursor = Some(summary.key.as_str().to_owned());
-                } else if let Some(last) = page.items.last() {
-                    // Version listing: resume at the LAST RETURNED (key, version_id). The next page
-                    // re-seeks that key and the version-id marker skips the versions already
-                    // returned (`version_id >= marker`), so paging within a multi-version key is
-                    // gap-free and duplicate-free.
-                    page.next_cursor = Some(last.key.as_str().to_owned());
-                    page.next_version_id_marker = Some(last.version_id.as_str().to_owned());
                 } else {
-                    page.next_cursor = Some(summary.key.as_str().to_owned());
+                    // Version listing. Which entry ended the page? CommonPrefixes and keys
+                    // interleave in ONE ascending sequence (a group sorts at the position of its
+                    // first member), so the greater of the two tails is the later-emitted one.
+                    let last_item = page
+                        .items
+                        .last()
+                        .map(|i| (i.key.as_str().to_owned(), i.version_id.as_str().to_owned()));
+                    let last_cp = page.common_prefixes.last().cloned();
+                    let cp_ended_the_page = match (&last_item, &last_cp) {
+                        (Some((k, _)), Some(cp)) => cp.as_str() > k.as_str(),
+                        (None, Some(_)) => true,
+                        _ => false,
+                    };
+                    if cp_ended_the_page {
+                        // Ended on a rolled-up group: resume with a BARE key marker naming that
+                        // prefix. An unpaired marker is exclusive and skips the whole group (see
+                        // the `start_after` seek above), so no version under it is returned twice.
+                        page.next_cursor = last_cp;
+                    } else if let Some((key, version)) = last_item {
+                        // Ended on a key: resume at the LAST RETURNED (key, version_id). The next
+                        // page re-seeks that key and the version-id marker skips the versions
+                        // already returned (`version_id >= marker`), so paging within a
+                        // multi-version key is gap-free and duplicate-free.
+                        page.next_cursor = Some(key);
+                        page.next_version_id_marker = Some(version);
+                    } else {
+                        page.next_cursor = Some(summary.key.as_str().to_owned());
+                    }
                 }
                 break 'outer;
             }

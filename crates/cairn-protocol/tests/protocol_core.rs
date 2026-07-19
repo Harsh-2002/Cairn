@@ -2356,9 +2356,12 @@ async fn list_object_versions_pagination_round_trips() {
         "{body2}"
     );
 
-    // A marker the CLIENT synthesized (no version-id half) must be honored too. The store's seek
-    // is inclusive on the key, so vk2's own versions are returned by design — assert only that
-    // vk1 is skipped.
+    // A marker the CLIENT synthesized (no version-id half) must be honored too, and a BARE
+    // key-marker is EXCLUSIVE: S3 begins listing after that key, so naming vk1 skips ALL of vk1's
+    // versions and lands on vk2. (This block previously sent "vk2" and asserted vk2 came back,
+    // documenting the store's then-inclusive seek "by design" — that was bug B from
+    // conformance/listing.py, not a design choice. The paired-marker case, which must still resume
+    // *within* a key, is covered by list_object_versions_paired_marker_still_resumes_within_a_key.)
     let (st, _, body) = drain(
         send(
             &h.svc,
@@ -2366,7 +2369,7 @@ async fn list_object_versions_pagination_round_trips() {
                 Method::GET,
                 Some("verbkt"),
                 None,
-                &[("versions", ""), ("key-marker", "vk2")],
+                &[("versions", ""), ("key-marker", "vk1")],
                 &[],
                 vec![],
             ),
@@ -2379,7 +2382,7 @@ async fn list_object_versions_pagination_round_trips() {
     assert!(body3.contains("<Key>vk2</Key>"), "{body3}");
     assert!(
         !body3.contains("<Key>vk1</Key>"),
-        "a client-synthesized key-marker must be honored, got: {body3}"
+        "a bare key-marker is exclusive: naming vk1 must skip every vk1 version, got: {body3}"
     );
 }
 
@@ -8424,4 +8427,728 @@ async fn cors_actual_request_gets_response_headers() {
     )
     .await;
     assert_eq!(header(&hdrs, "access-control-allow-origin"), None);
+}
+
+// =================================================================================================
+// Listing marker semantics (conformance/listing.py). S3 defines `marker` (v1) and `start-after`
+// (v2) as the SAME exclusive parameter — "Amazon S3 starts listing AFTER this specified key" — and
+// v1's `NextMarker` as the LAST key the page returned. Cairn had both halves inverted: an inclusive
+// marker paired with a NextMarker naming the first key NOT returned. That pair is self-consistent,
+// so Cairn's own pagination loop was duplicate-free and the defect stayed invisible; a client
+// following the AWS contract (resume from the last key it saw) re-read one key per page boundary.
+// These tests pin BOTH halves, since moving only one skips or duplicates a key.
+// =================================================================================================
+
+/// Create `bucket` and PUT each key with a one-byte body.
+async fn seed_keys(h: &Harness, bucket: &str, keys: &[&str]) {
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some(bucket), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    for k in keys {
+        let (st, _, _) = drain(
+            send(
+                &h.svc,
+                req(Method::PUT, Some(bucket), Some(k), &[], &[], b"x".to_vec()),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+    }
+}
+
+/// GET the bucket listing with `query` and return the response body as a string.
+async fn list_body(h: &Harness, bucket: &str, query: &[(&str, &str)]) -> String {
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(Method::GET, Some(bucket), None, query, &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    String::from_utf8(body).unwrap()
+}
+
+/// Every `<Key>` in a listing body, in document order.
+fn keys_of(body: &str) -> Vec<String> {
+    body.match_indices("<Key>")
+        .map(|(i, _)| {
+            let rest = &body[i + "<Key>".len()..];
+            rest[..rest.find("</Key>").unwrap()].to_owned()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn v1_marker_is_exclusive_and_next_marker_is_the_last_key_returned() {
+    let h = harness().await;
+    let keys: Vec<String> = (0..10).map(|i| format!("k{i:02}")).collect();
+    let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+    seed_keys(&h, "v1mark", &refs).await;
+
+    // NextMarker names the LAST key of the page, not the first key withheld.
+    let page1 = list_body(&h, "v1mark", &[("max-keys", "3")]).await;
+    assert_eq!(keys_of(&page1), ["k00", "k01", "k02"]);
+    assert!(page1.contains("<IsTruncated>true</IsTruncated>"));
+    assert_eq!(
+        between(&page1, "<NextMarker>", "</NextMarker>"),
+        "k02",
+        "NextMarker is the last key returned, not the first one withheld: {page1}"
+    );
+
+    // `marker` is EXCLUSIVE: listing resumes strictly after the named key.
+    let after = list_body(&h, "v1mark", &[("marker", "k04")]).await;
+    assert_eq!(
+        keys_of(&after),
+        ["k05", "k06", "k07", "k08", "k09"],
+        "marker=k04 must start at k05"
+    );
+
+    // The sharpest evidence the old behavior was wrong: `marker` and its v2 sibling `start-after`
+    // are the same S3 parameter, so they must agree exactly.
+    let start_after = list_body(&h, "v1mark", &[("list-type", "2"), ("start-after", "k04")]).await;
+    assert_eq!(
+        keys_of(&after),
+        keys_of(&start_after),
+        "v1 marker and v2 start-after must agree on exclusivity"
+    );
+
+    // The whole loop still returns every key exactly once, in order — the property that must not
+    // regress while both halves move.
+    let mut seen: Vec<String> = Vec::new();
+    let mut marker: Option<String> = None;
+    for _ in 0..25 {
+        let body = match &marker {
+            Some(m) => list_body(&h, "v1mark", &[("max-keys", "3"), ("marker", m)]).await,
+            None => list_body(&h, "v1mark", &[("max-keys", "3")]).await,
+        };
+        seen.extend(keys_of(&body));
+        if !body.contains("<IsTruncated>true</IsTruncated>") {
+            break;
+        }
+        marker = Some(between(&body, "<NextMarker>", "</NextMarker>"));
+    }
+    assert_eq!(seen, keys, "v1 pagination returns every key exactly once");
+}
+
+#[tokio::test]
+async fn v1_delimiter_pagination_advances_past_a_common_prefix() {
+    let h = harness().await;
+    seed_keys(
+        &h,
+        "v1delim",
+        &[
+            "a/b/c1.txt",
+            "a/b/c2.txt",
+            "a/d.txt",
+            "b/e.txt",
+            "m::n",
+            "m::o",
+        ],
+    )
+    .await;
+
+    // The page is all CommonPrefixes, so NextMarker is the last PREFIX — the last entry returned in
+    // result order, keys and prefixes interleaved.
+    let page1 = list_body(&h, "v1delim", &[("delimiter", "/"), ("max-keys", "2")]).await;
+    assert!(page1.contains("<Prefix>a/</Prefix>") && page1.contains("<Prefix>b/</Prefix>"));
+    assert!(page1.contains("<IsTruncated>true</IsTruncated>"));
+    let next = between(&page1, "<NextMarker>", "</NextMarker>");
+    assert_eq!(next, "b/", "NextMarker is the last CommonPrefix returned");
+
+    // Resuming from a prefix marker must skip the WHOLE group, not land on its first member —
+    // otherwise `b/` is re-emitted every page and the listing never advances.
+    let page2 = list_body(
+        &h,
+        "v1delim",
+        &[
+            ("delimiter", "/"),
+            ("max-keys", "2"),
+            ("marker", next.as_str()),
+        ],
+    )
+    .await;
+    assert_eq!(keys_of(&page2), ["m::n", "m::o"], "got: {page2}");
+    assert!(
+        !page2.contains("<Prefix>b/</Prefix>"),
+        "the grouped prefix must not repeat: {page2}"
+    );
+}
+
+#[tokio::test]
+async fn start_after_naming_a_real_key_that_ends_in_the_delimiter_is_not_a_group_skip() {
+    let h = harness().await;
+    // `photos/` is a real (folder-marker) object here, and under `prefix=photos/` nothing rolls up,
+    // so it is an ordinary key marker. Treating any marker that merely ENDS in the delimiter as a
+    // group would swallow `photos/a.jpg`.
+    seed_keys(&h, "folder", &["photos/", "photos/a.jpg", "photos/b.jpg"]).await;
+    let body = list_body(
+        &h,
+        "folder",
+        &[
+            ("list-type", "2"),
+            ("prefix", "photos/"),
+            ("delimiter", "/"),
+            ("start-after", "photos/"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        keys_of(&body),
+        ["photos/a.jpg", "photos/b.jpg"],
+        "a key marker that ends in the delimiter is not a group: {body}"
+    );
+}
+
+#[tokio::test]
+async fn list_object_versions_bare_key_marker_is_exclusive() {
+    let h = harness().await;
+    seed_keys(&h, "vermark", &["v1", "v2", "v3"]).await;
+
+    // A bare `key-marker` (no version-id-marker) begins the results AFTER that key.
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("vermark"),
+                None,
+                &[("versions", ""), ("key-marker", "v1")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let body = String::from_utf8(body).unwrap();
+    assert_eq!(
+        keys_of(&body),
+        ["v2", "v3"],
+        "a bare key-marker is exclusive: {body}"
+    );
+}
+
+#[tokio::test]
+async fn list_object_versions_paired_marker_still_resumes_within_a_key() {
+    let h = harness().await;
+    versioned_bucket(&h, "verpair").await;
+    // Three versions of ONE key: paging must resume INSIDE the key, which is exactly what the
+    // key-marker + version-id-marker PAIR means — and why the bare form's exclusivity must not
+    // leak into it.
+    for _ in 0..3 {
+        drain(
+            send(
+                &h.svc,
+                req(
+                    Method::PUT,
+                    Some("verpair"),
+                    Some("k"),
+                    &[],
+                    &[],
+                    b"x".to_vec(),
+                ),
+            )
+            .await,
+        )
+        .await;
+    }
+
+    let page1 = list_body(&h, "verpair", &[("versions", ""), ("max-keys", "2")]).await;
+    assert_eq!(keys_of(&page1).len(), 2, "page 1 holds two versions");
+    let key_marker = between(&page1, "<NextKeyMarker>", "</NextKeyMarker>");
+    let vid_marker = between(&page1, "<NextVersionIdMarker>", "</NextVersionIdMarker>");
+    assert_eq!(key_marker, "k");
+    assert!(!vid_marker.is_empty(), "the paired marker is emitted");
+
+    let page2 = list_body(
+        &h,
+        "verpair",
+        &[
+            ("versions", ""),
+            ("max-keys", "2"),
+            ("key-marker", key_marker.as_str()),
+            ("version-id-marker", vid_marker.as_str()),
+        ],
+    )
+    .await;
+    assert_eq!(
+        keys_of(&page2).len(),
+        1,
+        "the paired marker resumes WITHIN the key, returning its last version: {page2}"
+    );
+}
+
+/// An undecodable continuation token must be rejected, never folded into "no token": collapsing
+/// invalid to absent silently restarts the listing at page 1, so a paginating consumer whose token
+/// got truncated re-processes the bucket forever instead of failing.
+#[tokio::test]
+async fn undecodable_continuation_token_is_invalid_argument() {
+    let h = harness().await;
+    seed_keys(&h, "badtok", &["a", "b", "c"]).await;
+
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("badtok"),
+                None,
+                &[
+                    ("list-type", "2"),
+                    ("continuation-token", "!!!not-base64!!!"),
+                ],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "got: {st}");
+    let body = String::from_utf8(body).unwrap();
+    assert!(body.contains("<Code>InvalidArgument</Code>"), "{body}");
+    assert!(
+        !body.contains("<Key>a</Key>"),
+        "a bad token must not silently restart the listing: {body}"
+    );
+}
+
+#[tokio::test]
+async fn list_objects_v2_echoes_start_after() {
+    let h = harness().await;
+    seed_keys(&h, "echosa", &["k1", "k2", "k3"]).await;
+    let body = list_body(&h, "echosa", &[("list-type", "2"), ("start-after", "k1")]).await;
+    assert!(
+        body.contains("<StartAfter>k1</StartAfter>"),
+        "S3 echoes StartAfter: {body}"
+    );
+    // Absent start-after emits no element at all.
+    let body = list_body(&h, "echosa", &[("list-type", "2")]).await;
+    assert!(!body.contains("<StartAfter>"), "{body}");
+}
+
+/// `max-parts=0` must not advertise a page the client can never leave: `LIMIT 0+1` marks the page
+/// truncated while the page itself is emptied, so `IsTruncated=true` ships with no
+/// NextPartNumberMarker and a client looping on IsTruncated spins or restarts at part 1.
+#[tokio::test]
+async fn list_parts_max_parts_zero_is_not_an_unterminable_page() {
+    let h = harness().await;
+    let (upload_id, _) = start_upload_with_part(&h, "mpzero", "obj.bin").await;
+
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("mpzero"),
+                Some("obj.bin"),
+                &[("uploadId", upload_id.as_str()), ("max-parts", "0")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let body = String::from_utf8(body).unwrap();
+    assert!(
+        !body.contains("<Part>"),
+        "max-parts=0 returns no parts: {body}"
+    );
+    assert!(
+        !body.contains("<IsTruncated>true</IsTruncated>")
+            || body.contains("<NextPartNumberMarker>"),
+        "truncated with no marker is unterminable: {body}"
+    );
+
+    // The same strict parse the other page-size parameters get.
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("mpzero"),
+                Some("obj.bin"),
+                &[("uploadId", upload_id.as_str()), ("max-parts", "abc")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    assert!(
+        String::from_utf8(body)
+            .unwrap()
+            .contains("<Code>InvalidArgument</Code>")
+    );
+}
+
+/// A version-scoped DELETE must report WHICH version it removed and whether that version was a
+/// delete marker. Without both headers a client cannot confirm that the canonical undelete (DELETE
+/// the delete marker and the object comes back) removed a marker rather than a data version.
+#[tokio::test]
+async fn version_scoped_delete_reports_delete_marker_and_version_id() {
+    let h = harness().await;
+    versioned_bucket(&h, "delhdr").await;
+    let (st, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("delhdr"),
+                Some("obj"),
+                &[],
+                &[],
+                b"data".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let data_version = header(&hdrs, "x-amz-version-id").unwrap().to_owned();
+
+    // A plain DELETE creates a delete marker (this branch already set both headers).
+    let (st, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::DELETE,
+                Some("delhdr"),
+                Some("obj"),
+                &[],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    assert_eq!(header(&hdrs, "x-amz-delete-marker"), Some("true"));
+    let marker_version = header(&hdrs, "x-amz-version-id").unwrap().to_owned();
+
+    // THE UNDELETE: removing the marker by version id must report that a MARKER was removed.
+    let (st, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::DELETE,
+                Some("delhdr"),
+                Some("obj"),
+                &[("versionId", marker_version.as_str())],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    assert_eq!(
+        header(&hdrs, "x-amz-delete-marker"),
+        Some("true"),
+        "the version removed WAS a delete marker"
+    );
+    assert_eq!(
+        header(&hdrs, "x-amz-version-id"),
+        Some(marker_version.as_str()),
+        "the response names the version removed"
+    );
+
+    // Removing a real data version reports the same two headers, with the flag FALSE — the
+    // distinction the client is asking for.
+    let (st, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::DELETE,
+                Some("delhdr"),
+                Some("obj"),
+                &[("versionId", data_version.as_str())],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    assert_eq!(
+        header(&hdrs, "x-amz-delete-marker"),
+        Some("false"),
+        "a data version is not a delete marker"
+    );
+    assert_eq!(
+        header(&hdrs, "x-amz-version-id"),
+        Some(data_version.as_str())
+    );
+}
+
+/// Part ordering is a property of the request document alone and S3 validates it first. With the
+/// checks interleaved, parts [(2, small), (1, small)] passed the ordering test at entry 0 and then
+/// tripped the undersized test there — reporting EntityTooSmall for a request whose actual defect
+/// is the ordering the client must fix first.
+#[tokio::test]
+async fn complete_multipart_reports_invalid_part_order_before_entity_too_small() {
+    let h = harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("mporder"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::POST,
+                Some("mporder"),
+                Some("obj.bin"),
+                &[("uploads", "")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let upload_id = between(
+        &String::from_utf8(body).unwrap(),
+        "<UploadId>",
+        "</UploadId>",
+    );
+
+    // Two SMALL parts: each would independently trip the 5 MiB non-final-part rule.
+    let mut etags = Vec::new();
+    for pn in ["1", "2"] {
+        let (st, hdrs, _) = drain(
+            send(
+                &h.svc,
+                req(
+                    Method::PUT,
+                    Some("mporder"),
+                    Some("obj.bin"),
+                    &[("uploadId", upload_id.as_str()), ("partNumber", pn)],
+                    &[],
+                    b"tiny".to_vec(),
+                ),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        etags.push(header(&hdrs, "etag").unwrap().to_owned());
+    }
+
+    // Ask for them BACKWARDS. Both defects are present; S3 reports the ordering one.
+    let xml = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>2</PartNumber><ETag>{}</ETag></Part>\
+         <Part><PartNumber>1</PartNumber><ETag>{}</ETag></Part></CompleteMultipartUpload>",
+        etags[1], etags[0]
+    );
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::POST,
+                Some("mporder"),
+                Some("obj.bin"),
+                &[("uploadId", upload_id.as_str())],
+                &[],
+                xml.into_bytes(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let body = String::from_utf8(body).unwrap();
+    assert!(
+        body.contains("<Code>InvalidPartOrder</Code>"),
+        "ordering is reported before size, got: {body}"
+    );
+}
+
+/// PR #1 stripped the `aws-chunked` TRANSFER coding from the stored `content-encoding` on the PUT
+/// path; the copy path kept its own header read and was missed. A stored `aws-chunked` makes every
+/// later GET advertise a coding the response does not use.
+#[tokio::test]
+async fn copy_object_strips_aws_chunked_from_stored_content_encoding() {
+    let h = harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("cpenc"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("cpenc"),
+                Some("src"),
+                &[],
+                &[],
+                b"payload".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("cpenc"),
+                Some("dst"),
+                &[],
+                &[
+                    ("x-amz-copy-source", "/cpenc/src"),
+                    ("x-amz-metadata-directive", "REPLACE"),
+                    ("content-encoding", "aws-chunked,gzip"),
+                ],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let (st, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(Method::GET, Some("cpenc"), Some("dst"), &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        header(&hdrs, "content-encoding"),
+        Some("gzip"),
+        "the transfer coding is stripped, the real coding kept"
+    );
+}
+
+/// RFC 7233: "If the selected representation is zero length, the byte-range-spec is unsatisfiable."
+/// A suffix range selecting no bytes is equally unsatisfiable. Both answered 206 with a
+/// self-contradictory `bytes 0-0/0` Content-Range before the fix.
+#[tokio::test]
+async fn suffix_range_selecting_no_bytes_is_invalid_range() {
+    let h = harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("rng"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("rng"),
+                Some("empty.bin"),
+                &[],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("rng"),
+                Some("full.bin"),
+                &[],
+                &[],
+                b"abcdefghij".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+
+    // Any suffix against a zero-length representation.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("rng"),
+                Some("empty.bin"),
+                &[],
+                &[("range", "bytes=-5")],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::RANGE_NOT_SATISFIABLE, "suffix on empty");
+
+    // A zero-length suffix against a non-empty object.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("rng"),
+                Some("full.bin"),
+                &[],
+                &[("range", "bytes=-0")],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::RANGE_NOT_SATISFIABLE, "bytes=-0");
+
+    // The satisfiable suffix still works — the fix must not over-reject.
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("rng"),
+                Some("full.bin"),
+                &[],
+                &[("range", "bytes=-3")],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(body, b"hij");
 }

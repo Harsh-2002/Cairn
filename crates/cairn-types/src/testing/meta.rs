@@ -236,9 +236,34 @@ fn page_rows(
         .as_deref()
         .zip(q.cursor.as_deref())
         .map(|(vid, key)| (key.to_owned(), vid.to_owned()));
+    // An exclusive marker that names a rolled-up CommonPrefix excludes that WHOLE group, not just
+    // the marker string: the group was already returned in full, so resuming inside it would
+    // re-emit it forever. The marker names a group exactly when it equals the CommonPrefix its own
+    // key would roll up to — which keeps a real key that merely ends in the delimiter an ordinary
+    // key marker. Mirrors `seek_after` in cairn-meta/cairn-meta-async; the three engines MUST agree
+    // on marker semantics or a protocol test passes against this double while production differs.
+    // Derived from `start_after` ALONE, never the cursor: both SQL engines gate the group skip on
+    // the exclusive channel only, leaving `cursor` on the plain inclusive seek. Reading it from
+    // `after` (cursor OR start_after) would make a PAIRED `key-marker`/`version-id-marker` naming a
+    // group — or a v2 token whose cursor is exactly a group prefix — filter that whole group away
+    // here while production returns it.
+    let after_group: Option<String> = q.start_after.as_deref().and_then(|a| {
+        let delim = q.delimiter.as_deref().filter(|d| !d.is_empty())?;
+        let rest = a.strip_prefix(prefix.as_str())?;
+        let idx = rest.find(delim)?;
+        if format!("{}{}{}", prefix, &rest[..idx], delim) == a {
+            Some(a.to_owned())
+        } else {
+            None
+        }
+    });
     let mut ordered: Vec<&ObjectVersionRow> = rows
         .into_iter()
         .filter(|r| r.key.as_str().starts_with(&prefix))
+        .filter(|r| match &after_group {
+            Some(g) => !r.key.as_str().starts_with(g.as_str()),
+            None => true,
+        })
         .filter(|r| match (&after, &vid_marker) {
             // When a version-id marker is in play, the marker key itself is not excluded by the
             // key cursor; its post-marker versions resume below.
@@ -260,19 +285,42 @@ fn page_rows(
             .then_with(|| b.version_id.as_str().cmp(a.version_id.as_str()))
     });
 
-    let mut page = ListPage::default();
+    // Annotated rather than inferred: `T` would otherwise stay open until the return statement,
+    // and the `page.items.last().map(..)` closure below needs the element type before then.
+    let mut page: ListPage<ObjectSummary> = ListPage::default();
     let mut seen_cp: HashSet<String> = HashSet::new();
     let limit = q.limit.max(1) as usize;
     let mut last_key: Option<String> = None;
-    let mut last_version: Option<String> = None;
 
     for r in ordered {
         let count = page.items.len() + page.common_prefixes.len();
         if count >= limit {
             page.truncated = true;
-            page.next_cursor = last_key.clone();
             if version_listing {
-                page.next_version_id_marker = last_version.clone();
+                // Mirror the real stores: the resume marker names the last ENTRY returned. Keys and
+                // CommonPrefixes interleave in one ascending sequence (a group sorts at the position
+                // of its first member), so the greater of the two tails is the later-emitted one.
+                let last_item = page
+                    .items
+                    .last()
+                    .map(|i| (i.key.as_str().to_owned(), i.version_id.as_str().to_owned()));
+                let last_cp = page.common_prefixes.last().cloned();
+                let cp_ended_the_page = match (&last_item, &last_cp) {
+                    (Some((k, _)), Some(cp)) => cp.as_str() > k.as_str(),
+                    (None, Some(_)) => true,
+                    _ => false,
+                };
+                if cp_ended_the_page {
+                    // A bare (unpaired) prefix marker: exclusive, and skips the whole group.
+                    page.next_cursor = last_cp;
+                } else if let Some((key, version)) = last_item {
+                    page.next_cursor = Some(key);
+                    page.next_version_id_marker = Some(version);
+                } else {
+                    page.next_cursor = last_key.clone();
+                }
+            } else {
+                page.next_cursor = last_key.clone();
             }
             break;
         }
@@ -290,7 +338,6 @@ fn page_rows(
         }
         page.items.push(summarize(r));
         last_key = Some(r.key.as_str().to_owned());
-        last_version = Some(r.version_id.as_str().to_owned());
     }
     page
 }

@@ -208,11 +208,18 @@ pub enum Error {
     /// The request signature did not match.
     #[error("signature does not match")]
     SignatureDoesNotMatch,
+    /// The request's signed timestamp fell outside the allowed clock-skew window. Distinct from a
+    /// generic bad argument: SDKs key their clock-resync-and-retry logic off exactly this S3 code,
+    /// so it must not be folded into `InvalidArgument`.
+    #[error("The difference between the request time and the current time is too large")]
+    RequestTimeTooSkewed,
     /// The requested byte range is not satisfiable.
     #[error("invalid range")]
     InvalidRange,
-    /// The requested operation is not implemented.
-    #[error("not implemented")]
+    /// The requested operation is not implemented. This message reaches the client verbatim (it is
+    /// a client-facing capability answer, not an internal fault — see `error_map::error_response`),
+    /// so it is phrased for an operator reading it out of an SDK exception.
+    #[error("The requested operation is not implemented by this server")]
     NotImplemented,
     /// An ACL was supplied for a bucket whose Object Ownership disables ACLs.
     #[error("The bucket does not allow ACLs")]
@@ -290,9 +297,7 @@ impl From<AuthError> for Error {
             AuthError::SignatureMismatch | AuthError::ChunkSignatureMismatch => {
                 Error::SignatureDoesNotMatch
             }
-            AuthError::SkewedClock => {
-                Error::InvalidArgument("request timestamp outside skew window".to_owned())
-            }
+            AuthError::SkewedClock => Error::RequestTimeTooSkewed,
             AuthError::Expired => Error::AccessDenied,
         }
     }
@@ -313,5 +318,30 @@ mod tests {
             Error::from(MetaError::Conflict),
             Error::Internal(_)
         ));
+    }
+
+    #[test]
+    fn skewed_clock_is_its_own_variant() {
+        // A stale/future signed date is a distinct S3 condition (403 RequestTimeTooSkewed), not a
+        // generic 400 InvalidArgument: SDKs resync their clock and retry off that code alone.
+        assert!(matches!(
+            Error::from(AuthError::SkewedClock),
+            Error::RequestTimeTooSkewed
+        ));
+    }
+
+    #[test]
+    fn not_implemented_message_is_client_facing() {
+        // The 501 message is rendered verbatim to the client, so it must read as a permanent
+        // capability answer and must never look like a retryable internal fault. Asserting the
+        // DESCRIPTIVE shape, not merely the substring "not implemented" — the terse pre-fix
+        // message satisfied that and this test would have passed without the fix.
+        let m = Error::NotImplemented.to_string();
+        assert!(m.contains("not implemented"), "{m}");
+        assert!(!m.to_lowercase().contains("internal error"), "{m}");
+        assert!(
+            m.contains("requested operation") && m.contains("server"),
+            "the 501 body must name what was refused and by whom, got: {m}"
+        );
     }
 }
