@@ -34,6 +34,11 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   dangling row. Parses each synchronous CLI's stdout counts — **never sleeps.**
 
 ## regression / limit (where does it break?)
+- `routing.sh` (+`.py`) — **routing fall-through** (audit 2026-07, boto3 + hand-signed raw requests):
+  a PRESENT-BUT-INVALID segment must be rejected (400), never collapsed to `None` and re-routed to
+  the bucket/root handler — `DELETE /b/<1025-byte key>` destroyed an empty bucket, `GET` of the same
+  returned a `ListBucketResult`, `/UPPERCASE` reached ListBuckets. Also pins unhandled
+  `?subresource` → 501 (ARCH 13). Asserts exact status codes and that bucket + canary survive.
 - `replication_chaos.sh` (+`.py`) — break replication on purpose (target down, source SIGKILL); no loss.
 - `crash_multipoint.sh` (+`.py`) — crash at every blob-commit seam (PUT + multipart); reconcile reclaims.
 - `concurrency.sh` (+`.py`) — N clients race one key (create / CAS / last-writer); atomic, no corruption.
