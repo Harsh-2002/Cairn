@@ -1226,7 +1226,14 @@ impl MetadataStore for InMemoryMetadataStore {
     ) -> Result<ListPage<MultipartSession>, MetaError> {
         let st = self.state.lock().unwrap();
         let prefix = query.prefix.clone().unwrap_or_default();
-        let after = query.cursor.as_deref();
+        // S3 pages this listing on the (key-marker, upload-id-marker) PAIR — mirror the SQL
+        // engines exactly: key-marker alone skips that key, the pair resumes mid-key. The
+        // `> prefix` filter is load-bearing parity: both SQL engines seek from
+        // `key_marker.unwrap_or(prefix)`, so a marker at or below the prefix must be ignored
+        // rather than narrow the page (a marker EQUAL to the prefix would otherwise drop an
+        // upload whose key is exactly the prefix here but keep it in production).
+        let key_marker = query.cursor.as_deref().filter(|c| *c > prefix.as_str());
+        let upload_marker = key_marker.and(query.version_id_marker.as_deref());
         let mut items: Vec<MultipartSession> = st
             .multipart
             .values()
@@ -1234,7 +1241,11 @@ impl MetadataStore for InMemoryMetadataStore {
                 s.bucket.as_str() == bucket.as_str()
                     && s.status == MultipartStatus::Active
                     && s.key.as_str().starts_with(&prefix)
-                    && after.is_none_or(|c| s.key.as_str() > c)
+                    && match (key_marker, upload_marker) {
+                        (None, _) => true,
+                        (Some(km), None) => s.key.as_str() > km,
+                        (Some(km), Some(uim)) => (s.key.as_str(), s.upload_id.as_str()) > (km, uim),
+                    }
             })
             .cloned()
             .collect();
@@ -1247,16 +1258,19 @@ impl MetadataStore for InMemoryMetadataStore {
         let limit = query.limit.max(1) as usize;
         let truncated = items.len() > limit;
         items.truncate(limit);
-        let next_cursor = if truncated {
-            items.last().map(|s| s.key.as_str().to_owned())
-        } else {
-            None
+        // The next page resumes strictly after the last returned (key, upload id).
+        let (next_cursor, next_upload_marker) = match (truncated, items.last()) {
+            (true, Some(s)) => (
+                Some(s.key.as_str().to_owned()),
+                Some(s.upload_id.as_str().to_owned()),
+            ),
+            _ => (None, None),
         };
         Ok(ListPage {
             items,
             common_prefixes: Vec::new(),
             next_cursor,
-            next_version_id_marker: None,
+            next_version_id_marker: next_upload_marker,
             truncated,
         })
     }

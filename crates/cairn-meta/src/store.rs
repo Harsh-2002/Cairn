@@ -911,44 +911,65 @@ impl MetadataStore for SqliteMetadataStore {
         self.with_read(move |conn| {
             let prefix = q.prefix.clone().unwrap_or_default();
             let upper = prefix_upper_bound(&prefix);
-            // Resume strictly after the cursor key when one is supplied; otherwise seek to the
-            // half-open prefix lower bound.
-            let seek = match &q.cursor {
-                Some(c) if c.as_str() > prefix.as_str() => c.clone(),
-                _ => prefix.clone(),
-            };
+            // S3 pages this listing on the (key-marker, upload-id-marker) PAIR, and rows sort by
+            // (key, upload id) — `id` IS the upload id. A key-marker alone skips that key entirely
+            // ("only keys lexicographically greater than the marker are listed"); paired with an
+            // upload-id-marker it resumes mid-key, which is the only way past a key holding more
+            // than `max-uploads` concurrent sessions.
+            let key_marker = q
+                .cursor
+                .as_deref()
+                .filter(|c| *c > prefix.as_str())
+                .map(str::to_owned);
+            let upload_marker = key_marker.as_ref().and(q.version_id_marker.clone());
+            // Inclusive lower bound for the index seek; the tuple predicate below does the exclusion.
+            let seek = key_marker.clone().unwrap_or_else(|| prefix.clone());
             let limit = q.limit.max(1) as usize;
             // Half-open `prefix_upper_bound` seek like the other listings, fetching one extra row to
             // detect truncation.
             let mut sql = String::from(
                 "SELECT * FROM multipart_uploads WHERE bucket_name=?1 AND status='active' AND key>=?2",
             );
-            if upper.is_some() {
-                sql.push_str(" AND key<?3");
+            let mut args: Vec<rusqlite::types::Value> = vec![b.into(), seek.into()];
+            if let Some(ub) = &upper {
+                args.push(ub.clone().into());
+                sql.push_str(&format!(" AND key<?{}", args.len()));
             }
-            sql.push_str(" ORDER BY key, id LIMIT ?4");
+            match (&key_marker, &upload_marker) {
+                (Some(km), Some(uim)) => {
+                    args.push(km.clone().into());
+                    let i = args.len();
+                    args.push(uim.clone().into());
+                    let j = args.len();
+                    sql.push_str(&format!(" AND (key>?{i} OR (key=?{i} AND id>?{j}))"));
+                }
+                (Some(km), None) => {
+                    args.push(km.clone().into());
+                    sql.push_str(&format!(" AND key>?{}", args.len()));
+                }
+                (None, _) => {}
+            }
+            args.push(((limit + 1) as i64).into());
+            sql.push_str(&format!(" ORDER BY key, id LIMIT ?{}", args.len()));
             let mut stmt = conn.prepare_cached(&sql).map_err(engine_err)?;
-            let batch = (limit + 1) as i64;
-            let rows = if let Some(ub) = &upper {
-                stmt.query_map(params![b, seek, ub, batch], model::multipart_from_row)
-            } else {
-                stmt.query_map(
-                    params![b, seek, rusqlite::types::Null, batch],
-                    model::multipart_from_row,
-                )
-            }
-            .map_err(engine_err)?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(engine_err)?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(args), model::multipart_from_row)
+                .map_err(engine_err)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(engine_err)?;
             let mut items: Vec<MultipartSession> = rows;
             let truncated = items.len() > limit;
             items.truncate(limit);
-            let next_cursor = if truncated {
-                items.last().map(|s| s.key.as_str().to_owned())
-            } else {
-                None
+            // The next page resumes strictly after the last returned (key, upload id), so paging
+            // within a multi-upload key is gap-free and duplicate-free.
+            let (next_cursor, next_upload_marker) = match (truncated, items.last()) {
+                (true, Some(s)) => (
+                    Some(s.key.as_str().to_owned()),
+                    Some(s.upload_id.as_str().to_owned()),
+                ),
+                _ => (None, None),
             };
-            Ok(ListPage { items, common_prefixes: Vec::new(), next_cursor, next_version_id_marker: None, truncated })
+            Ok(ListPage { items, common_prefixes: Vec::new(), next_cursor, next_version_id_marker: next_upload_marker, truncated })
         })
         .await
     }

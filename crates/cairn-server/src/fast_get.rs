@@ -290,7 +290,11 @@ pub async fn try_sendfile_get(
             Some((p, q)) => (p.to_owned(), q.to_owned()),
             None => (head.target.clone(), String::new()),
         };
-        let (bucket, key) = route_path(&path);
+        // An unparseable bucket/key is not a fast-path GET; hand the buffered head to hyper, which
+        // renders the proper 400 through the normal adapter path.
+        let Ok((bucket, key)) = route_path(&path) else {
+            return fallback(stream, buf, "not_object");
+        };
         if bucket.is_none() || key.is_none() {
             return fallback(stream, buf, "not_object");
         }

@@ -610,6 +610,64 @@ async fn multipart_lifecycle_parity() {
             .unwrap();
         assert_eq!(active.items.len(), 1);
 
+        // Audit 2026-07: paging on the (key-marker, upload-id-marker) PAIR must behave identically
+        // in both engines, including within a single key. Add a second session on the SAME key so
+        // a key-only marker could never advance past it.
+        let upload2 = UploadId::from_string("upload-2".into());
+        s.submit(Mutation::CreateMultipart(Box::new(MultipartSession {
+            upload_id: upload2.clone(),
+            bucket: bk.clone(),
+            key: ObjectKey::parse("big").unwrap(),
+            content_type: "application/octet-stream".to_owned(),
+            status: MultipartStatus::Active,
+            owner_id: UserId("owner".to_owned()),
+            intended_acl: None,
+            user_metadata: Vec::new(),
+            sse_requested: false,
+            created_at: Timestamp(1),
+            updated_at: Timestamp(1),
+        })))
+        .await
+        .unwrap();
+        let page1 = s
+            .list_multipart_uploads(
+                &bk,
+                &ListQuery {
+                    limit: 1,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(page1.truncated);
+        assert_eq!(page1.items.len(), 1);
+        assert_eq!(page1.next_cursor.as_deref(), Some("big"));
+        assert_eq!(
+            page1.next_version_id_marker.as_deref(),
+            Some(page1.items[0].upload_id.as_str()),
+            "the upload-id half of the resume pair must be emitted"
+        );
+        let page2 = s
+            .list_multipart_uploads(
+                &bk,
+                &ListQuery {
+                    cursor: page1.next_cursor.clone(),
+                    version_id_marker: page1.next_version_id_marker.clone(),
+                    limit: 1,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(page2.items.len(), 1);
+        assert_ne!(
+            page2.items[0].upload_id, page1.items[0].upload_id,
+            "the pair must resume mid-key, not re-serve page 1"
+        );
+        assert!(!page2.truncated);
+        // Clean up so the rest of the lifecycle assertions see only `upload`.
+        s.submit(Mutation::AbortMultipart(upload2)).await.unwrap();
+
         // Claim then complete.
         let claim = s
             .submit(Mutation::ClaimMultipart(upload.clone()))

@@ -16,7 +16,7 @@ use cairn_protocol::{S3Body, S3Request, S3Response, error_response};
 use cairn_types::auth::{AuthMethod, AuthOutcome, Principal, RequestView, Role};
 use cairn_types::crypto::Nonce;
 use cairn_types::error::{BodyError, Error};
-use cairn_types::id::{BucketName, ObjectKey, UserId, VersionId};
+use cairn_types::id::{BucketName, InvalidName, MAX_KEY_LEN, ObjectKey, UserId, VersionId};
 use cairn_types::meta::{ActivityEntry, Mutation, ShareDisposition, ShareRow};
 use cairn_types::time::Timestamp;
 use cairn_types::traits::{Clock, Crypto};
@@ -257,7 +257,13 @@ pub async fn handle(
     // Virtual-host-style addressing (ARCH 13.1): when `CAIRN_S3_DOMAIN` is configured and the
     // request Host is `<bucket>.<s3_domain>`, the bucket is taken from the Host and the entire path
     // is the key. Otherwise fall back to path-style routing (`/<bucket>/<key>`).
-    let (bucket, key) = route_request(stack.s3_domain.as_deref(), &host, &raw_path);
+    // A malformed bucket/key must be REJECTED here, not silently dropped: a `None` segment is how
+    // `dispatch` decides an operation is bucket- or root-level, so an unparseable key would re-route
+    // an object request to the bucket handler (audit 2026-07).
+    let (bucket, key) = match route_request(stack.s3_domain.as_deref(), &host, &raw_path) {
+        Ok(bk) => bk,
+        Err(e) => return render(error_response(&e, &raw_path, &request_id)),
+    };
     let query = parse_query(&query_str);
     let body = incoming_to_stream(req.into_body());
 
@@ -948,19 +954,27 @@ async fn crypto_status_response(
 /// key (ARCH 13.1). Any other Host — including a bare `<s3_domain>` with no bucket label, or a Host
 /// that is not under the domain — falls through to path-style [`route_path`]. With `s3_domain`
 /// `None`, routing is always path-style.
+///
+/// # Errors
+/// [`Error::InvalidArgument`] when a segment is present but unparseable — on the virtual-host path
+/// that is the key (the whole request path), which suffered the same lossy `.ok()` collapse as
+/// [`route_path`] and let an over-long key re-route to the bucket handler (audit 2026-07). A Host
+/// whose leading label is not a valid bucket name is *not* an error: it simply is not a Cairn
+/// virtual-host request and falls through to path-style.
 pub(crate) fn route_request(
     s3_domain: Option<&str>,
     host: &str,
     raw_path: &str,
-) -> (Option<BucketName>, Option<ObjectKey>) {
+) -> Result<(Option<BucketName>, Option<ObjectKey>), Error> {
     if let Some(domain) = s3_domain {
         if let Some(bucket) = vhost_bucket(host, domain) {
             if let Ok(b) = BucketName::parse(&bucket) {
-                let key = raw_path.strip_prefix('/').unwrap_or(raw_path).to_owned();
-                let key = (!key.is_empty())
-                    .then(|| ObjectKey::parse(&pct_decode(&key)).ok())
-                    .flatten();
-                return (Some(b), key);
+                let key = raw_path.strip_prefix('/').unwrap_or(raw_path);
+                let key = match (!key.is_empty()).then_some(key) {
+                    Some(k) => Some(parse_key(&pct_decode(k))?),
+                    None => None,
+                };
+                return Ok((Some(b), key));
             }
         }
     }
@@ -984,20 +998,51 @@ fn vhost_bucket(host: &str, domain: &str) -> Option<String> {
 }
 
 /// Split a path-style request path into a bucket and key.
-pub(crate) fn route_path(raw_path: &str) -> (Option<BucketName>, Option<ObjectKey>) {
+///
+/// A segment that is **present but invalid** is a third state, distinct from *absent*, and is
+/// returned as an error rather than collapsed into `None`: `None` means "the request names no
+/// bucket/key", which is what steers `dispatch` to the bucket-level (or root-level) operation.
+/// Collapsing an invalid segment let `DELETE /b/<1025-byte-key>` re-route to **DeleteBucket** and
+/// destroy the bucket, and `GET /UPPERCASE/k` re-route to ListBuckets (audit 2026-07).
+///
+/// # Errors
+/// [`Error::InvalidArgument`] (400 `InvalidArgument`) when the bucket segment is not a valid
+/// bucket name or the key segment is not a valid object key.
+pub(crate) fn route_path(raw_path: &str) -> Result<(Option<BucketName>, Option<ObjectKey>), Error> {
     let p = raw_path.strip_prefix('/').unwrap_or(raw_path);
     if p.is_empty() {
-        return (None, None);
+        return Ok((None, None));
     }
     let (bucket_seg, key_rest) = match p.split_once('/') {
         Some((b, k)) => (b, Some(k)),
         None => (p, None),
     };
-    let bucket = BucketName::parse(&pct_decode(bucket_seg)).ok();
-    let key = key_rest
-        .filter(|k| !k.is_empty())
-        .and_then(|k| ObjectKey::parse(&pct_decode(k)).ok());
-    (bucket, key)
+    let bucket = BucketName::parse(&pct_decode(bucket_seg)).map_err(invalid_bucket)?;
+    // An EMPTY key segment (`/bucket/`) is genuinely absent — S3 treats it as a bucket-level
+    // request — so it is filtered out before parsing rather than rejected.
+    let key = match key_rest.filter(|k| !k.is_empty()) {
+        Some(k) => Some(parse_key(&pct_decode(k))?),
+        None => None,
+    };
+    Ok((Some(bucket), key))
+}
+
+/// Map a rejected bucket segment onto the wire error. AWS answers `InvalidBucketName`/400 here;
+/// Cairn's error tree folds every `InvalidName` into `InvalidArgument`, which is also 400
+/// (ARCH 25.2), so the status matches and only the code string differs.
+fn invalid_bucket(_: InvalidName) -> Error {
+    Error::InvalidArgument("invalid bucket name".to_owned())
+}
+
+/// Parse an object key, distinguishing the over-long case (AWS: `KeyTooLongError`/400) in the
+/// message so an operator can tell a 1 MiB path from a control character.
+fn parse_key(decoded: &str) -> Result<ObjectKey, Error> {
+    ObjectKey::parse(decoded).map_err(|e| match e {
+        InvalidName::Length => {
+            Error::InvalidArgument(format!("object key exceeds the {MAX_KEY_LEN} byte maximum"))
+        }
+        _ => Error::InvalidArgument("invalid object key".to_owned()),
+    })
 }
 
 fn parse_query(q: &str) -> Vec<(String, String)> {
@@ -1176,16 +1221,19 @@ mod tests {
             Some("s3.example.com"),
             "photos.s3.example.com",
             "/a/b/c.jpg",
-        );
+        )
+        .expect("valid route");
         assert_eq!(b.unwrap().as_str(), "photos");
         assert_eq!(k.unwrap().as_str(), "a/b/c.jpg");
 
         // Port on the Host is stripped; matching is case-insensitive.
-        let (b, _) = route_request(Some("s3.example.com"), "Photos.S3.Example.com:9000", "/x");
+        let (b, _) = route_request(Some("s3.example.com"), "Photos.S3.Example.com:9000", "/x")
+            .expect("valid route");
         assert_eq!(b.unwrap().as_str(), "photos");
 
         // A bucket-only request (path is just "/") yields the bucket with no key.
-        let (b, k) = route_request(Some("s3.example.com"), "logs.s3.example.com", "/");
+        let (b, k) =
+            route_request(Some("s3.example.com"), "logs.s3.example.com", "/").expect("valid route");
         assert_eq!(b.unwrap().as_str(), "logs");
         assert!(k.is_none());
     }
@@ -1195,7 +1243,8 @@ mod tests {
     #[test]
     fn route_request_falls_back_to_path_style() {
         // Bare domain (no leading bucket label) -> path-style: `/bucket/key`.
-        let (b, k) = route_request(Some("s3.example.com"), "s3.example.com", "/mybucket/obj");
+        let (b, k) = route_request(Some("s3.example.com"), "s3.example.com", "/mybucket/obj")
+            .expect("valid route");
         assert_eq!(b.unwrap().as_str(), "mybucket");
         assert_eq!(k.unwrap().as_str(), "obj");
 
@@ -1204,17 +1253,98 @@ mod tests {
             Some("s3.example.com"),
             "a.b.s3.example.com",
             "/mybucket/obj",
-        );
+        )
+        .expect("valid route");
         assert_eq!(b.unwrap().as_str(), "mybucket");
 
         // A Host not under the domain -> path-style.
-        let (b, _) = route_request(Some("s3.example.com"), "other.host.net", "/mybucket/obj");
+        let (b, _) = route_request(Some("s3.example.com"), "other.host.net", "/mybucket/obj")
+            .expect("valid route");
         assert_eq!(b.unwrap().as_str(), "mybucket");
 
         // No domain configured -> always path-style even for a domain-shaped Host.
-        let (b, k) = route_request(None, "photos.s3.example.com", "/mybucket/obj");
+        let (b, k) =
+            route_request(None, "photos.s3.example.com", "/mybucket/obj").expect("valid route");
         assert_eq!(b.unwrap().as_str(), "mybucket");
         assert_eq!(k.unwrap().as_str(), "obj");
+    }
+
+    /// **The critical routing-fallthrough regression** (audit 2026-07). A path segment that is
+    /// *present but invalid* must be rejected, never collapsed into `None`: `None` is how
+    /// `dispatch` decides an operation is bucket- or root-level, so an unparseable key silently
+    /// demoted an object request to a **bucket** request. Verified live before the fix:
+    /// `DELETE /b/<1025-byte-key>` executed DeleteBucket and destroyed an empty bucket (and
+    /// answered `BucketNotEmpty` 409 on a non-empty one — proof it reached `delete_bucket`), while
+    /// the same GET returned 200 with a `ListBucketResult` body.
+    #[test]
+    fn route_path_rejects_invalid_segments_instead_of_dropping_them() {
+        // Over-long key: the exact input that reached DeleteBucket. It must be an error, and the
+        // wire mapping must be 400 `InvalidArgument` — not a bucket-level route.
+        let err = route_path(&format!("/mybucket/{}", "a".repeat(MAX_KEY_LEN + 1)))
+            .expect_err("over-long key must be rejected");
+        assert!(matches!(err, Error::InvalidArgument(_)));
+        assert_eq!(
+            cairn_protocol::error_map::map(&err),
+            (StatusCode::BAD_REQUEST, "InvalidArgument")
+        );
+
+        // The boundary did not move: a key of exactly MAX_KEY_LEN is still a valid object route.
+        let (b, k) = route_path(&format!("/mybucket/{}", "a".repeat(MAX_KEY_LEN)))
+            .expect("a key at the limit is valid");
+        assert!(b.is_some() && k.is_some());
+
+        // An invalid BUCKET segment must not become `None` either — that turned `GET /UPPERCASE/obj`
+        // into ListBuckets, i.e. cross-bucket enumeration.
+        for path in ["/UPPERCASE/obj", "/ab", "//obj"] {
+            let err = route_path(path).expect_err("invalid bucket segment must be rejected");
+            assert!(matches!(err, Error::InvalidArgument(_)), "path {path}");
+        }
+
+        // The charset branch of the key check, not just the length branch: a NUL is XML-illegal.
+        let err = route_path("/mybucket/a\u{0}b").expect_err("control character must be rejected");
+        assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    /// The other half of the contract: rejecting invalid segments must not start rejecting *absent*
+    /// ones. `/bucket/` is a bucket-level request in S3 (empty key segment = no key), and a bare
+    /// `/` is the root ListBuckets request — both must still route, or the fix breaks the API.
+    #[test]
+    fn route_path_preserves_absent_segments() {
+        for path in ["/", ""] {
+            let (b, k) = route_path(path).expect("root is a valid route");
+            assert!(b.is_none() && k.is_none(), "path {path:?}");
+        }
+
+        // Bucket-level: no key, both with and without the trailing slash.
+        for path in ["/mybucket", "/mybucket/"] {
+            let (b, k) = route_path(path).expect("bucket-level is a valid route");
+            assert_eq!(b.unwrap().as_str(), "mybucket");
+            assert!(k.is_none(), "path {path:?}");
+        }
+
+        let (b, k) = route_path("/mybucket/a/b/c.jpg").expect("object is a valid route");
+        assert_eq!(b.unwrap().as_str(), "mybucket");
+        assert_eq!(k.unwrap().as_str(), "a/b/c.jpg");
+    }
+
+    /// The virtual-host branch had the same lossy `.ok()` collapse as [`route_path`], so the
+    /// escalation reproduced with `Host: <bucket>.<domain>` and an over-long path — the key
+    /// vanished and the request became a bucket operation.
+    #[test]
+    fn route_request_vhost_rejects_invalid_key() {
+        let err = route_request(
+            Some("s3.example.com"),
+            "photos.s3.example.com",
+            &format!("/{}", "a".repeat(MAX_KEY_LEN + 1)),
+        )
+        .expect_err("over-long vhost key must be rejected");
+        assert!(matches!(err, Error::InvalidArgument(_)));
+
+        // A genuine bucket-level vhost request (path "/") still carries no key.
+        let (b, k) =
+            route_request(Some("s3.example.com"), "photos.s3.example.com", "/").expect("valid");
+        assert_eq!(b.unwrap().as_str(), "photos");
+        assert!(k.is_none());
     }
 
     /// A buffered (`Bytes`) response stays a single bounded body.

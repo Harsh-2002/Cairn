@@ -648,11 +648,13 @@ pub struct ListQuery {
     pub prefix: Option<String>,
     /// Group keys sharing a prefix up to this delimiter into common prefixes.
     pub delimiter: Option<String>,
-    /// Continuation cursor (the last key returned).
+    /// Continuation cursor (the last key returned). For multipart-upload listings this is the S3
+    /// `key-marker`.
     pub cursor: Option<String>,
-    /// Version-id marker for version listings: resume strictly after `(cursor, version_id_marker)`
-    /// so a key whose versions span a page boundary continues mid-key. Ignored unless `cursor` is
-    /// also set (the key it pairs with). `None` resumes at the key boundary.
+    /// Secondary marker WITHIN the `cursor` key: resume strictly after `(cursor, marker)` so a key
+    /// whose entries span a page boundary continues mid-key. The version id for version listings,
+    /// the S3 `upload-id-marker` for multipart-upload listings. Ignored unless `cursor` is also set
+    /// (the key it pairs with). `None` resumes at the key boundary.
     pub version_id_marker: Option<String>,
     /// Start strictly after this key.
     pub start_after: Option<String>,
@@ -671,11 +673,12 @@ pub struct ListPage<T> {
     /// (paired with [`next_version_id_marker`](Self::next_version_id_marker)); for current-object
     /// listings it is the last key returned.
     pub next_cursor: Option<String>,
-    /// The boundary version id to resume after, for a version listing truncated mid-key. Threads
-    /// back as the next request's [`ListQuery::version_id_marker`] (paired with `next_cursor` as the
-    /// key) so a key whose versions span a page boundary continues strictly after the last returned
-    /// version. `None` for current-object listings and for version listings truncated on a key
-    /// boundary (the next page resumes at the next key).
+    /// The boundary secondary marker to resume after, for a listing truncated mid-key: the version
+    /// id for a version listing, the upload id (S3 `NextUploadIdMarker`) for a multipart-upload
+    /// listing. Threads back as the next request's [`ListQuery::version_id_marker`] (paired with
+    /// `next_cursor` as the key) so a key whose entries span a page boundary continues strictly
+    /// after the last returned one. `None` for current-object listings and for version listings
+    /// truncated on a key boundary (the next page resumes at the next key).
     pub next_version_id_marker: Option<String>,
     /// Whether more pages remain.
     pub truncated: bool,
