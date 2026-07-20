@@ -47,6 +47,11 @@ cargo nextest run --workspace                                # + cargo test --wo
 (cd ui && npm install && npm run build)                      # for any UI change / the embedded console
 ```
 
+`make check` runs the fast gate (fmt + clippy + nextest + doctests) in order, aborting on the first
+failure; `make check-all` adds the `--all-features` clippy leg and the UI build. `make help` lists
+every target. The `Makefile` is a thin front door over `cargo` and the conformance harnesses — it
+doesn't replace them, and the raw commands above remain the source of truth.
+
 - Toolchain is pinned in `rust-toolchain.toml` (stable). Warnings are denied; `unsafe_code`, `dbg!`,
   and `todo!` are lints — keep them out of committed code.
 - `ui/` is excluded from the cargo workspace. The built `ui/dist` is embedded into `cairn-ui` via
