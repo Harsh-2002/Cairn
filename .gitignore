@@ -47,6 +47,12 @@ venv/
 .playwright-mcp/
 *.png
 
+# --- impeccable (design-tool) generated session state ---
+# Per-run critique snapshots and live-mode state are local tool output, not project
+# artifacts. `.impeccable/design.json` (the extracted design system) is kept deliberately.
+.impeccable/critique/
+.impeccable/live/
+
 # --- Editor / OS noise ---
 .DS_Store
 *.swp
