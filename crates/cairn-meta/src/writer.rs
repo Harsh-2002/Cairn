@@ -243,15 +243,30 @@ fn run_control(conn: &Connection, ctl: Control) {
 }
 
 /// Run `PRAGMA wal_checkpoint(TRUNCATE)`, which returns one row of `(busy, log, checkpointed)`.
+///
+/// This runs on the writer thread, serialized with commit batches (`Control::Checkpoint` in the job
+/// loop), so a TRUNCATE that blocks stalls every queued mutation behind it. The writer connection
+/// carries a 5s `busy_timeout` (for its `BEGIN IMMEDIATE`s), and a TRUNCATE contended by an active
+/// WAL reader — the read pool holds snapshots, so this is the normal case — would otherwise honour
+/// that timeout and busy-wait up to 5s, freezing every PUT/DELETE/CompleteMPU in the meantime. We
+/// drop the busy handler for the duration of the checkpoint so a contended TRUNCATE returns `busy`
+/// *immediately* (the background checkpoint loop already retries on its next tick), then restore the
+/// connection's prior `busy_timeout` so nothing else on it changes.
 fn run_checkpoint(conn: &Connection) -> Result<WalCheckpointStats, MetaError> {
-    conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+    let prev_ms: i64 = conn
+        .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+        .unwrap_or(0);
+    let _ = conn.busy_timeout(Duration::from_millis(0));
+    let stats = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
         Ok(WalCheckpointStats {
             busy: r.get::<_, i64>(0)? != 0,
             log_frames: r.get::<_, i64>(1)?.max(0) as u64,
             checkpointed_frames: r.get::<_, i64>(2)?.max(0) as u64,
         })
-    })
-    .map_err(|e| MetaError::Engine(e.to_string()))
+    });
+    // Restore the connection's busy_timeout regardless of the checkpoint outcome.
+    let _ = conn.busy_timeout(Duration::from_millis(prev_ms.max(0) as u64));
+    stats.map_err(|e| MetaError::Engine(e.to_string()))
 }
 
 /// Apply a batch in one transaction with a savepoint per mutation, commit once, then ack.
@@ -391,6 +406,59 @@ mod tests {
         assert!(
             clean.checkpointed_frames <= clean.log_frames,
             "checkpointed cannot exceed total frames: {clean:?}"
+        );
+    }
+
+    /// A contended TRUNCATE on a connection with the production 5s `busy_timeout` must NOT busy-wait
+    /// it out — it runs on the writer thread, so a stall freezes every queued mutation. `run_checkpoint`
+    /// drops the busy handler for the checkpoint, so a pinned reader yields `busy` promptly instead of
+    /// after ~5s. Without that fix this test would sit for the full timeout before returning.
+    #[test]
+    fn contended_truncate_does_not_busy_wait_the_writer() {
+        use std::time::Instant;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("ckpt-timeout.sqlite");
+
+        // A writer connection configured like production: WAL + a 5s busy_timeout.
+        let writer = Connection::open(&db).unwrap();
+        writer.busy_timeout(Duration::from_millis(5000)).unwrap();
+        writer
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+            .unwrap();
+        writer
+            .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v BLOB);")
+            .unwrap();
+        for i in 0..200 {
+            writer
+                .execute("INSERT INTO t (id, v) VALUES (?1, zeroblob(4096))", [i])
+                .unwrap();
+        }
+
+        // Pin the WAL with an open read snapshot so the TRUNCATE is contended.
+        let reader = Connection::open(&db).unwrap();
+        reader
+            .execute_batch("BEGIN; SELECT COUNT(*) FROM t;")
+            .unwrap();
+
+        let start = Instant::now();
+        let pinned = run_checkpoint(&writer).unwrap();
+        let elapsed = start.elapsed();
+
+        assert!(pinned.busy, "a pinned reader must report busy: {pinned:?}");
+        // Old behaviour busy-waits ~5s; the fix returns instantly. A 2s ceiling separates the two
+        // with a wide margin either way (no timing flake).
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "contended TRUNCATE must not busy-wait the writer (took {elapsed:?})"
+        );
+        // The connection's busy_timeout is restored, so commits still get their 5s window.
+        let restored: i64 = writer
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            restored, 5000,
+            "busy_timeout must be restored after a checkpoint"
         );
     }
 }
