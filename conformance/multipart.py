@@ -17,16 +17,14 @@ through the SDK rather than asserted about the SQL.
 
 Every check runs to the end (they do not short-circuit) and the failures are reprinted as a list,
 because a harness written against untested behaviour is most useful when it shows ALL of the gaps
-in one run. As of 2026-07 exactly three assertions fail, each marked `KNOWN GAP` at its site and
-each believed to be a product defect, not a wrong expectation:
+in one run. This harness originally found three product defects; two — `max-parts=0` returning an
+unterminable page, and `EntityTooSmall` being reported before `InvalidPartOrder` — are now FIXED
+and their assertions are ordinary gating `check()`s. One remains open and is marked
+`known_issue()` so it reports loudly without gating CI:
 
-  1. `ListParts?max-parts=0` answers `IsTruncated=true` with NO `NextPartNumberMarker` — an
-     unterminable page (the exact shape of issue #3, which was fixed only for `max-uploads`).
-  2. An early 4xx on a body-bearing UploadPart abandons the request body without `Connection: close`,
-     so the keep-alive connection is silently unusable and a LATER, unrelated request fails.
-  3. Validation precedence: an out-of-order list of small parts reports `EntityTooSmall` instead of
-     `InvalidPartOrder`, because the minimum-size rule is applied positionally before the list is
-     known to be ordered.
+  * An early 4xx on a body-bearing UploadPart abandons the request body without `Connection: close`,
+    so the keep-alive connection is silently unusable and a LATER, unrelated request fails
+    (tracked as https://github.com/Harsh-2002/Cairn/issues/5; measured 6/6 failures at 2 MiB).
 
 Args: <sigv4_access_key> <sigv4_secret> <s3_endpoint>
 """
@@ -343,12 +341,10 @@ while True:
     marker = int(nxt)
 check("ListParts paging covered every part exactly once", collected == [1, 2, 3])
 
-# KNOWN GAP (suspected product bug, sibling of issue #3): `max-parts=0` renders IsTruncated=true
-# with NO NextPartNumberMarker, which is an unterminable page — a client looping on IsTruncated
-# either spins forever or silently restarts at part 1. `list_multipart_uploads` short-circuits the
-# 0 case against an empty page (service.rs ~1744); `list_parts` (service.rs ~1696) does not, and
-# `SqliteMetadataStore::list_parts` clamps LIMIT to 1 then truncates to 0, so `truncated` is
-# computed true while `items.last()` (the marker source) is gone.
+# FIXED (was a sibling of issue #3): `max-parts=0` used to render IsTruncated=true with NO
+# NextPartNumberMarker — an unterminable page. `list_parts` now short-circuits the 0 case against
+# an empty page through the same `page_size` parser as `list_multipart_uploads`, so the assertions
+# below are ordinary gating checks.
 st, body = raw("GET", f"/mpu-list/{pk}", query=f"uploadId={urllib.parse.quote(puid)}&max-parts=0")
 root = ET.fromstring(body)
 check("raw ListParts max-parts=0 -> 200 with zero <Part> entries",
@@ -606,14 +602,10 @@ check("the ordering session survived all three rejections",
        s3.list_parts(Bucket="mpu", Key=okey, UploadId=ouid)["Parts"]] == [1, 2])
 s3.abort_multipart_upload(Bucket="mpu", Key=okey, UploadId=ouid)
 
-# KNOWN GAP (suspected product bug): validation PRECEDENCE. `complete_multipart` walks the requested
-# list once and applies the minimum-size rule POSITIONALLY ("not the last entry") before it has
-# established that the list is ordered at all (service.rs ~1506-1520). So an out-of-order list of
-# small parts is reported as EntityTooSmall — telling the client its parts are too small when the
-# real defect is the ordering, and "non-final part" is not even a well-defined notion on an
-# unordered list. S3 reports InvalidPartOrder here; the same request with >= 5 MiB parts (above)
-# does get InvalidPartOrder from Cairn, which is what makes this a precedence bug rather than a
-# missing check. Fix = validate the whole ordering first, then sizes.
+# FIXED (validation PRECEDENCE): `complete_multipart` used to apply the minimum-size rule
+# POSITIONALLY before establishing that the list was ordered, so an out-of-order list of small
+# parts reported EntityTooSmall instead of InvalidPartOrder. Ordering is now validated in its own
+# pre-pass ahead of the size check, so this is an ordinary gating check.
 skey = "errors/precedence.bin"
 suid = begin("mpu", skey)
 s1 = put_part("mpu", skey, suid, 1, SMALL_A)["ETag"]

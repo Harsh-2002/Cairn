@@ -401,13 +401,8 @@ skewed = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours
 st, body = raw("GET", "/authz-root/secret.txt",
                headers=sign("GET", "/authz-root/secret.txt", root_ak, root_sk, when=skewed))
 check("a two-hour-stale X-Amz-Date is REJECTED (not accepted)", st != 200)
-# KNOWN GAP: Cairn maps AuthError::SkewedClock to Error::InvalidArgument (cairn-types
-# error.rs `impl From<AuthError> for Error`), which error_map.rs renders as 400 InvalidArgument.
-gap("skewed X-Amz-Date -> RequestTimeTooSkewed 403",
-    st == 403 and err_code(body) == "RequestTimeTooSkewed",
-    "403 RequestTimeTooSkewed",
-    f"{st} {err_code(body)}",
-    "cairn-types/src/error.rs: AuthError::SkewedClock => Error::InvalidArgument(..)")
+check("skewed X-Amz-Date -> RequestTimeTooSkewed 403",
+      st == 403 and err_code(body) == "RequestTimeTooSkewed")
 
 # A skew in the FUTURE is the same class and must be rejected identically.
 future = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=2)
