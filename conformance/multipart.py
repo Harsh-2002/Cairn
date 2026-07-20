@@ -17,14 +17,15 @@ through the SDK rather than asserted about the SQL.
 
 Every check runs to the end (they do not short-circuit) and the failures are reprinted as a list,
 because a harness written against untested behaviour is most useful when it shows ALL of the gaps
-in one run. This harness originally found three product defects; two — `max-parts=0` returning an
-unterminable page, and `EntityTooSmall` being reported before `InvalidPartOrder` — are now FIXED
-and their assertions are ordinary gating `check()`s. One remains open and is marked
-`known_issue()` so it reports loudly without gating CI:
+in one run. This harness originally found three product defects; all three are now FIXED and their assertions
+are ordinary gating `check()`s:
 
-  * An early 4xx on a body-bearing UploadPart abandons the request body without `Connection: close`,
-    so the keep-alive connection is silently unusable and a LATER, unrelated request fails
-    (tracked as https://github.com/Harsh-2002/Cairn/issues/5; measured 6/6 failures at 2 MiB).
+  * `max-parts=0` returning an unterminable page, and `EntityTooSmall` being reported before
+    `InvalidPartOrder`, in the multipart listing/validation path.
+  * An early 4xx on a body-bearing UploadPart abandoning the request body without draining it or
+    sending `Connection: close`, leaving the keep-alive connection silently unusable so a LATER,
+    unrelated request failed (was https://github.com/Harsh-2002/Cairn/issues/5; measured 6/6
+    failures at 2 MiB). The cairn-server adapter now drains the unread body (bounded) or closes.
 
 Args: <sigv4_access_key> <sigv4_secret> <s3_endpoint>
 """
@@ -66,20 +67,6 @@ def check(label, cond):
         FAILURES.append(label)
     else:
         print(f"  ok: {label}")
-
-
-def known_issue(label, cond, issue, why):
-    """A real assertion for a defect that is TRACKED but not yet fixed.
-
-    It reports loudly either way but does NOT fail the run, so the harness can gate CI on
-    everything else. This is deliberately NOT a way to soften an expectation: the assertion
-    keeps asserting the correct behavior, and `issue` must name an open issue. When the fix
-    lands, promote this back to `check` and delete the marker.
-    """
-    if cond:
-        print(f"  ok: {label}  (tracked as {issue} — appears FIXED, promote to check())")
-    else:
-        print(f"KNOWN ISSUE {issue} (not gating): {label}\n       {why}")
 
 
 def status_of(err):
@@ -365,11 +352,10 @@ check("AbortMultipartUpload returns 2xx", True)
 for label, op in (
     ("ListParts", lambda u: s3.list_parts(Bucket="mpu", Key=akey, UploadId=u)),
     ("AbortMultipartUpload", lambda u: s3.abort_multipart_upload(Bucket="mpu", Key=akey, UploadId=u)),
-    # UploadPart goes through a THROWAWAY client: the server answers this 404 without consuming the
-    # request body and leaves the keep-alive connection unusable ~1-in-20 times (measured), which
-    # poisons the shared client's pool and makes an unrelated LATER request fail. That defect is
-    # pinned deterministically in its own block below; here we just keep it from randomising the
-    # rest of the run.
+    # UploadPart goes through a THROWAWAY client out of an abundance of caution: the server answers
+    # this 404 before consuming the request body, and the early-error body hygiene (issue #5, now
+    # fixed) is pinned deterministically in its own block below. An isolated client here keeps that
+    # block, not this loop, as the single place the keep-alive contract is exercised.
     ("UploadPart", lambda u: fresh_client().upload_part(
         Bucket="mpu", Key=akey, UploadId=u, PartNumber=1, Body=SMALL_A)),
     ("CompleteMultipartUpload", lambda u: s3.complete_multipart_upload(
@@ -397,13 +383,13 @@ check("the aborted upload is gone from ListMultipartUploads",
       auid not in [u["UploadId"] for u in
                    s3.list_multipart_uploads(Bucket="mpu").get("Uploads", [])])
 
-# KNOWN GAP (suspected product bug): UploadPart against an unknown uploadId is rejected BEFORE the
-# request body is read (service.rs `upload_part` scopes the session ahead of `stage_part`, which is
-# correct and deliberate) — but the 404 is sent with neither `Connection: close` nor the body
-# drained, so the client cannot tell the connection is finished. Measured: with a 2 MiB body the
-# next request on that connection ALWAYS dies (6/6 broken pipe); with a small body the connection
-# survives ~19/20, so a pooled SDK client intermittently fails a LATER, UNRELATED request. Either
-# outcome is legal on its own; sending no signal is what makes it a defect.
+# REGRESSION (issue #5, FIXED): UploadPart against an unknown uploadId is rejected BEFORE the request
+# body is read (service.rs `upload_part` scopes the session ahead of `stage_part`, which is correct
+# and deliberate). The cairn-server adapter now DRAINS the unread body (bounded) so the client can
+# finish sending and reliably receive the 404, and sends `Connection: close` when the body outruns
+# the drain cap — so the pooled keep-alive connection is never mis-framed. Was: with a 2 MiB body the
+# next request on that connection ALWAYS died (6/6 broken pipe); with a small body the connection
+# survived ~19/20, so a pooled SDK client intermittently failed a LATER, UNRELATED request.
 # The assertion is the client-visible contract: after an early error the connection is either still
 # usable, or the response said it was closing.
 _ka = http.client.HTTPConnection(_url.hostname, _url.port, timeout=60)
@@ -431,14 +417,9 @@ try:
     reusable = st2 == 200
 except (BrokenPipeError, ConnectionResetError, http.client.HTTPException):
     reusable = False
-known_issue(
+check(
     "after an early error the connection is reusable OR the response said `Connection: close`",
     reusable or (conn_hdr or "").lower() == "close",
-    "https://github.com/Harsh-2002/Cairn/issues/5",
-    "Measured: with a 2 MiB body the next request on the connection dies 6/6; with a small body it "
-    "survives ~19/20, so a pooled SDK client intermittently fails a LATER, UNRELATED request. The "
-    "fix is in the cairn-server adapter (drain the body or send `Connection: close` on the early "
-    "reject path), a different subsystem from the protocol bugs fixed alongside this harness.",
 )
 try:
     _ka.close()

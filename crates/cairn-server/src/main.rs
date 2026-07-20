@@ -318,9 +318,14 @@ async fn repair_dangling_rows(
 
     for bucket in &buckets {
         let mut cursor: Option<String> = None;
+        // A version page resumes on the (key, version-id) PAIR, so thread BOTH the boundary key and
+        // its version-id marker back. Feeding only the key half re-lists a key that holds more
+        // versions than one page at every boundary and, worst case, never terminates (issue #7).
+        let mut vmarker: Option<String> = None;
         for _ in 0..REPAIR_MAX_PAGES {
             let query = ListQuery {
                 cursor: cursor.clone(),
+                version_id_marker: vmarker.clone(),
                 limit: REPAIR_PAGE_LIMIT,
                 ..Default::default()
             };
@@ -384,7 +389,10 @@ async fn repair_dangling_rows(
             }
 
             match page.next_cursor {
-                Some(next) => cursor = Some(next),
+                Some(next) => {
+                    cursor = Some(next);
+                    vmarker = page.next_version_id_marker;
+                }
                 None => break,
             }
         }

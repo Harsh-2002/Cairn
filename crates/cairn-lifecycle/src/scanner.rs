@@ -241,16 +241,25 @@ impl LifecycleScanner {
         // page is the unit of memory; the grouping holds only summaries (no bytes).
         let mut all: Vec<ObjectSummary> = Vec::new();
         let mut cursor: Option<String> = None;
+        // A version page resumes on the (key, version-id) PAIR, so thread BOTH the boundary key and
+        // its version-id marker back into the next query. Feeding only the key half re-lists a key
+        // that holds more versions than one page at every boundary and, worst case, never
+        // terminates (issue #7).
+        let mut vmarker: Option<String> = None;
         loop {
             let query = ListQuery {
                 cursor: cursor.clone(),
+                version_id_marker: vmarker.clone(),
                 limit: PAGE_LIMIT,
                 ..Default::default()
             };
             let page = meta.list_versions(&bucket.name, &query).await?;
             all.extend(page.items);
             match page.next_cursor {
-                Some(c) if page.truncated => cursor = Some(c),
+                Some(c) if page.truncated => {
+                    cursor = Some(c);
+                    vmarker = page.next_version_id_marker;
+                }
                 _ => break,
             }
         }
@@ -337,16 +346,25 @@ impl LifecycleScanner {
 
         let mut all: Vec<ObjectSummary> = Vec::new();
         let mut cursor: Option<String> = None;
+        // A version page resumes on the (key, version-id) PAIR, so thread BOTH the boundary key and
+        // its version-id marker back into the next query. Feeding only the key half re-lists a key
+        // that holds more versions than one page at every boundary and, worst case, never
+        // terminates (issue #7).
+        let mut vmarker: Option<String> = None;
         loop {
             let query = ListQuery {
                 cursor: cursor.clone(),
+                version_id_marker: vmarker.clone(),
                 limit: PAGE_LIMIT,
                 ..Default::default()
             };
             let page = meta.list_versions(&bucket.name, &query).await?;
             all.extend(page.items);
             match page.next_cursor {
-                Some(c) if page.truncated => cursor = Some(c),
+                Some(c) if page.truncated => {
+                    cursor = Some(c);
+                    vmarker = page.next_version_id_marker;
+                }
                 _ => break,
             }
         }
