@@ -8,6 +8,24 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
 
 ## e2e / feature (does it work as specified?)
 - `run.sh` (+`conformance.py`) — boto3 / real AWS SDK full object lifecycle; the broad smoke gate.
+- `listing.sh` (+`.py`) — listing / pagination / versioning (audit B–H): delimiter + CommonPrefixes,
+  empty-delimiter, max-keys truncation, the continuation/v1-marker/`start-after` token round-trip
+  driven as a real loop, `EncodingType`, delete markers + undelete, version-scoped GET/HEAD/DELETE.
+- `multipart.sh` (+`.py`) — full multipart lifecycle via the **low-level** API: out-of-order/undersized
+  parts (`InvalidPartOrder`/`EntityTooSmall`), `ListParts`/`ListMultipartUploads` paging, abort/complete
+  session-state errors, the `<md5>-<n>` ETag, multipart×versioning. Carries one `known_issue()` (#5).
+- `objects.sh` (+`.py`) — payload / headers / range: system-header + `x-amz-meta-*` round-trip,
+  CopyObject COPY vs REPLACE directives, response-header overrides, zero-byte objects, range edges
+  (416, suffix `bytes=-N`, open `bytes=N-`), URL-encoded / unicode keys, `Content-MD5` `BadDigest`.
+- `buckets.sh` (+`.py`) — bucket surface: CreateBucket idempotency + name validation, DeleteBucket
+  (`BucketNotEmpty`), HeadBucket, config-subresource PUT→GET→DELETE round-trips with a
+  bucket-survives guard after each DELETE (the routing fall-through class), CORS preflight.
+- `authz.sh` (+`.py`) — auth / tenancy / credentials: a second identity's tenant isolation,
+  `AccessDenied` beats `NoSuchKey`, SigV4 failure codes (`RequestTimeTooSkewed` et al.), presigned-URL
+  redeem + expiry rejection. **UI listener ON** (mints the second user via the management API).
+- `lifecycle.sh` (+`.py`) — lifecycle scanner **enforcement** (`CAIRN_LIFECYCLE_INTERVAL_SECS=1`):
+  an expiration rule actually removes a matching object (polled, no sleep) and leaves a non-match,
+  per-bucket scoping, a Disabled rule no-ops, a storage-class transition is rejected not ignored.
 - `checksums.sh` (+`.py`) — modern-SDK flexible-checksum round-trip (ARCH 21.1): PUT/GET/HEAD echo the
   stored `x-amz-checksum-<algo>` (+ `x-amz-checksum-type`) so default-on SDKs validate the transfer;
   CRC32/SHA256 always, CRC32C/CRC64NVME when `botocore[crt]` is installed; Range never echoes.
