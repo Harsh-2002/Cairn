@@ -231,11 +231,16 @@ fn page_rows(
     // A version-id marker (paired with the cursor key) resumes strictly after `(key, marker)`
     // within that key. Versions sort `version_id DESC`, so entries already returned for the marker
     // key have `version_id >= marker`; we exclude exactly those, plus all rows at-or-before the key.
-    let vid_marker: Option<(String, String)> = q
-        .version_id_marker
-        .as_deref()
-        .zip(q.cursor.as_deref())
-        .map(|(vid, key)| (key.to_owned(), vid.to_owned()));
+    // Only a version listing has one — the SQL engines null it for `latest_only`, and the
+    // current-object path has no per-version resume; keeping it gated here keeps the two in step.
+    let vid_marker: Option<(String, String)> = if version_listing {
+        q.version_id_marker
+            .as_deref()
+            .zip(q.cursor.as_deref())
+            .map(|(vid, key)| (key.to_owned(), vid.to_owned()))
+    } else {
+        None
+    };
     // An exclusive marker that names a rolled-up CommonPrefix excludes that WHOLE group, not just
     // the marker string: the group was already returned in full, so resuming inside it would
     // re-emit it forever. The marker names a group exactly when it equals the CommonPrefix its own
@@ -264,14 +269,28 @@ fn page_rows(
             Some(g) => !r.key.as_str().starts_with(g.as_str()),
             None => true,
         })
-        .filter(|r| match (&after, &vid_marker) {
-            // When a version-id marker is in play, the marker key itself is not excluded by the
-            // key cursor; its post-marker versions resume below.
-            (Some(a), Some((mk, _))) => {
-                r.key.as_str() > a.as_str() || r.key.as_str() == mk.as_str()
+        .filter(|r| {
+            if version_listing {
+                // Version listing keeps the interleaved exclusive-marker semantics: when a
+                // version-id marker is in play, the marker key itself is not excluded by the key
+                // cursor; its post-marker versions resume below.
+                match (&after, &vid_marker) {
+                    (Some(a), Some((mk, _))) => {
+                        r.key.as_str() > a.as_str() || r.key.as_str() == mk.as_str()
+                    }
+                    (Some(a), None) => r.key.as_str() > a.as_str(),
+                    (None, _) => true,
+                }
+            } else {
+                // Current-object listing mirrors the SQL seek
+                // `key >= max(cursor, successor(start_after))`: the v2 continuation `cursor` is an
+                // INCLUSIVE lower bound (the first key not yet returned — our own value round-tripped),
+                // while `start_after`/`marker` stays EXCLUSIVE. The old code conflated them into one
+                // exclusive `after`, which skipped the very key an inclusive cursor names — so emit
+                // (below) and consume had to BOTH be inclusive to agree with the SQL engines (#8).
+                q.cursor.as_deref().is_none_or(|c| r.key.as_str() >= c)
+                    && q.start_after.as_deref().is_none_or(|s| r.key.as_str() > s)
             }
-            (Some(a), None) => r.key.as_str() > a.as_str(),
-            (None, _) => true,
         })
         .filter(|r| match &vid_marker {
             Some((mk, mv)) if r.key.as_str() == mk.as_str() => r.version_id.as_str() < mv.as_str(),
@@ -292,7 +311,12 @@ fn page_rows(
     let limit = q.limit.max(1) as usize;
     let mut last_key: Option<String> = None;
 
-    for r in ordered {
+    // Index-based rather than `for r in ordered`: the non-version delimiter branch skips the whole
+    // rolled-up group at once (like the SQL `prefix_upper_bound` re-seek), which needs to advance
+    // over trailing rows the iterator would otherwise hand back one at a time.
+    let mut idx = 0usize;
+    while idx < ordered.len() {
+        let r = ordered[idx];
         let count = page.items.len() + page.common_prefixes.len();
         if count >= limit {
             page.truncated = true;
@@ -320,24 +344,44 @@ fn page_rows(
                     page.next_cursor = last_key.clone();
                 }
             } else {
-                page.next_cursor = last_key.clone();
+                // Current-object listing resumes at the INCLUSIVE first key not yet returned, exactly
+                // as the SQL engines do (`next_cursor = summary.key`, seeked with `key >= cursor`).
+                // The delimiter branch below has already advanced `idx` PAST any rolled-up group, so
+                // `r` is a real key outside every emitted CommonPrefix — never a member of a group
+                // already returned. Emitting the last RETURNED key (exclusive, the old behaviour)
+                // would, under a delimiter, land inside the last group and re-roll that prefix on the
+                // next page (a duplicate CommonPrefix the SQL engines never produce — GitHub #8).
+                page.next_cursor = Some(r.key.as_str().to_owned());
             }
             break;
         }
         // An empty delimiter is "no delimiter" (S3): guard against `"".find` matching at 0.
         if let Some(delim) = q.delimiter.as_deref().filter(|d| !d.is_empty()) {
             let rest = &r.key.as_str()[prefix.len()..];
-            if let Some(idx) = rest.find(delim) {
-                let cp = format!("{}{}{}", prefix, &rest[..idx], delim);
+            if let Some(pos) = rest.find(delim) {
+                let cp = format!("{}{}{}", prefix, &rest[..pos], delim);
                 if seen_cp.insert(cp.clone()) {
-                    page.common_prefixes.push(cp);
+                    page.common_prefixes.push(cp.clone());
                     last_key = Some(r.key.as_str().to_owned());
+                }
+                if version_listing {
+                    idx += 1;
+                } else {
+                    // Skip the WHOLE group, mirroring the SQL `seek = prefix_upper_bound(cp)`
+                    // re-seek: the next iteration lands on the first key past the group, so the
+                    // inclusive cursor computed above can never point back inside it.
+                    idx += 1;
+                    while idx < ordered.len() && ordered[idx].key.as_str().starts_with(cp.as_str())
+                    {
+                        idx += 1;
+                    }
                 }
                 continue;
             }
         }
         page.items.push(summarize(r));
         last_key = Some(r.key.as_str().to_owned());
+        idx += 1;
     }
     page
 }
@@ -2015,6 +2059,175 @@ mod tests {
             None,
             "deleting a user must take its identity policy with it (mirrors DELETE FROM users)"
         );
+    }
+
+    /// A minimal current-version row for `key`; only the fields listing reads matter.
+    fn list_row(bucket: &BucketName, key: &str) -> ObjectVersionRow {
+        ObjectVersionRow {
+            id: format!("id-{key}"),
+            bucket: bucket.clone(),
+            key: ObjectKey::parse(key).unwrap(),
+            version_id: VersionId::null(),
+            is_latest: true,
+            is_delete_marker: false,
+            size_logical: 1,
+            size_physical: 1,
+            etag: ETag::from_string("e".to_owned()),
+            content_type: "application/octet-stream".to_owned(),
+            content_encoding: None,
+            cache_control: None,
+            content_disposition: None,
+            content_language: None,
+            expires: None,
+            storage_path: Some(StoragePath::generate(bucket)),
+            compression: crate::object::CompressionDescriptor::Uncompressed,
+            storage_class: crate::object::StorageClass::Standard,
+            cold_locator: None,
+            owner_id: UserId::generate(),
+            user_metadata: Vec::new(),
+            acl: None,
+            checksums: Vec::new(),
+            sse_descriptor: None,
+            replication_status: None,
+            created_at: Timestamp(1),
+            updated_at: Timestamp(1),
+        }
+    }
+
+    /// GitHub #8: under a delimiter, the double's `next_cursor` must advance PAST the rolled-up
+    /// group (an INCLUSIVE first-unreturned-key cursor, mirroring both SQL engines' `key >= cursor`
+    /// re-seek), not name the last key it already returned. The old exclusive `next_cursor = last
+    /// key returned` pointed INSIDE the final group, so resuming re-rolled that same CommonPrefix —
+    /// a duplicate the real stores never emit. Drain a delimiter listing across a page boundary and
+    /// assert every prefix and key appears exactly once.
+    #[tokio::test]
+    async fn delimiter_pagination_advances_past_a_common_prefix() {
+        let store = InMemoryMetadataStore::new();
+        let bucket = BucketName::parse("photos").unwrap();
+        // Two groups (a/, b/) then a bare key. With max-keys=2 the first page is exactly the two
+        // CommonPrefixes, so the page ENDS on the b/ group — the case the old cursor got wrong.
+        for k in ["a/1", "a/2", "b/1", "b/2", "c"] {
+            store
+                .submit(Mutation::PutObjectVersion {
+                    row: Box::new(list_row(&bucket, k)),
+                    precondition: Precondition::default(),
+                    replication: Vec::new(),
+                })
+                .await
+                .unwrap();
+        }
+
+        let page1 = store
+            .list_current(
+                &bucket,
+                &ListQuery {
+                    delimiter: Some("/".to_owned()),
+                    limit: 2,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            page1.common_prefixes,
+            vec!["a/".to_owned(), "b/".to_owned()]
+        );
+        assert!(page1.items.is_empty());
+        assert!(page1.truncated);
+        // INCLUSIVE cursor = the first key not yet returned, PAST the whole b/ group — exactly what
+        // the SQL engines put here. The old double emitted "b/1" (the last key it returned, inside
+        // the group), which then re-rolled "b/" on page 2.
+        assert_eq!(page1.next_cursor.as_deref(), Some("c"));
+
+        let page2 = store
+            .list_current(
+                &bucket,
+                &ListQuery {
+                    delimiter: Some("/".to_owned()),
+                    cursor: page1.next_cursor.clone(),
+                    limit: 2,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        // The next page is just the bare key: no re-emitted "b/", no skipped "c".
+        assert!(
+            page2.common_prefixes.is_empty(),
+            "resuming must not re-roll an already-returned CommonPrefix, got {:?}",
+            page2.common_prefixes
+        );
+        assert_eq!(
+            page2
+                .items
+                .iter()
+                .map(|i| i.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["c"]
+        );
+        assert!(!page2.truncated);
+        assert!(page2.next_cursor.is_none());
+    }
+
+    /// The inclusive cursor must also round-trip a plain (no-delimiter) listing without skipping the
+    /// key it names: page 1 ends by naming the FIRST unreturned key, and consuming that cursor as an
+    /// inclusive lower bound (`key >= cursor`) must return it, not step over it.
+    #[tokio::test]
+    async fn plain_pagination_inclusive_cursor_skips_no_key() {
+        let store = InMemoryMetadataStore::new();
+        let bucket = BucketName::parse("photos").unwrap();
+        for k in ["a", "b", "c", "d"] {
+            store
+                .submit(Mutation::PutObjectVersion {
+                    row: Box::new(list_row(&bucket, k)),
+                    precondition: Precondition::default(),
+                    replication: Vec::new(),
+                })
+                .await
+                .unwrap();
+        }
+
+        let page1 = store
+            .list_current(
+                &bucket,
+                &ListQuery {
+                    limit: 2,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            page1
+                .items
+                .iter()
+                .map(|i| i.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+        assert_eq!(page1.next_cursor.as_deref(), Some("c"));
+
+        let page2 = store
+            .list_current(
+                &bucket,
+                &ListQuery {
+                    cursor: page1.next_cursor.clone(),
+                    limit: 2,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            page2
+                .items
+                .iter()
+                .map(|i| i.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["c", "d"],
+            "the inclusive cursor must return the key it names, not skip it"
+        );
+        assert!(!page2.truncated);
     }
 
     #[tokio::test]

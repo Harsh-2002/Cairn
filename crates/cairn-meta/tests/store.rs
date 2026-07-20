@@ -1914,3 +1914,110 @@ async fn version_listing_page_ending_on_a_group_resumes_past_it() {
         "the second page advances past the grouped prefixes"
     );
 }
+
+#[tokio::test]
+async fn version_listing_paginates_a_many_version_key_without_re_listing() {
+    // Issue #7: a version page resumes on the (key-marker, version-id-marker) PAIR. A key holding
+    // more versions than a single page must paginate to completion — returning each version exactly
+    // once — ONLY when the caller threads BOTH `next_cursor` and `next_version_id_marker` back into
+    // the next query. This is the store-level proof for the production loops that page `list_versions`
+    // and now thread both markers: cairn-lifecycle's scanner (`expire_noncurrent_versions` and
+    // `remove_expired_delete_markers`) and cairn-server's `repair_dangling_rows`.
+    let store = cairn_meta::open_in_memory().unwrap();
+    let b = BucketName::parse("mvk").unwrap();
+    // One key, five distinct versions — more than one page at limit=2.
+    let versions: Vec<VersionId> = (1..=5)
+        .map(|i| VersionId::from_string(format!("{i:08}")))
+        .collect();
+    for v in &versions {
+        store
+            .submit(put(
+                row(&b, "doc", v.clone(), "e", true),
+                Precondition::default(),
+            ))
+            .await
+            .unwrap();
+    }
+
+    // The FIXED production shape: thread both markers. Bounded so a hang is a failure, not a stall.
+    let mut seen: Vec<String> = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut vmarker: Option<String> = None;
+    let mut pages = 0;
+    for _ in 0..100 {
+        pages += 1;
+        let page = store
+            .list_versions(
+                &b,
+                &ListQuery {
+                    cursor: cursor.clone(),
+                    version_id_marker: vmarker.clone(),
+                    limit: 2,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        for it in &page.items {
+            seen.push(it.version_id.as_str().to_owned());
+        }
+        match page.next_cursor {
+            Some(c) if page.truncated => {
+                cursor = Some(c);
+                vmarker = page.next_version_id_marker;
+            }
+            _ => break,
+        }
+    }
+    let mut unique = seen.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(
+        seen.len(),
+        5,
+        "each version returned exactly once: {seen:?}"
+    );
+    assert_eq!(
+        unique.len(),
+        5,
+        "no version re-listed across a page boundary: {seen:?}"
+    );
+    assert!(
+        pages <= 4,
+        "five versions at limit=2 terminate promptly, took {pages} pages"
+    );
+
+    // Contrast — the PRE-FIX shape (drop the version-id marker, feed only the key). It must NOT
+    // cleanly enumerate the key: it either re-lists already-seen versions or skips the remainder.
+    // Bounded to 20 iterations so a re-listing regression can never hang this test.
+    let mut broken: Vec<String> = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..20 {
+        let page = store
+            .list_versions(
+                &b,
+                &ListQuery {
+                    cursor: cursor.clone(),
+                    limit: 2,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        for it in &page.items {
+            broken.push(it.version_id.as_str().to_owned());
+        }
+        match page.next_cursor {
+            Some(c) if page.truncated => cursor = Some(c),
+            _ => break,
+        }
+    }
+    let mut broken_unique = broken.clone();
+    broken_unique.sort();
+    broken_unique.dedup();
+    let clean = broken.len() == 5 && broken_unique.len() == 5;
+    assert!(
+        !clean,
+        "dropping the version-id marker must not cleanly enumerate the key; got {broken:?}"
+    );
+}

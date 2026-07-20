@@ -5,12 +5,13 @@
 //! flows blob -> socket with bounded memory (ARCH 7.4/7.6/7.8): no whole-object buffer is ever
 //! materialised. Empty and in-memory (XML/error) bodies stay fully buffered, which is correct —
 //! they are already small and bounded. Request bodies for object PUT are streamed separately via
-//! [`incoming_to_stream`].
+//! [`shared_body_stream`], which keeps the incoming body reachable so an early error can drain
+//! whatever the service left unread rather than poisoning the pooled keep-alive connection (issue #5).
 
 use crate::stack::AppStack;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use cairn_crypto::{SystemClock, SystemCrypto};
 use cairn_protocol::{S3Body, S3Request, S3Response, error_response};
 use cairn_types::auth::{AuthMethod, AuthOutcome, Principal, RequestView, Role};
@@ -21,7 +22,7 @@ use cairn_types::meta::{ActivityEntry, Mutation, ShareDisposition, ShareRow};
 use cairn_types::time::Timestamp;
 use cairn_types::traits::{Clock, Crypto};
 use futures_util::StreamExt;
-use http_body_util::{BodyExt, BodyStream, Full, StreamBody};
+use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::{Frame, Incoming};
 use hyper::{Method, Request, Response};
 use std::net::IpAddr;
@@ -101,7 +102,12 @@ pub async fn handle(
             AuthOutcome::NotApplicable => None,
             AuthOutcome::Denied(e) => {
                 let resource = raw_path.clone();
-                return render(error_response(&Error::from(e), &resource, &request_id));
+                let response = render(error_response(&Error::from(e), &resource, &request_id));
+                // Authentication rejects before any handler touches the body, so a body-bearing
+                // request (e.g. a bad-signature PUT) leaves its bytes entirely unread. Drain them
+                // (bounded) so the client can finish sending and reliably receive this 4xx, else
+                // close — otherwise the leftover bytes mis-frame the next pooled request (issue #5).
+                return drain_or_close(response, request_has_body(&headers), req.into_body()).await;
             }
         }
     };
@@ -124,7 +130,10 @@ pub async fn handle(
             {
                 let mut builder = Response::builder()
                     .status(http::StatusCode::PAYLOAD_TOO_LARGE)
-                    .header("content-type", "application/json");
+                    .header("content-type", "application/json")
+                    // We stopped reading at the cap, so the rest of the oversize body is still in
+                    // flight; close rather than let those bytes mis-frame the next pooled request (#5).
+                    .header(http::header::CONNECTION, "close");
                 if let Ok(v) = http::HeaderValue::from_str(&request_id) {
                     builder = builder.header("x-amz-request-id", v);
                 }
@@ -260,12 +269,26 @@ pub async fn handle(
     // A malformed bucket/key must be REJECTED here, not silently dropped: a `None` segment is how
     // `dispatch` decides an operation is bucket- or root-level, so an unparseable key would re-route
     // an object request to the bucket handler (audit 2026-07).
+    // Whether the request declares a body: only a body-bearing request can poison a pooled
+    // keep-alive connection when an early error leaves its bytes unread (issue #5).
+    let body_bearing = request_has_body(&headers);
     let (bucket, key) = match route_request(stack.s3_domain.as_deref(), &host, &raw_path) {
         Ok(bk) => bk,
-        Err(e) => return render(error_response(&e, &raw_path, &request_id)),
+        Err(e) => {
+            // Routing rejected the request before it reached a handler, so its body is unread.
+            let response = render(error_response(&e, &raw_path, &request_id));
+            return drain_or_close(response, body_bearing, req.into_body()).await;
+        }
     };
     let query = parse_query(&query_str);
-    let body = incoming_to_stream(req.into_body());
+    // Share the incoming body: the service streams object-PUT bytes out of it during `handle`, but
+    // if it returns before consuming the body (an early reject) we still need to reach the leftover
+    // bytes to drain them — hence the shared handle rather than moving the body away wholesale (#5).
+    let shared = std::sync::Arc::new(tokio::sync::Mutex::new(SharedIncoming {
+        incoming: req.into_body(),
+        ended: false,
+    }));
+    let body = shared_body_stream(shared.clone());
 
     let s3req = S3Request {
         method,
@@ -278,7 +301,14 @@ pub async fn handle(
         secure,
         request_id,
     };
-    render(stack.s3.handle(s3req, body).await)
+    let response = render(stack.s3.handle(s3req, body).await);
+    // If the service returned before consuming the body — e.g. an UploadPart rejected for an unknown
+    // uploadId, scoped ahead of `stage_part` — the unread request bytes are still in flight and would
+    // mis-frame the next request on the pooled HTTP/1.1 connection (issue #5). Drain a bounded amount
+    // so the client can finish sending and reliably RECEIVE this response; past the cap, close instead
+    // of mis-framing. A fully-consumed body (the normal PUT path) drains to nothing here and keeps
+    // keep-alive intact.
+    finish_body_hygiene(response, body_bearing, &shared).await
 }
 
 /// Build a 200 response for an embedded UI asset with its content type.
@@ -1055,13 +1085,146 @@ fn parse_query(q: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-fn incoming_to_stream(body: Incoming) -> cairn_types::BodyStream {
-    Box::pin(BodyStream::new(body).filter_map(|res| async move {
-        match res {
-            Ok(frame) => frame.into_data().ok().map(Ok),
-            Err(e) => Some(Err(BodyError::Transport(e.to_string()))),
+/// Bytes we are willing to drain from an unconsumed request body after an early error so the client
+/// can finish sending and reliably receive the response (issue #5). Past this we stop reading and
+/// close the connection instead — a rejected endpoint must not be forced to read an unbounded
+/// upload. Sized to cover a typical rejected `UploadPart` while staying bounded (it matches the
+/// management-API body cap above).
+const EARLY_ERROR_DRAIN_CAP: usize = 8 * 1024 * 1024;
+
+/// The request's incoming body, kept reachable after it is handed to the S3 service so an early
+/// error can drain the bytes the service left unread (issue #5). `ended` records that the body has
+/// reached EOF — nothing remains to drain and the connection is safe to keep alive.
+struct SharedIncoming {
+    incoming: Incoming,
+    ended: bool,
+}
+
+/// Build the [`cairn_types::BodyStream`] handed to the S3 service from a shared incoming body,
+/// preserving the data-frame-only contract of the old direct adapter (trailer frames are skipped).
+/// The shared handle lets [`finish_body_hygiene`] drain any bytes the service leaves unread.
+fn shared_body_stream(
+    shared: std::sync::Arc<tokio::sync::Mutex<SharedIncoming>>,
+) -> cairn_types::BodyStream {
+    Box::pin(futures_util::stream::unfold(shared, |shared| async move {
+        let mut guard = shared.lock().await;
+        if guard.ended {
+            return None;
+        }
+        loop {
+            match guard.incoming.frame().await {
+                // A non-data (trailer) frame falls through and keeps reading, matching the prior
+                // data-only stream so downstream chunk decoding is unchanged.
+                Some(Ok(frame)) => {
+                    if let Ok(data) = frame.into_data() {
+                        drop(guard);
+                        return Some((Ok(data), shared));
+                    }
+                }
+                Some(Err(e)) => {
+                    guard.ended = true;
+                    drop(guard);
+                    return Some((Err(BodyError::Transport(e.to_string())), shared));
+                }
+                None => {
+                    guard.ended = true;
+                    return None;
+                }
+            }
         }
     }))
+}
+
+/// Whether the request declares a payload body: a positive `Content-Length` or a chunked
+/// `Transfer-Encoding`. Only a body-bearing request can poison a pooled keep-alive connection when
+/// an early error leaves its bytes unread (issue #5); bodyless `GET`/`HEAD`/`DELETE` cannot.
+fn request_has_body(headers: &[(String, String)]) -> bool {
+    let mut chunked = false;
+    for (k, v) in headers {
+        match k.as_str() {
+            "content-length" => {
+                if v.trim().parse::<u64>().is_ok_and(|n| n > 0) {
+                    return true;
+                }
+            }
+            "transfer-encoding" if v.to_ascii_lowercase().contains("chunked") => {
+                chunked = true;
+            }
+            _ => {}
+        }
+    }
+    chunked
+}
+
+/// Read and discard up to `cap` bytes of `body`, returning whether it was fully drained (reached
+/// EOF or the peer hung up) rather than cut off at the cap. Bounded so a rejected endpoint cannot be
+/// forced to read an unbounded upload. Generic over the body type so it is unit-testable without a
+/// live socket (a real `Incoming` cannot be constructed in-process).
+async fn drain_frames<B>(body: &mut B, cap: usize) -> bool
+where
+    B: hyper::body::Body + Unpin,
+{
+    let mut drained: usize = 0;
+    while drained <= cap {
+        match body.frame().await {
+            Some(Ok(frame)) => {
+                if let Ok(data) = frame.into_data() {
+                    drained = drained.saturating_add(data.remaining());
+                }
+            }
+            // The peer hung up or the transport failed mid-drain: nothing more will arrive, so no
+            // leftover bytes can poison the connection.
+            Some(Err(_)) => return true,
+            None => return true,
+        }
+    }
+    false
+}
+
+/// Ensure `close`-or-drain hygiene for an early error on a request whose body is still fully unread
+/// (owned here, e.g. auth-denied or routing-rejected). Drains a bounded prefix so the client can
+/// finish sending and receive `response`; if the body outruns the cap, marks the connection to close.
+async fn drain_or_close(
+    mut response: Response<ResponseBody>,
+    body_bearing: bool,
+    mut body: Incoming,
+) -> Response<ResponseBody> {
+    if body_bearing && !drain_frames(&mut body, EARLY_ERROR_DRAIN_CAP).await {
+        set_connection_close(&mut response);
+    }
+    response
+}
+
+/// Ensure `close`-or-drain hygiene after the S3 service returned, for the body it may have left
+/// unread. A fully-consumed body (`ended`, or draining to EOF immediately) keeps keep-alive; a body
+/// still in flight past the drain cap forces the connection closed so it is not mis-framed (issue #5).
+async fn finish_body_hygiene(
+    mut response: Response<ResponseBody>,
+    body_bearing: bool,
+    shared: &std::sync::Arc<tokio::sync::Mutex<SharedIncoming>>,
+) -> Response<ResponseBody> {
+    if !body_bearing {
+        return response;
+    }
+    let mut guard = shared.lock().await;
+    if guard.ended {
+        return response;
+    }
+    let fully = drain_frames(&mut guard.incoming, EARLY_ERROR_DRAIN_CAP).await;
+    guard.ended = true;
+    if !fully {
+        set_connection_close(&mut response);
+    }
+    response
+}
+
+/// Mark a response so hyper ends the HTTP/1.1 connection after it, rather than reusing a connection
+/// whose framing we can no longer guarantee. Ignored by hyper on HTTP/2 (no per-connection framing).
+fn set_connection_close(response: &mut Response<ResponseBody>) {
+    response.headers_mut().insert(
+        http::header::CONNECTION,
+        http::HeaderValue::from_static("close"),
+    );
 }
 
 /// Render an [`S3Response`] onto the wire. `Empty`/`Bytes` bodies are already bounded and stay
@@ -1382,5 +1545,79 @@ mod tests {
         );
         let second = body.frame().await.expect("second frame");
         assert!(second.is_err(), "blob error must surface as a body error");
+    }
+
+    /// A body under the drain cap is reported fully drained, so the early-error path leaves the
+    /// keep-alive connection intact rather than closing it (issue #5). This is the mechanism that
+    /// lets a rejected `UploadPart` still deliver its 404 and keep the pooled connection usable.
+    #[tokio::test]
+    async fn drain_frames_reports_full_drain_within_cap() {
+        let frames: Vec<Result<Frame<Bytes>, std::convert::Infallible>> = vec![
+            Ok(Frame::data(Bytes::from_static(b"hello "))),
+            Ok(Frame::data(Bytes::from_static(b"world"))),
+        ];
+        let mut body = StreamBody::new(stream::iter(frames));
+        assert!(
+            drain_frames(&mut body, 1024).await,
+            "a body under the cap must report a full drain"
+        );
+    }
+
+    /// A body larger than the cap is reported *not* fully drained: the caller must then close the
+    /// connection rather than read an unbounded upload from a rejected endpoint (issue #5).
+    #[tokio::test]
+    async fn drain_frames_stops_and_reports_partial_past_cap() {
+        let frames: Vec<Result<Frame<Bytes>, std::convert::Infallible>> =
+            vec![Ok(Frame::data(Bytes::from(vec![b'z'; 20])))];
+        let mut body = StreamBody::new(stream::iter(frames));
+        assert!(
+            !drain_frames(&mut body, 4).await,
+            "a body past the cap must be reported not-fully-drained so the caller closes"
+        );
+    }
+
+    /// Trailer frames (e.g. `x-amz-checksum-*` on an aws-chunked upload) carry no payload bytes:
+    /// they must not count toward the drain budget, and the body still drains fully.
+    #[tokio::test]
+    async fn drain_frames_skips_trailer_frames() {
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert(
+            "x-amz-checksum-crc32",
+            http::HeaderValue::from_static("AAAAAA=="),
+        );
+        let frames: Vec<Result<Frame<Bytes>, std::convert::Infallible>> = vec![
+            Ok(Frame::data(Bytes::from_static(b"data"))),
+            Ok(Frame::trailers(trailers)),
+        ];
+        let mut body = StreamBody::new(stream::iter(frames));
+        assert!(
+            drain_frames(&mut body, 1024).await,
+            "a data+trailer body drains fully; the trailer is not payload"
+        );
+    }
+
+    /// The scoping predicate for the fix: only a positive `Content-Length` or a chunked
+    /// `Transfer-Encoding` is body-bearing. A bodyless `GET`/`HEAD`/`DELETE` (and `Content-Length: 0`)
+    /// must NOT trigger the drain/close path, so keep-alive is never regressed for them (issue #5).
+    #[test]
+    fn request_has_body_classifies_body_bearing_requests() {
+        let cl = |v: &str| vec![("content-length".to_owned(), v.to_owned())];
+        assert!(
+            request_has_body(&cl("5")),
+            "a positive length is body-bearing"
+        );
+        assert!(!request_has_body(&cl("0")), "content-length: 0 is bodyless");
+        assert!(
+            !request_has_body(&cl("")),
+            "an unparseable length is not counted as a body"
+        );
+        assert!(
+            request_has_body(&[("transfer-encoding".to_owned(), "Chunked".to_owned())]),
+            "a chunked transfer-encoding is body-bearing (case-insensitive)"
+        );
+        assert!(
+            !request_has_body(&[("host".to_owned(), "example".to_owned())]),
+            "a request with no length and no transfer-encoding has no body"
+        );
     }
 }
