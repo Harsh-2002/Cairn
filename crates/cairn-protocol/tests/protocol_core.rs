@@ -9152,3 +9152,121 @@ async fn suffix_range_selecting_no_bytes_is_invalid_range() {
     assert_eq!(st, StatusCode::PARTIAL_CONTENT);
     assert_eq!(body, b"hij");
 }
+
+/// ARCH 26.3: mutating S3 data-plane ops are recorded in the audit log (actor + action + resource +
+/// salient attributes), while reads are NOT. A PutObject records a `PutObject` entry naming the
+/// bucket/key/actor and carrying the size + ETag; GET/HEAD/ListObjects add nothing; a DeleteObject
+/// records a `DeleteObject` entry. Fails outright without the handler wiring (the log stays empty).
+#[tokio::test]
+async fn mutating_s3_ops_are_audited_and_reads_are_not() {
+    let h = harness().await;
+
+    // Create the bucket (bucket creation itself is a control-plane concern, not audited here).
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("audit-bkt"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(
+        h.meta.list_activity(100).await.unwrap().is_empty(),
+        "bucket create must not add an S3 audit entry"
+    );
+
+    // PUT an object -> one PutObject audit entry with the full salient attributes.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("audit-bkt"),
+                Some("docs/a.txt"),
+                &[],
+                &[("content-type", "text/plain")],
+                b"hello world".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let log = h.meta.list_activity(100).await.unwrap();
+    assert_eq!(
+        log.len(),
+        1,
+        "PutObject must record exactly one audit entry"
+    );
+    let put = &log[0];
+    assert_eq!(put.action, "PutObject");
+    assert_eq!(put.bucket.as_deref(), Some("audit-bkt"));
+    assert_eq!(put.key.as_deref(), Some("docs/a.txt"));
+    assert_eq!(put.size, Some(11));
+    // ETag is stored unquoted; "hello world" -> md5 5eb63bbbe01eeed093cb22bb8f5acdc3.
+    assert_eq!(
+        put.etag.as_deref(),
+        Some("5eb63bbbe01eeed093cb22bb8f5acdc3")
+    );
+    // The actor is the requester's access-key id (the admin principal's is "k").
+    assert_eq!(put.actor.as_deref(), Some("k"));
+
+    // Reads must NOT be audited: a GET, a HEAD, and a ListObjects add nothing to the log.
+    for parts in [
+        req(
+            Method::GET,
+            Some("audit-bkt"),
+            Some("docs/a.txt"),
+            &[],
+            &[],
+            vec![],
+        ),
+        req(
+            Method::HEAD,
+            Some("audit-bkt"),
+            Some("docs/a.txt"),
+            &[],
+            &[],
+            vec![],
+        ),
+        req(Method::GET, Some("audit-bkt"), None, &[], &[], vec![]),
+    ] {
+        let (st, _, _) = drain(send(&h.svc, parts).await).await;
+        assert_eq!(st, StatusCode::OK);
+    }
+    assert_eq!(
+        h.meta.list_activity(100).await.unwrap().len(),
+        1,
+        "reads (GET/HEAD/ListObjects) must not add audit entries"
+    );
+
+    // DELETE the object -> a DeleteObject audit entry (unversioned bucket: permanent removal).
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::DELETE,
+                Some("audit-bkt"),
+                Some("docs/a.txt"),
+                &[],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+
+    let log = h.meta.list_activity(100).await.unwrap();
+    assert_eq!(log.len(), 2, "DeleteObject must add a second audit entry");
+    let del = log
+        .iter()
+        .find(|e| e.action == "DeleteObject")
+        .expect("a DeleteObject audit entry is recorded");
+    assert_eq!(del.bucket.as_deref(), Some("audit-bkt"));
+    assert_eq!(del.key.as_deref(), Some("docs/a.txt"));
+    assert_eq!(del.actor.as_deref(), Some("k"));
+}
