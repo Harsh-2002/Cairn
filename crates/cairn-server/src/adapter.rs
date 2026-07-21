@@ -86,6 +86,20 @@ pub async fn handle(
         }
     }
 
+    // AWS-STS wire surface (ARCH 14): a form `POST /` on the **S3 data plane** carries an STS mint
+    // request (`AssumeRole`/`GetSessionToken`). It must be intercepted BEFORE the generic
+    // authenticate block, which would reject the `sts`-scoped signature as Malformed. Gated strictly
+    // to the S3 listener (`!serve_ui`), the root path, and the form content type, so no normal S3
+    // request is captured; disabled entirely by `CAIRN_STS_ENABLED=false`.
+    if stack.sts_enabled
+        && !serve_ui
+        && method == Method::POST
+        && raw_path == "/"
+        && content_type_is_form(&headers)
+    {
+        return handle_sts(&stack, req, headers, host, peer, secure, request_id).await;
+    }
+
     // Authenticate against a borrowed, library-neutral view.
     let principal = {
         let view = RequestView {
@@ -309,6 +323,110 @@ pub async fn handle(
     // of mis-framing. A fully-consumed body (the normal PUT path) drains to nothing here and keeps
     // keep-alive intact.
     finish_body_hygiene(response, body_bearing, &shared).await
+}
+
+/// Whether the request declares an `application/x-www-form-urlencoded` content type — the strict
+/// gate that distinguishes an STS form `POST /` from any other root request on the S3 listener.
+fn content_type_is_form(headers: &[(String, String)]) -> bool {
+    headers
+        .iter()
+        .find(|(k, _)| k == "content-type")
+        .is_some_and(|(_, v)| {
+            v.trim()
+                .to_ascii_lowercase()
+                .starts_with("application/x-www-form-urlencoded")
+        })
+}
+
+/// The maximum STS form body Cairn will buffer. The params (`Action`/`DurationSeconds`/`Policy`/…)
+/// are tiny; anything larger is not an STS request and is refused rather than buffered (DoS bound).
+const STS_MAX_BODY: usize = 16 * 1024;
+
+/// Serve an STS mint request (ARCH 14): buffer the bounded form body, bind it to the signature
+/// (hash + `authenticate_sts`, genuine SigV4 only — no dev bypass, no session chaining), then
+/// dispatch on `Action`. Terminal — always returns an STS XML document (success or the
+/// query-protocol error shape). The plaintext secret + token appear once in the success body and are
+/// never logged (this response is not routed through any body-logging path).
+async fn handle_sts(
+    stack: &std::sync::Arc<AppStack>,
+    req: Request<Incoming>,
+    headers: Vec<(String, String)>,
+    host: String,
+    peer: IpAddr,
+    secure: bool,
+    request_id: String,
+) -> Response<ResponseBody> {
+    // Buffer the (small, bounded) form body. Oversize is not an STS request; refuse it.
+    let body_bytes = match http_body_util::Limited::new(req.into_body(), STS_MAX_BODY)
+        .collect()
+        .await
+    {
+        Ok(c) => c.to_bytes(),
+        Err(_) => {
+            return sts_response(
+                crate::sts::StsHttpResponse {
+                    status: 400,
+                    body: cairn_xml::sts_error_document(
+                        "InvalidRequest",
+                        "the STS request body is malformed or too large",
+                        &request_id,
+                    ),
+                },
+                &request_id,
+            );
+        }
+    };
+    // Bind the body to the signature: the STS SDK signer folds sha256(body) into the canonical
+    // request (there is no trusted `x-amz-content-sha256` header to read for non-S3 services), so
+    // authentication verifies a genuine `sts`-scoped SigV4 signature over that same body hash —
+    // Action/DurationSeconds/Policy are all signature-bound.
+    let body_sha256 = cairn_auth::sha256_hex(&body_bytes);
+    let view = RequestView {
+        method: "POST",
+        path: "/",
+        query: "",
+        headers: &headers,
+        host: &host,
+        source: peer,
+        secure_transport: secure,
+    };
+    let principal = match stack.auth_chain.authenticate_sts(&view, &body_sha256).await {
+        AuthOutcome::Authenticated(p) => p,
+        AuthOutcome::Denied(e) => {
+            return sts_response(
+                crate::sts::auth_error_response(&e, &request_id),
+                &request_id,
+            );
+        }
+        AuthOutcome::NotApplicable => {
+            return sts_response(
+                crate::sts::StsHttpResponse {
+                    status: 403,
+                    body: cairn_xml::sts_error_document(
+                        "AccessDenied",
+                        "the request is not authenticated",
+                        &request_id,
+                    ),
+                },
+                &request_id,
+            );
+        }
+    };
+    let resp = crate::sts::handle(stack, &body_bytes, &principal, &request_id).await;
+    sts_response(resp, &request_id)
+}
+
+/// Render an [`crate::sts::StsHttpResponse`] onto the wire with `text/xml` and the request id.
+fn sts_response(resp: crate::sts::StsHttpResponse, request_id: &str) -> Response<ResponseBody> {
+    let mut builder = Response::builder()
+        .status(resp.status)
+        .header("content-type", "text/xml");
+    if let Ok(v) = http::HeaderValue::from_str(request_id) {
+        builder = builder.header("x-amz-request-id", v);
+    }
+    builder
+        .body(full_body(Bytes::from(resp.body)))
+        .unwrap_or_else(|_| Response::new(full_body(Bytes::new())))
 }
 
 /// Build a 200 response for an embedded UI asset with its content type.

@@ -286,6 +286,15 @@ pub struct Config {
     /// (`CAIRN_REQUEST_METRICS_RETENTION_DAYS`); older rows are pruned on each flush.
     pub request_metrics_retention_days: u64,
 
+    /// Whether the AWS-STS wire surface is served on the S3 data plane
+    /// (`CAIRN_STS_ENABLED`, ARCH 14). On by default (opt-out) so the AWS SDK default
+    /// credential-provider chain and Terraform's `assume_role{}` block obtain temporary credentials
+    /// (`AssumeRole`/`GetSessionToken`) with zero configuration. When `false`, a form `POST /` on the
+    /// S3 listener is not intercepted for STS and falls through to normal S3 routing; the
+    /// management-plane mint (`POST /api/v1/credentials/temporary`) is unaffected either way. Set
+    /// `false` to shrink the attack surface if no SDK/Terraform client needs the standard mint.
+    pub sts_enabled: bool,
+
     /// The root administrator's access key (`CAIRN_ROOT_ACCESS_KEY`). On every startup an active
     /// administrator with this access key is ensured in the store; the same access key + secret work
     /// for the web UI login, the management API (as a Bearer token `access.secret`), and the S3 API
@@ -381,6 +390,7 @@ impl Default for Config {
             request_metrics_flush_secs: 15,
             request_metrics_bucket_secs: 60,
             request_metrics_retention_days: 31,
+            sts_enabled: true,
             root_access_key: "cairn".to_owned(),
             root_secret_key: "cairnadmin".to_owned(),
             fastio_min_bytes: 256 * 1024,
@@ -1299,6 +1309,25 @@ mod tests {
         figment::Jail::expect_with(|jail| {
             jail.set_env("CAIRN_FASTIO_MIN_BYTES", "1048576");
             assert_eq!(Config::load().expect("loads").fastio_min_bytes, 1_048_576);
+            Ok(())
+        });
+    }
+
+    /// The AWS-STS wire surface is on by default (opt-out) and can be disabled from the environment.
+    #[test]
+    fn load_reads_sts_enabled_from_env() {
+        assert!(
+            Config::default().sts_enabled,
+            "STS is on by default (opt-out)"
+        );
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("CAIRN_STS_ENABLED", "false");
+            assert!(!Config::load().expect("loads").sts_enabled);
+            Ok(())
+        });
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("CAIRN_STS_ENABLED", "true");
+            assert!(Config::load().expect("loads").sts_enabled);
             Ok(())
         });
     }

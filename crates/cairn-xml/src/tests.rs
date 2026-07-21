@@ -1122,3 +1122,89 @@ fn xml_safe_neutralizes_illegal_chars() {
     assert_eq!(xml_safe("a\u{FFFE}b"), "a\u{FFFD}b");
     assert_eq!(xml_safe("a\tb\nc\rd"), "a\tb\nc\rd"); // legal whitespace controls pass through
 }
+
+// -------------------------------------------------------------------------------------------
+// AWS-STS wire surface (ARCH 14)
+// -------------------------------------------------------------------------------------------
+
+#[test]
+fn get_session_token_response_wire_shape() {
+    // The exact element names, `2011-06-15` default namespace, ISO-8601 `Expiration`, and
+    // `ResponseMetadata/RequestId` the SDK credential providers parse. A drift here silently breaks
+    // every SDK/Terraform client, so this golden pins the whole document.
+    let xml = get_session_token_response(
+        "CAIRNTMPABC",
+        "sekret",
+        "tok.en",
+        Timestamp(1_700_000_000_000),
+        "req-123",
+    );
+    assert_eq!(
+        xml,
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+         <GetSessionTokenResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\">\
+         <GetSessionTokenResult>\
+         <Credentials>\
+         <AccessKeyId>CAIRNTMPABC</AccessKeyId>\
+         <SecretAccessKey>sekret</SecretAccessKey>\
+         <SessionToken>tok.en</SessionToken>\
+         <Expiration>2023-11-14T22:13:20.000Z</Expiration>\
+         </Credentials>\
+         </GetSessionTokenResult>\
+         <ResponseMetadata><RequestId>req-123</RequestId></ResponseMetadata>\
+         </GetSessionTokenResponse>"
+    );
+}
+
+#[test]
+fn assume_role_response_wire_shape() {
+    // Adds the echoed `AssumedRoleUser` (`AssumedRoleId` + `Arn`) Terraform's assume_role{} expects,
+    // alongside the same `Credentials` block.
+    let xml = assume_role_response(
+        "CAIRNTMPXYZ",
+        "sekret",
+        "tok.en",
+        Timestamp(1_700_000_000_000),
+        "CAIRNTMPXYZ:sess",
+        "arn:aws:sts::cairn:assumed-role/deployer/sess",
+        "req-456",
+    );
+    assert_eq!(
+        xml,
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+         <AssumeRoleResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\">\
+         <AssumeRoleResult>\
+         <Credentials>\
+         <AccessKeyId>CAIRNTMPXYZ</AccessKeyId>\
+         <SecretAccessKey>sekret</SecretAccessKey>\
+         <SessionToken>tok.en</SessionToken>\
+         <Expiration>2023-11-14T22:13:20.000Z</Expiration>\
+         </Credentials>\
+         <AssumedRoleUser>\
+         <AssumedRoleId>CAIRNTMPXYZ:sess</AssumedRoleId>\
+         <Arn>arn:aws:sts::cairn:assumed-role/deployer/sess</Arn>\
+         </AssumedRoleUser>\
+         </AssumeRoleResult>\
+         <ResponseMetadata><RequestId>req-456</RequestId></ResponseMetadata>\
+         </AssumeRoleResponse>"
+    );
+}
+
+#[test]
+fn sts_error_document_wire_shape() {
+    // The query-protocol `<ErrorResponse>` shape (Type=Sender), which is distinct from the S3
+    // `<Error>` document; botocore keys retry/refresh behaviour off the `Code`.
+    let xml = sts_error_document("InvalidParameterValue", "duration out of range", "req-err");
+    assert_eq!(
+        xml,
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+         <ErrorResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\">\
+         <Error>\
+         <Type>Sender</Type>\
+         <Code>InvalidParameterValue</Code>\
+         <Message>duration out of range</Message>\
+         </Error>\
+         <RequestId>req-err</RequestId>\
+         </ErrorResponse>"
+    );
+}

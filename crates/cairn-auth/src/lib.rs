@@ -284,6 +284,67 @@ impl AuthChain {
         }))
     }
 
+    /// Authenticate an AWS-STS request (`AssumeRole`/`GetSessionToken`, ARCH 14) signed with the
+    /// credential-scope service `sts`. Deliberately **separate** from [`Self::authenticate`]: the
+    /// generic chain hard-rejects a non-`s3` scope (and must keep doing so), and STS minting must be
+    /// genuinely signed by a **long-term** key.
+    ///
+    /// Fail-closed and narrow by construction:
+    /// - resolves the key via [`Self::sigv4_creds`] **only** — a `CAIRNTMP…` session key lives in
+    ///   `user_by_session_key`, never consulted here, so it returns `None` → `Denied(UnknownKey)`.
+    ///   There is no credential chaining (you cannot mint a session from a session).
+    /// - **no dev bypass** — STS is always verified against a real signature.
+    /// - the signature is verified with `expected_service = "sts"` and the payload hash bound to the
+    ///   caller-supplied `body_sha256_hex` (the hash of the buffered form body), so `Action`,
+    ///   `DurationSeconds`, and `Policy` are all signature-bound; `host` must be signed and the ±900s
+    ///   skew window bounds replay.
+    ///
+    /// Returns the long-term user's [`Principal`] **without** attaching an identity policy — the STS
+    /// handler re-reads the policy itself (it needs the raw JSON to store, not a parsed `Box<Policy>`).
+    pub async fn authenticate_sts(
+        &self,
+        view: &RequestView<'_>,
+        body_sha256_hex: &str,
+    ) -> AuthOutcome {
+        let Some(header) = view.header("authorization") else {
+            return AuthOutcome::Denied(AuthError::Malformed);
+        };
+        let Some(parsed) = sigv4::parse_authorization_header(header) else {
+            return AuthOutcome::Denied(AuthError::Malformed);
+        };
+        // Long-term keys only: a session key is unknown here, so a session cannot be re-minted.
+        let Some(creds) = self.sigv4_creds(&parsed.access_key_id).await else {
+            return AuthOutcome::Denied(AuthError::UnknownKey);
+        };
+        let secret = match self
+            .crypto
+            .open(&creds.secret_ciphertext, &Nonce(creds.secret_nonce.clone()))
+        {
+            Ok(s) => s,
+            Err(_) => return AuthOutcome::Denied(AuthError::UnknownKey),
+        };
+        let secret = Zeroizing::new(String::from_utf8_lossy(&secret).into_owned());
+        match sigv4::verify_header_with_service(
+            view,
+            &parsed,
+            &secret,
+            self.clock.now(),
+            "sts",
+            Some(body_sha256_hex),
+        ) {
+            // STS is never a streaming-chunk body, so there is no signed-streaming context.
+            Ok(_) => AuthOutcome::Authenticated(sigv4::principal(
+                creds.user_id,
+                creds.display_name,
+                parsed.access_key_id,
+                creds.role,
+                AuthMethod::SigV4Header,
+                None,
+            )),
+            Err(e) => AuthOutcome::Denied(e),
+        }
+    }
+
     async fn verify_bearer(&self, header: &str) -> AuthOutcome {
         let Some((id, secret)) = parse_bearer(header) else {
             return AuthOutcome::Denied(AuthError::Malformed);

@@ -211,6 +211,138 @@ pub fn error_document(code: &str, message: &str, resource: &str, request_id: &st
 }
 
 // ===========================================================================================
+// AWS-STS wire surface (ARCH 14) — AssumeRole / GetSessionToken / error
+// ===========================================================================================
+
+/// The AWS-STS XML namespace. Every STS response document declares it as the default namespace so
+/// the SDK credential providers (which parse by local element name under this namespace) accept it.
+const STS_NAMESPACE: &str = "https://sts.amazonaws.com/doc/2011-06-15/";
+
+/// Write the shared `<Credentials>` block (`AccessKeyId`/`SecretAccessKey`/`SessionToken`/
+/// `Expiration`). `expiration` renders as ISO-8601 UTC — the form the SDK parses to schedule a
+/// refresh.
+fn sts_credentials(
+    w: &mut Writer<Cursor<Vec<u8>>>,
+    access_key_id: &str,
+    secret_access_key: &str,
+    session_token: &str,
+    expiration: Timestamp,
+) {
+    w.create_element("Credentials")
+        .write_inner_content(|w| {
+            leaf(w, "AccessKeyId", access_key_id);
+            leaf(w, "SecretAccessKey", secret_access_key);
+            leaf(w, "SessionToken", session_token);
+            leaf(w, "Expiration", &timefmt::format_iso8601(expiration));
+            Ok(())
+        })
+        .expect("writing to an in-memory buffer is infallible");
+}
+
+/// The `GetSessionTokenResponse` document (ARCH 14): the minted temporary credential the SDK
+/// consumes through the standard credential-provider chain.
+#[must_use]
+pub fn get_session_token_response(
+    access_key_id: &str,
+    secret_access_key: &str,
+    session_token: &str,
+    expiration: Timestamp,
+    request_id: &str,
+) -> String {
+    let mut w = new_doc();
+    w.create_element("GetSessionTokenResponse")
+        .with_attribute(("xmlns", STS_NAMESPACE))
+        .write_inner_content(|w| {
+            w.create_element("GetSessionTokenResult")
+                .write_inner_content(|w| {
+                    sts_credentials(
+                        w,
+                        access_key_id,
+                        secret_access_key,
+                        session_token,
+                        expiration,
+                    );
+                    Ok(())
+                })?;
+            w.create_element("ResponseMetadata")
+                .write_inner_content(|w| {
+                    leaf(w, "RequestId", request_id);
+                    Ok(())
+                })?;
+            Ok(())
+        })
+        .expect("infallible");
+    finish(w)
+}
+
+/// The `AssumeRoleResponse` document (ARCH 14): the minted temporary credential plus the echoed
+/// `AssumedRoleUser` (Cairn has no IAM roles, so `assumed_role_id`/`assumed_role_arn` are derived
+/// from the request for SDK/Terraform contract fidelity, not resolved against a real role).
+#[must_use]
+pub fn assume_role_response(
+    access_key_id: &str,
+    secret_access_key: &str,
+    session_token: &str,
+    expiration: Timestamp,
+    assumed_role_id: &str,
+    assumed_role_arn: &str,
+    request_id: &str,
+) -> String {
+    let mut w = new_doc();
+    w.create_element("AssumeRoleResponse")
+        .with_attribute(("xmlns", STS_NAMESPACE))
+        .write_inner_content(|w| {
+            w.create_element("AssumeRoleResult")
+                .write_inner_content(|w| {
+                    sts_credentials(
+                        w,
+                        access_key_id,
+                        secret_access_key,
+                        session_token,
+                        expiration,
+                    );
+                    w.create_element("AssumedRoleUser")
+                        .write_inner_content(|w| {
+                            leaf(w, "AssumedRoleId", assumed_role_id);
+                            leaf(w, "Arn", assumed_role_arn);
+                            Ok(())
+                        })?;
+                    Ok(())
+                })?;
+            w.create_element("ResponseMetadata")
+                .write_inner_content(|w| {
+                    leaf(w, "RequestId", request_id);
+                    Ok(())
+                })?;
+            Ok(())
+        })
+        .expect("infallible");
+    finish(w)
+}
+
+/// The AWS-STS `<ErrorResponse>` document (the query-protocol error shape, distinct from the S3
+/// `<Error>`): `<Type>` is always `Sender` (every STS failure Cairn returns is a 4xx client error),
+/// with the STS error `Code`, human `Message`, and the request id.
+#[must_use]
+pub fn sts_error_document(code: &str, message: &str, request_id: &str) -> String {
+    let mut w = new_doc();
+    w.create_element("ErrorResponse")
+        .with_attribute(("xmlns", STS_NAMESPACE))
+        .write_inner_content(|w| {
+            w.create_element("Error").write_inner_content(|w| {
+                leaf(w, "Type", "Sender");
+                leaf(w, "Code", code);
+                leaf(w, "Message", message);
+                Ok(())
+            })?;
+            leaf(w, "RequestId", request_id);
+            Ok(())
+        })
+        .expect("infallible");
+    finish(w)
+}
+
+// ===========================================================================================
 // Object listing — ListObjectsV2 / V1 / Versions
 // ===========================================================================================
 
