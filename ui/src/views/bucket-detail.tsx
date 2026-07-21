@@ -20,7 +20,11 @@ export function BucketDetail() {
   const navigate = useNavigate();
   const location = useLocation();
 
-  const tab = location.pathname.endsWith("/settings") ? "settings" : "browser";
+  const tab = location.pathname.endsWith("/settings")
+    ? "settings"
+    : location.pathname.endsWith("/uploads")
+      ? "uploads"
+      : "browser";
 
   return (
     <Page>
@@ -53,6 +57,9 @@ export function BucketDetail() {
         >
           <TabsTrigger value="browser" className="flex-none px-2.5 py-1.5">
             Browser
+          </TabsTrigger>
+          <TabsTrigger value="uploads" className="flex-none px-2.5 py-1.5">
+            Uploads
           </TabsTrigger>
           <TabsTrigger value="settings" className="flex-none px-2.5 py-1.5">
             Settings

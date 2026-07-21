@@ -271,6 +271,78 @@ export async function listObjectVersions(
   return { versions, commonPrefixes };
 }
 
+// --- Multipart uploads (?uploads) -----------------------------------------------
+
+export interface MultipartUpload {
+  key: string;
+  uploadId: string;
+  initiatedMs: number; // Date.parse(<Initiated>); may be NaN — the view guards it
+  ownerId: string; // <Owner><ID>; "" if absent
+}
+
+export interface MultipartUploadListing {
+  uploads: MultipartUpload[];
+  isTruncated: boolean;
+  nextKeyMarker: string;
+  nextUploadIdMarker: string;
+}
+
+// List a bucket's in-progress multipart uploads. No delimiter is sent (the backend hardcodes None,
+// so no CommonPrefixes ever come back). key-marker + upload-id-marker page together — the backend
+// ignores the id-marker unless the key-marker is present, so only send it alongside.
+export async function listMultipartUploads(
+  bucket: string,
+  opts: {
+    prefix?: string;
+    keyMarker?: string;
+    uploadIdMarker?: string;
+    maxUploads?: number;
+  } = {},
+): Promise<MultipartUploadListing> {
+  let url = `/${encodeURIComponent(bucket)}?uploads`;
+  if (opts.prefix) url += `&prefix=${encodeURIComponent(opts.prefix)}`;
+  if (opts.maxUploads) url += `&max-uploads=${opts.maxUploads}`;
+  if (opts.keyMarker) {
+    url += `&key-marker=${encodeURIComponent(opts.keyMarker)}`;
+    if (opts.uploadIdMarker)
+      url += `&upload-id-marker=${encodeURIComponent(opts.uploadIdMarker)}`;
+  }
+  const res = await fetch(url, { headers: s3headers() });
+  if (!res.ok)
+    throw await s3Error(res, "list uploads");
+  const doc = parseXml(await res.text());
+  // Read ID from the nested <Owner> (the <Upload> also carries an <Initiator><ID>).
+  const uploads = Array.from(doc.getElementsByTagName("Upload")).map((el) => {
+    const owner = el.getElementsByTagName("Owner")[0];
+    return {
+      key: childText(el, "Key"),
+      uploadId: childText(el, "UploadId"),
+      initiatedMs: Date.parse(childText(el, "Initiated")),
+      ownerId: owner ? childText(owner, "ID") : "",
+    };
+  });
+  return {
+    uploads,
+    isTruncated: childText(doc.documentElement, "IsTruncated") === "true",
+    nextKeyMarker: childText(doc.documentElement, "NextKeyMarker"),
+    nextUploadIdMarker: childText(doc.documentElement, "NextUploadIdMarker"),
+  };
+}
+
+// Abort an in-progress multipart upload, discarding its staged parts. Success is 204.
+export async function abortMultipartUpload(
+  bucket: string,
+  key: string,
+  uploadId: string,
+): Promise<void> {
+  const res = await fetch(
+    objectPath(bucket, key) + `?uploadId=${encodeURIComponent(uploadId)}`,
+    { method: "DELETE", headers: s3headers() },
+  );
+  if (!res.ok && res.status !== 204)
+    throw await s3Error(res, "abort upload");
+}
+
 // --- Object tagging (?tagging) --------------------------------------------------
 
 export interface ObjectTag {

@@ -11,6 +11,7 @@ import { BucketSettings } from "@/views/bucket-settings";
 import { Buckets } from "@/views/buckets";
 import { Credentials } from "@/views/credentials";
 import { Login } from "@/views/login";
+import { MultipartUploads } from "@/views/multipart-uploads";
 import { Overview } from "@/views/overview";
 import { Replication } from "@/views/replication";
 import { Imports } from "@/views/imports";
@@ -75,6 +76,7 @@ export const router = createHashRouter([
         children: [
           { index: true, element: <Navigate to="browser" replace /> },
           { path: "browser", element: <BucketBrowser /> },
+          { path: "uploads", element: <MultipartUploads /> },
           { path: "settings", element: <BucketSettings /> },
         ],
       },
