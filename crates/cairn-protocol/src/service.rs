@@ -910,6 +910,16 @@ impl S3Service {
                     now,
                 )
                 .await;
+                // Audit the mutation (ARCH 26.3, best-effort).
+                self.audit(
+                    "PutObject",
+                    bucket.name.as_str(),
+                    Some(key.as_str()),
+                    Some(staged.size_logical),
+                    Some(staged.etag.as_str()),
+                    req.principal.as_ref(),
+                )
+                .await;
                 let mut resp = S3Response::status(StatusCode::OK)
                     .with_header("etag", quoted(&staged.etag))
                     .with_header("x-amz-request-id", &request_id);
@@ -1109,6 +1119,15 @@ impl S3Service {
                 now,
             )
             .await;
+            self.audit(
+                "DeleteObject",
+                bucket.name.as_str(),
+                Some(event_key.as_str()),
+                None,
+                None,
+                req.principal.as_ref(),
+            )
+            .await;
             // Mirror the delete-marker-CREATING branch below: name the version acted on, and say
             // whether it was a marker.
             return Ok(S3Response::status(StatusCode::NO_CONTENT)
@@ -1169,6 +1188,15 @@ impl S3Service {
                     now,
                 )
                 .await;
+                self.audit(
+                    "DeleteObject",
+                    bucket.name.as_str(),
+                    Some(event_key.as_str()),
+                    None,
+                    None,
+                    req.principal.as_ref(),
+                )
+                .await;
                 // Signal the newly-created delete marker's identity to the client (Medium #4).
                 Ok(S3Response::status(StatusCode::NO_CONTENT)
                     .with_header("x-amz-delete-marker", "true")
@@ -1224,6 +1252,15 @@ impl S3Service {
                     now,
                 )
                 .await;
+                self.audit(
+                    "DeleteObject",
+                    bucket.name.as_str(),
+                    Some(event_key.as_str()),
+                    None,
+                    None,
+                    req.principal.as_ref(),
+                )
+                .await;
                 Ok(S3Response::status(StatusCode::NO_CONTENT)
                     .with_header("x-amz-delete-marker", "true")
                     .with_header("x-amz-request-id", &req.request_id))
@@ -1252,6 +1289,15 @@ impl S3Service {
                     None,
                     None,
                     now,
+                )
+                .await;
+                self.audit(
+                    "DeleteObject",
+                    bucket.name.as_str(),
+                    Some(event_key.as_str()),
+                    None,
+                    None,
+                    req.principal.as_ref(),
                 )
                 .await;
                 Ok(S3Response::status(StatusCode::NO_CONTENT)
@@ -1686,6 +1732,16 @@ impl S3Service {
                     now,
                 )
                 .await;
+                // Audit the mutation (ARCH 26.3, best-effort).
+                self.audit(
+                    "CompleteMultipartUpload",
+                    bucket.name.as_str(),
+                    Some(key.as_str()),
+                    Some(staged.size_logical),
+                    Some(etag.as_str()),
+                    req.principal.as_ref(),
+                )
+                .await;
                 let location = format!("/{}/{}", bucket.name.as_str(), key.as_str());
                 let body = cairn_xml::complete_multipart_result(
                     &location,
@@ -2079,6 +2135,16 @@ impl S3Service {
                     now,
                 )
                 .await;
+                // Audit the mutation against the destination (ARCH 26.3, best-effort).
+                self.audit(
+                    "CopyObject",
+                    dest_bucket.name.as_str(),
+                    Some(dest_key_for_event.as_str()),
+                    Some(staged.size_logical),
+                    Some(staged.etag.as_str()),
+                    req.principal.as_ref(),
+                )
+                .await;
                 let body = cairn_xml::copy_object_result(&staged.etag, now);
                 let mut resp = S3Response::xml(StatusCode::OK, body)
                     .with_header("x-amz-request-id", &req.request_id);
@@ -2113,6 +2179,11 @@ impl S3Service {
         if keys.len() > 1000 {
             return Err(Error::MalformedXml);
         }
+        // Total keys attempted, captured before `keys` is consumed into the per-group fan-out below.
+        // Each key yields exactly one outcome (a success or an `out.error`), so the number
+        // successfully deleted is `total_keys - errors.len()` — accurate even in `quiet` mode, where
+        // the per-key `deleted` list is intentionally left empty.
+        let total_keys = keys.len();
         let now = self.clock.now();
 
         // Request-level replica gate (audit #16), mirroring the single-object DELETE: an
@@ -2395,6 +2466,22 @@ impl S3Service {
         // Event-driven drain: a single wake covers every delete marker enqueued in this batch.
         if any_repl_enqueued {
             self.pulse_replication();
+        }
+        // Audit the batch as ONE aggregate entry (ARCH 26.3, best-effort): a per-key entry inside the
+        // bounded-concurrent fan-out would multiply writer submits on the hot delete path, so record a
+        // single `DeleteObjects` with `size` = the number of keys successfully removed. Skip a batch
+        // that deleted nothing (every key errored) — no mutation happened.
+        let deleted_count = (total_keys - errors.len()) as u64;
+        if deleted_count > 0 {
+            self.audit(
+                "DeleteObjects",
+                bucket.name.as_str(),
+                None,
+                Some(deleted_count),
+                None,
+                req.principal.as_ref(),
+            )
+            .await;
         }
         let body = cairn_xml::delete_result(&deleted, &errors);
         Ok(S3Response::xml(StatusCode::OK, body).with_header("x-amz-request-id", &req.request_id))
@@ -2852,6 +2939,9 @@ impl S3Service {
         let doc = drain_body(body, 64 * 1024).await?;
         let tags = cairn_xml::parse_tagging(&doc)?;
         cairn_xml::validate_tags(&tags, cairn_xml::MAX_TAGS_OBJECT)?;
+        // Captured before the mutation moves `bucket.name`/`key`; audited only on the success path.
+        let audit_bucket = bucket.name.as_str().to_owned();
+        let audit_key = key.as_str().to_owned();
         self.meta
             .submit(Mutation::PutObjectTags {
                 bucket: bucket.name,
@@ -2860,6 +2950,16 @@ impl S3Service {
                 tags,
             })
             .await?;
+        // Audit the mutation (ARCH 26.3, best-effort).
+        self.audit(
+            "PutObjectTagging",
+            audit_bucket.as_str(),
+            Some(audit_key.as_str()),
+            None,
+            None,
+            req.principal.as_ref(),
+        )
+        .await;
         Ok(S3Response::status(StatusCode::OK).with_header("x-amz-request-id", &req.request_id))
     }
 
@@ -2880,6 +2980,9 @@ impl S3Service {
                 .await?
                 .ok_or(Error::NoSuchKey)?,
         };
+        // Captured before the mutation moves `bucket.name`/`key`; audited only on the success path.
+        let audit_bucket = bucket.name.as_str().to_owned();
+        let audit_key = key.as_str().to_owned();
         self.meta
             .submit(Mutation::DeleteObjectTags {
                 bucket: bucket.name,
@@ -2887,6 +2990,16 @@ impl S3Service {
                 version_id: row.version_id,
             })
             .await?;
+        // Audit the mutation (ARCH 26.3, best-effort).
+        self.audit(
+            "DeleteObjectTagging",
+            audit_bucket.as_str(),
+            Some(audit_key.as_str()),
+            None,
+            None,
+            req.principal.as_ref(),
+        )
+        .await;
         Ok(S3Response::status(StatusCode::NO_CONTENT)
             .with_header("x-amz-request-id", &req.request_id))
     }
@@ -2987,6 +3100,9 @@ impl S3Service {
                 }
             }
         }
+        // Captured before the mutation moves `bucket.name`/`key`; audited only on the success path.
+        let audit_bucket = bucket.name.as_str().to_owned();
+        let audit_key = key.as_str().to_owned();
         self.meta
             .submit(Mutation::SetObjectRetention {
                 bucket: bucket.name,
@@ -2995,6 +3111,16 @@ impl S3Service {
                 retention: Some(new),
             })
             .await?;
+        // Audit the mutation (ARCH 26.3, best-effort).
+        self.audit(
+            "PutObjectRetention",
+            audit_bucket.as_str(),
+            Some(audit_key.as_str()),
+            None,
+            None,
+            req.principal.as_ref(),
+        )
+        .await;
         Ok(S3Response::status(StatusCode::OK).with_header("x-amz-request-id", &req.request_id))
     }
 
@@ -3028,6 +3154,9 @@ impl S3Service {
         let row = self.resolve_lock_target(&bucket.name, &key, &req).await?;
         let doc = drain_body(body, 64 * 1024).await?;
         let on = cairn_xml::parse_legal_hold(&doc)?;
+        // Captured before the mutation moves `bucket.name`/`key`; audited only on the success path.
+        let audit_bucket = bucket.name.as_str().to_owned();
+        let audit_key = key.as_str().to_owned();
         self.meta
             .submit(Mutation::SetObjectLegalHold {
                 bucket: bucket.name,
@@ -3036,6 +3165,16 @@ impl S3Service {
                 on,
             })
             .await?;
+        // Audit the mutation (ARCH 26.3, best-effort).
+        self.audit(
+            "PutObjectLegalHold",
+            audit_bucket.as_str(),
+            Some(audit_key.as_str()),
+            None,
+            None,
+            req.principal.as_ref(),
+        )
+        .await;
         Ok(S3Response::status(StatusCode::OK).with_header("x-amz-request-id", &req.request_id))
     }
 
@@ -3248,6 +3387,41 @@ impl S3Service {
             "x-amz-object-lock-legal-hold",
             if state.legal_hold { "ON" } else { "OFF" },
         ))
+    }
+
+    /// Best-effort per-event audit entry for a MUTATING S3 op (ARCH 26.3: both the S3 and
+    /// management surfaces are audited — the S3 data plane was the missing half). Fire-and-forget
+    /// through the single writer, exactly like `emit_events`: a failed audit write must never fail
+    /// the request, and the group-commit writer amortizes these across concurrent mutations. Reads
+    /// are NOT audited (the request-metrics aggregate covers read volume); only mutating handlers
+    /// call this. `principal` is `None` for an anonymous requester a public bucket policy allowed to
+    /// mutate — still audited, with a `None` actor (the write DID happen; ARCH 26.3 records "the
+    /// actor", which may legitimately be anonymous). Never bind the principal via a fallible
+    /// `require_principal(..)?` around this: an anonymous-permitted mutation carries no principal,
+    /// and failing the request for a missing actor would break the very write policy just allowed.
+    async fn audit(
+        &self,
+        action: &str,
+        bucket: &str,
+        key: Option<&str>,
+        size: Option<u64>,
+        etag: Option<&str>,
+        principal: Option<&Principal>,
+    ) {
+        let entry = cairn_types::meta::ActivityEntry {
+            id: uuid::Uuid::new_v4().simple().to_string(),
+            action: action.to_owned(),
+            bucket: Some(bucket.to_owned()),
+            key: key.map(str::to_owned),
+            size,
+            etag: etag.map(|e| e.trim_matches('"').to_owned()),
+            actor: principal.map(|p| p.access_key_id.clone()),
+            at: self.clock.now(),
+        };
+        let _ = self
+            .meta
+            .submit(cairn_types::meta::Mutation::RecordActivity(Box::new(entry)))
+            .await;
     }
 
     /// Emit event notifications for an object event (ARCH 20-style). Reads the bucket's webhook
