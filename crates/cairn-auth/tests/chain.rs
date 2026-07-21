@@ -465,3 +465,226 @@ async fn session_credential_denied_when_parent_deactivated() {
         "a session whose parent account is deactivated is denied"
     );
 }
+
+// -------------------------------------------------------------------------------------------
+// AWS-STS minting auth (`authenticate_sts`, ARCH 14)
+// -------------------------------------------------------------------------------------------
+
+/// The STS form body a client would POST (the exact bytes are what the signature binds).
+const STS_BODY: &str = "Action=GetSessionToken&Version=2011-06-15&DurationSeconds=3600";
+
+/// Sign a `POST /` STS request the way a non-S3 SDK signer does: the credential scope service is
+/// `sts` and the payload hash (the sha256 of the form body) is folded into the canonical request
+/// **without** an `x-amz-content-sha256` header. Returns the Authorization header value. `service`
+/// is a parameter only so a test can forge an `s3`-scoped signature onto the STS path.
+fn sign_sts(headers: &[(String, String)], body: &[u8], service: &str) -> String {
+    let amzdate = "20150830T123600Z";
+    let scope_date = "20150830";
+    let region = "us-east-1";
+    let payload_hash = cairn_auth::sha256_hex(body);
+    let mut signed: Vec<(String, String)> = headers.to_vec();
+    signed.sort();
+    let names: Vec<String> = signed.iter().map(|(n, _)| n.clone()).collect();
+    let signed_names = names.join(";");
+    let cr = cairn_auth::canonical_request("POST", "/", "", &signed, &signed_names, &payload_hash);
+    let sts = cairn_auth::string_to_sign(
+        amzdate,
+        &format!("{scope_date}/{region}/{service}/aws4_request"),
+        &cr,
+    );
+    let key = signing_key(SECRET, scope_date, region, service);
+    let sig = compute_signature(&key, &sts);
+    format!(
+        "AWS4-HMAC-SHA256 Credential={AKID}/{scope_date}/{region}/{service}/aws4_request, \
+         SignedHeaders={signed_names}, Signature={sig}"
+    )
+}
+
+/// A `POST /` STS request view carrying `headers`.
+fn sts_view<'a>(headers: &'a [(String, String)], host: &'a str) -> RequestView<'a> {
+    RequestView {
+        method: "POST",
+        path: "/",
+        query: "",
+        headers,
+        host,
+        source: IpAddr::V4(Ipv4Addr::LOCALHOST),
+        secure_transport: false,
+    }
+}
+
+fn sts_signed_headers(host: &str) -> Vec<(String, String)> {
+    vec![
+        (
+            "content-type".to_owned(),
+            "application/x-www-form-urlencoded".to_owned(),
+        ),
+        ("host".to_owned(), host.to_owned()),
+        ("x-amz-date".to_owned(), "20150830T123600Z".to_owned()),
+    ]
+}
+
+#[tokio::test]
+async fn authenticate_sts_accepts_sts_scoped_long_term_key() {
+    let (chain, _) = setup().await;
+    let host = "sts.example.com";
+    let base = sts_signed_headers(host);
+    let auth = sign_sts(&base, STS_BODY.as_bytes(), "sts");
+    let mut headers = base.clone();
+    headers.push(("authorization".to_owned(), auth));
+    let v = sts_view(&headers, host);
+    match chain
+        .authenticate_sts(&v, &cairn_auth::sha256_hex(STS_BODY.as_bytes()))
+        .await
+    {
+        AuthOutcome::Authenticated(p) => {
+            assert_eq!(p.access_key_id, AKID);
+            assert!(
+                !p.is_session,
+                "the STS caller is a long-term principal, not a session"
+            );
+        }
+        other => panic!("expected authenticated, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn authenticate_sts_rejects_tampered_body() {
+    // The signature binds the buffered body hash; presenting a different body hash must fail closed.
+    let (chain, _) = setup().await;
+    let host = "sts.example.com";
+    let base = sts_signed_headers(host);
+    let auth = sign_sts(&base, STS_BODY.as_bytes(), "sts");
+    let mut headers = base.clone();
+    headers.push(("authorization".to_owned(), auth));
+    let v = sts_view(&headers, host);
+    let tampered = cairn_auth::sha256_hex(b"Action=AssumeRole&DurationSeconds=43200");
+    assert!(
+        matches!(
+            chain.authenticate_sts(&v, &tampered).await,
+            AuthOutcome::Denied(_)
+        ),
+        "a body hash that does not match the signature is denied"
+    );
+}
+
+#[tokio::test]
+async fn authenticate_sts_rejects_s3_scope() {
+    // An s3-scoped signature must not authenticate on the STS surface.
+    let (chain, _) = setup().await;
+    let host = "sts.example.com";
+    let base = sts_signed_headers(host);
+    let auth = sign_sts(&base, STS_BODY.as_bytes(), "s3");
+    let mut headers = base.clone();
+    headers.push(("authorization".to_owned(), auth));
+    let v = sts_view(&headers, host);
+    assert!(matches!(
+        chain
+            .authenticate_sts(&v, &cairn_auth::sha256_hex(STS_BODY.as_bytes()))
+            .await,
+        AuthOutcome::Denied(cairn_types::error::AuthError::Malformed)
+    ));
+}
+
+#[tokio::test]
+async fn authenticate_sts_rejects_unsigned_host() {
+    // `host` must be among the signed headers (binding the request to the authority).
+    let (chain, _) = setup().await;
+    let host = "sts.example.com";
+    let base = vec![
+        (
+            "content-type".to_owned(),
+            "application/x-www-form-urlencoded".to_owned(),
+        ),
+        ("x-amz-date".to_owned(), "20150830T123600Z".to_owned()),
+    ];
+    let auth = sign_sts(&base, STS_BODY.as_bytes(), "sts");
+    let mut headers = base.clone();
+    headers.push(("host".to_owned(), host.to_owned()));
+    headers.push(("authorization".to_owned(), auth));
+    let v = sts_view(&headers, host);
+    assert!(matches!(
+        chain
+            .authenticate_sts(&v, &cairn_auth::sha256_hex(STS_BODY.as_bytes()))
+            .await,
+        AuthOutcome::Denied(cairn_types::error::AuthError::Malformed)
+    ));
+}
+
+#[tokio::test]
+async fn authenticate_sts_rejects_session_key_no_chaining() {
+    // A CAIRNTMP session credential is NOT a long-term key: `authenticate_sts` never consults the
+    // session-key table, so a session cannot mint another session (no credential chaining).
+    let chain = setup_session(Timestamp::from_secs(9_999_999_999), true).await;
+    let host = "sts.example.com";
+    let amzdate = "20150830T123600Z";
+    let scope_date = "20150830";
+    let region = "us-east-1";
+    let base = sts_signed_headers(host);
+    let mut signed = base.clone();
+    signed.sort();
+    let names: Vec<String> = signed.iter().map(|(n, _)| n.clone()).collect();
+    let signed_names = names.join(";");
+    let payload_hash = cairn_auth::sha256_hex(STS_BODY.as_bytes());
+    let cr = cairn_auth::canonical_request("POST", "/", "", &signed, &signed_names, &payload_hash);
+    let sts = cairn_auth::string_to_sign(
+        amzdate,
+        &format!("{scope_date}/{region}/sts/aws4_request"),
+        &cr,
+    );
+    let key = signing_key(SESSION_SECRET, scope_date, region, "sts");
+    let sig = compute_signature(&key, &sts);
+    let auth = format!(
+        "AWS4-HMAC-SHA256 Credential={SESSION_AKID}/{scope_date}/{region}/sts/aws4_request, \
+         SignedHeaders={signed_names}, Signature={sig}"
+    );
+    let mut headers = base.clone();
+    headers.push(("authorization".to_owned(), auth));
+    let v = sts_view(&headers, host);
+    assert!(matches!(
+        chain.authenticate_sts(&v, &payload_hash).await,
+        AuthOutcome::Denied(cairn_types::error::AuthError::UnknownKey)
+    ));
+}
+
+#[tokio::test]
+async fn sts_scope_on_generic_s3_chain_is_denied() {
+    // The dangerous refactor direction: an sts-scoped signature must NEVER authenticate a normal S3
+    // operation through the generic chain (`authenticate`). It is rejected as Malformed.
+    let (chain, _) = setup().await;
+    let host = "s3.example.com";
+    let payload = cairn_auth::sha256_hex(b"");
+    let base = vec![
+        ("host".to_owned(), host.to_owned()),
+        ("x-amz-date".to_owned(), "20150830T123600Z".to_owned()),
+        ("x-amz-content-sha256".to_owned(), payload.clone()),
+    ];
+    // Sign a GET /bucket/key but with the `sts` service in the credential scope.
+    let amzdate = "20150830T123600Z";
+    let scope_date = "20150830";
+    let region = "us-east-1";
+    let mut signed = base.clone();
+    signed.sort();
+    let names: Vec<String> = signed.iter().map(|(n, _)| n.clone()).collect();
+    let signed_names = names.join(";");
+    let cr =
+        cairn_auth::canonical_request("GET", "/bucket/key", "", &signed, &signed_names, &payload);
+    let sts = cairn_auth::string_to_sign(
+        amzdate,
+        &format!("{scope_date}/{region}/sts/aws4_request"),
+        &cr,
+    );
+    let key = signing_key(SECRET, scope_date, region, "sts");
+    let sig = compute_signature(&key, &sts);
+    let auth = format!(
+        "AWS4-HMAC-SHA256 Credential={AKID}/{scope_date}/{region}/sts/aws4_request, \
+         SignedHeaders={signed_names}, Signature={sig}"
+    );
+    let mut headers = base.clone();
+    headers.push(("authorization".to_owned(), auth));
+    let v = view(&headers, host);
+    assert!(matches!(
+        chain.authenticate(&v).await,
+        AuthOutcome::Denied(cairn_types::error::AuthError::Malformed)
+    ));
+}

@@ -221,13 +221,34 @@ pub struct HeaderAuth {
 /// Verify a header-form SigV4 request, given the (decrypted) secret. Returns the established
 /// auth method on success, plus a signed-streaming context when the request body is a
 /// `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` chunk stream.
+///
+/// The S3 data plane's verification path — a thin wrapper over [`verify_header_with_service`] that
+/// fixes the credential-scope service to `s3` and derives the payload hash from the
+/// `x-amz-content-sha256` header (the S3 convention). Byte-identical to the pre-STS-refactor code.
 pub fn verify_header(
     view: &RequestView<'_>,
     parsed: &ParsedSig,
     secret: &str,
     now: Timestamp,
 ) -> Result<HeaderAuth, AuthError> {
-    if parsed.service != "s3" {
+    verify_header_with_service(view, parsed, secret, now, "s3", None)
+}
+
+/// The service-parametric core of header-form SigV4 verification, shared by the S3 data plane
+/// ([`verify_header`], `expected_service = "s3"`) and the STS wire surface (`expected_service =
+/// "sts"`, ARCH 14). `payload_hash_override` supplies the canonical-request payload hash directly
+/// (the STS path hashes the buffered form body, which non-S3 SDK signers fold into the signature
+/// without an `x-amz-content-sha256` header); `None` falls back to that header, defaulting to
+/// `UNSIGNED-PAYLOAD` — the exact S3 behaviour.
+pub fn verify_header_with_service(
+    view: &RequestView<'_>,
+    parsed: &ParsedSig,
+    secret: &str,
+    now: Timestamp,
+    expected_service: &str,
+    payload_hash_override: Option<&str>,
+) -> Result<HeaderAuth, AuthError> {
+    if parsed.service != expected_service {
         return Err(AuthError::Malformed);
     }
     if !parsed
@@ -242,10 +263,13 @@ pub fn verify_header(
     if !amzdate.starts_with(&parsed.scope_date) {
         return Err(AuthError::Malformed);
     }
-    let payload_hash = view
-        .header("x-amz-content-sha256")
-        .unwrap_or("UNSIGNED-PAYLOAD")
-        .to_owned();
+    let payload_hash = match payload_hash_override {
+        Some(h) => h.to_owned(),
+        None => view
+            .header("x-amz-content-sha256")
+            .unwrap_or("UNSIGNED-PAYLOAD")
+            .to_owned(),
+    };
     let signed = signed_header_pairs(view, &parsed.signed_headers);
     let signed_names = sorted_names(&parsed.signed_headers);
     let cr = canonical_request(

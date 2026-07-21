@@ -68,6 +68,8 @@ cairn-blob.workspace = true
 cairn-crypto.workspace = true
 cairn-auth.workspace = true
 cairn-authz.workspace = true
+# The AWS-STS wire surface (`sts.rs`) renders the STS response/error XML via the shared codec.
+cairn-xml.workspace = true
 cairn-lifecycle.workspace = true
 cairn-replication.workspace = true
 cairn-webhook.workspace = true

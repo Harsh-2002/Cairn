@@ -37,6 +37,15 @@ pub struct AppStack {
     pub control: cairn_control::ControlService,
     /// The authenticator chain.
     pub auth: Arc<dyn Authenticator>,
+    /// The same authenticator chain behind its concrete type, kept so the STS wire surface can call
+    /// `AuthChain::authenticate_sts` (an inherent method that hosts an `sts`-scoped signature; the
+    /// generic `Authenticator::authenticate` deliberately rejects a non-`s3` scope). Mirrors the
+    /// `store: Vec<Arc<SqliteMetadataStore>>` concrete-handle-alongside-`dyn` pattern above; one
+    /// extra startup `Arc` clone, zero per-request cost.
+    pub auth_chain: Arc<AuthChain>,
+    /// Whether the AWS-STS wire surface is served on the S3 data plane (`CAIRN_STS_ENABLED`, ARCH
+    /// 14). When `false`, a form `POST /` on the S3 listener is not intercepted for STS.
+    pub sts_enabled: bool,
     /// The metadata store behind its trait object, used by request handlers, the readiness
     /// probe, and the background subsystems (multipart sweeper, lifecycle scanner). Backend-
     /// agnostic: it is the sqlite, libSQL, or Turso store depending on `CAIRN_META_BACKEND`.
@@ -483,13 +492,16 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
         std::time::Duration::from_secs(cfg.auth_cache_ttl_secs),
         meta_cache.auth_epoch_handle(),
     ));
-    let auth: Arc<dyn Authenticator> = Arc::new(AuthChain::new(
+    // Build the chain once and keep both the concrete `Arc<AuthChain>` (for `authenticate_sts`) and
+    // the `dyn Authenticator` view the rest of the stack uses.
+    let auth_chain = Arc::new(AuthChain::new(
         meta.clone(),
         crypto.clone(),
         clock.clone(),
         auth_cache,
         cfg.dev_auth,
     ));
+    let auth: Arc<dyn Authenticator> = auth_chain.clone();
     let authz: Arc<dyn AuthorizationEngine> = Arc::new(cairn_authz::PolicyEngine);
     let replication_notify = Arc::new(tokio::sync::Notify::new());
     let import_notify = Arc::new(tokio::sync::Notify::new());
@@ -587,6 +599,8 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
         s3,
         control,
         auth,
+        auth_chain,
+        sts_enabled: cfg.sts_enabled,
         meta,
         meta_cache,
         crypto: system_crypto,
