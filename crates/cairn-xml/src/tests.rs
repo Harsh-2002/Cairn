@@ -341,9 +341,34 @@ fn multipart_generators() {
     assert!(init.contains("<UploadId>up-1</UploadId>"));
 
     let etag = ETag::multipart("abc".to_owned(), 3);
-    let comp = complete_multipart_result("http://h/b/k", "b", "k", &etag);
+    let comp = complete_multipart_result("http://h/b/k", "b", "k", &etag, None, None);
     assert!(comp.contains("<Location>http://h/b/k</Location>"));
     assert!(comp.contains("<ETag>&quot;abc-3&quot;</ETag>"));
+    // No supplementary checksum -> no checksum elements.
+    assert!(!comp.contains("<ChecksumType>"));
+    assert!(!comp.contains("<ChecksumCRC32>"));
+
+    // A completed object with a COMPOSITE object checksum renders the algo element + type.
+    let cv = ChecksumValue {
+        algorithm: ChecksumAlgorithm::Crc32,
+        value: "AAAAAA==-2".to_owned(),
+    };
+    let comp = complete_multipart_result(
+        "http://h/b/k",
+        "b",
+        "k",
+        &etag,
+        Some(&cv),
+        Some("COMPOSITE"),
+    );
+    assert!(
+        comp.contains("<ChecksumCRC32>AAAAAA==-2</ChecksumCRC32>"),
+        "{comp}"
+    );
+    assert!(
+        comp.contains("<ChecksumType>COMPOSITE</ChecksumType>"),
+        "{comp}"
+    );
 }
 
 #[test]
@@ -526,7 +551,7 @@ fn copy_part_result_shape() {
 #[test]
 fn get_object_attributes_single_part() {
     let etag = ETag::from_md5_hex("d41d8cd9".to_owned());
-    let xml = get_object_attributes(&etag, 1234, StorageClass::Standard, &[], None);
+    let xml = get_object_attributes(&etag, 1234, StorageClass::Standard, &[], None, None);
     // The ETag is rendered UNQUOTED for GetObjectAttributes.
     assert!(xml.contains("<ETag>d41d8cd9</ETag>"), "{xml}");
     assert!(xml.contains("<ObjectSize>1234</ObjectSize>"));
@@ -549,10 +574,13 @@ fn get_object_attributes_with_checksum_and_parts() {
         5_242_888,
         StorageClass::Standard,
         &checksums,
+        Some("COMPOSITE"),
         Some(&parts),
     );
     assert!(
-        xml.contains("<Checksum><ChecksumCRC32C>AAAAAA==</ChecksumCRC32C></Checksum>"),
+        xml.contains(
+            "<Checksum><ChecksumCRC32C>AAAAAA==</ChecksumCRC32C><ChecksumType>COMPOSITE</ChecksumType></Checksum>"
+        ),
         "{xml}"
     );
     assert!(xml.contains("<ObjectParts><TotalPartsCount>2</TotalPartsCount>"));

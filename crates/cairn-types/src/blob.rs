@@ -77,6 +77,11 @@ pub struct StagedPart {
     pub size: u64,
     /// The part's hex MD5 (its part ETag, used in the multipart ETag formula).
     pub md5_hex: String,
+    /// The supplementary checksums computed over the part's plaintext (empty unless the caller
+    /// requested any via the `checksums` argument to [`crate::BlobStore::stage_part`]). The caller
+    /// validates these against any client-supplied `x-amz-checksum-*` header and persists the
+    /// per-part value for later composite/full-object composition at CompleteMultipartUpload.
+    pub checksums: Vec<ChecksumValue>,
 }
 
 /// A reference to one part during assembly, in part-number order.

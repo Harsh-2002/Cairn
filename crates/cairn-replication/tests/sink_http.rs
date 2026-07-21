@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use bytes::Bytes;
 use cairn_types::error::BlobError;
 use cairn_types::id::{BucketName, ObjectKey, VersionId};
-use cairn_types::object::ETag;
+use cairn_types::object::{ChecksumAlgorithm, ChecksumValue, ETag};
 use cairn_types::replication::ReplicatedObject;
 use cairn_types::time::Timestamp;
 use cairn_types::traits::Clock;
@@ -234,6 +234,62 @@ async fn put_object_issues_well_formed_signed_request() {
     let signature = auth.split("Signature=").nth(1).unwrap();
     assert_eq!(signature.len(), 64, "signature must be 64 hex chars");
     assert!(signature.bytes().all(|b| b.is_ascii_hexdigit()));
+}
+
+/// A COMPOSITE multipart checksum-of-checksums (a `-N`-suffixed value) is NOT re-emitted on the
+/// single-part replica PUT — the destination would reject it — while a whole-object FULL_OBJECT
+/// checksum still ships so a checksum-mode GET of the replica matches the source.
+#[tokio::test]
+async fn composite_checksum_is_not_replicated_but_full_object_is() {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let authority = spawn_server(captured.clone(), Reply { status: 200 }).await;
+    let sink = sink_for(&authority, 1_440_938_160);
+
+    let object = ReplicatedObject {
+        key: ObjectKey::parse("logs/app.log").unwrap(),
+        version_id: VersionId::from_string("v1".to_owned()),
+        content_type: "text/plain".to_owned(),
+        user_metadata: Vec::new(),
+        etag: ETag::from_string("\"abc-2\"".to_owned()),
+        size: 5,
+        tags: Vec::new(),
+        acl: None,
+        content_encoding: None,
+        cache_control: None,
+        content_disposition: None,
+        content_language: None,
+        expires: None,
+        storage_class: cairn_types::object::StorageClass::Standard,
+        checksums: vec![
+            // A composite CRC32 (checksum-of-checksums over 2 parts) — must be skipped.
+            ChecksumValue {
+                algorithm: ChecksumAlgorithm::Crc32,
+                value: "AAAAAA==-2".to_owned(),
+            },
+            // A whole-object SHA-256 — must still ship.
+            ChecksumValue {
+                algorithm: ChecksumAlgorithm::Sha256,
+                value: "ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0=".to_owned(),
+            },
+        ],
+        body: body_stream(b"hello"),
+    };
+
+    sink.put_object(&src(), object).await.unwrap();
+
+    let reqs = captured.lock().unwrap().clone();
+    assert_eq!(reqs.len(), 1);
+    let req = &reqs[0];
+    assert_eq!(
+        req.header("x-amz-checksum-crc32"),
+        None,
+        "a composite (-N) checksum must not be re-emitted to a single-part replica"
+    );
+    assert_eq!(
+        req.header("x-amz-checksum-sha256"),
+        Some("ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0="),
+        "a whole-object FULL_OBJECT checksum still replicates"
+    );
 }
 
 /// The object ACL is replicated as a base64(JSON) `x-amz-meta-cairn-replica-acl` header when (and

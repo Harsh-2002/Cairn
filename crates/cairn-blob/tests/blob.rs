@@ -570,11 +570,23 @@ async fn multipart_assembly_roundtrip() {
     let b = BucketName::parse("bkt").unwrap();
     let upload = UploadId::generate();
     let p1 = store
-        .stage_part(&upload, 1, body(b"part-one-".to_vec()), 1 << 20)
+        .stage_part(
+            &upload,
+            1,
+            body(b"part-one-".to_vec()),
+            ChecksumSet::none(),
+            1 << 20,
+        )
         .await
         .unwrap();
     let p2 = store
-        .stage_part(&upload, 2, body(b"part-two".to_vec()), 1 << 20)
+        .stage_part(
+            &upload,
+            2,
+            body(b"part-two".to_vec()),
+            ChecksumSet::none(),
+            1 << 20,
+        )
         .await
         .unwrap();
     let refs = vec![
@@ -616,11 +628,23 @@ async fn assemble_enforces_size_ceiling() {
     let b = BucketName::parse("bkt").unwrap();
     let upload = UploadId::generate();
     let p1 = store
-        .stage_part(&upload, 1, body(b"part-one-".to_vec()), 1 << 20)
+        .stage_part(
+            &upload,
+            1,
+            body(b"part-one-".to_vec()),
+            ChecksumSet::none(),
+            1 << 20,
+        )
         .await
         .unwrap();
     let p2 = store
-        .stage_part(&upload, 2, body(b"part-two".to_vec()), 1 << 20)
+        .stage_part(
+            &upload,
+            2,
+            body(b"part-two".to_vec()),
+            ChecksumSet::none(),
+            1 << 20,
+        )
         .await
         .unwrap();
     let refs = vec![
@@ -844,6 +868,118 @@ async fn delete_is_idempotent_and_paths_are_safe() {
     );
 }
 
+/// `stage_part` computes the requested supplementary checksum over the part's plaintext (composite
+/// multipart checksums, Phase 1): a CRC32 request returns the documented base64 CRC32 of the part's
+/// bytes, and no checksum is returned when none is requested. Fails before this change (the field and
+/// the `checksums` parameter did not exist).
+#[tokio::test]
+async fn stage_part_computes_requested_checksum() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let upload = UploadId::generate();
+    // CRC32("abc") = 0x352441C2; base64 of the big-endian bytes is "NSRBwg==".
+    let staged = store
+        .stage_part(
+            &upload,
+            1,
+            body(b"abc".to_vec()),
+            ChecksumSet(vec![ChecksumAlgorithm::Crc32]),
+            1 << 20,
+        )
+        .await
+        .unwrap();
+    assert_eq!(staged.checksums.len(), 1);
+    assert_eq!(staged.checksums[0].algorithm, ChecksumAlgorithm::Crc32);
+    assert_eq!(staged.checksums[0].value, "NSRBwg==");
+
+    // No algorithm requested -> no supplementary checksum computed.
+    let plain = store
+        .stage_part(
+            &upload,
+            2,
+            body(b"abc".to_vec()),
+            ChecksumSet::none(),
+            1 << 20,
+        )
+        .await
+        .unwrap();
+    assert!(plain.checksums.is_empty());
+}
+
+/// `assemble` honors `opts.extra_checksums`, recomputing a whole-object checksum over the assembled
+/// plaintext: the CRC64NVME of two assembled parts equals the CRC64NVME of the same concatenated
+/// bytes staged as a single object. Fails before this change (`assemble` returned `Vec::new()`).
+#[tokio::test]
+async fn assemble_honors_extra_checksums_whole_object() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let b = BucketName::parse("bkt").unwrap();
+    let upload = UploadId::generate();
+    let p1 = store
+        .stage_part(
+            &upload,
+            1,
+            body(b"part-one-".to_vec()),
+            ChecksumSet::none(),
+            1 << 20,
+        )
+        .await
+        .unwrap();
+    let p2 = store
+        .stage_part(
+            &upload,
+            2,
+            body(b"part-two".to_vec()),
+            ChecksumSet::none(),
+            1 << 20,
+        )
+        .await
+        .unwrap();
+    let refs = vec![
+        PartRef {
+            part_number: 1,
+            storage_path: p1.storage_path.clone(),
+            size: p1.size,
+        },
+        PartRef {
+            part_number: 2,
+            storage_path: p2.storage_path.clone(),
+            size: p2.size,
+        },
+    ];
+    let assemble_opts = StageOptions {
+        extra_checksums: ChecksumSet(vec![ChecksumAlgorithm::Crc64Nvme]),
+        size_ceiling: 100 * 1024 * 1024,
+        content_type: "text/plain".to_owned(),
+        ..StageOptions::default()
+    };
+    let assembled = store.assemble(&b, &refs, assemble_opts).await.unwrap();
+    let assembled_crc = assembled
+        .checksums
+        .iter()
+        .find(|c| c.algorithm == ChecksumAlgorithm::Crc64Nvme)
+        .expect("crc64nvme present");
+
+    // The same concatenated bytes staged as a single object must carry the identical whole-object
+    // CRC64NVME — proving assembly recomputes over the plaintext, not a checksum-of-checksums.
+    let whole = StageOptions {
+        extra_checksums: ChecksumSet(vec![ChecksumAlgorithm::Crc64Nvme]),
+        size_ceiling: 100 * 1024 * 1024,
+        content_type: "text/plain".to_owned(),
+        ..StageOptions::default()
+    };
+    let single = store
+        .stage(&b, body(b"part-one-part-two".to_vec()), whole)
+        .await
+        .unwrap();
+    let single_crc = single
+        .checksums
+        .iter()
+        .find(|c| c.algorithm == ChecksumAlgorithm::Crc64Nvme)
+        .expect("crc64nvme present");
+    assert_eq!(assembled_crc.value, single_crc.value);
+}
+
 /// An object staged through the io_uring write path reads back byte-for-byte identically and with
 /// the same ETag as the same bytes staged through the default `tokio::fs` path. This exercises the
 /// dedicated io_uring executor end to end: create the staging tmp, stream the payload, fsync,
@@ -975,11 +1111,23 @@ async fn io_uring_compressed_encrypted_and_multipart_roundtrip() {
     // Multipart parts staged + assembled via io_uring.
     let upload = UploadId::generate();
     let p1 = store
-        .stage_part(&upload, 1, body(b"uring-part-one-".to_vec()), 1 << 20)
+        .stage_part(
+            &upload,
+            1,
+            body(b"uring-part-one-".to_vec()),
+            ChecksumSet::none(),
+            1 << 20,
+        )
         .await
         .unwrap();
     let p2 = store
-        .stage_part(&upload, 2, body(b"uring-part-two".to_vec()), 1 << 20)
+        .stage_part(
+            &upload,
+            2,
+            body(b"uring-part-two".to_vec()),
+            ChecksumSet::none(),
+            1 << 20,
+        )
         .await
         .unwrap();
     let refs = vec![

@@ -9270,3 +9270,534 @@ async fn mutating_s3_ops_are_audited_and_reads_are_not() {
     assert_eq!(del.key.as_deref(), Some("docs/a.txt"));
     assert_eq!(del.actor.as_deref(), Some("k"));
 }
+
+// --- Composite multipart checksums (Phase 1) -------------------------------------------------
+
+fn crc32_b64(data: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(crc32fast::hash(data).to_be_bytes())
+}
+
+/// Independently compose the object-level COMPOSITE CRC32 the same way AWS does: base64-decode each
+/// per-part CRC32 digest, concatenate the raw bytes, CRC32 the concatenation, base64-encode, and
+/// append the `-N` part-count suffix. Used to cross-check Cairn's composition (checksum-of-checksums,
+/// not a whole-object hash).
+fn expected_composite_crc32(part_b64: &[&str]) -> String {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let mut concat = Vec::new();
+    for p in part_b64 {
+        concat.extend_from_slice(&b64.decode(p).unwrap());
+    }
+    format!(
+        "{}-{}",
+        b64.encode(crc32fast::hash(&concat).to_be_bytes()),
+        part_b64.len()
+    )
+}
+
+/// Initiate a multipart upload on a freshly-created bucket, returning the upload id.
+async fn init_mpu(h: &Harness, bucket: &str, key: &str) -> String {
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some(bucket), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::POST,
+                Some(bucket),
+                Some(key),
+                &[("uploads", "")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    between(
+        &String::from_utf8(body).unwrap(),
+        "<UploadId>",
+        "</UploadId>",
+    )
+}
+
+/// A part upload carrying a WRONG `x-amz-checksum-crc32` is rejected as BadDigest, and the just-staged
+/// part is deleted so no orphan blob is leaked (the no-orphan invariant).
+#[tokio::test]
+async fn upload_part_wrong_checksum_is_bad_digest_and_no_orphan() {
+    let h = harness().await;
+    let upload_id = init_mpu(&h, "mpc-bad", "k.bin").await;
+    let part = b"a part body".to_vec();
+    let wrong = crc32_b64(b"different bytes entirely");
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("mpc-bad"),
+                Some("k.bin"),
+                &[("uploadId", upload_id.as_str()), ("partNumber", "1")],
+                &[("x-amz-checksum-crc32", wrong.as_str())],
+                part,
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::BAD_REQUEST,
+        "wrong part checksum must be BadDigest"
+    );
+    // The staged part blob must have been deleted before returning — the session's staging dir holds
+    // no leftover part file (an orphan reconcile would otherwise have to reclaim).
+    let session_dir = h
+        ._dir
+        .path()
+        .join(".staging")
+        .join("multipart")
+        .join(&upload_id);
+    let leftover = std::fs::read_dir(&session_dir)
+        .map(|rd| rd.count())
+        .unwrap_or(0);
+    assert_eq!(leftover, 0, "a rejected part must leave no staged blob");
+}
+
+/// A part carrying more than one `x-amz-checksum-*` algorithm is rejected — exactly one algorithm may
+/// be stored per part so object-level composition stays unambiguous.
+#[tokio::test]
+async fn upload_part_two_checksum_algorithms_is_invalid_request() {
+    let h = harness().await;
+    let upload_id = init_mpu(&h, "mpc-two", "k.bin").await;
+    let part = b"body bytes".to_vec();
+    let c32 = crc32_b64(&part);
+    let s256 = sha256_b64(&part);
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("mpc-two"),
+                Some("k.bin"),
+                &[("uploadId", upload_id.as_str()), ("partNumber", "1")],
+                &[
+                    ("x-amz-checksum-crc32", c32.as_str()),
+                    ("x-amz-checksum-sha256", s256.as_str()),
+                ],
+                part,
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::BAD_REQUEST,
+        "two algorithms per part must be InvalidRequest"
+    );
+}
+
+/// A full 2-part CRC32 multipart upload composes an object-level COMPOSITE checksum: the Complete
+/// response body carries `<ChecksumCRC32>` (the checksum-of-checksums with a `-2` suffix) and
+/// `<ChecksumType>COMPOSITE</ChecksumType>`, and a checksum-mode GET echoes the same value + type.
+#[tokio::test]
+async fn multipart_crc32_composes_composite_checksum() {
+    let h = harness().await;
+    let upload_id = init_mpu(&h, "mpc-c32", "obj.bin").await;
+    let part1 = vec![b'a'; 5 * 1024 * 1024];
+    let part2 = b"the-tail".to_vec();
+    let c1 = crc32_b64(&part1);
+    let c2 = crc32_b64(&part2);
+
+    let (st, hdrs1, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("mpc-c32"),
+                Some("obj.bin"),
+                &[("uploadId", upload_id.as_str()), ("partNumber", "1")],
+                &[("x-amz-checksum-crc32", c1.as_str())],
+                part1,
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        header(&hdrs1, "x-amz-checksum-crc32"),
+        Some(c1.as_str()),
+        "part upload echoes its checksum"
+    );
+    let etag1 = header(&hdrs1, "etag").unwrap().to_owned();
+
+    let (_, hdrs2, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("mpc-c32"),
+                Some("obj.bin"),
+                &[("uploadId", upload_id.as_str()), ("partNumber", "2")],
+                &[("x-amz-checksum-crc32", c2.as_str())],
+                part2,
+            ),
+        )
+        .await,
+    )
+    .await;
+    let etag2 = header(&hdrs2, "etag").unwrap().to_owned();
+
+    let complete = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag1}</ETag></Part>\
+         <Part><PartNumber>2</PartNumber><ETag>{etag2}</ETag></Part></CompleteMultipartUpload>"
+    );
+    let (st, chdrs, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::POST,
+                Some("mpc-c32"),
+                Some("obj.bin"),
+                &[("uploadId", upload_id.as_str())],
+                &[],
+                complete.into_bytes(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let expected = expected_composite_crc32(&[c1.as_str(), c2.as_str()]);
+    assert!(
+        expected.ends_with("-2"),
+        "composite carries the part-count suffix"
+    );
+    let body_s = String::from_utf8(body).unwrap();
+    assert!(
+        body_s.contains(&format!("<ChecksumCRC32>{expected}</ChecksumCRC32>")),
+        "complete body carries the composite: {body_s}"
+    );
+    assert!(
+        body_s.contains("<ChecksumType>COMPOSITE</ChecksumType>"),
+        "{body_s}"
+    );
+    assert_eq!(
+        header(&chdrs, "x-amz-checksum-crc32"),
+        Some(expected.as_str())
+    );
+    assert_eq!(header(&chdrs, "x-amz-checksum-type"), Some("COMPOSITE"));
+
+    // A checksum-mode GET echoes the composite value and type.
+    let (st, ghdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("mpc-c32"),
+                Some("obj.bin"),
+                &[],
+                &[("x-amz-checksum-mode", "ENABLED")],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        header(&ghdrs, "x-amz-checksum-crc32"),
+        Some(expected.as_str())
+    );
+    assert_eq!(header(&ghdrs, "x-amz-checksum-type"), Some("COMPOSITE"));
+}
+
+/// A CRC64NVME multipart upload composes a whole-object FULL_OBJECT checksum (CRC64NVME has no
+/// composite form): the object checksum has NO `-N` suffix, its type is FULL_OBJECT, and it equals the
+/// CRC64NVME of the same bytes uploaded as a single-part PUT.
+#[tokio::test]
+async fn multipart_crc64nvme_recomputes_full_object_checksum() {
+    let h = harness().await;
+    let upload_id = init_mpu(&h, "mpc-c64", "obj.bin").await;
+    let part1 = vec![b'a'; 5 * 1024 * 1024];
+    let part2 = b"the-tail".to_vec();
+
+    // The SDK selector header asks the server to COMPUTE crc64nvme over each part (no value to verify).
+    let sel = [("x-amz-sdk-checksum-algorithm", "CRC64NVME")];
+    let (st, hdrs1, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("mpc-c64"),
+                Some("obj.bin"),
+                &[("uploadId", upload_id.as_str()), ("partNumber", "1")],
+                &sel,
+                part1.clone(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let etag1 = header(&hdrs1, "etag").unwrap().to_owned();
+    let (_, hdrs2, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("mpc-c64"),
+                Some("obj.bin"),
+                &[("uploadId", upload_id.as_str()), ("partNumber", "2")],
+                &sel,
+                part2.clone(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    let etag2 = header(&hdrs2, "etag").unwrap().to_owned();
+
+    let complete = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag1}</ETag></Part>\
+         <Part><PartNumber>2</PartNumber><ETag>{etag2}</ETag></Part></CompleteMultipartUpload>"
+    );
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::POST,
+                Some("mpc-c64"),
+                Some("obj.bin"),
+                &[("uploadId", upload_id.as_str())],
+                &[],
+                complete.into_bytes(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let body_s = String::from_utf8(body).unwrap();
+    assert!(
+        body_s.contains("<ChecksumType>FULL_OBJECT</ChecksumType>"),
+        "{body_s}"
+    );
+
+    let (_, ghdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("mpc-c64"),
+                Some("obj.bin"),
+                &[],
+                &[("x-amz-checksum-mode", "ENABLED")],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    let obj_crc = header(&ghdrs, "x-amz-checksum-crc64nvme")
+        .expect("object crc64nvme present")
+        .to_owned();
+    assert!(
+        !obj_crc.contains('-'),
+        "a FULL_OBJECT crc64nvme carries no -N suffix: {obj_crc}"
+    );
+    assert_eq!(header(&ghdrs, "x-amz-checksum-type"), Some("FULL_OBJECT"));
+
+    // The same concatenated bytes as a single-part PUT must yield the identical whole-object crc64nvme.
+    let mut whole = part1.clone();
+    whole.extend_from_slice(&part2);
+    drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("mpc-c64"),
+                Some("single.bin"),
+                &[],
+                &sel,
+                whole,
+            ),
+        )
+        .await,
+    )
+    .await;
+    let (_, shdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("mpc-c64"),
+                Some("single.bin"),
+                &[],
+                &[("x-amz-checksum-mode", "ENABLED")],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        header(&shdrs, "x-amz-checksum-crc64nvme"),
+        Some(obj_crc.as_str()),
+        "multipart FULL_OBJECT crc64nvme equals the single-part whole-object crc64nvme"
+    );
+}
+
+/// A multipart upload where only SOME parts carry a checksum (simulating a mixed UploadPart +
+/// UploadPartCopy session) completes with 200 and NO object-level checksum — never bricking an upload
+/// just because a part lacked a checksum (backward-compatible degrade).
+#[tokio::test]
+async fn multipart_mixed_present_and_absent_checksums_has_no_object_checksum() {
+    let h = harness().await;
+    let upload_id = init_mpu(&h, "mpc-mix", "obj.bin").await;
+    let part1 = vec![b'a'; 5 * 1024 * 1024];
+    let part2 = b"the-tail".to_vec();
+    let c1 = crc32_b64(&part1);
+
+    let (st, hdrs1, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("mpc-mix"),
+                Some("obj.bin"),
+                &[("uploadId", upload_id.as_str()), ("partNumber", "1")],
+                &[("x-amz-checksum-crc32", c1.as_str())],
+                part1,
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let etag1 = header(&hdrs1, "etag").unwrap().to_owned();
+    // Part 2 carries no checksum at all.
+    let (_, hdrs2, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("mpc-mix"),
+                Some("obj.bin"),
+                &[("uploadId", upload_id.as_str()), ("partNumber", "2")],
+                &[],
+                part2,
+            ),
+        )
+        .await,
+    )
+    .await;
+    let etag2 = header(&hdrs2, "etag").unwrap().to_owned();
+
+    let complete = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag1}</ETag></Part>\
+         <Part><PartNumber>2</PartNumber><ETag>{etag2}</ETag></Part></CompleteMultipartUpload>"
+    );
+    let (st, chdrs, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::POST,
+                Some("mpc-mix"),
+                Some("obj.bin"),
+                &[("uploadId", upload_id.as_str())],
+                &[],
+                complete.into_bytes(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "a mixed-checksum upload must still complete"
+    );
+    assert!(header(&chdrs, "x-amz-checksum-crc32").is_none());
+    assert!(!String::from_utf8(body).unwrap().contains("<ChecksumCRC32>"));
+}
+
+/// A multipart upload whose PRESENT part checksums use genuinely inconsistent algorithms is rejected
+/// with InvalidRequest — composing across algorithms would produce undefined bytes.
+#[tokio::test]
+async fn multipart_inconsistent_present_algorithms_is_invalid_request() {
+    let h = harness().await;
+    let upload_id = init_mpu(&h, "mpc-inc", "obj.bin").await;
+    let part1 = vec![b'a'; 5 * 1024 * 1024];
+    let part2 = b"the-tail".to_vec();
+    let c1 = crc32_b64(&part1);
+    let s2 = sha256_b64(&part2);
+
+    let (st, hdrs1, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("mpc-inc"),
+                Some("obj.bin"),
+                &[("uploadId", upload_id.as_str()), ("partNumber", "1")],
+                &[("x-amz-checksum-crc32", c1.as_str())],
+                part1,
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let etag1 = header(&hdrs1, "etag").unwrap().to_owned();
+    let (_, hdrs2, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("mpc-inc"),
+                Some("obj.bin"),
+                &[("uploadId", upload_id.as_str()), ("partNumber", "2")],
+                &[("x-amz-checksum-sha256", s2.as_str())],
+                part2,
+            ),
+        )
+        .await,
+    )
+    .await;
+    let etag2 = header(&hdrs2, "etag").unwrap().to_owned();
+
+    let complete = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag1}</ETag></Part>\
+         <Part><PartNumber>2</PartNumber><ETag>{etag2}</ETag></Part></CompleteMultipartUpload>"
+    );
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::POST,
+                Some("mpc-inc"),
+                Some("obj.bin"),
+                &[("uploadId", upload_id.as_str())],
+                &[],
+                complete.into_bytes(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::BAD_REQUEST,
+        "inconsistent present part algorithms must be InvalidRequest"
+    );
+}

@@ -141,7 +141,13 @@ async fn make_session(
         .unwrap();
     // Stage a part and record it.
     let staged = blob
-        .stage_part(&upload, 1, once_body(vec![1u8; 16]), 1 << 30)
+        .stage_part(
+            &upload,
+            1,
+            once_body(vec![1u8; 16]),
+            cairn_types::ChecksumSet::none(),
+            1 << 30,
+        )
         .await
         .unwrap();
     meta.submit(Mutation::RecordPart {

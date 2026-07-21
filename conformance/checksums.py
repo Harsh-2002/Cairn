@@ -95,6 +95,65 @@ rg = s3.get_object(Bucket="checks", Key="default", Range="bytes=0-9", ChecksumMo
 check(rg["Body"].read() == BODY[:10], "range GET returns the requested slice")
 check(not echoed(rg), "range GET does NOT echo a whole-object checksum")
 
+# Composite multipart checksums (Phase 1). A CRC32 multipart upload composes a COMPOSITE
+# checksum-of-checksums (a `-N`-suffixed object value); a CRC64NVME upload composes a whole-object
+# FULL_OBJECT value (no suffix). boto3/botocore[crt] itself validates the composite on the GET.
+PART = b"m" * (5 * 1024 * 1024)   # the non-final part must be >= 5 MiB
+TAIL = b"the-multipart-tail"
+FULL = PART + TAIL
+
+print("== multipart CRC32 (COMPOSITE) ==")
+mp = s3.create_multipart_upload(
+    Bucket="checks", Key="mpu-crc32", ChecksumAlgorithm="CRC32", ChecksumType="COMPOSITE")
+uid = mp["UploadId"]
+p1 = s3.upload_part(Bucket="checks", Key="mpu-crc32", UploadId=uid, PartNumber=1,
+                    Body=PART, ChecksumAlgorithm="CRC32")
+p2 = s3.upload_part(Bucket="checks", Key="mpu-crc32", UploadId=uid, PartNumber=2,
+                    Body=TAIL, ChecksumAlgorithm="CRC32")
+check("ChecksumCRC32" in p1, "upload_part echoes the per-part CRC32")
+parts = [
+    {"PartNumber": 1, "ETag": p1["ETag"], "ChecksumCRC32": p1["ChecksumCRC32"]},
+    {"PartNumber": 2, "ETag": p2["ETag"], "ChecksumCRC32": p2["ChecksumCRC32"]},
+]
+comp = s3.complete_multipart_upload(
+    Bucket="checks", Key="mpu-crc32", UploadId=uid,
+    MultipartUpload={"Parts": parts}, ChecksumType="COMPOSITE")
+check(comp.get("ChecksumCRC32", "").endswith("-2"), "complete returns a COMPOSITE CRC32 (-2 suffix)")
+check(comp.get("ChecksumType") == "COMPOSITE", "complete reports ChecksumType COMPOSITE")
+# The SDK validates the download against the echoed composite checksum.
+gm = s3.get_object(Bucket="checks", Key="mpu-crc32", ChecksumMode="ENABLED")
+check(gm["Body"].read() == FULL, "multipart CRC32 body round-trips byte-identical")
+check(gm.get("ChecksumType") == "COMPOSITE", "GET (mode=ENABLED) reports COMPOSITE type")
+attrs = s3.get_object_attributes(
+    Bucket="checks", Key="mpu-crc32", ObjectAttributes=["Checksum", "ObjectSize"])
+check(attrs.get("Checksum", {}).get("ChecksumType") == "COMPOSITE",
+      "GetObjectAttributes reports ChecksumType COMPOSITE")
+
+if HAVE_CRT:
+    print("== multipart CRC64NVME (FULL_OBJECT) ==")
+    mp = s3.create_multipart_upload(
+        Bucket="checks", Key="mpu-crc64", ChecksumAlgorithm="CRC64NVME", ChecksumType="FULL_OBJECT")
+    uid = mp["UploadId"]
+    q1 = s3.upload_part(Bucket="checks", Key="mpu-crc64", UploadId=uid, PartNumber=1,
+                        Body=PART, ChecksumAlgorithm="CRC64NVME")
+    q2 = s3.upload_part(Bucket="checks", Key="mpu-crc64", UploadId=uid, PartNumber=2,
+                        Body=TAIL, ChecksumAlgorithm="CRC64NVME")
+    qparts = [
+        {"PartNumber": 1, "ETag": q1["ETag"], "ChecksumCRC64NVME": q1["ChecksumCRC64NVME"]},
+        {"PartNumber": 2, "ETag": q2["ETag"], "ChecksumCRC64NVME": q2["ChecksumCRC64NVME"]},
+    ]
+    fc = s3.complete_multipart_upload(
+        Bucket="checks", Key="mpu-crc64", UploadId=uid,
+        MultipartUpload={"Parts": qparts}, ChecksumType="FULL_OBJECT")
+    check(fc.get("ChecksumType") == "FULL_OBJECT", "complete reports ChecksumType FULL_OBJECT")
+    check("-" not in fc.get("ChecksumCRC64NVME", ""),
+          "a FULL_OBJECT CRC64NVME carries no -N suffix")
+    # The whole-object value must equal the same bytes uploaded as a single-part PUT.
+    s3.put_object(Bucket="checks", Key="single-crc64", Body=FULL, ChecksumAlgorithm="CRC64NVME")
+    sp = s3.get_object(Bucket="checks", Key="single-crc64", ChecksumMode="ENABLED")
+    check(fc.get("ChecksumCRC64NVME") == sp.get("ChecksumCRC64NVME"),
+          "multipart FULL_OBJECT CRC64NVME equals the single-part whole-object value")
+
 if failures:
     print(f"\n{len(failures)} assertion(s) failed")
     sys.exit(1)

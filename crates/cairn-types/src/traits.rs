@@ -25,7 +25,7 @@ use crate::meta::{
     StoreCounts, TagSummary, TaggedObject, User, UserSessionCredentials, UserSigV4Credentials,
     UserWithBearerHash, WebhookEntry,
 };
-use crate::object::{CompressionDescriptor, ObjectVersionRow};
+use crate::object::{ChecksumSet, CompressionDescriptor, ObjectVersionRow};
 use crate::replication::ReplicatedObject;
 use crate::time::Timestamp;
 use async_trait::async_trait;
@@ -84,12 +84,16 @@ pub trait BlobStore: Send + Sync {
     /// Idempotently delete a committed blob (absence is success).
     async fn delete(&self, path: &StoragePath) -> Result<(), BlobError>;
 
-    /// Stage one multipart part durably, reporting its plaintext size and MD5.
+    /// Stage one multipart part durably, reporting its plaintext size, MD5, and any supplementary
+    /// `checksums` computed over the plaintext (empty when `checksums` is empty). The caller
+    /// validates the returned checksums against any client-supplied `x-amz-checksum-*` header and
+    /// persists the per-part value for composite/full-object composition at completion.
     async fn stage_part(
         &self,
         upload: &UploadId,
         part_number: u16,
         body: crate::BodyStream,
+        checksums: ChecksumSet,
         size_ceiling: u64,
     ) -> Result<StagedPart, BlobError>;
 

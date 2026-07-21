@@ -39,7 +39,7 @@ use cairn_types::blob::{
 use cairn_types::bucket::{CompressionAlgorithm, CompressionPolicy};
 use cairn_types::error::BlobError;
 use cairn_types::id::{BucketName, StoragePath, UploadId};
-use cairn_types::object::{CompressionDescriptor, ETag};
+use cairn_types::object::{ChecksumSet, CompressionDescriptor, ETag};
 use cairn_types::time::Timestamp;
 use cairn_types::traits::{BlobStore, ReconcileOracle};
 use futures_util::StreamExt;
@@ -462,13 +462,12 @@ impl LocalBlobStore {
         &self,
         sink: &mut Staging,
         parts: &[PartRef],
-        hasher: &mut md5::Md5,
+        hashers: &mut Hashers,
         enc: &mut Option<BlockEncoder>,
         logical: &mut u64,
         physical: &mut u64,
         size_ceiling: u64,
     ) -> Result<(), BlobError> {
-        use md5::Digest;
         use tokio::io::AsyncReadExt;
         for part in parts {
             let part_path = self.resolve(&part.storage_path)?;
@@ -487,7 +486,7 @@ impl LocalBlobStore {
                 if *logical > size_ceiling {
                     return Err(BlobError::SizeExceeded);
                 }
-                hasher.update(&buf[..n]);
+                hashers.update(&buf[..n]);
                 match enc {
                     Some(e) => {
                         let phys = e.feed(&buf[..n]);
@@ -710,6 +709,7 @@ impl BlobStore for LocalBlobStore {
         upload: &UploadId,
         part_number: u16,
         body: cairn_types::BodyStream,
+        checksums: ChecksumSet,
         size_ceiling: u64,
     ) -> Result<StagedPart, BlobError> {
         let _permit = self.acquire_io().await?;
@@ -722,8 +722,12 @@ impl BlobStore for LocalBlobStore {
         let id = format!("{part_number:05}-{}", uuid::Uuid::new_v4().simple());
         let path = dir.join(&id);
         // Parts are staged unencrypted intermediate artifacts; SSE-S3 is applied to the assembled
-        // object, not to individual parts (matching how compression is deferred to `assemble`).
+        // object, not to individual parts (matching how compression is deferred to `assemble`). The
+        // requested supplementary checksums ARE computed here, over the part's plaintext in the same
+        // streaming pass as the MD5, so the caller can validate a client `x-amz-checksum-*` header and
+        // persist the per-part digest for composition at CompleteMultipartUpload.
         let opts = StageOptions {
+            extra_checksums: checksums,
             size_ceiling,
             content_type: String::new(),
             ..StageOptions::default()
@@ -731,7 +735,7 @@ impl BlobStore for LocalBlobStore {
         // A part's length is not known to this seam, so no preallocation here; the assembled blob
         // (whose size is the sum of the parts) is preallocated in `assemble`.
         let mut sink = Staging::create(path, self.use_uring, None).await?;
-        let (logical, _phys, md5, _checks, _desc) = match write_staged(&mut sink, body, &opts).await
+        let (logical, _phys, md5, checks, _desc) = match write_staged(&mut sink, body, &opts).await
         {
             Ok(v) => v,
             Err(e) => {
@@ -756,6 +760,7 @@ impl BlobStore for LocalBlobStore {
             )),
             size: logical,
             md5_hex: md5,
+            checksums: checks,
         })
     }
 
@@ -800,8 +805,11 @@ impl BlobStore for LocalBlobStore {
             return Err(BlobError::SizeExceeded);
         }
         let mut sink = Staging::create(staging, self.use_uring, Some(assembled_len)).await?;
-        use md5::Digest;
-        let mut hasher = md5::Md5::new();
+        // Hash the assembled plaintext once, computing the MD5/ETag basis plus any supplementary
+        // checksums the caller requested via `opts.extra_checksums` (a whole-object FULL_OBJECT
+        // recompute at CompleteMultipartUpload). With no extra checksums this is byte-for-byte the
+        // same work as the previous bare-MD5 path, so the default multipart path is unchanged.
+        let mut hashers = Hashers::new(&opts.extra_checksums);
         let mut logical: u64 = 0;
         let mut physical: u64 = 0;
         let mut enc = block_pol.map(|p| match opts.encryption {
@@ -816,7 +824,7 @@ impl BlobStore for LocalBlobStore {
             .assemble_into(
                 &mut sink,
                 parts,
-                &mut hasher,
+                &mut hashers,
                 &mut enc,
                 &mut logical,
                 &mut physical,
@@ -854,14 +862,14 @@ impl BlobStore for LocalBlobStore {
         self.dir_sync.sync_dir(&bucket_dir).await?;
         fail::fail_point!("blob_after_assemble");
 
-        let md5_hex = hex::encode(hasher.finalize());
+        let (md5_hex, checksums) = hashers.finalize();
         Ok(StagedBlob {
             storage_path,
             size_logical: logical,
             size_physical: physical,
             etag: ETag::from_md5_hex(md5_hex.clone()),
             md5_hex,
-            checksums: Vec::new(),
+            checksums,
             compression: descriptor,
         })
     }
