@@ -485,9 +485,19 @@ pub fn initiate_multipart_result(bucket: &str, key: &str, upload_id: &str) -> St
     finish(w)
 }
 
-/// `CompleteMultipartUploadResult` (the ETag is rendered quoted).
+/// `CompleteMultipartUploadResult` (the ETag is rendered quoted). When the completed object carries
+/// a supplementary object-level `checksum`, its algorithm element (e.g. `<ChecksumCRC32>`) and the
+/// derived `<ChecksumType>` (COMPOSITE/FULL_OBJECT, supplied by the caller) are emitted too, so a
+/// modern SDK reads the same checksum it will later validate on GET.
 #[must_use]
-pub fn complete_multipart_result(location: &str, bucket: &str, key: &str, etag: &ETag) -> String {
+pub fn complete_multipart_result(
+    location: &str,
+    bucket: &str,
+    key: &str,
+    etag: &ETag,
+    checksum: Option<&ChecksumValue>,
+    checksum_type: Option<&str>,
+) -> String {
     let mut w = new_doc();
     w.create_element("CompleteMultipartUploadResult")
         .with_attribute(("xmlns", "http://s3.amazonaws.com/doc/2006-03-01/"))
@@ -496,6 +506,12 @@ pub fn complete_multipart_result(location: &str, bucket: &str, key: &str, etag: 
             leaf(w, "Bucket", bucket);
             leaf(w, "Key", key);
             etag_leaf(w, "ETag", etag);
+            if let Some(c) = checksum {
+                leaf(w, checksum_element(c.algorithm), &c.value);
+                if let Some(t) = checksum_type {
+                    leaf(w, "ChecksumType", t);
+                }
+            }
             Ok(())
         })
         .expect("infallible");
@@ -660,6 +676,7 @@ pub fn get_object_attributes(
     object_size: u64,
     storage_class: StorageClass,
     checksums: &[ChecksumValue],
+    checksum_type: Option<&str>,
     parts: Option<&[(u16, u64)]>,
 ) -> String {
     let mut w = new_doc();
@@ -673,6 +690,11 @@ pub fn get_object_attributes(
                 w.create_element("Checksum").write_inner_content(|w| {
                     for c in checksums {
                         leaf(w, checksum_element(c.algorithm), &c.value);
+                    }
+                    // The `<ChecksumType>` (COMPOSITE/FULL_OBJECT) matches the object's GET/HEAD
+                    // `x-amz-checksum-type`; absent when the caller has no type to report.
+                    if let Some(t) = checksum_type {
+                        leaf(w, "ChecksumType", t);
                     }
                     Ok(())
                 })?;

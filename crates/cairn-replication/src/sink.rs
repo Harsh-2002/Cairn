@@ -613,8 +613,16 @@ impl HttpS3Sink {
             ));
         }
         // Supplementary flexible checksums, re-emitted so a checksum-mode GET of the replica matches
-        // the source (audit 2026-07; AWS CRR preserves additional checksums).
+        // the source (audit 2026-07; AWS CRR preserves additional checksums). A COMPOSITE multipart
+        // checksum-of-checksums (a base64 body + `-<digits>` part-count suffix) is SKIPPED: the
+        // replica lands as a single-part PUT, so re-emitting the source's `-N` value would be
+        // rejected or mis-stored by the destination (composite multipart checksums). Only whole-object
+        // FULL_OBJECT values replicate; a composite object simply carries no supplementary checksum on
+        // the replica. Stored values use base64 STANDARD, so the only hyphen is the composite suffix.
         for c in &object.checksums {
+            if is_composite_checksum_value(&c.value) {
+                continue;
+            }
             user_headers.push((
                 checksum_header_name(c.algorithm).to_owned(),
                 c.value.clone(),
@@ -732,6 +740,20 @@ fn storage_class_token(sc: StorageClass) -> &'static str {
     match sc {
         StorageClass::Standard => "STANDARD",
         StorageClass::ColdTier => "GLACIER",
+    }
+}
+
+/// Whether a stored checksum value is a COMPOSITE multipart checksum-of-checksums — a base64 body
+/// followed by a literal `-<digits>` part-count suffix (e.g. `AAAAAA==-2`). Mirrors the protocol
+/// layer's `is_composite_value`. Stored values use base64 STANDARD (no `-` in that alphabet), so the
+/// only hyphen a stored value carries is this composite suffix. Such a value must NOT be re-emitted on
+/// a single-part replica PUT (the destination would reject or mis-store it).
+fn is_composite_checksum_value(value: &str) -> bool {
+    match value.rsplit_once('-') {
+        Some((body, count)) => {
+            !body.is_empty() && !count.is_empty() && count.bytes().all(|b| b.is_ascii_digit())
+        }
+        None => false,
     }
 }
 

@@ -166,6 +166,7 @@ impl BlobStore for InMemoryBlobStore {
         upload: &UploadId,
         part_number: u16,
         body: crate::BodyStream,
+        _checksums: crate::object::ChecksumSet,
         size_ceiling: u64,
     ) -> Result<StagedPart, BlobError> {
         let buf = Self::drain(body, size_ceiling).await?;
@@ -176,10 +177,14 @@ impl BlobStore for InMemoryBlobStore {
             .lock()
             .unwrap()
             .insert((upload.as_str().to_owned(), part_number), Arc::new(buf));
+        // Like `stage`/`assemble` here, the double models storage semantics without computing the
+        // supplementary checksums (no hash engine in `cairn-types`); it returns the faithful MD5 and
+        // an empty checksum set, so callers exercise the field's plumbing without a real digest.
         Ok(StagedPart {
             storage_path: path,
             size,
             md5_hex: md5,
+            checksums: Vec::new(),
         })
     }
 

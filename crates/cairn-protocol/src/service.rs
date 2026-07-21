@@ -1396,18 +1396,36 @@ impl S3Service {
         // ahead of `stage_part` also means a rejected request stages nothing to reclaim.
         self.scoped_multipart(&upload_id, &bucket.name, &key)
             .await?;
+        // Compute any supplementary checksum the client requested over this part's plaintext, so a
+        // client `x-amz-checksum-*` header can be validated and the per-part digest persisted for
+        // composition at CompleteMultipartUpload. Exactly one algorithm may be requested per part —
+        // more would leave the object-level composition ambiguous (AWS rejects it too).
+        let extra = requested_checksums(&req);
+        if extra.0.len() > 1 {
+            return Err(Error::InvalidRequest(
+                "at most one checksum algorithm may be specified per part".to_owned(),
+            ));
+        }
         let body = streaming_body(&req, raw_body, self.max_object_size)?;
         let staged = self
             .blob
-            .stage_part(&upload_id, part_number, body, self.max_object_size)
+            .stage_part(&upload_id, part_number, body, extra, self.max_object_size)
             .await
             .map_err(map_stage_err)?;
+        // Fail closed: a client-supplied `x-amz-checksum-*` that disagrees with the computed digest is
+        // a BadDigest, and the just-staged part must be deleted BEFORE returning so a rejected upload
+        // leaves no orphan (the no-orphan invariant every post-`stage` early return honors).
+        if let Err(e) = verify_client_checksums(&req, &staged.checksums) {
+            let _ = self.blob.delete(&staged.storage_path).await;
+            return Err(e);
+        }
         let part = cairn_types::meta::PartRecord {
             part_number,
             size: staged.size,
             etag: staged.md5_hex.clone(),
             storage_path: staged.storage_path.clone(),
-            checksum: None,
+            // At most one algorithm was requested, so the computed set holds at most one value.
+            checksum: staged.checksums.first().cloned(),
         };
         if let MutationOutcome::PartRecorded {
             superseded: Some(old),
@@ -1418,9 +1436,14 @@ impl S3Service {
         {
             let _ = self.blob.delete(&old).await;
         }
-        Ok(S3Response::status(StatusCode::OK)
+        let mut resp = S3Response::status(StatusCode::OK)
             .with_header("etag", format!("\"{}\"", staged.md5_hex))
-            .with_header("x-amz-request-id", &req.request_id))
+            .with_header("x-amz-request-id", &req.request_id);
+        // Echo the computed part checksum so a modern SDK can validate the part upload end-to-end.
+        if let Some(c) = staged.checksums.first() {
+            resp = resp.with_header(checksum_header_name(c.algorithm), c.value.clone());
+        }
+        Ok(resp)
     }
 
     /// `UploadPartCopy` (ARCH 21.3, 34.3): stage a part from a range of an existing object
@@ -1515,9 +1538,24 @@ impl S3Service {
                     r.map_err(|e| cairn_types::error::BodyError::Transport(e.to_string()))
                 }))
             };
+        // A copy carries no request body to verify against, but the client may still ask us to
+        // compute a supplementary checksum over the copied bytes (via a selector header). At most one
+        // algorithm may be requested, for the same composition-ambiguity reason as `upload_part`.
+        let extra = requested_checksums(req);
+        if extra.0.len() > 1 {
+            return Err(Error::InvalidRequest(
+                "at most one checksum algorithm may be specified per part".to_owned(),
+            ));
+        }
         let staged = self
             .blob
-            .stage_part(&upload_id, part_number, src_stream, self.max_object_size)
+            .stage_part(
+                &upload_id,
+                part_number,
+                src_stream,
+                extra,
+                self.max_object_size,
+            )
             .await
             .map_err(map_stage_err)?;
 
@@ -1526,7 +1564,8 @@ impl S3Service {
             size: staged.size,
             etag: staged.md5_hex.clone(),
             storage_path: staged.storage_path.clone(),
-            checksum: None,
+            // At most one algorithm was requested, so the computed set holds at most one value.
+            checksum: staged.checksums.first().cloned(),
         };
         if let MutationOutcome::PartRecorded {
             superseded: Some(old),
@@ -1603,6 +1642,7 @@ impl S3Service {
 
         let mut refs = Vec::with_capacity(requested.len());
         let mut part_md5s = Vec::with_capacity(requested.len());
+        let mut part_checksums = Vec::with_capacity(requested.len());
         for (i, (pn, etag)) in requested.iter().enumerate() {
             // AWS-correct S3 error codes (audit 2026-07): a missing or ETag-mismatched part ->
             // InvalidPart (not NoSuchUpload, which falsely tells the client the whole upload
@@ -1620,7 +1660,14 @@ impl S3Service {
                 size: rec.size,
             });
             part_md5s.push(rec.etag.clone());
+            part_checksums.push(rec.checksum.clone());
         }
+
+        // Decide the object-level checksum from the per-part checksums (already in hand from the
+        // validated `stored` map) plus any `x-amz-checksum-type`/`x-amz-checksum-*` hints on the
+        // Complete request. Computed BEFORE claiming the session so a genuinely-inconsistent request
+        // (mixed present algorithms) fails with InvalidRequest while the upload stays retryable.
+        let checksum_plan = plan_multipart_checksum(&req, &part_checksums)?;
 
         // Every requested part validated: now claim the session (active -> completing) and
         // assemble. A failure past this point is server-side (assembly/commit), not a client part
@@ -1643,9 +1690,16 @@ impl S3Service {
         } else {
             (None, None)
         };
+        // A FULL_OBJECT plan (CRC64NVME, or an explicitly-requested whole-object type) needs the
+        // assembler to recompute the checksum over the concatenated plaintext; a COMPOSITE plan is
+        // computed by us from the per-part digests and needs no extra work here.
+        let assemble_checksums = match &checksum_plan {
+            ChecksumPlan::FullObject { algo, .. } => ChecksumSet(vec![*algo]),
+            _ => ChecksumSet::none(),
+        };
         let opts = StageOptions {
             compression: bucket.compression,
-            extra_checksums: ChecksumSet::none(),
+            extra_checksums: assemble_checksums,
             size_ceiling: self.max_object_size,
             // `assemble` preallocates from the sum of the parts' sizes itself.
             content_length: None,
@@ -1654,6 +1708,26 @@ impl S3Service {
         };
         let staged = self.blob.assemble(&bucket.name, &refs, opts).await?;
         let etag = multipart_etag(&part_md5s);
+
+        // Resolve the object-level checksum to store. A FULL_OBJECT plan takes the whole-object digest
+        // just recomputed by `assemble`, verifying any client-supplied expected value (BadDigest on
+        // mismatch, deleting the assembled blob first so a rejected completion leaves no orphan).
+        let object_checksums = match checksum_plan {
+            ChecksumPlan::None => Vec::new(),
+            ChecksumPlan::Composite(value) => vec![value],
+            ChecksumPlan::FullObject { algo, expected } => {
+                match staged.checksums.iter().find(|c| c.algorithm == algo) {
+                    Some(cv) => {
+                        if expected.is_some_and(|e| e != cv.value) {
+                            let _ = self.blob.delete(&staged.storage_path).await;
+                            return Err(Error::BadDigest);
+                        }
+                        vec![cv.clone()]
+                    }
+                    None => Vec::new(),
+                }
+            }
+        };
 
         let versioned = bucket.versioning == VersioningState::Enabled;
         let version_id = if versioned {
@@ -1685,7 +1759,7 @@ impl S3Service {
             owner_id: bucket.owner_id.clone(),
             user_metadata: session.user_metadata.clone(),
             acl: None,
-            checksums: Vec::new(),
+            checksums: object_checksums.clone(),
             sse_descriptor: sse_descriptor.clone(),
             replication_status: None,
             created_at: now,
@@ -1743,14 +1817,21 @@ impl S3Service {
                 )
                 .await;
                 let location = format!("/{}/{}", bucket.name.as_str(), key.as_str());
+                // The object-level checksum (if any) rides both the result body and the response
+                // headers, with the type derived from the value (COMPOSITE = the `-N` suffix).
+                let object_checksum = object_checksums.first();
+                let checksum_type = object_checksum.map(|c| checksum_type_str(&c.value));
                 let body = cairn_xml::complete_multipart_result(
                     &location,
                     bucket.name.as_str(),
                     key.as_str(),
                     &etag,
+                    object_checksum,
+                    checksum_type,
                 );
                 let mut resp = S3Response::xml(StatusCode::OK, body)
                     .with_header("x-amz-request-id", &req.request_id);
+                resp = append_checksum_headers(resp, &object_checksums);
                 if versioned {
                     resp = resp.with_header("x-amz-version-id", version_id.as_str());
                 }
@@ -2751,11 +2832,15 @@ impl S3Service {
     /// returns it only while the parts are retrievable).
     async fn get_object_attributes(&self, req: &S3Request) -> Result<S3Response> {
         let (row, _bucket) = self.resolve_object(req).await?;
+        // Derive the checksum type from the stored value (COMPOSITE = the `-N` suffix) so the
+        // `<Checksum>` block carries a `<ChecksumType>` matching the object's GET/HEAD headers.
+        let checksum_type = row.checksums.first().map(|c| checksum_type_str(&c.value));
         let body = cairn_xml::get_object_attributes(
             &row.etag,
             row.size_logical,
             row.storage_class,
             &row.checksums,
+            checksum_type,
             None,
         );
         let mut resp =
@@ -4757,19 +4842,196 @@ fn checksum_header_name(algo: ChecksumAlgorithm) -> &'static str {
     }
 }
 
-/// Echo any stored checksums as `x-amz-checksum-{algo}` headers plus `x-amz-checksum-type:
-/// FULL_OBJECT` (Cairn computes each in a single pass over the whole plaintext), so a modern SDK with
-/// default response-integrity protection can verify the round-trip (ARCH 21.1). A no-op when the
-/// object carries no supplementary checksum. Never call this for a partial (Range/206) response — the
-/// stored value is the whole-object digest and would not match the returned bytes.
+/// Echo any stored checksums as `x-amz-checksum-{algo}` headers plus the derived `x-amz-checksum-type`
+/// (COMPOSITE for a multipart checksum-of-checksums, else FULL_OBJECT), so a modern SDK with default
+/// response-integrity protection can verify the round-trip (ARCH 21.1). A no-op when the object carries
+/// no supplementary checksum. Never call this for a partial (Range/206) response — the stored value is
+/// the whole-object digest and would not match the returned bytes.
 fn append_checksum_headers(mut resp: S3Response, checksums: &[ChecksumValue]) -> S3Response {
     if checksums.is_empty() {
         return resp;
     }
+    // A stored object carries at most one supplementary checksum, so the type derived from the first
+    // value describes them all.
+    let ty = checksums
+        .first()
+        .map_or("FULL_OBJECT", |c| checksum_type_str(&c.value));
     for c in checksums {
         resp = resp.with_header(checksum_header_name(c.algorithm), c.value.clone());
     }
-    resp.with_header("x-amz-checksum-type", "FULL_OBJECT")
+    resp.with_header("x-amz-checksum-type", ty)
+}
+
+/// The `x-amz-checksum-type` for a stored checksum value: COMPOSITE for a multipart
+/// checksum-of-checksums (recognized by [`is_composite_value`]), else the whole-object FULL_OBJECT.
+fn checksum_type_str(value: &str) -> &'static str {
+    if is_composite_value(value) {
+        "COMPOSITE"
+    } else {
+        "FULL_OBJECT"
+    }
+}
+
+/// Whether a stored checksum value is a COMPOSITE (checksum-of-checksums) digest — a base64 body
+/// followed by a literal `-<digits>` part-count suffix, e.g. `AAAAAA==-2`.
+///
+/// INVARIANT: stored checksum values are base64 STANDARD (see `cairn_blob::hash`), whose alphabet
+/// contains no `-`, so the only hyphen a stored value can carry is this composite suffix. A future
+/// switch to URL-safe base64 (which uses `-`) would break this predicate and MUST update it.
+fn is_composite_value(value: &str) -> bool {
+    match value.rsplit_once('-') {
+        Some((body, count)) => {
+            !body.is_empty() && !count.is_empty() && count.bytes().all(|b| b.is_ascii_digit())
+        }
+        None => false,
+    }
+}
+
+/// Whether an algorithm's multipart object checksum is composed as a COMPOSITE checksum-of-checksums
+/// (CRC32/CRC32C/SHA1/SHA256). CRC64NVME is NOT — AWS defines only a whole-object FULL_OBJECT value
+/// for it, so it takes the recompute-during-assembly path instead.
+fn is_composite_algorithm(algo: ChecksumAlgorithm) -> bool {
+    matches!(
+        algo,
+        ChecksumAlgorithm::Crc32
+            | ChecksumAlgorithm::Crc32c
+            | ChecksumAlgorithm::Sha1
+            | ChecksumAlgorithm::Sha256
+    )
+}
+
+/// Compose the COMPOSITE object-level checksum for a multipart upload: hash the concatenation of the
+/// raw (base64-decoded) per-part digests with `algo`, base64-encode, and append the `-N` part-count
+/// suffix — exactly as AWS S3 forms a multipart CRC32/CRC32C/SHA1/SHA256 checksum. `part_digests`
+/// holds the RAW (already decoded) per-part digest bytes, in ascending part order.
+fn compose_composite(algo: ChecksumAlgorithm, part_digests: &[Vec<u8>]) -> Result<String> {
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let concat: Vec<u8> = part_digests.iter().flatten().copied().collect();
+    let digest = match algo {
+        ChecksumAlgorithm::Crc32 => crc32fast::hash(&concat).to_be_bytes().to_vec(),
+        ChecksumAlgorithm::Crc32c => crc32c::crc32c(&concat).to_be_bytes().to_vec(),
+        ChecksumAlgorithm::Sha1 => {
+            use sha1::{Digest, Sha1};
+            let mut h = Sha1::new();
+            h.update(&concat);
+            h.finalize().to_vec()
+        }
+        ChecksumAlgorithm::Sha256 => {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(&concat);
+            h.finalize().to_vec()
+        }
+        // Never reached: the caller gates on `is_composite_algorithm`, which excludes CRC64NVME.
+        ChecksumAlgorithm::Crc64Nvme => {
+            return Err(Error::Internal(
+                "CRC64NVME has no composite checksum".to_owned(),
+            ));
+        }
+    };
+    Ok(format!("{}-{}", b64.encode(digest), part_digests.len()))
+}
+
+/// The plan for an object-level multipart checksum, derived from the per-part checksums and the
+/// Complete request's `x-amz-checksum-type`/`x-amz-checksum-*` hints ([`plan_multipart_checksum`]).
+enum ChecksumPlan {
+    /// No object-level checksum — some (or all) parts carried none. Backward-compatible: never brick
+    /// an upload just because it did not participate in flexible checksums.
+    None,
+    /// A COMPOSITE checksum-of-checksums, already composed from the stored per-part digests.
+    Composite(ChecksumValue),
+    /// A whole-object FULL_OBJECT digest to recompute during assembly, with any client-supplied
+    /// expected value to validate the completion against.
+    FullObject {
+        algo: ChecksumAlgorithm,
+        expected: Option<String>,
+    },
+}
+
+/// Decide the object-level checksum for a completing multipart upload from the per-part checksums
+/// (in ascending part order) and the Complete request headers. Graceful by design:
+///   * any part missing a checksum -> `None` (don't brick a non-checksum upload);
+///   * genuinely-inconsistent *present* algorithms -> `Error::InvalidRequest`;
+///   * CRC64NVME, or an explicit `x-amz-checksum-type: FULL_OBJECT`, -> a whole-object recompute;
+///   * otherwise a COMPOSITE checksum-of-checksums over the concatenated per-part digests.
+fn plan_multipart_checksum(
+    req: &S3Request,
+    part_checksums: &[Option<ChecksumValue>],
+) -> Result<ChecksumPlan> {
+    // A single missing per-part checksum (e.g. a mixed UploadPart + UploadPartCopy session) drops the
+    // whole object to no supplementary checksum, matching the pre-feature behavior.
+    if part_checksums.iter().any(Option::is_none) {
+        return Ok(ChecksumPlan::None);
+    }
+    // Every part has a checksum: they must all use the same algorithm, or the request is inconsistent.
+    let mut algo: Option<ChecksumAlgorithm> = None;
+    for c in part_checksums.iter().flatten() {
+        match algo {
+            None => algo = Some(c.algorithm),
+            Some(a) if a != c.algorithm => {
+                return Err(Error::InvalidRequest(
+                    "multipart parts use inconsistent checksum algorithms".to_owned(),
+                ));
+            }
+            _ => {}
+        }
+    }
+    let Some(algo) = algo else {
+        // No parts at all cannot happen (the request is validated non-empty), but stay total.
+        return Ok(ChecksumPlan::None);
+    };
+
+    let type_hdr = req.header("x-amz-checksum-type");
+    let full_object_requested = type_hdr.is_some_and(|t| t.eq_ignore_ascii_case("FULL_OBJECT"));
+    let composite_requested = type_hdr.is_some_and(|t| t.eq_ignore_ascii_case("COMPOSITE"));
+    // A client-supplied whole-object value on Complete to validate against (only meaningful for the
+    // FULL_OBJECT path; a COMPOSITE value carries the `-N` suffix and is checked below).
+    let client_value = req.header(checksum_header_name(algo)).map(|v| v.trim());
+
+    // CRC64NVME has no composite form; a FULL_OBJECT type header forces the whole-object recompute for
+    // the composable algorithms too.
+    if !is_composite_algorithm(algo) || full_object_requested {
+        if composite_requested && !is_composite_algorithm(algo) {
+            return Err(Error::InvalidRequest(
+                "the requested checksum algorithm has no COMPOSITE form".to_owned(),
+            ));
+        }
+        return Ok(ChecksumPlan::FullObject {
+            algo,
+            expected: client_value.map(str::to_owned),
+        });
+    }
+
+    // COMPOSITE: base64-decode each stored per-part digest (non-panicking; malformed is impossible
+    // since we wrote it, but treat it as Internal rather than unwrapping), then compose.
+    let mut digests = Vec::with_capacity(part_checksums.len());
+    for c in part_checksums.iter().flatten() {
+        digests.push(decode_stored_checksum(&c.value)?);
+    }
+    let value = compose_composite(algo, &digests)?;
+    // If the client sent the composite value on Complete, a mismatch means our composition disagrees
+    // with what the SDK will validate on GET — surface it now as a BadDigest rather than storing a
+    // value the SDK will later reject.
+    if let Some(expected) = client_value {
+        if expected != value {
+            return Err(Error::BadDigest);
+        }
+    }
+    Ok(ChecksumPlan::Composite(ChecksumValue {
+        algorithm: algo,
+        value,
+    }))
+}
+
+/// Base64-decode a stored checksum value's digest bytes (STANDARD alphabet), non-panicking. A
+/// malformed value is impossible for a value we wrote, so it folds to `Internal` rather than a panic,
+/// keeping the error translator total.
+fn decode_stored_checksum(value: &str) -> Result<Vec<u8>> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .decode(value.trim())
+        .map_err(|_| Error::Internal("malformed stored part checksum".to_owned()))
 }
 
 /// Whether a GET/HEAD asked for its checksum to be echoed (`x-amz-checksum-mode: ENABLED`). S3 only
