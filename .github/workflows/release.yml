@@ -10,9 +10,11 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write   # create/delete the GitHub Release and its tag
-  packages: write   # push the image to GHCR
-  actions: read     # read the CI run status for the release gate
+  contents: write       # create/delete the GitHub Release and its tag
+  packages: write       # push the image to GHCR
+  actions: read         # read the CI run status for the release gate
+  id-token: write       # keyless (OIDC) cosign signing + provenance attestation
+  attestations: write   # actions/attest-build-provenance
 
 env:
   CARGO_TERM_COLOR: always
@@ -131,6 +133,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - uses: docker/build-push-action@v6
+        id: build
         with:
           context: ctx
           file: ctx/Dockerfile
@@ -138,12 +141,28 @@ jobs:
           push: true
           # One active image: always just :latest (overwrites the previous release's image).
           tags: ${{ steps.m.outputs.image }}:latest
+      # Keyless (OIDC) signature over the pushed manifest, by immutable digest. A consumer verifies
+      # against the workflow identity + the GitHub OIDC issuer (see SECURITY.md), so a tampered or
+      # substituted image fails `cosign verify` even though `:latest` is mutable.
+      - uses: sigstore/cosign-installer@v3
+      - name: Sign the image (keyless) by digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          IMAGE: ${{ steps.m.outputs.image }}
+        run: cosign sign --yes "${IMAGE}@${DIGEST}"
+      # Native GitHub build-provenance attestation for the image (SLSA), stored in the registry.
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ steps.m.outputs.image }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
 
   release:
     name: publish dated release (one active)
     needs: [verify-ci, binaries, image]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v7   # for the Cargo.lock-based dependency SBOM
       - uses: actions/download-artifact@v8
         with:
           pattern: cairn-*
@@ -154,6 +173,29 @@ jobs:
           cp artifacts/cairn-amd64/cairn-linux-amd64 rel/
           cp artifacts/cairn-arm64/cairn-linux-arm64 rel/
           ( cd rel && sha256sum cairn-linux-* > SHA256SUMS )
+      # An SPDX SBOM of the Rust dependency tree (read from Cargo.lock), attached to the release.
+      - name: Generate the dependency SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: spdx-json
+          output-file: rel/cairn-sbom.spdx.json
+      # SLSA build-provenance attestation for the release binaries (verifiable via `gh attestation`).
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            rel/cairn-linux-amd64
+            rel/cairn-linux-arm64
+      # Keyless (OIDC) detached signature bundles over each binary + the checksums. Consumers verify
+      # with `cosign verify-blob` against the workflow identity + the GitHub OIDC issuer (SECURITY.md).
+      - uses: sigstore/cosign-installer@v3
+      - name: Sign the release assets (keyless)
+        run: |
+          set -euo pipefail
+          cd rel
+          for f in cairn-linux-amd64 cairn-linux-arm64 SHA256SUMS; do
+            cosign sign-blob --yes --bundle "${f}.cosign.bundle" "$f"
+          done
       - name: Publish the calendar-versioned release and retire the previous one
         env:
           GH_TOKEN: ${{ github.token }}
@@ -168,8 +210,10 @@ jobs:
           gh release delete "$TAG" --repo "$REPO" --yes --cleanup-tag 2>/dev/null || true
           gh release create "$TAG" --repo "$REPO" --target "${{ github.sha }}" \
             --title "$TAG" --latest \
-            --notes "Calendar-versioned release \`$TAG\` (vYYYY.MM.DD). Static linux binaries (amd64 + arm64) attached below; the multi-arch container image is \`$IMG:latest\` (always current)." \
-            rel/cairn-linux-amd64 rel/cairn-linux-arm64 rel/SHA256SUMS
+            --notes "Calendar-versioned release \`$TAG\` (vYYYY.MM.DD). Static linux binaries (amd64 + arm64) attached below; the multi-arch container image is \`$IMG:latest\` (always current). Binaries and checksums are cosign-keyless-signed (\`*.cosign.bundle\`), an SPDX dependency SBOM is attached, and both the binaries and the image carry SLSA build-provenance attestations — see SECURITY.md for verification." \
+            rel/cairn-linux-amd64 rel/cairn-linux-arm64 rel/SHA256SUMS \
+            rel/cairn-sbom.spdx.json \
+            rel/cairn-linux-amd64.cosign.bundle rel/cairn-linux-arm64.cosign.bundle rel/SHA256SUMS.cosign.bundle
           # one active release: delete every OTHER release and its tag
           gh release list --repo "$REPO" --limit 200 --json tagName --jq '.[].tagName' \
             | while read -r t; do
