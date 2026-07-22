@@ -306,6 +306,15 @@ pub struct Config {
     /// sendfile zero-copy nor the small-object whole-read GET fast path, so it stays opt-in.
     pub encrypt_at_rest: bool,
 
+    /// The SSE-KMS key-id allow-list (`CAIRN_KMS_KEY_IDS`, ARCH 27): a comma-separated list of key
+    /// ids accepted on an `x-amz-server-side-encryption: aws:kms` write (or a bucket KMS default).
+    /// **Unset (the default) accepts ANY key id** — the key id is a *label*, not cryptographic
+    /// isolation: every DEK is sealed under the same node master-key ring regardless of the id, and
+    /// this list gates **writes only** (removing an id does not lock existing objects, whose reads
+    /// unwrap under the master key). Set it to constrain which ids clients may name. Parsed by
+    /// [`parse_kms_key_ids`](Self::parse_kms_key_ids); blank entries are ignored.
+    pub kms_key_ids: Option<String>,
+
     /// The root administrator's access key (`CAIRN_ROOT_ACCESS_KEY`). On every startup an active
     /// administrator with this access key is ensured in the store; the same access key + secret work
     /// for the web UI login, the management API (as a Bearer token `access.secret`), and the S3 API
@@ -403,6 +412,7 @@ impl Default for Config {
             request_metrics_retention_days: 31,
             sts_enabled: true,
             encrypt_at_rest: false,
+            kms_key_ids: None,
             root_access_key: "cairn".to_owned(),
             root_secret_key: "cairnadmin".to_owned(),
             fastio_min_bytes: 256 * 1024,
@@ -467,6 +477,21 @@ impl Config {
                 ConfigError::Parse(format!("invalid CAIRN_REPLICATION_TARGETS JSON: {e}"))
             }),
         }
+    }
+
+    /// Parse the `CAIRN_KMS_KEY_IDS` allow-list (comma-separated) into the SSE-KMS key-id list, or
+    /// `None` when unset/blank (accept-all — the key id is a label, not a gate, ARCH 27). Blank
+    /// entries are dropped; a value with no non-blank entries collapses to `None`.
+    #[must_use]
+    pub fn parse_kms_key_ids(&self) -> Option<Vec<String>> {
+        let raw = self.kms_key_ids.as_deref()?;
+        let ids: Vec<String> = raw
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect();
+        if ids.is_empty() { None } else { Some(ids) }
     }
 }
 
@@ -1340,6 +1365,26 @@ mod tests {
         figment::Jail::expect_with(|jail| {
             jail.set_env("CAIRN_STS_ENABLED", "true");
             assert!(Config::load().expect("loads").sts_enabled);
+            Ok(())
+        });
+    }
+
+    /// `CAIRN_KMS_KEY_IDS` is unset by default (accept-all) and parses a comma-separated allow-list,
+    /// dropping blank entries; an all-blank value collapses to `None`.
+    #[test]
+    fn parse_kms_key_ids_from_env() {
+        assert_eq!(Config::default().parse_kms_key_ids(), None);
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("CAIRN_KMS_KEY_IDS", "alias/a, alias/b ,,");
+            assert_eq!(
+                Config::load().expect("loads").parse_kms_key_ids(),
+                Some(vec!["alias/a".to_owned(), "alias/b".to_owned()])
+            );
+            Ok(())
+        });
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("CAIRN_KMS_KEY_IDS", " , ");
+            assert_eq!(Config::load().expect("loads").parse_kms_key_ids(), None);
             Ok(())
         });
     }

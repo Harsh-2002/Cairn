@@ -27,8 +27,8 @@ mod parse;
 mod timefmt;
 
 pub use parse::{
-    CorsRule, parse_access_control_policy, parse_complete_multipart, parse_cors_configuration,
-    parse_delete,
+    CorsRule, ServerSideEncryptionRule, parse_access_control_policy, parse_complete_multipart,
+    parse_cors_configuration, parse_delete, parse_server_side_encryption_configuration,
 };
 pub use parse::{
     MAX_TAGS_BUCKET, MAX_TAGS_OBJECT, parse_tagging, parse_versioning_configuration, validate_tags,
@@ -950,6 +950,40 @@ pub fn versioning_configuration(state: VersioningState) -> String {
                 VersioningState::Enabled => leaf(w, "Status", "Enabled"),
                 VersioningState::Suspended => leaf(w, "Status", "Suspended"),
             }
+            Ok(())
+        })
+        .expect("infallible");
+    finish(w)
+}
+
+/// Serialize a `ServerSideEncryptionConfiguration` (GetBucketEncryption response) from the default
+/// algorithm (`AES256` or `aws:kms`), an optional KMS key id, and the `BucketKeyEnabled` flag.
+#[must_use]
+pub fn server_side_encryption_configuration(
+    sse_algorithm: &str,
+    kms_master_key_id: Option<&str>,
+    bucket_key_enabled: bool,
+) -> String {
+    let mut w = new_doc();
+    w.create_element("ServerSideEncryptionConfiguration")
+        .with_attribute(("xmlns", "http://s3.amazonaws.com/doc/2006-03-01/"))
+        .write_inner_content(|w| {
+            w.create_element("Rule").write_inner_content(|w| {
+                w.create_element("ApplyServerSideEncryptionByDefault")
+                    .write_inner_content(|w| {
+                        leaf(w, "SSEAlgorithm", sse_algorithm);
+                        if let Some(id) = kms_master_key_id {
+                            leaf(w, "KMSMasterKeyID", id);
+                        }
+                        Ok(())
+                    })?;
+                leaf(
+                    w,
+                    "BucketKeyEnabled",
+                    if bucket_key_enabled { "true" } else { "false" },
+                );
+                Ok(())
+            })?;
             Ok(())
         })
         .expect("infallible");
