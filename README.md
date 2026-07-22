@@ -24,12 +24,15 @@ manifest, plus a multi-arch image at `ghcr.io/harsh-2002/cairn`. Verify a downlo
 - Web console: a UI on its own port to manage buckets and users, browse, upload, download and share
   objects, mint access keys scoped by a policy, and view storage, compression, and replication status.
 - Access control: bucket policies, ACLs, Block Public Access, Object Ownership, and short-lived
-  (STS-style) credentials.
+  credentials, mintable through the AWS-STS wire surface (`AssumeRole`, `GetSessionToken`) served on
+  the S3 port or through the management API.
 - Durability: writes are staged, fsynced, atomically renamed, and acknowledged after a single
   metadata commit. On restart Cairn reconciles and reclaims any orphaned data. Acknowledged writes
   survive power loss.
 - Security: native TLS, AES-256-GCM encryption of secrets at rest with online master-key rotation,
-  and optional per-bucket SSE-S3 for object data.
+  and server-side object encryption: per-bucket SSE-S3, an `aws:kms` request surface (label-only, see
+  Scope), optional mandatory-encryption enforcement, and transparent encryption of all objects at rest
+  (`CAIRN_ENCRYPT_AT_REST`).
 - Storage efficiency: optional per-bucket block compression, with range reads that touch only the
   blocks they need.
 - Operations: Prometheus metrics, liveness and readiness endpoints, structured logs, asynchronous
@@ -160,16 +163,22 @@ BIN=target/release/cairn bash conformance/bench_compare.sh
 
 Cairn is single-node by design: one process, one data filesystem, one metadata database. Cross-host
 redundancy comes from asynchronous bucket replication, which is eventually consistent with observable
-lag, rather than from clustering. Drive redundancy is left to the storage underneath. SSE-S3 object
-encryption is supported; SSE-KMS is not yet. The target is homelab and small-to-mid production
-workloads that want the S3 API and a console without running a distributed system.
+lag, rather than from clustering. Drive redundancy is left to the storage underneath. Server-side encryption is supported — SSE-S3
+(per-bucket AES-256 default encryption, optionally mandatory), an `aws:kms` request surface for SDK
+compatibility (the key id is a validated label over the same node master key, not independent key
+material, so it is not cryptographic tenant isolation), and optional transparent encryption of every
+object at rest (`CAIRN_ENCRYPT_AT_REST`). A dedicated external KMS with distinct per-key material is
+not implemented. The target is homelab and small-to-mid production workloads that want the S3 API and
+a console without running a distributed system.
 
 ## Roadmap
 
 Planned work, tracked against the architecture in [`docs/delivery.md`](./docs/delivery.md) (Phase 15).
 These are additive and do not change the S3 or management API.
 
-- SSE-KMS object encryption and full-blob encryption at rest (SSE-S3 ships today).
+- Integration with an external KMS (distinct per-key material and tenant isolation); the current
+  `aws:kms` surface is a label over the node master key, and transparent encryption of all objects at
+  rest already ships (`CAIRN_ENCRYPT_AT_REST`).
 - Lifecycle transition to a remote cold tier, with a restore-from-cold workflow.
 - Zero-copy reads with kernel TLS, building on the existing sendfile fast path.
 - Signed release artifacts (cosign) and SBOM attestation.
