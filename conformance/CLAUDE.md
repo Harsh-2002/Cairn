@@ -29,6 +29,11 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
 - `checksums.sh` (+`.py`) — modern-SDK flexible-checksum round-trip (ARCH 21.1): PUT/GET/HEAD echo the
   stored `x-amz-checksum-<algo>` (+ `x-amz-checksum-type`) so default-on SDKs validate the transfer;
   CRC32/SHA256 always, CRC32C/CRC64NVME when `botocore[crt]` is installed; Range never echoes.
+- `encryption.sh` (+`.py`) — real-SDK SSE object-body conformance (ARCH 27), two boot legs: SSE-KMS +
+  SSE-S3 wire echo (PUT/GET/HEAD) + byte-exact GET, mandatory-SSE 400, bucket-default silent encrypt
+  (AES256/aws:kms), multipart+SSE incl. UploadPartCopy, cross-policy copy (upgrade/downgrade), and the
+  on-disk proofs — committed/staged blobs are VERSION_ENCRYPTED CRNB with the plaintext marker absent,
+  a tampered ciphertext byte makes GET fail closed, transparent at-rest (leg 2) advertises nothing.
 - `share.sh` — object sharing (revocable share tokens + interoperable SigV4 presigned URLs), pure curl.
 - `rotation.sh` (+`.py`) — master-key rotation lifecycle (#29), sharded.
 - `soak.sh` (+`.py`) — two-node replication, byte-identical verify + RSS leak check (boto3).

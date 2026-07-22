@@ -283,6 +283,24 @@ jobs:
       - name: Assert checksums are computed, stored, and echoed on PUT/GET/HEAD (ARCH 21.1)
         run: BIN=target/debug/cairn PY=python3 bash conformance/checksums.sh
 
+  encryption:
+    name: real-SDK SSE object-body conformance
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: cairn-bin
+          path: target/debug
+      - run: chmod +x target/debug/cairn
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.x"
+      - run: pip install boto3
+      - name: Assert SSE-S3/aws:kms/at-rest/mandatory/multipart wire contract + on-disk ciphertext + fail-closed (ARCH 27)
+        run: BIN=target/debug/cairn PY=python3 bash conformance/encryption.sh
+
   scrub:
     name: integrity scrub (bit-rot detection)
     needs: build
@@ -652,6 +670,7 @@ jobs:
       - authz
       - lifecycle
       - checksums
+      - encryption
       - scrub
       - object-lock
       - notifications
