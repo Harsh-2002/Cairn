@@ -12,8 +12,8 @@ not. This harness pins, with EXACT S3 error codes AND exact HTTP status codes:
   * HeadBucket: 200 owned / 404 missing.
   * GetBucketLocation.
   * The full PUT -> GET -> DELETE -> GET(404) round-trip for every bucket config subresource Cairn
-    implements (tagging, cors, lifecycle, policy, versioning, replication), and a 501 NotImplemented
-    for every one it does not (website, encryption, notification, accelerate, ...).
+    implements (tagging, cors, lifecycle, policy, versioning, replication, encryption), and a 501
+    NotImplemented for every one it does not (website, notification, accelerate, ...).
   * A REAL, unauthenticated CORS preflight (`OPTIONS` + `Origin` + `Access-Control-Request-Method`)
     against a configured rule set, asserting the `Access-Control-Allow-*` response headers, plus the
     negative cases (wrong origin / wrong method / disallowed header / no config).
