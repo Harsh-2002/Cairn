@@ -504,6 +504,24 @@ CREATE TABLE import_jobs (
 CREATE INDEX idx_import_jobs_state ON import_jobs (state, created_at);
 "#,
     },
+    Migration {
+        version: 21,
+        name: "multipart part-level encryption at rest",
+        sql: r#"
+-- Part-level SSE at rest (ARCH 27, Increment 3a). Two additive, back-compatible columns so an
+-- SSE / bucket-default-SSE / at-rest multipart upload stages every PART as ciphertext (nothing
+-- plaintext on disk); the assembled object is a decrypt-then-re-encrypt pass.
+--   * multipart_uploads.encrypt_parts: the part-encryption decision PINNED at initiate (AWS captures
+--     SSE intent at initiate). 1 => every UploadPart/UploadPartCopy mints a per-part DEK and stages a
+--     CRNB VERSION_ENCRYPTED blob; 0 => stage plaintext (legacy). A pre-v21 in-flight row reads 0 and
+--     still completes via the plaintext-parts -> encrypt-at-assemble legacy path.
+--   * multipart_parts.part_dek: that part's 32-byte DEK, freshly random per staging, sealed under the
+--     master ring (base64 CRK1 envelope). NULL = a plaintext part. Consumed and discarded at
+--     CompleteMultipartUpload; never enters the object rewrap stream (ephemeral, GC'd with the session).
+ALTER TABLE multipart_uploads ADD COLUMN encrypt_parts INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE multipart_parts   ADD COLUMN part_dek       TEXT;
+"#,
+    },
 ];
 
 /// Run all pending migrations on the write connection, recording each as applied.
@@ -638,6 +656,29 @@ mod tests {
             )
             .unwrap();
         assert_eq!(done, 0, "done_active_id defaults to 0 (not started)");
+    }
+
+    #[test]
+    fn migration_v21_adds_multipart_part_encryption() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        assert!(column_exists(&conn, "multipart_uploads", "encrypt_parts"));
+        assert!(column_exists(&conn, "multipart_parts", "part_dek"));
+        // encrypt_parts defaults to 0 (legacy plaintext parts); part_dek defaults to NULL.
+        conn.execute(
+            "INSERT INTO multipart_uploads (id, bucket_name, key, content_type, status, owner_id, user_metadata, created_at, updated_at) \
+             VALUES ('u', 'b', 'k', 'application/octet-stream', 'active', 'o', '[]', 0, 0)",
+            [],
+        )
+        .unwrap();
+        let ep: i64 = conn
+            .query_row(
+                "SELECT encrypt_parts FROM multipart_uploads WHERE id='u'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ep, 0, "encrypt_parts defaults to 0");
     }
 
     #[test]

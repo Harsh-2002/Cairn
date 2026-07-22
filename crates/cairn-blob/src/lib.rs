@@ -453,10 +453,48 @@ fn read_stream(
     }))
 }
 
+/// Feed one plaintext chunk of an assembled part through the shared downstream: enforce the running
+/// size ceiling, hash the plaintext (the ETag/checksum basis), then write it through the optional
+/// object block encoder/encrypter into the staging sink. Both the plaintext-part (raw-read) and the
+/// encrypted-part (decrypt-on-read) branches of `assemble_into` converge here so the ceiling/hash/
+/// encode logic is written once (ARCH 27).
+async fn feed_assembled_chunk(
+    sink: &mut Staging,
+    chunk: &[u8],
+    hashers: &mut Hashers,
+    enc: &mut Option<BlockEncoder>,
+    logical: &mut u64,
+    physical: &mut u64,
+    size_ceiling: u64,
+) -> Result<(), BlobError> {
+    *logical += chunk.len() as u64;
+    // Enforce the ceiling on the actual bytes read, so a part whose on-disk size exceeds its recorded
+    // size can't inflate the object past the limit (audit 2026-07).
+    if *logical > size_ceiling {
+        return Err(BlobError::SizeExceeded);
+    }
+    hashers.update(chunk);
+    match enc {
+        Some(e) => {
+            let phys = e.feed(chunk);
+            sink.write_all(&phys).await?;
+            *physical += phys.len() as u64;
+        }
+        None => {
+            sink.write_all(chunk).await?;
+            *physical += chunk.len() as u64;
+        }
+    }
+    Ok(())
+}
+
 impl LocalBlobStore {
     /// Read each part in order, hashing the plaintext, applying the (optional) block
-    /// encoder/encrypter, and streaming the physical bytes into the staging sink. Factored out of
-    /// `assemble` so the caller can `abort` the sink on any error without duplicating the unlink.
+    /// encoder/encrypter, and streaming the physical bytes into the staging sink. A part staged
+    /// encrypted (`PartRef.dek == Some`, ARCH 27) is decrypted on read through the same CRNB reader
+    /// GET uses, so `assemble` always sees plaintext before it re-encodes under the object DEK.
+    /// Factored out of `assemble` so the caller can `abort` the sink on any error without duplicating
+    /// the unlink.
     #[allow(clippy::too_many_arguments)]
     async fn assemble_into(
         &self,
@@ -471,31 +509,56 @@ impl LocalBlobStore {
         use tokio::io::AsyncReadExt;
         for part in parts {
             let part_path = self.resolve(&part.storage_path)?;
-            let mut f = tokio::fs::File::open(&part_path)
-                .await
-                .map_err(|_| BlobError::NotFound)?;
-            let mut buf = vec![0u8; READ_CHUNK];
-            loop {
-                let n = f.read(&mut buf).await.map_err(io_err)?;
-                if n == 0 {
-                    break;
-                }
-                *logical += n as u64;
-                // Enforce the ceiling on the actual bytes read, so a part whose on-disk size exceeds
-                // its recorded size can't inflate the object past the limit (audit 2026-07).
-                if *logical > size_ceiling {
-                    return Err(BlobError::SizeExceeded);
-                }
-                hashers.update(&buf[..n]);
-                match enc {
-                    Some(e) => {
-                        let phys = e.feed(&buf[..n]);
-                        sink.write_all(&phys).await?;
-                        *physical += phys.len() as u64;
+            match part.dek {
+                // Plaintext / pre-v21 part: raw read, unchanged.
+                None => {
+                    let mut f = tokio::fs::File::open(&part_path)
+                        .await
+                        .map_err(|_| BlobError::NotFound)?;
+                    let mut buf = vec![0u8; READ_CHUNK];
+                    loop {
+                        let n = f.read(&mut buf).await.map_err(io_err)?;
+                        if n == 0 {
+                            break;
+                        }
+                        feed_assembled_chunk(
+                            sink,
+                            &buf[..n],
+                            hashers,
+                            enc,
+                            logical,
+                            physical,
+                            size_ceiling,
+                        )
+                        .await?;
                     }
-                    None => {
-                        sink.write_all(&buf[..n]).await?;
-                        *physical += n as u64;
+                }
+                // Encrypted part: decrypt-on-read through the same CRNB reader GET uses, off the
+                // reactor via `spawn_blocking` feeding a bounded channel (mirrors `read_stream`). A
+                // wrong/tampered/truncated part fails per-block GCM auth inside `stream_blob` and
+                // surfaces here as `BlobError::Corruption`, which `assemble` turns into a `sink.abort()`
+                // — no orphan, no plaintext, no partial object.
+                Some(dek) => {
+                    let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<Bytes, BlobError>>(4);
+                    let path = part_path.clone();
+                    let size = part.size;
+                    tokio::task::spawn_blocking(move || {
+                        if let Err(e) = stream_blob(&path, true, Some(dek), 0, size, &tx) {
+                            let _ = tx.blocking_send(Err(e));
+                        }
+                    });
+                    while let Some(item) = rx.recv().await {
+                        let chunk = item?;
+                        feed_assembled_chunk(
+                            sink,
+                            &chunk,
+                            hashers,
+                            enc,
+                            logical,
+                            physical,
+                            size_ceiling,
+                        )
+                        .await?;
                     }
                 }
             }
@@ -711,6 +774,7 @@ impl BlobStore for LocalBlobStore {
         body: cairn_types::BodyStream,
         checksums: ChecksumSet,
         size_ceiling: u64,
+        encryption: Option<[u8; 32]>,
     ) -> Result<StagedPart, BlobError> {
         let _permit = self.acquire_io().await?;
         let dir = self
@@ -721,15 +785,18 @@ impl BlobStore for LocalBlobStore {
         tokio::fs::create_dir_all(&dir).await.map_err(io_err)?;
         let id = format!("{part_number:05}-{}", uuid::Uuid::new_v4().simple());
         let path = dir.join(&id);
-        // Parts are staged unencrypted intermediate artifacts; SSE-S3 is applied to the assembled
-        // object, not to individual parts (matching how compression is deferred to `assemble`). The
-        // requested supplementary checksums ARE computed here, over the part's plaintext in the same
-        // streaming pass as the MD5, so the caller can validate a client `x-amz-checksum-*` header and
-        // persist the per-part digest for composition at CompleteMultipartUpload.
+        // A part is staged as ciphertext when `encryption` is Some (SSE / bucket-default / at-rest
+        // multipart, ARCH 27) so nothing plaintext hits disk; otherwise it is a plaintext intermediate
+        // artifact (compression is still deferred to `assemble`). Either way the requested
+        // supplementary checksums ARE computed here, over the part's plaintext in the same streaming
+        // pass as the MD5 (before any encrypt transform), so the caller can validate a client
+        // `x-amz-checksum-*` header and persist the per-part digest for composition at
+        // CompleteMultipartUpload — the ETag/checksum basis is identical with or without encryption.
         let opts = StageOptions {
             extra_checksums: checksums,
             size_ceiling,
             content_type: String::new(),
+            encryption,
             ..StageOptions::default()
         };
         // A part's length is not known to this seam, so no preallocation here; the assembled blob

@@ -87,7 +87,10 @@ pub trait BlobStore: Send + Sync {
     /// Stage one multipart part durably, reporting its plaintext size, MD5, and any supplementary
     /// `checksums` computed over the plaintext (empty when `checksums` is empty). The caller
     /// validates the returned checksums against any client-supplied `x-amz-checksum-*` header and
-    /// persists the per-part value for composite/full-object composition at completion.
+    /// persists the per-part value for composite/full-object composition at completion. When
+    /// `encryption` is `Some`, the part is staged as a CRNB `VERSION_ENCRYPTED` blob under that DEK
+    /// (ARCH 27); the MD5/checksums are still computed over the plaintext, so the ETag basis is
+    /// unchanged. `None` stages the part in the clear (legacy).
     async fn stage_part(
         &self,
         upload: &UploadId,
@@ -95,6 +98,7 @@ pub trait BlobStore: Send + Sync {
         body: crate::BodyStream,
         checksums: ChecksumSet,
         size_ceiling: u64,
+        encryption: Option<[u8; 32]>,
     ) -> Result<StagedPart, BlobError>;
 
     /// Assemble ordered parts into one durably-committed blob, applying compression during

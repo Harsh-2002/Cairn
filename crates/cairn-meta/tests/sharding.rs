@@ -183,6 +183,7 @@ async fn n3_multipart_rides_the_bucket_shard_via_encoded_id() {
         intended_acl: None,
         user_metadata: Vec::new(),
         sse_requested: false,
+        encrypt_parts: false,
         created_at: Timestamp(1),
         updated_at: Timestamp(1),
     };

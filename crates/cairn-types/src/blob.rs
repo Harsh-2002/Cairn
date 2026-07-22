@@ -93,6 +93,10 @@ pub struct PartRef {
     pub storage_path: StoragePath,
     /// The plaintext part size.
     pub size: u64,
+    /// The part's raw 32-byte DEK to *decrypt* it on read when it was staged encrypted (ARCH 27);
+    /// `None` = a plaintext part (raw read). `assemble` decrypts through the CRNB reader before
+    /// hashing + re-encoding under the object DEK.
+    pub dek: Option<[u8; 32]>,
 }
 
 /// A resolved logical byte range (already validated against the object size by the caller).

@@ -380,6 +380,7 @@ fn list_parts_shape() {
             etag: "p1etag".to_owned(),
             storage_path: StoragePath::from_string("b/uuid".to_owned()),
             checksum: None,
+            part_dek: None,
         }],
         common_prefixes: vec![],
         next_cursor: None,
@@ -405,6 +406,7 @@ fn list_multipart_uploads_shape() {
         intended_acl: None,
         user_metadata: vec![],
         sse_requested: false,
+        encrypt_parts: false,
         created_at: Timestamp(1_750_000_000_000),
         updated_at: Timestamp(1_750_000_000_000),
     };
@@ -445,6 +447,7 @@ fn list_multipart_uploads_truncated_emits_both_markers() {
         intended_acl: None,
         user_metadata: vec![],
         sse_requested: false,
+        encrypt_parts: false,
         created_at: Timestamp(1_750_000_000_000),
         updated_at: Timestamp(1_750_000_000_000),
     };
@@ -495,6 +498,7 @@ fn list_multipart_uploads_url_encoding_encodes_key_fields() {
         intended_acl: None,
         user_metadata: vec![],
         sse_requested: false,
+        encrypt_parts: false,
         created_at: Timestamp(1_750_000_000_000),
         updated_at: Timestamp(1_750_000_000_000),
     };

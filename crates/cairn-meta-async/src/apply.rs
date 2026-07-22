@@ -77,8 +77,8 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
             driver
                 .execute(
                     "INSERT INTO multipart_uploads
-                     (id, bucket_name, key, content_type, status, owner_id, intended_acl, user_metadata, sse_requested, created_at, updated_at)
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                     (id, bucket_name, key, content_type, status, owner_id, intended_acl, user_metadata, sse_requested, encrypt_parts, created_at, updated_at)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
                     vec![
                         Value::Text(s.upload_id.as_str().to_owned()),
                         Value::Text(s.bucket.as_str().to_owned()),
@@ -89,6 +89,7 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
                         opt_text(s.intended_acl.as_ref().map(to_json)),
                         Value::Text(to_json(&s.user_metadata)),
                         Value::Int(s.sse_requested as i64),
+                        Value::Int(s.encrypt_parts as i64),
                         Value::Int(s.created_at.0),
                         Value::Int(s.updated_at.0),
                     ],
@@ -110,8 +111,8 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
             driver
                 .execute(
                     "INSERT OR REPLACE INTO multipart_parts
-                     (upload_id, part_number, size, etag, storage_path, checksum)
-                     VALUES (?1,?2,?3,?4,?5,?6)",
+                     (upload_id, part_number, size, etag, storage_path, checksum, part_dek)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7)",
                     vec![
                         Value::Text(upload_id.as_str().to_owned()),
                         Value::Int(i64::from(part.part_number)),
@@ -119,6 +120,7 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
                         Value::Text(part.etag.clone()),
                         Value::Text(part.storage_path.as_str().to_owned()),
                         opt_text(part.checksum.as_ref().map(to_json)),
+                        opt_text(part.part_dek.clone()),
                     ],
                 )
                 .await?;
