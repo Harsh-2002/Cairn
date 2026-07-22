@@ -14,12 +14,17 @@ freezing this crate freezes the seams. `#![forbid(unsafe_code)]`.
   via the `From` impls at the bottom. `Error` is the wire-mappable enum the single translator maps
   totally to S3 XML / control JSON (ARCH 25).
 - `meta.rs` — the largest module: `Mutation` (the write enum), `ListQuery`/`ListPage`, `OutboxEntry`,
-  `WebhookEntry`, and the metadata DTOs/rollups returned by `MetadataStore`.
+  `WebhookEntry`, and the metadata DTOs/rollups returned by `MetadataStore`. `MultipartSession`
+  carries the multipart SSE intent pinned at initiate (`sse_requested`, `encrypt_parts`,
+  `sse_kms_requested`/`sse_kms_key_id`/`sse_bucket_key_enabled`) and `PartRecord.part_dek` the
+  per-part DEK label (ARCH 27).
 - `id.rs` — validated newtypes: `BucketName`, `ObjectKey`, `StoragePath`, `VersionId`, `UploadId`,
   `UserId`, `InvalidName`. Validation is S3 wire-correctness, **not** path safety — keys never become
   filesystem paths (that lives in `cairn-blob`).
 - `auth.rs` / `authz.rs` / `object.rs` / `bucket.rs` / `blob.rs` / `crypto.rs` / `notification.rs` /
   `replication.rs` / `time.rs` — the per-domain DTOs; `lib.rs` re-exports the most-used items.
+  SSE additions live here too: `blob.rs` `PartRef.dek` (the staged part's DEK), `authz.rs` the
+  `Get`/`PutBucketEncryption` `Action`s.
 - `testing/` — **canonical in-memory doubles** behind `feature = "testing"`: `InMemoryMetadataStore`,
   `InMemoryBlobStore`, `StubCrypto`, `TestClock`, `FakeReplicationSink`, `FixedAuthenticator`,
   `AllowAll`/`DenyAll`. Every other crate enables this as a dev-dependency to unit-test without

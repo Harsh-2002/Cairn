@@ -12,7 +12,8 @@ range-seek, same outcomes. `cairn-meta` is left untouched. Selected at runtime b
   against this trait, engine-agnostic.
 - `libsql_driver.rs` / `turso_driver.rs` — the two concrete drivers behind that seam.
 - `apply.rs` — `Mutation` -> SQL. **One of the four mutation sites** (see below).
-- `schema.rs` — the migration table. Must mirror `cairn-meta/src/schema.rs`.
+- `schema.rs` — the migration table. Must mirror `cairn-meta/src/schema.rs` (latest is v22 — the
+  multipart SSE columns `sse_requested` v15, `encrypt_parts`/`part_dek` v21, `sse_kms_*` v22).
 - `store.rs` — `AsyncMetadataStore` (reads) + `AsyncReconcileOracle`; the read pool.
 - `writer.rs` — the single async group-committing `Writer` task.
 - `model.rs` — `Row`<->domain mappers + the `*_COLS` column lists; enum<->text strings.

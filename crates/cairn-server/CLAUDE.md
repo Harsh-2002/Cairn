@@ -12,10 +12,17 @@ CLI. This is the **only crate that names concrete impls** — everything else is
   they never touch the local data dir.
 - `config.rs` — **the `CAIRN_*` env config** (strict Figment, `default` + `deny_unknown_fields`).
   `Config::default()` overlaid with env; `validate()` fails fast on load. Add a knob here with a doc
-  comment AND validation (ARCH 28). `ReplicationTarget`, `LogFormat` live here too.
+  comment AND validation (ARCH 28). `ReplicationTarget`, `LogFormat` live here too. SSE/STS knobs:
+  `CAIRN_STS_ENABLED` (opt-out, default on), `CAIRN_ENCRYPT_AT_REST` (opt-in transparent at-rest),
+  `CAIRN_KMS_KEY_IDS` (comma-separated SSE-KMS allow-list → `parse_kms_key_ids`; unset = accept-all).
 - `stack.rs` — `build()` assembles `AppStack`; `open_meta` honours `CAIRN_META_BACKEND`
   (`sqlite`|`libsql`|`turso`) and `CAIRN_META_SHARDS`; `build_crypto` builds the key ring;
-  `enforce_retire_gate` is the #29 startup retire check.
+  `enforce_retire_gate` is the #29 startup retire check. Wires the S3 service's SSE `KeyProvider`
+  (`cairn_protocol::LocalRingProvider` from `CAIRN_KMS_KEY_IDS`) and `with_encrypt_at_rest`.
+- `sts.rs` — the **AWS-STS wire surface** (ARCH 14): `Action=AssumeRole` / `Action=GetSessionToken`
+  as a form `POST /` on the S3 data-plane port, returning AWS-STS XML. A dedicated `sts`-scoped
+  SigV4 verification (`AuthChain::authenticate_sts`, no dev bypass) mints a `CAIRNTMP…` session over
+  `Mutation::CreateSessionCredential`; sessions stay least-privilege (never broader than the caller).
 - `server.rs` — the accept/serve loops, the outer middleware (request id, span, concurrency
   `Semaphore`, timeout), graceful shutdown, and `/healthz` `/readyz` `/metrics`. `serve_ui` picks a
   listener's role (S3-only vs. console+API).
@@ -25,8 +32,10 @@ CLI. This is the **only crate that names concrete impls** — everything else is
   integrity scrub, WAL checkpointer, replication worker pool, and the #29 re-wrap + counter-sync.
 - `metrics_agg.rs` — sharded in-process request-metrics aggregator (zero DB I/O on the hot path;
   batched flush through the single writer). `observability.rs` — tracing + Prometheus recorder.
-- `key_rewrap.rs` — the #29 re-wrap worker (sqlite-only, one per shard). `sse.rs` — the console SSE
-  pulse channel + ticket mint. `tls.rs` — TLS load + SIGHUP reload.
+- `key_rewrap.rs` — the #29 re-wrap worker (sqlite-only, one per shard); reseals the DEK onto the
+  active key while **flatten-preserving** the SSE descriptor's additive `mode`/`kms_key_id` labels,
+  so a rotation never drops them (an at-rest object must not silently start advertising `AES256`).
+  `sse.rs` — the console SSE pulse channel + ticket mint. `tls.rs` — TLS load + SIGHUP reload.
 - `fast_get.rs` / `sendfile.rs` — the plaintext `sendfile(2)` GET fast path; **`#[cfg(all(feature =
   "fast-io", target_os = "linux"))]` only** (modules absent otherwise).
 - `import_run.rs` — the background S3-import worker: a single claimer reclaims orphaned (crashed,

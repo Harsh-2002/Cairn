@@ -7,10 +7,14 @@ domain types to and from the XML wire shapes S3 clients expect. Pure: depends on
 ## Layout (`src/`)
 - `lib.rs` — the response **generators**: listings (`list_objects_v2`/`_v1`/`list_object_versions`),
   multipart results, `error_document`, `delete_result`, tagging, versioning, object-lock/retention/
-  legal-hold, `get_object_attributes`, copy results. Plus the `new_doc`/`finish`/`leaf`/`etag_leaf`
-  writer helpers.
+  legal-hold, `get_object_attributes`, copy results, `server_side_encryption_configuration`
+  (GetBucketEncryption). Also the **AWS-STS** docs (own `STS_NAMESPACE`): `get_session_token_response`/
+  `assume_role_response` (shared `sts_credentials` block) + `sts_error_document`. Plus the
+  `new_doc`/`finish`/`leaf`/`etag_leaf` writer helpers.
 - `parse.rs` — the request **parsers**: complete-multipart, delete, tagging (+ `validate_tags`),
-  versioning, retention, legal-hold, object-lock-configuration, CORS, ACL. `CorsRule` is defined here.
+  versioning, retention, legal-hold, object-lock-configuration, CORS, ACL,
+  `parse_server_side_encryption_configuration` (PutBucketEncryption → `ServerSideEncryptionRule`).
+  `CorsRule` and `ServerSideEncryptionRule` are defined here.
 - `timefmt.rs` — hand-rolled ISO-8601 UTC formatter/parser (`format_iso8601`/`parse_iso8601`); no
   `chrono`/`time`.
 - `tests.rs` — the unit suite (`#[path]`-included from `lib.rs`).
