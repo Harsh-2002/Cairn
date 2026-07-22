@@ -75,6 +75,15 @@ fn describe_metrics() {
         "cairn_writer_queue_depth",
         "Inbound metadata-writer queue depth (submitted but not yet committed)"
     );
+    describe_histogram!(
+        "cairn_writer_commit_seconds",
+        Unit::Seconds,
+        "Wall time of a single metadata group-commit durability barrier (the fsync)"
+    );
+    describe_histogram!(
+        "cairn_writer_batch_size",
+        "Mutations coalesced into one metadata group-commit batch"
+    );
 
     // Replication observability (ARCH 20/26).
     describe_gauge!(

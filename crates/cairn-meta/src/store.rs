@@ -4,7 +4,7 @@
 
 use crate::model::{self, engine_err};
 use crate::range::{prefix_upper_bound, successor};
-use crate::writer::{WalCheckpointStats, Writer};
+use crate::writer::{CommitSample, WalCheckpointStats, Writer};
 use cairn_types::MetaError;
 use cairn_types::authz::PublicAccessBlock;
 use cairn_types::bucket::{Bucket, ConfigAspect, ConfigDoc};
@@ -88,6 +88,16 @@ impl SqliteMetadataStore {
     #[must_use]
     pub fn writer_queue_depth(&self) -> usize {
         self.writer.queue_depth()
+    }
+
+    /// Drain the writer's per-commit samples buffered since the last call (ARCH 26.2). The server
+    /// records each into the `cairn_writer_commit_seconds` and `cairn_writer_batch_size` histograms
+    /// on its metrics tick — the same expose-and-mirror shape as `writer_queue_depth`, since this
+    /// crate takes no `metrics` dependency. Only the concrete sqlite store exposes the writer
+    /// handle; libSQL/Turso self-manage and report no such histograms.
+    #[must_use]
+    pub fn drain_writer_commit_samples(&self) -> Vec<CommitSample> {
+        self.writer.drain_commit_samples()
     }
 
     /// Probe that the single writer is responsive (its thread is draining the queue). Used by the
