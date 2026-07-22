@@ -11896,3 +11896,448 @@ async fn multipart_kms_unknown_key_id_rejected_at_initiate() {
     .await;
     assert!(!uid.is_empty(), "an allow-listed key id initiates");
 }
+
+/// Run a fixed 2-part multipart upload on `h` (bucket freshly created): part 1 is 5 MiB of `a`, part 2
+/// is `the-tail`, with `p1_headers`/`p2_headers` applied to the respective UploadPart. Returns the
+/// multipart ETag (from the Complete result body) and the object-level `obj_checksum` header read back
+/// via a checksum-mode GET. The part plaintext is fixed, so a run on a plaintext harness and a run on an
+/// at-rest/SSE harness must yield BYTE-IDENTICAL results iff the ETag/checksum are computed over
+/// plaintext (never the ciphertext staged on disk).
+async fn two_part_object_checksum(
+    h: &Harness,
+    bucket: &str,
+    key: &str,
+    p1_headers: &[(&str, &str)],
+    p2_headers: &[(&str, &str)],
+    obj_checksum: &str,
+) -> (String, String) {
+    let uid = init_mpu(h, bucket, key).await;
+    let part1 = vec![b'a'; 5 * 1024 * 1024];
+    let part2 = b"the-tail".to_vec();
+    let (st, h1, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some(bucket),
+                Some(key),
+                &[("uploadId", uid.as_str()), ("partNumber", "1")],
+                p1_headers,
+                part1,
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "upload part 1");
+    let e1 = header(&h1, "etag").unwrap().to_owned();
+    let (st, h2, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some(bucket),
+                Some(key),
+                &[("uploadId", uid.as_str()), ("partNumber", "2")],
+                p2_headers,
+                part2,
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "upload part 2");
+    let e2 = header(&h2, "etag").unwrap().to_owned();
+    let (st, _, cbody) = complete(&h.svc, bucket, key, &uid, &[(1, &e1), (2, &e2)]).await;
+    assert_eq!(st, StatusCode::OK, "complete multipart");
+    let etag = between(&String::from_utf8(cbody).unwrap(), "<ETag>", "</ETag>");
+    let (st, ghdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some(bucket),
+                Some(key),
+                &[],
+                &[("x-amz-checksum-mode", "ENABLED")],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "checksum-mode GET");
+    let cksum = header(&ghdrs, obj_checksum).unwrap_or_default().to_owned();
+    (etag, cksum)
+}
+
+/// The multipart ETag and the object-level COMPOSITE/FULL_OBJECT checksums are computed over the
+/// PLAINTEXT even when the parts (and the assembled object) are ciphertext on disk. A refactor that
+/// hashed ciphertext would silently break default-on SDK download integrity on every encrypted-bucket
+/// multipart object with NO existing test failing — this pins it by asserting byte-identical ETag +
+/// checksum between an at-rest harness and a plaintext harness for the same plaintext.
+#[tokio::test]
+async fn multipart_checksum_is_over_plaintext_with_encryption() {
+    let plain = harness().await;
+    let enc = harness_encrypt_at_rest().await;
+
+    // CRC32 COMPOSITE via explicit per-part digests (fixed plaintext -> identical values on both runs).
+    let c1 = crc32_b64(&vec![b'a'; 5 * 1024 * 1024]);
+    let c2 = crc32_b64(b"the-tail");
+    let (etag_p, crc_p) = two_part_object_checksum(
+        &plain,
+        "mpp",
+        "obj.bin",
+        &[("x-amz-checksum-crc32", c1.as_str())],
+        &[("x-amz-checksum-crc32", c2.as_str())],
+        "x-amz-checksum-crc32",
+    )
+    .await;
+    let (etag_e, crc_e) = two_part_object_checksum(
+        &enc,
+        "mpe",
+        "obj.bin",
+        &[("x-amz-checksum-crc32", c1.as_str())],
+        &[("x-amz-checksum-crc32", c2.as_str())],
+        "x-amz-checksum-crc32",
+    )
+    .await;
+    assert_eq!(
+        etag_p, etag_e,
+        "multipart ETag must be the plaintext MD5 form (identical encrypted vs plaintext)"
+    );
+    assert_eq!(
+        crc_p, crc_e,
+        "composite CRC32 must be composed over plaintext part digests"
+    );
+    assert!(
+        crc_p.ends_with("-2"),
+        "composite carries the part-count suffix"
+    );
+    assert_eq!(crc_p, expected_composite_crc32(&[c1.as_str(), c2.as_str()]));
+
+    // CRC64NVME FULL_OBJECT via the SDK selector (the server computes over each part's plaintext).
+    let sel = [("x-amz-sdk-checksum-algorithm", "CRC64NVME")];
+    let (etag2_p, crc64_p) = two_part_object_checksum(
+        &plain,
+        "mpp2",
+        "obj.bin",
+        &sel,
+        &sel,
+        "x-amz-checksum-crc64nvme",
+    )
+    .await;
+    let (etag2_e, crc64_e) = two_part_object_checksum(
+        &enc,
+        "mpe2",
+        "obj.bin",
+        &sel,
+        &sel,
+        "x-amz-checksum-crc64nvme",
+    )
+    .await;
+    assert_eq!(
+        etag2_p, etag2_e,
+        "multipart ETag identical for crc64 run too"
+    );
+    assert_eq!(
+        crc64_p, crc64_e,
+        "full-object CRC64NVME must be recomputed over the whole plaintext"
+    );
+    assert!(
+        !crc64_p.is_empty() && !crc64_p.contains('-'),
+        "a FULL_OBJECT crc64nvme carries no -N suffix: {crc64_p}"
+    );
+
+    // The at-rest objects really ARE ciphertext on disk (both algo runs); the plaintext harness is not.
+    for bucket in ["mpe", "mpe2"] {
+        let row = enc
+            .meta
+            .current_version(
+                &BucketName::parse(bucket).unwrap(),
+                &ObjectKey::parse("obj.bin").unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            is_version_encrypted(&enc._dir.path().join(row.storage_path.unwrap().as_str())),
+            "the at-rest assembled object must be a ciphertext blob"
+        );
+    }
+    let prow = plain
+        .meta
+        .current_version(
+            &BucketName::parse("mpp").unwrap(),
+            &ObjectKey::parse("obj.bin").unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !is_version_encrypted(&plain._dir.path().join(prow.storage_path.unwrap().as_str())),
+        "the plaintext-harness object is stored in the clear (the checksum equality is not trivially so)"
+    );
+}
+
+/// Fail-closed guard (service.rs ~1812): a multipart session flagged `encrypt_parts = true` whose
+/// recorded part carries NO sealed `part_dek` (a corrupt/tampered session — the happy path always
+/// couples the on-disk ciphertext with its DEK) MUST fail CompleteMultipartUpload with Internal (500)
+/// and commit NO object. Without the guard the plaintext part would be assembled into an "encrypted"
+/// object — silent plaintext-into-SSE.
+#[tokio::test]
+async fn complete_multipart_encrypted_session_with_plaintext_part_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let meta: Arc<dyn MetadataStore> = Arc::new(cairn_meta::open_in_memory().unwrap());
+    let blob: Arc<dyn BlobStore> =
+        Arc::new(cairn_blob::LocalBlobStore::open(dir.path()).await.unwrap());
+    let svc = build_svc(meta.clone(), blob.clone(), [7u8; 32]);
+    drain(send(&svc, req(Method::PUT, Some("fcb"), None, &[], &[], vec![])).await).await;
+
+    // Fabricate a corrupt session: encrypt_parts=true, but its parts are staged PLAINTEXT (part_dek NULL).
+    let upload = cairn_types::id::UploadId::generate();
+    let bucket = BucketName::parse("fcb").unwrap();
+    let key = ObjectKey::parse("big.bin").unwrap();
+    let session = cairn_types::meta::MultipartSession {
+        upload_id: upload.clone(),
+        bucket: bucket.clone(),
+        key: key.clone(),
+        content_type: "application/octet-stream".to_owned(),
+        status: cairn_types::meta::MultipartStatus::Active,
+        owner_id: UserId("admin".to_owned()),
+        intended_acl: None,
+        user_metadata: Vec::new(),
+        sse_requested: true,
+        encrypt_parts: true,
+        sse_kms_requested: false,
+        sse_kms_key_id: None,
+        sse_bucket_key_enabled: false,
+        created_at: cairn_types::time::Timestamp(0),
+        updated_at: cairn_types::time::Timestamp(0),
+    };
+    meta.submit(cairn_types::meta::Mutation::CreateMultipart(Box::new(
+        session,
+    )))
+    .await
+    .unwrap();
+
+    let part1 = vec![b'P'; 6 * 1024 * 1024];
+    let part2 = b"tail".to_vec();
+    let mut etags = Vec::new();
+    for (n, bytes) in [(1u16, part1.clone()), (2u16, part2.clone())] {
+        let staged = blob
+            .stage_part(
+                &upload,
+                n,
+                once_body(bytes),
+                cairn_types::object::ChecksumSet::none(),
+                1 << 30,
+                None,
+            )
+            .await
+            .unwrap();
+        let part = cairn_types::meta::PartRecord {
+            part_number: n,
+            size: staged.size,
+            etag: staged.md5_hex.clone(),
+            storage_path: staged.storage_path.clone(),
+            checksum: None,
+            part_dek: None,
+        };
+        etags.push((n, staged.md5_hex.clone()));
+        meta.submit(cairn_types::meta::Mutation::RecordPart {
+            upload_id: upload.clone(),
+            part,
+        })
+        .await
+        .unwrap();
+    }
+
+    let refs: Vec<(u16, &str)> = etags.iter().map(|(n, e)| (*n, e.as_str())).collect();
+    let (st, _, _) = complete(&svc, "fcb", "big.bin", upload.as_str(), &refs).await;
+    assert_eq!(
+        st,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "an encrypt_parts session with a plaintext part must fail closed"
+    );
+
+    // No object was committed (the guard fires BEFORE the session is claimed/assembled).
+    let (st, _, _) = drain(
+        send(
+            &svc,
+            req(Method::GET, Some("fcb"), Some("big.bin"), &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::NOT_FOUND,
+        "no object may be readable after a fail-closed completion"
+    );
+}
+
+/// Per-version SSE DEKs (ARCH 27) in a versioning-Enabled bucket: two SSE-S3 PUTs of the same key mint
+/// DISTINCT per-version sse_descriptors over DISTINCT blobs; a `?versionId=v1` GET returns v1's exact
+/// bytes under v1's own DEK while the current GET returns v2; and v1's blob is NOT reclaimed by the v2
+/// commit (v1 stays GETtable). A version GET that resolved the wrong version's DEK/blob — or a v2 commit
+/// that reclaimed v1 — would be silent data loss.
+#[tokio::test]
+async fn sse_per_version_deks_are_distinct_and_addressable() {
+    let h = harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("vsse"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    let vcfg =
+        b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>".to_vec();
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("vsse"),
+                None,
+                &[("versioning", "")],
+                &[],
+                vcfg,
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let sse = [("x-amz-server-side-encryption", "AES256")];
+    let v1_bytes = b"version-one-plaintext".to_vec();
+    let (st, hv1, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("vsse"),
+                Some("k"),
+                &[],
+                &sse,
+                v1_bytes.clone(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let v1 = header(&hv1, "x-amz-version-id").unwrap().to_owned();
+
+    let v2_bytes = b"VERSION-TWO-different-length-plaintext".to_vec();
+    let (st, hv2, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("vsse"),
+                Some("k"),
+                &[],
+                &sse,
+                v2_bytes.clone(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let v2 = header(&hv2, "x-amz-version-id").unwrap().to_owned();
+    assert_ne!(v1, v2, "each PUT mints a new version id");
+
+    // Distinct per-version sealed-DEK descriptors over distinct blobs.
+    let bucket = BucketName::parse("vsse").unwrap();
+    let key = ObjectKey::parse("k").unwrap();
+    let r1 = h
+        .meta
+        .get_version(
+            &bucket,
+            &key,
+            &cairn_types::id::VersionId::from_string(v1.clone()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let r2 = h
+        .meta
+        .get_version(
+            &bucket,
+            &key,
+            &cairn_types::id::VersionId::from_string(v2.clone()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let d1 = r1.sse_descriptor.expect("v1 is encrypted");
+    let d2 = r2.sse_descriptor.expect("v2 is encrypted");
+    assert_ne!(d1, d2, "each version carries its own sealed DEK descriptor");
+    assert_ne!(
+        r1.storage_path, r2.storage_path,
+        "each version is a distinct blob"
+    );
+
+    // GET ?versionId=v1 returns v1's exact bytes (decrypted under v1's own DEK), advertising AES256.
+    let (st, gh1, b1) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("vsse"),
+                Some("k"),
+                &[("versionId", v1.as_str())],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        b1, v1_bytes,
+        "a version GET must return THAT version's plaintext"
+    );
+    assert_eq!(header(&gh1, "x-amz-server-side-encryption"), Some("AES256"));
+
+    // The current GET returns v2 exactly.
+    let (st, _, bc) = drain(
+        send(
+            &h.svc,
+            req(Method::GET, Some("vsse"), Some("k"), &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(bc, v2_bytes, "the current GET returns v2");
+
+    // v1's blob was NOT reclaimed by the v2 commit: it is still GETtable and byte-exact.
+    let (st, _, b1_again) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("vsse"),
+                Some("k"),
+                &[("versionId", v1.as_str())],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "v1 must survive the v2 commit (not reclaimed)"
+    );
+    assert_eq!(b1_again, v1_bytes);
+}
