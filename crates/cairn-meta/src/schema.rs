@@ -522,6 +522,24 @@ ALTER TABLE multipart_uploads ADD COLUMN encrypt_parts INTEGER NOT NULL DEFAULT 
 ALTER TABLE multipart_parts   ADD COLUMN part_dek       TEXT;
 "#,
     },
+    Migration {
+        version: 22,
+        name: "multipart kms intent",
+        sql: r#"
+-- Explicit SSE-KMS intent captured at CreateMultipartUpload (ARCH 27, Increment 3b). AWS pins the
+-- x-amz-server-side-encryption header at initiate; these additive, back-compatible columns carry an
+-- explicit `aws:kms` request from initiate to CompleteMultipartUpload so the assembled object
+-- advertises aws:kms + its key id. The KMS key id is a validated LABEL only (same master-sealed DEK
+-- per id) — no external KMS / network. A pre-v22 in-flight row reads sse_kms_requested=0 and
+-- completes via the SSE-S3 / bucket-default path unchanged.
+--   * multipart_uploads.sse_kms_requested: 1 => an explicit `aws:kms` header was accepted at initiate.
+--   * multipart_uploads.sse_kms_key_id: the validated key-id label to advertise (NULL = default key).
+--   * multipart_uploads.sse_bucket_key_enabled: echo x-amz-server-side-encryption-bucket-key-enabled.
+ALTER TABLE multipart_uploads ADD COLUMN sse_kms_requested      INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE multipart_uploads ADD COLUMN sse_kms_key_id         TEXT;
+ALTER TABLE multipart_uploads ADD COLUMN sse_bucket_key_enabled INTEGER NOT NULL DEFAULT 0;
+"#,
+    },
 ];
 
 /// Run all pending migrations on the write connection, recording each as applied.
@@ -679,6 +697,39 @@ mod tests {
             )
             .unwrap();
         assert_eq!(ep, 0, "encrypt_parts defaults to 0");
+    }
+
+    #[test]
+    fn migration_v22_adds_multipart_kms_intent() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        assert!(column_exists(
+            &conn,
+            "multipart_uploads",
+            "sse_kms_requested"
+        ));
+        assert!(column_exists(&conn, "multipart_uploads", "sse_kms_key_id"));
+        assert!(column_exists(
+            &conn,
+            "multipart_uploads",
+            "sse_bucket_key_enabled"
+        ));
+        // sse_kms_requested / sse_bucket_key_enabled default to 0; sse_kms_key_id defaults to NULL.
+        conn.execute(
+            "INSERT INTO multipart_uploads (id, bucket_name, key, content_type, status, owner_id, user_metadata, created_at, updated_at) \
+             VALUES ('u', 'b', 'k', 'application/octet-stream', 'active', 'o', '[]', 0, 0)",
+            [],
+        )
+        .unwrap();
+        let (req, bke): (i64, i64) = conn
+            .query_row(
+                "SELECT sse_kms_requested, sse_bucket_key_enabled FROM multipart_uploads WHERE id='u'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(req, 0, "sse_kms_requested defaults to 0");
+        assert_eq!(bke, 0, "sse_bucket_key_enabled defaults to 0");
     }
 
     #[test]

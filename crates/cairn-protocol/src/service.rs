@@ -1391,20 +1391,36 @@ impl S3Service {
         let key = req.key.clone().expect("key present");
         let upload_id = UploadId::generate();
         let now = self.clock.now();
-        // Capture the SSE-S3 intent now (ARCH 27): the `CompleteMultipartUpload` request carries no
-        // SSE header, so an explicit `x-amz-server-side-encryption: AES256` here is recorded on the
-        // session and applied at assembly, mirroring a single-part PUT. The bucket default (including
-        // a KMS default) is re-read fresh at Complete by `resolve_object_encryption`, so it is not
-        // captured here. SSE-KMS is NOT accepted at initiate: the multipart session schema carries no
-        // key id (the KMS-multipart schema change is a later increment), so an `aws:kms` request that
-        // could not survive to Complete is rejected up front rather than silently downgraded.
-        let want_sse = match requested_sse(req)? {
-            SseRequest::SseS3 => true,
-            SseRequest::None => false,
-            SseRequest::Kms { .. } => {
-                return Err(Error::NotImplemented);
+        // Capture the SSE intent now (ARCH 27): the `CompleteMultipartUpload` request carries no SSE
+        // header, so an explicit `x-amz-server-side-encryption` here is recorded on the session and
+        // applied at assembly, mirroring a single-part PUT. The bucket default (including a KMS
+        // default) is re-read fresh at Complete by `resolve_object_encryption`, so it is not captured
+        // here. An explicit `aws:kms` request (Increment 3b) is accepted: its key id is VALIDATED here
+        // (fail-closed — an unknown/invalid key id is rejected at initiate, never a silent downgrade
+        // to SSE-S3 or plaintext at Complete) and recorded on the session so the assembled object
+        // advertises aws:kms + the key id. A session sets at most one of `sse_requested` (AES256) /
+        // `sse_kms_requested`.
+        let requested = requested_sse(req)?;
+        let mut want_sse = false;
+        let mut sse_kms_requested = false;
+        let mut sse_kms_key_id: Option<String> = None;
+        let mut sse_bucket_key_enabled = false;
+        match &requested {
+            SseRequest::SseS3 => want_sse = true,
+            SseRequest::None => {}
+            SseRequest::Kms {
+                key_id,
+                bucket_key_enabled,
+            } => {
+                // Validate the key-id label at initiate, not at Complete (fail-closed up front).
+                if let Some(id) = key_id {
+                    self.key_provider.validate_key_id(id)?;
+                }
+                sse_kms_requested = true;
+                sse_kms_key_id = key_id.clone();
+                sse_bucket_key_enabled = *bucket_key_enabled;
             }
-        };
+        }
         // Pin ONCE, at initiate, whether this session's parts must be encrypted at rest, so every
         // part is treated identically and nothing plaintext hits disk (ARCH 27, Increment 3a). This
         // mirrors `resolve_object_encryption`'s mode SELECTION (explicit AES256 > any bucket default >
@@ -1413,6 +1429,7 @@ impl S3Service {
         // object DEK is resolved fresh at Complete. `bucket_default_sse` returns Some for a KMS default
         // too, so bucket-default-KMS multipart parts are covered for free.
         let encrypt_parts = want_sse
+            || sse_kms_requested
             || self.bucket_default_sse(&bucket.name).await?.is_some()
             || self.encrypt_at_rest;
         let session = MultipartSession {
@@ -1429,6 +1446,9 @@ impl S3Service {
             user_metadata: user_metadata(req),
             sse_requested: want_sse,
             encrypt_parts,
+            sse_kms_requested,
+            sse_kms_key_id,
+            sse_bucket_key_enabled,
             created_at: now,
             updated_at: now,
         };
@@ -1449,7 +1469,13 @@ impl S3Service {
             key.as_str(),
             upload_id.as_str(),
         );
-        Ok(S3Response::xml(StatusCode::OK, body).with_header("x-amz-request-id", &req.request_id))
+        // Echo the requested SSE on the initiate response (ARCH 27): AWS surfaces the algorithm (and,
+        // for aws:kms, the key id + BucketKeyEnabled) here so the SDK sees it before any part upload;
+        // CompleteMultipartUpload re-advertises identically from the stored descriptor. A bucket-default
+        // or unencrypted request resolves at Complete and echoes nothing here.
+        let resp =
+            S3Response::xml(StatusCode::OK, body).with_header("x-amz-request-id", &req.request_id);
+        Ok(with_requested_sse_headers(resp, &requested))
     }
 
     async fn upload_part(
@@ -1820,13 +1846,19 @@ impl S3Service {
         };
 
         // SSE (ARCH 27): resolve the assembled object's encryption exactly like a single-part PUT,
-        // honoring the intent captured at initiate. `sse_requested` is true when the client asked for
-        // AES256 or the bucket had a default at initiate — both `SseS3` (advertised); otherwise the
-        // resolver falls through to transparent at-rest (`AtRest`, not advertised) when enabled, or
-        // plaintext. The DEK is handed to `assemble`, which compress-then-encrypts each block, and the
-        // descriptor is sealed onto the row. Multipart *parts* stage plaintext for the in-flight
-        // window; the assembled object is encrypted here.
-        let requested = if session.sse_requested {
+        // honoring the intent captured at initiate. `sse_kms_requested` is true when the client asked
+        // for `aws:kms` at initiate (Increment 3b) — the assembled object advertises aws:kms + the
+        // validated key id (re-validated by `resolve_object_encryption`). `sse_requested` is true when
+        // the client asked for AES256 (`SseS3`, advertised); otherwise the resolver picks up a bucket
+        // default (which may itself be KMS), then falls through to transparent at-rest (`AtRest`, not
+        // advertised) when enabled, or plaintext. The DEK is handed to `assemble`, which
+        // compress-then-encrypts each block, and the descriptor is sealed onto the row.
+        let requested = if session.sse_kms_requested {
+            SseRequest::Kms {
+                key_id: session.sse_kms_key_id.clone(),
+                bucket_key_enabled: session.sse_bucket_key_enabled,
+            }
+        } else if session.sse_requested {
             SseRequest::SseS3
         } else {
             SseRequest::None
@@ -4687,6 +4719,31 @@ fn with_sse_headers(mut resp: S3Response, descriptor_json: Option<&str>) -> S3Re
         }
     }
     resp
+}
+
+/// Echo the SSE headers a client explicitly requested at `CreateMultipartUpload` (ARCH 27). Unlike
+/// [`with_sse_headers`], which reads a stored descriptor, this reads the request intent because the
+/// object does not exist yet: `AES256`, or `aws:kms` plus its key id / `BucketKeyEnabled`. A
+/// bucket-default or unencrypted request is resolved only at `CompleteMultipartUpload`, so it
+/// advertises nothing on the initiate response — matching AWS.
+fn with_requested_sse_headers(mut resp: S3Response, requested: &SseRequest) -> S3Response {
+    match requested {
+        SseRequest::None => resp,
+        SseRequest::SseS3 => resp.with_header("x-amz-server-side-encryption", SSE_AES256),
+        SseRequest::Kms {
+            key_id,
+            bucket_key_enabled,
+        } => {
+            resp = resp.with_header("x-amz-server-side-encryption", SSE_AWS_KMS);
+            if let Some(id) = key_id {
+                resp = resp.with_header("x-amz-server-side-encryption-aws-kms-key-id", id);
+            }
+            if *bucket_key_enabled {
+                resp = resp.with_header("x-amz-server-side-encryption-bucket-key-enabled", "true");
+            }
+            resp
+        }
+    }
 }
 
 /// What a request asked for via the `x-amz-server-side-encryption*` headers (ARCH 27).

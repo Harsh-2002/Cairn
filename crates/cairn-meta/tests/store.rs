@@ -477,6 +477,9 @@ fn multipart(bucket: &BucketName, key: &str, id: &str) -> Mutation {
         user_metadata: Vec::new(),
         sse_requested: false,
         encrypt_parts: false,
+        sse_kms_requested: false,
+        sse_kms_key_id: None,
+        sse_bucket_key_enabled: false,
         created_at: Timestamp(1),
         updated_at: Timestamp(1),
     }))
@@ -1113,6 +1116,9 @@ async fn delete_bucket_rejects_nonempty_inside_the_savepoint() {
         user_metadata: Vec::new(),
         sse_requested: false,
         encrypt_parts: false,
+        sse_kms_requested: false,
+        sse_kms_key_id: None,
+        sse_bucket_key_enabled: false,
         created_at: Timestamp(1),
         updated_at: Timestamp(1),
     };

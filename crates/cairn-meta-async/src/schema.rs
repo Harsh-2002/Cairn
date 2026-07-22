@@ -471,6 +471,25 @@ ALTER TABLE multipart_uploads ADD COLUMN encrypt_parts INTEGER NOT NULL DEFAULT 
 ALTER TABLE multipart_parts   ADD COLUMN part_dek       TEXT;
 "#,
     },
+    Migration {
+        version: 22,
+        name: "multipart kms intent",
+        sql: r#"
+-- Explicit SSE-KMS intent captured at CreateMultipartUpload (ARCH 27, Increment 3b). AWS pins the
+-- x-amz-server-side-encryption header at initiate; these additive, back-compatible columns carry an
+-- explicit `aws:kms` request from initiate to CompleteMultipartUpload so the assembled object
+-- advertises aws:kms + its key id. The KMS key id is a validated LABEL only (same master-sealed DEK
+-- per id) — no external KMS / network. A pre-v22 in-flight row reads sse_kms_requested=0 and
+-- completes via the SSE-S3 / bucket-default path unchanged.
+--   * multipart_uploads.sse_kms_requested: 1 => an explicit `aws:kms` header was accepted at initiate.
+--   * multipart_uploads.sse_kms_key_id: the validated key-id label to advertise (NULL = default key).
+--   * multipart_uploads.sse_bucket_key_enabled: echo x-amz-server-side-encryption-bucket-key-enabled.
+-- Mirrors cairn-meta/src/schema.rs v22 byte-for-byte (same version).
+ALTER TABLE multipart_uploads ADD COLUMN sse_kms_requested      INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE multipart_uploads ADD COLUMN sse_kms_key_id         TEXT;
+ALTER TABLE multipart_uploads ADD COLUMN sse_bucket_key_enabled INTEGER NOT NULL DEFAULT 0;
+"#,
+    },
 ];
 
 /// Run all pending migrations on the write driver, recording each as applied. Each migration is
@@ -578,5 +597,20 @@ mod tests {
         let driver = migrated_driver().await;
         assert!(column_exists(driver.as_ref(), "multipart_uploads", "encrypt_parts").await);
         assert!(column_exists(driver.as_ref(), "multipart_parts", "part_dek").await);
+    }
+
+    #[tokio::test]
+    async fn migration_v22_adds_multipart_kms_intent() {
+        let driver = migrated_driver().await;
+        assert!(column_exists(driver.as_ref(), "multipart_uploads", "sse_kms_requested").await);
+        assert!(column_exists(driver.as_ref(), "multipart_uploads", "sse_kms_key_id").await);
+        assert!(
+            column_exists(
+                driver.as_ref(),
+                "multipart_uploads",
+                "sse_bucket_key_enabled"
+            )
+            .await
+        );
     }
 }

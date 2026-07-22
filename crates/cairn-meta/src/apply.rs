@@ -74,8 +74,8 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
         Mutation::CreateMultipart(s) => {
             conn.execute(
                 "INSERT INTO multipart_uploads
-                 (id, bucket_name, key, content_type, status, owner_id, intended_acl, user_metadata, sse_requested, encrypt_parts, created_at, updated_at)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                 (id, bucket_name, key, content_type, status, owner_id, intended_acl, user_metadata, sse_requested, encrypt_parts, sse_kms_requested, sse_kms_key_id, sse_bucket_key_enabled, created_at, updated_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
                 params![
                     s.upload_id.as_str(),
                     s.bucket.as_str(),
@@ -87,6 +87,9 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
                     to_json(&s.user_metadata),
                     s.sse_requested as i64,
                     s.encrypt_parts as i64,
+                    s.sse_kms_requested as i64,
+                    s.sse_kms_key_id,
+                    s.sse_bucket_key_enabled as i64,
                     s.created_at.0,
                     s.updated_at.0,
                 ],

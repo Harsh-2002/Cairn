@@ -756,6 +756,19 @@ pub struct MultipartSession {
     /// complete. A pre-v21 in-flight session reads `false` and completes via the legacy
     /// plaintext-parts -> encrypt-at-assemble path.
     pub encrypt_parts: bool,
+    /// Whether an explicit `x-amz-server-side-encryption: aws:kms` header was accepted at initiate
+    /// (ARCH 27, Increment 3b). Captured because `CompleteMultipartUpload` carries no SSE header;
+    /// when `true` the assembled object advertises `aws:kms` + its key id. Distinct from
+    /// `sse_requested` (explicit SSE-S3) — a session sets at most one. A pre-v22 in-flight session
+    /// reads `false` and completes via the SSE-S3 / bucket-default path unchanged.
+    pub sse_kms_requested: bool,
+    /// The validated KMS key-id label to advertise on the assembled object (`None` = the default
+    /// key). The key id is validated at initiate (fail-closed) and is a LABEL only — the same
+    /// master-sealed DEK is used for every id; no external KMS / network (ARCH 27).
+    pub sse_kms_key_id: Option<String>,
+    /// Whether to echo `x-amz-server-side-encryption-bucket-key-enabled: true` on the assembled
+    /// object; only meaningful when `sse_kms_requested` is `true` (ARCH 27, Increment 3b).
+    pub sse_bucket_key_enabled: bool,
     /// Creation time.
     pub created_at: Timestamp,
     /// Last-update time.

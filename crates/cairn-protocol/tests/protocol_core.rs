@@ -11497,6 +11497,9 @@ async fn pre_v21_session_completes_legacy() {
         user_metadata: Vec::new(),
         sse_requested: true,
         encrypt_parts: false,
+        sse_kms_requested: false,
+        sse_kms_key_id: None,
+        sse_bucket_key_enabled: false,
         created_at: cairn_types::time::Timestamp(0),
         updated_at: cairn_types::time::Timestamp(0),
     };
@@ -11558,4 +11561,338 @@ async fn pre_v21_session_completes_legacy() {
     let mut expected = part1.clone();
     expected.extend_from_slice(&part2);
     assert_eq!(got, expected);
+}
+
+/// SSE-KMS multipart (ARCH 27, Increment 3b): an explicit `x-amz-server-side-encryption: aws:kms` +
+/// key id at initiate stages every part as ciphertext, and the assembled object advertises aws:kms +
+/// The `CreateMultipartUpload` response itself echoes the requested SSE (ARCH 27): AWS surfaces the
+/// algorithm + key id + BucketKeyEnabled on the initiate response so the SDK sees it before any part
+/// upload. Fails before the initiate-echo fix: `create_multipart` returned only `x-amz-request-id`.
+#[tokio::test]
+async fn multipart_kms_initiate_response_advertises_aws_kms_and_key_id() {
+    let h = harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("kmpi"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    let (st, hdrs, _body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::POST,
+                Some("kmpi"),
+                Some("obj"),
+                &[("uploads", "")],
+                &[
+                    ("x-amz-server-side-encryption", "aws:kms"),
+                    ("x-amz-server-side-encryption-aws-kms-key-id", "alias/app"),
+                    ("x-amz-server-side-encryption-bucket-key-enabled", "true"),
+                ],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        header(&hdrs, "x-amz-server-side-encryption"),
+        Some("aws:kms"),
+        "initiate advertises aws:kms"
+    );
+    assert_eq!(
+        header(&hdrs, "x-amz-server-side-encryption-aws-kms-key-id"),
+        Some("alias/app"),
+        "initiate echoes the key id"
+    );
+    assert_eq!(
+        header(&hdrs, "x-amz-server-side-encryption-bucket-key-enabled"),
+        Some("true"),
+        "initiate echoes BucketKeyEnabled"
+    );
+}
+
+/// the key id at complete, keeps the `-N` plaintext ETag, and GETs byte-exact. Fails before 3b:
+/// `create_multipart` returned `NotImplemented` for `aws:kms`.
+#[tokio::test]
+async fn multipart_kms_put_complete_advertises_aws_kms_and_key_id() {
+    let h = harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("kmpm"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    let uid = initiate(
+        &h.svc,
+        "kmpm",
+        "big.bin",
+        &[
+            ("x-amz-server-side-encryption", "aws:kms"),
+            ("x-amz-server-side-encryption-aws-kms-key-id", "alias/app"),
+        ],
+    )
+    .await;
+    let part1 = vec![b'K'; 6 * 1024 * 1024];
+    let part2 = b"kms-tail".to_vec();
+    let e1 = upload_part(&h.svc, "kmpm", "big.bin", &uid, 1, part1.clone()).await;
+    let e2 = upload_part(&h.svc, "kmpm", "big.bin", &uid, 2, part2.clone()).await;
+
+    for p in &staged_part_paths(h._dir.path(), &uid) {
+        assert!(
+            is_version_encrypted(p),
+            "an aws:kms multipart part must be staged as ciphertext"
+        );
+    }
+
+    let (st, hdrs, body) = complete(&h.svc, "kmpm", "big.bin", &uid, &[(1, &e1), (2, &e2)]).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        header(&hdrs, "x-amz-server-side-encryption"),
+        Some("aws:kms"),
+        "complete advertises aws:kms"
+    );
+    assert_eq!(
+        header(&hdrs, "x-amz-server-side-encryption-aws-kms-key-id"),
+        Some("alias/app"),
+        "complete echoes the KMS key id"
+    );
+    assert!(
+        String::from_utf8_lossy(&body).contains("-2"),
+        "multipart ETag keeps the part-count suffix"
+    );
+
+    // HEAD echoes the same SSE surface, and GET returns the exact concatenated plaintext.
+    let (st, hhdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::HEAD,
+                Some("kmpm"),
+                Some("big.bin"),
+                &[],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        header(&hhdrs, "x-amz-server-side-encryption"),
+        Some("aws:kms")
+    );
+    assert_eq!(
+        header(&hhdrs, "x-amz-server-side-encryption-aws-kms-key-id"),
+        Some("alias/app")
+    );
+    let (st, _, got) = drain(
+        send(
+            &h.svc,
+            req(Method::GET, Some("kmpm"), Some("big.bin"), &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let mut expected = part1.clone();
+    expected.extend_from_slice(&part2);
+    assert_eq!(got, expected);
+}
+
+/// SSE-KMS multipart with bucket-key-enabled at initiate round-trips: complete advertises
+/// `x-amz-server-side-encryption-bucket-key-enabled: true`. Fails before 3b (aws:kms rejected at
+/// initiate).
+#[tokio::test]
+async fn multipart_kms_bucket_key_enabled_round_trips() {
+    let h = harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("kmpb"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    let uid = initiate(
+        &h.svc,
+        "kmpb",
+        "big.bin",
+        &[
+            ("x-amz-server-side-encryption", "aws:kms"),
+            ("x-amz-server-side-encryption-aws-kms-key-id", "alias/app"),
+            ("x-amz-server-side-encryption-bucket-key-enabled", "true"),
+        ],
+    )
+    .await;
+    let e1 = upload_part(
+        &h.svc,
+        "kmpb",
+        "big.bin",
+        &uid,
+        1,
+        vec![b'B'; 6 * 1024 * 1024],
+    )
+    .await;
+    let e2 = upload_part(&h.svc, "kmpb", "big.bin", &uid, 2, b"tail".to_vec()).await;
+
+    let (st, hdrs, _) = complete(&h.svc, "kmpb", "big.bin", &uid, &[(1, &e1), (2, &e2)]).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        header(&hdrs, "x-amz-server-side-encryption"),
+        Some("aws:kms")
+    );
+    assert_eq!(
+        header(&hdrs, "x-amz-server-side-encryption-bucket-key-enabled"),
+        Some("true"),
+        "bucket-key-enabled survives initiate -> complete"
+    );
+}
+
+/// SSE-KMS multipart is never downgraded: the assembled object's advertised mode is aws:kms, never
+/// AES256 and never absent. Guards the fail-closed intent that an aws:kms initiate cannot silently
+/// become SSE-S3/plaintext at complete.
+#[tokio::test]
+async fn multipart_kms_survives_and_is_not_downgraded() {
+    let h = harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("kmpd"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    let uid = initiate(
+        &h.svc,
+        "kmpd",
+        "big.bin",
+        &[
+            ("x-amz-server-side-encryption", "aws:kms"),
+            ("x-amz-server-side-encryption-aws-kms-key-id", "alias/app"),
+        ],
+    )
+    .await;
+    let e1 = upload_part(
+        &h.svc,
+        "kmpd",
+        "big.bin",
+        &uid,
+        1,
+        vec![b'D'; 6 * 1024 * 1024],
+    )
+    .await;
+    let e2 = upload_part(&h.svc, "kmpd", "big.bin", &uid, 2, b"tail".to_vec()).await;
+    let (st, _, _) = complete(&h.svc, "kmpd", "big.bin", &uid, &[(1, &e1), (2, &e2)]).await;
+    assert_eq!(st, StatusCode::OK);
+
+    let (st, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::HEAD,
+                Some("kmpd"),
+                Some("big.bin"),
+                &[],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let mode = header(&hdrs, "x-amz-server-side-encryption");
+    assert_eq!(mode, Some("aws:kms"), "must stay aws:kms");
+    assert_ne!(mode, Some("AES256"), "must not downgrade to SSE-S3");
+    assert!(mode.is_some(), "must not downgrade to plaintext");
+}
+
+/// Fail-closed at INITIATE: with a `CAIRN_KMS_KEY_IDS` allow-list configured, an aws:kms initiate
+/// naming a key id NOT on the list is rejected up front (`InvalidArgument`) and creates no session —
+/// never a silent downgrade at complete. Fails before 3b for the opposite reason (aws:kms rejected as
+/// `NotImplemented` regardless of the key id).
+#[tokio::test]
+async fn multipart_kms_unknown_key_id_rejected_at_initiate() {
+    let dir = tempfile::tempdir().unwrap();
+    let meta: Arc<dyn MetadataStore> = Arc::new(cairn_meta::open_in_memory().unwrap());
+    let blob: Arc<dyn BlobStore> =
+        Arc::new(cairn_blob::LocalBlobStore::open(dir.path()).await.unwrap());
+    let clock = Arc::new(cairn_types::testing::TestClock::default());
+    let crypto: Arc<dyn cairn_types::traits::Crypto> =
+        Arc::new(cairn_crypto::SystemCrypto::new([7u8; 32]));
+    let svc = S3Service::new(
+        meta.clone(),
+        blob,
+        Arc::new(cairn_types::testing::AllowAll),
+        clock,
+        crypto.clone(),
+        "us-east-1".to_owned(),
+        5 * 1024 * 1024 * 1024,
+    )
+    .with_key_provider(Arc::new(cairn_protocol::LocalRingProvider::new(
+        crypto,
+        Some(vec!["alias/allowed".to_owned()]),
+    )));
+
+    drain(send(&svc, req(Method::PUT, Some("kmpa"), None, &[], &[], vec![])).await).await;
+
+    // An id NOT on the allow-list is rejected at initiate.
+    let (st, _, body) = drain(
+        send(
+            &svc,
+            req(
+                Method::POST,
+                Some("kmpa"),
+                Some("denied.bin"),
+                &[("uploads", "")],
+                &[
+                    ("x-amz-server-side-encryption", "aws:kms"),
+                    ("x-amz-server-side-encryption-aws-kms-key-id", "alias/nope"),
+                ],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "initiate fails closed");
+    assert!(
+        String::from_utf8_lossy(&body).contains("InvalidArgument"),
+        "expected InvalidArgument, got {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    // No session was created for the rejected upload.
+    let uploads = meta
+        .list_multipart_uploads(&BucketName::parse("kmpa").unwrap(), &Default::default())
+        .await
+        .unwrap();
+    assert!(
+        uploads.items.is_empty(),
+        "a rejected aws:kms initiate must not create a session"
+    );
+
+    // A key id ON the allow-list is accepted at initiate.
+    let uid = initiate(
+        &svc,
+        "kmpa",
+        "ok.bin",
+        &[
+            ("x-amz-server-side-encryption", "aws:kms"),
+            (
+                "x-amz-server-side-encryption-aws-kms-key-id",
+                "alias/allowed",
+            ),
+        ],
+    )
+    .await;
+    assert!(!uid.is_empty(), "an allow-listed key id initiates");
 }

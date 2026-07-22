@@ -287,6 +287,9 @@ pub fn multipart_from_row(row: &Row) -> rusqlite::Result<MultipartSession> {
         user_metadata,
         sse_requested: row.get::<_, i64>("sse_requested")? != 0,
         encrypt_parts: row.get::<_, i64>("encrypt_parts")? != 0,
+        sse_kms_requested: row.get::<_, i64>("sse_kms_requested")? != 0,
+        sse_kms_key_id: row.get::<_, Option<String>>("sse_kms_key_id")?,
+        sse_bucket_key_enabled: row.get::<_, i64>("sse_bucket_key_enabled")? != 0,
         created_at: Timestamp(row.get("created_at")?),
         updated_at: Timestamp(row.get("updated_at")?),
     })
