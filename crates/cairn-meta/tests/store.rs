@@ -2029,3 +2029,53 @@ async fn version_listing_paginates_a_many_version_key_without_re_listing() {
         "dropping the version-id marker must not cleanly enumerate the key; got {broken:?}"
     );
 }
+
+/// The writer records a per-commit sample for every durable batch, which the server drains into the
+/// `cairn_writer_commit_seconds` / `cairn_writer_batch_size` histograms. Driving a few real writes
+/// through the writer must leave sane samples behind: at least one per commit, each with a coalesced
+/// batch of >= 1 mutation and a measured (non-negative, finite) barrier duration. A second drain
+/// returns nothing, proving the buffer is drained (not merely peeked).
+#[tokio::test]
+async fn writer_records_commit_samples_for_group_committed_batches() {
+    let store = cairn_meta::open_in_memory().unwrap();
+
+    // A handful of writes. Each `submit` awaits its batch's durability barrier, so by the time these
+    // return the writer has committed — and recorded a sample for — every batch that carried them.
+    for i in 0..5 {
+        store
+            .submit(Mutation::CreateBucket(Box::new(bucket(&format!(
+                "bkt-{i}"
+            )))))
+            .await
+            .unwrap();
+    }
+
+    let samples = store.drain_writer_commit_samples();
+    assert!(
+        !samples.is_empty(),
+        "the writer must record at least one commit sample after committing writes"
+    );
+    let total_batched: usize = samples.iter().map(|s| s.batch_size).sum();
+    assert!(
+        total_batched >= 5,
+        "every committed mutation must be counted in some batch; got {total_batched} across {} samples",
+        samples.len()
+    );
+    for s in &samples {
+        assert!(
+            s.batch_size >= 1,
+            "a committed batch coalesces >= 1 mutation"
+        );
+        assert!(
+            s.commit_seconds.is_finite() && s.commit_seconds >= 0.0,
+            "commit_seconds must be a sane, finite duration; got {}",
+            s.commit_seconds
+        );
+    }
+
+    // Draining consumes the buffer: a second drain (no writes in between) is empty.
+    assert!(
+        store.drain_writer_commit_samples().is_empty(),
+        "commit samples must be drained, not peeked"
+    );
+}

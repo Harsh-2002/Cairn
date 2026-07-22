@@ -840,6 +840,18 @@ async fn metrics_loop(stack: Arc<AppStack>) {
         if !stack.store.is_empty() {
             let depth: usize = stack.store.iter().map(|s| s.writer_queue_depth()).sum();
             metrics::gauge!("cairn_writer_queue_depth").set(depth as f64);
+
+            // Group-commit health (ARCH 26.2): the writer buffers a sample per durable batch off the
+            // fsync barrier; drain and record each into the histograms. commit_seconds climbing is a
+            // stall; batch_size collapsing to 1 under load means the batching broke. Sqlite-only,
+            // like the queue-depth gauge — libSQL/Turso self-manage and expose no writer handle.
+            for s in &stack.store {
+                for sample in s.drain_writer_commit_samples() {
+                    metrics::histogram!("cairn_writer_commit_seconds")
+                        .record(sample.commit_seconds);
+                    metrics::histogram!("cairn_writer_batch_size").record(sample.batch_size as f64);
+                }
+            }
         }
 
         // Metadata config-cache effectiveness (ARCH 11.5). The cache is not a `metrics` dependency,

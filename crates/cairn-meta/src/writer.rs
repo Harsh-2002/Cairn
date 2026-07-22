@@ -8,15 +8,35 @@ use crate::apply::apply;
 use cairn_types::MetaError;
 use cairn_types::meta::{Mutation, MutationOutcome};
 use rusqlite::Connection;
-use std::sync::Arc;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
 type Ack = oneshot::Sender<Result<MutationOutcome, MetaError>>;
 type WriteRequest = (Mutation, Ack);
 
 const MAX_BATCH: usize = 256;
+
+/// Upper bound on the per-commit samples buffered between server scrapes. The server drains this
+/// buffer into the `cairn_writer_commit_seconds`/`cairn_writer_batch_size` histograms on its 15s
+/// tick; a bound keeps memory flat if the server ever stops draining, retaining the most recent
+/// samples (the oldest are dropped) — the ones a stress gate cares about.
+const MAX_COMMIT_SAMPLES: usize = 8192;
+
+/// One group-commit outcome, recorded after the durability barrier and drained by the server into
+/// the writer histograms. Together they show group-commit health under load: `commit_seconds`
+/// climbing is a stall on the fsync barrier; `batch_size` collapsing to 1 under concurrency means
+/// the batching broke.
+#[derive(Debug, Clone, Copy)]
+pub struct CommitSample {
+    /// Number of mutations coalesced into the batch (published as `cairn_writer_batch_size`).
+    pub batch_size: usize,
+    /// Wall time of the single `COMMIT` durability barrier (published as
+    /// `cairn_writer_commit_seconds`).
+    pub commit_seconds: f64,
+}
 
 /// The result of a `PRAGMA wal_checkpoint(TRUNCATE)` run on the writer thread (ARCH 8.4/11.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +90,11 @@ pub struct Writer {
     /// inbound backlog signal — a sustained nonzero depth means writes are arriving faster than the
     /// single writer can commit them.
     queue_depth: Arc<AtomicUsize>,
+    /// Bounded ring of per-commit samples recorded by the writer loop after each durable batch, and
+    /// drained by the server via [`Writer::drain_commit_samples`] into the writer histograms. Off
+    /// the fsync barrier: the sample is pushed only after `COMMIT` returns. Mirrors how the config
+    /// cache exposes counts the server mirrors into the registry (this crate has no `metrics` dep).
+    commit_samples: Arc<Mutex<VecDeque<CommitSample>>>,
 }
 
 impl Writer {
@@ -79,11 +104,17 @@ impl Writer {
         let (tx, rx) = mpsc::channel::<Job>(4096);
         let queue_depth = Arc::new(AtomicUsize::new(0));
         let loop_depth = queue_depth.clone();
+        let commit_samples = Arc::new(Mutex::new(VecDeque::new()));
+        let loop_samples = commit_samples.clone();
         std::thread::Builder::new()
             .name("cairn-meta-writer".to_owned())
-            .spawn(move || writer_loop(conn, rx, linger, &loop_depth))
+            .spawn(move || writer_loop(conn, rx, linger, &loop_depth, &loop_samples))
             .expect("spawn writer thread");
-        Writer { tx, queue_depth }
+        Writer {
+            tx,
+            queue_depth,
+            commit_samples,
+        }
     }
 
     /// The current inbound write-queue depth: mutations submitted but not yet pulled into a commit
@@ -91,6 +122,16 @@ impl Writer {
     #[must_use]
     pub fn queue_depth(&self) -> usize {
         self.queue_depth.load(Ordering::Relaxed)
+    }
+
+    /// Drain the per-commit samples buffered since the last call, oldest first. The server calls
+    /// this on its metrics tick and records each into the `cairn_writer_commit_seconds` and
+    /// `cairn_writer_batch_size` histograms — the same expose-and-mirror shape as the config
+    /// cache's counters, since this crate takes no `metrics` dependency.
+    #[must_use]
+    pub fn drain_commit_samples(&self) -> Vec<CommitSample> {
+        let mut q = lock_samples(&self.commit_samples);
+        q.drain(..).collect()
     }
 
     /// Submit a mutation; the returned future resolves only after the batch containing it has
@@ -158,11 +199,21 @@ impl Writer {
     }
 }
 
+/// Lock the commit-sample buffer, recovering the inner guard if a holder panicked. The buffer is
+/// only ever held for a brief push/drain with no panic path, so poisoning is not expected — but
+/// recovering keeps a stray panic from wedging both the writer's recording and the server's drain.
+fn lock_samples(
+    samples: &Mutex<VecDeque<CommitSample>>,
+) -> std::sync::MutexGuard<'_, VecDeque<CommitSample>> {
+    samples.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 fn writer_loop(
     conn: Connection,
     mut rx: mpsc::Receiver<Job>,
     linger: Option<Duration>,
     queue_depth: &AtomicUsize,
+    commit_samples: &Mutex<VecDeque<CommitSample>>,
 ) {
     loop {
         // Block for the first job; None means every handle dropped — shut down.
@@ -199,7 +250,7 @@ fn writer_loop(
             }
         }
 
-        commit_batch(&conn, batch);
+        commit_batch(&conn, batch, commit_samples);
         for ctl in deferred {
             run_control(&conn, ctl);
         }
@@ -270,7 +321,14 @@ fn run_checkpoint(conn: &Connection) -> Result<WalCheckpointStats, MetaError> {
 }
 
 /// Apply a batch in one transaction with a savepoint per mutation, commit once, then ack.
-fn commit_batch(conn: &Connection, batch: Vec<WriteRequest>) {
+fn commit_batch(
+    conn: &Connection,
+    batch: Vec<WriteRequest>,
+    commit_samples: &Mutex<VecDeque<CommitSample>>,
+) {
+    // The number of mutations coalesced into this batch — the `cairn_writer_batch_size` observation,
+    // captured before `batch` is consumed below.
+    let batch_size = batch.len();
     if let Err(e) = conn.execute_batch("BEGIN IMMEDIATE") {
         // Could not even begin; fail the whole batch.
         let msg = e.to_string();
@@ -345,9 +403,23 @@ fn commit_batch(conn: &Connection, batch: Vec<WriteRequest>) {
         return;
     }
 
-    // One commit = one durability barrier covering every surviving mutation in the batch.
+    // One commit = one durability barrier covering every surviving mutation in the batch. Time only
+    // the barrier itself (the fsync) for `cairn_writer_commit_seconds`.
+    let commit_start = Instant::now();
     match conn.execute_batch("COMMIT") {
         Ok(()) => {
+            // Record the sample off the barrier — the COMMIT has already returned — so metrics never
+            // sit on the fsync path. Push the newest, evicting the oldest if the ring is full.
+            let commit_seconds = commit_start.elapsed().as_secs_f64();
+            let mut q = lock_samples(commit_samples);
+            if q.len() >= MAX_COMMIT_SAMPLES {
+                q.pop_front();
+            }
+            q.push_back(CommitSample {
+                batch_size,
+                commit_seconds,
+            });
+            drop(q);
             for (ack, result) in acks {
                 let _ = ack.send(result);
             }
