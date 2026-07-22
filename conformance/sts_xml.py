@@ -65,8 +65,12 @@ body2 = sess2.get_object(Bucket="stsx", Key="hello.txt")["Body"].read()
 check("AssumeRole creds work through the S3 client", body2 == b"via STS XML")
 
 # ---- Negative: an out-of-range duration is rejected as InvalidParameterValue (400). ----
+# Cairn's bound is 900..=43200 (15m..12h). We probe the HIGH end (50000 > 43200) rather than a
+# sub-900 value, because botocore validates DurationSeconds >= 900 client-side and would raise its
+# own ParamValidationError before the request ever reaches the server; 50000 is within botocore's
+# GetSessionToken range (900..129600) so it is actually sent and Cairn rejects it server-side.
 try:
-    sts.get_session_token(DurationSeconds=100)
+    sts.get_session_token(DurationSeconds=50000)
     check("out-of-range duration rejected", False)
 except ClientError as e:
     check(

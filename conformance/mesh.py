@@ -126,6 +126,10 @@ def node_env(i, master_key):
         "CAIRN_MASTER_KEY": master_key,
         "CAIRN_ROOT_ACCESS_KEY": AKID, "CAIRN_ROOT_SECRET_KEY": SECRET,
         "CAIRN_REGION": REGION, "CAIRN_ALLOW_INSECURE": "true",
+        # The mesh wires replication targets through the management API, which enforces the
+        # cairn-net SSRF guard; the loopback topology needs the internal-endpoint escape hatch
+        # (soak.sh avoids this by using the operator-trusted CAIRN_REPLICATION_ENDPOINT config path).
+        "CAIRN_ALLOW_INTERNAL_ENDPOINTS": "true",
         "CAIRN_LOG_LEVEL": os.environ.get("CAIRN_LOG_LEVEL", "warn"),
         "CAIRN_REPLICATION_INTERVAL_SECS": REPL_INTERVAL,
         "CAIRN_REPLICATION_WORKER_CONCURRENCY": os.environ.get("WORKERS", "4"),
