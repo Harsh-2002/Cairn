@@ -1676,3 +1676,130 @@ async fn preallocation_holds_for_encrypted_parts() {
         expected
     );
 }
+
+/// The MD5/checksum basis is the PLAINTEXT, computed BEFORE the encrypt transform, at BOTH the
+/// `stage_part` (per-part) and `assemble` (whole-object) seams. Staging identical plaintext with a DEK
+/// yields the SAME per-part CRC32 (and MD5) as staging it in the clear — even though the DEK path writes
+/// a ciphertext CRNB container to disk. And `assemble` over the encrypted parts (decrypt-on-read)
+/// recomputes the SAME whole-object CRC64NVME as `assemble` over the plaintext parts. A refactor that
+/// hashed ciphertext would silently break SDK download integrity for every encrypted-bucket object.
+#[tokio::test]
+async fn stage_part_checksum_and_assemble_checksum_are_over_plaintext() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let b = BucketName::parse("bkt").unwrap();
+    let dek1 = [0x41u8; 32];
+    let dek2 = [0x42u8; 32];
+    let plain1 = vec![b'a'; 6 * 1024 * 1024];
+    let plain2 = b"the-tail".to_vec();
+
+    // --- per-part: encrypted staging computes the SAME CRC32 (and MD5) as plaintext staging ---
+    let enc_upload = UploadId::generate();
+    let plain_upload = UploadId::generate();
+    let enc_p1 = store
+        .stage_part(
+            &enc_upload,
+            1,
+            body(plain1.clone()),
+            ChecksumSet(vec![ChecksumAlgorithm::Crc32]),
+            1 << 30,
+            Some(dek1),
+        )
+        .await
+        .unwrap();
+    let plain_p1 = store
+        .stage_part(
+            &plain_upload,
+            1,
+            body(plain1.clone()),
+            ChecksumSet(vec![ChecksumAlgorithm::Crc32]),
+            1 << 30,
+            None,
+        )
+        .await
+        .unwrap();
+    // The DEK path really did write a ciphertext CRNB container (VERSION_ENCRYPTED trailer)...
+    let enc_raw = raw_blob_bytes(dir.path(), &enc_p1.storage_path);
+    assert_eq!(
+        enc_raw[enc_raw.len() - 34 + 4],
+        2,
+        "the encrypted part is ciphertext on disk"
+    );
+    // ...yet its per-part CRC32 and MD5 are byte-identical to the plaintext staging.
+    assert!(!enc_p1.checksums.is_empty());
+    assert_eq!(
+        enc_p1.checksums, plain_p1.checksums,
+        "per-part CRC32 must be over plaintext, identical encrypted vs plaintext"
+    );
+    assert_eq!(
+        enc_p1.md5_hex, plain_p1.md5_hex,
+        "per-part MD5/ETag basis must be over plaintext"
+    );
+
+    // --- whole-object: assemble over encrypted parts == assemble over plaintext parts (CRC64NVME) ---
+    let enc_p2 = store
+        .stage_part(
+            &enc_upload,
+            2,
+            body(plain2.clone()),
+            ChecksumSet::none(),
+            1 << 30,
+            Some(dek2),
+        )
+        .await
+        .unwrap();
+    let plain_p2 = store
+        .stage_part(
+            &plain_upload,
+            2,
+            body(plain2.clone()),
+            ChecksumSet::none(),
+            1 << 30,
+            None,
+        )
+        .await
+        .unwrap();
+    let asm_opts = StageOptions {
+        extra_checksums: ChecksumSet(vec![ChecksumAlgorithm::Crc64Nvme]),
+        size_ceiling: 100 * 1024 * 1024,
+        content_type: "application/octet-stream".to_owned(),
+        ..StageOptions::default()
+    };
+    let enc_asm = store
+        .assemble(
+            &b,
+            &[
+                part_ref(1, &enc_p1, Some(dek1)),
+                part_ref(2, &enc_p2, Some(dek2)),
+            ],
+            asm_opts.clone(),
+        )
+        .await
+        .unwrap();
+    let plain_asm = store
+        .assemble(
+            &b,
+            &[part_ref(1, &plain_p1, None), part_ref(2, &plain_p2, None)],
+            asm_opts,
+        )
+        .await
+        .unwrap();
+    let enc_crc = enc_asm
+        .checksums
+        .iter()
+        .find(|c| c.algorithm == ChecksumAlgorithm::Crc64Nvme)
+        .expect("crc64nvme present");
+    let plain_crc = plain_asm
+        .checksums
+        .iter()
+        .find(|c| c.algorithm == ChecksumAlgorithm::Crc64Nvme)
+        .expect("crc64nvme present");
+    assert_eq!(
+        enc_crc.value, plain_crc.value,
+        "whole-object CRC64NVME must be recomputed over plaintext (decrypt-on-read), not ciphertext"
+    );
+    assert_eq!(
+        enc_asm.md5_hex, plain_asm.md5_hex,
+        "whole-object MD5 over plaintext"
+    );
+}
