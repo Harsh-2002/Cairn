@@ -286,6 +286,7 @@ pub fn multipart_from_row(row: &Row) -> rusqlite::Result<MultipartSession> {
         intended_acl,
         user_metadata,
         sse_requested: row.get::<_, i64>("sse_requested")? != 0,
+        encrypt_parts: row.get::<_, i64>("encrypt_parts")? != 0,
         created_at: Timestamp(row.get("created_at")?),
         updated_at: Timestamp(row.get("updated_at")?),
     })
@@ -302,6 +303,7 @@ pub fn part_from_row(row: &Row) -> rusqlite::Result<PartRecord> {
         etag: row.get("etag")?,
         storage_path: StoragePath::from_string(row.get("storage_path")?),
         checksum,
+        part_dek: row.get::<_, Option<String>>("part_dek")?,
     })
 }
 

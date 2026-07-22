@@ -567,6 +567,7 @@ async fn multipart_lifecycle_parity() {
             intended_acl: None,
             user_metadata: Vec::new(),
             sse_requested: false,
+            encrypt_parts: false,
             created_at: Timestamp(1),
             updated_at: Timestamp(1),
         };
@@ -586,6 +587,7 @@ async fn multipart_lifecycle_parity() {
                 etag: format!("petag{n}"),
                 storage_path: StoragePath::from_string(format!("bkt/part-{n}")),
                 checksum: None,
+                part_dek: None,
             };
             s.submit(Mutation::RecordPart {
                 upload_id: upload.clone(),
@@ -624,6 +626,7 @@ async fn multipart_lifecycle_parity() {
             intended_acl: None,
             user_metadata: Vec::new(),
             sse_requested: false,
+            encrypt_parts: false,
             created_at: Timestamp(1),
             updated_at: Timestamp(1),
         })))
@@ -713,6 +716,80 @@ async fn multipart_lifecycle_parity() {
                 .as_str(),
             "final-etag"
         );
+    }
+}
+
+/// v21 parity (ARCH 27, Increment 3a): `encrypt_parts` on the session and `part_dek` on a part must
+/// round-trip identically through both backends. Guards the positional `MULTIPART_COLS[11]` /
+/// `PART_COLS[5]` mirror + the v21 migration in `cairn-meta-async`.
+#[tokio::test]
+async fn multipart_part_encryption_parity() {
+    let (a, b) = both().await;
+    for s in [&a as &dyn MetadataStore, &b as &dyn MetadataStore] {
+        let bk = BucketName::parse("enc").unwrap();
+        let upload = UploadId::from_string("enc-upload".into());
+        let session = MultipartSession {
+            upload_id: upload.clone(),
+            bucket: bk.clone(),
+            key: ObjectKey::parse("big").unwrap(),
+            content_type: "application/octet-stream".to_owned(),
+            status: MultipartStatus::Active,
+            owner_id: UserId("owner".to_owned()),
+            intended_acl: None,
+            user_metadata: Vec::new(),
+            sse_requested: true,
+            encrypt_parts: true,
+            created_at: Timestamp(1),
+            updated_at: Timestamp(1),
+        };
+        s.submit(Mutation::CreateMultipart(Box::new(session)))
+            .await
+            .unwrap();
+        // The pinned decision survives the round trip.
+        assert!(
+            s.get_multipart(&upload)
+                .await
+                .unwrap()
+                .unwrap()
+                .encrypt_parts
+        );
+
+        let part = PartRecord {
+            part_number: 1,
+            size: 5 * 1024 * 1024,
+            etag: "petag".to_owned(),
+            storage_path: StoragePath::from_string("enc/part-1".to_owned()),
+            checksum: None,
+            part_dek: Some("c2VhbGVkLWRlaw==".to_owned()),
+        };
+        s.submit(Mutation::RecordPart {
+            upload_id: upload.clone(),
+            part,
+        })
+        .await
+        .unwrap();
+        let parts = s.list_parts(&upload, 0, 100).await.unwrap();
+        assert_eq!(parts.items.len(), 1);
+        assert_eq!(parts.items[0].part_dek.as_deref(), Some("c2VhbGVkLWRlaw=="));
+
+        // A part without a DEK reads back None (the legacy / plaintext-part case).
+        let plain = PartRecord {
+            part_number: 2,
+            size: 5 * 1024 * 1024,
+            etag: "petag2".to_owned(),
+            storage_path: StoragePath::from_string("enc/part-2".to_owned()),
+            checksum: None,
+            part_dek: None,
+        };
+        s.submit(Mutation::RecordPart {
+            upload_id: upload.clone(),
+            part: plain,
+        })
+        .await
+        .unwrap();
+        let parts = s.list_parts(&upload, 0, 100).await.unwrap();
+        let p2 = parts.items.iter().find(|p| p.part_number == 2).unwrap();
+        assert_eq!(p2.part_dek, None);
     }
 }
 

@@ -452,6 +452,25 @@ CREATE TABLE import_jobs (
 CREATE INDEX idx_import_jobs_state ON import_jobs (state, created_at);
 "#,
     },
+    Migration {
+        version: 21,
+        name: "multipart part-level encryption at rest",
+        sql: r#"
+-- Part-level SSE at rest (ARCH 27, Increment 3a). Two additive, back-compatible columns so an
+-- SSE / bucket-default-SSE / at-rest multipart upload stages every PART as ciphertext (nothing
+-- plaintext on disk); the assembled object is a decrypt-then-re-encrypt pass.
+--   * multipart_uploads.encrypt_parts: the part-encryption decision PINNED at initiate (AWS captures
+--     SSE intent at initiate). 1 => every UploadPart/UploadPartCopy mints a per-part DEK and stages a
+--     CRNB VERSION_ENCRYPTED blob; 0 => stage plaintext (legacy). A pre-v21 in-flight row reads 0 and
+--     still completes via the plaintext-parts -> encrypt-at-assemble legacy path.
+--   * multipart_parts.part_dek: that part's 32-byte DEK, freshly random per staging, sealed under the
+--     master ring (base64 CRK1 envelope). NULL = a plaintext part. Consumed and discarded at
+--     CompleteMultipartUpload; never enters the object rewrap stream (ephemeral, GC'd with the session).
+-- Mirrors cairn-meta/src/schema.rs v21 byte-for-byte (same version).
+ALTER TABLE multipart_uploads ADD COLUMN encrypt_parts INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE multipart_parts   ADD COLUMN part_dek       TEXT;
+"#,
+    },
 ];
 
 /// Run all pending migrations on the write driver, recording each as applied. Each migration is
@@ -516,4 +535,48 @@ fn now_millis() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::libsql_driver::LibsqlDriver;
+    use libsql::Database;
+    use std::sync::Arc;
+
+    async fn migrated_driver() -> Arc<dyn AsyncSqlDriver> {
+        let name = format!(
+            "file:cairn-libsql-schema-{}?mode=memory&cache=shared",
+            uuid::Uuid::new_v4().simple()
+        );
+        #[allow(deprecated)]
+        let db = Database::open(name).unwrap();
+        let conn = db.connect().unwrap();
+        let driver: Arc<dyn AsyncSqlDriver> = Arc::new(LibsqlDriver::new(conn));
+        run_migrations(driver.as_ref()).await.unwrap();
+        driver
+    }
+
+    async fn column_exists(driver: &dyn AsyncSqlDriver, table: &str, column: &str) -> bool {
+        driver
+            .query(
+                "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name=?2",
+                vec![
+                    Value::Text(table.to_owned()),
+                    Value::Text(column.to_owned()),
+                ],
+            )
+            .await
+            .unwrap()
+            .first()
+            .map_or(0, |r| r.get_i64(0))
+            > 0
+    }
+
+    #[tokio::test]
+    async fn migration_v21_adds_multipart_part_encryption() {
+        let driver = migrated_driver().await;
+        assert!(column_exists(driver.as_ref(), "multipart_uploads", "encrypt_parts").await);
+        assert!(column_exists(driver.as_ref(), "multipart_parts", "part_dek").await);
+    }
 }

@@ -32,7 +32,11 @@ struct StoredBlob {
 }
 
 type BlobMap = HashMap<String, StoredBlob>;
-type PartMap = HashMap<(String, u16), Arc<Vec<u8>>>;
+/// A staged part: its plaintext bytes and the optional DEK it was staged under. The double models
+/// SSE-S3 part semantics with a key *label* (no real cryptography): `assemble` checks each
+/// `PartRef.dek` against the label a part was staged with, so the wrong-key-fails property is
+/// faithful. All real ciphertext/nonce assertions must run against the on-disk `LocalBlobStore`.
+type PartMap = HashMap<(String, u16), (Arc<Vec<u8>>, Option<[u8; 32]>)>;
 
 /// An in-memory blob store.
 #[derive(Debug, Default)]
@@ -168,15 +172,16 @@ impl BlobStore for InMemoryBlobStore {
         body: crate::BodyStream,
         _checksums: crate::object::ChecksumSet,
         size_ceiling: u64,
+        encryption: Option<[u8; 32]>,
     ) -> Result<StagedPart, BlobError> {
         let buf = Self::drain(body, size_ceiling).await?;
         let md5 = md5_hex(&buf);
         let size = buf.len() as u64;
         let path = StoragePath::from_string(format!("{}/part-{}", upload, part_number));
-        self.parts
-            .lock()
-            .unwrap()
-            .insert((upload.as_str().to_owned(), part_number), Arc::new(buf));
+        self.parts.lock().unwrap().insert(
+            (upload.as_str().to_owned(), part_number),
+            (Arc::new(buf), encryption),
+        );
         // Like `stage`/`assemble` here, the double models storage semantics without computing the
         // supplementary checksums (no hash engine in `cairn-types`); it returns the faithful MD5 and
         // an empty checksum set, so callers exercise the field's plumbing without a real digest.
@@ -203,7 +208,14 @@ impl BlobStore for InMemoryBlobStore {
                 let pn = key.rsplit('-').next().and_then(|n| n.parse::<u16>().ok());
                 let upload = key.split('/').next().unwrap_or_default().to_owned();
                 if let Some(pn) = pn {
-                    if let Some(bytes) = parts_map.get(&(upload, pn)) {
+                    if let Some((bytes, staged_dek)) = parts_map.get(&(upload, pn)) {
+                        // Model the decrypt-on-read: a part staged under a DEK is readable only with
+                        // the same DEK (mirrors `open_with_dek`); a wrong/missing key fails closed.
+                        if *staged_dek != p.dek && staged_dek.is_some() {
+                            return Err(BlobError::Corruption(
+                                "part is encrypted; wrong or missing data-encryption key".into(),
+                            ));
+                        }
                         buf.extend_from_slice(bytes);
                         continue;
                     }

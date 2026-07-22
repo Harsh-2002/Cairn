@@ -10910,3 +10910,652 @@ async fn at_rest_copy_and_multipart_are_encrypted() {
     expected.extend_from_slice(&part2);
     assert_eq!(got, expected, "assembled at-rest object round-trips");
 }
+
+// ---------------------------------------------------------------------------------------------
+// Part-level SSE at rest (ARCH 27, Increment 3a). An SSE / bucket-default / at-rest multipart
+// upload stages every part as ciphertext on disk; the assembled object round-trips byte-exact and
+// the ETag stays the plaintext md5(concat(part_md5s))-N. Every ciphertext assertion targets the
+// real LocalBlobStore staging files.
+// ---------------------------------------------------------------------------------------------
+
+fn once_body(data: Vec<u8>) -> cairn_types::BodyStream {
+    Box::pin(futures_util::stream::once(
+        async move { Ok(Bytes::from(data)) },
+    ))
+}
+
+/// The staged part files of an in-flight upload, in part-number order.
+fn staged_part_paths(root: &std::path::Path, upload_id: &str) -> Vec<std::path::PathBuf> {
+    let dir = root.join(".staging").join("multipart").join(upload_id);
+    let mut v: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .collect();
+    v.sort();
+    v
+}
+
+/// A CRNB blob's trailer is 34 bytes: magic(4) + version(1) at offset 4. VERSION_ENCRYPTED == 2.
+fn is_version_encrypted(path: &std::path::Path) -> bool {
+    let raw = std::fs::read(path).unwrap();
+    raw.len() >= 34 && raw[raw.len() - 34 + 4] == 2
+}
+
+fn build_svc(meta: Arc<dyn MetadataStore>, blob: Arc<dyn BlobStore>, key: [u8; 32]) -> S3Service {
+    let clock = Arc::new(cairn_types::testing::TestClock::default());
+    let crypto: Arc<dyn cairn_types::traits::Crypto> =
+        Arc::new(cairn_crypto::SystemCrypto::new(key));
+    S3Service::new(
+        meta,
+        blob,
+        Arc::new(cairn_types::testing::AllowAll),
+        clock,
+        crypto,
+        "us-east-1".to_owned(),
+        5 * 1024 * 1024 * 1024,
+    )
+}
+
+/// Initiate a multipart upload with the given initiate headers and return the upload id.
+async fn initiate(svc: &S3Service, bucket: &str, key: &str, headers: &[(&str, &str)]) -> String {
+    let (st, _, body) = drain(
+        send(
+            svc,
+            req(
+                Method::POST,
+                Some(bucket),
+                Some(key),
+                &[("uploads", "")],
+                headers,
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "initiate multipart");
+    between(
+        &String::from_utf8(body).unwrap(),
+        "<UploadId>",
+        "</UploadId>",
+    )
+}
+
+/// Upload one body part; returns its ETag header.
+async fn upload_part(
+    svc: &S3Service,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    n: u16,
+    body: Vec<u8>,
+) -> String {
+    let (st, hdrs, _) = drain(
+        send(
+            svc,
+            req(
+                Method::PUT,
+                Some(bucket),
+                Some(key),
+                &[("uploadId", upload_id), ("partNumber", &n.to_string())],
+                &[],
+                body,
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "upload part {n}");
+    header(&hdrs, "etag").unwrap().to_owned()
+}
+
+async fn complete(
+    svc: &S3Service,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    etags: &[(u16, &str)],
+) -> (StatusCode, Vec<(String, String)>, Vec<u8>) {
+    let parts: String = etags
+        .iter()
+        .map(|(n, e)| format!("<Part><PartNumber>{n}</PartNumber><ETag>{e}</ETag></Part>"))
+        .collect();
+    let complete = format!("<CompleteMultipartUpload>{parts}</CompleteMultipartUpload>");
+    drain(
+        send(
+            svc,
+            req(
+                Method::POST,
+                Some(bucket),
+                Some(key),
+                &[("uploadId", upload_id)],
+                &[],
+                complete.into_bytes(),
+            ),
+        )
+        .await,
+    )
+    .await
+}
+
+/// An explicit-AES256 multipart upload stages BOTH parts as ciphertext on disk, then completes to an
+/// object that GETs byte-exact, advertises AES256, and keeps the `-N` plaintext ETag. Fails before
+/// 3a: parts were staged plaintext.
+#[tokio::test]
+async fn multipart_sse_parts_are_ciphertext_and_object_roundtrips() {
+    let h = harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("msse"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    let uid = initiate(
+        &h.svc,
+        "msse",
+        "big.bin",
+        &[("x-amz-server-side-encryption", "AES256")],
+    )
+    .await;
+
+    let part1 = vec![b'A'; 6 * 1024 * 1024];
+    let part2 = b"the-tail".to_vec();
+    let e1 = upload_part(&h.svc, "msse", "big.bin", &uid, 1, part1.clone()).await;
+    let e2 = upload_part(&h.svc, "msse", "big.bin", &uid, 2, part2.clone()).await;
+
+    // Both staged part files are ciphertext (VERSION_ENCRYPTED) BEFORE complete deletes the session.
+    let staged = staged_part_paths(h._dir.path(), &uid);
+    assert_eq!(staged.len(), 2, "two staged parts");
+    for p in &staged {
+        assert!(
+            is_version_encrypted(p),
+            "staged SSE part must be ciphertext: {p:?}"
+        );
+    }
+
+    let (st, hdrs, body) = complete(&h.svc, "msse", "big.bin", &uid, &[(1, &e1), (2, &e2)]).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(
+        String::from_utf8(body).unwrap().contains("-2"),
+        "ETag has -N suffix"
+    );
+    assert_eq!(
+        header(&hdrs, "x-amz-server-side-encryption"),
+        Some("AES256")
+    );
+
+    let (st, hdrs, got) = drain(
+        send(
+            &h.svc,
+            req(Method::GET, Some("msse"), Some("big.bin"), &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let mut expected = part1.clone();
+    expected.extend_from_slice(&part2);
+    assert_eq!(got, expected);
+    assert_eq!(
+        header(&hdrs, "x-amz-server-side-encryption"),
+        Some("AES256")
+    );
+}
+
+/// The HIGH-finding regression: an SSE session mixing one UploadPart and one UploadPartCopy stages
+/// BOTH as ciphertext and the completed object round-trips. Fails if §5.3 (upload_part_copy) is
+/// omitted — the copied part would be plaintext (or read raw), corrupting the object.
+#[tokio::test]
+async fn mixed_uploadpart_and_uploadpartcopy_sse_all_ciphertext() {
+    let h = harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("mix"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    // A plaintext source object; its first 5 MiB is copied into part 1.
+    let mut source = vec![b'a'; 5 * 1024 * 1024];
+    source.extend_from_slice(&vec![b'b'; 4096]);
+    drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("mix"),
+                Some("src.bin"),
+                &[],
+                &[],
+                source.clone(),
+            ),
+        )
+        .await,
+    )
+    .await;
+
+    let uid = initiate(
+        &h.svc,
+        "mix",
+        "dest.bin",
+        &[("x-amz-server-side-encryption", "AES256")],
+    )
+    .await;
+
+    // Part 1: UploadPartCopy of the first 5 MiB.
+    let copy_range = format!("bytes=0-{}", 5 * 1024 * 1024 - 1);
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("mix"),
+                Some("dest.bin"),
+                &[("uploadId", uid.as_str()), ("partNumber", "1")],
+                &[
+                    ("x-amz-copy-source", "/mix/src.bin"),
+                    ("x-amz-copy-source-range", copy_range.as_str()),
+                ],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let e1 = between(&String::from_utf8(body).unwrap(), "<ETag>", "</ETag>");
+
+    // Part 2: a regular body part.
+    let part2 = b"copied-tail".to_vec();
+    let e2 = upload_part(&h.svc, "mix", "dest.bin", &uid, 2, part2.clone()).await;
+
+    // Both staged files — the copied one AND the body one — are ciphertext.
+    let staged = staged_part_paths(h._dir.path(), &uid);
+    assert_eq!(staged.len(), 2);
+    for p in &staged {
+        assert!(
+            is_version_encrypted(p),
+            "mixed staged part must be ciphertext: {p:?}"
+        );
+    }
+
+    let (st, _, _) = complete(&h.svc, "mix", "dest.bin", &uid, &[(1, &e1), (2, &e2)]).await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _, got) = drain(
+        send(
+            &h.svc,
+            req(Method::GET, Some("mix"), Some("dest.bin"), &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let mut expected = vec![b'a'; 5 * 1024 * 1024];
+    expected.extend_from_slice(&part2);
+    assert_eq!(got, expected);
+}
+
+/// With CAIRN_ENCRYPT_AT_REST and NO SSE header, multipart parts are still ciphertext on disk and the
+/// object round-trips, but GET advertises nothing (transparent AtRest).
+#[tokio::test]
+async fn multipart_at_rest_parts_are_ciphertext() {
+    let h = harness_encrypt_at_rest().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("atr"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    let uid = initiate(&h.svc, "atr", "big.bin", &[]).await;
+    let part1 = vec![b'C'; 6 * 1024 * 1024];
+    let part2 = b"tail".to_vec();
+    let e1 = upload_part(&h.svc, "atr", "big.bin", &uid, 1, part1.clone()).await;
+    let e2 = upload_part(&h.svc, "atr", "big.bin", &uid, 2, part2.clone()).await;
+
+    for p in &staged_part_paths(h._dir.path(), &uid) {
+        assert!(
+            is_version_encrypted(p),
+            "at-rest staged part must be ciphertext"
+        );
+    }
+
+    let (st, hdrs, _) = complete(&h.svc, "atr", "big.bin", &uid, &[(1, &e1), (2, &e2)]).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(
+        header(&hdrs, "x-amz-server-side-encryption").is_none(),
+        "AtRest advertises nothing"
+    );
+
+    let (st, hdrs, got) = drain(
+        send(
+            &h.svc,
+            req(Method::GET, Some("atr"), Some("big.bin"), &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let mut expected = part1.clone();
+    expected.extend_from_slice(&part2);
+    assert_eq!(got, expected);
+    assert!(header(&hdrs, "x-amz-server-side-encryption").is_none());
+}
+
+/// A bucket-default AES256 with no request header pins encrypt_parts at initiate: the staged parts are
+/// ciphertext and complete advertises AES256.
+#[tokio::test]
+async fn bucket_default_sse_multipart_parts_ciphertext() {
+    let h = harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("bdef"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    let put_xml = cairn_xml::server_side_encryption_configuration("AES256", None, false);
+    drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("bdef"),
+                None,
+                &[("encryption", "")],
+                &[],
+                put_xml.into_bytes(),
+            ),
+        )
+        .await,
+    )
+    .await;
+
+    let uid = initiate(&h.svc, "bdef", "big.bin", &[]).await;
+    let part1 = vec![b'D'; 6 * 1024 * 1024];
+    let part2 = b"tail".to_vec();
+    let e1 = upload_part(&h.svc, "bdef", "big.bin", &uid, 1, part1.clone()).await;
+    let e2 = upload_part(&h.svc, "bdef", "big.bin", &uid, 2, part2.clone()).await;
+
+    for p in &staged_part_paths(h._dir.path(), &uid) {
+        assert!(
+            is_version_encrypted(p),
+            "bucket-default SSE staged part must be ciphertext"
+        );
+    }
+
+    let (st, hdrs, _) = complete(&h.svc, "bdef", "big.bin", &uid, &[(1, &e1), (2, &e2)]).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        header(&hdrs, "x-amz-server-side-encryption"),
+        Some("AES256")
+    );
+    let (st, _, got) = drain(
+        send(
+            &h.svc,
+            req(Method::GET, Some("bdef"), Some("big.bin"), &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let mut expected = part1.clone();
+    expected.extend_from_slice(&part2);
+    assert_eq!(got, expected);
+}
+
+/// The protocol mints a DISTINCT per-part DEK on every staging: re-uploading the same part number
+/// stores a different sealed `part_dek`. Guards against a future refactor to a session-shared key
+/// (the blob unit test only proves the blob honors distinct keys).
+#[tokio::test]
+async fn reupload_part_mints_distinct_dek() {
+    let h = harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("reup"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    let uid = initiate(
+        &h.svc,
+        "reup",
+        "big.bin",
+        &[("x-amz-server-side-encryption", "AES256")],
+    )
+    .await;
+
+    upload_part(
+        &h.svc,
+        "reup",
+        "big.bin",
+        &uid,
+        1,
+        vec![b'x'; 6 * 1024 * 1024],
+    )
+    .await;
+    let upload = cairn_types::id::UploadId::from_string(uid.clone());
+    let first = h.meta.list_parts(&upload, 0, 100).await.unwrap().items[0]
+        .part_dek
+        .clone()
+        .expect("part 1 has a sealed DEK");
+
+    upload_part(
+        &h.svc,
+        "reup",
+        "big.bin",
+        &uid,
+        1,
+        vec![b'y'; 6 * 1024 * 1024],
+    )
+    .await;
+    let second = h.meta.list_parts(&upload, 0, 100).await.unwrap().items[0]
+        .part_dek
+        .clone()
+        .expect("re-uploaded part 1 has a sealed DEK");
+
+    assert_ne!(first, second, "re-upload must mint a fresh per-part DEK");
+}
+
+/// Tampering with a staged part's on-disk ciphertext fails the completion closed (GCM auth error at
+/// assemble) and writes no object version.
+#[tokio::test]
+async fn tampered_part_fails_complete() {
+    let h = harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("tmp"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    let uid = initiate(
+        &h.svc,
+        "tmp",
+        "big.bin",
+        &[("x-amz-server-side-encryption", "AES256")],
+    )
+    .await;
+    let e1 = upload_part(
+        &h.svc,
+        "tmp",
+        "big.bin",
+        &uid,
+        1,
+        vec![b'A'; 6 * 1024 * 1024],
+    )
+    .await;
+    let e2 = upload_part(&h.svc, "tmp", "big.bin", &uid, 2, b"tail".to_vec()).await;
+
+    // Flip a byte in part 1's block-0 ciphertext.
+    let staged = staged_part_paths(h._dir.path(), &uid);
+    let mut raw = std::fs::read(&staged[0]).unwrap();
+    raw[0] ^= 0xff;
+    std::fs::write(&staged[0], &raw).unwrap();
+
+    let (st, _, _) = complete(&h.svc, "tmp", "big.bin", &uid, &[(1, &e1), (2, &e2)]).await;
+    assert_ne!(st, StatusCode::OK, "a tampered part must fail completion");
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(Method::GET, Some("tmp"), Some("big.bin"), &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "no object version written");
+}
+
+/// A wrong master ring at completion fails to open the part DEKs — closed, BEFORE claiming — so no
+/// object is written and the upload stays retryable under the correct key.
+#[tokio::test]
+async fn wrong_master_key_fails_complete() {
+    let dir = tempfile::tempdir().unwrap();
+    let meta: Arc<dyn MetadataStore> = Arc::new(cairn_meta::open_in_memory().unwrap());
+    let blob: Arc<dyn BlobStore> =
+        Arc::new(cairn_blob::LocalBlobStore::open(dir.path()).await.unwrap());
+    let svc1 = build_svc(meta.clone(), blob.clone(), [7u8; 32]);
+    let svc2 = build_svc(meta.clone(), blob.clone(), [8u8; 32]);
+
+    drain(send(&svc1, req(Method::PUT, Some("wmk"), None, &[], &[], vec![])).await).await;
+    let uid = initiate(
+        &svc1,
+        "wmk",
+        "big.bin",
+        &[("x-amz-server-side-encryption", "AES256")],
+    )
+    .await;
+    let e1 = upload_part(
+        &svc1,
+        "wmk",
+        "big.bin",
+        &uid,
+        1,
+        vec![b'A'; 6 * 1024 * 1024],
+    )
+    .await;
+    let e2 = upload_part(&svc1, "wmk", "big.bin", &uid, 2, b"tail".to_vec()).await;
+
+    // Completing under the WRONG ring cannot open the sealed part DEKs -> fails closed, no object.
+    let (st, _, _) = complete(&svc2, "wmk", "big.bin", &uid, &[(1, &e1), (2, &e2)]).await;
+    assert_ne!(st, StatusCode::OK, "wrong master key must fail completion");
+    let (st, _, _) = drain(
+        send(
+            &svc1,
+            req(Method::GET, Some("wmk"), Some("big.bin"), &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::NOT_FOUND,
+        "no object after failed completion"
+    );
+
+    // The session stayed retryable: completing under the CORRECT ring succeeds.
+    let (st, _, _) = complete(&svc1, "wmk", "big.bin", &uid, &[(1, &e1), (2, &e2)]).await;
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "the upload stayed retryable under the correct key"
+    );
+}
+
+/// Back-compat: a pre-v21 in-flight session (encrypt_parts=0, sse_requested=1, plaintext parts with
+/// NULL part_dek) still completes via the legacy plaintext-parts -> encrypt-at-assemble path, and the
+/// object GETs byte-exact + advertises AES256.
+#[tokio::test]
+async fn pre_v21_session_completes_legacy() {
+    let dir = tempfile::tempdir().unwrap();
+    let meta: Arc<dyn MetadataStore> = Arc::new(cairn_meta::open_in_memory().unwrap());
+    let blob: Arc<dyn BlobStore> =
+        Arc::new(cairn_blob::LocalBlobStore::open(dir.path()).await.unwrap());
+    let svc = build_svc(meta.clone(), blob.clone(), [7u8; 32]);
+    drain(send(&svc, req(Method::PUT, Some("leg"), None, &[], &[], vec![])).await).await;
+
+    // Fabricate a legacy session: sse_requested but NO part encryption, and plaintext parts.
+    let upload = cairn_types::id::UploadId::generate();
+    let bucket = BucketName::parse("leg").unwrap();
+    let key = ObjectKey::parse("big.bin").unwrap();
+    let session = cairn_types::meta::MultipartSession {
+        upload_id: upload.clone(),
+        bucket: bucket.clone(),
+        key: key.clone(),
+        content_type: "application/octet-stream".to_owned(),
+        status: cairn_types::meta::MultipartStatus::Active,
+        owner_id: UserId("admin".to_owned()),
+        intended_acl: None,
+        user_metadata: Vec::new(),
+        sse_requested: true,
+        encrypt_parts: false,
+        created_at: cairn_types::time::Timestamp(0),
+        updated_at: cairn_types::time::Timestamp(0),
+    };
+    meta.submit(cairn_types::meta::Mutation::CreateMultipart(Box::new(
+        session,
+    )))
+    .await
+    .unwrap();
+
+    let part1 = vec![b'L'; 6 * 1024 * 1024];
+    let part2 = b"legacy-tail".to_vec();
+    let mut etags = Vec::new();
+    for (n, body) in [(1u16, part1.clone()), (2u16, part2.clone())] {
+        let staged = blob
+            .stage_part(
+                &upload,
+                n,
+                once_body(body),
+                cairn_types::object::ChecksumSet::none(),
+                1 << 30,
+                None,
+            )
+            .await
+            .unwrap();
+        let part = cairn_types::meta::PartRecord {
+            part_number: n,
+            size: staged.size,
+            etag: staged.md5_hex.clone(),
+            storage_path: staged.storage_path.clone(),
+            checksum: None,
+            part_dek: None,
+        };
+        etags.push((n, staged.md5_hex.clone()));
+        meta.submit(cairn_types::meta::Mutation::RecordPart {
+            upload_id: upload.clone(),
+            part,
+        })
+        .await
+        .unwrap();
+    }
+
+    let refs: Vec<(u16, &str)> = etags.iter().map(|(n, e)| (*n, e.as_str())).collect();
+    let (st, hdrs, _) = complete(&svc, "leg", "big.bin", upload.as_str(), &refs).await;
+    assert_eq!(st, StatusCode::OK, "legacy session completes");
+    assert_eq!(
+        header(&hdrs, "x-amz-server-side-encryption"),
+        Some("AES256")
+    );
+
+    let (st, _, got) = drain(
+        send(
+            &svc,
+            req(Method::GET, Some("leg"), Some("big.bin"), &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let mut expected = part1.clone();
+    expected.extend_from_slice(&part2);
+    assert_eq!(got, expected);
+}

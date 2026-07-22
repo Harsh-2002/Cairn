@@ -1405,6 +1405,16 @@ impl S3Service {
                 return Err(Error::NotImplemented);
             }
         };
+        // Pin ONCE, at initiate, whether this session's parts must be encrypted at rest, so every
+        // part is treated identically and nothing plaintext hits disk (ARCH 27, Increment 3a). This
+        // mirrors `resolve_object_encryption`'s mode SELECTION (explicit AES256 > any bucket default >
+        // CAIRN_ENCRYPT_AT_REST) WITHOUT minting a DEK or validating a KMS key id — a cheap predicate,
+        // so a KMS-default bucket's parts still encrypt under a master-sealed random DEK while the
+        // object DEK is resolved fresh at Complete. `bucket_default_sse` returns Some for a KMS default
+        // too, so bucket-default-KMS multipart parts are covered for free.
+        let encrypt_parts = want_sse
+            || self.bucket_default_sse(&bucket.name).await?.is_some()
+            || self.encrypt_at_rest;
         let session = MultipartSession {
             upload_id: upload_id.clone(),
             bucket: bucket.name.clone(),
@@ -1418,6 +1428,7 @@ impl S3Service {
             intended_acl: None,
             user_metadata: user_metadata(req),
             sse_requested: want_sse,
+            encrypt_parts,
             created_at: now,
             updated_at: now,
         };
@@ -1457,7 +1468,8 @@ impl S3Service {
         // Scope BEFORE staging: `Mutation::RecordPart` SUPERSEDES any existing part at this number,
         // so an unscoped id lets a caller overwrite a part of another key's live upload. Staying
         // ahead of `stage_part` also means a rejected request stages nothing to reclaim.
-        self.scoped_multipart(&upload_id, &bucket.name, &key)
+        let session = self
+            .scoped_multipart(&upload_id, &bucket.name, &key)
             .await?;
         // Compute any supplementary checksum the client requested over this part's plaintext, so a
         // client `x-amz-checksum-*` header can be validated and the per-part digest persisted for
@@ -1469,10 +1481,32 @@ impl S3Service {
                 "at most one checksum algorithm may be specified per part".to_owned(),
             ));
         }
+        // Part-level SSE at rest (ARCH 27, Increment 3a): an encrypt-parts session mints a FRESH random
+        // per-part DEK and stages the part as ciphertext, so nothing plaintext hits disk. Seal the DEK
+        // under the master ring BEFORE `stage_part` so no fallible step follows staging — a seal error
+        // returns with nothing staged to reclaim (the no-orphan invariant). The raw DEK is passed to
+        // the stager; the sealed form is persisted on the part record and reopened at Complete.
+        let (part_dek, part_dek_sealed): (Option<[u8; 32]>, Option<String>) =
+            if session.encrypt_parts {
+                use rand::RngCore;
+                let mut dek = [0u8; 32];
+                rand::thread_rng().fill_bytes(&mut dek);
+                let sealed = self.seal_part_dek(&dek)?;
+                (Some(dek), Some(sealed))
+            } else {
+                (None, None)
+            };
         let body = streaming_body(&req, raw_body, self.max_object_size)?;
         let staged = self
             .blob
-            .stage_part(&upload_id, part_number, body, extra, self.max_object_size)
+            .stage_part(
+                &upload_id,
+                part_number,
+                body,
+                extra,
+                self.max_object_size,
+                part_dek,
+            )
             .await
             .map_err(map_stage_err)?;
         // Fail closed: a client-supplied `x-amz-checksum-*` that disagrees with the computed digest is
@@ -1489,6 +1523,7 @@ impl S3Service {
             storage_path: staged.storage_path.clone(),
             // At most one algorithm was requested, so the computed set holds at most one value.
             checksum: staged.checksums.first().cloned(),
+            part_dek: part_dek_sealed,
         };
         if let MutationOutcome::PartRecorded {
             superseded: Some(old),
@@ -1526,7 +1561,8 @@ impl S3Service {
         // Same scoping rule as `upload_part`, and for the same reason: the recorded part supersedes
         // whatever sat at this number, so an unscoped id splices attacker-chosen bytes into another
         // key's upload. Must stay ahead of the `stage_part` below.
-        self.scoped_multipart(&upload_id, &dest_bucket.name, &key)
+        let session = self
+            .scoped_multipart(&upload_id, &dest_bucket.name, &key)
             .await?;
 
         // Resolve the copy source object version (reusing the copy-source parser and the
@@ -1610,6 +1646,20 @@ impl S3Service {
                 "at most one checksum algorithm may be specified per part".to_owned(),
             ));
         }
+        // Part-level SSE at rest (ARCH 27, Increment 3a): identical to `upload_part`. An encrypt-parts
+        // session stages this copied part as ciphertext under a fresh random per-part DEK, sealed
+        // BEFORE `stage_part` so no fallible step follows staging. The copy source is decrypted
+        // transparently upstream (`src_stream`), so the stager only ever sees plaintext.
+        let (part_dek, part_dek_sealed): (Option<[u8; 32]>, Option<String>) =
+            if session.encrypt_parts {
+                use rand::RngCore;
+                let mut dek = [0u8; 32];
+                rand::thread_rng().fill_bytes(&mut dek);
+                let sealed = self.seal_part_dek(&dek)?;
+                (Some(dek), Some(sealed))
+            } else {
+                (None, None)
+            };
         let staged = self
             .blob
             .stage_part(
@@ -1618,6 +1668,7 @@ impl S3Service {
                 src_stream,
                 extra,
                 self.max_object_size,
+                part_dek,
             )
             .await
             .map_err(map_stage_err)?;
@@ -1629,6 +1680,7 @@ impl S3Service {
             storage_path: staged.storage_path.clone(),
             // At most one algorithm was requested, so the computed set holds at most one value.
             checksum: staged.checksums.first().cloned(),
+            part_dek: part_dek_sealed,
         };
         if let MutationOutcome::PartRecorded {
             superseded: Some(old),
@@ -1671,7 +1723,10 @@ impl S3Service {
         // NoSuchUpload), and under CAIRN_META_SHARDS>1 the CompleteMultipart mutation routes by the
         // SESSION's shard while every read for the path bucket routes elsewhere — an unreadable,
         // ultimately GC'd object: a silently-lost acknowledged write (audit 2026-07).
-        self.scoped_multipart(&upload_id, &bucket.name, &key)
+        // Capture the session here: `encrypt_parts` (pinned at initiate) tells the pre-claim loop
+        // whether each part carries a sealed DEK to open before assembly (ARCH 27, Increment 3a).
+        let scoped = self
+            .scoped_multipart(&upload_id, &bucket.name, &key)
             .await?;
 
         // Validate the requested parts against what was uploaded BEFORE claiming the session, so a
@@ -1717,10 +1772,30 @@ impl S3Service {
             if i + 1 < requested.len() && rec.size < 5 * 1024 * 1024 {
                 return Err(Error::EntityTooSmall);
             }
+            // Part-level SSE at rest (ARCH 27, Increment 3a): open the sealed per-part DEK BEFORE
+            // claiming the session, so a wrong/rotated/retired master key or a tampered envelope fails
+            // closed here (a typed error) and leaves the upload retryable (audit #14) rather than
+            // bricking it in `completing`. `assemble` decrypts each ciphertext part via `PartRef.dek`.
+            let dek = match &rec.part_dek {
+                Some(sealed) => Some(self.open_part_dek(sealed)?),
+                None => {
+                    // Defense-in-depth: an encrypt-parts session must not carry a plaintext part. The
+                    // happy path always couples `part_dek` with the on-disk ciphertext (UploadPart /
+                    // UploadPartCopy set them together), so a `None` here means a corrupt/tampered
+                    // session — fail closed, never assemble it.
+                    if scoped.encrypt_parts {
+                        return Err(Error::Internal(
+                            "multipart part: encrypted session has a plaintext part".to_owned(),
+                        ));
+                    }
+                    None
+                }
+            };
             refs.push(PartRef {
                 part_number: *pn,
                 storage_path: rec.storage_path.clone(),
                 size: rec.size,
+                dek,
             });
             part_md5s.push(rec.etag.clone());
             part_checksums.push(rec.checksum.clone());
@@ -4861,6 +4936,29 @@ impl S3Service {
         let raw = self.crypto.open(&ciphertext, &Nonce(nonce_bytes))?;
         raw.as_slice().try_into().map_err(|_| {
             Error::Internal("sse descriptor: unwrapped key is not 32 bytes".to_owned())
+        })
+    }
+
+    /// Seal a per-part multipart DEK under the master ring, returning the base64 CRK1 envelope stored
+    /// in `multipart_parts.part_dek` (ARCH 27, Increment 3a). Uses the exact self-framing CRK1 seal
+    /// of `new_sse_dek_mode`/`open_sse_dek` (an empty nonce; the nonce rides inside the envelope), so
+    /// the same master ring — and only that ring — can reopen it. Fails closed on a seal error.
+    fn seal_part_dek(&self, dek: &[u8; 32]) -> Result<String> {
+        Ok(base64::engine::general_purpose::STANDARD.encode(&self.crypto.seal(dek)?.ciphertext))
+    }
+
+    /// Unwrap a per-part multipart DEK sealed by [`seal_part_dek`](Self::seal_part_dek). A bad base64,
+    /// a tampered envelope, or a wrong/rotated/retired master key fails closed (a typed error, never
+    /// plaintext); `complete_multipart` opens every part key BEFORE claiming the session so such a
+    /// failure leaves the upload retryable.
+    fn open_part_dek(&self, sealed_b64: &str) -> Result<[u8; 32]> {
+        let ct = base64::engine::general_purpose::STANDARD
+            .decode(sealed_b64.as_bytes())
+            .map_err(|_| Error::Internal("multipart part: bad wrapped key base64".to_owned()))?;
+        // CRK1: the nonce is inside the envelope, so `open` ignores this argument (empty nonce).
+        let raw = self.crypto.open(&ct, &Nonce(Vec::new()))?;
+        raw.as_slice().try_into().map_err(|_| {
+            Error::Internal("multipart part: unwrapped key is not 32 bytes".to_owned())
         })
     }
 }

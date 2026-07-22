@@ -198,6 +198,14 @@ unreadable when you add a key.
 > naming the key id and shard, rather than booting into unreadable data. Restore the key to the
 > ring, wait for re-wrap to finish, then retire it.
 
+> **In-flight multipart uploads and retirement.** A multipart upload seals each part under the
+> master key active when the part was uploaded, and those per-part keys are transient (not covered by
+> the re-wrap stream — they are consumed and discarded at completion). If a key is retired while an
+> upload started under it is still in flight, that upload's `CompleteMultipartUpload` fails closed
+> (the session stays active and can be aborted + retried); no plaintext is exposed and no corrupt
+> object is written. The exposure window is bounded by the multipart-session lifetime, so either drain
+> in-flight uploads before retiring or accept that any spanning a retirement must be re-run.
+
 **Seal-count bound.** Each key uses fresh random 96-bit GCM nonces; the active key's seal count is
 tracked (and survives restarts). At 75% of the safe ceiling the server logs a "rotate soon"
 warning; at 95% it refuses *new* seals (opens are never blocked) — rotate before then.

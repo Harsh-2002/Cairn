@@ -747,6 +747,15 @@ pub struct MultipartSession {
     /// request carries no SSE header; honored at completion so the assembled object is encrypted at
     /// rest exactly like a single-part PUT (ARCH 27).
     pub sse_requested: bool,
+    /// The part-encryption decision pinned at initiate (ARCH 27, Increment 3a). When `true`, every
+    /// `UploadPart`/`UploadPartCopy` of this session mints a fresh per-part DEK and stages the part
+    /// as a CRNB `VERSION_ENCRYPTED` blob, so nothing plaintext hits disk; the assembled object is
+    /// a decrypt-then-re-encrypt pass. Computed by a cheap predicate at initiate (explicit AES256, a
+    /// bucket default of any mode, or `CAIRN_ENCRYPT_AT_REST`) that mints no DEK and never validates
+    /// a KMS key id — distinct from `sse_requested`, which drives the object's advertised mode at
+    /// complete. A pre-v21 in-flight session reads `false` and completes via the legacy
+    /// plaintext-parts -> encrypt-at-assemble path.
+    pub encrypt_parts: bool,
     /// Creation time.
     pub created_at: Timestamp,
     /// Last-update time.
@@ -813,6 +822,11 @@ pub struct PartRecord {
     pub storage_path: StoragePath,
     /// Any client-supplied checksum.
     pub checksum: Option<ChecksumValue>,
+    /// The part's 32-byte DEK when it was staged encrypted (ARCH 27, Increment 3a), sealed under the
+    /// master ring (base64 CRK1 envelope) — opaque to the metadata layer. `None` = a plaintext part
+    /// (legacy / pre-v21). Consumed at `CompleteMultipartUpload` to decrypt the part before it is
+    /// re-encoded under the object DEK; it never enters the object rewrap stream.
+    pub part_dek: Option<String>,
 }
 
 /// The outcome of claiming a multipart session for completion.

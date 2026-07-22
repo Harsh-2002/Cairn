@@ -61,9 +61,12 @@ plain files under opaque IDs; metadata is someone else's job (`cairn-meta`).
 - Depends only on `cairn-types` (the trait spine + domain types) — no other engine crate. Implements
   the `BlobStore` and `ReconcileOracle` traits; the in-memory double lives in `cairn-types`
   (`feature = "testing"`).
-- Multipart parts are staged **unencrypted/uncompressed** intermediate artifacts (`fsync_in_place`, no
-  rename); SSE-S3 and compression are applied once at `assemble`, mirroring how the assembled object is
-  hashed. The MD5/ETag is always computed over plaintext, so it's identical with or without any transform.
+- Multipart parts are staged as **uncompressed** intermediate artifacts (`fsync_in_place`, no rename);
+  compression is applied once at `assemble`. A part is staged **encrypted** (a CRNB `VERSION_ENCRYPTED`
+  blob) when `stage_part` is passed a per-part DEK (SSE / bucket-default / at-rest multipart, ARCH 27),
+  so nothing plaintext hits disk; `assemble` decrypts each such part on read (via `PartRef.dek`) before
+  re-encoding under the object DEK. The MD5/ETag is always computed over plaintext (before any
+  encrypt/compress transform), so it's identical with or without any transform.
 - Failpoint seams (`--features failpoints`): `blob_after_durable`, `blob_after_assemble` — exercised by
   `conformance/crash_consistency.sh` and `crash_multipoint.sh`. CRNB-reader fuzz target in `fuzz/`.
 - Tests: unit tests in each module; integration in `tests/blob.rs`. Spec: `docs/storage-durability.md`

@@ -650,6 +650,7 @@ async fn multipart_assembly_roundtrip() {
             body(b"part-one-".to_vec()),
             ChecksumSet::none(),
             1 << 20,
+            None,
         )
         .await
         .unwrap();
@@ -660,6 +661,7 @@ async fn multipart_assembly_roundtrip() {
             body(b"part-two".to_vec()),
             ChecksumSet::none(),
             1 << 20,
+            None,
         )
         .await
         .unwrap();
@@ -668,11 +670,13 @@ async fn multipart_assembly_roundtrip() {
             part_number: 1,
             storage_path: p1.storage_path.clone(),
             size: p1.size,
+            dek: None,
         },
         PartRef {
             part_number: 2,
             storage_path: p2.storage_path.clone(),
             size: p2.size,
+            dek: None,
         },
     ];
     let assembled = store
@@ -708,6 +712,7 @@ async fn assemble_enforces_size_ceiling() {
             body(b"part-one-".to_vec()),
             ChecksumSet::none(),
             1 << 20,
+            None,
         )
         .await
         .unwrap();
@@ -718,6 +723,7 @@ async fn assemble_enforces_size_ceiling() {
             body(b"part-two".to_vec()),
             ChecksumSet::none(),
             1 << 20,
+            None,
         )
         .await
         .unwrap();
@@ -726,11 +732,13 @@ async fn assemble_enforces_size_ceiling() {
             part_number: 1,
             storage_path: p1.storage_path.clone(),
             size: p1.size,
+            dek: None,
         },
         PartRef {
             part_number: 2,
             storage_path: p2.storage_path.clone(),
             size: p2.size,
+            dek: None,
         },
     ];
     // The parts total 17 bytes; a 10-byte ceiling must reject the assembly.
@@ -959,6 +967,7 @@ async fn stage_part_computes_requested_checksum() {
             body(b"abc".to_vec()),
             ChecksumSet(vec![ChecksumAlgorithm::Crc32]),
             1 << 20,
+            None,
         )
         .await
         .unwrap();
@@ -974,6 +983,7 @@ async fn stage_part_computes_requested_checksum() {
             body(b"abc".to_vec()),
             ChecksumSet::none(),
             1 << 20,
+            None,
         )
         .await
         .unwrap();
@@ -996,6 +1006,7 @@ async fn assemble_honors_extra_checksums_whole_object() {
             body(b"part-one-".to_vec()),
             ChecksumSet::none(),
             1 << 20,
+            None,
         )
         .await
         .unwrap();
@@ -1006,6 +1017,7 @@ async fn assemble_honors_extra_checksums_whole_object() {
             body(b"part-two".to_vec()),
             ChecksumSet::none(),
             1 << 20,
+            None,
         )
         .await
         .unwrap();
@@ -1014,11 +1026,13 @@ async fn assemble_honors_extra_checksums_whole_object() {
             part_number: 1,
             storage_path: p1.storage_path.clone(),
             size: p1.size,
+            dek: None,
         },
         PartRef {
             part_number: 2,
             storage_path: p2.storage_path.clone(),
             size: p2.size,
+            dek: None,
         },
     ];
     let assemble_opts = StageOptions {
@@ -1191,6 +1205,7 @@ async fn io_uring_compressed_encrypted_and_multipart_roundtrip() {
             body(b"uring-part-one-".to_vec()),
             ChecksumSet::none(),
             1 << 20,
+            None,
         )
         .await
         .unwrap();
@@ -1201,6 +1216,7 @@ async fn io_uring_compressed_encrypted_and_multipart_roundtrip() {
             body(b"uring-part-two".to_vec()),
             ChecksumSet::none(),
             1 << 20,
+            None,
         )
         .await
         .unwrap();
@@ -1209,11 +1225,13 @@ async fn io_uring_compressed_encrypted_and_multipart_roundtrip() {
             part_number: 1,
             storage_path: p1.storage_path.clone(),
             size: p1.size,
+            dek: None,
         },
         PartRef {
             part_number: 2,
             storage_path: p2.storage_path.clone(),
             size: p2.size,
+            dek: None,
         },
     ];
     let assembled = store
@@ -1364,5 +1382,297 @@ async fn uring_vs_epoll_concurrent_staging() {
         "CONCURRENT staging ({conc} workers x {per} x 256KiB): io_uring={u:.1} MiB/s, \
          tokio::fs={e:.1} MiB/s, delta={:+.1}%",
         (u - e) / e * 100.0
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Part-level SSE at rest (ARCH 27, Increment 3a). A part staged with a per-part DEK is ciphertext
+// on disk; `assemble` decrypts it on read (via `PartRef.dek`) before hashing + re-encoding. All
+// real ciphertext/nonce assertions run here against the on-disk `LocalBlobStore`, never a double.
+// ---------------------------------------------------------------------------------------------
+
+/// Read a staged/committed blob file's raw on-disk bytes given its logical `StoragePath`.
+fn raw_blob_bytes(dir: &std::path::Path, path: &StoragePath) -> Vec<u8> {
+    std::fs::read(dir.join(path.as_str())).unwrap()
+}
+
+fn part_ref(part_number: u16, staged: &StagedPart, dek: Option<[u8; 32]>) -> PartRef {
+    PartRef {
+        part_number,
+        storage_path: staged.storage_path.clone(),
+        size: staged.size,
+        dek,
+    }
+}
+
+/// Two encrypted parts assembled with their matching per-part DEKs reproduce the plaintext concat
+/// byte-for-byte, and the object ETag is the plaintext MD5. Fails before this change: `stage_part`
+/// had no `encryption` param and `assemble_into` never decrypted a part.
+#[tokio::test]
+async fn stage_part_encrypted_roundtrips_via_assemble() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let b = BucketName::parse("bkt").unwrap();
+    let upload = UploadId::generate();
+    let dek1 = [7u8; 32];
+    let dek2 = [9u8; 32];
+    let plain1 = vec![b'A'; 6 * 1024 * 1024];
+    let plain2 = b"tail-bytes".to_vec();
+    let p1 = store
+        .stage_part(
+            &upload,
+            1,
+            body(plain1.clone()),
+            ChecksumSet::none(),
+            1 << 30,
+            Some(dek1),
+        )
+        .await
+        .unwrap();
+    let p2 = store
+        .stage_part(
+            &upload,
+            2,
+            body(plain2.clone()),
+            ChecksumSet::none(),
+            1 << 30,
+            Some(dek2),
+        )
+        .await
+        .unwrap();
+    let refs = vec![part_ref(1, &p1, Some(dek1)), part_ref(2, &p2, Some(dek2))];
+    let assembled = store
+        .assemble(&b, &refs, opts(None, "application/octet-stream"))
+        .await
+        .unwrap();
+    let mut expected = plain1.clone();
+    expected.extend_from_slice(&plain2);
+    assert_eq!(assembled.size_logical, expected.len() as u64);
+    assert_eq!(
+        read_all(
+            &store,
+            &assembled.storage_path,
+            None,
+            &assembled.compression
+        )
+        .await,
+        expected
+    );
+    // ETag/MD5 basis stays the PLAINTEXT digest (unchanged by per-part encryption): it matches the
+    // same concatenated bytes staged as a single plaintext object.
+    let single = store
+        .stage(
+            &b,
+            body(expected.clone()),
+            opts(None, "application/octet-stream"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(assembled.md5_hex, single.md5_hex);
+}
+
+/// A staged encrypted part is a `VERSION_ENCRYPTED` CRNB container on disk, and it cannot be opened
+/// without the DEK — proving nothing plaintext is written. Fails before: parts were staged plaintext.
+#[tokio::test]
+async fn staged_part_file_is_ciphertext() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let upload = UploadId::generate();
+    let dek = [3u8; 32];
+    let plain = vec![b'Z'; 4096];
+    let p = store
+        .stage_part(
+            &upload,
+            1,
+            body(plain.clone()),
+            ChecksumSet::none(),
+            1 << 30,
+            Some(dek),
+        )
+        .await
+        .unwrap();
+    let raw = raw_blob_bytes(dir.path(), &p.storage_path);
+    // The CRNB trailer is 34 bytes: magic(4) + version(1) at offset 4. VERSION_ENCRYPTED == 2.
+    let ver = raw[raw.len() - 34 + 4];
+    assert_eq!(ver, 2, "staged part trailer must be VERSION_ENCRYPTED");
+    // A known plaintext run is absent from the on-disk ciphertext.
+    assert!(
+        raw.windows(16).all(|w| w != [b'Z'; 16]),
+        "plaintext run leaked into the staged part file"
+    );
+    // The container refuses to open without a DEK (fails closed).
+    let f = std::fs::File::open(dir.path().join(p.storage_path.as_str())).unwrap();
+    assert!(cairn_blob::compress::CompressedReader::open_with_dek(f, None).is_err());
+}
+
+/// Identical plaintext staged as two parts under two independent random DEKs yields DIFFERENT
+/// block-0 ciphertext on disk — the nonce-reuse-catastrophe guard (block_index restarts at 0 per
+/// blob, so distinct keys are what keep `(key, nonce)` unique). Also covers the re-upload case: the
+/// same part number staged twice under fresh keys must differ. Fails under a shared-key strategy.
+#[tokio::test]
+async fn two_identical_parts_differ_in_block0_ciphertext() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let upload = UploadId::generate();
+    let plain = vec![b'Q'; 4096];
+    let a = store
+        .stage_part(
+            &upload,
+            1,
+            body(plain.clone()),
+            ChecksumSet::none(),
+            1 << 30,
+            Some([1u8; 32]),
+        )
+        .await
+        .unwrap();
+    let bpart = store
+        .stage_part(
+            &upload,
+            2,
+            body(plain.clone()),
+            ChecksumSet::none(),
+            1 << 30,
+            Some([2u8; 32]),
+        )
+        .await
+        .unwrap();
+    let ra = raw_blob_bytes(dir.path(), &a.storage_path);
+    let rb = raw_blob_bytes(dir.path(), &bpart.storage_path);
+    assert_ne!(
+        ra[..16],
+        rb[..16],
+        "identical plaintext must differ in block-0 ciphertext"
+    );
+
+    // Re-upload variant: the same part number staged twice under fresh keys must also differ.
+    let first = store
+        .stage_part(
+            &upload,
+            3,
+            body(plain.clone()),
+            ChecksumSet::none(),
+            1 << 30,
+            Some([4u8; 32]),
+        )
+        .await
+        .unwrap();
+    let second = store
+        .stage_part(
+            &upload,
+            3,
+            body(plain.clone()),
+            ChecksumSet::none(),
+            1 << 30,
+            Some([5u8; 32]),
+        )
+        .await
+        .unwrap();
+    let rf = raw_blob_bytes(dir.path(), &first.storage_path);
+    let rs = raw_blob_bytes(dir.path(), &second.storage_path);
+    assert_ne!(
+        rf[..16],
+        rs[..16],
+        "re-uploaded staging must differ in block-0 ciphertext"
+    );
+}
+
+/// Assembling an encrypted part with the WRONG DEK fails GCM auth → `BlobError::Corruption`, and no
+/// orphan tmp is left in `.staging`. Fails-closed: never plaintext/zeros/partial.
+#[tokio::test]
+async fn assemble_wrong_part_dek_is_corruption() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let b = BucketName::parse("bkt").unwrap();
+    let upload = UploadId::generate();
+    let plain = vec![b'W'; 6 * 1024 * 1024];
+    let p = store
+        .stage_part(
+            &upload,
+            1,
+            body(plain.clone()),
+            ChecksumSet::none(),
+            1 << 30,
+            Some([1u8; 32]),
+        )
+        .await
+        .unwrap();
+    // Assemble with a DIFFERENT key than the part was staged under.
+    let refs = vec![part_ref(1, &p, Some([2u8; 32]))];
+    let err = store
+        .assemble(&b, &refs, opts(None, "application/octet-stream"))
+        .await;
+    assert!(
+        matches!(err, Err(BlobError::Corruption(_))),
+        "wrong part DEK must be Corruption"
+    );
+    // No orphan staging tmp remains.
+    let staging = dir.path().join(".staging");
+    let leaked: Vec<_> = std::fs::read_dir(&staging)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "failed assembly left an orphan staging tmp"
+    );
+}
+
+/// Encrypted parts are physically larger on disk than their plaintext (per-block GCM tag + index +
+/// trailer), but `assemble` preallocates from the parts' LOGICAL sizes; the committed object still
+/// reads back byte-exact with `size_logical == Σ plaintext`.
+#[tokio::test]
+async fn preallocation_holds_for_encrypted_parts() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let b = BucketName::parse("bkt").unwrap();
+    let upload = UploadId::generate();
+    let plain1 = vec![b'M'; 6 * 1024 * 1024];
+    let plain2 = vec![b'N'; 5 * 1024 * 1024];
+    let p1 = store
+        .stage_part(
+            &upload,
+            1,
+            body(plain1.clone()),
+            ChecksumSet::none(),
+            1 << 30,
+            Some([1u8; 32]),
+        )
+        .await
+        .unwrap();
+    let p2 = store
+        .stage_part(
+            &upload,
+            2,
+            body(plain2.clone()),
+            ChecksumSet::none(),
+            1 << 30,
+            Some([2u8; 32]),
+        )
+        .await
+        .unwrap();
+    // The staged part file is larger than the plaintext (GCM overhead).
+    assert!(raw_blob_bytes(dir.path(), &p1.storage_path).len() > plain1.len());
+    let refs = vec![
+        part_ref(1, &p1, Some([1u8; 32])),
+        part_ref(2, &p2, Some([2u8; 32])),
+    ];
+    let assembled = store
+        .assemble(&b, &refs, opts(None, "application/octet-stream"))
+        .await
+        .unwrap();
+    let mut expected = plain1.clone();
+    expected.extend_from_slice(&plain2);
+    assert_eq!(assembled.size_logical, expected.len() as u64);
+    assert_eq!(
+        read_all(
+            &store,
+            &assembled.storage_path,
+            None,
+            &assembled.compression
+        )
+        .await,
+        expected
     );
 }

@@ -74,8 +74,8 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
         Mutation::CreateMultipart(s) => {
             conn.execute(
                 "INSERT INTO multipart_uploads
-                 (id, bucket_name, key, content_type, status, owner_id, intended_acl, user_metadata, sse_requested, created_at, updated_at)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                 (id, bucket_name, key, content_type, status, owner_id, intended_acl, user_metadata, sse_requested, encrypt_parts, created_at, updated_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
                 params![
                     s.upload_id.as_str(),
                     s.bucket.as_str(),
@@ -86,6 +86,7 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
                     s.intended_acl.as_ref().map(to_json),
                     to_json(&s.user_metadata),
                     s.sse_requested as i64,
+                    s.encrypt_parts as i64,
                     s.created_at.0,
                     s.updated_at.0,
                 ],
@@ -104,8 +105,8 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
                 .map_err(engine_err)?;
             conn.execute(
                 "INSERT OR REPLACE INTO multipart_parts
-                 (upload_id, part_number, size, etag, storage_path, checksum)
-                 VALUES (?1,?2,?3,?4,?5,?6)",
+                 (upload_id, part_number, size, etag, storage_path, checksum, part_dek)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7)",
                 params![
                     upload_id.as_str(),
                     part.part_number,
@@ -113,6 +114,7 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
                     part.etag,
                     part.storage_path.as_str(),
                     part.checksum.as_ref().map(to_json),
+                    part.part_dek,
                 ],
             )
             .map_err(engine_err)?;

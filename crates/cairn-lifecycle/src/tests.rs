@@ -133,6 +133,7 @@ async fn make_session(
         intended_acl: None,
         user_metadata: Vec::new(),
         sse_requested: false,
+        encrypt_parts: false,
         created_at: ts,
         updated_at: ts,
     };
@@ -147,6 +148,7 @@ async fn make_session(
             once_body(vec![1u8; 16]),
             cairn_types::ChecksumSet::none(),
             1 << 30,
+            None,
         )
         .await
         .unwrap();
@@ -158,6 +160,7 @@ async fn make_session(
             etag: staged.md5_hex,
             storage_path: staged.storage_path,
             checksum: None,
+            part_dek: None,
         },
     })
     .await
