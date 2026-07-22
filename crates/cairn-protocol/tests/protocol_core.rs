@@ -6196,8 +6196,8 @@ async fn put_without_sse_header_is_plaintext_and_no_header() {
     assert!(header(&hdrs, "x-amz-server-side-encryption").is_none());
 }
 
-/// An unsupported server-side-encryption mode (e.g. `aws:kms`) is rejected rather than silently
-/// stored unencrypted.
+/// An unrecognized server-side-encryption algorithm (neither `AES256` nor `aws:kms`) is rejected
+/// rather than silently stored unencrypted.
 #[tokio::test]
 async fn put_with_unsupported_sse_mode_is_rejected() {
     let h = harness().await;
@@ -6219,7 +6219,7 @@ async fn put_with_unsupported_sse_mode_is_rejected() {
                 Some("kms"),
                 Some("a.txt"),
                 &[],
-                &[("x-amz-server-side-encryption", "aws:kms")],
+                &[("x-amz-server-side-encryption", "rot13")],
                 b"data".to_vec(),
             ),
         )
@@ -6227,6 +6227,571 @@ async fn put_with_unsupported_sse_mode_is_rejected() {
     )
     .await;
     assert_eq!(st, StatusCode::BAD_REQUEST);
+}
+
+/// SSE-KMS (ARCH 27, Increment 2): a PUT with `x-amz-server-side-encryption: aws:kms` +
+/// `...-aws-kms-key-id` + `...-bucket-key-enabled` stores a `Kms`-mode descriptor, echoes `aws:kms`
+/// + the key id + BucketKeyEnabled on PUT/GET/HEAD, and round-trips the bytes byte-identically.
+#[tokio::test]
+async fn sse_kms_put_get_head_advertises_algorithm_key_id_and_bucket_key() {
+    let h = harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("kmsb"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+
+    let payload = b"kms-encrypted payload".to_vec();
+    let put = req(
+        Method::PUT,
+        Some("kmsb"),
+        Some("k.bin"),
+        &[],
+        &[
+            ("x-amz-server-side-encryption", "aws:kms"),
+            ("x-amz-server-side-encryption-aws-kms-key-id", "alias/app"),
+            ("x-amz-server-side-encryption-bucket-key-enabled", "true"),
+        ],
+        payload.clone(),
+    );
+    let (st, hdrs, _) = drain(send(&h.svc, put).await).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        header(&hdrs, "x-amz-server-side-encryption"),
+        Some("aws:kms")
+    );
+    assert_eq!(
+        header(&hdrs, "x-amz-server-side-encryption-aws-kms-key-id"),
+        Some("alias/app")
+    );
+    assert_eq!(
+        header(&hdrs, "x-amz-server-side-encryption-bucket-key-enabled"),
+        Some("true")
+    );
+
+    // Stored with a `kms`-mode descriptor.
+    let desc = stored_descriptor(&h, "kmsb", "k.bin").await.unwrap();
+    assert_eq!(descriptor_mode(&desc).as_deref(), Some("kms"));
+
+    // GET round-trips the bytes and re-advertises everything.
+    let (st, hdrs, body) = drain(
+        send(
+            &h.svc,
+            req(Method::GET, Some("kmsb"), Some("k.bin"), &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(body, payload, "aws:kms encryption is transparent on read");
+    assert_eq!(
+        header(&hdrs, "x-amz-server-side-encryption"),
+        Some("aws:kms")
+    );
+    assert_eq!(
+        header(&hdrs, "x-amz-server-side-encryption-aws-kms-key-id"),
+        Some("alias/app")
+    );
+    assert_eq!(
+        header(&hdrs, "x-amz-server-side-encryption-bucket-key-enabled"),
+        Some("true"),
+        "BucketKeyEnabled must round-trip on GET"
+    );
+
+    // HEAD echoes the same SSE surface.
+    let (st, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(Method::HEAD, Some("kmsb"), Some("k.bin"), &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        header(&hdrs, "x-amz-server-side-encryption"),
+        Some("aws:kms")
+    );
+    assert_eq!(
+        header(&hdrs, "x-amz-server-side-encryption-aws-kms-key-id"),
+        Some("alias/app")
+    );
+}
+
+/// A KMS key-id header WITHOUT `x-amz-server-side-encryption: aws:kms` is a malformed request
+/// (`InvalidArgument`), not a silent plaintext write.
+#[tokio::test]
+async fn sse_kms_key_id_without_algorithm_is_invalid_argument() {
+    let h = harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("kmsb2"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("kmsb2"),
+                Some("k.bin"),
+                &[],
+                &[("x-amz-server-side-encryption-aws-kms-key-id", "alias/app")],
+                b"data".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    assert!(
+        String::from_utf8_lossy(&body).contains("InvalidArgument"),
+        "expected InvalidArgument, got {}",
+        String::from_utf8_lossy(&body)
+    );
+    // Nothing was stored.
+    assert!(
+        h.meta
+            .current_version(
+                &BucketName::parse("kmsb2").unwrap(),
+                &ObjectKey::parse("k.bin").unwrap(),
+            )
+            .await
+            .unwrap()
+            .is_none(),
+        "a rejected KMS request must not store an object"
+    );
+}
+
+/// With a `CAIRN_KMS_KEY_IDS` allow-list configured, an `aws:kms` PUT naming a key id NOT on the list
+/// is rejected (fail-closed) and stores nothing; a key id ON the list is accepted.
+#[tokio::test]
+async fn sse_kms_key_id_allow_list_is_enforced() {
+    let dir = tempfile::tempdir().unwrap();
+    let meta: Arc<dyn MetadataStore> = Arc::new(cairn_meta::open_in_memory().unwrap());
+    let blob: Arc<dyn BlobStore> =
+        Arc::new(cairn_blob::LocalBlobStore::open(dir.path()).await.unwrap());
+    let clock = Arc::new(cairn_types::testing::TestClock::default());
+    let crypto: Arc<dyn cairn_types::traits::Crypto> =
+        Arc::new(cairn_crypto::SystemCrypto::new([7u8; 32]));
+    let svc = S3Service::new(
+        meta.clone(),
+        blob,
+        Arc::new(cairn_types::testing::AllowAll),
+        clock,
+        crypto.clone(),
+        "us-east-1".to_owned(),
+        5 * 1024 * 1024 * 1024,
+    )
+    .with_key_provider(Arc::new(cairn_protocol::LocalRingProvider::new(
+        crypto,
+        Some(vec!["alias/allowed".to_owned()]),
+    )));
+
+    drain(
+        send(
+            &svc,
+            req(Method::PUT, Some("albkt"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+
+    // A key id NOT on the allow-list is rejected, and nothing is stored.
+    let (st, _, _) = drain(
+        send(
+            &svc,
+            req(
+                Method::PUT,
+                Some("albkt"),
+                Some("denied.bin"),
+                &[],
+                &[
+                    ("x-amz-server-side-encryption", "aws:kms"),
+                    ("x-amz-server-side-encryption-aws-kms-key-id", "alias/nope"),
+                ],
+                b"data".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    assert!(
+        meta.current_version(
+            &BucketName::parse("albkt").unwrap(),
+            &ObjectKey::parse("denied.bin").unwrap(),
+        )
+        .await
+        .unwrap()
+        .is_none(),
+        "a KMS write with a disallowed key id must store nothing"
+    );
+
+    // A key id ON the allow-list is accepted.
+    let (st, hdrs, _) = drain(
+        send(
+            &svc,
+            req(
+                Method::PUT,
+                Some("albkt"),
+                Some("ok.bin"),
+                &[],
+                &[
+                    ("x-amz-server-side-encryption", "aws:kms"),
+                    (
+                        "x-amz-server-side-encryption-aws-kms-key-id",
+                        "alias/allowed",
+                    ),
+                ],
+                b"data".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        header(&hdrs, "x-amz-server-side-encryption"),
+        Some("aws:kms")
+    );
+}
+
+/// A tampered `Kms` descriptor fails closed on GET (crypto rejects the corrupted DEK envelope): the
+/// response is an error and never leaks the plaintext or zeros.
+#[tokio::test]
+async fn sse_kms_tampered_descriptor_fails_closed() {
+    use base64::Engine;
+    use cairn_types::meta::{Mutation, Precondition};
+
+    let h = harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("tkms"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+
+    const TOKEN: &[u8] = b"ZZKMSPLAINTEXTTOKENZZ";
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("tkms"),
+                Some("obj.bin"),
+                &[],
+                &[
+                    ("x-amz-server-side-encryption", "aws:kms"),
+                    ("x-amz-server-side-encryption-aws-kms-key-id", "alias/app"),
+                ],
+                TOKEN.to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    // Corrupt the wrapped DEK in the stored `Kms` descriptor and rewrite the version row.
+    let bucket = BucketName::parse("tkms").unwrap();
+    let key = ObjectKey::parse("obj.bin").unwrap();
+    let mut row = h
+        .meta
+        .current_version(&bucket, &key)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut desc: serde_json::Value =
+        serde_json::from_str(row.sse_descriptor.as_ref().unwrap()).unwrap();
+    let wrapped = desc["wrapped_dek_b64"].as_str().unwrap();
+    let mut raw = base64::engine::general_purpose::STANDARD
+        .decode(wrapped.as_bytes())
+        .unwrap();
+    raw[0] ^= 0xff; // flip a byte so the GCM tag no longer verifies
+    desc["wrapped_dek_b64"] =
+        serde_json::json!(base64::engine::general_purpose::STANDARD.encode(&raw));
+    // Confirm we kept the `kms` mode (still a Kms descriptor, just tampered).
+    assert_eq!(desc["mode"], serde_json::json!("kms"));
+    row.sse_descriptor = Some(desc.to_string());
+    h.meta
+        .submit(Mutation::PutObjectVersion {
+            row: Box::new(row),
+            precondition: Precondition::default(),
+            replication: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(Method::GET, Some("tkms"), Some("obj.bin"), &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_ne!(
+        st,
+        StatusCode::OK,
+        "a tampered KMS descriptor must fail the GET"
+    );
+    assert!(
+        !body.windows(TOKEN.len()).any(|w| w == TOKEN),
+        "a fail-closed GET must never leak plaintext, got {body:?}"
+    );
+}
+
+/// `?encryption` subresource round-trip (ARCH 27): PutBucketEncryption(aws:kms, key id) →
+/// GetBucketEncryption returns it → a header-less PUT into that bucket is encrypted + advertised as
+/// `aws:kms` with the default key id → DeleteBucketEncryption → GetBucketEncryption is 404 and the
+/// bucket SURVIVES (the routing fall-through guard keeps `DELETE ?encryption` off the bucket-delete).
+#[tokio::test]
+async fn bucket_encryption_subresource_round_trip_and_bucket_survives_delete() {
+    let h = harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("benc"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+
+    // PUT ?encryption with an aws:kms default + key id.
+    let put_xml =
+        cairn_xml::server_side_encryption_configuration("aws:kms", Some("alias/def"), false);
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("benc"),
+                None,
+                &[("encryption", "")],
+                &[],
+                put_xml.into_bytes(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    // GET ?encryption returns the stored configuration.
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("benc"),
+                None,
+                &[("encryption", "")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let xml = String::from_utf8_lossy(&body);
+    assert!(
+        xml.contains("<SSEAlgorithm>aws:kms</SSEAlgorithm>"),
+        "{xml}"
+    );
+    assert!(
+        xml.contains("<KMSMasterKeyID>alias/def</KMSMasterKeyID>"),
+        "{xml}"
+    );
+
+    // A header-less PUT into that bucket picks up the KMS default and advertises it + the key id.
+    let (st, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("benc"),
+                Some("plain.bin"),
+                &[],
+                &[],
+                b"default-kms bytes".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        header(&hdrs, "x-amz-server-side-encryption"),
+        Some("aws:kms")
+    );
+    assert_eq!(
+        header(&hdrs, "x-amz-server-side-encryption-aws-kms-key-id"),
+        Some("alias/def"),
+        "a bucket KMS default must supply the default key id"
+    );
+
+    // DELETE ?encryption clears the configuration.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::DELETE,
+                Some("benc"),
+                None,
+                &[("encryption", "")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+
+    // GetBucketEncryption is now a 404.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("benc"),
+                None,
+                &[("encryption", "")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+
+    // The bucket itself SURVIVED the `DELETE ?encryption` — a HEAD still finds it.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(Method::HEAD, Some("benc"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "the bucket must survive DELETE ?encryption"
+    );
+}
+
+/// Crypto-review F1 (downgrade): the S3 `?encryption` default-encryption surface shares the same
+/// `Encryption` aspect doc as the management-plane mandatory `required` flag, so a `PutBucketEncryption`
+/// or `DELETE ?encryption` from the data plane must NOT be able to silently clear that mandatory
+/// control. This sets `required:true`, exercises both S3 verbs, and asserts a plaintext client PUT
+/// stays refused throughout. Pre-fix, either verb overwrote/wiped the doc and a plaintext PUT then
+/// succeeded — a security-control removal from the data plane.
+#[tokio::test]
+async fn s3_encryption_surface_preserves_mandatory_required_flag() {
+    use cairn_types::bucket::{ConfigAspect, ConfigDoc};
+    use cairn_types::meta::Mutation;
+    let h = harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("menc"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    h.meta
+        .submit(Mutation::SetBucketConfig {
+            bucket: BucketName::parse("menc").unwrap(),
+            aspect: ConfigAspect::Encryption,
+            doc: Some(ConfigDoc(r#"{"required":true}"#.to_owned())),
+        })
+        .await
+        .unwrap();
+
+    macro_rules! plaintext_put_status {
+        () => {{
+            let (st, _, _) = drain(
+                send(
+                    &h.svc,
+                    req(
+                        Method::PUT,
+                        Some("menc"),
+                        Some("k"),
+                        &[],
+                        &[],
+                        b"x".to_vec(),
+                    ),
+                )
+                .await,
+            )
+            .await;
+            st
+        }};
+    }
+    macro_rules! s3_encryption {
+        ($m:expr, $body:expr) => {{
+            let (st, _, _) = drain(
+                send(
+                    &h.svc,
+                    req($m, Some("menc"), None, &[("encryption", "")], &[], $body),
+                )
+                .await,
+            )
+            .await;
+            st
+        }};
+    }
+    // Baseline: `required` with no default algorithm refuses a plaintext client PUT.
+    assert_eq!(plaintext_put_status!(), StatusCode::BAD_REQUEST);
+
+    // DeleteBucketEncryption drops only the (absent) default algorithm and must PRESERVE `required`,
+    // so a plaintext PUT stays refused. Pre-fix, DELETE wiped the whole aspect and the next plaintext
+    // PUT would have been accepted (200) — the downgrade.
+    assert_eq!(
+        s3_encryption!(Method::DELETE, vec![]),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        plaintext_put_status!(),
+        StatusCode::BAD_REQUEST,
+        "DeleteBucketEncryption must not clear the mandatory `required` flag"
+    );
+
+    // PutBucketEncryption(AES256) sets a default, so a header-less PUT is now ENCRYPTED (200), not
+    // refused — the default applies, satisfying `required`. That the `required` flag survived the PUT
+    // is proven by the NEXT DeleteBucketEncryption still refusing a plaintext PUT: if the PUT had
+    // dropped `required`, this delete would preserve nothing and the plaintext PUT would be accepted.
+    let put_xml = cairn_xml::server_side_encryption_configuration("AES256", None, false);
+    assert_eq!(
+        s3_encryption!(Method::PUT, put_xml.into_bytes()),
+        StatusCode::OK
+    );
+    assert_eq!(
+        plaintext_put_status!(),
+        StatusCode::OK,
+        "with a default algorithm a header-less PUT is encrypted, not refused"
+    );
+    assert_eq!(
+        s3_encryption!(Method::DELETE, vec![]),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        plaintext_put_status!(),
+        StatusCode::BAD_REQUEST,
+        "PutBucketEncryption must not clear the mandatory `required` flag"
+    );
 }
 
 /// Bucket default encryption (the `encryption` config aspect): a plain PUT with NO SSE header into
@@ -6608,8 +7173,9 @@ async fn mandatory_sse_denies_plaintext_but_exempts_replicas() {
         Some("AES256")
     );
 
-    // (3) SSE-KMS stays rejected (unsupported) — mandatory does not change that path.
-    let (st, _, _) = drain(
+    // (3) SSE-KMS is now an advertised encryption mode, so it satisfies the mandatory-encryption
+    // requirement: the PUT succeeds and advertises `aws:kms`.
+    let (st, hdrs, _) = drain(
         send(
             &h.svc,
             req(
@@ -6624,7 +7190,11 @@ async fn mandatory_sse_denies_plaintext_but_exempts_replicas() {
         .await,
     )
     .await;
-    assert_eq!(st, StatusCode::BAD_REQUEST, "SSE-KMS remains unsupported");
+    assert_eq!(st, StatusCode::OK, "SSE-KMS satisfies mandatory encryption");
+    assert_eq!(
+        header(&hdrs, "x-amz-server-side-encryption"),
+        Some("aws:kms")
+    );
 
     // (4) An inbound replica (admin + marker) without an SSE header is force-encrypted, NOT refused.
     let (st, hdrs, _) = drain(

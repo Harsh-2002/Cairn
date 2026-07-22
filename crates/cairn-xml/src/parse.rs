@@ -731,6 +731,89 @@ pub fn parse_cors_configuration(body: &[u8]) -> Result<Vec<CorsRule>, Error> {
 }
 
 // ===========================================================================================
+// ServerSideEncryptionConfiguration (PutBucketEncryption / GetBucketEncryption)
+// ===========================================================================================
+
+/// The default server-side-encryption rule of a `ServerSideEncryptionConfiguration` — a projection
+/// of the single `Rule > ApplyServerSideEncryptionByDefault` element S3 supports, plus the
+/// rule-level `BucketKeyEnabled` flag.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ServerSideEncryptionRule {
+    /// `SSEAlgorithm`: `AES256` (SSE-S3) or `aws:kms` (SSE-KMS).
+    pub sse_algorithm: String,
+    /// `KMSMasterKeyID`, when present (only meaningful with `aws:kms`).
+    pub kms_master_key_id: Option<String>,
+    /// `BucketKeyEnabled` (accepted and echoed so a round-trip GET does not drop it).
+    pub bucket_key_enabled: bool,
+}
+
+/// Parse a `ServerSideEncryptionConfiguration` body into its default-encryption rule.
+///
+/// The document carries a single `<Rule>` with an `<ApplyServerSideEncryptionByDefault>` naming the
+/// `<SSEAlgorithm>` (`AES256` or `aws:kms`) and an optional `<KMSMasterKeyID>`, plus an optional
+/// rule-level `<BucketKeyEnabled>` flag.
+///
+/// # Errors
+/// Returns [`Error::MalformedXml`] if the body is not well-formed, no `<SSEAlgorithm>` is present,
+/// or the algorithm is neither `AES256` nor `aws:kms`.
+pub fn parse_server_side_encryption_configuration(
+    body: &[u8],
+) -> Result<ServerSideEncryptionRule, Error> {
+    let mut algorithm: Option<String> = None;
+    let mut kms_key_id: Option<String> = None;
+    let mut bucket_key_enabled = false;
+    let mut cur: Option<&'static str> = None;
+    let mut buf = String::new();
+
+    drive(body, |ev| {
+        match ev {
+            Sax::Open(name) => {
+                cur = if name == b"SSEAlgorithm" {
+                    Some("alg")
+                } else if name == b"KMSMasterKeyID" {
+                    Some("kms")
+                } else if name == b"BucketKeyEnabled" {
+                    Some("bke")
+                } else {
+                    None
+                };
+                buf.clear();
+            }
+            Sax::Text(t) => {
+                if cur.is_some() {
+                    buf.push_str(&t);
+                }
+            }
+            Sax::Close(name) => {
+                if name == b"SSEAlgorithm" {
+                    algorithm = Some(buf.trim().to_owned());
+                } else if name == b"KMSMasterKeyID" {
+                    let id = buf.trim();
+                    if !id.is_empty() {
+                        kms_key_id = Some(id.to_owned());
+                    }
+                } else if name == b"BucketKeyEnabled" {
+                    bucket_key_enabled = buf.trim().eq_ignore_ascii_case("true");
+                }
+                cur = None;
+            }
+        }
+        Ok(())
+    })?;
+
+    let sse_algorithm = match algorithm {
+        Some(a) if a.eq_ignore_ascii_case("AES256") => "AES256".to_owned(),
+        Some(a) if a.eq_ignore_ascii_case("aws:kms") => "aws:kms".to_owned(),
+        _ => return Err(malformed()),
+    };
+    Ok(ServerSideEncryptionRule {
+        sse_algorithm,
+        kms_master_key_id: kms_key_id,
+        bucket_key_enabled,
+    })
+}
+
+// ===========================================================================================
 // AccessControlPolicy (PutBucketAcl / PutObjectAcl request body)
 // ===========================================================================================
 

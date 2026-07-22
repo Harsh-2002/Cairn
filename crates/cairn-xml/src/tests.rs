@@ -1208,3 +1208,84 @@ fn sts_error_document_wire_shape() {
          </ErrorResponse>"
     );
 }
+
+// -------------------------------------------------------------------------------------------
+// ServerSideEncryptionConfiguration
+// -------------------------------------------------------------------------------------------
+
+#[test]
+fn parse_sse_config_aes256() {
+    let body = b"<ServerSideEncryptionConfiguration><Rule>\
+        <ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm>\
+        </ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>";
+    let rule = crate::parse::parse_server_side_encryption_configuration(body).unwrap();
+    assert_eq!(rule.sse_algorithm, "AES256");
+    assert_eq!(rule.kms_master_key_id, None);
+    assert!(!rule.bucket_key_enabled);
+}
+
+#[test]
+fn parse_sse_config_kms_with_key_id() {
+    let body = b"<ServerSideEncryptionConfiguration><Rule>\
+        <ApplyServerSideEncryptionByDefault><SSEAlgorithm>aws:kms</SSEAlgorithm>\
+        <KMSMasterKeyID>alias/my-key</KMSMasterKeyID>\
+        </ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>";
+    let rule = crate::parse::parse_server_side_encryption_configuration(body).unwrap();
+    assert_eq!(rule.sse_algorithm, "aws:kms");
+    assert_eq!(rule.kms_master_key_id.as_deref(), Some("alias/my-key"));
+    assert!(!rule.bucket_key_enabled);
+}
+
+#[test]
+fn sse_config_bucket_key_enabled_round_trip() {
+    // Generate with BucketKeyEnabled, then parse it back and confirm the flag survives.
+    let xml = server_side_encryption_configuration("aws:kms", Some("k-1"), true);
+    let rule = crate::parse::parse_server_side_encryption_configuration(xml.as_bytes()).unwrap();
+    assert_eq!(rule.sse_algorithm, "aws:kms");
+    assert_eq!(rule.kms_master_key_id.as_deref(), Some("k-1"));
+    assert!(
+        rule.bucket_key_enabled,
+        "BucketKeyEnabled must survive a generate -> parse round-trip"
+    );
+}
+
+#[test]
+fn sse_config_generator_wire_shape() {
+    let xml = server_side_encryption_configuration("AES256", None, false);
+    assert_eq!(
+        xml,
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+         <ServerSideEncryptionConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+         <Rule>\
+         <ApplyServerSideEncryptionByDefault>\
+         <SSEAlgorithm>AES256</SSEAlgorithm>\
+         </ApplyServerSideEncryptionByDefault>\
+         <BucketKeyEnabled>false</BucketKeyEnabled>\
+         </Rule>\
+         </ServerSideEncryptionConfiguration>"
+    );
+}
+
+#[test]
+fn parse_sse_config_rejects_malformed() {
+    // Unknown algorithm.
+    assert_malformed(crate::parse::parse_server_side_encryption_configuration(
+        b"<ServerSideEncryptionConfiguration><Rule>\
+          <ApplyServerSideEncryptionByDefault><SSEAlgorithm>rot13</SSEAlgorithm>\
+          </ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>",
+    ));
+    // Missing SSEAlgorithm entirely.
+    assert_malformed(crate::parse::parse_server_side_encryption_configuration(
+        b"<ServerSideEncryptionConfiguration><Rule>\
+          <ApplyServerSideEncryptionByDefault></ApplyServerSideEncryptionByDefault>\
+          </Rule></ServerSideEncryptionConfiguration>",
+    ));
+    // Unbalanced / truncated body.
+    assert_malformed(crate::parse::parse_server_side_encryption_configuration(
+        b"<ServerSideEncryptionConfiguration><Rule>",
+    ));
+    // Invalid UTF-8.
+    assert_malformed(crate::parse::parse_server_side_encryption_configuration(&[
+        0xff, 0xff,
+    ]));
+}

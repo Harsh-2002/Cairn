@@ -56,6 +56,7 @@ pub enum Action {
     GetBucketOwnershipControls,
     GetBucketPublicAccessBlock,
     GetBucketObjectLockConfiguration,
+    GetBucketEncryption,
     // bucket config (write)
     PutBucketPolicy,
     PutBucketAcl,
@@ -67,6 +68,7 @@ pub enum Action {
     PutBucketOwnershipControls,
     PutBucketPublicAccessBlock,
     PutBucketObjectLockConfiguration,
+    PutBucketEncryption,
     // replication (cross-bucket propagation)
     ReplicateObject,
     ReplicateDelete,
@@ -113,6 +115,7 @@ impl Action {
             GetBucketOwnershipControls => "s3:GetBucketOwnershipControls",
             GetBucketPublicAccessBlock => "s3:GetBucketPublicAccessBlock",
             GetBucketObjectLockConfiguration => "s3:GetBucketObjectLockConfiguration",
+            GetBucketEncryption => "s3:GetEncryptionConfiguration",
             PutBucketPolicy => "s3:PutBucketPolicy",
             PutBucketAcl => "s3:PutBucketAcl",
             PutBucketCors => "s3:PutBucketCORS",
@@ -123,6 +126,7 @@ impl Action {
             PutBucketOwnershipControls => "s3:PutBucketOwnershipControls",
             PutBucketPublicAccessBlock => "s3:PutBucketPublicAccessBlock",
             PutBucketObjectLockConfiguration => "s3:PutBucketObjectLockConfiguration",
+            PutBucketEncryption => "s3:PutEncryptionConfiguration",
             ReplicateObject => "s3:ReplicateObject",
             ReplicateDelete => "s3:ReplicateDelete",
         }

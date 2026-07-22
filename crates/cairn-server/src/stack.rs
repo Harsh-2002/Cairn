@@ -515,6 +515,10 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
         cfg.max_object_size,
     )
     .with_encrypt_at_rest(cfg.encrypt_at_rest)
+    .with_key_provider(Arc::new(cairn_protocol::LocalRingProvider::new(
+        crypto.clone(),
+        cfg.parse_kms_key_ids(),
+    )))
     .with_replication_wake({
         let n = replication_notify.clone();
         Arc::new(move || n.notify_one())

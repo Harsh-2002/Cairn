@@ -5,6 +5,7 @@
 use crate::chunked::{ChunkDecoder, ChunkVerifier, decode_stream};
 use crate::error_map::error_response;
 use crate::httpdate::{http_date, parse_http_date};
+use crate::keyprovider::{KeyProvider, LocalRingProvider};
 use crate::request::{S3Body, S3Request, S3Response};
 use base64::Engine;
 use cairn_types::auth::{Principal, RequesterClass, Role};
@@ -44,6 +45,11 @@ pub struct S3Service {
     /// The cryptography facility, used to wrap (seal) and unwrap (open) per-object SSE-S3
     /// data-encryption keys under the master key (ARCH 27).
     crypto: Arc<dyn Crypto>,
+    /// Resolves an SSE-KMS key id to its DEK-sealing crypto and validates a requested key id against
+    /// the `CAIRN_KMS_KEY_IDS` allow-list (ARCH 27, Increment 2). The default is a
+    /// [`LocalRingProvider`] over the master ring with no allow-list (accept-all); the server wires a
+    /// configured one via [`with_key_provider`](Self::with_key_provider).
+    key_provider: Arc<dyn KeyProvider>,
     region: String,
     max_object_size: u64,
     /// Whether every committed object is transparently encrypted at rest even when the client did
@@ -79,17 +85,31 @@ impl S3Service {
         region: String,
         max_object_size: u64,
     ) -> Self {
+        // Default SSE-KMS provider: the master ring with no allow-list (accept any key id). The
+        // server overrides this with a `CAIRN_KMS_KEY_IDS`-configured provider via `with_key_provider`.
+        let key_provider: Arc<dyn KeyProvider> =
+            Arc::new(LocalRingProvider::new(crypto.clone(), None));
         Self {
             meta,
             blob,
             authz,
             clock,
             crypto,
+            key_provider,
             region,
             max_object_size,
             encrypt_at_rest: false,
             replication_wake: None,
         }
+    }
+
+    /// Set the SSE-KMS [`KeyProvider`] (ARCH 27): resolves a KMS key id to its DEK-sealing crypto and
+    /// enforces the `CAIRN_KMS_KEY_IDS` allow-list. Defaults to a master-ring [`LocalRingProvider`]
+    /// with no allow-list.
+    #[must_use]
+    pub fn with_key_provider(mut self, provider: Arc<dyn KeyProvider>) -> Self {
+        self.key_provider = provider;
+        self
     }
 
     /// Enable transparent at-rest encryption for every committed object (`CAIRN_ENCRYPT_AT_REST`,
@@ -266,6 +286,17 @@ impl S3Service {
             }
             Method::DELETE if req.has_query("cors") => {
                 self.clear_bucket_config(&req, ConfigAspect::Cors).await
+            }
+            // `?encryption` (ARCH 27): the default server-side-encryption configuration. Handled
+            // arms live ABOVE the `unhandled_bucket_subresource` guard (which still lists
+            // "encryption"), exactly like `cors`, so a bare `DELETE /b?encryption` clears the config
+            // rather than falling through to a bucket delete.
+            Method::GET if req.has_query("encryption") => self.get_bucket_encryption(&req).await,
+            Method::PUT if req.has_query("encryption") => {
+                self.put_bucket_encryption(req, body).await
+            }
+            Method::DELETE if req.has_query("encryption") => {
+                self.clear_bucket_encryption(&req).await
             }
             Method::GET if req.has_query("policy") => {
                 self.get_bucket_doc(&req, ConfigAspect::Policy, "NoSuchBucketPolicy")
@@ -692,14 +723,10 @@ impl S3Service {
         // it under the master key for the metadata row. The plaintext-MD5 ETag is unaffected
         // because the blob store hashes the plaintext before any transform. Without a header, the
         // bucket's default-encryption setting (the `encryption` config aspect) decides.
-        let explicit_sse = match requested_sse(&req) {
-            Some(Ok(())) => true,
-            Some(Err(e)) => return Err(e),
-            None => false,
-        };
+        let requested = requested_sse(&req)?;
         // Resolve the encryption plan (explicit header > bucket default > transparent at-rest > none).
         let mut plan = self
-            .resolve_object_encryption(&bucket.name, explicit_sse)
+            .resolve_object_encryption(&bucket.name, requested)
             .await?;
         // Mandatory encryption (the `encryption` aspect's `required` flag) is a CLIENT-facing
         // contract: a client PUT to the bucket must carry SSE. Transparent at-rest encryption
@@ -957,12 +984,10 @@ impl S3Service {
                 if versioned {
                     resp = resp.with_header("x-amz-version-id", version_id.as_str());
                 }
-                // Echo the SSE algorithm on the PUT response for an explicitly-requested/default
-                // encrypted object (ARCH 27). A transparent `AtRest` object advertises nothing —
-                // `advertised_sse` keys on the descriptor mode.
-                if let Some(alg) = sse_descriptor.as_deref().and_then(advertised_sse) {
-                    resp = resp.with_header("x-amz-server-side-encryption", alg);
-                }
+                // Echo the SSE algorithm (and, for SSE-KMS, the key id + BucketKeyEnabled) on the PUT
+                // response for an explicitly-requested/default encrypted object (ARCH 27). A
+                // transparent `AtRest` object advertises nothing.
+                resp = with_sse_headers(resp, sse_descriptor.as_deref());
                 // Echo any computed checksum so a modern SDK can verify the upload (ARCH 21.1).
                 resp = append_checksum_headers(resp, &staged.checksums);
                 Ok(resp)
@@ -1367,13 +1392,18 @@ impl S3Service {
         let upload_id = UploadId::generate();
         let now = self.clock.now();
         // Capture the SSE-S3 intent now (ARCH 27): the `CompleteMultipartUpload` request carries no
-        // SSE header, so the decision — an explicit `x-amz-server-side-encryption` header here, else
-        // the bucket default-encryption setting — must be recorded on the session and applied when
-        // the object is assembled, exactly mirroring a single-part PUT.
-        let want_sse = match requested_sse(req) {
-            Some(Ok(())) => true,
-            Some(Err(e)) => return Err(e),
-            None => self.bucket_default_sse(&bucket.name).await?,
+        // SSE header, so an explicit `x-amz-server-side-encryption: AES256` here is recorded on the
+        // session and applied at assembly, mirroring a single-part PUT. The bucket default (including
+        // a KMS default) is re-read fresh at Complete by `resolve_object_encryption`, so it is not
+        // captured here. SSE-KMS is NOT accepted at initiate: the multipart session schema carries no
+        // key id (the KMS-multipart schema change is a later increment), so an `aws:kms` request that
+        // could not survive to Complete is rejected up front rather than silently downgraded.
+        let want_sse = match requested_sse(req)? {
+            SseRequest::SseS3 => true,
+            SseRequest::None => false,
+            SseRequest::Kms { .. } => {
+                return Err(Error::NotImplemented);
+            }
         };
         let session = MultipartSession {
             upload_id: upload_id.clone(),
@@ -1721,8 +1751,13 @@ impl S3Service {
         // plaintext. The DEK is handed to `assemble`, which compress-then-encrypts each block, and the
         // descriptor is sealed onto the row. Multipart *parts* stage plaintext for the in-flight
         // window; the assembled object is encrypted here.
+        let requested = if session.sse_requested {
+            SseRequest::SseS3
+        } else {
+            SseRequest::None
+        };
         let plan = self
-            .resolve_object_encryption(&bucket.name, session.sse_requested)
+            .resolve_object_encryption(&bucket.name, requested)
             .await?;
         let sse_dek = plan.dek;
         let sse_descriptor = plan.descriptor_json;
@@ -1871,9 +1906,7 @@ impl S3Service {
                 if versioned {
                     resp = resp.with_header("x-amz-version-id", version_id.as_str());
                 }
-                if let Some(alg) = sse_descriptor.as_deref().and_then(advertised_sse) {
-                    resp = resp.with_header("x-amz-server-side-encryption", alg);
-                }
+                resp = with_sse_headers(resp, sse_descriptor.as_deref());
                 Ok(resp)
             }
             Ok(_) => Err(Error::Internal("unexpected completion outcome".to_owned())),
@@ -2120,21 +2153,14 @@ impl S3Service {
         // Resolve the DESTINATION's encryption independently of the source (a copy re-encrypts under
         // a fresh DEK): an explicit `x-amz-server-side-encryption` header on the copy request, else
         // the dest bucket's default, else transparent at-rest, else plaintext (ARCH 27).
-        let explicit_sse = match requested_sse(req) {
-            Some(Ok(())) => true,
-            Some(Err(e)) => return Err(e),
-            None => false,
-        };
+        let requested = requested_sse(req)?;
         let dest_plan = self
-            .resolve_object_encryption(&dest_bucket.name, explicit_sse)
+            .resolve_object_encryption(&dest_bucket.name, requested)
             .await?;
-        // Capture the SSE header to echo on the copy response BEFORE the descriptor is moved into the
-        // mutation below — a copy whose destination is SseS3 (explicit header or bucket default) must
-        // advertise it, exactly as PUT does. `AtRest` advertises nothing.
-        let dest_sse_header = dest_plan
-            .descriptor_json
-            .as_deref()
-            .and_then(advertised_sse);
+        // Capture the SSE descriptor to echo on the copy response BEFORE it is moved into the
+        // mutation below — a copy whose destination is SseS3/Kms (explicit header or bucket default)
+        // must advertise it, exactly as PUT does. `AtRest` advertises nothing.
+        let dest_sse_descriptor = dest_plan.descriptor_json.clone();
         let opts = StageOptions {
             compression: dest_bucket.compression,
             extra_checksums: ChecksumSet::none(),
@@ -2284,9 +2310,7 @@ impl S3Service {
                 let body = cairn_xml::copy_object_result(&staged.etag, now);
                 let mut resp = S3Response::xml(StatusCode::OK, body)
                     .with_header("x-amz-request-id", &req.request_id);
-                if let Some(alg) = dest_sse_header {
-                    resp = resp.with_header("x-amz-server-side-encryption", alg);
-                }
+                resp = with_sse_headers(resp, dest_sse_descriptor.as_deref());
                 if versioned {
                     resp = resp.with_header("x-amz-version-id", version_id.as_str());
                 }
@@ -2808,6 +2832,132 @@ impl S3Service {
                 bucket: bucket.name,
                 aspect,
                 doc: Some(ConfigDoc(text)),
+            })
+            .await?;
+        Ok(S3Response::status(StatusCode::NO_CONTENT)
+            .with_header("x-amz-request-id", &req.request_id))
+    }
+
+    /// `GetBucketEncryption` (ARCH 27): render the stored `encryption` config aspect (canonical JSON)
+    /// as a `ServerSideEncryptionConfiguration` XML document. A bucket with no default encryption —
+    /// or a `required`-only document with no default algorithm — returns
+    /// `ServerSideEncryptionConfigurationNotFoundError` (404), matching S3.
+    async fn get_bucket_encryption(&self, req: &S3Request) -> Result<S3Response> {
+        let bucket = self.fetch_bucket(req).await?;
+        let doc = self
+            .meta
+            .get_bucket_config(&bucket.name, ConfigAspect::Encryption)
+            .await?;
+        // Decode the canonical JSON into an advertised algorithm; a document that names no algorithm
+        // (e.g. `{"required":true}`) is not an encryption *configuration* to return here.
+        let advertised = doc.as_ref().and_then(|d| {
+            let v: serde_json::Value = serde_json::from_str(&d.0).ok()?;
+            let alg = v.get("algorithm").and_then(|a| a.as_str())?;
+            let alg = if alg.eq_ignore_ascii_case(SSE_AES256) {
+                SSE_AES256
+            } else if alg.eq_ignore_ascii_case(SSE_AWS_KMS) {
+                SSE_AWS_KMS
+            } else {
+                return None;
+            };
+            let key_id = v
+                .get("kms_key_id")
+                .and_then(|k| k.as_str())
+                .map(str::to_owned);
+            let bucket_key_enabled = v
+                .get("bucket_key_enabled")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            Some((alg, key_id, bucket_key_enabled))
+        });
+        match advertised {
+            Some((alg, key_id, bucket_key_enabled)) => {
+                let xml = cairn_xml::server_side_encryption_configuration(
+                    alg,
+                    key_id.as_deref(),
+                    bucket_key_enabled,
+                );
+                Ok(S3Response::xml(StatusCode::OK, xml)
+                    .with_header("x-amz-request-id", &req.request_id))
+            }
+            None => Ok(S3Response::xml(
+                StatusCode::NOT_FOUND,
+                cairn_xml::error_document(
+                    "ServerSideEncryptionConfigurationNotFoundError",
+                    "The server side encryption configuration was not found",
+                    &resource_path(req),
+                    &req.request_id,
+                ),
+            )),
+        }
+    }
+
+    /// `PutBucketEncryption` (ARCH 27): validate the `ServerSideEncryptionConfiguration` body, then
+    /// store it as the canonical `encryption` config-aspect JSON (the `algorithm`, an optional
+    /// `kms_key_id`, an optional `bucket_key_enabled`) — the SAME document shape the management API
+    /// writes, so both surfaces and the resolver read one canonical form. An `aws:kms` key id is
+    /// validated against the provider allow-list up front (fail-closed) so a bucket default can never
+    /// name a rejected id. The S3 API has no `required` flag, so it is left unset (that
+    /// mandatory-encryption knob stays a management-plane concern).
+    async fn put_bucket_encryption(
+        &self,
+        req: S3Request,
+        body: cairn_types::BodyStream,
+    ) -> Result<S3Response> {
+        let bucket = self.fetch_bucket(&req).await?;
+        let doc = drain_body(body, 1024 * 1024).await?;
+        let rule = cairn_xml::parse_server_side_encryption_configuration(&doc)?;
+        let mut json = serde_json::Map::new();
+        if rule.sse_algorithm.eq_ignore_ascii_case(SSE_AWS_KMS) {
+            json.insert("algorithm".to_owned(), serde_json::json!(SSE_AWS_KMS));
+            if let Some(id) = &rule.kms_master_key_id {
+                // Reject a default that names a key id outside the allow-list (fail-closed).
+                self.key_provider.validate_key_id(id)?;
+                json.insert("kms_key_id".to_owned(), serde_json::json!(id));
+            }
+        } else {
+            // The parser guarantees the algorithm is AES256 or aws:kms.
+            json.insert("algorithm".to_owned(), serde_json::json!(SSE_AES256));
+        }
+        if rule.bucket_key_enabled {
+            json.insert("bucket_key_enabled".to_owned(), serde_json::json!(true));
+        }
+        // Mandatory-encryption `required` lives in the SAME `Encryption` aspect doc (set via the
+        // management plane), and `bucket_sse_required` reads it from there. This S3 surface configures
+        // only the DEFAULT algorithm, so it MUST preserve an existing `required:true` — overwriting
+        // the whole aspect would silently strip a mandatory-encryption control from the data plane
+        // (a downgrade: a subsequent header-less plaintext PUT would then be accepted).
+        if self.bucket_sse_required(&bucket.name).await? {
+            json.insert("required".to_owned(), serde_json::json!(true));
+        }
+        let text = serde_json::Value::Object(json).to_string();
+        self.meta
+            .submit(Mutation::SetBucketConfig {
+                bucket: bucket.name,
+                aspect: ConfigAspect::Encryption,
+                doc: Some(ConfigDoc(text)),
+            })
+            .await?;
+        Ok(S3Response::status(StatusCode::OK).with_header("x-amz-request-id", &req.request_id))
+    }
+
+    /// DeleteBucketEncryption removes the DEFAULT-encryption algorithm. Cairn's mandatory-encryption
+    /// `required` flag shares the same `Encryption` aspect doc and is a SEPARATE security control, so
+    /// when it is set this rewrites the doc to `{"required":true}` (dropping only the default) rather
+    /// than clearing the aspect — a data-plane delete must never be able to remove the mandatory
+    /// guard (a downgrade).
+    async fn clear_bucket_encryption(&self, req: &S3Request) -> Result<S3Response> {
+        let bucket = self.fetch_bucket(req).await?;
+        let doc = if self.bucket_sse_required(&bucket.name).await? {
+            Some(ConfigDoc(r#"{"required":true}"#.to_owned()))
+        } else {
+            None
+        };
+        self.meta
+            .submit(Mutation::SetBucketConfig {
+                bucket: bucket.name,
+                aspect: ConfigAspect::Encryption,
+                doc,
             })
             .await?;
         Ok(S3Response::status(StatusCode::NO_CONTENT)
@@ -4174,6 +4324,7 @@ fn bucket_action(req: &S3Request) -> Result<Action> {
         Method::PUT if q("publicAccessBlock") => PutBucketPublicAccessBlock,
         Method::PUT if q("ownershipControls") => PutBucketOwnershipControls,
         Method::PUT if q("object-lock") => PutBucketObjectLockConfiguration,
+        Method::PUT if q("encryption") => PutBucketEncryption,
         Method::PUT => CreateBucket,
         Method::DELETE if q("tagging") => PutBucketTagging,
         Method::DELETE if q("cors") => PutBucketCors,
@@ -4181,6 +4332,7 @@ fn bucket_action(req: &S3Request) -> Result<Action> {
         Method::DELETE if q("lifecycle") => PutLifecycleConfiguration,
         Method::DELETE if q("replication") => PutReplicationConfiguration,
         Method::DELETE if q("publicAccessBlock") => PutBucketPublicAccessBlock,
+        Method::DELETE if q("encryption") => PutBucketEncryption,
         Method::DELETE => DeleteBucket,
         Method::HEAD => ListBucket,
         Method::GET if q("location") => GetBucketLocation,
@@ -4196,6 +4348,7 @@ fn bucket_action(req: &S3Request) -> Result<Action> {
         Method::GET if q("publicAccessBlock") => GetBucketPublicAccessBlock,
         Method::GET if q("ownershipControls") => GetBucketOwnershipControls,
         Method::GET if q("object-lock") => GetBucketObjectLockConfiguration,
+        Method::GET if q("encryption") => GetBucketEncryption,
         Method::POST if q("delete") => DeleteObject,
         Method::GET => ListBucket,
         _ => return Err(Error::NotImplemented),
@@ -4374,6 +4527,15 @@ struct SseDescriptor {
     mode: SseMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     kms_key_id: Option<String>,
+    /// The `x-amz-server-side-encryption-bucket-key-enabled` flag, echoed on read so a round-trip
+    /// GET does not drop it (SSE-KMS only). Additive: absent/false serializes away, so a legacy or
+    /// SSE-S3 descriptor is byte-identical.
+    #[serde(default, skip_serializing_if = "is_false")]
+    bucket_key_enabled: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// The resolved encryption for a committed-object write: the raw DEK handed to the blob store
@@ -4395,11 +4557,23 @@ impl EncryptionPlan {
     }
 }
 
+/// A bucket's configured default server-side encryption (the `encryption` config aspect), decoded
+/// from the canonical JSON document (ARCH 27).
+enum BucketDefaultSse {
+    /// `{"algorithm":"AES256"}` — advertise `AES256`.
+    SseS3,
+    /// `{"algorithm":"aws:kms", "kms_key_id"?, "bucket_key_enabled"?}` — advertise `aws:kms`.
+    Kms {
+        key_id: Option<String>,
+        bucket_key_enabled: bool,
+    },
+}
+
 /// The `x-amz-server-side-encryption` header value to advertise for a stored `sse_descriptor`, or
 /// `None` to advertise nothing. Keyed on the descriptor's `mode` (ARCH 27): `SseS3` advertises
 /// `AES256`; `AtRest` advertises nothing (transparent operator encryption the client never asked
-/// for); `Kms` advertises `aws:kms` (Increment 2 — Increment 1 never mints it). A malformed
-/// descriptor advertises nothing rather than failing the response.
+/// for); `Kms` advertises `aws:kms`. A malformed descriptor advertises nothing rather than failing
+/// the response.
 fn advertised_sse(descriptor_json: &str) -> Option<&'static str> {
     serde_json::from_str::<SseDescriptor>(descriptor_json)
         .ok()
@@ -4410,38 +4584,132 @@ fn advertised_sse(descriptor_json: &str) -> Option<&'static str> {
         })
 }
 
-/// Whether the request asks for SSE-S3 via `x-amz-server-side-encryption: AES256`. Any other value
-/// (e.g. `aws:kms`) is rejected as unsupported by the caller.
-fn requested_sse(req: &S3Request) -> Option<Result<()>> {
-    req.header("x-amz-server-side-encryption").map(|v| {
-        if v.eq_ignore_ascii_case(SSE_AES256) {
-            Ok(())
-        } else {
-            Err(Error::InvalidArgument(format!(
-                "unsupported server-side encryption: {v}"
-            )))
+/// The full advertised SSE surface for a stored descriptor: the algorithm plus, for `Kms`, the key
+/// id and `BucketKeyEnabled` flag. `None` when nothing is advertised (`AtRest` or a malformed
+/// descriptor). Drives every echo site so PUT/GET/HEAD/complete all agree.
+fn advertised_sse_full(descriptor_json: &str) -> Option<(&'static str, Option<String>, bool)> {
+    let d: SseDescriptor = serde_json::from_str(descriptor_json).ok()?;
+    match d.mode {
+        SseMode::SseS3 => Some((SSE_AES256, None, false)),
+        SseMode::AtRest => None,
+        SseMode::Kms => Some((SSE_AWS_KMS, d.kms_key_id, d.bucket_key_enabled)),
+    }
+}
+
+/// Apply the advertised SSE response headers for a stored descriptor (ARCH 27): the
+/// `x-amz-server-side-encryption` algorithm, and for SSE-KMS the
+/// `x-amz-server-side-encryption-aws-kms-key-id` and `x-amz-server-side-encryption-bucket-key-enabled`
+/// headers. A transparent `AtRest` (or absent) descriptor adds nothing. Used by PUT, GET/HEAD, copy,
+/// and CompleteMultipartUpload so every response advertises identically.
+fn with_sse_headers(mut resp: S3Response, descriptor_json: Option<&str>) -> S3Response {
+    if let Some((alg, key_id, bucket_key_enabled)) = descriptor_json.and_then(advertised_sse_full) {
+        resp = resp.with_header("x-amz-server-side-encryption", alg);
+        if let Some(key_id) = key_id {
+            resp = resp.with_header("x-amz-server-side-encryption-aws-kms-key-id", key_id);
         }
-    })
+        if bucket_key_enabled {
+            resp = resp.with_header("x-amz-server-side-encryption-bucket-key-enabled", "true");
+        }
+    }
+    resp
+}
+
+/// What a request asked for via the `x-amz-server-side-encryption*` headers (ARCH 27).
+enum SseRequest {
+    /// No `x-amz-server-side-encryption` header.
+    None,
+    /// `x-amz-server-side-encryption: AES256` (SSE-S3).
+    SseS3,
+    /// `x-amz-server-side-encryption: aws:kms` (SSE-KMS), with an optional key id and the
+    /// `BucketKeyEnabled` flag.
+    Kms {
+        key_id: Option<String>,
+        bucket_key_enabled: bool,
+    },
+}
+
+/// Parse the SSE request headers into an [`SseRequest`], validating the header combination (ARCH 27):
+/// a `aws-kms-key-id` header is only valid with `aws:kms` (else `InvalidArgument`); an unknown
+/// algorithm is rejected. The KMS key id itself is validated against the provider by the caller.
+fn requested_sse(req: &S3Request) -> Result<SseRequest> {
+    let key_id = req
+        .header("x-amz-server-side-encryption-aws-kms-key-id")
+        .map(str::to_owned);
+    // Bound the key id: it is persisted verbatim in every object version's descriptor and echoed in
+    // response headers, so cap the length (2048 covers any real KMS key id / alias / ARN) and reject
+    // control characters — defence-in-depth against a pathological id bloating rows or injecting into
+    // a header.
+    if let Some(id) = &key_id {
+        if id.len() > 2048 || id.chars().any(char::is_control) {
+            return Err(Error::InvalidArgument(
+                "x-amz-server-side-encryption-aws-kms-key-id is malformed".to_owned(),
+            ));
+        }
+    }
+    let bucket_key_enabled = req
+        .header("x-amz-server-side-encryption-bucket-key-enabled")
+        .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+    match req.header("x-amz-server-side-encryption") {
+        None => {
+            // A KMS key id without an algorithm is a malformed request (S3: InvalidArgument).
+            if key_id.is_some() {
+                return Err(Error::InvalidArgument(
+                    "x-amz-server-side-encryption-aws-kms-key-id requires \
+                     x-amz-server-side-encryption: aws:kms"
+                        .to_owned(),
+                ));
+            }
+            Ok(SseRequest::None)
+        }
+        Some(v) if v.eq_ignore_ascii_case(SSE_AES256) => {
+            // A KMS key id paired with AES256 is contradictory.
+            if key_id.is_some() {
+                return Err(Error::InvalidArgument(
+                    "a KMS key id is not valid with x-amz-server-side-encryption: AES256"
+                        .to_owned(),
+                ));
+            }
+            Ok(SseRequest::SseS3)
+        }
+        Some(v) if v.eq_ignore_ascii_case(SSE_AWS_KMS) => Ok(SseRequest::Kms {
+            key_id,
+            bucket_key_enabled,
+        }),
+        Some(v) => Err(Error::InvalidArgument(format!(
+            "unsupported server-side encryption: {v}"
+        ))),
+    }
 }
 
 impl S3Service {
-    /// Whether the bucket has default server-side encryption configured (the `encryption` config
-    /// aspect with algorithm AES256). A malformed stored document counts as "off" rather than
-    /// failing the upload — the setting is operator-managed and validated on write.
-    async fn bucket_default_sse(&self, bucket: &BucketName) -> Result<bool> {
+    /// The bucket's default server-side encryption (the `encryption` config aspect), or `None` when
+    /// none is configured. `AES256` maps to [`BucketDefaultSse::SseS3`]; `aws:kms` (with an optional
+    /// `kms_key_id`) to [`BucketDefaultSse::Kms`]. A malformed or unrecognized document counts as
+    /// "off" rather than failing the upload — the setting is operator-managed and validated on write.
+    async fn bucket_default_sse(&self, bucket: &BucketName) -> Result<Option<BucketDefaultSse>> {
         let doc = self
             .meta
             .get_bucket_config(bucket, ConfigAspect::Encryption)
             .await?;
-        Ok(doc.is_some_and(|d| {
-            serde_json::from_str::<serde_json::Value>(&d.0)
-                .ok()
-                .and_then(|v| {
-                    v.get("algorithm")
-                        .and_then(|a| a.as_str())
-                        .map(|a| a.eq_ignore_ascii_case(SSE_AES256))
+        Ok(doc.and_then(|d| {
+            let v: serde_json::Value = serde_json::from_str(&d.0).ok()?;
+            let alg = v.get("algorithm").and_then(|a| a.as_str())?;
+            if alg.eq_ignore_ascii_case(SSE_AES256) {
+                Some(BucketDefaultSse::SseS3)
+            } else if alg.eq_ignore_ascii_case(SSE_AWS_KMS) {
+                Some(BucketDefaultSse::Kms {
+                    key_id: v
+                        .get("kms_key_id")
+                        .and_then(|k| k.as_str())
+                        .map(str::to_owned),
+                    bucket_key_enabled: v
+                        .get("bucket_key_enabled")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
                 })
-                .unwrap_or(false)
+            } else {
+                None
+            }
         }))
     }
 
@@ -4469,22 +4737,27 @@ impl S3Service {
     /// descriptor (the mode a client explicitly asks for, or a bucket default); the transparent
     /// at-rest path calls [`new_sse_dek_mode`](Self::new_sse_dek_mode) with [`SseMode::AtRest`].
     fn new_sse_dek(&self) -> Result<([u8; 32], String)> {
-        self.new_sse_dek_mode(SseMode::SseS3, None)
+        self.new_sse_dek_mode(&*self.crypto, SseMode::SseS3, None, false)
     }
 
-    /// As [`new_sse_dek`](Self::new_sse_dek) but stamps the descriptor's `mode` (and optional KMS
-    /// key id): the mode is the advertising discriminator — `SseS3` advertises `AES256`, `AtRest`
-    /// advertises nothing (transparent operator encryption), `Kms` advertises `aws:kms` (Increment
-    /// 2). The sealed DEK envelope itself is identical across modes (label-only, ARCH 27).
+    /// As [`new_sse_dek`](Self::new_sse_dek) but stamps the descriptor's `mode` (and, for `Kms`, the
+    /// key id + `BucketKeyEnabled`), sealing the DEK with `crypto`. The mode is the advertising
+    /// discriminator — `SseS3` advertises `AES256`, `AtRest` advertises nothing (transparent operator
+    /// encryption), `Kms` advertises `aws:kms` + the key id. `crypto` is the DEK-sealing material
+    /// resolved from the key provider; for the v1 local provider it is always the master ring, so the
+    /// sealed envelope is identical across modes (label-only, ARCH 27) and `open_sse_dek` unwraps it
+    /// under the same ring.
     fn new_sse_dek_mode(
         &self,
+        crypto: &dyn Crypto,
         mode: SseMode,
         kms_key_id: Option<String>,
+        bucket_key_enabled: bool,
     ) -> Result<([u8; 32], String)> {
         use rand::RngCore;
         let mut dek = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut dek);
-        let sealed = self.crypto.seal(&dek)?;
+        let sealed = crypto.seal(&dek)?;
         let descriptor = SseDescriptor {
             alg: SSE_DESCRIPTOR_ALG.to_owned(),
             // The CRK1 envelope (audit #29) is self-describing — it carries its own key id and
@@ -4495,20 +4768,22 @@ impl S3Service {
             nonce_b64: String::new(),
             mode,
             kms_key_id,
+            bucket_key_enabled,
         };
         let json = serde_json::to_string(&descriptor)
             .map_err(|e| Error::Internal(format!("serialize sse descriptor: {e}")))?;
         Ok((dek, json))
     }
 
-    /// Resolve the encryption plan for a committed-object write into a bucket, given whether the
-    /// client explicitly requested SSE-S3 (`x-amz-server-side-encryption: AES256`). Priority,
-    /// highest first (ARCH 27):
-    ///   1. explicit client SSE-S3 header — mint an `SseS3` descriptor (advertised `AES256`);
-    ///   2. bucket default-encryption (the `encryption` config aspect) — `SseS3`, advertised;
-    ///   3. [`encrypt_at_rest`](Self::encrypt_at_rest) — mint an `AtRest` descriptor, **not**
+    /// Resolve the encryption plan for a committed-object write into a bucket, given what the client
+    /// requested via the SSE headers. Priority, highest first (ARCH 27):
+    ///   1. explicit client SSE-KMS (`aws:kms`) — validate the key id against the provider, mint a
+    ///      `Kms` descriptor (advertised `aws:kms` + key id);
+    ///   2. explicit client SSE-S3 (`AES256`) — mint an `SseS3` descriptor (advertised `AES256`);
+    ///   3. bucket default-encryption (the `encryption` config aspect) — `SseS3` or `Kms`, advertised;
+    ///   4. [`encrypt_at_rest`](Self::encrypt_at_rest) — mint an `AtRest` descriptor, **not**
     ///      advertised (transparent operator storage encryption the client never asked for);
-    ///   4. otherwise no encryption (plaintext blocks, no descriptor).
+    ///   5. otherwise no encryption (plaintext blocks, no descriptor).
     ///
     /// Mandatory encryption (`bucket_sse_required`) is handled by the caller *after* this resolver:
     /// when the plan is plaintext and the bucket requires SSE, a client PUT is refused and an inbound
@@ -4516,18 +4791,42 @@ impl S3Service {
     async fn resolve_object_encryption(
         &self,
         bucket: &BucketName,
-        explicit_sse: bool,
+        requested: SseRequest,
     ) -> Result<EncryptionPlan> {
-        let mode = if explicit_sse || self.bucket_default_sse(bucket).await? {
-            Some(SseMode::SseS3)
-        } else if self.encrypt_at_rest {
-            Some(SseMode::AtRest)
-        } else {
-            None
+        // Resolve the effective mode + KMS key material: an explicit header wins over the bucket
+        // default, which wins over transparent at-rest.
+        let plan = match requested {
+            SseRequest::Kms {
+                key_id,
+                bucket_key_enabled,
+            } => Some((SseMode::Kms, key_id, bucket_key_enabled)),
+            SseRequest::SseS3 => Some((SseMode::SseS3, None, false)),
+            SseRequest::None => match self.bucket_default_sse(bucket).await? {
+                Some(BucketDefaultSse::Kms {
+                    key_id,
+                    bucket_key_enabled,
+                }) => Some((SseMode::Kms, key_id, bucket_key_enabled)),
+                Some(BucketDefaultSse::SseS3) => Some((SseMode::SseS3, None, false)),
+                None if self.encrypt_at_rest => Some((SseMode::AtRest, None, false)),
+                None => None,
+            },
         };
-        match mode {
-            Some(m) => {
-                let (dek, descriptor) = self.new_sse_dek_mode(m, None)?;
+        match plan {
+            Some((mode, key_id, bucket_key_enabled)) => {
+                // For SSE-KMS, validate the key id against the provider (allow-list, fail-closed) and
+                // seal the DEK with the provider's crypto for that id. Other modes seal under the
+                // master ring.
+                let crypto: Arc<dyn Crypto> = if mode == SseMode::Kms {
+                    if let Some(id) = &key_id {
+                        self.key_provider.validate_key_id(id)?;
+                    }
+                    self.key_provider
+                        .crypto_for(key_id.as_deref().unwrap_or_default())?
+                } else {
+                    self.crypto.clone()
+                };
+                let (dek, descriptor) =
+                    self.new_sse_dek_mode(&*crypto, mode, key_id, bucket_key_enabled)?;
                 Ok(EncryptionPlan {
                     dek: Some(dek),
                     descriptor_json: Some(descriptor),
@@ -4540,6 +4839,11 @@ impl S3Service {
     /// Unwrap the raw 32-byte DEK from a stored `sse_descriptor` JSON document by opening the
     /// sealed key under the master key.
     fn open_sse_dek(&self, descriptor_json: &str) -> Result<[u8; 32]> {
+        // v1 is label-only: every DEK (SseS3, AtRest, Kms) is sealed under the SAME master ring, so
+        // opening on `self.crypto` is correct and symmetric with the seal path. A FUTURE external
+        // KeyProvider with per-key material would seal under provider material and this open would
+        // then have to resolve the crypto via `self.key_provider.crypto_for(d.kms_key_id)` — until
+        // then it fails CLOSED (a decrypt error, never plaintext), never a silent leak.
         let d: SseDescriptor = serde_json::from_str(descriptor_json)
             .map_err(|e| Error::Internal(format!("parse sse descriptor: {e}")))?;
         let ciphertext = base64::engine::general_purpose::STANDARD
@@ -4591,11 +4895,9 @@ fn object_headers(resp: S3Response, row: &ObjectVersionRow) -> S3Response {
     if let Some(v) = &row.expires {
         resp = resp.with_header("expires", v.clone());
     }
-    // Echo the SSE algorithm on GET/HEAD for a server-side-encrypted object (ARCH 27). A
-    // transparent `AtRest` object advertises nothing — `advertised_sse` keys on the descriptor mode.
-    if let Some(alg) = row.sse_descriptor.as_deref().and_then(advertised_sse) {
-        resp = resp.with_header("x-amz-server-side-encryption", alg);
-    }
+    // Echo the SSE algorithm (and, for SSE-KMS, the key id + BucketKeyEnabled) on GET/HEAD for a
+    // server-side-encrypted object (ARCH 27). A transparent `AtRest` object advertises nothing.
+    resp = with_sse_headers(resp, row.sse_descriptor.as_deref());
     if let CompressionDescriptor::Compressed { .. } = row.compression {
         // The physical form is hidden from clients; nothing leaks here.
     }
