@@ -4275,14 +4275,44 @@ const SSE_AES256: &str = "AES256";
 /// The algorithm recorded in the per-object SSE descriptor.
 const SSE_DESCRIPTOR_ALG: &str = "AES256-GCM";
 
+/// How an object version came to be encrypted, which decides what (if anything) GET/HEAD advertise
+/// to the client. The DEK envelope is identical for all three (CRK1-under-master) — this is a
+/// *labelling* discriminator, not distinct key material (SSE-KMS v1 is label-only, ARCH 27).
+///   * `SseS3`  — the client asked for `x-amz-server-side-encryption: AES256`; advertise `AES256`.
+///   * `AtRest` — transparent server-side-at-rest encryption the client did NOT request; advertise
+///     nothing (it is an operator storage property, not an SSE contract the client can rely on).
+///   * `Kms`    — the client asked for `aws:kms`; advertise `aws:kms` + the key id.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[serde(rename_all = "kebab-case")]
+enum SseMode {
+    #[default]
+    SseS3,
+    AtRest,
+    Kms,
+}
+
+fn is_default_sse_mode(m: &SseMode) -> bool {
+    *m == SseMode::SseS3
+}
+
 /// The JSON `sse_descriptor` persisted on an encrypted object version: the algorithm, the
 /// data-encryption key sealed under the master key (base64), and the wrapping nonce (base64). The
 /// raw DEK is never stored — only this wrapped form (ARCH 27, SSE-S3).
+///
+/// `mode`/`kms_key_id` are additive (both `#[serde(default)]` and skipped when default), so a legacy
+/// descriptor with neither field deserializes as an ordinary SSE-S3 descriptor and a plain SSE-S3
+/// descriptor still serializes byte-identically. The master-key re-wrap loop (`key_rewrap.rs`)
+/// preserves both across a rotation — dropping them would silently make an `AtRest` object start
+/// advertising `AES256`.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct SseDescriptor {
     alg: String,
     wrapped_dek_b64: String,
     nonce_b64: String,
+    #[serde(default, skip_serializing_if = "is_default_sse_mode")]
+    mode: SseMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kms_key_id: Option<String>,
 }
 
 /// Whether the request asks for SSE-S3 via `x-amz-server-side-encryption: AES256`. Any other value
@@ -4354,6 +4384,10 @@ impl S3Service {
             // on its presence.
             wrapped_dek_b64: base64::engine::general_purpose::STANDARD.encode(&sealed.ciphertext),
             nonce_b64: String::new(),
+            // Increment 0 mints only SSE-S3 descriptors (both default, so serialized byte-identically
+            // to a legacy descriptor). Increment 1 threads AtRest/Kms + a key id through here.
+            mode: SseMode::SseS3,
+            kms_key_id: None,
         };
         let json = serde_json::to_string(&descriptor)
             .map_err(|e| Error::Internal(format!("serialize sse descriptor: {e}")))?;

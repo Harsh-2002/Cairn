@@ -28,13 +28,20 @@ fn now_ms() -> i64 {
         .map_or(0, |d| d.as_millis() as i64)
 }
 
-/// The stored SSE descriptor JSON shape (mirrors `cairn-protocol`'s private struct).
+/// The stored SSE descriptor JSON shape (mirrors `cairn-protocol`'s private struct). Re-wrap only
+/// reseals the DEK and re-nonces; every OTHER field (`alg`, and the additive `mode`/`kms_key_id` the
+/// protocol layer stamps for at-rest/KMS encryption) is captured verbatim in `extra` and re-emitted
+/// unchanged — so a master-key rotation can never drop a label (which would make an `AtRest` object
+/// silently start advertising `AES256`), and this loop never needs editing when a new descriptor
+/// field is added.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct SseDesc {
     alg: String,
     wrapped_dek_b64: String,
     #[serde(default)]
     nonce_b64: String,
+    #[serde(flatten)]
+    extra: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 /// Spawn the per-shard re-wrap loop. `interval_secs == 0` disables it. The worker shares one
@@ -168,6 +175,7 @@ fn rewrap_sse_descriptor(crypto: &SystemCrypto, json: &str) -> Result<Option<Str
         alg: d.alg,
         wrapped_dek_b64: B64.encode(&resealed.ciphertext),
         nonce_b64: String::new(),
+        extra: d.extra,
     };
     serde_json::to_string(&new).map(Some).map_err(|_| ())
 }
@@ -321,7 +329,47 @@ fn targets_pass_done_id(active: u16, pass_failed: u64) -> u16 {
 
 #[cfg(test)]
 mod tests {
-    use super::targets_pass_done_id;
+    use super::{B64, Nonce, SystemCrypto, rewrap_sse_descriptor, targets_pass_done_id};
+    use base64::Engine;
+    use cairn_types::traits::Crypto;
+
+    #[test]
+    fn rewrap_preserves_mode_and_kms_key_id() {
+        // A master-key rotation must reseal the DEK under the new active key WITHOUT dropping the
+        // `mode`/`kms_key_id` labels — losing them would silently make an at-rest object (which
+        // advertises nothing) start advertising AES256. Increment 0's flatten-preserve guards this.
+        let (k1, k2, dek) = ([1u8; 32], [2u8; 32], [7u8; 32]);
+        // Seal the DEK under key 1 (key 1 active).
+        let old = SystemCrypto::from_ring(vec![(1, k1)], 1, 1, 0).unwrap();
+        let sealed = old.seal(&dek).unwrap();
+        let json = format!(
+            r#"{{"alg":"AES256","wrapped_dek_b64":"{}","nonce_b64":"","mode":"at-rest","kms_key_id":"tenant-A"}}"#,
+            B64.encode(&sealed.ciphertext)
+        );
+        // Now key 2 is active (key 1 retained for opening) — the descriptor needs a rewrap.
+        let new = SystemCrypto::from_ring(vec![(1, k1), (2, k2)], 2, 1, 0).unwrap();
+        let out = rewrap_sse_descriptor(&new, &json)
+            .unwrap()
+            .expect("a key-1-sealed descriptor must need rewrap under active key 2");
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        // The labels survived the rotation.
+        assert_eq!(v["mode"], "at-rest", "mode dropped on rewrap: {out}");
+        assert_eq!(
+            v["kms_key_id"], "tenant-A",
+            "kms_key_id dropped on rewrap: {out}"
+        );
+        // The DEK was genuinely resealed under the active key and still round-trips.
+        let env = B64.decode(v["wrapped_dek_b64"].as_str().unwrap()).unwrap();
+        assert!(
+            !new.needs_rewrap(&env),
+            "resealed DEK must be under the active key"
+        );
+        assert_eq!(
+            &new.open(&env, &Nonce(Vec::new())).unwrap()[..],
+            &dek[..],
+            "DEK must round-trip after rewrap"
+        );
+    }
 
     #[test]
     fn incomplete_targets_pass_does_not_record_completion() {
