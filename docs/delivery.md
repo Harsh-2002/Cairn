@@ -67,7 +67,7 @@ Build in this order. Each phase lists its deliverable and the acceptance criteri
 
 **Phase 14, conformance, benchmarks, and documentation.** The cross-client conformance suite and the community conformance suite green for the supported surface in continuous integration, the benchmarks with published numbers and the characterised write ceiling, and the operator documentation derived from the configuration and operations sections. Accepts when the clients and the suite pass in continuous integration, the benchmark numbers are recorded, and backup and restore including the repair mode are exercised end to end. This phase is the production release gate.
 
-**Phase 15, future work behind the interfaces.** The io_uring blob engine and the zero-copy read fast path with kernel TLS, an explicit restore-from-cold workflow, full-blob transparent encryption at rest as a blob-store decorator and SSE-KMS (object-level SSE-S3 already ships, with the per-object DEK sealed under the master key), and the protective version-deletion control. None of these require changes to the protocol or control layers, which is the payoff of the abstraction boundary.
+**Phase 15, future work behind the interfaces.** The io_uring blob engine and the zero-copy read fast path with kernel TLS, an explicit restore-from-cold workflow, and the protective version-deletion control. None of these require changes to the protocol or control layers, which is the payoff of the abstraction boundary. Transparent at-rest encryption (CAIRN_ENCRYPT_AT_REST), the label-only aws:kms surface with part-level multipart encryption, and composite multipart checksums have since shipped (ARCH 27).
 
 ---
 
@@ -91,6 +91,10 @@ Build in this order. Each phase lists its deliverable and the acceptance criteri
 | Control plane | One JSON management API consumed by both an embedded React UI compiled into the binary and a CLI. | A single artifact to deploy and parity between browser and terminal administration. |
 | Transport | Optional native TLS in addition to running behind a terminating proxy. | A standalone secure endpoint without mandating a proxy. |
 | Secrets at rest | Envelope-encrypt SigV4 and replication secrets under an out-of-band master key; hash Bearer secrets. | Database disclosure must not yield usable secrets; high-entropy tokens need only a fast hash. |
+| SSE-KMS surface | Accept the aws:kms client surface (header, key id, bucket-key flag) and a per-bucket allow-list, but seal every DEK under the same master key ring — the key id is a validated label, not distinct key material or external-KMS isolation. | SDK and tooling compatibility today without standing up a real KMS; the label-only limitation is documented so it is never mistaken for cryptographic isolation. |
+| Multipart encryption at rest | Encrypt every staged part under its own freshly-random per-part DEK (a VERSION_ENCRYPTED CRNB blob), and decrypt-then-re-encrypt at assembly under the object DEK; part intent is pinned at initiate. | Nothing plaintext ever touches disk for an SSE multipart upload, and per-part keys are ephemeral and GC'd with the session rather than entering the rewrap stream. |
+| Composite checksums | Compose the object-level checksum from the persisted per-part digests (a checksum-of-checksums with a `-N` part-count suffix), distinct from a whole-object FULL_OBJECT checksum. | Matches S3's multipart checksum semantics without re-reading assembled bytes. |
+| Temporary credentials | An AWS-STS form surface (GetSessionToken, AssumeRole) minting master-key-sealed session credentials on the S3 data plane; AssumeRole records the role for audit only and gates inline session policy to administrators. | SDK-default temporary-credential flows work without a separate STS endpoint or a real role engine. |
 
 ---
 
@@ -131,7 +135,7 @@ The schema below is the reference for the SQLite store. Types are given in the e
 | compression_policy | text | Nullable; the per-bucket compression policy document, absent meaning off. |
 | quota_bytes | integer | Nullable; an optional per-bucket byte quota enforced inside the commit transaction, null meaning unlimited. |
 
-**Bucket configuration aspects.** Each of the following is a validated document associated with a bucket, stored either as a column on a bucket-configuration table keyed by bucket name or as its own table; the choice is an implementation detail, but each is one logical document per bucket: the policy, the access-control list, the CORS configuration, the lifecycle configuration, the replication configuration, the replication remote-target descriptors (the ARN-identified targets whose secrets are sealed under the master key), the default-encryption setting (SSE-S3 applied to new uploads that carry no SSE header), and the tag set. The account-wide and per-bucket public-access-block settings are stored as their four boolean toggles.
+**Bucket configuration aspects.** Each of the following is a validated document associated with a bucket, stored either as a column on a bucket-configuration table keyed by bucket name or as its own table; the choice is an implementation detail, but each is one logical document per bucket: the policy, the access-control list, the CORS configuration, the lifecycle configuration, the replication configuration, the replication remote-target descriptors (the ARN-identified targets whose secrets are sealed under the master key), the default-encryption setting (SSE-S3 or the label-only aws:kms applied to new uploads that carry no SSE header, with an optional required flag that rejects a client write lacking SSE), and the tag set. The account-wide and per-bucket public-access-block settings are stored as their four boolean toggles.
 
 **Object versions.**
 
@@ -155,7 +159,7 @@ The schema below is the reference for the SQLite store. Types are given in the e
 | storage_path | text | Nullable for delete markers; the opaque blob path otherwise. |
 | compression | text | Not null; the algorithm and block size, or a marker that the blob is uncompressed. |
 | cold_locator | text | Nullable; the remote locator when the version has been transitioned to the cold tier. |
-| sse_descriptor | text | Nullable; the SSE-S3 data-encryption key sealed under the master key, null meaning the object data is unencrypted. |
+| sse_descriptor | text | Nullable; the SSE data-encryption key sealed under the master key (and, for an aws:kms object, the advertised mode and key-id label — the key id is a label over the same master ring, not distinct key material), null meaning the object data is unencrypted. |
 | storage_class | text | Not null; standard, or the cold tier after transition. |
 | owner_id | text | Not null; the version's owner under the ownership mode. |
 | user_metadata | text | The user-defined metadata entries. |
@@ -181,6 +185,11 @@ The schema below is the reference for the SQLite store. Types are given in the e
 | intended_acl | text | Nullable; the ACL to apply on completion. |
 | user_metadata | text | The metadata to apply on completion. |
 | created_at, updated_at | timestamp | Not null. |
+| sse_requested | integer | Not null, default 0; 1 means SSE-S3 (AES256) was requested at initiate, so completion encrypts the assembled object (migration v15). |
+| encrypt_parts | integer | Not null, default 0; the part-encryption decision pinned at initiate. 1 means every staged part is a per-part-DEK-encrypted CRNB blob (nothing plaintext on disk) and completion is a decrypt-then-re-encrypt pass; 0 is the legacy plaintext-parts path (migration v21). |
+| sse_kms_requested | integer | Not null, default 0; 1 means an explicit `aws:kms` header was accepted at initiate, so the assembled object advertises `aws:kms` and its key id (migration v22). |
+| sse_kms_key_id | text | Nullable; the validated key-id label to advertise, null meaning the default key (migration v22). |
+| sse_bucket_key_enabled | integer | Not null, default 0; echoes `x-amz-server-side-encryption-bucket-key-enabled` (migration v22). |
 | Index | | Over status and update time, for the sweeper. |
 
 **Multipart parts.**
@@ -193,6 +202,7 @@ The schema below is the reference for the SQLite store. Types are given in the e
 | etag | text | Not null; the plaintext MD5 of the part. |
 | storage_path | text | Not null. |
 | checksum | text | Nullable. |
+| part_dek | text | Nullable; the part's freshly-random 32-byte DEK sealed under the master ring (base64 CRK1 envelope) when `encrypt_parts` is set, null meaning a plaintext part. Consumed and discarded at completion; never enters the object rewrap stream (migration v21). |
 | Primary key | | The combination of upload and part number. |
 
 **Replication outbox.**
@@ -209,7 +219,16 @@ The schema below is the reference for the SQLite store. Types are given in the e
 | status | text | Not null; pending, claimed, completed, or failed. |
 | lease_until | integer | Nullable; the claim-lease expiry, set with the claimed status by the atomic claim so a stalled claim can be reclaimed. |
 | last_error | text | Nullable. |
-| Index | | Over status and next-attempt time, for due-entry claiming. |
+| enqueued_at | integer | Not null, default 0; the wall-clock millis an entry was first enqueued, so lag is the age of the oldest still-unreplicated entry's enqueue time rather than its backed-off next-attempt time. A value of 0 (rows predating the column) is treated as unknown by the lag query (migration v19). |
+| Index | | Over status and next-attempt time, for due-entry claiming, and over status and enqueue time, for the per-status aggregate and lag. |
+
+**Object locks (migration v16).** Per-version S3 Object Lock (WORM) state in a side table so the hot object-versions row is untouched; a row exists only for a version that has ever had a lock set. Columns: bucket_name, key, version_id (composite primary key); lock_mode ('GOVERNANCE'|'COMPLIANCE'|null for no retention); retain_until (epoch-ms retention expiry, nullable); legal_hold (integer, not null, default 0).
+
+**Webhook events outbox (migration v17).** The event-notification delivery outbox, mirroring the replication outbox: one row per object event matched to one bucket webhook endpoint, with the ready-to-POST JSON pre-rendered into `payload`. Columns: id (primary key); bucket_name, key, version_id; event_type; endpoint_id; payload; attempts; next_attempt_at; status ('pending'|'claimed'|'completed'|'failed'); last_error (nullable); priority (integer, not null, default 0); lease_until (nullable claim lease). Indexed over status and next-attempt time for claiming.
+
+**Session credentials (migration v18).** STS-style temporary credentials scoped to a parent user. Columns: access_key_id (primary key); parent_user_id; secret_ciphertext (blob, the temporary secret sealed under the master key exactly like a user's SigV4 secret, CRK1 with a null nonce); secret_nonce (nullable); session_token_hash; inline_policy (nullable); expires_at (epoch ms); created_at. Indexed over expiry.
+
+**Key-ring rotation state (migrations v13, v14).** Support for master-key-ring rotation (#29). `key_ring_state` records each ring id (a CHECK rejects id 0), a short key-hash prefix for operator display, and counters; key material never lives here. `rewrap_progress` tracks the re-wrap cursor per rewrappable stream (e.g. `object_versions.sse_descriptor`), plus a `done_active_id` completion marker (default 0 = not started, added in v14) so a stream is never reported complete until a full failure-free pass finishes.
 
 **S3 import jobs (migration v20).** The `import_jobs` table (Section 27.7) holds one account-global row per import: an identifier; the source endpoint, region, and access-key id; the **sealed** source secret (ciphertext under the master key, CRK1 envelope with a null nonce, exactly like a user's SigV4 secret) which is never returned by any read; an optional CA-certificate PEM and a TLS skip-verify flag; the requested worker count; the lifecycle state (`pending`/`running`/`completed`/`failed`/`cancelled`); the per-bucket progress and resume cursors serialized as a JSON column; denormalized aggregate object/byte counters; a nullable last-error and a nullable running-job lease; and creation and update timestamps. It is indexed over state and creation time for claiming. The full record (including the sealed secret and cursors) is read only by the server-internal import worker; the management API uses a secret-free view.
 
@@ -249,14 +268,16 @@ The indexes that carry the load are the unique index over bucket, key, and versi
 | GetObjectAttributes | Yes | |
 | Presigned GET and PUT | Yes | SigV4 query form. |
 | Signed public-read URL | Yes | A Cairn extension, not an S3 operation. |
+| STS AssumeRole, GetSessionToken | Yes | AWS-STS `Action=` form POST on the S3 data-plane root, minting temporary session credentials sealed under the master key. GetSessionToken inherits the caller's effective access; AssumeRole records RoleArn/RoleSessionName for audit only, and an inline session Policy is admin-only. On by default; disabled with `CAIRN_STS_ENABLED=false`. |
 | Object-level SSE-S3 (`x-amz-server-side-encryption: AES256`) | Yes | Accepted on writes and echoed on reads, with the per-object data-encryption key sealed under the master key; a per-bucket default-encryption setting applies it to new uploads that carry no SSE header. |
 | Object-level SSE-KMS (`x-amz-server-side-encryption: aws:kms`) | Yes | Accepted on single-part and multipart writes (including at `CreateMultipartUpload`) and on the bucket default; the key id is echoed on reads and the optional allow-list (`CAIRN_KMS_KEY_IDS`) gates writes, failing closed at initiate. Label-only: every DEK is sealed under the master key regardless of the key id — the key id is a label, not distinct key material or external-KMS isolation. |
-| GetBucketEncryption, PutBucketEncryption (the `?encryption` subresource) | No | The REST subresource returns not implemented; default encryption is set through the management plane. |
-| Object lock and retention, requester pays, website and accelerate and analytics and inventory and metrics configurations | No | Out of scope; requests are answered as not implemented. |
+| GetBucketEncryption, PutBucketEncryption, DeleteBucketEncryption (the `?encryption` subresource) | Yes | The REST subresource reads, sets, and clears the bucket default-encryption configuration as a `ServerSideEncryptionConfiguration` XML document (SSE-S3 or label-only aws:kms, with an optional `required` mandatory-SSE flag owned by the management plane, which this S3 surface neither sets nor returns); DELETE is gated by the same `s3:PutEncryptionConfiguration` action. A bucket with no default returns `ServerSideEncryptionConfigurationNotFoundError`. |
+| Object Lock: Put/GetObjectLockConfiguration, Put/GetObjectRetention, Put/GetObjectLegalHold | Yes | WORM retention (GOVERNANCE/COMPLIANCE) plus legal hold, enforced at every permanent-version-delete path; GOVERNANCE bypassable with `s3:BypassGovernanceRetention` + `x-amz-bypass-governance-retention: true`. |
+| Requester pays, website and accelerate and analytics and inventory and metrics configurations | No | Out of scope; requests are answered as not implemented. |
 
 ### 34.4 Supported policy action catalogue
 
-Each policy action names an operation or family that a statement can allow or deny. The catalogue maps the supported actions to the operations they govern: the object-read actions govern getting objects, their versions, their ACLs, their tags, and their attributes; the object-write actions govern putting objects, their ACLs, and their tags, and deleting objects and their versions and tags; the bucket-listing action governs listing a bucket's objects and versions and multipart uploads; the bucket-read and bucket-write configuration actions govern getting and putting each bucket configuration aspect, namely policy, ACL, CORS, lifecycle, replication, tagging, versioning, ownership, and public-access-block; the multipart actions govern initiating, uploading, listing, completing, and aborting uploads; and the bucket-existence actions govern creating, deleting, and heading buckets. The wildcard and prefix-wildcard forms expand over this catalogue so that a policy can grant a family of actions. The exact action names follow the storage-service action namespace, and the catalogue is the authoritative list of which names Cairn recognises; an unrecognised action in a statement simply never matches.
+Each policy action names an operation or family that a statement can allow or deny. The catalogue maps the supported actions to the operations they govern: the object-read actions govern getting objects, their versions, their ACLs, their tags, and their attributes; the object-write actions govern putting objects, their ACLs, and their tags, and deleting objects and their versions and tags; the bucket-listing action governs listing a bucket's objects and versions and multipart uploads; the bucket-read and bucket-write configuration actions govern getting and putting each bucket configuration aspect, namely policy, ACL, CORS, lifecycle, replication, tagging, versioning, ownership, public-access-block, object-lock configuration, and default-encryption configuration (`s3:GetEncryptionConfiguration` / `s3:PutEncryptionConfiguration`); the multipart actions govern initiating, uploading, listing, completing, and aborting uploads; the object-lock actions govern reading and setting a version's retention and legal hold, with a distinct bypass action gating the removal of a GOVERNANCE-mode retention; and the bucket-existence actions govern creating, deleting, and heading buckets. The wildcard and prefix-wildcard forms expand over this catalogue so that a policy can grant a family of actions. The exact action names follow the storage-service action namespace, and the catalogue is the authoritative list of which names Cairn recognises; an unrecognised action in a statement simply never matches.
 
 ### 34.5 Supported condition-key catalogue
 

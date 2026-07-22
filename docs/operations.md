@@ -36,6 +36,9 @@ without starting: `cairn validate-config`.
 | Request timeout | `CAIRN_REQUEST_TIMEOUT_SECS` | 300 | Per-request timeout. |
 | Log level / format | `CAIRN_LOG_LEVEL` / `CAIRN_LOG_FORMAT` | `info` / `text` | Verbosity; `text` or `json`. |
 | Dev auth | `CAIRN_DEV_AUTH` | `false` | Loopback-only auth bypass (debug builds only). |
+| Encrypt at rest | `CAIRN_ENCRYPT_AT_REST` | `false` | Transparently encrypt every stored object (an operator storage property; not advertised as SSE). |
+| KMS key-id allow-list | `CAIRN_KMS_KEY_IDS` | *(unset = accept-all)* | Comma-separated `aws:kms` key ids accepted on writes; a label, not key isolation. Gates writes only. |
+| STS wire surface | `CAIRN_STS_ENABLED` | `true` | Serve `AssumeRole`/`GetSessionToken` on the S3 port; set `false` to disable. |
 
 > **Master key.** SigV4 secrets and replication credentials are envelope-encrypted under this
 > key. Supply it out of band; **keep it out of the backup** that contains the database, so the
@@ -155,8 +158,8 @@ argument.
 
 ## 7. Master-key rotation
 
-Secrets at rest — per-object SSE-S3 data keys, users' SigV4 secrets, and replication-target
-secrets — are sealed under a 32-byte master key. A single key is fine for most deployments
+Secrets at rest — per-object data keys (SSE-S3, `aws:kms`, and transparent at-rest), users' SigV4
+secrets, and replication-target secrets — are sealed under a 32-byte master key. A single key is fine for most deployments
 (`CAIRN_MASTER_KEY`, 64 hex chars). To rotate the master key without re-encrypting object data,
 use a **key ring** and follow this procedure. The whole flow is online; no downtime and no
 re-upload of objects.
@@ -214,3 +217,30 @@ warning; at 95% it refuses *new* seals (opens are never blocked) — rotate befo
 `sqlite` backend. The libSQL/Turso backends can rotate and read all data (old keys still open
 everything), but do not auto-re-wrap or persist the counter, so the retire-gate and
 `retire_eligible` are not available there — keep retired keys in the ring on those backends.
+
+## 8. Server-side object encryption
+
+Object data can be encrypted at rest in several ways; every mode uses a per-object AES-256-GCM data
+key (DEK) sealed under the node master key / ring (§7), so all of them are covered by master-key
+rotation.
+
+- **Client SSE-S3.** A PUT with `x-amz-server-side-encryption: AES256` stores the object encrypted
+  and advertises it back — nothing to configure.
+- **Bucket default / mandatory.** Set a bucket's default encryption via the S3 `?encryption`
+  subresource (`PutBucketEncryption`); with the management-plane `required` flag a plaintext client
+  PUT is refused. Per bucket, not node-wide.
+- **`aws:kms` requests.** A PUT with `x-amz-server-side-encryption: aws:kms` (optionally
+  `-aws-kms-key-id`) is accepted for SDK compatibility. **The key id is a validated label, not
+  distinct key material** — every DEK still seals under the node master key, so this is not
+  cryptographic tenant isolation. Constrain which ids clients may name with `CAIRN_KMS_KEY_IDS`
+  (comma-separated allow-list; unset accepts any id). The list gates writes only — removing an id
+  never locks existing objects.
+- **Transparent at-rest.** `CAIRN_ENCRYPT_AT_REST=true` encrypts every committed object even when the
+  client requested no SSE, as an operator storage property (no `x-amz-server-side-encryption` is
+  advertised). It is a confidentiality/throughput trade — an encrypted object engages neither the
+  sendfile nor the small-object GET fast path — so it stays opt-in.
+
+Multipart uploads are encrypted per part: each staged part is written encrypted and assembly
+re-encrypts under the object DEK, so nothing plaintext is ever on disk for an SSE upload. An upload
+pins its encryption intent at `CreateMultipartUpload`; see §7's retirement note for the fail-closed
+window when the master key is retired mid-upload.

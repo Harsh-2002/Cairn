@@ -24,7 +24,7 @@ The schema is specified field by field in Appendix 34.1; this section describes 
 
 **Object tags** are held as a small set of key-value pairs associated with an object version, stored so they can be both returned by the tagging operations and matched by lifecycle filters and policy conditions.
 
-**Multipart uploads and their parts** hold the session's bucket and key and content type and status and owner and intended ACL and user metadata, and for each part its number, plaintext size, plaintext MD5 used for the eventual ETag, storage path, and any checksum, with the part identified by the session and the part number.
+**Multipart uploads and their parts** hold the session's bucket and key and content type and status and owner and intended ACL and user metadata, and for each part its number, plaintext size, plaintext MD5 used for the eventual ETag, storage path, and any checksum, with the part identified by the session and the part number. The session also pins, at initiate, its server-side-encryption intent: whether its parts are staged encrypted, and — where an explicit `aws:kms` request was accepted — the requested key-id label and bucket-key flag to advertise on the assembled object; a part staged encrypted additionally holds its own per-part data key sealed under the master-key ring, consumed and discarded at completion.
 
 **The replication outbox** is the durable queue that drives asynchronous replication: each entry records the bucket, key, and version it concerns, the operation, the destination rule, the number of attempts, the next attempt time, the status, and the last error, so that replication survives restarts and retries with backoff (Section 20).
 
