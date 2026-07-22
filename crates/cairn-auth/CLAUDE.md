@@ -7,10 +7,15 @@ do) is `cairn-authz`** — this crate depends on it only to parse the identity p
 ## Layout (`src/`)
 - `lib.rs` — `AuthChain` (the `Authenticator`). `classify()` is the ordered dispatch (SigV4 header →
   Bearer → SigV4 presigned → dev bypass); every success funnels through the single `authenticate()`
-  → `attach_policy()` chokepoint that loads the per-user identity policy. Holds STS session auth
-  (`authenticate_session`).
+  → `attach_policy()` chokepoint that loads the per-user identity policy. Holds STS session
+  *consumption* (`authenticate_session`, the temporary `CAIRNTMP…` credential) and STS *minting* auth
+  (`authenticate_sts`) — a **deliberately separate** path: `expected_service = "sts"` (the generic
+  chain hard-rejects a non-`s3` scope), the payload hash bound to the buffered form body, no dev
+  bypass, no session chaining; returns the long-term principal WITHOUT attaching an identity policy.
 - `sigv4.rs` — SigV4 canonicalization, signing, header + presigned verification, and `mint_presigned`
   (the signer reuses the verifier primitives, so a minted URL is what `aws s3 presign` produces).
+  Header verification takes an `expected_service` (`"s3"` | `"sts"`) and a `payload_hash_override`
+  (the STS path hashes the buffered form body itself).
 - `bearer.rs` — `Bearer <id>.<secret>` parse + fast-hash; `hash_session_token`.
 - `chunked.rs` — streaming chunk-signature primitives; the rolling chain is **verified by the ingest
   decoder in `cairn-protocol`**, seeded by the `ChunkSigningContext` `verify_header` returns.

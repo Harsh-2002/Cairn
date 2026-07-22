@@ -76,7 +76,9 @@ doesn't replace them, and the raw commands above remain the source of truth.
   (replication, webhooks, import) goes through this.
 - `cairn-xml` — the S3 request/response XML codec (quick-xml).
 - `cairn-protocol` — S3 handlers, the request lifecycles, the streaming chunked decoder. The S3
-  surface lives in `service.rs`.
+  surface lives in `service.rs`; SSE (SSE-S3, transparent at-rest, SSE-KMS incl. part-level multipart)
+  seals/opens here, with the `KeyProvider` trait + `LocalRingProvider` (label-only KMS) in
+  `keyprovider.rs`.
 - `cairn-replication` / `cairn-lifecycle` — outbox-driven replication engine; lifecycle scanner.
 - `cairn-webhook` — outbox-driven webhook event-notification delivery engine (mirrors `cairn-replication`).
 - `cairn-import` — streaming, bounded-concurrency engine that imports buckets + objects from a
@@ -93,7 +95,8 @@ doesn't replace them, and the raw commands above remain the source of truth.
   `crates/cairn-server/src/config.rs` with a doc comment **and** validation (ARCH 28).
 - **Two listeners.** S3 data plane on `:7373` (`CAIRN_LISTEN_ADDR`); web console + `/api/v1` on
   `:7374` (`CAIRN_UI_ADDR`; set to `off`/`none` for headless). `/healthz`, `/readyz`, `/metrics` are
-  served on the S3 port, ahead of the concurrency limiter.
+  served on the S3 port, ahead of the concurrency limiter. The AWS-STS surface (AssumeRole /
+  GetSessionToken, `cairn-server/src/sts.rs`, `CAIRN_STS_ENABLED`) is a form POST on the S3 port.
 - **All writes go through the single `Writer`** (group-commit, savepoint-isolated batches) in
   `cairn-meta`; reads use the WAL read pool. Never open ad-hoc write connections.
 - **The 4(+1)-site rule.** A new `Mutation` or shared read must be mirrored in
@@ -101,11 +104,15 @@ doesn't replace them, and the raw commands above remain the source of truth.
   in-memory double in `cairn-types`. A new **per-bucket** `Mutation` must also be classified in
   `cairn-meta/src/shard.rs` — both `ShardedMetadataStore::submit`'s routing match and
   `mutation_bucket` (both now exhaustive, so the compiler forces this). Schema changes are
-  **append-only** migrations in `cairn-meta/src/schema.rs` (never edit an applied migration).
+  **append-only** migrations in `cairn-meta/src/schema.rs` (never edit an applied migration; latest
+  is v22 — v21 per-part multipart DEKs, v22 multipart KMS intent).
 - **Crypto fails closed.** A missing/wrong key or tampered envelope must return an error — never
-  plaintext, zeros, or partial data. Secrets are sealed at rest and are never logged, echoed, or
-  returned by any endpoint. Master key via `CAIRN_MASTER_KEY` (or a `CAIRN_MASTER_KEY_RING`;
-  rotation runbook in `docs/operations.md`).
+  plaintext, zeros, or partial data. Server-side encryption (SSE-S3, transparent at-rest via
+  `CAIRN_ENCRYPT_AT_REST`, SSE-KMS via `CAIRN_KMS_KEY_IDS`) is **label-only** in v1: every DEK is
+  sealed under the one master ring, so a KMS key id is a label/write-time allow-list gate, not
+  cryptographic isolation. Secrets are sealed at rest and are never logged, echoed, or returned by
+  any endpoint. Master key via `CAIRN_MASTER_KEY` (or a `CAIRN_MASTER_KEY_RING`; rotation runbook in
+  `docs/operations.md`).
 - **Durability is the contract** (ARCH 8): stage → fsync file → rename → fsync dir → validate hashes
   → commit the metadata transaction (the single linearization point) → reclaim superseded blobs.
   Don't reorder these steps.

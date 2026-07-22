@@ -6,10 +6,18 @@ ONLY through the `cairn-types` trait spine (`Arc<dyn MetadataStore/BlobStore/Aut
 Clock/Crypto>`) — never a concrete engine.
 
 ## Layout (`src/`)
-- `service.rs` — **the entire S3 surface** (~4.3k lines, one `impl S3Service`): `dispatch` →
+- `service.rs` — **the entire S3 surface** (~6k lines, one `impl S3Service`): `dispatch` →
   `bucket_op`/`object_op` → per-operation handlers (PUT/GET/HEAD/DELETE, ranges, conditionals,
-  multipart, copy, listing, every subresource), plus the free-function helpers below the impl.
-  SSE-S3 seal/open and the central `authorize` live here.
+  multipart, copy, listing, every subresource incl. `?encryption`), plus the free-function helpers
+  below the impl. The central `authorize` and all SSE seal/open live here: `resolve_object_encryption`
+  (explicit header > bucket default > transparent `AtRest` > plaintext) mints the object DEK across
+  `SseMode {SseS3, AtRest, Kms}`; `open_sse_dek`/`seal_part_dek`/`open_part_dek` handle read and
+  per-part multipart keys.
+- `keyprovider.rs` — the SSE-KMS `KeyProvider` trait + `LocalRingProvider` (v1). Maps a KMS key id
+  to DEK-sealing crypto and gates writes via the `CAIRN_KMS_KEY_IDS` allow-list. **Label-only**: every
+  DEK is sealed under the same node master ring regardless of key id — the id is a label, not
+  cryptographic isolation (removing an id does not lock existing objects). Shaped so a real external
+  provider (AWS KMS/Vault) can slot in later without touching the S3 surface.
 - `chunked.rs` — the SigV4 streaming `aws-chunked` decoder (`ChunkDecoder`, `ChunkVerifier`,
   `decode_stream`). The single highest-risk ingest component (F-5); fuzzed via the `chunked_decoder`
   target under `fuzz/`, proptested in `mod fuzz_props`.
@@ -24,14 +32,21 @@ Clock/Crypto>`) — never a concrete engine.
   `bucket_action`/`object_action`; do not add a handler that skips this chokepoint.
 - **An unrecognized subresource MUST NOT fall through to a data-plane handler.** A `PUT object?acl`
   must never overwrite the object body — `unhandled_{object,bucket}_subresource` gates this and
-  returns `NotImplemented`. Add new `?subresource` arms *above* those guards.
+  returns `NotImplemented`. Add new `?subresource` arms *above* those guards (the `?encryption`
+  Get/Put/Delete arms sit above the bucket guard, exactly like `cors`).
 - **Durability ordering is the contract** (ARCH 8/21.1): stage (fsync file+dir) → verify
   Content-MD5 / signed SHA-256 / client checksums → `meta.submit(Mutation::…)` (the single
   linearization point) → reclaim the superseded blob best-effort. Don't reorder.
 - **Any failure after `blob.stage` MUST delete the staged blob** before returning (`blob.delete`),
   or you leak an orphan. Every early-return in `put_object`/copy/multipart after staging does this.
-- **Crypto fails closed.** `open_sse_dek` / SSE-DEK open returns an error on a bad/missing key or
-  tampered envelope — never plaintext. Mandatory-encryption buckets refuse a plaintext client PUT.
+- **Crypto fails closed** across every SSE seam. `open_sse_dek`/`open_part_dek` return an error on a
+  bad/missing key or tampered envelope — never plaintext. SSE-S3, transparent `AtRest`, and SSE-KMS
+  are all **label-only** (one master ring seals every DEK, so open is symmetric on `self.crypto`); a
+  KMS key id gates writes via the allow-list but is not isolation. Part-level multipart seals a
+  per-part DEK *before* `stage_part` (no fallible step after staging) and `complete_multipart` opens
+  every part key before claiming the session (a bad key leaves the upload retryable). Mandatory-SSE
+  buckets refuse a plaintext client PUT — transparent `AtRest` satisfies the data goal but NOT the
+  client contract, so it is force-upgraded to advertised SSE-S3.
 - **Session credentials never short-circuit.** In `authorize`, `is_session` principals are always
   `AuthenticatedMember` — they get no owner/admin bypass (least-privilege STS, ARCH 14).
 - **Corrupt security configs fail closed** (ARCH 15.3/15.5): an unparseable BPA/policy/ACL doc

@@ -11,13 +11,17 @@ metadata commit is **the single linearization point of every mutation** (ARCH 11
 - `writer.rs` — the single `Writer` thread: group-commit, **one savepoint per mutation**, one
   `COMMIT` = one durability barrier. ALL writes go through it; never open an ad-hoc write connection.
   Carries `Control::{Checkpoint,Probe,Exec}` on the same queue — `run_exec` runs the master-key
-  re-wrap closure (#29) serialized with mutations.
+  re-wrap closure (#29) serialized with mutations. `run_checkpoint` drops the conn's `busy_timeout`
+  for the TRUNCATE so a reader-contended checkpoint returns `busy` **immediately** (the background
+  loop retries next tick) instead of busy-waiting up to 5s and freezing every PUT/DELETE/CompleteMPU.
 - `store.rs` — `SqliteMetadataStore`: the `MetadataStore` trait impl. Writes → `Writer::submit`;
   reads → `with_read` on the blocking pool. Listing is a half-open range seek (`range.rs`).
 - `apply.rs` — `Mutation` → SQL. Preconditions are evaluated **here, inside the savepoint**, so
   check-and-upsert is atomic. **Mirror any change in `cairn-meta-async/src/apply.rs`** (4(+1)-site).
-- `schema.rs` — migrations: **append-only**, monotonic `version` (latest is 19); never edit an
-  applied migration, never reorder — add a new one.
+- `schema.rs` — migrations: **append-only**, monotonic `version` (latest is 22 — multipart SSE
+  columns: `multipart_uploads.sse_requested` v15, `.encrypt_parts` + `multipart_parts.part_dek` v21,
+  `.sse_kms_requested`/`sse_kms_key_id`/`sse_bucket_key_enabled` v22); never edit an applied
+  migration, never reorder — add a new one.
 - `model.rs` — SQL row ↔ domain-type conversions; complex fields (compression, ACL, checksums,
   user-metadata) are JSON columns. `engine_err` maps constraint violations → `MetaError::Conflict`.
 - `range.rs` — `successor`/`prefix_upper_bound` for the listing range seek (UTF-8 byte order);
