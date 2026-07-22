@@ -467,10 +467,29 @@ check("GET ?replication after DELETE -> 404 ReplicationConfigurationNotFoundErro
       st == 404 and err_code(body) == "ReplicationConfigurationNotFoundError")
 alive("bkt-cfg", "after DELETE ?replication")
 
+# --- 6f.5 encryption (SSE-KMS Increment 2: default-encryption config) ----------------------------
+# ?encryption is a full PUT->GET->DELETE round-trip. Critically, DeleteBucketEncryption must NOT
+# reach the bare DELETE verb (destroying the bucket) — the fall-through guard — and must not clear a
+# management-plane mandatory-encryption flag (crypto-review F1), though bkt-cfg sets none here.
+ENC_XML = (b"<ServerSideEncryptionConfiguration><Rule>"
+           b"<ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm>"
+           b"</ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>")
+st, _, _ = raw("PUT", "/bkt-cfg", query="encryption", body=ENC_XML)
+check("PutBucketEncryption(AES256) -> 200", st == 200)
+st, _, body = raw("GET", "/bkt-cfg", query="encryption")
+check("GetBucketEncryption round-trips the default algorithm",
+      st == 200 and b"<SSEAlgorithm>AES256</SSEAlgorithm>" in body)
+st, _, _ = raw("DELETE", "/bkt-cfg", query="encryption")
+check("DeleteBucketEncryption -> 204", st == 204)
+st, _, body = raw("GET", "/bkt-cfg", query="encryption")
+check("GET ?encryption after DELETE -> 404 ServerSideEncryptionConfigurationNotFoundError",
+      st == 404 and err_code(body) == "ServerSideEncryptionConfigurationNotFoundError")
+alive("bkt-cfg", "after DELETE ?encryption")
+
 # --- 6g. the subresources Cairn does NOT implement -----------------------------------------------
 # Not "skipped": an unimplemented operation must answer a clean 501 NotImplemented, and — the
 # fall-through guard again — must NOT reach the bare verb underneath it.
-UNIMPLEMENTED = ["website", "encryption", "notification", "accelerate", "requestPayment",
+UNIMPLEMENTED = ["website", "notification", "accelerate", "requestPayment",
                  "logging", "analytics", "inventory", "metrics", "intelligent-tiering",
                  "policyStatus"]
 for sub in UNIMPLEMENTED:
