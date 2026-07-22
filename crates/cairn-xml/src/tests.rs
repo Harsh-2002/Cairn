@@ -407,6 +407,9 @@ fn list_multipart_uploads_shape() {
         user_metadata: vec![],
         sse_requested: false,
         encrypt_parts: false,
+        sse_kms_requested: false,
+        sse_kms_key_id: None,
+        sse_bucket_key_enabled: false,
         created_at: Timestamp(1_750_000_000_000),
         updated_at: Timestamp(1_750_000_000_000),
     };
@@ -448,6 +451,9 @@ fn list_multipart_uploads_truncated_emits_both_markers() {
         user_metadata: vec![],
         sse_requested: false,
         encrypt_parts: false,
+        sse_kms_requested: false,
+        sse_kms_key_id: None,
+        sse_bucket_key_enabled: false,
         created_at: Timestamp(1_750_000_000_000),
         updated_at: Timestamp(1_750_000_000_000),
     };
@@ -499,6 +505,9 @@ fn list_multipart_uploads_url_encoding_encodes_key_fields() {
         user_metadata: vec![],
         sse_requested: false,
         encrypt_parts: false,
+        sse_kms_requested: false,
+        sse_kms_key_id: None,
+        sse_bucket_key_enabled: false,
         created_at: Timestamp(1_750_000_000_000),
         updated_at: Timestamp(1_750_000_000_000),
     };

@@ -37,7 +37,8 @@ pub const BUCKET_COLS: &str =
 
 /// `multipart_uploads` columns in mapper order.
 pub const MULTIPART_COLS: &str = "id, bucket_name, key, content_type, status, owner_id, \
-     intended_acl, user_metadata, created_at, updated_at, sse_requested, encrypt_parts";
+     intended_acl, user_metadata, created_at, updated_at, sse_requested, encrypt_parts, \
+     sse_kms_requested, sse_kms_key_id, sse_bucket_key_enabled";
 
 /// `multipart_parts` columns in mapper order.
 pub const PART_COLS: &str = "part_number, size, etag, storage_path, checksum, part_dek";
@@ -284,6 +285,9 @@ pub fn multipart_from_row(row: &Row) -> Result<MultipartSession, MetaError> {
         updated_at: Timestamp(row.get_i64(9)),
         sse_requested: row.get_i64(10) != 0,
         encrypt_parts: row.get_i64(11) != 0,
+        sse_kms_requested: row.get_i64(12) != 0,
+        sse_kms_key_id: row.get_opt_text(13),
+        sse_bucket_key_enabled: row.get_i64(14) != 0,
     })
 }
 

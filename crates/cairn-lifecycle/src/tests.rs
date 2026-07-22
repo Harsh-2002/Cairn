@@ -134,6 +134,9 @@ async fn make_session(
         user_metadata: Vec::new(),
         sse_requested: false,
         encrypt_parts: false,
+        sse_kms_requested: false,
+        sse_kms_key_id: None,
+        sse_bucket_key_enabled: false,
         created_at: ts,
         updated_at: ts,
     };

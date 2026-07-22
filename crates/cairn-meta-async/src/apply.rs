@@ -77,8 +77,8 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
             driver
                 .execute(
                     "INSERT INTO multipart_uploads
-                     (id, bucket_name, key, content_type, status, owner_id, intended_acl, user_metadata, sse_requested, encrypt_parts, created_at, updated_at)
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                     (id, bucket_name, key, content_type, status, owner_id, intended_acl, user_metadata, sse_requested, encrypt_parts, sse_kms_requested, sse_kms_key_id, sse_bucket_key_enabled, created_at, updated_at)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
                     vec![
                         Value::Text(s.upload_id.as_str().to_owned()),
                         Value::Text(s.bucket.as_str().to_owned()),
@@ -90,6 +90,9 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
                         Value::Text(to_json(&s.user_metadata)),
                         Value::Int(s.sse_requested as i64),
                         Value::Int(s.encrypt_parts as i64),
+                        Value::Int(s.sse_kms_requested as i64),
+                        opt_text(s.sse_kms_key_id.clone()),
+                        Value::Int(s.sse_bucket_key_enabled as i64),
                         Value::Int(s.created_at.0),
                         Value::Int(s.updated_at.0),
                     ],

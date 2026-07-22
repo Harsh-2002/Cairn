@@ -568,6 +568,9 @@ async fn multipart_lifecycle_parity() {
             user_metadata: Vec::new(),
             sse_requested: false,
             encrypt_parts: false,
+            sse_kms_requested: false,
+            sse_kms_key_id: None,
+            sse_bucket_key_enabled: false,
             created_at: Timestamp(1),
             updated_at: Timestamp(1),
         };
@@ -627,6 +630,9 @@ async fn multipart_lifecycle_parity() {
             user_metadata: Vec::new(),
             sse_requested: false,
             encrypt_parts: false,
+            sse_kms_requested: false,
+            sse_kms_key_id: None,
+            sse_bucket_key_enabled: false,
             created_at: Timestamp(1),
             updated_at: Timestamp(1),
         })))
@@ -739,6 +745,9 @@ async fn multipart_part_encryption_parity() {
             user_metadata: Vec::new(),
             sse_requested: true,
             encrypt_parts: true,
+            sse_kms_requested: false,
+            sse_kms_key_id: None,
+            sse_bucket_key_enabled: false,
             created_at: Timestamp(1),
             updated_at: Timestamp(1),
         };
@@ -790,6 +799,44 @@ async fn multipart_part_encryption_parity() {
         let parts = s.list_parts(&upload, 0, 100).await.unwrap();
         let p2 = parts.items.iter().find(|p| p.part_number == 2).unwrap();
         assert_eq!(p2.part_dek, None);
+    }
+}
+
+/// v22 parity (ARCH 27, Increment 3b): the explicit-KMS intent fields (`sse_kms_requested`,
+/// `sse_kms_key_id`, `sse_bucket_key_enabled`) on a multipart session must round-trip identically
+/// through both backends. Guards the positional `MULTIPART_COLS[12..15]` mirror + the v22 migration
+/// in `cairn-meta-async`.
+#[tokio::test]
+async fn multipart_kms_intent_parity() {
+    let (a, b) = both().await;
+    for s in [&a as &dyn MetadataStore, &b as &dyn MetadataStore] {
+        let bk = BucketName::parse("kms").unwrap();
+        let upload = UploadId::from_string("kms-upload".into());
+        let session = MultipartSession {
+            upload_id: upload.clone(),
+            bucket: bk.clone(),
+            key: ObjectKey::parse("big").unwrap(),
+            content_type: "application/octet-stream".to_owned(),
+            status: MultipartStatus::Active,
+            owner_id: UserId("owner".to_owned()),
+            intended_acl: None,
+            user_metadata: Vec::new(),
+            sse_requested: false,
+            encrypt_parts: true,
+            sse_kms_requested: true,
+            sse_kms_key_id: Some("alias/my-key".to_owned()),
+            sse_bucket_key_enabled: true,
+            created_at: Timestamp(1),
+            updated_at: Timestamp(1),
+        };
+        s.submit(Mutation::CreateMultipart(Box::new(session)))
+            .await
+            .unwrap();
+        let got = s.get_multipart(&upload).await.unwrap().unwrap();
+        assert!(got.sse_kms_requested);
+        assert_eq!(got.sse_kms_key_id.as_deref(), Some("alias/my-key"));
+        assert!(got.sse_bucket_key_enabled);
+        assert!(!got.sse_requested);
     }
 }
 

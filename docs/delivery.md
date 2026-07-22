@@ -249,7 +249,8 @@ The indexes that carry the load are the unique index over bucket, key, and versi
 | GetObjectAttributes | Yes | |
 | Presigned GET and PUT | Yes | SigV4 query form. |
 | Signed public-read URL | Yes | A Cairn extension, not an S3 operation. |
-| Object-level SSE-S3 (`x-amz-server-side-encryption: AES256`) | Yes | Accepted on writes and echoed on reads, with the per-object data-encryption key sealed under the master key; a per-bucket default-encryption setting applies it to new uploads that carry no SSE header. `aws:kms` is rejected as unsupported. |
+| Object-level SSE-S3 (`x-amz-server-side-encryption: AES256`) | Yes | Accepted on writes and echoed on reads, with the per-object data-encryption key sealed under the master key; a per-bucket default-encryption setting applies it to new uploads that carry no SSE header. |
+| Object-level SSE-KMS (`x-amz-server-side-encryption: aws:kms`) | Yes | Accepted on single-part and multipart writes (including at `CreateMultipartUpload`) and on the bucket default; the key id is echoed on reads and the optional allow-list (`CAIRN_KMS_KEY_IDS`) gates writes, failing closed at initiate. Label-only: every DEK is sealed under the master key regardless of the key id — the key id is a label, not distinct key material or external-KMS isolation. |
 | GetBucketEncryption, PutBucketEncryption (the `?encryption` subresource) | No | The REST subresource returns not implemented; default encryption is set through the management plane. |
 | Object lock and retention, requester pays, website and accelerate and analytics and inventory and metrics configurations | No | Out of scope; requests are answered as not implemented. |
 
