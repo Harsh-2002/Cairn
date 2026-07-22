@@ -426,6 +426,80 @@ async fn encrypted_roundtrip_etag_invariant_and_ranged() {
     );
 }
 
+/// The on-disk form of an encrypted blob is the CRNB **encrypted** variant, not merely a
+/// transformed plaintext blob: the stored file's trailer version byte is `VERSION_ENCRYPTED`, a
+/// DEK-less open through the store FAILS (the reader refuses an encrypted container without a key),
+/// and the read handle offers NO zero-copy hint (so ciphertext can never reach the sendfile fast
+/// path). This is stronger than "physical != logical" — a compressed *plaintext* blob also differs
+/// from its logical bytes, so size/version framing alone would not prove encryption.
+#[tokio::test]
+async fn encrypted_blob_on_disk_is_encrypted_variant_and_no_zero_copy() {
+    // The 34-byte CRNB trailer sits at the end of the file; the version byte is at trailer offset 4
+    // and `2` marks the encrypted variant (see `cairn-blob/src/compress.rs`).
+    const TRAILER_LEN: usize = 34;
+    const VERSION_ENCRYPTED: u8 = 2;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let b = BucketName::parse("bkt").unwrap();
+    let data: Vec<u8> = b"encrypt me at rest "
+        .iter()
+        .copied()
+        .cycle()
+        .take(9_000)
+        .collect();
+    let policy = CompressionPolicy {
+        algorithm: CompressionAlgorithm::Zstd,
+        block_size: 1024,
+    };
+    let dek = [0x5au8; 32];
+
+    let enc = store
+        .stage(
+            &b,
+            chunked_body(data.clone(), 512),
+            opts_encrypted(Some(policy), "text/plain", dek),
+        )
+        .await
+        .unwrap();
+
+    // (1) Opening with the correct DEK decrypts back to the exact plaintext.
+    assert_eq!(
+        read_all_dek(&store, &enc.storage_path, None, Some(dek), &enc.compression)
+            .await
+            .unwrap(),
+        data
+    );
+
+    // (2) The stored file on disk is the CRNB encrypted variant (version byte == 2).
+    let on_disk = dir.path().join(enc.storage_path.as_str());
+    let raw = std::fs::read(&on_disk).unwrap();
+    let trailer = &raw[raw.len() - TRAILER_LEN..];
+    assert_eq!(&trailer[0..4], b"CRNB", "stored blob is a CRNB container");
+    assert_eq!(
+        trailer[4], VERSION_ENCRYPTED,
+        "stored blob is the ENCRYPTED CRNB variant, not a compressed-plaintext one"
+    );
+
+    // (3) A DEK-less open FAILS — the reader refuses an encrypted container with no key rather than
+    // handing back ciphertext or plaintext (fails closed).
+    let no_dek = read_all_dek(&store, &enc.storage_path, None, None, &enc.compression).await;
+    assert!(
+        matches!(no_dek, Err(cairn_types::error::BlobError::Corruption(_))),
+        "a DEK-less open of an encrypted blob must fail, got {no_dek:?}"
+    );
+
+    // (4) An encrypted blob offers no zero-copy hint: ciphertext can never reach the sendfile path.
+    assert!(
+        store
+            .open_with_dek(&enc.storage_path, None, Some(dek), &enc.compression)
+            .await
+            .unwrap()
+            .zero_copy
+            .is_none()
+    );
+}
+
 /// An encrypted object encrypts even when the bucket has no compression policy: SSE flows through
 /// the block container with `CompressionAlgorithm::None`, and the wrong DEK (or no DEK) fails to
 /// decrypt rather than leaking plaintext.

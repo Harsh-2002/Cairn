@@ -46,6 +46,12 @@ pub struct S3Service {
     crypto: Arc<dyn Crypto>,
     region: String,
     max_object_size: u64,
+    /// Whether every committed object is transparently encrypted at rest even when the client did
+    /// not ask for SSE and no bucket default applies (`CAIRN_ENCRYPT_AT_REST`, ARCH 27). When set,
+    /// `resolve_object_encryption` mints an `AtRest` DEK for an otherwise-plaintext write — stored
+    /// encrypted, but advertised as nothing. Off by default; wired via
+    /// [`with_encrypt_at_rest`](Self::with_encrypt_at_rest).
+    encrypt_at_rest: bool,
     /// Invoked after a write commits replication outbox entries, so the replication worker drains
     /// within milliseconds instead of waiting out its poll interval. A runtime-agnostic wake
     /// callback (the server wires it to its drain notifier), keeping this crate free of any async
@@ -81,8 +87,19 @@ impl S3Service {
             crypto,
             region,
             max_object_size,
+            encrypt_at_rest: false,
             replication_wake: None,
         }
+    }
+
+    /// Enable transparent at-rest encryption for every committed object (`CAIRN_ENCRYPT_AT_REST`,
+    /// ARCH 27): a write with no explicit SSE header and no bucket default is still stored encrypted
+    /// under a freshly-minted `AtRest` DEK, but advertises no `x-amz-server-side-encryption`.
+    /// Default off.
+    #[must_use]
+    pub fn with_encrypt_at_rest(mut self, on: bool) -> Self {
+        self.encrypt_at_rest = on;
+        self
     }
 
     /// Attach a replication-drain wake callback: after a write commits replication outbox entries
@@ -675,19 +692,39 @@ impl S3Service {
         // it under the master key for the metadata row. The plaintext-MD5 ETag is unaffected
         // because the blob store hashes the plaintext before any transform. Without a header, the
         // bucket's default-encryption setting (the `encryption` config aspect) decides.
-        let want_sse = match requested_sse(&req) {
+        let explicit_sse = match requested_sse(&req) {
             Some(Ok(())) => true,
             Some(Err(e)) => return Err(e),
-            None => self.bucket_default_sse(&bucket.name).await?,
+            None => false,
         };
-        // Mandatory encryption (the `encryption` aspect's `required` flag): the bucket must hold no
-        // plaintext object. A client PUT whose resolved encryption is "none" is refused; an inbound
-        // replica is instead transparently force-encrypted (never refused), so turning on
-        // mandatory-SSE can never break replication into the bucket — the replica arrives without an
-        // SSE header but is still stored encrypted, honouring the policy.
-        let want_sse = if !want_sse && self.bucket_sse_required(&bucket.name).await? {
+        // Resolve the encryption plan (explicit header > bucket default > transparent at-rest > none).
+        let mut plan = self
+            .resolve_object_encryption(&bucket.name, explicit_sse)
+            .await?;
+        // Mandatory encryption (the `encryption` aspect's `required` flag) is a CLIENT-facing
+        // contract: a client PUT to the bucket must carry SSE. Transparent at-rest encryption
+        // satisfies the *data* goal (nothing plaintext on disk) but NOT the contract — an `AtRest`
+        // object advertises nothing, so a client relying on the required-bucket policy would neither
+        // be forced to send SSE nor see it acknowledged. So the reject fires whenever the resolved
+        // plan is not an ADVERTISED SSE mode (plaintext OR AtRest), not merely plaintext. The
+        // `!advertised` guard preserves the short-circuit so a non-encrypted PUT to an ordinary
+        // bucket still reads the config at most once. An inbound replica is never refused: if it
+        // resolved to plaintext it is force-encrypted (SSE-S3); if it already resolved to `AtRest`
+        // (at-rest on) it stays encrypted as-is.
+        let advertised_plan = plan
+            .descriptor_json
+            .as_deref()
+            .and_then(advertised_sse)
+            .is_some();
+        if !advertised_plan && self.bucket_sse_required(&bucket.name).await? {
             if is_replica {
-                true
+                if plan.dek.is_none() {
+                    let (dek, descriptor) = self.new_sse_dek()?;
+                    plan = EncryptionPlan {
+                        dek: Some(dek),
+                        descriptor_json: Some(descriptor),
+                    };
+                }
             } else {
                 return Err(Error::InvalidRequest(
                     "this bucket requires server-side encryption: send \
@@ -695,15 +732,9 @@ impl S3Service {
                         .to_owned(),
                 ));
             }
-        } else {
-            want_sse
-        };
-        let (sse_dek, sse_descriptor) = if want_sse {
-            let (dek, descriptor) = self.new_sse_dek()?;
-            (Some(dek), Some(descriptor))
-        } else {
-            (None, None)
-        };
+        }
+        let sse_dek = plan.dek;
+        let sse_descriptor = plan.descriptor_json;
 
         // The declared payload length for preallocation (ARCH 7.5): for a SigV4-streaming upload
         // the client sends the real payload length in `x-amz-decoded-content-length` (the
@@ -926,9 +957,11 @@ impl S3Service {
                 if versioned {
                     resp = resp.with_header("x-amz-version-id", version_id.as_str());
                 }
-                // Echo the SSE algorithm on the PUT response for an encrypted object (ARCH 27).
-                if sse_descriptor.is_some() {
-                    resp = resp.with_header("x-amz-server-side-encryption", SSE_AES256);
+                // Echo the SSE algorithm on the PUT response for an explicitly-requested/default
+                // encrypted object (ARCH 27). A transparent `AtRest` object advertises nothing —
+                // `advertised_sse` keys on the descriptor mode.
+                if let Some(alg) = sse_descriptor.as_deref().and_then(advertised_sse) {
+                    resp = resp.with_header("x-amz-server-side-encryption", alg);
                 }
                 // Echo any computed checksum so a modern SDK can verify the upload (ARCH 21.1).
                 resp = append_checksum_headers(resp, &staged.checksums);
@@ -1681,15 +1714,18 @@ impl S3Service {
             _ => return Err(Error::NoSuchUpload),
         };
 
-        // SSE-S3 (ARCH 27): honor the encryption intent captured at initiate — mint a fresh DEK and
-        // hand it to `assemble`, which compress-then-encrypts each block, then seal the descriptor for
-        // the row, so a multipart object is encrypted at rest exactly like a single-part PUT.
-        let (sse_dek, sse_descriptor) = if session.sse_requested {
-            let (dek, descriptor) = self.new_sse_dek()?;
-            (Some(dek), Some(descriptor))
-        } else {
-            (None, None)
-        };
+        // SSE (ARCH 27): resolve the assembled object's encryption exactly like a single-part PUT,
+        // honoring the intent captured at initiate. `sse_requested` is true when the client asked for
+        // AES256 or the bucket had a default at initiate — both `SseS3` (advertised); otherwise the
+        // resolver falls through to transparent at-rest (`AtRest`, not advertised) when enabled, or
+        // plaintext. The DEK is handed to `assemble`, which compress-then-encrypts each block, and the
+        // descriptor is sealed onto the row. Multipart *parts* stage plaintext for the in-flight
+        // window; the assembled object is encrypted here.
+        let plan = self
+            .resolve_object_encryption(&bucket.name, session.sse_requested)
+            .await?;
+        let sse_dek = plan.dek;
+        let sse_descriptor = plan.descriptor_json;
         // A FULL_OBJECT plan (CRC64NVME, or an explicitly-requested whole-object type) needs the
         // assembler to recompute the checksum over the concatenated plaintext; a COMPOSITE plan is
         // computed by us from the per-part digests and needs no extra work here.
@@ -1835,8 +1871,8 @@ impl S3Service {
                 if versioned {
                     resp = resp.with_header("x-amz-version-id", version_id.as_str());
                 }
-                if sse_descriptor.is_some() {
-                    resp = resp.with_header("x-amz-server-side-encryption", "AES256");
+                if let Some(alg) = sse_descriptor.as_deref().and_then(advertised_sse) {
+                    resp = resp.with_header("x-amz-server-side-encryption", alg);
                 }
                 Ok(resp)
             }
@@ -2081,12 +2117,30 @@ impl S3Service {
                     r.map_err(|e| cairn_types::error::BodyError::Transport(e.to_string()))
                 }))
             };
+        // Resolve the DESTINATION's encryption independently of the source (a copy re-encrypts under
+        // a fresh DEK): an explicit `x-amz-server-side-encryption` header on the copy request, else
+        // the dest bucket's default, else transparent at-rest, else plaintext (ARCH 27).
+        let explicit_sse = match requested_sse(req) {
+            Some(Ok(())) => true,
+            Some(Err(e)) => return Err(e),
+            None => false,
+        };
+        let dest_plan = self
+            .resolve_object_encryption(&dest_bucket.name, explicit_sse)
+            .await?;
+        // Capture the SSE header to echo on the copy response BEFORE the descriptor is moved into the
+        // mutation below — a copy whose destination is SseS3 (explicit header or bucket default) must
+        // advertise it, exactly as PUT does. `AtRest` advertises nothing.
+        let dest_sse_header = dest_plan
+            .descriptor_json
+            .as_deref()
+            .and_then(advertised_sse);
         let opts = StageOptions {
             compression: dest_bucket.compression,
             extra_checksums: ChecksumSet::none(),
             size_ceiling: self.max_object_size,
             content_type: content_type.clone(),
-            encryption: None,
+            encryption: dest_plan.dek,
             // The source object's plaintext size is known, so preallocate the destination blob.
             content_length: Some(src_row.size_logical),
         };
@@ -2142,8 +2196,9 @@ impl S3Service {
             user_metadata: user_meta,
             acl: None,
             checksums: staged.checksums.clone(),
-            // The copy destination is stored unencrypted (SSE on copy is out of scope here).
-            sse_descriptor: None,
+            // The copy destination's own encryption descriptor (a fresh DEK per the resolver above);
+            // `None` when the plan resolved to plaintext.
+            sse_descriptor: dest_plan.descriptor_json,
             replication_status: None,
             created_at: now,
             updated_at: now,
@@ -2229,6 +2284,9 @@ impl S3Service {
                 let body = cairn_xml::copy_object_result(&staged.etag, now);
                 let mut resp = S3Response::xml(StatusCode::OK, body)
                     .with_header("x-amz-request-id", &req.request_id);
+                if let Some(alg) = dest_sse_header {
+                    resp = resp.with_header("x-amz-server-side-encryption", alg);
+                }
                 if versioned {
                     resp = resp.with_header("x-amz-version-id", version_id.as_str());
                 }
@@ -4272,6 +4330,9 @@ fn quoted(etag: &ETag) -> String {
 
 /// The S3 algorithm token for SSE-S3 (the only server-side-encryption mode Cairn implements).
 const SSE_AES256: &str = "AES256";
+/// The S3 algorithm token for SSE-KMS (advertised for a `Kms`-mode descriptor; minted in Increment
+/// 2 — Increment 1 never produces one, but `advertised_sse` maps it exhaustively).
+const SSE_AWS_KMS: &str = "aws:kms";
 /// The algorithm recorded in the per-object SSE descriptor.
 const SSE_DESCRIPTOR_ALG: &str = "AES256-GCM";
 
@@ -4313,6 +4374,40 @@ struct SseDescriptor {
     mode: SseMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     kms_key_id: Option<String>,
+}
+
+/// The resolved encryption for a committed-object write: the raw DEK handed to the blob store
+/// (`None` = plaintext blocks) and the JSON `sse_descriptor` persisted on the object row (`None` =
+/// no descriptor). The two are always both-`Some` or both-`None`. Produced by
+/// [`S3Service::resolve_object_encryption`].
+struct EncryptionPlan {
+    dek: Option<[u8; 32]>,
+    descriptor_json: Option<String>,
+}
+
+impl EncryptionPlan {
+    /// The plaintext plan: no DEK, no descriptor.
+    fn none() -> Self {
+        Self {
+            dek: None,
+            descriptor_json: None,
+        }
+    }
+}
+
+/// The `x-amz-server-side-encryption` header value to advertise for a stored `sse_descriptor`, or
+/// `None` to advertise nothing. Keyed on the descriptor's `mode` (ARCH 27): `SseS3` advertises
+/// `AES256`; `AtRest` advertises nothing (transparent operator encryption the client never asked
+/// for); `Kms` advertises `aws:kms` (Increment 2 — Increment 1 never mints it). A malformed
+/// descriptor advertises nothing rather than failing the response.
+fn advertised_sse(descriptor_json: &str) -> Option<&'static str> {
+    serde_json::from_str::<SseDescriptor>(descriptor_json)
+        .ok()
+        .and_then(|d| match d.mode {
+            SseMode::SseS3 => Some(SSE_AES256),
+            SseMode::AtRest => None,
+            SseMode::Kms => Some(SSE_AWS_KMS),
+        })
 }
 
 /// Whether the request asks for SSE-S3 via `x-amz-server-side-encryption: AES256`. Any other value
@@ -4370,8 +4465,22 @@ impl S3Service {
     }
 
     /// Generate a fresh random 32-byte DEK, seal it under the master key, and return both the raw
-    /// DEK (for staging) and the JSON descriptor string (for the metadata row).
+    /// DEK (for staging) and the JSON descriptor string (for the metadata row). Mints an SSE-S3
+    /// descriptor (the mode a client explicitly asks for, or a bucket default); the transparent
+    /// at-rest path calls [`new_sse_dek_mode`](Self::new_sse_dek_mode) with [`SseMode::AtRest`].
     fn new_sse_dek(&self) -> Result<([u8; 32], String)> {
+        self.new_sse_dek_mode(SseMode::SseS3, None)
+    }
+
+    /// As [`new_sse_dek`](Self::new_sse_dek) but stamps the descriptor's `mode` (and optional KMS
+    /// key id): the mode is the advertising discriminator — `SseS3` advertises `AES256`, `AtRest`
+    /// advertises nothing (transparent operator encryption), `Kms` advertises `aws:kms` (Increment
+    /// 2). The sealed DEK envelope itself is identical across modes (label-only, ARCH 27).
+    fn new_sse_dek_mode(
+        &self,
+        mode: SseMode,
+        kms_key_id: Option<String>,
+    ) -> Result<([u8; 32], String)> {
         use rand::RngCore;
         let mut dek = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut dek);
@@ -4384,14 +4493,48 @@ impl S3Service {
             // on its presence.
             wrapped_dek_b64: base64::engine::general_purpose::STANDARD.encode(&sealed.ciphertext),
             nonce_b64: String::new(),
-            // Increment 0 mints only SSE-S3 descriptors (both default, so serialized byte-identically
-            // to a legacy descriptor). Increment 1 threads AtRest/Kms + a key id through here.
-            mode: SseMode::SseS3,
-            kms_key_id: None,
+            mode,
+            kms_key_id,
         };
         let json = serde_json::to_string(&descriptor)
             .map_err(|e| Error::Internal(format!("serialize sse descriptor: {e}")))?;
         Ok((dek, json))
+    }
+
+    /// Resolve the encryption plan for a committed-object write into a bucket, given whether the
+    /// client explicitly requested SSE-S3 (`x-amz-server-side-encryption: AES256`). Priority,
+    /// highest first (ARCH 27):
+    ///   1. explicit client SSE-S3 header — mint an `SseS3` descriptor (advertised `AES256`);
+    ///   2. bucket default-encryption (the `encryption` config aspect) — `SseS3`, advertised;
+    ///   3. [`encrypt_at_rest`](Self::encrypt_at_rest) — mint an `AtRest` descriptor, **not**
+    ///      advertised (transparent operator storage encryption the client never asked for);
+    ///   4. otherwise no encryption (plaintext blocks, no descriptor).
+    ///
+    /// Mandatory encryption (`bucket_sse_required`) is handled by the caller *after* this resolver:
+    /// when the plan is plaintext and the bucket requires SSE, a client PUT is refused and an inbound
+    /// replica force-encrypted — see `put_object`.
+    async fn resolve_object_encryption(
+        &self,
+        bucket: &BucketName,
+        explicit_sse: bool,
+    ) -> Result<EncryptionPlan> {
+        let mode = if explicit_sse || self.bucket_default_sse(bucket).await? {
+            Some(SseMode::SseS3)
+        } else if self.encrypt_at_rest {
+            Some(SseMode::AtRest)
+        } else {
+            None
+        };
+        match mode {
+            Some(m) => {
+                let (dek, descriptor) = self.new_sse_dek_mode(m, None)?;
+                Ok(EncryptionPlan {
+                    dek: Some(dek),
+                    descriptor_json: Some(descriptor),
+                })
+            }
+            None => Ok(EncryptionPlan::none()),
+        }
     }
 
     /// Unwrap the raw 32-byte DEK from a stored `sse_descriptor` JSON document by opening the
@@ -4448,9 +4591,10 @@ fn object_headers(resp: S3Response, row: &ObjectVersionRow) -> S3Response {
     if let Some(v) = &row.expires {
         resp = resp.with_header("expires", v.clone());
     }
-    // Echo the SSE algorithm on GET/HEAD for a server-side-encrypted object (ARCH 27).
-    if row.sse_descriptor.is_some() {
-        resp = resp.with_header("x-amz-server-side-encryption", SSE_AES256);
+    // Echo the SSE algorithm on GET/HEAD for a server-side-encrypted object (ARCH 27). A
+    // transparent `AtRest` object advertises nothing — `advertised_sse` keys on the descriptor mode.
+    if let Some(alg) = row.sse_descriptor.as_deref().and_then(advertised_sse) {
+        resp = resp.with_header("x-amz-server-side-encryption", alg);
     }
     if let CompressionDescriptor::Compressed { .. } = row.compression {
         // The physical form is hidden from clients; nothing leaks here.

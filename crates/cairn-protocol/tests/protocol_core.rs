@@ -100,6 +100,33 @@ async fn harness_sharded(shards: usize) -> Harness {
     }
 }
 
+/// A harness whose service has transparent at-rest encryption (`CAIRN_ENCRYPT_AT_REST`) enabled, so
+/// every committed object with no SSE header / bucket default is still stored encrypted (`AtRest`).
+async fn harness_encrypt_at_rest() -> Harness {
+    let dir = tempfile::tempdir().unwrap();
+    let meta: Arc<dyn MetadataStore> = Arc::new(cairn_meta::open_in_memory().unwrap());
+    let blob: Arc<dyn BlobStore> =
+        Arc::new(cairn_blob::LocalBlobStore::open(dir.path()).await.unwrap());
+    let clock = Arc::new(cairn_types::testing::TestClock::default());
+    let crypto: Arc<dyn cairn_types::traits::Crypto> =
+        Arc::new(cairn_crypto::SystemCrypto::new([7u8; 32]));
+    let svc = S3Service::new(
+        meta.clone(),
+        blob,
+        Arc::new(cairn_types::testing::AllowAll),
+        clock,
+        crypto,
+        "us-east-1".to_owned(),
+        5 * 1024 * 1024 * 1024,
+    )
+    .with_encrypt_at_rest(true);
+    Harness {
+        svc,
+        meta,
+        _dir: dir,
+    }
+}
+
 fn req(
     method: Method,
     bucket: Option<&str>,
@@ -6682,6 +6709,80 @@ async fn mandatory_sse_denies_plaintext_but_exempts_replicas() {
     );
 }
 
+/// A `required:true`-without-algorithm bucket must STILL refuse a plaintext client PUT even when
+/// `CAIRN_ENCRYPT_AT_REST` is on. Transparent at-rest encryption satisfies the data goal but not the
+/// client-facing required-bucket contract (an `AtRest` object advertises nothing), so the reject must
+/// fire — the client is required to send SSE. (Crypto-review F1: pre-fix, at-rest silently accepted
+/// the PUT because the plan carried a DEK.)
+#[tokio::test]
+async fn mandatory_sse_still_refuses_plaintext_client_put_with_at_rest_on() {
+    use cairn_types::bucket::{ConfigAspect, ConfigDoc};
+    use cairn_types::meta::Mutation;
+    let h = harness_encrypt_at_rest().await;
+
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("must"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    h.meta
+        .submit(Mutation::SetBucketConfig {
+            bucket: BucketName::parse("must").unwrap(),
+            aspect: ConfigAspect::Encryption,
+            doc: Some(ConfigDoc(r#"{"required":true}"#.to_owned())),
+        })
+        .await
+        .unwrap();
+
+    // A header-less client PUT: at-rest would encrypt it as `AtRest`, but the required-bucket
+    // contract demands the CLIENT send SSE — so it is still refused with 400.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("must"),
+                Some("plain"),
+                &[],
+                &[],
+                b"x".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::BAD_REQUEST,
+        "at-rest must NOT let a required bucket silently accept a plaintext client PUT"
+    );
+
+    // An explicit SSE-S3 PUT is accepted (satisfies the contract, advertised).
+    let (st, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("must"),
+                Some("sealed"),
+                &[],
+                &[("x-amz-server-side-encryption", "AES256")],
+                b"x".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        header(&hdrs, "x-amz-server-side-encryption"),
+        Some("AES256")
+    );
+}
+
 /// Resource regression (ARCH 7.5, audit #11): a PUT declaring a `content-length` above the
 /// configured object-size ceiling is refused on the HEADER alone — before any body is staged — so a
 /// client cannot pin server memory or disk by declaring a huge object. The harness ceiling is 5 GiB.
@@ -9800,4 +9901,442 @@ async fn multipart_inconsistent_present_algorithms_is_invalid_request() {
         StatusCode::BAD_REQUEST,
         "inconsistent present part algorithms must be InvalidRequest"
     );
+}
+
+/// Read the stored `sse_descriptor` (JSON) of a key's current version, or `None` if unencrypted.
+async fn stored_descriptor(h: &Harness, bucket: &str, key: &str) -> Option<String> {
+    h.meta
+        .current_version(
+            &BucketName::parse(bucket).unwrap(),
+            &ObjectKey::parse(key).unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .sse_descriptor
+}
+
+/// The `mode` field of a stored descriptor JSON: `Some("at-rest")` for transparent at-rest, `None`
+/// when the field is absent (a plain SSE-S3 descriptor serializes without it).
+fn descriptor_mode(descriptor_json: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(descriptor_json)
+        .unwrap()
+        .get("mode")
+        .and_then(|m| m.as_str())
+        .map(str::to_owned)
+}
+
+/// With `CAIRN_ENCRYPT_AT_REST` on, a plain PUT (no SSE header) round-trips, is stored ENCRYPTED
+/// with an `AtRest`-mode descriptor, and does NOT advertise `x-amz-server-side-encryption` on
+/// PUT/GET/HEAD (transparent operator encryption). An explicit SSE-S3 PUT in the same bucket IS
+/// advertised (`AES256`) and stores an SSE-S3 (mode-absent) descriptor.
+#[tokio::test]
+async fn at_rest_transparent_encryption_stores_encrypted_but_does_not_advertise() {
+    let h = harness_encrypt_at_rest().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("enc"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+
+    // A plain PUT with no SSE header.
+    let payload = b"transparent at-rest payload".to_vec();
+    let (st, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("enc"),
+                Some("plain.txt"),
+                &[],
+                &[("content-type", "text/plain")],
+                payload.clone(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        header(&hdrs, "x-amz-server-side-encryption"),
+        None,
+        "a transparent at-rest object must NOT advertise SSE on the PUT response"
+    );
+
+    // Stored encrypted: the descriptor is present and its mode is `at-rest`.
+    let desc = stored_descriptor(&h, "enc", "plain.txt")
+        .await
+        .expect("at-rest object stores an sse_descriptor");
+    assert_eq!(descriptor_mode(&desc).as_deref(), Some("at-rest"));
+
+    // GET round-trips the exact bytes and advertises nothing.
+    let (st, hdrs, got) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("enc"),
+                Some("plain.txt"),
+                &[],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(got, payload, "at-rest encryption is transparent on read");
+    assert_eq!(
+        header(&hdrs, "x-amz-server-side-encryption"),
+        None,
+        "GET of a transparent at-rest object must NOT advertise SSE"
+    );
+
+    // HEAD likewise advertises nothing.
+    let (st, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::HEAD,
+                Some("enc"),
+                Some("plain.txt"),
+                &[],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(header(&hdrs, "x-amz-server-side-encryption"), None);
+
+    // An EXPLICIT SSE-S3 PUT in the same bucket IS advertised and stores an SSE-S3 descriptor.
+    let (st, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("enc"),
+                Some("explicit.txt"),
+                &[],
+                &[("x-amz-server-side-encryption", "AES256")],
+                b"explicit sse".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        header(&hdrs, "x-amz-server-side-encryption"),
+        Some("AES256"),
+        "an explicitly-requested SSE-S3 object IS advertised"
+    );
+    let desc = stored_descriptor(&h, "enc", "explicit.txt").await.unwrap();
+    assert_eq!(
+        descriptor_mode(&desc),
+        None,
+        "an SSE-S3 descriptor serializes without a `mode` field (advertised as AES256)"
+    );
+    let (_, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("enc"),
+                Some("explicit.txt"),
+                &[],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        header(&hdrs, "x-amz-server-side-encryption"),
+        Some("AES256"),
+        "GET of an explicit SSE-S3 object advertises AES256"
+    );
+}
+
+/// With at-rest encryption OFF (the default), a plain PUT stores PLAINTEXT — no descriptor, nothing
+/// advertised — unchanged from before the feature.
+#[tokio::test]
+async fn at_rest_off_stores_plaintext() {
+    let h = harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("plainb"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    let (st, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("plainb"),
+                Some("k.txt"),
+                &[],
+                &[],
+                b"unencrypted".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(header(&hdrs, "x-amz-server-side-encryption"), None);
+    assert_eq!(
+        stored_descriptor(&h, "plainb", "k.txt").await,
+        None,
+        "with at-rest off a plain PUT stores no sse_descriptor"
+    );
+}
+
+/// Fails closed: an encrypted object whose DEK cannot be unwrapped (the master key that sealed it is
+/// gone) errors on GET rather than returning plaintext or zeros. Modeled by writing under one master
+/// key and reading through a service holding a different key, sharing the same metadata + blob.
+#[tokio::test]
+async fn encrypted_object_unopenable_dek_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let meta: Arc<dyn MetadataStore> = Arc::new(cairn_meta::open_in_memory().unwrap());
+    let blob: Arc<dyn BlobStore> =
+        Arc::new(cairn_blob::LocalBlobStore::open(dir.path()).await.unwrap());
+    let clock = Arc::new(cairn_types::testing::TestClock::default());
+    let mk = |key: [u8; 32], at_rest: bool| {
+        S3Service::new(
+            meta.clone(),
+            blob.clone(),
+            Arc::new(cairn_types::testing::AllowAll),
+            clock.clone(),
+            Arc::new(cairn_crypto::SystemCrypto::new(key)) as Arc<dyn cairn_types::traits::Crypto>,
+            "us-east-1".to_owned(),
+            5 * 1024 * 1024 * 1024,
+        )
+        .with_encrypt_at_rest(at_rest)
+    };
+    let writer = mk([1u8; 32], true);
+    let reader = mk([2u8; 32], false); // a different master key can never unwrap the DEK
+
+    // A distinctive plaintext token that does NOT appear in the key/bucket names, so an error
+    // response echoing the resource path can't be mistaken for a plaintext leak.
+    const TOKEN: &[u8] = b"ZZUNIQUEPLAINTEXTTOKENZZ";
+    drain(
+        send(
+            &writer,
+            req(Method::PUT, Some("failc"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    let (st, _, _) = drain(
+        send(
+            &writer,
+            req(
+                Method::PUT,
+                Some("failc"),
+                Some("obj.bin"),
+                &[],
+                &[],
+                TOKEN.to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let (st, _, body) = drain(
+        send(
+            &reader,
+            req(
+                Method::GET,
+                Some("failc"),
+                Some("obj.bin"),
+                &[],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_ne!(st, StatusCode::OK, "an unopenable DEK must fail the GET");
+    assert!(
+        !body.windows(TOKEN.len()).any(|w| w == TOKEN),
+        "a fail-closed GET must never leak plaintext, got {body:?}"
+    );
+    assert!(
+        body.iter().any(|&b| b != 0),
+        "a fail-closed GET must never return zeros"
+    );
+}
+
+/// With at-rest encryption on, both a CopyObject destination and a completed multipart object are
+/// stored encrypted (`AtRest` descriptor) and round-trip on GET.
+#[tokio::test]
+async fn at_rest_copy_and_multipart_are_encrypted() {
+    let h = harness_encrypt_at_rest().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("encb"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+
+    // Seed a source object, then server-side copy it within the same at-rest bucket.
+    let src_body = b"copy me while encrypting".to_vec();
+    drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("encb"),
+                Some("src.bin"),
+                &[],
+                &[],
+                src_body.clone(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("encb"),
+                Some("dst.bin"),
+                &[],
+                &[("x-amz-copy-source", "/encb/src.bin")],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let desc = stored_descriptor(&h, "encb", "dst.bin")
+        .await
+        .expect("copy destination stores an sse_descriptor under at-rest");
+    assert_eq!(descriptor_mode(&desc).as_deref(), Some("at-rest"));
+    let (st, _, got) = drain(
+        send(
+            &h.svc,
+            req(Method::GET, Some("encb"), Some("dst.bin"), &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(got, src_body, "copied at-rest object round-trips");
+
+    // Multipart: initiate, upload two parts, complete — the assembled object is encrypted.
+    let body_s = String::from_utf8(
+        drain(
+            send(
+                &h.svc,
+                req(
+                    Method::POST,
+                    Some("encb"),
+                    Some("mp.bin"),
+                    &[("uploads", "")],
+                    &[],
+                    vec![],
+                ),
+            )
+            .await,
+        )
+        .await
+        .2,
+    )
+    .unwrap();
+    let upload_id = between(&body_s, "<UploadId>", "</UploadId>");
+    let part1 = vec![b'z'; 5 * 1024 * 1024];
+    let part2 = b"-encrypted-tail".to_vec();
+    let (_, h1, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("encb"),
+                Some("mp.bin"),
+                &[("uploadId", upload_id.as_str()), ("partNumber", "1")],
+                &[],
+                part1.clone(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    let etag1 = header(&h1, "etag").unwrap().to_owned();
+    let (_, h2, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("encb"),
+                Some("mp.bin"),
+                &[("uploadId", upload_id.as_str()), ("partNumber", "2")],
+                &[],
+                part2.clone(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    let etag2 = header(&h2, "etag").unwrap().to_owned();
+    let complete = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag1}</ETag></Part>\
+         <Part><PartNumber>2</PartNumber><ETag>{etag2}</ETag></Part></CompleteMultipartUpload>"
+    );
+    let (st, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::POST,
+                Some("encb"),
+                Some("mp.bin"),
+                &[("uploadId", upload_id.as_str())],
+                &[],
+                complete.into_bytes(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        header(&hdrs, "x-amz-server-side-encryption"),
+        None,
+        "a transparent at-rest multipart object does not advertise SSE"
+    );
+    let desc = stored_descriptor(&h, "encb", "mp.bin")
+        .await
+        .expect("assembled multipart object stores an sse_descriptor under at-rest");
+    assert_eq!(descriptor_mode(&desc).as_deref(), Some("at-rest"));
+    let (st, _, got) = drain(
+        send(
+            &h.svc,
+            req(Method::GET, Some("encb"), Some("mp.bin"), &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let mut expected = part1;
+    expected.extend_from_slice(&part2);
+    assert_eq!(got, expected, "assembled at-rest object round-trips");
 }

@@ -514,6 +514,7 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
         cfg.region.clone(),
         cfg.max_object_size,
     )
+    .with_encrypt_at_rest(cfg.encrypt_at_rest)
     .with_replication_wake({
         let n = replication_notify.clone();
         Arc::new(move || n.notify_one())

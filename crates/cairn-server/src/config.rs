@@ -295,6 +295,17 @@ pub struct Config {
     /// `false` to shrink the attack surface if no SDK/Terraform client needs the standard mint.
     pub sts_enabled: bool,
 
+    /// Whether every committed object is transparently encrypted at rest, even when the client did
+    /// not request server-side encryption (`CAIRN_ENCRYPT_AT_REST`, ARCH 27). Off by default. When
+    /// on, a PUT/copy/multipart-completion with no SSE header and no bucket default-encryption still
+    /// mints a per-object DEK (sealed under the master key) and stores the blob encrypted — but the
+    /// object advertises **no** `x-amz-server-side-encryption` (it is an operator storage property,
+    /// not an SSE contract the client asked for; the `AtRest` descriptor mode records this). An
+    /// explicit client SSE header or a bucket default still takes priority and IS advertised.
+    /// This is a confidentiality/throughput trade: an encrypted object can engage neither the
+    /// sendfile zero-copy nor the small-object whole-read GET fast path, so it stays opt-in.
+    pub encrypt_at_rest: bool,
+
     /// The root administrator's access key (`CAIRN_ROOT_ACCESS_KEY`). On every startup an active
     /// administrator with this access key is ensured in the store; the same access key + secret work
     /// for the web UI login, the management API (as a Bearer token `access.secret`), and the S3 API
@@ -391,6 +402,7 @@ impl Default for Config {
             request_metrics_bucket_secs: 60,
             request_metrics_retention_days: 31,
             sts_enabled: true,
+            encrypt_at_rest: false,
             root_access_key: "cairn".to_owned(),
             root_secret_key: "cairnadmin".to_owned(),
             fastio_min_bytes: 256 * 1024,
