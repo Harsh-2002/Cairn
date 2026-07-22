@@ -373,6 +373,24 @@ jobs:
       - name: Mint + enforce scoped session credentials over a real SDK (management UI listener on)
         run: BIN=target/debug/cairn PY=python3 bash conformance/sts.sh
 
+  sts-xml:
+    name: STS XML wire surface (AssumeRole + GetSessionToken)
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: cairn-bin
+          path: target/debug
+      - run: chmod +x target/debug/cairn
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.x"
+      - run: pip install boto3
+      - name: A real SDK STS client mints + consumes creds via the AWS-STS XML form POST
+        run: BIN=target/debug/cairn PY=python3 bash conformance/sts_xml.sh
+
   console-session:
     name: console session-cookie auth
     needs: build
@@ -424,9 +442,23 @@ jobs:
       - name: Sendfile keep-alive engagement
         run: BIN=target/debug/cairn bash conformance/sendfile_keepalive.sh
 
-  # conformance/mesh.sh (5-node full-mesh replication) is intentionally NOT gated here: it needs the
-  # dev sandbox disabled and stands up five node processes on dedicated ports — too heavy and
-  # environment-specific for the shared runner. Run it manually: `bash conformance/mesh.sh`.
+  mesh:
+    name: 5-node full-mesh replication
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: cairn-bin
+          path: target/debug
+      - run: chmod +x target/debug/cairn
+      # Stdlib-only driver (no boto3). Stands up five node processes on loopback and self-tears-down;
+      # asserts convergence, fan-out latency, version-id identity, concurrent same-key, crash
+      # resiliency, delete-marker mesh, no-cascade, and integrity across the mesh.
+      - name: Full-mesh convergence + integrity across five nodes
+        run: BIN=target/debug/cairn PY=python3 bash conformance/mesh.sh
 
   rotation:
     name: master-key rotation e2e (#29)
@@ -675,6 +707,7 @@ jobs:
       - object-lock
       - notifications
       - sts
+      - sts-xml
       - console-session
       - backup-restore
       - rotation
@@ -682,6 +715,7 @@ jobs:
       - concurrency
       - soak
       - replication-chaos
+      - mesh
       - stress
       - blob-limits
     if: always()
