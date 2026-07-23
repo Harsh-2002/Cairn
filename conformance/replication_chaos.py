@@ -97,7 +97,7 @@ def client(port, akid, secret):
     return boto3.client(
         "s3", endpoint_url=f"http://127.0.0.1:{port}",
         aws_access_key_id=akid, aws_secret_access_key=secret, region_name=REGION,
-        config=Config(s3={"addressing_style": "path"}, retries={"max_attempts": 1}),
+        config=Config(s3={"addressing_style": "path"}, retries={"total_max_attempts": 1, "mode": "standard"}),
     )
 
 def setup_replication(src):

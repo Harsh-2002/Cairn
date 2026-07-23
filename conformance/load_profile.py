@@ -49,7 +49,7 @@ def make_client(akid, secret, endpoint):
         region_name="us-east-1",
         config=Config(
             s3={"addressing_style": "path"},
-            retries={"max_attempts": 1},
+            retries={"total_max_attempts": 1, "mode": "standard"},
             max_pool_connections=64,
             connect_timeout=30,
             read_timeout=120,

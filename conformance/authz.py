@@ -95,7 +95,7 @@ def client(ak, sk):
         # 14.1) correctly treats as an unsigned/anonymous request — so the presigned checks would
         # be testing anonymous denial rather than presigned redemption.
         config=Config(signature_version="s3v4", s3={"addressing_style": "path"},
-                      retries={"max_attempts": 1}),
+                      retries={"total_max_attempts": 1, "mode": "standard"}),
     )
 
 

@@ -55,7 +55,7 @@ s3 = boto3.client(
     aws_access_key_id=akid,
     aws_secret_access_key=secret,
     region_name=REGION,
-    config=Config(s3={"addressing_style": "path"}, retries={"max_attempts": 1}),
+    config=Config(s3={"addressing_style": "path"}, retries={"total_max_attempts": 1, "mode": "standard"}),
 )
 
 FAILURES = []
@@ -151,7 +151,7 @@ def fresh_client():
     return boto3.client(
         "s3", endpoint_url=endpoint, aws_access_key_id=akid, aws_secret_access_key=secret,
         region_name=REGION,
-        config=Config(s3={"addressing_style": "path"}, retries={"max_attempts": 1}))
+        config=Config(s3={"addressing_style": "path"}, retries={"total_max_attempts": 1, "mode": "standard"}))
 
 
 # =================================================================================================

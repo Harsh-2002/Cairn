@@ -108,12 +108,13 @@ if COPY_SESSIONS + BODY_SESSIONS < 2:
 POOL = max(SESSIONS + BG_WORKERS + 8, 32)
 # `total_max_attempts` (NOT `max_attempts`) is what disables retries, and the difference is
 # load-bearing for this harness: botocore reads `max_attempts` as the number of RETRIES and derives
-# total = max_attempts + 1, so the `retries={"max_attempts": 1}` used by the other conformance
-# drivers still allows ONE retry. That silently rewrote both of this harness's 5xx outcomes -- the
-# deliberate fail-closed 500 of scenario 2 came back to the caller as the second attempt's 404
-# NoSuchUpload (the first attempt had already moved the session to `completing`), and so did the
-# complete/abort race -- so the harness would assert against a status the server never returned to
-# the request it actually made, and the 5xx-budget gate could never balance. One attempt, no retries.
+# total = max_attempts + 1, so `retries={"max_attempts": 1}` still allows ONE retry. That would
+# silently rewrite both of this harness's 5xx outcomes -- the deliberate fail-closed 500 of scenario 2
+# would come back to the caller as the second attempt's 404 NoSuchUpload (the first attempt had
+# already moved the session to `completing`), and so would the complete/abort race -- so the harness
+# would assert against a status the server never returned to the request it actually made, and the
+# 5xx-budget gate could never balance. One attempt, no retries. (Every conformance driver now uses
+# this idiom.)
 s3 = boto3.client(
     "s3", endpoint_url=EP, aws_access_key_id=AK, aws_secret_access_key=SK,
     region_name="us-east-1",

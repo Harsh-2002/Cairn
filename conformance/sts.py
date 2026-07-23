@@ -30,7 +30,7 @@ def client(akid, secret, token=None):
     return boto3.client(
         "s3", endpoint_url=s3_endpoint, aws_access_key_id=akid, aws_secret_access_key=secret,
         aws_session_token=token, region_name="us-east-1",
-        config=Config(s3={"addressing_style": "path"}, retries={"max_attempts": 1}),
+        config=Config(s3={"addressing_style": "path"}, retries={"total_max_attempts": 1, "mode": "standard"}),
     )
 
 
