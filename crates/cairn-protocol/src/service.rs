@@ -1896,7 +1896,23 @@ impl S3Service {
             content_type: session.content_type.clone(),
             encryption: sse_dek,
         };
-        let staged = self.blob.assemble(&bucket.name, &refs, opts).await?;
+        // Assemble reads the staged part files. A concurrent AbortMultipartUpload can pull them out
+        // from under us: we hold the session `completing` (claimed above), but abort's teardown is
+        // unconditional, and it commits `AbortMultipart` (the row delete) BEFORE `delete_session`
+        // (the byte delete). So if assemble fails AND the session is now gone, the abort won this
+        // race — answer the AWS-shaped NoSuchUpload, not a 500 for what surfaces as a missing-parts
+        // I/O error. (The mirror case — abort winning the `ClaimMultipart` above — already yields
+        // NoSuchUpload at the claim.) The ordering makes the check reliable: bytes gone ⇒ row gone.
+        // A genuine assembly failure (the session is still present) still propagates as-is.
+        let staged = match self.blob.assemble(&bucket.name, &refs, opts).await {
+            Ok(s) => s,
+            Err(e) => {
+                if self.meta.get_multipart(&upload_id).await?.is_none() {
+                    return Err(Error::NoSuchUpload);
+                }
+                return Err(e.into());
+            }
+        };
         let etag = multipart_etag(&part_md5s);
 
         // Resolve the object-level checksum to store. A FULL_OBJECT plan takes the whole-object digest

@@ -126,9 +126,11 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   RSS/fd/thread/WAL ceilings as `stress.sh`, and a 5xx counter EQUAL to the driver's declared
   fail-closed budget. Complete wall times and background-PUT throughput with vs without the barrier
   are **advisory** (`STRESS_MP_OUT=` writes the JSON) — CI drives the debug artifact, whose AES-GCM is
-  unoptimized. Carries one pinned **KNOWN GAP** (reported, not gated): when Abort wins the race after
-  Complete already entered `assemble`, `delete_session` pulls the staged bytes and the loser answers
-  500 `InternalError` instead of `NoSuchUpload` — fail-closed, wrong code. **Coverage boundary:**
+  unoptimized. The former **KNOWN GAP** here is now **FIXED and GATED**: when Abort won the race after
+  Complete had entered `assemble`, `delete_session` pulled the staged bytes and the loser answered
+  500 `InternalError` instead of `NoSuchUpload`. `complete_multipart` now re-checks the session on an
+  assemble failure (abort commits its row delete *before* pulling the bytes, so bytes-gone ⇒ row-gone)
+  and returns `NoSuchUpload`; scenario 3a hard-gates every loser to a well-formed 4xx. **Coverage boundary:**
   scenario 2 flips a ciphertext BODY byte, which fails inside `assemble` (i.e. *after* `ClaimMultipart`)
   and so deliberately bricks that session; the complementary invariant — a bad **part DEK** is opened
   *before* the claim so the upload stays **retryable** (audit #14) — is covered in-process by
