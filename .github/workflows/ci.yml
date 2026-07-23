@@ -316,7 +316,7 @@ jobs:
         with:
           python-version: "3.x"
       - run: pip install boto3
-      - name: Corrupt a stored blob on disk; assert the background scrub detects the ETag mismatch
+      - name: Corrupt a blob (plaintext / at-rest / SSE-S3 / compressed); assert the scrub detects each
         run: BIN=target/debug/cairn PY=python3 bash conformance/scrub.sh
 
   object-lock:
