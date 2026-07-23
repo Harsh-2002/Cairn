@@ -74,7 +74,7 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   (and CPU-s/GiB moved) — plus `cairn_writer_queue_depth`, the **HTTP 5xx count**, and the writer's own
   **`cairn_writer_commit_seconds` / `cairn_writer_batch_size`** histograms. The stability gates are
   deliberately **shape/ratio/count** checks (fd·thread·WAL plateau vs monotonic climb; commit tail
-  bounded *relative* to the first ramp level; group-commit batching engaged at high concurrency; any 5xx
+  bounded *relative* to the first ramp level; any 5xx
   at all) so they hold on a contended CI runner — absolute obj/s + MiB/s stay **advisory**. Emits a
   PASS/FAIL verdict; `STRESS_OUT=`/`BASELINE=` write/compare a results JSON (schema is additive, so an
   older baseline still compares). Supersedes `warp.sh`+`warp_escalate.sh` (kept as focused tools).
