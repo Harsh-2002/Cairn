@@ -591,6 +591,33 @@ jobs:
       - name: Drive warp + concurrency ramp; assert zero errors, alive, no RSS leak
         run: BIN=target/debug/cairn DURATION=8s LEVELS="8 32 128 256" ESC_DURATION=6s LEAK_PCT=50 bash conformance/stress.sh
 
+  stress-encrypted:
+    name: encrypted-path stress (A/B plaintext vs at-rest)
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: cairn-bin
+          path: target/debug
+      - run: chmod +x target/debug/cairn
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.x"
+      # boto3 drives the explicit-SSE correctness arm (warp cannot send SSE headers).
+      - run: pip install boto3
+      # The same warp profile twice on one box: leg A plaintext, leg B CAIRN_ENCRYPT_AT_REST=true, so
+      # every committed blob is a VERSION_ENCRYPTED CRNB container. Encrypted objects are disqualified
+      # from BOTH GET fast paths (sendfile zero-copy, small-object inline read), so the read phases
+      # straddle the 256 KiB threshold to cover the streamed fallback. GATES are load-independent:
+      # byte-exact round-trip + on-disk ciphertext under concurrency, zero op-errors, zero HTTP 5xx,
+      # liveness, absolute RSS/fd/thread/WAL ceilings, and a catastrophic-collapse throughput floor.
+      # The floor auto-relaxes on this DEBUG artifact (unoptimized AES-GCM); the ratio is advisory.
+      - name: A/B plaintext vs encrypted under warp; assert byte-exact crypto + stability
+        run: BIN=target/debug/cairn PY=python3 DURATION=8s CONCURRENT=8 bash conformance/stress_encrypted.sh
+
   blob-limits:
     name: blob store limits (out-of-space, huge, many)
     needs: build
@@ -717,6 +744,7 @@ jobs:
       - replication-chaos
       - mesh
       - stress
+      - stress-encrypted
       - blob-limits
     if: always()
     runs-on: ubuntu-latest

@@ -76,6 +76,25 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   at all) so they hold on a contended CI runner — absolute obj/s + MiB/s stay **advisory**. Emits a
   PASS/FAIL verdict; `STRESS_OUT=`/`BASELINE=` write/compare a results JSON (schema is additive, so an
   older baseline still compares). Supersedes `warp.sh`+`warp_escalate.sh` (kept as focused tools).
+- `stress_encrypted.sh` (+`.py`, `warp`) — the **encrypted-path** stress A/B: the same warp profile
+  twice on one box, leg A plaintext vs leg B `CAIRN_ENCRYPT_AT_REST=true` (the boolean **`true`** —
+  Figment rejects `1`), so every committed blob is a VERSION_ENCRYPTED CRNB container. Transparent
+  at-rest needs no SSE headers, which is why warp can drive both legs unmodified. Read phases straddle
+  the 256 KiB small-object threshold (64 KiB + 1 MiB) because an encrypted object is disqualified from
+  **both** GET fast paths (sendfile zero-copy and the inline small-object read) and must fall back to
+  the streamed read. The `.py` arm (boto3, threads) is the headline gate: byte-exact round-trips under
+  concurrency plus the on-disk proof (CRNB v2 trailer, plaintext marker absent) for transparent at-rest,
+  explicit `AES256`, and `aws:kms`. GATES are load-independent — correctness, zero op-errors, zero HTTP
+  5xx, liveness, absolute RSS/fd/thread/WAL ceilings (same knobs as `stress.sh`), every phase parsing a
+  non-zero throughput, and — **on a release build only** — a *catastrophic* collapse floor
+  (`ENC_MIN_RATIO_PCT`, default 10%). On a **debug** binary the enc/plain ratio is **advisory, not
+  gated**: debug AES-GCM is unoptimized software crypto (release 65–135% of plaintext vs 0.7–34% for
+  the same debug build), so gating it would be pure flake and says nothing about the code — CI drives
+  the debug artifact, so there the load-independent gates are what protect the encrypted path.
+  Throughput ratios, CPU-s/GiB and the RSS/fd deltas between legs are **advisory**; `STRESS_ENC_OUT=`
+  writes them as JSON. `SKIP_SSE_ARM=1` is an **operator-requested** warp-only run (still passes); an
+  *automatic* skip because boto3 is missing **fails** the run, so a CI box that lost boto3 can't go
+  green without ever proving encryption correctness.
 - `warp.sh` — the MinIO `warp` macro benchmark (get/put/mixed); downloads `warp` once. Gates on errors.
 - `bench_compare.sh` — **Cairn vs MinIO head-to-head**: boots Cairn AND a pinned MinIO server on one
   host and drives warp against each side-by-side (PUT/GET/STAT/DELETE/LIST/MIXED). Runs per push
