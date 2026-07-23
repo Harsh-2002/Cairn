@@ -618,6 +618,35 @@ jobs:
       - name: A/B plaintext vs encrypted under warp; assert byte-exact crypto + stability
         run: BIN=target/debug/cairn PY=python3 DURATION=8s CONCURRENT=8 bash conformance/stress_encrypted.sh
 
+  stress-multipart:
+    name: concurrent multipart stress (barrier Complete, fail-closed, races)
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: cairn-bin
+          path: target/debug
+      - run: chmod +x target/debug/cairn
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.x"
+      # boto3 IS this harness (low-level multipart + threads); a box without it must go red, not green.
+      - run: pip install boto3
+      # The concurrent multipart write path: N SSE-KMS CompleteMultipartUpload calls released from one
+      # barrier (each assemble holds a blob-write permit across a serial decrypt-then-re-encrypt pass
+      # over every part) while a steady single-part PUT stream shares the same 64-permit pool; one
+      # session's staged part is corrupted on disk first, so fail-closed isolation is proven under
+      # concurrency. Plus the ClaimMultipart complete/abort race, the RecordPart supersede race, and
+      # UploadPartCopy under load. GATES are load-independent: byte-exact assemblies, zero operation
+      # errors, exact S3 error CODES, no torn object, no staging orphans, /healthz never stops
+      # answering, absolute RSS/fd/thread/WAL ceilings, and a 5xx counter equal to the driver's
+      # declared fail-closed budget. Timings are advisory (debug AES-GCM is unoptimized).
+      - name: Barrier-fire concurrent multipart Completes; assert byte-exact + fail-closed + races
+        run: BIN=target/debug/cairn PY=python3 bash conformance/stress_multipart.sh
+
   blob-limits:
     name: blob store limits (out-of-space, huge, many)
     needs: build
@@ -745,6 +774,7 @@ jobs:
       - mesh
       - stress
       - stress-encrypted
+      - stress-multipart
       - blob-limits
     if: always()
     runs-on: ubuntu-latest

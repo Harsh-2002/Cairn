@@ -95,6 +95,37 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   writes them as JSON. `SKIP_SSE_ARM=1` is an **operator-requested** warp-only run (still passes); an
   *automatic* skip because boto3 is missing **fails** the run, so a CI box that lost boto3 can't go
   green without ever proving encryption correctness.
+- `stress_multipart.sh` (+`.py`, boto3) — the **concurrent multipart write path**, which nothing else
+  touches: `multipart.sh` is serial, `encryption.sh` proves one SSE multipart, and the warp harnesses
+  never issue a Complete at all. Four scenarios on one hot node. **(1)** N SSE-KMS sessions are
+  pre-staged and every `CompleteMultipartUpload` is released from ONE `threading.Barrier` while a
+  separate pool runs a steady single-part PUT stream — `assemble` holds one of the 64 blob-**write**
+  permits across its serial `assemble_into` loop (a decrypt-then-re-encrypt pass per part) and `stage`
+  draws from the SAME pool, so this is the starvation shape. **(2)** one session in that same barrier
+  has a staged part corrupted on disk first (flipped ciphertext byte, the `encryption.py` technique):
+  its Complete must fail CLOSED with no object committed while every sibling still completes
+  byte-exact. **(3)** `ClaimMultipart` complete-vs-abort fired from two threads, and a `RecordPart`
+  supersede (part re-uploaded while another part uploads). **(4)** `UploadPartCopy` sessions staged
+  concurrently with body sessions, with the staged-part on-disk ciphertext proof. GATES are
+  load-independent: byte-exact assemblies + byte-exact background PUTs, zero op errors, exact S3 error
+  CODES (`InvalidPart` for a superseded ETag; the race loser from a fixed 4xx set), all-or-nothing
+  (never a torn object), the upload id RESOLVED with **no staging orphans**, ordinary PUTs making
+  progress AT ALL during the barrier (a count > 0, never a rate), `/healthz` never *stopping*
+  (a 60 s per-probe **wedge** timeout — probe latency is load, not signal), the same absolute
+  RSS/fd/thread/WAL ceilings as `stress.sh`, and a 5xx counter EQUAL to the driver's declared
+  fail-closed budget. Complete wall times and background-PUT throughput with vs without the barrier
+  are **advisory** (`STRESS_MP_OUT=` writes the JSON) — CI drives the debug artifact, whose AES-GCM is
+  unoptimized. Carries one pinned **KNOWN GAP** (reported, not gated): when Abort wins the race after
+  Complete already entered `assemble`, `delete_session` pulls the staged bytes and the loser answers
+  500 `InternalError` instead of `NoSuchUpload` — fail-closed, wrong code. **Coverage boundary:**
+  scenario 2 flips a ciphertext BODY byte, which fails inside `assemble` (i.e. *after* `ClaimMultipart`)
+  and so deliberately bricks that session; the complementary invariant — a bad **part DEK** is opened
+  *before* the claim so the upload stays **retryable** (audit #14) — is covered in-process by
+  `wrong_master_key_fails_complete` (`cairn-protocol/tests/protocol_core.rs`), not here, because
+  reaching it needs the sealed DEK envelope corrupted in the metadata DB under a live server. Profile is env-tunable
+  (`MP_SESSIONS`, `MP_PART_SIZE`, `MP_BG_WORKERS`, `MP_RACE_ROUNDS`, …); the default is ~2 min because
+  a real multi-part Complete must pay S3's 5 MiB non-final-part minimum, so 5 MiB is spent only where
+  a multi-part assemble is under test and every other part is a small tail.
 - `warp.sh` — the MinIO `warp` macro benchmark (get/put/mixed); downloads `warp` once. Gates on errors.
 - `bench_compare.sh` — **Cairn vs MinIO head-to-head**: boots Cairn AND a pinned MinIO server on one
   host and drives warp against each side-by-side (PUT/GET/STAT/DELETE/LIST/MIXED). Runs per push
