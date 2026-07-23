@@ -102,10 +102,13 @@ pub struct Config {
     pub multipart_sweep_interval_secs: u64,
     /// How often the background integrity scrub re-reads stored blobs and verifies them against the
     /// recorded ETag, in seconds (`CAIRN_SCRUB_INTERVAL_SECS`, ARCH 8.6/26.4). `0` (default) disables
-    /// it. Encrypted/compressed blobs are already integrity-checked on every read (AES-GCM / the
-    /// CRNB format), so the scrub targets the otherwise-unverified uncompressed-plaintext path,
+    /// it. It verifies EVERY version — plaintext, compressed, and encrypted (an encrypted version is
+    /// re-read through its own unsealed DEK, so an at-rest/SSE-S3/SSE-KMS node is covered; read-path
+    /// AEAD authentication only ever covers bytes somebody GETs, which is not what a scrub is for) —
     /// turning silent on-disk bit-rot into a logged `cairn_scrub_corruption_total` event instead of
-    /// serving a corrupted byte. It is bounded (paged enumeration) but reads every blob, so it is
+    /// serving a corrupted byte. Whatever it cannot verify is counted as
+    /// `cairn_scrub_skipped_total{reason}` (an off-ring key mid-rotation, a composite multipart
+    /// ETag), never silently dropped. It is bounded (paged enumeration) but reads every blob, so it is
     /// I/O-heavy — schedule it for quiet periods. A checksumming filesystem remains defense-in-depth.
     pub scrub_interval_secs: u64,
     /// How often the master-key re-wrap worker re-seals secrets onto the active key, in seconds

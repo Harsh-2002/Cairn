@@ -1106,24 +1106,144 @@ async fn sweeper_loop(stack: Arc<AppStack>, interval: Duration, lifetime_secs: i
     }
 }
 
+/// Why the scrub could not fully verify a version it walked. Every skip is COUNTED and emitted —
+/// a silent `continue` is the defect this enum exists to make impossible (ARCH 26.4).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SkipReason {
+    /// The version's DEK is sealed under a key that is not on this node's ring right now (a
+    /// rotation window, a not-yet-loaded ring entry). NOT corruption — reporting a rotation as bit
+    /// rot is a false alarm on a healthy store — so it is skipped and re-tried next pass.
+    KeyUnavailable,
+    /// A multipart ETag (`{md5}-{n}`) is a hash OF HASHES, not a whole-object digest, so the
+    /// re-read bytes cannot be compared to it. The blob is still read end-to-end (readability +
+    /// AEAD/CRNB authentication), but the content hash is NOT verified. Composite-ETag
+    /// verification is deliberately out of scope for this pass.
+    CompositeEtag,
+    /// The row carries no `storage_path` (nothing on this node's disk to re-read).
+    NoBlob,
+    /// A delete marker: a tombstone with no content.
+    DeleteMarker,
+    /// The listed version could not be re-read from the metadata store (concurrently deleted, or a
+    /// transient store error). Nothing to verify, but it is not a verified version either.
+    MetadataUnavailable,
+    /// A transient filesystem failure (`BlobError::Io`, `OutOfSpace`) — an fd exhaustion spike, a
+    /// full disk, an EIO blip. NOT corruption, for the same reason [`Self::KeyUnavailable`] is not:
+    /// the bytes are very likely fine and the condition clears, so paging an operator for bit rot
+    /// here is a false alarm on a healthy store. Re-tried next pass. A blob that is *missing*
+    /// (`BlobError::NotFound`) is a different thing and IS reported corrupt.
+    IoError,
+}
+
+impl SkipReason {
+    /// The stable metric-label / log-field slug.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::KeyUnavailable => "key_unavailable",
+            Self::CompositeEtag => "composite_etag",
+            Self::NoBlob => "no_blob",
+            Self::DeleteMarker => "delete_marker",
+            Self::MetadataUnavailable => "metadata_unavailable",
+            Self::IoError => "io_error",
+        }
+    }
+    /// Every variant, in tally order.
+    const ALL: [Self; 6] = [
+        Self::KeyUnavailable,
+        Self::CompositeEtag,
+        Self::NoBlob,
+        Self::DeleteMarker,
+        Self::MetadataUnavailable,
+        Self::IoError,
+    ];
+    const fn index(self) -> usize {
+        match self {
+            Self::KeyUnavailable => 0,
+            Self::CompositeEtag => 1,
+            Self::NoBlob => 2,
+            Self::DeleteMarker => 3,
+            Self::MetadataUnavailable => 4,
+            Self::IoError => 5,
+        }
+    }
+}
+
+/// The verdict for one walked version.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ScrubOutcome {
+    /// Re-read and the recomputed plaintext MD5 matched the stored ETag.
+    Verified,
+    /// Read or hash verification FAILED — bit rot, a broken container, a failed AEAD tag, or a
+    /// tampered/unopenable key envelope. Carries a stable corruption-kind label.
+    Corrupt(&'static str),
+    /// Not verifiable this pass; see [`SkipReason`].
+    Skipped(SkipReason),
+}
+
+/// The per-pass accounting. **INVARIANT: `scanned + skipped()` equals every version the pass
+/// walked.** `scanned` counts versions whose bytes were fully re-read AND hash-verified (`corrupt`
+/// is the subset of those that failed); `skipped` counts everything else, always with a reason. A
+/// pass that verifies nothing must be visibly distinguishable from a pass that verified everything
+/// and found nothing wrong — `scanned=0 skipped=N` says the first, `scanned=N skipped=0 corrupt=0`
+/// the second. Do not add an un-counted `continue`.
+#[derive(Default, Clone, Copy, Debug)]
+struct ScrubTally {
+    scanned: u64,
+    corrupt: u64,
+    skipped: [u64; SkipReason::ALL.len()],
+}
+
+impl ScrubTally {
+    fn record(&mut self, outcome: ScrubOutcome) {
+        match outcome {
+            ScrubOutcome::Verified => self.scanned += 1,
+            ScrubOutcome::Corrupt(_) => {
+                self.scanned += 1;
+                self.corrupt += 1;
+            }
+            ScrubOutcome::Skipped(r) => self.skipped[r.index()] += 1,
+        }
+    }
+    fn skipped_total(&self) -> u64 {
+        self.skipped.iter().sum()
+    }
+    fn skipped_for(&self, r: SkipReason) -> u64 {
+        self.skipped[r.index()]
+    }
+    /// Total versions walked — the invariant's left-hand side.
+    fn walked(&self) -> u64 {
+        self.scanned + self.skipped_total()
+    }
+}
+
 /// Periodically re-read every committed blob and verify it against the recorded ETag, turning silent
-/// on-disk bit-rot into an observable event (ARCH 8.6/26.4). Encrypted and compressed blobs are
-/// already integrity-checked on every read (AES-GCM authentication / the self-describing CRNB block
-/// format), so the scrub targets the otherwise-unverified uncompressed-plaintext path: it re-hashes
-/// the bytes and compares the MD5 to the stored single-part ETag. Enumeration is paged so memory
-/// stays flat regardless of store size.
+/// on-disk bit-rot into an observable event (ARCH 8.6/26.4). ENCRYPTED versions are verified too:
+/// the pass unseals the version's DEK (`cairn_types::sse`) and re-reads through it, so an at-rest /
+/// SSE-S3 / SSE-KMS node is covered exactly like a plaintext one. (The pass previously skipped
+/// every version carrying an `sse_descriptor` on the theory that a real GET authenticates them —
+/// true only for objects someone GETs, which is precisely the population a background scrub is NOT
+/// for; on a `CAIRN_ENCRYPT_AT_REST` node that skipped 100% of the store, silently.)
+///
+/// Whatever cannot be verified is COUNTED with a reason and emitted, never dropped — see
+/// [`ScrubTally`]. Enumeration is paged so memory stays flat regardless of store size.
 async fn scrub_loop(stack: Arc<AppStack>, interval: Duration) {
     use cairn_types::meta::ListQuery;
     loop {
         tokio::time::sleep(interval).await;
         let started = std::time::Instant::now();
-        let mut scanned: u64 = 0;
-        let mut corrupt: u64 = 0;
+        let mut tally = ScrubTally::default();
+        // Enumeration failures are coverage lost, not versions verified — count them so a partial
+        // pass is never mistaken for a clean one. A bucket-list failure yields an empty walk and
+        // STILL emits the pass line below (rather than `continue`-ing silently), so an operator
+        // alerting on `scanned == 0` always has a line to see.
+        let mut enum_errors: u64 = 0;
         let buckets = match stack.meta.list_buckets(None).await {
             Ok(b) => b,
             Err(e) => {
                 tracing::warn!(error = %e, "scrub: enumerating buckets failed");
-                continue;
+                metrics::counter!("cairn_scrub_enumeration_errors_total", "stage" => "buckets")
+                    .increment(1);
+                enum_errors += 1;
+                Vec::new()
             }
         };
         for bucket in &buckets {
@@ -1142,43 +1262,61 @@ async fn scrub_loop(stack: Arc<AppStack>, interval: Duration) {
                     Ok(p) => p,
                     Err(e) => {
                         tracing::warn!(bucket = %bucket.name.as_str(), error = %e, "scrub: listing versions failed");
+                        metrics::counter!("cairn_scrub_enumeration_errors_total", "stage" => "versions")
+                            .increment(1);
+                        enum_errors += 1;
                         break;
                     }
                 };
                 for s in &page.items {
-                    if s.is_delete_marker {
-                        continue;
-                    }
-                    let row = match stack
-                        .meta
-                        .get_version(&bucket.name, &s.key, &s.version_id)
-                        .await
-                    {
-                        Ok(Some(r)) => r,
-                        _ => continue,
+                    let outcome = if s.is_delete_marker {
+                        ScrubOutcome::Skipped(SkipReason::DeleteMarker)
+                    } else {
+                        match stack
+                            .meta
+                            .get_version(&bucket.name, &s.key, &s.version_id)
+                            .await
+                        {
+                            Ok(Some(row)) => {
+                                scrub_version(&*stack.blob, &*stack.crypto, &row).await
+                            }
+                            Ok(None) => ScrubOutcome::Skipped(SkipReason::MetadataUnavailable),
+                            Err(e) => {
+                                tracing::warn!(
+                                    bucket = %bucket.name.as_str(),
+                                    key = %s.key.as_str(),
+                                    version = %s.version_id.as_str(),
+                                    error = %e,
+                                    "scrub: re-reading version row failed"
+                                );
+                                ScrubOutcome::Skipped(SkipReason::MetadataUnavailable)
+                            }
+                        }
                     };
-                    let Some(path) = row.storage_path.clone() else {
-                        continue;
-                    };
-                    // Encrypted blobs are AES-GCM-authenticated on every read, so a real GET already
-                    // detects their corruption; the scrub closes the plaintext gap.
-                    if row.sse_descriptor.is_some() {
-                        continue;
-                    }
-                    scanned += 1;
-                    if let Err(kind) =
-                        scrub_one(&stack, &path, &row.compression, row.etag.as_str()).await
-                    {
-                        corrupt += 1;
-                        metrics::counter!("cairn_scrub_corruption_total", "kind" => kind)
-                            .increment(1);
-                        tracing::error!(
-                            bucket = %bucket.name.as_str(),
-                            key = %s.key.as_str(),
-                            version = %s.version_id.as_str(),
-                            kind,
-                            "scrub: blob failed integrity verification"
-                        );
+                    tally.record(outcome);
+                    match outcome {
+                        ScrubOutcome::Corrupt(kind) => {
+                            metrics::counter!("cairn_scrub_corruption_total", "kind" => kind)
+                                .increment(1);
+                            tracing::error!(
+                                bucket = %bucket.name.as_str(),
+                                key = %s.key.as_str(),
+                                version = %s.version_id.as_str(),
+                                kind,
+                                "scrub: blob failed integrity verification"
+                            );
+                        }
+                        ScrubOutcome::Skipped(SkipReason::KeyUnavailable) => {
+                            // Loud but not an error: the operator needs to know a rotation window
+                            // is shrinking coverage, without a corruption page.
+                            tracing::warn!(
+                                bucket = %bucket.name.as_str(),
+                                key = %s.key.as_str(),
+                                version = %s.version_id.as_str(),
+                                "scrub: data key unavailable, version not verified this pass"
+                            );
+                        }
+                        _ => {}
                     }
                 }
                 match page.next_cursor {
@@ -1190,44 +1328,120 @@ async fn scrub_loop(stack: Arc<AppStack>, interval: Duration) {
                 }
             }
         }
-        metrics::counter!("cairn_scrub_objects_total").increment(scanned);
+        metrics::counter!("cairn_scrub_objects_total").increment(tally.scanned);
+        // Emitted for EVERY reason, including zeros, so the series exists before the first skip and
+        // an alert on it never has to distinguish "no skips" from "no scrub".
+        for r in SkipReason::ALL {
+            metrics::counter!("cairn_scrub_skipped_total", "reason" => r.label())
+                .increment(tally.skipped_for(r));
+        }
+        // Register both enumeration-stage series each pass (increment(0) is a no-op on the count)
+        // so an alert on them exists before the first failure, exactly like the skip series above.
+        for stage in ["buckets", "versions"] {
+            metrics::counter!("cairn_scrub_enumeration_errors_total", "stage" => stage)
+                .increment(0);
+        }
         metrics::histogram!("cairn_scrub_pass_seconds").record(started.elapsed().as_secs_f64());
-        tracing::info!(scanned, corrupt, "scrub pass complete");
+        tracing::info!(
+            scanned = tally.scanned,
+            corrupt = tally.corrupt,
+            skipped = tally.skipped_total(),
+            walked = tally.walked(),
+            skipped_key_unavailable = tally.skipped_for(SkipReason::KeyUnavailable),
+            skipped_composite_etag = tally.skipped_for(SkipReason::CompositeEtag),
+            skipped_no_blob = tally.skipped_for(SkipReason::NoBlob),
+            skipped_delete_marker = tally.skipped_for(SkipReason::DeleteMarker),
+            skipped_metadata_unavailable = tally.skipped_for(SkipReason::MetadataUnavailable),
+            skipped_io_error = tally.skipped_for(SkipReason::IoError),
+            enumeration_errors = enum_errors,
+            "scrub pass complete"
+        );
     }
 }
 
-/// Re-read one unencrypted blob and verify it. The read decompresses a CRNB-compressed blob (so a
-/// corrupt compressed blob fails here), and for a single-part object the recomputed plaintext MD5 is
-/// compared to the stored ETag (so a bit flip in an uncompressed plaintext blob is caught). A
-/// multipart ETag (`{md5}-{n}`) is not a whole-object hash, so those are verified for readability
-/// only. Returns a static corruption-kind label on failure.
-async fn scrub_one(
-    stack: &Arc<AppStack>,
-    path: &cairn_types::id::StoragePath,
-    compression: &cairn_types::CompressionDescriptor,
-    etag: &str,
-) -> Result<(), &'static str> {
+/// Re-read one object version and verify it, decrypting through its own DEK when it is encrypted.
+///
+/// The read decompresses a CRNB-compressed blob and authenticates an encrypted one (so a corrupt
+/// container or a flipped ciphertext byte fails the AEAD tag here), and for a single-part object the
+/// recomputed PLAINTEXT MD5 is compared to the stored ETag — the right comparand under encryption
+/// too, because the blob store hashes the plaintext BEFORE compressing/encrypting it, so the ETag is
+/// the plaintext digest either way.
+///
+/// Error classification (deliberate — see [`SkipReason::KeyUnavailable`]):
+///   * DEK sealed under an off-ring key (`UnknownKeyId`/`Key`/`KeyRotationRequired`) → **skipped**,
+///     counted, warned. A rotation window is not bit rot.
+///   * A malformed descriptor or a tampered/undersized envelope (`Decrypt` and friends) → **corrupt**:
+///     it can never succeed, and it means the row's key material has been damaged.
+///   * Open/read/hash failure → **corrupt**. Fails closed: no path returns "verified" on an error.
+async fn scrub_version(
+    blobs: &dyn cairn_types::traits::BlobStore,
+    crypto: &dyn cairn_types::traits::Crypto,
+    row: &cairn_types::object::ObjectVersionRow,
+) -> ScrubOutcome {
+    use cairn_types::error::{BlobError, CryptoError};
     use futures_util::StreamExt;
     use md5::{Digest, Md5};
-    let handle = stack
-        .blob
-        .open_with_dek(path, None, None, compression)
-        .await
-        .map_err(|_| "open_failed")?;
+
+    let Some(path) = row.storage_path.as_ref() else {
+        return ScrubOutcome::Skipped(SkipReason::NoBlob);
+    };
+    // Resolve the DEK BEFORE reading a byte: reading an encrypted blob with `None` yields raw
+    // ciphertext at exactly the plaintext length, which would hash to a mismatch and be reported as
+    // corruption on a perfectly healthy store. Reuses the one shared descriptor module.
+    let dek = match row.sse_descriptor.as_deref() {
+        None => None,
+        Some(json) => {
+            let opened = cairn_types::sse::parse_descriptor(json)
+                .and_then(|d| cairn_types::sse::open_dek(crypto, &d));
+            match opened {
+                Ok(k) => Some(*k),
+                Err(
+                    CryptoError::UnknownKeyId | CryptoError::Key | CryptoError::KeyRotationRequired,
+                ) => {
+                    return ScrubOutcome::Skipped(SkipReason::KeyUnavailable);
+                }
+                Err(_) => return ScrubOutcome::Corrupt("dek_unopenable"),
+            }
+        }
+    };
+
+    let handle = match blobs.open_with_dek(path, None, dek, &row.compression).await {
+        Ok(h) => h,
+        // A blob missing from under its row is real damage (`cairn integrity --repair` would drop the
+        // dangling row), reported as corruption with its own kind. But a transient FS failure — fd
+        // exhaustion, a full or flaky disk — is not bit rot; skip-and-count so it does not page an
+        // operator, and re-try next pass.
+        Err(BlobError::NotFound) => return ScrubOutcome::Corrupt("missing_blob"),
+        Err(BlobError::Io(_) | BlobError::OutOfSpace) => {
+            return ScrubOutcome::Skipped(SkipReason::IoError);
+        }
+        Err(_) => return ScrubOutcome::Corrupt("open_failed"),
+    };
     let mut hasher = Md5::new();
     let mut body = handle.body;
     while let Some(chunk) = body.next().await {
-        let bytes = chunk.map_err(|_| "read_failed")?;
-        hasher.update(&bytes);
-    }
-    // Single-part ETag is a bare hex MD5; multipart is "{md5}-{partcount}" and is not re-hashable.
-    if !etag.contains('-') {
-        let computed = hex::encode(hasher.finalize());
-        if !computed.eq_ignore_ascii_case(etag.trim_matches('"')) {
-            return Err("hash_mismatch");
+        match chunk {
+            Ok(bytes) => hasher.update(&bytes),
+            // A decrypt/CRNB failure mid-stream is corruption; a bare I/O read error is transient.
+            Err(BlobError::Io(_) | BlobError::OutOfSpace) => {
+                return ScrubOutcome::Skipped(SkipReason::IoError);
+            }
+            Err(_) => return ScrubOutcome::Corrupt("read_failed"),
         }
     }
-    Ok(())
+    // Single-part ETag is a bare hex MD5; multipart is "{md5}-{partcount}" — a hash of hashes, not
+    // re-hashable from the assembled bytes. Those got the readability/AEAD check above but NOT a
+    // content-hash check, so they are reported skipped-with-reason rather than counted as verified.
+    let etag = row.etag.as_str();
+    if etag.contains('-') {
+        return ScrubOutcome::Skipped(SkipReason::CompositeEtag);
+    }
+    let computed = hex::encode(hasher.finalize());
+    if computed.eq_ignore_ascii_case(etag.trim_matches('"')) {
+        ScrubOutcome::Verified
+    } else {
+        ScrubOutcome::Corrupt("hash_mismatch")
+    }
 }
 
 /// Periodically apply each bucket's lifecycle rules.
@@ -1526,5 +1740,348 @@ mod tests {
         // The TLS trust defaults are the safe webpki path for the single-target node->node case.
         assert!(built.ca_cert_path.is_none());
         assert!(!built.insecure_skip_verify);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // The integrity scrub (ARCH 8.6 / 26.4).
+    //
+    // These exercise `scrub_version` against a REAL local blob store and a REAL master-key ring,
+    // because the whole defect class here is "the pass claims success without reading anything":
+    // an in-memory double that ignores the DEK could not tell a verified encrypted object from a
+    // skipped one. Every test below fails on the pre-fix code, which skipped any version carrying
+    // an `sse_descriptor` outright.
+    // ---------------------------------------------------------------------------------------
+    mod scrub {
+        use super::super::{ScrubOutcome, ScrubTally, SkipReason, scrub_version};
+        use cairn_blob::LocalBlobStore;
+        use cairn_crypto::SystemCrypto;
+        use cairn_types::ChecksumSet;
+        use cairn_types::blob::StageOptions;
+        use cairn_types::id::{BucketName, ObjectKey, StoragePath, VersionId};
+        use cairn_types::object::{ETag, ObjectVersionRow, StorageClass};
+        use cairn_types::traits::{BlobStore, Crypto};
+        use cairn_types::{CompressionDescriptor, Timestamp, UserId};
+
+        fn crypto_with_key_id(id: u16, byte: u8) -> SystemCrypto {
+            SystemCrypto::from_ring(vec![(id, [byte; 32])], id, id, 0).expect("ring builds")
+        }
+
+        /// Seal a DEK into the persisted descriptor exactly as the S3 write path does.
+        fn descriptor_for(crypto: &dyn Crypto, dek: &[u8; 32]) -> String {
+            use base64::Engine;
+            let sealed = crypto.seal(dek).expect("seal dek");
+            serde_json::to_string(&cairn_types::sse::SseDescriptor {
+                alg: "AES256-GCM".to_owned(),
+                wrapped_dek_b64: base64::engine::general_purpose::STANDARD
+                    .encode(&sealed.ciphertext),
+                ..cairn_types::sse::SseDescriptor::default()
+            })
+            .expect("descriptor serializes")
+        }
+
+        fn row_for(
+            path: StoragePath,
+            etag: ETag,
+            size: u64,
+            compression: CompressionDescriptor,
+            sse_descriptor: Option<String>,
+        ) -> ObjectVersionRow {
+            ObjectVersionRow {
+                id: "row-1".to_owned(),
+                bucket: BucketName::parse("scrub-bucket").unwrap(),
+                key: ObjectKey::parse("k").unwrap(),
+                version_id: VersionId::null(),
+                is_latest: true,
+                is_delete_marker: false,
+                size_logical: size,
+                size_physical: size,
+                etag,
+                content_type: "application/octet-stream".to_owned(),
+                content_encoding: None,
+                cache_control: None,
+                content_disposition: None,
+                content_language: None,
+                expires: None,
+                storage_path: Some(path),
+                compression,
+                storage_class: StorageClass::Standard,
+                cold_locator: None,
+                owner_id: UserId("owner".to_owned()),
+                user_metadata: Vec::new(),
+                acl: None,
+                checksums: Vec::new(),
+                sse_descriptor,
+                replication_status: None,
+                replicated_at: None,
+                created_at: Timestamp(0),
+                updated_at: Timestamp(0),
+            }
+        }
+
+        /// Stage a body (optionally encrypted / compressed) and return the row describing it.
+        async fn staged_row(
+            blobs: &LocalBlobStore,
+            body: &[u8],
+            dek: Option<[u8; 32]>,
+            descriptor: Option<String>,
+            compression: Option<cairn_types::bucket::CompressionPolicy>,
+        ) -> ObjectVersionRow {
+            let bucket = BucketName::parse("scrub-bucket").unwrap();
+            let bytes = bytes::Bytes::copy_from_slice(body);
+            let stream: cairn_types::BodyStream =
+                Box::pin(futures_util::stream::once(async move {
+                    Ok::<_, cairn_types::error::BodyError>(bytes)
+                }));
+            let staged = blobs
+                .stage(
+                    &bucket,
+                    stream,
+                    StageOptions {
+                        compression,
+                        extra_checksums: ChecksumSet::none(),
+                        size_ceiling: 1 << 30,
+                        content_type: "application/octet-stream".to_owned(),
+                        encryption: dek,
+                        content_length: None,
+                    },
+                )
+                .await
+                .expect("stage");
+            row_for(
+                staged.storage_path,
+                staged.etag,
+                staged.size_logical,
+                staged.compression,
+                descriptor,
+            )
+        }
+
+        /// Flip one byte of the blob's on-disk representation — simulated bit rot.
+        fn flip_a_byte(root: &std::path::Path, row: &ObjectVersionRow) {
+            let p = root.join(row.storage_path.as_ref().unwrap().as_str());
+            let mut data = std::fs::read(&p).expect("read blob");
+            let last = data.len() - 1;
+            data[last] ^= 0xff;
+            std::fs::write(&p, &data).expect("write blob");
+        }
+
+        /// The core of the fix: an ENCRYPTED version is actually re-read (through its DEK) and
+        /// hash-verified. Pre-fix this version was skipped entirely and never counted.
+        #[tokio::test]
+        async fn an_encrypted_version_is_verified() {
+            let dir = tempfile::tempdir().unwrap();
+            let blobs = LocalBlobStore::open(dir.path()).await.unwrap();
+            let crypto = crypto_with_key_id(1, 0xa1);
+            let dek = [7u8; 32];
+            let row = staged_row(
+                &blobs,
+                b"encrypted payload that the scrub must actually read",
+                Some(dek),
+                Some(descriptor_for(&crypto, &dek)),
+                None,
+            )
+            .await;
+            assert_eq!(
+                scrub_version(&blobs, &crypto, &row).await,
+                ScrubOutcome::Verified
+            );
+        }
+
+        /// Bit rot in an encrypted blob must be REPORTED, not skipped: the AEAD tag fails on the
+        /// re-read, which is exactly the signal a cold-data scrub exists to surface.
+        #[tokio::test]
+        async fn a_corrupted_encrypted_blob_is_reported_corrupt() {
+            let dir = tempfile::tempdir().unwrap();
+            let blobs = LocalBlobStore::open(dir.path()).await.unwrap();
+            let crypto = crypto_with_key_id(1, 0xa1);
+            let dek = [9u8; 32];
+            let row = staged_row(
+                &blobs,
+                b"encrypted payload that will be corrupted on disk",
+                Some(dek),
+                Some(descriptor_for(&crypto, &dek)),
+                None,
+            )
+            .await;
+            flip_a_byte(dir.path(), &row);
+            assert!(
+                matches!(
+                    scrub_version(&blobs, &crypto, &row).await,
+                    ScrubOutcome::Corrupt(_)
+                ),
+                "a flipped ciphertext byte must fail closed, never verify"
+            );
+        }
+
+        /// A COMPRESSED plaintext blob is verified as well (the read decompresses), and rot in it
+        /// is reported.
+        #[tokio::test]
+        async fn a_compressed_version_is_verified_and_its_rot_reported() {
+            let dir = tempfile::tempdir().unwrap();
+            let blobs = LocalBlobStore::open(dir.path()).await.unwrap();
+            let crypto = crypto_with_key_id(1, 0xa1);
+            let body = "compress me ".repeat(4096);
+            let row = staged_row(
+                &blobs,
+                body.as_bytes(),
+                None,
+                None,
+                Some(cairn_types::bucket::CompressionPolicy::default()),
+            )
+            .await;
+            assert_ne!(
+                row.compression,
+                CompressionDescriptor::Uncompressed,
+                "the fixture must actually be compressed for this to test anything"
+            );
+            assert_eq!(
+                scrub_version(&blobs, &crypto, &row).await,
+                ScrubOutcome::Verified
+            );
+            flip_a_byte(dir.path(), &row);
+            assert!(matches!(
+                scrub_version(&blobs, &crypto, &row).await,
+                ScrubOutcome::Corrupt(_)
+            ));
+        }
+
+        /// A key that is merely off this node's ring right now (a rotation window) is SKIPPED with
+        /// a reason — never reported as corruption. A false bit-rot page on a healthy store is its
+        /// own incident.
+        #[tokio::test]
+        async fn an_unknown_key_id_is_skipped_not_corrupt() {
+            let dir = tempfile::tempdir().unwrap();
+            let blobs = LocalBlobStore::open(dir.path()).await.unwrap();
+            let sealing = crypto_with_key_id(1, 0xa1);
+            let dek = [3u8; 32];
+            let row = staged_row(
+                &blobs,
+                b"sealed under a key this node no longer holds",
+                Some(dek),
+                Some(descriptor_for(&sealing, &dek)),
+                None,
+            )
+            .await;
+            // A ring holding a DIFFERENT key id: `open` reports UnknownKeyId, not Decrypt.
+            let other_ring = crypto_with_key_id(2, 0xb2);
+            assert_eq!(
+                scrub_version(&blobs, &other_ring, &row).await,
+                ScrubOutcome::Skipped(SkipReason::KeyUnavailable)
+            );
+        }
+
+        /// A tampered/undamaged-but-unparseable descriptor can never succeed: that is damage, not a
+        /// rotation, so it is corruption.
+        #[tokio::test]
+        async fn a_malformed_descriptor_is_corruption() {
+            let dir = tempfile::tempdir().unwrap();
+            let blobs = LocalBlobStore::open(dir.path()).await.unwrap();
+            let crypto = crypto_with_key_id(1, 0xa1);
+            let dek = [4u8; 32];
+            let mut row = staged_row(&blobs, b"body", Some(dek), None, None).await;
+            row.sse_descriptor = Some("{not-json".to_owned());
+            assert_eq!(
+                scrub_version(&blobs, &crypto, &row).await,
+                ScrubOutcome::Corrupt("dek_unopenable")
+            );
+        }
+
+        /// Plaintext coverage must not regress, and a plaintext bit flip is still a hash mismatch.
+        #[tokio::test]
+        async fn a_plaintext_version_is_verified_and_its_rot_reported() {
+            let dir = tempfile::tempdir().unwrap();
+            let blobs = LocalBlobStore::open(dir.path()).await.unwrap();
+            let crypto = crypto_with_key_id(1, 0xa1);
+            let row = staged_row(&blobs, b"plain bytes on disk", None, None, None).await;
+            assert_eq!(
+                scrub_version(&blobs, &crypto, &row).await,
+                ScrubOutcome::Verified
+            );
+            flip_a_byte(dir.path(), &row);
+            assert_eq!(
+                scrub_version(&blobs, &crypto, &row).await,
+                ScrubOutcome::Corrupt("hash_mismatch")
+            );
+        }
+
+        /// A composite (multipart) ETag is not a whole-object digest, so the content hash is NOT
+        /// checked — that must be visible as a counted skip, not silently pass as "verified".
+        #[tokio::test]
+        async fn a_composite_etag_is_skipped_with_a_reason() {
+            let dir = tempfile::tempdir().unwrap();
+            let blobs = LocalBlobStore::open(dir.path()).await.unwrap();
+            let crypto = crypto_with_key_id(1, 0xa1);
+            let mut row = staged_row(&blobs, b"assembled body", None, None, None).await;
+            row.etag = ETag::from_md5_hex(format!("{}-2", "0".repeat(32)));
+            assert_eq!(
+                scrub_version(&blobs, &crypto, &row).await,
+                ScrubOutcome::Skipped(SkipReason::CompositeEtag)
+            );
+        }
+
+        /// A row with no blob is counted, not dropped.
+        #[tokio::test]
+        async fn a_row_without_a_blob_is_skipped_with_a_reason() {
+            let dir = tempfile::tempdir().unwrap();
+            let blobs = LocalBlobStore::open(dir.path()).await.unwrap();
+            let crypto = crypto_with_key_id(1, 0xa1);
+            let mut row = staged_row(&blobs, b"body", None, None, None).await;
+            row.storage_path = None;
+            assert_eq!(
+                scrub_version(&blobs, &crypto, &row).await,
+                ScrubOutcome::Skipped(SkipReason::NoBlob)
+            );
+        }
+
+        /// A blob MISSING from under its row (present `storage_path`, absent file) is real damage —
+        /// reported corrupt with its own kind — NOT the transient-I/O skip. This is the boundary the
+        /// review flagged: only `NotFound` is corruption; an `Io`/`OutOfSpace` blip is skipped.
+        #[tokio::test]
+        async fn a_blob_missing_from_disk_is_reported_corrupt() {
+            let dir = tempfile::tempdir().unwrap();
+            let blobs = LocalBlobStore::open(dir.path()).await.unwrap();
+            let crypto = crypto_with_key_id(1, 0xa1);
+            let row = staged_row(&blobs, b"body that then vanishes", None, None, None).await;
+            let p = dir.path().join(row.storage_path.as_ref().unwrap().as_str());
+            std::fs::remove_file(&p).expect("remove blob");
+            assert_eq!(
+                scrub_version(&blobs, &crypto, &row).await,
+                ScrubOutcome::Corrupt("missing_blob")
+            );
+        }
+
+        /// THE ACCOUNTING INVARIANT: every walked version lands in exactly one bucket, and a pass
+        /// that verified nothing is distinguishable from one that verified everything cleanly.
+        #[test]
+        fn scanned_plus_skipped_accounts_for_every_walked_version() {
+            let mut t = ScrubTally::default();
+            let outcomes = [
+                ScrubOutcome::Verified,
+                ScrubOutcome::Verified,
+                ScrubOutcome::Corrupt("hash_mismatch"),
+                ScrubOutcome::Skipped(SkipReason::KeyUnavailable),
+                ScrubOutcome::Skipped(SkipReason::CompositeEtag),
+                ScrubOutcome::Skipped(SkipReason::DeleteMarker),
+                ScrubOutcome::Skipped(SkipReason::NoBlob),
+                ScrubOutcome::Skipped(SkipReason::MetadataUnavailable),
+                ScrubOutcome::Skipped(SkipReason::IoError),
+            ];
+            for o in outcomes {
+                t.record(o);
+            }
+            assert_eq!(t.walked(), outcomes.len() as u64);
+            assert_eq!(t.scanned, 3, "corrupt versions were still fully read");
+            assert_eq!(t.corrupt, 1);
+            assert_eq!(t.skipped_total(), 6);
+            for r in SkipReason::ALL {
+                assert_eq!(t.skipped_for(r), 1, "reason {} miscounted", r.label());
+            }
+
+            // The signal the defect erased: an all-skipped pass reports a non-zero denominator.
+            let mut nothing = ScrubTally::default();
+            nothing.record(ScrubOutcome::Skipped(SkipReason::KeyUnavailable));
+            assert_eq!(nothing.scanned, 0);
+            assert_eq!(nothing.walked(), 1);
+        }
     }
 }

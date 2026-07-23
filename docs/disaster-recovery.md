@@ -94,9 +94,50 @@ viable DR posture and is sufficient for a backup-target deployment.
 
 ### 4.4 Detected blob corruption (bit-rot)
 
-The scrub re-reads stored blobs and raises `cairn_scrub_corruption_total` on an ETag mismatch
-(`operations.md`, scrub interval `CAIRN_SCRUB_INTERVAL_SECS`). For the affected object, re-fetch the
-good copy from a replica or backup and re-`PUT` it; the corrupt blob is superseded and reclaimed.
+**The scrub is OFF BY DEFAULT.** `CAIRN_SCRUB_INTERVAL_SECS` defaults to `0`, and at `0` no pass ever
+runs — "Cairn has a scrub" and "this node is detecting bit rot" are different claims, and only the
+first is true out of the box. If you are relying on corruption detection, set the interval (ARCH 28.2)
+and alert on the metrics below. Note also that `cairn integrity [--repair]` is a *reconcile* pass
+(orphan blobs, rows with missing blobs) — it never re-reads or re-hashes content, so it is not a
+substitute.
+
+When enabled, the scrub re-reads stored blobs and raises `cairn_scrub_corruption_total` on a failed
+integrity check (`operations.md`; ARCH 8.6 / 26.4). It covers **encrypted objects as well as
+plaintext ones** — an at-rest / SSE-S3 / SSE-KMS version is re-read through its own unsealed data key
+and its AES-GCM blocks are authenticated — so a node with `CAIRN_ENCRYPT_AT_REST=true` is scrubbed
+like any other. For the affected object, re-fetch the good copy from a replica or backup and re-`PUT`
+it; the corrupt blob is superseded and reclaimed.
+
+What the scrub does **not** verify is counted, not hidden. Alert on both series:
+
+- `cairn_scrub_objects_total` — versions fully re-read and hash-verified. **A pass with `scanned = 0`
+  and a non-zero skipped count means you have lost coverage, not that the store is clean**; the
+  per-pass log line (`scanned`, `skipped`, `corrupt`, `walked`) states the same thing, and
+  `scanned + skipped` accounts for every version walked.
+- `cairn_scrub_skipped_total{reason="key_unavailable"}` — the version's key is not on the ring right
+  now (mid-rotation). Deliberately **not** reported as corruption; it is retried on the next pass. A
+  sustained non-zero value means part of the store is going unverified — check the master-key ring
+  (`operations.md`, rotation runbook).
+- `cairn_scrub_skipped_total{reason="composite_etag"}` — a known limit: a multipart object's
+  `{md5}-{n}` ETag is a hash of hashes, so those objects are read and authenticated (a rotted block
+  still fails) but their content hash is not compared. Whole-object verification of composite ETags
+  is not implemented. For multipart-heavy data, rely on the storage layer (ZFS/RAID scrub) as well.
+- `cairn_scrub_skipped_total{reason="io_error"}` — a transient filesystem failure (fd exhaustion, a
+  full or flaky disk) prevented the re-read. Like `key_unavailable`, deliberately **not** reported as
+  corruption — the bytes are most likely fine and the condition clears — and retried next pass. A
+  missing blob file is a different thing and *is* reported corrupt (`cairn_scrub_corruption_total{kind="missing_blob"}`).
+- `cairn_scrub_skipped_total{reason="no_blob"|"delete_marker"|"metadata_unavailable"}` — rows with
+  nothing to read.
+- `cairn_scrub_enumeration_errors_total{stage="buckets"|"versions"}` — a metadata listing failed, so
+  part of the store was not walked at all. A pass that hits one still emits its log line and counters
+  (it does not abort silently), but its `scanned`/`skipped` cover less than the whole store.
+
+**Cost on an encrypted node.** The scrub now re-reads *and decrypts* every version, so on a
+`CAIRN_ENCRYPT_AT_REST` / heavily-SSE store its per-pass CPU and duration scale with stored bytes
+(AES-GCM over the whole dataset) where before it did nearly nothing — the earlier behaviour was the
+bug, not a feature. There is **no rate limiter**; it takes one blob-read permit at a time (so live
+GETs are not starved) but a full pass is I/O- and CPU-heavy. Schedule `CAIRN_SCRUB_INTERVAL_SECS` for
+quiet periods and size it well above a single pass's duration.
 
 ## 5. Pre-disaster checklist
 

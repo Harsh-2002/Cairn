@@ -43,8 +43,17 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   version-id identity, concurrent same-key, crash resiliency, delete-marker mesh, no-cascade,
   integrity. The driver owns all five node processes and self-tears-down. `mesh.sh [scenario-ids...]`.
 - `crash_consistency.sh` — the F-4 durability property at one crash seam (orphan-blob reclaim).
-- `scrub.sh` — integrity scrub: corrupt a stored blob on disk, assert the background scrub
-  (`CAIRN_SCRUB_INTERVAL_SECS`) flags the ETag mismatch (`cairn_scrub_corruption_total`).
+- `scrub.sh` — integrity scrub, **four arms, one throwaway node each**: corrupt a stored blob on disk
+  and assert the background scrub (`CAIRN_SCRUB_INTERVAL_SECS`) flags it
+  (`cairn_scrub_corruption_total`) for a **plaintext**, a **transparently at-rest encrypted**
+  (`CAIRN_ENCRYPT_AT_REST=true` — the boolean `true`, Figment rejects `1`), a **client SSE-S3**, and a
+  **compressed** object. The middle two are THE REGRESSION GUARD for the encrypted scrub: the pass
+  used to skip any version carrying an `sse_descriptor`, so on an at-rest node it verified 0% of the
+  store while logging `scanned=0 corrupt=0 "scrub pass complete"` — indistinguishable from an empty
+  store. Every arm also gates the ACCOUNTING: a non-zero `cairn_scrub_objects_total` (no vacuous
+  pass), a zero `cairn_scrub_skipped_total{reason="key_unavailable"}` on a healthy ring, and — arm 4 —
+  a non-zero `{reason="composite_etag"}`, pinning that the un-hashable multipart ETag is *counted*
+  rather than silently skipped. Do not soften these back to "reported".
 - `object_lock.sh` — Object Lock / WORM: COMPLIANCE immutable, GOVERNANCE yields only to
   `s3:BypassGovernanceRetention` + bypass header, legal hold, bucket default retention echoed on HEAD.
 - `notifications.sh` (+`.py`) — webhook event notifications: local sink, bucket endpoint via the
