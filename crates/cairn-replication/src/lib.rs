@@ -514,7 +514,12 @@ impl ReplicationEngine {
             length: row.size_logical,
         });
         let handle = blobs
-            .open_with_dek(path, range, dek, &row.compression)
+            .open_raw(
+                path,
+                range,
+                cairn_types::blob::BlobCipher::from_dek(dek),
+                &row.compression,
+            )
             .await
             .map_err(map_blob_err)?;
 

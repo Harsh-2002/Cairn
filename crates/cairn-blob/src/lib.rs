@@ -33,8 +33,8 @@ use crate::staging::Staging;
 use async_trait::async_trait;
 use bytes::Bytes;
 use cairn_types::blob::{
-    BlobReadHandle, ByteRange, ContentRange, PartRef, ReconcileOpts, ReconcileReport, StageOptions,
-    StagedBlob, StagedPart, ZeroCopyRead,
+    BlobCipher, BlobProbe, BlobReadHandle, ByteRange, ContentRange, PartRef, ReconcileOpts,
+    ReconcileReport, StageOptions, StagedBlob, StagedPart, ZeroCopyRead,
 };
 use cairn_types::bucket::{CompressionAlgorithm, CompressionPolicy};
 use cairn_types::error::BlobError;
@@ -95,14 +95,14 @@ pub struct LocalBlobStore {
     /// [`with_small_read_max`]: LocalBlobStore::with_small_read_max
     small_read_max: u64,
     /// Cumulative count of reads REFUSED because the blob is a self-consistent encrypted CRNB
-    /// container but the caller supplied no DEK (the fail-closed guard in [`open_with_dek`]).
+    /// container but the caller supplied no DEK (the fail-closed guard in [`open_raw`]).
     ///
     /// Exposed as state rather than emitted here: `cairn-blob` is an engine crate with no `metrics`
     /// dependency, so the server mirrors this into `cairn_blob_encrypted_without_key_total` on its
     /// metrics tick — the same expose-and-mirror shape as `writer_queue_depth` and the metadata
     /// cache's `(hits, misses)`. A `tracing::error!` alone is not alertable; this is.
     ///
-    /// [`open_with_dek`]: cairn_types::traits::BlobStore::open_with_dek
+    /// [`open_raw`]: cairn_types::traits::BlobStore::open_raw
     encrypted_without_key: Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -649,13 +649,19 @@ impl BlobStore for LocalBlobStore {
         })
     }
 
-    async fn open_with_dek(
+    async fn open_raw(
         &self,
         path: &StoragePath,
         range: Option<ByteRange>,
-        dek: Option<[u8; 32]>,
+        cipher: BlobCipher,
         compression: &CompressionDescriptor,
     ) -> Result<BlobReadHandle, BlobError> {
+        // Translate the named cipher to the internal `Option<[u8; 32]>` once, here, so every use of
+        // `dek` below (the framing decision, the DEK-less refusal guard, the CompressedReader open)
+        // is byte-for-byte what it was: `KnownPlaintext` => `None`, `Dek(k)` => `Some(k)`. The
+        // fail-closed semantics MUST NOT change — a `KnownPlaintext` open of an encrypted container
+        // still hits the refusal guard and errors, never streams ciphertext.
+        let dek = cipher.dek();
         let file_path = self.resolve(path)?;
         // The blob is a self-describing CRNB block container iff it was compressed OR encrypted at
         // write time (audit #18). Decide that from the caller's stored compression descriptor and
@@ -827,6 +833,22 @@ impl BlobStore for LocalBlobStore {
             body,
             zero_copy,
         })
+    }
+
+    async fn probe(&self, path: &StoragePath) -> Result<BlobProbe, BlobError> {
+        // Presence + basic framing only: a single `stat`, no body open, no CompressedReader, no
+        // DEK. The physical (on-disk) length is all a container-free probe can honestly report; a
+        // healthy encrypted blob therefore probes present (Ok), never Corruption — presence is not
+        // decryptability. Absence maps to NotFound (the dangling-row case `--repair` deletes); a
+        // real I/O fault surfaces as the corresponding BlobError.
+        let file_path = self.resolve(path)?;
+        match tokio::fs::metadata(&file_path).await {
+            Ok(m) => Ok(BlobProbe {
+                physical_len: m.len(),
+            }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(BlobError::NotFound),
+            Err(e) => Err(io_err(e)),
+        }
     }
 
     async fn delete(&self, path: &StoragePath) -> Result<(), BlobError> {
@@ -1344,7 +1366,12 @@ mod tests {
         assert_eq!(store.read_permits.available_permits(), 1);
 
         let mut handle = store
-            .open(&staged.storage_path, None, &staged.compression)
+            .open_raw(
+                &staged.storage_path,
+                None,
+                BlobCipher::KnownPlaintext,
+                &staged.compression,
+            )
             .await
             .unwrap();
         assert!(

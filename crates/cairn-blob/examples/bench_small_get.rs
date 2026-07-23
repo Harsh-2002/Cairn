@@ -20,7 +20,9 @@
 use bytes::Bytes;
 use cairn_blob::LocalBlobStore;
 use cairn_types::traits::BlobStore;
-use cairn_types::{BodyStream, BucketName, CompressionDescriptor, StageOptions, StoragePath};
+use cairn_types::{
+    BlobCipher, BodyStream, BucketName, CompressionDescriptor, StageOptions, StoragePath,
+};
 use futures_util::StreamExt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -52,7 +54,10 @@ async fn bench_reads(
         let count = count.clone();
         handles.push(tokio::spawn(async move {
             while Instant::now() < deadline {
-                let handle = store.open(&path, None, &compression).await.unwrap();
+                let handle = store
+                    .open_raw(&path, None, BlobCipher::KnownPlaintext, &compression)
+                    .await
+                    .unwrap();
                 let mut body = handle.body;
                 let mut n = 0usize;
                 while let Some(chunk) = body.next().await {

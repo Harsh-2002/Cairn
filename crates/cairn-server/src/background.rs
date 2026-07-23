@@ -1405,7 +1405,15 @@ async fn scrub_version(
         }
     };
 
-    let handle = match blobs.open_with_dek(path, None, dek, &row.compression).await {
+    let handle = match blobs
+        .open_raw(
+            path,
+            None,
+            cairn_types::blob::BlobCipher::from_dek(dek),
+            &row.compression,
+        )
+        .await
+    {
         Ok(h) => h,
         // A blob missing from under its row is real damage (`cairn integrity --repair` would drop the
         // dangling row), reported as corruption with its own kind. But a transient FS failure — fd

@@ -1023,7 +1023,12 @@ impl S3Service {
         };
         let handle = self
             .blob
-            .open_with_dek(&storage, range, dek, &row.compression)
+            .open_raw(
+                &storage,
+                range,
+                cairn_types::blob::BlobCipher::from_dek(dek),
+                &row.compression,
+            )
             .await?;
         let status = if handle.content_range.is_some() {
             StatusCode::PARTIAL_CONTENT
@@ -1035,7 +1040,7 @@ impl S3Service {
         let content_range = handle.content_range;
         // A GET of an uncompressed, unencrypted blob carries the zero-copy hint up so the connection
         // layer can `sendfile` it on the fast path. This covers a full object AND a single resolved
-        // byte-range: `open_with_dek` set the hint's `offset`/`len` to the sub-range and `logical_len`
+        // byte-range: `open_raw` set the hint's `offset`/`len` to the sub-range and `logical_len`
         // to the range length, so the kernel transfers exactly the requested bytes (a 206 with the
         // `content-range` header added below). It still carries the portable stream, so every non-fast
         // path serves it identically. A compressed/encrypted blob yields `zero_copy == None`, and a
@@ -1656,7 +1661,12 @@ impl S3Service {
         };
         let handle = self
             .blob
-            .open_with_dek(&src_path, range, src_dek, &src_row.compression)
+            .open_raw(
+                &src_path,
+                range,
+                cairn_types::blob::BlobCipher::from_dek(src_dek),
+                &src_row.compression,
+            )
             .await?;
         let src_stream: cairn_types::BodyStream =
             {
@@ -2250,7 +2260,12 @@ impl S3Service {
         };
         let handle = self
             .blob
-            .open_with_dek(&src_path, None, src_dek, &src_row.compression)
+            .open_raw(
+                &src_path,
+                None,
+                cairn_types::blob::BlobCipher::from_dek(src_dek),
+                &src_row.compression,
+            )
             .await?;
         // Re-tag the blob read errors as body errors so the source can feed `stage`.
         let src_stream: cairn_types::BodyStream =
