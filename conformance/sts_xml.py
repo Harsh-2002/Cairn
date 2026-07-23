@@ -27,7 +27,7 @@ def s3_client(akid, secret, token=None):
     return boto3.client(
         "s3", endpoint_url=s3_endpoint, aws_access_key_id=akid, aws_secret_access_key=secret,
         aws_session_token=token, region_name="us-east-1",
-        config=Config(s3={"addressing_style": "path"}, retries={"max_attempts": 1}),
+        config=Config(s3={"addressing_style": "path"}, retries={"total_max_attempts": 1, "mode": "standard"}),
     )
 
 
@@ -35,7 +35,7 @@ def s3_client(akid, secret, token=None):
 # an operator sets `sts_endpoint == s3_endpoint` for the SDK / Terraform's assume_role{}.
 sts = boto3.client(
     "sts", endpoint_url=s3_endpoint, aws_access_key_id=ak, aws_secret_access_key=sk,
-    region_name="us-east-1", config=Config(retries={"max_attempts": 1}),
+    region_name="us-east-1", config=Config(retries={"total_max_attempts": 1, "mode": "standard"}),
 )
 
 # ---- GetSessionToken: mint via the XML surface, then use the creds through S3. ----

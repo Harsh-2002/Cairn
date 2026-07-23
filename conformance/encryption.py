@@ -38,7 +38,7 @@ UI_EP = sys.argv[7] if len(sys.argv) > 7 else ""
 s3 = boto3.client(
     "s3", endpoint_url=EP, aws_access_key_id=AK, aws_secret_access_key=SK,
     region_name="us-east-1",
-    config=Config(s3={"addressing_style": "path"}, retries={"max_attempts": 1}),
+    config=Config(s3={"addressing_style": "path"}, retries={"total_max_attempts": 1, "mode": "standard"}),
 )
 
 fails = []
