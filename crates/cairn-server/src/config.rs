@@ -239,6 +239,23 @@ pub struct Config {
     /// periodically reclaimed so the outbox stays a bounded work queue rather than a permanent
     /// per-object ledger. Pending/claimed entries (outstanding work) are never pruned.
     pub replication_retention_secs: u64,
+    /// Allow replicating an object the CLIENT asked us to encrypt (SSE-S3 / SSE-KMS) to a plaintext
+    /// `http://` replication endpoint (`CAIRN_REPLICATION_ALLOW_PLAINTEXT_SSE_OVER_HTTP`, ARCH 20).
+    ///
+    /// Replication ships the **decrypted** body: the engine unseals the version's DEK and reads the
+    /// plaintext, because shipping the stored ciphertext would leave the mirror holding bytes no
+    /// destination can decrypt. For a client-encrypted object over an `http://` endpoint that puts
+    /// data the client explicitly asked to have encrypted onto an unauthenticated, unencrypted link.
+    ///
+    /// Default `false`: such an object is refused per-object as *unavailable*, so it is rescheduled
+    /// without consuming its attempt budget and ships by itself once the endpoint becomes `https://`
+    /// (or this is set). Nothing else is affected — unencrypted objects, and objects encrypted only
+    /// by transparent at-rest encryption (`CAIRN_ENCRYPT_AT_REST`, an operator storage property
+    /// rather than a client contract), replicate over `http://` exactly as before.
+    ///
+    /// Set `true` only when the link is trusted by other means (an in-datacentre VLAN, a VPN, a
+    /// service mesh doing the TLS). It emits a loud startup warning.
+    pub replication_allow_plaintext_sse_over_http: bool,
     /// Retention for terminally-failed webhook-outbox (`events_outbox`) rows in seconds
     /// (`CAIRN_EVENTS_OUTBOX_RETENTION_SECS`): failed entries older than this are periodically
     /// reclaimed so a misconfigured/decommissioned webhook sink cannot grow the metadata DB (the
@@ -399,6 +416,9 @@ impl Default for Config {
             replication_base_backoff_secs: 5,
             replication_max_backoff_secs: 900,
             replication_retention_secs: 86_400,
+            // Refuse by default: a correctness fix (replicating plaintext instead of ciphertext)
+            // must not silently start putting client-encrypted bodies on an unencrypted link.
+            replication_allow_plaintext_sse_over_http: false,
             events_outbox_retention_secs: 86_400,
             allow_internal_endpoints: false,
             import_default_workers: 8,
@@ -791,6 +811,26 @@ impl Config {
                 "replication_retention_secs must be positive".into(),
             ));
         }
+        // The plaintext-SSE-over-http opt-in is only meaningful for an `http://` destination. If the
+        // ONLY configured destination is the env single target and it is `https://`, the knob is
+        // inert — and a knob that reads as "encrypted bodies may go out in the clear" must never sit
+        // in an environment doing nothing, because the next operator will assume it is load-bearing.
+        // Only checked when there is no target list and no chance of a console-configured target
+        // shape being misjudged (`replication_targets` unset), so this can never refuse a startup
+        // whose real destinations live outside the env.
+        if self.replication_allow_plaintext_sse_over_http
+            && self.replication_targets.is_none()
+            && self
+                .replication_endpoint
+                .as_deref()
+                .is_some_and(|e| e.starts_with("https://"))
+        {
+            return Err(ConfigError::Invalid(
+                "replication_allow_plaintext_sse_over_http is set but the only configured \
+                 replication endpoint is https:// — the knob has no effect; unset it"
+                    .into(),
+            ));
+        }
         if self.events_outbox_retention_secs == 0 {
             return Err(ConfigError::Invalid(
                 "events_outbox_retention_secs must be positive".into(),
@@ -976,6 +1016,29 @@ mod tests {
     #[test]
     fn default_is_valid() {
         assert!(base().validate().is_ok());
+    }
+
+    /// The plaintext-SSE-over-http opt-in must be OFF by default — replication now ships DECRYPTED
+    /// bodies, and a correctness fix must not silently start putting client-encrypted data on an
+    /// unauthenticated link — and must not be able to sit in an environment doing nothing.
+    #[test]
+    fn plaintext_sse_over_http_opt_in_defaults_off_and_refuses_being_inert() {
+        assert!(
+            !Config::default().replication_allow_plaintext_sse_over_http,
+            "the default MUST be refuse"
+        );
+        // Set with an http:// endpoint: meaningful, accepted.
+        let mut c = base();
+        c.replication_allow_plaintext_sse_over_http = true;
+        c.replication_endpoint = Some("http://peer.example.com:9000".to_owned());
+        assert!(c.validate().is_ok());
+        // Set with only an https:// endpoint and no target list: provably inert, refused — a knob
+        // reading "encrypted bodies may go out in the clear" must never be decorative.
+        c.replication_endpoint = Some("https://peer.example.com".to_owned());
+        assert!(c.validate().is_err());
+        // ...unless a target list is configured, whose endpoints are not judged here.
+        c.replication_targets = Some("[]".to_owned());
+        assert!(c.validate().is_ok());
     }
 
     fn hex64(b: u8) -> String {

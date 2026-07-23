@@ -335,11 +335,18 @@ impl Crypto for SystemCrypto {
             let nonce_bytes = &ciphertext[HEADER_LEN..VERSIONED_PREFIX];
             let ct = &ciphertext[VERSIONED_PREFIX..];
             let aad = &ciphertext[..HEADER_LEN];
-            let cipher = self.ring.get(&key_id).ok_or(CryptoError::Decrypt)?;
+            // A key id that is not on the ring is a ROTATION condition, not tampering: report it
+            // as `UnknownKeyId` so callers can retry (the key may be re-added, or the row re-wrapped)
+            // instead of classifying the object permanently corrupt. A tag/AAD failure below is
+            // still `Decrypt`.
+            let cipher = self.ring.get(&key_id).ok_or(CryptoError::UnknownKeyId)?;
             return self.decrypt(cipher, ct, nonce_bytes, Some(aad));
         }
         // Legacy (pre-#29) blob: no magic, nonce stored separately, no AAD, legacy key only.
-        let cipher = self.ring.get(&self.legacy_id).ok_or(CryptoError::Decrypt)?;
+        let cipher = self
+            .ring
+            .get(&self.legacy_id)
+            .ok_or(CryptoError::UnknownKeyId)?;
         self.decrypt(cipher, ciphertext, &nonce.0, None)
     }
 
@@ -466,12 +473,25 @@ mod tests {
 
     #[test]
     fn missing_key_id_fails_closed_no_fallback() {
+        // Still fail-closed — but reported as `UnknownKeyId`, NOT `Decrypt`. The ring simply does
+        // not hold that key id, which is a rotation/ring-configuration condition a caller may retry; a `Decrypt`
+        // here would be indistinguishable from tampering and would make callers (replication)
+        // classify a mid-rotation window as permanent corruption.
         let c = crypto(); // single key id 1
         let mut sealed = c.seal(b"y").expect("seal");
         sealed.ciphertext[4] = 0x03;
         sealed.ciphertext[5] = 0xE7; // key_id 999, absent from the ring
         assert!(matches!(
             c.open(&sealed.ciphertext, &sealed.nonce),
+            Err(CryptoError::UnknownKeyId)
+        ));
+        // A key id that IS on the ring but whose tag fails is still `Decrypt` — the distinction is
+        // only ever "no such key" vs "the bytes do not authenticate".
+        let mut tampered = c.seal(b"y").expect("seal");
+        let last = tampered.ciphertext.len() - 1;
+        tampered.ciphertext[last] ^= 0xff;
+        assert!(matches!(
+            c.open(&tampered.ciphertext, &tampered.nonce),
             Err(CryptoError::Decrypt)
         ));
     }
@@ -479,7 +499,8 @@ mod tests {
     #[test]
     fn legacy_prefix_collision_is_fail_closed() {
         // A random legacy ct could (2^-32) start with "CRK1". Such a false-positive is classified
-        // versioned, its random 2-byte id is almost never live, and it fails closed regardless.
+        // versioned, its random 2-byte id is almost never live, and it fails closed regardless —
+        // as `UnknownKeyId`, since the failure is "no key 999 on the ring".
         let c = crypto();
         let mut buf = Vec::new();
         buf.extend_from_slice(&MAGIC);
@@ -487,7 +508,7 @@ mod tests {
         buf.extend_from_slice(&[0u8; NONCE_LEN + 16]); // nonce + a 16-byte "tag"
         assert!(matches!(
             c.open(&buf, &Nonce(vec![])),
-            Err(CryptoError::Decrypt)
+            Err(CryptoError::UnknownKeyId)
         ));
     }
 

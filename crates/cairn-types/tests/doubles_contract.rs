@@ -551,3 +551,62 @@ async fn set_object_acl_replaces_the_version_acl() {
         .unwrap();
     assert!(got.acl.is_none());
 }
+
+/// An encrypted blob read WITHOUT its data-encryption key must fail closed — never plaintext,
+/// never the raw ciphertext, never zeros.
+///
+/// This is a *contract* case rather than a double-only test on purpose: the in-memory double has
+/// always refused a DEK-less encrypted read, while `LocalBlobStore` (which decides its framing from
+/// the DEK argument, not from the bytes) happily streamed the ciphertext for an
+/// encrypted-but-uncompressed blob — the exact divergence that let replication ship ciphertext to
+/// mirrors while every doubles-based test stayed green. `cairn-blob` mirrors these assertions
+/// against the real store.
+#[tokio::test]
+async fn encrypted_blob_read_without_a_dek_fails_closed() {
+    let blob = InMemoryBlobStore::new();
+    let bucket = BucketName::parse("sse-bucket").unwrap();
+    let dek = [9u8; 32];
+    let staged = blob
+        .stage(
+            &bucket,
+            body(b"top secret"),
+            StageOptions {
+                encryption: Some(dek),
+                ..opts()
+            },
+        )
+        .await
+        .unwrap();
+
+    // No key at all: refused.
+    let err = blob
+        .open_with_dek(&staged.storage_path, None, None, &staged.compression)
+        .await
+        .expect_err("a DEK-less read of an encrypted blob must fail, not return bytes");
+    assert!(
+        matches!(err, BlobError::Corruption(_)),
+        "unexpected: {err:?}"
+    );
+
+    // The wrong key: also refused.
+    let err = blob
+        .open_with_dek(
+            &staged.storage_path,
+            None,
+            Some([1u8; 32]),
+            &staged.compression,
+        )
+        .await
+        .expect_err("a wrong-key read of an encrypted blob must fail");
+    assert!(
+        matches!(err, BlobError::Corruption(_)),
+        "unexpected: {err:?}"
+    );
+
+    // The right key: the plaintext, byte-for-byte.
+    let handle = blob
+        .open_with_dek(&staged.storage_path, None, Some(dek), &staged.compression)
+        .await
+        .unwrap();
+    assert_eq!(read_all(handle).await, b"top secret".to_vec());
+}

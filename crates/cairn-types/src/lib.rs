@@ -20,6 +20,7 @@ pub mod meta;
 pub mod notification;
 pub mod object;
 pub mod replication;
+pub mod sse;
 pub mod time;
 pub mod traits;
 

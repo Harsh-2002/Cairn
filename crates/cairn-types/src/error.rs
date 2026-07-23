@@ -108,6 +108,13 @@ pub enum CryptoError {
     /// The master key was required but absent or malformed.
     #[error("master key missing or malformed")]
     Key,
+    /// The envelope names a key id that is not on this node's ring — a rotation/retirement window
+    /// or a misconfigured ring, NOT tampering. Distinct from [`Decrypt`](Self::Decrypt) so callers
+    /// can treat it as *transiently unavailable* (retry, preserve the budget) instead of
+    /// permanently corrupt: conflating the two lets one mid-rotation pass stamp whole buckets
+    /// terminally failed.
+    #[error("no master key with that key id is on the ring")]
+    UnknownKeyId,
     /// The active master key reached its seal-count hard stop; rotate to a new active key
     /// before sealing more secrets (audit #29, Phase E). Opens are never affected.
     #[error("active master key reached its seal-count limit; rotate the master key")]

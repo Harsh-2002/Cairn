@@ -288,6 +288,40 @@ impl BlockEncoder {
     }
 }
 
+/// The length of the CRNB trailer, exported so a caller can read exactly the bytes
+/// [`is_encrypted_container_trailer`] needs.
+pub const TRAILER_BYTES: usize = TRAILER_LEN as usize;
+
+/// Whether `trailer` (the last [`TRAILER_BYTES`] bytes of a `total`-byte file) is a **fully
+/// self-consistent** CRNB trailer marking an *encrypted* container.
+///
+/// This is deliberately NOT the trailer sniffing audit #18 removed: framing is still decided from
+/// the caller's stored descriptor, and this predicate is only ever used to **refuse** a read — never
+/// to parse a blob as a container. Every field must agree (magic, the encrypted version byte, the
+/// `index_len == block_count * INDEX_ENTRY_LEN` identity, and the
+/// `index_offset + index_len + TRAILER_LEN == total` layout identity), so a plaintext blob whose
+/// bytes merely end in `CRNB` is not matched: the odds of a plaintext blob satisfying all four are
+/// negligible, and the consequence of one is a single refused read, not a misread body.
+#[must_use]
+pub fn is_encrypted_container_trailer(trailer: &[u8], total: u64) -> bool {
+    if trailer.len() != TRAILER_BYTES || total < TRAILER_LEN {
+        return false;
+    }
+    if &trailer[0..4] != MAGIC || trailer[4] != VERSION_ENCRYPTED {
+        return false;
+    }
+    let block_count = u32::from_le_bytes(trailer[18..22].try_into().unwrap()) as u64;
+    let index_offset = u64::from_le_bytes(trailer[22..30].try_into().unwrap());
+    let index_len = u64::from(u32::from_le_bytes(trailer[30..34].try_into().unwrap()));
+    if index_len != block_count * INDEX_ENTRY_LEN as u64 {
+        return false;
+    }
+    index_offset
+        .checked_add(index_len)
+        .and_then(|n| n.checked_add(TRAILER_LEN))
+        == Some(total)
+}
+
 /// A random-access reader over a compressed (and optionally SSE-S3-encrypted) blob file.
 pub struct CompressedReader<R: Read + Seek> {
     inner: R,

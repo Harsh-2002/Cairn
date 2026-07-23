@@ -179,8 +179,8 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   fixed-size worker pool holds a **CONSTANT** source workload — single-part PUTs, version churn,
   delete markers (both on already-versioned keys and on write-once **tomb** keys), real ≥ 5 MiB
   multipart Completes — plus an SSE-S3/`aws:kms` arm; both nodes are sampled every second.
-  **GATED** (all load-independent): every plaintext-leg version read back **from the TARGET by the
-  SOURCE's version id** is BYTE-EXACT — the headline, and only possible if the source decrypted to
+  **GATED** (all load-independent): every version on **both legs** — plaintext *and* SSE-encrypted —
+  read back **from the TARGET by the SOURCE's version id** is BYTE-EXACT — the headline, and only possible if the source decrypted to
   logical bytes and the target re-sealed under its own ring; no replica ever carries **wrong bytes**;
   version-id identity incl. whole-**set** equality for a churn key; every delete marker present on
   the target with the same id and every tombstoned key answering **exactly `404 NoSuchKey`**; the
@@ -197,15 +197,18 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   (`REPL_SECS`, `REPL_WORKERS`, `REPL_MP_PART`, `REPL_SSE_EVERY`, …) is validated at startup. The
   launcher **pins** `CAIRN_REQUEST_TIMEOUT_SECS=600` (so a slow runner cannot manufacture a 503) and
   pre-flights all three ports (a stale cairn answering `/healthz` would otherwise make the run
-  silently measure someone else's process). Carries **TWO pinned KNOWN GAPS** (reported, NOT gated —
-  fixing them is a product change): `ReplicationEngine::put_object` opens the source blob with
-  `BlobStore::open`, i.e. **with no DEK**, so an SSE-encrypted source version ships raw **ciphertext**
-  — (1) a **single-part** one is refused `400 BadDigest` at the destination and, a 4xx being terminal,
-  **never replicates at all** (fail-closed); (2) a **multipart-completed** one carries a composite
-  `<md5>-<n>` ETag the destination cannot MD5-verify, so it is **ACCEPTED** and the replica is
-  right-sized, `200`-answering **garbage** — silent corruption, the more serious of the two. The
-  driver counts all three outcomes and prints `KNOWN GAPS APPEAR FIXED` when they stop happening; the
-  fail-closed gate is therefore scoped to the plaintext leg.
+  silently measure someone else's process). **The SSE arm is THE REGRESSION GUARD for the DEK fix** and is
+  gated exactly like the plaintext leg. It was written while `ReplicationEngine::put_object` opened
+  the source blob with `BlobStore::open` — **with no DEK** — so an SSE-encrypted source version
+  shipped raw **ciphertext**: a **single-part** one was refused `400 BadDigest` at the destination
+  and, a 4xx being terminal, **never replicated at all**, while a **multipart-completed** one carries
+  a composite `<md5>-<n>` ETag the destination cannot MD5-verify, so it was **ACCEPTED** and the
+  replica was right-sized, `200`-answering **garbage** (silent corruption). The engine now resolves
+  `row.sse_descriptor` via `cairn_types::sse::open_dek` and reads through `open_with_dek`; nothing
+  else in CI would catch a regression, so do **not** soften this arm back to "reported". Because
+  replication now ships **decrypted** bodies, the launcher must set
+  `CAIRN_REPLICATION_ALLOW_PLAINTEXT_SSE_OVER_HTTP=true` (the two nodes talk over loopback `http://`,
+  and a client-encrypted object is otherwise refused on a plaintext endpoint) — it does.
 - `soak_features.sh` (+`.py`, boto3) — the **mixed-FEATURE soak**, and **the harness where
   constant-load LEAK DETECTION lives**. Everything else either exercises one feature functionally or
   RAMPS load; `soak.sh` is long-running but is two-node replication only (plaintext, one bucket, a

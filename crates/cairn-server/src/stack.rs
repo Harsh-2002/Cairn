@@ -53,6 +53,12 @@ pub struct AppStack {
     /// The blob store. Held for the background subsystems (sweeper, periodic reconcile).
     #[allow(dead_code)]
     pub blob: Arc<dyn BlobStore>,
+    /// The same local blob store behind its concrete type, kept so the metrics loop can scrape
+    /// `encrypted_without_key_total()` into `cairn_blob_encrypted_without_key_total` — an inherent
+    /// accessor, not part of the `BlobStore` trait object. Mirrors the `meta_cache` /
+    /// `store: Vec<Arc<SqliteMetadataStore>>` concrete-handle-alongside-`dyn` pattern; one extra
+    /// startup `Arc` clone, zero per-request cost.
+    pub blob_local: Arc<LocalBlobStore>,
     /// The reconciliation oracle behind its trait object. Held for periodic out-of-band reconcile.
     /// Boxed because the concrete oracle type differs per backend (sqlite vs the shared async one).
     #[allow(dead_code)]
@@ -95,6 +101,12 @@ pub struct AppStack {
     /// (`CAIRN_ALLOW_INTERNAL_ENDPOINTS`). Threaded into every replication/webhook/import sink so the
     /// SSRF guard's connect-time policy is server-global and consistent. Default `false` (enforcing).
     pub allow_internal_endpoints: bool,
+    /// Whether a CLIENT-encrypted (SSE-S3 / SSE-KMS) object may be replicated — as the decrypted
+    /// body, which is what replication ships — to a plaintext `http://` endpoint
+    /// (`CAIRN_REPLICATION_ALLOW_PLAINTEXT_SSE_OVER_HTTP`). Threaded into every replication sink
+    /// (env single target, env named targets, and stored per-bucket targets) so the policy is
+    /// server-global. Default `false` (refuse, and reschedule the object rather than fail it).
+    pub replication_allow_plaintext_sse_over_http: bool,
     /// The public base URL (`CAIRN_PUBLIC_BASE_URL`) shares/presigned links are built against; when
     /// `None`, the minting request's own scheme + Host is used.
     pub public_base_url: Option<String>,
@@ -438,6 +450,15 @@ pub(crate) async fn open_meta_store(
 /// # Errors
 /// Returns a message if any store cannot be opened or the master key is invalid.
 pub async fn build(cfg: &Config) -> Result<AppStack, String> {
+    if cfg.replication_allow_plaintext_sse_over_http {
+        // Loud, operator-visible warning: replication ships the DECRYPTED body, so this permits
+        // data the client asked us to encrypt to cross an unauthenticated, unencrypted link.
+        tracing::warn!(
+            "CAIRN_REPLICATION_ALLOW_PLAINTEXT_SSE_OVER_HTTP is set: objects the client encrypted \
+             with SSE-S3/SSE-KMS will be replicated as DECRYPTED bodies over plaintext http:// \
+             endpoints"
+        );
+    }
     if cfg.allow_internal_endpoints {
         // Loud, operator-visible warning: the SSRF guard is off, so a replication target / webhook /
         // import source may be pointed at loopback, a private network, or the cloud-metadata service.
@@ -475,7 +496,8 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
         .check_single_filesystem()
         .map_err(|e| format!("single-filesystem check failed: {e}"))?;
 
-    let blob: Arc<dyn BlobStore> = Arc::new(blob_impl);
+    let blob_local = Arc::new(blob_impl);
+    let blob: Arc<dyn BlobStore> = blob_local.clone();
 
     // Keep the concrete `SystemCrypto` (the replication target unsealing needs the concrete type,
     // `seal_target`/`open_target` take `&SystemCrypto`) as well as the `dyn Crypto` view the rest
@@ -613,11 +635,13 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
         import_notify,
         sse_tickets: crate::sse::SseTicketStore::default(),
         blob,
+        blob_local,
         oracle,
         store,
         s3_domain: cfg.s3_domain.clone(),
         region: cfg.region.clone(),
         allow_internal_endpoints: cfg.allow_internal_endpoints,
+        replication_allow_plaintext_sse_over_http: cfg.replication_allow_plaintext_sse_over_http,
         public_base_url: cfg.public_base_url.clone(),
         request_metrics: Arc::new(crate::metrics_agg::RequestMetricsAgg::new(
             cfg.request_metrics_bucket_secs,

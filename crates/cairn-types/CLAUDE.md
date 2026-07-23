@@ -21,6 +21,11 @@ freezing this crate freezes the seams. `#![forbid(unsafe_code)]`.
 - `id.rs` — validated newtypes: `BucketName`, `ObjectKey`, `StoragePath`, `VersionId`, `UploadId`,
   `UserId`, `InvalidName`. Validation is S3 wire-correctness, **not** path safety — keys never become
   filesystem paths (that lives in `cairn-blob`).
+- `sse.rs` — the persisted `sse_descriptor` (`SseDescriptor`/`SseMode`) and `open_dek`: the ONE
+  definition of the DEK envelope layout, shared by `cairn-protocol`, `cairn-server`'s re-wrap worker
+  and `cairn-replication`. It was hand-copied in three places, and the crate that lacked a copy
+  shipped ciphertext. `SseDescriptor.extra` (`#[serde(flatten)]`) is load-bearing: it is what stops
+  a read-modify-write on an older node from erasing a field a newer node wrote.
 - `auth.rs` / `authz.rs` / `object.rs` / `bucket.rs` / `blob.rs` / `crypto.rs` / `notification.rs` /
   `replication.rs` / `time.rs` — the per-domain DTOs; `lib.rs` re-exports the most-used items.
   SSE additions live here too: `blob.rs` `PartRef.dek` (the staged part's DEK), `authz.rs` the
@@ -42,6 +47,9 @@ freezing this crate freezes the seams. `#![forbid(unsafe_code)]`.
 - Async traits use `#[async_trait]` to stay object-safe (`dyn`-compatible); zero-copy of object
   *bytes* is a `BlobReadHandle` hint, not part of the futures. Don't make a trait non-dyn-safe.
 - `Crypto::open` returns `Zeroizing<Vec<u8>>` — secrets zeroize at the source. A wrong/missing key or
-  tampered envelope is a hard `CryptoError`, never plaintext (fail-closed).
+  tampered envelope is a hard `CryptoError`, never plaintext (fail-closed). `CryptoError::UnknownKeyId`
+  (the key id is simply not on the ring — a rotation window) is deliberately DISTINCT from
+  `Decrypt` (tampering): callers classify the first as transient and the second as permanent, and
+  conflating them lets one rotation pass stamp whole buckets terminally failed.
 - Spec: trait spine + metadata model in `docs/metadata.md` (11–12); error model in
   `docs/security-errors.md` (25). See the root `../../CLAUDE.md` for the gate and workspace-wide rules.

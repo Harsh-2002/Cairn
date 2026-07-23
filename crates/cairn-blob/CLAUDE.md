@@ -33,6 +33,34 @@ plain files under opaque IDs; metadata is someone else's job (`cairn-meta`).
   `cairn-crypto`); `compress.rs` types deliberately do **not** derive `Debug` so a DEK can't be logged.
   Compress-then-encrypt (ciphertext is incompressible); the 12-byte nonce is `HMAC-SHA256(DEK,
   block_index)[..12]` — deterministic, never stored, never reused for a fixed key. See ARCH 27.
+- **Framing comes from the caller's descriptor + DEK, but a DEK-less read of an encrypted blob is
+  REFUSED.** `is_container = dek.is_some() || compressed`, and staging records only the *logical*
+  compression — so an encrypted-but-**uncompressed** blob is `Uncompressed`, and a caller passing
+  `dek: None` used to get the raw CRNB container bytes streamed as if they were the body (compression
+  is off by default, so this was the default configuration; it is how replication mirrored
+  ciphertext). `open_with_dek`'s probe now cross-checks the trailer and returns
+  `Corruption("encrypted blob read without a data key")` when the blob is a fully self-consistent
+  `VERSION_ENCRYPTED` container. It only ever **refuses** — it never parses as a container — so
+  audit #18's rule (no trailer sniffing to decide framing) still holds, and an uncompressed blob
+  whose bytes merely end in `CRNB` still reads. The trailer is fetched with ONE positioned
+  `read_exact_at` (`#[cfg(unix)]`; a seek/read/rewind fallback elsewhere), so the tuned plaintext
+  read path pays no extra `lseek` and nothing downstream depends on an implicit rewind.
+- **The guard has a KNOWN false-positive class — it is not a random collision.** The four identity
+  checks are satisfied *by construction* by any object whose body is the verbatim bytes of an
+  encrypted blob file, i.e. the "back up `CAIRN_DATA_DIR` by `rclone`/`aws s3 sync`-ing it into a
+  bucket" workflow. Such an object PUTs fine and then reads back as
+  `Corruption("encrypted blob read without a data key")` even though nothing is wrong: the bytes are
+  intact on disk and can still be recovered out-of-band (copy the file out of `data_root`); only the
+  API read is refused. Do **not** weaken the guard to fix this — it closes a real fail-open (shipping
+  ciphertext as a body). The ambiguity is structural: framing is decided from the *caller's*
+  descriptor, and the guard's only input is the bytes. The row-keyed reader in a later ADR stage,
+  which resolves framing from the version row that owns the blob rather than from the file's
+  contents, removes it. Until then the counter below is how an operator tells the two apart.
+- **The refusal is counted, not just logged.** `LocalBlobStore::encrypted_without_key_total()` is a
+  cumulative count of refused DEK-less encrypted reads; the server mirrors it into
+  `cairn_blob_encrypted_without_key_total` on its metrics tick (this crate takes no `metrics`
+  dependency — expose state, let `cairn-server` emit, exactly like `writer_queue_depth`). A
+  `tracing::error!` is not alertable; a counter is.
 - **Never resolve a storage path that escapes `data_root`.** `resolve` rejects absolute paths and any
   `..`/root/prefix component → `BlobError::Io("unsafe storage path")`. Object bytes live under opaque
   IDs, never under the user key, so key-based traversal is structurally impossible — keep it that way.

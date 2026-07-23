@@ -27,39 +27,38 @@ THE MIX (all continuous, all against the source):
   * VERSION CHURN — a small owned key set overwritten repeatedly, so a key carries many versions;
   * DELETE MARKERS on churn keys, so the marker-replication path runs all run;
   * MULTIPART-COMPLETED uploads (a real >= 5 MiB non-final part), so an assembled blob replicates;
-  * an SSE arm (`AES256` + `aws:kms`) into a second versioned bucket — see the KNOWN GAP below.
+  * an SSE arm (`AES256` + `aws:kms`, single-part AND multipart) into a second versioned bucket
+    — GATED exactly like the plaintext leg; see below.
 
-=== TWO KNOWN GAPS, PINNED AND REPORTED, DELIBERATELY NOT GATED ====================================
-ROOT CAUSE (shared). `ReplicationEngine::put_object` opens the source blob with `BlobStore::open` —
-i.e. with NO DEK (crates/cairn-replication/src/lib.rs; the crate contains no DEK code at all). For a
-server-side-encrypted source version that ships the raw CIPHERTEXT, truncated to `size_logical`, as
-if it were the logical body. Both gaps below are that one omission, and they diverge only in whether
-the destination happens to be able to catch it.
+=== WHY THE SSE ARM IS GATED (this harness IS the regression guard) ================================
+This driver was written while `ReplicationEngine::put_object` opened the source blob with
+`BlobStore::open` — with NO DEK — so a server-side-encrypted source version shipped its raw
+CIPHERTEXT, truncated to `size_logical`, as if it were the logical body. Single-part versions were
+refused `400 BadDigest` by the destination's MD5 check and therefore NEVER REPLICATED AT ALL;
+multipart-completed versions carry a composite `<md5>-<n>` ETag the destination cannot verify, so
+the ciphertext was ACCEPTED and the replica existed, had exactly the right size, answered `200`, and
+was GARBAGE. The SSE arm was reported and not gated because the product was broken.
 
-GAP 1 — fail-closed, no data loss on the target. A SINGLE-PART encrypted version carries a plain MD5
-ETag; the destination verifies the body against it and refuses the PUT with `400 BadDigest`. A 4xx is
-TERMINAL, so the entry is never retried and the object NEVER REACHES THE TARGET. Wrong, but safe.
+The engine now resolves `row.sse_descriptor` through `cairn_types::sse::open_dek` and reads via
+`open_with_dek`, so it ships PLAINTEXT. The arm is therefore GATED: every SSE-encrypted source
+version must be present on the target and byte-exact, exactly like a plaintext one. Nothing else in
+CI would catch a regression of that fix — this is the guard. Do not soften these gates back into
+"reported": an un-gated SSE arm is what let the bug live.
 
-GAP 2 — NOT fail-closed: SILENT CORRUPTION. A MULTIPART-COMPLETED encrypted version carries a
-COMPOSITE `<md5>-<n>` ETag, which the destination cannot MD5-verify, so it ACCEPTS the ciphertext.
-The replica then exists, has exactly the right size, answers `200`, and is GARBAGE — a reader on the
-target cannot tell. This is the more serious of the two, and it is why this driver counts
-"present with WRONG BYTES" separately instead of folding it into "missing".
-
-Both were measured here, live, against the debug binary; a plaintext object of the same bytes
-replicates fine either way. Fixing them is a PRODUCT change (the engine must unseal the version's
-`sse_descriptor` and open the blob with its DEK), and this is a harness-only harness — so the SSE arm
-is REPORTED, never gated: its objects are excluded from the byte-exact gate and counted instead, and
-the fail-closed gate is scoped to the plaintext leg. When the product is fixed this driver prints
-`KNOWN GAPS APPEAR FIXED` and the arm should be promoted into the gated leg.
+NOTE FOR THE TWO-NODE RIG: because replication now ships DECRYPTED bodies, a client-encrypted
+(SSE-S3 / SSE-KMS) object is REFUSED by the sink when the destination endpoint is plaintext
+`http://`, unless `CAIRN_REPLICATION_ALLOW_PLAINTEXT_SSE_OVER_HTTP=true`. The launcher must set that
+knob (or use an https endpoint) or every object on this arm will sit rescheduled and the gates below
+will fail with "missing on the target" — which is the guard working, not a flake.
 ====================================================================================================
 
 GATES — every one valid REGARDLESS OF OFFERED LOAD (the lesson stress.sh / stress_multipart.py
 encode), so they hold on a contended 2-core runner:
-  * BYTE-EXACT ACROSS THE KEY BOUNDARY (the headline) — every plaintext-leg version, read from the
-    TARGET by the SOURCE's version id, is byte-identical to what was written. A count, not a rate.
-  * FAIL-CLOSED on the plaintext leg — no plaintext-leg version is ever present on the target with
-    WRONG bytes (scoped to that leg only because of pinned GAP 2 above).
+  * BYTE-EXACT ACROSS THE KEY BOUNDARY (the headline) — every version on BOTH legs, plaintext and
+    SSE-encrypted, read from the TARGET by the SOURCE's version id, is byte-identical to what was
+    written. A count, not a rate.
+  * FAIL-CLOSED on both legs — no version is ever present on the target with WRONG bytes. For the
+    SSE leg this is the specific shape of the old silent corruption: right size, `200`, garbage.
   * VERSION-ID IDENTITY — the target resolves the source's version id (that is how the byte-exact
     read is issued), and a sampled churn key's whole version-id SET is identical on both nodes.
   * DELETE MARKERS — every replicated marker exists on the target with the SAME version id and the
@@ -76,7 +75,7 @@ encode), so they hold on a contended 2-core runner:
     empty a loop is validated below.
 
 ADVISORY (printed + written to the JSON, never gating): convergence-latency percentiles, replication
-throughput, the outbox-depth series, the lag metric, and the SSE arm's landed/failed counts. All of
+throughput, the outbox-depth series, and the lag metric. All of
 those are load- and build-profile-bound (CI drives the DEBUG artifact, whose AES-GCM is unoptimized
 software crypto).
 
@@ -531,9 +530,8 @@ def verify_records():
     """Read EVERY recorded version from the TARGET by the SOURCE's version id and compare bytes.
 
     Three outcomes per record: `match` (present, byte-exact), `missing` (absent), `wrong` (present
-    with different bytes). `wrong` is the fail-closed violation and is gated for BOTH legs; `missing`
-    is gated only for the plaintext leg, because the SSE arm's known gap makes absence expected there
-    (and expected-but-not-required: a fixed product simply reports fewer misses).
+    with different bytes). Both are gated on BOTH legs. `wrong` on the SSE leg is the exact shape of
+    the silent corruption this harness now guards against: right size, `200`, garbage bytes.
     """
     out = {"match": collections.Counter(), "missing": collections.Counter(),
            "wrong": collections.Counter(), "wrong_sample": []}
@@ -790,12 +788,26 @@ def main():
     gate(f"every plaintext-leg version is BYTE-EXACT on the target across the master-key boundary "
          f"({plain_match}/{plain_total}; missing {ver['missing']['plain']})",
          plain_total > 0 and plain_match == plain_total)
-    # FAIL-CLOSED, on the leg that is supposed to work: a plaintext-leg replica must never exist on
-    # the target with the wrong bytes. (Scoped to the plaintext leg because the SSE arm currently
-    # DOES corrupt — gap #2, pinned and reported below, not gated.)
+    # THE REGRESSION GUARD. Identical to the plaintext gate, on the leg that used to be reported and
+    # not gated. A SSE-encrypted source version must be DECRYPTED by the engine, shipped as logical
+    # bytes, and re-sealed under the TARGET's own (different) master key — so this single count
+    # covers both halves of the old bug: single-part versions that never arrived at all, and
+    # multipart versions that arrived as ciphertext.
+    gate(f"every SSE-leg version is BYTE-EXACT on the target across the master-key boundary "
+         f"({sse_match}/{sse_total}; missing {ver['missing']['sse']})",
+         sse_total > 0 and sse_match == sse_total)
+    gate(f"the SSE multipart arm replicated byte-exact — the SILENT-CORRUPTION shape (composite "
+         f"ETag, unverifiable at the destination) "
+         f"({ver['match']['sse-multipart']}/{c['mp_kms_completes']} kms completes)",
+         c["mp_kms_completes"] > 0
+         and ver["match"]["sse-multipart"] == c["mp_kms_completes"])
+    # FAIL-CLOSED, now on BOTH legs: a replica must never exist on the target with the wrong bytes.
     gate(f"no plaintext-leg version has wrong bytes on the target "
          f"({ver['wrong']['plain']}; {ver.get('wrong_plain', [])[:2] or 'none'})",
          ver["wrong"]["plain"] == 0)
+    gate(f"no SSE-leg version has wrong bytes on the target "
+         f"({ver['wrong']['sse']}; {ver.get('wrong_sse', [])[:2] or 'none'})",
+         ver["wrong"]["sse"] == 0)
     gate(f"the multipart arm actually ran and every assembled blob replicated byte-exact "
          f"({ver['match']['plain-multipart']}/{c['mp_completes']} completes)",
          c["mp_completes"] > 0 and ver["match"]["plain-multipart"] == c["mp_completes"])
@@ -835,7 +847,7 @@ def main():
          src_sse_disk["sampled"] > 0
          and src_sse_disk["encrypted"] == src_sse_disk["sampled"]
          and src_sse_disk["with_marker"] == 0)
-    gate(f"both SSE modes ran on the pinned arm (AES256 {c['sse_aes256']}, aws:kms {c['sse_kms']}, "
+    gate(f"both SSE modes ran on the gated arm (AES256 {c['sse_aes256']}, aws:kms {c['sse_kms']}, "
          f"kms multipart {c['mp_kms_completes']})",
          c["sse_aes256"] > 0 and c["sse_kms"] > 0 and c["mp_kms_completes"] > 0)
     gate(f"the replication OUTBOX drained after writes stopped ({drain_detail})", drained)
@@ -845,32 +857,15 @@ def main():
              f"worst {c[f'healthz_{label}_worst_ms']} ms, wedge timeout {HEALTHZ_TIMEOUT}s)",
              c[f"healthz_{label}_probes"] > 0 and c[f"healthz_{label}_failures"] == 0)
 
-    # --- the pinned KNOWN GAP: reported, never gated ----------------------------------------------
-    print("\n  === KNOWN GAPS (reported, NOT gated — see this file's header) ===", flush=True)
-    print(f"    SSE-encrypted SOURCE versions written: {sse_total} "
+    # The SSE leg is gated above; these counts stay in the output as diagnostics so a failure
+    # report says *which* shape broke (never arrived vs. arrived corrupt) without a re-run.
+    print(f"\n  SSE leg: {sse_total} encrypted source versions "
           f"(AES256 {c['sse_aes256']}, aws:kms {c['sse_kms']}, aws:kms multipart "
-          f"{c['mp_kms_completes']})", flush=True)
-    print(f"      absent on the target (fail-closed): {ver['missing']['sse']}", flush=True)
-    print(f"      present and byte-exact:             {sse_match}", flush=True)
-    print(f"      present with WRONG BYTES:           {ver['wrong']['sse']} "
-          f"(of which multipart: {ver['wrong']['sse-multipart']})", flush=True)
-    print("    ROOT CAUSE (both gaps): ReplicationEngine::put_object opens the source blob with "
-          "BlobStore::open — with NO DEK (crates/cairn-replication has no DEK code at all) — so an "
-          "encrypted version ships the raw CIPHERTEXT, truncated to size_logical, as its body.",
+          f"{c['mp_kms_completes']}) — byte-exact {sse_match}, missing {ver['missing']['sse']}, "
+          f"wrong bytes {ver['wrong']['sse']} (multipart {ver['wrong']['sse-multipart']})",
           flush=True)
-    print("    GAP 1, fail-closed: a SINGLE-PART encrypted version carries a plain MD5 ETag, the "
-          "destination verifies it, and the PUT is refused 400 BadDigest. A 4xx is TERMINAL, so the "
-          "object is never retried and never replicates. Wrong, but safe.", flush=True)
-    print("    GAP 2, NOT fail-closed — SILENT CORRUPTION: a MULTIPART-completed encrypted version "
-          "carries a COMPOSITE '<md5>-<n>' ETag, which the destination cannot MD5-verify, so it "
-          "ACCEPTS the ciphertext. The replica then exists, has the right size, reads back 200, and "
-          "is GARBAGE. This is the more serious of the two.", flush=True)
     if ver["wrong"]["sse"]:
-        print(f"      samples: {ver['wrong_sample'][:3]}", flush=True)
-    if sse_total > 0 and sse_match == sse_total:
-        print("    *** KNOWN GAPS APPEAR FIXED: every encrypted source version replicated "
-              "byte-exact. Promote the SSE arm into the gated leg and delete this pin. ***",
-              flush=True)
+        print(f"    samples: {ver['wrong_sample'][:3]}", flush=True)
 
     # --- advisory ---------------------------------------------------------------------------------
     adv.update({k: v for k, v in c.items()})
@@ -938,8 +933,9 @@ def main():
     if fails:
         print(f"\n  replication stress FAILED ({len(fails)}): " + "; ".join(fails[:5]), flush=True)
         return 1
-    print(f"\n  replication stress PASSED — {plain_match} versions byte-exact on the target across "
-          f"a master-key boundary, outbox drained, 0 errors", flush=True)
+    print(f"\n  replication stress PASSED — {plain_match} plaintext + {sse_match} SSE-encrypted "
+          f"versions byte-exact on the target across a master-key boundary, outbox drained, "
+          f"0 errors", flush=True)
     return 0
 
 

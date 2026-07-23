@@ -29,6 +29,7 @@ use cairn_types::object::{
     ChecksumAlgorithm, ChecksumSet, ChecksumValue, CompressionDescriptor, ETag, ObjectLockMode,
     ObjectRetention, ObjectVersionRow, StorageClass,
 };
+use cairn_types::sse::{SseDescriptor, SseMode};
 use cairn_types::traits::{AuthorizationEngine, BlobStore, Clock, Crypto, MetadataStore};
 use http::{Method, StatusCode};
 use std::sync::Arc;
@@ -4596,54 +4597,9 @@ const SSE_AWS_KMS: &str = "aws:kms";
 /// The algorithm recorded in the per-object SSE descriptor.
 const SSE_DESCRIPTOR_ALG: &str = "AES256-GCM";
 
-/// How an object version came to be encrypted, which decides what (if anything) GET/HEAD advertise
-/// to the client. The DEK envelope is identical for all three (CRK1-under-master) — this is a
-/// *labelling* discriminator, not distinct key material (SSE-KMS v1 is label-only, ARCH 27).
-///   * `SseS3`  — the client asked for `x-amz-server-side-encryption: AES256`; advertise `AES256`.
-///   * `AtRest` — transparent server-side-at-rest encryption the client did NOT request; advertise
-///     nothing (it is an operator storage property, not an SSE contract the client can rely on).
-///   * `Kms`    — the client asked for `aws:kms`; advertise `aws:kms` + the key id.
-#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
-#[serde(rename_all = "kebab-case")]
-enum SseMode {
-    #[default]
-    SseS3,
-    AtRest,
-    Kms,
-}
-
-fn is_default_sse_mode(m: &SseMode) -> bool {
-    *m == SseMode::SseS3
-}
-
-/// The JSON `sse_descriptor` persisted on an encrypted object version: the algorithm, the
-/// data-encryption key sealed under the master key (base64), and the wrapping nonce (base64). The
-/// raw DEK is never stored — only this wrapped form (ARCH 27, SSE-S3).
-///
-/// `mode`/`kms_key_id` are additive (both `#[serde(default)]` and skipped when default), so a legacy
-/// descriptor with neither field deserializes as an ordinary SSE-S3 descriptor and a plain SSE-S3
-/// descriptor still serializes byte-identically. The master-key re-wrap loop (`key_rewrap.rs`)
-/// preserves both across a rotation — dropping them would silently make an `AtRest` object start
-/// advertising `AES256`.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct SseDescriptor {
-    alg: String,
-    wrapped_dek_b64: String,
-    nonce_b64: String,
-    #[serde(default, skip_serializing_if = "is_default_sse_mode")]
-    mode: SseMode,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    kms_key_id: Option<String>,
-    /// The `x-amz-server-side-encryption-bucket-key-enabled` flag, echoed on read so a round-trip
-    /// GET does not drop it (SSE-KMS only). Additive: absent/false serializes away, so a legacy or
-    /// SSE-S3 descriptor is byte-identical.
-    #[serde(default, skip_serializing_if = "is_false")]
-    bucket_key_enabled: bool,
-}
-
-fn is_false(b: &bool) -> bool {
-    !*b
-}
+// `SseMode` / `SseDescriptor` (the persisted `sse_descriptor` JSON) and `open_dek` live in
+// `cairn_types::sse` — the ONE definition, shared with the `cairn-server` re-wrap worker and with
+// `cairn-replication`, which shipped raw ciphertext for as long as it did not know this format.
 
 /// The resolved encryption for a committed-object write: the raw DEK handed to the blob store
 /// (`None` = plaintext blocks) and the JSON `sse_descriptor` persisted on the object row (`None` =
@@ -4901,6 +4857,7 @@ impl S3Service {
             mode,
             kms_key_id,
             bucket_key_enabled,
+            extra: std::collections::BTreeMap::new(),
         };
         let json = serde_json::to_string(&descriptor)
             .map_err(|e| Error::Internal(format!("serialize sse descriptor: {e}")))?;
@@ -4969,31 +4926,16 @@ impl S3Service {
     }
 
     /// Unwrap the raw 32-byte DEK from a stored `sse_descriptor` JSON document by opening the
-    /// sealed key under the master key.
+    /// sealed key under the master key. Delegates to [`cairn_types::sse::open_dek`] — the single
+    /// definition of the envelope layout — and fails CLOSED (a typed error, never plaintext).
     fn open_sse_dek(&self, descriptor_json: &str) -> Result<[u8; 32]> {
         // v1 is label-only: every DEK (SseS3, AtRest, Kms) is sealed under the SAME master ring, so
         // opening on `self.crypto` is correct and symmetric with the seal path. A FUTURE external
-        // KeyProvider with per-key material would seal under provider material and this open would
-        // then have to resolve the crypto via `self.key_provider.crypto_for(d.kms_key_id)` — until
-        // then it fails CLOSED (a decrypt error, never plaintext), never a silent leak.
-        let d: SseDescriptor = serde_json::from_str(descriptor_json)
+        // KeyProvider with per-key material would resolve the crypto via
+        // `self.key_provider.crypto_for(d.kms_key_id)` — until then this fails CLOSED.
+        let d = cairn_types::sse::parse_descriptor(descriptor_json)
             .map_err(|e| Error::Internal(format!("parse sse descriptor: {e}")))?;
-        let ciphertext = base64::engine::general_purpose::STANDARD
-            .decode(d.wrapped_dek_b64.as_bytes())
-            .map_err(|_| Error::Internal("sse descriptor: bad wrapped key base64".to_owned()))?;
-        // A CRK1 envelope leaves `nonce_b64` empty (its nonce is inside the envelope and `open`
-        // ignores this argument for it); a legacy descriptor carries the nonce separately (#29).
-        let nonce_bytes = if d.nonce_b64.is_empty() {
-            Vec::new()
-        } else {
-            base64::engine::general_purpose::STANDARD
-                .decode(d.nonce_b64.as_bytes())
-                .map_err(|_| Error::Internal("sse descriptor: bad nonce base64".to_owned()))?
-        };
-        let raw = self.crypto.open(&ciphertext, &Nonce(nonce_bytes))?;
-        raw.as_slice().try_into().map_err(|_| {
-            Error::Internal("sse descriptor: unwrapped key is not 32 bytes".to_owned())
-        })
+        Ok(*cairn_types::sse::open_dek(&*self.crypto, &d)?)
     }
 
     /// Seal a per-part multipart DEK under the master ring, returning the base64 CRK1 envelope stored

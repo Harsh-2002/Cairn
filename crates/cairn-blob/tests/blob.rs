@@ -545,15 +545,17 @@ async fn encrypted_without_compression_and_wrong_dek_fails() {
         wrong,
         Err(cairn_types::error::BlobError::Corruption(_))
     ));
-    // With the descriptor+DEK contract (audit #18) the blob layer trusts the caller's signals
-    // instead of sniffing the trailer. Reading this (uncompressed-descriptor) encrypted blob with
-    // NO DEK therefore yields the stored CRNB-container bytes as-is rather than erroring — but
-    // never the plaintext. This cannot occur on the production GET path, which always supplies the
-    // DEK derived from the object's SSE descriptor when the object is encrypted.
-    let none = read_all_dek(&store, &enc.storage_path, None, None, &enc.compression)
-        .await
-        .expect("trusting the descriptor, a no-DEK read returns the raw stored bytes");
-    assert_ne!(none, data, "a no-DEK read must never yield plaintext");
+    // A no-DEK read is now REFUSED. This assertion used to say the opposite: the descriptor+DEK
+    // contract (audit #18) had the blob layer trust the caller's signals, so this read returned the
+    // raw CRNB-container bytes — "never the plaintext", which was true and beside the point. A
+    // caller that got ciphertext back with an `Ok` shipped it: that is exactly how replication
+    // mirrored garbage. The trailer cross-check keeps the descriptor authoritative for *framing*
+    // while making "read an encrypted blob as plaintext" impossible to do silently.
+    let none = read_all_dek(&store, &enc.storage_path, None, None, &enc.compression).await;
+    assert!(
+        matches!(&none, Err(cairn_types::error::BlobError::Corruption(m)) if m.contains("without a data key")),
+        "a no-DEK read of an encrypted blob must fail closed, got: {none:?}"
+    );
 }
 
 /// An old-format (unencrypted) blob still reads unchanged through both `open` and `open_with_dek`
@@ -1802,4 +1804,167 @@ async fn stage_part_checksum_and_assemble_checksum_are_over_plaintext() {
         enc_asm.md5_hex, plain_asm.md5_hex,
         "whole-object MD5 over plaintext"
     );
+}
+
+#[tokio::test]
+async fn encrypted_uncompressed_blob_read_without_a_dek_is_refused() {
+    // THE fail-open that shipped raw ciphertext to replication mirrors. Framing is decided from the
+    // DEK *argument* (`is_container = dek.is_some() || compressed`), and staging records only the
+    // LOGICAL compression — so an encrypted-but-uncompressed blob is `Uncompressed`, and a reader
+    // that passes `dek: None` never parses the CRNB container: `logical_len` becomes the file
+    // length and the ciphertext streams out as if it were the body. Compression is off by default,
+    // so this was the DEFAULT configuration. The trailer cross-check now refuses.
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let b = BucketName::parse("bkt").unwrap();
+    let dek = [42u8; 32];
+    let plaintext = b"the quick brown fox jumps over the lazy dog".to_vec();
+
+    // Compression explicitly OFF: the descriptor is `Uncompressed` even though the file on disk is
+    // an encrypted CRNB container.
+    let staged = store
+        .stage(
+            &b,
+            body(plaintext.clone()),
+            opts_encrypted(None, "application/octet-stream", dek),
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(staged.compression, CompressionDescriptor::Uncompressed),
+        "an encrypted-but-uncompressed blob records Uncompressed — the premise of the bug"
+    );
+
+    let err = store
+        .open_with_dek(&staged.storage_path, None, None, &staged.compression)
+        .await
+        .expect_err("reading an encrypted blob with no DEK must fail, not stream ciphertext");
+    assert!(
+        matches!(&err, BlobError::Corruption(m) if m.contains("without a data key")),
+        "unexpected error: {err:?}"
+    );
+
+    // The legitimate read is unaffected: with the DEK it is the plaintext, byte-for-byte.
+    let handle = store
+        .open_with_dek(&staged.storage_path, None, Some(dek), &staged.compression)
+        .await
+        .unwrap();
+    let mut out = Vec::new();
+    {
+        use futures_util::StreamExt;
+        let mut s = handle.body;
+        while let Some(c) = s.next().await {
+            out.extend_from_slice(&c.unwrap());
+        }
+    }
+    assert_eq!(out, plaintext);
+}
+
+#[tokio::test]
+async fn encrypted_compressed_blob_read_without_a_dek_stays_refused() {
+    // The already-correct arm (the container IS parsed, and `CompressedReader` fails fast). Pinned
+    // so the new trailer cross-check does not change which error a caller sees here.
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let b = BucketName::parse("bkt").unwrap();
+    let dek = [42u8; 32];
+    let data = vec![b'a'; 64 * 1024];
+    let staged = store
+        .stage(
+            &b,
+            body(data),
+            opts_encrypted(
+                Some(CompressionPolicy {
+                    algorithm: CompressionAlgorithm::Zstd,
+                    block_size: 1 << 16,
+                }),
+                "text/plain",
+                dek,
+            ),
+        )
+        .await
+        .unwrap();
+    let err = store
+        .open_with_dek(&staged.storage_path, None, None, &staged.compression)
+        .await
+        .expect_err("an encrypted+compressed blob must still refuse a DEK-less read");
+    assert!(
+        matches!(err, BlobError::Corruption(_)),
+        "unexpected: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_guards_known_false_positive_class_is_pinned_and_counted() {
+    // The guard has a SYSTEMATIC false positive, not a random collision: an object whose BODY is
+    // the verbatim bytes of an encrypted blob file satisfies all four identity checks by
+    // construction. That is not hypothetical — it is the "back up CAIRN_DATA_DIR by rclone/aws s3
+    // sync-ing it into a bucket" workflow, which stores whole blob files as ordinary objects.
+    //
+    // Pinned rather than fixed: the guard closes a real fail-open (streaming ciphertext as a body)
+    // and must not be weakened. The ambiguity is structural — framing comes from the caller's
+    // descriptor, and the guard's only input is the bytes — and is removed by the row-keyed reader
+    // in a later stage. The bytes are never lost: they are intact on disk, only the API read is
+    // refused. The counter is what lets an operator tell this apart from a caller that lost a DEK.
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let b = BucketName::parse("bkt").unwrap();
+
+    // Produce a real encrypted blob file, then read its raw bytes off disk.
+    let victim = store
+        .stage(
+            &b,
+            body(b"the original secret".to_vec()),
+            opts_encrypted(None, "application/octet-stream", [7u8; 32]),
+        )
+        .await
+        .unwrap();
+    let raw = tokio::fs::read(dir.path().join(victim.storage_path.as_str()))
+        .await
+        .expect("read the encrypted blob file back");
+
+    assert_eq!(store.encrypted_without_key_total(), 0);
+
+    // PUT those bytes as an ordinary, UNENCRYPTED object — the backup workflow.
+    let backup = store
+        .stage(
+            &b,
+            body(raw.clone()),
+            opts(None, "application/octet-stream"),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        backup.compression,
+        CompressionDescriptor::Uncompressed
+    ));
+
+    // Reading it back is refused, even though nothing is wrong with it.
+    let err = read_all_dek(
+        &store,
+        &backup.storage_path,
+        None,
+        None,
+        &backup.compression,
+    )
+    .await
+    .expect_err("the documented false positive: a stored blob file reads back as Corruption");
+    assert!(
+        matches!(&err, BlobError::Corruption(m) if m.contains("without a data key")),
+        "unexpected: {err:?}"
+    );
+
+    // The refusal is COUNTED, not merely logged: a tracing::error! cannot be alerted on, and this
+    // is the signal an operator needs both for this benign class and for the real fail-open.
+    assert_eq!(
+        store.encrypted_without_key_total(),
+        1,
+        "the guard must bump cairn_blob_encrypted_without_key_total"
+    );
+
+    // The bytes are not lost — they are still exactly on disk, recoverable out of band.
+    let on_disk = tokio::fs::read(dir.path().join(backup.storage_path.as_str()))
+        .await
+        .unwrap();
+    assert_eq!(on_disk, raw, "the object's bytes are intact on disk");
 }

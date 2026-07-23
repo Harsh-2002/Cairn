@@ -13,10 +13,10 @@ use cairn_types::object::{
 };
 use cairn_types::testing::{
     FakeReplicationSink, InMemoryBlobStore, InMemoryMetadataStore, RecordedIntent, SinkBehavior,
-    TestClock,
+    StubCrypto, TestClock,
 };
 use cairn_types::time::Timestamp;
-use cairn_types::traits::{BlobStore, Clock, MetadataStore};
+use cairn_types::traits::{BlobStore, Clock, Crypto, MetadataStore};
 
 use cairn_replication::{
     BucketRoutedSink, ReplicationEngine, ReplicationOpts, SingleSink, SinkRouter, next_backoff,
@@ -210,12 +210,19 @@ async fn version_status(
 }
 
 fn engine() -> ReplicationEngine {
-    ReplicationEngine::new(ReplicationOpts {
-        batch_size: 64,
-        max_attempts: 3,
-        base_backoff_secs: 10,
-        max_backoff_secs: 100,
-    })
+    engine_with_crypto(Arc::new(StubCrypto))
+}
+
+fn engine_with_crypto(crypto: Arc<dyn Crypto>) -> ReplicationEngine {
+    ReplicationEngine::new(
+        ReplicationOpts {
+            batch_size: 64,
+            max_attempts: 3,
+            base_backoff_secs: 10,
+            max_backoff_secs: 100,
+        },
+        crypto,
+    )
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1072,4 +1079,457 @@ async fn completing_replication_does_not_demote_a_newer_version() {
         version_status(&meta, "k", &v1).await,
         Some(ReplicationStatus::Completed)
     );
+}
+
+// --- encrypted source versions ------------------------------------------------------------
+//
+// Every test above this line ships a version whose `sse_descriptor` is `None`. That omission is
+// exactly why the engine shipped raw ciphertext to mirrors for as long as it did: the doubles-based
+// gate never exercised the encrypted arm at all.
+
+/// A sink that keeps the bytes it was handed, so a test can assert the replica received the
+/// PLAINTEXT rather than the stored ciphertext.
+#[derive(Default)]
+struct CapturingSink {
+    bodies: std::sync::Mutex<Vec<(String, Vec<u8>)>>,
+    /// The `client_encrypted` classification each shipped object carried, so a test can pin that
+    /// the sink is actually TOLD whether the plaintext it is about to put on the wire was
+    /// encrypted at the client's request.
+    client_encrypted: std::sync::Mutex<Vec<bool>>,
+}
+
+impl CapturingSink {
+    fn bodies(&self) -> Vec<(String, Vec<u8>)> {
+        self.bodies.lock().unwrap().clone()
+    }
+
+    fn client_encrypted_flags(&self) -> Vec<bool> {
+        self.client_encrypted.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl cairn_types::traits::ReplicationSink for CapturingSink {
+    async fn put_object(
+        &self,
+        object: cairn_types::replication::ReplicatedObject,
+    ) -> Result<(), cairn_types::error::ReplicationError> {
+        use futures_util::StreamExt;
+        let key = object.key.as_str().to_owned();
+        let mut body = object.body;
+        let mut out = Vec::new();
+        while let Some(chunk) = body.next().await {
+            out.extend_from_slice(
+                &chunk
+                    .map_err(|e| cairn_types::error::ReplicationError::Retryable(e.to_string()))?,
+            );
+        }
+        self.client_encrypted
+            .lock()
+            .unwrap()
+            .push(object.client_encrypted);
+        self.bodies.lock().unwrap().push((key, out));
+        Ok(())
+    }
+
+    async fn delete_marker(
+        &self,
+        _key: &ObjectKey,
+        _version: &VersionId,
+    ) -> Result<(), cairn_types::error::ReplicationError> {
+        Ok(())
+    }
+}
+
+/// A crypto double whose `open` always reports the sealing key as absent from the ring — the
+/// mid-rotation / not-yet-loaded-key condition.
+#[derive(Debug)]
+struct UnknownKeyCrypto;
+
+impl Crypto for UnknownKeyCrypto {
+    fn seal(
+        &self,
+        _plaintext: &[u8],
+    ) -> Result<cairn_types::crypto::Sealed, cairn_types::error::CryptoError> {
+        Err(cairn_types::error::CryptoError::Encrypt)
+    }
+    fn open(
+        &self,
+        _ciphertext: &[u8],
+        _nonce: &cairn_types::crypto::Nonce,
+    ) -> Result<zeroize::Zeroizing<Vec<u8>>, cairn_types::error::CryptoError> {
+        Err(cairn_types::error::CryptoError::UnknownKeyId)
+    }
+    fn ct_eq(&self, a: &[u8], b: &[u8]) -> bool {
+        a == b
+    }
+}
+
+/// A crypto double whose `open` reports authenticated-decryption failure — tampering, or a key
+/// that is present but wrong. Unlike an unknown key id, this can never start working.
+#[derive(Debug)]
+struct TamperedCrypto;
+
+impl Crypto for TamperedCrypto {
+    fn seal(
+        &self,
+        _plaintext: &[u8],
+    ) -> Result<cairn_types::crypto::Sealed, cairn_types::error::CryptoError> {
+        Err(cairn_types::error::CryptoError::Encrypt)
+    }
+    fn open(
+        &self,
+        _ciphertext: &[u8],
+        _nonce: &cairn_types::crypto::Nonce,
+    ) -> Result<zeroize::Zeroizing<Vec<u8>>, cairn_types::error::CryptoError> {
+        Err(cairn_types::error::CryptoError::Decrypt)
+    }
+    fn ct_eq(&self, a: &[u8], b: &[u8]) -> bool {
+        a == b
+    }
+}
+
+/// The DEK an encrypted fixture is staged under, and the `sse_descriptor` that seals it with
+/// [`StubCrypto`] (which XORs, so the sealed form differs from the raw key).
+fn encrypted_fixture_dek() -> ([u8; 32], String) {
+    use base64::Engine;
+    let dek = [0x11u8; 32];
+    let sealed = StubCrypto.seal(&dek).unwrap();
+    let json = format!(
+        r#"{{"alg":"AES256-GCM","wrapped_dek_b64":"{}","nonce_b64":""}}"#,
+        base64::engine::general_purpose::STANDARD.encode(&sealed.ciphertext)
+    );
+    (dek, json)
+}
+
+/// Commit an encrypted ObjectCreate version (blob staged under `dek`, row carrying the matching
+/// `sse_descriptor`) with a pending, due outbox entry.
+async fn put_encrypted_with_outbox(
+    meta: &InMemoryMetadataStore,
+    blobs: &InMemoryBlobStore,
+    entry_id: &str,
+    key: &str,
+    data: &'static [u8],
+    now: Timestamp,
+) -> VersionId {
+    let (dek, descriptor) = encrypted_fixture_dek();
+    let staged = blobs
+        .stage(
+            &bucket(),
+            body(data),
+            StageOptions {
+                compression: None,
+                extra_checksums: ChecksumSet::none(),
+                size_ceiling: 1 << 30,
+                content_type: "text/plain".to_owned(),
+                encryption: Some(dek),
+                content_length: None,
+            },
+        )
+        .await
+        .unwrap();
+    let version = VersionId::generate();
+    let mut row = version_row(
+        key,
+        &version,
+        Some(staged.storage_path.clone()),
+        staged.etag.clone(),
+        staged.size_logical,
+        false,
+        ReplicationStatus::Pending,
+        now,
+    );
+    row.sse_descriptor = Some(descriptor);
+    let entry = outbox_entry_for(
+        entry_id,
+        bucket(),
+        ObjectKey::parse(key).unwrap(),
+        version.clone(),
+        ReplicationOp::ObjectCreate,
+        "rule-0",
+        None,
+        now,
+        0,
+    );
+    meta.submit(Mutation::PutObjectVersion {
+        row: Box::new(row),
+        precondition: Precondition::default(),
+        replication: vec![entry],
+    })
+    .await
+    .unwrap();
+    version
+}
+
+#[tokio::test]
+async fn encrypted_version_replicates_plaintext_not_ciphertext() {
+    // THE incident. Before the fix the engine read the source blob with no DEK, so the replica
+    // received the stored ciphertext at exactly the plaintext length — a mirror that answers 200
+    // with garbage. Now the engine unseals `sse_descriptor` and ships the plaintext.
+    let meta = InMemoryMetadataStore::new();
+    let blobs = Arc::new(InMemoryBlobStore::new());
+    let sink = CapturingSink::default();
+    let router = SingleSink(sink);
+    let clock = TestClock::at_secs(1_000);
+    let now = clock.now();
+
+    let version =
+        put_encrypted_with_outbox(&meta, &blobs, "e1", "secret.txt", b"attack at dawn", now).await;
+
+    let report = engine()
+        .run_once(&meta, &router, &blobs, &clock)
+        .await
+        .unwrap();
+    assert_eq!(report.completed, 1, "the encrypted version must replicate");
+    assert_eq!(
+        version_status(&meta, "secret.txt", &version).await,
+        Some(ReplicationStatus::Completed)
+    );
+    let bodies = router.0.bodies();
+    assert_eq!(bodies.len(), 1);
+    assert_eq!(
+        bodies[0].1,
+        b"attack at dawn".to_vec(),
+        "the replica must receive the PLAINTEXT, not the stored ciphertext"
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_key_id_is_unavailable_and_preserves_the_attempt_budget() {
+    // A key that is merely not on the ring right now (mid-rotation) must NOT burn the attempt
+    // budget: at max_attempts=3, three passes would otherwise stamp the version permanently failed
+    // and silently stop the whole bucket replicating. And nothing may be shipped on the error path
+    // — no ciphertext egress.
+    let meta = InMemoryMetadataStore::new();
+    let blobs = Arc::new(InMemoryBlobStore::new());
+    let router = SingleSink(CapturingSink::default());
+    let clock = TestClock::at_secs(1_000);
+    let now = clock.now();
+
+    let version =
+        put_encrypted_with_outbox(&meta, &blobs, "e2", "secret.txt", b"attack at dawn", now).await;
+
+    let engine = engine_with_crypto(Arc::new(UnknownKeyCrypto));
+    for _ in 0..5 {
+        let report = engine
+            .run_once(&meta, &router, &blobs, &clock)
+            .await
+            .unwrap();
+        assert_eq!(report.failed, 0, "a rotation window must never be terminal");
+        clock.advance_secs(60);
+    }
+    assert!(
+        router.0.bodies().is_empty(),
+        "nothing may be shipped when the DEK cannot be resolved"
+    );
+    assert_ne!(
+        version_status(&meta, "secret.txt", &version).await,
+        Some(ReplicationStatus::Failed),
+        "an unavailable key must leave the version retryable, not failed"
+    );
+    // Still queued, with the attempt budget intact (5 passes > max_attempts of 3).
+    let due = due_entries(&meta, clock.now()).await;
+    assert_eq!(due.len(), 1, "the entry must still be queued");
+    assert_eq!(due[0].attempts, 0, "the attempt budget must be untouched");
+    // The condition must be attributed to the SOURCE KEY, not the destination. Because
+    // `Unavailable` never consumes the attempt budget, a permanently-removed key id retries here
+    // forever and never lands in `failed` — so a message blaming the (healthy) destination would
+    // send an operator to the wrong system indefinitely, and the pass counter below is the only
+    // durable signal that such objects exist at all (review finding 4).
+    let last = due[0].last_error.as_deref().unwrap_or_default();
+    assert!(
+        last.contains("source data key unavailable"),
+        "last_error must name the local master ring, not the target: {last}"
+    );
+    assert!(
+        !last.contains("target unavailable"),
+        "a DEK failure must not be reported as a destination failure: {last}"
+    );
+    let report = engine
+        .run_once(&meta, &router, &blobs, &clock)
+        .await
+        .unwrap();
+    assert_eq!(
+        report.dek_resolve_failures, 1,
+        "the pass must count the DEK-resolve failure (cairn_replication_dek_resolve_failed_total)"
+    );
+    assert_eq!(report.retried, 1, "and still count it as a reschedule");
+}
+
+#[tokio::test]
+async fn client_requested_encryption_is_flagged_to_the_sink_but_at_rest_is_not() {
+    // The sink refuses to put a CLIENT-encrypted plaintext body on an unauthenticated http://
+    // endpoint, so the engine must classify the source correctly. `SseS3`/`Kms` = the client asked
+    // for encryption (a contract); `AtRest` = transparent operator storage encryption, which is NOT
+    // a client contract and must NOT gate replication that worked before this change.
+    for (mode_json, expected) in [
+        (None, true), // legacy descriptor: defaults to SSE-S3
+        (Some(r#","mode":"sse-s3""#), true),
+        (Some(r#","mode":"kms","kms_key_id":"k1""#), true),
+        (Some(r#","mode":"at-rest""#), false),
+    ] {
+        let meta = InMemoryMetadataStore::new();
+        let blobs = Arc::new(InMemoryBlobStore::new());
+        let router = SingleSink(CapturingSink::default());
+        let clock = TestClock::at_secs(1_000);
+        let now = clock.now();
+
+        let (dek, descriptor) = encrypted_fixture_dek();
+        let descriptor = match mode_json {
+            Some(extra) => format!("{}{extra}}}", descriptor.trim_end_matches('}')),
+            None => descriptor,
+        };
+        let staged = blobs
+            .stage(
+                &bucket(),
+                body(b"attack at dawn"),
+                StageOptions {
+                    compression: None,
+                    extra_checksums: ChecksumSet::none(),
+                    size_ceiling: 1 << 30,
+                    content_type: "text/plain".to_owned(),
+                    encryption: Some(dek),
+                    content_length: None,
+                },
+            )
+            .await
+            .unwrap();
+        let version = VersionId::generate();
+        let mut row = version_row(
+            "secret.txt",
+            &version,
+            Some(staged.storage_path.clone()),
+            staged.etag.clone(),
+            staged.size_logical,
+            false,
+            ReplicationStatus::Pending,
+            now,
+        );
+        row.sse_descriptor = Some(descriptor.clone());
+        let entry = outbox_entry_for(
+            "m1",
+            bucket(),
+            ObjectKey::parse("secret.txt").unwrap(),
+            version.clone(),
+            ReplicationOp::ObjectCreate,
+            "rule-0",
+            None,
+            now,
+            0,
+        );
+        meta.submit(Mutation::PutObjectVersion {
+            row: Box::new(row),
+            precondition: Precondition::default(),
+            replication: vec![entry],
+        })
+        .await
+        .unwrap();
+
+        let report = engine()
+            .run_once(&meta, &router, &blobs, &clock)
+            .await
+            .unwrap();
+        assert_eq!(report.completed, 1, "descriptor {descriptor}");
+        assert_eq!(
+            router.0.client_encrypted_flags(),
+            vec![expected],
+            "descriptor {descriptor}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_unencrypted_version_is_not_flagged_client_encrypted() {
+    // The common case must stay `false`, or every plaintext object would start being gated on an
+    // http:// endpoint.
+    let meta = InMemoryMetadataStore::new();
+    let blobs = Arc::new(InMemoryBlobStore::new());
+    let router = SingleSink(CapturingSink::default());
+    let clock = TestClock::at_secs(1_000);
+    let now = clock.now();
+    put_with_outbox(&meta, &blobs, "p1", "plain.txt", b"hello", now, now).await;
+    let report = engine()
+        .run_once(&meta, &router, &blobs, &clock)
+        .await
+        .unwrap();
+    assert_eq!(report.completed, 1);
+    assert_eq!(router.0.client_encrypted_flags(), vec![false]);
+    assert_eq!(report.dek_resolve_failures, 0);
+}
+
+#[tokio::test]
+async fn a_tampered_or_unopenable_dek_is_terminal() {
+    // An AEAD failure can never succeed on retry: fail it fast and loudly rather than burning eight
+    // attempts. Still fail-CLOSED — the sink is never contacted.
+    let meta = InMemoryMetadataStore::new();
+    let blobs = Arc::new(InMemoryBlobStore::new());
+    let router = SingleSink(CapturingSink::default());
+    let clock = TestClock::at_secs(1_000);
+    let now = clock.now();
+
+    let version =
+        put_encrypted_with_outbox(&meta, &blobs, "e3", "secret.txt", b"attack at dawn", now).await;
+
+    let report = engine_with_crypto(Arc::new(TamperedCrypto))
+        .run_once(&meta, &router, &blobs, &clock)
+        .await
+        .unwrap();
+    assert_eq!(report.failed, 1, "a tampered envelope is terminal at once");
+    assert_eq!(
+        version_status(&meta, "secret.txt", &version).await,
+        Some(ReplicationStatus::Failed)
+    );
+    assert!(
+        router.0.bodies().is_empty(),
+        "nothing may be shipped when the DEK cannot be opened"
+    );
+}
+
+#[tokio::test]
+async fn a_malformed_sse_descriptor_is_terminal() {
+    // A descriptor that does not parse is permanently unreadable — not a transient condition.
+    let meta = InMemoryMetadataStore::new();
+    let blobs = Arc::new(InMemoryBlobStore::new());
+    let router = SingleSink(CapturingSink::default());
+    let clock = TestClock::at_secs(1_000);
+    let now = clock.now();
+
+    let (path, etag, size) = stage_blob(&blobs, b"plain").await;
+    let version = VersionId::generate();
+    let mut row = version_row(
+        "bad.txt",
+        &version,
+        Some(path),
+        etag,
+        size,
+        false,
+        ReplicationStatus::Pending,
+        now,
+    );
+    row.sse_descriptor = Some("{not json".to_owned());
+    let entry = outbox_entry_for(
+        "e4",
+        bucket(),
+        ObjectKey::parse("bad.txt").unwrap(),
+        version.clone(),
+        ReplicationOp::ObjectCreate,
+        "rule-0",
+        None,
+        now,
+        0,
+    );
+    meta.submit(Mutation::PutObjectVersion {
+        row: Box::new(row),
+        precondition: Precondition::default(),
+        replication: vec![entry],
+    })
+    .await
+    .unwrap();
+
+    let report = engine()
+        .run_once(&meta, &router, &blobs, &clock)
+        .await
+        .unwrap();
+    assert_eq!(report.failed, 1);
+    assert!(router.0.bodies().is_empty());
 }
