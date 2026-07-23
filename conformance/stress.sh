@@ -3,8 +3,17 @@
 # run after a change. It drives `warp` (the MinIO S3 macro-benchmark) against a throwaway Cairn and
 # reports, in one table: peak write/read/mixed throughput (obj/s + MiB/s), a concurrency-escalation
 # ramp that proves the server bends-not-breaks past the single-writer ceiling (throughput plateaus,
-# zero errors, stays alive), and server-side stability — RSS over the whole run (leak check) and the
-# peak writer-queue depth. Emits a PASS/FAIL verdict.
+# zero errors, stays alive), and server-side stability — RSS, open file descriptors, thread count,
+# summed WAL bytes, CPU-seconds (and CPU-s/GiB moved), HTTP 5xx count, and the writer's own
+# group-commit histograms (commit-barrier tail + mean batch size). Emits a PASS/FAIL verdict.
+#
+# GATED here (valid no matter how much load is offered, so they hold on a contended CI runner):
+# zero operation errors, server liveness, and absolute CEILINGS on RSS / fds / threads / WAL bytes,
+# zero HTTP 5xx, plus group-commit batching ONCE the writer is genuinely saturated.
+# ADVISORY here (reported, never the gate): absolute obj/s + MiB/s (hardware-bound), and the
+# fd/thread/WAL %-climbs and commit-barrier tail — because this harness deliberately RAMPS
+# concurrency, so those grow with offered load and a climb here does NOT imply a leak. Constant-load
+# leak detection (where a climb really is a leak) is soak.sh's job.
 #
 # Unlike warp.sh (which only gates on the error count) this parses warp's throughput numbers and
 # samples the server process, so the output is a usable benchmark + a stability assertion.
@@ -41,6 +50,17 @@ ESC_DURATION="${ESC_DURATION:-6s}"
 LEAK_PCT="${LEAK_PCT:-25}"       # fail if STEADY-STATE RSS (last third vs middle third) grows >this %
 RSS_CEILING_KIB="${RSS_CEILING_KIB:-1048576}"  # absolute runaway backstop (default 1 GiB)
 REGRESS_PCT="${REGRESS_PCT:-20}" # warn if a headline obj/s is more than this % below BASELINE
+
+# Widened stability gates (all SHAPE/RATIO/COUNT — contended-runner-safe, unlike absolute obj/s).
+FD_CEILING="${FD_CEILING:-4096}"                       # hard ceiling on open fds (fd-leak backstop)
+WAL_CEILING_BYTES="${WAL_CEILING_BYTES:-$((512*1024*1024))}"  # hard ceiling on summed WAL bytes (512 MiB)
+THREAD_CEILING="${THREAD_CEILING:-512}"   # hard ceiling on OS threads (blocking-pool runaway backstop)
+BATCH_MIN_QUEUE="${BATCH_MIN_QUEUE:-4}"   # only judge batching once the writer actually backed up
+# NOTE: the fd/thread/WAL %-climbs and the commit-tail ratio are reported as ADVISORY here, not gated
+# — this harness RAMPS concurrency, so those legitimately grow with offered load (see section 5).
+# Constant-load leak detection belongs to soak.sh, where a climb really does mean a leak.
+BATCH_CONC_MIN="${BATCH_CONC_MIN:-32}"    # concurrency at/above which group-commit batching must engage
+BATCH_MEAN_MIN="${BATCH_MEAN_MIN:-4}"     # min mean batch size at high concurrency (group-commit works)
 
 WARP_VERSION="${WARP_VERSION:-1.0.0}"
 WARP_URL="https://github.com/minio/warp/releases/download/v${WARP_VERSION}/warp_Linux_x86_64.tar.gz"
@@ -97,13 +117,58 @@ for _ in $(seq 1 100); do
 done
 note "cairn (pid $SRV) healthy on 127.0.0.1:$PORT — $(uname -m), $(nproc) cores"
 
-# --- 2. background sampler: RSS (KiB) + writer queue depth every 1s ---------------------------
+# --- 2. background sampler + /metrics scrape helpers -----------------------------------------
+# CLK_TCK converts /proc jiffies to CPU-seconds (ported from sendfile_bench.sh proc_cpu_secs()).
+CLK_TCK="$(getconf CLK_TCK 2>/dev/null || echo 100)"
+# WAL files: the primary <db>-wal plus one per extra shard (<db>.shard<N>-wal under CAIRN_META_SHARDS).
+# Sum them shard-aware; the glob is re-evaluated each sample (files appear once the server writes).
+WAL_GLOB="${CAIRN_DB_PATH}*-wal"
+
+# Sum a /metrics counter family (all label sets) into one integer.
+scrape_sum() { # <metric-name-prefix regex-anchored>
+  curl -fsS "http://127.0.0.1:$PORT/metrics" 2>/dev/null \
+    | awk -v m="$1" '$1 ~ m {s += $2} END {printf "%.0f", s+0}'
+}
+# Total 5xx served so far: cairn_requests_total rows whose status label is 5xx.
+scrape_5xx() {
+  curl -fsS "http://127.0.0.1:$PORT/metrics" 2>/dev/null \
+    | awk '/^cairn_requests_total\{/ && /status="5[0-9][0-9]"/ {s+=$2} END {printf "%d", s+0}'
+}
+# A single summary quantile of a histogram (metrics_exporter_prometheus renders histograms as
+# summaries: <m>{quantile="Q"} plus <m>_sum / <m>_count). Empty when the series hasn't flushed yet.
+scrape_quantile() { # <metric> <quantile-string>
+  curl -fsS "http://127.0.0.1:$PORT/metrics" 2>/dev/null \
+    | awk -v m="$1" -v q="$2" '$0 ~ ("^" m "\\{") && index($0, "quantile=\"" q "\"") {print $2; exit}'
+}
+# Exact-named scalar series (e.g. a summary's _sum / _count).
+scrape_val() { # <exact-metric-name>
+  curl -fsS "http://127.0.0.1:$PORT/metrics" 2>/dev/null \
+    | awk -v m="$1" '$1 == m {print $2; exit}'
+}
+# commit p99 max renders as quantile="1" (some builds "1.0") — try both.
+scrape_commit_max() {
+  local v; v="$(scrape_quantile cairn_writer_commit_seconds 1)"
+  [ -z "$v" ] && v="$(scrape_quantile cairn_writer_commit_seconds 1.0)"
+  printf '%s' "$v"
+}
+
+# Bytes moved so far (received + sent), for the CPU-seconds/GiB cost figure.
+bytes_start="$(scrape_sum '^cairn_bytes_(received|sent)_total')"
+
+# Per-second sampler. Columns: RSS(KiB)  queue_depth  fd_count  wal_bytes  thread_count  cpu_ticks.
+# All signals are cheap /proc reads + one /metrics scrape; the 1s cadence is unchanged.
 SAMPLES="$DATA/samples.tsv"
 (
   while kill -0 "$SRV" 2>/dev/null; do
     rss="$(ps -o rss= -p "$SRV" 2>/dev/null | tr -d ' ')"
     wq="$(curl -fsS "http://127.0.0.1:$PORT/metrics" 2>/dev/null | awk '/^cairn_writer_queue_depth/ {print $2; exit}')"
-    printf '%s\t%s\n' "${rss:-0}" "${wq:-0}" >>"$SAMPLES"
+    fd="$(ls "/proc/$SRV/fd" 2>/dev/null | wc -l)"
+    th="$(ls "/proc/$SRV/task" 2>/dev/null | wc -l)"
+    # shellcheck disable=SC2086
+    wal="$(stat --format=%s $WAL_GLOB 2>/dev/null | awk '{s+=$1} END {print s+0}')"
+    cpu="$(awk '{print $14 + $15}' "/proc/$SRV/stat" 2>/dev/null)"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "${rss:-0}" "${wq:-0}" "${fd:-0}" "${wal:-0}" "${th:-0}" "${cpu:-0}" >>"$SAMPLES"
     sleep 1
   done
 ) &
@@ -141,7 +206,17 @@ run_phase MIXED mixed --objects "$OBJECTS" --duration "$DURATION"
 # --- 3. escalation: ramp concurrency, prove plateau + liveness + zero errors ------------------
 printf '\n=== escalation (write-pressure, obj.size %s) ===\n' "$ESC_OBJ_SIZE"
 esc_report=""
+# Writer-health shape signals sampled around the ramp (all deltas/ratios — contended-runner-safe).
+fivexx_start="$(scrape_5xx)"; fivexx_start="${fivexx_start:-0}"
+commit_p99_first=""; commit_p99_peak=0
+batch_pre_sum=""; batch_pre_cnt=""
 for lvl in $LEVELS; do
+  # Snapshot the batch-size counters just before the first HIGH-concurrency level, so the mean we
+  # gate on covers only the levels where group-commit batching is actually supposed to engage.
+  if [ -z "$batch_pre_sum" ] && [ "$lvl" -ge "$BATCH_CONC_MIN" ] 2>/dev/null; then
+    batch_pre_sum="$(scrape_val cairn_writer_batch_size_sum)"
+    batch_pre_cnt="$(scrape_val cairn_writer_batch_size_count)"
+  fi
   out="$(cd "$DATA" && "$WARP" put --host "127.0.0.1:$PORT" --access-key "$AK" --secret-key "$SK" \
         --region "$REGION" --bucket "stress-esc" --obj.size "$ESC_OBJ_SIZE" \
         --concurrent "$lvl" --duration "$ESC_DURATION" --noclear 2>&1)"; rc=$?
@@ -154,7 +229,24 @@ for lvl in $LEVELS; do
   printf '  concurrency %-4s  ->  %8s obj/s   alive=%s  errors=%s\n' "$lvl" "${objs:-?}" "$alive" "$errs"
   esc_report="${esc_report}${lvl}:${objs:-0} "
   [ "$alive" = "yes" ] || { total_errors=$((total_errors+1)); note "server NOT alive at concurrency $lvl"; }
+  # Commit-barrier tail per level: we gate on the RATIO (peak vs first level), never the absolute,
+  # so a slow runner shifts both ends equally and does not flake the gate.
+  cmax="$(scrape_commit_max)"; cmax="${cmax:-0}"
+  [ -z "$commit_p99_first" ] && commit_p99_first="$cmax"
+  awk "BEGIN{exit !($cmax > $commit_p99_peak)}" && commit_p99_peak="$cmax"
 done
+
+# Mean group-commit batch size over the high-concurrency levels (delta of the cumulative summary).
+batch_mean_hi=""
+if [ -n "$batch_pre_sum" ]; then
+  bs="$(scrape_val cairn_writer_batch_size_sum)"; bc="$(scrape_val cairn_writer_batch_size_count)"
+  batch_mean_hi="$(awk -v s0="${batch_pre_sum:-0}" -v c0="${batch_pre_cnt:-0}" \
+                       -v s1="${bs:-0}" -v c1="${bc:-0}" \
+                       'BEGIN{d=c1-c0; printf "%.2f", (d>0 ? (s1-s0)/d : 0)}')"
+fi
+fivexx_end="$(scrape_5xx)"; fivexx_end="${fivexx_end:-0}"
+fivexx_delta=$(( fivexx_end - fivexx_start ))
+[ "$fivexx_delta" -lt 0 ] && fivexx_delta=0
 
 # --- 4. stability: RSS leak check + peak writer queue depth -----------------------------------
 sleep 1
@@ -178,6 +270,41 @@ $(awk -F'\t' '{r[NR]=$1; n=NR} END {
 }' "$SAMPLES" 2>/dev/null)
 EOF
 rss_mid="${rss_mid:-0}"; rss_late="${rss_late:-0}"; rss_delta_pct="${rss_delta_pct:-0.0}"
+
+# Same middle-third-vs-last-third windowing as the RSS check, for any sampler column. A leak keeps
+# climbing under sustained load; a healthy server plateaus (fd/threads) or sawtooths (WAL, on checkpoint).
+col_climb() { # <1-based column index> -> "mid late growth%"
+  awk -F'\t' -v c="$1" '{r[NR]=$c; n=NR} END {
+    if (n < 6) { print "0 0 0.0"; exit }
+    a=int(n/3); b=int(2*n/3);
+    for(i=a;i<b;i++){m1+=r[i+1];k1++}
+    for(i=b;i<n;i++){m2+=r[i+1];k2++}
+    mid=(k1?m1/k1:0); late=(k2?m2/k2:0);
+    g=(mid>0?(late-mid)*100.0/mid:0);
+    printf "%.0f %.0f %.1f", mid, late, g
+  }' "$SAMPLES" 2>/dev/null
+}
+col_peak() { awk -F'\t' -v c="$1" 'BEGIN{m=0} {if($c>m)m=$c} END{print m+0}' "$SAMPLES" 2>/dev/null; }
+
+fd_peak="$(col_peak 3)";     wal_peak="$(col_peak 4)";    thread_peak="$(col_peak 5)"
+read -r fd_mid fd_late fd_climb_pct <<EOF
+$(col_climb 3)
+EOF
+read -r wal_mid wal_late wal_climb_pct <<EOF
+$(col_climb 4)
+EOF
+read -r th_mid th_late th_climb_pct <<EOF
+$(col_climb 5)
+EOF
+fd_climb_pct="${fd_climb_pct:-0.0}"; wal_climb_pct="${wal_climb_pct:-0.0}"; th_climb_pct="${th_climb_pct:-0.0}"
+
+# CPU cost: jiffies delta over the whole run -> CPU-seconds, and CPU-seconds per GiB moved.
+cpu_first="$(head -1 "$SAMPLES" 2>/dev/null | cut -f6)"; cpu_last="$(tail -1 "$SAMPLES" 2>/dev/null | cut -f6)"
+cpu_secs="$(awk -v a="${cpu_first:-0}" -v b="${cpu_last:-0}" -v t="$CLK_TCK" 'BEGIN{printf "%.1f", (b-a)/(t>0?t:100)}')"
+bytes_end="$(scrape_sum '^cairn_bytes_(received|sent)_total')"
+cpu_per_gib="$(awk -v c="${cpu_secs:-0}" -v b0="${bytes_start:-0}" -v b1="${bytes_end:-0}" \
+  'BEGIN{g=(b1-b0)/1073741824.0; printf "%.1f", (g>0? c/g : 0)}')"
+
 # total requests served, from the server's own counters
 reqs="$(curl -fsS "http://127.0.0.1:$PORT/metrics" 2>/dev/null | awk '/^cairn_requests_total/ {s+=$2} END {printf "%d", s+0}')"
 
@@ -200,10 +327,57 @@ if awk "BEGIN{exit !($rss_delta_pct > $LEAK_PCT)}"; then
 fi
 server_alive="no"; kill -0 "$SRV" 2>/dev/null && server_alive="yes"
 
+# --- widened stability signals (SHAPE / RATIO / COUNT gates — safe on a contended runner) --------
+printf '  fd      peak=%s  middle-third=%s  last-third=%s  (gated on ceiling %s)\n' \
+  "$fd_peak" "$fd_mid" "$fd_late" "$FD_CEILING"
+printf '  threads peak=%s  middle-third=%s  last-third=%s  (gated on ceiling %s)\n' \
+  "$thread_peak" "$th_mid" "$th_late" "$THREAD_CEILING"
+printf '  WAL     peak=%s B  middle-third=%s B  last-third=%s B  (gated on ceiling %s B)\n' \
+  "$wal_peak" "$wal_mid" "$wal_late" "$WAL_CEILING_BYTES"
+printf '  CPU     %s s over the run  (%s CPU-s/GiB moved)   5xx responses: %s\n' \
+  "$cpu_secs" "$cpu_per_gib" "$fivexx_delta"
+printf '  writer  commit p99: first-level=%ss peak=%ss   mean batch size at conc>=%s: %s (gate >=%s when saturated)\n' \
+  "${commit_p99_first:-?}" "${commit_p99_peak:-?}" \
+  "$BATCH_CONC_MIN" "${batch_mean_hi:-n/a}" "$BATCH_MEAN_MIN"
+
+# GATE vs ADVISORY, and why. This harness's escalation phase deliberately RAISES concurrency over the
+# run (4 -> 64), so a middle-third-vs-last-third comparison here measures "more load applied", NOT
+# "resource leaked": threads, fds, WAL bytes and the commit-barrier tail all legitimately grow when
+# concurrency triples. Gating on those %-climbs would fail a perfectly healthy server. So under a
+# RAMPING load we hard-gate only the signals that stay valid regardless of offered load — absolute
+# CEILINGS, zero 5xx, zero op-errors, liveness — and report the climbs as ADVISORY diagnostics.
+# Constant-load leak detection (where a climb IS a leak) is soak.sh's job, not this harness's.
+gate_fail=""
+[ "${fd_peak:-0}" -gt "$FD_CEILING" ] 2>/dev/null && gate_fail="$gate_fail fd_ceiling($fd_peak>$FD_CEILING)"
+[ "${thread_peak:-0}" -gt "$THREAD_CEILING" ] 2>/dev/null && gate_fail="$gate_fail thread_ceiling($thread_peak>$THREAD_CEILING)"
+[ "${wal_peak:-0}" -gt "$WAL_CEILING_BYTES" ] 2>/dev/null && gate_fail="$gate_fail wal_ceiling($wal_peak>$WAL_CEILING_BYTES)"
+[ "${fivexx_delta:-0}" -gt 0 ] && gate_fail="$gate_fail http_5xx($fivexx_delta)"
+# Group-commit batching can only coalesce work that is actually QUEUED. If the writer never backed up
+# (peak queue depth below BATCH_MIN_QUEUE) a mean batch size near 1 is correct behaviour, not a
+# collapse — so this gate applies only once the writer was genuinely saturated.
+batch_verdict="skipped (writer never saturated: peak queue depth ${wq_peak:-0} < $BATCH_MIN_QUEUE)"
+if [ "${wq_peak:-0}" -ge "$BATCH_MIN_QUEUE" ] 2>/dev/null && [ -n "$batch_mean_hi" ]; then
+  if awk "BEGIN{exit !($batch_mean_hi > 0 && $batch_mean_hi < $BATCH_MEAN_MIN)}"; then
+    gate_fail="$gate_fail batch_collapse(${batch_mean_hi}<${BATCH_MEAN_MIN})"
+    batch_verdict="FAIL (${batch_mean_hi} < ${BATCH_MEAN_MIN})"
+  else
+    batch_verdict="ok (${batch_mean_hi} >= ${BATCH_MEAN_MIN})"
+  fi
+fi
+printf '  advisory (ramping load, not gated): fd climb %s%%  threads climb %s%%  WAL climb %s%%  commit p99 %ss -> %ss\n' \
+  "$fd_climb_pct" "$th_climb_pct" "$wal_climb_pct" "${commit_p99_first:-?}" "${commit_p99_peak:-?}"
+printf '  group-commit batching gate: %s\n' "$batch_verdict"
+[ -n "$gate_fail" ] && printf '  STABILITY GATE FAILURES:%s\n' "$gate_fail" >&2
+
 if [ -n "${STRESS_OUT:-}" ]; then
-  printf '{"write_obj_s":%s,"read_obj_s":%s,"mixed_obj_s":%s,"write_mib_s":%s,"read_mib_s":%s,"escalation":"%s","rss_start_kib":%s,"rss_peak_kib":%s,"rss_end_kib":%s,"rss_delta_pct":%s,"wq_peak":%s,"errors":%s}\n' \
+  # Schema is ADDITIVE: older baselines simply lack the new keys, and the compare loop skips a key
+  # it cannot find, so a pre-widening BASELINE still works.
+  printf '{"write_obj_s":%s,"read_obj_s":%s,"mixed_obj_s":%s,"write_mib_s":%s,"read_mib_s":%s,"escalation":"%s","rss_start_kib":%s,"rss_peak_kib":%s,"rss_end_kib":%s,"rss_delta_pct":%s,"wq_peak":%s,"errors":%s,"fd_peak":%s,"fd_climb_pct":%s,"thread_peak":%s,"thread_climb_pct":%s,"wal_peak_bytes":%s,"wal_climb_pct":%s,"cpu_secs":%s,"cpu_secs_per_gib":%s,"http_5xx":%s,"commit_p99_first":%s,"commit_p99_peak":%s,"batch_mean_high_conc":%s}\n' \
     "${OBJS[WRITE]:-0}" "${OBJS[READ]:-0}" "${OBJS[MIXED]:-0}" "${MIBS[WRITE]:-0}" "${MIBS[READ]:-0}" \
-    "$esc_report" "$rss_start" "$rss_peak" "$rss_end" "$rss_delta_pct" "$wq_peak" "$total_errors" >"$STRESS_OUT"
+    "$esc_report" "$rss_start" "$rss_peak" "$rss_end" "$rss_delta_pct" "$wq_peak" "$total_errors" \
+    "${fd_peak:-0}" "${fd_climb_pct:-0}" "${thread_peak:-0}" "${th_climb_pct:-0}" \
+    "${wal_peak:-0}" "${wal_climb_pct:-0}" "${cpu_secs:-0}" "${cpu_per_gib:-0}" "${fivexx_delta:-0}" \
+    "${commit_p99_first:-0}" "${commit_p99_peak:-0}" "${batch_mean_hi:-0}" >"$STRESS_OUT"
   note "results written to $STRESS_OUT"
 fi
 
@@ -223,12 +397,16 @@ if [ -n "${BASELINE:-}" ] && [ -f "${BASELINE:-/nonexistent}" ]; then
 fi
 
 printf '\n=== verdict ===\n'
-if [ "$total_errors" -eq 0 ] && [ "$server_alive" = "yes" ] && [ "$leaked" = "no" ]; then
-  printf 'PASS: %s WRITE / %s READ / %s MIXED obj/s; 0 op-errors; server alive; RSS peak %s KiB (< %s ceiling).\n' \
-    "${OBJS[WRITE]:-?}" "${OBJS[READ]:-?}" "${OBJS[MIXED]:-?}" "$rss_peak" "$RSS_CEILING_KIB"
+if [ "$total_errors" -eq 0 ] && [ "$server_alive" = "yes" ] && [ "$leaked" = "no" ] && [ -z "$gate_fail" ]; then
+  printf 'PASS: %s WRITE / %s READ / %s MIXED obj/s; 0 op-errors; server alive.\n' \
+    "${OBJS[WRITE]:-?}" "${OBJS[READ]:-?}" "${OBJS[MIXED]:-?}"
+  printf '      Under ceilings: RSS %s/%s KiB, fd %s/%s, threads %s/%s, WAL %s/%s B. 0 HTTP 5xx. Batching: %s.\n' \
+    "$rss_peak" "$RSS_CEILING_KIB" "$fd_peak" "$FD_CEILING" "$thread_peak" "$THREAD_CEILING" \
+    "$wal_peak" "$WAL_CEILING_BYTES" "$batch_verdict"
   exit 0
 fi
-printf 'FAIL: errors=%s alive=%s leaked=%s (rss peak %s KiB, ceiling %s KiB)\n' \
-  "$total_errors" "$server_alive" "$leaked" "$rss_peak" "$RSS_CEILING_KIB" >&2
+printf 'FAIL: errors=%s alive=%s leaked=%s (rss peak %s KiB, ceiling %s KiB)%s\n' \
+  "$total_errors" "$server_alive" "$leaked" "$rss_peak" "$RSS_CEILING_KIB" \
+  "${gate_fail:+ stability-gates:$gate_fail}" >&2
 [ "$server_alive" != "yes" ] && printf 'server log tail:\n%s\n' "$(tail -8 "$DATA/server.log")" >&2
 exit 1
