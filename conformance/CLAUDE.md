@@ -128,6 +128,84 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   (`MP_SESSIONS`, `MP_PART_SIZE`, `MP_BG_WORKERS`, `MP_RACE_ROUNDS`, …); the default is ~2 min because
   a real multi-part Complete must pay S3's 5 MiB non-final-part minimum, so 5 MiB is spent only where
   a multi-part assemble is under test and every other part is a small tail.
+- `stress_adversarial.sh` (+`.py`, boto3 + raw sockets) — the **REJECTION paths under CONCURRENCY**,
+  which nothing else covers: every other limit/abuse probe in this directory is SERIAL (one bad
+  `Content-MD5`, one tmpfs fill, one tampered token, one continuation loop on an idle server). Five
+  scenarios on one hot node. **(1)** The SigV4 **aws-chunked streaming decoder**
+  (`cairn-protocol/src/chunked.rs`, the F-5 component — get it wrong and objects corrupt *silently*):
+  one barrier releases valid signed **and** unsigned streaming uploads together with deliberately
+  MALFORMED ones — bad chunk signature, truncated stream, chunk length over- **and** under-declared,
+  oversized chunk header, non-hex chunk size, missing per-chunk signature. Driven over **raw sockets
+  with hand-rolled SigV4**: no SDK will emit malformed framing, and `http.client` loses the response
+  when the server rejects mid-body. **(2)** A per-bucket **quota** (set via the management API) and
+  `CAIRN_MAX_OBJECT_SIZE` attacked by concurrent PUTs. **(3)** A real **continuation-token loop**
+  while other workers PUT/DELETE inside the very prefix being listed. **(4)** **STS** sessions
+  minted / used / tampered / **revoked** concurrently. **(5)** Large-fanout **DeleteObjects** mixing
+  present, absent, structurally invalid and 3×-duplicated keys. GATES are load-independent: every
+  valid stream byte-exact *beside* the malformed ones (a malformed stream must never corrupt a
+  concurrent valid one), EXACT `(status, S3 code)` pairs everywhere — never "any 4xx" — with nothing
+  committed for a rejected request; stored bytes **never** exceeding the quota **and** the admitted
+  count exactly `quota/size` (a race that let one extra write through fails even when the sum still
+  fits), every quota rejection exactly `507 InsufficientStorage`, every oversized PUT exactly
+  `400 EntityTooLarge`, and a cleared quota re-admitting writes; every listing pass terminating
+  inside a bound derived from the **keyspace** (the churn workers cycle a FIXED key ring, so the
+  bound is load-independent), with no duplicate key, strictly increasing keys, every token accepted
+  and every key that existed for the whole pass returned; a session refused with exactly
+  `AccessDenied` / `SignatureDoesNotMatch` (tampered) / `InvalidArgument` (no token) /
+  `InvalidAccessKeyId` (revoked, with `CAIRN_AUTH_CACHE_TTL_SECS=0` pinned so revocation is not a
+  race); an exact per-key delete split (an **absent** key is a SUCCESS — S3's delete is idempotent)
+  with the one invalid key the only `InvalidArgument` and a control namespace intact and byte-exact;
+  `/healthz` never *stopping* (60 s wedge timeout); the `stress.sh` RSS/fd/thread/WAL ceilings **plus
+  a sampler-read-nothing gate** (a column reading zero all run FAILS — a zero peak passes every
+  ceiling); and a 5xx counter EQUAL to the declared budget. **UI listener ON**; the launcher pins
+  `CAIRN_MAX_OBJECT_SIZE` (it is under test) and `CAIRN_REQUEST_TIMEOUT_SECS=600`. Carries four
+  pinned **FINDINGS** (reported loudly + declared into the 5xx budget, not gated): the under-declared
+  chunk length, oversized chunk header, non-hex chunk size and missing per-chunk signature each
+  answer **500 InternalError** instead of a 4xx — fail-closed (nothing is committed, and *that* is
+  gated) but a client-caused framing error surfacing as a server fault, because `DecodeError` travels
+  as `BlobError::Body(Transport(..))` and only `BodyError::Truncated` has a 4xx arm in
+  `impl From<BlobError> for Error` (`cairn-types/src/error.rs`). The other two 5xx here are correct:
+  `507` is S3's quota answer and simply lives in the 5xx range. Profile is env-tunable
+  (`ADV_CHUNK_ROUNDS`, `ADV_PAGE_KEYS`, `ADV_DEL_PRESENT`, …), every knob that could empty a loop is
+  validated at startup, and `STRESS_ADV_OUT=` writes the advisory JSON.
+- `stress_replication.sh` (+`.py`, boto3) — **replication under SUSTAINED LOAD across a MASTER-KEY
+  boundary**, the gap `soak.sh` leaves (plaintext only, one fixed 64 KiB body, source RSS the only
+  signal) and `mesh.sh` leaves (distinct keys, but a handful of objects per scenario, not a load).
+  TWO nodes, **different master keys** (derived per node from a label, the `mesh.py` technique), wired
+  through the operator-trusted **`CAIRN_REPLICATION_ENDPOINT` config path** — SSRF-guard-exempt, so
+  unlike `mesh` this needs **no** `CAIRN_ALLOW_INTERNAL_ENDPOINTS`; the source's UI listener is on
+  only so the driver can read `GET /api/v1/replication/summary` (exact outbox counts + true lag). The
+  target runs `CAIRN_ENCRYPT_AT_REST=true`, so it re-seals every replica under **its own** key. A
+  fixed-size worker pool holds a **CONSTANT** source workload — single-part PUTs, version churn,
+  delete markers (both on already-versioned keys and on write-once **tomb** keys), real ≥ 5 MiB
+  multipart Completes — plus an SSE-S3/`aws:kms` arm; both nodes are sampled every second.
+  **GATED** (all load-independent): every plaintext-leg version read back **from the TARGET by the
+  SOURCE's version id** is BYTE-EXACT — the headline, and only possible if the source decrypted to
+  logical bytes and the target re-sealed under its own ring; no replica ever carries **wrong bytes**;
+  version-id identity incl. whole-**set** equality for a churn key; every delete marker present on
+  the target with the same id and every tombstoned key answering **exactly `404 NoSuchKey`**; the
+  **on-disk proof** — target blobs are `VERSION_ENCRYPTED` CRNB with the plaintext marker absent
+  while the matching **source** blobs are plain and *do* carry it; the **OUTBOX DRAINING** to 0 after
+  writes stop, bounded, with a **no-progress stall** detector (the load-independent way to state "the
+  backlog is not growing without bound" — the in-run depth is advisory, since source and target share
+  one box); zero driver errors; `/healthz` never *stopping* on either node (60 s **wedge** timeout);
+  both alive; per-node 5xx EQUAL to the declared budget (0 — the one deliberate rejection here is a
+  400); per-node RSS/fd/thread/WAL **ceilings** (same knobs as `stress.sh`) plus a
+  **sampler-read-nothing** gate, because a zero peak would pass its ceiling for free. Convergence-
+  latency percentiles, replication throughput, the outbox-depth series, peak lag and per-node CPU/RSS
+  are **advisory** (`STRESS_REPL_OUT=` writes the JSON); every knob that could empty a loop
+  (`REPL_SECS`, `REPL_WORKERS`, `REPL_MP_PART`, `REPL_SSE_EVERY`, …) is validated at startup. The
+  launcher **pins** `CAIRN_REQUEST_TIMEOUT_SECS=600` (so a slow runner cannot manufacture a 503) and
+  pre-flights all three ports (a stale cairn answering `/healthz` would otherwise make the run
+  silently measure someone else's process). Carries **TWO pinned KNOWN GAPS** (reported, NOT gated —
+  fixing them is a product change): `ReplicationEngine::put_object` opens the source blob with
+  `BlobStore::open`, i.e. **with no DEK**, so an SSE-encrypted source version ships raw **ciphertext**
+  — (1) a **single-part** one is refused `400 BadDigest` at the destination and, a 4xx being terminal,
+  **never replicates at all** (fail-closed); (2) a **multipart-completed** one carries a composite
+  `<md5>-<n>` ETag the destination cannot MD5-verify, so it is **ACCEPTED** and the replica is
+  right-sized, `200`-answering **garbage** — silent corruption, the more serious of the two. The
+  driver counts all three outcomes and prints `KNOWN GAPS APPEAR FIXED` when they stop happening; the
+  fail-closed gate is therefore scoped to the plaintext leg.
 - `soak_features.sh` (+`.py`, boto3) — the **mixed-FEATURE soak**, and **the harness where
   constant-load LEAK DETECTION lives**. Everything else either exercises one feature functionally or
   RAMPS load; `soak.sh` is long-running but is two-node replication only (plaintext, one bucket, a
@@ -188,7 +266,8 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   `CAIRN_*` directly; mirror that, never invent a config file.
 - Python drivers that **restart** the server (rotation, replication_chaos, crash_multipoint,
   blob_limits, mesh) own the process lifecycle themselves; the bash launcher just hands them the env.
-- Needs: boto3 (`run`, `soak`, `soak_features`, `replication_chaos`); passwordless sudo (`blob_limits`, for a tmpfs —
+- Needs: boto3 (`run`, `soak`, `soak_features`, `stress_adversarial`, `stress_replication`,
+  `replication_chaos`); passwordless sudo (`blob_limits`, for a tmpfs —
   CI runners have it); a `--features failpoints` build for the `crash_*` seams (`FAILPOINTS=...`); a
   `--features fast-io` Linux build for `sendfile_*` (else they SKIP); `warp`/`go` for `warp*`.
 - Prefer asserting on synchronous CLI stdout or a metric/poll loop over `sleep` — the no-sleep

@@ -647,6 +647,79 @@ jobs:
       - name: Barrier-fire concurrent multipart Completes; assert byte-exact + fail-closed + races
         run: BIN=target/debug/cairn PY=python3 bash conformance/stress_multipart.sh
 
+  stress-adversarial:
+    name: adversarial limits under load (chunked decoder, quota, pagination, STS, bulk delete)
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: cairn-bin
+          path: target/debug
+      - run: chmod +x target/debug/cairn
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.x"
+      # boto3 is half this harness (the malformed-framing scenario is raw sockets + hand-rolled
+      # SigV4, but every verification path is boto3); a box without it must go red, not green.
+      - run: pip install boto3
+      # The REJECTION paths, driven CONCURRENTLY for the first time — everything else probes a limit
+      # serially. (1) The aws-chunked streaming decoder (the F-5 ingest component): one barrier
+      # releases valid signed/unsigned streaming uploads together with deliberately malformed ones
+      # (bad chunk signature, truncated stream, chunk length over/under-declared, oversized chunk
+      # header, non-hex size, missing per-chunk signature). (2) A per-bucket quota and
+      # CAIRN_MAX_OBJECT_SIZE attacked by concurrent PUTs. (3) A continuation-token loop while other
+      # workers mutate the prefix being listed. (4) STS sessions minted/used/tampered/revoked
+      # concurrently. (5) Large-fanout DeleteObjects mixing present/absent/invalid/duplicate keys.
+      # GATES are load-independent: byte-exact valid round-trips beside the malformed streams, EXACT
+      # (status, S3 code) pairs everywhere, stored bytes never exceeding the quota and the admitted
+      # count exact, the listing loop terminating inside a keyspace-derived page bound with no
+      # duplicate key, a session never widening its scope, an exact per-key delete split with an
+      # untouched control namespace, /healthz never wedging, absolute RSS/fd/thread/WAL ceilings
+      # (plus a sampler-read-nothing gate), and a 5xx counter EQUAL to the driver's declared budget.
+      - name: Drive the limit + abuse paths concurrently; assert exact codes and no bypass
+        run: BIN=target/debug/cairn PY=python3 bash conformance/stress_adversarial.sh
+
+  stress-replication:
+    name: replication under sustained load (two nodes, two master keys)
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: cairn-bin
+          path: target/debug
+      - run: chmod +x target/debug/cairn
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.x"
+      # boto3 IS this harness (SSE, versioning, low-level multipart, delete markers, byte-exact
+      # verification); a box without it must go red, not green-with-no-coverage.
+      - run: pip install boto3
+      # TWO nodes with DIFFERENT master keys, wired source -> target through the operator-trusted
+      # CAIRN_REPLICATION_ENDPOINT config path (SSRF-guard-exempt, so unlike `mesh` this needs no
+      # CAIRN_ALLOW_INTERNAL_ENDPOINTS). The target runs CAIRN_ENCRYPT_AT_REST=true. A fixed-size
+      # worker pool holds a CONSTANT source workload — single-part PUTs, version churn, delete
+      # markers, real >= 5 MiB multipart Completes, plus an SSE-S3/aws:kms arm — while BOTH nodes are
+      # sampled every second. GATES are load-independent: every plaintext-leg version read back from
+      # the TARGET by the SOURCE's version id is BYTE-EXACT (proving the source decrypted and the
+      # target re-sealed under its own key), no replica ever carries wrong bytes, version-id identity
+      # incl. whole-set equality, delete markers with EXACTLY 404 NoSuchKey, the on-disk proof
+      # (target blobs VERSION_ENCRYPTED CRNB with the plaintext marker absent while the matching
+      # source blobs are plain), the OUTBOX draining to 0 after writes stop with a no-progress stall
+      # detector, /healthz never wedging on either node, both alive, per-node 5xx EQUAL to the
+      # declared budget, and per-node RSS/fd/thread/WAL ceilings plus a sampler-read-nothing gate.
+      # Convergence percentiles, throughput, outbox depth and lag are advisory (debug AES-GCM).
+      # Carries TWO pinned KNOWN GAPS (reported, NOT gated): an SSE-encrypted SOURCE version ships
+      # ciphertext, so single-part ones are refused 400 BadDigest (terminal, never replicate) and
+      # multipart ones are ACCEPTED and silently corrupt on the mirror.
+      - name: Replicate under constant load across a master-key boundary; assert byte-exact + drain
+        run: BIN=target/debug/cairn PY=python3 bash conformance/stress_replication.sh
+
   soak-features:
     name: mixed-feature soak (constant load, leak shape)
     needs: build
@@ -807,6 +880,8 @@ jobs:
       - stress
       - stress-encrypted
       - stress-multipart
+      - stress-adversarial
+      - stress-replication
       - soak-features
       - blob-limits
     if: always()
