@@ -17,6 +17,15 @@ pub enum BodyError {
     /// The body ended before the declared content length.
     #[error("client body ended prematurely")]
     Truncated,
+    /// The `aws-chunked` framing was malformed (bad chunk header/size, non-hex size, an over-long
+    /// header, a missing CRLF or per-chunk signature). A CLIENT error — the request is unparseable,
+    /// not a server fault — so it maps to a 4xx, not `InternalError`. Carries the decoder's reason.
+    #[error("malformed chunked request body: {0}")]
+    Malformed(String),
+    /// The streamed payload exceeded the configured size ceiling mid-stream. Maps to
+    /// `EntityTooLarge` (413), matching [`BlobError::SizeExceeded`].
+    #[error("streamed body exceeds the configured size ceiling")]
+    TooLarge,
     /// A per-request timeout elapsed while reading the body.
     #[error("client body read timed out")]
     Timeout,
@@ -283,6 +292,11 @@ impl From<BlobError> for Error {
             BlobError::Body(BodyError::Truncated) => {
                 Error::InvalidArgument("client body ended prematurely".to_owned())
             }
+            // A malformed aws-chunked frame is the client's fault, not ours: 400, not a 500 that
+            // pages an on-call for a bad request. (Fail-closed is unchanged — nothing is committed;
+            // this only corrects the status code.)
+            BlobError::Body(BodyError::Malformed(msg)) => Error::InvalidArgument(msg),
+            BlobError::Body(BodyError::TooLarge) => Error::EntityTooLarge,
             other => Error::Internal(other.to_string()),
         }
     }
@@ -334,6 +348,29 @@ mod tests {
         // 409 BucketAlreadyExists. Only the bucket-create call sites map Conflict, before this From.
         assert!(matches!(
             Error::from(MetaError::Conflict),
+            Error::Internal(_)
+        ));
+    }
+
+    #[test]
+    fn malformed_chunked_body_is_a_client_error_not_internal() {
+        // A malformed aws-chunked frame is the client's fault: it must map to a 400 InvalidArgument,
+        // NOT Internal (500). Before this, every framing DecodeError folded into Body(Transport(..))
+        // and fell through to Internal — a client-caused error paging an on-call as a server fault.
+        assert!(matches!(
+            Error::from(BlobError::Body(BodyError::Malformed(
+                "invalid chunk size".into()
+            ))),
+            Error::InvalidArgument(_)
+        ));
+        // An over-size stream is 413, matching BlobError::SizeExceeded — never a generic 400 or 500.
+        assert!(matches!(
+            Error::from(BlobError::Body(BodyError::TooLarge)),
+            Error::EntityTooLarge
+        ));
+        // A genuine transport failure stays Internal — this fix does not reclassify real faults.
+        assert!(matches!(
+            Error::from(BlobError::Body(BodyError::Transport("socket reset".into()))),
             Error::Internal(_)
         ));
     }
