@@ -36,7 +36,9 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   a tampered ciphertext byte makes GET fail closed, transparent at-rest (leg 2) advertises nothing.
 - `share.sh` — object sharing (revocable share tokens + interoperable SigV4 presigned URLs), pure curl.
 - `rotation.sh` (+`.py`) — master-key rotation lifecycle (#29), sharded.
-- `soak.sh` (+`.py`) — two-node replication, byte-identical verify + RSS leak check (boto3).
+- `soak.sh` (+`.py`) — two-node replication, byte-identical verify + RSS leak check (boto3). For the
+  single-node **mixed-feature** soak (and constant-load leak detection generally) see
+  `soak_features.sh` below.
 - `mesh.sh` (+`.py`) — **5-node FULL mesh** replication (stdlib only): convergence, fan-out latency,
   version-id identity, concurrent same-key, crash resiliency, delete-marker mesh, no-cascade,
   integrity. The driver owns all five node processes and self-tears-down. `mesh.sh [scenario-ids...]`.
@@ -126,6 +128,43 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   (`MP_SESSIONS`, `MP_PART_SIZE`, `MP_BG_WORKERS`, `MP_RACE_ROUNDS`, …); the default is ~2 min because
   a real multi-part Complete must pay S3's 5 MiB non-final-part minimum, so 5 MiB is spent only where
   a multi-part assemble is under test and every other part is a small tail.
+- `soak_features.sh` (+`.py`, boto3) — the **mixed-FEATURE soak**, and **the harness where
+  constant-load LEAK DETECTION lives**. Everything else either exercises one feature functionally or
+  RAMPS load; `soak.sh` is long-running but is two-node replication only (plaintext, one bucket, a
+  fixed 64 KiB body, source RSS the only signal). This one holds a **fixed-size worker pool** busy
+  for `SOAK_SECS` (default 180 s, env-tunable to a deep run) against ONE node, so **offered load
+  never drifts** — which is precisely what makes a steady-state climb gateable here and deliberately
+  *not* in `stress.sh` (which ramps 4→64, where a climb only means more load was offered). The mix
+  runs concurrently and continuously: SSE-S3 + `aws:kms` single-part churn; a **versioned** bucket
+  accumulating per-version DEKs, delete markers and version-scoped deletes; **composite-checksum**
+  multipart (`CRC32`/`COMPOSITE`) completed AND deliberately aborted, plus sessions **abandoned** for
+  the background sweeper; an **object-lock** bucket whose GOVERNANCE-locked versions are attacked with
+  deletes all run; **STS** session credentials minted on a cadence that drive a slice of the traffic;
+  and a **1 s lifecycle** scanner with an expiring prefix plus a control prefix it must never touch.
+  Workers own private key namespaces (`w<N>/…`) so a self-inflicted 404 can never fire the
+  zero-errors gate. Samples every second: RSS, fds, threads, summed WAL (shard-aware), CPU ticks,
+  and — every `SOAK_HEAVY_EVERY` ticks — `.staging` bytes and the `session_credentials` row count.
+  **GATED, correctness:** zero operation errors, every sampled read byte-exact, WORM unbroken for the
+  whole soak, the lifecycle control prefix never touched (and expirations actually observed), a
+  tampered session token refused on **every** mint, aborted uploads leaving no staging, `/healthz`
+  never *stopping* (60 s per-probe **wedge** timeout — latency is load, not signal), server alive, and
+  a 5xx counter EQUAL to the declared budget, which for this mix is exactly **zero** (every
+  deliberate rejection here is a 4xx). **GATED, leak shape** (middle-third vs last-third, the
+  `stress.sh` windowing, each requiring BOTH a % growth AND a meaningful absolute delta so a +4 fd
+  wobble cannot fail a run): RSS, fd and thread counts must not climb; staging bytes and WAL bytes
+  must **plateau** — asserted as *last-third minimum vs middle-third maximum*, because a healthy
+  sawtooth always comes back down. **GATED, ceilings:** the same RSS/fd/thread/WAL knobs and defaults
+  as `stress.sh`. The launcher pins `CAIRN_WAL_CHECKPOINT_INTERVAL_SECS=15` (the 300 s default is
+  longer than a CI soak, which would make the WAL climb by *configuration* and the gate unsound) and
+  `CAIRN_REQUEST_TIMEOUT_SECS=600` (so a slow runner cannot manufacture a 503). Two assertions need a
+  long run and report as **explicitly SKIPPED** rather than silently passing when it is too short:
+  the multipart **sweeper** reclaiming abandoned sessions (needs the run to outlast
+  `CAIRN_MULTIPART_UPLOAD_LIFETIME_SECS`; it *does* gate at the 180 s default) and an **expired**
+  session credential being refused (the server's floor for a session is 900 s, ARCH 14, so it needs
+  `SOAK_SECS` > ~930). The `session_credentials` row count is sampled and **reported, never gated**,
+  for the same reason: on a sub-900 s soak a rising row count is *correct*. Everything rate-shaped —
+  ops/s, Complete wall times, CPU-s/GiB, expirations observed — is advisory (CI drives the debug
+  artifact); `SOAK_OUT=` writes it all as JSON.
 - `warp.sh` — the MinIO `warp` macro benchmark (get/put/mixed); downloads `warp` once. Gates on errors.
 - `bench_compare.sh` — **Cairn vs MinIO head-to-head**: boots Cairn AND a pinned MinIO server on one
   host and drives warp against each side-by-side (PUT/GET/STAT/DELETE/LIST/MIXED). Runs per push
@@ -149,7 +188,7 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   `CAIRN_*` directly; mirror that, never invent a config file.
 - Python drivers that **restart** the server (rotation, replication_chaos, crash_multipoint,
   blob_limits, mesh) own the process lifecycle themselves; the bash launcher just hands them the env.
-- Needs: boto3 (`run`, `soak`, `replication_chaos`); passwordless sudo (`blob_limits`, for a tmpfs —
+- Needs: boto3 (`run`, `soak`, `soak_features`, `replication_chaos`); passwordless sudo (`blob_limits`, for a tmpfs —
   CI runners have it); a `--features failpoints` build for the `crash_*` seams (`FAILPOINTS=...`); a
   `--features fast-io` Linux build for `sendfile_*` (else they SKIP); `warp`/`go` for `warp*`.
 - Prefer asserting on synchronous CLI stdout or a metric/poll loop over `sleep` — the no-sleep
