@@ -128,15 +128,14 @@ VERSION_ENCRYPTED = 2
 MARKER = b"PLAINTEXT-MARKER-DO-NOT-FIND-ON-DISK-"
 
 fails = []
-gaps = []
 ADVISORY = {}
-# The 5xx BUDGET. Two operations in this harness can legitimately answer 5xx, and both are declared
-# here so the launcher can gate the server's own 5xx counter against EXACTLY this number: any 5xx
-# from any other request still fails the run.
+# The 5xx BUDGET. Exactly ONE operation in this harness legitimately answers 5xx, declared here so
+# the launcher can gate the server's own 5xx counter against EXACTLY this number: any 5xx from any
+# other request still fails the run.
 #   * scenario 2's poisoned Complete -- a tampered stored part is an integrity failure, so
 #     BlobError::Corruption -> Error::Internal -> 500 is the CORRECT fail-closed answer.
-#   * scenario 3a's losing Complete when Abort deleted its staged bytes mid-assemble -- see the
-#     KNOWN GAP note there. Declared, not gated, and loudly reported.
+# (Scenario 3a's abort-race Complete used to be a second, pinned-not-gated deviation returning 500;
+# it is now FIXED to NoSuchUpload and hard-gated, so it no longer contributes to this budget.)
 DECLARED_5XX = [0]
 
 
@@ -154,11 +153,6 @@ def check(label, cond):
     return bool(cond)
 
 
-def known_gap(label):
-    """A pinned-but-NOT-gating observation: real behaviour we record so a change to it is visible in
-    the log, without turning a pre-existing product gap into a red CI gate on a harness-only PR."""
-    print("    KNOWN GAP: " + label, flush=True)
-    gaps.append(label)
 
 
 def body_of(size):
@@ -547,25 +541,13 @@ def scenario_3_race():
             status, code = info
             if code in ALLOWED and status is not None and status < 500:
                 continue
-            # KNOWN GAP (pinned, not gated): when Abort wins the ClaimMultipart race *after* Complete
-            # has already claimed the session and entered `assemble`, the abort's `delete_session`
-            # removes the staged part files out from under the running assembly, so the loser fails
-            # with BlobError::Io -> Error::Internal -> 500 InternalError instead of the AWS-shaped
-            # NoSuchUpload. It is FAIL-CLOSED (asserted below: no object is committed, nothing is
-            # torn, no orphan staging), just not the AWS-parity code. This harness is test-only, so
-            # the finding is reported and its 5xx declared into the budget rather than turned into a
-            # red gate; fixing the code belongs to a product change.
-            # Narrowly scoped: ONLY an InternalError on the Complete side when the Abort actually
-            # succeeded (i.e. the interleaving under discussion really happened). Accepting any
-            # complete-side 5xx would make `bad_codes` unable to ever trip for a 500 from Complete,
-            # and would inflate the declared-5xx budget so the launcher's equality gate stayed green
-            # too — a future unrelated regression would pass silently.
-            if (side == "complete" and a_ok and code == "InternalError"
-                    and status is not None and 500 <= status < 600):
-                known_gap(f"round {r}: Complete lost the abort race mid-assemble and returned "
-                          f"HTTP {status} {code} instead of NoSuchUpload (fail-closed, wrong code)")
-                declare_5xx(status)
-                continue
+            # FIXED and now GATED: when Abort won the race *after* Complete had claimed the session
+            # and entered `assemble`, the loser used to fail BlobError::Io -> Error::Internal -> 500
+            # instead of the AWS-shaped NoSuchUpload. complete_multipart now re-checks the session on
+            # an assemble failure (abort commits its row delete BEFORE pulling the part bytes, so
+            # bytes-gone implies row-gone) and returns NoSuchUpload — which is in ALLOWED, so it is
+            # caught by the `code in ALLOWED and status < 500` branch above. Any complete-side 5xx
+            # here is now a REGRESSION and falls through to `bad_codes`, failing the run.
             bad_codes.append(f"round {r} {side}: HTTP {status} {code}")
 
         # The object is either fully there (byte-exact) or not there at all -- never torn.
@@ -595,7 +577,8 @@ def scenario_3_race():
     print(f"    outcomes: complete won {tally['complete']}, abort won {tally['abort']}, "
           f"both succeeded {tally['both']}, neither {tally['neither']}", flush=True)
     check(f"[3a] every loser returned a well-formed S3 error code from "
-          f"{sorted(ALLOWED)}, modulo the pinned known gap (bad: {bad_codes[:3] or 'none'})",
+          f"{sorted(ALLOWED)} — including the abort-race loser, now NoSuchUpload not 500 "
+          f"(bad: {bad_codes[:3] or 'none'})",
           not bad_codes)
     check(f"[3a] the object is always all-or-nothing, never torn (bad: {torn[:3] or 'none'})", not torn)
     check(f"[3a] the upload id is RESOLVED after every race (bad: {unresolved[:3] or 'none'})",
@@ -604,10 +587,6 @@ def scenario_3_race():
           f"(bad: {orphans[:3] or 'none'})", not orphans)
     check("[3a] at least one side won every round (the race never deadlocks both)",
           tally["neither"] == 0)
-    # The known-gap hatch must stay bounded by the rounds actually run; if it ever exceeds that,
-    # something is emitting InternalError outside the abort-race interleaving.
-    check(f"[3a] known-gap 5xx bounded by round count ({len(gaps)} <= {RACE_ROUNDS})",
-          len(gaps) <= RACE_ROUNDS)
     ADVISORY["race_outcomes"] = tally
 
 
@@ -787,10 +766,7 @@ def main():
     scenario_4_copy()
     ADVISORY["driver_secs"] = round(time.time() - t0, 1)
     ADVISORY["declared_5xx"] = DECLARED_5XX[0]
-    ADVISORY["known_gaps"] = gaps
     ADVISORY["failures"] = fails
-    if gaps:
-        print(f"\n  KNOWN GAPS pinned (not gating, {len(gaps)}): " + "; ".join(gaps[:4]))
     if OUT_JSON:
         with open(OUT_JSON, "w", encoding="utf-8") as fh:
             json.dump(ADVISORY, fh)

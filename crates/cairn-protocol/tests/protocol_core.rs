@@ -40,6 +40,7 @@ fn member(user: &str) -> Principal {
 struct Harness {
     svc: S3Service,
     meta: Arc<dyn MetadataStore>,
+    blob: Arc<dyn BlobStore>,
     _dir: tempfile::TempDir,
 }
 
@@ -57,7 +58,7 @@ async fn harness_with_authz(authz: Arc<dyn cairn_types::traits::AuthorizationEng
         Arc::new(cairn_crypto::SystemCrypto::new([7u8; 32]));
     let svc = S3Service::new(
         meta.clone(),
-        blob,
+        blob.clone(),
         authz,
         clock,
         crypto,
@@ -67,6 +68,7 @@ async fn harness_with_authz(authz: Arc<dyn cairn_types::traits::AuthorizationEng
     Harness {
         svc,
         meta,
+        blob,
         _dir: dir,
     }
 }
@@ -86,7 +88,7 @@ async fn harness_sharded(shards: usize) -> Harness {
         Arc::new(cairn_crypto::SystemCrypto::new([7u8; 32]));
     let svc = S3Service::new(
         meta.clone(),
-        blob,
+        blob.clone(),
         Arc::new(cairn_types::testing::AllowAll),
         clock,
         crypto,
@@ -96,6 +98,7 @@ async fn harness_sharded(shards: usize) -> Harness {
     Harness {
         svc,
         meta,
+        blob,
         _dir: dir,
     }
 }
@@ -112,7 +115,7 @@ async fn harness_encrypt_at_rest() -> Harness {
         Arc::new(cairn_crypto::SystemCrypto::new([7u8; 32]));
     let svc = S3Service::new(
         meta.clone(),
-        blob,
+        blob.clone(),
         Arc::new(cairn_types::testing::AllowAll),
         clock,
         crypto,
@@ -123,6 +126,7 @@ async fn harness_encrypt_at_rest() -> Harness {
     Harness {
         svc,
         meta,
+        blob,
         _dir: dir,
     }
 }
@@ -1484,6 +1488,50 @@ async fn start_upload_with_part(h: &Harness, bucket: &str, key: &str) -> (String
     assert_eq!(st, StatusCode::OK);
     let etag = header(&hdrs, "etag").unwrap().to_owned();
     (upload_id, etag)
+}
+
+/// The abort/complete race fix must NOT OVER-classify. `complete_multipart` answers `NoSuchUpload`
+/// on an assemble failure only when the session has vanished under it (a concurrent AbortMultipart
+/// won the race — that true concurrency case is gated by `conformance/stress_multipart.py` 3a).
+/// Here we prove the complementary invariant deterministically: a GENUINE assembly failure while the
+/// session is STILL present must surface the real error, never be masked as `NoSuchUpload` — masking
+/// it would hide real assembly faults as "the upload vanished". Delete the staged part BYTES (an I/O
+/// failure for assemble) while leaving the session row intact, then Complete.
+#[tokio::test]
+async fn assemble_failure_with_the_session_present_is_not_masked_as_no_such_upload() {
+    let h = harness().await;
+    let (upload_id, etag) = start_upload_with_part(&h, "mpbucket", "obj").await;
+    // Pull the staged part artifacts out from under the soon-to-run assemble WITHOUT touching the
+    // session row — this is a real assembly I/O failure, not an abort.
+    h.blob
+        .delete_session(&cairn_types::UploadId::from_string(upload_id.clone()))
+        .await
+        .unwrap();
+    let body = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part></CompleteMultipartUpload>"
+    );
+    let (st, _, resp) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::POST,
+                Some("mpbucket"),
+                Some("obj"),
+                &[("uploadId", upload_id.as_str())],
+                &[],
+                body.into_bytes(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    let xml = String::from_utf8(resp).unwrap();
+    assert_ne!(st, StatusCode::OK, "assemble should have failed: {xml}");
+    assert!(
+        !xml.contains("NoSuchUpload"),
+        "a genuine assembly failure with the session present must not be masked as NoSuchUpload; \
+         got {st} {xml}"
+    );
 }
 
 /// Audit 2026-07 (critical): `abort_multipart` never checked that the uploadId belonged to the
