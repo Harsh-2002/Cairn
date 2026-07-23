@@ -377,19 +377,12 @@ async fn repair_dangling_rows(
                     continue;
                 };
 
-                // Probe the blob store. Opening a present blob succeeds (we read nothing); a
-                // missing blob yields `NotFound`, which is exactly the dangling case we repair. Any
-                // other error is surfaced rather than treated as "missing", so a transient I/O fault
-                // never deletes good metadata.
-                match blob.open(&path, None, &row.compression).await {
-                    Ok(_) => {}
-                    // PRESENT but unreadable without its data key. `repair` only ever deletes rows
-                    // whose blob is MISSING, and presence is all this probe needs — so an encrypted
-                    // blob must count as present, not abort the pass. Without this arm the
-                    // fail-closed guard in `open_with_dek` turns the documented DR repair path into
-                    // a hard error on the FIRST encrypted object, i.e. under the default SSE /
-                    // CAIRN_ENCRYPT_AT_REST configuration.
-                    Err(BlobError::Corruption(_)) => {}
+                // Probe the blob store for PRESENCE only (no body, no DEK, no decrypt): a present
+                // blob — plaintext or encrypted — returns `Ok`; a missing blob yields `NotFound`,
+                // exactly the dangling case we repair. Any other error is surfaced rather than
+                // treated as "missing", so a transient I/O fault never deletes good metadata.
+                match blob.probe(&path).await {
+                    Ok(_present) => {}
                     Err(BlobError::NotFound) => {
                         match meta
                             .submit(Mutation::DeleteVersion {
@@ -775,7 +768,12 @@ impl HttpReplicaVerifier {
         };
         let handle = self
             .blob
-            .open_with_dek(path, None, dek, &row.compression)
+            .open_raw(
+                path,
+                None,
+                cairn_types::blob::BlobCipher::from_dek(dek),
+                &row.compression,
+            )
             .await
             .map_err(|e| format!("reading the source blob: {e}"))?;
         let mut hasher = md5::Md5::new();

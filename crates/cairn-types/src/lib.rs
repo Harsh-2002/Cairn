@@ -45,8 +45,8 @@ pub use authz::{
     Permission, Policy, PublicAccessBlock, RequestContext, Resource, Statement,
 };
 pub use blob::{
-    BlobReadHandle, ByteRange, ContentRange, PartRef, ReconcileOpts, ReconcileReport, StageOptions,
-    StagedBlob, StagedPart, ZeroCopyRead,
+    BlobCipher, BlobProbe, BlobReadHandle, ByteRange, ContentRange, PartRef, ReconcileOpts,
+    ReconcileReport, StageOptions, StagedBlob, StagedPart, ZeroCopyRead,
 };
 pub use bucket::{
     Bucket, CompressionAlgorithm, CompressionPolicy, ConfigAspect, ConfigDoc, DefaultRetention,

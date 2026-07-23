@@ -11,8 +11,8 @@
 use crate::auth::{AuthOutcome, RequestView};
 use crate::authz::{AuthzInput, Decision, PublicAccessBlock};
 use crate::blob::{
-    BlobReadHandle, ByteRange, PartRef, ReconcileOpts, ReconcileReport, StageOptions, StagedBlob,
-    StagedPart,
+    BlobCipher, BlobProbe, BlobReadHandle, ByteRange, PartRef, ReconcileOpts, ReconcileReport,
+    StageOptions, StagedBlob, StagedPart,
 };
 use crate::bucket::{Bucket, ConfigAspect, ConfigDoc};
 use crate::crypto::{Nonce, Sealed, Signature};
@@ -47,39 +47,46 @@ pub trait BlobStore: Send + Sync {
         opts: StageOptions,
     ) -> Result<StagedBlob, BlobError>;
 
-    /// Open a committed blob for reading, transparently decompressing, optionally for a range
-    /// expressed in logical (plaintext) coordinates.
+    /// Open a committed blob for reading, transparently decompressing and — when `cipher` is
+    /// [`BlobCipher::Dek`] — transparently decrypting each AES-256-GCM block with the supplied raw
+    /// 32-byte data-encryption key, optionally for a range expressed in logical (plaintext)
+    /// coordinates.
     ///
-    /// This is the default reader for unencrypted (SSE-S3-disabled) objects; it delegates to
-    /// [`open_with_dek`](BlobStore::open_with_dek) with no data-encryption key, so a single
-    /// implementation of `open_with_dek` serves both paths and existing callers of `open`
-    /// (cairn-server, cairn-replication) keep compiling unchanged.
-    async fn open(
-        &self,
-        path: &StoragePath,
-        range: Option<ByteRange>,
-        compression: &CompressionDescriptor,
-    ) -> Result<BlobReadHandle, BlobError> {
-        self.open_with_dek(path, range, None, compression).await
-    }
-
-    /// Open a committed blob for reading, transparently decompressing and — when `dek` is
-    /// `Some` — transparently decrypting each AES-256-GCM block with the supplied raw 32-byte
-    /// data-encryption key, optionally for a range expressed in logical (plaintext) coordinates.
-    /// An encrypted blob opened with the wrong (or no) DEK fails with [`BlobError::Corruption`]
-    /// rather than yielding plaintext (ARCH 27, SSE-S3).
+    /// This is the **one** reader: there is no DEK-less `open`. The caller MUST name the cipher —
+    /// [`BlobCipher::KnownPlaintext`] for a blob written in the clear, [`BlobCipher::Dek`] for an
+    /// encrypted one. That is deliberate. The former `open` forwarded to a DEK of `None`, so any
+    /// caller that forgot the key streamed an encrypted container's raw ciphertext as if it were
+    /// the plaintext body — silently, at exactly the plaintext length (it is how replication and
+    /// the integrity scrub shipped ciphertext). Requiring the cipher by name removes that footgun.
+    ///
+    /// **Fail-closed (unchanged, ARCH 27, SSE-S3):** an encrypted blob opened with
+    /// [`BlobCipher::KnownPlaintext`] (or with the wrong DEK) fails with [`BlobError::Corruption`]
+    /// rather than yielding plaintext or ciphertext. `KnownPlaintext` behaves exactly as the old
+    /// `dek: None` did — the fail-closed guard still fires for a plaintext-open of an encrypted
+    /// container.
     ///
     /// `compression` is the object version's stored compression descriptor, the source of truth
     /// for whether the blob is a self-describing CRNB block container. The reader trusts it (and
-    /// `dek` — encryption also uses the container) rather than sniffing the trailer magic, which
-    /// an uncompressed object's bytes can collide with (audit #18).
-    async fn open_with_dek(
+    /// the cipher — encryption also uses the container) rather than sniffing the trailer magic,
+    /// which an uncompressed object's bytes can collide with (audit #18).
+    async fn open_raw(
         &self,
         path: &StoragePath,
         range: Option<ByteRange>,
-        dek: Option<[u8; 32]>,
+        cipher: BlobCipher,
         compression: &CompressionDescriptor,
     ) -> Result<BlobReadHandle, BlobError>;
+
+    /// Cheaply answer whether a committed blob is PRESENT, plus basic framing — WITHOUT a DEK and
+    /// WITHOUT decrypting. It stats the file / reads the fixed container header only; it never
+    /// opens the body. Contract: a well-formed *encrypted* blob returns `Ok` (present), NOT
+    /// [`BlobError::Corruption`] — presence is not decryptability. An absent blob is
+    /// [`BlobError::NotFound`]; a real I/O failure is the corresponding `BlobError`.
+    ///
+    /// This is the presence probe the integrity `--repair` pass needs: it must distinguish a
+    /// dangling row (blob missing) from a healthy encrypted object it holds no key for, and
+    /// `open_raw` cannot serve that — a DEK-less open of an encrypted blob fails closed by design.
+    async fn probe(&self, path: &StoragePath) -> Result<BlobProbe, BlobError>;
 
     /// Idempotently delete a committed blob (absence is success).
     async fn delete(&self, path: &StoragePath) -> Result<(), BlobError>;

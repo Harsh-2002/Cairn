@@ -123,9 +123,10 @@ async fn put_get_list_delete_roundtrip() {
         .unwrap()
         .unwrap();
     let handle = blob
-        .open(
+        .open_raw(
             current.storage_path.as_ref().unwrap(),
             None,
+            BlobCipher::KnownPlaintext,
             &current.compression,
         )
         .await
@@ -572,10 +573,12 @@ async fn set_object_acl_replaces_the_version_acl() {
 /// never the raw ciphertext, never zeros.
 ///
 /// This is a *contract* case rather than a double-only test on purpose: the in-memory double has
-/// always refused a DEK-less encrypted read, while `LocalBlobStore` (which decides its framing from
-/// the DEK argument, not from the bytes) happily streamed the ciphertext for an
+/// always refused a keyless encrypted read, while `LocalBlobStore` (which decides its framing from
+/// the cipher argument, not from the bytes) happily streamed the ciphertext for an
 /// encrypted-but-uncompressed blob — the exact divergence that let replication ship ciphertext to
-/// mirrors while every doubles-based test stayed green. `cairn-blob` mirrors these assertions
+/// mirrors while every doubles-based test stayed green. Now that `open_raw` requires the cipher be
+/// named, `BlobCipher::KnownPlaintext` is the read that must fail closed. `cairn-blob` mirrors these
+/// assertions
 /// against the real store.
 #[tokio::test]
 async fn encrypted_blob_read_without_a_dek_fails_closed() {
@@ -594,11 +597,16 @@ async fn encrypted_blob_read_without_a_dek_fails_closed() {
         .await
         .unwrap();
 
-    // No key at all: refused.
+    // No key at all (KnownPlaintext): refused — never yields the plaintext bytes.
     let err = blob
-        .open_with_dek(&staged.storage_path, None, None, &staged.compression)
+        .open_raw(
+            &staged.storage_path,
+            None,
+            BlobCipher::KnownPlaintext,
+            &staged.compression,
+        )
         .await
-        .expect_err("a DEK-less read of an encrypted blob must fail, not return bytes");
+        .expect_err("a KnownPlaintext read of an encrypted blob must fail, not return bytes");
     assert!(
         matches!(err, BlobError::Corruption(_)),
         "unexpected: {err:?}"
@@ -606,10 +614,10 @@ async fn encrypted_blob_read_without_a_dek_fails_closed() {
 
     // The wrong key: also refused.
     let err = blob
-        .open_with_dek(
+        .open_raw(
             &staged.storage_path,
             None,
-            Some([1u8; 32]),
+            BlobCipher::Dek([1u8; 32]),
             &staged.compression,
         )
         .await
@@ -621,10 +629,56 @@ async fn encrypted_blob_read_without_a_dek_fails_closed() {
 
     // The right key: the plaintext, byte-for-byte.
     let handle = blob
-        .open_with_dek(&staged.storage_path, None, Some(dek), &staged.compression)
+        .open_raw(
+            &staged.storage_path,
+            None,
+            BlobCipher::Dek(dek),
+            &staged.compression,
+        )
         .await
         .unwrap();
     assert_eq!(read_all(handle).await, b"top secret".to_vec());
+}
+
+/// `probe` reports PRESENCE without a DEK and never decrypts: a well-formed ENCRYPTED blob probes
+/// `Ok` (present) — not `Corruption` — a missing path is `NotFound`, and a plaintext blob's
+/// physical length is reported. This is the seam the integrity `--repair` pass leans on to tell a
+/// dangling row from a healthy encrypted object it holds no key for. `cairn-blob` mirrors it.
+#[tokio::test]
+async fn probe_reports_presence_without_a_dek() {
+    let blob = InMemoryBlobStore::new();
+    let bucket = BucketName::parse("probe-bucket").unwrap();
+
+    // A plaintext blob: present, and its physical length is the byte length.
+    let plain = blob
+        .stage(&bucket, body(b"twelve bytes"), opts())
+        .await
+        .unwrap();
+    let p = blob.probe(&plain.storage_path).await.unwrap();
+    assert_eq!(p.physical_len, 12);
+
+    // A well-formed ENCRYPTED blob probes present WITHOUT any DEK — presence is not decryptability.
+    let enc = blob
+        .stage(
+            &bucket,
+            body(b"top secret"),
+            StageOptions {
+                encryption: Some([9u8; 32]),
+                ..opts()
+            },
+        )
+        .await
+        .unwrap();
+    blob.probe(&enc.storage_path)
+        .await
+        .expect("an encrypted blob must probe present, never error");
+
+    // A missing path is NotFound (the dangling-row case repair deletes).
+    let missing = StoragePath::from_string(format!("{}/does-not-exist", bucket.as_str()));
+    assert!(matches!(
+        blob.probe(&missing).await,
+        Err(BlobError::NotFound)
+    ));
 }
 
 /// The in-memory double must implement `RequeueReplicationVersions` exactly like both SQL engines

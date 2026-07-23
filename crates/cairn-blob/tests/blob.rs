@@ -54,7 +54,10 @@ async fn read_all(
     compression: &CompressionDescriptor,
 ) -> Vec<u8> {
     use futures_util::StreamExt;
-    let handle = store.open(path, range, compression).await.unwrap();
+    let handle = store
+        .open_raw(path, range, BlobCipher::KnownPlaintext, compression)
+        .await
+        .unwrap();
     let mut out = Vec::new();
     let mut body = handle.body;
     while let Some(c) = body.next().await {
@@ -86,7 +89,12 @@ async fn uncompressed_roundtrip_and_etag() {
     // single probe open, no second open and no streaming channel), so it exposes NO zero-copy hint —
     // and its body still reads back byte-exact (verified above via `read_all`).
     let handle = store
-        .open(&staged.storage_path, None, &staged.compression)
+        .open_raw(
+            &staged.storage_path,
+            None,
+            BlobCipher::KnownPlaintext,
+            &staged.compression,
+        )
         .await
         .unwrap();
     assert!(
@@ -116,7 +124,12 @@ async fn uncompressed_roundtrip_and_etag() {
         big
     );
     let handle_big = store
-        .open(&staged_big.storage_path, None, &staged_big.compression)
+        .open_raw(
+            &staged_big.storage_path,
+            None,
+            BlobCipher::KnownPlaintext,
+            &staged_big.compression,
+        )
         .await
         .unwrap();
     assert!(
@@ -147,7 +160,12 @@ async fn small_object_fast_path_ranged_reads_are_exact() {
 
     // The whole read is byte-exact and offers no zero-copy hint (fast path, not sendfile).
     let full = store
-        .open(&staged.storage_path, None, &staged.compression)
+        .open_raw(
+            &staged.storage_path,
+            None,
+            BlobCipher::KnownPlaintext,
+            &staged.compression,
+        )
         .await
         .unwrap();
     assert!(full.zero_copy.is_none());
@@ -177,7 +195,12 @@ async fn small_object_fast_path_ranged_reads_are_exact() {
             "fast-path range offset={offset} length={length} returned wrong bytes"
         );
         let cr = store
-            .open(&staged.storage_path, Some(range), &staged.compression)
+            .open_raw(
+                &staged.storage_path,
+                Some(range),
+                BlobCipher::KnownPlaintext,
+                &staged.compression,
+            )
             .await
             .unwrap()
             .content_range
@@ -326,7 +349,12 @@ async fn compression_is_transparent_and_etag_invariant() {
     // A compressed read offers no zero-copy hint.
     assert!(
         store
-            .open(&comp.storage_path, Some(range), &comp.compression)
+            .open_raw(
+                &comp.storage_path,
+                Some(range),
+                BlobCipher::KnownPlaintext,
+                &comp.compression
+            )
             .await
             .unwrap()
             .zero_copy
@@ -342,7 +370,9 @@ async fn read_all_dek(
     compression: &CompressionDescriptor,
 ) -> Result<Vec<u8>, cairn_types::error::BlobError> {
     use futures_util::StreamExt;
-    let handle = store.open_with_dek(path, range, dek, compression).await?;
+    let handle = store
+        .open_raw(path, range, BlobCipher::from_dek(dek), compression)
+        .await?;
     let mut out = Vec::new();
     let mut body = handle.body;
     while let Some(c) = body.next().await {
@@ -418,7 +448,12 @@ async fn encrypted_roundtrip_etag_invariant_and_ranged() {
     // An encrypted blob never offers a zero-copy hint (the kernel cannot decrypt).
     assert!(
         store
-            .open_with_dek(&enc.storage_path, None, Some(dek), &enc.compression)
+            .open_raw(
+                &enc.storage_path,
+                None,
+                BlobCipher::Dek(dek),
+                &enc.compression
+            )
             .await
             .unwrap()
             .zero_copy
@@ -492,7 +527,12 @@ async fn encrypted_blob_on_disk_is_encrypted_variant_and_no_zero_copy() {
     // (4) An encrypted blob offers no zero-copy hint: ciphertext can never reach the sendfile path.
     assert!(
         store
-            .open_with_dek(&enc.storage_path, None, Some(dek), &enc.compression)
+            .open_raw(
+                &enc.storage_path,
+                None,
+                BlobCipher::Dek(dek),
+                &enc.compression
+            )
             .await
             .unwrap()
             .zero_copy
@@ -558,8 +598,9 @@ async fn encrypted_without_compression_and_wrong_dek_fails() {
     );
 }
 
-/// An old-format (unencrypted) blob still reads unchanged through both `open` and `open_with_dek`
-/// after the format gained encryption, confirming the version gate keeps backward compatibility.
+/// An old-format (unencrypted) blob still reads unchanged through `open_raw` — with both
+/// `KnownPlaintext` and a stray `Dek` refused only where crypto requires — after the format gained
+/// encryption, confirming the version gate keeps backward compatibility.
 #[tokio::test]
 async fn old_unencrypted_blob_reads_unchanged() {
     let dir = tempfile::tempdir().unwrap();
@@ -579,7 +620,7 @@ async fn old_unencrypted_blob_reads_unchanged() {
         .stage(&b, body(data.clone()), opts(Some(policy), "text/plain"))
         .await
         .unwrap();
-    // Reads via the legacy `open` and via `open_with_dek(None)` both succeed and match.
+    // Reads via `open_raw(KnownPlaintext)` (twice, once through each helper) both succeed and match.
     assert_eq!(
         read_all(&store, &staged.storage_path, None, &staged.compression).await,
         data
@@ -803,7 +844,12 @@ async fn reconcile_reclaims_orphans_only() {
     );
     assert!(matches!(
         store
-            .open(&orphan.storage_path, None, &orphan.compression)
+            .open_raw(
+                &orphan.storage_path,
+                None,
+                BlobCipher::KnownPlaintext,
+                &orphan.compression
+            )
             .await,
         Err(BlobError::NotFound)
     ));
@@ -946,7 +992,12 @@ async fn delete_is_idempotent_and_paths_are_safe() {
     let evil = StoragePath::from_string("../../../etc/passwd".to_owned());
     assert!(
         store
-            .open(&evil, None, &CompressionDescriptor::Uncompressed)
+            .open_raw(
+                &evil,
+                None,
+                BlobCipher::KnownPlaintext,
+                &CompressionDescriptor::Uncompressed
+            )
             .await
             .is_err()
     );
@@ -1836,7 +1887,12 @@ async fn encrypted_uncompressed_blob_read_without_a_dek_is_refused() {
     );
 
     let err = store
-        .open_with_dek(&staged.storage_path, None, None, &staged.compression)
+        .open_raw(
+            &staged.storage_path,
+            None,
+            BlobCipher::KnownPlaintext,
+            &staged.compression,
+        )
         .await
         .expect_err("reading an encrypted blob with no DEK must fail, not stream ciphertext");
     assert!(
@@ -1846,7 +1902,12 @@ async fn encrypted_uncompressed_blob_read_without_a_dek_is_refused() {
 
     // The legitimate read is unaffected: with the DEK it is the plaintext, byte-for-byte.
     let handle = store
-        .open_with_dek(&staged.storage_path, None, Some(dek), &staged.compression)
+        .open_raw(
+            &staged.storage_path,
+            None,
+            BlobCipher::Dek(dek),
+            &staged.compression,
+        )
         .await
         .unwrap();
     let mut out = Vec::new();
@@ -1885,7 +1946,12 @@ async fn encrypted_compressed_blob_read_without_a_dek_stays_refused() {
         .await
         .unwrap();
     let err = store
-        .open_with_dek(&staged.storage_path, None, None, &staged.compression)
+        .open_raw(
+            &staged.storage_path,
+            None,
+            BlobCipher::KnownPlaintext,
+            &staged.compression,
+        )
         .await
         .expect_err("an encrypted+compressed blob must still refuse a DEK-less read");
     assert!(
@@ -1967,4 +2033,61 @@ async fn the_guards_known_false_positive_class_is_pinned_and_counted() {
         .await
         .unwrap();
     assert_eq!(on_disk, raw, "the object's bytes are intact on disk");
+}
+
+/// `probe` on the real store answers PRESENCE + physical framing WITHOUT a DEK and never decrypts:
+/// a well-formed ENCRYPTED, uncompressed blob probes `Ok` (present) — NOT the fail-closed
+/// `Corruption` that `open_raw(KnownPlaintext)` returns for the same blob — a plaintext blob's
+/// physical length is its byte length, and a missing path is `NotFound`. This mirrors the
+/// double's `probe_reports_presence_without_a_dek` against `LocalBlobStore`, and is the seam the
+/// integrity `--repair` pass uses instead of a DEK-less `open`.
+#[tokio::test]
+async fn probe_reports_presence_on_the_real_store_without_a_dek() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let b = BucketName::parse("bkt").unwrap();
+
+    // A plaintext, uncompressed blob: present, physical length == plaintext length.
+    let plain = store
+        .stage(&b, body(b"twelve bytes".to_vec()), opts(None, "text/plain"))
+        .await
+        .unwrap();
+    let p = store.probe(&plain.storage_path).await.unwrap();
+    assert_eq!(p.physical_len, 12);
+
+    // An encrypted-but-uncompressed blob: `open_raw(KnownPlaintext)` fails closed, but `probe`
+    // reports it PRESENT without any DEK — presence is not decryptability.
+    let dek = [42u8; 32];
+    let enc = store
+        .stage(
+            &b,
+            body(b"top secret payload".to_vec()),
+            opts_encrypted(None, "application/octet-stream", dek),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        enc.compression,
+        CompressionDescriptor::Uncompressed
+    ));
+    store
+        .open_raw(
+            &enc.storage_path,
+            None,
+            BlobCipher::KnownPlaintext,
+            &enc.compression,
+        )
+        .await
+        .expect_err("a KnownPlaintext read of an encrypted blob must fail closed");
+    store
+        .probe(&enc.storage_path)
+        .await
+        .expect("but probe must report the encrypted blob present, without a DEK");
+
+    // A missing path is NotFound (the dangling-row case repair deletes).
+    let missing = StoragePath::from_string(format!("{}/does-not-exist", b.as_str()));
+    assert!(matches!(
+        store.probe(&missing).await,
+        Err(BlobError::NotFound)
+    ));
 }

@@ -99,6 +99,73 @@ pub struct PartRef {
     pub dek: Option<[u8; 32]>,
 }
 
+/// How to read a committed blob: either the blob is known-plaintext, or a raw 32-byte
+/// data-encryption key opens it. Stating the cipher **by name** is the whole point — it is
+/// the only way to express a read, so a caller cannot ask to "read a blob" without declaring
+/// whether it is plaintext or which key decrypts it.
+///
+/// This exists because the previous DEK-less `open` let a caller forget the key and silently
+/// stream an encrypted container's raw ciphertext at exactly the plaintext length — the way
+/// replication and the integrity scrub once shipped ciphertext to mirrors (ARCH 27). Making
+/// the cipher a required, named argument makes that whole class of bug unrepresentable.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum BlobCipher {
+    /// The blob was written in the clear. Opening an *encrypted* container this way fails
+    /// closed — it errors, it never streams ciphertext (see [`crate::BlobStore::open_raw`]).
+    KnownPlaintext,
+    /// The blob is AES-256-GCM-encrypted at rest; these are the raw 32 key bytes that open it.
+    Dek([u8; 32]),
+}
+
+impl BlobCipher {
+    /// Bridge for the callers that already hold an `Option<[u8; 32]>` (the unwrapped SSE DEK,
+    /// `None` for an unencrypted version): `None` => [`Self::KnownPlaintext`], `Some(k)` =>
+    /// [`Self::Dek`]. Keeps the call sites one line and the intent visible.
+    #[must_use]
+    pub fn from_dek(dek: Option<[u8; 32]>) -> Self {
+        match dek {
+            Some(k) => Self::Dek(k),
+            None => Self::KnownPlaintext,
+        }
+    }
+
+    /// The raw DEK when this is [`Self::Dek`], else `None`. For an implementation that
+    /// translates the cipher back into the internal `Option<[u8; 32]>` at the exact point it
+    /// once consumed the old `dek` argument, so the fail-closed logic below it is unchanged.
+    #[must_use]
+    pub fn dek(&self) -> Option<[u8; 32]> {
+        match self {
+            Self::Dek(k) => Some(*k),
+            Self::KnownPlaintext => None,
+        }
+    }
+}
+
+impl std::fmt::Debug for BlobCipher {
+    /// The DEK is secret — this mirrors how [`BlobReadHandle`]/`ReplicatedObject` redact, and
+    /// never renders the key bytes.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::KnownPlaintext => f.write_str("KnownPlaintext"),
+            Self::Dek(_) => f.write_str("Dek(<redacted>)"),
+        }
+    }
+}
+
+/// The result of a [`crate::BlobStore::probe`]: PRESENCE plus basic, DEK-free framing. A probe
+/// stats the file / reads the fixed container header only — it NEVER opens the body, never needs
+/// a key, and never decrypts, so a well-formed *encrypted* blob probes `Ok` (present), never an
+/// error. Absence is [`crate::error::BlobError::NotFound`]; a real I/O fault is the corresponding
+/// `BlobError`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlobProbe {
+    /// The on-disk (physical) byte length of the container file. For a plaintext, uncompressed
+    /// blob this equals the logical length; for a CRNB container (compressed or encrypted) it is
+    /// the container size, NOT the plaintext length — resolving a container's logical length needs
+    /// its framing/DEK, which probe deliberately avoids (that read seam is `open_raw`).
+    pub physical_len: u64,
+}
+
 /// A resolved logical byte range (already validated against the object size by the caller).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ByteRange {
@@ -193,4 +260,41 @@ pub struct ReconcileReport {
     pub dirs_pruned: u64,
     /// Non-fatal errors encountered.
     pub errors: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BlobCipher;
+
+    #[test]
+    fn blob_cipher_debug_never_prints_key_bytes() {
+        // A DEK of a recognisable, non-repeating byte pattern: if any key byte leaked into the
+        // Debug output, hex/decimal renderings of these values would appear.
+        let key = [0xABu8; 32];
+        let dbg = format!("{:?}", BlobCipher::Dek(key));
+        assert_eq!(dbg, "Dek(<redacted>)");
+        assert!(!dbg.contains("171"), "decimal key byte leaked: {dbg}");
+        assert!(
+            !dbg.to_ascii_lowercase().contains("ab"),
+            "hex key leaked: {dbg}"
+        );
+        // The plaintext variant names itself and carries no secret.
+        assert_eq!(
+            format!("{:?}", BlobCipher::KnownPlaintext),
+            "KnownPlaintext"
+        );
+    }
+
+    #[test]
+    fn blob_cipher_from_dek_bridges_the_option() {
+        assert!(matches!(
+            BlobCipher::from_dek(None),
+            BlobCipher::KnownPlaintext
+        ));
+        let k = [7u8; 32];
+        assert!(matches!(BlobCipher::from_dek(Some(k)), BlobCipher::Dek(d) if d == k));
+        // Round-trips back to the internal Option at the point an impl consumes it.
+        assert_eq!(BlobCipher::KnownPlaintext.dek(), None);
+        assert_eq!(BlobCipher::Dek(k).dek(), Some(k));
+    }
 }

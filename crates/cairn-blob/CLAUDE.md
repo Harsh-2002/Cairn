@@ -33,12 +33,22 @@ plain files under opaque IDs; metadata is someone else's job (`cairn-meta`).
   `cairn-crypto`); `compress.rs` types deliberately do **not** derive `Debug` so a DEK can't be logged.
   Compress-then-encrypt (ciphertext is incompressible); the 12-byte nonce is `HMAC-SHA256(DEK,
   block_index)[..12]` — deterministic, never stored, never reused for a fixed key. See ARCH 27.
-- **Framing comes from the caller's descriptor + DEK, but a DEK-less read of an encrypted blob is
-  REFUSED.** `is_container = dek.is_some() || compressed`, and staging records only the *logical*
-  compression — so an encrypted-but-**uncompressed** blob is `Uncompressed`, and a caller passing
-  `dek: None` used to get the raw CRNB container bytes streamed as if they were the body (compression
-  is off by default, so this was the default configuration; it is how replication mirrored
-  ciphertext). `open_with_dek`'s probe now cross-checks the trailer and returns
+- **The reader seam is `open_raw(path, range, cipher: BlobCipher, compression)` + `probe(path)` —
+  there is NO DEK-less `open`.** `BlobCipher` (in `cairn-types`) is `KnownPlaintext | Dek([u8;32])`;
+  a caller cannot express a read without naming the cipher, which is what removes the footgun below.
+  `open_raw` translates the cipher to the internal `Option<[u8;32]>` (`KnownPlaintext` => `None`,
+  `Dek(k)` => `Some(k)`) at the top, so every downstream check — the framing decision, the refusal
+  guard, the `CompressedReader::open_with_dek` call (an unrelated internal method — do NOT rename it)
+  — is byte-for-byte unchanged. `probe` answers PRESENCE + physical framing only: one `stat`, no
+  body open, no DEK, no decrypt, so a well-formed ENCRYPTED blob probes `Ok` (present), NOT
+  `Corruption`; absence is `NotFound`. It is what `cairn integrity --repair` uses to tell a dangling
+  row from a healthy encrypted object it holds no key for.
+- **Framing comes from the caller's descriptor + cipher, but a `KnownPlaintext` read of an encrypted
+  blob is REFUSED.** `is_container = dek.is_some() || compressed`, and staging records only the
+  *logical* compression — so an encrypted-but-**uncompressed** blob is `Uncompressed`, and a caller
+  passing `KnownPlaintext` (the old `dek: None`) used to get the raw CRNB container bytes streamed as
+  if they were the body (compression is off by default, so this was the default configuration; it is
+  how replication mirrored ciphertext). `open_raw`'s probe now cross-checks the trailer and returns
   `Corruption("encrypted blob read without a data key")` when the blob is a fully self-consistent
   `VERSION_ENCRYPTED` container. It only ever **refuses** — it never parses as a container — so
   audit #18's rule (no trailer sniffing to decide framing) still holds, and an uncompressed blob
@@ -95,6 +105,12 @@ plain files under opaque IDs; metadata is someone else's job (`cairn-meta`).
   so nothing plaintext hits disk; `assemble` decrypts each such part on read (via `PartRef.dek`) before
   re-encoding under the object DEK. The MD5/ETag is always computed over plaintext (before any
   encrypt/compress transform), so it's identical with or without any transform.
+- **Known API asymmetry (a decision, not an oversight).** The *read* seam names its cipher
+  (`open_raw` + `BlobCipher`), but the *write* seam does not: `stage`/`stage_part`/`assemble` still
+  take a bare `encryption: Option<[u8;32]>` / `PartRef.dek`. Stage 3 deliberately closed only the
+  read seam, because that is where the leak lived (a DEK-less read streamed ciphertext). Giving the
+  write path the same by-name cipher is a later, separate change; until then the write DEK stays an
+  `Option`.
 - Failpoint seams (`--features failpoints`): `blob_after_durable`, `blob_after_assemble` — exercised by
   `conformance/crash_consistency.sh` and `crash_multipoint.sh`. CRNB-reader fuzz target in `fuzz/`.
 - Tests: unit tests in each module; integration in `tests/blob.rs`. Spec: `docs/storage-durability.md`

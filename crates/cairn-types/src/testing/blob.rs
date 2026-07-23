@@ -3,8 +3,8 @@
 //! compression; it computes the real plaintext MD5 so ETags are faithful.
 
 use crate::blob::{
-    BlobReadHandle, ByteRange, ContentRange, PartRef, ReconcileOpts, ReconcileReport, StageOptions,
-    StagedBlob, StagedPart,
+    BlobCipher, BlobProbe, BlobReadHandle, ByteRange, ContentRange, PartRef, ReconcileOpts,
+    ReconcileReport, StageOptions, StagedBlob, StagedPart,
 };
 use crate::error::BlobError;
 use crate::id::{BucketName, StoragePath, UploadId};
@@ -114,20 +114,25 @@ impl BlobStore for InMemoryBlobStore {
         })
     }
 
-    async fn open_with_dek(
+    async fn open_raw(
         &self,
         path: &StoragePath,
         range: Option<ByteRange>,
-        dek: Option<[u8; 32]>,
+        cipher: BlobCipher,
         _compression: &CompressionDescriptor,
     ) -> Result<BlobReadHandle, BlobError> {
+        // Translate the named cipher back to the internal `Option<[u8; 32]>` at the exact point the
+        // fail-closed check runs: `KnownPlaintext` is `None`, `Dek(k)` is `Some(k)` — so the
+        // wrong/missing-key semantics below are byte-for-byte what the old `dek: Option` did.
+        let dek = cipher.dek();
         // The in-memory double stores logical bytes directly (no CRNB container), so the stored
         // compression descriptor is irrelevant to reads here.
         let data = {
             let blobs = self.blobs.lock().unwrap();
             let stored = blobs.get(path.as_str()).ok_or(BlobError::NotFound)?;
             // Model SSE-S3: a blob staged under a DEK is readable only with the same DEK, and a
-            // blob staged in the clear ignores any supplied DEK.
+            // blob staged in the clear ignores any supplied DEK. A KnownPlaintext open of an
+            // encrypted blob fails closed here — never yields the plaintext bytes.
             if stored.dek != dek && stored.dek.is_some() {
                 return Err(BlobError::Corruption(
                     "blob is encrypted; wrong or missing data-encryption key".into(),
@@ -157,6 +162,17 @@ impl BlobStore for InMemoryBlobStore {
             content_range,
             body,
             zero_copy: None,
+        })
+    }
+
+    async fn probe(&self, path: &StoragePath) -> Result<BlobProbe, BlobError> {
+        // Presence + basic framing, no DEK, no decrypt: an encrypted blob probes present. The
+        // double stores plaintext bytes directly, so the stored length IS the physical length
+        // (there is no CRNB container here). Absence is NotFound.
+        let blobs = self.blobs.lock().unwrap();
+        let stored = blobs.get(path.as_str()).ok_or(BlobError::NotFound)?;
+        Ok(BlobProbe {
+            physical_len: stored.bytes.len() as u64,
         })
     }
 
@@ -210,7 +226,7 @@ impl BlobStore for InMemoryBlobStore {
                 if let Some(pn) = pn {
                     if let Some((bytes, staged_dek)) = parts_map.get(&(upload, pn)) {
                         // Model the decrypt-on-read: a part staged under a DEK is readable only with
-                        // the same DEK (mirrors `open_with_dek`); a wrong/missing key fails closed.
+                        // the same DEK (mirrors `open_raw`); a wrong/missing key fails closed.
                         if *staged_dek != p.dek && staged_dek.is_some() {
                             return Err(BlobError::Corruption(
                                 "part is encrypted; wrong or missing data-encryption key".into(),

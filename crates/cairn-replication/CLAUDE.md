@@ -52,12 +52,12 @@ is cheap to construct and safe to run from many workers at once.
   `attempts`.
 - **Ship PLAINTEXT: resolve the version's DEK before reading its body.** `resolve_dek` unseals
   `row.sse_descriptor` via `cairn_types::sse::open_dek` and `put_object` reads through
-  `open_with_dek`. Reading an
-  encrypted version with `dek: None` returns the stored **ciphertext at exactly the plaintext
-  length** — the destination cannot tell (it has no Content-MD5 to check, and a multipart source's
-  composite ETag is unverifiable), so the mirror ends up holding intact-looking garbage. Never call
-  the DEK-less `open` here. Resolve per read; never cache a DEK across passes (the re-wrap worker
-  re-seals descriptors underneath us).
+  `open_raw(BlobCipher::from_dek(dek))`. Reading an encrypted version as `BlobCipher::KnownPlaintext`
+  would return the stored **ciphertext at exactly the plaintext length** — the destination cannot
+  tell (it has no Content-MD5 to check, and a multipart source's composite ETag is unverifiable), so
+  the mirror ends up holding intact-looking garbage. The old DEK-less `open` that made this a
+  one-character mistake is deleted (Stage 3); the reader now forces you to name the cipher. Resolve
+  per read; never cache a DEK across passes (the re-wrap worker re-seals descriptors underneath us).
 - **A DEK failure is a LOCAL condition and must say so.** DEK resolution happens in `process_entry`
   (not inside `put_object`) precisely so the failure is classified with its cause statically known:
   `reschedule_unavailable` takes an `UnavailableCause`, and the SourceKey arm logs/stamps "source
