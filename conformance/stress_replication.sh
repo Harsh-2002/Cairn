@@ -178,6 +178,14 @@ PYEOF
 # zero-errors gate and the exact-5xx-count gate at once — a load-dependent flake.
 # CAIRN_WAL_CHECKPOINT_INTERVAL_SECS is pinned too, so the WAL ceiling is judged against a store
 # that actually checkpoints within the length of this run rather than one held open by configuration.
+# CAIRN_WAL_CHECKPOINT_SIZE_BYTES is pinned for the same reason but along the other axis. Cairn sets
+# `wal_autocheckpoint=0` (cairn-meta/src/lib.rs:104), so the background checkpointer is the WAL's ONLY
+# bound, and config.rs:676-686 warns in as many words that a TIME trigger alone lets the WAL grow
+# between checkpoints. A time trigger bounds the WAL by seconds-of-writes, which on a fast CI runner
+# sustaining ~130 versions/s (with this harness's ~2x metadata amplification: a version row AND an
+# outbox row per object) reached 783 MB in one 15 s window and blew a 512 MB ceiling. That is not a
+# leak, it is the documented behaviour of a size-triggerless configuration — so bound it by SIZE, which
+# is what makes the ceiling a meaningful runaway backstop instead of a proxy for the runner's speed.
 common_env() { # <data-dir> <s3-port> <ui-addr> <master-key>
   printf '%s\n' \
     "CAIRN_DATA_DIR=$1/data" "CAIRN_DB_PATH=$1/data/cairn.db" \
@@ -185,7 +193,8 @@ common_env() { # <data-dir> <s3-port> <ui-addr> <master-key>
     "CAIRN_REGION=us-east-1" "CAIRN_ALLOW_INSECURE=true" \
     "CAIRN_LOG_LEVEL=${CAIRN_LOG_LEVEL:-error}" \
     "CAIRN_REQUEST_TIMEOUT_SECS=${CAIRN_REQUEST_TIMEOUT_SECS:-600}" \
-    "CAIRN_WAL_CHECKPOINT_INTERVAL_SECS=${CAIRN_WAL_CHECKPOINT_INTERVAL_SECS:-15}"
+    "CAIRN_WAL_CHECKPOINT_INTERVAL_SECS=${CAIRN_WAL_CHECKPOINT_INTERVAL_SECS:-15}" \
+    "CAIRN_WAL_CHECKPOINT_SIZE_BYTES=${CAIRN_WAL_CHECKPOINT_SIZE_BYTES:-$((64*1024*1024))}"
 }
 # shellcheck disable=SC2046
 target_env=( $(common_env "$DATA_T" "$PORT_T" off "$KEY_T") "CAIRN_ENCRYPT_AT_REST=true" )
