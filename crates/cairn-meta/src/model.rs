@@ -231,6 +231,7 @@ pub fn object_version_from_row(row: &Row) -> rusqlite::Result<ObjectVersionRow> 
         replication_status: row
             .get::<_, Option<String>>("replication_status")?
             .map(|s| repl_status_from(&s)),
+        replicated_at: row.get::<_, Option<i64>>("replicated_at")?.map(Timestamp),
         created_at: Timestamp(row.get("created_at")?),
         updated_at: Timestamp(row.get("updated_at")?),
     })

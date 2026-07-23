@@ -442,6 +442,7 @@ impl MetadataStore for InMemoryMetadataStore {
                     checksums: Vec::new(),
                     sse_descriptor: None,
                     replication_status: None,
+                    replicated_at: None,
                     created_at: now,
                     updated_at: now,
                 };
@@ -686,6 +687,134 @@ impl MetadataStore for InMemoryMetadataStore {
                 }
                 Ok(MutationOutcome::Ack)
             }
+            Mutation::RequeueReplicationVersions {
+                bucket,
+                only_encrypted,
+                now,
+                after_key,
+                limit,
+            } => {
+                // Mirrors both engines: page over KEYS (never rows), then move every terminal row of
+                // every key in the page — outbox half and version-ledger half — from the SAME page.
+                // `completed`/`failed` only: `replica` is never resurrected, `pending`/`claimed` is
+                // live work.
+                //
+                // The key-atomicity is the whole point and must be faithful here too, because
+                // downstream tests trust this double as the reference engine. Taking the first
+                // `limit` ROWS in insertion order (what this used to do) can requeue a key's NEWER
+                // `completed` version in one batch and its OLDER `failed` version in a later one;
+                // the heartbeat ships the newer one in between and the mirror reverts to the old
+                // bytes, or resurrects a key deleted by a newer delete marker.
+                //
+                // `only_encrypted` is a KEY-level predicate in both engines (the correlated EXISTS
+                // omits `version_id`), so it is one here too.
+                let encrypted_keys: std::collections::HashSet<String> = st
+                    .versions
+                    .iter()
+                    .filter(|((b, _, _), r)| b == bucket.as_str() && r.sse_descriptor.is_some())
+                    .map(|((_, k, _), _)| k.clone())
+                    .collect();
+                let in_scope = |key: &str| !only_encrypted || encrypted_keys.contains(key);
+                let past_cursor = |key: &str| after_key.as_deref().is_none_or(|after| key > after);
+
+                // The page: distinct keys with terminal work, from the UNION of the outbox and the
+                // ledger (a key whose outbox row was pruned still has a stamp to reset), ordered,
+                // strictly after the cursor, capped at `limit` KEYS.
+                let mut page: Vec<String> = st
+                    .outbox
+                    .iter()
+                    .filter(|e| {
+                        e.bucket.as_str() == bucket.as_str()
+                            && matches!(
+                                e.status,
+                                ReplicationStatus::Completed | ReplicationStatus::Failed
+                            )
+                    })
+                    .map(|e| e.key.as_str().to_owned())
+                    .chain(
+                        st.versions
+                            .iter()
+                            .filter(|((b, _, _), r)| {
+                                b == bucket.as_str()
+                                    && matches!(
+                                        r.replication_status,
+                                        Some(ReplicationStatus::Completed)
+                                            | Some(ReplicationStatus::Failed)
+                                    )
+                            })
+                            .map(|((_, k, _), _)| k.clone()),
+                    )
+                    .filter(|k| past_cursor(k) && in_scope(k))
+                    .collect();
+                page.sort();
+                page.dedup();
+                page.truncate(limit as usize);
+                let Some(page_end) = page.last().cloned() else {
+                    return Ok(MutationOutcome::RowsRequeued {
+                        rows: 0,
+                        page_end: None,
+                    });
+                };
+                let in_page: std::collections::HashSet<String> = page.into_iter().collect();
+
+                let mut changed = 0u64;
+                for e in st.outbox.iter_mut() {
+                    if e.bucket.as_str() != bucket.as_str()
+                        || !in_page.contains(e.key.as_str())
+                        || !matches!(
+                            e.status,
+                            ReplicationStatus::Completed | ReplicationStatus::Failed
+                        )
+                    {
+                        continue;
+                    }
+                    e.status = ReplicationStatus::Pending;
+                    e.next_attempt_at = now;
+                    e.attempts = 0;
+                    e.lease_until = None;
+                    changed += 1;
+                }
+                // `replicated_at` is deliberately untouched — it records when the version last
+                // SHIPPED, and the re-ship has not happened yet. Only `MarkReplicationDone` advances
+                // it.
+                //
+                // The ledger half is NARROWER than the outbox half, exactly as in both SQL engines:
+                // a version may only be flipped to `pending` if it is CURRENT (the resync backfill
+                // enumerates `list_current`, so it will get a fresh entry) or if it still HAS an
+                // outbox row for this exact (bucket, key, version_id) (the loop above just requeued
+                // it). A non-current version whose outbox row was pruned has nothing that could ever
+                // ship it, so marking it `pending` would be the ledger claiming queued work that no
+                // queue holds — and the audit's `repair_pending` gauge could then never reach zero.
+                //
+                // The membership set is taken AFTER the outbox loop and ignores status on purpose:
+                // those rows now read `pending`, and the question is only whether a row exists.
+                let queued: std::collections::HashSet<(String, String)> = st
+                    .outbox
+                    .iter()
+                    .filter(|e| e.bucket.as_str() == bucket.as_str())
+                    .map(|e| (e.key.as_str().to_owned(), e.version_id.as_str().to_owned()))
+                    .collect();
+                for ((b, k, v), row) in st.versions.iter_mut() {
+                    if b != bucket.as_str() || !in_page.contains(k) {
+                        continue;
+                    }
+                    if !matches!(
+                        row.replication_status,
+                        Some(ReplicationStatus::Completed) | Some(ReplicationStatus::Failed)
+                    ) {
+                        continue;
+                    }
+                    if !row.is_latest && !queued.contains(&(k.clone(), v.clone())) {
+                        continue;
+                    }
+                    row.replication_status = Some(ReplicationStatus::Pending);
+                    changed += 1;
+                }
+                Ok(MutationOutcome::RowsRequeued {
+                    rows: changed,
+                    page_end: Some(page_end),
+                })
+            }
             Mutation::SetAccountPublicAccessBlock(bpa) => {
                 st.account_bpa = bpa;
                 Ok(MutationOutcome::Ack)
@@ -858,7 +987,7 @@ impl MetadataStore for InMemoryMetadataStore {
                 }
                 Ok(MutationOutcome::ReplicationBatch(claimed))
             }
-            Mutation::MarkReplicationDone(id) => {
+            Mutation::MarkReplicationDone { id, now } => {
                 let mut coords = None;
                 if let Some(e) = st.outbox.iter_mut().find(|e| e.id == id) {
                     e.status = ReplicationStatus::Completed;
@@ -877,6 +1006,10 @@ impl MetadataStore for InMemoryMetadataStore {
                         // `replication_status IS NOT 'replica'` guard).
                         if r.replication_status != Some(ReplicationStatus::Replica) {
                             r.replication_status = Some(ReplicationStatus::Completed);
+                            // `replicated_at` moves in the same step as the status in both engines
+                            // (schema v23) — it is what lets the replication audit tell a
+                            // successful repair from a pre-fix ship.
+                            r.replicated_at = Some(now);
                         }
                     }
                 }
@@ -2089,6 +2222,7 @@ mod tests {
             checksums: Vec::new(),
             sse_descriptor: None,
             replication_status: None,
+            replicated_at: None,
             created_at: Timestamp(1),
             updated_at: Timestamp(1),
         }

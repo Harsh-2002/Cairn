@@ -454,7 +454,7 @@ impl CachedMetadataStore {
             | Mutation::DeleteExpiredSessionCredentials { .. }
             | Mutation::DeleteSessionCredential { .. }
             | Mutation::ClaimReplicationBatch { .. }
-            | Mutation::MarkReplicationDone(_)
+            | Mutation::MarkReplicationDone { .. }
             | Mutation::MarkReplicationFailed { .. }
             | Mutation::RetryFailedReplication { .. }
             | Mutation::PruneReplicationOutbox { .. }
@@ -462,6 +462,9 @@ impl CachedMetadataStore {
             | Mutation::DeferReplication { .. }
             | Mutation::RecoverClaimedReplication
             | Mutation::EnqueueReplication(_)
+            // Touches only `replication_outbox` and `object_versions.replication_status`; this
+            // cache holds bucket rows and config aspects, neither of which changes.
+            | Mutation::RequeueReplicationVersions { .. }
             | Mutation::EnqueueWebhooks(_)
             | Mutation::ClaimWebhookBatch { .. }
             | Mutation::MarkWebhookDone(_)

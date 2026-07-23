@@ -276,6 +276,127 @@ impl HttpS3Sink {
         content_type: Option<&str>,
         user_headers: &[(String, String)],
     ) -> Result<(), ReplicationError> {
+        let request =
+            self.build_signed_request(method, dest_bucket, key, body, content_type, user_headers)?;
+
+        // A connection/transport failure means the destination node is unreachable: classify it
+        // `Unavailable` so the entry retries without burning the terminal attempt budget (a target
+        // that is down for hours then returns must auto-resume, not exhaust to terminal).
+        let response = self
+            .client
+            .request(request)
+            .await
+            .map_err(|e| ReplicationError::Unavailable(format!("transport error: {e}")))?;
+
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
+        }
+
+        // Drain the (bounded, error) body so the message can quote it, ignoring read errors.
+        let detail = response
+            .into_body()
+            .collect()
+            .await
+            .map(|b| String::from_utf8_lossy(&b.to_bytes()).into_owned())
+            .unwrap_or_default();
+        Err(classify_status(status.as_u16(), &detail))
+    }
+
+    /// GET the replica of `key` from the destination bucket resolved for `source_bucket` and feed
+    /// its body to `on_chunk` **as it arrives**, returning the total number of bytes read.
+    ///
+    /// This exists for the **operator audit** (`cairn replication audit --verify`), not for the
+    /// drain path: replication never reads back what it wrote. It is the only way to answer "is the
+    /// replica the right bytes?", because the corrupt-replica population left by the pre-release-X
+    /// plaintext seam is invisible to any cheaper probe — the replica has exactly the right *length*
+    /// (the engine requested `[0, size_logical)`, the plaintext length) and a multipart source lands
+    /// as a single-part PUT, so neither `Content-Length` nor the ETag distinguishes a good replica
+    /// from a garbage one. Only the bytes do.
+    ///
+    /// **The body is never resident.** The only question the audit asks of it is "does it hash to
+    /// the source plaintext MD5?", and a digest is incremental — so this streams frame by frame into
+    /// the caller's hasher and keeps a running byte count. Memory is O(1) regardless of object size;
+    /// buffering an object of up to `max_bytes` in order to hash it would have made an audit the
+    /// most likely thing on the node to OOM it, which is precisely what an audit must never be.
+    /// `max_bytes` therefore bounds the **total bytes read**, not a buffer: a hostile or absurdly
+    /// large body still terminates instead of streaming forever.
+    ///
+    /// # Errors
+    /// [`ReplicationError::Unavailable`] on a transport failure or a 5xx/408/429;
+    /// [`ReplicationError::NotFound`] on a 404 (an absent replica);
+    /// [`ReplicationError::Terminal`] on any other non-2xx or when the body exceeds `max_bytes`.
+    pub async fn stream_object(
+        &self,
+        source_bucket: &str,
+        key: &str,
+        max_bytes: u64,
+        on_chunk: &mut (dyn FnMut(&[u8]) + Send),
+    ) -> Result<u64, ReplicationError> {
+        let dest_bucket = self.dest_for(source_bucket).to_owned();
+        let request = self.build_signed_request(
+            &Method::GET,
+            &dest_bucket,
+            key,
+            bytes::Bytes::new(),
+            None,
+            &[],
+        )?;
+        let response = self
+            .client
+            .request(request)
+            .await
+            .map_err(|e| ReplicationError::Unavailable(format!("transport error: {e}")))?;
+
+        let status = response.status();
+        let mut body = response.into_body();
+        if !status.is_success() {
+            let detail = body
+                .collect()
+                .await
+                .map(|b| String::from_utf8_lossy(&b.to_bytes()).into_owned())
+                .unwrap_or_default();
+            return Err(classify_status(status.as_u16(), &detail));
+        }
+
+        // Frame loop, nothing retained: each frame is handed to the caller's digest and dropped.
+        // The running total is checked BEFORE the frame is consumed, so the cap bounds what this
+        // reads even when the destination's `Content-Length` lies (or is absent, on a chunked
+        // response) — the header is never trusted for the bound.
+        let mut read: u64 = 0;
+        loop {
+            let frame = match body.frame().await {
+                Some(Ok(f)) => f,
+                Some(Err(e)) => {
+                    return Err(ReplicationError::Unavailable(format!(
+                        "reading replica body: {e}"
+                    )));
+                }
+                None => break,
+            };
+            if let Ok(data) = frame.into_data() {
+                read = read.saturating_add(data.len() as u64);
+                if read > max_bytes {
+                    return Err(ReplicationError::Terminal(format!(
+                        "replica body exceeds the {max_bytes}-byte verify read cap"
+                    )));
+                }
+                on_chunk(&data);
+            }
+        }
+        Ok(read)
+    }
+
+    /// Build the SigV4-signed wire request shared by every verb the sink issues.
+    fn build_signed_request(
+        &self,
+        method: &Method,
+        dest_bucket: &str,
+        key: &str,
+        body: bytes::Bytes,
+        content_type: Option<&str>,
+        user_headers: &[(String, String)],
+    ) -> Result<Request<Full<bytes::Bytes>>, ReplicationError> {
         let now = self.clock.now();
         let amz_date = format_amz_datetime(now);
         let scope_date = &amz_date[..8];
@@ -344,32 +465,9 @@ impl HttpS3Sink {
         for (name, value) in user_headers {
             builder = builder.header(name.as_str(), value);
         }
-        let request = builder
+        builder
             .body(Full::new(body))
-            .map_err(|e| ReplicationError::Terminal(format!("failed to build request: {e}")))?;
-
-        // A connection/transport failure means the destination node is unreachable: classify it
-        // `Unavailable` so the entry retries without burning the terminal attempt budget (a target
-        // that is down for hours then returns must auto-resume, not exhaust to terminal).
-        let response = self
-            .client
-            .request(request)
-            .await
-            .map_err(|e| ReplicationError::Unavailable(format!("transport error: {e}")))?;
-
-        let status = response.status();
-        if status.is_success() {
-            return Ok(());
-        }
-
-        // Drain the (bounded, error) body so the message can quote it, ignoring read errors.
-        let detail = response
-            .into_body()
-            .collect()
-            .await
-            .map(|b| String::from_utf8_lossy(&b.to_bytes()).into_owned())
-            .unwrap_or_default();
-        Err(classify_status(status.as_u16(), &detail))
+            .map_err(|e| ReplicationError::Terminal(format!("failed to build request: {e}")))
     }
 }
 
@@ -551,6 +649,11 @@ impl ServerCertVerifier for NoVerification {
 /// Classify a non-2xx HTTP status into the sink error taxonomy: `5xx` and the transient `408`/`429`
 /// mean the destination is unavailable/overloaded (retry without consuming the attempt budget);
 /// every other `4xx` is a per-request rejection and is terminal.
+///
+/// `404` gets its own **terminal** variant. The message below embeds the destination's response
+/// body, so a caller asking "did the replica simply never land?" by string-matching `"404"` would
+/// also match any other 4xx whose XML body happens to contain those digits — a request id, a key
+/// name, a byte count. The status is the fact; carry it structurally.
 fn classify_status(code: u16, detail: &str) -> ReplicationError {
     let msg = if detail.trim().is_empty() {
         format!("destination returned HTTP {code}")
@@ -559,6 +662,8 @@ fn classify_status(code: u16, detail: &str) -> ReplicationError {
     };
     if code >= 500 || code == 408 || code == 429 {
         ReplicationError::Unavailable(msg)
+    } else if code == 404 {
+        ReplicationError::NotFound(msg)
     } else {
         ReplicationError::Terminal(msg)
     }
@@ -932,13 +1037,40 @@ mod tests {
             classify_status(403, "AccessDenied"),
             ReplicationError::Terminal(_)
         ));
+        // 404 is terminal too, but structurally distinct: "the destination has no such object" is
+        // what the operator audit reports as `absent` rather than `corrupt`.
         assert!(matches!(
             classify_status(404, ""),
-            ReplicationError::Terminal(_)
+            ReplicationError::NotFound(_)
         ));
         assert!(matches!(
             classify_status(400, ""),
             ReplicationError::Terminal(_)
+        ));
+    }
+
+    /// The absent-replica signal must come from the STATUS, never from the message text. The
+    /// terminal message quotes the destination's response body verbatim, and an S3 error body
+    /// routinely carries digit strings (request ids, key names, sizes) — a `msg.contains("404")`
+    /// probe therefore reports "the replica never landed" for an object the destination is actively
+    /// refusing to serve, which is the opposite conclusion.
+    #[test]
+    fn a_non_404_body_mentioning_404_is_not_classified_absent() {
+        let body = "<Error><Code>AccessDenied</Code><RequestId>tx404abc</RequestId>\
+                    <Message>object 404.log is not readable</Message></Error>";
+        let err = classify_status(403, body);
+        assert!(
+            matches!(err, ReplicationError::Terminal(_)),
+            "a 403 whose body mentions 404 must stay Terminal, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("404"),
+            "the message still quotes the body — which is exactly why matching on it is unsound"
+        );
+        // And a real 404 is recognised regardless of what its body says.
+        assert!(matches!(
+            classify_status(404, "<Error><Code>NoSuchKey</Code></Error>"),
+            ReplicationError::NotFound(_)
         ));
     }
 

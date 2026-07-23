@@ -490,6 +490,32 @@ ALTER TABLE multipart_uploads ADD COLUMN sse_kms_key_id         TEXT;
 ALTER TABLE multipart_uploads ADD COLUMN sse_bucket_key_enabled INTEGER NOT NULL DEFAULT 0;
 "#,
     },
+    Migration {
+        version: 23,
+        name: "replication completion timestamp",
+        sql: r#"
+-- When a version was last SHIPPED (ARCH 20.5, the SSE plaintext-seam repair). `replication_status`
+-- alone cannot tell a version that replicated BEFORE the fix from one that was force-requeued and
+-- has since re-shipped CORRECTLY: both read `completed`, and `created_at` is never rewritten. The
+-- audit's "is this replica suspect?" predicate therefore needs a second, replication-owned clock.
+--   * object_versions.replicated_at: unix seconds at which MarkReplicationDone last stamped this
+--     version `completed`. NULL = never successfully shipped from this node, OR shipped before this
+--     migration — the two are indistinguishable on an upgraded node, and the audit deliberately
+--     treats NULL as SUSPECT (over-report costs one wasted re-ship; under-report leaves a garbage
+--     replica nobody looks for). It resolves itself as versions are re-shipped and stamped.
+--     Deliberately NOT `updated_at`, which feeds the client-visible S3 `LastModified` — stamping
+--     that on replication would silently mutate object metadata.
+-- Mirrors cairn-meta/src/schema.rs v23 byte-for-byte (same version).
+ALTER TABLE object_versions ADD COLUMN replicated_at INTEGER;
+
+-- The forced-resync requeue pages the bucket's terminal outbox rows KEY BY KEY (a key's rows must
+-- be requeued together, or an older version re-ships after a newer one). The existing indexes are
+-- (status, next_attempt_at) and (status, enqueued_at), neither of which can order or seek by key —
+-- so without this the per-page `key > ?cursor ORDER BY key` seek is a full scan per page, i.e.
+-- quadratic on exactly the large buckets the paging exists for.
+CREATE INDEX idx_outbox_bucket_key ON replication_outbox (bucket_name, key);
+"#,
+    },
 ];
 
 /// Run all pending migrations on the write driver, recording each as applied. Each migration is

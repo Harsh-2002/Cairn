@@ -101,6 +101,7 @@ fn version_row(
         checksums: Vec::new(),
         sse_descriptor: None,
         replication_status: Some(status),
+        replicated_at: None,
         created_at: now,
         updated_at: now,
     }
@@ -1532,4 +1533,59 @@ async fn a_malformed_sse_descriptor_is_terminal() {
         .unwrap();
     assert_eq!(report.failed, 1);
     assert!(router.0.bodies().is_empty());
+}
+
+/// A clock that advances one second on every read, so "the batch started" and "the ship finished"
+/// are distinguishable instants.
+#[derive(Debug, Default)]
+struct TickingClock(std::sync::atomic::AtomicI64);
+
+impl Clock for TickingClock {
+    fn now(&self) -> Timestamp {
+        Timestamp(self.0.fetch_add(1_000, std::sync::atomic::Ordering::SeqCst))
+    }
+}
+
+/// `replicated_at` is documented as "when this version was last **successfully shipped**", so it is
+/// stamped with the clock read at SHIP COMPLETION, not the one read when the drain batch was
+/// claimed. The two can differ by a whole pass on a slow batch; the cutoff comparison in the audit
+/// tolerates that (the cutoff is always in the past), but the field and its doc must agree.
+#[tokio::test]
+async fn replicated_at_is_stamped_at_ship_completion_not_batch_start() {
+    let meta = InMemoryMetadataStore::new();
+    let blobs = Arc::new(InMemoryBlobStore::new());
+    let router = SingleSink(FakeReplicationSink::new());
+    let clock = TickingClock(std::sync::atomic::AtomicI64::new(1_000_000));
+
+    let version = put_with_outbox(
+        &meta,
+        &blobs,
+        "e1",
+        "obj/a",
+        b"hello",
+        Timestamp(0),
+        Timestamp(0),
+    )
+    .await;
+
+    // The first read inside `run_once` is the batch clock; the ship's stamp must be a later one.
+    let batch_start = Timestamp(1_000_000);
+    let report = engine()
+        .run_once(&meta, &router, &blobs, &clock)
+        .await
+        .unwrap();
+    assert_eq!(report.completed, 1);
+
+    let row = meta
+        .get_version(&bucket(), &ObjectKey::parse("obj/a").unwrap(), &version)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.replication_status, Some(ReplicationStatus::Completed));
+    let stamped = row.replicated_at.expect("a shipped version is stamped");
+    assert!(
+        stamped.0 > batch_start.0,
+        "replicated_at ({stamped:?}) must come from the clock read AFTER the ship, not the \
+         batch-start clock ({batch_start:?})"
+    );
 }

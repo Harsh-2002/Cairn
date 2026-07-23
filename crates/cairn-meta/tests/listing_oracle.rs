@@ -46,6 +46,7 @@ fn row(bucket: &BucketName, key: &str) -> ObjectVersionRow {
         checksums: Vec::new(),
         sse_descriptor: None,
         replication_status: None,
+        replicated_at: None,
         created_at: Timestamp(1),
         updated_at: Timestamp(1),
     }

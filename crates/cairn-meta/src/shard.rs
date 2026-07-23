@@ -186,7 +186,11 @@ impl MetadataStore for ShardedMetadataStore {
             | Mutation::SetObjectAcl { .. }
             | Mutation::SetObjectRetention { .. }
             | Mutation::SetObjectLegalHold { .. }
-            | Mutation::EnqueueReplication(_) => {
+            | Mutation::EnqueueReplication(_)
+            // Both of its statements are keyed on `bucket_name`, and every outbox row and version
+            // row for a bucket lives on that bucket's shard — so this is a single-shard mutation,
+            // NOT a fan-out like the id-keyed `MarkReplication*` marks.
+            | Mutation::RequeueReplicationVersions { .. } => {
                 let bucket = mutation_bucket(&mutation).expect("per-bucket mutation has a bucket");
                 self.for_bucket(&bucket).submit(mutation).await
             }
@@ -244,7 +248,7 @@ impl MetadataStore for ShardedMetadataStore {
             }
 
             // --- replication/webhook marks/retry: idempotent, so fan out; only the owner's row changes ---
-            Mutation::MarkReplicationDone(_)
+            Mutation::MarkReplicationDone { .. }
             | Mutation::MarkReplicationFailed { .. }
             | Mutation::RetryFailedReplication { .. }
             | Mutation::PruneReplicationOutbox { .. }
@@ -776,6 +780,7 @@ fn mutation_bucket(m: &Mutation) -> Option<String> {
         Mutation::SetObjectRetention { bucket, .. } => bucket.as_str(),
         Mutation::SetObjectLegalHold { bucket, .. } => bucket.as_str(),
         Mutation::EnqueueReplication(e) => e.bucket.as_str(),
+        Mutation::RequeueReplicationVersions { bucket, .. } => bucket.as_str(),
         // Not per-bucket, so no single target bucket to route by: multipart routes by upload id,
         // webhooks by their first entry, replication/webhook marks & batch claims fan out or hit
         // shard 0, and every account-global table (users, sessions, activity, shares, metrics,
@@ -798,7 +803,7 @@ fn mutation_bucket(m: &Mutation) -> Option<String> {
         | Mutation::DeleteExpiredSessionCredentials { .. }
         | Mutation::DeleteSessionCredential { .. }
         | Mutation::ClaimReplicationBatch { .. }
-        | Mutation::MarkReplicationDone(_)
+        | Mutation::MarkReplicationDone { .. }
         | Mutation::MarkReplicationFailed { .. }
         | Mutation::RetryFailedReplication { .. }
         | Mutation::PruneReplicationOutbox { .. }

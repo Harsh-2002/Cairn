@@ -13,6 +13,12 @@ is cheap to construct and safe to run from many workers at once.
 - `sink.rs` — `HttpS3Sink`: the production sink; SigV4-signed `PUT`/`DELETE` to a remote
   S3-compatible endpoint over http **or** https (one `https_or_http` connector). Owns error
   classification, per-target TLS trust, per-source→dest bucket routing, and `sink_for_target`.
+  `stream_object` is the **operator-audit-only** read-back (`cairn replication audit --verify`): the
+  drain path never reads what it wrote, and it exists because a corrupt replica is exactly the right
+  size and the ETag differs even for a correct one — only the bytes distinguish them. It streams the
+  body frame-by-frame into a caller-supplied digest and holds none of it (an audit must never be the
+  most likely thing to OOM the node); its `max_bytes` bounds the total bytes **read**, not a buffer,
+  so a hostile/endless body still terminates.
 - `route.rs` — `BucketRoutedSink` (the engine's sink boundary — threads the *source* bucket into
   every call) and `SinkRouter`/`SingleSink`. A blanket impl makes any `ReplicationSink` (e.g. the
   test double) a `BucketRoutedSink`.
@@ -86,6 +92,32 @@ is cheap to construct and safe to run from many workers at once.
   `MarkReplicationFailed`, `DeferReplication`, plus `PutObjectVersion` to stamp status) — they ride
   the single `Writer` and obey the 4(+1)-site rule. This crate adds no mutation of its own here, but
   honour that rule if you do.
+- **The outbox is a work queue, not the incident ledger.** `PruneReplicationOutbox` deletes
+  `completed` AND `failed` rows past `CAIRN_REPLICATION_RETENTION_SECS` (default 24 h), so the
+  failed-entry API answers "all clear" for anything older. The durable per-object ledger is
+  `object_versions.replication_status`. Repair of a *wrongly-completed* version therefore needs
+  `Mutation::RequeueReplicationVersions` (`cairn-control`'s `resync?force=true`): the deterministic
+  `backfill:{rule}:{key}:{version}` id means `EnqueueReplication`'s `INSERT OR IGNORE` cannot
+  resurrect a terminal row. That requeue is **key-scoped, never version-scoped** — re-shipping one
+  version of a key while its siblings stay settled lands an older version *after* a newer one
+  (reverting the mirror's current object) and never re-ships a delete marker (resurrecting a deleted
+  object); with the whole key queued, `has_unreplicated_predecessor` restores the ordering. It is
+  also **paged by key with a forward cursor**, never by row — a row page is served in index order
+  (all `completed` before all `failed`) and would split a key across batches, which is the same
+  ordering bug one layer down. Its two halves have different scopes on purpose: the outbox half moves
+  every terminal row of a paged key, the **ledger** half only rows that are `is_latest` or still have
+  an outbox row. A non-current version whose outbox row was pruned can be shipped by nothing, so
+  stamping it `pending` would make the ledger claim queued work no queue holds and pin the audit's
+  `repair_pending` gauge above zero forever. `MarkReplicationDone` additionally stamps
+  `object_versions.replicated_at` (schema v23) with the clock read at **ship completion**, not at
+  batch claim; that stamp is what lets the audit tell a repaired
+  version from a pre-fix one, and it is never `updated_at` (the client-visible S3 `LastModified`).
+  Detection lives in `cairn-server/src/replication_audit.rs`; the runbook is `docs/operations.md` 8.7.
+- **A 404 from the destination is `ReplicationError::NotFound`, not `Terminal`.** Both are terminal
+  for the engine; the split exists so the operator audit can tell "the replica never landed" from
+  "it landed wrong" *structurally*. The terminal message embeds the destination's response body, so
+  any `msg.contains("404")` probe misfires on a 4xx whose XML happens to carry those digits. Never
+  reintroduce string-sniffing on these messages.
 
 ## Notes
 - `HttpS3Sink` buffers the whole body in memory to hash it for the signed-payload PUT; streaming

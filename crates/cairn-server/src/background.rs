@@ -191,7 +191,140 @@ pub fn spawn(stack: Arc<AppStack>, cfg: &Config, shutdown: tokio::sync::watch::R
         tracing::info!("request-metrics ingestion enabled");
     }
 
+    // The encrypted-suspect audit gauges (ARCH 20.5/26.4) — OPT-IN, and off unless the operator has
+    // supplied a cutoff via `CAIRN_REPLICATION_AUDIT_BEFORE`. Unset means the loop is never spawned:
+    // no version walk, no gauges, no warning, zero cost. See `replication_audit_loop` for why a
+    // cutoff-less gauge is not a conservative default but a broken signal.
+    //
+    // Deliberately NOT part of `metrics_loop` either way: it is a full version-row enumeration, and
+    // `object_versions.replication_status` has no index (adding one is a migration, which this
+    // remediation deliberately avoids).
+    match cfg.replication_audit_before.as_deref() {
+        None => tracing::debug!(
+            "encrypted-suspect replication audit disabled (set CAIRN_REPLICATION_AUDIT_BEFORE to \
+             the moment this node was upgraded past the SSE replication defect to enable it)"
+        ),
+        Some(raw) => match crate::replication_audit::parse_cutoff(raw) {
+            // Config validation already rejected an unparseable value at load; this arm cannot fire
+            // on a validated config, and refuses to guess a cutoff if it somehow does.
+            Err(e) => {
+                tracing::error!(error = %e, "CAIRN_REPLICATION_AUDIT_BEFORE is unusable; the \
+                 encrypted-suspect audit will not run")
+            }
+            Ok(cutoff) => {
+                tracing::info!(
+                    created_before = cutoff.0,
+                    "encrypted-suspect replication audit enabled"
+                );
+                tokio::spawn(replication_audit_loop(
+                    stack.clone(),
+                    cutoff,
+                    cfg.replication_allow_plaintext_sse_over_http,
+                    cfg.replication_endpoint.clone(),
+                ));
+            }
+        },
+    }
+
     tokio::spawn(metrics_loop(stack));
+}
+
+/// How long after startup the first encrypted-suspect audit pass runs. Long enough that it never
+/// competes with the startup reconcile/readiness path (ARCH 8), short enough that an operator who
+/// restarts a node to pick up the fix sees the number within the same maintenance window.
+const AUDIT_FIRST_PASS_DELAY: Duration = Duration::from_secs(300);
+
+/// The steady-state cadence of the encrypted-suspect audit pass: **every 6 hours**.
+///
+/// This is a deliberate choice, not a default. The pass walks every version of every bucket that has
+/// an enabled replication rule and reads each candidate's row, and there is **no index** on
+/// `object_versions.replication_status` — creating one would be a schema migration, which this
+/// remediation explicitly does not take. Six hours keeps the cost off the per-scrape path entirely
+/// (a Prometheus scrape must never trigger a table walk) while still being far faster than the
+/// human loop it feeds: an operator reads this gauge on a dashboard, decides to run a repair, and
+/// watches it fall over hours.
+///
+/// The cost is genuinely two-sided and both halves matter. Buckets without an enabled replication
+/// rule are skipped before any version is read, so on a store that does not replicate — the
+/// overwhelming majority — a pass costs one `list_buckets` plus one config read per bucket. A bucket
+/// that **does** replicate costs a full version listing *plus one `get_version` point query per
+/// listed version*, because the listing page carries no `sse_descriptor`. On a large replicated
+/// bucket that per-version query is the pass, which is the other reason this is opt-in and slow.
+const AUDIT_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// Periodically count the **encrypted + terminally replicated** version population created before
+/// `created_before` and publish it as gauges, so the field damage from the pre-release-X plaintext
+/// seam is visible on a dashboard rather than only from a CLI an operator has to know to run
+/// (ARCH 20.5, 26.4). Spawned only when the operator has set `CAIRN_REPLICATION_AUDIT_BEFORE`.
+///
+/// `cairn_replication_unreplicated` does **not** cover this: those versions are `completed`: the
+/// engine believes they shipped, and the replica exists — it is just the wrong bytes. That is
+/// exactly why it needs its own signal.
+///
+/// Three gauges, because one cannot express convergence. A forced requeue moves damaged rows to
+/// `pending`, which the suspect predicate excludes — so the suspect gauge falls to zero the moment
+/// the repair is *queued*, before a byte re-ships, and would then appear to regress as entries
+/// complete. `…_repair_pending_versions` counts the in-flight population, and it genuinely reaches
+/// zero: a version is only ever moved to `pending` when something can actually ship it (it is
+/// current, so the resync backfill re-enqueues it, or it still has an outbox row).
+/// `…_non_current_suspect_versions` is the third, and it is the FLOOR of the suspect gauge —
+/// versions the backfill cannot reach (TRAP 2). The reachable done-state is therefore
+/// `repair_pending == 0` **and** `suspect == non_current_suspect`; demanding `suspect == 0` where
+/// non-current suspects exist would be alerting on something only a destination rebuild can fix.
+async fn replication_audit_loop(
+    stack: Arc<AppStack>,
+    created_before: cairn_types::time::Timestamp,
+    allow_plaintext_sse_over_http: bool,
+    env_endpoint: Option<String>,
+) {
+    tokio::time::sleep(AUDIT_FIRST_PASS_DELAY).await;
+    loop {
+        let started = std::time::Instant::now();
+        // `sample_limit = 0`: the gauge path wants counts, and materializes no sample list.
+        match crate::replication_audit::audit_store(
+            stack.meta.as_ref(),
+            None,
+            created_before,
+            0,
+            allow_plaintext_sse_over_http,
+            env_endpoint.as_deref(),
+            None,
+        )
+        .await
+        {
+            Ok(report) => {
+                metrics::gauge!("cairn_replication_encrypted_suspect_versions")
+                    .set(report.present_and_suspect as f64);
+                metrics::gauge!("cairn_replication_encrypted_absent_versions")
+                    .set(report.absent as f64);
+                metrics::gauge!("cairn_replication_encrypted_repair_pending_versions")
+                    .set(report.repair_pending as f64);
+                // The FLOOR of the suspect gauge. Non-current suspects are unrepairable by any
+                // command (TRAP 2 — the backfill enumerates current versions only), so without this
+                // series an operator cannot write a convergent alert on the suspect count: it stops
+                // falling here, not at zero.
+                metrics::gauge!("cairn_replication_encrypted_non_current_suspect_versions")
+                    .set(report.non_current_suspect as f64);
+                metrics::gauge!("cairn_replication_audit_pass_seconds")
+                    .set(started.elapsed().as_secs_f64());
+                // Bounded by the cutoff, so this is a real, convergent alarm rather than a
+                // permanent one: it stops firing when the repair finishes.
+                if report.present_and_suspect > 0 {
+                    tracing::warn!(
+                        suspect = report.present_and_suspect,
+                        absent = report.absent,
+                        repair_pending = report.repair_pending,
+                        created_before = created_before.0,
+                        "encrypted versions created before the audit cutoff are stamped replicated \
+                         but may hold CIPHERTEXT on the mirror; run `cairn replication audit` \
+                         (docs/operations.md 8.7)"
+                    );
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "replication encrypted-suspect audit failed"),
+        }
+        tokio::time::sleep(AUDIT_INTERVAL).await;
+    }
 }
 
 /// Periodically flush the in-process request-metrics aggregator into the rollup table and prune

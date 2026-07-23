@@ -132,6 +132,7 @@ async fn put_object(h: &Harness, bucket: &str, key: &str, data: &'static [u8]) {
         checksums: Vec::new(),
         sse_descriptor: None,
         replication_status: None,
+        replicated_at: None,
         created_at: now,
         updated_at: now,
     };
@@ -1299,6 +1300,7 @@ async fn failed_replication_reflects_a_planted_terminal_entry() {
         checksums: Vec::new(),
         sse_descriptor: None,
         replication_status: Some(cairn_types::meta::ReplicationStatus::Pending),
+        replicated_at: None,
         created_at: now,
         updated_at: now,
     };
@@ -2036,6 +2038,7 @@ async fn replication_retry_endpoint_requeues_failed_for_bucket() {
         checksums: Vec::new(),
         sse_descriptor: None,
         replication_status: Some(cairn_types::meta::ReplicationStatus::Pending),
+        replicated_at: None,
         created_at: now,
         updated_at: now,
     };
@@ -2414,4 +2417,234 @@ async fn list_objects_with_delimiter_folds_folders() {
         .collect();
     assert_eq!(keys, vec!["docs/a.txt", "docs/b.txt"]);
     assert!(v["common_prefixes"].as_array().unwrap().is_empty());
+}
+
+/// STAGE-2 REPAIR (ARCH 20.5). A version that replicated *successfully but wrongly* — the
+/// pre-release-X SSE plaintext seam — leaves a `completed` outbox row under the deterministic
+/// backfill id. `EnqueueReplication` is `INSERT OR IGNORE`, so a plain resync inside the outbox
+/// retention window silently repairs NOTHING; `?force=true` requeues the terminal rows first, which
+/// is what makes the second pass real. This is the whole remediation, so it is gated here.
+#[tokio::test]
+async fn forced_resync_requeues_completed_work_while_an_unforced_resync_is_a_no_op() {
+    let h = harness();
+    let a = admin();
+    make_bucket(&h, &a, "repl").await;
+    let bucket = BucketName::parse("repl").unwrap();
+    // Replication requires versioning; resync refuses an unversioned bucket.
+    h.meta
+        .submit(Mutation::SetVersioning {
+            bucket: bucket.clone(),
+            state: VersioningState::Enabled,
+        })
+        .await
+        .unwrap();
+    // An enabled rule WITH existing-object replication (trap 1 satisfied).
+    h.meta
+        .submit(Mutation::SetBucketConfig {
+            bucket: bucket.clone(),
+            aspect: cairn_types::bucket::ConfigAspect::Replication,
+            doc: Some(cairn_types::bucket::ConfigDoc(
+                r#"<ReplicationConfiguration><Role>r</Role><Rule><ID>r1</ID><Status>Enabled</Status><Prefix></Prefix><Destination><Bucket>arn:aws:s3:::mirror</Bucket></Destination><ExistingObjectReplication><Status>Enabled</Status></ExistingObjectReplication></Rule></ReplicationConfiguration>"#
+                    .to_owned(),
+            )),
+        })
+        .await
+        .unwrap();
+
+    // An ENCRYPTED version whose backfill entry already reads `completed`.
+    let key = ObjectKey::parse("photo.jpg").unwrap();
+    let version = VersionId::from_string("00000001".to_owned());
+    let id = "backfill:r1:photo.jpg:00000001";
+    let entry = cairn_types::meta::OutboxEntry {
+        enqueued_at: cairn_types::time::Timestamp(0),
+        id: id.to_owned(),
+        bucket: bucket.clone(),
+        key: key.clone(),
+        version_id: version.clone(),
+        operation: cairn_types::meta::ReplicationOp::ObjectCreate,
+        rule_id: "r1".to_owned(),
+        target_arn: None,
+        attempts: 0,
+        next_attempt_at: cairn_types::time::Timestamp(0),
+        status: cairn_types::meta::ReplicationStatus::Pending,
+        last_error: None,
+        priority: 0,
+        lease_until: None,
+    };
+    let now = h.clock.now();
+    let row = ObjectVersionRow {
+        id: uuid::Uuid::new_v4().simple().to_string(),
+        bucket: bucket.clone(),
+        key: key.clone(),
+        version_id: version.clone(),
+        is_latest: true,
+        is_delete_marker: false,
+        size_logical: 4,
+        size_physical: 4,
+        etag: ETag::from_md5_hex("deadbeef".to_owned()),
+        content_type: "image/jpeg".to_owned(),
+        content_encoding: None,
+        cache_control: None,
+        content_disposition: None,
+        content_language: None,
+        expires: None,
+        storage_path: Some(cairn_types::id::StoragePath::from_string(
+            "repl/00000001".to_owned(),
+        )),
+        compression: CompressionDescriptor::Uncompressed,
+        storage_class: StorageClass::Standard,
+        cold_locator: None,
+        owner_id: UserId("admin".to_owned()),
+        user_metadata: Vec::new(),
+        acl: None,
+        checksums: Vec::new(),
+        sse_descriptor: Some(
+            r#"{"alg":"AES256-GCM","wrapped_dek_b64":"AAAA","nonce_b64":""}"#.to_owned(),
+        ),
+        replication_status: Some(cairn_types::meta::ReplicationStatus::Pending),
+        replicated_at: None,
+        created_at: now,
+        updated_at: now,
+    };
+    h.meta
+        .submit(Mutation::PutObjectVersion {
+            row: Box::new(row),
+            precondition: Precondition::default(),
+            replication: vec![entry],
+        })
+        .await
+        .unwrap();
+    h.meta
+        .claim_replication_batch(10, cairn_types::time::Timestamp(1))
+        .await
+        .unwrap();
+    h.meta
+        .submit(Mutation::MarkReplicationDone {
+            id: id.to_owned(),
+            now: cairn_types::time::Timestamp(0),
+        })
+        .await
+        .unwrap();
+
+    // An UNFORCED resync: accepted, backfill runs, and nothing becomes claimable — the trap.
+    let resp = h
+        .svc
+        .handle(
+            &Method::POST,
+            "/buckets/repl/replication/resync",
+            &[],
+            Some(&a),
+            Bytes::new(),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::ACCEPTED);
+    assert_eq!(json(&resp)["forced"], false);
+    // Let the spawned backfill run to completion.
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        h.meta
+            .claim_replication_batch(10, h.clock.now())
+            .await
+            .unwrap()
+            .is_empty(),
+        "INSERT OR IGNORE cannot resurrect a completed entry: an unforced resync repairs nothing"
+    );
+
+    // The FORCED resync requeues it, and the version ledger stops claiming it was replicated.
+    let resp = h
+        .svc
+        .handle(
+            &Method::POST,
+            "/buckets/repl/replication/resync",
+            &[("force".to_owned(), "true".to_owned())],
+            Some(&a),
+            Bytes::new(),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::ACCEPTED);
+    let v = json(&resp);
+    assert_eq!(v["forced"], true);
+    assert_eq!(v["only_encrypted"], true);
+    assert_eq!(v["existing_object_replication"], true);
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        h.meta
+            .object_replication_status(&bucket, &key, &version)
+            .await
+            .unwrap(),
+        Some(cairn_types::meta::ReplicationStatus::Pending),
+        "the durable ledger stops claiming this version is replicated"
+    );
+    // The requeue schedules at the service clock's `now`, so claim at that instant.
+    let claimed = h
+        .meta
+        .claim_replication_batch(10, h.clock.now())
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 1, "the corrupt version is re-shipped");
+    assert_eq!(claimed[0].id, id);
+    assert_eq!(claimed[0].attempts, 0);
+}
+
+/// Without `?force=true` a bucket whose rules lack `ExistingObjectReplication` is refused outright
+/// (TRAP 1). WITH `force` the request is accepted — the requeue half is still worth doing — but the
+/// response must say the backfill will enqueue nothing, or the operator reads a success that
+/// repaired nothing.
+#[tokio::test]
+async fn resync_reports_the_existing_object_replication_trap() {
+    let h = harness();
+    let a = admin();
+    make_bucket(&h, &a, "repl").await;
+    let bucket = BucketName::parse("repl").unwrap();
+    h.meta
+        .submit(Mutation::SetVersioning {
+            bucket: bucket.clone(),
+            state: VersioningState::Enabled,
+        })
+        .await
+        .unwrap();
+    h.meta
+        .submit(Mutation::SetBucketConfig {
+            bucket: bucket.clone(),
+            aspect: cairn_types::bucket::ConfigAspect::Replication,
+            doc: Some(cairn_types::bucket::ConfigDoc(
+                r#"<ReplicationConfiguration><Role>r</Role><Rule><ID>r1</ID><Status>Enabled</Status><Prefix></Prefix><Destination><Bucket>arn:aws:s3:::mirror</Bucket></Destination></Rule></ReplicationConfiguration>"#
+                    .to_owned(),
+            )),
+        })
+        .await
+        .unwrap();
+
+    let resp = h
+        .svc
+        .handle(
+            &Method::POST,
+            "/buckets/repl/replication/resync",
+            &[],
+            Some(&a),
+            Bytes::new(),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::BAD_REQUEST);
+
+    let resp = h
+        .svc
+        .handle(
+            &Method::POST,
+            "/buckets/repl/replication/resync",
+            &[("force".to_owned(), "true".to_owned())],
+            Some(&a),
+            Bytes::new(),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::ACCEPTED);
+    assert_eq!(
+        json(&resp)["existing_object_replication"],
+        false,
+        "the caller must be told the backfill half will enqueue nothing"
+    );
 }

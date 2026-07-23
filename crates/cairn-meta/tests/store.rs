@@ -39,6 +39,7 @@ fn row(
         checksums: Vec::new(),
         sse_descriptor: None,
         replication_status: None,
+        replicated_at: None,
         created_at: Timestamp(1),
         updated_at: Timestamp(1),
     }
@@ -743,20 +744,18 @@ fn bucket(name: &str) -> Bucket {
     }
 }
 
+/// A minimal sealed-DEK descriptor: enough for `sse_descriptor IS NOT NULL` to select the row.
+const ENC_DESCRIPTOR: &str = r#"{"alg":"AES256-GCM","wrapped_dek_b64":"AAAA","nonce_b64":""}"#;
+
 /// Commit one object version carrying a replication outbox entry, returning the entry id.
-async fn plant_outbox(
-    store: &cairn_meta::SqliteMetadataStore,
-    b: &BucketName,
-    key: &str,
-    version: VersionId,
-    id: &str,
-) {
-    let entry = OutboxEntry {
+/// A pending `ObjectCreate` outbox entry for (bucket, key, version) under a caller-chosen id.
+fn outbox_entry(b: &BucketName, key: &str, version: VersionId, id: &str) -> OutboxEntry {
+    OutboxEntry {
         enqueued_at: Timestamp(0),
         id: id.to_owned(),
         bucket: b.clone(),
         key: ObjectKey::parse(key).unwrap(),
-        version_id: version.clone(),
+        version_id: version,
         operation: ReplicationOp::ObjectCreate,
         rule_id: "rule-1".to_owned(),
         target_arn: None,
@@ -766,7 +765,17 @@ async fn plant_outbox(
         last_error: None,
         priority: 0,
         lease_until: None,
-    };
+    }
+}
+
+async fn plant_outbox(
+    store: &cairn_meta::SqliteMetadataStore,
+    b: &BucketName,
+    key: &str,
+    version: VersionId,
+    id: &str,
+) {
+    let entry = outbox_entry(b, key, version.clone(), id);
     store
         .submit(Mutation::PutObjectVersion {
             row: Box::new(row(b, key, version, "e", true)),
@@ -2077,5 +2086,1005 @@ async fn writer_records_commit_samples_for_group_committed_batches() {
     assert!(
         store.drain_writer_commit_samples().is_empty(),
         "commit samples must be drained, not peeked"
+    );
+}
+
+/// The Stage-2 repair primitive (ARCH 20.5): a version that replicated *successfully but wrongly*
+/// (the pre-release-X SSE plaintext seam) has a `completed` outbox row, and the deterministic
+/// backfill id means `EnqueueReplication`'s `INSERT OR IGNORE` silently no-ops for it — so a repeat
+/// resync repairs NOTHING until that row is requeued. `RequeueReplicationVersions` is what makes the
+/// second pass real; `only_encrypted` keeps it scoped to the blast radius.
+#[tokio::test]
+async fn requeue_replication_versions_reships_completed_encrypted_work() {
+    let store = cairn_meta::open_in_memory().unwrap();
+    let b = BucketName::parse("bkt").unwrap();
+    store
+        .submit(Mutation::CreateBucket(Box::new(bucket("bkt"))))
+        .await
+        .unwrap();
+
+    // An ENCRYPTED version that "replicated" (completed) — the dangerous population.
+    let venc = VersionId::from_string("00000001".into());
+    let mut enc = row(&b, "enc", venc.clone(), "e", true);
+    enc.sse_descriptor = Some(ENC_DESCRIPTOR.to_owned());
+    let enc_entry = OutboxEntry {
+        enqueued_at: Timestamp(0),
+        id: "backfill:r1:enc:00000001".to_owned(),
+        bucket: b.clone(),
+        key: ObjectKey::parse("enc").unwrap(),
+        version_id: venc.clone(),
+        operation: ReplicationOp::ObjectCreate,
+        rule_id: "r1".to_owned(),
+        target_arn: None,
+        attempts: 0,
+        next_attempt_at: Timestamp(0),
+        status: ReplicationStatus::Pending,
+        last_error: None,
+        priority: 0,
+        lease_until: None,
+    };
+    store
+        .submit(Mutation::PutObjectVersion {
+            row: Box::new(enc),
+            precondition: Precondition::default(),
+            replication: vec![enc_entry.clone()],
+        })
+        .await
+        .unwrap();
+    // A PLAINTEXT version that also completed — unaffected by the incident.
+    let vplain = VersionId::from_string("00000002".into());
+    plant_outbox(
+        &store,
+        &b,
+        "plain",
+        vplain.clone(),
+        "backfill:r1:plain:00000002",
+    )
+    .await;
+
+    // Drain both to `completed`, stamping the version ledger.
+    store
+        .claim_replication_batch(10, Timestamp(1))
+        .await
+        .unwrap();
+    for id in ["backfill:r1:enc:00000001", "backfill:r1:plain:00000002"] {
+        store
+            .submit(Mutation::MarkReplicationDone {
+                id: id.to_owned(),
+                now: Timestamp(0),
+            })
+            .await
+            .unwrap();
+    }
+    let counts = store.replication_counts(Some(&b)).await.unwrap();
+    assert_eq!((counts.pending, counts.completed), (0, 2));
+
+    // A repeat resync is a NO-OP: the deterministic id still has a row, so INSERT OR IGNORE ignores.
+    store
+        .submit(Mutation::EnqueueReplication(Box::new(enc_entry)))
+        .await
+        .unwrap();
+    let counts = store.replication_counts(Some(&b)).await.unwrap();
+    assert_eq!(
+        (counts.pending, counts.completed),
+        (0, 2),
+        "the idempotent enqueue cannot resurrect a completed entry — this is the trap"
+    );
+
+    // The forced requeue, scoped to encrypted versions.
+    store
+        .submit(Mutation::RequeueReplicationVersions {
+            bucket: b.clone(),
+            only_encrypted: true,
+            after_key: None,
+            now: Timestamp(5000),
+            limit: 1000,
+        })
+        .await
+        .unwrap();
+
+    let counts = store.replication_counts(Some(&b)).await.unwrap();
+    assert_eq!(
+        (counts.pending, counts.completed),
+        (1, 1),
+        "only the encrypted version's entry is requeued"
+    );
+    // The durable ledger is reset too, so the audit stops calling it replicated.
+    assert_eq!(
+        store
+            .object_replication_status(&b, &ObjectKey::parse("enc").unwrap(), &venc)
+            .await
+            .unwrap(),
+        Some(ReplicationStatus::Pending)
+    );
+    assert_eq!(
+        store
+            .object_replication_status(&b, &ObjectKey::parse("plain").unwrap(), &vplain)
+            .await
+            .unwrap(),
+        Some(ReplicationStatus::Completed),
+        "a plaintext version was never corrupt and must not be re-shipped"
+    );
+    // And the requeued entry is genuinely claimable again (attempts reset, lease cleared).
+    let claimed = store
+        .claim_replication_batch(10, Timestamp(6000))
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].id, "backfill:r1:enc:00000001");
+    assert_eq!(claimed[0].attempts, 0);
+}
+
+/// `only_encrypted: false` widens the requeue to every terminal entry in the bucket — and a
+/// terminally FAILED entry is requeued with its attempt budget reset (it sits at the max-attempts
+/// boundary and would otherwise re-fail on the very next attempt). An inbound `replica` stamp is
+/// never resurrected: that is the only cycle-breaker replication has (ARCH 20.4).
+#[tokio::test]
+async fn requeue_replication_versions_can_widen_and_never_touches_replicas() {
+    let store = cairn_meta::open_in_memory().unwrap();
+    let b = BucketName::parse("bkt").unwrap();
+    store
+        .submit(Mutation::CreateBucket(Box::new(bucket("bkt"))))
+        .await
+        .unwrap();
+
+    let v1 = VersionId::from_string("00000001".into());
+    plant_outbox(&store, &b, "failed", v1.clone(), "e-failed").await;
+    store
+        .claim_replication_batch(10, Timestamp(1))
+        .await
+        .unwrap();
+    store
+        .submit(Mutation::MarkReplicationFailed {
+            id: "e-failed".to_owned(),
+            error: "down".to_owned(),
+            next_attempt_at: None,
+        })
+        .await
+        .unwrap();
+
+    // A version that arrived here VIA replication.
+    let v2 = VersionId::from_string("00000002".into());
+    let mut inbound = row(&b, "inbound", v2.clone(), "e", true);
+    inbound.replication_status = Some(ReplicationStatus::Replica);
+    store
+        .submit(Mutation::PutObjectVersion {
+            row: Box::new(inbound),
+            precondition: Precondition::default(),
+            replication: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+    store
+        .submit(Mutation::RequeueReplicationVersions {
+            bucket: b.clone(),
+            only_encrypted: false,
+            after_key: None,
+            now: Timestamp(5000),
+            limit: 1000,
+        })
+        .await
+        .unwrap();
+
+    let counts = store.replication_counts(Some(&b)).await.unwrap();
+    assert_eq!(counts.failed, 0, "the terminal entry was requeued");
+    assert_eq!(counts.pending, 1);
+    let claimed = store
+        .claim_replication_batch(10, Timestamp(6000))
+        .await
+        .unwrap();
+    assert_eq!(claimed[0].attempts, 0, "the attempt budget is reset");
+    assert_eq!(
+        store
+            .object_replication_status(&b, &ObjectKey::parse("inbound").unwrap(), &v2)
+            .await
+            .unwrap(),
+        Some(ReplicationStatus::Replica),
+        "loop prevention must survive a forced requeue"
+    );
+}
+
+/// FINDING 2 (i): a forced encrypted-only requeue must re-ship the key's **delete marker** too.
+///
+/// The requeue used to filter per version on that version's own `sse_descriptor`. A delete marker
+/// has no descriptor, so it was never requeued — and the resync backfill that follows enumerates
+/// CURRENT objects, which skips deleted keys entirely. The net effect of "repairing" such a key was
+/// to PUT the old encrypted version at the destination with nothing to delete it again: **a deleted
+/// object resurrected on the mirror**. Scoping to the KEY fixes it — the marker rides along, and
+/// `has_unreplicated_predecessor` then holds it behind v1 so it lands last.
+#[tokio::test]
+async fn requeue_encrypted_only_also_reships_the_keys_delete_marker() {
+    let store = cairn_meta::open_in_memory().unwrap();
+    let b = BucketName::parse("bkt").unwrap();
+    store
+        .submit(Mutation::CreateBucket(Box::new(bucket("bkt"))))
+        .await
+        .unwrap();
+
+    // v1: an ENCRYPTED object that "replicated".
+    let v1 = VersionId::from_string("00000001".into());
+    let mut enc = row(&b, "k", v1.clone(), "e", true);
+    enc.sse_descriptor = Some(ENC_DESCRIPTOR.to_owned());
+    store
+        .submit(Mutation::PutObjectVersion {
+            row: Box::new(enc),
+            precondition: Precondition::default(),
+            replication: vec![outbox_entry(&b, "k", v1.clone(), "backfill:r1:k:1")],
+        })
+        .await
+        .unwrap();
+
+    // v2: the DELETE MARKER that removed it. No body, and therefore no sse_descriptor.
+    let v2 = VersionId::from_string("00000002".into());
+    store
+        .submit(Mutation::CreateDeleteMarker {
+            bucket: b.clone(),
+            key: ObjectKey::parse("k").unwrap(),
+            version_id: v2.clone(),
+            owner_id: UserId::generate(),
+            now: Timestamp(2),
+            replication: vec![OutboxEntry {
+                operation: ReplicationOp::DeleteMarker,
+                ..outbox_entry(&b, "k", v2.clone(), "backfill:r1:k:2")
+            }],
+        })
+        .await
+        .unwrap();
+
+    // Both ship successfully.
+    store
+        .claim_replication_batch(10, Timestamp(3))
+        .await
+        .unwrap();
+    for id in ["backfill:r1:k:1", "backfill:r1:k:2"] {
+        store
+            .submit(Mutation::MarkReplicationDone {
+                id: id.to_owned(),
+                now: Timestamp(0),
+            })
+            .await
+            .unwrap();
+    }
+
+    store
+        .submit(Mutation::RequeueReplicationVersions {
+            bucket: b.clone(),
+            only_encrypted: true,
+            after_key: None,
+            now: Timestamp(5000),
+            limit: 1000,
+        })
+        .await
+        .unwrap();
+
+    let claimed = store
+        .claim_replication_batch(10, Timestamp(6000))
+        .await
+        .unwrap();
+    let ids: Vec<&str> = claimed.iter().map(|e| e.id.as_str()).collect();
+    assert!(
+        ids.contains(&"backfill:r1:k:2"),
+        "the delete marker MUST be requeued with its key, or the repair resurrects a deleted \
+         object on the mirror; got {ids:?}"
+    );
+    assert!(ids.contains(&"backfill:r1:k:1"), "got {ids:?}");
+}
+
+/// FINDING 2 (ii): a forced encrypted-only requeue must re-ship a LATER PLAINTEXT version of the
+/// same key too.
+///
+/// With a per-version filter, only the older encrypted v1 was requeued — so v1 was PUT at the
+/// destination *after* the newer v2 had already landed there, and **the mirror's current object
+/// silently reverted to the old version**. This is the ordinary state of any key written while
+/// `CAIRN_ENCRYPT_AT_REST` was on and then rewritten after it was turned off.
+#[tokio::test]
+async fn requeue_encrypted_only_also_reships_a_later_plaintext_version_of_the_same_key() {
+    let store = cairn_meta::open_in_memory().unwrap();
+    let b = BucketName::parse("bkt").unwrap();
+    store
+        .submit(Mutation::CreateBucket(Box::new(bucket("bkt"))))
+        .await
+        .unwrap();
+
+    let v1 = VersionId::from_string("00000001".into());
+    let mut enc = row(&b, "k", v1.clone(), "e1", true);
+    enc.sse_descriptor = Some(ENC_DESCRIPTOR.to_owned());
+    store
+        .submit(Mutation::PutObjectVersion {
+            row: Box::new(enc),
+            precondition: Precondition::default(),
+            replication: vec![outbox_entry(&b, "k", v1.clone(), "backfill:r1:k:1")],
+        })
+        .await
+        .unwrap();
+
+    // v2: PLAINTEXT, current, and already replicated.
+    let v2 = VersionId::from_string("00000002".into());
+    store
+        .submit(Mutation::PutObjectVersion {
+            row: Box::new(row(&b, "k", v2.clone(), "e2", true)),
+            precondition: Precondition::default(),
+            replication: vec![outbox_entry(&b, "k", v2.clone(), "backfill:r1:k:2")],
+        })
+        .await
+        .unwrap();
+
+    // A DIFFERENT key with no encrypted version at all must stay untouched — `only_encrypted` is
+    // still a filter, just a key-level one.
+    let v3 = VersionId::from_string("00000003".into());
+    plant_outbox(&store, &b, "other", v3.clone(), "backfill:r1:other:3").await;
+
+    store
+        .claim_replication_batch(10, Timestamp(3))
+        .await
+        .unwrap();
+    for id in ["backfill:r1:k:1", "backfill:r1:k:2", "backfill:r1:other:3"] {
+        store
+            .submit(Mutation::MarkReplicationDone {
+                id: id.to_owned(),
+                now: Timestamp(0),
+            })
+            .await
+            .unwrap();
+    }
+
+    store
+        .submit(Mutation::RequeueReplicationVersions {
+            bucket: b.clone(),
+            only_encrypted: true,
+            after_key: None,
+            now: Timestamp(5000),
+            limit: 1000,
+        })
+        .await
+        .unwrap();
+
+    let claimed = store
+        .claim_replication_batch(10, Timestamp(6000))
+        .await
+        .unwrap();
+    let ids: Vec<&str> = claimed.iter().map(|e| e.id.as_str()).collect();
+    assert!(
+        ids.contains(&"backfill:r1:k:2"),
+        "the key's LATER plaintext version must be requeued too, or re-shipping v1 alone reverts \
+         the mirror's current object to the old version; got {ids:?}"
+    );
+    assert!(ids.contains(&"backfill:r1:k:1"), "got {ids:?}");
+    assert!(
+        !ids.contains(&"backfill:r1:other:3"),
+        "a key with no encrypted version anywhere is still out of scope; got {ids:?}"
+    );
+    // The ledger half is key-scoped to match: v2's stamp must not still read `completed` while its
+    // entry is queued, or the audit and the queue disagree about the same object.
+    assert_eq!(
+        store
+            .object_replication_status(&b, &ObjectKey::parse("k").unwrap(), &v2)
+            .await
+            .unwrap(),
+        Some(ReplicationStatus::Pending)
+    );
+    assert_eq!(
+        store
+            .object_replication_status(&b, &ObjectKey::parse("other").unwrap(), &v3)
+            .await
+            .unwrap(),
+        Some(ReplicationStatus::Completed)
+    );
+}
+
+/// FINDING 3: the requeue is PAGED, and the page unit is the KEY. Each submit covers at most `limit`
+/// distinct keys, moves every terminal row of every key in that page, and returns the page's last
+/// key; the caller threads that back as `after_key`. A large bucket therefore never becomes one
+/// unbounded UPDATE holding the single Writer's group-commit transaction, and no pass rescans what
+/// an earlier pass drained. An empty page (`page_end: None`) is the caller's stop condition — NOT a
+/// zero row count.
+#[tokio::test]
+async fn requeue_replication_versions_pages_by_key_and_threads_the_cursor() {
+    let store = cairn_meta::open_in_memory().unwrap();
+    let b = BucketName::parse("bkt").unwrap();
+    store
+        .submit(Mutation::CreateBucket(Box::new(bucket("bkt"))))
+        .await
+        .unwrap();
+
+    for i in 1..=5u32 {
+        let v = VersionId::from_string(format!("0000000{i}"));
+        plant_outbox(&store, &b, &format!("k{i}"), v, &format!("e{i}")).await;
+    }
+    store
+        .claim_replication_batch(10, Timestamp(1))
+        .await
+        .unwrap();
+    for i in 1..=5u32 {
+        store
+            .submit(Mutation::MarkReplicationDone {
+                id: format!("e{i}"),
+                now: Timestamp(0),
+            })
+            .await
+            .unwrap();
+    }
+
+    // Pages of 2 KEYS: each pass moves both halves for at most 2 keys (here 1 version each).
+    let mut passes = 0;
+    let mut total = 0u64;
+    let mut after_key: Option<String> = None;
+    let mut seen_ends: Vec<String> = Vec::new();
+    loop {
+        let outcome = store
+            .submit(Mutation::RequeueReplicationVersions {
+                bucket: b.clone(),
+                only_encrypted: false,
+                after_key: after_key.clone(),
+                now: Timestamp(5000),
+                limit: 2,
+            })
+            .await
+            .unwrap();
+        let MutationOutcome::RowsRequeued { rows, page_end } = outcome else {
+            panic!("the requeue must report rows + a page cursor, got {outcome:?}");
+        };
+        total += rows;
+        let Some(end) = page_end else { break };
+        assert!(
+            rows <= 4,
+            "a page of 2 single-version keys moves at most 2 outbox + 2 ledger rows, got {rows}"
+        );
+        // The cursor is MONOTONE FORWARD: a pass that did not advance would rescan forever (and
+        // makes a full requeue quadratic).
+        if let Some(prev) = &after_key {
+            assert!(&end > prev, "cursor went backwards: {prev:?} -> {end:?}");
+        }
+        seen_ends.push(end.clone());
+        after_key = Some(end);
+        passes += 1;
+        assert!(passes < 100, "the loop must converge");
+    }
+    assert_eq!(total, 10, "5 outbox rows + 5 version rows, all requeued");
+    assert_eq!(
+        seen_ends,
+        vec!["k2".to_owned(), "k4".to_owned(), "k5".to_owned()],
+        "pages are ordered by key and resume strictly past the previous page"
+    );
+
+    let counts = store.replication_counts(Some(&b)).await.unwrap();
+    assert_eq!((counts.pending, counts.completed), (5, 0));
+}
+
+/// THE ORDERING REGRESSION the paging must not reintroduce (review 2, blocking 2).
+///
+/// A row-bounded page (`WHERE rowid IN (SELECT rowid … LIMIT ?)`) carries no `ORDER BY`, so SQLite
+/// serves rows through `idx_outbox_status_next` — which groups **every** `completed` row ahead of
+/// **every** `failed` row. Key `k` here is exactly the population this incident created: its OLDER
+/// encrypted version is `failed` (the destination rejected the ciphertext with `BadDigest`) and its
+/// NEWER version is `completed`. Under row paging at limit 1 the claimable set after one batch was
+/// `["k:2"]` — the newer row alone — and the 30 s replication heartbeat ships it long before the
+/// older one is even requeued, so the mirror REVERTS to the old bytes.
+///
+/// Key paging makes a batch key-atomic: `k` is either wholly in a page or wholly absent.
+#[tokio::test]
+async fn requeue_page_never_splits_a_keys_versions_across_batches() {
+    let store = cairn_meta::open_in_memory().unwrap();
+    let b = BucketName::parse("bkt").unwrap();
+    store
+        .submit(Mutation::CreateBucket(Box::new(bucket("bkt"))))
+        .await
+        .unwrap();
+
+    // Key "a" — sorts first, and exists only so that `limit: 1` genuinely forces a page boundary
+    // between it and "k".
+    let av = VersionId::from_string("00000001".into());
+    let mut arow = row(&b, "a", av.clone(), "ea", true);
+    arow.sse_descriptor = Some(ENC_DESCRIPTOR.to_owned());
+    store
+        .submit(Mutation::PutObjectVersion {
+            row: Box::new(arow),
+            precondition: Precondition::default(),
+            replication: vec![outbox_entry(&b, "a", av.clone(), "a:1")],
+        })
+        .await
+        .unwrap();
+
+    // Key "k" v1: ENCRYPTED, and terminally `failed` — the BadDigest population.
+    let v1 = VersionId::from_string("00000001".into());
+    let mut enc = row(&b, "k", v1.clone(), "e1", true);
+    enc.sse_descriptor = Some(ENC_DESCRIPTOR.to_owned());
+    store
+        .submit(Mutation::PutObjectVersion {
+            row: Box::new(enc),
+            precondition: Precondition::default(),
+            replication: vec![outbox_entry(&b, "k", v1.clone(), "k:1")],
+        })
+        .await
+        .unwrap();
+    // Key "k" v2: the NEWER version, `completed`.
+    let v2 = VersionId::from_string("00000002".into());
+    store
+        .submit(Mutation::PutObjectVersion {
+            row: Box::new(row(&b, "k", v2.clone(), "e2", true)),
+            precondition: Precondition::default(),
+            replication: vec![outbox_entry(&b, "k", v2.clone(), "k:2")],
+        })
+        .await
+        .unwrap();
+
+    store
+        .claim_replication_batch(10, Timestamp(1))
+        .await
+        .unwrap();
+    store
+        .submit(Mutation::MarkReplicationFailed {
+            id: "k:1".to_owned(),
+            error: "BadDigest".to_owned(),
+            next_attempt_at: None,
+        })
+        .await
+        .unwrap();
+    for id in ["a:1", "k:2"] {
+        store
+            .submit(Mutation::MarkReplicationDone {
+                id: id.to_owned(),
+                now: Timestamp(2),
+            })
+            .await
+            .unwrap();
+    }
+
+    // Page 1, limit 1 key: must be "a" alone. NOTHING of "k" may become claimable yet.
+    let outcome = store
+        .submit(Mutation::RequeueReplicationVersions {
+            bucket: b.clone(),
+            only_encrypted: true,
+            after_key: None,
+            now: Timestamp(5000),
+            limit: 1,
+        })
+        .await
+        .unwrap();
+    let MutationOutcome::RowsRequeued { page_end, .. } = outcome else {
+        panic!("expected a paged outcome, got {outcome:?}");
+    };
+    assert_eq!(page_end.as_deref(), Some("a"));
+    let claimed = store
+        .claim_replication_batch(10, Timestamp(5001))
+        .await
+        .unwrap();
+    let ids: Vec<&str> = claimed.iter().map(|e| e.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec!["a:1"],
+        "a page must not leak a partial key: requeueing k's NEWER `completed` row while its OLDER \
+         `failed` row waits for a later page lets the heartbeat ship them out of order and REVERT \
+         the mirror; got {ids:?}"
+    );
+
+    // Page 2: "k", wholly — BOTH of its terminal rows in the same transaction.
+    let outcome = store
+        .submit(Mutation::RequeueReplicationVersions {
+            bucket: b.clone(),
+            only_encrypted: true,
+            after_key: page_end,
+            now: Timestamp(6000),
+            limit: 1,
+        })
+        .await
+        .unwrap();
+    let MutationOutcome::RowsRequeued { page_end, .. } = outcome else {
+        panic!("expected a paged outcome, got {outcome:?}");
+    };
+    assert_eq!(page_end.as_deref(), Some("k"));
+    let claimed = store
+        .claim_replication_batch(10, Timestamp(6001))
+        .await
+        .unwrap();
+    let mut ids: Vec<&str> = claimed.iter().map(|e| e.id.as_str()).collect();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        vec!["k:1", "k:2"],
+        "both of the key's terminal rows must be requeued by the SAME batch"
+    );
+}
+
+/// The delete-marker shape of the same defect: `k` v1 is ENCRYPTED and `failed`, and `k` v2 is a
+/// DELETE MARKER that is `completed`. Splitting the key across pages requeues the marker first, the
+/// heartbeat ships it, and then v1 lands afterwards — **resurrecting a deleted object on the
+/// mirror**.
+#[tokio::test]
+async fn requeue_page_never_splits_a_key_whose_newer_version_is_a_delete_marker() {
+    let store = cairn_meta::open_in_memory().unwrap();
+    let b = BucketName::parse("bkt").unwrap();
+    store
+        .submit(Mutation::CreateBucket(Box::new(bucket("bkt"))))
+        .await
+        .unwrap();
+
+    let av = VersionId::from_string("00000001".into());
+    let mut arow = row(&b, "a", av.clone(), "ea", true);
+    arow.sse_descriptor = Some(ENC_DESCRIPTOR.to_owned());
+    store
+        .submit(Mutation::PutObjectVersion {
+            row: Box::new(arow),
+            precondition: Precondition::default(),
+            replication: vec![outbox_entry(&b, "a", av.clone(), "a:1")],
+        })
+        .await
+        .unwrap();
+
+    let v1 = VersionId::from_string("00000001".into());
+    let mut enc = row(&b, "k", v1.clone(), "e1", true);
+    enc.sse_descriptor = Some(ENC_DESCRIPTOR.to_owned());
+    store
+        .submit(Mutation::PutObjectVersion {
+            row: Box::new(enc),
+            precondition: Precondition::default(),
+            replication: vec![outbox_entry(&b, "k", v1.clone(), "k:1")],
+        })
+        .await
+        .unwrap();
+    let v2 = VersionId::from_string("00000002".into());
+    store
+        .submit(Mutation::CreateDeleteMarker {
+            bucket: b.clone(),
+            key: ObjectKey::parse("k").unwrap(),
+            version_id: v2.clone(),
+            owner_id: UserId::generate(),
+            now: Timestamp(2),
+            replication: vec![OutboxEntry {
+                operation: ReplicationOp::DeleteMarker,
+                ..outbox_entry(&b, "k", v2.clone(), "k:2")
+            }],
+        })
+        .await
+        .unwrap();
+
+    store
+        .claim_replication_batch(10, Timestamp(1))
+        .await
+        .unwrap();
+    store
+        .submit(Mutation::MarkReplicationFailed {
+            id: "k:1".to_owned(),
+            error: "BadDigest".to_owned(),
+            next_attempt_at: None,
+        })
+        .await
+        .unwrap();
+    for id in ["a:1", "k:2"] {
+        store
+            .submit(Mutation::MarkReplicationDone {
+                id: id.to_owned(),
+                now: Timestamp(2),
+            })
+            .await
+            .unwrap();
+    }
+
+    let outcome = store
+        .submit(Mutation::RequeueReplicationVersions {
+            bucket: b.clone(),
+            only_encrypted: true,
+            after_key: None,
+            now: Timestamp(5000),
+            limit: 1,
+        })
+        .await
+        .unwrap();
+    let MutationOutcome::RowsRequeued { page_end, .. } = outcome else {
+        panic!("expected a paged outcome, got {outcome:?}");
+    };
+    assert_eq!(page_end.as_deref(), Some("a"));
+    let claimed = store
+        .claim_replication_batch(10, Timestamp(5001))
+        .await
+        .unwrap();
+    let ids: Vec<&str> = claimed.iter().map(|e| e.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec!["a:1"],
+        "the delete marker must not be requeued ahead of the older version it deletes; got {ids:?}"
+    );
+
+    let outcome = store
+        .submit(Mutation::RequeueReplicationVersions {
+            bucket: b.clone(),
+            only_encrypted: true,
+            after_key: page_end,
+            now: Timestamp(6000),
+            limit: 1,
+        })
+        .await
+        .unwrap();
+    let MutationOutcome::RowsRequeued { page_end, .. } = outcome else {
+        panic!("expected a paged outcome, got {outcome:?}");
+    };
+    assert_eq!(page_end.as_deref(), Some("k"));
+    let claimed = store
+        .claim_replication_batch(10, Timestamp(6001))
+        .await
+        .unwrap();
+    let mut ids: Vec<&str> = claimed.iter().map(|e| e.id.as_str()).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, vec!["k:1", "k:2"]);
+}
+
+/// `MarkReplicationDone` stamps `replicated_at` in the same step as the status (schema v23). Without
+/// it the replication audit cannot tell a version that shipped BEFORE a fix from one that was
+/// force-requeued and has since re-shipped correctly — both read `completed`, and `created_at` is
+/// never rewritten — so its gauge can never fall back to zero after a successful repair.
+#[tokio::test]
+async fn mark_replication_done_stamps_replicated_at() {
+    let store = cairn_meta::open_in_memory().unwrap();
+    let b = BucketName::parse("bkt").unwrap();
+    store
+        .submit(Mutation::CreateBucket(Box::new(bucket("bkt"))))
+        .await
+        .unwrap();
+    let v = VersionId::from_string("00000001".into());
+    plant_outbox(&store, &b, "k", v.clone(), "e1").await;
+    let key = ObjectKey::parse("k").unwrap();
+
+    // Fresh version: never shipped, so the stamp is absent.
+    assert_eq!(
+        store
+            .get_version(&b, &key, &v)
+            .await
+            .unwrap()
+            .unwrap()
+            .replicated_at,
+        None,
+        "a version that has never shipped carries no completion stamp"
+    );
+
+    store
+        .claim_replication_batch(10, Timestamp(1))
+        .await
+        .unwrap();
+    store
+        .submit(Mutation::MarkReplicationDone {
+            id: "e1".to_owned(),
+            now: Timestamp(9_000),
+        })
+        .await
+        .unwrap();
+    let row = store.get_version(&b, &key, &v).await.unwrap().unwrap();
+    assert_eq!(row.replication_status, Some(ReplicationStatus::Completed));
+    assert_eq!(row.replicated_at, Some(Timestamp(9_000)));
+    assert_eq!(
+        row.updated_at,
+        Timestamp(1),
+        "replication must NOT touch updated_at — it feeds the client-visible S3 LastModified"
+    );
+
+    // A re-ship advances it, which is the whole point: this is what drops a REPAIRED version out of
+    // the audit's suspect population.
+    store
+        .submit(Mutation::RequeueReplicationVersions {
+            bucket: b.clone(),
+            only_encrypted: false,
+            after_key: None,
+            now: Timestamp(9_500),
+            limit: 100,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get_version(&b, &key, &v)
+            .await
+            .unwrap()
+            .unwrap()
+            .replicated_at,
+        Some(Timestamp(9_000)),
+        "a requeue must NOT advance or clear the stamp — the re-ship has not happened yet"
+    );
+    store
+        .claim_replication_batch(10, Timestamp(9_600))
+        .await
+        .unwrap();
+    store
+        .submit(Mutation::MarkReplicationDone {
+            id: "e1".to_owned(),
+            now: Timestamp(10_000),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get_version(&b, &key, &v)
+            .await
+            .unwrap()
+            .unwrap()
+            .replicated_at,
+        Some(Timestamp(10_000))
+    );
+}
+
+/// A `replica` row (inbound, loop prevention ARCH 20.4) is excluded from the `replicated_at` stamp
+/// by the same `IS NOT 'replica'` guard that protects its status — the two move together or not
+/// at all.
+#[tokio::test]
+async fn mark_replication_done_leaves_a_replica_row_entirely_alone() {
+    let store = cairn_meta::open_in_memory().unwrap();
+    let b = BucketName::parse("bkt").unwrap();
+    store
+        .submit(Mutation::CreateBucket(Box::new(bucket("bkt"))))
+        .await
+        .unwrap();
+    let v = VersionId::from_string("00000001".into());
+    let mut inbound = row(&b, "k", v.clone(), "e", true);
+    inbound.replication_status = Some(ReplicationStatus::Replica);
+    store
+        .submit(Mutation::PutObjectVersion {
+            row: Box::new(inbound),
+            precondition: Precondition::default(),
+            replication: vec![outbox_entry(&b, "k", v.clone(), "e1")],
+        })
+        .await
+        .unwrap();
+    store
+        .submit(Mutation::MarkReplicationDone {
+            id: "e1".to_owned(),
+            now: Timestamp(9_000),
+        })
+        .await
+        .unwrap();
+    let row = store
+        .get_version(&b, &ObjectKey::parse("k").unwrap(), &v)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.replication_status, Some(ReplicationStatus::Replica));
+    assert_eq!(
+        row.replicated_at, None,
+        "an inbound replica is never stamped as shipped FROM here"
+    );
+}
+
+/// THE LEDGER MAY NOT CLAIM QUEUED WORK THAT NO QUEUE HOLDS.
+///
+/// A forced requeue flips version rows to `pending`, and `pending` is what the replication audit
+/// reports as `repair_pending` — "repair in flight". For a NON-CURRENT version whose outbox row the
+/// retention sweep already pruned (24 h after an incident, essentially all of them) nothing will
+/// ever enqueue that work: the resync backfill that follows enumerates `list_current` only. So such
+/// a row would sit `pending` forever, `repair_pending` could never reach zero, the runbook's
+/// done-state would be unreachable, and the alert `docs/operations.md` 8.7 tells operators to raise
+/// on that gauge would fire permanently.
+///
+/// The ledger half is therefore narrower than the outbox half: a version may go back to `pending`
+/// only if it is CURRENT (the backfill will re-enqueue it) or if it still HAS an outbox row for its
+/// exact (bucket, key, version_id) (the outbox half just requeued it). A non-current version with a
+/// pruned row stays `completed` — still counted as `present_and_suspect` / `non_current_suspect`,
+/// which is the truth, and which TRAP 2 already explains is unrepairable without rebuilding the
+/// destination bucket.
+#[tokio::test]
+async fn requeue_ledger_skips_a_non_current_version_no_queue_can_ever_ship() {
+    let store = cairn_meta::open_in_memory().unwrap();
+    let b = BucketName::parse("bkt").unwrap();
+    store
+        .submit(Mutation::CreateBucket(Box::new(bucket("bkt"))))
+        .await
+        .unwrap();
+    let v1 = VersionId::from_string("00000001".into());
+    let v2 = VersionId::from_string("00000002".into());
+
+    // Key `pruned`: an encrypted v1 that "replicated", then a v2 that demotes it. v1's outbox row
+    // is enqueued in the distant past so the retention sweep reclaims it; v2's is recent.
+    // Key `kept`: the same shape, but v1's outbox row is recent and SURVIVES the sweep.
+    for key in ["pruned", "kept"] {
+        let mut enc = row(&b, key, v1.clone(), "e1", true);
+        enc.sse_descriptor = Some(ENC_DESCRIPTOR.to_owned());
+        store
+            .submit(Mutation::PutObjectVersion {
+                row: Box::new(enc),
+                precondition: Precondition::default(),
+                replication: vec![OutboxEntry {
+                    enqueued_at: if key == "pruned" {
+                        Timestamp(0)
+                    } else {
+                        Timestamp(1_000)
+                    },
+                    ..outbox_entry(&b, key, v1.clone(), &format!("{key}:1"))
+                }],
+            })
+            .await
+            .unwrap();
+        store
+            .submit(Mutation::PutObjectVersion {
+                row: Box::new(row(&b, key, v2.clone(), "e2", true)),
+                precondition: Precondition::default(),
+                replication: vec![OutboxEntry {
+                    enqueued_at: Timestamp(1_000),
+                    ..outbox_entry(&b, key, v2.clone(), &format!("{key}:2"))
+                }],
+            })
+            .await
+            .unwrap();
+    }
+    store
+        .claim_replication_batch(10, Timestamp(1))
+        .await
+        .unwrap();
+    for id in ["pruned:1", "pruned:2", "kept:1", "kept:2"] {
+        store
+            .submit(Mutation::MarkReplicationDone {
+                id: id.to_owned(),
+                now: Timestamp(2),
+            })
+            .await
+            .unwrap();
+    }
+    // The retention sweep: `pruned:1` is gone, and with it any way to ship that version.
+    store
+        .submit(Mutation::PruneReplicationOutbox { before_ms: 500 })
+        .await
+        .unwrap();
+
+    store
+        .submit(Mutation::RequeueReplicationVersions {
+            bucket: b.clone(),
+            only_encrypted: true,
+            after_key: None,
+            now: Timestamp(5_000),
+            limit: 1_000,
+        })
+        .await
+        .unwrap();
+
+    let status = async |key: &str, v: &VersionId| {
+        store
+            .object_replication_status(&b, &ObjectKey::parse(key).unwrap(), v)
+            .await
+            .unwrap()
+    };
+    assert_eq!(
+        status("pruned", &v1).await,
+        Some(ReplicationStatus::Completed),
+        "a non-current version whose outbox row was pruned has NOTHING that could ship it; \
+         marking it `pending` would make repair_pending permanently non-zero"
+    );
+    assert_eq!(
+        status("pruned", &v2).await,
+        Some(ReplicationStatus::Pending),
+        "the CURRENT version is requeued — the resync backfill enumerates list_current, so this \
+         one really will be re-enqueued"
+    );
+    assert_eq!(
+        status("kept", &v1).await,
+        Some(ReplicationStatus::Pending),
+        "a non-current version that STILL has an outbox row is genuinely queued work"
+    );
+    assert_eq!(status("kept", &v2).await, Some(ReplicationStatus::Pending));
+
+    // KEY ATOMICITY IS UNCHANGED: the OUTBOX half still moves every terminal row of every paged
+    // key. Only the ledger half narrowed.
+    let claimed = store
+        .claim_replication_batch(10, Timestamp(5_001))
+        .await
+        .unwrap();
+    let mut ids: Vec<&str> = claimed.iter().map(|e| e.id.as_str()).collect();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        vec!["kept:1", "kept:2", "pruned:2"],
+        "every surviving terminal outbox row of a paged key is requeued together; got {ids:?}"
+    );
+
+    // And the ledger row that stayed `completed` is not a leak in the other direction either: the
+    // requeue is idempotent, so a second pass does not quietly flip it.
+    store
+        .submit(Mutation::RequeueReplicationVersions {
+            bucket: b.clone(),
+            only_encrypted: true,
+            after_key: None,
+            now: Timestamp(6_000),
+            limit: 1_000,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        status("pruned", &v1).await,
+        Some(ReplicationStatus::Completed)
     );
 }

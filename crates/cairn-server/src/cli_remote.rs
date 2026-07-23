@@ -301,6 +301,59 @@ pub enum ReplicationCmd {
         /// The source bucket.
         bucket: String,
     },
+    /// Backfill existing objects to the destination (existing-object replication / resync).
+    ///
+    /// TRAP: this does nothing unless an enabled rule sets `ExistingObjectReplication` — edit the
+    /// rule first. It also enumerates CURRENT versions only. With `--force` the bucket's already
+    /// terminal (`completed`/`failed`) outbox entries are requeued first, which is REQUIRED for a
+    /// second repair pass inside `CAIRN_REPLICATION_RETENTION_SECS` — without it the idempotent
+    /// enqueue silently no-ops and the resync repairs nothing.
+    Resync {
+        /// The source bucket.
+        bucket: String,
+        /// Requeue already-terminal entries so versions that replicated (wrongly) are re-shipped.
+        #[arg(long)]
+        force: bool,
+        /// With `--force`, requeue every terminal entry rather than only the encrypted ones.
+        ///
+        /// `requires = "force"`: on its own this flag does nothing at all (the requeue only happens
+        /// under `--force`), and a resync that quietly did the narrow thing while the operator
+        /// believed they had widened it is exactly the failure mode this command exists to avoid.
+        #[arg(long, requires = "force")]
+        all_versions: bool,
+    },
+    /// NODE-LOCAL: report object versions that are encrypted AND terminally replicated, i.e. the
+    /// suspect population left by the pre-release-X SSE replication defect (`docs/replication.md`
+    /// 20.1, `docs/operations.md` 8.7).
+    ///
+    /// Unlike every other `replication` subcommand this reads the local data dir directly (it needs
+    /// the durable version-row ledger, which no API exposes), so it honours `CAIRN_*` config and
+    /// ignores the connection flags. `GET /replication/failed` is NOT a substitute: the outbox is
+    /// pruned at `CAIRN_REPLICATION_RETENTION_SECS` (default 24 h) and shows only recent failures.
+    Audit {
+        /// REQUIRED cutoff: only versions created STRICTLY BEFORE this are suspect. RFC-3339
+        /// (`2026-07-23T10:00:00Z`) or whole epoch seconds (`1753264800`).
+        ///
+        /// Set it to the moment this node was upgraded past the SSE replication defect. Only
+        /// versions written by the pre-fix binary can be damaged; a version encrypted and replicated
+        /// *after* the fix is equally encrypted and equally `completed`, and is healthy. Without the
+        /// cutoff the count includes those too and can never reach zero, which makes it useless as
+        /// a repair-progress signal. Defaults to `CAIRN_REPLICATION_AUDIT_BEFORE` if that is set.
+        #[arg(long)]
+        before: Option<String>,
+        /// Restrict the audit to one source bucket.
+        #[arg(long)]
+        bucket: Option<String>,
+        /// Emit the full report as JSON.
+        #[arg(long)]
+        json: bool,
+        /// EXPENSIVE: additionally GET every suspect replica from its destination and compare it
+        /// byte-for-byte against the source plaintext. This is a full transfer of the suspect set,
+        /// in both directions of the link. It is the only conclusive check — a corrupt replica has
+        /// exactly the right size, and the ETag differs even for a correct one.
+        #[arg(long)]
+        verify: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -464,6 +517,23 @@ struct ReplicationStatusResp {
 struct ReplicationRetryResp {
     requeued: bool,
     failed_observed: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReplicationResyncResp {
+    started: bool,
+    #[serde(default)]
+    forced: bool,
+    /// The SCOPE the force ran with. Decoded because `forced: true` alone does not tell the operator
+    /// whether `--all-versions` was actually honoured — and the difference is whether every terminal
+    /// entry in the bucket is re-shipped or only the encrypted keys. Printing `forced=true` without
+    /// it is the same ambiguity as not echoing the scope at all.
+    #[serde(default)]
+    only_encrypted: bool,
+    /// Echoed so the CLI can shout when the backfill will enqueue nothing (see the resync doc
+    /// comment in `cairn-control`: this is the trap operators hit first).
+    #[serde(default)]
+    existing_object_replication: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1321,6 +1391,69 @@ async fn replication(
             }
             Ok(())
         }
+        ReplicationCmd::Resync {
+            bucket,
+            force,
+            all_versions,
+        } => {
+            let mut subpath = format!(
+                "/buckets/{}/replication/resync",
+                pct_encode_segment(&bucket)
+            );
+            if force {
+                subpath.push_str("?force=true");
+                if all_versions {
+                    subpath.push_str("&only_encrypted=false");
+                }
+            }
+            let resp = api_send(client, cfg, Method::POST, &subpath, None).await?;
+            if cfg.json {
+                print_json_body(&resp.body);
+            } else {
+                let started: ReplicationResyncResp = decode(&resp)?;
+                // The SCOPE is confirmed back, not just the fact of forcing: `forced=true` alone
+                // leaves the operator unable to tell whether `--all-versions` was honoured, and the
+                // two scopes differ by the entire plaintext population of the bucket. The server's
+                // echo is authoritative — never re-print the flag we sent.
+                println!(
+                    "started={} forced={}{}",
+                    started.started,
+                    started.forced,
+                    if started.forced {
+                        if started.only_encrypted {
+                            " scope=encrypted-keys-only"
+                        } else {
+                            " scope=all-versions"
+                        }
+                    } else {
+                        ""
+                    }
+                );
+                if force && all_versions && started.forced && started.only_encrypted {
+                    println!(
+                        "WARNING: --all-versions was NOT honoured — the server scoped the requeue \
+                         to encrypted keys only (an older node ignores `only_encrypted`)."
+                    );
+                }
+                if !started.existing_object_replication {
+                    println!(
+                        "WARNING: no enabled rule sets ExistingObjectReplication — this backfill \
+                         will enqueue NOTHING. Edit the replication rule first."
+                    );
+                }
+                println!(
+                    "note: the backfill enumerates CURRENT versions only; non-current versions are \
+                     not repaired."
+                );
+            }
+            Ok(())
+        }
+        // Node-local; intercepted in `main.rs` before this remote client is ever built.
+        ReplicationCmd::Audit { .. } => Err(
+            "`replication audit` is node-local and is dispatched before the remote client \
+                 (internal error: it should never reach here)"
+                .to_owned(),
+        ),
     }
 }
 

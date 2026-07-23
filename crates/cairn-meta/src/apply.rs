@@ -55,6 +55,7 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
                 checksums: Vec::new(),
                 sse_descriptor: None,
                 replication_status: None,
+                replicated_at: None,
                 created_at: now,
                 updated_at: now,
             };
@@ -346,6 +347,163 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             .map_err(engine_err)?;
             Ok(MutationOutcome::Ack)
         }
+        Mutation::RequeueReplicationVersions {
+            bucket,
+            only_encrypted,
+            now,
+            after_key,
+            limit,
+        } => {
+            // (0) THE KEY PAGE. Both DML statements below are driven from this one page, so the
+            // outbox and the ledger can never disagree about a key.
+            //
+            // Paging by ROW instead of by key is a correctness bug, not a slower option: a bare
+            // `WHERE rowid IN (SELECT rowid … LIMIT ?)` has no ORDER BY, so SQLite serves rows via
+            // `idx_outbox_status_next`, which groups every `completed` row ahead of every `failed`
+            // row. A key whose OLDER encrypted version is `failed` and whose NEWER version is
+            // `completed` would get the newer row requeued pages before the older one, the
+            // heartbeat would ship it in between, and the mirror would revert to the old bytes (or
+            // resurrect a deleted key, when the newer row is a delete marker). See the
+            // `Mutation::RequeueReplicationVersions` doc.
+            //
+            // The UNION is load-bearing: a key whose outbox row was already pruned by the retention
+            // sweep still carries a `completed` ledger stamp that has to be reset. `after_key` makes
+            // the sweep monotone forward — each pass resumes strictly past the previous page's last
+            // key, so a full requeue is linear rather than quadratic. Migration v23's
+            // `idx_outbox_bucket_key` is what makes the outbox arm of this an index seek; the
+            // ledger arm rides the `UNIQUE (bucket_name, key, version_id)` auto-index.
+            //
+            // `only_encrypted` correlates on (bucket_name, key) ONLY — never on version_id, for the
+            // same ordering reason. With it false the OR short-circuits and the EXISTS is never
+            // evaluated.
+            let page: Vec<String> = {
+                let mut stmt = conn
+                    .prepare_cached(
+                        "SELECT u.k FROM ( \
+                             SELECT DISTINCT o.key AS k FROM replication_outbox o \
+                             WHERE o.bucket_name=?1 AND o.status IN ('completed','failed') \
+                               AND (?2 IS NULL OR o.key > ?2) \
+                             UNION \
+                             SELECT DISTINCT v.key AS k FROM object_versions v \
+                             WHERE v.bucket_name=?1 AND v.replication_status IN ('completed','failed') \
+                               AND (?2 IS NULL OR v.key > ?2) \
+                         ) AS u \
+                         WHERE ?3 = 0 OR EXISTS ( \
+                             SELECT 1 FROM object_versions ov \
+                             WHERE ov.bucket_name=?1 AND ov.key=u.k AND ov.sse_descriptor IS NOT NULL) \
+                         ORDER BY u.k LIMIT ?4",
+                    )
+                    .map_err(engine_err)?;
+                let rows = stmt
+                    .query_map(
+                        params![
+                            bucket.as_str(),
+                            after_key.as_deref(),
+                            i64::from(only_encrypted),
+                            limit
+                        ],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .map_err(engine_err)?;
+                rows.collect::<rusqlite::Result<Vec<String>>>()
+                    .map_err(engine_err)?
+            };
+            let Some(page_end) = page.last().cloned() else {
+                // Drained: nothing at or past the cursor. The caller stops here.
+                return Ok(MutationOutcome::RowsRequeued {
+                    rows: 0,
+                    page_end: None,
+                });
+            };
+            // Both UPDATEs run over the CLOSED KEY RANGE the page covers, so every terminal row of
+            // every key in the page moves in this one transaction together with its siblings. A key
+            // is therefore never split across a batch boundary — including the pathological key with
+            // an enormous version history, whose rows are deliberately NOT split (splitting them is
+            // the bug this shape exists to prevent).
+            //
+            // (1) The outbox half. `EnqueueReplication`'s INSERT OR IGNORE cannot resurrect a
+            // terminal row, so a repeat resync inside the retention window is a silent no-op; this
+            // is the only way to re-ship a version whose entry already reads `completed`.
+            // `attempts=0` matches `RetryFailedReplication`: a `failed` entry sits at the
+            // max-attempts boundary and would re-fail on the very next attempt otherwise.
+            let outbox = conn.execute(
+                "UPDATE replication_outbox SET status='pending', next_attempt_at=?2, attempts=0, lease_until=NULL \
+                 WHERE bucket_name=?1 AND status IN ('completed','failed') \
+                   AND (?3 IS NULL OR key > ?3) AND key <= ?4 \
+                   AND (?5 = 0 OR EXISTS ( \
+                        SELECT 1 FROM object_versions ov \
+                        WHERE ov.bucket_name = replication_outbox.bucket_name \
+                          AND ov.key = replication_outbox.key \
+                          AND ov.sse_descriptor IS NOT NULL))",
+                params![
+                    bucket.as_str(),
+                    now.0,
+                    after_key.as_deref(),
+                    page_end,
+                    i64::from(only_encrypted)
+                ],
+            )
+            .map_err(engine_err)?;
+            // (2) The ledger half, over the SAME key range: if a key's plaintext version is being
+            // re-shipped, its ledger stamp must stop reading `completed` too, or the audit and the
+            // queue disagree. Filtering on `IN ('completed','failed')` already excludes `replica`
+            // (loop prevention, ARCH 20.4) and `pending`/`claimed` (live work), so the statement is
+            // idempotent and can never resurrect an inbound replica for re-shipping.
+            //
+            // `replicated_at` is deliberately LEFT ALONE. It records when the version last shipped,
+            // and it has not shipped again yet; clearing it here would make a repair in flight
+            // indistinguishable from a version that never replicated, and re-stamping it would
+            // declare success before the ship. `MarkReplicationDone` advances it, and only it.
+            //
+            // THE LEDGER HALF IS NARROWER THAN THE OUTBOX HALF, and that asymmetry is the accurate
+            // rule rather than a workaround. `pending` in the ledger is a claim that *something*
+            // will ship this version. Two populations can honour that claim:
+            //
+            //   * `is_latest = 1` — the resync backfill that follows a forced requeue enumerates
+            //     `list_current`, so a current version gets a fresh `INSERT OR IGNORE` entry;
+            //   * a version that still HAS an outbox row for this exact (bucket, key, version_id) —
+            //     the outbox half above just moved it back to `pending`, so the queue holds it.
+            //     (The existence test is status-agnostic on purpose: that UPDATE has already run in
+            //     this same transaction, so these rows now read `pending`, not `completed`.)
+            //
+            // Everything else — a NON-CURRENT version whose outbox row the retention sweep already
+            // pruned, which 24 h after an incident is essentially all of them — has no queue entry
+            // and nothing that will ever create one. Flipping it to `pending` would make the ledger
+            // claim queued work that no queue holds: the audit's `repair_pending` gauge would count
+            // it forever, the runbook's `repair_pending == 0` done-state would be unreachable, and
+            // an alert on it would fire permanently. Leaving it `completed` is the truth — it is
+            // still a suspect replica, it is reported as `non_current_suspect`, and TRAP 2 already
+            // tells the operator non-current versions are unrepairable without rebuilding the
+            // destination bucket.
+            let ledger = conn
+                .execute(
+                    "UPDATE object_versions SET replication_status=?2 \
+                     WHERE bucket_name=?1 AND replication_status IN ('completed','failed') \
+                       AND (?3 IS NULL OR key > ?3) AND key <= ?4 \
+                       AND (is_latest = 1 OR EXISTS ( \
+                            SELECT 1 FROM replication_outbox ob \
+                            WHERE ob.bucket_name = object_versions.bucket_name \
+                              AND ob.key = object_versions.key \
+                              AND ob.version_id = object_versions.version_id)) \
+                       AND (?5 = 0 OR EXISTS ( \
+                            SELECT 1 FROM object_versions ov \
+                            WHERE ov.bucket_name = object_versions.bucket_name \
+                              AND ov.key = object_versions.key \
+                              AND ov.sse_descriptor IS NOT NULL))",
+                    params![
+                        bucket.as_str(),
+                        repl_status_str(cairn_types::meta::ReplicationStatus::Pending),
+                        after_key.as_deref(),
+                        page_end,
+                        i64::from(only_encrypted)
+                    ],
+                )
+                .map_err(engine_err)?;
+            Ok(MutationOutcome::RowsRequeued {
+                rows: (outbox + ledger) as u64,
+                page_end: Some(page_end),
+            })
+        }
         Mutation::SetAccountPublicAccessBlock(bpa) => {
             conn.execute(
                 "INSERT OR REPLACE INTO account_config (k, v) VALUES ('public_access_block', ?1)",
@@ -610,7 +768,7 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             now,
             lease_secs,
         } => claim_replication_batch(conn, limit, now, lease_secs),
-        Mutation::MarkReplicationDone(id) => {
+        Mutation::MarkReplicationDone { id, now } => {
             if let Some((bucket, key, version)) = conn
                 .query_row(
                     "SELECT bucket_name, key, version_id FROM replication_outbox WHERE id=?1",
@@ -629,10 +787,17 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
                 // Preserve a `replica` marker: a version that arrived here via replication must keep
                 // that status for loop prevention (ARCH 20.4) even when a stray outbox entry for it is
                 // drained. `IS NOT` is NULL-safe (a NULL/other status is stamped Completed).
+                //
+                // `replicated_at` moves in the SAME statement as the status (schema v23). The status
+                // alone is not enough for the replication audit: a version that shipped BEFORE a fix
+                // and one that was force-requeued and has since re-shipped correctly both read
+                // `completed`, and `created_at` is never rewritten — so without this stamp the audit
+                // gauge can never fall back to zero after a successful repair. Deliberately not
+                // `updated_at`, which feeds the client-visible S3 `LastModified`.
                 conn.execute(
-                    "UPDATE object_versions SET replication_status=?4 \
+                    "UPDATE object_versions SET replication_status=?4, replicated_at=?5 \
                      WHERE bucket_name=?1 AND key=?2 AND version_id=?3 AND replication_status IS NOT 'replica'",
-                    params![bucket, key, version, repl_status_str(cairn_types::meta::ReplicationStatus::Completed)],
+                    params![bucket, key, version, repl_status_str(cairn_types::meta::ReplicationStatus::Completed), now.0],
                 )
                 .map_err(engine_err)?;
             }
@@ -1626,6 +1791,7 @@ mod tests {
             checksums: Vec::new(),
             sse_descriptor: None,
             replication_status: None,
+            replicated_at: None,
             created_at: Timestamp(1),
             updated_at: Timestamp(1),
         }

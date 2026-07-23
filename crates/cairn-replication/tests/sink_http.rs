@@ -805,3 +805,112 @@ async fn the_opt_in_allows_a_client_encrypted_object_over_http() {
         .expect("the operator opted in");
     assert_eq!(captured.lock().unwrap().len(), 1);
 }
+
+/// Spawn a server that answers every request with `chunks`, emitted as SEPARATE body frames and
+/// with no `Content-Length` (chunked transfer). Returns the bound authority.
+///
+/// The framing is the point: `stream_object` must hash what it is handed frame by frame and hold
+/// none of it, and its byte cap must be enforced against what it has actually read rather than
+/// against a header the destination controls.
+async fn spawn_chunked_server(chunks: Vec<&'static [u8]>) -> String {
+    use futures_util::stream;
+    use http_body_util::StreamBody;
+    use hyper::body::Frame;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let authority = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream_io, _)) = listener.accept().await else {
+                return;
+            };
+            let chunks = chunks.clone();
+            tokio::spawn(async move {
+                let io = TokioIo::new(stream_io);
+                let service = service_fn(move |_req: Request<Incoming>| {
+                    let chunks = chunks.clone();
+                    async move {
+                        let frames: Vec<Result<Frame<Bytes>, std::convert::Infallible>> = chunks
+                            .into_iter()
+                            .map(|c: &'static [u8]| Ok(Frame::data(Bytes::from_static(c))))
+                            .collect();
+                        let frames = stream::iter(frames);
+                        Ok::<_, std::convert::Infallible>(Response::new(StreamBody::new(frames)))
+                    }
+                });
+                let _ = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
+                    .serve_connection(io, service)
+                    .await;
+            });
+        }
+    });
+    authority
+}
+
+/// `--verify` compares an MD5, and a digest is incremental — so the replica body is hashed as it
+/// arrives and NEVER buffered. This asserts the observable consequence: the caller sees the body one
+/// frame at a time (not one 2 GiB `Bytes`), and the returned count is the bytes actually read.
+#[tokio::test]
+async fn stream_object_feeds_the_caller_frame_by_frame_without_buffering() {
+    let authority = spawn_chunked_server(vec![b"alpha", b"beta", b"gamma"]).await;
+    let sink = sink_for(&authority, 1_700_000_000);
+
+    let mut seen: Vec<Vec<u8>> = Vec::new();
+    let read = sink
+        .stream_object("source-bucket", "k", 1_000, &mut |c: &[u8]| {
+            seen.push(c.to_vec())
+        })
+        .await
+        .expect("a 200 with a body streams");
+
+    assert_eq!(read, 14, "the return value is the total bytes read");
+    assert_eq!(
+        seen,
+        vec![b"alpha".to_vec(), b"beta".to_vec(), b"gamma".to_vec()],
+        "each frame is handed over and dropped; nothing accumulates in the sink"
+    );
+}
+
+/// The cap survives the switch to streaming, and it bounds the bytes actually READ rather than a
+/// buffer size — the response above carries no `Content-Length`, so there is no header to trust.
+/// A hostile or misconfigured destination that streams without end must terminate the audit, not
+/// run until an operator kills it.
+#[tokio::test]
+async fn stream_object_stops_at_the_read_cap() {
+    let authority = spawn_chunked_server(vec![b"alpha", b"beta", b"gamma"]).await;
+    let sink = sink_for(&authority, 1_700_000_000);
+
+    let mut read_back = 0u64;
+    let err = sink
+        .stream_object("source-bucket", "k", 6, &mut |c: &[u8]| {
+            read_back += c.len() as u64
+        })
+        .await
+        .expect_err("a body past the cap must error");
+    assert!(
+        matches!(err, ReplicationError::Terminal(_)),
+        "over-cap is terminal (parked, not retried forever): {err:?}"
+    );
+    assert!(
+        read_back <= 6,
+        "the cap is checked BEFORE the frame is consumed, so at most `max_bytes` reach the caller"
+    );
+}
+
+/// A 404 from the destination is the absent-replica population, and it must arrive as the
+/// structural `NotFound` variant so the audit never has to sniff a message for digits.
+#[tokio::test]
+async fn stream_object_maps_a_404_to_not_found() {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let authority = spawn_server(captured, Reply { status: 404 }).await;
+    let sink = sink_for(&authority, 1_700_000_000);
+
+    let err = sink
+        .stream_object("source-bucket", "k", 1_000, &mut |_: &[u8]| {})
+        .await
+        .expect_err("a 404 is an error");
+    assert!(
+        matches!(err, ReplicationError::NotFound(_)),
+        "unexpected: {err:?}"
+    );
+}

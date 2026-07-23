@@ -256,6 +256,28 @@ pub struct Config {
     /// Set `true` only when the link is trusted by other means (an in-datacentre VLAN, a VPN, a
     /// service mesh doing the TLS). It emits a loud startup warning.
     pub replication_allow_plaintext_sse_over_http: bool,
+    /// The cutoff for the background **encrypted-suspect audit** — an RFC-3339 timestamp
+    /// (`2026-07-23T10:00:00Z`) or whole epoch seconds (`CAIRN_REPLICATION_AUDIT_BEFORE`, ARCH 20.5,
+    /// 26.2). Set it to the moment this node was upgraded past the SSE replication defect.
+    ///
+    /// **Unset by default, and unset means the loop does not run at all**: no version walk, no
+    /// gauges, no warning, zero cost. That is deliberate. The pass counts encrypted versions stamped
+    /// terminally replicated, and *only* versions written by the pre-fix binary can be damaged — a
+    /// version encrypted and replicated after the fix is equally encrypted and equally `completed`,
+    /// and is perfectly healthy. Without a cutoff the count is permanently non-zero on every healthy
+    /// node that uses SSE with replication: an alert on it would fire forever and a runbook that
+    /// says "watch it fall to zero" would be describing something that cannot happen. A permanent
+    /// false alarm shipped as a default is worse than no alarm, so the operator opts in by supplying
+    /// the one fact the node cannot know.
+    ///
+    /// With it set, `cairn_replication_encrypted_suspect_versions` and
+    /// `cairn_replication_encrypted_repair_pending_versions` genuinely converge to zero as a repair
+    /// completes, and alerting on either is meaningful. The one-off CLI (`cairn replication audit`)
+    /// takes the same value as `--before` and does not require this knob.
+    ///
+    /// Validated at load: an unparseable value fails startup rather than surfacing six hours later
+    /// inside a background loop.
+    pub replication_audit_before: Option<String>,
     /// Retention for terminally-failed webhook-outbox (`events_outbox`) rows in seconds
     /// (`CAIRN_EVENTS_OUTBOX_RETENTION_SECS`): failed entries older than this are periodically
     /// reclaimed so a misconfigured/decommissioned webhook sink cannot grow the metadata DB (the
@@ -419,6 +441,10 @@ impl Default for Config {
             // Refuse by default: a correctness fix (replicating plaintext instead of ciphertext)
             // must not silently start putting client-encrypted bodies on an unencrypted link.
             replication_allow_plaintext_sse_over_http: false,
+            // Unset: the encrypted-suspect audit loop does not run and emits no gauge until an
+            // operator supplies the cutoff. See the field doc — a gauge with no cutoff cannot
+            // converge, and a permanently-firing default alarm is worse than none.
+            replication_audit_before: None,
             events_outbox_retention_secs: 86_400,
             allow_internal_endpoints: false,
             import_default_workers: 8,
@@ -831,6 +857,16 @@ impl Config {
                     .into(),
             ));
         }
+        // Fail fast on an unparseable audit cutoff. The value is only consumed by a background loop
+        // that first ticks minutes after startup, so without this check a typo would look like a
+        // clean boot and then silently produce no gauges at all.
+        if let Some(raw) = self.replication_audit_before.as_deref() {
+            if let Err(e) = crate::replication_audit::parse_cutoff(raw) {
+                return Err(ConfigError::Invalid(format!(
+                    "replication_audit_before: {e}"
+                )));
+            }
+        }
         if self.events_outbox_retention_secs == 0 {
             return Err(ConfigError::Invalid(
                 "events_outbox_retention_secs must be positive".into(),
@@ -1039,6 +1075,30 @@ mod tests {
         // ...unless a target list is configured, whose endpoints are not judged here.
         c.replication_targets = Some("[]".to_owned());
         assert!(c.validate().is_ok());
+    }
+
+    /// The encrypted-suspect audit cutoff is OFF by default (so the background loop never runs and
+    /// emits no gauge), accepts both operator-facing forms, and fails startup on a typo rather than
+    /// surfacing as "no gauges appeared" six hours into an incident.
+    #[test]
+    fn replication_audit_before_defaults_off_and_is_validated() {
+        assert!(
+            Config::default().replication_audit_before.is_none(),
+            "the audit loop must be opt-in: an unbounded suspect gauge cannot converge, and a \
+             permanently-firing default alarm is worse than no alarm"
+        );
+        let mut c = base();
+        assert!(c.validate().is_ok());
+        c.replication_audit_before = Some("2026-07-23T10:00:00Z".to_owned());
+        assert!(c.validate().is_ok(), "RFC-3339 is accepted");
+        c.replication_audit_before = Some("1753264800".to_owned());
+        assert!(c.validate().is_ok(), "bare epoch seconds are accepted");
+        c.replication_audit_before = Some("last tuesday".to_owned());
+        let err = c.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("replication_audit_before"),
+            "the failure must name the knob, got {err:?}"
+        );
     }
 
     fn hex64(b: u8) -> String {

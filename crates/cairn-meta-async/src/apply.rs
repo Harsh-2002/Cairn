@@ -57,6 +57,7 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
                 checksums: Vec::new(),
                 sse_descriptor: None,
                 replication_status: None,
+                replicated_at: None,
                 created_at: now,
                 updated_at: now,
             };
@@ -424,6 +425,108 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
             }
             Ok(MutationOutcome::Ack)
         }
+        Mutation::RequeueReplicationVersions {
+            bucket,
+            only_encrypted,
+            now,
+            after_key,
+            limit,
+        } => {
+            // Mirrors `cairn-meta`'s SQL exactly (the 4(+1)-site rule): select one page of KEYS with
+            // terminal work, then drive both UPDATEs from that page's closed key range. See the
+            // sqlite backend for why `INSERT OR IGNORE` cannot substitute for this, why `replica` is
+            // excluded, why the `only_encrypted` EXISTS correlates on (bucket_name, key) and NOT on
+            // version_id, why paging by ROW instead of by key silently reverts the mirror, and why
+            // `replicated_at` is left alone here.
+            let cursor = after_key
+                .clone()
+                .map_or(Value::Null, |k| Value::Text(k.clone()));
+            let page_rows = driver
+                .query(
+                    "SELECT u.k FROM ( \
+                         SELECT DISTINCT o.key AS k FROM replication_outbox o \
+                         WHERE o.bucket_name=?1 AND o.status IN ('completed','failed') \
+                           AND (?2 IS NULL OR o.key > ?2) \
+                         UNION \
+                         SELECT DISTINCT v.key AS k FROM object_versions v \
+                         WHERE v.bucket_name=?1 AND v.replication_status IN ('completed','failed') \
+                           AND (?2 IS NULL OR v.key > ?2) \
+                     ) AS u \
+                     WHERE ?3 = 0 OR EXISTS ( \
+                         SELECT 1 FROM object_versions ov \
+                         WHERE ov.bucket_name=?1 AND ov.key=u.k AND ov.sse_descriptor IS NOT NULL) \
+                     ORDER BY u.k LIMIT ?4",
+                    vec![
+                        Value::Text(bucket.as_str().to_owned()),
+                        cursor.clone(),
+                        Value::Int(i64::from(only_encrypted)),
+                        Value::Int(i64::from(limit)),
+                    ],
+                )
+                .await?;
+            let Some(page_end) = page_rows.last().map(|r| r.get_text(0)) else {
+                return Ok(MutationOutcome::RowsRequeued {
+                    rows: 0,
+                    page_end: None,
+                });
+            };
+            let outbox = driver
+                .execute(
+                    "UPDATE replication_outbox SET status='pending', next_attempt_at=?2, attempts=0, lease_until=NULL \
+                     WHERE bucket_name=?1 AND status IN ('completed','failed') \
+                       AND (?3 IS NULL OR key > ?3) AND key <= ?4 \
+                       AND (?5 = 0 OR EXISTS ( \
+                            SELECT 1 FROM object_versions ov \
+                            WHERE ov.bucket_name = replication_outbox.bucket_name \
+                              AND ov.key = replication_outbox.key \
+                              AND ov.sse_descriptor IS NOT NULL))",
+                    vec![
+                        Value::Text(bucket.as_str().to_owned()),
+                        Value::Int(now.0),
+                        cursor.clone(),
+                        Value::Text(page_end.clone()),
+                        Value::Int(i64::from(only_encrypted)),
+                    ],
+                )
+                .await?;
+            // The ledger half is NARROWER than the outbox half: only `is_latest = 1` rows (which the
+            // resync backfill's `list_current` enumeration will re-enqueue) or rows that still have
+            // an outbox entry for this exact (bucket, key, version_id) may be flipped to `pending`.
+            // See the sqlite backend for why — a non-current version whose outbox row was pruned has
+            // nothing that could ever ship it, so `pending` there is the ledger claiming queued work
+            // no queue holds, and the audit's `repair_pending` gauge could never fall to zero.
+            let ledger = driver
+                .execute(
+                    "UPDATE object_versions SET replication_status=?2 \
+                     WHERE bucket_name=?1 AND replication_status IN ('completed','failed') \
+                       AND (?3 IS NULL OR key > ?3) AND key <= ?4 \
+                       AND (is_latest = 1 OR EXISTS ( \
+                            SELECT 1 FROM replication_outbox ob \
+                            WHERE ob.bucket_name = object_versions.bucket_name \
+                              AND ob.key = object_versions.key \
+                              AND ob.version_id = object_versions.version_id)) \
+                       AND (?5 = 0 OR EXISTS ( \
+                            SELECT 1 FROM object_versions ov \
+                            WHERE ov.bucket_name = object_versions.bucket_name \
+                              AND ov.key = object_versions.key \
+                              AND ov.sse_descriptor IS NOT NULL))",
+                    vec![
+                        Value::Text(bucket.as_str().to_owned()),
+                        Value::Text(
+                            repl_status_str(cairn_types::meta::ReplicationStatus::Pending)
+                                .to_owned(),
+                        ),
+                        cursor,
+                        Value::Text(page_end.clone()),
+                        Value::Int(i64::from(only_encrypted)),
+                    ],
+                )
+                .await?;
+            Ok(MutationOutcome::RowsRequeued {
+                rows: outbox + ledger,
+                page_end: Some(page_end),
+            })
+        }
         Mutation::SetAccountPublicAccessBlock(bpa) => {
             driver
                 .execute(
@@ -698,7 +801,7 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
             now,
             lease_secs,
         } => claim_replication_batch(driver, limit, now, lease_secs).await,
-        Mutation::MarkReplicationDone(id) => {
+        Mutation::MarkReplicationDone { id, now } => {
             if let Some(row) = query_one(
                 driver,
                 "SELECT bucket_name, key, version_id FROM replication_outbox WHERE id=?1",
@@ -707,9 +810,12 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
             .await?
             {
                 let (bucket, key, version) = (row.get_text(0), row.get_text(1), row.get_text(2));
+                // `replicated_at` moves in the SAME statement as the status (schema v23) — see the
+                // sqlite backend for why the status alone cannot tell a pre-fix ship from a
+                // successful repair, and why this is not `updated_at`.
                 driver
                     .execute(
-                        "UPDATE object_versions SET replication_status=?4 WHERE bucket_name=?1 AND key=?2 AND version_id=?3 AND replication_status IS NOT 'replica'",
+                        "UPDATE object_versions SET replication_status=?4, replicated_at=?5 WHERE bucket_name=?1 AND key=?2 AND version_id=?3 AND replication_status IS NOT 'replica'",
                         vec![
                             Value::Text(bucket),
                             Value::Text(key),
@@ -718,6 +824,7 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
                                 repl_status_str(cairn_types::meta::ReplicationStatus::Completed)
                                     .to_owned(),
                             ),
+                            Value::Int(now.0),
                         ],
                     )
                     .await?;
