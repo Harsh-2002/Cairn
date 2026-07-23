@@ -98,28 +98,41 @@ metric() {
 }
 ge1() { [ "${1%.*}" -ge 1 ] 2>/dev/null; }
 
-# Flip one byte of the single blob stored under bucket $1 (blobs live at
-# $CAIRN_DATA_DIR/<bucket>/<id>), simulating bit rot.
+# Flip one byte of the OBJECT blob stored under bucket $1 (blobs live at
+# $CAIRN_DATA_DIR/<bucket>/<id>), simulating bit rot. Deterministically target the LARGEST regular
+# file under the bucket dir — the object blob — rather than `find | head -1`, whose traversal order
+# is filesystem-dependent: a wrong pick (a sidecar, or another bucket's smaller blob) would leave the
+# object's real blob intact, so the scrub reads it clean and the arm "detects nothing" nondeterministically.
 corrupt_blob() {
-  local bucket="$1" blob
-  blob="$(find "$DATADIR/$bucket" -type f | head -1)"
+  local bucket="$1" blob size
+  blob="$(find "$DATADIR/$bucket" -type f -printf '%s\t%p\n' 2>/dev/null | sort -rn | head -1 | cut -f2-)"
   [ -n "$blob" ] || fail "could not locate a stored blob under $DATADIR/$bucket"
-  local size
   size="$(wc -c <"$blob")"
+  # Guard the selection: the object blobs these arms create are ~1 KiB+; a tiny file means we picked
+  # the wrong one and the corruption would land somewhere the scrub never reads.
+  [ "${size:-0}" -ge 100 ] 2>/dev/null || fail "picked an implausibly small blob ($size bytes) under $DATADIR/$bucket — refusing to corrupt the wrong file"
   printf '\xff' | dd of="$blob" bs=1 seek="$((size / 2))" count=1 conv=notrunc 2>/dev/null
   echo "  corrupted one byte of $blob ($size bytes)"
 }
 
-# The shared assertions every arm makes after a pass has run.
+# The shared assertions every arm makes. POLL for detection rather than a fixed sleep: the scrub runs
+# every 2s, but a post-corruption pass now DECRYPTS every object, so on a contended CI runner it can
+# take longer than any single fixed wait — a genuinely corrupt blob is detected within a few passes,
+# so wait for the counter deterministically (the memory rule: poll, never guess a sleep).
 assert_pass() {
   local arm="$1"
-  sleep 5 # at least one full scrub pass after the corruption (interval is 2s)
-  local corrupt scanned key_unavail
-  corrupt="$(metric '^cairn_scrub_corruption_total')"
+  local corrupt scanned key_unavail deadline
+  corrupt=0
+  deadline=$(( SECONDS + ${SCRUB_POLL_SECS:-60} ))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    corrupt="$(metric '^cairn_scrub_corruption_total')"
+    ge1 "$corrupt" && break
+    sleep 1
+  done
   scanned="$(metric '^cairn_scrub_objects_total')"
   key_unavail="$(metric '^cairn_scrub_skipped_total.reason="key_unavailable"')"
   echo "  [$arm] corruption_total=$corrupt objects_total(scanned)=$scanned skipped{key_unavailable}=$key_unavail"
-  ge1 "$corrupt" || fail "[$arm] the scrub did not detect the corruption (counter=$corrupt); log: $(tail -5 "$TMPROOT/$arm/server.log")"
+  ge1 "$corrupt" || fail "[$arm] the scrub did not detect the corruption within ${SCRUB_POLL_SECS:-60}s (counter=$corrupt); log: $(tail -5 "$TMPROOT/$arm/server.log")"
   # The zero-count companion: a pass that verified NOTHING must not be able to satisfy this arm.
   ge1 "$scanned" || fail "[$arm] the scrub verified nothing (cairn_scrub_objects_total=$scanned) — an all-skipped pass, not coverage"
   [ "${key_unavail%.*}" -eq 0 ] 2>/dev/null || fail "[$arm] versions skipped for an unavailable key on a healthy ring ($key_unavail)"

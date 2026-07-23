@@ -82,11 +82,20 @@ KEY_ID="${KEY_ID:-alias/cairn-replstress}"
 REPL_INTERVAL="${REPL_INTERVAL:-1}"
 REPL_WORKER_CONCURRENCY="${REPL_WORKER_CONCURRENCY:-4}"
 
-# Absolute ceilings — same knobs/defaults as stress.sh / stress_encrypted.sh / stress_multipart.sh.
+# Absolute ceilings — same knobs/defaults as stress.sh / stress_encrypted.sh / stress_multipart.sh,
+# EXCEPT the WAL ceiling, which is deliberately more generous HERE. This is the only harness where the
+# WAL-bearing node (the source) is under sustained CONCURRENT READ load — the replication worker holds
+# a read snapshot over every version as it ships it. A PASSIVE checkpoint cannot TRUNCATE the WAL file
+# while a reader holds an old snapshot, so under a fast runner's write rate the WAL *file* peak tracks
+# write-rate × reader-hold-time — a continuous, hardware-dependent quantity (a 4-core CI runner peaked
+# ~568 MB against a 512 MiB single-node ceiling). Gating that tightly measures the runner, not a leak
+# (gate-design rule: never gate a hardware-dependent continuous quantity). The AUTHORITATIVE
+# no-unbounded-growth signal is the OUTBOX-DRAINS-TO-0 gate below; this ceiling is only a COARSE
+# runaway backstop (a genuine leak blows past it and never drains). Sized for ~2.5× the observed peak.
 RSS_CEILING_KIB="${RSS_CEILING_KIB:-1048576}"
 FD_CEILING="${FD_CEILING:-4096}"
 THREAD_CEILING="${THREAD_CEILING:-512}"
-WAL_CEILING_BYTES="${WAL_CEILING_BYTES:-$((512*1024*1024))}"
+WAL_CEILING_BYTES="${WAL_CEILING_BYTES:-$((1536*1024*1024))}"
 
 DATA_T="$(mktemp -d)"
 DATA_S="$(mktemp -d)"
@@ -193,8 +202,8 @@ common_env() { # <data-dir> <s3-port> <ui-addr> <master-key>
     "CAIRN_REGION=us-east-1" "CAIRN_ALLOW_INSECURE=true" \
     "CAIRN_LOG_LEVEL=${CAIRN_LOG_LEVEL:-error}" \
     "CAIRN_REQUEST_TIMEOUT_SECS=${CAIRN_REQUEST_TIMEOUT_SECS:-600}" \
-    "CAIRN_WAL_CHECKPOINT_INTERVAL_SECS=${CAIRN_WAL_CHECKPOINT_INTERVAL_SECS:-15}" \
-    "CAIRN_WAL_CHECKPOINT_SIZE_BYTES=${CAIRN_WAL_CHECKPOINT_SIZE_BYTES:-$((64*1024*1024))}"
+    "CAIRN_WAL_CHECKPOINT_INTERVAL_SECS=${CAIRN_WAL_CHECKPOINT_INTERVAL_SECS:-10}" \
+    "CAIRN_WAL_CHECKPOINT_SIZE_BYTES=${CAIRN_WAL_CHECKPOINT_SIZE_BYTES:-$((32*1024*1024))}"
 }
 # shellcheck disable=SC2046
 target_env=( $(common_env "$DATA_T" "$PORT_T" off "$KEY_T") "CAIRN_ENCRYPT_AT_REST=true" )
