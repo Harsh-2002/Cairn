@@ -647,6 +647,38 @@ jobs:
       - name: Barrier-fire concurrent multipart Completes; assert byte-exact + fail-closed + races
         run: BIN=target/debug/cairn PY=python3 bash conformance/stress_multipart.sh
 
+  soak-features:
+    name: mixed-feature soak (constant load, leak shape)
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: cairn-bin
+          path: target/debug
+      - run: chmod +x target/debug/cairn
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.x"
+      # boto3 IS this harness (SSE, versioning, low-level multipart, object lock, STS); a box without
+      # it must go red, not green-with-no-coverage.
+      - run: pip install boto3
+      # The features RUNNING TOGETHER under a CONSTANT load: SSE-S3/SSE-KMS churn, a versioned bucket
+      # accumulating per-version DEKs + delete markers + version deletes, composite-checksum multipart
+      # completed AND aborted (plus abandoned sessions for the sweeper), an object-lock bucket whose
+      # locked versions are attacked with deletes all run, STS session credentials minted on a cadence
+      # and driving a slice of the traffic, and a 1 s lifecycle scanner. Because the worker pool is
+      # FIXED-SIZE and never sleeps, offered load does not drift — which is what makes the
+      # steady-state SHAPE gates legitimate here and deliberately not in `stress`: RSS / fd / thread
+      # climb, plus staging and WAL having to PLATEAU rather than grow monotonically. Correctness
+      # (byte-exact reads, WORM unbroken, control prefix untouched, tampered tokens refused), zero
+      # operation errors, an exact 5xx budget of zero, /healthz never wedging and the absolute
+      # RSS/fd/thread/WAL ceilings are gated too. Every rate is advisory (debug AES-GCM).
+      - name: Hold a mixed-feature workload constant; assert correctness + no steady-state climb
+        run: BIN=target/debug/cairn PY=python3 bash conformance/soak_features.sh
+
   blob-limits:
     name: blob store limits (out-of-space, huge, many)
     needs: build
@@ -775,6 +807,7 @@ jobs:
       - stress
       - stress-encrypted
       - stress-multipart
+      - soak-features
       - blob-limits
     if: always()
     runs-on: ubuntu-latest

@@ -13,7 +13,7 @@
 # ADVISORY here (reported, never the gate): absolute obj/s + MiB/s (hardware-bound), and the
 # fd/thread/WAL %-climbs and commit-barrier tail — because this harness deliberately RAMPS
 # concurrency, so those grow with offered load and a climb here does NOT imply a leak. Constant-load
-# leak detection (where a climb really is a leak) is soak.sh's job.
+# leak detection (where a climb really is a leak) is soak_features.sh's job.
 #
 # Unlike warp.sh (which only gates on the error count) this parses warp's throughput numbers and
 # samples the server process, so the output is a usable benchmark + a stability assertion.
@@ -58,7 +58,7 @@ THREAD_CEILING="${THREAD_CEILING:-512}"   # hard ceiling on OS threads (blocking
 BATCH_MIN_QUEUE="${BATCH_MIN_QUEUE:-4}"   # only judge batching once the writer actually backed up
 # NOTE: the fd/thread/WAL %-climbs and the commit-tail ratio are reported as ADVISORY here, not gated
 # — this harness RAMPS concurrency, so those legitimately grow with offered load (see section 5).
-# Constant-load leak detection belongs to soak.sh, where a climb really does mean a leak.
+# Constant-load leak detection belongs to soak_features.sh, where a climb really does mean a leak.
 BATCH_CONC_MIN="${BATCH_CONC_MIN:-32}"    # concurrency at/above which group-commit batching must engage
 BATCH_MEAN_MIN="${BATCH_MEAN_MIN:-4}"     # min mean batch size at high concurrency (group-commit works)
 
@@ -318,11 +318,11 @@ printf '  peak writer queue depth: %s    server requests served: %s\n' "$wq_peak
 # Hard leak gate: the absolute RSS ceiling. A real leak grows roughly with request count and blows
 # unbounded past it under sustained load; a byte-budgeted cache plateaus well under. The steady-state
 # %-growth is ADVISORY only — on fast hardware the cache fills faster than a short run can plateau, so
-# a high % is usually warm-up, not a leak. For sensitive leak detection use the long-run soak.sh.
+# a high % is usually warm-up, not a leak. For sensitive leak detection use the long-run soak_features.sh.
 leaked="no"
 [ "${rss_peak:-0}" -gt "$RSS_CEILING_KIB" ] 2>/dev/null && leaked="yes"
 if awk "BEGIN{exit !($rss_delta_pct > $LEAK_PCT)}"; then
-  printf '  advisory: steady-state RSS grew %s%% (> %s%%) — likely warm-up on fast/short runs; not fatal. Hard gate is the %s KiB ceiling; run soak.sh for sensitive leak detection.\n' \
+  printf '  advisory: steady-state RSS grew %s%% (> %s%%) — likely warm-up on fast/short runs; not fatal. Hard gate is the %s KiB ceiling; run soak_features.sh for sensitive leak detection.\n' \
     "$rss_delta_pct" "$LEAK_PCT" "$RSS_CEILING_KIB"
 fi
 server_alive="no"; kill -0 "$SRV" 2>/dev/null && server_alive="yes"
@@ -346,7 +346,7 @@ printf '  writer  commit p99: first-level=%ss peak=%ss   mean batch size at conc
 # concurrency triples. Gating on those %-climbs would fail a perfectly healthy server. So under a
 # RAMPING load we hard-gate only the signals that stay valid regardless of offered load — absolute
 # CEILINGS, zero 5xx, zero op-errors, liveness — and report the climbs as ADVISORY diagnostics.
-# Constant-load leak detection (where a climb IS a leak) is soak.sh's job, not this harness's.
+# Constant-load leak detection (where a climb IS a leak) is soak_features.sh's job, not this harness's.
 gate_fail=""
 [ "${fd_peak:-0}" -gt "$FD_CEILING" ] 2>/dev/null && gate_fail="$gate_fail fd_ceiling($fd_peak>$FD_CEILING)"
 [ "${thread_peak:-0}" -gt "$THREAD_CEILING" ] 2>/dev/null && gate_fail="$gate_fail thread_ceiling($thread_peak>$THREAD_CEILING)"
