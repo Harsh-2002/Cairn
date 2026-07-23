@@ -12,6 +12,15 @@ shard DB:
   P4 retire id=1 before rewrap -> startup retire-gate REFUSES to boot (fail-closed, no leak)
   P5 seal counter             -> survives a restart (primed from durable state)
 
+All THREE encrypted modes ride the whole lifecycle (the server boots every phase with
+CAIRN_ENCRYPT_AT_REST + CAIRN_KMS_KEY_IDS): explicit SSE-S3 (AES256), transparent at-rest
+(mode "at-rest"), and SSE-KMS (aws:kms + key id). Since all three seal their DEK under the same
+master ring, re-wrap and the retire-gate must treat them identically — and the additive descriptor
+labels (mode, kms_key_id) MUST survive a re-wrap on disk (a dropped `mode` would silently downgrade
+an at-rest object to advertising AES256). P2b/P3 assert the on-disk descriptor is resealed to the
+new key with those labels intact and that GET/HEAD still advertise the right per-mode headers; P4
+proves the retire-gate protects the at-rest and KMS objects, not only SSE-S3.
+
 Config via env: BIN (cairn binary), DATA (temp dir), PORT (S3 port; UI = PORT+1), SHARDS.
 """
 import base64, datetime, hashlib, hmac, http.client, json, os, signal, sqlite3, subprocess, sys, time, urllib.parse
@@ -30,6 +39,7 @@ K1 = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
 K2 = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100"
 RING_12 = json.dumps([{"id": 1, "key": K1}, {"id": 2, "key": K2}])
 RING_2 = json.dumps([{"id": 2, "key": K2}])
+KMSID = "tenant-rot"  # the SSE-KMS key id (label-only; sealed under the master ring like any DEK)
 
 PASS, FAIL = [], []
 def check(name, cond, detail=""):
@@ -72,6 +82,20 @@ def s3(method, path, query=None, headers=None, body=b""):
     return r.status, d
 def put_sse(bucket, key, body):
     return s3("PUT", f"/{bucket}/{key}", headers={"x-amz-server-side-encryption": "AES256"}, body=body)
+def put_kms(bucket, key, body, key_id=KMSID):
+    return s3("PUT", f"/{bucket}/{key}",
+              headers={"x-amz-server-side-encryption": "aws:kms",
+                       "x-amz-server-side-encryption-aws-kms-key-id": key_id}, body=body)
+def put_plain(bucket, key, body):
+    # No SSE header: under CAIRN_ENCRYPT_AT_REST=true this is stored as transparent at-rest (mode
+    # "at-rest", advertises nothing on read).
+    return s3("PUT", f"/{bucket}/{key}", body=body)
+def head(bucket, key):
+    h = sigv4("HEAD", f"/{bucket}/{key}", {}, {}, b"", AK, SK)
+    c = http.client.HTTPConnection(*S3, timeout=30)
+    c.request("HEAD", f"/{bucket}/{key}", headers=h)
+    r = c.getresponse(); r.read(); hs = {k.lower(): v for k, v in r.getheaders()}; c.close()
+    return r.status, hs
 def mkuser(name):
     c = http.client.HTTPConnection(*MGMT, timeout=30)
     c.request("POST", "/api/v1/users", body=json.dumps({"display_name": name, "role": "member"}).encode(),
@@ -100,6 +124,11 @@ def base_env(extra):
         "CAIRN_META_CACHE_TOTAL_BUDGET_BYTES": str(8 * 1024 ** 3),
         "CAIRN_LOG_LEVEL": os.environ.get("CAIRN_LOG_LEVEL", "warn"),
         "CAIRN_KEY_REWRAP_INTERVAL_SECS": "0", "CAIRN_KEY_COUNTER_SYNC_SECS": "0",
+        # Enable the two encrypted modes the rotation gate must also cover, on EVERY phase's boot:
+        # transparent at-rest (a plain PUT becomes a `mode:"at-rest"` object) and SSE-KMS (the
+        # `aws:kms` allow-list). Both seal their DEK under the same master ring, so re-wrap and the
+        # retire-gate treat them exactly like SSE-S3 — this harness proves that end to end.
+        "CAIRN_ENCRYPT_AT_REST": "true", "CAIRN_KMS_KEY_IDS": KMSID,
     })
     e.update(extra); return e
 def _port_free():
@@ -159,6 +188,20 @@ def user_ids():
             out.append(kid(ct))
         con.close()
     return out
+def descriptor_for(objkey):
+    """The on-disk sse_descriptor of the object with this key: {mode, kms_key_id, kid}. `mode` is
+    None for SSE-S3 (it is the default and serializes away), "at-rest" / "kms" otherwise. `kid` is
+    the master-key id the wrapped DEK is sealed under (what re-wrap advances)."""
+    for p in shards():
+        con = sqlite3.connect(p)
+        rows = con.execute("SELECT sse_descriptor FROM object_versions WHERE key=? AND sse_descriptor IS NOT NULL",
+                           (objkey,)).fetchall()
+        con.close()
+        if rows:
+            j = json.loads(rows[0][0])
+            return {"mode": j.get("mode"), "kms_key_id": j.get("kms_key_id"),
+                    "kid": kid(base64.b64decode(j["wrapped_dek_b64"]))}
+    return None
 
 # =====================================================================
 print(f"=== audit #29 rotation e2e (BIN={BIN} SHARDS={SHARDS} PORT={PORT}) ===", flush=True)
@@ -173,6 +216,24 @@ if ok:
     st, body = s3("GET", "/abkt/s1.txt"); check("[P1] GET SSE object decrypts", st == 200 and body == b"payload-one", f"{st} {body!r}")
     check("[P1] create user (seals a SigV4 secret)", mkuser("alice"))
     s3("PUT", "/zbkt"); put_sse("zbkt", "s2.txt", b"payload-two")
+    # Two more encrypted modes whose descriptors carry ADDITIVE labels (mode, kms_key_id) that a
+    # re-wrap must preserve. A dropped `mode` would make the at-rest object silently start
+    # advertising AES256; a dropped kms_key_id would orphan the KMS label.
+    st, _ = put_plain("abkt", "atr.txt", b"at-rest-payload")
+    check("[P1] PUT transparent at-rest object", st in (200, 204), str(st))
+    st, hh = head("abkt", "atr.txt")
+    check("[P1] at-rest object advertises NO SSE header (transparent)",
+          st == 200 and "x-amz-server-side-encryption" not in hh, str(hh))
+    st, _ = put_kms("zbkt", "kms.txt", b"kms-payload")
+    check("[P1] PUT SSE-KMS object (aws:kms + key id)", st in (200, 204), str(st))
+    st, hh = head("zbkt", "kms.txt")
+    check("[P1] KMS object advertises aws:kms + the key id",
+          st == 200 and hh.get("x-amz-server-side-encryption") == "aws:kms"
+          and hh.get("x-amz-server-side-encryption-aws-kms-key-id") == KMSID, str(hh))
+    da, dk = descriptor_for("atr.txt"), descriptor_for("kms.txt")
+    check("[P1] at-rest descriptor: mode=at-rest, sealed id=1", da and da["mode"] == "at-rest" and da["kid"] == 1, str(da))
+    check("[P1] KMS descriptor: mode=kms, kms_key_id preserved, sealed id=1",
+          dk and dk["mode"] == "kms" and dk["kms_key_id"] == KMSID and dk["kid"] == 1, str(dk))
     sse = sse_ids(); usr = user_ids()
     check("[P1] every SSE DEK sealed under id=1", len(sse) >= 2 and all(i == 1 for i in sse), str(sse))
     check("[P1] every user SigV4 secret sealed under id=1", usr and all(i == 1 for i in usr), str(usr))
@@ -213,16 +274,41 @@ if ok:
     check("[P2b] id=1 retire_eligible ONLY after real completion", k1 and k1.get("retire_eligible") is True, str(k1))
     check("[P2b] crypto-status leaks no key material", all(len(k.get("key_hash", "")) <= 16 for k in cs.get("keys", [])), str(cs.get("keys")))
     st, body = s3("GET", "/zbkt/s2.txt"); check("[P2b] re-wrapped cross-shard object still decrypts", st == 200 and body == b"payload-two", str(st))
+    # The additive labels MUST survive re-wrap (the whole point of the in-place-mutate guard in
+    # key_rewrap.rs): mode/kms_key_id unchanged, only the sealing key id advances 1 -> 2.
+    da, dk = descriptor_for("atr.txt"), descriptor_for("kms.txt")
+    check("[P2b] at-rest descriptor re-wrapped to id=2, mode label intact",
+          da and da["kid"] == 2 and da["mode"] == "at-rest", str(da))
+    check("[P2b] KMS descriptor re-wrapped to id=2, mode+kms_key_id labels intact",
+          dk and dk["kid"] == 2 and dk["mode"] == "kms" and dk["kms_key_id"] == KMSID, str(dk))
+    st, body = s3("GET", "/abkt/atr.txt")
+    check("[P2b] at-rest object decrypts byte-exact after re-wrap", st == 200 and body == b"at-rest-payload", str(st))
+    st, body = s3("GET", "/zbkt/kms.txt")
+    check("[P2b] KMS object decrypts byte-exact after re-wrap", st == 200 and body == b"kms-payload", str(st))
+    st, hh = head("zbkt", "kms.txt")
+    check("[P2b] KMS object still advertises aws:kms + key id after re-wrap",
+          st == 200 and hh.get("x-amz-server-side-encryption") == "aws:kms"
+          and hh.get("x-amz-server-side-encryption-aws-kms-key-id") == KMSID, str(hh))
+    st, hh = head("abkt", "atr.txt")
+    check("[P2b] at-rest object still advertises nothing after re-wrap",
+          st == 200 and "x-amz-server-side-encryption" not in hh, str(hh))
 stop()
 
 print("\n== P3: retire id=1 (ring [2]) — all data still opens ==", flush=True)
 ok = start(base_env({"CAIRN_MASTER_KEY_RING": RING_2, "CAIRN_MASTER_KEY_ACTIVE_ID": "2"}), "p3")
 check("[P3] boots with id=1 retired", ok)
 if ok:
-    for (b, k, want) in [("abkt", "s1.txt", b"payload-one"), ("zbkt", "s2.txt", b"payload-two"), ("abkt", "s3.txt", b"payload-three")]:
+    for (b, k, want) in [("abkt", "s1.txt", b"payload-one"), ("zbkt", "s2.txt", b"payload-two"), ("abkt", "s3.txt", b"payload-three"),
+                         ("abkt", "atr.txt", b"at-rest-payload"), ("zbkt", "kms.txt", b"kms-payload")]:
         st, body = s3("GET", f"/{b}/{k}"); check(f"[P3] GET {b}/{k} opens after retire", st == 200 and body == want, f"{st} {body!r}")
+    st, hh = head("zbkt", "kms.txt")
+    check("[P3] KMS object still advertises aws:kms + key id after retire",
+          st == 200 and hh.get("x-amz-server-side-encryption") == "aws:kms"
+          and hh.get("x-amz-server-side-encryption-aws-kms-key-id") == KMSID, str(hh))
     put_sse("abkt", "s4.txt", b"post-retire")
     st, body = s3("GET", "/abkt/s4.txt"); check("[P3] new SSE write/read after retire", st == 200 and body == b"post-retire", str(st))
+    put_kms("zbkt", "kms2.txt", b"post-retire-kms")
+    st, body = s3("GET", "/zbkt/kms2.txt"); check("[P3] new SSE-KMS write/read after retire", st == 200 and body == b"post-retire-kms", str(st))
 stop()
 
 print("\n== P4: retire id=1 BEFORE re-wrap — startup retire-gate must refuse ==", flush=True)
@@ -232,6 +318,11 @@ check("[P4] baseline boots (single key id=1)", ok)
 if ok:
     s3("PUT", "/failbkt"); put_sse("failbkt", "doomed.txt", b"PLAINTEXT-MUST-NOT-LEAK")
     st, body = s3("GET", "/failbkt/doomed.txt"); check("[P4] baseline object readable under id=1", st == 200 and body == b"PLAINTEXT-MUST-NOT-LEAK", str(st))
+    # An at-rest and a KMS object sealed under id=1 too, so the retire-gate must refuse removing id=1
+    # for ALL three modes (it scans object_versions.sse_descriptor regardless of mode), not just
+    # SSE-S3. If the gate ever missed a mode, that mode would surface UnknownKeyId -> 5xx on read.
+    put_plain("failbkt", "doomed-atr.txt", b"PLAINTEXT-AT-REST-MUST-NOT-LEAK")
+    put_kms("failbkt", "doomed-kms.txt", b"PLAINTEXT-KMS-MUST-NOT-LEAK")
 stop()
 ok = start(base_env({"CAIRN_MASTER_KEY_RING": RING_2, "CAIRN_MASTER_KEY_ACTIVE_ID": "2"}), "p4b", expect_ok=False)
 check("[P4] retire-gate REFUSES startup when id=1 removed before re-wrap", not ok, "server unexpectedly started")
