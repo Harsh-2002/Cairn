@@ -167,14 +167,15 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   `/healthz` never *stopping* (60 s wedge timeout); the `stress.sh` RSS/fd/thread/WAL ceilings **plus
   a sampler-read-nothing gate** (a column reading zero all run FAILS — a zero peak passes every
   ceiling); and a 5xx counter EQUAL to the declared budget. **UI listener ON**; the launcher pins
-  `CAIRN_MAX_OBJECT_SIZE` (it is under test) and `CAIRN_REQUEST_TIMEOUT_SECS=600`. Carries four
-  pinned **FINDINGS** (reported loudly + declared into the 5xx budget, not gated): the under-declared
-  chunk length, oversized chunk header, non-hex chunk size and missing per-chunk signature each
-  answer **500 InternalError** instead of a 4xx — fail-closed (nothing is committed, and *that* is
-  gated) but a client-caused framing error surfacing as a server fault, because `DecodeError` travels
-  as `BlobError::Body(Transport(..))` and only `BodyError::Truncated` has a 4xx arm in
-  `impl From<BlobError> for Error` (`cairn-types/src/error.rs`). The other two 5xx here are correct:
-  `507` is S3's quota answer and simply lives in the 5xx range. Profile is env-tunable
+  `CAIRN_MAX_OBJECT_SIZE` (it is under test) and `CAIRN_REQUEST_TIMEOUT_SECS=600`. The four aws-chunked
+  framing malformations that once answered **500** (under-declared chunk length, oversized chunk header,
+  non-hex chunk size, missing per-chunk signature) are now **FIXED and GATED at exactly `(400,
+  InvalidArgument)`**: the decoder classifies each framing `DecodeError` as `BodyError::Malformed`
+  (→ 400) and `SizeExceeded` as `BodyError::TooLarge` (→ 413), instead of the old blanket
+  `Body(Transport(..)) → other => Error::Internal` (`cairn-types/src/error.rs`). Their `gap` is now
+  `None`, so any answer other than the exact 4xx FAILS the run. The pin/`gap` mechanism remains for any
+  future deviation. The one legitimately-declared 5xx is `507`, S3's quota answer, which lives in the
+  5xx range. Profile is env-tunable
   (`ADV_CHUNK_ROUNDS`, `ADV_PAGE_KEYS`, `ADV_DEL_PRESENT`, …), every knob that could empty a loop is
   validated at startup, and `STRESS_ADV_OUT=` writes the advisory JSON.
 - `stress_replication.sh` (+`.py`, boto3) — **replication under SUSTAINED LOAD across a MASTER-KEY

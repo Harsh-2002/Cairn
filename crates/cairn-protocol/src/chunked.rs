@@ -361,12 +361,24 @@ pub fn decode_stream(
                     let mut out = Vec::new();
                     if let Err(e) = st.decoder.push(&chunk, &mut out) {
                         st.done = true;
-                        let msg = if e == DecodeError::SignatureMismatch {
-                            CHUNK_SIGNATURE_FAILURE_MARKER.to_owned()
-                        } else {
-                            e.to_string()
+                        // Classify the decode failure so the ingest path returns the RIGHT status,
+                        // not a blanket 500. A signature mismatch is an auth failure (kept as a
+                        // marked `Transport` so `map_stage_err` surfaces it as `SignatureDoesNotMatch`,
+                        // 403); an over-size stream is `TooLarge` (413); every other framing error is
+                        // a client-caused `Malformed` body (400) — a bad chunk header/size/CRLF is
+                        // the client's fault, never a server fault.
+                        let body_err = match e {
+                            DecodeError::SignatureMismatch => {
+                                BodyError::Transport(CHUNK_SIGNATURE_FAILURE_MARKER.to_owned())
+                            }
+                            DecodeError::SizeExceeded => BodyError::TooLarge,
+                            DecodeError::BadHeader
+                            | DecodeError::BadHex
+                            | DecodeError::HeaderTooLong
+                            | DecodeError::MissingCrlf
+                            | DecodeError::Incomplete => BodyError::Malformed(e.to_string()),
                         };
-                        return Some((Err(BodyError::Transport(msg)), st));
+                        return Some((Err(body_err), st));
                     }
                     st.pending.extend(out);
                 }
@@ -529,6 +541,47 @@ mod tests {
             d.push(&tampered, &mut out),
             Err(DecodeError::SignatureMismatch)
         );
+    }
+
+    use cairn_types::error::BodyError;
+
+    // Drive `decode_stream` over a single raw chunk and return its terminal item.
+    async fn drive_stream(
+        raw: &'static [u8],
+        decoder: ChunkDecoder,
+    ) -> Option<Result<Bytes, BodyError>> {
+        use futures_util::StreamExt;
+        let body: cairn_types::BodyStream = Box::pin(futures_util::stream::once(async move {
+            Ok(Bytes::from_static(raw))
+        }));
+        let mut out = decode_stream(body, decoder);
+        let mut last = None;
+        while let Some(item) = out.next().await {
+            last = Some(item);
+        }
+        last
+    }
+
+    #[tokio::test]
+    async fn a_malformed_frame_folds_to_a_client_error_not_a_transport_fault() {
+        // A non-hex chunk size (`BadHex`) is a client framing error. It must surface as
+        // `BodyError::Malformed` (→ 400), NOT the old `Transport` (→ 500 InternalError). This is the
+        // exact class the adversarial harness pinned as a FINDING; before the change it folded to
+        // Transport and this asserts it no longer does.
+        match drive_stream(b"zz\r\n", ChunkDecoder::unsigned(1 << 20)).await {
+            Some(Err(BodyError::Malformed(_))) => {}
+            other => panic!("expected Malformed for a non-hex size, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_oversize_stream_folds_to_too_large() {
+        // Declaring a chunk larger than the payload ceiling is `SizeExceeded` → `TooLarge` (→ 413),
+        // matching BlobError::SizeExceeded, not a generic 400/500.
+        match drive_stream(b"10\r\n0123456789abcdef\r\n", ChunkDecoder::unsigned(4)).await {
+            Some(Err(BodyError::TooLarge)) => {}
+            other => panic!("expected TooLarge for an over-ceiling chunk, got {other:?}"),
+        }
     }
 }
 

@@ -31,12 +31,14 @@ duplicate key in one pass; no unrelated key destroyed), fail-closed-ness (a reje
 nothing), and liveness. Every assertion loop has a non-zero-count companion gate and every env knob
 that could empty a loop is validated up front, so the harness cannot be tuned into a vacuous pass.
 
-FINDINGS, NOT A HIDDEN BUDGET. A malformed request should never be a 5xx. Where this server answers
-one anyway, the case is pinned as a FINDING: printed loudly, written to the JSON, and declared into
-the launcher's 5xx budget so the budget stays an EQUALITY (any *other* 5xx still fails the run) --
-never silently accepted as "expected". The other 5xx class is legitimate and declared for the same
-reason: `507 InsufficientStorage` is the S3-correct answer to a quota rejection and simply happens
-to live in the 5xx range.
+FINDINGS, NOT A HIDDEN BUDGET. A malformed request should never be a 5xx. The four aws-chunked
+framing malformations that once answered 500 (under-declared length, over-long header, non-hex size,
+missing per-chunk signature) are now FIXED and GATED at exactly (400, InvalidArgument) -- the decoder
+classifies each as BodyError::Malformed. The mechanism remains for any FUTURE deviation: a case can
+pin a `gap` (status, code) that is printed loudly, written to the JSON, and declared into the
+launcher's 5xx budget so the budget stays an EQUALITY (any *other* 5xx still fails the run) -- never
+silently accepted. The one legitimately-declared 5xx is `507 InsufficientStorage`, the S3-correct
+answer to a quota rejection, which simply happens to live in the 5xx range.
 
 Usage: stress_adversarial.py <ak> <sk> <bearer> <s3-endpoint> <mgmt-endpoint> <out-json>
 Env knobs (all validated): ADV_CHUNK_ROUNDS ADV_CHUNK_VALID ADV_CHUNK_BODY ADV_CHUNK_PIECE
@@ -420,16 +422,18 @@ MALFORMED_CASES = [
     {"name": "declared_length_too_long", "corrupt": "declared_long",
      "expect": (400, "InvalidArgument"), "gap": None},
     # The rest UNDER-declare / mangle the framing. All are pure client-side malformation, so a 4xx
-    # is the correct answer; today they travel as BlobError::Body(Transport(..)) which the blanket
-    # `other => Error::Internal` arm maps to 500 (see the FINDING notes in the scenario).
+    # is the correct answer, and now GATED at exactly that: the decoder classifies each framing
+    # DecodeError as BodyError::Malformed -> InvalidArgument (400) instead of the old blanket
+    # Body(Transport(..)) -> `other => Error::Internal` (500). `gap: None` -> no 5xx is declared and
+    # any answer other than (400, InvalidArgument) now FAILS the run (previously a pinned FINDING).
     {"name": "declared_length_too_short", "corrupt": "declared_short",
-     "expect": (400, "InvalidArgument"), "gap": (500, "InternalError")},
+     "expect": (400, "InvalidArgument"), "gap": None},
     {"name": "oversized_chunk_header", "corrupt": "oversized_header",
-     "expect": (400, "InvalidArgument"), "gap": (500, "InternalError")},
+     "expect": (400, "InvalidArgument"), "gap": None},
     {"name": "non_hex_chunk_size", "corrupt": "bad_hex",
-     "expect": (400, "InvalidArgument"), "gap": (500, "InternalError")},
+     "expect": (400, "InvalidArgument"), "gap": None},
     {"name": "missing_chunk_signature", "corrupt": "no_signature",
-     "expect": (400, "InvalidArgument"), "gap": (500, "InternalError")},
+     "expect": (400, "InvalidArgument"), "gap": None},
 ]
 
 
