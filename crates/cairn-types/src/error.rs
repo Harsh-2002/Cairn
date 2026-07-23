@@ -136,6 +136,17 @@ pub enum ReplicationError {
     /// does consume the budget.)
     #[error("replication target unavailable: {0}")]
     Unavailable(String),
+    /// The destination answered `404`: it has no such object/bucket. **Terminal**, exactly like
+    /// [`Terminal`](Self::Terminal) — it is split out only so callers can recognise "the replica
+    /// never landed" *structurally*.
+    ///
+    /// It exists because the alternative was a substring match: the terminal message embeds the
+    /// destination's response body, so `msg.contains("404")` misclassifies any 4xx whose XML body
+    /// happens to contain those three digits (a request id, a key name, a byte count) as a benign
+    /// absent replica. The audit's `--verify` distinguishes "absent" from "corrupt", and that
+    /// distinction must not hinge on string formatting.
+    #[error("replication destination has no such object: {0}")]
+    NotFound(String),
     /// A permanent failure; the entry should be marked failed for operator attention.
     #[error("terminal replication failure: {0}")]
     Terminal(String),

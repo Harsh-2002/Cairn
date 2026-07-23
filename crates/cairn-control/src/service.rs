@@ -38,6 +38,23 @@ const MAX_PAGES: u32 = 100_000;
 /// fails to delete cannot accumulate an unbounded error list in memory (audit #26).
 const MAX_DELETE_PREFIX_ERRORS: usize = 1_000;
 
+/// Distinct **keys** a single `RequeueReplicationVersions` batch may page over. A forced resync is
+/// otherwise an unbounded UPDATE running inside one group-commit transaction on the single Writer —
+/// i.e. it would stall every write on the node and grow the WAL for exactly the large-bucket
+/// incident this repairs.
+///
+/// The unit is the key, not the row, and that is a **correctness** requirement: every terminal row
+/// of a key must be requeued in the same transaction as its siblings, or an older version can be
+/// re-shipped after a newer one (see `Mutation::RequeueReplicationVersions`). Sized so that one
+/// transaction — `limit` keys times their version histories — stays well under a human-perceptible
+/// stall.
+const REQUEUE_BATCH_KEYS: u32 = 500;
+
+/// Hard bound on requeue batches per resync request, so a pathological store (or a bug that stops
+/// the cursor advancing) can never spin the writer forever. At `REQUEUE_BATCH_KEYS` this covers a
+/// bucket of five hundred million keys.
+const REQUEUE_MAX_BATCHES: u32 = 1_000_000;
+
 /// A management-API response: an HTTP status, a JSON body, and a per-request id. The caller sets
 /// `content-type: application/json` and emits `request_id` as the `x-amz-request-id` header on
 /// every response, success or error (ARCH 25.1).
@@ -378,7 +395,7 @@ impl ControlService {
                 self.retry_replication(name, principal).await
             }
             (&Method::POST, ["buckets", name, "replication", "resync"]) => {
-                self.resync_replication(name, principal).await
+                self.resync_replication(name, query, principal).await
             }
             (&Method::GET, ["buckets", name, "replication", "status"]) => {
                 self.replication_status(name).await
@@ -2747,14 +2764,34 @@ impl ControlService {
         )
     }
 
-    /// `POST /buckets/{name}/replication/resync`: trigger existing-object backfill (ARCH 20.5).
-    /// Requires the bucket to have a replication configuration with at least one enabled rule whose
-    /// `ExistingObjectReplication` is enabled. The actual enumeration runs as a spawned background
-    /// task (a large bucket must not block the request); the entries it enqueues are idempotent, so
-    /// re-running a resync is safe and already-replicated versions are not re-shipped.
+    /// `POST /buckets/{name}/replication/resync[?force=true][&only_encrypted=false]`: trigger
+    /// existing-object backfill (ARCH 20.5). The enumeration runs as a spawned background task (a
+    /// large bucket must not block the request).
+    ///
+    /// The enqueue is idempotent on the deterministic `backfill:{rule}:{key}:{version}` id, which
+    /// makes a repeat resync safe — and, in the repair case, **useless**: while a terminal
+    /// (`completed`/`failed`) outbox row for that id still exists, `INSERT OR IGNORE` silently
+    /// no-ops. The row survives for `CAIRN_REPLICATION_RETENTION_SECS` (default 24 h). *(The former
+    /// doc comment here claimed "already-replicated versions are not re-shipped"; that is factually
+    /// wrong and the operator remediation depends on the real behaviour — `process_entry`
+    /// deliberately does **not** skip a version stamped `Completed`, because under 1→N fan-out that
+    /// would starve every other target. A first-pass resync therefore DOES re-ship a corrupt
+    /// `completed` version, provided its outbox row was already pruned.)*
+    ///
+    /// `?force=true` closes that window: [`Mutation::RequeueReplicationVersions`] flips the bucket's
+    /// terminal outbox rows (and their version-row ledger stamps) back to `pending` before the
+    /// backfill runs, so a **second** repair pass actually re-ships. Scoped to encrypted versions by
+    /// default (`&only_encrypted=false` widens it), because that is the blast radius of the
+    /// pre-release-X SSE replication defect.
+    ///
+    /// TRAP: without `force`, a bucket whose rules do not set `ExistingObjectReplication` is
+    /// rejected outright. **With** `force` the requeue half is still worth doing, so the request is
+    /// accepted and the flag is echoed in the response instead — the caller must surface it, or the
+    /// operator sees a success that repaired nothing.
     async fn resync_replication(
         &self,
         name: &str,
+        query: &[(String, String)],
         principal: Option<&Principal>,
     ) -> ControlResponse {
         let bucket_name = match self.require_bucket(name).await {
@@ -2790,22 +2827,48 @@ impl ControlService {
                 return ControlResponse::bad_request(&format!("invalid replication config: {e}"));
             }
         };
-        if !cfg
+        let force = find_query(query, "force").is_some_and(|v| v.eq_ignore_ascii_case("true"));
+        let only_encrypted =
+            !find_query(query, "only_encrypted").is_some_and(|v| v.eq_ignore_ascii_case("false"));
+        let existing_object_replication = cfg
             .rules
             .iter()
-            .any(|r| r.enabled && r.existing_object_replication)
-        {
+            .any(|r| r.enabled && r.existing_object_replication);
+        if !existing_object_replication && !force {
             return ControlResponse::bad_request(
                 "no enabled rule has existing-object replication (set ExistingObjectReplication=Enabled)",
             );
         }
 
-        // Spawn the bounded backfill; the request returns immediately.
+        // Spawn the repair: the requeue (when forced) and then the backfill, in that order and in
+        // one task. The request returns immediately — neither half may block it.
+        //
+        // The requeue must complete BEFORE the backfill, because the backfill's `INSERT OR IGNORE`
+        // has to observe the requeued rows rather than race them; running them in the same task in
+        // sequence is what guarantees that without holding the HTTP request open.
+        //
+        // And the requeue is NOT one statement. A single unbounded UPDATE on a large bucket would
+        // hold one group-commit transaction, and therefore every write on the node, for the length
+        // of a full-table scan while growing the WAL. `RetryFailedReplication` is not a precedent
+        // for that: it touches only the `failed` rows. Instead each submit pages over
+        // `REQUEUE_BATCH_KEYS` distinct KEYS — never a bare row count, because a key's terminal rows
+        // must move together or an older version re-ships after a newer one — and `requeue_all`
+        // threads the page cursor forward until the keyspace is drained, so the Writer drains
+        // between batches and no pass rescans what an earlier one already did.
         let meta = self.meta.clone();
         let clock = self.clock.clone();
         let bucket = bucket_name.clone();
         let wake = self.replication_wake.clone();
+        let actor = principal.map(|p| p.access_key_id.clone());
         tokio::spawn(async move {
+            if force {
+                requeue_all(&meta, &clock, &bucket, only_encrypted, actor).await;
+                // The requeued entries are due immediately; wake the worker so the repair starts
+                // draining now rather than on the next heartbeat.
+                if let Some(w) = &wake {
+                    w();
+                }
+            }
             backfill_replication(meta, clock, bucket, cfg, wake).await;
         });
 
@@ -2818,7 +2881,12 @@ impl ControlService {
         .await;
         ControlResponse::json(
             StatusCode::ACCEPTED,
-            &wire::ReplicationResyncResp { started: true },
+            &wire::ReplicationResyncResp {
+                started: true,
+                forced: force,
+                only_encrypted: force && only_encrypted,
+                existing_object_replication,
+            },
         )
     }
 
@@ -3231,6 +3299,154 @@ fn target_count_wire(
     }
 }
 
+/// Drive [`Mutation::RequeueReplicationVersions`] to completion for `bucket`, one key page at a
+/// time, threading the page cursor forward.
+///
+/// Each submit pages over at most [`REQUEUE_BATCH_KEYS`] distinct keys, requeues every terminal row
+/// of every key in that page in one transaction, and returns the page's last key; this loops with
+/// that key as the next `after_key` until a pass returns an empty page. The forward cursor is what
+/// keeps a full requeue linear — re-deriving the page from the start of the keyspace on every pass
+/// would be quadratic on exactly the large buckets paging exists for.
+///
+/// Termination is driven by the CURSOR, never by the row count: a page that changed no rows must
+/// still advance, or the requeue stops half-way and reports success.
+///
+/// Runs in the spawned repair task, so a failure is logged rather than returned: the request has
+/// already been answered `202 Accepted`, exactly like the backfill that follows it.
+async fn requeue_all(
+    meta: &Arc<dyn MetadataStore>,
+    clock: &Arc<dyn Clock>,
+    bucket: &BucketName,
+    only_encrypted: bool,
+    principal: Option<String>,
+) {
+    let mut requeued: u64 = 0;
+    let mut after_key: Option<String> = None;
+    let mut converged = false;
+    for _ in 0..REQUEUE_MAX_BATCHES {
+        let outcome = meta
+            .submit(Mutation::RequeueReplicationVersions {
+                bucket: bucket.clone(),
+                only_encrypted,
+                now: clock.now(),
+                after_key: after_key.clone(),
+                limit: REQUEUE_BATCH_KEYS,
+            })
+            .await;
+        match outcome {
+            Ok(MutationOutcome::RowsRequeued { rows, page_end }) => {
+                requeued += rows;
+                match page_end {
+                    Some(k) => after_key = Some(k),
+                    // Empty page: the bucket's keyspace is drained.
+                    None => {
+                        converged = true;
+                        break;
+                    }
+                }
+            }
+            // No other outcome is reachable; stop rather than spinning the writer on a mutation
+            // that is not reporting progress. NOT convergence — say so.
+            Ok(_) => break,
+            Err(e) => {
+                // The LOUDER of the two non-convergence paths, so it gets at least as much
+                // operator-visible signal as the truncation below: a log line alone is invisible to
+                // anyone who was not tailing logs at the moment the spawned task failed, and the 202
+                // went out long ago. Same shape, same `resume_after` cursor, different action.
+                tracing::error!(
+                    bucket = %bucket.as_str(),
+                    only_encrypted,
+                    rows = requeued,
+                    resume_after = after_key.as_deref().unwrap_or(""),
+                    error = %e,
+                    "forced replication resync: requeue FAILED part-way; the rows already requeued \
+                     WILL re-ship, keys at or past `resume_after` were NOT requeued and will not — \
+                     re-run the resync"
+                );
+                record_resync_incident(
+                    meta,
+                    clock,
+                    bucket,
+                    "ResyncReplicationFailed",
+                    after_key,
+                    principal,
+                )
+                .await;
+                return;
+            }
+        }
+        // Yield between batches so a very large bucket's repair interleaves with live writes
+        // instead of monopolising the queue.
+        tokio::task::yield_now().await;
+    }
+    if !converged {
+        // Falling out of the loop with the cursor still set means the batch budget was exhausted (or
+        // the mutation stopped reporting progress) with keys left unrequeued. Practically
+        // unreachable, but it is the one path that could otherwise report a half-done repair as
+        // done — so it is loud, and it is recorded in the activity feed where an operator who was
+        // not tailing logs will still see it. The 202 was already sent, so it cannot ride the HTTP
+        // response; `resume_after` is the cursor to hand back on a re-run.
+        tracing::error!(
+            bucket = %bucket.as_str(),
+            only_encrypted,
+            rows = requeued,
+            max_batches = REQUEUE_MAX_BATCHES,
+            resume_after = after_key.as_deref().unwrap_or(""),
+            "forced replication resync: requeue DID NOT CONVERGE — the batch budget was exhausted \
+             with keys still unrequeued. The repair is INCOMPLETE: keys at or past `resume_after` \
+             were NOT requeued and will NOT re-ship. Re-run the resync."
+        );
+        record_resync_incident(
+            meta,
+            clock,
+            bucket,
+            "ResyncReplicationTruncated",
+            after_key,
+            principal,
+        )
+        .await;
+        return;
+    }
+    tracing::warn!(
+        bucket = %bucket.as_str(),
+        only_encrypted,
+        rows = requeued,
+        "forced replication resync: terminal outbox entries requeued for UNCONDITIONAL re-ship \
+         (expect a drain surge and destination egress)"
+    );
+}
+
+/// Record an incomplete forced-requeue in the activity feed.
+///
+/// Both non-convergence paths — the batch budget running out and the mutation erroring part-way —
+/// leave the repair INCOMPLETE, and both happen inside the spawned task long after the `202
+/// Accepted` went out. A `tracing` line reaches only an operator who happened to be tailing logs, so
+/// each also lands here, where the console shows it. `key` carries the resume cursor: keys at or
+/// past it were not requeued.
+///
+/// Best-effort by construction — this runs on a path where the store is already misbehaving, and a
+/// failure to record the incident must not panic the task or mask the log line above it.
+async fn record_resync_incident(
+    meta: &Arc<dyn MetadataStore>,
+    clock: &Arc<dyn Clock>,
+    bucket: &BucketName,
+    action: &str,
+    resume_after: Option<String>,
+    actor: Option<String>,
+) {
+    let entry = cairn_types::meta::ActivityEntry {
+        id: uuid::Uuid::new_v4().simple().to_string(),
+        action: action.to_owned(),
+        bucket: Some(bucket.as_str().to_owned()),
+        key: resume_after,
+        size: None,
+        etag: None,
+        actor,
+        at: clock.now(),
+    };
+    let _ = meta.submit(Mutation::RecordActivity(Box::new(entry))).await;
+}
+
 async fn backfill_replication(
     meta: Arc<dyn MetadataStore>,
     clock: Arc<dyn Clock>,
@@ -3315,4 +3531,54 @@ async fn backfill_replication(
         }
     }
     tracing::info!(bucket = %bucket.as_str(), enqueued, "replication backfill complete");
+}
+
+#[cfg(test)]
+mod resync_incident_tests {
+    use super::record_resync_incident;
+    use cairn_types::id::BucketName;
+    use cairn_types::testing::{InMemoryMetadataStore, TestClock};
+    use cairn_types::traits::{Clock, MetadataStore};
+    use std::sync::Arc;
+
+    /// BOTH non-convergence paths of a forced requeue must leave an operator-visible record, not
+    /// just a log line. They run inside the spawned repair task, long after the `202 Accepted` went
+    /// out, so an operator who was not tailing logs at that exact moment has no other way to learn
+    /// that the repair is incomplete — and the ERROR path is the louder failure of the two.
+    #[tokio::test]
+    async fn both_incomplete_requeue_paths_are_recorded_in_the_activity_feed() {
+        let meta: Arc<dyn MetadataStore> = Arc::new(InMemoryMetadataStore::new());
+        let clock: Arc<dyn Clock> = Arc::new(TestClock::at_secs(7));
+        let bucket = BucketName::parse("photos").unwrap();
+
+        for action in ["ResyncReplicationTruncated", "ResyncReplicationFailed"] {
+            record_resync_incident(
+                &meta,
+                &clock,
+                &bucket,
+                action,
+                Some("k/resume-here".to_owned()),
+                Some("AKIAOPERATOR".to_owned()),
+            )
+            .await;
+        }
+
+        let feed = meta.list_activity(10).await.unwrap();
+        let mut actions: Vec<&str> = feed.iter().map(|e| e.action.as_str()).collect();
+        actions.sort_unstable();
+        assert_eq!(
+            actions,
+            vec!["ResyncReplicationFailed", "ResyncReplicationTruncated"],
+            "the error path must not be the quieter of the two"
+        );
+        for e in &feed {
+            assert_eq!(e.bucket.as_deref(), Some("photos"));
+            assert_eq!(
+                e.key.as_deref(),
+                Some("k/resume-here"),
+                "the resume cursor is the actionable part: keys at or past it were not requeued"
+            );
+            assert_eq!(e.actor.as_deref(), Some("AKIAOPERATOR"));
+        }
+    }
 }

@@ -18,9 +18,10 @@ metadata commit is **the single linearization point of every mutation** (ARCH 11
   reads → `with_read` on the blocking pool. Listing is a half-open range seek (`range.rs`).
 - `apply.rs` — `Mutation` → SQL. Preconditions are evaluated **here, inside the savepoint**, so
   check-and-upsert is atomic. **Mirror any change in `cairn-meta-async/src/apply.rs`** (4(+1)-site).
-- `schema.rs` — migrations: **append-only**, monotonic `version` (latest is 22 — multipart SSE
+- `schema.rs` — migrations: **append-only**, monotonic `version` (latest is 23 — multipart SSE
   columns: `multipart_uploads.sse_requested` v15, `.encrypt_parts` + `multipart_parts.part_dek` v21,
-  `.sse_kms_requested`/`sse_kms_key_id`/`sse_bucket_key_enabled` v22); never edit an applied
+  `.sse_kms_requested`/`sse_kms_key_id`/`sse_bucket_key_enabled` v22; `object_versions.replicated_at`
+  + `idx_outbox_bucket_key` v23); never edit an applied
   migration, never reorder — add a new one.
 - `model.rs` — SQL row ↔ domain-type conversions; complex fields (compression, ACL, checksums,
   user-metadata) are JSON columns. `engine_err` maps constraint violations → `MetaError::Conflict`.

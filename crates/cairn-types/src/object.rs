@@ -215,6 +215,21 @@ pub struct ObjectVersionRow {
     pub sse_descriptor: Option<String>,
     /// Replication status for replication-enabled buckets.
     pub replication_status: Option<crate::meta::ReplicationStatus>,
+    /// When this version was last **successfully shipped** to a replication destination — stamped
+    /// by [`Mutation::MarkReplicationDone`](crate::meta::Mutation::MarkReplicationDone) in the same
+    /// UPDATE that sets `replication_status = Completed` (schema v23). The engine reads the clock at
+    /// **ship completion**, not at the start of the drain batch, so the stamp means what it says.
+    ///
+    /// `None` means "never shipped from this node" *or* "shipped before the v23 migration"; the two
+    /// are indistinguishable on an upgraded node. The replication audit treats `None` as suspect on
+    /// purpose — over-reporting costs one wasted re-ship, under-reporting leaves a garbage replica
+    /// nobody looks for.
+    ///
+    /// This exists because `replication_status` alone cannot distinguish a version that replicated
+    /// *before* a fix from one that was force-requeued and has since re-shipped correctly (both read
+    /// `Completed`, and `created_at` is never rewritten). It is deliberately **not** `updated_at`,
+    /// which feeds the client-visible S3 `LastModified`.
+    pub replicated_at: Option<Timestamp>,
     /// Creation time.
     pub created_at: Timestamp,
     /// Last-update time.

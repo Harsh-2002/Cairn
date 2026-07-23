@@ -231,7 +231,10 @@ impl ReplicationEngine {
                     report.deferred += 1;
                     continue;
                 }
-                match self.process_entry(meta, router, blobs, now, entry).await? {
+                match self
+                    .process_entry(meta, router, blobs, clock, now, entry)
+                    .await?
+                {
                     EntryOutcome::Completed { bytes } => {
                         report.completed += 1;
                         report.bytes += bytes;
@@ -308,11 +311,12 @@ impl ReplicationEngine {
 
     /// Process exactly one outbox entry, contacting the sink and recording the result on the
     /// outbox. Returns how the entry resolved so the caller can preserve per-key ordering.
-    async fn process_entry<M, R, B>(
+    async fn process_entry<M, R, B, C>(
         &self,
         meta: &M,
         router: &R,
         blobs: &Arc<B>,
+        clock: &C,
         now: Timestamp,
         entry: &OutboxEntry,
     ) -> Result<EntryOutcome, MetaError>
@@ -320,6 +324,7 @@ impl ReplicationEngine {
         M: MetadataStore + ?Sized,
         R: SinkRouter + ?Sized,
         B: BlobStore + ?Sized,
+        C: Clock + ?Sized,
     {
         // Load the version this entry concerns.
         let row = meta
@@ -342,8 +347,11 @@ impl ReplicationEngine {
         // target re-ships, which is harmless because the destination overwrites identical bytes
         // (at-least-once, ARCH 20.4).
         if row.replication_status == Some(ReplicationStatus::Replica) {
-            meta.submit(Mutation::MarkReplicationDone(entry.id.clone()))
-                .await?;
+            meta.submit(Mutation::MarkReplicationDone {
+                id: entry.id.clone(),
+                now,
+            })
+            .await?;
             return Ok(EntryOutcome::Completed { bytes: 0 });
         }
 
@@ -442,7 +450,12 @@ impl ReplicationEngine {
 
         match sink_result {
             Ok(bytes) => {
-                self.mark_done(meta, entry).await?;
+                // SHIP-COMPLETION time, not the batch-start `now`. `replicated_at` is documented as
+                // "when this version was last successfully shipped", and a batch can take a while:
+                // stamping the batch-start clock would understate it by up to one pass. The
+                // difference never changes the audit's cutoff comparison (the cutoff is always in
+                // the past), but the field and its doc have to mean the same thing.
+                self.mark_done(meta, entry, clock.now()).await?;
                 Ok(EntryOutcome::Completed { bytes })
             }
             Err(ReplicationError::Retryable(msg)) => {
@@ -457,7 +470,11 @@ impl ReplicationEngine {
                 self.reschedule_unavailable(meta, entry, now, &msg, UnavailableCause::Destination)
                     .await
             }
-            Err(ReplicationError::Terminal(msg)) => {
+            // `NotFound` is terminal exactly like `Terminal` — the destination rejecting the
+            // request with a 404 (no such bucket, say) is not something a retry fixes. It is a
+            // distinct variant only so the operator audit can tell "never landed" from "landed
+            // wrong" without pattern-matching on a message string.
+            Err(ReplicationError::NotFound(msg) | ReplicationError::Terminal(msg)) => {
                 self.mark_failed(meta, entry, &msg, None).await?;
                 Ok(EntryOutcome::Failed)
             }
@@ -529,7 +546,12 @@ impl ReplicationEngine {
     /// Mark the entry done and stamp the version [`ReplicationStatus::Completed`]. The
     /// version re-upsert carries `replication: None`, so it enqueues no new outbox entry and
     /// cannot cause a replication loop.
-    async fn mark_done<M>(&self, meta: &M, entry: &OutboxEntry) -> Result<(), MetaError>
+    async fn mark_done<M>(
+        &self,
+        meta: &M,
+        entry: &OutboxEntry,
+        now: Timestamp,
+    ) -> Result<(), MetaError>
     where
         M: MetadataStore + ?Sized,
     {
@@ -537,8 +559,13 @@ impl ReplicationEngine {
         // UPDATE keyed to (bucket,key,version). We must NOT additionally re-`PutObjectVersion` the
         // whole (pre-ship) row: that forces is_latest and would demote a newer version written during
         // the ship window, or resurrect one deleted meanwhile (audit 2026-07).
-        meta.submit(Mutation::MarkReplicationDone(entry.id.clone()))
-            .await?;
+        // `now` also stamps the version's `replicated_at` (schema v23) — the replication-owned
+        // clock the audit needs to tell a fresh, correct ship from a stale pre-fix one.
+        meta.submit(Mutation::MarkReplicationDone {
+            id: entry.id.clone(),
+            now,
+        })
+        .await?;
         Ok(())
     }
 

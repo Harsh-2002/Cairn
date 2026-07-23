@@ -540,6 +540,31 @@ ALTER TABLE multipart_uploads ADD COLUMN sse_kms_key_id         TEXT;
 ALTER TABLE multipart_uploads ADD COLUMN sse_bucket_key_enabled INTEGER NOT NULL DEFAULT 0;
 "#,
     },
+    Migration {
+        version: 23,
+        name: "replication completion timestamp",
+        sql: r#"
+-- When a version was last SHIPPED (ARCH 20.5, the SSE plaintext-seam repair). `replication_status`
+-- alone cannot tell a version that replicated BEFORE the fix from one that was force-requeued and
+-- has since re-shipped CORRECTLY: both read `completed`, and `created_at` is never rewritten. The
+-- audit's "is this replica suspect?" predicate therefore needs a second, replication-owned clock.
+--   * object_versions.replicated_at: unix seconds at which MarkReplicationDone last stamped this
+--     version `completed`. NULL = never successfully shipped from this node, OR shipped before this
+--     migration — the two are indistinguishable on an upgraded node, and the audit deliberately
+--     treats NULL as SUSPECT (over-report costs one wasted re-ship; under-report leaves a garbage
+--     replica nobody looks for). It resolves itself as versions are re-shipped and stamped.
+--     Deliberately NOT `updated_at`, which feeds the client-visible S3 `LastModified` — stamping
+--     that on replication would silently mutate object metadata.
+ALTER TABLE object_versions ADD COLUMN replicated_at INTEGER;
+
+-- The forced-resync requeue pages the bucket's terminal outbox rows KEY BY KEY (a key's rows must
+-- be requeued together, or an older version re-ships after a newer one). The existing indexes are
+-- (status, next_attempt_at) and (status, enqueued_at), neither of which can order or seek by key —
+-- so without this the per-page `key > ?cursor ORDER BY key` seek is a full scan per page, i.e.
+-- quadratic on exactly the large buckets the paging exists for.
+CREATE INDEX idx_outbox_bucket_key ON replication_outbox (bucket_name, key);
+"#,
+    },
 ];
 
 /// Run all pending migrations on the write connection, recording each as applied.
@@ -730,6 +755,43 @@ mod tests {
             .unwrap();
         assert_eq!(req, 0, "sse_kms_requested defaults to 0");
         assert_eq!(bke, 0, "sse_bucket_key_enabled defaults to 0");
+    }
+
+    #[test]
+    fn migration_v23_adds_replication_completion_stamp_and_outbox_key_index() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        assert!(column_exists(&conn, "object_versions", "replicated_at"));
+        // NULL for every existing row, including ones that replicated fine before the upgrade —
+        // the audit deliberately reads that as suspect and re-ships them once (see the module doc
+        // on `replication_audit` and `docs/operations.md` 8.7).
+        conn.execute(
+            "INSERT INTO object_versions (id, bucket_name, key, version_id, is_latest, is_delete_marker, \
+             size_logical, size_physical, etag, content_type, compression, storage_class, owner_id, \
+             user_metadata, checksums, created_at, updated_at) \
+             VALUES ('i', 'b', 'k', 'v', 1, 0, 0, 0, 'e', 'text/plain', '\"Uncompressed\"', 'standard', 'o', '[]', '[]', 0, 0)",
+            [],
+        )
+        .unwrap();
+        let stamp: Option<i64> = conn
+            .query_row(
+                "SELECT replicated_at FROM object_versions WHERE id='i'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stamp, None, "replicated_at backfills as NULL, never as 0");
+
+        // The key-paged requeue seeks `(bucket_name, key)` on the outbox; without this index every
+        // page is a full scan, i.e. quadratic on exactly the buckets paging exists for.
+        let idx: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_outbox_bucket_key'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx, 1);
     }
 
     #[test]

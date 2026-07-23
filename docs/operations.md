@@ -244,3 +244,267 @@ Multipart uploads are encrypted per part: each staged part is written encrypted 
 re-encrypts under the object DEK, so nothing plaintext is ever on disk for an SSE upload. An upload
 pins its encryption intent at `CreateMultipartUpload`; see §7's retirement note for the fail-closed
 window when the master key is retired mid-upload.
+
+### 8.7 Repairing encrypted objects that replicated wrongly (the plaintext-seam incident)
+
+**What happened.** Before release X the replication engine read source blobs with **no data key**
+(`docs/replication.md` 20.1). Any version encrypted by SSE-S3, SSE-KMS, or `CAIRN_ENCRYPT_AT_REST`
+was therefore shipped to the mirror as raw **ciphertext**. Two outcomes, and they need different
+urgency:
+
+- the destination rejected it with `400 BadDigest` **only** when the source object happened to carry
+  a supplementary `x-amz-checksum-*` value. That is terminal and never retried, so the object is
+  simply **absent** on the mirror. Unprotected, but not misleading;
+- otherwise — a multipart-completed object, a `curl` or presigned PUT, an older SDK — the
+  destination **accepted** it. The replica exists, is exactly the right size, answers `200`, and is
+  **garbage**. Anyone who failed over to the mirror in that window restored garbage and got a `200`
+  while doing it.
+
+Upgrading fixes new writes. **It heals nothing already on the mirror.**
+
+#### Detect
+
+`GET /replication/failed` is **not** the ledger and will reassure you falsely: the outbox is pruned
+at `CAIRN_REPLICATION_RETENTION_SECS` (default 24 h) and shows only recent failures. The durable
+ledger is the version row (`object_versions.replication_status`), which is never pruned. Enumerate
+it node-locally:
+
+```sh
+# --before is REQUIRED: the moment you deployed the fix on THIS node.
+cairn replication audit --before 2026-07-23T10:00:00Z         # or bare epoch seconds
+cairn replication audit --before 2026-07-23T10:00:00Z --bucket photos --json
+cairn replication audit --before 2026-07-23T10:00:00Z --verify  # EXPENSIVE, see below
+```
+
+**Why the cutoff is mandatory.** Only versions written by the *pre-fix* binary can be damaged. A
+version encrypted and replicated after the fix is equally encrypted and equally `completed`, and is
+perfectly healthy — nothing about the row distinguishes it except when it was created. Audit without
+a bound and you are counting your healthy encrypted replicas alongside the damaged ones: the number
+never reaches zero, so it tells you nothing about whether the repair worked. Use the deployment
+timestamp; err slightly late rather than early (an extra re-ship costs egress, a missed one leaves
+garbage on the mirror).
+
+The output separates three populations:
+
+| Count | Meaning | Action |
+|---|---|---|
+| `present_and_suspect` | On the mirror, may be garbage. **The dangerous one.** | Repair. |
+| `absent` | Rejected at the destination, never landed. Unprotected but honest. | Repair (or accept). |
+| `repair_pending` | In-window and queued/claimed: **repair in flight**, bytes not yet re-shipped. | Wait. |
+
+Do **not** try to narrow the set by comparing with the remote: the engine requested the *plaintext*
+length, so a corrupt replica has exactly the right number of wrong bytes, and a multipart source
+lands as a single-part PUT so the ETag differs even for a **correct** replica. `--verify` is the only
+conclusive check and it transfers every suspect object in full. `--verify` compares against the
+destination's **current** object (its GET carries no `versionId`), so it **skips non-current source
+versions** and reports them as `skipped_non_current` — comparing a superseded version against the
+destination's current object would report a mismatch for a perfectly healthy mirror. Those versions
+are unrepairable here anyway (trap 2 below).
+
+On a dashboard, watch `cairn_replication_encrypted_suspect_versions` **and**
+`cairn_replication_encrypted_repair_pending_versions` (plus `…_encrypted_absent_versions` and
+`…_encrypted_non_current_suspect_versions`, which is the *floor* of the suspect gauge — see
+"Verifying convergence" below). These are
+**opt-in**: they are emitted only when `CAIRN_REPLICATION_AUDIT_BEFORE` is set — same value as
+`--before` — and the loop does not run at all otherwise. They are recomputed on a **6-hour
+background cadence**, not per scrape: there is no index on `object_versions.replication_status`, and
+adding one would be a schema migration this remediation deliberately does not take. A pass is
+near-free on a store with **no enabled replication rule** (skipped before any version is read) but a
+bucket that *does* replicate costs a full version listing **plus one point query per version**, since
+the listing page carries no SSE descriptor — on a large replicated bucket that is the whole cost, and
+it is the other reason the cadence is slow and the loop opt-in.
+
+#### Decide — the three traps
+
+Each of these silently wastes a repair pass. The audit prints all three; read them.
+
+1. **Resync is gated on `ExistingObjectReplication`.** Most rules do not set it, and a resync against
+   such a rule returns success and enqueues **nothing**. Edit the rule first (management API
+   `PUT /buckets/{name}/config`, or the console's replication editor).
+2. **The backfill enumerates CURRENT versions only.** A non-current version that replicated corrupt
+   is **not repaired** by any command here — the audit counts these as `non_current_suspect`. Full
+   version-history fidelity on the mirror requires rebuilding the destination bucket (delete and
+   re-replicate, or re-import). This is stated plainly rather than papered over.
+3. **Repair re-ships PLAINTEXT.** If the destination endpoint is `http://`, the confidentiality gate
+   refuses every client-encrypted (SSE-S3/SSE-KMS) object and reschedules it *forever* without ever
+   consuming the attempt budget — so the repair never fails, it just never happens. Move the endpoint
+   to `https://`, or set `CAIRN_REPLICATION_ALLOW_PLAINTEXT_SSE_OVER_HTTP=true` and accept sending
+   decrypted bodies over an unauthenticated link. Transparent at-rest (`CAIRN_ENCRYPT_AT_REST`)
+   objects are **not** gated — that is an operator storage property, not a client contract.
+
+#### Repair — re-ship unconditionally, never diff
+
+```sh
+# 0. Record the moment you deploy — that timestamp is the audit cutoff for every step below.
+CUTOFF=2026-07-23T10:00:00Z
+# 1. Upgrade every node. Source first is fine; the wire format is unchanged, and an in-flight
+#    outbox entry carries no encryption state, so it is read by the NEW code at drain time.
+# 2. Look.
+cairn replication audit --before "$CUTOFF"
+# 3. Fix trap 1 (edit the rule) and trap 3 (https:// or the opt-in) if the audit flagged them.
+# 4. Recover the recent 'failed' entries the outbox still remembers.
+cairn replication retry photos
+# 5. Re-ship the corrupt-but-'completed' population. --force is REQUIRED for any pass after the
+#    first, and harmless on the first.
+cairn replication resync photos --force
+# 6. Verify — see below. Done is repair-pending 0 AND suspects down to the non-current floor;
+#    neither number alone is a completion signal.
+cairn replication audit --before "$CUTOFF"
+# 7. Optional hard proof (current versions only).
+cairn replication audit --before "$CUTOFF" --verify
+```
+
+##### Verifying convergence — read this before watching the numbers
+
+The audit's suspect predicate runs on **two** clocks, and you need both to read the numbers:
+
+* `created_at < cutoff` — only versions written by the pre-fix binary can be damaged;
+* `replicated_at IS NULL OR replicated_at < cutoff` — `replicated_at` (schema **v23**) is stamped by
+  the replication engine every time a version ships successfully. It is what makes a **repaired**
+  version leave the population. Without it a damaged version would match forever: `created_at` is
+  never rewritten, so once the repair re-stamped the row `completed` the count would return to its
+  pre-repair value *because the repair worked*.
+
+**Three consequences, all of which will surprise you if you have not read this.**
+
+**1. The suspect count drops sharply the moment the repair is queued, before a single byte
+re-ships.** `--force` flips the repairable damaged rows to `pending`, and `pending` is not a suspect
+state. If you watch `present_and_suspect` alone you will see it fall immediately — which is not
+success — and then you will see `repair_pending` carry the real progress.
+
+So the sequence to expect is:
+
+1. before the repair: `present_and_suspect` high, `repair_pending` 0;
+2. immediately after `--force`: `present_and_suspect` down to `non_current_suspect` (see below),
+   `repair_pending` high — nothing has shipped yet;
+3. as the queue drains: `repair_pending` falls, and each entry that completes gets a fresh
+   `replicated_at` *after* the cutoff — so it leaves the population entirely instead of returning to
+   `present_and_suspect`. Both numbers therefore fall and stay down;
+4. **done when `repair_pending == 0` AND `present_and_suspect == non_current_suspect`.** Neither
+   number alone is a completion signal, and on a bucket with non-current suspects `0 / 0` is *not*
+   the end state — see the next point. `repair_pending` really does reach 0: a version is only ever
+   moved to `pending` when something can actually ship it. That is the difference `replicated_at`
+   and the requeue's ledger scope make together.
+
+**2. `present_and_suspect` floors at `non_current_suspect`, and that floor is correct.** A forced
+requeue moves a version row to `pending` — i.e. into `repair_pending`, "repair in flight" — only when
+something will genuinely ship it: the version is **current** (the resync backfill that follows
+enumerates current objects, so it gets a fresh queue entry), or it still has an outbox row (the
+requeue just put that row back to `pending`).
+
+A **non-current** version whose outbox row the retention sweep already pruned — which, 24 h after the
+incident, is essentially all of them — has neither. Nothing enqueues it, so if it were marked
+`pending` it would sit there forever: the ledger would claim queued work that no queue holds,
+`repair_pending` could never reach 0, and the alert below would fire permanently on a node whose
+repair had in fact finished. So it stays counted in `present_and_suspect` and in
+`non_current_suspect`, which is the truth — it is still on the mirror and still wrong, and **no
+command in this runbook repairs it** (trap 2). Getting it off the mirror means rebuilding the
+destination bucket: delete and re-replicate, or re-import.
+
+`repair_pending` can also stall above zero for two *operator-fixable* reasons, and both are printed
+by the audit: **trap 1** (no enabled rule sets `ExistingObjectReplication`, so the backfill enqueues
+nothing for the current versions the requeue just marked `pending`) and **trap 3** (an `http://`
+destination with client-encrypted objects, whose entries are rescheduled forever and never fail).
+Fix the trap and re-run the resync; the number then drains.
+
+**3. On a node upgraded mid-incident, the FIRST audit over-reports.** `replicated_at` is `NULL` for
+every row that existed before the v23 migration — including versions that replicated perfectly well
+long ago — and a `NULL` stamp is counted as suspect. So the first audit after the upgrade will size
+the damage *too large*, and the excess resolves itself as those versions are re-shipped and stamped.
+
+This is deliberate, and it is the right direction to be wrong in: an over-report costs a wasted
+re-ship, an under-report leaves a garbage replica on the mirror that nobody ever goes looking for. Do
+not try to "fix" the first number by narrowing the cutoff — you would be hiding real damage to make a
+dashboard look tidy. Let it re-ship.
+
+Alert on
+`cairn_replication_encrypted_suspect_versions - cairn_replication_encrypted_non_current_suspect_versions > 0`
+**or** `cairn_replication_encrypted_repair_pending_versions > 0`, and only once
+`CAIRN_REPLICATION_AUDIT_BEFORE` is set — an unbounded audit cannot converge, so an alert on it would
+fire forever on a healthy node.
+
+Subtracting the non-current floor is not cosmetic: those versions are unrepairable by any command
+here, so a bare `suspect > 0` alert on a bucket that has them is a permanently-firing alarm, exactly
+what the cutoff exists to avoid. Track `…_non_current_suspect_versions` on its own — it should be
+flat, and it going *up* means new damage, not leftover damage. If you have decided to rebuild the
+destination bucket, it drops to 0 when you do and the subtraction becomes a no-op.
+
+`--force` submits `RequeueReplicationVersions`, which flips the bucket's terminal (`completed` /
+`failed`) outbox rows back to `pending` with the attempt budget reset, and resets the version-row
+ledger stamps of everything that will actually be re-shipped. Without it, a **second** resync inside
+the retention window is a silent no-op: the
+backfill's enqueue is `INSERT OR IGNORE` on a deterministic `backfill:{rule}:{key}:{version}` id, and
+that id still has a row. Add `--all-versions` to widen the requeue beyond encrypted keys (it requires
+`--force`, and is rejected without it rather than silently ignored).
+
+The requeue is scoped to the **key**, not the individual version: every terminal entry of any key
+that has at least one encrypted version is re-queued, including that key's later plaintext versions
+and delete markers. That is deliberate and load-bearing — re-shipping only the encrypted version
+would PUT it *after* newer versions already at the destination, reverting the mirror's current object
+to an old one, or resurrecting an object whose delete marker was never re-shipped.
+
+The two halves have **deliberately different scopes**, and the asymmetry is the accurate rule rather
+than an optimisation. The *outbox* half moves every terminal row of every key in scope. The *ledger*
+half is narrower: a version row goes back to `pending` only if it is the **current** version (the
+backfill will re-enqueue it) or it still has an outbox row (now requeued). `pending` in the ledger is
+a claim that something will ship this version, and for a non-current version whose outbox row was
+pruned nothing ever will — writing `pending` there would be the ledger lying, and the lie is not
+harmless: it is what would leave `repair_pending` permanently above zero and the alarm permanently
+firing. Those versions stay counted as suspects (trap 2), which is what they are.
+
+The requeue is **paged by key**, not by row, and the page unit is a correctness property rather than
+a tuning knob: every terminal row of a key is requeued in the same transaction as its siblings, and
+each pass resumes strictly past the previous page's last key. A row-bounded page would serve rows in
+index order — every `completed` row ahead of every `failed` one — and could requeue a key's newer
+version pages before its older one, letting the 30-second heartbeat ship them out of order. The one
+unbounded case is a single key with an enormous version history: its rows are never split, because
+splitting them is the bug.
+
+> **A forced resync on a very large bucket is write-heavy.** It rewrites every terminal outbox row
+> and every terminal version-row stamp for the keys in scope, through the single metadata writer.
+> The work is paged (a bounded number of keys per transaction, resuming forward until the bucket's
+> keyspace is drained) precisely so it does not hold one long transaction and stall every other write
+> on the node — but the total write volume is proportional to the bucket, the WAL will grow during
+> the pass, and write latency will be elevated while it runs. Do it in a maintenance window on a
+> bucket with millions of versions, one bucket at a time.
+>
+> If the requeue ever exhausts its batch budget it logs **`requeue DID NOT CONVERGE`** with a
+> `resume_after` key and records a `ResyncReplicationTruncated` entry in the activity feed; if it
+> errors part-way it logs **`requeue FAILED part-way`** and records `ResyncReplicationFailed`, with
+> the same cursor. Either way the repair is INCOMPLETE — keys at or past that cursor were not
+> requeued. Re-run the resync. (The HTTP response cannot carry this: the requeue runs after the
+> request has already been answered `202 Accepted`, which is why both land in the activity feed
+> rather than only in the log.)
+
+Expect a **drain surge and destination egress** on the first pass: buckets that were silently not
+replicating will start.
+
+**Rolling back to a pre-fix binary silently resumes the corruption.** This upgrade is one-way in
+that sense; nothing needs draining before it.
+
+**Standing rule this incident bought** (see also `docs/testing-performance.md` 29): resolve a DEK
+from the row you were handed, per read, and never cache one across passes — the master-key re-wrap
+worker re-seals descriptors underneath a live consumer.
+
+#### Release-note text (paste verbatim)
+
+> **Encrypted objects did not replicate correctly before this release.** The replication worker read
+> source blobs without their data key, so any object encrypted by SSE-S3, SSE-KMS, or
+> `CAIRN_ENCRYPT_AT_REST` was shipped to the mirror as raw ciphertext. Where the source object
+> carried a supplementary checksum the destination refused it and the object is simply **missing**
+> on the mirror. Where it did not — every multipart-completed object, and any single-part object PUT
+> without an `x-amz-checksum-*` header (`curl`, presigned PUT, older SDKs) — the destination
+> **accepted** it: the replica exists, is exactly the right size, and answers `200` with garbage.
+> **Anyone who failed over to a mirror in this window restored garbage for those objects, and got a
+> 200 while doing it.**
+>
+> Upgrading fixes all new replication. It does **not** heal what is already on the mirror. Run
+> `cairn replication audit --before <the moment you upgraded this node>` on each source node to size
+> the damage (it reads the durable version-row ledger; the failed-entry API only covers the last
+> `CAIRN_REPLICATION_RETENTION_SECS`; the cutoff is required because a version encrypted and
+> replicated *after* the fix is indistinguishable from a damaged one by anything but its age), then follow
+> the repair runbook in `docs/operations.md` 8.7. Three things will silently make a repair do
+> nothing, and the audit flags all three: a rule without `ExistingObjectReplication`, a non-current
+> version (the backfill only covers current versions), and an `http://` destination (repair ships
+> plaintext and the confidentiality gate refuses it). Rolling back to a pre-fix binary resumes the
+> corruption.

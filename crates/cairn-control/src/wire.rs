@@ -816,6 +816,19 @@ pub struct ReplicationRetryResp {
 pub struct ReplicationResyncResp {
     /// Always `true` once the backfill task is spawned.
     pub started: bool,
+    /// Whether `?force=true` was honoured: the bucket's already-terminal (`completed`/`failed`)
+    /// outbox entries were requeued before the backfill, so versions that replicated *successfully
+    /// but wrongly* are re-shipped. Without this a repeat resync inside
+    /// `CAIRN_REPLICATION_RETENTION_SECS` is silently a no-op (the idempotent enqueue ignores an
+    /// id that still has a row).
+    pub forced: bool,
+    /// Whether `?force=true` was scoped to encrypted versions only (the default, and the blast
+    /// radius of the SSE replication defect). `false` means every terminal entry was requeued.
+    pub only_encrypted: bool,
+    /// Whether some enabled rule actually sets `ExistingObjectReplication`. Echoed because a
+    /// backfill without it enqueues NOTHING — the endpoint no longer rejects the request outright
+    /// when `force` is set (the requeue half is still useful), so the caller must be told.
+    pub existing_object_replication: bool,
 }
 
 /// `GET /buckets/{name}/replication/status` response: per-bucket replication counters plus the

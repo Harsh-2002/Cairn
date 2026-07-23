@@ -268,7 +268,19 @@ pub enum Mutation {
         lease_secs: i64,
     },
     /// Mark a replication outbox entry done and stamp the version replicated.
-    MarkReplicationDone(String),
+    ///
+    /// The version-row UPDATE sets `replication_status = Completed` **and**
+    /// [`replicated_at`](crate::object::ObjectVersionRow::replicated_at) `= now` in the same
+    /// statement (schema v23). They must move together: the status alone cannot distinguish a
+    /// version that shipped before a fix from one that was force-requeued and has since re-shipped
+    /// correctly, which is precisely what the replication audit has to decide. A `replica` row
+    /// (inbound, loop prevention ARCH 20.4) is left untouched by both.
+    MarkReplicationDone {
+        /// The outbox entry id.
+        id: String,
+        /// The completion time to stamp on the version row.
+        now: Timestamp,
+    },
     /// Mark a replication outbox entry failed/retry with backoff.
     MarkReplicationFailed {
         /// The entry id.
@@ -286,6 +298,115 @@ pub enum Mutation {
         bucket: Option<BucketName>,
         /// The time to schedule the retry at (immediately due).
         now: Timestamp,
+    },
+    /// Force a bucket's already-terminal replication work back into the queue so it is **re-shipped
+    /// unconditionally** — the operator remediation for versions that replicated *successfully* but
+    /// wrongly (ARCH 20.5, the pre-release-X SSE plaintext-seam incident: an encrypted version was
+    /// shipped as raw ciphertext and the destination accepted it, so the replica exists, is the
+    /// right size, answers 200, and is garbage).
+    ///
+    /// Two DML statements, no schema change:
+    /// 1. every `completed`/`failed` outbox row for the bucket goes back to `pending` with
+    ///    `attempts=0`, `next_attempt_at=now` and the lease cleared — this is what
+    ///    [`EnqueueReplication`](Self::EnqueueReplication) *cannot* do, because its `INSERT OR
+    ///    IGNORE` on the deterministic `backfill:{rule}:{key}:{version}` id silently no-ops while a
+    ///    row for that id still exists (i.e. for the whole
+    ///    `CAIRN_REPLICATION_RETENTION_SECS` window a second resync repairs nothing);
+    /// 2. every matching version row's `replication_status` goes back to `pending`, so the durable
+    ///    ledger stops claiming the object is replicated. `replica` rows are never touched (loop
+    ///    prevention, ARCH 20.4).
+    ///
+    /// Rows whose outbox entry was already pruned are covered by the resync backfill that runs
+    /// after this mutation — for those, `INSERT OR IGNORE` genuinely inserts. The two halves
+    /// together are what make a repair pass complete.
+    ///
+    /// ## The LEDGER half is narrower than the OUTBOX half
+    ///
+    /// `pending` on a version row is a promise that something will ship that version, and the
+    /// replication audit reports it as `repair_pending` — "repair in flight". Only two populations
+    /// can honour that promise: rows that are **current** (the resync backfill enumerates current
+    /// objects, so they get a fresh entry) and rows that still **have** an outbox entry for their
+    /// exact `(bucket, key, version_id)` — which statement 1 has just requeued.
+    ///
+    /// A NON-CURRENT version whose outbox row the retention sweep already pruned has neither, and 24
+    /// h after an incident that is essentially all of them. Marking it `pending` would make the
+    /// ledger claim queued work that no queue holds: it would sit there forever, `repair_pending`
+    /// could never reach zero, the runbook's done-state would be unreachable, and the alert
+    /// `docs/operations.md` 8.7 prescribes on that gauge would fire permanently. So statement 2
+    /// skips it and it stays `completed` — still reported as a suspect replica, which is the truth,
+    /// and which the runbook's TRAP 2 already explains is unrepairable without rebuilding the
+    /// destination bucket. Statement 1 is **not** narrowed: key atomicity there is a correctness
+    /// property (see below).
+    ///
+    /// ## The scope is the KEY, never the single version
+    ///
+    /// `only_encrypted` selects **keys that have at least one encrypted terminal version**, and then
+    /// requeues *every* terminal row of those keys. Filtering per version would be a correctness
+    /// bug, not an optimisation:
+    ///
+    /// * key `k` with `v1` encrypted (`completed`) and a later **plaintext** `v2` (`completed`) —
+    ///   e.g. `CAIRN_ENCRYPT_AT_REST` was turned off, or the key was rewritten without SSE. Requeue
+    ///   only `v1` and it is PUT last at the destination, so the mirror's current object silently
+    ///   becomes the **old** version;
+    /// * key `k` with `v1` encrypted (`completed`) and a `v2` **delete marker** (`completed`, no
+    ///   descriptor). Requeue only `v1` — and the resync backfill enumerates *current* objects, so
+    ///   it never re-enqueues the marker — and the mirror **resurrects a deleted object**.
+    ///
+    /// With every version of the key queued, `has_unreplicated_predecessor` re-establishes the
+    /// write-order guarantee (an earlier version outstanding defers the later one), which is exactly
+    /// what makes the key-level scope the correct one rather than merely the wider one.
+    ///
+    /// ## Bounded — but the batch is a page of KEYS, never a page of rows
+    ///
+    /// An unbounded UPDATE on a large bucket would hold the group-commit transaction — and
+    /// therefore every write on the node — for as long as a full-table scan takes, while growing the
+    /// WAL. So the work is paged. **The page unit is the key, and this is a correctness
+    /// requirement, not a tuning choice.**
+    ///
+    /// A row-bounded page (`WHERE rowid IN (SELECT rowid … LIMIT ?)`) reintroduces the very
+    /// ordering bug the key-level scope exists to prevent. It has no `ORDER BY`, so SQLite serves
+    /// rows in whatever order the cheapest index gives — `(status, next_attempt_at)`, which groups
+    /// **all** `completed` rows ahead of **all** `failed` rows. A key whose OLDER encrypted version
+    /// is `failed` and whose NEWER version is `completed` then gets the newer row requeued in an
+    /// early page and the older one many pages later; the replication heartbeat ships the newer one
+    /// in between, and the mirror reverts to the old bytes (or resurrects a deleted key, when the
+    /// newer row is a delete marker). Only buckets larger than one page are affected — i.e.
+    /// precisely the ones paging exists for.
+    ///
+    /// So each apply:
+    /// 1. selects the next page of at most `limit` **distinct keys** with terminal work, ordered by
+    ///    key, strictly after `after_key`, from the UNION of the outbox and the version ledger (a
+    ///    key whose outbox row was already pruned still has a ledger stamp to reset);
+    /// 2. runs BOTH UPDATEs over the closed key range `(after_key, page_end]` — so every terminal
+    ///    row of every key in the page moves in the SAME transaction as its siblings, and the queue
+    ///    and the ledger cannot disagree about a key;
+    /// 3. returns [`MutationOutcome::RowsRequeued`] carrying the rows changed **and** `page_end`.
+    ///
+    /// The caller threads `page_end` back as `after_key`, so progress is monotone forward and no
+    /// pass ever rescans what an earlier pass drained (re-deriving the page by scanning from the
+    /// start each time would be quadratic on exactly the large buckets this exists for). A `None`
+    /// `page_end` means the bucket is drained and the caller stops.
+    ///
+    /// Per-transaction write volume is bounded by `limit` keys × that key's version count. The one
+    /// exception is a pathological single key with an enormous version history: its rows are
+    /// **never** split across transactions, because splitting them is the bug above. That is a
+    /// deliberate, documented unbounded case, not an oversight.
+    RequeueReplicationVersions {
+        /// The source bucket to requeue. Always bucket-scoped: this is a deliberately destructive
+        /// re-ship, never a store-wide sweep.
+        bucket: BucketName,
+        /// Restrict to keys that have at least one version carrying an `sse_descriptor` (the
+        /// encrypted-only blast radius of the incident). `false` requeues every terminal entry in
+        /// the bucket. See the type doc for why this is key-scoped and not version-scoped.
+        only_encrypted: bool,
+        /// The time to schedule the requeued entries at (immediately due).
+        now: Timestamp,
+        /// Forward cursor: resume strictly **after** this key. `None` starts at the beginning of the
+        /// bucket's keyspace. The caller feeds back the `page_end` of the previous pass.
+        after_key: Option<String>,
+        /// Maximum number of distinct **keys** this one transaction may page over (not rows — see
+        /// the variant doc for why a row bound is a correctness bug).
+        limit: u32,
     },
     /// Enqueue a single replication-outbox entry idempotently (INSERT OR IGNORE on the entry id),
     /// used by existing-object backfill / resync (ARCH 20.5). Unlike the enqueue that rides a
@@ -480,6 +601,20 @@ pub enum MutationOutcome {
     WebhookBatch(Vec<WebhookEntry>),
     /// A user was created.
     UserCreated(UserId),
+    /// The result of one key-paged [`Mutation::RequeueReplicationVersions`] batch: how many rows it
+    /// changed (both statements summed) and the last key it covered.
+    ///
+    /// `page_end` is the forward cursor — the caller feeds it back as `after_key` on the next pass,
+    /// which is what makes progress monotone and keeps a full requeue linear rather than quadratic.
+    /// `None` means the page was empty, i.e. the bucket is drained and the caller stops. `rows` is
+    /// reporting only: a non-empty page with zero changed rows is possible in principle and must
+    /// **not** terminate the loop, or the requeue silently stops half-way.
+    RowsRequeued {
+        /// Rows changed by this batch, outbox + ledger.
+        rows: u64,
+        /// The last key covered by this batch, or `None` when the page was empty (drained).
+        page_end: Option<String>,
+    },
     /// A generic acknowledgement for mutations with no specific return value.
     Ack,
 }

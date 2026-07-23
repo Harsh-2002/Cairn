@@ -899,6 +899,7 @@ impl S3Service {
             checksums: staged.checksums.clone(),
             sse_descriptor: sse_descriptor.clone(),
             replication_status,
+            replicated_at: None,
             created_at: now,
             updated_at: now,
         };
@@ -1941,6 +1942,7 @@ impl S3Service {
             checksums: object_checksums.clone(),
             sse_descriptor: sse_descriptor.clone(),
             replication_status: None,
+            replicated_at: None,
             created_at: now,
             updated_at: now,
         };
@@ -2334,6 +2336,7 @@ impl S3Service {
             // `None` when the plan resolved to plaintext.
             sse_descriptor: dest_plan.descriptor_json,
             replication_status: None,
+            replicated_at: None,
             created_at: now,
             updated_at: now,
         };
@@ -5734,6 +5737,7 @@ fn replica_marker_row(
         checksums: Vec::new(),
         sse_descriptor: None,
         replication_status: Some(cairn_types::meta::ReplicationStatus::Replica),
+        replicated_at: None,
         created_at: now,
         updated_at: now,
     }

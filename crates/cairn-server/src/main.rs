@@ -23,6 +23,7 @@ mod import_run;
 mod key_rewrap;
 mod metrics_agg;
 mod observability;
+mod replication_audit;
 mod server;
 mod sse;
 mod sts;
@@ -160,7 +161,15 @@ fn main() -> ExitCode {
         Command::User { opts, cmd } => {
             return cli_remote::run(&opts, cli_remote::RemoteCommand::User { cmd });
         }
-        Command::Replication { opts, cmd } => {
+        // `replication audit` is the one NODE-LOCAL replication subcommand: it reads the durable
+        // version-row ledger (`object_versions.replication_status`), which no management API
+        // exposes — deliberately, because the outbox the API *does* expose is pruned at
+        // `CAIRN_REPLICATION_RETENTION_SECS` and would answer "all clear" for an incident that
+        // predates the window. It falls through to `Config::load()` below; every other replication
+        // subcommand is a thin remote client.
+        Command::Replication { opts, cmd }
+            if !matches!(cmd, cli_remote::ReplicationCmd::Audit { .. }) =>
+        {
             return cli_remote::run(&opts, cli_remote::RemoteCommand::Replication { cmd });
         }
         Command::Object { opts, cmd } => {
@@ -210,6 +219,17 @@ fn main() -> ExitCode {
             }
             run_server(cfg)
         }
+        // The one node-local replication subcommand (see the dispatch guard above).
+        Command::Replication {
+            cmd:
+                cli_remote::ReplicationCmd::Audit {
+                    before,
+                    bucket,
+                    json,
+                    verify,
+                },
+            ..
+        } => replication_audit(cfg, before.as_deref(), bucket.as_deref(), json, verify),
         // The remote-admin variants are handled and returned above.
         Command::Bucket { .. }
         | Command::User { .. }
@@ -407,6 +427,420 @@ async fn repair_dangling_rows(
     }
 
     Ok(dropped)
+}
+
+/// How many suspect versions per bucket the human-readable audit lists individually. Counts are
+/// always exact; only this sample is bounded, so a bucket with a million suspects still prints.
+const AUDIT_SAMPLE_LIMIT: usize = 20;
+
+/// The largest replica body `--verify` will **read** for the byte comparison. Matches the sink's
+/// PUT buffer cap: an object too large to have been replicated is also too large to verify.
+///
+/// This is a total-bytes-read bound, not a buffer size — the body is hashed frame by frame and
+/// never held (`HttpS3Sink::stream_object`), so verifying a 2 GiB replica costs O(1) memory. The cap
+/// survives anyway, because a hostile or misconfigured destination that streams without end must
+/// still terminate the check rather than run until the operator kills it.
+const AUDIT_VERIFY_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// `cairn replication audit --before TS [--bucket B] [--json] [--verify]` (ARCH 20.5, 26.4).
+///
+/// Reports the object versions that are **encrypted**, **terminally replicated**, and **created
+/// before the cutoff** — the population left behind by the pre-release-X replication defect that
+/// shipped SSE objects as raw ciphertext. See `replication_audit.rs` for why this reads the
+/// version-row ledger rather than the outbox, why the cutoff is mandatory, and why a remote
+/// size/ETag comparison would be worthless.
+fn replication_audit(
+    cfg: Config,
+    before: Option<&str>,
+    bucket: Option<&str>,
+    json: bool,
+    verify: bool,
+) -> ExitCode {
+    // The cutoff is required. `--before` wins; `CAIRN_REPLICATION_AUDIT_BEFORE` is the fallback so
+    // an operator who configured the gauge does not have to retype it. There is deliberately NO
+    // implicit default: guessing a cutoff would silently change what every number in this report
+    // means, and "now" in particular would report every healthy encrypted replica as suspect.
+    let raw = match before.or(cfg.replication_audit_before.as_deref()) {
+        Some(v) => v,
+        None => {
+            eprintln!(
+                "replication audit needs a cutoff: pass --before <RFC3339|epoch-seconds>, or set \
+                 CAIRN_REPLICATION_AUDIT_BEFORE.\nUse the moment this node was upgraded past the \
+                 SSE replication defect — only versions written before it can be damaged, and \
+                 without the bound the report counts healthy encrypted replicas too."
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    let created_before = match replication_audit::parse_cutoff(raw) {
+        Ok(ts) => ts,
+        Err(e) => {
+            eprintln!("--before: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let rt = match runtime(&cfg) {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("failed to start runtime: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    rt.block_on(async {
+        let (meta, _oracle) = match stack::open_meta_store(&cfg).await {
+            Ok(pair) => pair,
+            Err(e) => {
+                eprintln!("failed to open metadata store: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+
+        // `--verify` is the only arm that needs bytes, keys and the network; the default audit is
+        // pure metadata and opens neither the blob store nor the master ring.
+        let verifier = if verify {
+            match build_replica_verifier(&cfg, meta.clone()).await {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    eprintln!("failed to prepare --verify: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        } else {
+            None
+        };
+
+        let report = match replication_audit::audit_store(
+            meta.as_ref(),
+            bucket,
+            created_before,
+            AUDIT_SAMPLE_LIMIT,
+            cfg.replication_allow_plaintext_sse_over_http,
+            cfg.replication_endpoint.as_deref(),
+            verifier
+                .as_ref()
+                .map(|v| v.as_ref() as &dyn replication_audit::ReplicaVerifier),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("replication audit failed: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+
+        if json {
+            match serde_json::to_string_pretty(&report) {
+                Ok(s) => println!("{s}"),
+                Err(e) => {
+                    eprintln!("failed to render the audit as JSON: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+            return ExitCode::SUCCESS;
+        }
+
+        if report.buckets.is_empty() {
+            println!(
+                "no bucket has an enabled replication rule; nothing to audit{}",
+                bucket.map_or(String::new(), |b| format!(" (filtered to {b})"))
+            );
+            return ExitCode::SUCCESS;
+        }
+        println!(
+            "replication audit (versions created before {}): {} present-and-suspect (ON the \
+             mirror, possibly GARBAGE), {} absent (never landed), {} repair-pending (re-shipping \
+             now), {} of the suspects NOT CURRENT (unrepairable here)",
+            created_before.0,
+            report.present_and_suspect,
+            report.absent,
+            report.repair_pending,
+            report.non_current_suspect
+        );
+        // The done-state, stated so it is actually reachable. A forced requeue only moves a version
+        // to `pending` when something can really ship it — it is current (the resync backfill
+        // re-enqueues current versions) or it still has an outbox row — so repair-pending genuinely
+        // drains to 0. The suspect count does NOT drain to 0 when non-current suspects exist: the
+        // backfill cannot reach them (TRAP 2), so they stay, and that is the floor.
+        if report.non_current_suspect > 0 {
+            println!(
+                "DONE = repair-pending 0 AND present-and-suspect {} (the non-current floor: those \
+                 versions are unrepairable without rebuilding the destination bucket — see TRAP 2 \
+                 below). A forced requeue moves rows into repair-pending, so suspects drop before \
+                 any byte re-ships.",
+                report.non_current_suspect
+            );
+        } else {
+            println!(
+                "the repair is complete when present-and-suspect AND repair-pending are BOTH 0 — a \
+                 forced requeue moves rows into repair-pending, so suspects hit 0 before any byte \
+                 re-ships."
+            );
+        }
+        for b in &report.buckets {
+            println!(
+                "\nbucket {}: scanned={} present_and_suspect={} absent={} repair_pending={} \
+                 non_current_suspect={} client_encrypted={}",
+                b.bucket,
+                b.versions_scanned,
+                b.present_and_suspect,
+                b.absent,
+                b.repair_pending,
+                b.non_current_suspect,
+                b.client_encrypted_suspect
+            );
+            if verify {
+                println!(
+                    "  verified: matched={} MISMATCHED={} absent={} errors={} \
+                     skipped_non_current={}",
+                    b.verified_matched,
+                    b.verified_mismatched,
+                    b.verified_absent,
+                    b.verify_errors,
+                    b.verify_skipped_non_current
+                );
+                if b.verify_skipped_non_current > 0 {
+                    println!(
+                        "  (the byte check GETs the destination's CURRENT object — it carries no \
+                         versionId — so comparing a superseded source version would report a false \
+                         MISMATCH. Those {} are skipped, not verified clean.)",
+                        b.verify_skipped_non_current
+                    );
+                }
+            }
+            // The three traps, printed where the operator is already looking (§C of the runbook in
+            // docs/operations.md 8.7). Each of these silently wastes a repair pass.
+            if b.present_and_suspect > 0 && !b.existing_object_replication {
+                println!(
+                    "  TRAP 1: no enabled rule sets ExistingObjectReplication — a resync will \
+                     return success and repair NOTHING. Edit the rule first."
+                );
+            }
+            if b.non_current_suspect > 0 {
+                println!(
+                    "  TRAP 2: {} suspect version(s) are NOT current. A resync backfill enumerates \
+                     CURRENT versions only, so these are NOT repaired by any command here; full \
+                     version-history fidelity requires rebuilding the destination bucket.",
+                    b.non_current_suspect
+                );
+            }
+            if b.repair_blocked_by_http_gate {
+                println!(
+                    "  TRAP 3: destination endpoint(s) {} are http:// and this bucket has \
+                     client-encrypted suspects. Repair re-ships PLAINTEXT, so the confidentiality \
+                     gate will refuse every one of them (rescheduled forever, never failed). Move \
+                     the endpoint to https://, or set \
+                     CAIRN_REPLICATION_ALLOW_PLAINTEXT_SSE_OVER_HTTP=true before repairing.",
+                    b.plaintext_http_endpoints.join(", ")
+                );
+            }
+            for s in &b.samples {
+                println!(
+                    "  {} {} v={} size={} mode={}{}",
+                    s.status,
+                    s.key,
+                    s.version_id,
+                    s.size,
+                    s.mode,
+                    if s.is_latest { "" } else { " (non-current)" }
+                );
+            }
+            let listed = b.samples.len() as u64;
+            let total = b.present_and_suspect + b.absent;
+            if total > listed {
+                println!(
+                    "  … and {} more (use --json for the full set)",
+                    total - listed
+                );
+            }
+        }
+        if report.present_and_suspect > 0 {
+            println!(
+                "\nremediation: docs/operations.md 8.7. Repair re-ships UNCONDITIONALLY — never \
+                 diff, the bytes are the wrong bytes at exactly the right length."
+            );
+        }
+        ExitCode::SUCCESS
+    })
+}
+
+/// Build the `--verify` byte checker: the local blob store + master ring to re-derive each source
+/// version's **plaintext** MD5, and a per-bucket destination sink to fetch the replica.
+async fn build_replica_verifier(
+    cfg: &Config,
+    meta: Arc<dyn cairn_types::traits::MetadataStore>,
+) -> Result<Box<HttpReplicaVerifier>, String> {
+    let blob = cairn_blob::LocalBlobStore::open(cfg.data_dir.clone())
+        .await
+        .map_err(|e| format!("opening the blob store: {e}"))?;
+    let crypto = Arc::new(stack::build_crypto(cfg)?);
+    Ok(Box::new(HttpReplicaVerifier {
+        meta,
+        blob,
+        crypto,
+        allow_internal_endpoints: cfg.allow_internal_endpoints,
+        allow_plaintext_sse_over_http: cfg.replication_allow_plaintext_sse_over_http,
+        sinks: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+    }))
+}
+
+/// The `--verify` implementation: GET the replica, compare it to the source plaintext MD5.
+struct HttpReplicaVerifier {
+    meta: Arc<dyn cairn_types::traits::MetadataStore>,
+    blob: cairn_blob::LocalBlobStore,
+    crypto: Arc<cairn_crypto::SystemCrypto>,
+    allow_internal_endpoints: bool,
+    allow_plaintext_sse_over_http: bool,
+    /// Lazily-built destination sink per source bucket (`None` = this bucket has no resolvable
+    /// target, so nothing can be verified for it).
+    sinks: tokio::sync::Mutex<
+        std::collections::HashMap<String, Option<Arc<cairn_replication::HttpS3Sink>>>,
+    >,
+}
+
+impl HttpReplicaVerifier {
+    /// Resolve (and memoize) the destination sink for a source bucket.
+    async fn sink_for(
+        &self,
+        bucket: &cairn_types::id::BucketName,
+    ) -> Option<Arc<cairn_replication::HttpS3Sink>> {
+        let mut cache = self.sinks.lock().await;
+        if let Some(hit) = cache.get(bucket.as_str()) {
+            return hit.clone();
+        }
+        let built = self.build_sink(bucket).await;
+        cache.insert(bucket.as_str().to_owned(), built.clone());
+        built
+    }
+
+    async fn build_sink(
+        &self,
+        bucket: &cairn_types::id::BucketName,
+    ) -> Option<Arc<cairn_replication::HttpS3Sink>> {
+        use cairn_types::bucket::ConfigAspect;
+        let rules = self
+            .meta
+            .get_bucket_config(bucket, ConfigAspect::Replication)
+            .await
+            .ok()??;
+        let cfg = cairn_replication::parse_replication(rules.0.as_bytes()).ok()?;
+        let arn = cfg
+            .rules
+            .iter()
+            .find(|r| r.enabled)
+            .and_then(|r| r.target_arn.clone())?;
+        let targets_doc = self
+            .meta
+            .get_bucket_config(bucket, ConfigAspect::ReplicationTargets)
+            .await
+            .ok()??;
+        let targets = cairn_replication::parse_targets(targets_doc.0.as_bytes()).ok()?;
+        let target = cairn_replication::resolve_target(&targets, &arn)?;
+        let open = cairn_replication::open_target(&self.crypto, target).ok()?;
+        cairn_replication::sink_for_target(
+            &open,
+            self.allow_internal_endpoints,
+            self.allow_plaintext_sse_over_http,
+        )
+        .ok()
+        .map(Arc::new)
+    }
+
+    /// The source version's **plaintext** MD5, read through its own DEK. Never the stored ETag: a
+    /// multipart-completed object's ETag is the composite `<md5>-<n>`, which is not the MD5 of
+    /// anything the destination holds.
+    async fn source_plaintext_md5(
+        &self,
+        row: &cairn_types::object::ObjectVersionRow,
+    ) -> Result<String, String> {
+        use cairn_types::traits::BlobStore;
+        use futures_util::StreamExt;
+        use md5::Digest;
+
+        let path = row
+            .storage_path
+            .as_ref()
+            .ok_or_else(|| "version has no backing blob".to_owned())?;
+        let dek = match row.sse_descriptor.as_deref() {
+            Some(json) => {
+                let d = cairn_types::sse::parse_descriptor(json)
+                    .map_err(|e| format!("parsing the sse descriptor: {e}"))?;
+                Some(
+                    *cairn_types::sse::open_dek(self.crypto.as_ref(), &d)
+                        .map_err(|e| format!("unsealing the data key: {e}"))?,
+                )
+            }
+            None => None,
+        };
+        let handle = self
+            .blob
+            .open_with_dek(path, None, dek, &row.compression)
+            .await
+            .map_err(|e| format!("reading the source blob: {e}"))?;
+        let mut hasher = md5::Md5::new();
+        let mut body = handle.body;
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk.map_err(|e| format!("streaming the source blob: {e}"))?;
+            hasher.update(&chunk);
+        }
+        Ok(hex::encode(hasher.finalize()))
+    }
+}
+
+#[async_trait::async_trait]
+impl replication_audit::ReplicaVerifier for HttpReplicaVerifier {
+    async fn verify(
+        &self,
+        row: &cairn_types::object::ObjectVersionRow,
+    ) -> replication_audit::VerifyOutcome {
+        use cairn_types::error::ReplicationError;
+        use md5::Digest;
+        use replication_audit::VerifyOutcome;
+
+        let Some(sink) = self.sink_for(&row.bucket).await else {
+            return VerifyOutcome::Errored;
+        };
+        let want = match self.source_plaintext_md5(row).await {
+            Ok(md5) => md5,
+            Err(e) => {
+                eprintln!(
+                    "  verify {}/{}: cannot read the source plaintext: {e}",
+                    row.bucket.as_str(),
+                    row.key.as_str()
+                );
+                return VerifyOutcome::Errored;
+            }
+        };
+        // The replica is hashed AS IT ARRIVES and never held: both sides of this comparison are
+        // now O(1) in memory (`source_plaintext_md5` already streamed its blob through the same
+        // kind of loop). The cap below bounds the bytes read, not a buffer.
+        let mut hasher = md5::Md5::new();
+        let streamed = sink
+            .stream_object(
+                row.bucket.as_str(),
+                row.key.as_str(),
+                AUDIT_VERIFY_MAX_BYTES,
+                &mut |chunk: &[u8]| hasher.update(chunk),
+            )
+            .await;
+        match streamed {
+            Ok(_) => {
+                let got = hex::encode(hasher.finalize());
+                if got == want {
+                    VerifyOutcome::Matched
+                } else {
+                    VerifyOutcome::Mismatched
+                }
+            }
+            // A structural 404 is the `failed`/BadDigest population: the replica never landed.
+            // This deliberately does NOT sniff the message for "404" — the terminal message quotes
+            // the destination's response body, so any 4xx whose XML happens to carry those digits
+            // (a request id, a key name, a size) would be reported as a benign absent replica.
+            Err(ReplicationError::NotFound(_)) => VerifyOutcome::Absent,
+            Err(_) => VerifyOutcome::Errored,
+        }
+    }
 }
 
 /// Open the metadata store (which runs any pending migrations) and report the resulting schema
@@ -773,7 +1207,46 @@ fn bootstrap(cfg: Config) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{copy_blob_tree, schema_version};
+    use super::{Cli, copy_blob_tree, schema_version};
+    use clap::Parser;
+
+    /// `--all-versions` widens a forced requeue, and does NOTHING without `--force`. It used to be
+    /// accepted and silently ignored, so `cairn replication resync b --all-versions` reported
+    /// success while doing the narrow thing — the exact "a repair that repaired nothing" failure
+    /// this command exists to prevent. Clap must reject it instead.
+    #[test]
+    fn resync_all_versions_requires_force() {
+        let err = Cli::try_parse_from(["cairn", "replication", "resync", "b", "--all-versions"])
+            .expect_err("--all-versions without --force must be rejected, not silently ignored");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--force"),
+            "the error must point at the missing flag, got {msg:?}"
+        );
+        // With --force it parses, and either flag alone on the force path is fine.
+        Cli::try_parse_from([
+            "cairn",
+            "replication",
+            "resync",
+            "b",
+            "--force",
+            "--all-versions",
+        ])
+        .expect("--force --all-versions is the widened repair");
+        Cli::try_parse_from(["cairn", "replication", "resync", "b", "--force"])
+            .expect("--force alone is the default encrypted-only repair");
+    }
+
+    /// The audit's cutoff is a real CLI argument in both accepted forms; the command must not
+    /// quietly acquire a default, because the cutoff determines what every count in the report
+    /// means.
+    #[test]
+    fn audit_accepts_a_before_cutoff() {
+        for v in ["2026-07-23T10:00:00Z", "1753264800"] {
+            Cli::try_parse_from(["cairn", "replication", "audit", "--before", v])
+                .unwrap_or_else(|e| panic!("--before {v} must parse: {e}"));
+        }
+    }
 
     /// `copy_blob_tree` copies committed per-bucket blob directories but skips the staging area
     /// and database sidecars, so a snapshot contains only durable blobs (ARCH 31.4).
