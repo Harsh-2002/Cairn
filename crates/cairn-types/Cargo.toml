@@ -10,6 +10,7 @@ description = "Shared domain types, error tree, and the trait spine for Cairn."
 workspace = true
 
 [dependencies]
+base64.workspace = true
 bytes.workspace = true
 thiserror.workspace = true
 async-trait.workspace = true

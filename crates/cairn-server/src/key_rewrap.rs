@@ -12,6 +12,7 @@ use cairn_meta::{CachedMetadataStore, SqliteMetadataStore};
 use cairn_types::bucket::ConfigAspect;
 use cairn_types::crypto::Nonce;
 use cairn_types::error::MetaError;
+use cairn_types::sse::SseDescriptor;
 use cairn_types::traits::{Crypto, MetadataStore};
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,22 +27,6 @@ fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as i64)
-}
-
-/// The stored SSE descriptor JSON shape (mirrors `cairn-protocol`'s private struct). Re-wrap only
-/// reseals the DEK and re-nonces; every OTHER field (`alg`, and the additive `mode`/`kms_key_id` the
-/// protocol layer stamps for at-rest/KMS encryption) is captured verbatim in `extra` and re-emitted
-/// unchanged — so a master-key rotation can never drop a label (which would make an `AtRest` object
-/// silently start advertising `AES256`), and this loop never needs editing when a new descriptor
-/// field is added.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct SseDesc {
-    alg: String,
-    wrapped_dek_b64: String,
-    #[serde(default)]
-    nonce_b64: String,
-    #[serde(flatten)]
-    extra: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 /// Spawn the per-shard re-wrap loop. `interval_secs == 0` disables it. The worker shares one
@@ -159,7 +144,7 @@ async fn rewrap_sse(store: &SqliteMetadataStore, crypto: &SystemCrypto) -> Resul
 
 /// Re-wrap one SSE descriptor's DEK onto the active key. `Ok(None)` if already active.
 fn rewrap_sse_descriptor(crypto: &SystemCrypto, json: &str) -> Result<Option<String>, ()> {
-    let d: SseDesc = serde_json::from_str(json).map_err(|_| ())?;
+    let mut d: SseDescriptor = serde_json::from_str(json).map_err(|_| ())?;
     let envelope = B64.decode(d.wrapped_dek_b64.as_bytes()).map_err(|_| ())?;
     if !crypto.needs_rewrap(&envelope) {
         return Ok(None);
@@ -171,13 +156,12 @@ fn rewrap_sse_descriptor(crypto: &SystemCrypto, json: &str) -> Result<Option<Str
     };
     let dek = crypto.open(&envelope, &Nonce(nonce)).map_err(|_| ())?;
     let resealed = crypto.seal(&dek).map_err(|_| ())?;
-    let new = SseDesc {
-        alg: d.alg,
-        wrapped_dek_b64: B64.encode(&resealed.ciphertext),
-        nonce_b64: String::new(),
-        extra: d.extra,
-    };
-    serde_json::to_string(&new).map(Some).map_err(|_| ())
+    // Mutate IN PLACE — never reconstruct field-by-field. A rebuild silently drops any field this
+    // binary does not name, which is exactly the label-drop the `extra` flatten exists to prevent;
+    // in-place keeps every known and unknown field by construction.
+    d.wrapped_dek_b64 = B64.encode(&resealed.ciphertext);
+    d.nonce_b64.clear();
+    serde_json::to_string(&d).map(Some).map_err(|_| ())
 }
 
 async fn rewrap_users(store: &SqliteMetadataStore, crypto: &SystemCrypto) -> Result<(), MetaError> {
@@ -368,6 +352,28 @@ mod tests {
             &new.open(&env, &Nonce(Vec::new())).unwrap()[..],
             &dek[..],
             "DEK must round-trip after rewrap"
+        );
+    }
+
+    #[test]
+    fn rewrap_preserves_unknown_fields_written_by_a_newer_node() {
+        // The descriptor's `#[serde(flatten)] extra` is load-bearing: a field a NEWER node stamped
+        // (and this binary has never heard of) must survive a master-key rotation untouched.
+        // Without the flatten — or if the rewrap rebuilt the struct field-by-field — the rotation
+        // would silently erase it.
+        let (k1, k2, dek) = ([1u8; 32], [2u8; 32], [9u8; 32]);
+        let old = SystemCrypto::from_ring(vec![(1, k1)], 1, 1, 0).unwrap();
+        let sealed = old.seal(&dek).unwrap();
+        let json = format!(
+            r#"{{"alg":"AES256","wrapped_dek_b64":"{}","nonce_b64":"","future_field":{{"x":1}}}}"#,
+            B64.encode(&sealed.ciphertext)
+        );
+        let new = SystemCrypto::from_ring(vec![(1, k1), (2, k2)], 2, 1, 0).unwrap();
+        let out = rewrap_sse_descriptor(&new, &json).unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            v["future_field"]["x"], 1,
+            "an unknown descriptor field must survive a rewrap: {out}"
         );
     }
 

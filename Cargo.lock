@@ -691,6 +691,7 @@ name = "cairn-types"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
  "bytes",
  "cairn-types",
  "futures-core",

@@ -363,6 +363,13 @@ async fn repair_dangling_rows(
                 // never deletes good metadata.
                 match blob.open(&path, None, &row.compression).await {
                     Ok(_) => {}
+                    // PRESENT but unreadable without its data key. `repair` only ever deletes rows
+                    // whose blob is MISSING, and presence is all this probe needs — so an encrypted
+                    // blob must count as present, not abort the pass. Without this arm the
+                    // fail-closed guard in `open_with_dek` turns the documented DR repair path into
+                    // a hard error on the FIRST encrypted object, i.e. under the default SSE /
+                    // CAIRN_ENCRYPT_AT_REST configuration.
+                    Err(BlobError::Corruption(_)) => {}
                     Err(BlobError::NotFound) => {
                         match meta
                             .submit(Mutation::DeleteVersion {

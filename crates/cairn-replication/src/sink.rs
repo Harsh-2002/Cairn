@@ -139,6 +139,20 @@ pub struct S3SinkConfig {
     /// internal addresses so a target can't be pointed at the node's own loopback or the metadata
     /// service. See [`cairn_net`].
     pub allow_internal_endpoints: bool,
+    /// Whether an object the CLIENT asked us to encrypt (SSE-S3 / SSE-KMS) may be shipped — as
+    /// **plaintext**, which is what replication ships — to an `http://` endpoint.
+    ///
+    /// Sourced from `CAIRN_REPLICATION_ALLOW_PLAINTEXT_SSE_OVER_HTTP`. Default `false`: such an
+    /// object is refused with [`ReplicationError::Unavailable`], so it is rescheduled (no attempt
+    /// budget consumed) and ships by itself once the endpoint moves to `https://` or the operator
+    /// opts in. Transparent at-rest encryption (`SseMode::AtRest`) is NOT gated — it is an operator
+    /// storage property, not a client contract.
+    ///
+    /// This gate exists because resolving the source DEK is *new*: before it, a client-encrypted
+    /// object either never replicated or replicated as raw ciphertext, so its plaintext had never
+    /// been on an unauthenticated link. Turning that on silently would be a security regression
+    /// introduced by a correctness fix.
+    pub allow_plaintext_sse_over_http: bool,
 }
 
 /// A production replication sink issuing SigV4-signed S3 requests to a remote endpoint over
@@ -370,6 +384,7 @@ impl HttpS3Sink {
 pub fn sink_for_target(
     open: &crate::OpenTarget,
     allow_internal_endpoints: bool,
+    allow_plaintext_sse_over_http: bool,
 ) -> Result<HttpS3Sink, ReplicationError> {
     HttpS3Sink::new(S3SinkConfig {
         endpoint: open.endpoint.clone(),
@@ -382,6 +397,7 @@ pub fn sink_for_target(
         ca_cert_pem: open.ca_cert_pem.clone(),
         insecure_skip_verify: open.insecure_skip_verify,
         allow_internal_endpoints,
+        allow_plaintext_sse_over_http,
     })
 }
 
@@ -555,6 +571,30 @@ impl HttpS3Sink {
         source_bucket: &str,
         object: ReplicatedObject,
     ) -> Result<(), ReplicationError> {
+        // Refuse to put a CLIENT-encrypted object's decrypted body on an unauthenticated link,
+        // before a byte is read (so nothing is buffered and nothing is dialled). See
+        // `S3SinkConfig::allow_plaintext_sse_over_http`.
+        //
+        // `Unavailable`, NOT `Terminal`: this is an operator-fixable *configuration* condition, and
+        // `Unavailable` reschedules at a bounded cadence without consuming the attempt budget — so
+        // the moment the endpoint becomes `https://` (or the opt-in is set) the queued objects ship
+        // by themselves, with no operator retry and no bucket stamped permanently failed. The
+        // message names the real cause; an operator reading "target unavailable" would go look at a
+        // destination that is perfectly healthy.
+        if object.client_encrypted
+            && self.scheme == "http"
+            && !self.config.allow_plaintext_sse_over_http
+        {
+            return Err(ReplicationError::Unavailable(format!(
+                "refusing to replicate client-encrypted object {:?} to a plaintext http:// \
+                 endpoint: replication ships the DECRYPTED body, and this object was encrypted \
+                 because the client requested SSE. Use an https:// endpoint, or set \
+                 CAIRN_REPLICATION_ALLOW_PLAINTEXT_SSE_OVER_HTTP=true to accept sending decrypted \
+                 bodies over an unencrypted link",
+                object.key.as_str()
+            )));
+        }
+
         let dest_bucket = self.dest_for(source_bucket).to_owned();
 
         // Buffer the logical body so the payload can be hashed for the signed-payload PUT, bounded so
@@ -941,6 +981,7 @@ mod tests {
             ca_cert_pem: None,
             insecure_skip_verify: false,
             allow_internal_endpoints: false,
+            allow_plaintext_sse_over_http: false,
         }
     }
 
@@ -989,6 +1030,7 @@ mod tests {
             ca_cert_pem: None,
             insecure_skip_verify: false,
             allow_internal_endpoints: false,
+            allow_plaintext_sse_over_http: false,
         };
         let sink = HttpS3Sink::new(cfg).unwrap();
         // Mapped sources resolve to their explicit destinations.

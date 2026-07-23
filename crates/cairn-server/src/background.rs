@@ -290,6 +290,7 @@ fn single_target_sink_cfg(cfg: &Config) -> Option<cairn_replication::S3SinkConfi
             ca_cert_pem: None,
             insecure_skip_verify: false,
             allow_internal_endpoints: cfg.allow_internal_endpoints,
+            allow_plaintext_sse_over_http: cfg.replication_allow_plaintext_sse_over_http,
         }),
         _ => None,
     }
@@ -330,7 +331,9 @@ async fn replication_loop(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     opts: cairn_replication::ReplicationOpts,
 ) {
-    let engine = cairn_replication::ReplicationEngine::new(opts);
+    // The engine unseals each encrypted version's DEK through the shared master ring before
+    // reading its body, so the replica receives plaintext rather than raw ciphertext.
+    let engine = cairn_replication::ReplicationEngine::new(opts, stack.crypto.clone());
     let clock = SystemClock::new();
     while wait_for_drain_trigger(interval, &notify, &mut shutdown).await {
         // Resolve the per-source destination map from each bucket's replication rule.
@@ -410,14 +413,20 @@ async fn multi_target_replication_loop(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     opts: cairn_replication::ReplicationOpts,
 ) {
-    let engine = cairn_replication::ReplicationEngine::new(opts);
+    // The engine unseals each encrypted version's DEK through the shared master ring before
+    // reading its body, so the replica receives plaintext rather than raw ciphertext.
+    let engine = cairn_replication::ReplicationEngine::new(opts, stack.crypto.clone());
     let clock = SystemClock::new();
 
     // Build a sink per named target once. A target whose sink fails to construct (a bad endpoint,
     // an unreadable CA bundle, conflicting trust knobs) is logged and dropped; the rest still run.
     let mut target_sinks: Vec<(ReplicationTarget, Arc<HttpS3Sink>)> = Vec::new();
     for target in targets {
-        match HttpS3Sink::new(target_sink_cfg(&target, stack.allow_internal_endpoints)) {
+        match HttpS3Sink::new(target_sink_cfg(
+            &target,
+            stack.allow_internal_endpoints,
+            stack.replication_allow_plaintext_sse_over_http,
+        )) {
             Ok(sink) => target_sinks.push((target, Arc::new(sink))),
             Err(e) => {
                 tracing::error!(target = %target.name, error = %e,
@@ -470,6 +479,13 @@ async fn drain_with_router(
                 .increment(report.completed as u64);
             metrics::counter!("cairn_replication_failed_total").increment(report.failed as u64);
             metrics::counter!("cairn_replication_bytes_total").increment(report.bytes);
+            // Source-DEK resolve failures (ARCH 20/26/27). These are rescheduled as *unavailable*,
+            // which never consumes the attempt budget — so an object whose key id was permanently
+            // removed from the master ring retries forever and NEVER appears in `failed`. This
+            // counter is the only durable signal that such objects exist; a sustained non-zero rate
+            // means replication is silently stalled on local key material, not on the destination.
+            metrics::counter!("cairn_replication_dek_resolve_failed_total")
+                .increment(report.dek_resolve_failures as u64);
             tracing::info!(
                 completed = report.completed,
                 failed = report.failed,
@@ -537,7 +553,11 @@ async fn resolve_stored_target_sinks(stack: &Arc<AppStack>) -> HashMap<String, A
                     continue;
                 }
             };
-            match cairn_replication::sink_for_target(&open, stack.allow_internal_endpoints) {
+            match cairn_replication::sink_for_target(
+                &open,
+                stack.allow_internal_endpoints,
+                stack.replication_allow_plaintext_sse_over_http,
+            ) {
                 Ok(sink) => {
                     by_arn.insert(target.arn.clone(), Arc::new(sink));
                 }
@@ -573,6 +593,7 @@ fn build_router(
 fn target_sink_cfg(
     target: &ReplicationTarget,
     allow_internal_endpoints: bool,
+    allow_plaintext_sse_over_http: bool,
 ) -> cairn_replication::S3SinkConfig {
     cairn_replication::S3SinkConfig {
         endpoint: target.endpoint.clone(),
@@ -585,6 +606,7 @@ fn target_sink_cfg(
         ca_cert_pem: None,
         insecure_skip_verify: target.insecure_skip_verify,
         allow_internal_endpoints,
+        allow_plaintext_sse_over_http,
     }
 }
 
@@ -860,6 +882,15 @@ async fn metrics_loop(stack: Arc<AppStack>) {
         let (hits, misses) = stack.meta_cache.stats();
         metrics::counter!("cairn_meta_cache_hits_total").absolute(hits);
         metrics::counter!("cairn_meta_cache_misses_total").absolute(misses);
+
+        // Fail-closed encrypted-read refusals (ARCH 27). `cairn-blob` takes no `metrics` dependency
+        // either, so it exposes a cumulative count we mirror here. Non-zero means a read of an
+        // encrypted blob arrived with no data key — either a caller lost a DEK it should have
+        // resolved (the class of bug that had replication shipping ciphertext), or the documented
+        // false positive: an object whose body IS the verbatim bytes of an encrypted blob file
+        // (a `CAIRN_DATA_DIR` backed up into a bucket). Alertable; a log line is not.
+        metrics::counter!("cairn_blob_encrypted_without_key_total")
+            .absolute(stack.blob_local.encrypted_without_key_total());
 
         // Replication health (ARCH 20/26) from the uncapped aggregate (no 10k probe cap). Lag is
         // the age of the oldest still-pending *enqueue* (not its backed-off next_attempt_at, which
@@ -1156,7 +1187,8 @@ mod tests {
         targets
             .iter()
             .map(|t| {
-                let sink = HttpS3Sink::new(target_sink_cfg(t, false)).expect("target sink builds");
+                let sink =
+                    HttpS3Sink::new(target_sink_cfg(t, false, false)).expect("target sink builds");
                 (t.clone(), Arc::new(sink))
             })
             .collect()
@@ -1189,7 +1221,7 @@ mod tests {
     fn target_sink_cfg_carries_trust_knobs() {
         let mut t = target("secure", "mirror", "https://s3.secure.example");
         t.insecure_skip_verify = true;
-        let cfg = target_sink_cfg(&t, false);
+        let cfg = target_sink_cfg(&t, false, false);
         assert_eq!(cfg.endpoint, "https://s3.secure.example");
         assert_eq!(cfg.dest_bucket, "mirror");
         assert!(cfg.dest_buckets.is_empty());
@@ -1198,7 +1230,7 @@ mod tests {
 
         let mut t = target("ca", "mirror", "https://s3.ca.example");
         t.ca_path = Some(std::path::PathBuf::from("/etc/ca.pem"));
-        let cfg = target_sink_cfg(&t, false);
+        let cfg = target_sink_cfg(&t, false, false);
         assert_eq!(
             cfg.ca_cert_path,
             Some(std::path::PathBuf::from("/etc/ca.pem"))
@@ -1225,6 +1257,7 @@ mod tests {
                 ca_cert_pem: None,
                 insecure_skip_verify: false,
                 allow_internal_endpoints: false,
+                allow_plaintext_sse_over_http: false,
             })
             .unwrap(),
         );
@@ -1270,6 +1303,7 @@ mod tests {
                 ca_cert_pem: None,
                 insecure_skip_verify: false,
                 allow_internal_endpoints: false,
+                allow_plaintext_sse_over_http: false,
             })
             .unwrap(),
         )

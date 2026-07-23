@@ -203,7 +203,13 @@ source_env=( $(common_env "$DATA_S" "$PORT_S" "127.0.0.1:$PORT_S_UI" "$KEY_S")
              "CAIRN_KMS_KEY_IDS=$KEY_ID"
              "CAIRN_REPLICATION_REGION=us-east-1"
              "CAIRN_REPLICATION_INTERVAL_SECS=$REPL_INTERVAL"
-             "CAIRN_REPLICATION_WORKER_CONCURRENCY=$REPL_WORKER_CONCURRENCY" )
+             "CAIRN_REPLICATION_WORKER_CONCURRENCY=$REPL_WORKER_CONCURRENCY"
+             # The two nodes talk over loopback http://. Replication ships DECRYPTED bodies, so a
+             # CLIENT-encrypted (SSE-S3 / aws:kms) object is refused on a plaintext endpoint unless
+             # the operator opts in. This rig is loopback-only, and the driver's SSE arm is a GATED
+             # leg — without this every SSE object would sit rescheduled and the byte-exact gate
+             # would fail with "missing on the target".
+             "CAIRN_REPLICATION_ALLOW_PLAINTEXT_SSE_OVER_HTTP=true" )
 
 T_BOOT="$(env "${target_env[@]}" "$BIN" bootstrap)" || fail "target bootstrap failed"
 T_AK="$(echo "$T_BOOT" | awk '/Access Key Id/ {print $NF}')"
@@ -441,10 +447,11 @@ if [ -z "$GATE_FAIL" ]; then
     "$(jget delete_markers)"
   printf '      outbox drained to 0 in %ss, both nodes alive, 0 HTTP 5xx each, under every ceiling.\n' \
     "$(jget drain_secs)"
-  printf '      PINNED GAPS (not gated): %s SSE-encrypted source versions — %s absent (fail-closed),\n' \
-    "$(jget sse_total)" "$(jget sse_missing)"
-  printf '      %s byte-exact, %s present with WRONG BYTES (%s multipart: silent corruption).\n' \
-    "$(jget sse_match)" "$(jget sse_corrupt_on_target)" "$(jget sse_corrupt_multipart)"
+  printf '      SSE leg (GATED): %s encrypted source versions — %s byte-exact, %s missing,\n' \
+    "$(jget sse_total)" "$(jget sse_match)" "$(jget sse_missing)"
+  printf '      %s with wrong bytes (%s multipart). Any non-zero here fails the run: this leg IS the\n' \
+    "$(jget sse_corrupt_on_target)" "$(jget sse_corrupt_multipart)"
+  printf '      regression guard for the replication-ships-ciphertext defect.\n' 
   exit 0
 fi
 printf 'FAIL: gates:%s\n' "$GATE_FAIL" >&2

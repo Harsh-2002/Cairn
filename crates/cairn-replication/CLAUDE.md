@@ -44,6 +44,36 @@ is cheap to construct and safe to run from many workers at once.
   request forever.
 - **Ordering deferral is not a failure** — `DeferReplication` reschedules without incrementing
   `attempts`.
+- **Ship PLAINTEXT: resolve the version's DEK before reading its body.** `resolve_dek` unseals
+  `row.sse_descriptor` via `cairn_types::sse::open_dek` and `put_object` reads through
+  `open_with_dek`. Reading an
+  encrypted version with `dek: None` returns the stored **ciphertext at exactly the plaintext
+  length** — the destination cannot tell (it has no Content-MD5 to check, and a multipart source's
+  composite ETag is unverifiable), so the mirror ends up holding intact-looking garbage. Never call
+  the DEK-less `open` here. Resolve per read; never cache a DEK across passes (the re-wrap worker
+  re-seals descriptors underneath us).
+- **A DEK failure is a LOCAL condition and must say so.** DEK resolution happens in `process_entry`
+  (not inside `put_object`) precisely so the failure is classified with its cause statically known:
+  `reschedule_unavailable` takes an `UnavailableCause`, and the SourceKey arm logs/stamps "source
+  data key unavailable on this node's master ring" instead of "target unavailable" — the destination
+  is healthy, and blaming it pages the wrong system. Because `Unavailable` never consumes the attempt
+  budget, a PERMANENTLY removed key id retries forever and never reaches `failed`; each reschedule is
+  counted into `RunReport::dek_resolve_failures`, which `cairn-server` emits as
+  `cairn_replication_dek_resolve_failed_total`. That counter is the only signal such objects exist —
+  don't drop it.
+- **Client-encrypted objects are gated on a plaintext endpoint.** `ReplicatedObject.client_encrypted`
+  is true only for `SseMode::SseS3`/`Kms` (client-requested), never for `AtRest` (an operator storage
+  property). `HttpS3Sink` refuses such an object on an `http://` endpoint unless
+  `allow_plaintext_sse_over_http` (`CAIRN_REPLICATION_ALLOW_PLAINTEXT_SSE_OVER_HTTP`, default off).
+  The refusal is `Unavailable`, NOT `Terminal` — an operator-fixable config condition must not burn
+  the attempt budget or stamp a bucket failed; the object ships by itself once the endpoint is https.
+  This exposure is created BY the DEK fix: before it, such an object never replicated or replicated
+  as ciphertext.
+- **Key-failure classification is part of the fix.** `CryptoError::UnknownKeyId`/`Key` →
+  `Unavailable` (a rotation window must not consume the attempt budget and stamp a whole bucket
+  failed); a tampered envelope or a malformed descriptor → `Terminal`. `BlobError::Corruption` is
+  `Terminal` too — no retry count changes what is on disk. On every one of these paths the sink is
+  never contacted, so nothing leaks on the error path.
 - **Target secrets are sealed at rest.** `seal_target`/`open_target` go through `Crypto`; the
   plaintext lives only in a `Zeroizing` buffer. NEVER log, persist, or return the unsealed secret.
   Fails closed — wrong key / tampered ciphertext is `Terminal`, never plaintext (#29 sealed site).
@@ -64,7 +94,8 @@ is cheap to construct and safe to run from many workers at once.
 - `backfill_outbox_entries` stamps `BACKFILL_PLACEHOLDER_BUCKET` — the caller **must** substitute
   the real source bucket before committing.
 - `insecure_skip_verify` defeats TLS auth (testing only); mutually exclusive with a custom CA.
-- Tests: `tests/gate.rs` (engine), `tests/sink_http.rs` (real mock server). Fault injection:
+- Tests: `tests/gate.rs` (engine), `tests/sink_http.rs` (real mock server). The two-node
+  `conformance/stress_replication.py` SSE arm is the GATED regression guard for the DEK fix. Fault injection:
   `conformance/replication_chaos.sh`; two-node soak: `conformance/soak.sh`.
 - Spec: `docs/replication.md` (20). Env knobs/wiring: `cairn-server` `config.rs`/`background.rs`.
   See the root `../../CLAUDE.md` for the gate.

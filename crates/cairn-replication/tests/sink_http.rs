@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use bytes::Bytes;
-use cairn_types::error::BlobError;
+use cairn_types::error::{BlobError, ReplicationError};
 use cairn_types::id::{BucketName, ObjectKey, VersionId};
 use cairn_types::object::{ChecksumAlgorithm, ChecksumValue, ETag};
 use cairn_types::replication::ReplicatedObject;
@@ -128,6 +128,7 @@ fn sink_for(authority: &str, clock_secs: i64) -> HttpS3Sink {
             insecure_skip_verify: false,
             // The mock S3 server runs on loopback, so opt out of the SSRF guard for these tests.
             allow_internal_endpoints: true,
+            allow_plaintext_sse_over_http: false,
         },
         Arc::new(FixedClock(clock_secs)),
     )
@@ -164,6 +165,7 @@ async fn put_object_issues_well_formed_signed_request() {
         expires: None,
         storage_class: cairn_types::object::StorageClass::Standard,
         checksums: Vec::new(),
+        client_encrypted: false,
         body: body_stream(b"hello"),
     };
 
@@ -272,6 +274,7 @@ async fn composite_checksum_is_not_replicated_but_full_object_is() {
                 value: "ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0=".to_owned(),
             },
         ],
+        client_encrypted: false,
         body: body_stream(b"hello"),
     };
 
@@ -334,6 +337,7 @@ async fn put_object_emits_acl_header_only_when_present() {
         expires: None,
         storage_class: cairn_types::object::StorageClass::Standard,
         checksums: Vec::new(),
+        client_encrypted: false,
         body: body_stream(b"abc"),
     };
     sink.put_object(&src(), object).await.unwrap();
@@ -370,6 +374,7 @@ async fn put_object_emits_acl_header_only_when_present() {
         expires: None,
         storage_class: cairn_types::object::StorageClass::Standard,
         checksums: Vec::new(),
+        client_encrypted: false,
         body: body_stream(b""),
     };
     sink2.put_object(&src(), object2).await.unwrap();
@@ -405,6 +410,7 @@ async fn put_object_recomputes_signature_when_a_header_changes() {
         expires: None,
         storage_class: cairn_types::object::StorageClass::Standard,
         checksums: Vec::new(),
+        client_encrypted: false,
         body: body_stream(b"hello"),
     };
 
@@ -467,6 +473,7 @@ async fn server_5xx_is_unavailable() {
         expires: None,
         storage_class: cairn_types::object::StorageClass::Standard,
         checksums: Vec::new(),
+        client_encrypted: false,
         body: body_stream(b"x"),
     };
     let err = sink.put_object(&src(), object).await.unwrap_err();
@@ -519,6 +526,7 @@ async fn put_object_routes_to_per_source_destination_bucket() {
             insecure_skip_verify: false,
             // The mock S3 server runs on loopback, so opt out of the SSRF guard for these tests.
             allow_internal_endpoints: true,
+            allow_plaintext_sse_over_http: false,
         },
         Arc::new(FixedClock(1_440_938_160)),
     )
@@ -540,6 +548,7 @@ async fn put_object_routes_to_per_source_destination_bucket() {
         expires: None,
         storage_class: cairn_types::object::StorageClass::Standard,
         checksums: Vec::new(),
+        client_encrypted: false,
         body: body_stream(b"x"),
     };
 
@@ -606,6 +615,7 @@ async fn https_endpoint_negotiates_tls_not_plaintext() {
             insecure_skip_verify: false,
             // The mock S3 server runs on loopback, so opt out of the SSRF guard for these tests.
             allow_internal_endpoints: true,
+            allow_plaintext_sse_over_http: false,
         },
         Arc::new(FixedClock(1_440_938_160)),
     )
@@ -627,6 +637,7 @@ async fn https_endpoint_negotiates_tls_not_plaintext() {
         expires: None,
         storage_class: cairn_types::object::StorageClass::Standard,
         checksums: Vec::new(),
+        client_encrypted: false,
         body: body_stream(b"x"),
     };
     // The handshake fails (server presents no certificate), so the call errors as unavailable.
@@ -672,6 +683,7 @@ async fn put_object_replicates_system_headers_and_checksums() {
             algorithm: cairn_types::object::ChecksumAlgorithm::Sha256,
             value: "aGFzaA==".to_owned(),
         }],
+        client_encrypted: false,
         body: body_stream(b"hello"),
     };
     sink.put_object(&src(), object).await.unwrap();
@@ -684,4 +696,112 @@ async fn put_object_replicates_system_headers_and_checksums() {
     assert_eq!(req.header("expires"), Some("Wed, 21 Oct 2026 07:28:00 GMT"));
     assert_eq!(req.header("x-amz-storage-class"), Some("GLACIER"));
     assert_eq!(req.header("x-amz-checksum-sha256"), Some("aGFzaA=="));
+}
+
+// --- client-encrypted objects over a plaintext endpoint -------------------------------------
+//
+// Replication ships the DECRYPTED body (it must: the stored ciphertext is unreadable at the
+// destination). For an object the client asked us to encrypt, sending that plaintext to an
+// `http://` endpoint is new exposure created by the DEK fix itself — before it, such an object
+// either never replicated or replicated as ciphertext. It is therefore gated.
+
+/// Build a `ReplicatedObject` carrying `client_encrypted`.
+fn encrypted_object(client_encrypted: bool) -> ReplicatedObject {
+    ReplicatedObject {
+        key: ObjectKey::parse("secret.txt").unwrap(),
+        version_id: VersionId::from_string("v1".to_owned()),
+        content_type: "text/plain".to_owned(),
+        user_metadata: Vec::new(),
+        etag: ETag::from_string("\"abc\"".to_owned()),
+        size: 5,
+        tags: Vec::new(),
+        acl: None,
+        content_encoding: None,
+        cache_control: None,
+        content_disposition: None,
+        content_language: None,
+        expires: None,
+        storage_class: cairn_types::object::StorageClass::Standard,
+        checksums: Vec::new(),
+        client_encrypted,
+        body: body_stream(b"hello"),
+    }
+}
+
+#[tokio::test]
+async fn client_encrypted_object_is_refused_over_http_and_never_dials() {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let authority = spawn_server(captured.clone(), Reply { status: 200 }).await;
+    let sink = sink_for(&authority, 1_440_938_160);
+
+    let err = sink
+        .put_object(&src(), encrypted_object(true))
+        .await
+        .expect_err("a client-encrypted object must not be shipped in the clear");
+
+    // Unavailable, NOT Terminal: this is an operator-fixable configuration condition, and
+    // `Unavailable` reschedules without consuming the attempt budget — so the object ships by
+    // itself once the endpoint becomes https:// or the opt-in is set, with no operator retry and
+    // no bucket stamped permanently failed.
+    let msg = match &err {
+        ReplicationError::Unavailable(m) => m.clone(),
+        other => panic!("must be Unavailable (rescheduled, budget preserved), got {other:?}"),
+    };
+    // The message must name the REAL cause. "target unavailable" would send an operator to a
+    // destination that is perfectly healthy.
+    assert!(msg.contains("client-encrypted"), "{msg}");
+    assert!(msg.contains("http://"), "{msg}");
+    assert!(
+        msg.contains("CAIRN_REPLICATION_ALLOW_PLAINTEXT_SSE_OVER_HTTP"),
+        "the message must name the opt-in: {msg}"
+    );
+    // Fail closed: refused BEFORE the body is buffered or the endpoint dialled.
+    assert!(
+        captured.lock().unwrap().is_empty(),
+        "nothing may reach the wire"
+    );
+}
+
+#[tokio::test]
+async fn a_non_client_encrypted_object_still_ships_over_http() {
+    // At-rest-encrypted and unencrypted objects are `client_encrypted: false` and must be
+    // completely unaffected — gating them would break every existing plaintext-endpoint
+    // deployment for no security gain (at-rest is an operator storage property, not a client
+    // contract).
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let authority = spawn_server(captured.clone(), Reply { status: 200 }).await;
+    let sink = sink_for(&authority, 1_440_938_160);
+    sink.put_object(&src(), encrypted_object(false))
+        .await
+        .expect("an unflagged object ships over http exactly as before");
+    assert_eq!(captured.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn the_opt_in_allows_a_client_encrypted_object_over_http() {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let authority = spawn_server(captured.clone(), Reply { status: 200 }).await;
+    // The same rig as `sink_for`, but with the operator opt-in set.
+    let cfg_sink = HttpS3Sink::with_clock(
+        S3SinkConfig {
+            endpoint: format!("http://{authority}"),
+            dest_bucket: "dest-bucket".to_owned(),
+            dest_buckets: std::collections::HashMap::new(),
+            region: "us-east-1".to_owned(),
+            access_key_id: "AKIDEXAMPLE".to_owned(),
+            secret_access_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_owned(),
+            ca_cert_path: None,
+            ca_cert_pem: None,
+            insecure_skip_verify: false,
+            allow_internal_endpoints: true,
+            allow_plaintext_sse_over_http: true,
+        },
+        Arc::new(FixedClock(1_440_938_160)),
+    )
+    .unwrap();
+    cfg_sink
+        .put_object(&src(), encrypted_object(true))
+        .await
+        .expect("the operator opted in");
+    assert_eq!(captured.lock().unwrap().len(), 1);
 }

@@ -94,6 +94,16 @@ pub struct LocalBlobStore {
     ///
     /// [`with_small_read_max`]: LocalBlobStore::with_small_read_max
     small_read_max: u64,
+    /// Cumulative count of reads REFUSED because the blob is a self-consistent encrypted CRNB
+    /// container but the caller supplied no DEK (the fail-closed guard in [`open_with_dek`]).
+    ///
+    /// Exposed as state rather than emitted here: `cairn-blob` is an engine crate with no `metrics`
+    /// dependency, so the server mirrors this into `cairn_blob_encrypted_without_key_total` on its
+    /// metrics tick — the same expose-and-mirror shape as `writer_queue_depth` and the metadata
+    /// cache's `(hits, misses)`. A `tracing::error!` alone is not alertable; this is.
+    ///
+    /// [`open_with_dek`]: cairn_types::traits::BlobStore::open_with_dek
+    encrypted_without_key: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Default upper bound (bytes) for the small-object GET fast path — see [`LocalBlobStore`]'s
@@ -127,7 +137,23 @@ impl LocalBlobStore {
             write_permits: Arc::new(tokio::sync::Semaphore::new(DEFAULT_BLOB_IO_CONCURRENCY)),
             dir_sync: Arc::new(commit::DirSyncCoalescer::spawn()),
             small_read_max: SMALL_READ_MAX,
+            encrypted_without_key: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
+    }
+
+    /// Cumulative number of reads refused because the blob is an encrypted CRNB container and the
+    /// caller passed no data key (see the `encrypted_without_key` field). Monotonic for the life of
+    /// the process and shared across clones of the store; the server publishes it as
+    /// `cairn_blob_encrypted_without_key_total`.
+    ///
+    /// A non-zero value means either a caller lost a DEK it should have resolved (the replication
+    /// bug this guard closes) **or** the false-positive class documented in this crate's
+    /// `CLAUDE.md`: an object whose body is the verbatim bytes of somebody else's encrypted blob
+    /// file (an `rclone`/`aws s3 sync` backup of a `CAIRN_DATA_DIR` into a bucket).
+    #[must_use]
+    pub fn encrypted_without_key_total(&self) -> u64 {
+        self.encrypted_without_key
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Override the small-object GET fast-path size bound (see the `small_read_max` field). An
@@ -647,6 +673,7 @@ impl BlobStore for LocalBlobStore {
         // anyway, so it would never take the zero-copy path). This is the small-object GET fast path.
         let small_read_max = self.small_read_max;
         let probe_path = file_path.clone();
+        let refused = self.encrypted_without_key.clone();
         let (compressed, logical_len, reuse_file, whole) = tokio::task::spawn_blocking(
             move || -> Result<(bool, u64, Option<std::fs::File>, Option<Bytes>), BlobError> {
                 use std::io::{Read, Seek, SeekFrom};
@@ -662,6 +689,50 @@ impl BlobStore for LocalBlobStore {
                 // stored descriptor + DEK (`is_container`, audit #18), so there is no trailer sniff
                 // to misfire on an uncompressed object whose own bytes happen to end in "CRNB".
                 let compressed = is_container;
+                // Defence in depth: framing is decided from the DEK ARGUMENT, so a caller that
+                // forgets the key for an encrypted-but-uncompressed blob would otherwise stream raw
+                // ciphertext as if it were the plaintext body — silently, at exactly the right
+                // length. (That is precisely how replication shipped ciphertext to mirrors.) Before
+                // taking the plaintext branch, cross-check the trailer and REFUSE if the blob is
+                // demonstrably an encrypted container. We only ever refuse — never parse as a
+                // container — so a plaintext blob that merely ends in the magic still reads (the
+                // predicate additionally requires the full layout identity to hold).
+                //
+                // The trailer is fetched with ONE POSITIONED read (`pread`) rather than
+                // seek-to-end / read / seek-back: the plaintext branch is the tuned hot path
+                // (including the small-object fast path), so the guard must not cost it two extra
+                // `lseek`s per GET — and, more importantly, the rewind was an *unstated* invariant
+                // that both the `read_to_end` branch and the reused zero-copy fd silently depended
+                // on. A positioned read leaves the file offset untouched, so that dependency is
+                // gone rather than merely satisfied. `read_exact_at` is a safe `std` API, so
+                // `#![forbid(unsafe_code)]` still holds.
+                if !compressed && file_len >= compress::TRAILER_BYTES as u64 {
+                    let mut t = [0u8; compress::TRAILER_BYTES];
+                    let off = file_len - compress::TRAILER_BYTES as u64;
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::FileExt;
+                        f.read_exact_at(&mut t, off).map_err(io_err)?;
+                    }
+                    // Portable fallback (the crate targets unix in practice — `raw_io` keeps the
+                    // same shape). Seek/read/rewind, restoring the offset the branches below want.
+                    #[cfg(not(unix))]
+                    {
+                        f.seek(SeekFrom::Start(off)).map_err(io_err)?;
+                        f.read_exact(&mut t).map_err(io_err)?;
+                        f.seek(SeekFrom::Start(0)).map_err(io_err)?;
+                    }
+                    if compress::is_encrypted_container_trailer(&t, file_len) {
+                        refused.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        tracing::error!(
+                            path = %probe_path.display(),
+                            "refusing to read an encrypted blob without a data key"
+                        );
+                        return Err(BlobError::Corruption(
+                            "encrypted blob read without a data key".into(),
+                        ));
+                    }
+                }
                 if compressed {
                     // Parse the header for the logical length; the fd is consumed by the reader and
                     // not reused (compressed/encrypted blobs never take the kernel fast path).

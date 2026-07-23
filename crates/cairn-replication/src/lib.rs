@@ -49,13 +49,14 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use cairn_types::blob::ByteRange;
-use cairn_types::error::{BlobError, MetaError, ReplicationError};
+use cairn_types::error::{BlobError, CryptoError, MetaError, ReplicationError};
 use cairn_types::id::{BucketName, ObjectKey, VersionId};
 use cairn_types::meta::{Mutation, OutboxEntry, ReplicationOp, ReplicationStatus};
 use cairn_types::object::ObjectVersionRow;
 use cairn_types::replication::ReplicatedObject;
+use cairn_types::sse::SseMode;
 use cairn_types::time::Timestamp;
-use cairn_types::traits::{BlobStore, Clock, MetadataStore};
+use cairn_types::traits::{BlobStore, Clock, Crypto, MetadataStore};
 
 /// Tunables governing a replication worker pass.
 #[derive(Debug, Clone, Copy)]
@@ -111,6 +112,15 @@ pub struct RunReport {
     /// drained replica/duplicate entries contribute zero). Observability emits this as the
     /// replicated-bytes counter.
     pub bytes: u64,
+    /// Entries rescheduled this pass because the source version's DEK could not be unsealed on the
+    /// LOCAL master ring. Emitted as `cairn_replication_dek_resolve_failed_total`.
+    ///
+    /// This is the only visibility this condition gets: a DEK failure is classified `Unavailable`,
+    /// which reschedules *without* consuming the attempt budget, so an entry whose key id was
+    /// **permanently** removed from the ring retries forever and never lands in `failed` — it would
+    /// otherwise be silent apart from a per-pass log line. Included in `retried`, not in addition
+    /// to it (the same entry is counted once in each).
+    pub dek_resolve_failures: usize,
 }
 
 impl RunReport {
@@ -126,16 +136,33 @@ impl RunReport {
 ///
 /// It holds no mutable state of its own: the durable outbox is the source of truth, so an
 /// engine is cheap to construct and safe to run from many workers concurrently.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Clone)]
 pub struct ReplicationEngine {
     opts: ReplicationOpts,
+    /// The master-key facility used to unseal an encrypted source version's DEK before the body is
+    /// read. Without it the engine reads the blob with no key and ships **raw ciphertext**: the
+    /// destination cannot tell (the byte count is the plaintext length), so an encrypted multipart
+    /// object replicates as an intact-looking, unreadable replica. The key must be resolved from
+    /// the version row for every object read — never cached across passes, since the re-wrap worker
+    /// re-seals descriptors underneath us.
+    crypto: Arc<dyn Crypto>,
+}
+
+impl std::fmt::Debug for ReplicationEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `dyn Crypto` is deliberately not `Debug` — key material never reaches a log line.
+        f.debug_struct("ReplicationEngine")
+            .field("opts", &self.opts)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ReplicationEngine {
-    /// Construct an engine with the given options.
+    /// Construct an engine with the given options and the master-key facility used to unseal
+    /// encrypted source versions.
     #[must_use]
-    pub fn new(opts: ReplicationOpts) -> Self {
-        Self { opts }
+    pub fn new(opts: ReplicationOpts, crypto: Arc<dyn Crypto>) -> Self {
+        Self { opts, crypto }
     }
 
     /// The options this engine runs with.
@@ -209,10 +236,13 @@ impl ReplicationEngine {
                         report.completed += 1;
                         report.bytes += bytes;
                     }
-                    EntryOutcome::Retried => {
+                    EntryOutcome::Retried { dek_unavailable } => {
                         // A retry/unavailable reschedule for THIS version: a later version of the
                         // same key+target must wait for it, so block the rest of the group.
                         report.retried += 1;
+                        if dek_unavailable {
+                            report.dek_resolve_failures += 1;
+                        }
                         blocked = true;
                     }
                     EntryOutcome::Failed => {
@@ -379,9 +409,29 @@ impl ReplicationEngine {
                     .get_object_tags(&entry.bucket, &entry.key, &entry.version_id)
                     .await
                     .map_err(|e| ReplicationError::Retryable(format!("loading object tags: {e}")));
-                match tags {
-                    Ok(tags) => self.put_object(sink, blobs, &row, tags).await,
-                    Err(e) => Err(e),
+                // Resolve the source version's DEK HERE rather than inside `put_object`, so a key
+                // failure is classified with its cause statically known instead of being flattened
+                // into the same `Unavailable(String)` the destination raises. A DEK failure means
+                // the LOCAL master ring is the problem and the destination is healthy; reporting it
+                // as "target unavailable" pages the wrong system (review finding 4).
+                match (tags, resolve_dek(&*self.crypto, &row)) {
+                    (Err(e), _) => Err(e),
+                    (Ok(_), Err(ReplicationError::Unavailable(msg))) => {
+                        return self
+                            .reschedule_unavailable(
+                                meta,
+                                entry,
+                                now,
+                                &msg,
+                                UnavailableCause::SourceKey,
+                            )
+                            .await;
+                    }
+                    (Ok(_), Err(e)) => Err(e),
+                    (Ok(tags), Ok((dek, client_encrypted))) => {
+                        self.put_object(sink, blobs, &row, tags, dek, client_encrypted)
+                            .await
+                    }
                 }
             }
             ReplicationOp::DeleteMarker => sink
@@ -400,9 +450,12 @@ impl ReplicationEngine {
                 self.retry_or_exhaust(meta, entry, now, &msg).await
             }
             Err(ReplicationError::Unavailable(msg)) => {
-                // The destination target is down: retry at a bounded cadence WITHOUT consuming the
-                // attempt budget, so the queue survives an extended outage and auto-resumes.
-                self.reschedule_unavailable(meta, entry, now, &msg).await
+                // The destination target is down (the DEK-unavailable case never reaches here — it
+                // is handled above with its cause known): retry at a bounded cadence WITHOUT
+                // consuming the attempt budget, so the queue survives an extended outage and
+                // auto-resumes.
+                self.reschedule_unavailable(meta, entry, now, &msg, UnavailableCause::Destination)
+                    .await
             }
             Err(ReplicationError::Terminal(msg)) => {
                 self.mark_failed(meta, entry, &msg, None).await?;
@@ -422,6 +475,8 @@ impl ReplicationEngine {
         blobs: &Arc<B>,
         row: &ObjectVersionRow,
         tags: Vec<(String, String)>,
+        dek: Option<[u8; 32]>,
+        client_encrypted: bool,
     ) -> Result<u64, ReplicationError>
     where
         B: BlobStore + ?Sized,
@@ -434,7 +489,7 @@ impl ReplicationEngine {
             ));
         };
 
-        // Read the whole logical body. Opening the blob is local I/O: a failure here is
+        // Read the whole logical body — through the DEK the caller resolved (see `resolve_dek`). Opening the blob is local I/O: a failure here is
         // transient (the blob may be momentarily unavailable), so classify it retryable
         // unless the blob is genuinely gone.
         let range = Some(ByteRange {
@@ -442,7 +497,7 @@ impl ReplicationEngine {
             length: row.size_logical,
         });
         let handle = blobs
-            .open(path, range, &row.compression)
+            .open_with_dek(path, range, dek, &row.compression)
             .await
             .map_err(map_blob_err)?;
 
@@ -463,6 +518,7 @@ impl ReplicationEngine {
             expires: row.expires.clone(),
             storage_class: row.storage_class,
             checksums: row.checksums.clone(),
+            client_encrypted,
             body: handle.body,
         };
 
@@ -543,7 +599,9 @@ impl ReplicationEngine {
             );
             let next = now.plus_secs(delay as i64);
             self.mark_failed(meta, entry, msg, Some(next)).await?;
-            Ok(EntryOutcome::Retried)
+            Ok(EntryOutcome::Retried {
+                dek_unavailable: false,
+            })
         }
     }
 
@@ -574,12 +632,25 @@ impl ReplicationEngine {
     /// attempt budget, so a target that is down for an extended period keeps its queued work and
     /// auto-resumes when it returns instead of exhausting to a terminal failure (which would need an
     /// operator retry). Records the reason on the entry for observability.
+    ///
+    /// `cause` decides what the operator is told, because two structurally identical reschedules
+    /// have opposite remedies (review finding 4): a down destination, and this node's own master
+    /// ring failing to unseal the source version's DEK. The second must never be reported as
+    /// "target unavailable" — the destination is healthy and the fix is local key material.
+    ///
+    /// NOTE the standing hazard of this path: `Unavailable` deliberately never consumes the attempt
+    /// budget, so a condition that is in fact PERMANENT (a key id removed from the ring for good,
+    /// an endpoint decommissioned) retries at this cadence forever and never surfaces in the
+    /// `failed` count or on `/metrics` as a failure. That is why the DEK case is counted into
+    /// [`RunReport::dek_resolve_failures`] → `cairn_replication_dek_resolve_failed_total`: a
+    /// sustained non-zero rate there is the only signal that objects are silently never shipping.
     async fn reschedule_unavailable<M>(
         &self,
         meta: &M,
         entry: &OutboxEntry,
         now: Timestamp,
         msg: &str,
+        cause: UnavailableCause,
     ) -> Result<EntryOutcome, MetaError>
     where
         M: MetadataStore + ?Sized,
@@ -587,20 +658,47 @@ impl ReplicationEngine {
         let delay = UNAVAILABLE_RETRY_SECS
             .min(self.opts.max_backoff_secs)
             .max(1);
-        tracing::warn!(
-            bucket = %entry.bucket.as_str(),
-            key = %entry.key.as_str(),
-            error = msg,
-            "replication target unavailable; retrying without consuming the attempt budget"
-        );
+        let dek_unavailable = matches!(cause, UnavailableCause::SourceKey);
+        match cause {
+            UnavailableCause::Destination => tracing::warn!(
+                bucket = %entry.bucket.as_str(),
+                key = %entry.key.as_str(),
+                error = msg,
+                "replication target unavailable; retrying without consuming the attempt budget"
+            ),
+            UnavailableCause::SourceKey => tracing::error!(
+                bucket = %entry.bucket.as_str(),
+                key = %entry.key.as_str(),
+                error = msg,
+                "replication cannot unseal the SOURCE object's data key on this node's master \
+                 ring; the destination is not implicated. Retrying without consuming the attempt \
+                 budget — if the key id was removed permanently this object will never ship"
+            ),
+        }
         meta.submit(Mutation::DeferReplication {
             id: entry.id.clone(),
             next_attempt_at: now.plus_secs(delay as i64),
-            last_error: Some(format!("target unavailable: {msg}")),
+            last_error: Some(match cause {
+                UnavailableCause::Destination => format!("target unavailable: {msg}"),
+                UnavailableCause::SourceKey => {
+                    format!("source data key unavailable on this node's master ring: {msg}")
+                }
+            }),
         })
         .await?;
-        Ok(EntryOutcome::Retried)
+        Ok(EntryOutcome::Retried { dek_unavailable })
     }
+}
+
+/// Which side of the replication path is unavailable. Both reschedule identically; they differ only
+/// in what the operator is told and in whether the pass counts a DEK-resolve failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnavailableCause {
+    /// The remote destination could not be reached or returned a 5xx/408/429.
+    Destination,
+    /// This node could not unseal the SOURCE version's DEK from its master ring. The destination
+    /// is healthy; the fault is local key material.
+    SourceKey,
 }
 
 /// The disposition of a single processed entry, used to preserve per-key ordering. A completed
@@ -610,7 +708,14 @@ enum EntryOutcome {
     Completed {
         bytes: u64,
     },
-    Retried,
+    Retried {
+        /// True when the reschedule was caused by the LOCAL master ring failing to unseal the
+        /// source version's DEK, rather than by the destination. Counted into
+        /// [`RunReport::dek_resolve_failures`] so a permanently-removed key id is visible: the
+        /// `Unavailable` path never consumes the attempt budget, so such an entry never becomes
+        /// `failed` and would otherwise leave no durable signal at all.
+        dek_unavailable: bool,
+    },
     Failed,
     /// An earlier version of this key has not yet replicated (it is in flight in a separate drain
     /// batch). The entry was left untouched — still `claimed` under its lease — so a later drain
@@ -636,7 +741,57 @@ fn entry_target_arn(entry: &OutboxEntry) -> Option<&str> {
 fn map_blob_err(e: BlobError) -> ReplicationError {
     match e {
         BlobError::NotFound => ReplicationError::Terminal(format!("source blob missing: {e}")),
+        // Corruption (a bad container, a wrong/absent DEK, a failed AEAD tag) is a property of the
+        // bytes on disk: no number of retries changes it. Retrying it merely burns the attempt
+        // budget and delays the operator signal, so it is terminal.
+        BlobError::Corruption(_) => {
+            ReplicationError::Terminal(format!("source blob unreadable: {e}"))
+        }
         other => ReplicationError::Retryable(format!("source blob read failed: {other}")),
+    }
+}
+
+/// Resolve the source version's data-encryption key BEFORE a byte of its body is read, together
+/// with whether the encryption was **client-requested**.
+///
+/// A row carrying an `sse_descriptor` is stored as ciphertext; reading it without the DEK yields
+/// raw ciphertext at exactly the plaintext length, which the destination happily accepts — silent,
+/// unverifiable corruption of the replica. A row with no descriptor is plaintext and reads with
+/// `None`.
+///
+/// The second element is `true` only for [`SseMode::SseS3`]/[`SseMode::Kms`] — encryption the
+/// client asked for, and therefore a contract the sink must not quietly break by putting the
+/// decrypted body on an unauthenticated link. [`SseMode::AtRest`] is an operator storage property,
+/// not a client contract, so it is `false`.
+fn resolve_dek(
+    crypto: &dyn Crypto,
+    row: &ObjectVersionRow,
+) -> Result<(Option<[u8; 32]>, bool), ReplicationError> {
+    match row.sse_descriptor.as_deref() {
+        Some(json) => {
+            let d = cairn_types::sse::parse_descriptor(json).map_err(map_crypto_err)?;
+            let client_encrypted = matches!(d.mode, SseMode::SseS3 | SseMode::Kms);
+            let dek = *cairn_types::sse::open_dek(crypto, &d).map_err(map_crypto_err)?;
+            Ok((Some(dek), client_encrypted))
+        }
+        None => Ok((None, false)),
+    }
+}
+
+/// Classify a failure to unseal an encrypted source version's DEK.
+///
+/// The distinction is the whole point of [`CryptoError::UnknownKeyId`]: a key that is merely not on
+/// this node's ring right now (mid-rotation, a not-yet-loaded ring entry) is **unavailable**, and
+/// `Unavailable` reschedules at a bounded cadence *without* consuming the attempt budget — so a
+/// rotation window cannot permanently stamp a whole bucket failed. A tampered envelope or a
+/// malformed descriptor can never succeed and is terminal. Either way we fail CLOSED: no body is
+/// read and nothing is shipped, so ciphertext never egresses on the error path.
+fn map_crypto_err(e: CryptoError) -> ReplicationError {
+    match e {
+        CryptoError::UnknownKeyId | CryptoError::Key | CryptoError::KeyRotationRequired => {
+            ReplicationError::Unavailable(format!("source data key unavailable: {e}"))
+        }
+        other => ReplicationError::Terminal(format!("source data key unusable: {other}")),
     }
 }
 

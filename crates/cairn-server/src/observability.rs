@@ -100,4 +100,17 @@ fn describe_metrics() {
         Unit::Bytes,
         "Total logical bytes shipped by successful object replications"
     );
+    describe_counter!(
+        "cairn_replication_dek_resolve_failed_total",
+        "Replication attempts rescheduled because the source object's data key could not be \
+         unsealed on this node's master ring (the destination is not implicated). These never \
+         consume the attempt budget, so they never surface as failed entries — alert on this."
+    );
+
+    // Fail-closed encrypted-read refusals (ARCH 27).
+    describe_counter!(
+        "cairn_blob_encrypted_without_key_total",
+        "Blob reads refused because the blob is an encrypted container and no data key was \
+         supplied (fail-closed; never streams ciphertext as a body)"
+    );
 }
