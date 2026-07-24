@@ -167,6 +167,7 @@ The schema below is the reference for the SQLite store. Types are given in the e
 | acl | text | Nullable; the object ACL where ownership keeps ACLs in force. |
 | checksums | text | Nullable; any client-supplied checksums. |
 | replication_status | text | Nullable; pending, completed, failed, or replica, for replication-enabled buckets. |
+| replicated_at | integer | Nullable; unix seconds MarkReplicationDone last stamped this version completed (migration v23); NULL = never shipped from this node or shipped pre-v23 (treated as suspect by the encrypted-replica audit). |
 | created_at, updated_at | timestamp | Not null. |
 | Unique key | | The combination of bucket, key, and version identifier is unique. |
 | Index | | Over bucket and key and version ordering, for current-version lookup and version listing. |
@@ -214,6 +215,7 @@ The schema below is the reference for the SQLite store. Types are given in the e
 | bucket_name, key, version_id | text | Not null; the version this entry concerns. |
 | operation | text | Not null; an object creation or a delete-marker propagation. |
 | rule_id | text | Not null; the replication rule. |
+| target_arn | text | Nullable; the remote-target ARN stamped at enqueue (migration v6) so drain-time routing is a per-entry lookup for multi-target buckets; NULL routes via the legacy endpoint. |
 | attempts | integer | Not null; the retry count. |
 | next_attempt_at | timestamp | Not null; the backoff schedule. |
 | priority | integer | Not null, default 0; higher dispatches first, carried from the matching rule. |
@@ -221,7 +223,7 @@ The schema below is the reference for the SQLite store. Types are given in the e
 | lease_until | integer | Nullable; the claim-lease expiry, set with the claimed status by the atomic claim so a stalled claim can be reclaimed. |
 | last_error | text | Nullable. |
 | enqueued_at | integer | Not null, default 0; the wall-clock millis an entry was first enqueued, so lag is the age of the oldest still-unreplicated entry's enqueue time rather than its backed-off next-attempt time. A value of 0 (rows predating the column) is treated as unknown by the lag query (migration v19). |
-| Index | | Over status and next-attempt time, for due-entry claiming, and over status and enqueue time, for the per-status aggregate and lag. |
+| Index | | Over status and next-attempt time, for due-entry claiming, and over status and enqueue time, for the per-status aggregate and lag; a third index over (bucket_name, key) on replication_outbox (idx_outbox_bucket_key, migration v23) backing the key-paged forced-resync requeue seek. |
 
 **Object locks (migration v16).** Per-version S3 Object Lock (WORM) state in a side table so the hot object-versions row is untouched; a row exists only for a version that has ever had a lock set. Columns: bucket_name, key, version_id (composite primary key); lock_mode ('GOVERNANCE'|'COMPLIANCE'|null for no retention); retain_until (epoch-ms retention expiry, nullable); legal_hold (integer, not null, default 0).
 

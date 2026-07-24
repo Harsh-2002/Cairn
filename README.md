@@ -36,8 +36,10 @@ manifest, plus a multi-arch image at `ghcr.io/harsh-2002/cairn`. Verify a downlo
 - Storage efficiency: optional per-bucket block compression, with range reads that touch only the
   blocks they need.
 - Operations: Prometheus metrics, liveness and readiness endpoints, structured logs, asynchronous
-  bucket replication to another node or S3 endpoint, webhook event notifications, and a CLI for
-  bootstrap, config validation, integrity checks, and backup and restore.
+  bucket replication to another node or S3 endpoint, webhook event notifications, one-shot streaming
+  import/migration of buckets and objects from another S3-compatible store (MinIO/Garage/R2/AWS/another
+  Cairn) into this node, and a CLI for bootstrap, config validation, integrity checks, and backup and
+  restore.
 
 ## Install
 
