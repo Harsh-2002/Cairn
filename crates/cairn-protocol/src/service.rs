@@ -3873,7 +3873,7 @@ impl S3Service {
             .try_emit_events(bucket, key, version_id, event, size, etag, now)
             .await
         {
-            tracing::warn!(bucket = %bucket.as_str(), key = %key.as_str(), error = ?e, "event notification enqueue failed (best-effort)");
+            tracing::warn!(bucket = %bucket.as_str(), key = ?key.as_str(), error = ?e, "event notification enqueue failed (best-effort)");
         }
     }
 

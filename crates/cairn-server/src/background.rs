@@ -1284,7 +1284,7 @@ async fn scrub_loop(stack: Arc<AppStack>, interval: Duration) {
                             Err(e) => {
                                 tracing::warn!(
                                     bucket = %bucket.name.as_str(),
-                                    key = %s.key.as_str(),
+                                    key = ?s.key.as_str(),
                                     version = %s.version_id.as_str(),
                                     error = %e,
                                     "scrub: re-reading version row failed"
@@ -1300,7 +1300,7 @@ async fn scrub_loop(stack: Arc<AppStack>, interval: Duration) {
                                 .increment(1);
                             tracing::error!(
                                 bucket = %bucket.name.as_str(),
-                                key = %s.key.as_str(),
+                                key = ?s.key.as_str(),
                                 version = %s.version_id.as_str(),
                                 kind,
                                 "scrub: blob failed integrity verification"
@@ -1311,7 +1311,7 @@ async fn scrub_loop(stack: Arc<AppStack>, interval: Duration) {
                             // is shrinking coverage, without a corruption page.
                             tracing::warn!(
                                 bucket = %bucket.name.as_str(),
-                                key = %s.key.as_str(),
+                                key = ?s.key.as_str(),
                                 version = %s.version_id.as_str(),
                                 "scrub: data key unavailable, version not verified this pass"
                             );
