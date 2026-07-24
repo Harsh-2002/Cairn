@@ -217,6 +217,95 @@ impl cairn_types::traits::AuthorizationEngine for DenyPutObjectOn {
     }
 }
 
+/// Denies `s3:GetObject`/`GetObjectVersion` on ONE bucket, allows everything else — to prove the
+/// copy source-read authorization runs BEFORE any existence/precondition check.
+struct DenyGetObjectOn(&'static str);
+impl cairn_types::traits::AuthorizationEngine for DenyGetObjectOn {
+    fn evaluate(&self, input: &cairn_types::authz::AuthzInput) -> cairn_types::authz::Decision {
+        use cairn_types::authz::{Action, Decision, DenyReason, Resource};
+        let on_target =
+            matches!(&input.resource, Resource::Object { bucket, .. } if bucket.as_str() == self.0);
+        if on_target && matches!(input.action, Action::GetObject | Action::GetObjectVersion) {
+            Decision::Deny(DenyReason::DefaultDeny)
+        } else {
+            Decision::Allow
+        }
+    }
+}
+
+/// SECURITY regression (Phase-4 tenancy audit): a CopyObject whose source read the requester is NOT
+/// authorized for must be denied with a UNIFORM AccessDenied — BEFORE the source version is resolved
+/// or any `x-amz-copy-source-if-*` precondition is evaluated. Otherwise a member who owns the
+/// destination bucket learns cross-tenant metadata: existence (404 NoSuchKey vs 403 AccessDenied),
+/// exact ETag (`if-match` -> 412 vs 403), and last-modified. This test fails without the reorder:
+/// pre-fix, a non-existent denied source returns 404 and a mismatching `if-match` returns 412.
+#[tokio::test]
+async fn copy_source_read_is_authorized_before_existence_and_preconditions() {
+    let h = harness_with_authz(Arc::new(DenyGetObjectOn("srcb"))).await;
+    for b in ["srcb", "destb"] {
+        drain(send(&h.svc, req(Method::PUT, Some(b), None, &[], &[], vec![])).await).await;
+    }
+    // Source object exists (PUT allowed; only GET is denied on srcb).
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("srcb"),
+                Some("obj"),
+                &[],
+                &[],
+                b"secret".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    async fn copy_status(h: &Harness, hs: &[(&str, &str)]) -> StatusCode {
+        drain(
+            send(
+                &h.svc,
+                req(Method::PUT, Some("destb"), Some("dst"), &[], hs, vec![]),
+            )
+            .await,
+        )
+        .await
+        .0
+    }
+    // (1) EXISTENCE oracle closed: an existing and a non-existent denied source both return 403.
+    let existing = copy_status(&h, &[("x-amz-copy-source", "/srcb/obj")]).await;
+    let missing = copy_status(&h, &[("x-amz-copy-source", "/srcb/does-not-exist")]).await;
+    assert_eq!(
+        existing,
+        StatusCode::FORBIDDEN,
+        "a denied source read must be 403"
+    );
+    assert_eq!(
+        missing,
+        StatusCode::FORBIDDEN,
+        "a NON-existent denied source must ALSO be 403, not 404 — no cross-tenant existence oracle"
+    );
+    // (2) PRECONDITION oracle closed: a mismatching if-match on a denied source is 403, not 412.
+    let mismatch = copy_status(
+        &h,
+        &[
+            ("x-amz-copy-source", "/srcb/obj"),
+            (
+                "x-amz-copy-source-if-match",
+                "\"00000000000000000000000000000000\"",
+            ),
+        ],
+    )
+    .await;
+    assert_eq!(
+        mismatch,
+        StatusCode::FORBIDDEN,
+        "a mismatching precondition on a denied source must be 403, not 412 — no ETag oracle"
+    );
+}
+
 /// SECURITY regression (Phase-1 authn/authz audit): `object_op` dispatches a copy-source PUT to
 /// `copy_object` AHEAD of the `?tagging` arm, so the authorize chokepoint must classify it as the
 /// write it performs — `PutObject` — not as the metadata-only `PutObjectTagging` the coexisting
