@@ -2,6 +2,7 @@
 import Base from "../layouts/Base.astro";
 import Section from "../components/Section.astro";
 import CodeBlock from "../components/CodeBlock.astro";
+import Architecture from "../components/Architecture.astro";
 
 const repo = "https://github.com/Harsh-2002/Cairn";
 
@@ -116,7 +117,10 @@ const bench = [
     </dl>
   </Section>
 
-  {/* 3 — Features */}
+  {/* 3 — Architecture (low-level design) */}
+  <Architecture />
+
+  {/* 4 — Features */}
   <Section eyebrow="Features" title="What it does">
     <dl class="points points--features">
       {
@@ -130,7 +134,7 @@ const bench = [
     </dl>
   </Section>
 
-  {/* 4 — Performance */}
+  {/* 5 — Performance */}
   <Section eyebrow="Performance" title="Measured against MinIO">
     <p>
       A like-for-like comparison against MinIO, both on the same 2 vCPU / 16 GB host, both single-node
@@ -178,7 +182,7 @@ const bench = [
     />
   </Section>
 
-  {/* 5 — Why Cairn */}
+  {/* 6 — Why Cairn */}
   <Section eyebrow="Why Cairn" title="Built to replace a single-node MinIO">
     <p>
       If you run a single-node MinIO, or any single-drive or single-host S3 endpoint, Cairn is built
@@ -209,7 +213,7 @@ const bench = [
     </dl>
   </Section>
 
-  {/* 6 — Scope */}
+  {/* 7 — Scope */}
   <Section eyebrow="Scope" title="Single-node by design">
     <p>
       Cairn is single-node by design: one process, one data filesystem, one metadata database.
@@ -238,7 +242,7 @@ const bench = [
     </ul>
   </Section>
 
-  {/* 7 — Quickstart */}
+  {/* 8 — Quickstart */}
   <Section eyebrow="Quickstart" title="Run it by hand with Docker">
     <CodeBlock code={dockerRun} />
     <ul class="notes">
@@ -259,7 +263,7 @@ const bench = [
     </p>
   </Section>
 
-  {/* 8 — Roadmap */}
+  {/* 9 — Roadmap */}
   <Section eyebrow="Roadmap" title="Planned and additive">
     <p>None of it changes the S3 or management API.</p>
     <ul class="scope">
@@ -270,7 +274,7 @@ const bench = [
     </ul>
   </Section>
 
-  {/* 9 — Get started */}
+  {/* 10 — Get started */}
   <Section eyebrow="Get started" title="Install it" id="get-started">
     <p>
       Install on a host or with Docker, then open the console on <code>:7374</code> and point any S3
@@ -291,7 +295,7 @@ const bench = [
     </nav>
   </Section>
 
-  {/* 10 — Footer */}
+  {/* 11 — Footer */}
   <footer class="site-footer wrap">
     <p class="site-footer__tag">Cairn — self-hosted, S3-compatible object storage.</p>
     <p>

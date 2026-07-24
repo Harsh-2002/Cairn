@@ -112,15 +112,25 @@ const canonical = new URL(base, Astro.site);
         margin-bottom: var(--space-5);
       }
       .wordmark {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.5ch;
         font-family: var(--font-mono);
         font-weight: 600;
         font-size: 1.05rem;
         letter-spacing: -0.02em;
         color: var(--fg);
       }
+      /* The Cairn mark: the filled rounded square from the console logo + favicon
+         (in-app `size-4 rounded`, ~0.25 corner ratio). Foreground-coloured, so it
+         inverts with the theme. Decorative — the link's aria-label names it. */
       .wordmark::before {
-        content: "$ ";
-        color: var(--fg-faint);
+        content: "";
+        width: 0.82em;
+        height: 0.82em;
+        border-radius: 0.22em;
+        background: var(--fg);
+        flex: none;
       }
       .theme-toggle {
         display: inline-flex;

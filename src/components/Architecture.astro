@@ -1,0 +1,214 @@
+---
+import Section from "./Section.astro";
+
+// A typographic, low-level view of Cairn's request/data path and its durability
+// contract. No images: hairline-bordered layers + mono chips that reflow at every
+// width (so nothing scrolls sideways on mobile). Top-to-bottom is the flow.
+const layers = [
+  { tier: "Clients", nodes: [{ t: "S3 SDKs" }, { t: "aws CLI" }, { t: "Console" }] },
+  {
+    tier: "Listeners",
+    nodes: [{ t: ":7373 — S3 data plane" }, { t: ":7374 — console + /api/v1" }],
+  },
+  {
+    tier: "Request path",
+    nodes: [
+      { t: "SigV4 / Bearer" },
+      { t: "policy · ACL · BPA" },
+      { t: "S3 handler + lifecycle" },
+      { t: "SSE seal / open" },
+    ],
+  },
+  {
+    tier: "Metadata",
+    nodes: [
+      { t: "Writer — all writes" },
+      { t: "WAL pool + cache — reads" },
+      { t: "SQLite — source of truth", key: true },
+    ],
+  },
+  {
+    tier: "Object bytes",
+    nodes: [{ t: "BlobStore — plain files (POSIX)", key: true }, { t: "block compression" }],
+  },
+  {
+    tier: "Background",
+    nodes: [{ t: "replication" }, { t: "lifecycle" }, { t: "webhooks" }],
+  },
+];
+
+// The write path is an ordered contract: bytes are durable before the metadata
+// transaction that references them, and that commit is the one linearization point.
+const steps = [
+  "stage bytes",
+  "fsync file",
+  "rename",
+  "fsync dir",
+  "validate hashes",
+  "commit metadata",
+  "reclaim",
+];
+const keyStep = "commit metadata";
+---
+
+<Section eyebrow="Architecture" title="How it works">
+  <p>
+    Cairn is one process with two listeners and two durable stores — no clustering layer, no external
+    database, no separate storage daemon. A request flows straight down the stack: authenticated,
+    authorized, and handled, then committed. Reads come off a WAL pool; every write goes through a
+    single group-committing writer, so the database has exactly one linearization point.
+  </p>
+
+  <div class="arch">
+    {
+      layers.map((l, i) => (
+        <>
+          {i > 0 && <span class="arch__link" aria-hidden="true" />}
+          <div class="arch__layer">
+            <span class="arch__tier">{l.tier}</span>
+            <div class="arch__nodes">
+              {l.nodes.map((n) => (
+                <span class={`chip ${n.key ? "chip--key" : ""}`}>{n.t}</span>
+              ))}
+            </div>
+          </div>
+        </>
+      ))
+    }
+  </div>
+
+  <p class="arch__lead">
+    Durability is an ordered contract. Object bytes are staged and fsynced <em>before</em> the
+    metadata transaction that references them, and that commit is the single point where a write
+    becomes real — so an acknowledged write has already survived power loss. On restart, Cairn
+    reconciles and reclaims anything a crash left behind.
+  </p>
+
+  <div class="writepath" role="list" aria-label="Durable write path, in order">
+    {
+      steps.map((s, i) => (
+        <>
+          {i > 0 && (
+            <span class="writepath__arrow" aria-hidden="true">
+              →
+            </span>
+          )}
+          <span role="listitem" class={`writepath__step ${s === keyStep ? "is-key" : ""}`}>
+            <span class="writepath__n">{i + 1}</span>
+            {s}
+          </span>
+        </>
+      ))
+    }
+  </div>
+  <p class="writepath__note">
+    Step 6 is the linearization point: nothing before it is acknowledged, and nothing after it can
+    lose the object.
+  </p>
+</Section>
+
+<style>
+  /* --- Layered flow diagram: each tier is a full-width hairline row, so it reflows
+         cleanly and never scrolls sideways. Top-to-bottom implies the request flow. --- */
+  .arch {
+    margin-top: var(--space-4);
+    display: flex;
+    flex-direction: column;
+  }
+  .arch__layer {
+    display: grid;
+    grid-template-columns: 8rem 1fr;
+    gap: 0.5rem 0.9rem;
+    align-items: center;
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius);
+    padding: 0.7rem 0.9rem;
+    background: var(--bg-subtle);
+  }
+  .arch__tier {
+    font-family: var(--font-mono);
+    font-size: var(--step--1);
+    letter-spacing: 0.04em;
+    color: var(--fg-faint);
+  }
+  .arch__nodes {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+  }
+  .chip {
+    font-family: var(--font-mono);
+    font-size: var(--step--1);
+    color: var(--fg-muted);
+    background: var(--bg);
+    border: 1px solid var(--hairline-bold);
+    border-radius: 5px;
+    padding: 0.25rem 0.55rem;
+  }
+  /* The linchpins — the single source of truth and the on-disk bytes — read at full
+     foreground so the eye lands on them. */
+  .chip--key {
+    color: var(--fg);
+    border-color: var(--fg);
+  }
+  /* A centered hairline between tiers, in the page's own 1px-rule language. */
+  .arch__link {
+    width: 1px;
+    height: var(--space-4);
+    margin-inline: auto;
+    background: var(--hairline-bold);
+  }
+
+  /* --- The durable write path: an ordered row of numbered steps that wraps instead
+         of scrolling. The arrows are flow, not content (aria-hidden). --- */
+  .arch__lead {
+    margin-top: var(--space-5);
+  }
+  .writepath {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.45rem 0.35rem;
+    margin-top: var(--space-3);
+  }
+  .writepath__step {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.55ch;
+    font-family: var(--font-mono);
+    font-size: var(--step--1);
+    color: var(--fg-muted);
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius);
+    padding: 0.3rem 0.6rem;
+  }
+  .writepath__step.is-key {
+    color: var(--fg);
+    border-color: var(--fg);
+  }
+  .writepath__n {
+    font-size: 0.74em;
+    color: var(--fg-faint);
+    font-variant-numeric: tabular-nums;
+  }
+  .writepath__step.is-key .writepath__n {
+    color: var(--fg-muted);
+  }
+  .writepath__arrow {
+    color: var(--fg-faint);
+    font-family: var(--font-mono);
+  }
+  .writepath__note {
+    font-size: var(--step--1);
+    color: var(--fg-faint);
+    margin-top: var(--space-3);
+  }
+
+  /* Narrow screens: tier label stacks above its nodes; chips may wrap their text
+     rather than overflow. No horizontal scroll at any width. */
+  @media (max-width: 34rem) {
+    .arch__layer {
+      grid-template-columns: 1fr;
+    }
+  }
+</style>

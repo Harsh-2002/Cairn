@@ -61,7 +61,12 @@ const { code, label } = Astro.props;
     margin: 0;
     padding: 0.9rem 1rem;
     padding-right: 4.5rem;
-    overflow-x: auto;
+    /* Wrap long commands (the install one-liner, the docker block) instead of
+       scrolling — so there is no horizontal scrollbar on any device or OS. pre-wrap
+       preserves the intentional newlines + indentation; overflow-wrap breaks the
+       rare over-long token (a URL) rather than overflowing the box. */
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
     font-family: var(--font-mono);
     font-size: 0.9rem;
     line-height: 1.65;
