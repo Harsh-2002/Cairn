@@ -6849,6 +6849,227 @@ async fn bucket_encryption_subresource_round_trip_and_bucket_survives_delete() {
 /// control. This sets `required:true`, exercises both S3 verbs, and asserts a plaintext client PUT
 /// stays refused throughout. Pre-fix, either verb overwrote/wiped the doc and a plaintext PUT then
 /// succeeded — a security-control removal from the data plane.
+/// SECURITY regression (Phase-2 crypto audit): a bucket marked mandatory-SSE (`required:true`, no
+/// default algorithm) must refuse a header-less object on EVERY create path — not only a plain PUT.
+/// Before the fix, a header-less multipart upload and a header-less CopyObject silently stored
+/// PLAINTEXT in the bucket the operator mandated must be encrypted, defeating the control (each
+/// returned 200 and the object landed unencrypted). This test fails without the enforce_mandatory_sse
+/// calls in complete_multipart / copy_object.
+#[tokio::test]
+async fn mandatory_sse_is_enforced_on_multipart_complete_and_copy() {
+    use cairn_types::bucket::{ConfigAspect, ConfigDoc};
+    use cairn_types::meta::Mutation;
+    let h = harness().await;
+    for b in ["reqb", "srcb"] {
+        drain(send(&h.svc, req(Method::PUT, Some(b), None, &[], &[], vec![])).await).await;
+    }
+    h.meta
+        .submit(Mutation::SetBucketConfig {
+            bucket: BucketName::parse("reqb").unwrap(),
+            aspect: ConfigAspect::Encryption,
+            doc: Some(ConfigDoc(r#"{"required":true}"#.to_owned())),
+        })
+        .await
+        .unwrap();
+    // A readable source object in the non-required bucket.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("srcb"),
+                Some("src"),
+                &[],
+                &[],
+                b"source".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    // --- header-less MULTIPART complete into the required bucket must be REFUSED ---
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::POST,
+                Some("reqb"),
+                Some("mpk"),
+                &[("uploads", "")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let uid = between(
+        &String::from_utf8(body).unwrap(),
+        "<UploadId>",
+        "</UploadId>",
+    );
+    let (st, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("reqb"),
+                Some("mpk"),
+                &[("uploadId", uid.as_str()), ("partNumber", "1")],
+                &[],
+                b"part".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let petag = header(&hdrs, "etag").unwrap().to_owned();
+    let cbody = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{petag}</ETag></Part></CompleteMultipartUpload>"
+    );
+    let (st, _, xml) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::POST,
+                Some("reqb"),
+                Some("mpk"),
+                &[("uploadId", uid.as_str())],
+                &[],
+                cbody.into_bytes(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    let xml = String::from_utf8(xml).unwrap();
+    assert_eq!(
+        st,
+        StatusCode::BAD_REQUEST,
+        "mandatory-SSE bucket must refuse a header-less multipart complete; got {st}: {xml}"
+    );
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(Method::GET, Some("reqb"), Some("mpk"), &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_ne!(
+        st,
+        StatusCode::OK,
+        "no plaintext multipart object may exist in the mandatory-SSE bucket"
+    );
+
+    // --- header-less COPY into the required bucket must be REFUSED ---
+    let (st, _, xml) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("reqb"),
+                Some("cpk"),
+                &[],
+                &[("x-amz-copy-source", "/srcb/src")],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    let xml = String::from_utf8(xml).unwrap();
+    assert_eq!(
+        st,
+        StatusCode::BAD_REQUEST,
+        "mandatory-SSE bucket must refuse a header-less copy; got {st}: {xml}"
+    );
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(Method::GET, Some("reqb"), Some("cpk"), &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_ne!(
+        st,
+        StatusCode::OK,
+        "no plaintext copied object may exist in the mandatory-SSE bucket"
+    );
+
+    // --- POSITIVE: WITH an SSE header, multipart complete succeeds (compliant writes still work) ---
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::POST,
+                Some("reqb"),
+                Some("ok"),
+                &[("uploads", "")],
+                &[("x-amz-server-side-encryption", "AES256")],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let uid2 = between(
+        &String::from_utf8(body).unwrap(),
+        "<UploadId>",
+        "</UploadId>",
+    );
+    let (st, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("reqb"),
+                Some("ok"),
+                &[("uploadId", uid2.as_str()), ("partNumber", "1")],
+                &[],
+                b"part".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let petag2 = header(&hdrs, "etag").unwrap().to_owned();
+    let cbody2 = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{petag2}</ETag></Part></CompleteMultipartUpload>"
+    );
+    let (st, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::POST,
+                Some("reqb"),
+                Some("ok"),
+                &[("uploadId", uid2.as_str())],
+                &[],
+                cbody2.into_bytes(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "an SSE multipart complete must succeed on a mandatory-SSE bucket"
+    );
+    assert_eq!(
+        header(&hdrs, "x-amz-server-side-encryption"),
+        Some("AES256")
+    );
+}
+
 #[tokio::test]
 async fn s3_encryption_surface_preserves_mandatory_required_flag() {
     use cairn_types::bucket::{ConfigAspect, ConfigDoc};

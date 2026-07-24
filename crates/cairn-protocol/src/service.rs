@@ -726,7 +726,7 @@ impl S3Service {
         // bucket's default-encryption setting (the `encryption` config aspect) decides.
         let requested = requested_sse(&req)?;
         // Resolve the encryption plan (explicit header > bucket default > transparent at-rest > none).
-        let mut plan = self
+        let plan = self
             .resolve_object_encryption(&bucket.name, requested)
             .await?;
         // Mandatory encryption (the `encryption` aspect's `required` flag) is a CLIENT-facing
@@ -739,28 +739,9 @@ impl S3Service {
         // bucket still reads the config at most once. An inbound replica is never refused: if it
         // resolved to plaintext it is force-encrypted (SSE-S3); if it already resolved to `AtRest`
         // (at-rest on) it stays encrypted as-is.
-        let advertised_plan = plan
-            .descriptor_json
-            .as_deref()
-            .and_then(advertised_sse)
-            .is_some();
-        if !advertised_plan && self.bucket_sse_required(&bucket.name).await? {
-            if is_replica {
-                if plan.dek.is_none() {
-                    let (dek, descriptor) = self.new_sse_dek()?;
-                    plan = EncryptionPlan {
-                        dek: Some(dek),
-                        descriptor_json: Some(descriptor),
-                    };
-                }
-            } else {
-                return Err(Error::InvalidRequest(
-                    "this bucket requires server-side encryption: send \
-                     `x-amz-server-side-encryption: AES256` or configure a default"
-                        .to_owned(),
-                ));
-            }
-        }
+        let plan = self
+            .enforce_mandatory_sse(&bucket.name, plan, is_replica)
+            .await?;
         let sse_dek = plan.dek;
         let sse_descriptor = plan.descriptor_json;
 
@@ -1878,6 +1859,13 @@ impl S3Service {
         let plan = self
             .resolve_object_encryption(&bucket.name, requested)
             .await?;
+        // A multipart complete is an object-create path, so it MUST honour the bucket's mandatory-SSE
+        // contract exactly as a plain PUT does — otherwise a header-less multipart upload stores
+        // plaintext in a bucket the operator mandated must be encrypted (Phase-2 security audit). A
+        // multipart upload is never an inbound replica.
+        let plan = self
+            .enforce_mandatory_sse(&bucket.name, plan, false)
+            .await?;
         let sse_dek = plan.dek;
         let sse_descriptor = plan.descriptor_json;
         // A FULL_OBJECT plan (CRC64NVME, or an explicitly-requested whole-object type) needs the
@@ -2297,6 +2285,13 @@ impl S3Service {
         let requested = requested_sse(req)?;
         let dest_plan = self
             .resolve_object_encryption(&dest_bucket.name, requested)
+            .await?;
+        // A copy is an object-create path, so the DESTINATION bucket's mandatory-SSE contract applies
+        // exactly as for a plain PUT — a header-less copy must not store the destination plaintext in
+        // a bucket the operator mandated must be encrypted (Phase-2 security audit). A copy is never an
+        // inbound replica (replicas arrive as marked plain PUTs).
+        let dest_plan = self
+            .enforce_mandatory_sse(&dest_bucket.name, dest_plan, false)
             .await?;
         // Capture the SSE descriptor to echo on the copy response BEFORE it is moved into the
         // mutation below — a copy whose destination is SseS3/Kms (explicit header or bucket default)
@@ -4862,6 +4857,46 @@ impl S3Service {
                 .and_then(|v| v.get("required").and_then(serde_json::Value::as_bool))
                 .unwrap_or(false)
         }))
+    }
+
+    /// Enforce a bucket's MANDATORY-SSE contract on an already-resolved encryption plan. A bucket
+    /// marked `required` must not store an object that does not ADVERTISE server-side encryption
+    /// (SSE-S3/KMS) — transparent `AtRest` encrypts the bytes but advertises nothing, so it does not
+    /// satisfy the client/compliance contract. A normal request is REFUSED; an inbound replica is
+    /// force-encrypted (SSE-S3) instead, so replicating a compliant source never stalls.
+    ///
+    /// EVERY object-create path (`put_object`, `complete_multipart`, `copy_object`) MUST call this
+    /// after `resolve_object_encryption` — a path that skips it silently defeats the operator's
+    /// mandatory-encryption control and stores plaintext at rest (Phase-2 security audit).
+    async fn enforce_mandatory_sse(
+        &self,
+        bucket: &BucketName,
+        mut plan: EncryptionPlan,
+        is_replica: bool,
+    ) -> Result<EncryptionPlan> {
+        let advertised = plan
+            .descriptor_json
+            .as_deref()
+            .and_then(advertised_sse)
+            .is_some();
+        if !advertised && self.bucket_sse_required(bucket).await? {
+            if is_replica {
+                if plan.dek.is_none() {
+                    let (dek, descriptor) = self.new_sse_dek()?;
+                    plan = EncryptionPlan {
+                        dek: Some(dek),
+                        descriptor_json: Some(descriptor),
+                    };
+                }
+            } else {
+                return Err(Error::InvalidRequest(
+                    "this bucket requires server-side encryption: send \
+                     `x-amz-server-side-encryption: AES256` or configure a default"
+                        .to_owned(),
+                ));
+            }
+        }
+        Ok(plan)
     }
 
     /// Generate a fresh random 32-byte DEK, seal it under the master key, and return both the raw
