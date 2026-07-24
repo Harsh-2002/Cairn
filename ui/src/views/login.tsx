@@ -82,7 +82,10 @@ export function Login() {
       <Card className="w-full max-w-sm">
         <CardHeader className="gap-1.5">
           <div className="mb-2 flex items-center gap-2">
-            <span aria-hidden="true" className="size-4 rounded bg-foreground" />
+            <span
+              aria-hidden="true"
+              className="size-4 rounded-[4px] bg-foreground"
+            />
             <span className="text-sm font-semibold">Cairn</span>
           </div>
           <h1 className="text-lg font-semibold tracking-tight">

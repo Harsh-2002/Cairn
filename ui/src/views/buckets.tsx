@@ -1,5 +1,5 @@
-import { useId, useState, type FormEvent } from "react";
-import { useNavigate } from "react-router";
+import { useEffect, useId, useState, type FormEvent } from "react";
+import { useNavigate, useSearchParams } from "react-router";
 import { Database, MoreHorizontal, Plus } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
@@ -160,6 +160,17 @@ export function Buckets() {
       setServerError(null);
     }
   }
+
+  // The command palette's "Create bucket" action lands here with ?new=1 — open the create dialog and
+  // strip the param so a refresh or Back doesn't reopen it.
+  const [searchParams, setSearchParams] = useSearchParams();
+  useEffect(() => {
+    if (searchParams.get("new") !== "1") return;
+    openCreate(true);
+    const next = new URLSearchParams(searchParams);
+    next.delete("new");
+    setSearchParams(next, { replace: true });
+  }, [searchParams, setSearchParams]);
 
   async function create(e: FormEvent) {
     e.preventDefault();

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Link, Outlet, useLocation } from "react-router";
 import { AppSidebar } from "@/components/app-sidebar";
+import { CommandPalette } from "@/components/command-palette";
 import { SidebarInset, SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar";
 import { Toaster } from "@/components/ui/sonner";
 
@@ -85,6 +86,8 @@ export function AppShell() {
           </div>
         </main>
       </SidebarInset>
+      {/* Cmd/Ctrl+K launcher — owns its own open state and global shortcut. */}
+      <CommandPalette />
       <Toaster position="bottom-right" />
       {/* Polite live region: announces the destination on every client-side navigation. */}
       <div role="status" aria-live="polite" className="sr-only">

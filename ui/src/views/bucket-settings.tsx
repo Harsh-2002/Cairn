@@ -129,6 +129,18 @@ interface AspectsSource {
   public_access_block: unknown | null;
 }
 
+// One plain-language line for the SELECTED ownership mode, shown live under the picker so a
+// non-IAM-expert sees what their choice actually does at the decision point — not just in the
+// prose above it.
+const OWNERSHIP_CONSEQUENCE: Record<string, string> = {
+  BucketOwnerEnforced:
+    "ACLs are disabled — access is governed only by bucket and IAM policies. The simplest and safest choice; keep this unless a specific client needs ACLs.",
+  BucketOwnerPreferred:
+    "ACLs apply, but an object uploaded with the bucket-owner-full-control ACL is owned by the bucket owner.",
+  ObjectWriter:
+    "ACLs apply, and the uploading account owns each object it writes. Only needed for cross-account writers that rely on ACLs.",
+};
+
 // Single-source the settings-card chrome: the `gap-4` Card, the `text-base`
 // CardTitle, the optional description, and the `border-t pt-4` footer that the
 // ~11 cards below all share. Each card supplies only its title, body, and
@@ -1299,17 +1311,17 @@ export function BucketSettings() {
               </Button>
             }
           >
-            <CardContent>
+            <CardContent className="space-y-2">
               <Select value={ownership} onValueChange={setOwnership}>
                 <SelectTrigger
-                  className="w-full sm:w-56"
+                  className="w-full sm:w-64"
                   aria-label="Object ownership"
                 >
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
                   <SelectItem value="BucketOwnerEnforced">
-                    Bucket owner enforced
+                    Bucket owner enforced · Recommended
                   </SelectItem>
                   <SelectItem value="BucketOwnerPreferred">
                     Bucket owner preferred
@@ -1317,6 +1329,10 @@ export function BucketSettings() {
                   <SelectItem value="ObjectWriter">Object writer</SelectItem>
                 </SelectContent>
               </Select>
+              {/* What the CURRENT selection means, in plain words — updates as the picker changes. */}
+              <p className="text-[13px] leading-relaxed text-muted-foreground">
+                {OWNERSHIP_CONSEQUENCE[ownership]}
+              </p>
             </CardContent>
           </SettingsCard>
           )}
@@ -1326,10 +1342,27 @@ export function BucketSettings() {
             <SettingsCard
             title="Public Access Block"
             description="Guardrails that neutralise public access regardless of ACLs or policy. Enabling all four is the safe default."
+            footerClassName="gap-2"
             footer={
-              <Button onClick={savePab} disabled={busy === "pab"}>
-                {busy === "pab" ? "Saving…" : "Save"}
-              </Button>
+              <>
+                {/* One click to the recommended posture instead of four toggles. */}
+                <Button
+                  variant="ghost"
+                  onClick={() =>
+                    setPab((cur) => {
+                      const next = { ...cur };
+                      for (const t of PAB_TOGGLES) next[t.key] = true;
+                      return next;
+                    })
+                  }
+                  disabled={busy === "pab"}
+                >
+                  Enable all (safe default)
+                </Button>
+                <Button onClick={savePab} disabled={busy === "pab"}>
+                  {busy === "pab" ? "Saving…" : "Save"}
+                </Button>
+              </>
             }
           >
             <CardContent className="space-y-3">

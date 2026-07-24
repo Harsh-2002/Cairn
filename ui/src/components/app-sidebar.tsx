@@ -11,8 +11,10 @@ import {
   LogOut,
   PanelLeft,
   RefreshCw,
+  Search,
   Tags,
   Users,
+  type LucideIcon,
 } from "lucide-react";
 import {
   Collapsible,
@@ -25,6 +27,7 @@ import {
   SidebarFooter,
   SidebarGroup,
   SidebarGroupContent,
+  SidebarGroupLabel,
   SidebarHeader,
   SidebarMenu,
   SidebarMenuButton,
@@ -40,22 +43,61 @@ import { api } from "@/lib/api";
 import { useAuth } from "@/providers/auth-provider";
 import { cn } from "@/lib/utils";
 
-const NAV = [
-  { label: "Overview", path: "/overview", icon: Home },
-  { label: "Metrics", path: "/metrics", icon: BarChart3 },
-  { label: "Buckets", path: "/buckets", icon: Database },
-  { label: "Tags", path: "/tags", icon: Tags },
-  { label: "Users", path: "/users", icon: Users },
-  { label: "Credentials", path: "/credentials", icon: KeyRound },
-  { label: "Activity", path: "/activity", icon: Activity },
-  { label: "Replication", path: "/replication", icon: RefreshCw },
-  { label: "Import", path: "/imports", icon: DownloadCloud },
+interface NavItem {
+  label: string;
+  path: string;
+  icon: LucideIcon;
+}
+
+// Platform-correct hint for the command-palette shortcut.
+const SHORTCUT_HINT =
+  typeof navigator !== "undefined" &&
+  /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent)
+    ? "⌘K"
+    : "Ctrl K";
+
+// The rail is grouped so nine destinations read as three short, labelled scans
+// instead of one long flat list. Buckets carries an inline accordion of the
+// bucket names (below), so Tags/Replication/Import sit with it under Storage.
+const NAV_GROUPS: { label: string; items: NavItem[] }[] = [
+  {
+    label: "Insights",
+    items: [
+      { label: "Overview", path: "/overview", icon: Home },
+      { label: "Metrics", path: "/metrics", icon: BarChart3 },
+      { label: "Activity", path: "/activity", icon: Activity },
+    ],
+  },
+  {
+    label: "Storage",
+    items: [
+      { label: "Buckets", path: "/buckets", icon: Database },
+      { label: "Tags", path: "/tags", icon: Tags },
+      { label: "Replication", path: "/replication", icon: RefreshCw },
+      { label: "Import", path: "/imports", icon: DownloadCloud },
+    ],
+  },
+  {
+    label: "Access",
+    items: [
+      { label: "Users", path: "/users", icon: Users },
+      { label: "Credentials", path: "/credentials", icon: KeyRound },
+    ],
+  },
 ];
 
-/** Which nav section a path belongs to (bucket subroutes light up Buckets, etc.). */
+/** Which nav section a path belongs to (bucket subroutes light up Buckets, etc.).
+ * Segment-aware: a prefix only matches on a `/` boundary, so `/tags` never lights
+ * up for a hypothetical `/tagsomething` and each section owns exactly its subtree. */
 function isActive(navPath: string, pathname: string): boolean {
-  if (navPath === "/overview") return pathname === "/" || pathname.startsWith("/overview");
-  return pathname.startsWith(navPath) || (navPath === "/users" && pathname.startsWith("/users"));
+  if (navPath === "/overview") {
+    return (
+      pathname === "/" ||
+      pathname === "/overview" ||
+      pathname.startsWith("/overview/")
+    );
+  }
+  return pathname === navPath || pathname.startsWith(navPath + "/");
 }
 
 export function AppSidebar() {
@@ -85,6 +127,105 @@ export function AppSidebar() {
       .then((r) => setBuckets(r.buckets.map((b) => b.name)))
       .catch(() => setBuckets([]));
   }, [bucketsOpen, buckets]);
+
+  function closeOnMobile() {
+    if (isMobile) setOpenMobile(false);
+  }
+
+  // One item's markup. Buckets is the accordion special case: the label still
+  // navigates to the list view, but a chevron expands an inline, lazily-loaded
+  // list of buckets without leaving the current page.
+  function renderNavItem(item: NavItem) {
+    const active = isActive(item.path, location.pathname);
+
+    if (item.path === "/buckets") {
+      return (
+        <Collapsible
+          key={item.path}
+          open={bucketsOpen}
+          onOpenChange={setBucketsOpen}
+          asChild
+        >
+          <SidebarMenuItem>
+            <SidebarMenuButton asChild isActive={active} tooltip={item.label}>
+              <Link
+                to={item.path}
+                aria-current={active ? "page" : undefined}
+                onClick={closeOnMobile}
+              >
+                <item.icon aria-hidden="true" />
+                <span>{item.label}</span>
+              </Link>
+            </SidebarMenuButton>
+            <CollapsibleTrigger asChild>
+              <button
+                type="button"
+                aria-label={bucketsOpen ? "Collapse buckets" : "Expand buckets"}
+                className="absolute top-1.5 right-1 flex aspect-square w-5 items-center justify-center rounded-md text-sidebar-foreground/70 ring-sidebar-ring outline-hidden transition-transform hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:ring-2 group-data-[collapsible=icon]:hidden"
+              >
+                <ChevronRight
+                  aria-hidden="true"
+                  className={cn(
+                    "transition-transform duration-150 ease-out",
+                    bucketsOpen && "rotate-90"
+                  )}
+                />
+              </button>
+            </CollapsibleTrigger>
+            <CollapsibleContent>
+              <SidebarMenuSub>
+                {buckets === null ? (
+                  <SidebarMenuSubItem>
+                    <span className="flex h-7 items-center px-2 text-xs text-muted-foreground">
+                      Loading…
+                    </span>
+                  </SidebarMenuSubItem>
+                ) : buckets.length === 0 ? (
+                  <SidebarMenuSubItem>
+                    <span className="flex h-7 items-center px-2 text-xs text-muted-foreground">
+                      No buckets
+                    </span>
+                  </SidebarMenuSubItem>
+                ) : (
+                  buckets.map((b) => {
+                    const bucketActive = activeBucket === b;
+                    return (
+                      <SidebarMenuSubItem key={b}>
+                        <SidebarMenuSubButton asChild isActive={bucketActive}>
+                          <Link
+                            to={`/buckets/${encodeURIComponent(b)}/browser`}
+                            aria-current={bucketActive ? "page" : undefined}
+                            onClick={closeOnMobile}
+                          >
+                            <span className="font-mono text-[13px]">{b}</span>
+                          </Link>
+                        </SidebarMenuSubButton>
+                      </SidebarMenuSubItem>
+                    );
+                  })
+                )}
+              </SidebarMenuSub>
+            </CollapsibleContent>
+          </SidebarMenuItem>
+        </Collapsible>
+      );
+    }
+
+    return (
+      <SidebarMenuItem key={item.path}>
+        <SidebarMenuButton asChild isActive={active} tooltip={item.label}>
+          <Link
+            to={item.path}
+            aria-current={active ? "page" : undefined}
+            onClick={closeOnMobile}
+          >
+            <item.icon aria-hidden="true" />
+            <span>{item.label}</span>
+          </Link>
+        </SidebarMenuButton>
+      </SidebarMenuItem>
+    );
+  }
 
   return (
     <Sidebar collapsible="icon">
@@ -119,125 +260,40 @@ export function AppSidebar() {
         </div>
       </SidebarHeader>
       <SidebarContent>
-        <SidebarGroup>
-          <SidebarGroupContent role="navigation" aria-label="Main">
-            <SidebarMenu className="stagger-children">
-              {NAV.map((item) => {
-                // One source of truth for "current section": both the visual
-                // highlight and the announced aria-current come from the same
-                // helper, so they can never disagree (plain Link, not NavLink,
-                // whose own exact-match aria-current would override ours).
-                const active = isActive(item.path, location.pathname);
-
-                // Buckets is an accordion: the label still navigates to the
-                // list view, but a chevron expands an inline, lazily-loaded
-                // list of buckets without leaving the current page.
-                if (item.path === "/buckets") {
-                  return (
-                    <Collapsible
-                      key={item.path}
-                      open={bucketsOpen}
-                      onOpenChange={setBucketsOpen}
-                      asChild
-                    >
-                      <SidebarMenuItem>
-                        <SidebarMenuButton asChild isActive={active} tooltip={item.label}>
-                          <Link
-                            to={item.path}
-                            aria-current={active ? "page" : undefined}
-                            onClick={() => {
-                              if (isMobile) setOpenMobile(false);
-                            }}
-                          >
-                            <item.icon aria-hidden="true" />
-                            <span>{item.label}</span>
-                          </Link>
-                        </SidebarMenuButton>
-                        <CollapsibleTrigger asChild>
-                          <button
-                            type="button"
-                            aria-label={
-                              bucketsOpen ? "Collapse buckets" : "Expand buckets"
-                            }
-                            className="absolute top-1.5 right-1 flex aspect-square w-5 items-center justify-center rounded-md text-sidebar-foreground/70 ring-sidebar-ring outline-hidden transition-transform hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:ring-2 group-data-[collapsible=icon]:hidden"
-                          >
-                            <ChevronRight
-                              aria-hidden="true"
-                              className={cn(
-                                "transition-transform duration-150 ease-out",
-                                bucketsOpen && "rotate-90"
-                              )}
-                            />
-                          </button>
-                        </CollapsibleTrigger>
-                        <CollapsibleContent>
-                          <SidebarMenuSub>
-                            {buckets === null ? (
-                              <SidebarMenuSubItem>
-                                <span className="flex h-7 items-center px-2 text-xs text-muted-foreground">
-                                  Loading…
-                                </span>
-                              </SidebarMenuSubItem>
-                            ) : buckets.length === 0 ? (
-                              <SidebarMenuSubItem>
-                                <span className="flex h-7 items-center px-2 text-xs text-muted-foreground">
-                                  No buckets
-                                </span>
-                              </SidebarMenuSubItem>
-                            ) : (
-                              buckets.map((b) => {
-                                const bucketActive = activeBucket === b;
-                                return (
-                                  <SidebarMenuSubItem key={b}>
-                                    <SidebarMenuSubButton
-                                      asChild
-                                      isActive={bucketActive}
-                                    >
-                                      <Link
-                                        to={`/buckets/${encodeURIComponent(b)}/browser`}
-                                        aria-current={
-                                          bucketActive ? "page" : undefined
-                                        }
-                                        onClick={() => {
-                                          if (isMobile) setOpenMobile(false);
-                                        }}
-                                      >
-                                        <span className="font-mono text-[13px]">
-                                          {b}
-                                        </span>
-                                      </Link>
-                                    </SidebarMenuSubButton>
-                                  </SidebarMenuSubItem>
-                                );
-                              })
-                            )}
-                          </SidebarMenuSub>
-                        </CollapsibleContent>
-                      </SidebarMenuItem>
-                    </Collapsible>
-                  );
-                }
-
-                return (
-                  <SidebarMenuItem key={item.path}>
-                    <SidebarMenuButton asChild isActive={active} tooltip={item.label}>
-                      <Link
-                        to={item.path}
-                        aria-current={active ? "page" : undefined}
-                        onClick={() => {
-                          if (isMobile) setOpenMobile(false);
-                        }}
-                      >
-                        <item.icon aria-hidden="true" />
-                        <span>{item.label}</span>
-                      </Link>
-                    </SidebarMenuButton>
-                  </SidebarMenuItem>
-                );
-              })}
-            </SidebarMenu>
+        {/* Visible entry to the Cmd/Ctrl+K palette, so the shortcut isn't the only way to find it.
+            Collapses to just the search icon in the icon rail. */}
+        <SidebarGroup className="pb-0">
+          <SidebarGroupContent>
+            <button
+              type="button"
+              onClick={() =>
+                window.dispatchEvent(new Event("cairn:command-palette"))
+              }
+              aria-label="Open command palette (search)"
+              className="flex h-8 w-full items-center gap-2 rounded-md border border-sidebar-border bg-background px-2 text-sm text-muted-foreground outline-none transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:ring-2 focus-visible:ring-sidebar-ring group-data-[collapsible=icon]:justify-center group-data-[collapsible=icon]:px-0"
+            >
+              <Search aria-hidden="true" className="size-4 shrink-0" />
+              <span className="group-data-[collapsible=icon]:hidden">
+                Search…
+              </span>
+              <kbd className="ms-auto hidden rounded border bg-muted px-1.5 font-mono text-[11px] text-muted-foreground md:inline group-data-[collapsible=icon]:!hidden">
+                {SHORTCUT_HINT}
+              </kbd>
+            </button>
           </SidebarGroupContent>
         </SidebarGroup>
+        {NAV_GROUPS.map((group) => (
+          <SidebarGroup key={group.label}>
+            {/* The group label is hidden in the collapsed icon rail (there's no room), where the
+                per-item tooltips carry the names instead. */}
+            <SidebarGroupLabel>{group.label}</SidebarGroupLabel>
+            <SidebarGroupContent role="navigation" aria-label={group.label}>
+              <SidebarMenu className="stagger-children">
+                {group.items.map((item) => renderNavItem(item))}
+              </SidebarMenu>
+            </SidebarGroupContent>
+          </SidebarGroup>
+        ))}
       </SidebarContent>
       <SidebarFooter className="px-3 py-3 group-data-[collapsible=icon]:px-2">
         {/* Account + appearance controls live at the foot of the rail (webapp shell), not a header.
