@@ -171,6 +171,25 @@ pub struct SystemInfo {
     pub data_dir: std::path::PathBuf,
     /// Process start instant, for uptime.
     pub started_at: std::time::Instant,
+    /// Live release-update status, refreshed by the server's background update-check loop. Shared so
+    /// `GET /system` reads the freshest value without re-snapshotting `SystemInfo`. Empty (all-none,
+    /// `update_available=false`) when the check is disabled, hasn't run yet, or the feed is
+    /// unreachable (air-gapped) — the console then simply shows no update hint.
+    pub update_status: std::sync::Arc<std::sync::RwLock<UpdateStatus>>,
+}
+
+/// The result of the periodic release check (ARCH 28, `CAIRN_UPDATE_CHECK_*`). Populated by the
+/// server's update-check loop and surfaced on `GET /system` so the console can show an
+/// "update available" hint. All-empty means "unknown" — the check is off, has not run, or the
+/// release feed was unreachable.
+#[derive(Debug, Clone, Default)]
+pub struct UpdateStatus {
+    /// The latest release tag from the feed (e.g. `v2026.07.25`), when known.
+    pub latest_version: Option<String>,
+    /// True when the latest published release differs from the running release build.
+    pub update_available: bool,
+    /// The release's web page, for a "release notes" link.
+    pub release_url: Option<String>,
 }
 
 /// The JSON management API service. It owns shared handles to the trait spine and is otherwise
@@ -512,6 +531,16 @@ impl ControlService {
             Some((total, free)) => (Some(total), Some(free)),
             None => (None, None),
         };
+        // Read the freshest update status (a poisoned lock degrades to "unknown", never blocks).
+        let (latest_version, update_available, release_url) = match self.system.update_status.read()
+        {
+            Ok(u) => (
+                u.latest_version.clone(),
+                u.update_available,
+                u.release_url.clone(),
+            ),
+            Err(_) => (None, false, None),
+        };
         ControlResponse::json(
             StatusCode::OK,
             &wire::SystemResp {
@@ -523,6 +552,9 @@ impl ControlService {
                 data_dir: self.system.data_dir.display().to_string(),
                 disk_total_bytes,
                 disk_free_bytes,
+                latest_version,
+                update_available,
+                release_url,
             },
         )
     }

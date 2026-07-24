@@ -20,6 +20,9 @@ export interface SystemResp {
   data_dir: string;
   disk_total_bytes: number | null;
   disk_free_bytes: number | null;
+  latest_version: string | null;
+  update_available: boolean;
+  release_url: string | null;
 }
 
 export interface BucketUsageEntry {
@@ -95,7 +98,7 @@ export interface CreateShareReq {
 
 export interface CreateShareResp {
   token: string;
-  url: string; // path "/p/{token}"
+  url: string; // path "/share/{token}"
   expires_at_ms: number | null;
 }
 

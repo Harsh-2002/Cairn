@@ -62,6 +62,16 @@ pub fn spawn(stack: Arc<AppStack>, cfg: &Config, shutdown: tokio::sync::watch::R
             Duration::from_secs(cfg.scrub_interval_secs),
         ));
     }
+    // The release update check (ARCH 28): opt-out, best-effort. Dials the configured feed through the
+    // SSRF guard on a slow cadence and publishes the result for `GET /system`. Never spawned when off.
+    if cfg.update_check_enabled {
+        tokio::spawn(update_check_loop(
+            stack.clone(),
+            cfg.update_check_url.clone(),
+            Duration::from_secs(cfg.update_check_interval_secs),
+            cfg.allow_internal_endpoints,
+        ));
+    }
     // The WAL checkpointer drives inherent methods on the concrete `SqliteMetadataStore`, so it
     // runs only for the `sqlite` backend (where `stack.store` holds one handle per shard). The
     // libSQL and Turso engines self-manage their WAL, so the loop is not spawned for them.
@@ -1225,6 +1235,31 @@ impl ScrubTally {
 ///
 /// Whatever cannot be verified is COUNTED with a reason and emitted, never dropped — see
 /// [`ScrubTally`]. Enumeration is paged so memory stays flat regardless of store size.
+/// Periodically refresh the release-update status (ARCH 28). `tokio::time::interval` ticks
+/// immediately, so the first check runs on startup; thereafter every `interval`. Best-effort:
+/// `run_once` swallows every error, so an air-gapped node simply never populates the status and the
+/// console shows no update hint. A short per-attempt timeout keeps a hung feed from wedging the loop.
+async fn update_check_loop(
+    stack: Arc<AppStack>,
+    url: String,
+    interval: Duration,
+    allow_internal: bool,
+) {
+    let mut ticker = tokio::time::interval(interval);
+    let attempt_timeout = Duration::from_secs(10);
+    loop {
+        ticker.tick().await;
+        crate::update_check::run_once(
+            &url,
+            crate::CAIRN_VERSION,
+            allow_internal,
+            attempt_timeout,
+            &stack.update_status,
+        )
+        .await;
+    }
+}
+
 async fn scrub_loop(stack: Arc<AppStack>, interval: Duration) {
     use cairn_types::meta::ListQuery;
     loop {

@@ -106,7 +106,7 @@ export function ManageSharesDialog({
                 </div>
                 <CopyField
                   label="Link"
-                  value={window.location.origin + "/p/" + s.token}
+                  value={window.location.origin + "/share/" + s.token}
                 />
                 <p className="text-[13px] text-muted-foreground">
                   {s.disposition === "attachment" ? "Download" : "View"}

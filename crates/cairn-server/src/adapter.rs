@@ -168,11 +168,11 @@ pub async fn handle(
         }
         // Minting a persistent public-read ("share") URL is handled here, not in cairn-control,
         // because it streams object bytes through the server stack on redemption:
-        // POST /api/v1/buckets/{bucket}/objects/share.
+        // POST /api/v1/buckets/{bucket}/objects/shares (the plural collection).
         if method == Method::POST {
             if let Some(bucket) = subpath
                 .strip_prefix("/buckets/")
-                .and_then(|r| r.strip_suffix("/objects/share"))
+                .and_then(|r| r.strip_suffix("/objects/shares"))
             {
                 return create_share(&stack, bucket, &body_bytes, principal.as_ref()).await;
             }
@@ -246,15 +246,11 @@ pub async fn handle(
     // On the web-console listener only, serve the management console at the ROOT path and its embedded
     // assets BEFORE S3 routing (so `/assets/...` can never be shadowed by a bucket named `assets`).
     // Any path that is not the root or a known embedded asset falls through to the S3/data routing,
-    // which is what the console's own object operations and the API listener rely on. The former
-    // `/web` mount redirects to the root for back-compat.
+    // which is what the console's own object operations and the API listener rely on.
     if serve_web && method == Method::GET {
         if raw_path == "/" {
             let (content_type, bytes) = cairn_web::spa_shell();
             return web_asset_response(content_type, bytes.into_owned());
-        }
-        if raw_path == "/web" || raw_path.starts_with("/web/") {
-            return redirect("/");
         }
         if let Some(rel) = raw_path.strip_prefix('/').filter(|r| !r.is_empty()) {
             if let Some((content_type, bytes)) = cairn_web::asset(rel) {
@@ -263,10 +259,10 @@ pub async fn handle(
         }
     }
 
-    // Persistent public-read ("share") URLs: GET|HEAD /p/{token} — unauthenticated, resolved by an
-    // opaque registry token (ARCH 15.8). The token is a single path segment.
-    if (method == Method::GET || method == Method::HEAD) && raw_path.starts_with("/p/") {
-        let token = &raw_path[3..]; // after "/p/"
+    // Persistent public-read ("share") URLs: GET|HEAD /share/{token} — unauthenticated, resolved by
+    // an opaque registry token (ARCH 15.8). The token is a single path segment.
+    if (method == Method::GET || method == Method::HEAD) && raw_path.starts_with("/share/") {
+        let token = &raw_path["/share/".len()..]; // after "/share/"
         if token.is_empty() || token.contains('/') {
             return json_status(404, r#"{"error":"not found"}"#);
         }
@@ -431,15 +427,6 @@ fn web_asset_response(content_type: String, bytes: Vec<u8>) -> Response<Response
         .status(200)
         .header("content-type", content_type)
         .body(full_body(Bytes::from(bytes)))
-        .unwrap_or_else(|_| Response::new(full_body(Bytes::new())))
-}
-
-/// A 301 redirect to `location`.
-fn redirect(location: &str) -> Response<ResponseBody> {
-    Response::builder()
-        .status(301)
-        .header("location", location)
-        .body(full_body(Bytes::new()))
         .unwrap_or_else(|_| Response::new(full_body(Bytes::new())))
 }
 
@@ -627,7 +614,7 @@ fn generate_share_token() -> String {
 
 /// Mint a persistent public-read ("share") token for an object (ARCH 15.8). Admin-only. Body:
 /// `{"key", "expires_in_secs"?: null=forever, "disposition"?: "inline"|"attachment", "filename"?,
-/// "version_id"?}`. Returns `{"token","url":"/p/{token}","expires_at_ms": ms|null}`.
+/// "version_id"?}`. Returns `{"token","url":"/share/{token}","expires_at_ms": ms|null}`.
 async fn create_share(
     stack: &AppStack,
     bucket: &str,
@@ -710,7 +697,7 @@ async fn create_share(
     let expires_json = expires_at.map_or_else(|| "null".to_owned(), |t| t.0.to_string());
     json_status(
         200,
-        &format!(r#"{{"token":"{token}","url":"/p/{token}","expires_at_ms":{expires_json}}}"#),
+        &format!(r#"{{"token":"{token}","url":"/share/{token}","expires_at_ms":{expires_json}}}"#),
     )
 }
 

@@ -516,13 +516,13 @@ fn next_request_id() -> String {
     format!("{salt:016x}{seq:016x}")
 }
 
-/// Redact the object-share token from a path before it is logged. `GET /p/{token}` carries a 256-bit
+/// Redact the object-share token from a path before it is logged. `GET /share/{token}` carries a 256-bit
 /// revocable capability in the path, and the request span is recorded at info level — anyone with
 /// access-log access (a broader, less-trusted audience than DB/filesystem access) could otherwise
 /// extract and replay it until revoked (audit 2026-07). Correlation is preserved via the request_id.
 fn redact_log_path(path: &str) -> &str {
-    if path.starts_with("/p/") {
-        "/p/<redacted>"
+    if path.starts_with("/share/") {
+        "/share/<redacted>"
     } else {
         path
     }
@@ -702,8 +702,8 @@ pub(crate) fn classify_route(path: &str) -> &'static str {
         "/metrics" => "metrics",
         "/" => "web",
         _ if path.starts_with("/api/v1") => "api",
-        _ if path.starts_with("/p/") => "share",
-        _ if path.starts_with("/assets/") || path.starts_with("/web/") => "web",
+        _ if path.starts_with("/share/") => "share",
+        _ if path.starts_with("/assets/") => "web",
         _ => "s3",
     }
 }
@@ -712,7 +712,7 @@ pub(crate) fn classify_route(path: &str) -> &'static str {
 /// (ARCH 26.5), or `None` for paths that should not be counted.
 ///
 /// `None` is returned for the infra endpoints (`/healthz`, `/readyz`, `/metrics`), the web console
-/// and its assets, the signed-share redeem path (`/p/…`), and the bare root (`/`) — none of which
+/// and its assets, the signed-share redeem path (`/share/…`), and the bare root (`/`) — none of which
 /// are an S3 or management API operation worth charting. Management API calls (`/api/v1/…`) collapse
 /// to a single `Management` operation with no bucket. Everything else is treated as path-style S3
 /// addressing: the first path segment is the bucket and the method + sub-resource query select the
@@ -734,7 +734,7 @@ pub(crate) fn classify_operation(
         "/" | "/healthz" | "/readyz" | "/metrics" => return None,
         _ => {}
     }
-    if path.starts_with("/p/") || path.starts_with("/assets/") || path.starts_with("/web/") {
+    if path.starts_with("/share/") || path.starts_with("/assets/") {
         return None;
     }
     if path.starts_with("/api/v1") {
@@ -1310,8 +1310,11 @@ mod redact_tests {
     #[test]
     fn share_token_is_redacted() {
         // Audit 2026-07: the share capability must never reach the access log.
-        assert_eq!(redact_log_path("/p/abc123deadbeef"), "/p/<redacted>");
-        assert_eq!(redact_log_path("/p/"), "/p/<redacted>");
+        assert_eq!(
+            redact_log_path("/share/abc123deadbeef"),
+            "/share/<redacted>"
+        );
+        assert_eq!(redact_log_path("/share/"), "/share/<redacted>");
         // Other paths pass through unchanged.
         assert_eq!(redact_log_path("/bucket/key"), "/bucket/key");
         assert_eq!(redact_log_path("/healthz"), "/healthz");

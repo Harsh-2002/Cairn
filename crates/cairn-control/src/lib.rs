@@ -19,4 +19,4 @@
 mod service;
 mod wire;
 
-pub use service::{ControlResponse, ControlService, SystemInfo};
+pub use service::{ControlResponse, ControlService, SystemInfo, UpdateStatus};

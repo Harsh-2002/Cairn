@@ -353,11 +353,11 @@ export const api = {
   },
 
   // Persistent object shares (ARCH 15.8): revocable, optionally forever. `url` is a path
-  // (/p/{token}) the caller turns into an absolute link.
+  // (/share/{token}) the caller turns into an absolute link.
   createShare: (name: string, body: CreateShareReq) =>
     request<CreateShareResp>(
       "POST",
-      `/buckets/${enc(name)}/objects/share`,
+      `/buckets/${enc(name)}/objects/shares`,
       body,
     ),
   listShares: (name: string, key?: string) => {

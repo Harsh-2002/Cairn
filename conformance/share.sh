@@ -44,29 +44,29 @@ curl -s "${AUTH[@]}" -X POST "$BASE/api/v1/buckets" -H 'content-type: applicatio
 printf 'v1-contents' | curl -s "${AUTH[@]}" -X PUT --data-binary @- "$BASE/$B/doc.txt" -o /dev/null
 
 # --- persistent share: create -> fetch 200 + forced-download disposition ---
-SH=$(curl -s "${AUTH[@]}" -X POST "$API/share" -H 'content-type: application/json' \
+SH=$(curl -s "${AUTH[@]}" -X POST "$API/shares" -H 'content-type: application/json' \
   -d '{"key":"doc.txt","expires_in_secs":3600,"disposition":"attachment","filename":"r.txt"}')
 TOK=$(echo "$SH" | grep -oE '"token":"[^"]+"' | cut -d'"' -f4)
 [ -n "$TOK" ] || fail "share create returned no token"
-BODY=$(curl -s "$BASE/p/$TOK")
+BODY=$(curl -s "$BASE/share/$TOK")
 [ "$BODY" = "v1-contents" ] || fail "share fetch body mismatch ($BODY)"
-DISP=$(curl -sI "$BASE/p/$TOK" | tr -d '\r' | awk -F': ' 'tolower($1)=="content-disposition"{print $2}')
+DISP=$(curl -sI "$BASE/share/$TOK" | tr -d '\r' | awk -F': ' 'tolower($1)=="content-disposition"{print $2}')
 [ "$DISP" = 'attachment; filename="r.txt"' ] || fail "disposition mismatch ($DISP)"
 ok "persistent share fetch + forced-download disposition"
 
 # --- forever share ---
-FSH=$(curl -s "${AUTH[@]}" -X POST "$API/share" -H 'content-type: application/json' -d '{"key":"doc.txt"}')
+FSH=$(curl -s "${AUTH[@]}" -X POST "$API/shares" -H 'content-type: application/json' -d '{"key":"doc.txt"}')
 echo "$FSH" | grep -q '"expires_at_ms":null' || fail "forever share should have null expiry"
 FTOK=$(echo "$FSH" | grep -oE '"token":"[^"]+"' | cut -d'"' -f4)
-as 200 "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/p/$FTOK")" "forever share fetches 200"
+as 200 "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/share/$FTOK")" "forever share fetches 200"
 
 # --- revoke -> 410; unknown -> 404 ---
 curl -s "${AUTH[@]}" -X DELETE "$API/shares/$TOK" -o /dev/null
-as 410 "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/p/$TOK")" "revoked share -> 410"
-as 404 "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/p/deadbeefdeadbeef")" "unknown token -> 404"
+as 410 "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/share/$TOK")" "revoked share -> 410"
+as 404 "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/share/deadbeefdeadbeef")" "unknown token -> 404"
 
 # --- anonymous mint -> 403 ---
-as 403 "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$API/share" -H 'content-type: application/json' -d '{"key":"doc.txt"}')" "anonymous mint -> 403"
+as 403 "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$API/shares" -H 'content-type: application/json' -d '{"key":"doc.txt"}')" "anonymous mint -> 403"
 
 # --- presigned GET: mint -> fetch unauth 200 ---
 PG=$(curl -s "${AUTH[@]}" -X POST "$API/presign" -H 'content-type: application/json' -d '{"key":"doc.txt","method":"GET","expires_in_secs":3600}')
@@ -89,10 +89,10 @@ curl -s "${AUTH[@]}" -X PUT "$BASE/api/v1/buckets/$B/versioning" -H 'content-typ
 printf 'pinned-v1' | curl -s "${AUTH[@]}" -X PUT --data-binary @- "$BASE/$B/ver.txt" -o /dev/null
 VID=$(curl -sI "${AUTH[@]}" "$BASE/$B/ver.txt" | tr -d '\r' | awk -F': ' 'tolower($1)=="x-amz-version-id"{print $2}')
 [ -n "$VID" ] || fail "no version id returned for ver.txt"
-PSH=$(curl -s "${AUTH[@]}" -X POST "$API/share" -H 'content-type: application/json' -d "{\"key\":\"ver.txt\",\"version_id\":\"$VID\"}")
+PSH=$(curl -s "${AUTH[@]}" -X POST "$API/shares" -H 'content-type: application/json' -d "{\"key\":\"ver.txt\",\"version_id\":\"$VID\"}")
 PTOK=$(echo "$PSH" | grep -oE '"token":"[^"]+"' | cut -d'"' -f4)
 printf 'NEW-v2' | curl -s "${AUTH[@]}" -X PUT --data-binary @- "$BASE/$B/ver.txt" -o /dev/null
-[ "$(curl -s "$BASE/p/$PTOK")" = "pinned-v1" ] || fail "version-pinned share did not serve the pinned version"
+[ "$(curl -s "$BASE/share/$PTOK")" = "pinned-v1" ] || fail "version-pinned share did not serve the pinned version"
 ok "version-pinned share serves the pinned version after overwrite"
 
 echo "ALL SHARE CONFORMANCE CHECKS PASSED ($PASS)"
