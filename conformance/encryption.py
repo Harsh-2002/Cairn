@@ -161,6 +161,42 @@ def case_c():
     check("an explicit SSE PUT to the required-SSE bucket succeeds",
           ok_put.get("ServerSideEncryption") == "AES256")
 
+    # SECURITY (Phase-2 audit): the mandatory-SSE control must hold on EVERY create path, not only a
+    # plain PUT. A header-less MULTIPART upload and a header-less COPY must also be refused — before
+    # the fix they silently stored PLAINTEXT in the required bucket.
+    def absent(bucket, key):
+        try:
+            s3.head_object(Bucket=bucket, Key=key)
+            return False
+        except ClientError:
+            return True
+    mp_refused = False
+    try:
+        up = s3.create_multipart_upload(Bucket="mandatory", Key="mpk")["UploadId"]
+        pp = s3.upload_part(Bucket="mandatory", Key="mpk", UploadId=up, PartNumber=1, Body=b"x" * 16)
+        s3.complete_multipart_upload(Bucket="mandatory", Key="mpk", UploadId=up,
+                                     MultipartUpload={"Parts": [{"PartNumber": 1, "ETag": pp["ETag"]}]})
+    except ClientError as e:
+        mp_refused = e.response["Error"]["Code"] == "InvalidRequest"
+    check("header-less MULTIPART complete to a required-SSE bucket is refused", mp_refused)
+    check("no plaintext multipart object landed in the required-SSE bucket", absent("mandatory", "mpk"))
+    cp_refused = False
+    try:
+        s3.copy_object(Bucket="mandatory", Key="cpk",
+                       CopySource={"Bucket": "mandatory", "Key": "ok"})
+    except ClientError as e:
+        cp_refused = e.response["Error"]["Code"] == "InvalidRequest"
+    check("header-less COPY into a required-SSE bucket is refused", cp_refused)
+    check("no plaintext copied object landed in the required-SSE bucket", absent("mandatory", "cpk"))
+    # WITH an SSE header, multipart still completes — the control blocks only non-compliant writes.
+    up2 = s3.create_multipart_upload(Bucket="mandatory", Key="mpok",
+                                     ServerSideEncryption="AES256")["UploadId"]
+    pp2 = s3.upload_part(Bucket="mandatory", Key="mpok", UploadId=up2, PartNumber=1, Body=b"y" * 16)
+    s3.complete_multipart_upload(Bucket="mandatory", Key="mpok", UploadId=up2,
+                                 MultipartUpload={"Parts": [{"PartNumber": 1, "ETag": pp2["ETag"]}]})
+    check("an explicit-SSE multipart complete to the required-SSE bucket succeeds",
+          not absent("mandatory", "mpok"))
+
 
 # ============================================================ (d) bucket-default silent encryption
 def case_d():
