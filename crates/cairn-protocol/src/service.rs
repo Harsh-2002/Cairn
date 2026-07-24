@@ -4572,6 +4572,16 @@ fn object_action(req: &S3Request) -> Result<Action> {
     let q = |s: &str| req.has_query(s);
     let versioned = req.query("versionId").is_some();
     Ok(match req.method {
+        // SECURITY (authorize-vs-dispatch parity): `object_op` dispatches a copy-source PUT
+        // (`copy_object` / `upload_part_copy`) and a multipart part PUT (`upload_part`) AHEAD of the
+        // `?tagging`/`?acl`/`?retention`/`?legal-hold` subresource arms. The authorize classifier must
+        // therefore also classify them FIRST — as `PutObject`, the write they actually perform —
+        // regardless of any subresource query that also rides the request. Otherwise a request like
+        // `PUT /dest/key?tagging` carrying `x-amz-copy-source` (or `?uploadId&partNumber&tagging`)
+        // would authorize the metadata-only `PutObjectTagging` while a full object OVERWRITE / part
+        // SPLICE runs — a privilege escalation from a tag/acl grant to arbitrary object write.
+        Method::PUT if req.has_query("uploadId") && req.query("partNumber").is_some() => PutObject,
+        Method::PUT if req.header("x-amz-copy-source").is_some() => PutObject,
         Method::PUT if q("tagging") => PutObjectTagging,
         Method::GET if q("tagging") => GetObjectTagging,
         Method::DELETE if q("tagging") => DeleteObjectTagging,

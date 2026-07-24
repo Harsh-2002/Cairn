@@ -199,6 +199,109 @@ fn header<'a>(h: &'a [(String, String)], name: &str) -> Option<&'a str> {
     h.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
 }
 
+/// An authorization engine that denies `s3:PutObject` on ONE bucket and allows everything else — used
+/// to prove the authorize chokepoint classifies a copy-source / part PUT by the write it performs.
+struct DenyPutObjectOn(&'static str);
+impl cairn_types::traits::AuthorizationEngine for DenyPutObjectOn {
+    fn evaluate(&self, input: &cairn_types::authz::AuthzInput) -> cairn_types::authz::Decision {
+        use cairn_types::authz::{Action, Decision, DenyReason, Resource};
+        let on_target = match &input.resource {
+            Resource::Object { bucket, .. } => bucket.as_str() == self.0,
+            Resource::Bucket(b) => b.as_str() == self.0,
+        };
+        if input.action == Action::PutObject && on_target {
+            Decision::Deny(DenyReason::DefaultDeny)
+        } else {
+            Decision::Allow
+        }
+    }
+}
+
+/// SECURITY regression (Phase-1 authn/authz audit): `object_op` dispatches a copy-source PUT to
+/// `copy_object` AHEAD of the `?tagging` arm, so the authorize chokepoint must classify it as the
+/// write it performs — `PutObject` — not as the metadata-only `PutObjectTagging` the coexisting
+/// `?tagging` query would otherwise select. Before the fix, a principal holding only PutObjectTagging
+/// on the destination could OVERWRITE arbitrary objects there via `PUT /dest/key?tagging` carrying
+/// `x-amz-copy-source`. This test denies PutObject on the destination and proves the exploit is now
+/// refused (it fails without the fix: the copy would authorize as tagging, run, and return 200).
+#[tokio::test]
+async fn copy_source_put_behind_a_tagging_query_authorizes_as_putobject() {
+    let h = harness_with_authz(Arc::new(DenyPutObjectOn("destb"))).await;
+    // Seed a readable source object (PutObject on the SOURCE bucket is allowed).
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("srcbkt"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("srcbkt"),
+                Some("srckey"),
+                &[],
+                &[],
+                b"source".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("destb"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    // The exploit: a copy that overwrites destb/victim, disguised behind a `?tagging` query.
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("destb"),
+                Some("victim"),
+                &[("tagging", "")],
+                &[("x-amz-copy-source", "/srcbkt/srckey")],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    let xml = String::from_utf8(body).unwrap();
+    assert_eq!(
+        st,
+        StatusCode::FORBIDDEN,
+        "a copy-source PUT?tagging must authorize as PutObject (denied), not tagging; got {st}: {xml}"
+    );
+    assert!(
+        xml.contains("AccessDenied"),
+        "expected AccessDenied, got: {xml}"
+    );
+    // ...and nothing was written to the destination.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(Method::GET, Some("destb"), Some("victim"), &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_ne!(
+        st,
+        StatusCode::OK,
+        "no object should have been created at destb/victim"
+    );
+}
+
 #[tokio::test]
 async fn full_object_lifecycle() {
     let h = harness().await;
