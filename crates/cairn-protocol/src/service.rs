@@ -1587,6 +1587,35 @@ impl S3Service {
         let src_bucket = BucketName::parse(&src_bucket_s)?;
         let src_key = ObjectKey::parse(&src_key_s)?;
         let src_versioned = src_version.is_some();
+        // Authorize the SOURCE read BEFORE resolving the source version or checking preconditions
+        // (see copy_object): ordering the authorize first denies an unauthorized requester with a
+        // uniform AccessDenied and no existence / ETag / mtime leak — the copy oracle closed in the
+        // Phase-4 audit. Version-scoped conditions use the REQUEST's versionId.
+        let src_bucket_obj = self
+            .meta
+            .get_bucket(&src_bucket)
+            .await?
+            .ok_or(Error::NoSuchBucket)?;
+        let src_action = if src_versioned {
+            Action::GetObjectVersion
+        } else {
+            Action::GetObject
+        };
+        let req_src_version = src_version
+            .as_ref()
+            .map(|v| VersionId::from_string(v.clone()));
+        self.authorize(
+            req,
+            &src_bucket_obj,
+            src_action,
+            Resource::Object {
+                bucket: src_bucket.clone(),
+                key: src_key.clone(),
+            },
+            req_src_version.as_ref(),
+        )
+        .await?;
+        // Authorized: resolve the source version and evaluate preconditions.
         let src_row = match src_version {
             Some(v) => self
                 .meta
@@ -1603,29 +1632,6 @@ impl S3Service {
             return Err(Error::NoSuchKey);
         }
         check_copy_source_conditions(req, &src_row)?;
-        // Authorize the SOURCE read (see copy_object): the requester must hold s3:GetObject(Version)
-        // on the source object, evaluated against the source bucket — not the destination upload's.
-        let src_bucket_obj = self
-            .meta
-            .get_bucket(&src_bucket)
-            .await?
-            .ok_or(Error::NoSuchBucket)?;
-        let src_action = if src_versioned {
-            Action::GetObjectVersion
-        } else {
-            Action::GetObject
-        };
-        self.authorize(
-            req,
-            &src_bucket_obj,
-            src_action,
-            Resource::Object {
-                bucket: src_bucket.clone(),
-                key: src_key.clone(),
-            },
-            Some(&src_row.version_id),
-        )
-        .await?;
         let src_path = src_row.storage_path.clone().ok_or(Error::NoSuchKey)?;
 
         // Parse the optional copy-source range (logical bytes of the source object). An absent
@@ -2162,6 +2168,41 @@ impl S3Service {
         // s3:GetObject. Capture this before `src_version` is consumed below.
         let src_versioned = src_version.is_some();
 
+        // Authorize the SOURCE read BEFORE resolving the source version or evaluating any
+        // `x-amz-copy-source-if-*` precondition: a copy reads the source object's bytes, so the
+        // requester must hold s3:GetObject(Version) on the SOURCE, evaluated against the source
+        // bucket's policy / ownership / ACLs (not the destination's). Ordering the authorize FIRST is
+        // also what keeps an unauthorized requester from learning the source object's existence, ETag,
+        // or last-modified: resolving the version (NoSuchKey vs found) or checking a precondition
+        // (412 vs 403) BEFORE denying leaks that metadata cross-tenant — a copy/UploadPartCopy oracle
+        // over another tenant's keyspace (Phase-4 audit). Version-scoped conditions use the REQUEST's
+        // versionId (exactly as `object_op` authorizes the destination), so no pre-authorization
+        // metadata read is required.
+        let src_bucket_obj = self
+            .meta
+            .get_bucket(&src_bucket)
+            .await?
+            .ok_or(Error::NoSuchBucket)?;
+        let src_action = if src_versioned {
+            Action::GetObjectVersion
+        } else {
+            Action::GetObject
+        };
+        let req_src_version = src_version
+            .as_ref()
+            .map(|v| VersionId::from_string(v.clone()));
+        self.authorize(
+            req,
+            &src_bucket_obj,
+            src_action,
+            Resource::Object {
+                bucket: src_bucket.clone(),
+                key: src_key.clone(),
+            },
+            req_src_version.as_ref(),
+        )
+        .await?;
+        // Authorized: now the requester may learn the source object's existence / ETag / mtime.
         let src_row = match src_version {
             Some(v) => self
                 .meta
@@ -2179,31 +2220,6 @@ impl S3Service {
         }
         // Evaluate any x-amz-copy-source-if-* preconditions against the source version (21.6).
         check_copy_source_conditions(req, &src_row)?;
-        // Authorize the SOURCE read: a copy reads the source object's bytes, so the requester must
-        // hold s3:GetObject(Version) on the SOURCE, evaluated against the source bucket's policy /
-        // ownership / ACLs (not the destination's). Without this, a user who merely owns the
-        // destination bucket could exfiltrate any other tenant's object via x-amz-copy-source.
-        let src_bucket_obj = self
-            .meta
-            .get_bucket(&src_bucket)
-            .await?
-            .ok_or(Error::NoSuchBucket)?;
-        let src_action = if src_versioned {
-            Action::GetObjectVersion
-        } else {
-            Action::GetObject
-        };
-        self.authorize(
-            req,
-            &src_bucket_obj,
-            src_action,
-            Resource::Object {
-                bucket: src_bucket.clone(),
-                key: src_key.clone(),
-            },
-            Some(&src_row.version_id),
-        )
-        .await?;
         let src_path = src_row.storage_path.clone().ok_or(Error::NoSuchKey)?;
 
         // `x-amz-metadata-directive` (ARCH 21.6): COPY (the default) carries the SOURCE's system
