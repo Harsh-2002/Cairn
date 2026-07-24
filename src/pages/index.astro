@@ -22,24 +22,22 @@ const compose = `services:
     restart: unless-stopped
     ports:
       - "7373:7373"   # S3 API
-      - "7374:7374"   # Web console + management API
+      - "7374:7374"   # console + API
     volumes:
       - cairn-data:/data
     environment:
-      # Minimum — generate a real key with: openssl rand -hex 32
-      # Seals every secret at rest; keep it constant for the life of your data.
+      # Required — openssl rand -hex 32
       CAIRN_MASTER_KEY: "REPLACE_WITH_A_32_BYTE_HEX_KEY"
 
-      # Optional — defaults shown; uncomment to change.
-      # CAIRN_ROOT_ACCESS_KEY: "cairn"          # admin access key
-      # CAIRN_ROOT_SECRET_KEY: "cairnadmin"     # admin secret — override in production
-      # CAIRN_REGION: "us-east-1"               # SigV4 region label
-      # CAIRN_ENCRYPT_AT_REST: "true"           # encrypt every object at rest
-      # CAIRN_S3_DOMAIN: "s3.example.com"       # virtual-host-style addressing
-      # CAIRN_PUBLIC_BASE_URL: "https://s3.example.com"  # external URL behind ingress
-      # CAIRN_TLS_CERT_PATH: "/certs/tls.crt"   # built-in TLS (set both)
+      # Optional (defaults shown)
+      # CAIRN_ROOT_ACCESS_KEY: "cairn"        # admin key
+      # CAIRN_ROOT_SECRET_KEY: "cairnadmin"   # admin secret
+      # CAIRN_REGION: "us-east-1"             # region label
+      # CAIRN_ENCRYPT_AT_REST: "true"         # encrypt at rest
+      # CAIRN_S3_DOMAIN: "s3.example.com"     # virtual-host style
+      # CAIRN_TLS_CERT_PATH: "/certs/tls.crt" # TLS (set both)
       # CAIRN_TLS_KEY_PATH: "/certs/tls.key"
-      # CAIRN_WEB_ADDR: "off"                   # run headless — no web console
+      # CAIRN_WEB_ADDR: "off"                 # headless
 volumes:
   cairn-data:`;
 
@@ -382,19 +380,28 @@ const bench = [
       Every variable has a default and an invalid one fails fast at startup with a clear message. The
       one you should set for a real node is <code>CAIRN_MASTER_KEY</code>; the rest are optional.
     </p>
-    <dl class="config">
-      {
-        envs.map((e) => (
-          <div>
-            <dt>
-              <span class="cfg-name">{e.name}</span>
-              <span class="cfg-default">default: {e.def}</span>
-            </dt>
-            <dd>{e.desc}</dd>
-          </div>
-        ))
-      }
-    </dl>
+    <div class="table-scroll">
+      <table class="envtable">
+        <thead>
+          <tr>
+            <th scope="col">Variable</th>
+            <th scope="col">Default</th>
+            <th scope="col">What it&apos;s for</th>
+          </tr>
+        </thead>
+        <tbody>
+          {
+            envs.map((e) => (
+              <tr>
+                <td class="envtable__name">{e.name}</td>
+                <td class="envtable__def">{e.def}</td>
+                <td class="envtable__desc">{e.desc}</td>
+              </tr>
+            ))
+          }
+        </tbody>
+      </table>
+    </div>
     <p class="note">
       That&apos;s the common set. There are roughly fifty knobs in all — replication, lifecycle,
       webhooks, KMS allow-listing, metadata sharding, runtime and durability tuning. See the full{" "}
@@ -598,33 +605,43 @@ const bench = [
     margin-bottom: var(--space-2);
   }
 
-  /* configuration reference: variable + default, then description — reflows, never scrolls */
-  .config {
-    display: grid;
-    gap: var(--space-4);
-    margin-top: var(--space-4);
-  }
-  .config dt {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: baseline;
-    gap: 0.4rem 0.75rem;
-  }
-  .config .cfg-name {
-    font-family: var(--font-mono);
+  /* configuration reference table. No min-width: the description column wraps so the
+     table fits any width; the bordered .table-scroll wrapper catches the rare overflow. */
+  table.envtable {
+    width: 100%;
+    border-collapse: collapse;
     font-size: var(--step--1);
+  }
+  .envtable th,
+  .envtable td {
+    padding: 0.55rem 0.85rem;
+    text-align: left;
+    vertical-align: top;
+    border-bottom: 1px solid var(--hairline);
+  }
+  .envtable thead th {
+    font-weight: 500;
+    color: var(--fg-faint);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    background: var(--bg-subtle);
+    white-space: nowrap;
+  }
+  .envtable tbody tr:last-child td {
+    border-bottom: 0;
+  }
+  .envtable__name {
+    font-family: var(--font-mono);
     color: var(--fg);
-    overflow-wrap: anywhere;
+    white-space: nowrap; /* keep each variable on one line on desktop (breaks on mobile below) */
   }
-  .config .cfg-default {
+  .envtable__def {
     font-family: var(--font-mono);
-    font-size: var(--step--1);
     color: var(--fg-faint);
   }
-  .config dd {
-    margin: 0.3rem 0 0;
+  .envtable__desc {
     color: var(--fg-muted);
-    max-width: var(--measure);
+    min-width: 15ch;
   }
 
   .linkrow {
@@ -666,6 +683,46 @@ const bench = [
     }
     .hero h1 br {
       display: none;
+    }
+    /* On phones, let long variable names break and tighten padding so the whole table
+       fits the viewport without scrolling. */
+    /* On phones, stack each row into a readable block (variable → default → purpose)
+       instead of squeezing three columns — no scroll, no cramped mid-word wrapping. */
+    .envtable thead {
+      display: none;
+    }
+    .envtable,
+    .envtable tbody,
+    .envtable tr,
+    .envtable td {
+      display: block;
+      width: 100%;
+    }
+    .envtable tr {
+      padding: 0.75rem 0.9rem;
+      border-bottom: 1px solid var(--hairline);
+    }
+    .envtable tbody tr:last-child {
+      border-bottom: 0;
+    }
+    .envtable td {
+      padding: 0;
+      border: 0;
+    }
+    .envtable__name {
+      white-space: normal;
+      font-weight: 600;
+    }
+    .envtable__def {
+      margin-top: 0.15rem;
+    }
+    .envtable__def::before {
+      content: "default: ";
+      color: var(--fg-faint);
+    }
+    .envtable__desc {
+      margin-top: 0.35rem;
+      min-width: 0;
     }
   }
 </style>
