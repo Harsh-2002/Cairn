@@ -60,8 +60,8 @@ fn emit_version() {
 }
 
 /// The short HEAD commit for a dev build, best-effort. A build from a source tarball (no git) or
-/// without `git` on PATH simply omits the suffix. Rerun the script when HEAD moves so an incremental
-/// dev rebuild picks up the new commit.
+/// without `git` on PATH simply omits the suffix. Rerun the script whenever the commit changes (see
+/// the watch list below) so an incremental dev rebuild picks up the new hash.
 fn git_short_sha() -> Option<String> {
     let git = |args: &[&str]| {
         let out = std::process::Command::new("git").args(args).output().ok()?;
@@ -70,9 +70,23 @@ fn git_short_sha() -> Option<String> {
             .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
             .filter(|s| !s.is_empty())
     };
-    // `--git-path HEAD` resolves correctly even from a worktree or a non-root package dir.
-    if let Some(head) = git(&["rev-parse", "--git-path", "HEAD"]) {
-        println!("cargo:rerun-if-changed={head}");
+    // Rerun the script when the commit changes. Watching HEAD ALONE is not enough: a commit or a
+    // `git merge --ff-only` on the CURRENT branch moves the branch ref (`refs/heads/<branch>`), while
+    // HEAD is a symbolic ref whose own bytes do not change — so a build that watched only HEAD kept a
+    // stale hash after any same-branch advance. Watch three things, each only if it EXISTS (a
+    // non-existent `rerun-if-changed` path makes cargo rerun on EVERY build): HEAD (branch switches +
+    // detached-HEAD moves), the resolved branch ref (same-branch commits while the ref is loose), and
+    // packed-refs (same, once `git gc`/fetch has packed the ref away). `--git-path` resolves each
+    // correctly even from a worktree or a non-root package dir.
+    let watch = |path: Option<String>| {
+        if let Some(p) = path.filter(|p| std::path::Path::new(p).exists()) {
+            println!("cargo:rerun-if-changed={p}");
+        }
+    };
+    watch(git(&["rev-parse", "--git-path", "HEAD"]));
+    if let Some(branch_ref) = git(&["symbolic-ref", "--quiet", "HEAD"]) {
+        watch(git(&["rev-parse", "--git-path", &branch_ref]));
     }
+    watch(git(&["rev-parse", "--git-path", "packed-refs"]));
     git(&["rev-parse", "--short=8", "HEAD"])
 }
