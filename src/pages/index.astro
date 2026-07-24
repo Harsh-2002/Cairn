@@ -418,8 +418,11 @@ const bench = [
     color: var(--fg-muted);
   }
   .bench .ratio {
-    color: var(--fg-faint);
-    font-size: 0.82rem;
+    /* The copy says "the ratio is what to read", so it earns --fg-muted (7.7:1),
+       not --fg-faint which the token system reserves for non-essential metadata.
+       The bolded winning throughput (.win) still outranks it. */
+    color: var(--fg-muted);
+    font-size: 0.85rem;
   }
 
   .scope,
