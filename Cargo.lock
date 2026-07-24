@@ -652,7 +652,7 @@ dependencies = [
  "cairn-protocol",
  "cairn-replication",
  "cairn-types",
- "cairn-ui",
+ "cairn-web",
  "cairn-webhook",
  "cairn-xml",
  "clap",
@@ -707,7 +707,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "cairn-ui"
+name = "cairn-web"
 version = "0.1.0"
 dependencies = [
  "rust-embed",

@@ -45,7 +45,7 @@ The assets Cairn protects are the object bytes, the user credentials, the destin
 
 ### 27.2 Transport security
 
-Cairn can terminate TLS itself using a modern Rust TLS stack with current defaults and reloadable certificate material, so a deployment is secure on the wire without an external proxy (N-6), and it also runs behind a terminating proxy on a trusted interface. Where Cairn terminates TLS and the platform supports kernel TLS, the read fast path can stay zero-copy by offloading symmetric encryption to the kernel after a userspace handshake (Section 7.6). The control plane, including the UI and the CLI, is held to the same transport expectations as the data plane.
+Cairn can terminate TLS itself using a modern Rust TLS stack with current defaults and reloadable certificate material, so a deployment is secure on the wire without an external proxy (N-6), and it also runs behind a terminating proxy on a trusted interface. Where Cairn terminates TLS and the platform supports kernel TLS, the read fast path can stay zero-copy by offloading symmetric encryption to the kernel after a userspace handshake (Section 7.6). The control plane, including the web console and the CLI, is held to the same transport expectations as the data plane.
 
 ### 27.3 Authentication and authorization controls
 

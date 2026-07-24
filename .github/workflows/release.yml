@@ -2,7 +2,7 @@ name: Release
 
 # Calendar-versioned (CalVer) release policy. A release is a deliberate act (run from the Actions tab)
 # that is gated on a green CI for the exact commit being released. It then:
-#   * builds static linux/amd64 + linux/arm64 binaries (musl, real UI embedded);
+#   * builds static linux/amd64 + linux/arm64 binaries (musl, real web console embedded);
 #   * publishes a multi-arch image to GHCR built from those exact binaries (:latest, one active image);
 #   * publishes ONE GitHub Release tagged vYYYY.MM.DD (a calendar version) and retires the previous
 #     one — so exactly one release is ever active.
@@ -61,7 +61,7 @@ jobs:
           - { arch: arm64, target: aarch64-unknown-linux-musl }
     steps:
       - uses: actions/checkout@v7
-      - uses: ./.github/actions/setup   # builds the real UI bundle + the Rust toolchain
+      - uses: ./.github/actions/setup   # builds the real web console bundle + the Rust toolchain
         with:
           targets: ${{ matrix.target }}
       - run: pip install ziglang

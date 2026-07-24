@@ -29,8 +29,8 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 use serde::Deserialize;
 
-/// The default management/data endpoint: the web-UI listener, where `/api/v1` and the S3 data
-/// plane are both served (the two-listener model; UI on 7374). Overridable via `--endpoint` /
+/// The default management/data endpoint: the web-console listener, where `/api/v1` and the S3 data
+/// plane are both served (the two-listener model; web console on 7374). Overridable via `--endpoint` /
 /// `CAIRN_ENDPOINT`.
 pub const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:7374";
 
@@ -42,7 +42,7 @@ pub const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:7374";
 /// when absent, the corresponding `CAIRN_*` environment variable.
 #[derive(Debug, Clone, Args)]
 pub struct RemoteOpts {
-    /// The server endpoint base URL (the web-UI listener that serves `/api/v1` and S3).
+    /// The server endpoint base URL (the web-console listener that serves `/api/v1` and S3).
     #[arg(long, env = "CAIRN_ENDPOINT", default_value = DEFAULT_ENDPOINT, global = true)]
     pub endpoint: String,
     /// The Bearer access-key id (the part before the dot in the token).

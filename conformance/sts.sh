@@ -2,7 +2,7 @@
 # STS temporary-credential regression (ARCH 14): boot a real cairn binary, mint a scoped, expiring
 # session credential through the management API, and prove a standard S3 SDK consumes it
 # (X-Amz-Security-Token) with exactly the granted access — scoped GET allowed, ungranted PUT denied,
-# cross-bucket denied, tampered/absent token denied. The UI/management listener must be ON (minting
+# cross-bucket denied, tampered/absent token denied. The web console/management listener must be ON (minting
 # is via /api/v1).
 #
 # Usage: BIN=target/debug/cairn PY=/path/to/python-with-boto3 conformance/sts.sh
@@ -18,7 +18,7 @@ DATA="$(mktemp -d)"
 export CAIRN_DATA_DIR="$DATA/data"
 export CAIRN_DB_PATH="$DATA/data/cairn.db"
 export CAIRN_LISTEN_ADDR="127.0.0.1:$PORT"
-export CAIRN_UI_ADDR="127.0.0.1:$UIPORT"
+export CAIRN_WEB_ADDR="127.0.0.1:$UIPORT"
 export CAIRN_MASTER_KEY; CAIRN_MASTER_KEY="$(openssl rand -hex 32)"
 export CAIRN_LOG_LEVEL="${CAIRN_LOG_LEVEL:-warn}"
 

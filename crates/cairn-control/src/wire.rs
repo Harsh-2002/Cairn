@@ -104,8 +104,8 @@ pub struct SystemResp {
     pub uptime_secs: u64,
     /// The S3 API listener address as configured.
     pub s3_addr: String,
-    /// The web-UI listener address as configured (may be `off`).
-    pub ui_addr: String,
+    /// The web-console listener address as configured (may be `off`).
+    pub web_addr: String,
     /// Whether TLS is enabled on the S3 listener.
     pub tls: bool,
     /// The data directory path.
@@ -145,7 +145,7 @@ pub struct OverviewBucketsResp {
 /// latency average and p95, peak window, active buckets) and the timeline window.
 #[derive(Debug, Serialize)]
 pub struct RequestMetricsResp {
-    /// The timeline downsampling window, in seconds (for the UI to derive req/s).
+    /// The timeline downsampling window, in seconds (for the web console to derive req/s).
     pub window_secs: i64,
     /// Grand total requests in range.
     pub total: u64,

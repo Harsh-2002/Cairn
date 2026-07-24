@@ -79,7 +79,7 @@ throughput, the outbox-depth series, and the lag metric. All of
 those are load- and build-profile-bound (CI drives the DEBUG artifact, whose AES-GCM is unoptimized
 software crypto).
 
-Usage: stress_replication.py <src-ak> <src-sk> <src-ep> <src-ui-ep> <tgt-ak> <tgt-sk> <tgt-ep>
+Usage: stress_replication.py <src-ak> <src-sk> <src-ep> <src-web-ep> <tgt-ak> <tgt-sk> <tgt-ep>
                              <src-data-dir> <tgt-data-dir> <kms-key-id> <out-json>
 """
 import collections
@@ -98,7 +98,7 @@ import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
-(SRC_AK, SRC_SK, SRC_EP, SRC_UI, TGT_AK, TGT_SK, TGT_EP,
+(SRC_AK, SRC_SK, SRC_EP, SRC_WEB, TGT_AK, TGT_SK, TGT_EP,
  SRC_DATA, TGT_DATA) = sys.argv[1:10]
 KEY_ID = sys.argv[10] if len(sys.argv) > 10 else "alias/cairn-replstress"
 OUT_JSON = sys.argv[11] if len(sys.argv) > 11 else ""
@@ -461,7 +461,7 @@ def summary():
     """`GET /api/v1/replication/summary` on the SOURCE's control listener: exact pending / claimed /
     failed / completed counts and the true lag, straight from the outbox (the `/metrics` gauges are
     the same numbers republished on a background cadence, so they are sampled as advisory instead)."""
-    u = urllib.parse.urlparse(SRC_UI)
+    u = urllib.parse.urlparse(SRC_WEB)
     try:
         conn = http.client.HTTPConnection(u.hostname, u.port, timeout=20)
         conn.request("GET", "/api/v1/replication/summary",

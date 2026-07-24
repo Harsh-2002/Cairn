@@ -126,7 +126,7 @@
     "keyCharacteristics": [
       "Pure-neutral surfaces (white / near-black) with hairline borders; depth is structural, never shadowy.",
       "One neutral primary button. Blue is for links and focus only. Green/amber/red appear only as meaning.",
-      "Geist Sans for everything UI; Geist Mono with tabular numerals for every identifier, size, address, and number.",
+      "Geist Sans for everything web console; Geist Mono with tabular numerals for every identifier, size, address, and number.",
       "Fixed rem type scale (12 / 13px-mono / 14 / 16 / 20 / 24), never fluid clamp().",
       "Spacious by default; dense only where data demands it, and calm even there.",
       "Light and dark at contrast parity; motion conveys state, never decorates."
@@ -151,7 +151,7 @@
     "donts": [
       "Don't use border-left/border-right greater than 1px as a colored accent stripe. Full hairline borders or background tints instead.",
       "Don't use gradient text, decorative glassmorphism, or a gradient hero. This is the generic AI-SaaS template Cairn rejects.",
-      "Don't drift toward consumer-cute / toy-like UI: no mascots, no playful illustrations, no bouncy or elastic motion, no emoji-as-UI.",
+      "Don't drift toward consumer-cute / toy-like web console: no mascots, no playful illustrations, no bouncy or elastic motion, no emoji-as-web console.",
       "Don't ship MinIO's utilitarian density: controls jammed together with no hierarchy or air.",
       "Don't color anything that isn't carrying meaning; no blue except links and the focus ring; no full-saturation accents on inactive states.",
       "Don't nest cards, reach for a modal as the first thought, or reinvent a standard affordance for flavor.",

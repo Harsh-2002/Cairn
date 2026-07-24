@@ -21,7 +21,7 @@
 # this harness does NOT need `CAIRN_ALLOW_INTERNAL_ENDPOINTS=true` (which `mesh.py` does need,
 # because it registers targets through the guarded management API). The per-bucket rules still name
 # `arn:aws:s3:::<bucket>`, which `resolve_dest_buckets` maps onto the configured endpoint.
-# The SOURCE's UI listener IS on, but only so the driver can read `GET /api/v1/replication/summary`
+# The SOURCE's web console listener IS on, but only so the driver can read `GET /api/v1/replication/summary`
 # — exact outbox pending/claimed/failed counts and the true lag, straight from the store.
 #
 # WORKLOAD (constant, fixed worker pool, never sleeps — see the driver header): single-part PUTs,
@@ -77,7 +77,7 @@ BIN="${BIN:-$ROOT/target/debug/cairn}"
 PY="${PY:-python3}"
 PORT_T="${PORT_T:-9112}"     # target S3
 PORT_S="${PORT_S:-9113}"     # source S3
-PORT_S_UI="${PORT_S_UI:-9114}"   # source control API (replication summary)
+PORT_S_WEB="${PORT_S_WEB:-9114}"   # source control API (replication summary)
 KEY_ID="${KEY_ID:-alias/cairn-replstress}"
 REPL_INTERVAL="${REPL_INTERVAL:-1}"
 REPL_WORKER_CONCURRENCY="${REPL_WORKER_CONCURRENCY:-4}"
@@ -134,9 +134,9 @@ command -v "$PY" >/dev/null 2>&1 || fail "python interpreter not found: $PY"
 # PORT PRE-FLIGHT. Without this a STALE cairn already bound to one of these ports answers /healthz,
 # the launcher happily proceeds, and the whole run silently measures somebody else's process while
 # our own node dies with EADDRINUSE. Found the hard way on a shared dev box.
-for p in "$PORT_T" "$PORT_S" "$PORT_S_UI"; do
+for p in "$PORT_T" "$PORT_S" "$PORT_S_WEB"; do
   if (exec 3<>"/dev/tcp/127.0.0.1/$p") 2>/dev/null; then
-    fail "127.0.0.1:$p already has a listener — another server is running. Set PORT_T/PORT_S/PORT_S_UI."
+    fail "127.0.0.1:$p already has a listener — another server is running. Set PORT_T/PORT_S/PORT_S_WEB."
   fi
 done
 
@@ -195,10 +195,10 @@ PYEOF
 # outbox row per object) reached 783 MB in one 15 s window and blew a 512 MB ceiling. That is not a
 # leak, it is the documented behaviour of a size-triggerless configuration — so bound it by SIZE, which
 # is what makes the ceiling a meaningful runaway backstop instead of a proxy for the runner's speed.
-common_env() { # <data-dir> <s3-port> <ui-addr> <master-key>
+common_env() { # <data-dir> <s3-port> <web-addr> <master-key>
   printf '%s\n' \
     "CAIRN_DATA_DIR=$1/data" "CAIRN_DB_PATH=$1/data/cairn.db" \
-    "CAIRN_LISTEN_ADDR=127.0.0.1:$2" "CAIRN_UI_ADDR=$3" "CAIRN_MASTER_KEY=$4" \
+    "CAIRN_LISTEN_ADDR=127.0.0.1:$2" "CAIRN_WEB_ADDR=$3" "CAIRN_MASTER_KEY=$4" \
     "CAIRN_REGION=us-east-1" "CAIRN_ALLOW_INSECURE=true" \
     "CAIRN_LOG_LEVEL=${CAIRN_LOG_LEVEL:-error}" \
     "CAIRN_REQUEST_TIMEOUT_SECS=${CAIRN_REQUEST_TIMEOUT_SECS:-600}" \
@@ -208,7 +208,7 @@ common_env() { # <data-dir> <s3-port> <ui-addr> <master-key>
 # shellcheck disable=SC2046
 target_env=( $(common_env "$DATA_T" "$PORT_T" off "$KEY_T") "CAIRN_ENCRYPT_AT_REST=true" )
 # shellcheck disable=SC2046
-source_env=( $(common_env "$DATA_S" "$PORT_S" "127.0.0.1:$PORT_S_UI" "$KEY_S")
+source_env=( $(common_env "$DATA_S" "$PORT_S" "127.0.0.1:$PORT_S_WEB" "$KEY_S")
              "CAIRN_KMS_KEY_IDS=$KEY_ID"
              "CAIRN_REPLICATION_REGION=us-east-1"
              "CAIRN_REPLICATION_INTERVAL_SECS=$REPL_INTERVAL"
@@ -294,7 +294,7 @@ fivexx_s_start="$(scrape_5xx "$PORT_S")"; fivexx_s_start="${fivexx_s_start:-0}"
 DRIVER_JSON="$DATA_S/driver.json"
 DRIVER_RC=0
 "$PY" "$ROOT/conformance/stress_replication.py" \
-  "$S_AK" "$S_SK" "http://127.0.0.1:$PORT_S" "http://127.0.0.1:$PORT_S_UI" \
+  "$S_AK" "$S_SK" "http://127.0.0.1:$PORT_S" "http://127.0.0.1:$PORT_S_WEB" \
   "$T_AK" "$T_SK" "http://127.0.0.1:$PORT_T" \
   "$DATA_S/data" "$DATA_T/data" "$KEY_ID" "$DRIVER_JSON" || DRIVER_RC=$?
 

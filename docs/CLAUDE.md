@@ -30,7 +30,7 @@ Operator runbooks (NOT spec — these number their own local `## 1/2/3` headings
 "ARCH N"): `operations.md` (deploy + **master-key rotation runbook**), `upgrade-rollback.md`,
 `scaling-limits.md`, `troubleshooting.md`, `deployment-kubernetes.md`, `backup-restore.md`,
 `disaster-recovery.md`, `migration.md` (import from another S3 store), `s3-api-matrix.md`,
-`benchmarks.md`. Design/product: `design.md` (UI visual system),
+`benchmarks.md`. Design/product: `design.md` (web console visual system),
 `product.md` (positioning/brand).
 
 ## Notes

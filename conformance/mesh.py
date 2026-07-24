@@ -38,11 +38,11 @@ AKID, SECRET = "cairn", "cairnadmin"
 BUCKET = "mesh"
 N = 5
 
-# node i: S3 port = BASE + i*10 + 1, UI/control port = BASE + i*10 + 2
+# node i: S3 port = BASE + i*10 + 1, web/control port = BASE + i*10 + 2
 def s3_port(i): return BASE + i * 10 + 1
-def ui_port(i): return BASE + i * 10 + 2
+def web_port(i): return BASE + i * 10 + 2
 def s3_url(i): return f"http://127.0.0.1:{s3_port(i)}"
-def ui_url(i): return f"http://127.0.0.1:{ui_port(i)}"
+def web_url(i): return f"http://127.0.0.1:{web_port(i)}"
 NAMES = [chr(ord("A") + i) for i in range(N)]
 
 PASS, FAIL = [], []
@@ -97,9 +97,9 @@ def s3req(endpoint, method, path, query=None, body=b"", content_type=None, extra
         return 0, {}, str(e).encode()
 
 def ctl(i, method, path, body=None):
-    """Control-API call (Bearer auth) against node i's UI port. Returns (status, json_or_bytes)."""
+    """Control-API call (Bearer auth) against node i's web console port. Returns (status, json_or_bytes)."""
     data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(ui_url(i).rstrip("/") + "/api/v1" + path, data=data, method=method)
+    req = urllib.request.Request(web_url(i).rstrip("/") + "/api/v1" + path, data=data, method=method)
     req.add_header("Authorization", f"Bearer {AKID}.{SECRET}")
     if data is not None: req.add_header("Content-Type", "application/json")
     try:
@@ -124,7 +124,7 @@ def node_env(i, master_key):
         "CAIRN_DATA_DIR": os.path.join(d, "data"),
         "CAIRN_DB_PATH": os.path.join(d, "data/cairn.db"),
         "CAIRN_LISTEN_ADDR": f"127.0.0.1:{s3_port(i)}",
-        "CAIRN_UI_ADDR": f"127.0.0.1:{ui_port(i)}",
+        "CAIRN_WEB_ADDR": f"127.0.0.1:{web_port(i)}",
         "CAIRN_MASTER_KEY": master_key,
         "CAIRN_ROOT_ACCESS_KEY": AKID, "CAIRN_ROOT_SECRET_KEY": SECRET,
         "CAIRN_REGION": REGION, "CAIRN_ALLOW_INSECURE": "true",
@@ -498,7 +498,7 @@ def sc10_sse_convergence():
 
 def main():
     only = sys.argv[1:] or None
-    print(f"Spinning {N} nodes on ports {s3_port(0)}..{s3_port(N-1)} (UI {ui_port(0)}..{ui_port(N-1)})", flush=True)
+    print(f"Spinning {N} nodes on ports {s3_port(0)}..{s3_port(N-1)} (web console {web_port(0)}..{web_port(N-1)})", flush=True)
     try:
         for i in range(N): bootstrap(i)
         for i in range(N):

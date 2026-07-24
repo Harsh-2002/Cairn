@@ -14,7 +14,7 @@ Within the process, two logical planes share the same address space and the same
 
 The **data plane** is the S3 request path: accept a connection, parse and authenticate and authorize the request, and move object bytes between the socket and the disk, touching metadata at the commit point. It is latency- and throughput-critical and is where the I/O model (Section 7) and the durability model (Section 8) live.
 
-The **control plane** is everything that configures and observes the system: the management API and its two clients (the embedded UI and the CLI), the background subsystems (lifecycle scanner, replication worker pool, multipart sweeper, WAL checkpointer, webhook delivery, integrity scrub, S3-import worker, outbox-prune plus the key-rewrap and counter-sync workers), and bootstrap. The control plane is not on the object hot path; it values correctness, observability, and clear operator semantics over raw throughput.
+The **control plane** is everything that configures and observes the system: the management API and its two clients (the embedded web console and the CLI), the background subsystems (lifecycle scanner, replication worker pool, multipart sweeper, WAL checkpointer, webhook delivery, integrity scrub, S3-import worker, outbox-prune plus the key-rewrap and counter-sync workers), and bootstrap. The control plane is not on the object hot path; it values correctness, observability, and clear operator semantics over raw throughput.
 
 ### 6.3 The request path, end to end
 

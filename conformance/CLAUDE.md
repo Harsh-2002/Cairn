@@ -22,7 +22,7 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   bucket-survives guard after each DELETE (the routing fall-through class), CORS preflight.
 - `authz.sh` (+`.py`) — auth / tenancy / credentials: a second identity's tenant isolation,
   `AccessDenied` beats `NoSuchKey`, SigV4 failure codes (`RequestTimeTooSkewed` et al.), presigned-URL
-  redeem + expiry rejection. **UI listener ON** (mints the second user via the management API).
+  redeem + expiry rejection. **web console listener ON** (mints the second user via the management API).
 - `lifecycle.sh` (+`.py`) — lifecycle scanner **enforcement** (`CAIRN_LIFECYCLE_INTERVAL_SECS=1`):
   an expiration rule actually removes a matching object (polled, no sleep) and leaves a non-match,
   per-bucket scoping, a Disabled rule no-ops, a storage-class transition is rejected not ignored.
@@ -57,12 +57,12 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
 - `object_lock.sh` — Object Lock / WORM: COMPLIANCE immutable, GOVERNANCE yields only to
   `s3:BypassGovernanceRetention` + bypass header, legal hold, bucket default retention echoed on HEAD.
 - `notifications.sh` (+`.py`) — webhook event notifications: local sink, bucket endpoint via the
-  management API, assert HMAC-signed S3 event records arrive correctly shaped. **UI listener ON.**
+  management API, assert HMAC-signed S3 event records arrive correctly shaped. **web console listener ON.**
 - `sts.sh` (+`.py`) — STS temp creds: mint a scoped session, prove an S3 SDK consumes it
-  (`X-Amz-Security-Token`) with exactly the granted access, all else denied. **UI listener ON.**
+  (`X-Amz-Security-Token`) with exactly the granted access, all else denied. **web console listener ON.**
 - `console_session.sh` — console httpOnly session-cookie auth (pure curl): `cairn_session` from
-  `POST /session` authenticates management API + S3 on the UI port, REJECTED on the S3 port, cleared
-  by `DELETE /session`. **UI listener ON.**
+  `POST /session` authenticates management API + S3 on the web console port, REJECTED on the S3 port, cleared
+  by `DELETE /session`. **web console listener ON.**
 - `backup_restore.sh` — backup/restore/integrity (pure curl, Bearer): `cairn backup`, corrupt then
   `cairn restore` into a FRESH dir → byte-identical, `cairn integrity --repair` drops exactly the
   dangling row. Parses each synchronous CLI's stdout counts — **never sleeps.**
@@ -168,7 +168,7 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   with the one invalid key the only `InvalidArgument` and a control namespace intact and byte-exact;
   `/healthz` never *stopping* (60 s wedge timeout); the `stress.sh` RSS/fd/thread/WAL ceilings **plus
   a sampler-read-nothing gate** (a column reading zero all run FAILS — a zero peak passes every
-  ceiling); and a 5xx counter EQUAL to the declared budget. **UI listener ON**; the launcher pins
+  ceiling); and a 5xx counter EQUAL to the declared budget. **web console listener ON**; the launcher pins
   `CAIRN_MAX_OBJECT_SIZE` (it is under test) and `CAIRN_REQUEST_TIMEOUT_SECS=600`. The four aws-chunked
   framing malformations that once answered **500** (under-declared chunk length, oversized chunk header,
   non-hex chunk size, missing per-chunk signature) are now **FIXED and GATED at exactly `(400,
@@ -185,7 +185,7 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   signal) and `mesh.sh` leaves (distinct keys, but a handful of objects per scenario, not a load).
   TWO nodes, **different master keys** (derived per node from a label, the `mesh.py` technique), wired
   through the operator-trusted **`CAIRN_REPLICATION_ENDPOINT` config path** — SSRF-guard-exempt, so
-  unlike `mesh` this needs **no** `CAIRN_ALLOW_INTERNAL_ENDPOINTS`; the source's UI listener is on
+  unlike `mesh` this needs **no** `CAIRN_ALLOW_INTERNAL_ENDPOINTS`; the source's web console listener is on
   only so the driver can read `GET /api/v1/replication/summary` (exact outbox counts + true lag). The
   target runs `CAIRN_ENCRYPT_AT_REST=true`, so it re-seals every replica under **its own** key. A
   fixed-size worker pool holds a **CONSTANT** source workload — single-part PUTs, version churn,
@@ -275,7 +275,7 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
 - Invoke as `BIN=target/debug/cairn PY=python3 bash conformance/<name>.sh` (the CI form). Most
   default `BIN` to `$ROOT/target/debug/cairn`, so they run from any cwd; a few (`run`, `share`,
   `rotation`, `concurrency`, `warp*`) want `target/debug/cairn` relative to the repo root.
-- The bash launcher is thin: `mktemp -d` data dir, `CAIRN_UI_ADDR=off` unless the script needs the
+- The bash launcher is thin: `mktemp -d` data dir, `CAIRN_WEB_ADDR=off` unless the script needs the
   console, `bootstrap`, `serve`, poll `/healthz`, cleanup via `trap`. **A running server needs the
   dev sandbox disabled** (it binds listen sockets). Default config is env-only (ARCH 28) — these set
   `CAIRN_*` directly; mirror that, never invent a config file.

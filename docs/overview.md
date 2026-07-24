@@ -1,6 +1,6 @@
 # Cairn: Architecture and Engineering Specification
 
-**A production-grade, fully S3-compatible object storage server written in Rust, storing data natively on the local filesystem, with an embedded management UI, a command-line interface, optional transparent compression at rest, and asynchronous bucket replication.**
+**A production-grade, fully S3-compatible object storage server written in Rust, storing data natively on the local filesystem, with an embedded management web console, a command-line interface, optional transparent compression at rest, and asynchronous bucket replication.**
 
 > **On the name.** This document uses the working codename **Cairn** for the new system. A cairn is a deliberate stack of stones that marks and endures; it suits a store whose job is to keep bytes safe on local disk. The name is a placeholder. Rename freely; nothing in the design depends on it.
 
@@ -31,7 +31,7 @@ Part III (Sections 11 to 12) covers the metadata store and the internal abstract
 
 Part IV (Sections 13 to 21) is the S3 surface in full: the operation catalogue, authentication, the authorization model (bucket policy, ACL, Block Public Access, Object Ownership), versioning, tagging, CORS, lifecycle, bucket replication, and the end-to-end server-side request lifecycles that tie them together.
 
-Part V (Sections 22 to 24) is the control plane: the management API, the embedded React web UI compiled into the binary, and the command-line interface.
+Part V (Sections 22 to 24) is the control plane: the management API, the embedded React web console compiled into the binary, and the command-line interface.
 
 Part VI (Sections 25 to 28) covers cross-cutting concerns: the error model, observability and audit, the security and threat model, and the full configuration surface.
 
@@ -46,7 +46,7 @@ If you intend to start building immediately, read Sections 5, 6, 7, 8, 12, and 3
 
 Cairn is a single-binary object storage server that speaks the Amazon S3 API with enough fidelity that unmodified S3 clients, SDKs, and tools work against it without special-casing. It stores object data as plain files on a local POSIX filesystem and keeps all metadata in an embedded SQLite database. Its defining principle is that the metadata database is the single source of truth and object bytes live under opaque identifiers on disk, so that a metadata commit is the one and only linearization point of any mutation. Everything else in the system is built outward from that principle.
 
-Cairn is intended for production. The design goal is that a team running a single-node MinIO, or any single-drive or single-host S3 endpoint, can replace it with Cairn and gain a simpler operational model, a smaller and safer binary, transparent compression, an embedded management UI, and asynchronous bucket replication for redundancy, without losing S3 compatibility. Cairn does not attempt to be a distributed, erasure-coded, multi-node cluster; that is an explicit non-goal (Section 2). Its redundancy and geo-distribution story is asynchronous bucket replication between independent Cairn deployments (or to any S3-compatible destination), in the spirit of S3 Cross-Region Replication, rather than synchronous clustering. Within a node, durability rests on correct fsync ordering plus the operator's choice of resilient storage underneath (RAID, ZFS, or a cloud block device with its own redundancy).
+Cairn is intended for production. The design goal is that a team running a single-node MinIO, or any single-drive or single-host S3 endpoint, can replace it with Cairn and gain a simpler operational model, a smaller and safer binary, transparent compression, an embedded management web console, and asynchronous bucket replication for redundancy, without losing S3 compatibility. Cairn does not attempt to be a distributed, erasure-coded, multi-node cluster; that is an explicit non-goal (Section 2). Its redundancy and geo-distribution story is asynchronous bucket replication between independent Cairn deployments (or to any S3-compatible destination), in the spirit of S3 Cross-Region Replication, rather than synchronous clustering. Within a node, durability rests on correct fsync ordering plus the operator's choice of resilient storage underneath (RAID, ZFS, or a cloud block device with its own redundancy).
 
 The feature surface is the full practical S3 control set: object operations (including multipart and ranged, conditional reads and writes, copy, and bulk delete), object versioning with delete markers, object and bucket tagging, per-bucket ACLs and bucket policies with a real policy-evaluation engine, Block Public Access and Object Ownership, per-bucket CORS configuration, per-bucket lifecycle rules with expiration and incomplete-multipart cleanup (cold-tier transition is parsed but rejected as `NotImplemented` — not yet supported), and per-bucket asynchronous replication. Control happens through a JSON management API that is consumed both by an embedded React single-page application compiled directly into the server binary and by a first-class command-line interface, so an operator manages Cairn from a browser or a terminal with the same capabilities.
 
@@ -64,7 +64,7 @@ The remainder of this document specifies, in depth and without code, how every p
 - A **single-node, locally-backed, fully S3-compatible** object storage server. One process, one binary, one data directory plus one database file, serving the S3 API and a management API.
 - **Production-capable.** Stability, performance, security hardening, observability, and operational tooling are first-class requirements, not afterthoughts. The yardstick is "can replace a single-node MinIO in production."
 - **Native to S3.** Cairn is, in the operator's words, a bridge: it presents the S3 contract on the front and keeps bytes on whatever local storage the operator chooses on the back. Compatibility is verified against real clients and against the de-facto S3 conformance test suite (Section 29), not asserted.
-- **Self-contained.** The management web UI is built and embedded into the binary at compile time. There is no separate UI service to deploy. A CLI provides the same control from a terminal and a few node-local operations (bootstrap, integrity check, reconciliation, backup) that do not go through the API.
+- **Self-contained.** The management web console is built and embedded into the binary at compile time. There is no separate web console service to deploy. A CLI provides the same control from a terminal and a few node-local operations (bootstrap, integrity check, reconciliation, backup) that do not go through the API.
 - **Redundant by replication, not by clustering.** Asynchronous per-bucket replication to peer Cairn deployments or to any S3-compatible target provides cross-host and cross-site copies.
 
 ### 2.2 In scope (this is the work)
@@ -81,7 +81,7 @@ The following are all in scope and specified in this document. Several were out 
 - **Bucket replication**: per-bucket asynchronous replication rules with prefix and tag filters, delete-marker replication, status tracking, and retries.
 - **Transparent compression at rest**: optional, per-bucket, range-friendly block compression that preserves S3 ETag semantics.
 - **Server-side encryption**: per-bucket SSE-S3, an `aws:kms` (label-only) request surface, optional mandatory encryption, and transparent at-rest encryption (`CAIRN_ENCRYPT_AT_REST`).
-- **Embedded React management UI** and a **management CLI**, both over a common management API.
+- **Embedded React management web console** and a **management CLI**, both over a common management API.
 - **Native TLS** (in addition to running behind a terminating proxy), production observability (metrics, tracing, audit log), and a specified backup and restore procedure.
 
 ### 2.3 Non-goals (explicitly out)
@@ -98,7 +98,7 @@ The following are all in scope and specified in this document. Several were out 
 - Embedded metadata store: SQLite. The metadata abstraction already carries multiple backends, selectable at runtime via `CAIRN_META_BACKEND`: the bundled-C `rusqlite` engine is the default, with an async embedded `libsql` engine and a pure-Rust SQLite engine (Turso) also selectable (Section 11, Section 33). The operator's stated preference for a Rust-native SQLite is honoured by keeping the metadata backend behind a single interface, so the engine can be swapped without touching protocol code.
 - Object data: plain files on a single local POSIX filesystem. The database file, the staging directory, and the blob directory must share one filesystem so that atomic rename works (a cross-device rename fails and would break the commit protocol).
 - Platforms: Linux x86_64 and aarch64 for production, including a fully static build for minimal containers. macOS is supported for development.
-- Operability: one binary that contains the server, the embedded UI, and the CLI subcommands. A single environment-variable configuration surface (`CAIRN_*` variables); the server has no configuration file and no command-line configuration flags (Section 28). The CLI subcommands take their own flags.
+- Operability: one binary that contains the server, the embedded web console, and the CLI subcommands. A single environment-variable configuration surface (`CAIRN_*` variables); the server has no configuration file and no command-line configuration flags (Section 28). The CLI subcommands take their own flags.
 
 ---
 
@@ -129,7 +129,7 @@ The performance ceiling of a local-disk object store is set by how efficiently i
 
 ### 3.6 A small, dependency-light, predictable footprint
 
-The result of compiling Cairn is a single static binary with no virtual machine, no interpreter, and a small, predictable memory footprint. It starts instantly, runs in a `scratch` or distroless container, and is dense to deploy. The mature async networking stack it builds on (the same stack used by high-throughput production systems and by AWS's own Rust SDK) is proven at scale. For an operator, the deployment artifact is one file that contains the server, its management UI, and its CLI.
+The result of compiling Cairn is a single static binary with no virtual machine, no interpreter, and a small, predictable memory footprint. It starts instantly, runs in a `scratch` or distroless container, and is dense to deploy. The mature async networking stack it builds on (the same stack used by high-throughput production systems and by AWS's own Rust SDK) is proven at scale. For an operator, the deployment artifact is one file that contains the server, its management web console, and its CLI.
 
 ### 3.7 The honest counterpoints
 
@@ -229,7 +229,7 @@ This is the bridge from the baseline to the production system. Each finding stat
 
 **F-20 [LOW] Shutdown does not drain or checkpoint deterministically.** **Cairn:** ordered graceful shutdown that drains in-flight work, flushes the writer, checkpoints, and stops background tasks (Section 11, Section 31).
 
-**N-7 [MED] An embedded management UI and a CLI are required.** **Cairn:** a React single-page application built and embedded into the binary at compile time and served by the server, plus a CLI, both over one management API (Sections 22 to 24).
+**N-7 [MED] An embedded management web console and a CLI are required.** **Cairn:** a React single-page application built and embedded into the binary at compile time and served by the server, plus a CLI, both over one management API (Sections 22 to 24).
 
 **N-8 [MED] Transparent compression at rest is required, without breaking S3 semantics or ranges.** **Cairn:** optional per-bucket block compression with a stored block index that keeps range reads efficient and preserves the plaintext-based ETag (Section 10).
 
@@ -241,7 +241,7 @@ This is the bridge from the baseline to the production system. Each finding stat
 
 ### 5.8 Consolidated delta
 
-The net of the above: Cairn keeps the baseline storage model and its correct instincts, fixes the durability and memory and concurrency weaknesses of a naive implementation, adds the entire production S3 control surface (versioning, tagging, ACL, policy, BPA, ownership, CORS, lifecycle, replication), engineers the write path for throughput via group commit, engineers the read path for zero-copy, adds transparent compression, adds server-side encryption (per-bucket SSE-S3, an `aws:kms` label-only request surface, optional mandatory encryption, and transparent at-rest encryption via `CAIRN_ENCRYPT_AT_REST`), adds native TLS and a full security posture, adds metrics and audit and a tested backup story, and ships an embedded UI and a CLI. The subsequent parts specify each of these.
+The net of the above: Cairn keeps the baseline storage model and its correct instincts, fixes the durability and memory and concurrency weaknesses of a naive implementation, adds the entire production S3 control surface (versioning, tagging, ACL, policy, BPA, ownership, CORS, lifecycle, replication), engineers the write path for throughput via group commit, engineers the read path for zero-copy, adds transparent compression, adds server-side encryption (per-bucket SSE-S3, an `aws:kms` label-only request surface, optional mandatory encryption, and transparent at-rest encryption via `CAIRN_ENCRYPT_AT_REST`), adds native TLS and a full security posture, adds metrics and audit and a tested backup story, and ships an embedded web console and a CLI. The subsequent parts specify each of these.
 
 ---
 

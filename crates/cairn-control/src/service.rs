@@ -163,8 +163,8 @@ pub struct SystemInfo {
     pub version: String,
     /// The S3 API listener address as configured.
     pub s3_addr: String,
-    /// The web-UI listener address as configured (may be `off`).
-    pub ui_addr: String,
+    /// The web-console listener address as configured (may be `off`).
+    pub web_addr: String,
     /// Whether TLS is enabled on the S3 listener.
     pub tls: bool,
     /// The data directory (also the statvfs target for disk figures).
@@ -518,7 +518,7 @@ impl ControlService {
                 version: self.system.version.clone(),
                 uptime_secs: self.system.started_at.elapsed().as_secs(),
                 s3_addr: self.system.s3_addr.clone(),
-                ui_addr: self.system.ui_addr.clone(),
+                web_addr: self.system.web_addr.clone(),
                 tls: self.system.tls,
                 data_dir: self.system.data_dir.display().to_string(),
                 disk_total_bytes,
@@ -532,7 +532,7 @@ impl ControlService {
     /// bucket, and HTTP status class, with range-wide totals (bytes, errors, latency average and
     /// p95, peak window, active buckets). An unknown or absent `range` falls back to `1d`. Timeline
     /// timestamps are converted from the store's epoch *seconds* into epoch *milliseconds* (`ts_ms`)
-    /// for the UI.
+    /// for the web console.
     async fn request_metrics(&self, query: &[(String, String)]) -> ControlResponse {
         let range = MetricsRange::parse(find_query(query, "range").unwrap_or("1d"));
         let now_secs = self.clock.now().as_secs();
@@ -912,7 +912,7 @@ impl ControlService {
     /// marker) under `prefix` — the proven force-empty path of [`delete_bucket`], scoped to a
     /// prefix. We re-list from the start each round because each deletion removes the rows the
     /// cursor was anchored against, so the loop converges. If [`MAX_PAGES`] is exhausted while
-    /// items remain, `more = true` signals the UI to re-invoke.
+    /// items remain, `more = true` signals the web console to re-invoke.
     async fn delete_prefix(
         &self,
         name: &str,
@@ -1084,7 +1084,7 @@ impl ControlService {
             Err(e) => return ControlResponse::error_internal(&e.to_string()),
         };
 
-        // Each aspect is an opaque stored document; surface it as parsed JSON so the UI can
+        // Each aspect is an opaque stored document; surface it as parsed JSON so the web console can
         // render it, falling back to a JSON string if it is not itself JSON.
         let (policy, cors, tagging, lifecycle, acl, public_access_block, encryption) =
             match self.read_aspects(&bucket_name).await {
@@ -3255,7 +3255,7 @@ fn compression_ratio(counts: &StoreCounts) -> f64 {
 }
 
 /// Render a stored config document as JSON: if the document text is itself JSON, return the
-/// parsed value so the UI sees structured data; otherwise return it as a JSON string so the
+/// parsed value so the web console sees structured data; otherwise return it as a JSON string so the
 /// response is always valid JSON.
 fn config_doc_to_json(doc: &ConfigDoc) -> serde_json::Value {
     serde_json::from_str(&doc.0).unwrap_or_else(|_| serde_json::Value::String(doc.0.clone()))

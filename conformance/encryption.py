@@ -18,7 +18,7 @@ Two phases, one per server-config leg (the launcher restarts the server between 
   (f) a tampered committed blob fails closed (GET errors, never plaintext)
   (g) cross-policy CopyObject (upgrade to kms default; downgrade to plaintext default)
 
-Usage: encryption.py <phase> <ak> <sk> <s3-endpoint> <data-dir> <key-id> <ui-endpoint>
+Usage: encryption.py <phase> <ak> <sk> <s3-endpoint> <data-dir> <key-id> <web-endpoint>
 """
 import http.client
 import json
@@ -33,7 +33,7 @@ from botocore.exceptions import ClientError
 PHASE = sys.argv[1]
 AK, SK, EP, DATA_DIR = sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
 KEY_ID = sys.argv[6] if len(sys.argv) > 6 else ""
-UI_EP = sys.argv[7] if len(sys.argv) > 7 else ""
+WEB_EP = sys.argv[7] if len(sys.argv) > 7 else ""
 
 s3 = boto3.client(
     "s3", endpoint_url=EP, aws_access_key_id=AK, aws_secret_access_key=SK,
@@ -76,8 +76,8 @@ def assert_encrypted_on_disk(path, label):
     check(f"{label}: known plaintext marker is ABSENT from the stored bytes", MARKER not in blob)
 
 def mgmt(method, path, body=None):
-    """A management-API call on the UI listener, authenticated with the bootstrap Bearer token."""
-    u = urllib.parse.urlparse(UI_EP)
+    """A management-API call on the web-console listener, authenticated with the bootstrap Bearer token."""
+    u = urllib.parse.urlparse(WEB_EP)
     c = http.client.HTTPConnection(u.hostname, u.port, timeout=30)
     payload = json.dumps(body).encode() if body is not None else b""
     c.request(method, path, body=payload,

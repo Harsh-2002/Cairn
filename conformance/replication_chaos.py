@@ -45,7 +45,7 @@ def node_env(data, key, port, repl_to=None):
             del e[k]
     e.update({
         "CAIRN_DATA_DIR": os.path.join(data, "data"), "CAIRN_DB_PATH": os.path.join(data, "data/cairn.db"),
-        "CAIRN_LISTEN_ADDR": f"127.0.0.1:{port}", "CAIRN_UI_ADDR": "off",
+        "CAIRN_LISTEN_ADDR": f"127.0.0.1:{port}", "CAIRN_WEB_ADDR": "off",
         "CAIRN_MASTER_KEY": key, "CAIRN_REGION": REGION,
         "CAIRN_LOG_LEVEL": os.environ.get("CAIRN_LOG_LEVEL", "error"),
     })

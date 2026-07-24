@@ -19,7 +19,7 @@ DATA="$(mktemp -d)"
 export CAIRN_DATA_DIR="$DATA/data"
 export CAIRN_DB_PATH="$DATA/data/cairn.db"
 export CAIRN_LISTEN_ADDR="127.0.0.1:$PORT"
-export CAIRN_UI_ADDR=off  # the harness only drives the S3 port; no console listener
+export CAIRN_WEB_ADDR=off  # the harness only drives the S3 port; no console listener
 CAIRN_MASTER_KEY="$(openssl rand -hex 32)"   # split from `export`: `export X=$(cmd)` masks failure
 export CAIRN_MASTER_KEY
 export CAIRN_LOG_LEVEL="${CAIRN_LOG_LEVEL:-warn}"

@@ -59,14 +59,14 @@ pub async fn serve(
 ) -> std::io::Result<()> {
     let listener = TcpListener::bind(config.listen_addr).await?;
     let local = listener.local_addr()?;
-    // The web-UI listener is a second, optional socket. It serves the same stack but additionally
+    // The web-console listener is a second, optional socket. It serves the same stack but additionally
     // serves the management console at the root path, so an operator can firewall it off from the
-    // S3 data-plane port. `None` (CAIRN_UI_ADDR empty/off) runs headless with only the S3 listener.
-    let ui_listener = match config.ui_listen_addr().ok().flatten() {
+    // S3 data-plane port. `None` (CAIRN_WEB_ADDR empty/off) runs headless with only the S3 listener.
+    let web_listener = match config.web_listen_addr().ok().flatten() {
         Some(addr) => Some(TcpListener::bind(addr).await?),
         None => None,
     };
-    let ui_local = ui_listener.as_ref().and_then(|l| l.local_addr().ok());
+    let web_local = web_listener.as_ref().and_then(|l| l.local_addr().ok());
     let state = Arc::new(AppState {
         ready: AtomicBool::new(false),
         concurrency: Semaphore::new(config.concurrency_limit),
@@ -113,10 +113,10 @@ pub async fn serve(
     // Background subsystems: multipart sweeper, lifecycle scanner, WAL checkpointer, metrics, and
     // the replication worker pool (which takes the shutdown receiver).
     crate::background::spawn(state.stack.clone(), &config, shutdown_rx.clone());
-    tracing::info!(s3_api = %local, web_ui = ?ui_local, tls = tls_rx.is_some(), "cairn listening");
+    tracing::info!(s3_api = %local, web_console = ?web_local, tls = tls_rx.is_some(), "cairn listening");
 
-    // Run the S3-API accept loop and (optionally) the web-UI accept loop concurrently. The UI loop
-    // sets `serve_ui = true`, which makes its connections serve the console at the root path.
+    // Run the S3-API accept loop and (optionally) the web-console accept loop concurrently. The web console loop
+    // sets `serve_web = true`, which makes its connections serve the console at the root path.
     let api = accept_loop(
         listener,
         state.clone(),
@@ -125,9 +125,9 @@ pub async fn serve(
         false,
         shutdown_rx.clone(),
     );
-    match ui_listener {
-        Some(ui) => {
-            let web = accept_loop(ui, state.clone(), tls_rx, ktls_ready, true, shutdown_rx);
+    match web_listener {
+        Some(sock) => {
+            let web = accept_loop(sock, state.clone(), tls_rx, ktls_ready, true, shutdown_rx);
             tokio::join!(api, web);
         }
         None => api.await,
@@ -138,14 +138,14 @@ pub async fn serve(
 }
 
 /// Accept and serve connections on one listener until shutdown, then drain in-flight connections
-/// within a bounded grace period. `serve_ui` selects the listener's role: `true` adds the web
+/// within a bounded grace period. `serve_web` selects the listener's role: `true` adds the web
 /// console at the root path; `false` is the pure S3 data-plane listener.
 async fn accept_loop(
     listener: TcpListener,
     state: Arc<AppState>,
     tls_rx: Option<watch::Receiver<Arc<rustls::ServerConfig>>>,
     ktls_ready: bool,
-    serve_ui: bool,
+    serve_web: bool,
     shutdown_rx: watch::Receiver<bool>,
 ) {
     let mut conns = tokio::task::JoinSet::new();
@@ -177,8 +177,8 @@ async fn accept_loop(
                 conns.spawn(async move {
                     let _permit = permit; // released when the connection task ends
                     match tls {
-                        Some(cfg) => serve_tls(stream, cfg, ktls_ready, st, peer, serve_ui, conn_shutdown).await,
-                        None => serve_plaintext(stream, st, peer, serve_ui, conn_shutdown).await,
+                        Some(cfg) => serve_tls(stream, cfg, ktls_ready, st, peer, serve_web, conn_shutdown).await,
+                        None => serve_plaintext(stream, st, peer, serve_web, conn_shutdown).await,
                     }
                 });
             }
@@ -221,16 +221,16 @@ async fn serve_tls(
     ktls_ready: bool,
     state: Arc<AppState>,
     peer: std::net::SocketAddr,
-    serve_ui: bool,
+    serve_web: bool,
     conn_shutdown: watch::Receiver<bool>,
 ) {
-    // Console courtesy: on the web-UI listener, a browser that connects in plaintext to the TLS port
+    // Console courtesy: on the web-console listener, a browser that connects in plaintext to the TLS port
     // gets a `308` to the `https://` URL rather than an opaque handshake failure. Peek the first byte
     // WITHOUT consuming it — a TLS ClientHello is a handshake record (`0x16`); any other first byte is
     // a plaintext HTTP request (`G`/`P`/… are all != 0x16). The S3 data-plane listener
-    // (`serve_ui == false`) deliberately skips this and stays TLS-only: redirecting a SigV4 request
+    // (`serve_web == false`) deliberately skips this and stays TLS-only: redirecting a SigV4 request
     // would require first accepting its `Authorization`/presigned credentials over cleartext.
-    if serve_ui {
+    if serve_web {
         // Bound the wait for the first byte: a client that connects and never sends one must not pin
         // this task (an unauthenticated slow-loris). A genuine TLS or HTTP client sends immediately,
         // so a short cap is invisible to real traffic and drops idle/hostile sockets.
@@ -273,7 +273,7 @@ async fn serve_tls(
                 Ok(ktls_stream) => {
                     metrics::counter!("cairn_ktls_offload_total", "result" => "ok").increment(1);
                     tracing::debug!(%peer, "kTLS offload engaged");
-                    serve_io(ktls_stream, state, peer, true, serve_ui, conn_shutdown).await;
+                    serve_io(ktls_stream, state, peer, true, serve_web, conn_shutdown).await;
                 }
                 Err(e) => {
                     metrics::counter!("cairn_ktls_offload_total", "result" => "error").increment(1);
@@ -288,7 +288,7 @@ async fn serve_tls(
     // Userspace path (feature off, non-Linux, or kTLS unavailable): the original behaviour.
     let _ = ktls_ready;
     match acceptor.accept(stream).await {
-        Ok(tls) => serve_io(tls, state, peer, true, serve_ui, conn_shutdown).await,
+        Ok(tls) => serve_io(tls, state, peer, true, serve_web, conn_shutdown).await,
         Err(e) => tracing::debug!(error = %e, "TLS handshake failed"),
     }
 }
@@ -426,13 +426,13 @@ async fn serve_plaintext(
     stream: tokio::net::TcpStream,
     state: Arc<AppState>,
     peer: std::net::SocketAddr,
-    serve_ui: bool,
+    serve_web: bool,
     conn_shutdown: watch::Receiver<bool>,
 ) {
-    // The sendfile fast path runs only on the S3 data-plane listener: the UI listener serves console
+    // The sendfile fast path runs only on the S3 data-plane listener: the web console listener serves console
     // assets at paths that must be matched before S3 routing, so it always goes straight to hyper.
     #[cfg(all(feature = "fast-io", target_os = "linux"))]
-    if !serve_ui {
+    if !serve_web {
         match crate::fast_get::try_sendfile_get(
             stream,
             state.stack.as_ref(),
@@ -444,12 +444,12 @@ async fn serve_plaintext(
         {
             crate::fast_get::Fast::Handled => {}
             crate::fast_get::Fast::Fallback { stream } => {
-                serve_io(stream, state, peer, false, serve_ui, conn_shutdown).await;
+                serve_io(stream, state, peer, false, serve_web, conn_shutdown).await;
             }
         }
         return;
     }
-    serve_io(stream, state, peer, false, serve_ui, conn_shutdown).await;
+    serve_io(stream, state, peer, false, serve_web, conn_shutdown).await;
 }
 
 async fn serve_io<S>(
@@ -457,7 +457,7 @@ async fn serve_io<S>(
     state: Arc<AppState>,
     peer: std::net::SocketAddr,
     secure: bool,
-    serve_ui: bool,
+    serve_web: bool,
     mut conn_shutdown: watch::Receiver<bool>,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -471,7 +471,7 @@ async fn serve_io<S>(
             state.clone(),
             peer,
             secure,
-            serve_ui,
+            serve_web,
             req,
             svc_shutdown.clone(),
         )
@@ -534,7 +534,7 @@ async fn handle(
     state: Arc<AppState>,
     peer: std::net::SocketAddr,
     secure: bool,
-    serve_ui: bool,
+    serve_web: bool,
     req: Request<Incoming>,
     shutdown: watch::Receiver<bool>,
 ) -> Result<Response<ResponseBody>, Infallible> {
@@ -563,7 +563,7 @@ async fn handle(
     let response = async move {
         // Infra endpoints (`/healthz`, `/readyz`, `/metrics`) must answer even when the server is
         // shedding load, so a liveness/readiness probe or scrape never trips the concurrency
-        // limiter and flaps the instance out of rotation (audit #21). Only real S3/UI work takes a
+        // limiter and flaps the instance out of rotation (audit #21). Only real S3/web console work takes a
         // permit; the guard is held for the whole request via the `Option`.
         let _permit = if infra {
             None
@@ -585,7 +585,7 @@ async fn handle(
                     req,
                     peer.ip(),
                     secure,
-                    serve_ui,
+                    serve_web,
                     request_id.clone(),
                     shutdown.clone(),
                 )
@@ -627,7 +627,7 @@ async fn handle(
         // Usage-analytics ingestion (ARCH 26.5): count this completed request into the in-process
         // aggregator. This is a single sharded hashmap bump — zero DB I/O on the hot path; the
         // background flush loop drains it periodically. Gated on the subsystem being enabled, and
-        // skipped for infra/UI/share/root paths the classifier returns `None` for.
+        // skipped for infra/web console/share/root paths the classifier returns `None` for.
         if state.request_metrics_enabled {
             // A successful bucket deletion — whether through the raw S3 path (`DELETE /{bucket}`) or
             // the management console/CLI (`DELETE /api/v1/buckets/{name}`) — removes the bucket and
@@ -641,7 +641,7 @@ async fn handle(
                     state.stack.request_metrics.forget_bucket(deleted);
                 }
             }
-            if let Some((op, mut bucket)) = classify_operation(serve_ui, &method, &path, &query) {
+            if let Some((op, mut bucket)) = classify_operation(serve_web, &method, &path, &query) {
                 // The raw S3 DeleteBucket request itself: attribute it to the non-bucket sentinel so
                 // it does not re-create a per-bucket row for the bucket just deleted. (The management
                 // delete is already classified as Management/"".)
@@ -700,15 +700,10 @@ pub(crate) fn classify_route(path: &str) -> &'static str {
         "/healthz" => "healthz",
         "/readyz" => "readyz",
         "/metrics" => "metrics",
-        "/" => "ui",
+        "/" => "web",
         _ if path.starts_with("/api/v1") => "api",
         _ if path.starts_with("/p/") => "share",
-        _ if path.starts_with("/assets/")
-            || path.starts_with("/web/")
-            || path.starts_with("/ui/") =>
-        {
-            "ui"
-        }
+        _ if path.starts_with("/assets/") || path.starts_with("/web/") => "web",
         _ => "s3",
     }
 }
@@ -724,12 +719,12 @@ pub(crate) fn classify_route(path: &str) -> &'static str {
 /// S3 operation name. Virtual-host attribution is out of scope, so a request whose bucket cannot be
 /// read from the path falls back to an empty bucket string.
 ///
-/// `serve_ui` is the listener role: on the web-console listener everything that is not `/api/v1` is
+/// `serve_web` is the listener role: on the web-console listener everything that is not `/api/v1` is
 /// the SPA shell or a root-served static asset (e.g. `/favicon.svg`), not S3 traffic (which uses the
 /// data-plane listener), so it is not charted — otherwise a console asset shows up as a phantom
 /// path-style bucket.
 pub(crate) fn classify_operation(
-    serve_ui: bool,
+    serve_web: bool,
     method: &Method,
     path: &str,
     query: &str,
@@ -739,11 +734,7 @@ pub(crate) fn classify_operation(
         "/" | "/healthz" | "/readyz" | "/metrics" => return None,
         _ => {}
     }
-    if path.starts_with("/p/")
-        || path.starts_with("/assets/")
-        || path.starts_with("/web/")
-        || path.starts_with("/ui/")
-    {
+    if path.starts_with("/p/") || path.starts_with("/assets/") || path.starts_with("/web/") {
         return None;
     }
     if path.starts_with("/api/v1") {
@@ -754,7 +745,7 @@ pub(crate) fn classify_operation(
     // data-plane traffic uses the S3 listener, so don't misclassify a console asset as a phantom
     // path-style bucket — which is exactly how `/favicon.svg` surfaced as a bucket named
     // "favicon.svg" in the usage analytics.
-    if serve_ui {
+    if serve_web {
         return None;
     }
 
@@ -1300,7 +1291,7 @@ mod redirect_tests {
             "fallback:7374".to_owned(),
         ));
         client
-            .write_all(b"GET /buckets HTTP/1.1\r\nHost: ui.local:7374\r\nUser-Agent: x\r\n\r\n")
+            .write_all(b"GET /buckets HTTP/1.1\r\nHost: web.local:7374\r\nUser-Agent: x\r\n\r\n")
             .await
             .unwrap();
         let mut resp = Vec::new();
@@ -1308,7 +1299,7 @@ mod redirect_tests {
         task.await.unwrap();
         let resp = String::from_utf8(resp).unwrap();
         assert!(resp.starts_with("HTTP/1.1 308 "), "got: {resp}");
-        assert!(resp.contains("Location: https://ui.local:7374/buckets\r\n"));
+        assert!(resp.contains("Location: https://web.local:7374/buckets\r\n"));
     }
 }
 

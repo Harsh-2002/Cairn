@@ -26,7 +26,7 @@ BK="$WORK/backup"         # the snapshot
 PAY="$WORK/payloads"      # local copies of every object body, for byte-identical verification
 
 export CAIRN_LISTEN_ADDR="127.0.0.1:$PORT"
-export CAIRN_UI_ADDR=off
+export CAIRN_WEB_ADDR=off
 export CAIRN_MASTER_KEY; CAIRN_MASTER_KEY="$(openssl rand -hex 32)"
 export CAIRN_LOG_LEVEL="${CAIRN_LOG_LEVEL:-warn}"
 

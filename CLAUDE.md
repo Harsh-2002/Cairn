@@ -33,7 +33,7 @@ rotation), [`docs/backup-restore.md`](./docs/backup-restore.md),
 [`docs/disaster-recovery.md`](./docs/disaster-recovery.md),
 [`docs/migration.md`](./docs/migration.md) (import from another S3 store),
 [`docs/s3-api-matrix.md`](./docs/s3-api-matrix.md), [`docs/benchmarks.md`](./docs/benchmarks.md).
-UI visual system: [`docs/design.md`](./docs/design.md). Doc index: [`docs/CLAUDE.md`](./docs/CLAUDE.md).
+web console visual system: [`docs/design.md`](./docs/design.md). Doc index: [`docs/CLAUDE.md`](./docs/CLAUDE.md).
 
 ## Build, test, and the gate
 
@@ -44,17 +44,17 @@ it mirrors `.github/workflows/ci.yml` and must be green before any change is fin
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings        # also run with --all-features
 cargo nextest run --workspace                                # + cargo test --workspace --doc
-(cd ui && npm install && npm run build)                      # for any UI change / the embedded console
+(cd web && npm install && npm run build)                      # for any web console change / the embedded console
 ```
 
 `make check` runs the fast gate (fmt + clippy + nextest + doctests) in order, aborting on the first
-failure; `make check-all` adds the `--all-features` clippy leg and the UI build. `make help` lists
+failure; `make check-all` adds the `--all-features` clippy leg and the web console build. `make help` lists
 every target. The `Makefile` is a thin front door over `cargo` and the conformance harnesses — it
 doesn't replace them, and the raw commands above remain the source of truth.
 
 - Toolchain is pinned in `rust-toolchain.toml` (stable). Warnings are denied; `unsafe_code`, `dbg!`,
   and `todo!` are lints — keep them out of committed code.
-- `ui/` is excluded from the cargo workspace. The built `ui/dist` is embedded into `cairn-ui` via
+- `web/` is excluded from the cargo workspace. The built `web/dist` is embedded into `cairn-web` via
   `rust_embed`; without a real `npm run build` the crate compiles against a placeholder that fails
   the `index_referenced_bundles_are_embedded` test.
 - The optional `cairn-meta-async` backend (libSQL/Turso) is glibc-only and is excluded from the
@@ -84,7 +84,7 @@ doesn't replace them, and the raw commands above remain the source of truth.
 - `cairn-import` — streaming, bounded-concurrency engine that imports buckets + objects from a
   remote S3-compatible store (MinIO/Garage/R2/AWS/another Cairn) into this node; trait-generic like
   `cairn-replication`, wired to a concrete `SourceReader`/`DestWriter` by `cairn-server`.
-- `cairn-control` / `cairn-ui` — management JSON API (`/api/v1`); embedded React console (source in `ui/`).
+- `cairn-control` / `cairn-web` — management JSON API (`/api/v1`); embedded React console (source in `web/`).
 - `cairn-server` — the binary: wires the concrete stack (`stack.rs`), the hyper/rustls server,
   background loops (`background.rs`), config (`config.rs`), and the CLI subcommands (`main.rs`).
 
@@ -94,7 +94,7 @@ doesn't replace them, and the raw commands above remain the source of truth.
   (`deny_unknown_fields`) — no config file, no CLI flags. Add new knobs to
   `crates/cairn-server/src/config.rs` with a doc comment **and** validation (ARCH 28).
 - **Two listeners.** S3 data plane on `:7373` (`CAIRN_LISTEN_ADDR`); web console + `/api/v1` on
-  `:7374` (`CAIRN_UI_ADDR`; set to `off`/`none` for headless). `/healthz`, `/readyz`, `/metrics` are
+  `:7374` (`CAIRN_WEB_ADDR`; set to `off`/`none` for headless). `/healthz`, `/readyz`, `/metrics` are
   served on the S3 port, ahead of the concurrency limiter. The AWS-STS surface (AssumeRole /
   GetSessionToken, `cairn-server/src/sts.rs`, `CAIRN_STS_ENABLED`) is a form POST on the S3 port.
 - **All writes go through the single `Writer`** (group-commit, savepoint-isolated batches) in

@@ -555,7 +555,7 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
             // and the console footer report the same string as `cairn --version`.
             version: crate::CAIRN_VERSION.to_owned(),
             s3_addr: cfg.listen_addr.to_string(),
-            ui_addr: cfg.ui_addr.clone(),
+            web_addr: cfg.web_addr.clone(),
             tls: cfg.tls_enabled(),
             data_dir: cfg.data_dir.clone(),
             started_at: std::time::Instant::now(),
@@ -573,7 +573,7 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
     });
 
     // Ensure the root administrator exists so the deployment is usable immediately: the same access
-    // key + secret log into the web UI, authenticate the management API, and sign S3 requests.
+    // key + secret log into the web console, authenticate the management API, and sign S3 requests.
     ensure_root_admin(&meta, &crypto, &clock, cfg).await?;
 
     // Startup reconciliation reclaims orphaned blobs from any crash window before serving. The
@@ -651,7 +651,7 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
 
 /// Ensure an active administrator with the configured root access key exists, so the server is
 /// usable out of the box. The same `CAIRN_ROOT_ACCESS_KEY` / `CAIRN_ROOT_SECRET_KEY` pair is valid
-/// for the web UI login, the management API (as a Bearer token `access.secret`), and the S3 API
+/// for the web console login, the management API (as a Bearer token `access.secret`), and the S3 API
 /// (SigV4 — the access key is registered as the SigV4 key id too). Idempotent: created when absent,
 /// secret/role refreshed when the env changed, left untouched when already in sync.
 pub(crate) async fn ensure_root_admin(

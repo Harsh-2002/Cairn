@@ -100,7 +100,7 @@ export CAIRN_DB_PATH="$DATA/data/cairn.db"
 export CAIRN_LISTEN_ADDR="127.0.0.1:$PORT"
 # The management API is REQUIRED here (bucket quota + STS mint/revoke), so unlike the other stress
 # harnesses the console listener is ON.
-export CAIRN_UI_ADDR="127.0.0.1:$UIPORT"
+export CAIRN_WEB_ADDR="127.0.0.1:$UIPORT"
 export CAIRN_LOG_LEVEL="${CAIRN_LOG_LEVEL:-error}"
 export CAIRN_MASTER_KEY="${CAIRN_MASTER_KEY:-00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff}"
 # The object-size ceiling is UNDER TEST, so it is pinned small and handed to the driver as the same

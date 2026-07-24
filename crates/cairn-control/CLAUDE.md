@@ -48,11 +48,11 @@ in-memory doubles).
   edits); `tokio` is pulled only for the `rt` spawn handle used by the resync backfill.
 
 ## Notes
-- Served on the **web-UI listener** (`CAIRN_UI_ADDR`, :7374), wired in `cairn-server`, **not** the S3
+- Served on the **web-console listener** (`CAIRN_WEB_ADDR`, :7374), wired in `cairn-server`, **not** the S3
   port. `/health` here is the console probe — distinct from the S3-plane `/healthz`/`/readyz`.
 - `rustix` (`cfg(unix)`) gives the `statvfs` disk figures for `GET /system` — the crate forbids
   `unsafe`, so no raw `libc`. `SystemInfo` is a startup snapshot; the service never re-reads config.
-- `request_metrics` converts the store's epoch **seconds** to **milliseconds** (`ts_ms`) for the UI.
+- `request_metrics` converts the store's epoch **seconds** to **milliseconds** (`ts_ms`) for the web console.
 - Spec: `docs/control-plane.md` (ARCH 22); request-id/error envelope ARCH 25.1, readiness ARCH 26.4.
   Tests: `tests/gate.rs` (the admin-gate, lifecycle, and secret-once contract). See the root
   `../../CLAUDE.md`.

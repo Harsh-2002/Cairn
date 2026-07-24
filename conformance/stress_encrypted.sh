@@ -239,7 +239,7 @@ run_leg() {
   export CAIRN_DATA_DIR="$dir/data"
   export CAIRN_DB_PATH="$dir/data/cairn.db"
   export CAIRN_LISTEN_ADDR="127.0.0.1:$PORT"
-  export CAIRN_UI_ADDR=off
+  export CAIRN_WEB_ADDR=off
   if [ "$leg" = "B" ]; then
     # Figment is strict: the boolean must be the literal `true`, NOT `1`.
     export CAIRN_ENCRYPT_AT_REST=true

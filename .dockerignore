@@ -9,9 +9,9 @@ target
 *.profraw
 *.profdata
 
-ui/node_modules
-ui/dist
-ui/tsconfig.tsbuildinfo
+web/node_modules
+web/dist
+web/tsconfig.tsbuildinfo
 
 docs
 conformance

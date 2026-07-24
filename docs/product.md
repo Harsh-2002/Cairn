@@ -41,7 +41,7 @@ Identifiers, sizes, and addresses set in Geist Mono with tabular numerals.
 ## Anti-references
 
 - **Consumer-cute / toy-like.** Rounded mascots, playful illustrations, bouncy or elastic motion,
-  emoji-as-UI. Undermines trust for an infrastructure tool.
+  emoji-as-web console. Undermines trust for an infrastructure tool.
 - **MinIO's utilitarian density.** The thing we replace: capable but cramped, dated, and uncrafted,
   every control jammed together with no hierarchy or air. Functional is not the bar; crafted is.
 - Also avoid: the generic AI-SaaS template (gradient hero, purple-everywhere, identical icon+heading
