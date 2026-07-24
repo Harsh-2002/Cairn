@@ -1,39 +1,39 @@
 ---
 import Section from "./Section.astro";
 
-// A typographic, low-level view of Cairn's request/data path and its durability
-// contract. No images: hairline-bordered layers + mono chips that reflow at every
-// width (so nothing scrolls sideways on mobile). Top-to-bottom is the flow.
+// A low-level view of Cairn's request/data path and its durability contract, grounded in
+// the spec (data plane 6–7, metadata 11–12, durability 8–10). No images: hairline tiers +
+// mono chips + a one-line note per tier that reflow at every width. Top-to-bottom is flow.
 const layers = [
-  { tier: "Clients", nodes: [{ t: "S3 SDKs" }, { t: "aws CLI" }, { t: "Console" }] },
   {
-    tier: "Listeners",
-    nodes: [{ t: ":7373 — S3 data plane" }, { t: ":7374 — console + /api/v1" }],
+    tier: "Clients",
+    nodes: ["S3 SDKs", "aws CLI", "Console", "presigned URLs"],
+    desc: "Any unmodified S3 client. Requests are signed with SigV4 or carry a Bearer token; the console drives the same API over its session.",
   },
   {
-    tier: "Request path",
-    nodes: [
-      { t: "SigV4 / Bearer" },
-      { t: "policy · ACL · BPA" },
-      { t: "S3 handler + lifecycle" },
-      { t: "SSE seal / open" },
-    ],
+    tier: "Listeners",
+    nodes: [":7373 — S3 data plane", ":7374 — console + /api/v1", "/healthz · /readyz · /metrics", "AWS-STS"],
+    desc: "Two ports, one process. Health, metrics and the STS mint answer on :7373 ahead of the concurrency limiter.",
+  },
+  {
+    tier: "Request pipeline",
+    nodes: ["authenticate", "authorize — policy · ACL · BPA · ownership", "S3 handler + lifecycle", "chunked decoder", "SSE seal / open"],
+    desc: "Each request is authenticated, then run through a real policy-evaluation engine, then handled. Bodies stream; server-side encryption seals on write and opens on read, and fails closed.",
   },
   {
     tier: "Metadata",
-    nodes: [
-      { t: "Writer — all writes" },
-      { t: "WAL pool + cache — reads" },
-      { t: "SQLite — source of truth", key: true },
-    ],
+    nodes: ["Writer — group-commit", "WAL read pool", "read-through cache", "SQLite (WAL)"],
+    desc: "All writes funnel through one group-committing writer — the single linearization point. Reads come off a WAL connection pool; a bounded cache fronts both.",
   },
   {
     tier: "Object bytes",
-    nodes: [{ t: "BlobStore — plain files (POSIX)", key: true }, { t: "block compression" }],
+    nodes: ["BlobStore", "plain files (POSIX)", "block compression", "reconciliation"],
+    desc: "Object data is ordinary files on the filesystem. Writes stage, fsync, and rename into place; a bounded reconciliation reclaims orphaned blobs on restart.",
   },
   {
     tier: "Background",
-    nodes: [{ t: "replication" }, { t: "lifecycle" }, { t: "webhooks" }],
+    nodes: ["replication", "lifecycle", "webhooks", "integrity scrub", "multipart sweep", "key re-wrap"],
+    desc: "Durable outbox-driven workers run off the metadata store: asynchronous replication, lifecycle expiry, webhook delivery, and an opt-in integrity scrub.",
   },
 ];
 
@@ -48,7 +48,6 @@ const steps = [
   "commit metadata",
   "reclaim",
 ];
-const keyStep = "commit metadata";
 ---
 
 <Section eyebrow="Architecture" title="How it works">
@@ -56,7 +55,9 @@ const keyStep = "commit metadata";
     Cairn is one process with two listeners and two durable stores — no clustering layer, no external
     database, no separate storage daemon. A request flows straight down the stack: authenticated,
     authorized, and handled, then committed. Reads come off a WAL pool; every write goes through a
-    single group-committing writer, so the database has exactly one linearization point.
+    single group-committing writer, so the database has exactly one linearization point. Each store
+    sits behind a small trait interface, so the SQLite metadata engine, the file BlobStore, and the
+    crypto layer are swappable without touching the S3 surface above them.
   </p>
 
   <div class="arch">
@@ -66,10 +67,13 @@ const keyStep = "commit metadata";
           {i > 0 && <span class="arch__link" aria-hidden="true" />}
           <div class="arch__layer">
             <span class="arch__tier">{l.tier}</span>
-            <div class="arch__nodes">
-              {l.nodes.map((n) => (
-                <span class={`chip ${n.key ? "chip--key" : ""}`}>{n.t}</span>
-              ))}
+            <div class="arch__body">
+              <div class="arch__nodes">
+                {l.nodes.map((n) => (
+                  <span class="chip">{n}</span>
+                ))}
+              </div>
+              <p class="arch__desc">{l.desc}</p>
             </div>
           </div>
         </>
@@ -93,7 +97,7 @@ const keyStep = "commit metadata";
               →
             </span>
           )}
-          <span role="listitem" class={`writepath__step ${s === keyStep ? "is-key" : ""}`}>
+          <span role="listitem" class="writepath__step">
             <span class="writepath__n">{i + 1}</span>
             {s}
           </span>
@@ -102,8 +106,8 @@ const keyStep = "commit metadata";
     }
   </div>
   <p class="writepath__note">
-    Step 6 is the linearization point: nothing before it is acknowledged, and nothing after it can
-    lose the object.
+    The metadata commit (step 6) is the linearization point: nothing before it is acknowledged, and
+    nothing after it can lose the object.
   </p>
 </Section>
 
@@ -119,10 +123,10 @@ const keyStep = "commit metadata";
     display: grid;
     grid-template-columns: 8rem 1fr;
     gap: 0.5rem 0.9rem;
-    align-items: center;
+    align-items: start;
     border: 1px solid var(--hairline);
     border-radius: var(--radius);
-    padding: 0.7rem 0.9rem;
+    padding: 0.8rem 0.9rem;
     background: var(--bg-subtle);
   }
   .arch__tier {
@@ -130,6 +134,7 @@ const keyStep = "commit metadata";
     font-size: var(--step--1);
     letter-spacing: 0.04em;
     color: var(--fg-faint);
+    padding-top: 0.3rem;
   }
   .arch__nodes {
     display: flex;
@@ -145,11 +150,12 @@ const keyStep = "commit metadata";
     border-radius: 5px;
     padding: 0.25rem 0.55rem;
   }
-  /* The linchpins — the single source of truth and the on-disk bytes — read at full
-     foreground so the eye lands on them. */
-  .chip--key {
-    color: var(--fg);
-    border-color: var(--fg);
+  .arch__desc {
+    font-size: var(--step--1);
+    line-height: 1.5;
+    color: var(--fg-muted);
+    margin-top: 0.55rem;
+    max-width: 52ch;
   }
   /* A centered hairline between tiers, in the page's own 1px-rule language. */
   .arch__link {
@@ -182,17 +188,10 @@ const keyStep = "commit metadata";
     border-radius: var(--radius);
     padding: 0.3rem 0.6rem;
   }
-  .writepath__step.is-key {
-    color: var(--fg);
-    border-color: var(--fg);
-  }
   .writepath__n {
     font-size: 0.74em;
     color: var(--fg-faint);
     font-variant-numeric: tabular-nums;
-  }
-  .writepath__step.is-key .writepath__n {
-    color: var(--fg-muted);
   }
   .writepath__arrow {
     color: var(--fg-faint);
@@ -204,11 +203,13 @@ const keyStep = "commit metadata";
     margin-top: var(--space-3);
   }
 
-  /* Narrow screens: tier label stacks above its nodes; chips may wrap their text
-     rather than overflow. No horizontal scroll at any width. */
+  /* Narrow screens: tier label stacks above its nodes; chips wrap. No horizontal scroll. */
   @media (max-width: 34rem) {
     .arch__layer {
       grid-template-columns: 1fr;
+    }
+    .arch__tier {
+      padding-top: 0;
     }
   }
 </style>

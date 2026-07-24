@@ -5,20 +5,131 @@ import CodeBlock from "../components/CodeBlock.astro";
 import Architecture from "../components/Architecture.astro";
 
 const repo = "https://github.com/Harsh-2002/Cairn";
+const docs = `${repo}/blob/main/docs`;
 
 const install = "curl -fsSL https://raw.githubusercontent.com/Harsh-2002/Cairn/main/install.sh | sudo sh";
 
-const dockerRun = `docker build -t cairn .
-
-docker run -d --name cairn \\
+const dockerRun = `docker run -d --name cairn \\
   -p 7373:7373 -p 7374:7374 \\
   -v cairn-data:/data \\
   -e CAIRN_MASTER_KEY="$(openssl rand -hex 32)" \\
-  cairn serve`;
+  ghcr.io/harsh-2002/cairn:latest`;
 
-const smoke = `aws --endpoint-url http://localhost:7373 s3 mb s3://demo
-echo 'hello cairn' | aws --endpoint-url http://localhost:7373 s3 cp - s3://demo/hi.txt
-aws --endpoint-url http://localhost:7373 s3 cp s3://demo/hi.txt -`;
+const compose = `services:
+  cairn:
+    image: ghcr.io/harsh-2002/cairn:latest
+    container_name: cairn
+    restart: unless-stopped
+    ports:
+      - "7373:7373"   # S3 API
+      - "7374:7374"   # Web console + management API
+    volumes:
+      - cairn-data:/data
+    environment:
+      # Minimum — generate a real key with: openssl rand -hex 32
+      # Seals every secret at rest; keep it constant for the life of your data.
+      CAIRN_MASTER_KEY: "REPLACE_WITH_A_32_BYTE_HEX_KEY"
+
+      # Optional — defaults shown; uncomment to change.
+      # CAIRN_ROOT_ACCESS_KEY: "cairn"          # admin access key
+      # CAIRN_ROOT_SECRET_KEY: "cairnadmin"     # admin secret — override in production
+      # CAIRN_REGION: "us-east-1"               # SigV4 region label
+      # CAIRN_ENCRYPT_AT_REST: "true"           # encrypt every object at rest
+      # CAIRN_S3_DOMAIN: "s3.example.com"       # virtual-host-style addressing
+      # CAIRN_PUBLIC_BASE_URL: "https://s3.example.com"  # external URL behind ingress
+      # CAIRN_TLS_CERT_PATH: "/certs/tls.crt"   # built-in TLS (set both)
+      # CAIRN_TLS_KEY_PATH: "/certs/tls.key"
+      # CAIRN_WEB_ADDR: "off"                   # run headless — no web console
+volumes:
+  cairn-data:`;
+
+const awsConfig = `aws configure set aws_access_key_id cairn
+aws configure set aws_secret_access_key cairnadmin
+aws configure set region us-east-1`;
+
+const awsUse = `# A short alias for the endpoint
+alias s3="aws --endpoint-url http://localhost:7373"
+
+s3 mb s3://demo                        # create a bucket
+s3 cp ./report.pdf s3://demo/          # upload a file
+s3 ls s3://demo/                       # list objects
+s3 cp s3://demo/report.pdf ./out.pdf   # download it back
+s3 sync ./site s3://demo/site          # sync a directory
+s3 presign s3://demo/report.pdf --expires-in 3600   # shareable link`;
+
+// The common configuration surface (the full CAIRN_* reference is in docs/configuration.md).
+const envs = [
+  {
+    name: "CAIRN_MASTER_KEY",
+    def: "a dev key (insecure)",
+    desc: "A 32-byte hex key that seals every secret at rest. Set it in production — a node still on the built-in key refuses to bind a public address. Keep it constant for the life of your data.",
+  },
+  {
+    name: "CAIRN_ROOT_ACCESS_KEY",
+    def: "cairn",
+    desc: "The root administrator's access key, ensured on every startup.",
+  },
+  {
+    name: "CAIRN_ROOT_SECRET_KEY",
+    def: "cairnadmin",
+    desc: "The root administrator's secret. Override it before exposing a node.",
+  },
+  {
+    name: "CAIRN_LISTEN_ADDR",
+    def: "0.0.0.0:7373",
+    desc: "Where the S3 API binds — it also serves /healthz, /readyz, /metrics and the AWS-STS mint.",
+  },
+  {
+    name: "CAIRN_WEB_ADDR",
+    def: "0.0.0.0:7374",
+    desc: "Where the web console and management API bind. Set to off / none / disabled to run headless.",
+  },
+  {
+    name: "CAIRN_DATA_DIR",
+    def: "/data",
+    desc: "Root of the object (blob) storage. Must share a filesystem with the metadata database.",
+  },
+  {
+    name: "CAIRN_DB_PATH",
+    def: "/data/cairn.db",
+    desc: "The SQLite metadata file — the single source of truth. Back it up together with the data directory.",
+  },
+  {
+    name: "CAIRN_REGION",
+    def: "us-east-1",
+    desc: "The region label returned by the location API and checked in the SigV4 credential scope.",
+  },
+  {
+    name: "CAIRN_TLS_CERT_PATH / _KEY_PATH",
+    def: "unset (plaintext)",
+    desc: "Set both to enable built-in TLS; otherwise run plaintext behind a TLS-terminating proxy.",
+  },
+  {
+    name: "CAIRN_ENCRYPT_AT_REST",
+    def: "off",
+    desc: "Transparently encrypt every stored object at rest, even when the client sends no SSE header.",
+  },
+  {
+    name: "CAIRN_S3_DOMAIN",
+    def: "unset",
+    desc: "Base domain for virtual-host-style addressing (bucket.domain); unset serves path-style only.",
+  },
+  {
+    name: "CAIRN_PUBLIC_BASE_URL",
+    def: "unset",
+    desc: "External base URL used when generating links behind an ingress or reverse proxy.",
+  },
+  {
+    name: "CAIRN_META_SYNCHRONOUS",
+    def: "full",
+    desc: "full survives power loss; normal is ~1.7× faster on writes but may lose the last few acknowledged writes on power loss. Neither ever corrupts.",
+  },
+  {
+    name: "CAIRN_ALLOW_INSECURE",
+    def: "off",
+    desc: "Permit the built-in insecure defaults on a public bind — for a closed demo rig only, never production.",
+  },
+];
 
 const features = [
   {
@@ -74,12 +185,9 @@ const bench = [
       metadata in embedded SQLite. One static binary. No external database, no clustering layer, no
       separate storage daemon to run.
     </p>
-    <CodeBlock code={install} />
-    <p class="hero__note">
-      Sets Cairn up on a host or with Docker, and updates an existing install when you run it again.
-    </p>
     <div class="cta">
-      <a class="btn" href={`${repo}#readme`}>Read the docs</a>
+      <a class="btn" href="#get-started">Get started</a>
+      <a class="btn btn--ghost" href={`${docs}/overview.md`}>Documentation</a>
       <a class="btn btn--ghost" href={repo}>GitHub</a>
     </div>
   </section>
@@ -175,11 +283,6 @@ const bench = [
       MinIO&apos;s <span class="mono">1072 MB</span> — about a tenth — at
       <span class="mono">76%</span> mean CPU versus <span class="mono">88%</span>.
     </p>
-
-    <CodeBlock
-      label="Reproduce — the same harness CI runs on every push (bench-compare)"
-      code="BIN=target/release/cairn bash conformance/bench_compare.sh"
-    />
   </Section>
 
   {/* 6 — Why Cairn */}
@@ -242,71 +345,118 @@ const bench = [
     </ul>
   </Section>
 
-  {/* 8 — Quickstart */}
-  <Section eyebrow="Quickstart" title="Run it by hand with Docker">
-    <CodeBlock code={dockerRun} />
-    <ul class="notes">
-      <li>S3 API on <code>:7373</code> — point any S3 client at <code>http://localhost:7373</code>.</li>
-      <li>Web console on <code>:7374</code> — open it in a browser.</li>
-      <li>
-        Default login is <code>cairn</code> / <code>cairnadmin</code>. Override with
-        <code>CAIRN_ROOT_ACCESS_KEY</code> and <code>CAIRN_ROOT_SECRET_KEY</code> before exposing a
-        node.
-      </li>
-      <li><code>/healthz</code>, <code>/readyz</code>, and <code>/metrics</code> are served on the S3 port.</li>
-    </ul>
-    <p>Smoke-test with the AWS CLI (configure it with the access key and secret above, any region):</p>
-    <CodeBlock code={smoke} />
-    <p class="hero__note">
-      <code>CAIRN_MASTER_KEY</code> is a 32-byte hex key that seals every secret at rest. Generate it
-      once, keep it constant for the life of your data, and store it outside the database backup.
-    </p>
-  </Section>
-
-  {/* 9 — Roadmap */}
-  <Section eyebrow="Roadmap" title="Planned and additive">
-    <p>None of it changes the S3 or management API.</p>
-    <ul class="scope">
-      <li>Integration with an external KMS, with distinct per-key material and tenant isolation.</li>
-      <li>Lifecycle transition to a remote cold tier, with a restore-from-cold workflow.</li>
-      <li>Zero-copy reads with kernel TLS, building on the existing sendfile fast path.</li>
-      <li>Signed release artifacts (cosign) and SBOM attestation.</li>
-    </ul>
-  </Section>
-
-  {/* 10 — Get started */}
-  <Section eyebrow="Get started" title="Install it" id="get-started">
+  {/* 8 — Get started / deploy */}
+  <Section eyebrow="Get started" title="Deploy Cairn" id="get-started">
     <p>
-      Install on a host or with Docker, then open the console on <code>:7374</code> and point any S3
-      client at <code>:7373</code>.
+      One command sets Cairn up on a host or with Docker, and updates an existing install when you run
+      it again. The installer asks which you want, or take <code>--host</code> or
+      <code>--docker --yes</code> to skip the prompt; <code>--uninstall</code> removes it and keeps
+      your data.
     </p>
     <CodeBlock code={install} />
+
+    <h3 class="deploy__h">Run the container directly</h3>
     <p>
-      Releases are CI-gated and publish static <code>linux/amd64</code> and <code>linux/arm64</code>
-      binaries with a <code>SHA256SUMS</code> manifest, plus a multi-arch image at
-      <code>ghcr.io/harsh-2002/cairn</code>. Verify a download with <code>sha256sum -c SHA256SUMS</code>.
+      The image ships a nonroot <code>/data</code> and defaults to <code>serve</code>. The only
+      variable you need to set is the master key.
     </p>
-    <nav class="linkrow" aria-label="Project links">
-      <a class="link" href={`${repo}#readme`}>Documentation</a>
+    <CodeBlock code={dockerRun} />
+
+    <h3 class="deploy__h">Or with Docker Compose</h3>
+    <p>
+      Copy this, set a real <code>CAIRN_MASTER_KEY</code>, and run <code>docker compose up -d</code>.
+      The optional variables are commented with their defaults — uncomment what you need.
+    </p>
+    <CodeBlock label="docker-compose.yml" code={compose} />
+    <p class="note">
+      The S3 API is then on <code>:7373</code> and the web console on <code>:7374</code>. Default login
+      is <code>cairn</code> / <code>cairnadmin</code> — override it before exposing a node.
+    </p>
+  </Section>
+
+  {/* 9 — Configuration */}
+  <Section eyebrow="Configuration" title="Configure with the environment">
+    <p>
+      Cairn is configured entirely by <code>CAIRN_*</code> environment variables — no config file, no
+      server flags — so a deployment is reproducible whether it runs on a host or in a container.
+      Every variable has a default and an invalid one fails fast at startup with a clear message. The
+      one you should set for a real node is <code>CAIRN_MASTER_KEY</code>; the rest are optional.
+    </p>
+    <dl class="config">
+      {
+        envs.map((e) => (
+          <div>
+            <dt>
+              <span class="cfg-name">{e.name}</span>
+              <span class="cfg-default">default: {e.def}</span>
+            </dt>
+            <dd>{e.desc}</dd>
+          </div>
+        ))
+      }
+    </dl>
+    <p class="note">
+      That&apos;s the common set. There are roughly fifty knobs in all — replication, lifecycle,
+      webhooks, KMS allow-listing, metadata sharding, runtime and durability tuning. See the full{" "}
+      <a class="link" href={`${docs}/configuration.md`}><code>CAIRN_*</code> reference</a>.
+    </p>
+  </Section>
+
+  {/* 10 — Using the AWS CLI */}
+  <Section eyebrow="Usage" title="Use it with the AWS CLI">
+    <p>
+      Because Cairn speaks the S3 API, the <code>aws</code> CLI and the AWS SDKs work against it
+      unmodified — you just point them at the endpoint. Configure a profile once (the default
+      credentials shown; use your own in production):
+    </p>
+    <CodeBlock code={awsConfig} />
+    <p>Then every S3 command works as usual:</p>
+    <CodeBlock code={awsUse} />
+    <p class="note">
+      Everything the SDKs expect is here — multipart for large objects, byte-range reads, versioning,
+      tagging, and presigned URLs. See the <a class="link" href={`${docs}/s3-api-matrix.md`}>S3 API
+      support matrix</a> for the exact surface.
+    </p>
+  </Section>
+
+  {/* 11 — Release policy */}
+  <Section eyebrow="Releases" title="One version, always the latest">
+    <p>
+      Cairn is calendar-versioned. A release is tagged <code>vYYYY.MM.DD</code>, and exactly one
+      release is ever active: cutting one publishes today&apos;s tag, attaches the static
+      <code>linux/amd64</code> and <code>linux/arm64</code> binaries with a <code>SHA256SUMS</code>
+      manifest, pushes the multi-arch container image as <code>:latest</code>, and retires every prior
+      release and tag. A release is a deliberate, manual act, gated on a green CI run for the exact
+      commit it ships.
+    </p>
+    <p>
+      Why keep only one active version? Cairn is single-node, self-hosted infrastructure — not a
+      library other code compiles against — so there is no dependency graph pinning old versions and
+      no back-catalogue of stale binaries to pick the wrong one from. One line moves forward: the
+      latest release is the supported release. The version is baked into the binary and reported by
+      <code>cairn --version</code> and the console footer, and always equals the tag it shipped in; a
+      local build reports a <code>-dev</code> string so it is never mistaken for a release. Each node
+      checks for a newer version hourly and surfaces a hint in the console — best-effort, and off if
+      you set <code>CAIRN_UPDATE_CHECK_ENABLED=false</code>.
+    </p>
+  </Section>
+
+  {/* 12 — Footer */}
+  <footer class="site-footer wrap">
+    <p class="site-footer__tag">Cairn — self-hosted, S3-compatible object storage.</p>
+    <p>Apache-2.0. The license is permanent; there is no enterprise edition or open-core split.</p>
+    <nav class="linkrow" aria-label="Documentation">
+      <a class="link" href={`${docs}/overview.md`}>Overview</a>
+      <a class="link" href={`${docs}/data-plane.md`}>Architecture</a>
+      <a class="link" href={`${docs}/configuration.md`}>Configuration</a>
+      <a class="link" href={`${docs}/s3-api-matrix.md`}>S3 API matrix</a>
+      <a class="link" href={`${docs}/operations.md`}>Operations</a>
+    </nav>
+    <nav class="linkrow linkrow--muted" aria-label="Project">
       <a class="link" href={repo}>GitHub</a>
       <a class="link" href={`${repo}/releases`}>Releases</a>
       <a class="link" href={`${repo}/pkgs/container/cairn`}>Container image</a>
-      <a class="link" href={`${repo}/blob/main/docs/s3-api-matrix.md`}>S3 API support matrix</a>
-    </nav>
-  </Section>
-
-  {/* 11 — Footer */}
-  <footer class="site-footer wrap">
-    <p class="site-footer__tag">Cairn — self-hosted, S3-compatible object storage.</p>
-    <p>
-      Apache-2.0. The license is permanent; there is no enterprise edition or open-core split.
-    </p>
-    <nav class="linkrow" aria-label="Footer links">
-      <a class="link" href={repo}>GitHub</a>
-      <a class="link" href={`${repo}#readme`}>Docs</a>
-      <a class="link" href={`${repo}/releases`}>Releases</a>
       <a class="link" href={`${repo}/blob/main/SECURITY.md`}>Security</a>
-      <a class="link" href={`${repo}/blob/main/GOVERNANCE.md`}>Governance</a>
       <a class="link" href={`${repo}/blob/main/LICENSE`}>License</a>
     </nav>
   </footer>
@@ -348,16 +498,24 @@ const bench = [
     max-width: 60ch;
     margin-bottom: var(--space-4);
   }
-  .hero__note {
-    font-size: var(--step--1);
-    color: var(--fg-faint);
-    margin-top: 0.5rem;
-  }
   .cta {
     display: flex;
     flex-wrap: wrap;
     gap: 0.75rem;
     margin-top: var(--space-4);
+  }
+
+  /* small, faint note under a code block or list */
+  .note {
+    font-size: var(--step--1);
+    color: var(--fg-faint);
+    margin-top: 0.6rem;
+  }
+  .note .link {
+    color: var(--fg-muted);
+  }
+  .note .link:hover {
+    color: var(--fg);
   }
 
   /* definition-list feature/point blocks */
@@ -383,6 +541,7 @@ const bench = [
   /* benchmark table */
   .table-scroll {
     overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
     margin-block: var(--space-4);
     border: 1px solid var(--hairline);
     border-radius: var(--radius);
@@ -429,23 +588,43 @@ const bench = [
     font-size: 0.85rem;
   }
 
-  .scope,
-  .notes {
+  .scope {
     margin-top: var(--space-3);
   }
-  .notes {
-    list-style: none;
-    padding-left: 0;
+
+  /* deploy sub-headings */
+  .deploy__h {
+    margin-top: var(--space-5);
+    margin-bottom: var(--space-2);
   }
-  .notes li {
-    padding-left: 1.1rem;
-    position: relative;
+
+  /* configuration reference: variable + default, then description — reflows, never scrolls */
+  .config {
+    display: grid;
+    gap: var(--space-4);
+    margin-top: var(--space-4);
   }
-  .notes li::before {
-    content: "—";
-    position: absolute;
-    left: 0;
+  .config dt {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 0.4rem 0.75rem;
+  }
+  .config .cfg-name {
+    font-family: var(--font-mono);
+    font-size: var(--step--1);
+    color: var(--fg);
+    overflow-wrap: anywhere;
+  }
+  .config .cfg-default {
+    font-family: var(--font-mono);
+    font-size: var(--step--1);
     color: var(--fg-faint);
+  }
+  .config dd {
+    margin: 0.3rem 0 0;
+    color: var(--fg-muted);
+    max-width: var(--measure);
   }
 
   .linkrow {
@@ -461,6 +640,9 @@ const bench = [
   }
   .linkrow a:hover {
     color: var(--fg);
+  }
+  .linkrow--muted a {
+    color: var(--fg-faint);
   }
 
   .site-footer {

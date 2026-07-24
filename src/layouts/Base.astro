@@ -15,38 +15,61 @@ const {
 // (BASE_URL comes through as "/Cairn" without one).
 const base = import.meta.env.BASE_URL.replace(/\/?$/, "/");
 const canonical = new URL(base, Astro.site);
+
+// Structured data for search engines: Cairn is a self-hostable developer application.
+const jsonLd = {
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  name: "Cairn",
+  applicationCategory: "DeveloperApplication",
+  operatingSystem: "Linux",
+  description,
+  url: canonical.href,
+  license: "https://www.apache.org/licenses/LICENSE-2.0",
+  codeRepository: "https://github.com/Harsh-2002/Cairn",
+  offers: { "@type": "Offer", price: "0", priceCurrency: "USD" },
+};
 ---
 
 <!doctype html>
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <meta name="color-scheme" content="light dark" />
+    {/* theme-color follows the active theme (updated live by the toggle) — native browser chrome */}
+    <meta name="theme-color" content="#ffffff" />
+    <meta name="robots" content="index, follow" />
     <title>{title}</title>
     <meta name="description" content={description} />
     <link rel="canonical" href={canonical} />
     <link rel="icon" href={`${base}favicon.svg`} type="image/svg+xml" />
 
     <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="Cairn" />
+    <meta property="og:locale" content="en_US" />
     <meta property="og:title" content={title} />
     <meta property="og:description" content={description} />
     <meta property="og:url" content={canonical} />
     <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content={title} />
+    <meta name="twitter:description" content={description} />
+    <script type="application/ld+json" set:html={JSON.stringify(jsonLd)} />
 
     {/* Blocking, pre-paint: stamp the theme on <html> before the first paint so there is no
         flash of the wrong theme. Reads the saved choice, else the OS preference. is:inline keeps
         it verbatim (not bundled) so it runs synchronously here in <head>, before the stylesheet. */}
     <script is:inline>
       (function () {
+        var t = "light";
         try {
-          var t =
+          t =
             localStorage.getItem("theme") ||
             (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
-          document.documentElement.dataset.theme = t;
-        } catch (e) {
-          document.documentElement.dataset.theme = "light";
-        }
+        } catch (e) {}
+        document.documentElement.dataset.theme = t;
+        var m = document.querySelector('meta[name="theme-color"]');
+        if (m) m.setAttribute("content", t === "dark" ? "#0a0a0a" : "#ffffff");
         document.documentElement.classList.add("no-transitions");
       })();
     </script>
@@ -56,7 +79,7 @@ const canonical = new URL(base, Astro.site);
     <a class="skip-link" href="#main">Skip to content</a>
 
     <header class="wrap site-header">
-      <a href={base} class="wordmark" aria-label="Cairn — home">cairn</a>
+      <a href={base} class="wordmark" aria-label="Cairn — home">Cairn</a>
       <button
         id="theme-toggle"
         class="theme-toggle"
@@ -83,6 +106,9 @@ const canonical = new URL(base, Astro.site);
         root.dataset.theme = t;
         btn?.setAttribute("aria-pressed", String(t === "dark"));
         if (label) label.textContent = t === "dark" ? "Light" : "Dark";
+        document
+          .querySelector('meta[name="theme-color"]')
+          ?.setAttribute("content", t === "dark" ? "#0a0a0a" : "#ffffff");
       }
       paint(root.dataset.theme || "light");
 

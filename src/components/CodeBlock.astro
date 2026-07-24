@@ -20,7 +20,7 @@ const { code, label } = Astro.props;
 </div>
 
 <script>
-  // One delegated handler for every code block on the page.
+  // Copy handler (one delegated listener for every block on the page).
   document.addEventListener("click", async (e) => {
     const btn = (e.target as HTMLElement)?.closest<HTMLButtonElement>(".codeblock__copy");
     if (!btn) return;
@@ -37,6 +37,18 @@ const { code, label } = Astro.props;
       /* clipboard blocked — no-op */
     }
   });
+
+  // Console scripts don't wrap and don't scroll: a long line clips, and Copy hands over
+  // the full text. Flag the blocks that actually clip so the right-edge fade only shows
+  // where there is more than fits.
+  function markClipped() {
+    document.querySelectorAll<HTMLElement>(".codeblock__body").forEach((body) => {
+      const pre = body.querySelector("pre");
+      if (pre) body.toggleAttribute("data-clipped", pre.scrollWidth > pre.clientWidth + 1);
+    });
+  }
+  markClipped();
+  addEventListener("resize", markClipped);
 </script>
 
 <style>
@@ -56,27 +68,37 @@ const { code, label } = Astro.props;
     border: 1px solid var(--hairline);
     border-radius: var(--radius);
     background: var(--bg-subtle);
+    overflow: hidden; /* clip long lines to the rounded box — no scrollbar on any device */
   }
   pre {
     margin: 0;
     padding: 0.9rem 1rem;
     padding-right: 4.5rem;
-    /* Wrap long commands (the install one-liner, the docker block) instead of
-       scrolling — so there is no horizontal scrollbar on any device or OS. pre-wrap
-       preserves the intentional newlines + indentation; overflow-wrap breaks the
-       rare over-long token (a URL) rather than overflowing the box. */
-    white-space: pre-wrap;
-    overflow-wrap: anywhere;
+    /* Keep each command on its own line, exactly as typed. Long lines clip instead of
+       wrapping or scrolling; the Copy button carries the full, exact text. */
+    white-space: pre;
+    overflow: hidden;
     font-family: var(--font-mono);
     font-size: 0.9rem;
     line-height: 1.65;
     color: var(--fg);
     font-variant-numeric: slashed-zero;
   }
+  /* A soft right-edge fade shown only when a line is clipped — signals there's more,
+     and that Copy grabs all of it. */
+  .codeblock__body[data-clipped]::after {
+    content: "";
+    position: absolute;
+    inset: 0 0 0 auto;
+    width: 3.5rem;
+    background: linear-gradient(to right, transparent, var(--bg-subtle));
+    pointer-events: none;
+  }
   .codeblock__copy {
     position: absolute;
     top: 0.55rem;
     right: 0.55rem;
+    z-index: 1; /* above the fade */
     font: inherit;
     font-family: var(--font-mono);
     font-size: 0.72rem;
