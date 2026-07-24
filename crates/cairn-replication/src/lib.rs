@@ -589,7 +589,7 @@ impl ReplicationEngine {
     {
         tracing::warn!(
             bucket = %entry.bucket.as_str(),
-            key = %entry.key.as_str(),
+            key = ?entry.key.as_str(),
             terminal = next_attempt_at.is_none(),
             error,
             "replication delivery failed"
@@ -694,13 +694,13 @@ impl ReplicationEngine {
         match cause {
             UnavailableCause::Destination => tracing::warn!(
                 bucket = %entry.bucket.as_str(),
-                key = %entry.key.as_str(),
+                key = ?entry.key.as_str(),
                 error = msg,
                 "replication target unavailable; retrying without consuming the attempt budget"
             ),
             UnavailableCause::SourceKey => tracing::error!(
                 bucket = %entry.bucket.as_str(),
-                key = %entry.key.as_str(),
+                key = ?entry.key.as_str(),
                 error = msg,
                 "replication cannot unseal the SOURCE object's data key on this node's master \
                  ring; the destination is not implicated. Retrying without consuming the attempt \
