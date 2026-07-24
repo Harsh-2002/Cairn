@@ -1,10 +1,10 @@
 # syntax=docker/dockerfile:1
 
-FROM --platform=$BUILDPLATFORM node:22-bookworm-slim AS ui
-WORKDIR /ui
-COPY ui/package.json ui/package-lock.json ./
+FROM --platform=$BUILDPLATFORM node:22-bookworm-slim AS web
+WORKDIR /web
+COPY web/package.json web/package-lock.json ./
 RUN npm ci
-COPY ui/ ./
+COPY web/ ./
 RUN npm run build
 
 FROM --platform=$BUILDPLATFORM rust:1-bookworm AS build
@@ -24,7 +24,7 @@ RUN case "$TARGETARCH" in \
     && rustup target add "$(cat /tmp/triple)"
 WORKDIR /src
 COPY . .
-COPY --from=ui /ui/dist ./ui/dist
+COPY --from=web /web/dist ./web/dist
 RUN cargo zigbuild --release --bin cairn --target "$(cat /tmp/triple)" \
     && cp "target/$(cat /tmp/triple)/release/cairn" /cairn \
     && mkdir -p /seed-data

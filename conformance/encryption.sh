@@ -5,8 +5,8 @@
 # and TAMPERS committed blobs under the data dir to prove on-disk ciphertext and fail-closed reads.
 #
 # Two boot legs (two server configs); the bash launcher owns the process, the .py drives each phase:
-#   leg 1  CAIRN_KMS_KEY_IDS allow-list set, at-rest OFF, UI listener ON  -> cases a, c, d, e, f, g
-#   leg 2  CAIRN_ENCRYPT_AT_REST=true, UI listener OFF                    -> case b
+#   leg 1  CAIRN_KMS_KEY_IDS allow-list set, at-rest OFF, web console listener ON  -> cases a, c, d, e, f, g
+#   leg 2  CAIRN_ENCRYPT_AT_REST=true, web console listener OFF                    -> case b
 #
 # Usage: BIN=target/debug/cairn PY=python3 conformance/encryption.sh
 set -euo pipefail
@@ -43,12 +43,12 @@ wait_healthz() {
 }
 stop_srv() { [ -n "$SRV" ] && kill "$SRV" 2>/dev/null || true; [ -n "$SRV" ] && wait "$SRV" 2>/dev/null || true; SRV=""; }
 
-# ---- leg 1: KMS allow-list, at-rest OFF, UI ON (cases a, c, d, e, f, g) ----
+# ---- leg 1: KMS allow-list, at-rest OFF, web console ON (cases a, c, d, e, f, g) ----
 D1="$DATA/d1"
 export CAIRN_DATA_DIR="$D1/data"
 export CAIRN_DB_PATH="$D1/data/cairn.db"
 export CAIRN_LISTEN_ADDR="127.0.0.1:$PORT"
-export CAIRN_UI_ADDR="127.0.0.1:$UIPORT"
+export CAIRN_WEB_ADDR="127.0.0.1:$UIPORT"
 export CAIRN_KMS_KEY_IDS="$KEY_ID"
 unset CAIRN_ENCRYPT_AT_REST || true
 
@@ -69,11 +69,11 @@ else
 fi
 stop_srv
 
-# ---- leg 2: transparent at-rest, UI OFF (case b) ----
+# ---- leg 2: transparent at-rest, web console OFF (case b) ----
 D2="$DATA/d2"
 export CAIRN_DATA_DIR="$D2/data"
 export CAIRN_DB_PATH="$D2/data/cairn.db"
-export CAIRN_UI_ADDR=off
+export CAIRN_WEB_ADDR=off
 export CAIRN_ENCRYPT_AT_REST=true
 unset CAIRN_KMS_KEY_IDS || true
 

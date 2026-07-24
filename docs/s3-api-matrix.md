@@ -45,5 +45,5 @@ and the non-streaming header-checksum path is verified and `BadDigest`-rejected 
 `s3-api.md` §21.7).
 
 **Management API** (`/api/v1`, admin-gated JSON) and the **embedded React console** (its own listener, port 7374) provide
-control-plane operations (overview, bucket/user/activity management) consumed by both the web UI
+control-plane operations (overview, bucket/user/activity management) consumed by both the web console
 and the CLI.

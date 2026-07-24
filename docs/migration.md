@@ -36,7 +36,7 @@ both remote) and per-object checksum-verification ledgers are future work.
 
 ## 3. Run an import (management API)
 
-The endpoints live on the console/API listener (`CAIRN_UI_ADDR`, default `:7374`), under `/api/v1`,
+The endpoints live on the console/API listener (`CAIRN_WEB_ADDR`, default `:7374`), under `/api/v1`,
 and require an administrator Bearer token (`<access-key>.<secret>`).
 
 Optionally, list the buckets a set of source credentials can see before committing to a job — this is

@@ -49,7 +49,7 @@ CLI. This is the **only crate that names concrete impls** — everything else is
   SigV4 verification (`AuthChain::authenticate_sts`, no dev bypass) mints a `CAIRNTMP…` session over
   `Mutation::CreateSessionCredential`; sessions stay least-privilege (never broader than the caller).
 - `server.rs` — the accept/serve loops, the outer middleware (request id, span, concurrency
-  `Semaphore`, timeout), graceful shutdown, and `/healthz` `/readyz` `/metrics`. `serve_ui` picks a
+  `Semaphore`, timeout), graceful shutdown, and `/healthz` `/readyz` `/metrics`. `serve_web` picks a
   listener's role (S3-only vs. console+API).
 - `adapter.rs` — hyper ⇄ `S3Request`/`S3Response`; this is where **authentication** runs and
   path-style addressing routes into the S3 service; also the management-API adapter + `crypto-status`.
@@ -76,7 +76,7 @@ CLI. This is the **only crate that names concrete impls** — everything else is
 
 ## Notes
 - **Two listeners.** S3 + `/p/…` shares + `/healthz` `/readyz` `/metrics` on `CAIRN_LISTEN_ADDR`
-  (:7373); console + `/api/v1` + SSE on `CAIRN_UI_ADDR` (:7374; `off`/`none` for headless). Infra
+  (:7373); console + `/api/v1` + SSE on `CAIRN_WEB_ADDR` (:7374; `off`/`none` for headless). Infra
   endpoints answer **ahead of the concurrency limiter** so a probe/scrape never sheds.
 - **Crypto fails closed; `unsafe` is forbidden.** `#![forbid(unsafe_code)]` on every build except
   `fast-io`, which relaxes to `deny` for the SAFETY-commented syscall blocks. Never widen this.

@@ -29,11 +29,11 @@ pub struct Config {
     /// public-read share URLs (`/p/…`), and the liveness/readiness/metrics endpoints. This is the
     /// data-plane port you expose to S3 clients. Default `0.0.0.0:7373`.
     pub listen_addr: SocketAddr,
-    /// Where the **web UI** listener binds (`CAIRN_UI_ADDR`): the management console served at the
+    /// Where the **web console** listener binds (`CAIRN_WEB_ADDR`): the management console served at the
     /// root path, the management API (`/api/v1`), and the S3 data plane the console drives. This is
     /// the control-plane port you can firewall off from the internet. Default `0.0.0.0:7374`.
-    /// Set it empty (or `off`/`none`/`disabled`) to run headless with no UI listener.
-    pub ui_addr: String,
+    /// Set it empty (or `off`/`none`/`disabled`) to run headless with no web console listener.
+    pub web_addr: String,
     /// Root of the staging and per-bucket blob directories.
     pub data_dir: PathBuf,
     /// Location of the SQLite metadata file.
@@ -359,7 +359,7 @@ pub struct Config {
 
     /// The root administrator's access key (`CAIRN_ROOT_ACCESS_KEY`). On every startup an active
     /// administrator with this access key is ensured in the store; the same access key + secret work
-    /// for the web UI login, the management API (as a Bearer token `access.secret`), and the S3 API
+    /// for the web console login, the management API (as a Bearer token `access.secret`), and the S3 API
     /// (SigV4). Defaults to a well-known value for out-of-the-box access — override in production.
     pub root_access_key: String,
     /// The root administrator's secret key (`CAIRN_ROOT_SECRET_KEY`). Paired with
@@ -381,7 +381,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             listen_addr: "0.0.0.0:7373".parse().expect("valid default addr"),
-            ui_addr: "0.0.0.0:7374".to_owned(),
+            web_addr: "0.0.0.0:7374".to_owned(),
             data_dir: PathBuf::from("./data"),
             db_path: PathBuf::from("./data/cairn.db"),
             meta_backend: "sqlite".to_owned(),
@@ -504,18 +504,20 @@ impl Config {
     /// # Errors
     /// Returns a [`ConfigError::Parse`] if the JSON is malformed or does not match the
     /// [`ReplicationTarget`] shape.
-    /// Resolve the web-UI listener address from [`ui_addr`](Self::ui_addr): `Some(addr)` to bind a
-    /// UI listener, or `None` for headless mode (empty / `off` / `none` / `disabled`).
+    /// Resolve the web-console listener address from [`web_addr`](Self::web_addr): `Some(addr)` to bind a
+    /// web console listener, or `None` for headless mode (empty / `off` / `none` / `disabled`).
     ///
     /// # Errors
     /// Returns a [`ConfigError::Invalid`] if a non-empty value does not parse as `host:port`.
-    pub fn ui_listen_addr(&self) -> Result<Option<SocketAddr>, ConfigError> {
-        let v = self.ui_addr.trim();
+    pub fn web_listen_addr(&self) -> Result<Option<SocketAddr>, ConfigError> {
+        let v = self.web_addr.trim();
         if v.is_empty() || matches!(v.to_ascii_lowercase().as_str(), "off" | "none" | "disabled") {
             return Ok(None);
         }
         v.parse::<SocketAddr>().map(Some).map_err(|e| {
-            ConfigError::Invalid(format!("CAIRN_UI_ADDR {v:?} is not a valid host:port: {e}"))
+            ConfigError::Invalid(format!(
+                "CAIRN_WEB_ADDR {v:?} is not a valid host:port: {e}"
+            ))
         })
     }
 
@@ -977,12 +979,13 @@ impl Config {
                 )));
             }
         }
-        // Validate (but don't bind) the UI listener address.
-        let ui = self.ui_listen_addr()?;
-        if let Some(ui) = ui {
-            if ui == self.listen_addr {
+        // Validate (but don't bind) the web-console listener address.
+        let web = self.web_listen_addr()?;
+        if let Some(web) = web {
+            if web == self.listen_addr {
                 return Err(ConfigError::Invalid(
-                    "CAIRN_UI_ADDR must differ from the S3 API listener (CAIRN_LISTEN_ADDR)".into(),
+                    "CAIRN_WEB_ADDR must differ from the S3 API listener (CAIRN_LISTEN_ADDR)"
+                        .into(),
                 ));
             }
         }

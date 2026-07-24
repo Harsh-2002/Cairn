@@ -93,7 +93,7 @@ DATA="$(mktemp -d)"
 export CAIRN_DATA_DIR="$DATA/data"
 export CAIRN_DB_PATH="$DATA/data/cairn.db"
 export CAIRN_LISTEN_ADDR="127.0.0.1:$PORT"
-export CAIRN_UI_ADDR=off
+export CAIRN_WEB_ADDR=off
 export CAIRN_LOG_LEVEL="${CAIRN_LOG_LEVEL:-error}"
 export CAIRN_MASTER_KEY="${CAIRN_MASTER_KEY:-00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff}"
 # The sessions request `aws:kms`, so the key id must be on the write-time allow-list (label-only KMS).

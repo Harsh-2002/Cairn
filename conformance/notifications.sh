@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Webhook event-notification regression (ARCH 20-style): boot a real cairn binary, configure a
 # bucket webhook endpoint through the management API, drive S3 PUT/DELETE, and assert a local sink
-# receives the correctly-shaped, HMAC-signed S3 event records. The UI/management listener must be ON
+# receives the correctly-shaped, HMAC-signed S3 event records. The web console/management listener must be ON
 # (the notification config is set via /api/v1, not the S3 ?notification subresource).
 #
 # Usage: BIN=target/debug/cairn PY=/path/to/python-with-boto3 conformance/notifications.sh
@@ -17,7 +17,7 @@ DATA="$(mktemp -d)"
 export CAIRN_DATA_DIR="$DATA/data"
 export CAIRN_DB_PATH="$DATA/data/cairn.db"
 export CAIRN_LISTEN_ADDR="127.0.0.1:$PORT"
-export CAIRN_UI_ADDR="127.0.0.1:$UIPORT"
+export CAIRN_WEB_ADDR="127.0.0.1:$UIPORT"
 export CAIRN_MASTER_KEY; CAIRN_MASTER_KEY="$(openssl rand -hex 32)"
 export CAIRN_LOG_LEVEL="${CAIRN_LOG_LEVEL:-warn}"
 # Drain the outbox every 2s so the test sees deliveries promptly.

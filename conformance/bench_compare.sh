@@ -88,7 +88,7 @@ note "cairn: $("$BIN" --version 2>&1 | head -1)"
 
 # --- 1. boot Cairn (bootstrap -> serve -> healthz), like conformance/warp.sh ----------------------
 export CAIRN_DATA_DIR="$DATA/cairn" CAIRN_DB_PATH="$DATA/cairn/cairn.db"
-export CAIRN_LISTEN_ADDR="127.0.0.1:$CPORT" CAIRN_UI_ADDR=off
+export CAIRN_LISTEN_ADDR="127.0.0.1:$CPORT" CAIRN_WEB_ADDR=off
 export CAIRN_MASTER_KEY="$(openssl rand -hex 32)" CAIRN_LOG_LEVEL="${CAIRN_LOG_LEVEL:-error}"
 BOOT="$("$BIN" bootstrap)" || fail "cairn bootstrap failed"
 CAK="$(echo "$BOOT" | awk '/Access Key Id/ {print $NF}')"

@@ -1535,7 +1535,7 @@ pub struct RequestMetricsSeries {
     pub peak_window_count: u64,
     /// Number of distinct buckets that saw any traffic in range.
     pub active_buckets: u64,
-    /// The timeline downsampling window, in seconds (for the UI to derive req/s).
+    /// The timeline downsampling window, in seconds (for the web console to derive req/s).
     pub window_secs: i64,
 }
 

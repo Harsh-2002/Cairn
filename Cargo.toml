@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
-exclude = ["reference", "ui"]
+exclude = ["reference", "web"]
 
 [workspace.package]
 version = "0.1.0"
@@ -28,7 +28,7 @@ cairn-import = { path = "crates/cairn-import" }
 cairn-webhook = { path = "crates/cairn-webhook" }
 cairn-lifecycle = { path = "crates/cairn-lifecycle" }
 cairn-control = { path = "crates/cairn-control" }
-cairn-ui = { path = "crates/cairn-ui" }
+cairn-web = { path = "crates/cairn-web" }
 
 # --- async runtime & HTTP ---
 tokio = { version = "1.43", default-features = false }
@@ -89,7 +89,7 @@ uuid = { version = "1.11", features = ["v4", "v7"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 figment = { version = "0.10", features = ["toml", "env"] }
 
-# --- ui embedding ---
+# --- web embedding ---
 rust-embed = { version = "8", features = ["mime-guess"] }
 mime_guess = "2"
 

@@ -25,7 +25,7 @@ without starting: `cairn validate-config`.
 | Setting | Env var | Default | Meaning |
 |---|---|---|---|
 | S3 API listener | `CAIRN_LISTEN_ADDR` | `0.0.0.0:7373` | S3 data plane, plus `/healthz`, `/readyz`, `/metrics`, and signed `/p/` share URLs. |
-| Web console listener | `CAIRN_UI_ADDR` | `0.0.0.0:7374` | Management console (root path) + management API (`/api/v1`). Set `off`/`none`/empty to run headless. |
+| Web console listener | `CAIRN_WEB_ADDR` | `0.0.0.0:7374` | Management console (root path) + management API (`/api/v1`). Set `off`/`none`/empty to run headless. |
 | Data directory | `CAIRN_DATA_DIR` | `./data` | Root of staging + per-bucket blobs. |
 | Database path | `CAIRN_DB_PATH` | `./data/cairn.db` | SQLite metadata file (same FS as data). |
 | Region | `CAIRN_REGION` | `us-east-1` | Location label + SigV4 scope. |
@@ -112,12 +112,12 @@ Two first-class shapes:
 Never expose the plaintext interface to an untrusted network.
 
 Cairn binds **two listeners**: the S3 data plane (`CAIRN_LISTEN_ADDR`, default `:7373`) and the
-web console + management API (`CAIRN_UI_ADDR`, default `:7374`). Expose the S3 port to clients;
+web console + management API (`CAIRN_WEB_ADDR`, default `:7374`). Expose the S3 port to clients;
 keep the console/management port on a trusted interface, firewalled off, or disabled entirely with
-`CAIRN_UI_ADDR=off`.
+`CAIRN_WEB_ADDR=off`.
 
 The release artifact is one fully static binary (`musl`) containing the server, the management
-UI, and the CLI; it runs in a `scratch`/distroless container.
+web console, and the CLI; it runs in a `scratch`/distroless container.
 
 ## 5. Day-two operations
 

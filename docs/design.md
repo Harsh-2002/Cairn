@@ -101,12 +101,12 @@ Cairn is infrastructure: a self-hosted, S3-compatible object store that someone 
 
 This system is built on subtraction. Depth comes from a single 1px border, not a stack of shadows. Hierarchy comes from scale and weight, not boxes-within-boxes. The primary action is neutral black-on-white, not a saturated brand color, because in a tool full of irreversible actions the loudest thing on screen should be a warning, not a "Save" button. Density is reserved for the places data demands it (object lists, tables, the metrics dashboard) and even there the hierarchy stays quiet. The deliberate opposite of MinIO's cramped widget-soup: let the interface breathe, and reserve every drop of emphasis for the moment an operator needs to make a decision about their data.
 
-What it explicitly rejects: consumer-cute / toy-like UI (mascots, bouncy or elastic motion, emoji-as-UI); MinIO's utilitarian density (capable but cramped and uncrafted); and the generic AI-SaaS template (gradient hero, purple-everywhere, identical icon+heading card grids, enterprise widget-soup). Crafted is the bar; functional is not enough.
+What it explicitly rejects: consumer-cute / toy-like web console (mascots, bouncy or elastic motion, emoji-as-web console); MinIO's utilitarian density (capable but cramped and uncrafted); and the generic AI-SaaS template (gradient hero, purple-everywhere, identical icon+heading card grids, enterprise widget-soup). Crafted is the bar; functional is not enough.
 
 **Key Characteristics:**
 - Pure-neutral surfaces (white / near-black) with hairline borders; depth is structural, never shadowy.
 - One neutral primary button. Blue is for links and focus only. Green/amber/red appear only as meaning.
-- Geist Sans for everything UI; Geist Mono with tabular numerals for every identifier, size, address, and number.
+- Geist Sans for everything web console; Geist Mono with tabular numerals for every identifier, size, address, and number.
 - Fixed rem type scale (12 / 13px-mono / 14 / 16 / 20 / 24), never fluid `clamp()`.
 - Spacious by default; dense only where data demands it, and calm even there.
 - Light and dark at contrast parity; motion conveys state, never decorates.
@@ -140,10 +140,10 @@ A pure-neutral gray ramp carries 95% of every screen; a single blue and three se
 
 ## 3. Typography
 
-**UI Font:** Geist Sans (with `ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto` fallback)
+**web console Font:** Geist Sans (with `ui-sans-serif, system-ui, -apple-system, "Segoe web console", Roboto` fallback)
 **Mono Font:** Geist Mono (with `ui-monospace, SFMono-Regular, Menlo, Consolas` fallback)
 
-**Character:** One family does all the UI work in three weights (400 / 500 / 600); Geist Mono is its exact-width partner for anything an operator might copy, compare, or trust as a literal value. The pairing is two members of one type family, not a contrast pairing: this is product, not editorial, and consistency is the point. `font-feature-settings: "tnum"` is global, so every numeral aligns in columns.
+**Character:** One family does all the web console work in three weights (400 / 500 / 600); Geist Mono is its exact-width partner for anything an operator might copy, compare, or trust as a literal value. The pairing is two members of one type family, not a contrast pairing: this is product, not editorial, and consistency is the point. `font-feature-settings: "tnum"` is global, so every numeral aligns in columns.
 
 ### Hierarchy
 - **Headline** (Geist Sans 600, 1.25rem/20px, `tracking-tight` -0.01em): The page title (`<h1>` in PageHeader). The largest type on a normal screen. There is no hero/display tier; this is the ceiling.
@@ -156,7 +156,7 @@ A pure-neutral gray ramp carries 95% of every screen; a single blue and three se
 ### Named Rules
 **The Mono-for-Truth Rule.** Every value an operator reads as a literal (key, size, id, address, count) is set in Geist Mono with tabular numerals. Prose is Geist Sans. The font *is* the signal of "this is exact data, not commentary."
 
-**The Fixed-Scale Rule.** Type is a fixed rem scale (12 / 13 / 14 / 16 / 20 / 24). Fluid `clamp()` headings are forbidden: users view at a consistent DPI, a heading that shrinks in a sidebar looks worse, and product UI has too many type elements for exaggerated scale contrast. No type element exceeds 24px.
+**The Fixed-Scale Rule.** Type is a fixed rem scale (12 / 13 / 14 / 16 / 20 / 24). Fluid `clamp()` headings are forbidden: users view at a consistent DPI, a heading that shrinks in a sidebar looks worse, and product web console has too many type elements for exaggerated scale contrast. No type element exceeds 24px.
 
 ## 4. Elevation
 
@@ -216,7 +216,7 @@ The vocabulary is deliberately small and identical screen to screen. A "Save" bu
 ### Don't:
 - **Don't** use `border-left`/`border-right` greater than 1px as a colored accent stripe on cards, alerts, or list items. Full hairline borders or background tints instead.
 - **Don't** use gradient text (`background-clip: text`), decorative glassmorphism, or any gradient hero. This is the generic AI-SaaS template Cairn explicitly rejects.
-- **Don't** drift toward consumer-cute / toy-like UI: no mascots, no playful illustrations, no bouncy or elastic motion, no emoji-as-UI. It undermines trust in an infrastructure tool.
+- **Don't** drift toward consumer-cute / toy-like web console: no mascots, no playful illustrations, no bouncy or elastic motion, no emoji-as-web console. It undermines trust in an infrastructure tool.
 - **Don't** ship MinIO's utilitarian density: controls jammed together with no hierarchy or air. Spacious by default; density only where data demands it, calm even there.
 - **Don't** color anything that isn't carrying meaning. No green/amber/red for decoration or category coding; no blue except links and the focus ring; no full-saturation accents on inactive states.
 - **Don't** nest cards, or reach for a modal as the first thought (exhaust inline / progressive alternatives first), or reinvent a standard affordance (custom scrollbars, weird form controls, non-standard modals) for flavor.

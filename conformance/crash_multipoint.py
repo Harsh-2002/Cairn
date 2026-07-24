@@ -89,7 +89,7 @@ def env(failpoints=None, encrypt=False):
         if k.startswith("CAIRN_") or k == "FAILPOINTS": del e[k]
     e.update({
         "CAIRN_DATA_DIR": os.path.join(ROOT, "data"), "CAIRN_DB_PATH": os.path.join(ROOT, "data/cairn.db"),
-        "CAIRN_LISTEN_ADDR": f"127.0.0.1:{PORT}", "CAIRN_UI_ADDR": "off",
+        "CAIRN_LISTEN_ADDR": f"127.0.0.1:{PORT}", "CAIRN_WEB_ADDR": "off",
         "CAIRN_MASTER_KEY": "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
         "CAIRN_LOG_LEVEL": os.environ.get("CAIRN_LOG_LEVEL", "error"),
     })

@@ -21,7 +21,7 @@ manifest, plus a multi-arch image at `ghcr.io/harsh-2002/cairn`. Verify a downlo
   Versioning, tagging, CORS, lifecycle expiration, object lock (WORM), and presigned URLs. SigV4
   (header and streaming-chunked) and Bearer authentication. The aws CLI and the standard AWS SDKs
   work against it.
-- Web console: a UI on its own port to manage buckets and users, browse, upload, download and share
+- Web console: a web console on its own port to manage buckets and users, browse, upload, download and share
   objects, mint access keys scoped by a policy, and view storage, compression, and replication status.
 - Access control: bucket policies, ACLs, Block Public Access, Object Ownership, and short-lived
   credentials, mintable through the AWS-STS wire surface (`AssumeRole`, `GetSessionToken`) served on
@@ -101,7 +101,7 @@ Configuration is environment-only. Every setting is a `CAIRN_*` variable, valida
 | `CAIRN_DB_PATH` | `./data/cairn.db` | SQLite metadata file (same filesystem as the data) |
 | `CAIRN_MASTER_KEY` | dev key | 32-byte hex key sealing secrets at rest; set it in production |
 | `CAIRN_LISTEN_ADDR` | `0.0.0.0:7373` | S3 API listener |
-| `CAIRN_UI_ADDR` | `0.0.0.0:7374` | Console and management API; set `off` to run headless |
+| `CAIRN_WEB_ADDR` | `0.0.0.0:7374` | Console and management API; set `off` to run headless |
 | `CAIRN_REGION` | `us-east-1` | Region label and SigV4 scope |
 | `CAIRN_TLS_CERT_PATH` / `CAIRN_TLS_KEY_PATH` | unset | Enable built-in TLS when both are set |
 | `CAIRN_MASTER_KEY_RING` | unset | Key ring for online master-key rotation |
@@ -113,7 +113,7 @@ The full reference is in [`docs/configuration.md`](./docs/configuration.md). CLI
 ## Deploying
 
 - Two listeners. Expose the S3 port to clients, and keep the console and management port on a trusted
-  interface, firewalled, or disabled with `CAIRN_UI_ADDR=off`. Do not expose a plaintext interface to
+  interface, firewalled, or disabled with `CAIRN_WEB_ADDR=off`. Do not expose a plaintext interface to
   an untrusted network.
 - TLS. Terminate TLS at Cairn (set the cert and key paths; `SIGHUP` reloads) or at a reverse proxy in
   front.

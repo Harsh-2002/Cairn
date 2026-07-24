@@ -14,7 +14,7 @@ CARGO    ?= cargo
 .NOTPARALLEL:
 
 .PHONY: help check check-all fmt fmt-fix lint lint-all test doc build build-release \
-        ui conformance conformance-suite bench run clean
+        web conformance conformance-suite bench run clean
 
 help: ## List the available targets
 	@grep -hE '^[a-z][a-z-]*:.*##' $(MAKEFILE_LIST) \
@@ -25,7 +25,7 @@ help: ## List the available targets
 
 check: fmt lint test ## Fast gate: fmt + clippy + nextest + doctests (the inner loop)
 
-check-all: fmt lint lint-all test ui ## Full gate mirroring CI: adds --all-features clippy + the UI build
+check-all: fmt lint lint-all test web ## Full gate mirroring CI: adds --all-features clippy + the web console build
 
 fmt: ## Check formatting (does not modify files)
 	$(CARGO) fmt --all --check
@@ -54,8 +54,8 @@ build: ## Debug build of the cairn binary
 build-release: ## Optimized release build of the cairn binary
 	$(CARGO) build --release --bin cairn
 
-ui: ## Build the embedded React console (ui/dist, embedded into cairn-ui)
-	cd ui && npm install && npm run build
+web: ## Build the embedded React console (web/dist, embedded into cairn-web)
+	cd web && npm install && npm run build
 
 ## --- conformance (drives a REAL cairn binary) --------------------------------
 

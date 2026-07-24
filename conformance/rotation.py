@@ -21,7 +21,7 @@ an at-rest object to advertising AES256). P2b/P3 assert the on-disk descriptor i
 new key with those labels intact and that GET/HEAD still advertise the right per-mode headers; P4
 proves the retire-gate protects the at-rest and KMS objects, not only SSE-S3.
 
-Config via env: BIN (cairn binary), DATA (temp dir), PORT (S3 port; UI = PORT+1), SHARDS.
+Config via env: BIN (cairn binary), DATA (temp dir), PORT (S3 port; web console = PORT+1), SHARDS.
 """
 import base64, datetime, hashlib, hmac, http.client, json, os, signal, sqlite3, subprocess, sys, time, urllib.parse
 
@@ -113,7 +113,7 @@ def base_env(extra):
     for k in ("CAIRN_MASTER_KEY", "CAIRN_MASTER_KEY_RING", "CAIRN_MASTER_KEY_ACTIVE_ID"):
         e.pop(k, None)
     e.update({
-        "CAIRN_LISTEN_ADDR": f"127.0.0.1:{PORT}", "CAIRN_UI_ADDR": f"127.0.0.1:{UIPORT}",
+        "CAIRN_LISTEN_ADDR": f"127.0.0.1:{PORT}", "CAIRN_WEB_ADDR": f"127.0.0.1:{UIPORT}",
         "CAIRN_DATA_DIR": RDATA, "CAIRN_DB_PATH": os.path.join(RDATA, "cairn.db"),
         "CAIRN_REGION": REGION, "CAIRN_ROOT_ACCESS_KEY": AK, "CAIRN_ROOT_SECRET_KEY": SK,
         "CAIRN_META_SHARDS": str(SHARDS), "CAIRN_META_BACKEND": "sqlite",

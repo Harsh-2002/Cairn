@@ -29,7 +29,7 @@ use std::net::IpAddr;
 use zeroize::Zeroizing;
 
 /// The unified HTTP response body: either a fully-buffered in-memory body (empty, XML, errors,
-/// UI assets, management JSON) or a blob stream forwarded frame-by-frame from the blob store.
+/// web console assets, management JSON) or a blob stream forwarded frame-by-frame from the blob store.
 /// Boxing both into one type lets every response path return a single concrete `Body`. It is an
 /// `UnsyncBoxBody` rather than a `BoxBody` because the underlying blob stream is `Send` but not
 /// `Sync`; hyper only requires the body to be `Send`, so dropping the `Sync` bound is correct and
@@ -49,7 +49,7 @@ pub async fn handle(
     req: Request<Incoming>,
     peer: IpAddr,
     secure: bool,
-    serve_ui: bool,
+    serve_web: bool,
     request_id: String,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Response<ResponseBody> {
@@ -72,15 +72,15 @@ pub async fn handle(
         .map(|(_, v)| v.clone())
         .unwrap_or_default();
 
-    // Console session cookie → Bearer. On the web-UI listener only, a request carrying the
+    // Console session cookie → Bearer. On the web-console listener only, a request carrying the
     // `cairn_session` httpOnly cookie (and no explicit Authorization header) is authenticated as if
     // it sent the Bearer token the cookie holds — so the console never has to keep the credential in
-    // JS-readable storage. Gated on `serve_ui` because cookies are NOT port-isolated: a cookie set by
+    // JS-readable storage. Gated on `serve_web` because cookies are NOT port-isolated: a cookie set by
     // the console on :7374 is also sent to the S3 data plane on :7373, which must keep ignoring it.
     // The login endpoint (POST /api/v1/session) is exempt so a stale/invalid cookie cannot turn a
     // fresh sign-in into a 401 before the body credentials are even checked.
     let is_login = method == Method::POST && raw_path == "/api/v1/session";
-    if serve_ui && !is_login && !headers.iter().any(|(k, _)| k == "authorization") {
+    if serve_web && !is_login && !headers.iter().any(|(k, _)| k == "authorization") {
         if let Some(token) = session_cookie_token(&headers) {
             headers.push(("authorization".to_owned(), format!("Bearer {token}")));
         }
@@ -89,10 +89,10 @@ pub async fn handle(
     // AWS-STS wire surface (ARCH 14): a form `POST /` on the **S3 data plane** carries an STS mint
     // request (`AssumeRole`/`GetSessionToken`). It must be intercepted BEFORE the generic
     // authenticate block, which would reject the `sts`-scoped signature as Malformed. Gated strictly
-    // to the S3 listener (`!serve_ui`), the root path, and the form content type, so no normal S3
+    // to the S3 listener (`!serve_web`), the root path, and the form content type, so no normal S3
     // request is captured; disabled entirely by `CAIRN_STS_ENABLED=false`.
     if stack.sts_enabled
-        && !serve_ui
+        && !serve_web
         && method == Method::POST
         && raw_path == "/"
         && content_type_is_form(&headers)
@@ -126,7 +126,7 @@ pub async fn handle(
         }
     };
 
-    // The management JSON API and the embedded web UI share the listener with the S3 surface.
+    // The management JSON API and the embedded web console share the listener with the S3 surface.
     if let Some(subpath) = raw_path.strip_prefix("/api/v1") {
         let query = parse_query(&query_str);
         // Bound the management-API request body (audit #11). The whole body is buffered for JSON
@@ -243,26 +243,22 @@ pub async fn handle(
             .body(full_body(Bytes::from(resp.body)))
             .unwrap_or_else(|_| Response::new(full_body(Bytes::new())));
     }
-    // On the web-UI listener only, serve the management console at the ROOT path and its embedded
+    // On the web-console listener only, serve the management console at the ROOT path and its embedded
     // assets BEFORE S3 routing (so `/assets/...` can never be shadowed by a bucket named `assets`).
     // Any path that is not the root or a known embedded asset falls through to the S3/data routing,
     // which is what the console's own object operations and the API listener rely on. The former
-    // `/web` and `/ui` mounts redirect to the root for back-compat.
-    if serve_ui && method == Method::GET {
+    // `/web` mount redirects to the root for back-compat.
+    if serve_web && method == Method::GET {
         if raw_path == "/" {
-            let (content_type, bytes) = cairn_ui::spa_shell();
-            return ui_asset_response(content_type, bytes.into_owned());
+            let (content_type, bytes) = cairn_web::spa_shell();
+            return web_asset_response(content_type, bytes.into_owned());
         }
-        if raw_path == "/web"
-            || raw_path.starts_with("/web/")
-            || raw_path == "/ui"
-            || raw_path.starts_with("/ui/")
-        {
+        if raw_path == "/web" || raw_path.starts_with("/web/") {
             return redirect("/");
         }
         if let Some(rel) = raw_path.strip_prefix('/').filter(|r| !r.is_empty()) {
-            if let Some((content_type, bytes)) = cairn_ui::asset(rel) {
-                return ui_asset_response(content_type, bytes.into_owned());
+            if let Some((content_type, bytes)) = cairn_web::asset(rel) {
+                return web_asset_response(content_type, bytes.into_owned());
             }
         }
     }
@@ -429,8 +425,8 @@ fn sts_response(resp: crate::sts::StsHttpResponse, request_id: &str) -> Response
         .unwrap_or_else(|_| Response::new(full_body(Bytes::new())))
 }
 
-/// Build a 200 response for an embedded UI asset with its content type.
-fn ui_asset_response(content_type: String, bytes: Vec<u8>) -> Response<ResponseBody> {
+/// Build a 200 response for an embedded web console asset with its content type.
+fn web_asset_response(content_type: String, bytes: Vec<u8>) -> Response<ResponseBody> {
     Response::builder()
         .status(200)
         .header("content-type", content_type)
@@ -473,7 +469,7 @@ fn json_status_with_headers(
         .unwrap_or_else(|_| Response::new(full_body(Bytes::new())))
 }
 
-/// Name of the console's httpOnly session cookie (set on the web-UI listener only).
+/// Name of the console's httpOnly session cookie (set on the web-console listener only).
 const SESSION_COOKIE: &str = "cairn_session";
 /// How long the browser keeps the session cookie before it must sign in again.
 const SESSION_COOKIE_MAX_AGE_SECS: u64 = 43_200; // 12 hours

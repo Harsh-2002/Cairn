@@ -203,7 +203,7 @@ mod tests {
 
     #[test]
     fn known_topics_are_the_console_set() {
-        // Every topic the console subscribes to (see ui/src/views/*: useLiveTopic) must be accepted,
+        // Every topic the console subscribes to (see web/src/views/*: useLiveTopic) must be accepted,
         // or its pulses are silently dropped. A typo'd / unknown topic must be rejected.
         for t in [
             "overview",

@@ -16,9 +16,9 @@ crates/cairn-blob/fuzz/artifacts/
 crates/cairn-types/fuzz/corpus/
 crates/cairn-types/fuzz/artifacts/
 
-/ui/node_modules
-/ui/dist
-/ui/tsconfig.tsbuildinfo
+/web/node_modules
+/web/dist
+/web/tsconfig.tsbuildinfo
 
 /data
 *.db

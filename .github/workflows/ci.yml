@@ -44,7 +44,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: ./.github/actions/setup   # builds ui/dist (embedded into the binary) + toolchain + cache
+      - uses: ./.github/actions/setup   # builds web/dist (embedded into the binary) + toolchain + cache
       - run: cargo build --bin cairn
       # Conformance asserts behaviour, not Rust-level state, so it does not need debug symbols.
       # Stripping shrinks the artifact from ~260 MB to ~25 MB — far faster to upload once + download many.
@@ -352,7 +352,7 @@ jobs:
         with:
           python-version: "3.x"
       - run: pip install boto3
-      - name: Event-notification delivery + HMAC signing (management UI listener on)
+      - name: Event-notification delivery + HMAC signing (management web console listener on)
         run: BIN=target/debug/cairn PY=python3 bash conformance/notifications.sh
 
   sts:
@@ -370,7 +370,7 @@ jobs:
         with:
           python-version: "3.x"
       - run: pip install boto3
-      - name: Mint + enforce scoped session credentials over a real SDK (management UI listener on)
+      - name: Mint + enforce scoped session credentials over a real SDK (management web console listener on)
         run: BIN=target/debug/cairn PY=python3 bash conformance/sts.sh
 
   sts-xml:
@@ -402,8 +402,8 @@ jobs:
           name: cairn-bin
           path: target/debug
       - run: chmod +x target/debug/cairn
-      # Pure curl (no SDK): the httpOnly cookie flow is plain HTTP. Management UI listener on.
-      - name: httpOnly session-cookie auth + S3 data-plane port isolation (management UI listener on)
+      # Pure curl (no SDK): the httpOnly cookie flow is plain HTTP. Management web console listener on.
+      - name: httpOnly session-cookie auth + S3 data-plane port isolation (management web console listener on)
         run: BIN=target/debug/cairn bash conformance/console_session.sh
 
   backup-restore:
@@ -782,7 +782,7 @@ jobs:
       # that env propagates to cargo-fuzz's nested `cargo build`.
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
-      # These fuzz targets live in crates that do not embed the UI, so no UI build is needed.
+      # These fuzz targets live in crates that do not embed the web console, so no web console build is needed.
       - name: Fuzz smoke (nightly build)
         env:
           RUSTUP_TOOLCHAIN: nightly
@@ -830,7 +830,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: ./.github/actions/setup   # ui/dist (embedded) + toolchain + cache
+      - uses: ./.github/actions/setup   # web/dist (embedded) + toolchain + cache
       # A throughput comparison needs an OPTIMIZED build. The shared `cairn-bin` artifact is an
       # unstripped DEBUG binary (correct behaviour, but many× slower on hot loops) — benchmarking it
       # against a release MinIO would be meaningless, so this job builds cairn in RELEASE itself.

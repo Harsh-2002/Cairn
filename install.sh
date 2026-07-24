@@ -24,7 +24,7 @@ HOST_ENV="/etc/cairn/cairn.env"
 DOCKER_DIR="/opt/cairn"
 SVC_USER="cairn"
 S3_PORT="7373"
-UI_PORT="7374"
+WEB_PORT="7374"
 
 # Options (defaults; overridden by flags / prompts).
 OPT_TARGET="auto"     # auto | host | docker
@@ -182,7 +182,7 @@ print_access() {
   printf '\n'
   step "Cairn is ready"
   info "S3 API     ${C_B}$pa_scheme://<host>:$S3_PORT${C_RESET}"
-  info "Console    ${C_B}$pa_scheme://<host>:$UI_PORT${C_RESET}"
+  info "Console    ${C_B}$pa_scheme://<host>:$WEB_PORT${C_RESET}"
   info "Access key ${C_B}$ROOT_AK${C_RESET}"
   info "Secret key ${C_B}$ROOT_SK${C_RESET}"
   info "${C_DIM}Keep these and the master key safe. Update later by re-running this script.${C_RESET}"
@@ -228,7 +228,7 @@ write_env_file() {
     printf 'CAIRN_ROOT_ACCESS_KEY=%s\n' "$ROOT_AK"
     printf 'CAIRN_ROOT_SECRET_KEY=%s\n' "$ROOT_SK"
     printf 'CAIRN_LISTEN_ADDR=0.0.0.0:%s\n' "$S3_PORT"
-    printf 'CAIRN_UI_ADDR=0.0.0.0:%s\n' "$UI_PORT"
+    printf 'CAIRN_WEB_ADDR=0.0.0.0:%s\n' "$WEB_PORT"
     if [ -n "$OPT_TLS_CERT" ]; then
       printf 'CAIRN_TLS_CERT_PATH=%s\n' "$OPT_TLS_CERT"
       printf 'CAIRN_TLS_KEY_PATH=%s\n' "$OPT_TLS_KEY"
@@ -358,7 +358,7 @@ services:
     restart: unless-stopped
     ports:
       - "$S3_PORT:7373"
-      - "$UI_PORT:7374"
+      - "$WEB_PORT:7374"
     environment:
       CAIRN_DATA_DIR: /data
       CAIRN_DB_PATH: /data/cairn.db

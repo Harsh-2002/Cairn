@@ -1,5 +1,5 @@
 name: setup
-description: Build the embedded React UI (ui/dist), set up the Rust toolchain, and restore the cargo build cache.
+description: Build the embedded React web console (web/dist), set up the Rust toolchain, and restore the cargo build cache.
 
 inputs:
   targets:
@@ -19,15 +19,15 @@ runs:
       with:
         # Vite 8 requires Node >= 20.19; 22 LTS gives headroom.
         node-version: "22"
-        # Cache the npm download cache, keyed on the UI lockfile, so `npm ci` is fast run-to-run.
+        # Cache the npm download cache, keyed on the web console lockfile, so `npm ci` is fast run-to-run.
         cache: npm
-        cache-dependency-path: ui/package-lock.json
-    # The server binary embeds ui/dist via rust-embed, so the real UI must be built before any Rust
+        cache-dependency-path: web/package-lock.json
+    # The server binary embeds web/dist via rust-embed, so the real web console must be built before any Rust
     # compile. (A build.rs scaffolds a placeholder so `cargo build` never *fails* without this, but
-    # the UI tests and shipped binaries need the real bundle.)
-    - name: Build the embedded management UI
+    # the web console tests and shipped binaries need the real bundle.)
+    - name: Build the embedded management web console
       shell: bash
-      working-directory: ui
+      working-directory: web
       run: |
         npm ci
         npm run build

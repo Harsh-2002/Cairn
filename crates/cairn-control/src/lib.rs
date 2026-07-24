@@ -1,6 +1,6 @@
 //! `cairn-control` — the JSON management API for Cairn (ARCH 22). It is the admin-gated
 //! control surface, distinct from the S3 data plane: JSON over HTTP, versioned in its path
-//! (`/api/v1`), and consumed by both the embedded web UI and the command-line interface.
+//! (`/api/v1`), and consumed by both the embedded web console and the command-line interface.
 //!
 //! The crate is written entirely against the trait spine in [`cairn_types::traits`]
 //! ([`MetadataStore`], [`BlobStore`], [`Crypto`], [`Clock`]), so it is unit-testable against

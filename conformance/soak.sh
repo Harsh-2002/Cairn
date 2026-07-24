@@ -23,7 +23,7 @@
 # Exit status: 0 only if mismatches == 0 AND the source RSS did not grow past the leak threshold;
 # non-zero on any infrastructure failure or assertion failure.
 set -euo pipefail
-export CAIRN_UI_ADDR=off  # multi-node harness: no UI listener (would collide on the default UI port)
+export CAIRN_WEB_ADDR=off  # multi-node harness: no web console listener (would collide on the default web console port)
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BIN:-$ROOT/target/debug/cairn}"

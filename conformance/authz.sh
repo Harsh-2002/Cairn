@@ -14,7 +14,7 @@
 #   * anonymous access — denied by default, allowed exactly as far as a public bucket policy
 #     grants, and shut off again by Block Public Access.
 #
-# The UI/management listener must be ON: minting the second identity is `POST /api/v1/users`.
+# The web console/management listener must be ON: minting the second identity is `POST /api/v1/users`.
 #
 # Usage: BIN=target/debug/cairn PY=/path/to/python-with-boto3 conformance/authz.sh
 #        STRICT_GAPS=1 ... conformance/authz.sh   # treat known S3-spec deviations as failures
@@ -31,7 +31,7 @@ export CAIRN_DATA_DIR="$DATA/data"
 export CAIRN_DB_PATH="$DATA/data/cairn.db"
 export CAIRN_LISTEN_ADDR="127.0.0.1:$PORT"
 # The console listener stays ON: the harness mints its second tenant via POST /api/v1/users.
-export CAIRN_UI_ADDR="127.0.0.1:$UIPORT"
+export CAIRN_WEB_ADDR="127.0.0.1:$UIPORT"
 export CAIRN_MASTER_KEY; CAIRN_MASTER_KEY="$(openssl rand -hex 32)"
 export CAIRN_LOG_LEVEL="${CAIRN_LOG_LEVEL:-warn}"
 
