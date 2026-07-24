@@ -10503,6 +10503,85 @@ async fn upload_part_wrong_checksum_is_bad_digest_and_no_orphan() {
     assert_eq!(leftover, 0, "a rejected part must leave no staged blob");
 }
 
+/// SECURITY regression (Phase-1 audit fast-follow, parity with `put_verifies_signed_content_sha256`):
+/// `UploadPart` must verify a header-form SigV4 `x-amz-content-sha256` against the staged part body,
+/// exactly as `put_object` does (audit #25). Without the check a MITM on a plaintext hop could swap
+/// part bytes past the signature. The verification-only hash is dropped afterwards so a part that
+/// never requested a SHA-256 checksum does not silently advertise one at Complete.
+#[tokio::test]
+async fn upload_part_verifies_signed_content_sha256() {
+    let h = harness().await;
+    // sha256("hi"); a wrong hash that no body produces.
+    let good = "8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4";
+    let bad = "0000000000000000000000000000000000000000000000000000000000000000";
+
+    // (1) A part body matching the signed hash is accepted.
+    let ok_id = init_mpu(&h, "spb", "match.bin").await;
+    let (st, hdrs, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("spb"),
+                Some("match.bin"),
+                &[("uploadId", ok_id.as_str()), ("partNumber", "1")],
+                &[("x-amz-content-sha256", good)],
+                b"hi".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "a part matching the signed sha256 is accepted"
+    );
+    // (3) The verification-only SHA-256 is dropped: an unrequested checksum is not echoed on the part
+    // (and so is never persisted on the part record or composed into the completed object's checksum).
+    assert!(
+        header(&hdrs, "x-amz-checksum-sha256").is_none(),
+        "an unrequested verification sha256 must not be echoed on the part"
+    );
+
+    // (2) A part body NOT matching the signed hash is BadDigest, and leaves no staged orphan — this is
+    // the assertion that fails without the fix (an unverified swap is accepted 200 and staged).
+    let bad_id = init_mpu(&h, "spb", "swap.bin").await;
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("spb"),
+                Some("swap.bin"),
+                &[("uploadId", bad_id.as_str()), ("partNumber", "1")],
+                &[("x-amz-content-sha256", bad)],
+                b"hi".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::BAD_REQUEST,
+        "a part not matching the signed sha256 is BadDigest"
+    );
+    let session_dir = h
+        ._dir
+        .path()
+        .join(".staging")
+        .join("multipart")
+        .join(&bad_id);
+    let leftover = std::fs::read_dir(&session_dir)
+        .map(|rd| rd.count())
+        .unwrap_or(0);
+    assert_eq!(
+        leftover, 0,
+        "a signed-hash-rejected part must leave no staged blob"
+    );
+}
+
 /// A part carrying more than one `x-amz-checksum-*` algorithm is rejected — exactly one algorithm may
 /// be stored per part so object-level composition stays unambiguous.
 #[tokio::test]

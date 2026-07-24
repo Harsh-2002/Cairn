@@ -1495,6 +1495,26 @@ impl S3Service {
                 "at most one checksum algorithm may be specified per part".to_owned(),
             ));
         }
+        // Verify the SigV4-signed payload hash against the part body actually staged — audit #25
+        // parity with `put_object`, previously missing on the multipart part path. A header-form SigV4
+        // request commits `x-amz-content-sha256` into the signature, but the signature binds the HEADER
+        // value, not the bytes; without this an active MITM on a plaintext hop could swap the part body
+        // and it would be accepted, then assembled. Derive the concrete signed hash — the
+        // UNSIGNED-PAYLOAD / STREAMING-* sentinels are not 64 hex chars, so they fall through to `None`
+        // and are unaffected (those bodies are authenticated per chunk by the streaming decoder).
+        let signed_sha256 = req.header("x-amz-content-sha256").and_then(|v| {
+            let v = v.trim();
+            (v.len() == 64 && v.bytes().all(|b| b.is_ascii_hexdigit()))
+                .then(|| v.to_ascii_lowercase())
+        });
+        // The "one algorithm per part" rule above is about what the CLIENT requested. Add SHA-256 to a
+        // SEPARATE staging set for verification only, so the client-facing count is unaffected, and
+        // drop it after the check unless the client actually requested SHA-256.
+        let store_sha256 = extra.0.contains(&ChecksumAlgorithm::Sha256);
+        let mut stage_checksums = extra;
+        if signed_sha256.is_some() && !store_sha256 {
+            stage_checksums.0.push(ChecksumAlgorithm::Sha256);
+        }
         // Part-level SSE at rest (ARCH 27, Increment 3a): an encrypt-parts session mints a FRESH random
         // per-part DEK and stages the part as ciphertext, so nothing plaintext hits disk. Seal the DEK
         // under the master ring BEFORE `stage_part` so no fallible step follows staging — a seal error
@@ -1511,18 +1531,44 @@ impl S3Service {
                 (None, None)
             };
         let body = streaming_body(&req, raw_body, self.max_object_size)?;
-        let staged = self
+        let mut staged = self
             .blob
             .stage_part(
                 &upload_id,
                 part_number,
                 body,
-                extra,
+                stage_checksums,
                 self.max_object_size,
                 part_dek,
             )
             .await
             .map_err(map_stage_err)?;
+        // Verify the signed SHA-256 (derived above) against the part body just staged — over the
+        // PLAINTEXT bytes the client signed (`stage_part` hashes before any at-rest encrypt). A
+        // mismatch is a BadDigest, and the staged part is deleted BEFORE returning (the no-orphan
+        // invariant, exactly like the client-checksum guard below). Drop the verification-only SHA-256
+        // so it is never persisted on the part record or composed into the object checksum at Complete.
+        if let Some(want_hex) = &signed_sha256 {
+            let got_hex = staged
+                .checksums
+                .iter()
+                .find(|c| c.algorithm == ChecksumAlgorithm::Sha256)
+                .and_then(|c| {
+                    base64::engine::general_purpose::STANDARD
+                        .decode(c.value.as_bytes())
+                        .ok()
+                })
+                .map(hex::encode);
+            if got_hex.as_deref() != Some(want_hex.as_str()) {
+                let _ = self.blob.delete(&staged.storage_path).await;
+                return Err(Error::BadDigest);
+            }
+            if !store_sha256 {
+                staged
+                    .checksums
+                    .retain(|c| c.algorithm != ChecksumAlgorithm::Sha256);
+            }
+        }
         // Fail closed: a client-supplied `x-amz-checksum-*` that disagrees with the computed digest is
         // a BadDigest, and the just-staged part must be deleted BEFORE returning so a rejected upload
         // leaves no orphan (the no-orphan invariant every post-`stage` early return honors).
