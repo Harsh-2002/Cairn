@@ -1,0 +1,154 @@
+---
+import "../styles/tokens.css";
+
+interface Props {
+  title?: string;
+  description?: string;
+}
+
+const {
+  title = "Cairn — Self-hosted, S3-compatible object storage",
+  description = "Cairn speaks the S3 API, stores objects as plain files, and keeps all metadata in embedded SQLite. One static binary. No external database, no clustering layer.",
+} = Astro.props;
+
+// Normalize to a single trailing slash so `${base}asset` concatenation is always correct
+// (BASE_URL comes through as "/Cairn" without one).
+const base = import.meta.env.BASE_URL.replace(/\/?$/, "/");
+const canonical = new URL(base, Astro.site);
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>{title}</title>
+    <meta name="description" content={description} />
+    <link rel="canonical" href={canonical} />
+    <link rel="icon" href={`${base}favicon.svg`} type="image/svg+xml" />
+
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content={title} />
+    <meta property="og:description" content={description} />
+    <meta property="og:url" content={canonical} />
+    <meta name="twitter:card" content="summary" />
+
+    {/* Blocking, pre-paint: stamp the theme on <html> before the first paint so there is no
+        flash of the wrong theme. Reads the saved choice, else the OS preference. is:inline keeps
+        it verbatim (not bundled) so it runs synchronously here in <head>, before the stylesheet. */}
+    <script is:inline>
+      (function () {
+        try {
+          var t =
+            localStorage.getItem("theme") ||
+            (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+          document.documentElement.dataset.theme = t;
+        } catch (e) {
+          document.documentElement.dataset.theme = "light";
+        }
+        document.documentElement.classList.add("no-transitions");
+      })();
+    </script>
+  </head>
+
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+
+    <header class="wrap site-header">
+      <a href={base} class="wordmark" aria-label="Cairn — home">cairn</a>
+      <button
+        id="theme-toggle"
+        class="theme-toggle"
+        type="button"
+        aria-label="Toggle light and dark theme"
+        aria-pressed="false"
+      >
+        <span class="theme-toggle__glyph" aria-hidden="true">◐</span>
+        <span class="theme-toggle__label" aria-hidden="true"></span>
+      </button>
+    </header>
+
+    <main id="main">
+      <slot />
+    </main>
+
+    <script>
+      // Theme toggle: persists the explicit choice and only then stops following the OS.
+      const root = document.documentElement;
+      const btn = document.getElementById("theme-toggle");
+      const label = btn?.querySelector(".theme-toggle__label");
+
+      function paint(t: string) {
+        root.dataset.theme = t;
+        btn?.setAttribute("aria-pressed", String(t === "dark"));
+        if (label) label.textContent = t === "dark" ? "Light" : "Dark";
+      }
+      paint(root.dataset.theme || "light");
+
+      btn?.addEventListener("click", () => {
+        const next = root.dataset.theme === "dark" ? "light" : "dark";
+        localStorage.setItem("theme", next);
+        paint(next);
+      });
+
+      // Follow the OS live until the user has expressed a preference.
+      matchMedia("(prefers-color-scheme: dark)").addEventListener("change", (e) => {
+        if (!localStorage.getItem("theme")) paint(e.matches ? "dark" : "light");
+      });
+
+      // Re-enable color transitions only after first paint (no toggle-fade on load).
+      requestAnimationFrame(() =>
+        requestAnimationFrame(() => root.classList.remove("no-transitions")),
+      );
+    </script>
+
+    <style>
+      .site-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding-block: 1.25rem;
+        margin-bottom: var(--space-5);
+      }
+      .wordmark {
+        font-family: var(--font-mono);
+        font-weight: 600;
+        font-size: 1.05rem;
+        letter-spacing: -0.02em;
+        color: var(--fg);
+      }
+      .wordmark::before {
+        content: "$ ";
+        color: var(--fg-faint);
+      }
+      .theme-toggle {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.55ch;
+        font: inherit;
+        font-family: var(--font-mono);
+        font-size: var(--step--1);
+        color: var(--fg-muted);
+        background: transparent;
+        border: 1px solid var(--hairline-bold);
+        border-radius: var(--radius);
+        padding: 0.35rem 0.7rem;
+        cursor: pointer;
+        transition:
+          background-color 0.15s ease,
+          color 0.15s ease,
+          border-color 0.15s ease;
+      }
+      .theme-toggle:hover {
+        color: var(--fg);
+        border-color: var(--fg);
+        background: var(--bg-subtle);
+      }
+      .theme-toggle__glyph {
+        font-size: 1.05em;
+        line-height: 1;
+      }
+    </style>
+  </body>
+</html>

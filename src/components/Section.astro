@@ -1,0 +1,32 @@
+---
+interface Props {
+  eyebrow?: string;
+  title?: string;
+  id?: string;
+}
+const { eyebrow, title, id } = Astro.props;
+---
+
+<section class="section" id={id}>
+  <div class="wrap">
+    {eyebrow && <span class="eyebrow">{eyebrow}</span>}
+    {title && <h2>{title}</h2>}
+    <slot />
+  </div>
+</section>
+
+<style>
+  .section {
+    padding-block: var(--space-6);
+    border-top: 1px solid var(--hairline);
+  }
+  .section :global(h2) {
+    margin-bottom: var(--space-4);
+  }
+  .section :global(p) {
+    margin-bottom: var(--space-3);
+  }
+  .section :global(p:last-child) {
+    margin-bottom: 0;
+  }
+</style>

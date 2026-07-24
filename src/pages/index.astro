@@ -1,0 +1,482 @@
+---
+import Base from "../layouts/Base.astro";
+import Section from "../components/Section.astro";
+import CodeBlock from "../components/CodeBlock.astro";
+
+const repo = "https://github.com/Harsh-2002/Cairn";
+
+const install = "curl -fsSL https://raw.githubusercontent.com/Harsh-2002/Cairn/main/install.sh | sudo sh";
+
+const dockerRun = `docker build -t cairn .
+
+docker run -d --name cairn \\
+  -p 7373:7373 -p 7374:7374 \\
+  -v cairn-data:/data \\
+  -e CAIRN_MASTER_KEY="$(openssl rand -hex 32)" \\
+  cairn serve`;
+
+const smoke = `aws --endpoint-url http://localhost:7373 s3 mb s3://demo
+echo 'hello cairn' | aws --endpoint-url http://localhost:7373 s3 cp - s3://demo/hi.txt
+aws --endpoint-url http://localhost:7373 s3 cp s3://demo/hi.txt -`;
+
+const features = [
+  {
+    h: "S3 API",
+    p: "Buckets and objects, byte-range and conditional reads, multipart upload, copy, and bulk delete. v1/v2 and version listings. Checksums (CRC32, CRC32C, CRC64NVME, SHA-1, SHA-256). Versioning, tagging, CORS, lifecycle expiration, object lock (WORM), and presigned URLs. SigV4 — header and streaming-chunked — and Bearer authentication. The aws CLI and the standard AWS SDKs work against it.",
+  },
+  {
+    h: "Web console",
+    p: "Manage buckets and users on its own port. Browse, upload, download, and share objects. Mint access keys scoped by a policy. Watch storage, compression, and replication status. Jump anywhere with a command palette, and see when a newer release is available.",
+  },
+  {
+    h: "Access control",
+    p: "Bucket policies, ACLs, Block Public Access, and Object Ownership — a real policy-evaluation engine, not a role check. Short-lived credentials through the AWS-STS surface (AssumeRole, GetSessionToken), served on the S3 port or the management API.",
+  },
+  {
+    h: "Security & encryption",
+    p: "Native TLS. AES-256-GCM encryption of secrets at rest, with online master-key rotation. Server-side object encryption: per-bucket SSE-S3, an aws:kms request surface, optional mandatory-encryption enforcement, and transparent encryption of every object at rest.",
+  },
+  {
+    h: "Durability",
+    p: "Writes are staged, fsynced, atomically renamed, and acknowledged only after a single metadata commit. On restart Cairn reconciles and reclaims orphaned data. Acknowledged writes survive power loss.",
+  },
+  {
+    h: "Storage efficiency",
+    p: "Optional per-bucket block compression, with range reads that touch only the blocks they need.",
+  },
+  {
+    h: "Operations",
+    p: "Prometheus metrics, liveness and readiness endpoints, and structured logs. Asynchronous bucket replication to another node or S3 endpoint. Webhook event notifications. One-shot streaming import from another S3-compatible store — MinIO, Garage, R2, AWS, or another Cairn. A CLI for bootstrap, config validation, integrity checks, and backup and restore.",
+  },
+];
+
+const bench = [
+  ["PUT", "4 KiB", "1696 obj/s", "1308 obj/s", "Cairn 1.30×", "cairn"],
+  ["PUT", "8 MiB", "115 MiB/s", "128 MiB/s", "MinIO 1.12×", "minio"],
+  ["GET", "4 KiB", "3431 obj/s", "1815 obj/s", "Cairn 1.89×", "cairn"],
+  ["GET", "8 MiB", "1463 MiB/s", "801 MiB/s", "Cairn 1.83×", "cairn"],
+  ["STAT", "4 KiB", "3494 obj/s", "1824 obj/s", "Cairn 1.92×", "cairn"],
+  ["DELETE", "4 KiB", "7442 obj/s", "5236 obj/s", "Cairn 1.42×", "cairn"],
+  ["LIST", "4 KiB", "21183 obj/s", "10288 obj/s", "Cairn 2.06×", "cairn"],
+  ["MIXED", "1 MiB", "285 MiB/s", "271 MiB/s", "Cairn 1.05×", "cairn"],
+];
+---
+
+<Base>
+  {/* 1 — Hero */}
+  <section class="hero wrap">
+    <h1>
+      Self-hosted, S3-compatible<br /> object storage.<span class="caret" aria-hidden="true"></span>
+    </h1>
+    <p class="lead">
+      Cairn speaks the S3 API, stores objects as plain files on a normal filesystem, and keeps all
+      metadata in embedded SQLite. One static binary. No external database, no clustering layer, no
+      separate storage daemon to run.
+    </p>
+    <CodeBlock code={install} />
+    <p class="hero__note">
+      Sets Cairn up on a host or with Docker, and updates an existing install when you run it again.
+    </p>
+    <div class="cta">
+      <a class="btn" href={`${repo}#readme`}>Read the docs</a>
+      <a class="btn btn--ghost" href={repo}>GitHub</a>
+    </div>
+  </section>
+
+  {/* 2 — What it is */}
+  <Section eyebrow="What it is" title="A single-node object store that speaks S3">
+    <p>
+      Cairn implements the Amazon S3 API with enough fidelity that unmodified S3 clients, SDKs, and
+      the <code>aws</code> CLI work against it without special-casing. Object bytes live as plain files
+      on a POSIX filesystem; all metadata lives in one embedded SQLite database, which is the single
+      source of truth. Point any S3 client at it, or use the built-in web console.
+    </p>
+    <dl class="points">
+      <div>
+        <dt>Plain files on disk</dt>
+        <dd>
+          Object data is ordinary files on whatever filesystem you choose — nothing proprietary to
+          unpack if you ever walk away.
+        </dd>
+      </div>
+      <div>
+        <dt>Embedded SQLite metadata</dt>
+        <dd>
+          All metadata in one database file, the single commit point for every write. Back it up,
+          copy it, reason about it.
+        </dd>
+      </div>
+      <div>
+        <dt>One static binary</dt>
+        <dd>
+          The server, the web console, and the CLI ship as one file — on a homelab box, a VPS, or a
+          small production node. A distroless container image is published too.
+        </dd>
+      </div>
+    </dl>
+  </Section>
+
+  {/* 3 — Features */}
+  <Section eyebrow="Features" title="What it does">
+    <dl class="points points--features">
+      {
+        features.map((f) => (
+          <div>
+            <dt>{f.h}</dt>
+            <dd>{f.p}</dd>
+          </div>
+        ))
+      }
+    </dl>
+  </Section>
+
+  {/* 4 — Performance */}
+  <Section eyebrow="Performance" title="Measured against MinIO">
+    <p>
+      A like-for-like comparison against MinIO, both on the same 2 vCPU / 16 GB host, both single-node
+      and single-drive over plaintext HTTP, using MinIO&apos;s own <code>warp</code> benchmark. Each
+      figure is the median of three runs. Absolute numbers depend on the host; the ratio is what to
+      read.
+    </p>
+
+    <div class="table-scroll">
+      <table class="bench">
+        <thead>
+          <tr>
+            <th scope="col">Op</th>
+            <th scope="col">Size</th>
+            <th scope="col" class="num">Cairn</th>
+            <th scope="col" class="num">MinIO</th>
+            <th scope="col">Ratio</th>
+          </tr>
+        </thead>
+        <tbody>
+          {
+            bench.map(([op, size, cairn, minio, ratio, win]) => (
+              <tr>
+                <td class="mono">{op}</td>
+                <td class="mono">{size}</td>
+                <td class={`num mono ${win === "cairn" ? "win" : ""}`}>{cairn}</td>
+                <td class={`num mono ${win === "minio" ? "win" : ""}`}>{minio}</td>
+                <td class="mono ratio">{ratio}</td>
+              </tr>
+            ))
+          }
+        </tbody>
+      </table>
+    </div>
+
+    <p>
+      Serving the same workload, Cairn peaked at <strong class="mono">106 MB</strong> of memory to
+      MinIO&apos;s <span class="mono">1072 MB</span> — about a tenth — at
+      <span class="mono">76%</span> mean CPU versus <span class="mono">88%</span>.
+    </p>
+
+    <CodeBlock
+      label="Reproduce — the same harness CI runs on every push (bench-compare)"
+      code="BIN=target/release/cairn bash conformance/bench_compare.sh"
+    />
+  </Section>
+
+  {/* 5 — Why Cairn */}
+  <Section eyebrow="Why Cairn" title="Built to replace a single-node MinIO">
+    <p>
+      If you run a single-node MinIO, or any single-drive or single-host S3 endpoint, Cairn is built
+      to replace it: a simpler operational model, a smaller and safer binary, transparent compression,
+      an embedded console, and asynchronous replication for redundancy — without losing S3
+      compatibility. The wire protocol is a commodity; the console and the operational model are the
+      product.
+    </p>
+    <dl class="points">
+      <div>
+        <dt>Written in Rust</dt>
+        <dd>
+          Predictable, garbage-collector-free tail latency, and memory safety on a surface that parses
+          untrusted input — SigV4 chunk framing, S3 XML, policy JSON — with no runtime cost.
+        </dd>
+      </div>
+      <div>
+        <dt>Self-contained</dt>
+        <dd>
+          The web console is compiled into the binary; there is no separate service to deploy. The CLI
+          gives the same control from a terminal.
+        </dd>
+      </div>
+      <div>
+        <dt>Honest about what it is</dt>
+        <dd>Single-node by design, and clear about the line. See Scope.</dd>
+      </div>
+    </dl>
+  </Section>
+
+  {/* 6 — Scope */}
+  <Section eyebrow="Scope" title="Single-node by design">
+    <p>
+      Cairn is single-node by design: one process, one data filesystem, one metadata database.
+      That&apos;s the line, and it&apos;s deliberate — it&apos;s what keeps Cairn simple to operate.
+    </p>
+    <ul class="scope">
+      <li>
+        Cross-host redundancy comes from <strong>asynchronous bucket replication</strong> — eventually
+        consistent, with observable lag — not from clustering. There is no consensus, sharding, or
+        erasure coding.
+      </li>
+      <li>
+        <strong>Drive redundancy is left to the storage underneath</strong>: ZFS, RAID, or a
+        replicated block volume.
+      </li>
+      <li>
+        Server-side encryption is real, but the <code>aws:kms</code> key id is a validated
+        <strong> label over the one node master key</strong>, not independent key material — so it is
+        SDK compatibility, not cryptographic tenant isolation. A dedicated external KMS with distinct
+        per-key material isn&apos;t implemented yet.
+      </li>
+      <li>
+        The target is <strong>homelab and small-to-mid production</strong> that wants the S3 API and a
+        console without running a distributed system.
+      </li>
+    </ul>
+  </Section>
+
+  {/* 7 — Quickstart */}
+  <Section eyebrow="Quickstart" title="Run it by hand with Docker">
+    <CodeBlock code={dockerRun} />
+    <ul class="notes">
+      <li>S3 API on <code>:7373</code> — point any S3 client at <code>http://localhost:7373</code>.</li>
+      <li>Web console on <code>:7374</code> — open it in a browser.</li>
+      <li>
+        Default login is <code>cairn</code> / <code>cairnadmin</code>. Override with
+        <code>CAIRN_ROOT_ACCESS_KEY</code> and <code>CAIRN_ROOT_SECRET_KEY</code> before exposing a
+        node.
+      </li>
+      <li><code>/healthz</code>, <code>/readyz</code>, and <code>/metrics</code> are served on the S3 port.</li>
+    </ul>
+    <p>Smoke-test with the AWS CLI (configure it with the access key and secret above, any region):</p>
+    <CodeBlock code={smoke} />
+    <p class="hero__note">
+      <code>CAIRN_MASTER_KEY</code> is a 32-byte hex key that seals every secret at rest. Generate it
+      once, keep it constant for the life of your data, and store it outside the database backup.
+    </p>
+  </Section>
+
+  {/* 8 — Roadmap */}
+  <Section eyebrow="Roadmap" title="Planned and additive">
+    <p>None of it changes the S3 or management API.</p>
+    <ul class="scope">
+      <li>Integration with an external KMS, with distinct per-key material and tenant isolation.</li>
+      <li>Lifecycle transition to a remote cold tier, with a restore-from-cold workflow.</li>
+      <li>Zero-copy reads with kernel TLS, building on the existing sendfile fast path.</li>
+      <li>Signed release artifacts (cosign) and SBOM attestation.</li>
+    </ul>
+  </Section>
+
+  {/* 9 — Get started */}
+  <Section eyebrow="Get started" title="Install it" id="get-started">
+    <p>
+      Install on a host or with Docker, then open the console on <code>:7374</code> and point any S3
+      client at <code>:7373</code>.
+    </p>
+    <CodeBlock code={install} />
+    <p>
+      Releases are CI-gated and publish static <code>linux/amd64</code> and <code>linux/arm64</code>
+      binaries with a <code>SHA256SUMS</code> manifest, plus a multi-arch image at
+      <code>ghcr.io/harsh-2002/cairn</code>. Verify a download with <code>sha256sum -c SHA256SUMS</code>.
+    </p>
+    <nav class="linkrow" aria-label="Project links">
+      <a class="link" href={`${repo}#readme`}>Documentation</a>
+      <a class="link" href={repo}>GitHub</a>
+      <a class="link" href={`${repo}/releases`}>Releases</a>
+      <a class="link" href={`${repo}/pkgs/container/cairn`}>Container image</a>
+      <a class="link" href={`${repo}/blob/main/docs/s3-api-matrix.md`}>S3 API support matrix</a>
+    </nav>
+  </Section>
+
+  {/* 10 — Footer */}
+  <footer class="site-footer wrap">
+    <p class="site-footer__tag">Cairn — self-hosted, S3-compatible object storage.</p>
+    <p>
+      Apache-2.0. The license is permanent; there is no enterprise edition or open-core split.
+    </p>
+    <nav class="linkrow" aria-label="Footer links">
+      <a class="link" href={repo}>GitHub</a>
+      <a class="link" href={`${repo}#readme`}>Docs</a>
+      <a class="link" href={`${repo}/releases`}>Releases</a>
+      <a class="link" href={`${repo}/blob/main/SECURITY.md`}>Security</a>
+      <a class="link" href={`${repo}/blob/main/GOVERNANCE.md`}>Governance</a>
+      <a class="link" href={`${repo}/blob/main/LICENSE`}>License</a>
+    </nav>
+  </footer>
+</Base>
+
+<style>
+  .hero {
+    padding-block: var(--space-6) var(--space-5);
+  }
+  .hero h1 {
+    font-size: var(--step-hero);
+    line-height: 1.08;
+    letter-spacing: -0.03em;
+    margin-bottom: var(--space-4);
+  }
+  .caret {
+    display: inline-block;
+    width: 0.55ch;
+    height: 1.05em;
+    margin-left: 0.15ch;
+    translate: 0 0.14em;
+    background: var(--fg);
+    animation: blink 1.05s steps(1) infinite;
+  }
+  @keyframes blink {
+    50% {
+      opacity: 0;
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .caret {
+      animation: none;
+    }
+  }
+  .lead {
+    font-size: var(--step-1);
+    line-height: 1.5;
+    color: var(--fg-muted);
+    max-width: 60ch;
+    margin-bottom: var(--space-4);
+  }
+  .hero__note {
+    font-size: var(--step--1);
+    color: var(--fg-faint);
+    margin-top: 0.5rem;
+  }
+  .cta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.75rem;
+    margin-top: var(--space-4);
+  }
+
+  /* definition-list feature/point blocks */
+  .points {
+    display: grid;
+    gap: var(--space-4);
+    margin-top: var(--space-4);
+  }
+  .points dt {
+    font-weight: 600;
+    color: var(--fg);
+    margin-bottom: 0.15rem;
+  }
+  .points dd {
+    margin: 0;
+    color: var(--fg-muted);
+    max-width: var(--measure);
+  }
+  .points--features {
+    gap: var(--space-5);
+  }
+
+  /* benchmark table */
+  .table-scroll {
+    overflow-x: auto;
+    margin-block: var(--space-4);
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius);
+  }
+  table.bench {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.9rem;
+    min-width: 30rem;
+  }
+  .bench th,
+  .bench td {
+    padding: 0.5rem 0.85rem;
+    text-align: left;
+    border-bottom: 1px solid var(--hairline);
+    white-space: nowrap;
+  }
+  .bench thead th {
+    font-size: var(--step--1);
+    font-weight: 500;
+    color: var(--fg-faint);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    background: var(--bg-subtle);
+  }
+  .bench tbody tr:last-child td {
+    border-bottom: 0;
+  }
+  .bench .num {
+    text-align: right;
+  }
+  .bench .win {
+    color: var(--fg);
+    font-weight: 500;
+  }
+  .bench td:not(.win).num {
+    color: var(--fg-muted);
+  }
+  .bench .ratio {
+    color: var(--fg-faint);
+    font-size: 0.82rem;
+  }
+
+  .scope,
+  .notes {
+    margin-top: var(--space-3);
+  }
+  .notes {
+    list-style: none;
+    padding-left: 0;
+  }
+  .notes li {
+    padding-left: 1.1rem;
+    position: relative;
+  }
+  .notes li::before {
+    content: "—";
+    position: absolute;
+    left: 0;
+    color: var(--fg-faint);
+  }
+
+  .linkrow {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem 1.25rem;
+    margin-top: var(--space-4);
+    font-family: var(--font-mono);
+    font-size: var(--step--1);
+  }
+  .linkrow a {
+    color: var(--fg-muted);
+  }
+  .linkrow a:hover {
+    color: var(--fg);
+  }
+
+  .site-footer {
+    padding-block: var(--space-6);
+    border-top: 1px solid var(--hairline);
+    margin-top: var(--space-4);
+  }
+  .site-footer__tag {
+    color: var(--fg);
+    font-weight: 500;
+    margin-bottom: 0.4rem;
+  }
+  .site-footer p {
+    font-size: var(--step--1);
+    color: var(--fg-faint);
+  }
+
+  @media (max-width: 34rem) {
+    .hero h1 {
+      font-size: 2.1rem;
+    }
+    .hero h1 br {
+      display: none;
+    }
+  }
+</style>

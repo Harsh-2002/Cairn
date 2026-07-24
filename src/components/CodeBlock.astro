@@ -1,0 +1,96 @@
+---
+interface Props {
+  code: string;
+  label?: string;
+}
+const { code, label } = Astro.props;
+---
+
+<div class="codeblock">
+  {label && <span class="codeblock__label">{label}</span>}
+  <div class="codeblock__body">
+    <pre><code>{code.trim()}</code></pre>
+    <button
+      class="codeblock__copy"
+      type="button"
+      data-copy={code.trim()}
+      aria-label="Copy to clipboard">Copy</button
+    >
+  </div>
+</div>
+
+<script>
+  // One delegated handler for every code block on the page.
+  document.addEventListener("click", async (e) => {
+    const btn = (e.target as HTMLElement)?.closest<HTMLButtonElement>(".codeblock__copy");
+    if (!btn) return;
+    try {
+      await navigator.clipboard.writeText(btn.dataset.copy || "");
+      const prev = btn.textContent;
+      btn.textContent = "Copied";
+      btn.classList.add("is-copied");
+      setTimeout(() => {
+        btn.textContent = prev;
+        btn.classList.remove("is-copied");
+      }, 1400);
+    } catch {
+      /* clipboard blocked — no-op */
+    }
+  });
+</script>
+
+<style>
+  .codeblock {
+    margin-block: var(--space-4);
+    max-width: 100%;
+  }
+  .codeblock__label {
+    display: block;
+    font-family: var(--font-mono);
+    font-size: var(--step--1);
+    color: var(--fg-faint);
+    margin-bottom: var(--space-2);
+  }
+  .codeblock__body {
+    position: relative;
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius);
+    background: var(--bg-subtle);
+  }
+  pre {
+    margin: 0;
+    padding: 0.9rem 1rem;
+    padding-right: 4.5rem;
+    overflow-x: auto;
+    font-family: var(--font-mono);
+    font-size: 0.9rem;
+    line-height: 1.65;
+    color: var(--fg);
+    font-variant-numeric: slashed-zero;
+  }
+  .codeblock__copy {
+    position: absolute;
+    top: 0.55rem;
+    right: 0.55rem;
+    font: inherit;
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    color: var(--fg-muted);
+    background: var(--bg);
+    border: 1px solid var(--hairline-bold);
+    border-radius: 4px;
+    padding: 0.2rem 0.5rem;
+    cursor: pointer;
+    transition:
+      color 0.15s ease,
+      border-color 0.15s ease;
+  }
+  .codeblock__copy:hover {
+    color: var(--fg);
+    border-color: var(--fg);
+  }
+  .codeblock__copy.is-copied {
+    color: var(--fg);
+    border-color: var(--fg);
+  }
+</style>

@@ -1,0 +1,312 @@
+/* ============================================================================
+   Cairn landing page — design system.
+   Typography-only, strictly monochrome, light/dark. No color accent, no images.
+   Hierarchy is built from size -> weight -> tracking/case -> whitespace, plus a
+   monospace "second voice" for identifiers, endpoints, versions, and commands.
+   ============================================================================ */
+
+/* --- Self-hosted Geist (variable, Latin). Relative URLs so Astro rewrites them
+       for the /Cairn/ base path and content-hashes the files. -------------------- */
+@font-face {
+  font-family: "Geist";
+  src: url("../fonts/geist-sans-var.woff2") format("woff2");
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Geist Mono";
+  src: url("../fonts/geist-mono-var.woff2") format("woff2");
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* --- Tokens. Every color routes through these; they invert per theme. Values are
+       neutral grays (equal R/G/B) so nothing ever reads as tinted; contrast ratios
+       are noted and hold in BOTH directions. ---------------------------------------- */
+:root,
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: #ffffff;
+  --bg-subtle: #fafafa;
+  --fg: #0a0a0a;            /* headings + body — 19.8:1 (AAA) */
+  --fg-muted: #52525b;      /* secondary text, captions — 7.7:1 (AAA) */
+  --fg-faint: #71717a;      /* non-essential metadata only — 4.83:1 (AA) */
+  --hairline: #e4e4e7;
+  --hairline-bold: #d4d4d8;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #0a0a0a;
+  --bg-subtle: #141414;
+  --fg: #fafafa;            /* 19.0:1 (AAA) */
+  --fg-muted: #a1a1aa;      /* 7.7:1 (AAA) — NOT #71717a, which fails AA on near-black */
+  --fg-faint: #8b8b93;      /* 5.86:1 (AA) */
+  --hairline: #262626;
+  --hairline-bold: #333333;
+}
+
+/* --- Type scale (rem) + spacing. Fixed, restrained: this is an engineering
+       document, not a billboard. --------------------------------------------------- */
+:root {
+  --font-sans: "Geist", ui-sans-serif, system-ui, -apple-system, "Segoe UI",
+    Roboto, Helvetica, Arial, sans-serif;
+  --font-mono: "Geist Mono", ui-monospace, "SF Mono", "Cascadia Code",
+    "Source Code Pro", Menlo, Consolas, monospace;
+
+  --step--1: 0.833rem; /* eyebrow / caption / mono meta */
+  --step-0: 1rem;      /* body */
+  --step-1: 1.25rem;   /* lead */
+  --step-2: 1.563rem;  /* h3 */
+  --step-3: 1.953rem;  /* h2 / section title */
+  --step-hero: 2.75rem;
+
+  --space-1: 0.5rem;
+  --space-2: 0.75rem;
+  --space-3: 1rem;
+  --space-4: 1.5rem;
+  --space-5: 2.5rem;
+  --space-6: 4rem;
+  --space-7: 6rem;
+
+  --measure: 68ch;
+  --column: 46rem; /* ~720px reading column */
+  --radius: 6px;
+}
+
+/* --- Reset (minimal, modern) ---------------------------------------------------- */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+* {
+  margin: 0;
+}
+html {
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+  scroll-behavior: smooth;
+}
+body {
+  min-height: 100svh;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font-sans);
+  font-size: var(--step-0);
+  line-height: 1.6;
+  font-feature-settings: "tnum";
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+img,
+svg {
+  display: block;
+  max-width: 100%;
+}
+
+/* First-paint theme swap must not animate; JS removes this after load. */
+html.no-transitions,
+html.no-transitions * {
+  transition: none !important;
+}
+:root {
+  transition: background-color 0.2s ease, color 0.2s ease;
+}
+
+/* --- Layout: one centered reading column ---------------------------------------- */
+.wrap {
+  width: 100%;
+  max-width: var(--column);
+  margin-inline: auto;
+  padding-inline: 1.5rem;
+}
+
+/* --- Base type ------------------------------------------------------------------- */
+h1,
+h2,
+h3 {
+  font-weight: 600;
+  color: var(--fg);
+  text-wrap: balance;
+}
+h1 {
+  font-size: var(--step-3);
+  line-height: 1.15;
+  letter-spacing: -0.02em;
+}
+h2 {
+  font-size: var(--step-3);
+  line-height: 1.15;
+  letter-spacing: -0.015em;
+}
+h3 {
+  font-size: var(--step-2);
+  line-height: 1.25;
+  letter-spacing: -0.01em;
+  font-weight: 500;
+}
+p {
+  max-width: var(--measure);
+  color: var(--fg-muted);
+  text-wrap: pretty;
+}
+p strong,
+strong {
+  color: var(--fg);
+  font-weight: 500;
+}
+small {
+  font-size: var(--step--1);
+  color: var(--fg-faint);
+}
+ul {
+  padding-left: 1.15rem;
+  max-width: var(--measure);
+  color: var(--fg-muted);
+}
+li {
+  margin-block: 0.35rem;
+}
+li::marker {
+  color: var(--fg-faint);
+}
+
+/* --- Links: monochrome, underline grows on hover (no layout shift, no color) ------ */
+a {
+  color: var(--fg);
+  text-decoration: none;
+}
+a.link {
+  background-image: linear-gradient(currentColor, currentColor);
+  background-size: 0% 1px;
+  background-position: 0 100%;
+  background-repeat: no-repeat;
+  transition: background-size 0.3s ease;
+  padding-bottom: 1px;
+}
+a.link:hover,
+a.link:focus-visible {
+  background-size: 100% 1px;
+}
+
+/* --- Mono second voice: identifiers, endpoints, versions, code ------------------- */
+code,
+kbd,
+.mono {
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+  font-variant-numeric: tabular-nums slashed-zero;
+}
+:not(pre) > code {
+  color: var(--fg);
+  background: var(--bg-subtle);
+  border: 1px solid var(--hairline);
+  border-radius: 4px;
+  padding: 0.05em 0.35em;
+}
+
+/* --- Rules ----------------------------------------------------------------------- */
+hr {
+  border: 0;
+  border-top: 1px solid var(--hairline);
+  margin-block: var(--space-6);
+}
+
+/* --- Focus: monochrome, on-palette ---------------------------------------------- */
+:where(a, button, input, [tabindex]):focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+/* --- Buttons (invert on hover) --------------------------------------------------- */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5ch;
+  font: inherit;
+  font-size: var(--step--1);
+  font-weight: 500;
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--fg);
+  border-radius: var(--radius);
+  padding: 0.5rem 0.9rem;
+  cursor: pointer;
+  transition: background-color 0.15s ease, color 0.15s ease;
+}
+.btn:hover {
+  background: var(--fg);
+  color: var(--bg);
+}
+.btn--ghost {
+  border-color: var(--hairline-bold);
+  color: var(--fg-muted);
+}
+.btn--ghost:hover {
+  background: var(--bg-subtle);
+  color: var(--fg);
+  border-color: var(--fg);
+}
+
+/* --- Eyebrow: a tracked-caps label as the section marker (replaces color) --------- */
+.eyebrow {
+  display: block;
+  font-family: var(--font-mono);
+  font-size: var(--step--1);
+  font-weight: 500;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--fg-faint);
+  margin-bottom: var(--space-3);
+}
+
+/* Content is visible by default — never gated on a JS scroll-reveal (that ships blank to crawlers,
+   headless renderers, and reduced-motion). The page's life comes from the caret, link underlines,
+   and invert-on-hover, not from hiding-then-revealing sections. */
+
+/* Global reduced-motion safety net. */
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}
+
+/* --- Screen-reader only + skip link --------------------------------------------- */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+.skip-link {
+  position: fixed;
+  top: 0.75rem;
+  left: 0.75rem;
+  z-index: 100;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--fg);
+  border-radius: var(--radius);
+  padding: 0.5rem 0.85rem;
+  transform: translateY(-160%);
+  transition: transform 0.15s ease;
+}
+.skip-link:focus {
+  transform: translateY(0);
+}
