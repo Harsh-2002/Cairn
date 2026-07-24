@@ -472,6 +472,7 @@ export function BucketBrowser() {
   // Multi-select for bulk delete (object mode only).
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [bulkDeleting, setBulkDeleting] = useState(false);
+  const [bulkDownloading, setBulkDownloading] = useState(false);
   const [confirmBulk, setConfirmBulk] = useState(false);
 
   // Recursive folder (prefix) delete: removes every object + version under a prefix.
@@ -642,6 +643,43 @@ export function BucketBrowser() {
       URL.revokeObjectURL(url);
     } catch (e) {
       toast.error(errorMessage(e, "Download failed."));
+    }
+  }
+
+  // Download every selected object. Each fetch→anchor click is spaced by the awaited blob fetch, so
+  // the browser handles them as a sequence rather than one burst; a per-object failure is counted,
+  // not fatal, and the summary toast reports the split.
+  async function downloadSelected() {
+    if (selected.size === 0) return;
+    setBulkDownloading(true);
+    const keys = [...selected];
+    let ok = 0;
+    try {
+      for (const key of keys) {
+        try {
+          const blob = await getObjectBlob(name, key);
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = key.split("/").pop() || key;
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          URL.revokeObjectURL(url);
+          ok++;
+        } catch {
+          /* counted in the summary below */
+        }
+      }
+      if (ok === keys.length) {
+        toast.success(`Downloaded ${ok} object${ok === 1 ? "" : "s"}.`);
+      } else {
+        toast.error(
+          `Downloaded ${ok} of ${keys.length}; ${keys.length - ok} failed.`,
+        );
+      }
+    } finally {
+      setBulkDownloading(false);
     }
   }
 
@@ -1170,14 +1208,23 @@ export function BucketBrowser() {
                 <Button
                   variant="ghost"
                   size="sm"
+                  disabled={bulkDownloading || bulkDeleting}
                   onClick={() => setSelected(new Set())}
                 >
                   Clear
                 </Button>
                 <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={bulkDownloading || bulkDeleting}
+                  onClick={() => void downloadSelected()}
+                >
+                  {bulkDownloading ? "Downloading…" : "Download"}
+                </Button>
+                <Button
                   variant="destructive-outline"
                   size="sm"
-                  disabled={bulkDeleting}
+                  disabled={bulkDeleting || bulkDownloading}
                   onClick={() => setConfirmBulk(true)}
                 >
                   Delete selected
