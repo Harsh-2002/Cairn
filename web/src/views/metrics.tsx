@@ -257,6 +257,7 @@ function RangePicker({
     onChange(RANGES[next].value);
   }
   return (
+    // eslint-disable-next-line jsx-a11y/interactive-supports-focus -- roving-tabindex radiogroup: the radio children carry tabIndex (0 active, -1 otherwise), the correct ARIA pattern; the container is intentionally not focusable
     <div
       role="radiogroup"
       aria-label="Time range"

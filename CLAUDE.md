@@ -44,7 +44,7 @@ it mirrors `.github/workflows/ci.yml` and must be green before any change is fin
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings        # also run with --all-features
 cargo nextest run --workspace                                # + cargo test --workspace --doc
-(cd web && npm install && npm run build)                      # for any web console change / the embedded console
+(cd web && npm install && npm run lint && npm run build)                      # for any web console change / the embedded console
 ```
 
 `make check` runs the fast gate (fmt + clippy + nextest + doctests) in order, aborting on the first

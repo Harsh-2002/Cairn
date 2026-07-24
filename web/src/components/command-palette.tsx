@@ -208,7 +208,6 @@ export function CommandPalette() {
               aria-hidden="true"
               className="size-4 shrink-0 text-muted-foreground"
             />
-            {/* eslint-disable-next-line jsx-a11y/no-autofocus */}
             <input
               autoFocus
               type="text"
