@@ -20,6 +20,8 @@ Scenarios:
   7  throughput / bottleneck      — bulk write to one node, time full-mesh convergence + capture gauges
   8  no-cascade                   — a partial ring does NOT converge transitively
   9  integrity                    — cross-node version-set equality + `cairn integrity` clean
+  10 SSE convergence              — an SSE-encrypted object reaches all 5 nodes byte-exact, across
+                                    DISTINCT per-node master keys (source decrypts, each dest re-seals)
 
 Env: BIN (cairn binary), DATA (temp root), BASE_PORT (default 7500), REPL_INTERVAL (default 2).
 """
@@ -130,6 +132,11 @@ def node_env(i, master_key):
         # cairn-net SSRF guard; the loopback topology needs the internal-endpoint escape hatch
         # (soak.sh avoids this by using the operator-trusted CAIRN_REPLICATION_ENDPOINT config path).
         "CAIRN_ALLOW_INTERNAL_ENDPOINTS": "true",
+        # The SSE convergence scenario replicates client-encrypted objects, which now ship as
+        # DECRYPTED plaintext (Stage-1 fix). The Stage-1 gate refuses that over an http:// endpoint
+        # unless opted in — and the mesh talks over loopback http — so enable it here, exactly as
+        # stress_replication.sh does for its cross-key SSE leg.
+        "CAIRN_REPLICATION_ALLOW_PLAINTEXT_SSE_OVER_HTTP": "true",
         "CAIRN_LOG_LEVEL": os.environ.get("CAIRN_LOG_LEVEL", "warn"),
         "CAIRN_REPLICATION_INTERVAL_SECS": REPL_INTERVAL,
         "CAIRN_REPLICATION_WORKER_CONCURRENCY": os.environ.get("WORKERS", "4"),
@@ -466,6 +473,29 @@ def sc9_integrity():
     check("cairn integrity ran on node A", out.returncode == 0)
     serve(0)
 
+def sc10_sse_convergence():
+    banner("Scenario 10: SSE convergence (an ENCRYPTED object written to each node reaches all 5 "
+           "byte-exact, across DISTINCT per-node master keys)")
+    # Each node seals under its OWN master key (sha256("mesh-key-{i}")), so an SSE-encrypted source
+    # object must be DECRYPTED at the source and re-sealed at each destination under a DIFFERENT key.
+    # Byte-exact convergence is the regression guard for the "replication ships ciphertext" defect in
+    # the mesh topology: had the source shipped ciphertext, the destination would hold intact-looking
+    # garbage (a single-part object is refused BadDigest and never lands; a multipart one is accepted
+    # and reads back wrong) — either way the byte-exact GET below fails.
+    sse = {"x-amz-server-side-encryption": "AES256"}
+    expected = {}
+    for i in range(N):
+        key = f"s10/enc-from-{NAMES[i]}.txt"
+        body = (f"encrypted-object-from-{NAMES[i]}-" + "payload" * 40).encode()
+        st, _ = put(i, key, body, extra=sse)
+        expected[key] = body
+        check(f"PUT SSE {key} on {NAMES[i]}", st == 200, f"status {st}")
+    ok = converged_everywhere(expected, timeout=60)
+    check("every SSE object present + BYTE-EXACT on every node (correct source-decrypt then re-seal)", ok)
+    if ok:
+        agree = all(len({get(i, k)[1] for i in range(N)}) == 1 for k in expected)
+        check("plaintext-MD5 ETag identical across all nodes (identical plaintext everywhere)", agree)
+
 def main():
     only = sys.argv[1:] or None
     print(f"Spinning {N} nodes on ports {s3_port(0)}..{s3_port(N-1)} (UI {ui_port(0)}..{ui_port(N-1)})", flush=True)
@@ -478,7 +508,8 @@ def main():
         note("full mesh wired (20 target+rule pairs)")
         scenarios = {"1": sc1_convergence, "2": sc2_fanout_latency, "3": sc3_version_id_identity,
                      "4": sc4_concurrent, "5": sc5_crash, "6": sc6_delete_marker,
-                     "7": sc7_throughput, "8": sc8_no_cascade, "9": sc9_integrity}
+                     "7": sc7_throughput, "8": sc8_no_cascade, "9": sc9_integrity,
+                     "10": sc10_sse_convergence}
         for tag, fn in scenarios.items():
             if only and tag not in only: continue
             fn()
