@@ -15,7 +15,7 @@ The spec (sections are **stable identifiers** — every `ARCH N` in the code poi
 | `overview.md` | 0–5 | how-to-read, exec summary, scope/non-goals, why-Rust, baseline arch, gap analysis |
 | `data-plane.md` | 6–7 | node model, data/control plane; concurrency, runtime, I/O model |
 | `storage-durability.md` | 8–10 | durability & crash consistency; on-disk layout; compression at rest |
-| `metadata.md` | 11–12 | metadata store (writer/WAL/cache, schema); the 8-trait abstraction layer |
+| `metadata.md` | 11–12 | metadata store (writer/WAL/cache, schema); the 9-trait abstraction layer |
 | `s3-api.md` | 13, 16–19, 21 | S3 protocol & op catalogue; versioning + Object Lock; tagging; CORS; lifecycle; request lifecycles |
 | `auth.md` | 14–15 | authentication (SigV4/Bearer); authorization (policy/ACL/BPA/ownership) |
 | `replication.md` | 20 | bucket replication (outbox engine, SigV4-signing sink) |

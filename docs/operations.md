@@ -319,8 +319,8 @@ it is the other reason the cadence is slow and the loop opt-in.
 Each of these silently wastes a repair pass. The audit prints all three; read them.
 
 1. **Resync is gated on `ExistingObjectReplication`.** Most rules do not set it, and a resync against
-   such a rule returns success and enqueues **nothing**. Edit the rule first (management API
-   `PUT /buckets/{name}/config`, or the console's replication editor).
+   such a rule returns success and enqueues **nothing**. Edit the rule first (S3
+   `PUT /{bucket}?replication` (PutBucketReplication), or the console's replication editor).
 2. **The backfill enumerates CURRENT versions only.** A non-current version that replicated corrupt
    is **not repaired** by any command here — the audit counts these as `non_current_suspect`. Full
    version-history fidelity on the mirror requires rebuilding the destination bucket (delete and
