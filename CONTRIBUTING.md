@@ -13,7 +13,7 @@ mirrors [`.github/workflows/ci.yml`](./.github/workflows/ci.yml):
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings    # also run with --all-features
 cargo nextest run --workspace                             # + cargo test --workspace --doc
-(cd web && npm install && npm run build)                   # for any web console change
+(cd web && npm install && npm run lint && npm run build)                   # for any web console change
 ```
 
 ## Conventions

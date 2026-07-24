@@ -58,6 +58,25 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
+  # Lint the console (ESLint flat config: typescript-eslint + react-hooks + jsx-a11y). Node-only, so
+  # it does not pull the Rust toolchain — it runs alongside `fmt + clippy` as the front-end gate,
+  # complementing the strict `tsc -b` type-check that the shared setup action already runs.
+  web-lint:
+    name: web lint (ESLint)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install + lint the console
+        working-directory: web
+        run: |
+          npm ci
+          npm run lint
+
   lint:
     name: fmt + clippy
     runs-on: ubuntu-latest

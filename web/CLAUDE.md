@@ -3,7 +3,7 @@
 The management console: a **React 19 + TypeScript SPA** (Vite, Tailwind v4, shadcn-style
 `radix-ui` components, self-hosted Geist fonts). Built into `web/dist`, which the `cairn-web` crate
 embeds into the binary and the server serves at the root of the web-console listener
-(`CAIRN_WEB_ADDR`, :7374). **Excluded from the cargo workspace** — its gate is `npm run build`, not
+(`CAIRN_WEB_ADDR`, :7374). **Excluded from the cargo workspace** — its gate is `npm run lint` (ESLint) + `npm run build` (strict `tsc` + vite), not
 cargo (see the root `../CLAUDE.md`).
 
 ## Layout (`src/`)
