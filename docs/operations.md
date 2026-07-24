@@ -24,7 +24,7 @@ without starting: `cairn validate-config`.
 
 | Setting | Env var | Default | Meaning |
 |---|---|---|---|
-| S3 API listener | `CAIRN_LISTEN_ADDR` | `0.0.0.0:7373` | S3 data plane, plus `/healthz`, `/readyz`, `/metrics`, and signed `/p/` share URLs. |
+| S3 API listener | `CAIRN_LISTEN_ADDR` | `0.0.0.0:7373` | S3 data plane, plus `/healthz`, `/readyz`, `/metrics`, and signed `/share/` share URLs. |
 | Web console listener | `CAIRN_WEB_ADDR` | `0.0.0.0:7374` | Management console (root path) + management API (`/api/v1`). Set `off`/`none`/empty to run headless. |
 | Data directory | `CAIRN_DATA_DIR` | `./data` | Root of staging + per-bucket blobs. |
 | Database path | `CAIRN_DB_PATH` | `./data/cairn.db` | SQLite metadata file (same FS as data). |

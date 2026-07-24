@@ -36,6 +36,7 @@ mod sendfile;
 mod fast_get;
 mod stack;
 mod tls;
+mod update_check;
 
 use clap::{Parser, Subcommand};
 use config::Config;

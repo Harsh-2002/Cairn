@@ -114,6 +114,12 @@ pub struct SystemResp {
     pub disk_total_bytes: Option<u64>,
     /// Bytes available to unprivileged writers on that filesystem (`null` when unavailable).
     pub disk_free_bytes: Option<u64>,
+    /// Latest release tag from the update-check feed (`null` when unknown / check disabled).
+    pub latest_version: Option<String>,
+    /// True when a newer release than the running build is available.
+    pub update_available: bool,
+    /// The latest release's web page (release notes), when known.
+    pub release_url: Option<String>,
 }
 
 /// One entry in the `GET /overview/buckets` breakdown.
@@ -539,7 +545,7 @@ pub struct ActivityListResp {
 /// A persistent object-share, as returned by the management API (ARCH 15.8).
 #[derive(Debug, Serialize)]
 pub struct ShareRecord {
-    /// The opaque token; also the `/p/{token}` path tail.
+    /// The opaque token; also the `/share/{token}` path tail.
     pub token: String,
     /// The shared object's bucket.
     pub bucket: String,

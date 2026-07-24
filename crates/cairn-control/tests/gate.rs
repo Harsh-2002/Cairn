@@ -64,6 +64,7 @@ fn harness() -> Harness {
             tls: false,
             data_dir: std::env::temp_dir(),
             started_at: std::time::Instant::now(),
+            update_status: Default::default(),
         },
     );
     Harness {

@@ -5110,7 +5110,7 @@ fn object_headers(resp: S3Response, row: &ObjectVersionRow) -> S3Response {
         .with_header("last-modified", http_date(row.updated_at))
         .with_header("accept-ranges", "bytes")
         // Never let a browser MIME-sniff object bytes into an executable type (audit #13): an
-        // attacker-uploaded object served inline same-origin (S3 GET, or a `/p/` share) could
+        // attacker-uploaded object served inline same-origin (S3 GET, or a `/share/` share) could
         // otherwise be sniffed into HTML/JS and run as stored XSS. The declared content-type is
         // honored verbatim; nothing is sniffed.
         .with_header("x-content-type-options", "nosniff");

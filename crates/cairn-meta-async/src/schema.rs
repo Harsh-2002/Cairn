@@ -226,7 +226,7 @@ ALTER TABLE replication_outbox ADD COLUMN target_arn TEXT;
         name: "object share tokens (persistent public sharing)",
         sql: r#"
 -- Persistent, revocable, optionally-forever object-share tokens (ARCH 15.8). The opaque token is
--- the bearer capability served at GET /p/{token}; revoke flips revoked_at with no global key
+-- the bearer capability served at GET /share/{token}; revoke flips revoked_at with no global key
 -- rotation. version_id NULL follows the current version; expires_at NULL is a forever share.
 CREATE TABLE object_shares (
     token        TEXT PRIMARY KEY,

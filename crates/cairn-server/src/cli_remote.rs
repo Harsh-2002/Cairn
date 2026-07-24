@@ -1592,7 +1592,7 @@ async fn share(client: &HttpClient, cfg: &ClientConfig, cmd: ShareCmd) -> Result
                 client,
                 cfg,
                 Method::POST,
-                &format!("/buckets/{bucket}/objects/share"),
+                &format!("/buckets/{bucket}/objects/shares"),
                 Some(Bytes::from(body)),
             )
             .await?;
@@ -1678,7 +1678,7 @@ fn print_share_url(resp: &HttpResponse, cfg: &ClientConfig) -> Result<(), String
     }
     let v: serde_json::Value = serde_json::from_slice(&resp.body).map_err(|e| e.to_string())?;
     if let Some(url) = v.get("url").and_then(|u| u.as_str()) {
-        // A persistent share returns a path (/p/{token}); make it absolute against the endpoint.
+        // A persistent share returns a path (/share/{token}); make it absolute against the endpoint.
         if let Some(path) = url.strip_prefix('/') {
             let base = cfg.endpoint.trim_end_matches('/');
             println!("{base}/{path}");

@@ -35,6 +35,9 @@ pub struct AppStack {
     pub s3: S3Service,
     /// The management JSON API service.
     pub control: cairn_control::ControlService,
+    /// Shared release-update status, written by the background update-check loop and read live by
+    /// `GET /system` (a clone is also held inside `SystemInfo` so the console sees the freshest value).
+    pub update_status: Arc<std::sync::RwLock<cairn_control::UpdateStatus>>,
     /// The authenticator chain.
     pub auth: Arc<dyn Authenticator>,
     /// The same authenticator chain behind its concrete type, kept so the STS wire surface can call
@@ -545,6 +548,9 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
         let n = replication_notify.clone();
         Arc::new(move || n.notify_one())
     });
+    let update_status = Arc::new(std::sync::RwLock::new(
+        cairn_control::UpdateStatus::default(),
+    ));
     let control = cairn_control::ControlService::new(
         meta.clone(),
         blob.clone(),
@@ -559,6 +565,7 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
             tls: cfg.tls_enabled(),
             data_dir: cfg.data_dir.clone(),
             started_at: std::time::Instant::now(),
+            update_status: update_status.clone(),
         },
     )
     .with_replication_wake({
@@ -625,6 +632,7 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
     Ok(AppStack {
         s3,
         control,
+        update_status,
         auth,
         auth_chain,
         sts_enabled: cfg.sts_enabled,

@@ -931,7 +931,7 @@ pub enum ShareDisposition {
 }
 
 /// A persistent, revocable, optionally-forever object-share token (ARCH 15.8). The token is the
-/// bearer capability served at `GET /p/{token}`; revoking flips `revoked_at` without rotating any
+/// bearer capability served at `GET /share/{token}`; revoking flips `revoked_at` without rotating any
 /// global key. Stored in the `object_shares` table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShareRow {

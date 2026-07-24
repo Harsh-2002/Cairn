@@ -1,6 +1,6 @@
 // Share one object two ways (ARCH 15.8):
 //  • "Share link" (default): a persistent, revocable Cairn share — pick a duration
-//    or "Never expires", view-in-browser vs force-download, get a /p/{token} link.
+//    or "Never expires", view-in-browser vs force-download, get a /share/{token} link.
 //  • "S3 link": a standard SigV4 presigned URL (download or upload), interoperable
 //    with any S3 tool, capped at 7 days, stateless (not revocable).
 

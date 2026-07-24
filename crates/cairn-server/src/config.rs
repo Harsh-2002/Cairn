@@ -26,7 +26,7 @@ pub enum LogFormat {
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// Where the **S3 API** listener binds (`CAIRN_LISTEN_ADDR`): the S3 protocol, the signed
-    /// public-read share URLs (`/p/…`), and the liveness/readiness/metrics endpoints. This is the
+    /// public-read share URLs (`/share/…`), and the liveness/readiness/metrics endpoints. This is the
     /// data-plane port you expose to S3 clients. Default `0.0.0.0:7373`.
     pub listen_addr: SocketAddr,
     /// Where the **web console** listener binds (`CAIRN_WEB_ADDR`): the management console served at the
@@ -296,6 +296,19 @@ pub struct Config {
     /// private network (e.g. an on-prem MinIO on `10.x`); it emits a loud startup warning.
     pub allow_internal_endpoints: bool,
 
+    /// Whether the node periodically checks for a newer Cairn release and surfaces it in the console
+    /// (`CAIRN_UPDATE_CHECK_ENABLED`, ARCH 28). Cairn is always self-hosted, so this is how an
+    /// operator learns a new version shipped; default `true`. The check is best-effort — it dials the
+    /// feed through the SSRF guard, caches the result, and fails silently when the node is air-gapped.
+    /// Set `false` to disable the outbound request entirely.
+    pub update_check_enabled: bool,
+    /// The release feed the update check queries (`CAIRN_UPDATE_CHECK_URL`); default the project's
+    /// GitHub Releases "latest" endpoint. Point it at a private mirror to avoid contacting GitHub.
+    pub update_check_url: String,
+    /// How often the update check runs, in seconds (`CAIRN_UPDATE_CHECK_INTERVAL_SECS`); default
+    /// 3600 (hourly). Must be positive when the check is enabled.
+    pub update_check_interval_secs: u64,
+
     /// Default object-worker count for a new S3 import job when the request does not specify one
     /// (`CAIRN_IMPORT_DEFAULT_WORKERS`, ARCH 27).
     pub import_default_workers: usize,
@@ -450,6 +463,10 @@ impl Default for Config {
             replication_audit_before: None,
             events_outbox_retention_secs: 86_400,
             allow_internal_endpoints: false,
+            update_check_enabled: true,
+            update_check_url: "https://api.github.com/repos/Harsh-2002/Cairn/releases/latest"
+                .to_owned(),
+            update_check_interval_secs: 3_600,
             import_default_workers: 8,
             import_max_workers: 32,
             import_global_max_inflight: 24,
@@ -789,6 +806,11 @@ impl Config {
         if self.webhook_interval_secs == 0 {
             return Err(ConfigError::Invalid(
                 "webhook_interval_secs must be positive".into(),
+            ));
+        }
+        if self.update_check_enabled && self.update_check_interval_secs == 0 {
+            return Err(ConfigError::Invalid(
+                "update_check_interval_secs must be positive".into(),
             ));
         }
         if self.multipart_sweep_interval_secs == 0 {

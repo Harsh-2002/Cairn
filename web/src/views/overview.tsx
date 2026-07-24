@@ -94,6 +94,31 @@ export function Overview() {
         <OverviewSkeleton />
       ) : data && o && sys ? (
         <div className="space-y-4">
+          {/* Release-update hint (opt-out; ARCH 28). Quiet by default — only appears when the
+              background check found a newer release than the running build. */}
+          {sys.update_available && sys.latest_version ? (
+            <a
+              href={sys.release_url ?? undefined}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 rounded-lg border px-4 py-2.5 text-sm transition-colors hover:bg-accent"
+            >
+              <span>
+                A newer release is available —{" "}
+                <span className="font-mono text-[13px] font-medium text-foreground">
+                  {sys.latest_version}
+                </span>
+                <span className="text-muted-foreground">
+                  {" "}
+                  (you&apos;re on {sys.version})
+                </span>
+              </span>
+              <span className="shrink-0 text-[13px] font-medium text-link">
+                Release notes →
+              </span>
+            </a>
+          ) : null}
+
           {/* Stat grid: the four numbers the eye should land on first. */}
           <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
             <StatCard label="Buckets" value={count(o.buckets)} />

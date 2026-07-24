@@ -75,7 +75,7 @@ CLI. This is the **only crate that names concrete impls** — everything else is
   quota, versioning, and events all apply exactly as a normal upload.
 
 ## Notes
-- **Two listeners.** S3 + `/p/…` shares + `/healthz` `/readyz` `/metrics` on `CAIRN_LISTEN_ADDR`
+- **Two listeners.** S3 + `/share/…` shares + `/healthz` `/readyz` `/metrics` on `CAIRN_LISTEN_ADDR`
   (:7373); console + `/api/v1` + SSE on `CAIRN_WEB_ADDR` (:7374; `off`/`none` for headless). Infra
   endpoints answer **ahead of the concurrency limiter** so a probe/scrape never sheds.
 - **Crypto fails closed; `unsafe` is forbidden.** `#![forbid(unsafe_code)]` on every build except
