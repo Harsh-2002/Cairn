@@ -306,7 +306,7 @@ pub struct Config {
     /// GitHub Releases "latest" endpoint. Point it at a private mirror to avoid contacting GitHub.
     pub update_check_url: String,
     /// How often the update check runs, in seconds (`CAIRN_UPDATE_CHECK_INTERVAL_SECS`); default
-    /// 86400 (daily). Must be positive when the check is enabled.
+    /// 3600 (hourly). Must be positive when the check is enabled.
     pub update_check_interval_secs: u64,
 
     /// Default object-worker count for a new S3 import job when the request does not specify one
@@ -466,7 +466,7 @@ impl Default for Config {
             update_check_enabled: true,
             update_check_url: "https://api.github.com/repos/Harsh-2002/Cairn/releases/latest"
                 .to_owned(),
-            update_check_interval_secs: 86_400,
+            update_check_interval_secs: 3_600,
             import_default_workers: 8,
             import_max_workers: 32,
             import_global_max_inflight: 24,
