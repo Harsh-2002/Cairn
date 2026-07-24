@@ -21,8 +21,10 @@ manifest, plus a multi-arch image at `ghcr.io/harsh-2002/cairn`. Verify a downlo
   Versioning, tagging, CORS, lifecycle expiration, object lock (WORM), and presigned URLs. SigV4
   (header and streaming-chunked) and Bearer authentication. The aws CLI and the standard AWS SDKs
   work against it.
-- Web console: a web console on its own port to manage buckets and users, browse, upload, download and share
-  objects, mint access keys scoped by a policy, and view storage, compression, and replication status.
+- Web console: on its own port, manage buckets and users; browse, upload, download and share
+  objects; mint access keys scoped by a policy; view storage, compression, and replication status;
+  jump anywhere with a command palette; and see when a newer release is available (an hourly,
+  opt-out check).
 - Access control: bucket policies, ACLs, Block Public Access, Object Ownership, and short-lived
   credentials, mintable through the AWS-STS wire surface (`AssumeRole`, `GetSessionToken`) served on
   the S3 port or through the management API.
