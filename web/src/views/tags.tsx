@@ -46,7 +46,9 @@ export function Tags() {
   const [sel, setSel] = useState<TagSummaryItem | null>(null);
   const [filter, setFilter] = useState("");
 
-  const list = tags.data?.tags ?? [];
+  // Memoized so the identity is stable across renders: a fresh `[]` fallback each render would
+  // otherwise invalidate every downstream useMemo that depends on it.
+  const list = useMemo(() => tags.data?.tags ?? [], [tags.data]);
   const shown = useMemo(() => {
     const q = filter.trim().toLowerCase();
     if (!q) return list;
