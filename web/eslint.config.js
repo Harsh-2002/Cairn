@@ -29,9 +29,17 @@ export default tseslint.config(
     rules: {
       "react-hooks/rules-of-hooks": "error",
       "react-hooks/exhaustive-deps": "warn",
+      // Fast Refresh wants a module to export only components. Two patterns here are deliberate
+      // and correct, so they are named rather than left to warn forever: a context hook exported
+      // beside the provider it belongs to (`useAuth`/`useTheme`/`useSidebar` — splitting them from
+      // their provider would be worse code for a dev-only refresh nicety), and the router object
+      // `main.tsx` mounts. Everything else still warns.
       "react-refresh/only-export-components": [
         "warn",
-        { allowConstantExport: true },
+        {
+          allowConstantExport: true,
+          allowExportNames: ["useAuth", "useTheme", "useSidebar", "router"],
+        },
       ],
       // Our `<label>`s wrap shadcn control *components* (a valid nested association); teach the rule
       // to recognize them as controls instead of flagging correct markup as unassociated.
@@ -54,5 +62,13 @@ export default tseslint.config(
       // page-load form. Off rather than per-attribute disables that fight the formatter.
       "jsx-a11y/no-autofocus": "off",
     },
+  },
+  {
+    // The shadcn/radix primitives are vendored generated code, regenerated through the shadcn CLI
+    // rather than hand-edited (see CLAUDE.md). They pair each component with its `cva` variant
+    // recipe in one file, which Fast Refresh dislikes; restructuring them would be undone by the
+    // next regeneration, so the rule is off for that directory alone.
+    files: ["src/components/primitives/**/*.{ts,tsx}"],
+    rules: { "react-refresh/only-export-components": "off" },
   },
 );

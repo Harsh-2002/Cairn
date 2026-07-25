@@ -14,6 +14,26 @@ Releases are CI-gated and publish static `linux/amd64` and `linux/arm64` binarie
 manifest, plus a multi-arch image at `ghcr.io/harsh-2002/cairn`. Verify a download with
 `sha256sum -c SHA256SUMS`.
 
+## The console
+
+The S3 wire protocol is a commodity; the console is the reason to pick Cairn. It ships inside the
+same binary — nothing extra to deploy.
+
+[![The Cairn console — Overview](https://harsh-2002.github.io/Cairn/screenshots/overview-dashboard.webp)](https://harsh-2002.github.io/Cairn/)
+
+<sup>Storage, compression and per-bucket usage across the node.</sup>
+
+|  |  |
+|---|---|
+| [![Bucket browser](https://harsh-2002.github.io/Cairn/screenshots/bucket-browser.webp)](https://harsh-2002.github.io/Cairn/screenshots/bucket-browser.webp) | [![Object preview](https://harsh-2002.github.io/Cairn/screenshots/object-preview.webp)](https://harsh-2002.github.io/Cairn/screenshots/object-preview.webp) |
+| **Bucket browser** — preview, download, tag, copy, share or delete any object. | **In-place preview** — images, video, audio, PDF, Markdown, JSON, CSV and text, without downloading. |
+| [![Bucket policy](https://harsh-2002.github.io/Cairn/screenshots/bucket-settings-access.webp)](https://harsh-2002.github.io/Cairn/screenshots/bucket-settings-access.webp) | [![Data protection](https://harsh-2002.github.io/Cairn/screenshots/bucket-settings-data-protection.webp)](https://harsh-2002.github.io/Cairn/screenshots/bucket-settings-data-protection.webp) |
+| **Access** — a validated bucket-policy editor, object ownership, Block Public Access. | **Data protection** — encryption at rest, Object Lock, lifecycle rules. |
+| [![Temporary credentials](https://harsh-2002.github.io/Cairn/screenshots/credentials-temporary.webp)](https://harsh-2002.github.io/Cairn/screenshots/credentials-temporary.webp) | [![Metrics](https://harsh-2002.github.io/Cairn/screenshots/metrics-charts.webp)](https://harsh-2002.github.io/Cairn/screenshots/metrics-charts.webp) |
+| **Credentials** — mint short-lived scoped keys with a policy builder that explains them. | **Metrics** — requests, errors, throughput and latency from Cairn's own stored series. |
+
+More screens on the [project site](https://harsh-2002.github.io/Cairn/#).
+
 ## Features
 
 - S3 API: buckets and objects, byte-range and conditional reads, checksums (CRC32, CRC32C,
@@ -22,7 +42,8 @@ manifest, plus a multi-arch image at `ghcr.io/harsh-2002/cairn`. Verify a downlo
   (header and streaming-chunked) and Bearer authentication. The aws CLI and the standard AWS SDKs
   work against it.
 - Web console: on its own port, manage buckets and users; browse, upload, download and share
-  objects; mint access keys scoped by a policy; view storage, compression, and replication status;
+  objects; preview images, video, audio, PDFs, Markdown, JSON, CSV and text in place without
+  downloading them; mint access keys scoped by a policy; view storage, compression, and replication status;
   jump anywhere with a command palette; and see when a newer release is available (an hourly,
   opt-out check).
 - Access control: bucket policies, ACLs, Block Public Access, Object Ownership, and short-lived
@@ -37,7 +58,8 @@ manifest, plus a multi-arch image at `ghcr.io/harsh-2002/cairn`. Verify a downlo
   (`CAIRN_ENCRYPT_AT_REST`).
 - Storage efficiency: optional per-bucket block compression, with range reads that touch only the
   blocks they need.
-- Operations: Prometheus metrics, liveness and readiness endpoints, structured logs, asynchronous
+- Operations: Prometheus metrics (with a ready-to-import [dashboard](dashboards/) for an external
+  monitoring stack), liveness and readiness endpoints, structured logs, asynchronous
   bucket replication to another node or S3 endpoint, webhook event notifications, one-shot streaming
   import/migration of buckets and objects from another S3-compatible store (MinIO/Garage/R2/AWS/another
   Cairn) into this node, and a CLI for bootstrap, config validation, integrity checks, and backup and

@@ -18,6 +18,7 @@ mod adapter;
 mod background;
 mod cli_remote;
 mod config;
+mod error_page;
 mod import_dest;
 mod import_run;
 mod key_rewrap;

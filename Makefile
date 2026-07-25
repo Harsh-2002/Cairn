@@ -64,7 +64,7 @@ conformance: build ## boto3 smoke: run.sh drives the full object lifecycle
 
 conformance-suite: build ## Run the gated boto3 e2e harnesses (skips failpoints/sudo/multi-node ones)
 	@for h in run routing listing multipart objects buckets authz lifecycle \
-	          checksums object_lock share sts console_session backup_restore scrub; do \
+	          checksums object_lock share sts console_session error_pages backup_restore scrub; do \
 		echo ">> conformance/$$h.sh"; \
 		BIN=$(BIN) PY=$(PY) bash conformance/$$h.sh || exit 1; \
 	done

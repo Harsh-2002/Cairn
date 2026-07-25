@@ -12,10 +12,13 @@ cargo (see the root `../CLAUDE.md`).
 - `views/` — one file per route (`buckets`, `bucket-detail` + nested `bucket-browser`/`-settings`,
   `users`, `overview`, `metrics`, `replication`, `tags`, `activity`, `credentials`, `login`).
 - `components/` — hand-written shared web console (`permission-builder.tsx`, `data-table.tsx`,
-  `share-dialog.tsx`, the `*-card.tsx` settings panels, `app-shell.tsx`/`app-sidebar.tsx`).
+  `share-dialog.tsx`, `object-preview.tsx` (the in-place object viewer), the `*-card.tsx` settings
+  panels, `app-shell.tsx`/`app-sidebar.tsx`).
   `components/primitives/` — the generated shadcn/radix primitives; treat as vendored, regenerate via the
   shadcn CLI rather than hand-editing.
-- `lib/` — `api.ts` (the `/api/v1` client + the error humanizer), `s3.ts` (object data plane),
+- `lib/` — `api.ts` (the `/api/v1` client + the error humanizer), `s3.ts` (object data plane,
+  including `previewUrl`/`getObjectText` for the viewer), `preview.ts` (type detection + size caps),
+  `markdown.tsx` (a safe, element-only Markdown subset),
   `live.ts` (SSE), `use-resource.ts` (data-fetch hook), `policy.ts` (policy↔builder codec),
   `types.ts`, `format.ts`, `activity.ts`, `utils.ts` (`cn`). `hooks/`, `providers/`.
 
@@ -29,6 +32,12 @@ cargo (see the root `../CLAUDE.md`).
   authorizes the S3 data plane at root (`lib/s3.ts`), so the browser uploads/downloads bytes
   directly. (The "Bearer" copy in `users`/`user-detail`/`login` views is about the **end-user S3
   credentials the console mints**, not how the console authenticates — keep them distinct.)
+- **Object bytes are never rendered as active content in the console origin.** `object-preview.tsx`
+  renders only through inert paths (media elements; a PDF frame whose URL forces
+  `response-content-type=application/pdf`, which `nosniff` then pins; text fetched and rendered as
+  text — never `innerHTML`, never a same-origin navigation to the object). A stored `text/html` or
+  `image/svg+xml` object would otherwise be stored XSS. Do not add a `sandbox` to the PDF frame: it
+  breaks the built-in viewer, which is script-driven.
 - **Hash routing on purpose** (`createHashRouter`). The server serves the SPA shell only at `/`;
   every other path is the S3 data plane, so history-mode routes would collide with `/{bucket}/{key}`.
   Don't switch to a browser router.

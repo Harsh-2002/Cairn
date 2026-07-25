@@ -24,7 +24,7 @@ use cairn_types::traits::{Clock, Crypto};
 use futures_util::StreamExt;
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::{Frame, Incoming};
-use hyper::{Method, Request, Response};
+use hyper::{Method, Request, Response, StatusCode};
 use std::net::IpAddr;
 use zeroize::Zeroizing;
 
@@ -116,7 +116,11 @@ pub async fn handle(
             AuthOutcome::NotApplicable => None,
             AuthOutcome::Denied(e) => {
                 let resource = raw_path.clone();
-                let response = render(error_response(&Error::from(e), &resource, &request_id));
+                let response = render_negotiated(
+                    error_response(&Error::from(e), &resource, &request_id),
+                    crate::error_page::wants_html_pairs(&method, &headers),
+                    &resource,
+                );
                 // Authentication rejects before any handler touches the body, so a body-bearing
                 // request (e.g. a bad-signature PUT) leaves its bytes entirely unread. Drain them
                 // (bounded) so the client can finish sending and reliably receive this 4xx, else
@@ -282,7 +286,11 @@ pub async fn handle(
         Ok(bk) => bk,
         Err(e) => {
             // Routing rejected the request before it reached a handler, so its body is unread.
-            let response = render(error_response(&e, &raw_path, &request_id));
+            let response = render_negotiated(
+                error_response(&e, &raw_path, &request_id),
+                crate::error_page::wants_html_pairs(&method, &headers),
+                &raw_path,
+            );
             return drain_or_close(response, body_bearing, req.into_body()).await;
         }
     };
@@ -296,6 +304,8 @@ pub async fn handle(
     }));
     let body = shared_body_stream(shared.clone());
 
+    // Decide browser-vs-machine now: the request head moves into `S3Request` on the next line.
+    let wants_html = crate::error_page::wants_html_pairs(&method, &headers);
     let s3req = S3Request {
         method,
         bucket,
@@ -307,7 +317,7 @@ pub async fn handle(
         secure,
         request_id,
     };
-    let response = render(stack.s3.handle(s3req, body).await);
+    let response = render_negotiated(stack.s3.handle(s3req, body).await, wants_html, &raw_path);
     // If the service returned before consuming the body — e.g. an UploadPart rejected for an unknown
     // uploadId, scoped ahead of `stage_part` — the unread request bytes are still in flight and would
     // mis-frame the next request on the pooled HTTP/1.1 connection (issue #5). Drain a bounded amount
@@ -889,17 +899,31 @@ async fn serve_share(
     secure: bool,
     request_id: String,
 ) -> Response<ResponseBody> {
+    // A share link is opened by a person far more often than by a program, so a dead link explains
+    // itself as a page. The share token is a credential and is deliberately NOT echoed into the
+    // page (the resource is left blank) — it already rides the URL, and `Referrer-Policy:
+    // no-referrer` keeps it out of onward requests.
+    let wants_html = crate::error_page::wants_html_pairs(&method, in_headers);
+    let share_err = |status: u16, json: &'static str| -> Response<ResponseBody> {
+        let code = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST);
+        if wants_html {
+            html_error_response(code, "", "", &request_id, &[])
+        } else {
+            json_status(status, json)
+        }
+    };
+
     let row = match stack.meta.get_share(token).await {
         Ok(Some(r)) => r,
-        Ok(None) => return json_status(404, r#"{"error":"not found"}"#),
-        Err(_) => return json_status(500, r#"{"error":"internal error"}"#),
+        Ok(None) => return share_err(404, r#"{"error":"not found"}"#),
+        Err(_) => return share_err(500, r#"{"error":"internal error"}"#),
     };
     if row.revoked_at.is_some() {
-        return json_status(410, r#"{"error":"this share has been revoked"}"#);
+        return share_err(410, r#"{"error":"this share has been revoked"}"#);
     }
     if let Some(exp) = row.expires_at {
         if SystemClock::new().now().as_millis() > exp.0 {
-            return json_status(410, r#"{"error":"this share has expired"}"#);
+            return share_err(410, r#"{"error":"this share has expired"}"#);
         }
     }
 
@@ -966,7 +990,10 @@ async fn serve_share(
         request_id,
     };
     let empty: cairn_types::BodyStream = Box::pin(futures_util::stream::empty());
-    let mut resp = render(stack.s3.handle(s3req, empty).await);
+    // A share link is the most browser-facing surface Cairn has: a failure here (revoked, expired,
+    // or a deleted object) should read as a page, not as XML.
+    let resp_raw = stack.s3.handle(s3req, empty).await;
+    let mut resp = render_negotiated(resp_raw, wants_html, "");
 
     // Server-controlled delivery + privacy: override any object-set disposition, and never leak the
     // token through a referer.
@@ -1357,6 +1384,99 @@ fn render(resp: S3Response) -> Response<ResponseBody> {
     builder
         .body(body)
         .unwrap_or_else(|_| Response::new(full_body(Bytes::new())))
+}
+
+/// Render an [`S3Response`], swapping the machine-readable error body for a human-readable HTML
+/// page when — and only when — the request is a browser top-level navigation (ARCH 25).
+///
+/// An object store is addressed by both programs and people. A presigned link that 404s in an SDK
+/// must keep returning the exact `<Error>` XML the SDK parses; the same link pasted into a browser
+/// should explain itself. `error_page::wants_html` draws that line (GET + `Accept: text/html` +
+/// `Sec-Fetch-Dest: document`), so every machine client — SDK, CLI, `fetch()`, conformance suite —
+/// receives a byte-identical response to before.
+///
+/// Only a buffered `Bytes` error body is ever swapped: a `Stream` body is a partially-sent object
+/// read, and a `ZeroCopy`/`Empty` body carries nothing to replace.
+/// `wants_html` is decided by the caller (via [`crate::error_page::wants_html`]) while the request
+/// head is still in scope — the head is moved into `S3Request` before the response exists.
+fn render_negotiated(resp: S3Response, wants_html: bool, resource: &str) -> Response<ResponseBody> {
+    let is_error = resp.status.is_client_error() || resp.status.is_server_error();
+    if !is_error {
+        return render(resp);
+    }
+    // The body shape of an error now depends on request headers, so every error response must say
+    // so — otherwise a shared cache can serve an SDK the browser's HTML (or the reverse).
+    let mut resp = resp;
+    resp.headers
+        .push(("vary".to_owned(), crate::error_page::VARY.to_owned()));
+    if !wants_html {
+        return render(resp);
+    }
+    let S3Body::Bytes(ref body) = resp.body else {
+        return render(resp);
+    };
+    // Our own error document, so a scan for the element is sufficient — no XML parser needed.
+    let xml = std::str::from_utf8(body).unwrap_or_default();
+    let code = xml
+        .split_once("<Code>")
+        .and_then(|(_, rest)| rest.split_once("</Code>"))
+        .map(|(c, _)| c)
+        .unwrap_or_default()
+        .to_owned();
+    let request_id = resp
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("x-amz-request-id"))
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default();
+
+    html_error_response(resp.status, &code, resource, &request_id, &resp.headers)
+}
+
+/// Build the HTML error page response: the page itself plus the headers that make it safe to serve
+/// attacker-influenced text (a `default-src 'none'` CSP and `nosniff`) and uncacheable.
+fn html_error_response(
+    status: StatusCode,
+    code: &str,
+    resource: &str,
+    request_id: &str,
+    carry: &[(String, String)],
+) -> Response<ResponseBody> {
+    let html = crate::error_page::render(status, code, resource, request_id);
+    let mut builder = Response::builder().status(status);
+    // Carry over everything except the body-describing headers we are replacing.
+    for (k, v) in carry {
+        if k.eq_ignore_ascii_case("content-type") || k.eq_ignore_ascii_case("content-length") {
+            continue;
+        }
+        builder = builder.header(k, v);
+    }
+    builder
+        .header("content-type", "text/html; charset=utf-8")
+        // The page interpolates an attacker-controlled path. It is escaped, but a page that can
+        // load nothing and run nothing cannot be turned into a reflected-XSS sink even if that
+        // escaping ever regressed.
+        .header(
+            "content-security-policy",
+            "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'",
+        )
+        .header("x-content-type-options", "nosniff")
+        .header("cache-control", "no-store")
+        .header("vary", crate::error_page::VARY)
+        // A share token rides the URL; keep it out of any onward request this page could trigger.
+        // (It has no links or subresources, but the header costs nothing and the share error branch
+        // returns before the normal share headers are applied.)
+        .header("referrer-policy", "no-referrer")
+        .body(full_body(Bytes::from(html)))
+        .unwrap_or_else(|_| render_fallback(status))
+}
+
+/// A last-resort empty response if the HTML response somehow fails to build.
+fn render_fallback(status: StatusCode) -> Response<ResponseBody> {
+    Response::builder()
+        .status(status)
+        .body(full_body(Bytes::new()))
+        .expect("status-only response is always valid")
 }
 
 /// Minimal percent-decoding for path/query segments.

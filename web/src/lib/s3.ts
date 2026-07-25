@@ -149,6 +149,63 @@ export async function getObjectBlob(
   return await res.blob();
 }
 
+/**
+ * A same-origin object URL for INLINE preview, carrying the server-side response-header overrides
+ * that make it safe to hand to a script-inert element (`<img>`/`<video>`/`<audio>`) or a forced-type
+ * `<iframe>` (PDF). `mime` sets `response-content-type` so an object stored as `application/octet-
+ * stream` still renders as the right type; the server also stamps `x-content-type-options: nosniff`,
+ * so a mistyped/HTML object served as e.g. `application/pdf` is handed to the PDF viewer, never the
+ * HTML parser (audit #13). Reuses {@link objectPath} for the audit-#31 dot-segment escaping. Auth
+ * rides the httpOnly session cookie automatically on these same-origin requests.
+ */
+export function previewUrl(
+  bucket: string,
+  key: string,
+  opts: { mime?: string; disposition?: "inline" | "attachment"; versionId?: string } = {},
+): string {
+  const params = new URLSearchParams();
+  if (opts.versionId) params.set("versionId", opts.versionId);
+  if (opts.mime) params.set("response-content-type", opts.mime);
+  params.set("response-content-disposition", opts.disposition ?? "inline");
+  return `${objectPath(bucket, key)}?${params.toString()}`;
+}
+
+export interface TextSlice {
+  text: string;
+  /** True when the object is larger than what we fetched. */
+  truncated: boolean;
+  /** Full object size in bytes, or null if the server didn't report it. */
+  totalBytes: number | null;
+}
+
+/**
+ * Fetch the first `maxBytes` of an object as UTF-8 text for inline text/code/markdown/csv preview.
+ * A Range request keeps a huge log out of the DOM. The bytes are rendered as inert text by the caller
+ * — never navigated to, never innerHTML — so they can't become active content (audit #13).
+ */
+export async function getObjectText(
+  bucket: string,
+  key: string,
+  opts: { versionId?: string; maxBytes?: number } = {},
+): Promise<TextSlice> {
+  const max = opts.maxBytes ?? 2 * 1024 * 1024;
+  const q = opts.versionId ? `?versionId=${encodeURIComponent(opts.versionId)}` : "";
+  const res = await fetch(objectPath(bucket, key) + q, {
+    headers: s3headers({ Range: `bytes=0-${max - 1}` }),
+  });
+  // A zero-byte object (or an otherwise-unsatisfiable range) comes back 416 — treat as empty.
+  if (res.status === 416) return { text: "", truncated: false, totalBytes: 0 };
+  if (!res.ok) throw await s3Error(res, "load preview");
+  let totalBytes: number | null = null;
+  const cr = res.headers.get("Content-Range"); // "bytes 0-N/TOTAL"
+  const m = cr ? /\/(\d+)\s*$/.exec(cr) : null;
+  if (m) totalBytes = Number(m[1]);
+  const buf = await res.arrayBuffer();
+  const text = new TextDecoder("utf-8", { fatal: false }).decode(buf);
+  const truncated = totalBytes !== null ? totalBytes > buf.byteLength : buf.byteLength >= max;
+  return { text, truncated, totalBytes };
+}
+
 export async function deleteObject(
   bucket: string,
   key: string,

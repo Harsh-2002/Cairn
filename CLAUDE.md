@@ -34,6 +34,7 @@ rotation), [`docs/backup-restore.md`](./docs/backup-restore.md),
 [`docs/migration.md`](./docs/migration.md) (import from another S3 store),
 [`docs/s3-api-matrix.md`](./docs/s3-api-matrix.md), [`docs/benchmarks.md`](./docs/benchmarks.md).
 web console visual system: [`docs/design.md`](./docs/design.md). Doc index: [`docs/CLAUDE.md`](./docs/CLAUDE.md).
+External-monitoring dashboard (OpenObserve, generated): [`dashboards/`](./dashboards).
 
 ## Build, test, and the gate
 

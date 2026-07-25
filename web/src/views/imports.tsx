@@ -14,7 +14,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { api, errorMessage } from "@/lib/api";
-import { copyText } from "@/components/copy-field";
+import { copyText } from "@/lib/clipboard";
 import { bytes } from "@/lib/format";
 import { useResource } from "@/lib/use-resource";
 import { useLiveTopic } from "@/lib/live";

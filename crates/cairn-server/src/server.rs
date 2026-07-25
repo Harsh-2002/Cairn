@@ -559,6 +559,23 @@ async fn handle(
 
     let infra =
         method == Method::GET && matches!(path.as_str(), "/healthz" | "/readyz" | "/metrics");
+    // Load-shed and timeout are the two failures a person is most likely to meet under load, and
+    // both answer before the request ever reaches the S3 adapter. Decide here, while the head is
+    // still in hand, whether this caller is a browser navigating (ARCH 25.1.1); machine clients keep
+    // the exact plain-text body they have always received.
+    let shed_wants_html = {
+        let hdrs: Vec<(String, String)> = req
+            .headers()
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.as_str().to_owned(),
+                    v.to_str().unwrap_or_default().to_owned(),
+                )
+            })
+            .collect();
+        crate::error_page::wants_html_pairs(&method, &hdrs)
+    };
 
     let response = async move {
         // Infra endpoints (`/healthz`, `/readyz`, `/metrics`) must answer even when the server is
@@ -571,7 +588,12 @@ async fn handle(
             match state.concurrency.try_acquire() {
                 Ok(p) => Some(p),
                 Err(_) => {
-                    return error_response(StatusCode::SERVICE_UNAVAILABLE, "TooManyRequests");
+                    return shed_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "TooManyRequests",
+                        shed_wants_html,
+                        &request_id,
+                    );
                 }
             }
         };
@@ -594,7 +616,12 @@ async fn handle(
         };
         let mut resp = match tokio::time::timeout(state.request_timeout, work).await {
             Ok(r) => r,
-            Err(_) => error_response(StatusCode::SERVICE_UNAVAILABLE, "RequestTimeout"),
+            Err(_) => shed_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "RequestTimeout",
+                shed_wants_html,
+                &request_id,
+            ),
         };
         let status = resp.status();
         let elapsed_dur = start.elapsed();
@@ -896,6 +923,35 @@ fn text(status: StatusCode, body: &'static str) -> Response<ResponseBody> {
         .header("content-type", "text/plain")
         .body(full_body(Bytes::from_static(body.as_bytes())))
         .expect("valid text response")
+}
+
+/// The load-shed / request-timeout answer. A browser navigation gets the same readable page every
+/// other failure renders (ARCH 25.1.1); every machine client keeps the byte-identical plain-text
+/// body, which the stress harnesses assert on.
+fn shed_response(
+    status: StatusCode,
+    code: &str,
+    wants_html: bool,
+    request_id: &str,
+) -> Response<ResponseBody> {
+    if wants_html {
+        let html = crate::error_page::render(status, code, "", request_id);
+        if let Ok(resp) = Response::builder()
+            .status(status)
+            .header("content-type", "text/html; charset=utf-8")
+            .header(
+                "content-security-policy",
+                "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'",
+            )
+            .header("x-content-type-options", "nosniff")
+            .header("cache-control", "no-store")
+            .header("vary", crate::error_page::VARY)
+            .body(full_body(Bytes::from(html)))
+        {
+            return resp;
+        }
+    }
+    error_response(status, code)
 }
 
 fn error_response(status: StatusCode, code: &str) -> Response<ResponseBody> {
