@@ -75,7 +75,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: "22"
           cache: npm
@@ -135,7 +135,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Free disk space
-        uses: jlumbroso/free-disk-space@main
+        uses: jlumbroso/free-disk-space@v1.3.1
         with:
           tool-cache: false
           large-packages: false
@@ -157,7 +157,7 @@ jobs:
           name: cairn-bin
           path: target/debug
       - run: chmod +x target/debug/cairn
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.x"
       - run: pip install boto3
@@ -175,7 +175,7 @@ jobs:
           name: cairn-bin
           path: target/debug
       - run: chmod +x target/debug/cairn
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.x"
       - run: pip install boto3
@@ -193,7 +193,7 @@ jobs:
           name: cairn-bin
           path: target/debug
       - run: chmod +x target/debug/cairn
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.x"
       - run: pip install boto3
@@ -211,7 +211,7 @@ jobs:
           name: cairn-bin
           path: target/debug
       - run: chmod +x target/debug/cairn
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.x"
       - run: pip install boto3
@@ -229,7 +229,7 @@ jobs:
           name: cairn-bin
           path: target/debug
       - run: chmod +x target/debug/cairn
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.x"
       - run: pip install boto3
@@ -247,7 +247,7 @@ jobs:
           name: cairn-bin
           path: target/debug
       - run: chmod +x target/debug/cairn
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.x"
       - run: pip install boto3
@@ -265,7 +265,7 @@ jobs:
           name: cairn-bin
           path: target/debug
       - run: chmod +x target/debug/cairn
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.x"
       - run: pip install boto3
@@ -285,7 +285,7 @@ jobs:
           name: cairn-bin
           path: target/debug
       - run: chmod +x target/debug/cairn
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.x"
       - run: pip install boto3
@@ -303,7 +303,7 @@ jobs:
           name: cairn-bin
           path: target/debug
       - run: chmod +x target/debug/cairn
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.x"
       # botocore[crt] lets boto3 emit CRC32C + CRC64NVME so the harness exercises every algorithm.
@@ -322,7 +322,7 @@ jobs:
           name: cairn-bin
           path: target/debug
       - run: chmod +x target/debug/cairn
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.x"
       - run: pip install boto3
@@ -340,7 +340,7 @@ jobs:
           name: cairn-bin
           path: target/debug
       - run: chmod +x target/debug/cairn
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.x"
       - run: pip install boto3
@@ -358,7 +358,7 @@ jobs:
           name: cairn-bin
           path: target/debug
       - run: chmod +x target/debug/cairn
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.x"
       - run: pip install boto3
@@ -376,7 +376,7 @@ jobs:
           name: cairn-bin
           path: target/debug
       - run: chmod +x target/debug/cairn
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.x"
       - run: pip install boto3
@@ -394,7 +394,7 @@ jobs:
           name: cairn-bin
           path: target/debug
       - run: chmod +x target/debug/cairn
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.x"
       - run: pip install boto3
@@ -412,7 +412,7 @@ jobs:
           name: cairn-bin
           path: target/debug
       - run: chmod +x target/debug/cairn
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.x"
       - run: pip install boto3
@@ -472,7 +472,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.x"
       - run: pip install boto3
@@ -516,7 +516,7 @@ jobs:
           name: cairn-bin
           path: target/debug
       - run: chmod +x target/debug/cairn
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.x"
       - name: Add a key, re-wrap stored secrets onto it, retire the old key (sharded); assert the fail-closed retire-gate
@@ -547,7 +547,7 @@ jobs:
           name: cairn-bin
           path: target/debug
       - run: chmod +x target/debug/cairn
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.x"
       - name: Race N clients on one key (create / CAS / last-writer); assert atomic, no corruption
@@ -571,7 +571,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.x"
       # Self-builds `cairn --features failpoints` (see crash_multipoint.sh) — keeps its own compile.
@@ -590,7 +590,7 @@ jobs:
           name: cairn-bin
           path: target/debug
       - run: chmod +x target/debug/cairn
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.x"
       - run: pip install boto3
@@ -609,7 +609,7 @@ jobs:
           name: cairn-bin
           path: target/debug
       - run: chmod +x target/debug/cairn
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.x"
       - run: pip install boto3
@@ -648,7 +648,7 @@ jobs:
           name: cairn-bin
           path: target/debug
       - run: chmod +x target/debug/cairn
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.x"
       # boto3 drives the explicit-SSE correctness arm (warp cannot send SSE headers).
@@ -675,7 +675,7 @@ jobs:
           name: cairn-bin
           path: target/debug
       - run: chmod +x target/debug/cairn
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.x"
       # boto3 IS this harness (low-level multipart + threads); a box without it must go red, not green.
@@ -704,7 +704,7 @@ jobs:
           name: cairn-bin
           path: target/debug
       - run: chmod +x target/debug/cairn
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.x"
       # boto3 is half this harness (the malformed-framing scenario is raw sockets + hand-rolled
@@ -739,7 +739,7 @@ jobs:
           name: cairn-bin
           path: target/debug
       - run: chmod +x target/debug/cairn
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.x"
       # boto3 IS this harness (SSE, versioning, low-level multipart, delete markers, byte-exact
@@ -777,7 +777,7 @@ jobs:
           name: cairn-bin
           path: target/debug
       - run: chmod +x target/debug/cairn
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.x"
       # boto3 IS this harness (SSE, versioning, low-level multipart, object lock, STS); a box without
@@ -809,7 +809,7 @@ jobs:
           name: cairn-bin
           path: target/debug
       - run: chmod +x target/debug/cairn
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.x"
       - name: Out-of-space 507 on a constrained FS, huge-object round-trip, many objects paginated
@@ -852,7 +852,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Free disk space
-        uses: jlumbroso/free-disk-space@main
+        uses: jlumbroso/free-disk-space@v1.3.1
         with:
           tool-cache: false
           large-packages: false
