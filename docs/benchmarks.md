@@ -373,9 +373,10 @@ dedicated hardware (e.g. the arm64 testbed) for representative throughput.
 > `REGRESS_PCT` or treat single-run swings as noise. The error-count / liveness / RSS-leak assertions
 > are robust regardless and are what the PASS/FAIL verdict hinges on.
 
-## 7. Head-to-head vs MinIO (`conformance/bench_compare.sh`, per-push CI)
+## 7. Head-to-head vs MinIO (`conformance/bench_compare.sh`, per-commit CI)
 
-Runs on **every push** (the `bench-compare` CI job) to answer one question continuously: *for each S3
+Runs once on **every commit** (the `bench-compare` CI job — via the `pull_request` trigger on a branch
+under review, via `push` on `main`) to answer one question continuously: *for each S3
 operation, how does Cairn compare to MinIO on the same machine?* The harness boots **both** servers on
 one host — Cairn from the built binary, MinIO from a **pinned** release binary
 (`RELEASE.2025-09-07T16-13-09Z`, `dl.min.io`) — single-node/single-drive, plaintext HTTP, and drives

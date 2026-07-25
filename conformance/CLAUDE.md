@@ -291,7 +291,8 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   `--features fast-io` Linux build for `sendfile_*` (else they SKIP); `warp`/`go` for `warp*`.
 - Prefer asserting on synchronous CLI stdout or a metric/poll loop over `sleep` — the no-sleep
   harnesses are deliberately deterministic; don't add timing flake.
-- **Every real test runs in CI on every push** — the whole point of the harness layer is that each
+- **Every real test runs in CI on every commit** (once — via `pull_request` on a branch under review,
+  via `push` on `main`) — the whole point of the harness layer is that each
   commit gets a complete verdict; running locally is only a dev convenience. `mesh.sh` (5-node) and
   `sts_xml.sh` (STS XML surface) are now CI-gated jobs like the rest; `mesh` needs the internal-endpoint
   escape hatch (`CAIRN_ALLOW_INTERNAL_ENDPOINTS=true`, set by `mesh.py`) because it wires targets
