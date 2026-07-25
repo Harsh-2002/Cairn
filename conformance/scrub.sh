@@ -111,8 +111,63 @@ corrupt_blob() {
   # Guard the selection: the object blobs these arms create are ~1 KiB+; a tiny file means we picked
   # the wrong one and the corruption would land somewhere the scrub never reads.
   [ "${size:-0}" -ge 100 ] 2>/dev/null || fail "picked an implausibly small blob ($size bytes) under $DATADIR/$bucket — refusing to corrupt the wrong file"
-  printf '\xff' | dd of="$blob" bs=1 seek="$((size / 2))" count=1 conv=notrunc 2>/dev/null
-  echo "  corrupted one byte of $blob ($size bytes)"
+  # PROVE the corruption, do not assume it. This used to `printf '\xff' | dd … 2>/dev/null` and then
+  # print "corrupted one byte" unconditionally: dd's status was discarded, and writing 0xff over a
+  # byte that is ALREADY 0xff is a no-op. Either way the bytes were untouched, the scrub then
+  # correctly verified a healthy blob, and the arm failed 60s later blaming the scrub — the one
+  # explanation the log ruled *in*, while the real cause (the write never landed) was invisible.
+  # Flip the existing byte instead, so the write always changes the file, and verify it did.
+  local off before after
+  off=$(( size / 2 ))
+  before="$(md5sum "$blob" | cut -d' ' -f1)"
+  "$PY" - "$blob" "$off" <<'PY' || fail "the corrupting write itself failed on $blob — the scrub is not at fault"
+import sys
+path, off = sys.argv[1], int(sys.argv[2])
+with open(path, "r+b") as f:
+    f.seek(off)
+    b = f.read(1)
+    if not b:
+        raise SystemExit(f"offset {off} is past EOF of {path}")
+    f.seek(off)
+    f.write(bytes([b[0] ^ 0x5A]))          # XOR: always a different byte, whatever was there
+    f.flush()
+    import os
+    os.fsync(f.fileno())                    # the scrub reads through the filesystem, so land it there
+PY
+  after="$(md5sum "$blob" | cut -d' ' -f1)"
+  [ "$before" != "$after" ] || fail \
+    "the corrupting write did not change $blob (offset $off of ${size}B) — the scrub is not at fault"
+  echo "  corrupted one byte of $blob ($size bytes) at offset $off [md5 ${before:0:8} -> ${after:0:8}]"
+  # More than one blob under the bucket means `find | sort | head` may have hit a superseded orphan
+  # that the scrub correctly never reads. Surface it instead of letting it read as a missed detection.
+  local nblobs
+  nblobs="$(find "$DATADIR/$bucket" -type f | wc -l)"
+  [ "$nblobs" -eq 1 ] || echo "  NOTE: $nblobs blob files under $DATADIR/$bucket — the corrupted one may be an orphan"
+}
+
+# Prove the corruption landed on the blob the OBJECT RESOLVES TO, not on an orphaned or superseded
+# file the scrub correctly ignores. Only meaningful where the read path authenticates (encrypted or
+# compressed containers): a tampered *plaintext* blob still streams back fine, because a plaintext
+# read carries no integrity check — which is the very gap the scrub exists to close.
+assert_object_unreadable() { # $1=bucket $2=key
+  local verdict
+  verdict="$("$PY" - "$AK" "$SK" "http://127.0.0.1:$ARMPORT" "$1" "$2" <<'PY'
+import sys, boto3
+from botocore.config import Config
+ak, sk, ep, bucket, key = sys.argv[1:6]
+s3 = boto3.client("s3", endpoint_url=ep, aws_access_key_id=ak, aws_secret_access_key=sk,
+                  region_name="us-east-1",
+                  config=Config(s3={"addressing_style": "path"}, retries={"max_attempts": 1}))
+try:
+    s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+    print("READABLE")
+except Exception:
+    print("UNREADABLE")
+PY
+)"
+  [ "$verdict" = "UNREADABLE" ] || fail \
+    "after corruption s3://$1/$2 still reads back intact — the write hit a file the object does not resolve to (an orphan/superseded blob), so this run proves nothing about the scrub"
+  echo "  confirmed: the corrupted blob is the one s3://$1/$2 resolves to"
 }
 
 # The shared assertions every arm makes. POLL for detection rather than a fixed sleep: the scrub runs
@@ -171,6 +226,7 @@ put_object scrub obj 100000 ""
 # by corrupt>=1 and proves nothing about the healthy path).
 put_object intact healthy 100000 ""
 corrupt_blob scrub
+assert_object_unreadable scrub obj
 assert_pass atrest
 scanned="$(metric '^cairn_scrub_objects_total')"
 corrupt="$(metric '^cairn_scrub_corruption_total')"
@@ -186,6 +242,7 @@ start_node ssesd "$((PORT + 2))" "$((UIPORT + 2))"
 put_object plain other 1000 ""
 put_object scrub obj 100000 AES256
 corrupt_blob scrub
+assert_object_unreadable scrub obj
 assert_pass ssesd
 stop_node
 echo "PASS: the scrub detected corruption of a client-SSE-S3 blob"
