@@ -22,7 +22,8 @@ manifest, plus a multi-arch image at `ghcr.io/harsh-2002/cairn`. Verify a downlo
   (header and streaming-chunked) and Bearer authentication. The aws CLI and the standard AWS SDKs
   work against it.
 - Web console: on its own port, manage buckets and users; browse, upload, download and share
-  objects; mint access keys scoped by a policy; view storage, compression, and replication status;
+  objects; preview images, video, audio, PDFs, Markdown, JSON, CSV and text in place without
+  downloading them; mint access keys scoped by a policy; view storage, compression, and replication status;
   jump anywhere with a command palette; and see when a newer release is available (an hourly,
   opt-out check).
 - Access control: bucket policies, ACLs, Block Public Access, Object Ownership, and short-lived
@@ -37,7 +38,8 @@ manifest, plus a multi-arch image at `ghcr.io/harsh-2002/cairn`. Verify a downlo
   (`CAIRN_ENCRYPT_AT_REST`).
 - Storage efficiency: optional per-bucket block compression, with range reads that touch only the
   blocks they need.
-- Operations: Prometheus metrics, liveness and readiness endpoints, structured logs, asynchronous
+- Operations: Prometheus metrics (with a ready-to-import [dashboard](dashboards/) for an external
+  monitoring stack), liveness and readiness endpoints, structured logs, asynchronous
   bucket replication to another node or S3 endpoint, webhook event notifications, one-shot streaming
   import/migration of buckets and objects from another S3-compatible store (MinIO/Garage/R2/AWS/another
   Cairn) into this node, and a CLI for bootstrap, config validation, integrity checks, and backup and
