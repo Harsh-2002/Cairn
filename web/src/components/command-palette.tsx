@@ -223,7 +223,10 @@ export function CommandPalette() {
                 setActive(0);
               }}
               onKeyDown={onInputKeyDown}
-              className="h-11 w-full bg-transparent text-sm outline-none placeholder:text-muted-foreground"
+              // The combobox input is always focused while the palette is open, so the global
+              // :focus-visible ring (globals.css) just draws a stray rectangle around it — the real
+              // cursor is the highlighted result row. Suppress the ring here only.
+              className="h-11 w-full bg-transparent text-sm outline-none focus-visible:ring-0 focus-visible:ring-offset-0 placeholder:text-muted-foreground"
               autoComplete="off"
               autoCorrect="off"
               spellCheck={false}

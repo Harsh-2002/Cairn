@@ -2,6 +2,7 @@ import {
   useCallback,
   useEffect,
   useId,
+  useMemo,
   useRef,
   useState,
   type ChangeEvent,
@@ -66,6 +67,7 @@ import {
   BreadcrumbSeparator,
 } from "@/components/primitives/breadcrumb";
 import { ConfirmDialog } from "@/components/confirm-dialog";
+import { ObjectPreview, type PreviewItem } from "@/components/object-preview";
 import { DataTable, SkeletonRows, type Column } from "@/components/data-table";
 import { FieldError } from "@/components/field-error";
 import { EmptyState } from "@/components/empty-state";
@@ -469,6 +471,28 @@ export function BucketBrowser() {
   const [pendingDelete, setPendingDelete] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
 
+  // Inline object preview (image / video / audio / pdf / text / …), opened from an object name or the
+  // row "Preview" action. `preview` snapshots the previewable set + the current index so the viewer
+  // can page prev/next; the viewer renders every path through a script-inert mechanism (audit #13).
+  const [preview, setPreview] = useState<{ items: PreviewItem[]; index: number } | null>(null);
+  const objectPreviewItems = useMemo<PreviewItem[]>(
+    () => (objects ?? []).map((o) => ({ key: o.key, size: o.size })),
+    [objects],
+  );
+  const tagPreviewItems = useMemo<PreviewItem[]>(
+    () =>
+      (tagObjects ?? []).map((o) => ({
+        key: o.key,
+        size: o.size,
+        versionId: o.version_id && o.version_id !== "null" ? o.version_id : undefined,
+      })),
+    [tagObjects],
+  );
+  const openPreviewAt = useCallback((items: PreviewItem[], key: string) => {
+    const index = items.findIndex((it) => it.key === key);
+    setPreview({ items, index: index < 0 ? 0 : index });
+  }, []);
+
   // Multi-select for bulk delete (object mode only).
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [bulkDeleting, setBulkDeleting] = useState(false);
@@ -606,27 +630,6 @@ export function BucketBrowser() {
       toast.error(errorMessage(e, "Failed to create the folder."));
     } finally {
       setCreatingFolder(false);
-    }
-  }
-
-  // Open an object via a short-lived presigned GET URL. Object bytes are never rendered inline
-  // same-origin: an attacker-uploaded object whose stored Content-Type is active (text/html,
-  // image/svg+xml, ...) would otherwise execute as stored XSS in the console origin (audit #13).
-  // Force an attachment disposition and a benign content type so the browser saves the bytes
-  // instead of interpreting them; the server also sends X-Content-Type-Options: nosniff.
-  async function openPreview(key: string) {
-    try {
-      const res = await api.presignShare(name, {
-        key,
-        method: "GET",
-        expires_in_secs: 3600,
-        version_id: null,
-        response_content_disposition: "attachment",
-        content_type: "application/octet-stream",
-      });
-      window.open(res.url, "_blank", "noopener,noreferrer");
-    } catch (e) {
-      toast.error(errorMessage(e, "Could not open preview."));
     }
   }
 
@@ -1104,12 +1107,14 @@ export function BucketBrowser() {
               {tagObjects.map((o) => (
                 <TableRow key={`${o.key}:${o.version_id}`}>
                   <TableCell className="max-w-[28rem]">
-                    <span
-                      className="block truncate font-mono text-[13px]"
-                      title={o.key}
+                    <button
+                      type="button"
+                      onClick={() => openPreviewAt(tagPreviewItems, o.key)}
+                      className="block max-w-full truncate text-left font-mono text-[13px] hover:underline focus-visible:underline"
+                      title={`Preview ${o.key}`}
                     >
                       {o.key}
-                    </span>
+                    </button>
                   </TableCell>
                   <TableCell data-label="Size" className="text-right text-[13px] tabular-nums">
                     {bytes(o.size)}
@@ -1130,7 +1135,9 @@ export function BucketBrowser() {
                         </Button>
                       </DropdownMenuTrigger>
                       <DropdownMenuContent align="end">
-                        <DropdownMenuItem onSelect={() => void openPreview(o.key)}>
+                        <DropdownMenuItem
+                          onSelect={() => openPreviewAt(tagPreviewItems, o.key)}
+                        >
                           Preview
                         </DropdownMenuItem>
                         <DropdownMenuItem onSelect={() => void download(o.key)}>
@@ -1292,12 +1299,14 @@ export function BucketBrowser() {
                             onCheckedChange={() => toggleSelected(o.key)}
                             aria-label={`Select ${o.key}`}
                           />
-                          <span
-                            className="block truncate font-mono text-[13px]"
-                            title={o.key}
+                          <button
+                            type="button"
+                            onClick={() => openPreviewAt(objectPreviewItems, o.key)}
+                            className="block max-w-full truncate text-left font-mono text-[13px] hover:underline focus-visible:underline"
+                            title={`Preview ${o.key}`}
                           >
                             {o.key.slice(path.length) || o.key}
-                          </span>
+                          </button>
                         </span>
                       </TableCell>
                       <TableCell data-label="Size" className="text-right text-[13px] tabular-nums">
@@ -1319,7 +1328,9 @@ export function BucketBrowser() {
                             </Button>
                           </DropdownMenuTrigger>
                           <DropdownMenuContent align="end">
-                            <DropdownMenuItem onSelect={() => void openPreview(o.key)}>
+                            <DropdownMenuItem
+                              onSelect={() => openPreviewAt(objectPreviewItems, o.key)}
+                            >
                               Preview
                             </DropdownMenuItem>
                             <DropdownMenuItem onSelect={() => void download(o.key)}>
@@ -1458,6 +1469,21 @@ export function BucketBrowser() {
           if (!open) setShareKey(null);
         }}
       />
+
+      {preview && (
+        <ObjectPreview
+          bucket={name}
+          items={preview.items}
+          index={preview.index}
+          open
+          onIndexChange={(i) => setPreview((p) => (p ? { ...p, index: i } : p))}
+          onOpenChange={(open) => {
+            if (!open) setPreview(null);
+          }}
+          onDownload={(it) => void download(it.key, it.versionId)}
+          onShare={(it) => setShareKey(it.key)}
+        />
+      )}
 
       <ManageSharesDialog
         bucket={name}
