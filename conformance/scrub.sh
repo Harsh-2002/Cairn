@@ -149,6 +149,10 @@ PY
 # file the scrub correctly ignores. Only meaningful where the read path authenticates (encrypted or
 # compressed containers): a tampered *plaintext* blob still streams back fine, because a plaintext
 # read carries no integrity check — which is the very gap the scrub exists to close.
+# A bare `except Exception -> UNREADABLE` would make this assertion pass VACUOUSLY: a refused
+# connection, a 404 or a 403 all raise, so a broken node would read as "the corruption landed".
+# That is the same shape of bug this harness exists to rule out, so gate on a HEAD first — it proves
+# the node is up, the credentials work and the version row resolves — and only then classify the GET.
 assert_object_unreadable() { # $1=bucket $2=key
   local verdict
   verdict="$("$PY" - "$AK" "$SK" "http://127.0.0.1:$ARMPORT" "$1" "$2" <<'PY'
@@ -159,15 +163,25 @@ s3 = boto3.client("s3", endpoint_url=ep, aws_access_key_id=ak, aws_secret_access
                   region_name="us-east-1",
                   config=Config(s3={"addressing_style": "path"}, retries={"max_attempts": 1}))
 try:
+    s3.head_object(Bucket=bucket, Key=key)
+except Exception as e:
+    print(f"NOHEAD {type(e).__name__}")
+    raise SystemExit(0)
+try:
     s3.get_object(Bucket=bucket, Key=key)["Body"].read()
     print("READABLE")
-except Exception:
-    print("UNREADABLE")
+except Exception as e:
+    print(f"UNREADABLE {type(e).__name__}")
 PY
 )"
-  [ "$verdict" = "UNREADABLE" ] || fail \
-    "after corruption s3://$1/$2 still reads back intact — the write hit a file the object does not resolve to (an orphan/superseded blob), so this run proves nothing about the scrub"
-  echo "  confirmed: the corrupted blob is the one s3://$1/$2 resolves to"
+  case "$verdict" in
+    UNREADABLE*)
+      echo "  confirmed: the corrupted blob is the one s3://$1/$2 resolves to ($verdict)" ;;
+    READABLE)
+      fail "after corruption s3://$1/$2 still reads back intact — the write hit a file the object does not resolve to (an orphan/superseded blob), so this run proves nothing about the scrub" ;;
+    *)
+      fail "could not even HEAD s3://$1/$2 after corruption — the node or its metadata is the problem, so this run proves nothing about the scrub (verdict: ${verdict:-<empty>})" ;;
+  esac
 }
 
 # The shared assertions every arm makes. POLL for detection rather than a fixed sleep: the scrub runs
