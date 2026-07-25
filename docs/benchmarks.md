@@ -429,34 +429,53 @@ body below `CAIRN_FASTIO_MIN_BYTES`) falls back to the unchanged streamed path b
 is **server CPU per GiB sent**, not latency, so the measurement is an A/B of CPU-seconds/GiB at equal
 throughput.
 
-The fast path is now a small Cairn-owned **HTTP/1.1 keep-alive loop** on the plaintext data-plane
+The fast path is a small Cairn-owned **HTTP/1.1 keep-alive loop** on the plaintext data-plane
 listener: per connection it serves each eligible large GET with one `sendfile(2)` and keeps the
 connection open for the next request, handing the connection to hyper (with the already-read bytes
-replayed) only when it hits a request it cannot serve. So a connection-pooled client engages the
-zero-copy path on **every** eligible GET on a connection, not just the first. The size floor
-(`CAIRN_FASTIO_MIN_BYTES`, default 256 KiB) still keeps small objects on the streamed path, where the
-per-request `sendfile` setup would outweigh the zero-copy saving.
+replayed) when it hits a request it cannot serve. **That hand-off is permanent for that connection.**
+So the loop engages on every eligible GET of a connection *it still owns* — but a connection whose
+**first** request is not an eligible GET is lost to hyper for its whole lifetime, and every later GET
+on it bypasses the fast path. The size floor (`CAIRN_FASTIO_MIN_BYTES`, default 256 KiB) still keeps
+small objects on the streamed path, where the per-request `sendfile` setup would outweigh the
+zero-copy saving.
 
-### Engagement: before vs after the keep-alive rewrite
+**This is the load-bearing limitation, and it is why the fast path is still off by default.** A
+pooled S3 client (warp, boto3, aws-sdk) opens a few connections, and the first request on each is a
+bucket-create, a prepare PUT or a HEAD — never a large GET. Every one of those connections is handed
+to hyper at request one and then reused for the entire GET phase, so the fast path serves nothing.
+See the measurements below.
 
-The earlier design **peeked only the first request** of a fresh TCP connection and then force-closed
-or handed the socket to hyper, so a pooled client accelerated only its first request. Measured then on
-both x86_64 and a real aarch64 Pi (kernel 7.0) under `warp get --concurrent 4`:
+### Engagement: measured, and still 0% under a pooled client
+
+The original design **peeked only the first request** of a fresh TCP connection, then force-closed or
+handed the socket to hyper. Measured on x86_64 and a real aarch64 Pi (kernel 7.0) under
+`warp get --concurrent 4`:
 
 | run | GETs served | served via `sendfile` | engage |
 |---|---:|---:|---:|
 | x86_64, fast-io (peek-first, old) | 1703 | 0 | **0%** |
 | aarch64, fast-io (peek-first, old) | 800 | 0 | **0%** |
+| x86_64, fast-io (keep-alive loop, 2026-07) | 8 MiB × 20 s | 0 | **0%** |
+| x86_64, fast-io (keep-alive loop) — `curl`, one connection, first request a GET | 20 | 20 | **100%** |
 
-Because `warp` (like every pooled S3 SDK — boto3, aws-sdk, etc.) opens a few keep-alive connections
-whose first request is a prepare/PUT, the peek saw a non-GET → `ineligible` → hyper owned the
-connection → every subsequent GET bypassed the fast path. The keep-alive rewrite removes that ceiling:
-the loop consumes each request and serves eligible GETs back-to-back without closing. This is now a
-**deterministic regression gate** — `conformance/sendfile_keepalive.sh` issues N GETs of a large
-object over one keep-alive connection and asserts `cairn_sendfile_get_total{result=ok}` rose by N (it
-rose by 1 under the old design); the gated `fast-io-conformance` CI job also runs the full boto3
-lifecycle through the fast path. The warp A/B above remains the way to measure the **CPU-per-GiB** win
-itself once engagement is non-zero.
+The keep-alive rewrite (`8265689`) lets the loop serve **every** eligible GET on a connection it still
+owns — the 100% row, which `conformance/sendfile_keepalive.sh` gates deterministically. **It did not
+change the pooled-client outcome.** Re-measured 2026-07 with the keep-alive loop and
+`CAIRN_FASTIO_MIN_BYTES=0`, `warp get` still engages **0%**: the counters show only
+`cairn_sendfile_fallback_total{reason="not_object"}=3` and `{reason="ineligible"}=3` — six connections,
+each handed to hyper on its *first* request (bucket-create, prepare PUT), then reused for the whole
+GET phase. `cairn_sendfile_get_total` never appears at all.
+
+So the two tests measure genuinely different things, and only one of them resembles a real client:
+`curl` issues an eligible GET as the connection's first request, which the loop keeps; a pooled SDK
+never does. **The `sendfile` fast path therefore delivers no measurable benefit to any pooled S3
+client today**, which is why it remains off by default and is not shipped in the release binaries.
+
+A CPU-per-GiB A/B is *undefined* while engagement is 0% — there is nothing on the fast path to
+measure. (`sendfile_bench.sh` correctly reports "insufficient data for a ratio".) Closing this gap
+requires keeping a connection in the loop *after* an ineligible request — i.e. replaying to hyper for
+one request and taking the connection back — which is a substantially larger change than the current
+loop and is **not** planned.
 
 > **Build note:** `fast-io` is **glibc-Linux-only**. The `ktls` dependency does not cross-compile to
 > `aarch64-unknown-linux-musl` (a `cmsghdr`/`msghdr` struct-layout mismatch), so build the fast-io

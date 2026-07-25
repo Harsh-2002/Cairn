@@ -273,6 +273,10 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
 - `load_profile.sh` (+`.py`) — throughput methodology, **NOT a gate**; see `../docs/benchmarks.md`.
 - `sendfile_keepalive.sh` — `fast-io` keep-alive engagement (pure curl): N GETs over ONE keep-alive
   conn must all engage zero-copy (`cairn_sendfile_get_total{result=ok}` += N). SKIPs on non-`fast-io`.
+  **Scope caveat:** curl's first request on the connection is an eligible GET, so the loop keeps it —
+  the best case. A pooled SDK's first request is a prepare PUT, which surrenders the connection to
+  hyper permanently; `warp get` measures **0%** engagement even with this test green. A pass proves
+  no regression, not that a real client benefits (`docs/benchmarks.md` §"Engagement").
 - `sendfile_bench.sh` — `fast-io` plaintext sendfile A/B (CPU/GiB + engage rate); **NOT a gate.**
 
 ## Notes

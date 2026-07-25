@@ -1,10 +1,18 @@
 #!/usr/bin/env bash
-# Sendfile keep-alive engagement (ARCH 7.6, `fast-io`). The whole point of the keep-alive rewrite is
-# that a POOLED client is served on the zero-copy `sendfile` path for EVERY request on a connection,
-# not just the first. This is a deterministic regression (no warp needed): PUT one large object, then
-# issue N GETs of it over a SINGLE keep-alive TCP connection (curl reuses the connection across the
-# URLs in one invocation) and assert that `cairn_sendfile_get_total{result=ok}` rose by N — under the
-# old peek-then-handoff it would rise by 1. Every body is verified byte-identical.
+# Sendfile keep-alive engagement (ARCH 7.6, `fast-io`). Asserts that once the loop OWNS a connection
+# it serves EVERY eligible GET on it via zero-copy `sendfile`, not just the first. Deterministic, no
+# warp needed: PUT one large object, then issue N GETs of it over a SINGLE keep-alive TCP connection
+# (curl reuses the connection across the URLs in one invocation) and assert that
+# `cairn_sendfile_get_total{result=ok}` rose by N — under the old peek-then-handoff it rose by 1.
+# Every body is verified byte-identical.
+#
+# SCOPE — read this before citing the result. curl's FIRST request on the connection is an eligible
+# GET, so the loop keeps the connection. That is the best case, not the common one. A pooled S3 client
+# (warp, boto3, aws-sdk) opens connections whose first request is a bucket-create or a prepare PUT;
+# the loop hands those to hyper permanently at request one, and every later GET on them bypasses the
+# fast path. Measured 2026-07: `warp get` engages **0%** even with this test at 20/20. So a pass here
+# proves the loop does not regress — it does NOT show that a real client benefits. See
+# `docs/benchmarks.md` §"Engagement".
 #
 # Needs a `--features fast-io` binary on Linux; on any other build the fast path is compiled out and
 # the engagement counter stays flat, so this is skipped there.
@@ -77,5 +85,5 @@ delta=$((after - before))
 [ "$delta" -eq "$N" ] || fail "expected $N sendfile engagements on one connection, got $delta (a regression: the connection is not being kept alive across GETs)"
 ok "every one of the $N GETs engaged the sendfile path on the single connection (delta=$delta)"
 
-echo "SENDFILE KEEP-ALIVE OK — pooled GETs engage the zero-copy path on every request, not just the first"
+echo "SENDFILE KEEP-ALIVE OK — a connection the loop owns engages zero-copy on every GET, not just the first"
 echo "PASS: sendfile keep-alive engagement holds ($N/$N on one connection)"
