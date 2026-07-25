@@ -115,8 +115,25 @@ ok "backup wrote cairn.db + blobs/ ($ENTRIES blob entries)"
 victim="$(find "$D1/data" -type f ! -path '*/.staging/*' ! -name '*.db' ! -name '*.db-wal' ! -name '*.db-shm' \
   -printf '%s\t%p\n' 2>/dev/null | sort -rn | sed -n '1p' | cut -f2-)"
 [ -n "$victim" ] || fail "could not locate the largest primary blob to corrupt"
-printf '\xff\xff\xff\xff' | dd of="$victim" bs=1 seek=1024 count=4 conv=notrunc 2>/dev/null
-ok "corrupted the primary's largest blob (post-snapshot bit-rot): $(basename "$victim")"
+# PROVE the corruption, do not assume it. This used to `printf '\xff\xff\xff\xff' | dd … 2>/dev/null`
+# and then print "corrupted" unconditionally: dd's status was discarded, and writing 0xff over bytes
+# that are ALREADY 0xff is a no-op — so a silently-skipped write left this step asserting a
+# precondition it had not established, and everything downstream would pass without ever testing
+# post-snapshot bit rot. (This is the scrub.sh failure mode; see corrupt_blob there.) Flip the
+# existing bytes instead, so the write always changes the file, and verify that it did.
+vsize="$(wc -c <"$victim")"
+[ "${vsize:-0}" -ge 1025 ] || fail "the largest primary blob is only ${vsize}B — offset 1024 is past EOF, so the bit-rot step cannot land"
+vbefore="$(md5sum "$victim" | cut -d' ' -f1)"
+# Read the byte that is actually there, XOR it, write it back: always a real change, whatever it was.
+vbyte="$(dd if="$victim" bs=1 skip=1024 count=1 status=none | od -An -tu1 | tr -d ' \n')"
+[ -n "$vbyte" ] || fail "could not read the byte at offset 1024 of $victim"
+printf "$(printf '\\x%02x' "$(( vbyte ^ 0x5A ))")" \
+  | dd of="$victim" bs=1 seek=1024 count=1 conv=notrunc status=none \
+  || fail "the corrupting write itself failed on $victim"
+sync
+vafter="$(md5sum "$victim" | cut -d' ' -f1)"
+[ "$vbefore" != "$vafter" ] || fail "the corrupting write did not change $victim — the post-snapshot bit-rot step never happened"
+ok "corrupted the primary's largest blob (post-snapshot bit-rot): $(basename "$victim") [md5 ${vbefore:0:8} -> ${vafter:0:8}]"
 
 # --- 4) restore the snapshot into a FRESH data dir; everything round-trips ---------------------
 use_data_dir "$D2"
