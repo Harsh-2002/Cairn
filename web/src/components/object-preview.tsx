@@ -86,39 +86,74 @@ const KIND_LABEL: Record<PreviewKind, string> = {
  * For images the shape is derived from the image's own aspect ratio once it loads, so a panorama
  * opens wide and a phone photo opens tall.
  */
-function shapeFor(kind: PreviewKind, aspect: number | null): { cls: string; fluid: boolean } {
+interface Shape {
+  /** Ideal width in px on a roomy screen. Narrow viewports clamp it to near-full-bleed. */
+  ideal: number;
+  /** A fixed height for content that scrolls; null shrink-wraps to the content. */
+  height: string | null;
+  /**
+   * For an image, its decoded aspect ratio. The frame is then also capped at the width the image
+   * can actually occupy once its height is limited by the viewport, so the dialog hugs the picture
+   * instead of leaving an empty gutter down each side of a tall one.
+   */
+  aspect?: number;
+}
+
+function shapeFor(kind: PreviewKind, aspect: number | null): Shape {
   switch (kind) {
     case "image":
-      if (aspect === null) return { cls: "w-[min(880px,92vw)]", fluid: true };
-      if (aspect >= 1.25) return { cls: "w-[min(1280px,96vw)]", fluid: true }; // landscape
-      if (aspect <= 0.8) return { cls: "w-[min(620px,90vw)]", fluid: true }; // portrait
-      return { cls: "w-[min(860px,92vw)]", fluid: true }; // roughly square
+      if (aspect === null) return { ideal: 880, height: null };
+      if (aspect >= 2.2) return { ideal: 1360, height: null, aspect }; // panorama
+      if (aspect >= 1.25) return { ideal: 1180, height: null, aspect }; // landscape
+      if (aspect <= 0.8) return { ideal: 700, height: null, aspect }; // portrait
+      return { ideal: 820, height: null, aspect }; // roughly square
     case "video":
       // Video is nearly always landscape and sizes itself from its own intrinsic ratio.
-      return { cls: "w-[min(1280px,96vw)]", fluid: true };
+      return { ideal: 1180, height: null };
     case "audio":
     case "none":
       // A player and a fallback card need a card, not a full-screen frame.
-      return { cls: "w-[min(560px,92vw)]", fluid: true };
+      return { ideal: 520, height: null };
     case "pdf":
       // Pages are portrait; give it height and let the viewer paginate.
-      return {
-        cls: "w-[min(1000px,94vw)] h-[min(92vh,calc(100dvh-1rem))]",
-        fluid: false,
-      };
+      return { ideal: 980, height: "min(92vh, calc(100dvh - 2rem))" };
     case "markdown":
       // Prose wants a readable measure, not the full width of a monitor.
-      return {
-        cls: "w-[min(880px,94vw)] h-[min(88vh,calc(100dvh-2rem))]",
-        fluid: false,
-      };
+      return { ideal: 860, height: "min(88vh, calc(100dvh - 2rem))" };
     default:
       // text / code / json / csv — long lines and wide tables benefit from width.
-      return {
-        cls: "w-[min(1280px,96vw)] h-[min(85vh,calc(100dvh-2rem))]",
-        fluid: false,
-      };
+      return { ideal: 1280, height: "min(85vh, calc(100dvh - 2rem))" };
   }
+}
+
+/**
+ * Geometry as inline style rather than utility classes.
+ *
+ * The dialog primitive is vendored and ships `sm:max-w-lg`; a media-query utility outranks a plain
+ * `max-w-none`, so every per-kind width was silently clamped to 512px — a wide CSV and a panorama
+ * were being squeezed into the same narrow column as a phone photo. Inline style settles it without
+ * a specificity war, and without hand-editing a file the shadcn CLI regenerates.
+ *
+ * Width is `min(ideal, 100vw - gutter)`, so the same rule that gives a monitor a 1280px frame gives
+ * a 390px phone a near-full-bleed sheet — the scarce axis on a phone is space, not margin.
+ */
+function geometryFor(shape: Shape): React.CSSProperties {
+  // `IMAGE_CHROME` is the header plus the stage padding the picture cannot use; keep it in step with
+  // the image's own max-height below.
+  const IMAGE_CHROME = "9rem";
+  const caps = [`${shape.ideal}px`, "calc(100vw - 2rem)"];
+  if (shape.aspect) {
+    // The width the image can actually fill once its height is viewport-capped. CSS calc multiplies
+    // a length by a unitless number, so this stays correct as the viewport changes — no JS needed.
+    caps.push(`calc((100dvh - ${IMAGE_CHROME}) * ${shape.aspect.toFixed(4)} + 2rem)`);
+  }
+  const width = `min(${caps.join(", ")})`;
+  return {
+    width,
+    maxWidth: width,
+    height: shape.height ?? undefined,
+    maxHeight: "calc(100dvh - 2rem)",
+  };
 }
 
 export function ObjectPreview({
@@ -169,11 +204,8 @@ export function ObjectPreview({
       <DialogContent
         showCloseButton={false}
         onKeyDown={onKeyDown}
-        className={cn(
-          "flex max-w-none flex-col gap-0 overflow-hidden p-0 transition-[width,height] duration-200 ease-out",
-          shape.cls,
-          shape.fluid && "h-auto max-h-[calc(100dvh-2rem)]",
-        )}
+        style={geometryFor(shape)}
+        className="flex flex-col gap-0 overflow-hidden p-0 transition-[width,height] duration-200 ease-out motion-reduce:transition-none"
       >
         <DialogTitle className="sr-only">Preview: {name}</DialogTitle>
         <DialogDescription className="sr-only">
@@ -206,6 +238,7 @@ export function ObjectPreview({
             <Button
               variant="ghost"
               size="icon-sm"
+              className="[@media(pointer:coarse)]:size-11"
               onClick={() => onDownload(current)}
               title="Download"
               aria-label="Download"
@@ -216,6 +249,7 @@ export function ObjectPreview({
               <Button
                 variant="ghost"
                 size="icon-sm"
+                className="[@media(pointer:coarse)]:size-11"
                 onClick={() => onShare(current)}
                 title="Share"
                 aria-label="Share"
@@ -226,6 +260,7 @@ export function ObjectPreview({
             <Button
               variant="ghost"
               size="icon-sm"
+              className="[@media(pointer:coarse)]:size-11"
               onClick={() => onOpenChange(false)}
               title="Close"
               aria-label="Close preview"
@@ -235,12 +270,12 @@ export function ObjectPreview({
           </div>
         </header>
 
-        {/* Stage. A fluid shape shrink-wraps its content (the media caps itself against the
-            viewport); a fixed shape stretches so the scrolling panes fill the frame. */}
+        {/* Stage. A shrink-wrapping shape lets the media set the height (it caps itself against the
+            viewport); a fixed-height shape stretches so the scrolling panes fill the frame. */}
         <div
           className={cn(
-            "relative flex items-stretch justify-center bg-muted/30",
-            shape.fluid ? "min-h-0" : "min-h-0 flex-1",
+            "relative flex min-h-0 items-stretch justify-center bg-muted/30",
+            shape.height !== null && "flex-1",
           )}
         >
           {items.length > 1 && (
@@ -292,7 +327,9 @@ function NavButton({
       }}
       aria-label={side === "left" ? "Previous file" : "Next file"}
       className={cn(
-        "absolute top-1/2 z-10 flex size-9 -translate-y-1/2 items-center justify-center rounded-full border bg-background/80 text-foreground shadow-sm backdrop-blur transition-opacity duration-150 ease-out",
+        // 36px reads well with a mouse; a finger needs 44 (WCAG 2.5.5 / platform guidance), so the
+        // hit area grows on coarse pointers.
+        "absolute top-1/2 z-10 flex size-9 -translate-y-1/2 items-center justify-center rounded-full border bg-background/80 text-foreground shadow-sm backdrop-blur transition-opacity duration-150 ease-out motion-reduce:transition-none [@media(pointer:coarse)]:size-11",
         disabled ? "cursor-default opacity-30" : "hover:bg-background",
         side === "left" ? "left-3" : "right-3",
       )}
@@ -435,7 +472,7 @@ function ImageStage({
             onNaturalSize(el.naturalWidth / el.naturalHeight);
           }
         }}
-        className="max-h-[calc(100dvh-11rem)] max-w-full object-contain select-none"
+        className="max-h-[calc(100dvh-9rem)] max-w-full object-contain select-none"
         // A checkerboard shows through transparent PNGs/SVGs so alpha reads clearly.
         style={{
           backgroundImage:
@@ -477,7 +514,7 @@ function VideoStage({
         controls
         preload="metadata"
         onError={() => setErrored(true)}
-        className="max-h-[calc(100dvh-11rem)] w-full rounded-md bg-black"
+        className="max-h-[calc(100dvh-9rem)] w-full rounded-md bg-black"
       >
         <track kind="captions" />
       </video>
