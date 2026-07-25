@@ -1,10 +1,11 @@
 name: CI
 
-# Runs the complete test methodology on every commit (any branch) and every pull request:
-# formatting + lint, unit/integration tests (gnu + musl, default and all-features), doc tests,
-# the boto3 S3 conformance suite, the crash-consistency (durability) harness, a two-node
-# replication soak, the warp-based stress harness, fuzz smoke tests, a benchmark compile check,
-# and coverage. Release artifacts are built by release.yml, not here.
+# Runs the complete test methodology exactly once per commit — via `pull_request` for a branch under
+# review, via `push` for `main` (see the trigger note below): formatting + lint, unit/integration
+# tests (gnu + musl, default and all-features), doc tests, the boto3 S3 conformance suite, the
+# crash-consistency (durability) harness, a two-node replication soak, the warp-based stress harness,
+# fuzz smoke tests, a benchmark compile check, and coverage. Release artifacts are built by
+# release.yml, not here.
 #
 # Build-once: the `build` job compiles the `cairn` binary a single time and uploads it as a
 # temporary artifact (retention-days: 1); every conformance job that just drives a prebuilt binary
@@ -13,8 +14,16 @@ name: CI
 # fast-io` path, and the `--features failpoints` crash harnesses) keep building, but are now warmed by
 # a shared cargo cache (Swatinem/rust-cache, wired into ./.github/actions/setup).
 on:
+  # Every commit still gets a complete verdict, but exactly ONE run per commit. `push` used to be
+  # `branches: ["**"]`, which double-ran every commit on a branch with an open PR: `github.ref` is
+  # `refs/heads/<branch>` for a push but `refs/pull/<n>/merge` for a pull_request, so the two runs
+  # landed in DIFFERENT concurrency groups and neither cancelled the other — two full 45-job suites
+  # for the same tree, competing for the same runner pool. Feature branches are covered by the
+  # `pull_request` trigger (every branch here gets a PR; Dependabot opens branch + PR atomically),
+  # and `main` is covered by `push` — which is also the run `release.yml`'s `verify-ci` gate looks
+  # for, since a pull_request run's headBranch is the PR's source branch and never `main`.
   push:
-    branches: ["**"]
+    branches: [main]
   pull_request:
 
 concurrency:

@@ -10,6 +10,14 @@ TLS, async bucket replication, an embedded React console, and a CLI.
 > **section numbers are stable** — code comments say e.g. "ARCH 28"; use the table below to open the
 > exact document instead of grepping. Read the relevant doc before any non-trivial change.
 
+**Orientation for agents.** This file is the entry point and covers *how* to work here; `AGENTS.md`
+is a symlink to it, so either filename gets you the same content. Two more things to know:
+**[`CONTRACT.md`](./CONTRACT.md)** holds the hard architectural ceilings — the things you may not
+decide alone, where the correct move is to stop and ask rather than to build. And every crate and
+major directory carries its own `CLAUDE.md` (e.g. [`crates/cairn-meta/CLAUDE.md`](./crates/cairn-meta/CLAUDE.md),
+[`web/CLAUDE.md`](./web/CLAUDE.md), [`conformance/CLAUDE.md`](./conformance/CLAUDE.md)) with
+folder-scoped context; read the nearest one before changing code in that directory.
+
 ## Documentation map — open the doc for what you're touching
 
 | Need | Document | Sections |

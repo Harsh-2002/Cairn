@@ -273,6 +273,10 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
 - `load_profile.sh` (+`.py`) — throughput methodology, **NOT a gate**; see `../docs/benchmarks.md`.
 - `sendfile_keepalive.sh` — `fast-io` keep-alive engagement (pure curl): N GETs over ONE keep-alive
   conn must all engage zero-copy (`cairn_sendfile_get_total{result=ok}` += N). SKIPs on non-`fast-io`.
+  **Scope caveat:** curl's first request on the connection is an eligible GET, so the loop keeps it —
+  the best case. A pooled SDK's first request is a prepare PUT, which surrenders the connection to
+  hyper permanently; `warp get` measures **0%** engagement even with this test green. A pass proves
+  no regression, not that a real client benefits (`docs/benchmarks.md` §"Engagement").
 - `sendfile_bench.sh` — `fast-io` plaintext sendfile A/B (CPU/GiB + engage rate); **NOT a gate.**
 
 ## Notes
@@ -291,7 +295,8 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   `--features fast-io` Linux build for `sendfile_*` (else they SKIP); `warp`/`go` for `warp*`.
 - Prefer asserting on synchronous CLI stdout or a metric/poll loop over `sleep` — the no-sleep
   harnesses are deliberately deterministic; don't add timing flake.
-- **Every real test runs in CI on every push** — the whole point of the harness layer is that each
+- **Every real test runs in CI on every commit** (once — via `pull_request` on a branch under review,
+  via `push` on `main`) — the whole point of the harness layer is that each
   commit gets a complete verdict; running locally is only a dev convenience. `mesh.sh` (5-node) and
   `sts_xml.sh` (STS XML surface) are now CI-gated jobs like the rest; `mesh` needs the internal-endpoint
   escape hatch (`CAIRN_ALLOW_INTERNAL_ENDPOINTS=true`, set by `mesh.py`) because it wires targets
