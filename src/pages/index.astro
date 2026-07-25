@@ -3,6 +3,7 @@ import Base from "../layouts/Base.astro";
 import Section from "../components/Section.astro";
 import CodeBlock from "../components/CodeBlock.astro";
 import Architecture from "../components/Architecture.astro";
+import Screenshots from "../components/Screenshots.astro";
 
 const repo = "https://github.com/Harsh-2002/Cairn";
 const docs = `${repo}/blob/main/docs`;
@@ -240,7 +241,10 @@ const bench = [
     </dl>
   </Section>
 
-  {/* 5 — Performance */}
+  {/* 5 — Console gallery */}
+  <Screenshots />
+
+  {/* 6 — Performance */}
   <Section eyebrow="Performance" title="Measured against MinIO">
     <p>
       A like-for-like comparison against MinIO, both on the same 2 vCPU / 16 GB host, both single-node

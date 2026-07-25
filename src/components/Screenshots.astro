@@ -1,0 +1,125 @@
+---
+import Section from "./Section.astro";
+
+// The console gallery. The rest of this page is typography-only on purpose; this section is the one
+// place an image earns its keep, because "the console is the product" is a claim best settled by
+// showing it. Every shot is a real screen from a running node.
+//
+// Images are WebP at 1600px (~70 KB each), lazy-loaded below the hero, with intrinsic dimensions set
+// so nothing shifts as they arrive.
+const base = import.meta.env.BASE_URL.replace(/\/?$/, "/");
+const W = 1600;
+const H = 1047;
+
+const hero = {
+  slug: "overview-dashboard",
+  caption:
+    "The Overview: bucket, object, and version counts beside node details, compression savings, and per-bucket storage.",
+};
+
+const shots = [
+  {
+    slug: "bucket-browser",
+    caption: "Browsing a bucket, with per-object preview, download, tagging, copy, share and delete.",
+  },
+  {
+    slug: "object-preview",
+    caption: "Objects preview in place — images, video, audio, PDFs, Markdown, JSON, CSV and text.",
+  },
+  {
+    slug: "bucket-settings-access",
+    caption: "A validated bucket-policy editor, object ownership, and Block Public Access.",
+  },
+  {
+    slug: "bucket-settings-data-protection",
+    caption: "Encryption at rest, Object Lock, and lifecycle rules, per bucket.",
+  },
+  {
+    slug: "credentials-temporary",
+    caption: "Minting a short-lived scoped credential, with a policy builder that says what it can do.",
+  },
+  {
+    slug: "metrics-charts",
+    caption: "Requests, errors, throughput and latency over time, from Cairn's own stored metrics.",
+  },
+  {
+    slug: "tags-browser",
+    caption: "Every object tag in use, and the objects carrying the one you pick.",
+  },
+  {
+    slug: "activity-audit-log",
+    caption: "An audit log of administrative actions, with actor, bucket and key.",
+  },
+  {
+    slug: "bucket-settings-replication",
+    caption: "Replication rules and remote targets for asynchronous cross-host copies.",
+  },
+];
+---
+
+<Section eyebrow="Console" title="What it looks like">
+  <p>
+    The S3 wire protocol is a commodity; the console is the reason to pick Cairn. It ships inside the
+    same binary — nothing extra to deploy — and covers everything short of the S3 API itself.
+  </p>
+
+  <figure class="shot shot--hero">
+    <img
+      src={`${base}screenshots/${hero.slug}.webp`}
+      alt={hero.caption}
+      width={W}
+      height={H}
+      loading="eager"
+      decoding="async"
+    />
+    <figcaption>{hero.caption}</figcaption>
+  </figure>
+
+  <div class="grid">
+    {
+      shots.map((s) => (
+        <figure class="shot">
+          <img
+            src={`${base}screenshots/${s.slug}.webp`}
+            alt={s.caption}
+            width={W}
+            height={H}
+            loading="lazy"
+            decoding="async"
+          />
+          <figcaption>{s.caption}</figcaption>
+        </figure>
+      ))
+    }
+  </div>
+</Section>
+
+<style>
+  .shot {
+    margin: 0;
+  }
+  .shot img {
+    width: 100%;
+    height: auto;
+    display: block;
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius);
+    background: var(--bg-subtle);
+  }
+  .shot figcaption {
+    margin-top: 0.6rem;
+    font-size: var(--step--1);
+    line-height: 1.5;
+    color: var(--fg-faint);
+    max-width: 60ch;
+  }
+  .shot--hero {
+    margin-top: var(--space-4);
+  }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(20rem, 100%), 1fr));
+    gap: var(--space-5) var(--space-4);
+    margin-top: var(--space-5);
+  }
+</style>
