@@ -8,6 +8,37 @@
 
 Each module defines its own typed errors describing what went wrong in its own terms, rather than passing strings around, so that the cause of a failure is preserved with structure as it propagates (F-22). At the protocol boundary a single translator maps every internal error to the wire response: for the S3 surface to the S3 XML error document with a code, a human-readable message, the resource, and a request identifier, paired with the right HTTP status; for the management surface to the JSON error envelope. Keeping the mapping in one place makes it total and testable, and a test enumerates every internal error variant and asserts that each maps to a defined status and code, so no failure can reach a client as an unmapped internal error.
 
+### 25.1.1 Content negotiation: readable pages for browsers
+
+An object store is addressed by both programs and people. The same URL that an SDK follows is also
+pasted into a browser — a share link, a presigned link, a typo'd console path — and answering a
+person with a raw `<Error>` XML document tells them nothing they can act on. Cairn therefore renders
+a **human-readable HTML error page** when, and only when, the request is unambiguously a browser
+performing a top-level navigation; every other client receives the byte-identical XML or JSON
+described above. The predicate is deliberately narrow, and each clause is chosen against measured
+client behaviour rather than assumption:
+
+- the method is `GET` (never `HEAD`, which may carry no body, and never a mutating verb);
+- `Accept` lists `text/html` as an exact media type — no AWS SDK, CLI, Go or Python client sends
+  this, so machine traffic is unaffected by construction; and
+- the request carries a browser navigation signal: `Sec-Fetch-Dest: document`, or, on a plain-HTTP
+  origin where browsers suppress Fetch Metadata entirely, `Upgrade-Insecure-Requests`. This second
+  clause excludes the one common non-browser that does send `text/html` (a bare
+  `java.net.HttpURLConnection`), and excludes `<img>`/`<video>`/`fetch()` subresource loads, which
+  must keep the machine-readable body.
+
+Both branches carry `Vary: accept, sec-fetch-dest, upgrade-insecure-requests`, so a shared cache can
+never serve one client class the other's body shape. The page is self-contained — inline CSS, no
+scripts, images, or webfonts — because it must render on the S3 listener, where the console's assets
+do not exist, and while the node is degraded enough to be returning a 5xx. It states the HTTP status,
+a plain-language explanation of that specific failure, and the S3 code, resource, and **request id**,
+so an operator can grep the logs for the exact failure. The share route deliberately omits the
+resource: the token is a credential and is never echoed into the page. Because the page interpolates
+an attacker-controlled path, it is HTML-escaped and additionally served with
+`Content-Security-Policy: default-src 'none'` and `X-Content-Type-Options: nosniff`, making a
+reflected script structurally impossible rather than merely escaped away. The generalization of 5xx
+detail (§25.1) holds identically on this surface: the page renders fixed copy, never the cause.
+
 ### 25.2 The mapping
 
 The principal mappings are as follows.
