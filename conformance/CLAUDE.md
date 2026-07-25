@@ -60,6 +60,10 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   management API, assert HMAC-signed S3 event records arrive correctly shaped. **web console listener ON.**
 - `sts.sh` (+`.py`) — STS temp creds: mint a scoped session, prove an S3 SDK consumes it
   (`X-Amz-Security-Token`) with exactly the granted access, all else denied. **web console listener ON.**
+- `error_pages.sh` — browser error-page content negotiation (ARCH 25.1.1), pure curl: an SDK-shaped
+  request keeps the byte-identical `application/xml` `<Error><Code>` document (the invariant every
+  other harness's `<Code>` assertions rest on), while only a real browser navigation gets HTML;
+  `<img>`/`fetch()` subresources, `text/htmlx`, a bare java `Accept` and HEAD all stay machine-shaped.
 - `console_session.sh` — console httpOnly session-cookie auth (pure curl): `cairn_session` from
   `POST /session` authenticates management API + S3 on the web console port, REJECTED on the S3 port, cleared
   by `DELETE /session`. **web console listener ON.**

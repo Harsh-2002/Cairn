@@ -425,6 +425,23 @@ jobs:
       - name: httpOnly session-cookie auth + S3 data-plane port isolation (management web console listener on)
         run: BIN=target/debug/cairn bash conformance/console_session.sh
 
+  error-pages:
+    name: browser error-page negotiation (ARCH 25.1.1)
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: cairn-bin
+          path: target/debug
+      - run: chmod +x target/debug/cairn
+      # Pure curl: pins that an SDK-shaped request still receives byte-identical <Error><Code> XML,
+      # and that only a real browser navigation gets the HTML page. Guards every <Code>-parsing
+      # assertion in the rest of conformance/ against a loosened negotiation predicate.
+      - name: HTML for browsers, byte-identical XML for every machine client
+        run: BIN=target/debug/cairn bash conformance/error_pages.sh
+
   backup-restore:
     name: backup / restore / integrity e2e
     needs: build
