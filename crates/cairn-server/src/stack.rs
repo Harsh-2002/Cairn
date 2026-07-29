@@ -6,7 +6,10 @@ use crate::config::Config;
 use cairn_auth::AuthChain;
 use cairn_blob::LocalBlobStore;
 use cairn_crypto::{SystemClock, SystemCrypto};
-use cairn_meta::{CachedMetadataStore, OpenOptions, SqliteMetadataStore};
+use cairn_meta::{
+    CachedMetadataStore, KeyHashBindingMatch, KeyRingStateRow, OpenOptions, SqliteMetadataStore,
+    classify_key_hash_binding,
+};
 use cairn_protocol::S3Service;
 use cairn_types::blob::ReconcileOpts;
 use cairn_types::traits::{
@@ -113,6 +116,10 @@ pub struct AppStack {
     /// The public base URL (`CAIRN_PUBLIC_BASE_URL`) shares/presigned links are built against; when
     /// `None`, the minting request's own scheme + Host is used.
     pub public_base_url: Option<String>,
+    /// The data-listener address. Without an explicit public base URL, control-plane URL minting
+    /// combines this port with the request Host's hostname to keep object bytes on a distinct
+    /// origin.
+    pub data_listen_addr: std::net::SocketAddr,
     /// The in-process request-metrics aggregator (ARCH 26.5). Every completed request bumps a
     /// counter here (zero DB I/O on the hot path); the background flush loop drains it into a
     /// batched upsert through the single writer. Held behind an `Arc` so the request path and the
@@ -157,83 +164,40 @@ pub(crate) fn build_crypto(cfg: &Config) -> Result<SystemCrypto, String> {
         tracing::warn!(
             "no master_key configured; using a fixed DEVELOPMENT key (insecure). Set CAIRN_MASTER_KEY in production."
         );
-        Ok(SystemCrypto::new([0u8; 32]))
+        Ok(SystemCrypto::new(cairn_types::SecretKey32::new([0u8; 32])))
     }
 }
 
-/// The `(id, key_hash, is_active)` rows to record in `key_ring_state` for operator display
-/// (audit #29). The hash is the first 8 hex of SHA-256(key) — never key material. Re-derived from
-/// config (the key bytes were scrubbed into ciphers by `build_crypto`).
-fn ring_for_state(cfg: &Config) -> Vec<(u16, String, bool)> {
+/// The `(id, key_hash, is_active)` rows durably bound in `key_ring_state` (audit #29).
+///
+/// The durable hash is the full 64-hex SHA-256(key) — never key material. The status API abbreviates
+/// it separately. Unlike the old best-effort display seeding, deriving this identity cannot
+/// silently fall back: invalid configuration is a startup error, and an existing id may never be
+/// rebound to a different hash.
+fn ring_for_state(cfg: &Config) -> Result<Vec<(u16, String, bool)>, String> {
     use sha2::{Digest, Sha256};
-    let hash = |bytes: &[u8]| hex::encode(&Sha256::digest(bytes)[..4]);
+    let hash = |bytes: &[u8]| hex::encode(Sha256::digest(bytes));
     if let Some(ring_json) = &cfg.master_key_ring {
-        if let Ok(keys) = crate::config::parse_key_ring(ring_json) {
-            let max_id = keys.iter().map(|(id, _)| *id).max().unwrap_or(1);
-            let active = cfg.master_key_active_id.unwrap_or(max_id);
-            return keys
-                .iter()
-                .map(|(id, k)| (*id, hash(k), *id == active))
-                .collect();
-        }
+        let keys = crate::config::parse_key_ring(ring_json)
+            .map_err(|e| format!("invalid CAIRN_MASTER_KEY_RING {e}"))?;
+        let max_id = keys
+            .iter()
+            .map(|(id, _)| *id)
+            .max()
+            .ok_or_else(|| "CAIRN_MASTER_KEY_RING must not be empty".to_owned())?;
+        let active = cfg.master_key_active_id.unwrap_or(max_id);
+        return Ok(keys
+            .iter()
+            .map(|(id, k)| (*id, hash(k.expose_secret()), *id == active))
+            .collect());
     }
     if let Some(mk) = &cfg.master_key {
-        if let Ok(bytes) = hex::decode(mk) {
-            return vec![(1, hash(&bytes), true)];
-        }
+        let bytes = hex::decode(mk.expose_secret())
+            .map_err(|_| "invalid CAIRN_MASTER_KEY hex".to_owned())?;
+        return Ok(vec![(1, hash(&bytes), true)]);
     }
-    vec![(1, hash(&[0u8; 32]), true)] // development key
+    Ok(vec![(1, hash(&[0u8; 32]), true)]) // development key
 }
-
-/// Seed each sqlite shard's `key_ring_state` for the env ring keys and prime the in-process
-/// active-key seal counter from the max durable count across shards (audit #29, Phase E).
-async fn prime_key_state(store: &[Arc<SqliteMetadataStore>], crypto: &SystemCrypto, cfg: &Config) {
-    let ring = ring_for_state(cfg);
-    let active = crypto.active_key_id();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as i64);
-    let mut base = 0u64;
-    for s in store {
-        for (id, key_hash, is_active) in &ring {
-            if let Err(e) = s
-                .key_ring_upsert(*id, key_hash.clone(), *is_active, now)
-                .await
-            {
-                tracing::warn!(error = %e, "key_ring_state upsert failed");
-            }
-        }
-        if let Ok(states) = s.key_ring_states().await {
-            if let Some(row) = states.iter().find(|r| r.id == active) {
-                base = base.max(row.sealed_count);
-            }
-        }
-    }
-    crypto.prime_seal_count(base);
-    if !store.is_empty() {
-        tracing::info!(
-            active_key_id = active,
-            primed_seal_count = base,
-            ring_keys = ring.len(),
-            "master-key rotation state primed (audit #29)"
-        );
-    }
-}
-
-/// The set of ring ids in the current env config (audit #29 retire-gate).
-fn env_ring_ids(cfg: &Config) -> std::collections::HashSet<u16> {
-    ring_for_state(cfg)
-        .into_iter()
-        .map(|(id, _, _)| id)
-        .collect()
-}
-
-/// The re-wrap streams whose completion gates a key retirement (audit #29).
-const REWRAP_STREAMS: [&str; 3] = [
-    "object_versions.sse_descriptor",
-    "users.sigv4_secret",
-    "bucket_config.replication_targets",
-];
 
 /// Pure retire-gate decision for one shard (audit #29 / spec 5.4). Given the key ids this shard has
 /// ever recorded, the current env ring ids, the active id, and the lowest `done_active_id` across
@@ -243,7 +207,7 @@ const REWRAP_STREAMS: [&str; 3] = [
 /// iff `K < active` (it is an older key the active one supersedes) AND the re-wrap has not swept past
 /// it (`min_done <= K`). A removed key newer than `active`, or one fully swept (`min_done > K`), is
 /// safe. An empty result means it is safe to start.
-fn retire_gate_unsafe_ids(
+pub(crate) fn retire_gate_unsafe_ids(
     recorded_ids: &[u16],
     env_ids: &std::collections::HashSet<u16>,
     active: u16,
@@ -259,48 +223,112 @@ fn retire_gate_unsafe_ids(
     bad
 }
 
-/// Enforce the retire-gate across every sqlite shard before the listener binds (audit #29). Returns
-/// an `Err` (failing startup) naming the offending key id(s) and shard when a removed key still has
-/// un-re-wrapped data; a read error on a shard is logged and skipped (it never wedges startup), and
-/// the async backends (no concrete shard handles) are not gated.
-async fn enforce_retire_gate(
+/// Validate one shard's durable key identity and retirement state.
+///
+/// The `Result` inputs are intentional: tests inject both state and progress read failures through
+/// this exact decision seam. Either error is fatal; only successful reads may authorize startup.
+fn validate_key_gate_reads(
+    shard: usize,
+    ring: &[(u16, String, bool)],
+    env_ids: &std::collections::HashSet<u16>,
+    active: u16,
+    states: Result<Vec<KeyRingStateRow>, cairn_types::MetaError>,
+    progress: Result<Vec<(String, u16)>, cairn_types::MetaError>,
+) -> Result<Vec<KeyRingStateRow>, String> {
+    let states = states
+        .map_err(|e| format!("master-key gate: read key_ring_state on shard {shard}: {e}"))?;
+    let progress = progress
+        .map_err(|e| format!("master-key gate: read rewrap_progress on shard {shard}: {e}"))?;
+
+    for (id, configured_hash, _) in ring {
+        if let Some(stored) = states.iter().find(|row| row.id == *id) {
+            match classify_key_hash_binding(&stored.key_hash, configured_hash) {
+                KeyHashBindingMatch::Exact | KeyHashBindingMatch::LegacyPrefix => {}
+                KeyHashBindingMatch::Mismatch => {
+                    return Err(format!(
+                        "master-key identity mismatch on shard {shard}: key id {id} is already \
+                         bound to different key material or a malformed durable hash; refusing \
+                         same-id replacement. Restore the original key bytes for id {id}, or \
+                         rotate by adding a new id."
+                    ));
+                }
+            }
+        }
+    }
+
+    let dones: std::collections::HashMap<String, u16> = progress.into_iter().collect();
+    let min_done = crate::key_rewrap::SEALED_SECRET_STREAMS
+        .iter()
+        .map(|stream| dones.get(stream.name()).copied().unwrap_or(0))
+        .min()
+        .unwrap_or(0);
+    let recorded: Vec<u16> = states.iter().map(|row| row.id).collect();
+    let unsafe_ids = retire_gate_unsafe_ids(&recorded, env_ids, active, min_done);
+    if !unsafe_ids.is_empty() {
+        return Err(format!(
+            "audit #29 retire-gate: shard {shard} still holds data sealed under master key id(s) \
+             {unsafe_ids:?} that were removed from CAIRN_MASTER_KEY_RING before re-wrap onto the \
+             active key {active} completed (re-wrap reached id {min_done}). Restore those key \
+             id(s) to the ring and wait for GET /api/v1/system/crypto-status to report them \
+             retire_eligible before removing them; refusing to start to avoid unreadable data."
+        ));
+    }
+    Ok(states)
+}
+
+/// Fail-closed master-key initialization for every SQLite shard.
+///
+/// Phase 1 reads and validates every shard — durable id→full-hash identity, re-wrap progress, and
+/// the retire gate — before **any** key-state write occurs. A matching legacy eight-hex prefix is
+/// accepted only so phase 2 can atomically upgrade it to the configured full hash through each
+/// Writer. That write defensively rechecks the binding in one transaction; once upgraded, later
+/// comparisons are exact. Every read/write error is fatal. A retry after a partial cross-shard
+/// phase-2 failure accepts the already-full shards and upgrades the remaining legacy shards.
+/// Finally, the active key's in-process seal counter is primed from the preflight snapshots.
+async fn initialize_key_state(
     store: &[Arc<SqliteMetadataStore>],
     crypto: &SystemCrypto,
     cfg: &Config,
 ) -> Result<(), String> {
-    let env_ids = env_ring_ids(cfg);
+    let ring = ring_for_state(cfg)?;
+    let env_ids: std::collections::HashSet<u16> = ring.iter().map(|(id, _, _)| *id).collect();
     let active = crypto.active_key_id();
+    let mut snapshots = Vec::with_capacity(store.len());
     for (i, s) in store.iter().enumerate() {
-        let recorded: Vec<u16> = match s.key_ring_states().await {
-            Ok(rows) => rows.into_iter().map(|r| r.id).collect(),
-            Err(e) => {
-                tracing::warn!(error = %e, shard = i, "retire-gate: could not read key_ring_state; skipping");
-                continue;
-            }
-        };
-        let dones: std::collections::HashMap<String, u16> = match s.rewrap_done_active_ids().await {
-            Ok(v) => v.into_iter().collect(),
-            Err(e) => {
-                tracing::warn!(error = %e, shard = i, "retire-gate: could not read rewrap progress; skipping");
-                continue;
-            }
-        };
-        // The lowest completion across the gated streams (0 = a stream never finished a clean pass).
-        let min_done = REWRAP_STREAMS
-            .iter()
-            .map(|st| dones.get(*st).copied().unwrap_or(0))
-            .min()
-            .unwrap_or(0);
-        let unsafe_ids = retire_gate_unsafe_ids(&recorded, &env_ids, active, min_done);
-        if !unsafe_ids.is_empty() {
-            return Err(format!(
-                "audit #29 retire-gate: shard {i} still holds data sealed under master key id(s) \
-                 {unsafe_ids:?} that were removed from CAIRN_MASTER_KEY_RING before re-wrap onto the \
-                 active key {active} completed (re-wrap reached id {min_done}). Restore those key \
-                 id(s) to the ring and wait for GET /api/v1/system/crypto-status to report them \
-                 retire_eligible before removing them; refusing to start to avoid unreadable data."
-            ));
-        }
+        snapshots.push(validate_key_gate_reads(
+            i,
+            &ring,
+            &env_ids,
+            active,
+            s.key_ring_states().await,
+            s.rewrap_done_active_ids().await,
+        )?);
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64);
+    for (i, s) in store.iter().enumerate() {
+        s.key_ring_apply_config(ring.clone(), now)
+            .await
+            .map_err(|e| format!("master-key gate: bind configured ring on shard {i}: {e}"))?;
+    }
+
+    let base = snapshots
+        .iter()
+        .flatten()
+        .filter(|row| row.id == active)
+        .map(|row| row.sealed_count)
+        .max()
+        .unwrap_or(0);
+    crypto.prime_seal_count(base);
+    if !store.is_empty() {
+        tracing::info!(
+            active_key_id = active,
+            primed_seal_count = base,
+            ring_keys = ring.len(),
+            "master-key identity and retirement gate passed"
+        );
     }
     Ok(())
 }
@@ -463,11 +491,12 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
         );
     }
     if cfg.allow_internal_endpoints {
-        // Loud, operator-visible warning: the SSRF guard is off, so a replication target / webhook /
-        // import source may be pointed at loopback, a private network, or the cloud-metadata service.
+        // Loud, operator-visible warning: the SSRF guard is off, so a replication target, webhook,
+        // import source, or update feed may reach loopback/private/cloud-metadata addresses.
         tracing::warn!(
-            "CAIRN_ALLOW_INTERNAL_ENDPOINTS is set: outbound dialers (replication, webhook, import) \
-             may connect to internal/loopback/link-local addresses — the SSRF guard is DISABLED"
+            "CAIRN_ALLOW_INTERNAL_ENDPOINTS is set: outbound dialers (replication, webhook, import, \
+             update check) may connect to internal/loopback/link-local addresses — the SSRF guard \
+             is DISABLED"
         );
     }
     tokio::fs::create_dir_all(&cfg.data_dir)
@@ -506,6 +535,10 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
     // `seal_target`/`open_target` take `&SystemCrypto`) as well as the `dyn Crypto` view the rest
     // of the stack uses.
     let system_crypto = Arc::new(build_crypto(cfg)?);
+    // The durable id→hash binding and retire gate are a precondition for using this crypto at all.
+    // Run them immediately after construction, before root bootstrap, compatibility migrations, or
+    // any other path can seal a secret. The two-phase helper reads every shard before writing one.
+    initialize_key_state(&store, &system_crypto, cfg).await?;
     let crypto: Arc<dyn Crypto> = system_crypto.clone();
     let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
 
@@ -540,6 +573,7 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
         cfg.max_object_size,
     )
     .with_encrypt_at_rest(cfg.encrypt_at_rest)
+    .with_multipart_limits(cfg.multipart_limits())
     .with_key_provider(Arc::new(cairn_protocol::LocalRingProvider::new(
         crypto.clone(),
         cfg.parse_kms_key_ids(),
@@ -574,6 +608,7 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
     })
     .with_root_access_key(cfg.root_access_key.clone())
     .with_allow_internal_endpoints(cfg.allow_internal_endpoints)
+    .with_import_timeouts(cfg.import_timeouts())
     .with_import_wake({
         let n = import_notify.clone();
         Arc::new(move || n.notify_one())
@@ -583,51 +618,53 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
     // key + secret log into the web console, authenticate the management API, and sign S3 requests.
     ensure_root_admin(&meta, &crypto, &clock, cfg).await?;
 
+    // Older releases stored notification HMAC keys as plaintext JSON. Seal those values through the
+    // ordinary writer before any listener binds, on every metadata backend and even when periodic
+    // key rewrap is disabled. Fail startup rather than knowingly serve with database-readable keys.
+    let migrated_webhooks =
+        crate::key_rewrap::migrate_legacy_webhook_secrets(&*meta, &*crypto).await?;
+    if migrated_webhooks > 0 {
+        tracing::info!(
+            buckets = migrated_webhooks,
+            "sealed legacy webhook signing secrets during startup"
+        );
+    }
+
+    // Completion ownership is process-local: no request survives a restart. Restore every
+    // transient `completing` claim before reconciliation or listener bind so the durable session
+    // and its parts remain retryable instead of being stranded forever. This global mutation fans
+    // out across all metadata shards and is idempotent.
+    recover_orphaned_multipart_claims(&*meta).await?;
+
     // Startup reconciliation reclaims orphaned blobs from any crash window before serving. The
     // oracle is taken by `&dyn ReconcileOracle`, so the boxed oracle is borrowed via `as_ref`.
     // No request is in flight yet (the listener is not bound), so a crash-orphan is unambiguous —
     // reclaim it immediately (margin 0); the safety margin only matters for a reconcile that races
     // live PUTs, which startup never does.
-    match blob
-        .reconcile(
+    let report = require_startup_reconciliation(
+        blob.reconcile(
             oracle.as_ref(),
             ReconcileOpts {
                 staging_safety_margin_secs: 0,
                 ..ReconcileOpts::default()
             },
         )
-        .await
-    {
-        Ok(report) => tracing::info!(
-            orphans = report.orphans_reclaimed,
-            scanned = report.blobs_scanned,
-            "startup reconciliation complete"
-        ),
-        Err(e) => tracing::warn!(error = %e, "startup reconciliation failed"),
-    }
+        .await,
+    )?;
+    tracing::info!(
+        orphans = report.orphans_reclaimed,
+        scanned = report.blobs_scanned,
+        "startup reconciliation complete"
+    );
+    recover_multipart_staging_accounting(&*meta).await?;
 
     // Replication crash-recovery: release any `claimed` outbox entries left leased by a worker that
     // crashed mid-ship. A freshly-started process has no live workers, so every claimed row is an
     // orphan — reclaim them to `pending` now so they re-ship immediately, instead of waiting out the
     // 300s claim lease. Runs before the listener binds and the workers start, so it never races a
-    // live claim.
-    if let Err(e) = meta
-        .submit(cairn_types::meta::Mutation::RecoverClaimedReplication)
-        .await
-    {
-        tracing::warn!(error = %e, "replication claim recovery failed");
-    }
-
-    // Master-key rotation state (audit #29, Phase E): seed each sqlite shard's key_ring_state for
-    // the env ring keys and prime the in-process seal counter from durable state so the seal-count
-    // bound survives a restart. No-op for the async backends (no concrete shard handles).
-    prime_key_state(&store, &system_crypto, cfg).await;
-
-    // Retire-gate (audit #29 / spec 5.4): refuse to start if a master key was removed from the ring
-    // before its data was re-wrapped onto the active key — otherwise that data (object DEKs, SigV4
-    // secrets) is unreadable and the failure surfaces only as a confusing flood of per-request
-    // errors. Fail fast with a diagnostic naming the key id(s) and shard instead.
-    enforce_retire_gate(&store, &system_crypto, cfg).await?;
+    // live claim. Failure is fatal: a sharded fan-out can recover early shards before a later shard
+    // errors, and only a startup retry can safely complete that idempotent partial recovery.
+    recover_orphaned_replication_claims(&*meta).await?;
 
     Ok(AppStack {
         s3,
@@ -651,10 +688,188 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
         allow_internal_endpoints: cfg.allow_internal_endpoints,
         replication_allow_plaintext_sse_over_http: cfg.replication_allow_plaintext_sse_over_http,
         public_base_url: cfg.public_base_url.clone(),
+        data_listen_addr: cfg.listen_addr,
         request_metrics: Arc::new(crate::metrics_agg::RequestMetricsAgg::new(
             cfg.request_metrics_bucket_secs,
         )),
     })
+}
+
+async fn recover_orphaned_multipart_claims(meta: &dyn MetadataStore) -> Result<(), String> {
+    meta.submit(cairn_types::meta::Mutation::RecoverMultipartClaims)
+        .await
+        .map_err(|error| format!("recover orphaned multipart completion claims: {error}"))?;
+    tracing::info!("orphaned multipart completion claims recovered");
+    Ok(())
+}
+
+async fn recover_multipart_staging_accounting(meta: &dyn MetadataStore) -> Result<(), String> {
+    let mut released = 0u64;
+    loop {
+        match meta
+            .submit(cairn_types::meta::Mutation::RecoverMultipartStagingAccounting { limit: 1_000 })
+            .await
+            .map_err(|error| format!("recover multipart staging accounting: {error}"))?
+        {
+            cairn_types::meta::MutationOutcome::MultipartAccountingReleased(0) => break,
+            cairn_types::meta::MutationOutcome::MultipartAccountingReleased(count) => {
+                released += count;
+            }
+            outcome => {
+                return Err(format!(
+                    "recover multipart staging accounting returned unexpected outcome: {outcome:?}"
+                ));
+            }
+        }
+    }
+    if released > 0 {
+        tracing::info!(
+            released,
+            "released crash-orphaned multipart staging accounting"
+        );
+    }
+    Ok(())
+}
+
+async fn recover_orphaned_replication_claims(meta: &dyn MetadataStore) -> Result<(), String> {
+    meta.submit(cairn_types::meta::Mutation::RecoverClaimedReplication)
+        .await
+        .map_err(|error| format!("recover orphaned replication claims: {error}"))?;
+    tracing::info!("orphaned replication claims recovered");
+    Ok(())
+}
+
+/// Convert the pre-bind reconciliation result into the stack-construction contract.
+///
+/// Serving with unresolved metadata/blob divergence violates ARCH 8, so every reconciliation
+/// failure is fatal. Keeping this mapping in a small pure seam makes the startup behavior directly
+/// testable without weakening the filesystem-only blob boundary with a production fault injector.
+fn require_startup_reconciliation(
+    result: Result<cairn_types::blob::ReconcileReport, cairn_types::error::BlobError>,
+) -> Result<cairn_types::blob::ReconcileReport, String> {
+    let report = result.map_err(|error| format!("startup reconciliation failed: {error}"))?;
+    if report.errors > 0 {
+        return Err(format!(
+            "startup reconciliation failed: {} filesystem reclamation operation(s) failed",
+            report.errors
+        ));
+    }
+    Ok(report)
+}
+
+#[cfg(test)]
+mod multipart_recovery_tests {
+    use super::recover_orphaned_multipart_claims;
+    use cairn_types::id::{BucketName, ObjectKey, UploadId, UserId};
+    use cairn_types::meta::{
+        ClaimOutcome, MultipartSession, MultipartStatus, Mutation, MutationOutcome,
+    };
+    use cairn_types::testing::InMemoryMetadataStore;
+    use cairn_types::time::Timestamp;
+    use cairn_types::traits::MetadataStore;
+
+    #[tokio::test]
+    async fn pre_bind_recovery_restores_an_orphaned_completion_claim() {
+        let store = InMemoryMetadataStore::new();
+        let upload_id = UploadId::from_string("restart-recovery".to_owned());
+        store
+            .submit(Mutation::CreateMultipart {
+                session: Box::new(MultipartSession {
+                    upload_id: upload_id.clone(),
+                    bucket: BucketName::parse("recovery-bucket").unwrap(),
+                    key: ObjectKey::parse("large-object").unwrap(),
+                    content_type: "application/octet-stream".to_owned(),
+                    status: MultipartStatus::Active,
+                    owner_id: UserId("owner".to_owned()),
+                    initiated_by: UserId("owner".to_owned()),
+                    intended_acl: None,
+                    user_metadata: Vec::new(),
+                    initial_tags: Vec::new(),
+                    lock_intent: cairn_types::ExplicitObjectLockIntent::default(),
+                    sse_requested: false,
+                    encrypt_parts: false,
+                    sse_kms_requested: false,
+                    sse_kms_key_id: None,
+                    sse_bucket_key_enabled: false,
+                    created_at: Timestamp(1),
+                    updated_at: Timestamp(1),
+                }),
+                limits: cairn_types::meta::MultipartLimits::default(),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            store
+                .submit(Mutation::ClaimMultipart(upload_id.clone()))
+                .await
+                .unwrap(),
+            MutationOutcome::MultipartClaim(ClaimOutcome::Claimed(_))
+        ));
+
+        recover_orphaned_multipart_claims(&store).await.unwrap();
+        assert_eq!(
+            store
+                .get_multipart(&upload_id)
+                .await
+                .unwrap()
+                .expect("session survives recovery")
+                .status,
+            MultipartStatus::Active
+        );
+        assert!(matches!(
+            store
+                .submit(Mutation::ClaimMultipart(upload_id))
+                .await
+                .unwrap(),
+            MutationOutcome::MultipartClaim(ClaimOutcome::Claimed(_))
+        ));
+    }
+}
+
+#[cfg(test)]
+mod reconciliation_tests {
+    use super::require_startup_reconciliation;
+    use cairn_types::blob::ReconcileReport;
+    use cairn_types::error::BlobError;
+
+    #[test]
+    fn failed_blob_walk_is_fatal_before_listener_bind() {
+        let error =
+            require_startup_reconciliation(Err(BlobError::Io("sentinel walk failure".to_owned())))
+                .expect_err("startup must not continue after reconciliation failure");
+
+        assert!(error.contains("startup reconciliation failed"));
+        assert!(error.contains("sentinel walk failure"));
+    }
+
+    #[test]
+    fn successful_reconciliation_report_is_preserved() {
+        let report = ReconcileReport {
+            blobs_scanned: 7,
+            orphans_reclaimed: 2,
+            ..ReconcileReport::default()
+        };
+
+        assert_eq!(
+            require_startup_reconciliation(Ok(report.clone())).unwrap(),
+            report
+        );
+    }
+
+    #[test]
+    fn partial_reclamation_failure_is_fatal_before_accounting_recovery() {
+        let report = ReconcileReport {
+            blobs_scanned: 7,
+            orphans_reclaimed: 2,
+            errors: 1,
+            ..ReconcileReport::default()
+        };
+
+        let error = require_startup_reconciliation(Ok(report))
+            .expect_err("accounting must remain charged when a filesystem unlink failed");
+        assert!(error.contains("startup reconciliation failed"));
+        assert!(error.contains("1 filesystem reclamation operation"));
+    }
 }
 
 /// Ensure an active administrator with the configured root access key exists, so the server is
@@ -739,7 +954,10 @@ pub(crate) async fn ensure_root_admin(
 
 #[cfg(test)]
 mod retire_gate_tests {
-    use super::retire_gate_unsafe_ids;
+    use super::{retire_gate_unsafe_ids, ring_for_state, validate_key_gate_reads};
+    use crate::config::Config;
+    use cairn_meta::KeyRingStateRow;
+    use cairn_types::MetaError;
     use std::collections::HashSet;
 
     fn ids(xs: &[u16]) -> HashSet<u16> {
@@ -765,6 +983,89 @@ mod retire_gate_tests {
         // No keys removed (every recorded id still in the ring) -> always safe.
         assert!(retire_gate_unsafe_ids(&[1, 2], &ids(&[1, 2]), 2, 0).is_empty());
     }
+
+    fn state(id: u16, hash: &str) -> KeyRingStateRow {
+        KeyRingStateRow {
+            id,
+            key_hash: hash.to_owned(),
+            is_active: true,
+            sealed_count: 0,
+            created_at: 1,
+        }
+    }
+
+    #[test]
+    fn configured_key_identity_uses_the_full_sha256() {
+        let ring = ring_for_state(&Config::default()).expect("development key is valid");
+        assert_eq!(ring.len(), 1);
+        assert_eq!(
+            ring[0].1, "66687aadf862bd776c8fc18b8e9f8e20089714856ee233b3902a591d0d5f2925",
+            "the durable identity must retain all 256 SHA-256 bits"
+        );
+    }
+
+    #[test]
+    fn same_id_replacement_is_rejected_before_binding() {
+        let configured = "11".repeat(32);
+        let durable = "22".repeat(32);
+        let err = validate_key_gate_reads(
+            2,
+            &[(7, configured, true)],
+            &ids(&[7]),
+            7,
+            Ok(vec![state(7, &durable)]),
+            Ok(Vec::new()),
+        )
+        .expect_err("same-id replacement must fail closed");
+        assert!(err.contains("key id 7"));
+        assert!(err.contains("same-id replacement"));
+    }
+
+    #[test]
+    fn every_gate_read_error_is_fatal() {
+        let full_hash = "11".repeat(32);
+        let ring = [(7, full_hash.clone(), true)];
+        let state_err = validate_key_gate_reads(
+            0,
+            &ring,
+            &ids(&[7]),
+            7,
+            Err(MetaError::Engine("injected state read failure".to_owned())),
+            Ok(Vec::new()),
+        )
+        .expect_err("key-state read failure must refuse startup");
+        assert!(state_err.contains("read key_ring_state"));
+
+        let progress_err = validate_key_gate_reads(
+            1,
+            &ring,
+            &ids(&[7]),
+            7,
+            Ok(vec![state(7, &full_hash)]),
+            Err(MetaError::Engine(
+                "injected progress read failure".to_owned(),
+            )),
+        )
+        .expect_err("re-wrap progress read failure must refuse startup");
+        assert!(progress_err.contains("read rewrap_progress"));
+    }
+
+    #[test]
+    fn partial_shard_legacy_upgrade_is_safe_to_retry() {
+        let full_hash = format!("deadbeef{}", "11".repeat(28));
+        let ring = [(7, full_hash.clone(), true)];
+        for (shard, stored) in [(0, full_hash.as_str()), (1, "deadbeef")] {
+            validate_key_gate_reads(
+                shard,
+                &ring,
+                &ids(&[7]),
+                7,
+                Ok(vec![state(7, stored)]),
+                Ok(Vec::new()),
+            )
+            .expect("both an already-upgraded shard and its matching legacy peer must preflight");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -772,7 +1073,8 @@ mod sharding_tests {
     use super::*;
     use cairn_types::authz::OwnershipMode;
     use cairn_types::bucket::{Bucket, VersioningState};
-    use cairn_types::{BucketName, Mutation, Timestamp, UserId};
+    use cairn_types::meta::{OutboxEntry, ReplicationOp, ReplicationStatus};
+    use cairn_types::{BucketName, Mutation, ObjectKey, Timestamp, UserId, VersionId};
 
     fn bucket(name: &str) -> Mutation {
         Mutation::CreateBucket(Box::new(Bucket {
@@ -827,5 +1129,80 @@ mod sharding_tests {
         assert!(dir.path().join("meta.db").exists());
         assert!(dir.path().join("meta.db.shard1").exists());
         assert!(dir.path().join("meta.db.shard2").exists());
+    }
+
+    #[tokio::test]
+    async fn startup_replication_recovery_releases_claims_on_every_physical_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            data_dir: dir.path().to_path_buf(),
+            db_path: dir.path().join("meta.db"),
+            meta_backend: "sqlite".to_owned(),
+            meta_shards: 3,
+            ..Config::default()
+        };
+        let (meta, _oracle, handles) = open_meta(&cfg).await.unwrap();
+
+        // Pick one valid bucket name for each physical shard, then enqueue through the router so
+        // this fixture exercises exactly the same ownership classification as production.
+        let mut bucket_for_shard: Vec<Option<BucketName>> = vec![None; handles.len()];
+        for index in 0..1_000 {
+            let name = format!("recovery-bucket-{index}");
+            let shard = cairn_meta::shard_for_bucket(&name, handles.len());
+            if bucket_for_shard[shard].is_none() {
+                bucket_for_shard[shard] = Some(BucketName::parse(&name).unwrap());
+            }
+            if bucket_for_shard.iter().all(Option::is_some) {
+                break;
+            }
+        }
+        let bucket_for_shard: Vec<BucketName> = bucket_for_shard
+            .into_iter()
+            .map(|bucket| bucket.expect("candidate search covers every shard"))
+            .collect();
+
+        for (shard, bucket_name) in bucket_for_shard.iter().enumerate() {
+            meta.submit(bucket(bucket_name.as_str())).await.unwrap();
+            meta.submit(Mutation::EnqueueReplication(Box::new(OutboxEntry {
+                id: format!("orphaned-claim-{shard}"),
+                bucket: bucket_name.clone(),
+                key: ObjectKey::parse("object").unwrap(),
+                version_id: VersionId::from_string(format!("version-{shard}")),
+                operation: ReplicationOp::ObjectCreate,
+                rule_id: "rule".to_owned(),
+                target_arn: None,
+                attempts: 0,
+                next_attempt_at: Timestamp(0),
+                status: ReplicationStatus::Pending,
+                last_error: None,
+                priority: 0,
+                lease_until: None,
+                enqueued_at: Timestamp(0),
+            })))
+            .await
+            .unwrap();
+        }
+
+        let claimed = meta
+            .claim_replication_batch(handles.len() as u32, Timestamp(1_000))
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), handles.len());
+        for handle in &handles {
+            let counts = handle.replication_counts(None).await.unwrap();
+            assert_eq!(counts.claimed, 1);
+            assert_eq!(counts.pending, 0);
+        }
+
+        // This is the exact pre-bind helper. Its router mutation must broadcast, not route to only
+        // shard zero, because cancellation can strand leases on any bucket shard.
+        recover_orphaned_replication_claims(meta.as_ref())
+            .await
+            .unwrap();
+        for (shard, handle) in handles.iter().enumerate() {
+            let counts = handle.replication_counts(None).await.unwrap();
+            assert_eq!(counts.claimed, 0, "shard {shard} retained a stale lease");
+            assert_eq!(counts.pending, 1, "shard {shard} was not recovered");
+        }
     }
 }

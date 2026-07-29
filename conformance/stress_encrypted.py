@@ -9,10 +9,12 @@ Three arms, all with a thread pool hammering the same node:
   1. transparent at-rest round-trip — concurrent PUTs of marker-rich, high-entropy bodies spanning
      BOTH sides of the 256 KiB small-object read threshold, then concurrent GETs asserting
      BYTE-EXACT equality (SHA-256 over the returned body vs the body written).
-  2. on-disk proof — the committed blobs for those objects are VERSION_ENCRYPTED CRNB containers
-     (magic `CRNB`, version byte 2, 34-byte trailer — crates/cairn-blob/src/compress.rs) and the
-     known plaintext marker is ABSENT from the stored bytes. Same logic as conformance/encryption.py;
-     here it runs after concurrent load rather than after a single quiet PUT.
+  2. on-disk proof — the committed blobs for those objects are current-writer VERSION_ENCRYPTED
+     CRNB containers (magic `CRNB`, version byte 3, 34-byte trailer —
+     crates/cairn-blob/src/compress.rs) and the known plaintext marker is ABSENT from the stored
+     bytes. Legacy encrypted v2 remains read-compatible, but is not valid proof of a fresh write.
+     Same logic as conformance/encryption.py; here it runs after concurrent load rather than after a
+     single quiet PUT.
   3. explicit-SSE arm — warp cannot send SSE headers, so this drives concurrent PUT/GET with
      `x-amz-server-side-encryption: AES256` and with `aws:kms` (+ the CAIRN_KMS_KEY_IDS-allow-listed
      key id), asserting the wire echo and byte-exact round-trips under concurrency. Deliberately
@@ -42,9 +44,9 @@ s3 = boto3.client(
                   max_pool_connections=max(WORKERS * 2, 16)),
 )
 
-# Encrypted CRNB container trailer: 34 bytes, magic `CRNB` then the version byte;
-# VERSION_ENCRYPTED == 2 (crates/cairn-blob/src/compress.rs).
-VERSION_ENCRYPTED = 2
+# Encrypted CRNB container trailer: 34 bytes, magic `CRNB` then the version byte. Encrypted v2
+# remains read-compatible, but this current-writer proof must require authenticated-metadata v3.
+VERSION_ENCRYPTED_CURRENT = 3
 MARKER = b"PLAINTEXT-MARKER-DO-NOT-FIND-ON-DISK-"
 
 fails = []
@@ -74,7 +76,11 @@ def committed_blobs(bucket):
 
 
 def trailer_encrypted(blob):
-    return len(blob) >= 34 and blob[-34:-30] == b"CRNB" and blob[-30] == VERSION_ENCRYPTED
+    return (
+        len(blob) >= 34
+        and blob[-34:-30] == b"CRNB"
+        and blob[-30] == VERSION_ENCRYPTED_CURRENT
+    )
 
 
 def assert_disk_encrypted(bucket, label, sample=8):

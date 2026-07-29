@@ -20,8 +20,12 @@ rest), `Clock` (OS wall clock), `PublicUrl` (HMAC-SHA256 signed public-read URLs
   `CryptoError::Decrypt` — **never plaintext, zeros, partial data, or a fallback to another key**.
   Tampering the `CRK1` magic routes a blob to the legacy path, where it also fails.
 - **`open` returns `Zeroizing<Vec<u8>>`** (F-15): the secret is scrubbed on drop. Don't copy it out
-  into a plain `Vec`/`String` — that defeats the scrubbing. The whole `Crypto::open` chain carries
-  `Zeroizing` end to end. Likewise key buffers are zeroized once a cipher is built.
+  into a plain `Vec`/`String`; callers that need owned plaintext must move it into
+  `SecretString`/`SecretKey32`. `SystemCrypto` retains master keys only in `SecretKey32` owners and
+  builds AES-GCM schedules per operation. The workspace enables upstream zeroization for AES,
+  AES-GCM, GHASH, and POLYVAL. Upstream `polyval 0.6` does not yet scrub the aarch64 PMULL backend,
+  so do not claim stronger architecture-wide schedule guarantees until that dependency closes the
+  gap.
 - **`CRK1` envelope** = `magic ‖ key_id(2, BE) ‖ nonce(12) ‖ ct‖tag`; `magic ‖ key_id` is bound as
   GCM **AAD**, so repointing the key id fails auth. `seal` uses the **active** key + a fresh random
   96-bit nonce (same plaintext → distinct ciphertexts). `open` routes by magic to the named ring
@@ -32,10 +36,19 @@ rest), `Clock` (OS wall clock), `PublicUrl` (HMAC-SHA256 signed public-read URLs
   `KeyRotationRequired` at 95%** of the `2^32` GCM random-nonce ceiling. `open` is **never** blocked.
 - **Never log/echo/return secrets or key material.** `Debug` for `SystemCrypto`/`HmacPublicUrl`
   redacts; keep it that way.
+- The workspace explicitly enables the RustCrypto `zeroize` features on `aes-gcm`, `aes`, `ghash`,
+  and `polyval`: construction intermediates and AES round-key schedules are scrubbed, and the
+  supported x86/soft POLYVAL backends scrub their state on drop. Upstream `polyval 0.6.2` does not
+  yet implement that drop hook for its AArch64 PMULL backend, so do not claim complete
+  architecture-independent schedule scrubbing.
 
 ## Notes
 - The ring + key rotation (audit #29) is wired in `cairn-server`: `stack.rs build_crypto` /
-  `prime_seal_count`, `key_rewrap.rs` (re-wrap loop + `needs_rewrap` + durable seal-count sync).
+  `initialize_key_state` / `prime_seal_count`, `key_rewrap.rs` (exhaustive re-wrap registry +
+  `needs_rewrap` + durable seal-count sync). On SQLite, a ring id is permanently bound to its first
+  durable full SHA-256 key hash before any secret-sealing startup path; changing bytes under the
+  same id is a fatal configuration error, never a rotation mechanism. The status API's eight-hex
+  fingerprint is display-only.
   `SystemCrypto` is `Arc`-shared; `prime_seal_count` takes `&self` so the durable base is set once
   before the listener binds. Single-key dev/test path goes through `SystemCrypto::new` (id 1).
 - `HmacPublicUrl` keys off the raw master-key **bytes** via an HMAC PRF, not the hex string — same

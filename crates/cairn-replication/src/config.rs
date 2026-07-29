@@ -424,34 +424,60 @@ where
 {
     let s = std::str::from_utf8(body).map_err(|_| malformed())?;
     let mut reader = Reader::from_str(s);
-    let cfg = reader.config_mut();
-    cfg.trim_text(true);
 
     let mut depth: u32 = 0;
+    let mut text_buf: Option<String> = None;
+    macro_rules! flush_text {
+        () => {
+            if let Some(text) = text_buf.take() {
+                let text = text.trim_matches(|ch| matches!(ch, ' ' | '\t' | '\r' | '\n'));
+                if !text.is_empty() {
+                    on_event(Sax::Text(std::borrow::Cow::Owned(text.to_owned())))?;
+                }
+            }
+        };
+    }
     loop {
         match reader.read_event().map_err(|_| malformed())? {
             Event::Start(e) => {
+                flush_text!();
                 depth += 1;
                 on_event(Sax::Open(local(e.name())))?;
             }
             Event::Empty(e) => {
+                flush_text!();
                 let name = local(e.name());
                 on_event(Sax::Open(name.clone()))?;
                 on_event(Sax::Close(name))?;
             }
             Event::Text(t) => {
-                let text = t.unescape().map_err(|_| malformed())?;
-                on_event(Sax::Text(text))?;
+                let text = t.decode().map_err(|_| malformed())?;
+                text_buf.get_or_insert_with(String::new).push_str(&text);
+            }
+            Event::GeneralRef(r) => {
+                let buf = text_buf.get_or_insert_with(String::new);
+                if let Some(ch) = r.resolve_char_ref().map_err(|_| malformed())? {
+                    buf.push(ch);
+                } else {
+                    let name = r.decode().map_err(|_| malformed())?;
+                    let replacement =
+                        quick_xml::escape::resolve_xml_entity(&name).ok_or_else(malformed)?;
+                    buf.push_str(replacement);
+                }
             }
             Event::CData(t) => {
                 let text = t.decode().map_err(|_| malformed())?;
-                on_event(Sax::Text(text))?;
+                text_buf.get_or_insert_with(String::new).push_str(&text);
             }
             Event::End(e) => {
+                flush_text!();
                 depth = depth.checked_sub(1).ok_or_else(malformed)?;
                 on_event(Sax::Close(local(e.name())))?;
             }
-            Event::Eof => break,
+            Event::Eof => {
+                flush_text!();
+                break;
+            }
             _ => {}
         }
     }
@@ -598,6 +624,26 @@ mod tests {
     fn rejects_invalid_utf8() {
         let err = parse_replication(&[0xff, 0xfe, 0x00]).unwrap_err();
         assert!(matches!(err, Error::MalformedXml));
+    }
+
+    #[test]
+    fn entities_and_cdata_are_coalesced_after_quick_xml_upgrade() {
+        let xml = br#"<ReplicationConfiguration><Role>role &amp; one</Role>
+            <Rule><ID>logs<![CDATA[-archive]]>&#x2d;one</ID><Status>Enabled</Status>
+              <Prefix>logs &#x2f; &amp; /</Prefix>
+              <Destination><Bucket>arn:aws:s3:::dest</Bucket></Destination></Rule>
+        </ReplicationConfiguration>"#;
+        let cfg = parse_replication(xml).unwrap();
+        assert_eq!(cfg.role, "role & one");
+        assert_eq!(cfg.rules[0].id, "logs-archive-one");
+        assert_eq!(cfg.rules[0].filter.prefix.as_deref(), Some("logs / & /"));
+
+        assert!(matches!(
+            parse_replication(
+                b"<ReplicationConfiguration><Role>&unknown;</Role></ReplicationConfiguration>"
+            ),
+            Err(Error::MalformedXml)
+        ));
     }
 
     #[test]

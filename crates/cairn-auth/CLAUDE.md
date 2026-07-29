@@ -24,7 +24,9 @@ do) is `cairn-authz`** — this crate depends on it only to parse the identity p
 
 ## Invariants
 - **Fail closed, always.** Bad/missing signature, unknown/inactive key, expired or unparseable
-  session policy → `Denied`/no-grant, **never** a bypass or a silently widened principal.
+  session policy → `Denied`/no-grant, **never** a bypass or a silently widened principal. A user
+  identity-policy read or parse failure is `PolicyUnavailable` (opaque 5xx), never cached or
+  represented as an absent policy: absence would restore the owner/admin baseline allow.
 - **The canonical URI is `uri_encode(percent_decode(path), encode_slash=false)` — keep it exactly.**
   It is what signs keys containing `(`, `)`, space correctly (warp-regression-tested). Don't
   "simplify" the decode-then-reencode.
@@ -37,18 +39,21 @@ do) is `cairn-authz`** — this crate depends on it only to parse the identity p
 - **Sessions (STS) are least-privilege and must stay that way.** A session principal carries the
   parent's identity (ownership/audit) but `is_session = true`, `role` capped to `Member`, and
   `attach_policy` **skips the parent-policy load** — a session is governed *solely* by its scoped
-  inline policy. Removing either cap lets a session widen to the parent. (The owner/admin
-  short-circuit suppression for sessions lives in `cairn-protocol`.)
+  inline policy. Administrator-derived mint paths therefore store the requested boundary together
+  with a snapshot of every parent identity Deny; consumption must neither discard that snapshot nor
+  live-merge the parent policy. Removing either cap lets a session widen to the parent. (The
+  owner/admin short-circuit suppression for sessions lives in `cairn-protocol`.)
 - **The dev bypass is triple-gated:** compiled only under the `dev-auth` cargo feature (release builds
-  omit it), AND `dev_enabled`, AND `view.source.is_loopback()`. Don't loosen any gate.
+  omit it), AND `dev_enabled`, AND `view.source.is_direct_loopback()`. A trusted proxy's forwarded
+  loopback claim never qualifies. Don't loosen any gate.
 
 ## Cache coherency (cache.rs)
 Entries are tagged with a shared **auth epoch** (`AtomicU64` the metadata layer bumps on every
 user-identity mutation) plus a TTL. `observe_epoch()` *before* the fetch, pass it to `put_*`; an
 install is refused if the epoch advanced meanwhile (closes the TOCTOU window). So a deactivation /
 policy change takes effect on the next request, not after the TTL. `ttl == 0` disables the cache
-entirely (every lookup misses). A malformed stored policy is cached as a remembered absence (warn +
-fail-closed) so a known-bad doc isn't re-parsed every request.
+entirely (every lookup misses). Only a confirmed `NULL` policy is cached as absence; malformed
+documents and read failures deny the request and remain misses.
 
 ## Notes
 - Pure crate: no filesystem, no DB writes. Reads creds/policy through `MetadataStore` and decrypts

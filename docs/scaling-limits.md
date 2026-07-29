@@ -42,6 +42,15 @@ regime — bounded by disk/network, not the writer.
 - **Max object size:** configurable via `CAIRN_MAX_OBJECT_SIZE` (default 5 TiB). Large objects stream
   to disk with bounded memory; the cost is disk bandwidth, not the writer. Multipart uploads assemble
   parts during a single staging pass.
+- **Incomplete multipart uploads:** active sessions default to 1,000 per bucket and 1,000 per
+  initiating principal; each upload defaults to at most 10,000 distinct part numbers. Tune
+  `CAIRN_MULTIPART_MAX_ACTIVE_UPLOADS_PER_BUCKET`,
+  `CAIRN_MULTIPART_MAX_ACTIVE_UPLOADS_PER_PRINCIPAL`, and
+  `CAIRN_MULTIPART_MAX_PARTS_PER_UPLOAD`. Declared part bytes, replacement cleanup debt, and
+  terminal-session cleanup remain charged against normal bucket/principal byte quota until their
+  files are removed. Per-bucket admission remains exact on its owning shard; like ordinary user
+  byte quota, a principal spanning buckets on multiple metadata shards has only per-shard
+  enforcement.
 - **Per-bucket object count:** there is no hard cap, but list/copy/tag operations are index-backed
   SQLite queries — latency grows with the number of versions under a bucket/prefix. For very large
   buckets, paginate listings (the API is always paged) and prefer prefix-scoped queries. If a single
@@ -80,10 +89,15 @@ zero-downtime upgrades (drain to the peer first). Capacity notes:
 
 - Lag is visible as `cairn_replication_unreplicated` (pending + in-flight + terminally-failed) and the
   oldest-pending age. A growing lag under sustained writes means the worker pool or the destination is
-  the bottleneck; tune `CAIRN_REPLICATION_WORKER_CONCURRENCY` / batch size, or check the target.
+  the bottleneck; check the target, then tune `CAIRN_REPLICATION_WORKER_CONCURRENCY` / batch size.
+  More workers improve body throughput only when the process-wide
+  `CAIRN_REPLICATION_BUFFER_BUDGET_BYTES` can admit their combined declared sizes; raise that budget
+  only with matching resident-memory headroom. It is shared across every destination, so worker or
+  target count never multiplies it.
 - A target that is down does not consume the retry budget — work stays pending and ships when it
-  returns. Watch `cairn_replication_unreplicated` so a dashboard never reads "healthy" while objects
-  are owed.
+  returns. A request/header/body stall is cut off by
+  `CAIRN_REPLICATION_DELIVERY_TIMEOUT_SECS` and releases its payload admission before backoff. Watch
+  `cairn_replication_unreplicated` so a dashboard never reads "healthy" while objects are owed.
 - **ACLs are replicated** via an admin-gated header; bucket policy / public-access-block / ownership
   are **not** replicated — set those on each destination.
 

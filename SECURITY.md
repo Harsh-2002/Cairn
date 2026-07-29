@@ -30,7 +30,19 @@ The architecture and threat model are documented in
 Every release is signed and comes with provenance. The binaries and `SHA256SUMS` are signed with
 [cosign](https://docs.sigstore.dev/) **keyless** (Sigstore OIDC — no long-lived key), an SPDX
 dependency SBOM (`cairn-sbom.spdx.json`) is attached, and both the binaries and the container image
-carry SLSA **build-provenance attestations**.
+carry SLSA **build-provenance attestations**. The no-authority build jobs emit the SLSA v1
+predicates; isolated attestation jobs consume them only after checking the subject, commit,
+version, target/image and registry-digest bindings. `PUBLISH-MANIFEST.sha256` covers every
+published binary, signature bundle, checksum file, SBOM, provenance predicate, and `IMAGE-DIGEST`;
+verify it before selecting a subject.
+
+The workflow gives compilation and OCI assembly no package/repository write or OIDC permission.
+Isolated publishing and signing jobs verify the build job's SHA-256, commit, CalVer, target, and
+image-digest bindings before using their one authority. All actions, tool installers,
+SBOM/signing tools, BuildKit inputs, and container bases are immutable commit/version/checksum or
+digest pins, enforced by `python3 tests/release_policy.py`. GitHub-hosted runner images are not
+content-addressable; the workflow bounds that platform trust to the `ubuntu-24.04` label and uses
+its bootstrap/system tools, while checksum-verifying every downloaded high-impact release tool.
 
 The signing identity is this repository's release workflow, and the issuer is GitHub's OIDC
 provider. Substituting the identity/issuer below with anything else means the artifact was not built
@@ -40,6 +52,9 @@ by this pipeline.
 IDENTITY='https://github.com/Harsh-2002/Cairn/.github/workflows/release.yml@refs/heads/main'
 ISSUER='https://token.actions.githubusercontent.com'
 
+# Verify the release bundle's fixed subjects first:
+sha256sum -c PUBLISH-MANIFEST.sha256
+
 # Binary (and SHA256SUMS) — verify the detached cosign bundle attached to the release:
 cosign verify-blob \
   --certificate-identity "$IDENTITY" \
@@ -47,15 +62,18 @@ cosign verify-blob \
   --bundle cairn-linux-amd64.cosign.bundle \
   cairn-linux-amd64
 
-# Container image — verify the keyless signature by digest:
+# Container image — use the digest attached to this release, never the mutable tag as the subject:
+IMAGE='ghcr.io/harsh-2002/cairn'
+DIGEST="$(cat IMAGE-DIGEST)"
+printf '%s\n' "$DIGEST" | grep -Eq '^sha256:[0-9a-f]{64}$'
 cosign verify \
   --certificate-identity "$IDENTITY" \
   --certificate-oidc-issuer "$ISSUER" \
-  ghcr.io/harsh-2002/cairn:latest
+  "${IMAGE}@${DIGEST}"
 
 # Build provenance (binary or image) via the GitHub CLI:
 gh attestation verify cairn-linux-amd64 --repo Harsh-2002/Cairn
-gh attestation verify oci://ghcr.io/harsh-2002/cairn:latest --repo Harsh-2002/Cairn
+gh attestation verify "oci://${IMAGE}@${DIGEST}" --repo Harsh-2002/Cairn
 ```
 
 ## Supported versions

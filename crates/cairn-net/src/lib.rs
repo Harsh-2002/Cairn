@@ -9,10 +9,10 @@
 //! This crate is the one place that decides *what an outbound connection may reach*. It exposes:
 //!
 //! - [`ip_is_internal`] — the pure predicate: is this resolved IP one we refuse to dial?
-//! - [`GuardedResolver`] / [`guarded_http_connector`] — the **connect-time** guarantee: a DNS
-//!   resolver wrapper that runs on every dial (initial connect, redirect, reconnect) and rejects the
-//!   whole address set if *any* resolved address is internal. This is the layer that defeats
-//!   DNS-rebinding, because it checks the exact addresses hyper is about to connect to.
+//! - [`GuardedHttpConnector`] / [`guarded_http_connector`] — the **connect-time** guarantee: it
+//!   rejects blocked IP-literal URI hosts before Hyper can bypass DNS, then delegates hostname dials
+//!   to [`GuardedResolver`], which rejects the whole resolved address set if *any* entry is internal.
+//!   The resolver runs on every dial and therefore also defeats DNS rebinding.
 //! - [`validate_endpoint`] — the **validate-time** layer: a fast, operator-visible check at
 //!   configuration time (e.g. when creating an import job) so a bad endpoint is rejected with a clear
 //!   message instead of failing later mid-run. It is defence-in-depth/UX, not the guarantee — the
@@ -24,6 +24,6 @@
 mod ssrf;
 
 pub use ssrf::{
-    GuardConfig, GuardedResolver, SsrfError, guarded_http_connector, ip_is_internal,
-    validate_endpoint,
+    GuardConfig, GuardedHttpConnector, GuardedResolver, SsrfError, guarded_http_connector,
+    ip_is_internal, validate_endpoint,
 };

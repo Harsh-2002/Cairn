@@ -2,8 +2,8 @@
 //! the engine stack, and runs the HTTP server with ordered graceful shutdown. Also carries the
 //! node-local commands that operate directly on the data dir from config: `bootstrap` (mint the
 //! first administrator), `integrity` (on-demand reconciliation), `migrate` (run migrations and
-//! report the schema version), and `backup`/`restore` (the ARCH 31.4 consistent snapshot and its
-//! inverse). The full remote-admin CLI ships as `cairn-cli` in a later wave.
+//! report the schema version), and `backup`/`restore` (the ARCH 31.4 offline single-SQLite snapshot
+//! and its inverse). The full remote-admin CLI ships as `cairn-cli` in a later wave.
 
 // The default (and every non-`fast-io`) build keeps the strongest posture: `forbid(unsafe_code)`
 // makes it impossible to introduce `unsafe` anywhere in the crate. The experimental, Linux-only
@@ -23,7 +23,9 @@ mod import_dest;
 mod import_run;
 mod key_rewrap;
 mod metrics_agg;
+mod node_lock;
 mod observability;
+mod proxy;
 mod replication_audit;
 mod server;
 mod sse;
@@ -82,14 +84,12 @@ enum Command {
     },
     /// Open the store (running migrations) and report the applied schema version.
     Migrate,
-    /// Take a consistent snapshot of the data dir into DIR (ARCH 31.4): checkpoint + copy the
-    /// database, then copy the blob tree excluding the staging area.
+    /// Take an offline, validated single-SQLite snapshot into an empty DIR (ARCH 31.4).
     Backup {
         /// Destination directory for the snapshot (created if absent).
         dir: PathBuf,
     },
-    /// Restore a snapshot from DIR into the configured data dir, then run reconciliation
-    /// (ARCH 31.4): place the database and blobs, then reconcile.
+    /// Restore an offline, validated single-SQLite snapshot, then reconcile (ARCH 31.4).
     Restore {
         /// Source snapshot directory produced by `backup`.
         dir: PathBuf,
@@ -198,6 +198,31 @@ fn main() -> ExitCode {
         }
     };
 
+    if matches!(&command, Command::Backup { .. } | Command::Restore { .. })
+        && let Err(error) = require_canonical_backup_topology(&cfg)
+    {
+        eprintln!("{error}");
+        return ExitCode::from(2);
+    }
+
+    // Every command that directly accesses node-local state cooperates on the data-root and
+    // database locks. In particular this makes backup/restore explicitly offline relative to a
+    // running Cairn process. `validate-config` remains side-effect-free.
+    let _node_lock = if matches!(&command, Command::ValidateConfig) {
+        None
+    } else {
+        match node_lock::NodeLock::acquire(&cfg.data_dir, &cfg.db_path) {
+            Ok(lock) => Some(lock),
+            Err(error) => {
+                eprintln!(
+                    "cannot access node-local state exclusively: {error}; stop the running Cairn \
+                     server or other node-local command and retry"
+                );
+                return ExitCode::FAILURE;
+            }
+        }
+    };
+
     match command {
         Command::ValidateConfig => {
             // The fields parsed; also enforce the serve-time deployment guardrail so an operator who
@@ -300,9 +325,20 @@ fn integrity(cfg: Config, repair: bool) -> ExitCode {
         // backing object, and deletes the row when the blob is gone.
         if repair {
             match repair_dangling_rows(meta.as_ref(), &blob).await {
-                Ok(dropped) => {
-                    println!("repair complete: dangling_rows_dropped={dropped}");
+                Ok(report) if report.protected == 0 => {
+                    println!(
+                        "repair complete: dangling_rows_dropped={} protected_unresolved=0",
+                        report.dropped
+                    );
                     ExitCode::SUCCESS
+                }
+                Ok(report) => {
+                    eprintln!(
+                        "repair incomplete: dangling_rows_dropped={} protected_unresolved={}; \
+                         Object Lock protected metadata was preserved",
+                        report.dropped, report.protected
+                    );
+                    ExitCode::FAILURE
                 }
                 Err(e) => {
                     eprintln!("repair failed: {e}");
@@ -323,7 +359,8 @@ const REPAIR_MAX_PAGES: u32 = 100_000;
 /// Repair-mode reconciliation (ARCH 24.3/29.4): drop every metadata row whose backing blob is
 /// missing on disk. Walks each bucket's versions, resolves each non-delete-marker version's
 /// `storage_path`, probes the blob store for it, and submits a `DeleteVersion` mutation when the
-/// blob is absent. Returns the count of rows dropped.
+/// blob is absent. Protected rows remain as explicit unresolved damage rather than silently
+/// erasing WORM metadata.
 ///
 /// This composes only the public store/blob primitives (no privileged internals): it is the
 /// node-local inverse of orphan reclamation and is deliberately destructive, so it runs only under
@@ -331,13 +368,17 @@ const REPAIR_MAX_PAGES: u32 = 100_000;
 async fn repair_dangling_rows(
     meta: &dyn cairn_types::traits::MetadataStore,
     blob: &cairn_blob::LocalBlobStore,
-) -> Result<u64, String> {
+) -> Result<RepairDanglingReport, String> {
+    use cairn_types::Clock;
     use cairn_types::error::BlobError;
     use cairn_types::meta::{ListQuery, Mutation, MutationOutcome};
+    use cairn_types::object::GovernanceBypass;
     use cairn_types::traits::BlobStore;
 
     let buckets = meta.list_buckets(None).await.map_err(|e| e.to_string())?;
     let mut dropped = 0u64;
+    let mut protected = 0u64;
+    let now = cairn_crypto::SystemClock::new().now();
 
     for bucket in &buckets {
         let mut cursor: Option<String> = None;
@@ -392,6 +433,8 @@ async fn repair_dangling_rows(
                                 key: item.key.clone(),
                                 version_id: item.version_id.clone(),
                                 expected_updated_at: None,
+                                now,
+                                bypass: GovernanceBypass::Denied,
                             })
                             .await
                         {
@@ -403,7 +446,10 @@ async fn repair_dangling_rows(
                                 }
                                 dropped += 1;
                             }
-                            Ok(_) => {}
+                            Ok(MutationOutcome::DeleteProtected) => protected += 1,
+                            Ok(_) => {
+                                return Err("unexpected integrity-repair delete outcome".to_owned());
+                            }
                             Err(e) => return Err(e.to_string()),
                         }
                     }
@@ -421,7 +467,13 @@ async fn repair_dangling_rows(
         }
     }
 
-    Ok(dropped)
+    Ok(RepairDanglingReport { dropped, protected })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RepairDanglingReport {
+    dropped: u64,
+    protected: u64,
 }
 
 /// How many suspect versions per bucket the human-readable audit lists individually. Counts are
@@ -676,6 +728,7 @@ async fn build_replica_verifier(
         crypto,
         allow_internal_endpoints: cfg.allow_internal_endpoints,
         allow_plaintext_sse_over_http: cfg.replication_allow_plaintext_sse_over_http,
+        sink_runtime: cfg.replication_sink_runtime(),
         sinks: tokio::sync::Mutex::new(std::collections::HashMap::new()),
     }))
 }
@@ -687,6 +740,7 @@ struct HttpReplicaVerifier {
     crypto: Arc<cairn_crypto::SystemCrypto>,
     allow_internal_endpoints: bool,
     allow_plaintext_sse_over_http: bool,
+    sink_runtime: cairn_replication::ReplicationSinkRuntime,
     /// Lazily-built destination sink per source bucket (`None` = this bucket has no resolvable
     /// target, so nothing can be verified for it).
     sinks: tokio::sync::Mutex<
@@ -737,6 +791,7 @@ impl HttpReplicaVerifier {
             &open,
             self.allow_internal_endpoints,
             self.allow_plaintext_sse_over_http,
+            self.sink_runtime.clone(),
         )
         .ok()
         .map(Arc::new)
@@ -762,7 +817,7 @@ impl HttpReplicaVerifier {
                 let d = cairn_types::sse::parse_descriptor(json)
                     .map_err(|e| format!("parsing the sse descriptor: {e}"))?;
                 Some(
-                    *cairn_types::sse::open_dek(self.crypto.as_ref(), &d)
+                    cairn_types::sse::open_dek(self.crypto.as_ref(), &d)
                         .map_err(|e| format!("unsealing the data key: {e}"))?,
                 )
             }
@@ -874,7 +929,12 @@ fn migrate(cfg: Config) -> ExitCode {
 
 /// Read the highest applied migration version from the database file.
 fn schema_version(db_path: &std::path::Path) -> Result<i64, String> {
-    let conn = rusqlite::Connection::open(db_path).map_err(|e| e.to_string())?;
+    ensure_regular_file_no_symlink(db_path, "SQLite database")?;
+    let conn = rusqlite::Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| e.to_string())?;
     conn.query_row(
         "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
         [],
@@ -883,13 +943,613 @@ fn schema_version(db_path: &std::path::Path) -> Result<i64, String> {
     .map_err(|e| e.to_string())
 }
 
-/// Take a consistent snapshot into `dir` (ARCH 31.4). The database is snapshotted first
-/// (checkpoint to fold the WAL into the main file, then copy it), and the blob tree is copied
-/// second excluding the staging area. Taking the database first guarantees the copied blob set is
-/// a superset of what the snapshot references, so restore finds a blob for every row; any extra
-/// blobs from writes after the snapshot are reclaimed by reconciliation on restore. The master
-/// key is deliberately not part of the data dir, so it is not disclosed by the snapshot.
+/// The backup/restore format currently has one deliberately narrow topology contract.
+///
+/// Alternate engines and sharded SQLite use multiple physical metadata stores. Treating any one of
+/// them as a complete snapshot would let restore reclaim valid blobs as orphans, so refuse them
+/// until a topology-aware manifest exists.
+fn require_canonical_backup_topology(cfg: &Config) -> Result<(), String> {
+    if cfg.meta_backend != "sqlite" || cfg.meta_shards != 1 {
+        return Err(format!(
+            "backup/restore supports only CAIRN_META_BACKEND=sqlite with \
+             CAIRN_META_SHARDS=1; configured backend={:?}, shards={}",
+            cfg.meta_backend, cfg.meta_shards
+        ));
+    }
+    Ok(())
+}
+
+const SNAPSHOT_FORMAT_VERSION: u32 = 1;
+const SNAPSHOT_BLOB_LAYOUT_VERSION: u32 = 1;
+const SNAPSHOT_DATABASE_FILE: &str = "metadata.sqlite3";
+const SNAPSHOT_BLOB_DIRECTORY: &str = "blobs";
+const SNAPSHOT_MANIFEST_FILE: &str = "manifest.json";
+const MAX_SNAPSHOT_MANIFEST_BYTES: u64 = 64 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SnapshotManifest {
+    format_version: u32,
+    complete: bool,
+    created_at_unix_ms: u64,
+    created_by: String,
+    metadata: SnapshotMetadataManifest,
+    blobs: SnapshotBlobManifest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SnapshotMetadataManifest {
+    backend: String,
+    shards: u32,
+    schema_version: i64,
+    database_file: String,
+    database_size: u64,
+    database_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SnapshotBlobManifest {
+    layout_version: u32,
+}
+
+#[derive(Debug)]
+struct ValidatedSnapshot {
+    manifest: SnapshotManifest,
+    database: std::path::PathBuf,
+    blobs: std::path::PathBuf,
+    referenced_files: u64,
+}
+
+/// Create a transactionally-consistent, self-contained SQLite file.
+///
+/// The process-wide [`node_lock::NodeLock`] already excludes every Cairn writer and blob mutator.
+/// We still refuse a contended truncating checkpoint (which reveals an external WAL-pinning
+/// reader/writer), then use SQLite's own `VACUUM INTO` snapshot facility rather than reading pages
+/// with a filesystem copy.
+async fn snapshot_sqlite_database(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+) -> Result<(), String> {
+    if destination.exists() {
+        return Err(format!(
+            "snapshot database destination already exists: {}",
+            destination.display()
+        ));
+    }
+    // Opening the concrete store may apply pending migrations, and every such write plus both
+    // maintenance operations stay serialized on its one Writer.
+    let store = cairn_meta::open(source, &cairn_meta::OpenOptions::default())
+        .map_err(|error| format!("failed to open source SQLite metadata store: {error}"))?;
+    let stats = store
+        .checkpoint()
+        .await
+        .map_err(|error| format!("failed to checkpoint source SQLite database: {error}"))?;
+    if stats.busy {
+        return Err(format!(
+            "source SQLite WAL is busy ({}/{} frames checkpointed); stop every reader/writer and \
+             retry the offline backup",
+            stats.checkpointed_frames, stats.log_frames
+        ));
+    }
+
+    store
+        .vacuum_into_snapshot(destination.to_owned())
+        .await
+        .map_err(|error| format!("SQLite snapshot failed: {error}"))?;
+    let snapshot_file = tokio::fs::OpenOptions::new()
+        .read(true)
+        .open(destination)
+        .await
+        .map_err(|error| format!("failed to reopen snapshot database for sync: {error}"))?;
+    snapshot_file
+        .sync_all()
+        .await
+        .map_err(|error| format!("failed to sync snapshot database: {error}"))?;
+    Ok(())
+}
+
+fn validate_snapshot_database(path: &std::path::Path) -> Result<(), String> {
+    use rusqlite::{OpenFlags, OptionalExtension};
+
+    ensure_regular_file_no_symlink(path, "snapshot database")?;
+    let conn = rusqlite::Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| format!("failed to open snapshot database: {error}"))?;
+    let mut statement = conn
+        .prepare("PRAGMA integrity_check")
+        .map_err(|error| format!("failed to start SQLite integrity_check: {error}"))?;
+    let mut rows = statement
+        .query([])
+        .map_err(|error| format!("failed to run SQLite integrity_check: {error}"))?;
+    let first = rows
+        .next()
+        .map_err(|error| format!("failed to read SQLite integrity_check: {error}"))?
+        .ok_or_else(|| "SQLite integrity_check returned no result".to_owned())?
+        .get::<_, String>(0)
+        .map_err(|error| format!("invalid SQLite integrity_check result: {error}"))?;
+    let extra = rows
+        .next()
+        .map_err(|error| format!("failed to read SQLite integrity_check: {error}"))?
+        .is_some();
+    if first != "ok" || extra {
+        return Err(format!("SQLite integrity_check failed: {first}"));
+    }
+    drop(rows);
+    drop(statement);
+    let foreign_key_violation: Option<(String, Option<i64>)> = conn
+        .query_row("PRAGMA foreign_key_check", [], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
+        })
+        .optional()
+        .map_err(|error| format!("failed to run SQLite foreign_key_check: {error}"))?;
+    if let Some((table, rowid)) = foreign_key_violation {
+        return Err(format!(
+            "SQLite foreign_key_check failed at table {table:?}, rowid {rowid:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// Verify that every durable object and multipart-part path named by the snapshot exists in its
+/// copied blob tree. This is intentionally streaming: backup validation remains bounded by one
+/// SQLite row and one filesystem stat regardless of object count.
+fn verify_snapshot_blob_references(
+    database: &std::path::Path,
+    blob_root: &std::path::Path,
+) -> Result<u64, String> {
+    use rusqlite::OpenFlags;
+    use std::path::Component;
+
+    let conn = rusqlite::Connection::open_with_flags(
+        database,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| format!("failed to open snapshot database: {error}"))?;
+    let mut statement = conn
+        .prepare(
+            "SELECT storage_path FROM object_versions WHERE storage_path IS NOT NULL
+             UNION ALL
+             SELECT storage_path FROM multipart_parts",
+        )
+        .map_err(|error| format!("failed to enumerate snapshot blob references: {error}"))?;
+    let paths = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|error| format!("failed to enumerate snapshot blob references: {error}"))?;
+
+    let mut checked = 0u64;
+    for path in paths {
+        let path = path.map_err(|error| format!("invalid snapshot blob reference: {error}"))?;
+        let relative = std::path::Path::new(&path);
+        if relative.as_os_str().is_empty()
+            || relative.is_absolute()
+            || !relative
+                .components()
+                .all(|component| matches!(component, Component::Normal(_)))
+        {
+            return Err(format!(
+                "unsafe storage_path in snapshot database: {path:?}"
+            ));
+        }
+        let resolved = blob_root.join(relative);
+        let metadata = std::fs::symlink_metadata(&resolved).map_err(|error| {
+            format!(
+                "snapshot is missing referenced blob {path:?} at {}: {error}",
+                resolved.display()
+            )
+        })?;
+        if !metadata.is_file() {
+            return Err(format!(
+                "referenced blob {path:?} is not a regular file at {}",
+                resolved.display()
+            ));
+        }
+        checked = checked.saturating_add(1);
+    }
+    Ok(checked)
+}
+
+fn ensure_regular_file_no_symlink(
+    path: &std::path::Path,
+    description: &str,
+) -> Result<std::fs::Metadata, String> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("{description} {} is unavailable: {error}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!(
+            "{description} must be a non-symlink regular file: {}",
+            path.display()
+        ));
+    }
+    Ok(metadata)
+}
+
+fn ensure_directory_no_symlink(
+    path: &std::path::Path,
+    description: &str,
+) -> Result<std::fs::Metadata, String> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("{description} {} is unavailable: {error}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!(
+            "{description} must be a non-symlink directory: {}",
+            path.display()
+        ));
+    }
+    Ok(metadata)
+}
+
+fn present_sqlite_sidecars(path: &std::path::Path) -> Result<Vec<std::path::PathBuf>, String> {
+    let mut present = Vec::new();
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let sidecar = sqlite_sidecar_path(path, suffix);
+        match std::fs::symlink_metadata(&sidecar) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_file() {
+                    return Err(format!(
+                        "SQLite sidecar must be a non-symlink regular file: {}",
+                        sidecar.display()
+                    ));
+                }
+                present.push(sidecar);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "failed to inspect SQLite sidecar {}: {error}",
+                    sidecar.display()
+                ));
+            }
+        }
+    }
+    Ok(present)
+}
+
+async fn file_fingerprint(path: &std::path::Path) -> Result<(u64, String), String> {
+    use sha2::Digest;
+    use tokio::io::AsyncReadExt;
+
+    ensure_regular_file_no_symlink(path, "snapshot file")?;
+    let file = cairn_blob::open_readonly_nofollow(path).map_err(|error| {
+        format!(
+            "failed to open {} without following symlinks: {error}",
+            path.display()
+        )
+    })?;
+    let metadata = file.metadata().map_err(|error| {
+        format!(
+            "failed to stat opened snapshot file {}: {error}",
+            path.display()
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "opened snapshot path is not a regular file: {}",
+            path.display()
+        ));
+    }
+    let expected_size = metadata.len();
+    let mut file = tokio::fs::File::from_std(file);
+    let mut hash = sha2::Sha256::new();
+    let mut size = 0u64;
+    let mut buffer = vec![0u8; 128 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .await
+            .map_err(|error| format!("failed to hash snapshot file {}: {error}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        size = size.saturating_add(read as u64);
+        hash.update(&buffer[..read]);
+    }
+    if size != expected_size {
+        return Err(format!(
+            "snapshot file changed while hashing {} (stat size {expected_size}, read {size})",
+            path.display()
+        ));
+    }
+    Ok((size, hex::encode(hash.finalize())))
+}
+
+async fn build_snapshot_manifest(database: &std::path::Path) -> Result<SnapshotManifest, String> {
+    let (database_size, database_sha256) = file_fingerprint(database).await?;
+    let schema_version = schema_version(database)?;
+    let created_at_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| format!("system clock is before the Unix epoch: {error}"))?
+        .as_millis()
+        .try_into()
+        .map_err(|_| "snapshot creation timestamp does not fit in u64".to_owned())?;
+    Ok(SnapshotManifest {
+        format_version: SNAPSHOT_FORMAT_VERSION,
+        complete: true,
+        created_at_unix_ms,
+        created_by: format!("cairn/{}", CAIRN_VERSION.trim()),
+        metadata: SnapshotMetadataManifest {
+            backend: "sqlite".to_owned(),
+            shards: 1,
+            schema_version,
+            database_file: SNAPSHOT_DATABASE_FILE.to_owned(),
+            database_size,
+            database_sha256,
+        },
+        blobs: SnapshotBlobManifest {
+            layout_version: SNAPSHOT_BLOB_LAYOUT_VERSION,
+        },
+    })
+}
+
+async fn write_snapshot_manifest_last(
+    snapshot_root: &std::path::Path,
+    manifest: &SnapshotManifest,
+) -> Result<(), String> {
+    use tokio::io::AsyncWriteExt;
+
+    let destination = snapshot_root.join(SNAPSHOT_MANIFEST_FILE);
+    if destination.exists() {
+        return Err(format!(
+            "snapshot completion manifest already exists: {}",
+            destination.display()
+        ));
+    }
+    let staged = snapshot_root.join(format!(
+        ".{SNAPSHOT_MANIFEST_FILE}.{}.tmp",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let mut bytes = serde_json::to_vec_pretty(manifest)
+        .map_err(|error| format!("failed to serialize snapshot manifest: {error}"))?;
+    bytes.push(b'\n');
+    let result = async {
+        let mut file = tokio::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&staged)
+            .await
+            .map_err(|error| format!("failed to create staged snapshot manifest: {error}"))?;
+        file.write_all(&bytes)
+            .await
+            .map_err(|error| format!("failed to write staged snapshot manifest: {error}"))?;
+        file.sync_all()
+            .await
+            .map_err(|error| format!("failed to sync staged snapshot manifest: {error}"))?;
+        drop(file);
+        tokio::fs::rename(&staged, &destination)
+            .await
+            .map_err(|error| format!("failed to publish snapshot completion manifest: {error}"))?;
+        sync_directory(snapshot_root)
+            .await
+            .map_err(|error| format!("failed to sync completed snapshot directory: {error}"))?;
+        if let Some(parent) = snapshot_root.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            sync_directory(parent)
+                .await
+                .map_err(|error| format!("failed to sync snapshot parent directory: {error}"))?;
+        }
+        Ok(())
+    }
+    .await;
+    if result.is_err() {
+        let _ = remove_file_if_present(&staged).await;
+    }
+    result
+}
+
+async fn read_snapshot_manifest(
+    snapshot_root: &std::path::Path,
+) -> Result<SnapshotManifest, String> {
+    use tokio::io::AsyncReadExt;
+
+    ensure_directory_no_symlink(snapshot_root, "snapshot root")?;
+    let path = snapshot_root.join(SNAPSHOT_MANIFEST_FILE);
+    let metadata = ensure_regular_file_no_symlink(&path, "snapshot completion manifest")?;
+    if metadata.len() > MAX_SNAPSHOT_MANIFEST_BYTES {
+        return Err(format!(
+            "snapshot manifest exceeds {} bytes: {}",
+            MAX_SNAPSHOT_MANIFEST_BYTES,
+            path.display()
+        ));
+    }
+    let file = cairn_blob::open_readonly_nofollow(&path)
+        .map_err(|error| format!("failed to open snapshot manifest safely: {error}"))?;
+    let mut file = tokio::fs::File::from_std(file).take(MAX_SNAPSHOT_MANIFEST_BYTES + 1);
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.read_to_end(&mut bytes)
+        .await
+        .map_err(|error| format!("failed to read snapshot manifest: {error}"))?;
+    if bytes.len() as u64 > MAX_SNAPSHOT_MANIFEST_BYTES {
+        return Err(
+            "snapshot manifest changed while reading and exceeded its size limit".to_owned(),
+        );
+    }
+    serde_json::from_slice(&bytes).map_err(|error| {
+        format!("snapshot manifest is invalid JSON or has unknown fields: {error}")
+    })
+}
+
+fn validate_snapshot_manifest(manifest: &SnapshotManifest) -> Result<(), String> {
+    if manifest.format_version != SNAPSHOT_FORMAT_VERSION {
+        return Err(format!(
+            "unsupported snapshot format version {} (this binary supports {})",
+            manifest.format_version, SNAPSHOT_FORMAT_VERSION
+        ));
+    }
+    if !manifest.complete {
+        return Err("snapshot manifest is not marked complete".to_owned());
+    }
+    if manifest.created_at_unix_ms == 0 || manifest.created_by.trim().is_empty() {
+        return Err("snapshot manifest has invalid creation metadata".to_owned());
+    }
+    if manifest.metadata.backend != "sqlite" || manifest.metadata.shards != 1 {
+        return Err(format!(
+            "unsupported snapshot metadata topology: backend={:?}, shards={}",
+            manifest.metadata.backend, manifest.metadata.shards
+        ));
+    }
+    if manifest.metadata.database_file != SNAPSHOT_DATABASE_FILE {
+        return Err(format!(
+            "snapshot database_file must be the fixed name {SNAPSHOT_DATABASE_FILE:?}, got {:?}",
+            manifest.metadata.database_file
+        ));
+    }
+    let latest = cairn_meta::latest_schema_version();
+    if manifest.metadata.schema_version <= 0 {
+        return Err(format!(
+            "snapshot schema version must be positive, got {}",
+            manifest.metadata.schema_version
+        ));
+    }
+    if manifest.metadata.schema_version > latest {
+        return Err(format!(
+            "snapshot schema version {} is newer than this binary understands ({latest})",
+            manifest.metadata.schema_version
+        ));
+    }
+    if manifest.metadata.database_sha256.len() != 64
+        || !manifest
+            .metadata
+            .database_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(
+            "snapshot database SHA-256 must be 64 lowercase hexadecimal characters".to_owned(),
+        );
+    }
+    if manifest.blobs.layout_version != SNAPSHOT_BLOB_LAYOUT_VERSION {
+        return Err(format!(
+            "unsupported blob-layout version {} (this binary supports {})",
+            manifest.blobs.layout_version, SNAPSHOT_BLOB_LAYOUT_VERSION
+        ));
+    }
+    Ok(())
+}
+
+async fn validate_snapshot(snapshot_root: &std::path::Path) -> Result<ValidatedSnapshot, String> {
+    let manifest = read_snapshot_manifest(snapshot_root).await?;
+    validate_snapshot_manifest(&manifest)?;
+    let database = snapshot_root.join(SNAPSHOT_DATABASE_FILE);
+    let blobs = snapshot_root.join(SNAPSHOT_BLOB_DIRECTORY);
+    ensure_regular_file_no_symlink(&database, "snapshot database")?;
+    ensure_directory_no_symlink(&blobs, "snapshot blob root")?;
+
+    let sidecars = present_sqlite_sidecars(&database)?;
+    if !sidecars.is_empty() {
+        return Err(format!(
+            "snapshot contains forbidden SQLite sidecar {}; the database image must be \
+             self-contained",
+            sidecars[0].display()
+        ));
+    }
+
+    let (size, sha256) = file_fingerprint(&database).await?;
+    if size != manifest.metadata.database_size {
+        return Err(format!(
+            "snapshot database size mismatch: manifest={}, actual={size}",
+            manifest.metadata.database_size
+        ));
+    }
+    if sha256 != manifest.metadata.database_sha256 {
+        return Err(format!(
+            "snapshot database SHA-256 mismatch: manifest={}, actual={sha256}",
+            manifest.metadata.database_sha256
+        ));
+    }
+    validate_snapshot_database(&database)?;
+    let actual_schema = schema_version(&database)?;
+    if actual_schema != manifest.metadata.schema_version {
+        return Err(format!(
+            "snapshot schema-version mismatch: manifest={}, database={actual_schema}",
+            manifest.metadata.schema_version
+        ));
+    }
+    validate_blob_tree_layout(&blobs).await?;
+    let referenced_files = verify_snapshot_blob_references(&database, &blobs)?;
+    Ok(ValidatedSnapshot {
+        manifest,
+        database,
+        blobs,
+        referenced_files,
+    })
+}
+
+fn ensure_empty_snapshot_destination(dir: &std::path::Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(dir) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(format!(
+                    "backup destination must be a non-symlink directory: {}",
+                    dir.display()
+                ));
+            }
+            let mut entries = std::fs::read_dir(dir)
+                .map_err(|error| format!("failed to inspect backup destination: {error}"))?;
+            if entries
+                .next()
+                .transpose()
+                .map_err(|error| format!("failed to inspect backup destination: {error}"))?
+                .is_some()
+            {
+                return Err(format!(
+                    "backup destination must be empty: {}",
+                    dir.display()
+                ));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(dir)
+                .map_err(|error| format!("failed to create backup destination: {error}"))?;
+            ensure_directory_no_symlink(dir, "backup destination")?;
+        }
+        Err(error) => {
+            return Err(format!(
+                "failed to inspect backup destination {}: {error}",
+                dir.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn reject_overlapping_trees(
+    first: &std::path::Path,
+    second: &std::path::Path,
+    operation: &str,
+) -> Result<(), String> {
+    let first = std::fs::canonicalize(first)
+        .map_err(|error| format!("failed to resolve {}: {error}", first.display()))?;
+    let second = std::fs::canonicalize(second)
+        .map_err(|error| format!("failed to resolve {}: {error}", second.display()))?;
+    if first.starts_with(&second) || second.starts_with(&first) {
+        return Err(format!(
+            "{operation} source and destination trees overlap: {} and {}",
+            first.display(),
+            second.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Take an explicitly offline, internally-validated snapshot into `dir` (ARCH 31.4).
 fn backup(cfg: Config, dir: &std::path::Path) -> ExitCode {
+    if let Err(error) = require_canonical_backup_topology(&cfg) {
+        eprintln!("{error}");
+        return ExitCode::from(2);
+    }
+    if let Err(error) = ensure_empty_snapshot_destination(dir) {
+        eprintln!("{error}");
+        return ExitCode::FAILURE;
+    }
+    if let Err(error) = reject_overlapping_trees(&cfg.data_dir, dir, "backup") {
+        eprintln!("{error}");
+        return ExitCode::FAILURE;
+    }
+
     let rt = match runtime(&cfg) {
         Ok(rt) => rt,
         Err(e) => {
@@ -898,46 +1558,57 @@ fn backup(cfg: Config, dir: &std::path::Path) -> ExitCode {
         }
     };
     rt.block_on(async move {
-        if let Err(e) = tokio::fs::create_dir_all(dir).await {
-            eprintln!("failed to create backup dir: {e}");
+        let db_dest = dir.join(SNAPSHOT_DATABASE_FILE);
+        if let Err(error) = snapshot_sqlite_database(&cfg.db_path, &db_dest).await {
+            eprintln!("failed to snapshot database: {error}");
+            return ExitCode::FAILURE;
+        }
+        if let Err(error) = validate_snapshot_database(&db_dest) {
+            eprintln!("snapshot database validation failed: {error}");
             return ExitCode::FAILURE;
         }
 
-        // 1. Database first: open (runs migrations), checkpoint to fold the WAL into the main
-        //    file, then copy the now-self-contained database file.
-        let store = match cairn_meta::open(&cfg.db_path, &cairn_meta::OpenOptions::default()) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("failed to open metadata store: {e}");
+        // The node lock makes the source tree quiescent. Copy committed object blobs plus durable
+        // multipart parts; transient single-object `.staging/*.tmp` files are never metadata-
+        // referenced and remain excluded.
+        let blob_dest = dir.join(SNAPSHOT_BLOB_DIRECTORY);
+        let excluded = match database_artifact_names(&cfg.data_dir, &cfg.db_path) {
+            Ok(names) => names,
+            Err(error) => {
+                eprintln!("failed to identify database artifacts: {error}");
                 return ExitCode::FAILURE;
             }
         };
-        if let Err(e) = store.checkpoint().await {
-            eprintln!("failed to checkpoint before snapshot: {e}");
-            return ExitCode::FAILURE;
-        }
-        let db_name = match cfg.db_path.file_name() {
-            Some(n) => n.to_owned(),
-            None => {
-                eprintln!("db_path has no file name: {}", cfg.db_path.display());
-                return ExitCode::FAILURE;
-            }
-        };
-        let db_dest = dir.join(&db_name);
-        if let Err(e) = tokio::fs::copy(&cfg.db_path, &db_dest).await {
-            eprintln!("failed to copy database: {e}");
-            return ExitCode::FAILURE;
-        }
-        // Drop the store so its connections (and any -wal/-shm) are released before we finish.
-        drop(store);
-
-        // 2. Blobs second: copy every per-bucket directory, excluding the staging area.
-        let blob_dest = dir.join("blobs");
-        match copy_blob_tree(&cfg.data_dir, &blob_dest).await {
+        match copy_blob_tree(&cfg.data_dir, &blob_dest, &excluded).await {
             Ok(n) => {
+                let referenced = match verify_snapshot_blob_references(&db_dest, &blob_dest) {
+                    Ok(referenced) => referenced,
+                    Err(error) => {
+                        eprintln!("snapshot blob validation failed: {error}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                if let Err(error) = sync_directory(dir).await {
+                    eprintln!("failed to sync snapshot contents before completion: {error}");
+                    return ExitCode::FAILURE;
+                }
+                let manifest = match build_snapshot_manifest(&db_dest).await {
+                    Ok(manifest) => manifest,
+                    Err(error) => {
+                        eprintln!("failed to build snapshot manifest: {error}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                if let Err(error) = write_snapshot_manifest_last(dir, &manifest).await {
+                    eprintln!("failed to complete snapshot manifest: {error}");
+                    return ExitCode::FAILURE;
+                }
                 println!(
-                    "backup complete: database -> {} ({n} blob entries) -> {}",
+                    "backup complete: offline single-SQLite snapshot database={} \
+                     manifest={} ({n} blob entries, {referenced} referenced files verified) \
+                     blobs={}",
                     db_dest.display(),
+                    dir.join(SNAPSHOT_MANIFEST_FILE).display(),
                     blob_dest.display()
                 );
                 ExitCode::SUCCESS
@@ -950,12 +1621,23 @@ fn backup(cfg: Config, dir: &std::path::Path) -> ExitCode {
     })
 }
 
-/// Restore a snapshot from `dir` into the configured data dir, then reconcile (ARCH 31.4). The
-/// database and blob tree produced by `backup` are placed, and reconciliation reclaims any blobs
-/// written after the snapshot was taken.
+/// Restore an offline single-SQLite snapshot, validating it before replacing any metadata.
 fn restore(cfg: Config, dir: &std::path::Path) -> ExitCode {
     use cairn_types::blob::ReconcileOpts;
     use cairn_types::traits::BlobStore;
+
+    if let Err(error) = require_canonical_backup_topology(&cfg) {
+        eprintln!("{error}");
+        return ExitCode::from(2);
+    }
+    if !dir.is_dir() {
+        eprintln!("snapshot directory does not exist: {}", dir.display());
+        return ExitCode::FAILURE;
+    }
+    if let Err(error) = reject_overlapping_trees(&cfg.data_dir, dir, "restore") {
+        eprintln!("{error}");
+        return ExitCode::FAILURE;
+    }
 
     let rt = match runtime(&cfg) {
         Ok(rt) => rt,
@@ -965,40 +1647,61 @@ fn restore(cfg: Config, dir: &std::path::Path) -> ExitCode {
         }
     };
     rt.block_on(async move {
-        let db_name = match cfg.db_path.file_name() {
-            Some(n) => n.to_owned(),
-            None => {
-                eprintln!("db_path has no file name: {}", cfg.db_path.display());
+        // The manifest is the completion marker. Validate its topology/schema ceiling, creation
+        // metadata, exact DB size+digest, sidecar-free SQLite image, referenced files, and complete
+        // non-symlink blob-tree shape before creating or modifying any target-owned path.
+        let snapshot = match validate_snapshot(dir).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                eprintln!("snapshot validation failed: {error}");
                 return ExitCode::FAILURE;
             }
         };
-        let db_src = dir.join(&db_name);
-        let blob_src = dir.join("blobs");
-        if !db_src.exists() {
-            eprintln!("snapshot is missing the database: {}", db_src.display());
+
+        // Copy into a target-owned sibling and validate that inode against the manifest. A source
+        // swap or short copy therefore cannot reach the publication rename.
+        let staged =
+            match stage_snapshot_database(&snapshot.database, &cfg.db_path, &snapshot.manifest)
+                .await
+            {
+                Ok(staged) => staged,
+                Err(error) => {
+                    eprintln!("failed to stage restored database: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
+
+        // Make any old sidecar-owning generation self-contained before the publication name can
+        // change. Crashing before rename then reopens old state; crashing after rename sees only
+        // the new, independently validated image.
+        if let Err(error) = prepare_target_database_for_publish(&cfg.db_path).await {
+            eprintln!("failed to prepare current database generation: {error}");
             return ExitCode::FAILURE;
         }
 
-        // 1. Place files: the blob tree into the data dir, then the database.
-        if let Some(parent) = cfg.db_path.parent() {
-            let _ = tokio::fs::create_dir_all(parent).await;
-        }
-        if let Err(e) = tokio::fs::create_dir_all(&cfg.data_dir).await {
-            eprintln!("failed to create data dir: {e}");
-            return ExitCode::FAILURE;
-        }
-        if blob_src.exists() {
-            if let Err(e) = copy_blob_tree(&blob_src, &cfg.data_dir).await {
-                eprintln!("failed to restore blob tree: {e}");
-                return ExitCode::FAILURE;
-            }
-        }
-        if let Err(e) = tokio::fs::copy(&db_src, &cfg.db_path).await {
-            eprintln!("failed to restore database: {e}");
+        // Blob-first durability: if copying stops before metadata publication, the old database
+        // remains authoritative and any newly introduced opaque files are only orphans.
+        if let Err(error) = copy_blob_tree(&snapshot.blobs, &cfg.data_dir, &[]).await {
+            eprintln!("failed to restore blob tree: {error}");
             return ExitCode::FAILURE;
         }
 
-        // 2. Reconcile: reclaim any blobs from writes after the snapshot (ARCH 31.4).
+        // Revalidate the target-owned staging inode immediately before the one metadata
+        // linearization point. Publication also refuses if an old sidecar has reappeared.
+        if let Err(error) = publish_staged_database(staged, &cfg.db_path, &snapshot.manifest).await
+        {
+            eprintln!("failed to restore database: {error}");
+            return ExitCode::FAILURE;
+        }
+        if let Err(error) =
+            validate_database_against_manifest(&cfg.db_path, &snapshot.manifest).await
+        {
+            eprintln!("restored database validation failed: {error}");
+            return ExitCode::FAILURE;
+        }
+
+        // Reconcile while the node lock is still held, before any listener can serve the restored
+        // state. This reclaims target-side blobs that were not present in the snapshot.
         let store = match cairn_meta::open(&cfg.db_path, &cairn_meta::OpenOptions::default()) {
             Ok(s) => s,
             Err(e) => {
@@ -1026,8 +1729,9 @@ fn restore(cfg: Config, dir: &std::path::Path) -> ExitCode {
         {
             Ok(r) => {
                 println!(
-                    "restore complete: reconciled scanned={} orphans_reclaimed={}",
-                    r.blobs_scanned, r.orphans_reclaimed
+                    "restore complete: reconciled scanned={} orphans_reclaimed={}; offline \
+                     single-SQLite snapshot verified {} referenced files",
+                    r.blobs_scanned, r.orphans_reclaimed, snapshot.referenced_files
                 );
                 ExitCode::SUCCESS
             }
@@ -1039,51 +1743,538 @@ fn restore(cfg: Config, dir: &std::path::Path) -> ExitCode {
     })
 }
 
-/// Recursively copy the per-bucket blob directories from `src` to `dst`, skipping the `.staging`
-/// area (in-progress writes are not part of a consistent snapshot, ARCH 31.4) and any database
-/// sidecar files. Returns the number of top-level entries copied.
-async fn copy_blob_tree(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<u64> {
-    tokio::fs::create_dir_all(dst).await?;
+fn database_artifact_names(
+    data_root: &std::path::Path,
+    db_path: &std::path::Path,
+) -> std::io::Result<Vec<std::ffi::OsString>> {
+    let data_root = std::fs::canonicalize(data_root)?;
+    let db_parent = db_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let db_parent = std::fs::canonicalize(db_parent)?;
+    if data_root != db_parent {
+        return Ok(Vec::new());
+    }
+    let name = db_path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("database path has no file name: {}", db_path.display()),
+        )
+    })?;
+    let mut wal = name.to_os_string();
+    wal.push("-wal");
+    let mut shm = name.to_os_string();
+    shm.push("-shm");
+    let mut journal = name.to_os_string();
+    journal.push("-journal");
+    Ok(vec![name.to_os_string(), wal, shm, journal])
+}
+
+fn sqlite_sidecar_path(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    std::path::PathBuf::from(value)
+}
+
+async fn remove_file_if_present(path: &std::path::Path) -> std::io::Result<()> {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+#[derive(Debug)]
+struct StagedDatabase {
+    path: std::path::PathBuf,
+    published: bool,
+}
+
+impl StagedDatabase {
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for StagedDatabase {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn validate_target_database_entry(destination: &std::path::Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(destination) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => Err(format!(
+            "target database must be a non-symlink regular file when it exists: {}",
+            destination.display()
+        )),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "failed to inspect target database {}: {error}",
+            destination.display()
+        )),
+    }
+}
+
+async fn validate_database_against_manifest(
+    database: &std::path::Path,
+    manifest: &SnapshotManifest,
+) -> Result<(), String> {
+    let sidecars = present_sqlite_sidecars(database)?;
+    if !sidecars.is_empty() {
+        return Err(format!(
+            "staged snapshot database unexpectedly has sidecar {}",
+            sidecars[0].display()
+        ));
+    }
+    let (size, sha256) = file_fingerprint(database).await?;
+    if size != manifest.metadata.database_size || sha256 != manifest.metadata.database_sha256 {
+        return Err(format!(
+            "staged database digest mismatch: expected {} bytes/{}, got {size} bytes/{sha256}",
+            manifest.metadata.database_size, manifest.metadata.database_sha256
+        ));
+    }
+    validate_snapshot_database(database)?;
+    let version = schema_version(database)?;
+    if version != manifest.metadata.schema_version {
+        return Err(format!(
+            "staged database schema mismatch: expected {}, got {version}",
+            manifest.metadata.schema_version
+        ));
+    }
+    Ok(())
+}
+
+async fn stage_snapshot_database(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+    manifest: &SnapshotManifest,
+) -> Result<StagedDatabase, String> {
+    validate_target_database_entry(destination)?;
+    let parent = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    tokio::fs::create_dir_all(parent)
+        .await
+        .map_err(|error| format!("failed to create database parent: {error}"))?;
+    ensure_directory_no_symlink(parent, "target database parent")?;
+    let name = destination
+        .file_name()
+        .ok_or_else(|| format!("database path has no file name: {}", destination.display()))?;
+    let staged = parent.join(format!(
+        ".{}.restore-{}.tmp",
+        name.to_string_lossy(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    durable_copy_file(source, &staged)
+        .await
+        .map_err(|error| format!("failed to stage snapshot database: {error}"))?;
+    let staged = StagedDatabase {
+        path: staged,
+        published: false,
+    };
+    validate_database_against_manifest(staged.path(), manifest).await?;
+    Ok(staged)
+}
+
+async fn sync_regular_file_no_symlink(path: &std::path::Path) -> Result<(), String> {
+    ensure_regular_file_no_symlink(path, "database")?;
+    let file = cairn_blob::open_readonly_nofollow(path)
+        .map_err(|error| format!("failed to open database safely for sync: {error}"))?;
+    tokio::fs::File::from_std(file)
+        .sync_all()
+        .await
+        .map_err(|error| format!("failed to sync database {}: {error}", path.display()))
+}
+
+/// Make the currently published database generation self-contained before it can be replaced.
+///
+/// If no exact SQLite sidecar exists, a corrupt main file remains replaceable. When a sidecar is
+/// present, however, only SQLite may fold it into the main file: the canonical Writer runs a
+/// truncating checkpoint, every owned connection closes, the main file is synced, and only then
+/// are the exact sidecars removed and their parent directory synced.
+async fn prepare_target_database_for_publish(destination: &std::path::Path) -> Result<(), String> {
+    validate_target_database_entry(destination)?;
+    let sidecars = present_sqlite_sidecars(destination)?;
+    if sidecars.is_empty() {
+        return Ok(());
+    }
+    ensure_regular_file_no_symlink(destination, "target database with SQLite sidecars")?;
+    let store =
+        cairn_meta::open(destination, &cairn_meta::OpenOptions::default()).map_err(|error| {
+            format!("failed to open old database generation for consolidation: {error}")
+        })?;
+    let stats = store.checkpoint_and_close().await.map_err(|error| {
+        format!("failed to checkpoint and close old database generation: {error}")
+    })?;
+    if stats.busy {
+        return Err(format!(
+            "old database WAL is busy ({}/{} frames checkpointed); target generation was not \
+             replaced",
+            stats.checkpointed_frames, stats.log_frames
+        ));
+    }
+    sync_regular_file_no_symlink(destination).await?;
+    for sidecar in present_sqlite_sidecars(destination)? {
+        remove_file_if_present(&sidecar).await.map_err(|error| {
+            format!(
+                "failed to remove consolidated sidecar {}: {error}",
+                sidecar.display()
+            )
+        })?;
+    }
+    let parent = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    sync_directory(parent)
+        .await
+        .map_err(|error| format!("failed to sync database parent after sidecar removal: {error}"))
+}
+
+async fn publish_staged_database(
+    mut staged: StagedDatabase,
+    destination: &std::path::Path,
+    manifest: &SnapshotManifest,
+) -> Result<(), String> {
+    validate_database_against_manifest(staged.path(), manifest).await?;
+    validate_target_database_entry(destination)?;
+    let sidecars = present_sqlite_sidecars(destination)?;
+    if !sidecars.is_empty() {
+        return Err(format!(
+            "refusing to publish while old-generation sidecar still exists: {}",
+            sidecars[0].display()
+        ));
+    }
+    tokio::fs::rename(staged.path(), destination)
+        .await
+        .map_err(|error| format!("failed to atomically publish restored database: {error}"))?;
+    staged.published = true;
+    let parent = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    sync_directory(parent)
+        .await
+        .map_err(|error| format!("failed to sync published database generation: {error}"))
+}
+
+fn invalid_filesystem_entry(message: impl Into<String>) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, message.into())
+}
+
+fn require_source_directory(path: &std::path::Path) -> std::io::Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(invalid_filesystem_entry(format!(
+            "source path must be a non-symlink directory: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+async fn ensure_safe_destination_directory(path: &std::path::Path) -> std::io::Result<()> {
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            Err(invalid_filesystem_entry(format!(
+                "destination path must be a non-symlink directory: {}",
+                path.display()
+            )))
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            tokio::fs::create_dir(path).await
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn validate_blob_tree_layout(root: &std::path::Path) -> Result<(), String> {
+    require_source_directory(root)
+        .map_err(|error| format!("invalid snapshot blob root {}: {error}", root.display()))?;
+    let mut entries = tokio::fs::read_dir(root)
+        .await
+        .map_err(|error| format!("failed to inspect snapshot blob root: {error}"))?;
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|error| format!("failed to inspect snapshot blob root: {error}"))?
+    {
+        let file_type = entry
+            .file_type()
+            .await
+            .map_err(|error| format!("failed to classify snapshot blob entry: {error}"))?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if file_type.is_symlink() {
+            return Err(format!(
+                "snapshot blob tree contains symlink: {}",
+                entry.path().display()
+            ));
+        }
+        if name_str == ".staging" {
+            if !file_type.is_dir() {
+                return Err(format!(
+                    "snapshot .staging entry is not a directory: {}",
+                    entry.path().display()
+                ));
+            }
+            let mut staging_entries = tokio::fs::read_dir(entry.path()).await.map_err(|error| {
+                format!("failed to inspect snapshot staging directory: {error}")
+            })?;
+            while let Some(staging_entry) = staging_entries
+                .next_entry()
+                .await
+                .map_err(|error| format!("failed to inspect snapshot staging directory: {error}"))?
+            {
+                if staging_entry.file_name() != "multipart" {
+                    return Err(format!(
+                        "snapshot staging directory contains unexpected entry: {}",
+                        staging_entry.path().display()
+                    ));
+                }
+                let staging_type = staging_entry.file_type().await.map_err(|error| {
+                    format!("failed to classify snapshot multipart directory: {error}")
+                })?;
+                if staging_type.is_symlink() || !staging_type.is_dir() {
+                    return Err(format!(
+                        "snapshot multipart staging path is not a non-symlink directory: {}",
+                        staging_entry.path().display()
+                    ));
+                }
+                Box::pin(validate_blob_directory_recursive(&staging_entry.path())).await?;
+            }
+            continue;
+        }
+        if !file_type.is_dir() {
+            return Err(format!(
+                "snapshot blob root contains a top-level non-directory entry: {}",
+                entry.path().display()
+            ));
+        }
+        Box::pin(validate_blob_directory_recursive(&entry.path())).await?;
+    }
+    Ok(())
+}
+
+async fn validate_blob_directory_recursive(path: &std::path::Path) -> Result<(), String> {
+    require_source_directory(path).map_err(|error| {
+        format!(
+            "invalid snapshot blob directory {}: {error}",
+            path.display()
+        )
+    })?;
+    let mut entries = tokio::fs::read_dir(path)
+        .await
+        .map_err(|error| format!("failed to inspect snapshot blob directory: {error}"))?;
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|error| format!("failed to inspect snapshot blob directory: {error}"))?
+    {
+        let file_type = entry
+            .file_type()
+            .await
+            .map_err(|error| format!("failed to classify snapshot blob entry: {error}"))?;
+        if file_type.is_symlink() {
+            return Err(format!(
+                "snapshot blob tree contains symlink: {}",
+                entry.path().display()
+            ));
+        }
+        if file_type.is_dir() {
+            Box::pin(validate_blob_directory_recursive(&entry.path())).await?;
+        } else if !file_type.is_file() {
+            return Err(format!(
+                "snapshot blob tree contains a non-regular entry: {}",
+                entry.path().display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Recursively copy committed object blobs and durable multipart parts. Transient
+/// `.staging/*.tmp`, Cairn advisory locks, and the explicitly-named database artifacts are
+/// excluded. Every copied path is a non-symlink directory or regular file, and a top-level regular
+/// file is never interpreted as a blob bucket. Returns the number of top-level blob entries copied.
+async fn copy_blob_tree(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    excluded_database_names: &[std::ffi::OsString],
+) -> std::io::Result<u64> {
+    require_source_directory(src)?;
+    ensure_safe_destination_directory(dst).await?;
     let mut copied = 0u64;
     let mut entries = tokio::fs::read_dir(src).await?;
     while let Some(entry) = entries.next_entry().await? {
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
-        // Exclude the staging area and the database files; only committed per-bucket blob
-        // directories belong in the snapshot.
-        if name_str == ".staging"
-            || name_str.ends_with(".db")
-            || name_str.ends_with(".db-wal")
-            || name_str.ends_with(".db-shm")
+        let file_type = entry.file_type().await?;
+        if file_type.is_symlink() {
+            return Err(invalid_filesystem_entry(format!(
+                "refusing to copy symlink {}",
+                entry.path().display()
+            )));
+        }
+        if node_lock::is_lock_file_name(&name_str)
+            || excluded_database_names
+                .iter()
+                .any(|excluded| excluded == &name)
         {
+            if !file_type.is_file() {
+                return Err(invalid_filesystem_entry(format!(
+                    "excluded node artifact is not a regular file: {}",
+                    entry.path().display()
+                )));
+            }
             continue;
         }
         let from = entry.path();
         let to = dst.join(&name);
-        if entry.file_type().await?.is_dir() {
-            Box::pin(copy_dir_recursive(&from, &to)).await?;
-        } else {
-            tokio::fs::copy(&from, &to).await?;
+        if name_str == ".staging" {
+            if !file_type.is_dir() {
+                return Err(invalid_filesystem_entry(format!(
+                    "staging root is not a directory: {}",
+                    from.display()
+                )));
+            }
+            let multipart = from.join("multipart");
+            match tokio::fs::symlink_metadata(&multipart).await {
+                Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                    return Err(invalid_filesystem_entry(format!(
+                        "multipart staging path is not a non-symlink directory: {}",
+                        multipart.display()
+                    )));
+                }
+                Ok(_) => {
+                    ensure_safe_destination_directory(&to).await?;
+                    let staging_dest = to.join("multipart");
+                    Box::pin(copy_dir_recursive(&multipart, &staging_dest)).await?;
+                    sync_directory(&to).await?;
+                    copied = copied.saturating_add(1);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            continue;
         }
-        copied += 1;
+        if !file_type.is_dir() {
+            return Err(invalid_filesystem_entry(format!(
+                "top-level blob entry must be a bucket directory, not a file or special node: {}",
+                from.display()
+            )));
+        }
+        Box::pin(copy_dir_recursive(&from, &to)).await?;
+        copied = copied.saturating_add(1);
     }
+    sync_directory(dst).await?;
     Ok(copied)
 }
 
 /// Recursively copy a directory and its contents.
 async fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
-    tokio::fs::create_dir_all(dst).await?;
+    require_source_directory(src)?;
+    ensure_safe_destination_directory(dst).await?;
     let mut entries = tokio::fs::read_dir(src).await?;
     while let Some(entry) = entries.next_entry().await? {
         let from = entry.path();
         let to = dst.join(entry.file_name());
-        if entry.file_type().await?.is_dir() {
+        let file_type = entry.file_type().await?;
+        if file_type.is_symlink() {
+            return Err(invalid_filesystem_entry(format!(
+                "refusing to copy symlink {}",
+                from.display()
+            )));
+        }
+        if file_type.is_dir() {
             Box::pin(copy_dir_recursive(&from, &to)).await?;
+        } else if file_type.is_file() {
+            durable_copy_file(&from, &to).await?;
         } else {
-            tokio::fs::copy(&from, &to).await?;
+            return Err(invalid_filesystem_entry(format!(
+                "refusing to copy non-regular filesystem entry {}",
+                from.display()
+            )));
         }
     }
-    Ok(())
+    sync_directory(dst).await
+}
+
+async fn durable_copy_file(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+) -> std::io::Result<()> {
+    let source_metadata = std::fs::symlink_metadata(source)?;
+    if source_metadata.file_type().is_symlink() || !source_metadata.is_file() {
+        return Err(invalid_filesystem_entry(format!(
+            "copy source must be a non-symlink regular file: {}",
+            source.display()
+        )));
+    }
+    match tokio::fs::symlink_metadata(destination).await {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err(invalid_filesystem_entry(format!(
+                "copy destination must be a non-symlink regular file when it exists: {}",
+                destination.display()
+            )));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let parent = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    ensure_safe_destination_directory(parent).await?;
+
+    let source_file = cairn_blob::open_readonly_nofollow(source)?;
+    let opened_metadata = source_file.metadata()?;
+    if !opened_metadata.is_file() {
+        return Err(invalid_filesystem_entry(format!(
+            "opened copy source is not a regular file: {}",
+            source.display()
+        )));
+    }
+    let staged = parent.join(format!(".cairn-copy-{}.tmp", uuid::Uuid::new_v4().simple()));
+    let result = async {
+        let mut input = tokio::fs::File::from_std(source_file);
+        let mut output = tokio::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&staged)
+            .await?;
+        let copied = tokio::io::copy(&mut input, &mut output).await?;
+        if copied != opened_metadata.len() {
+            return Err(invalid_filesystem_entry(format!(
+                "source file changed size while copying {} (expected {}, copied {copied})",
+                source.display(),
+                opened_metadata.len()
+            )));
+        }
+        output.sync_all().await?;
+        drop(output);
+        tokio::fs::rename(&staged, destination).await
+    }
+    .await;
+    if result.is_err() {
+        let _ = remove_file_if_present(&staged).await;
+    }
+    result
+}
+
+async fn sync_directory(path: &std::path::Path) -> std::io::Result<()> {
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || std::fs::File::open(path)?.sync_all())
+        .await
+        .map_err(|error| std::io::Error::other(format!("directory sync task failed: {error}")))?
 }
 
 fn runtime(cfg: &Config) -> std::io::Result<tokio::runtime::Runtime> {
@@ -1188,11 +2379,15 @@ fn bootstrap(cfg: Config) -> ExitCode {
         println!("  Bearer (web console + management API):");
         println!(
             "    Authorization: Bearer {}.{}",
-            cfg.root_access_key, cfg.root_secret_key
+            cfg.root_access_key,
+            cfg.root_secret_key.expose_secret()
         );
         println!("\n  SigV4 (S3 SDKs / aws-cli):");
         println!("    Access Key Id:     {}", cfg.root_access_key);
-        println!("    Secret Access Key: {}", cfg.root_secret_key);
+        println!(
+            "    Secret Access Key: {}",
+            cfg.root_secret_key.expose_secret()
+        );
         println!("    Region:            {}", cfg.region);
         println!("\n  Create further users from the console or `cairn remote user create`.",);
         if insecure_defaults {
@@ -1207,8 +2402,196 @@ fn bootstrap(cfg: Config) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, copy_blob_tree, schema_version};
+    use super::{
+        Cli, Config, SNAPSHOT_BLOB_DIRECTORY, SNAPSHOT_DATABASE_FILE, SNAPSHOT_MANIFEST_FILE,
+        SnapshotManifest, build_snapshot_manifest, copy_blob_tree, database_artifact_names,
+        prepare_target_database_for_publish, publish_staged_database, repair_dangling_rows,
+        require_canonical_backup_topology, schema_version, snapshot_sqlite_database,
+        stage_snapshot_database, validate_snapshot, validate_snapshot_database,
+        verify_snapshot_blob_references, write_snapshot_manifest_last,
+    };
     use clap::Parser;
+
+    async fn create_complete_empty_snapshot(
+        workspace: &std::path::Path,
+    ) -> (std::path::PathBuf, SnapshotManifest) {
+        let snapshot = workspace.join("snapshot");
+        std::fs::create_dir(&snapshot).unwrap();
+        std::fs::create_dir(snapshot.join(SNAPSHOT_BLOB_DIRECTORY)).unwrap();
+        let source = workspace.join("source.db");
+        let database = snapshot.join(SNAPSHOT_DATABASE_FILE);
+        snapshot_sqlite_database(&source, &database).await.unwrap();
+        let manifest = build_snapshot_manifest(&database).await.unwrap();
+        write_snapshot_manifest_last(&snapshot, &manifest)
+            .await
+            .unwrap();
+        (snapshot, manifest)
+    }
+
+    fn dangling_row(bucket: &cairn_types::BucketName, key: &str) -> cairn_types::ObjectVersionRow {
+        let now = cairn_types::Timestamp::from_secs(1);
+        cairn_types::ObjectVersionRow {
+            id: uuid::Uuid::new_v4().simple().to_string(),
+            bucket: bucket.clone(),
+            key: cairn_types::ObjectKey::parse(key).unwrap(),
+            version_id: cairn_types::VersionId::generate(),
+            is_latest: true,
+            is_delete_marker: false,
+            size_logical: 1,
+            size_physical: 1,
+            etag: cairn_types::ETag::from_md5_hex("9dd4e461268c8034f5c8564e155c67a6".to_owned()),
+            content_type: "application/octet-stream".to_owned(),
+            content_encoding: None,
+            cache_control: None,
+            content_disposition: None,
+            content_language: None,
+            expires: None,
+            storage_path: Some(cairn_types::StoragePath::generate(bucket)),
+            compression: cairn_types::CompressionDescriptor::Uncompressed,
+            storage_class: cairn_types::StorageClass::Standard,
+            cold_locator: None,
+            owner_id: cairn_types::UserId("admin".to_owned()),
+            user_metadata: Vec::new(),
+            acl: None,
+            checksums: Vec::new(),
+            sse_descriptor: None,
+            replication_status: None,
+            replicated_at: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[tokio::test]
+    async fn integrity_repair_preserves_protected_dangling_rows_and_reports_incomplete() {
+        use cairn_types::traits::MetadataStore;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let blob = cairn_blob::LocalBlobStore::open(workspace.path().join("blobs"))
+            .await
+            .unwrap();
+        let meta = cairn_types::testing::InMemoryMetadataStore::new();
+        let bucket_name = cairn_types::BucketName::parse("worm-repair").unwrap();
+        let bucket = cairn_types::Bucket {
+            name: bucket_name.clone(),
+            owner_id: cairn_types::UserId("admin".to_owned()),
+            created_at: cairn_types::Timestamp::from_secs(1),
+            versioning: cairn_types::VersioningState::Enabled,
+            ownership_mode: cairn_types::OwnershipMode::BucketOwnerEnforced,
+            region: "us-east-1".to_owned(),
+            compression: None,
+        };
+        meta.submit(cairn_types::Mutation::CreateObjectLockBucket(Box::new(
+            bucket,
+        )))
+        .await
+        .unwrap();
+
+        let protected = dangling_row(&bucket_name, "protected");
+        let protected_version = protected.version_id.clone();
+        meta.submit(cairn_types::Mutation::PutObjectVersion {
+            row: Box::new(protected),
+            precondition: cairn_types::Precondition::default(),
+            initial_state: cairn_types::InitialObjectState {
+                tags: Vec::new(),
+                lock_intent: cairn_types::ExplicitObjectLockIntent {
+                    retention: Some(cairn_types::ObjectRetention {
+                        mode: cairn_types::ObjectLockMode::Compliance,
+                        retain_until: cairn_types::Timestamp(i64::MAX / 2),
+                    }),
+                    legal_hold: None,
+                },
+            },
+            replication: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+        let held = dangling_row(&bucket_name, "held");
+        let held_version = held.version_id.clone();
+        meta.submit(cairn_types::Mutation::PutObjectVersion {
+            row: Box::new(held),
+            precondition: cairn_types::Precondition::default(),
+            initial_state: cairn_types::InitialObjectState {
+                tags: Vec::new(),
+                lock_intent: cairn_types::ExplicitObjectLockIntent {
+                    retention: None,
+                    legal_hold: Some(true),
+                },
+            },
+            replication: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+        let unprotected = dangling_row(&bucket_name, "unprotected");
+        let unprotected_version = unprotected.version_id.clone();
+        meta.submit(cairn_types::Mutation::PutObjectVersion {
+            row: Box::new(unprotected),
+            precondition: cairn_types::Precondition::default(),
+            initial_state: cairn_types::InitialObjectState::default(),
+            replication: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+        let report = repair_dangling_rows(&meta, &blob).await.unwrap();
+        assert_eq!(report.dropped, 1);
+        assert_eq!(report.protected, 2);
+        assert!(
+            meta.get_version(
+                &bucket_name,
+                &cairn_types::ObjectKey::parse("protected").unwrap(),
+                &protected_version,
+            )
+            .await
+            .unwrap()
+            .is_some(),
+            "repair must preserve the WORM metadata even when its blob is missing"
+        );
+        assert!(
+            meta.get_version(
+                &bucket_name,
+                &cairn_types::ObjectKey::parse("held").unwrap(),
+                &held_version,
+            )
+            .await
+            .unwrap()
+            .is_some(),
+            "repair must preserve a legally held version even when its blob is missing"
+        );
+        assert!(
+            meta.get_version(
+                &bucket_name,
+                &cairn_types::ObjectKey::parse("unprotected").unwrap(),
+                &unprotected_version,
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "ordinary dangling metadata remains repairable"
+        );
+    }
+
+    #[test]
+    #[ignore = "subprocess helper for the WAL crash-boundary regression"]
+    fn sqlite_wal_crash_helper() {
+        let Ok(path) = std::env::var("CAIRN_TEST_WAL_CRASH_PATH") else {
+            return;
+        };
+        let connection = rusqlite::Connection::open(path).unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 PRAGMA wal_autocheckpoint=0;
+                 CREATE TABLE generation (value TEXT NOT NULL);
+                 INSERT INTO generation VALUES ('old-wal');",
+            )
+            .unwrap();
+        // Model process death: `process::exit` deliberately skips Rust destructors, so SQLite does
+        // not run its last-connection close checkpoint and the committed generation remains in WAL.
+        std::process::exit(17);
+    }
 
     /// `--all-versions` widens a forced requeue, and does NOTHING without `--force`. It used to be
     /// accepted and silently ignored, so `cairn replication resync b --all-versions` reported
@@ -1248,8 +2631,135 @@ mod tests {
         }
     }
 
-    /// `copy_blob_tree` copies committed per-bucket blob directories but skips the staging area
-    /// and database sidecars, so a snapshot contains only durable blobs (ARCH 31.4).
+    #[test]
+    fn backup_restore_rejects_every_noncanonical_metadata_topology() {
+        let mut cfg = Config {
+            meta_backend: "sqlite".to_owned(),
+            meta_shards: 1,
+            ..Config::default()
+        };
+        require_canonical_backup_topology(&cfg).unwrap();
+
+        cfg.meta_shards = 2;
+        assert!(
+            require_canonical_backup_topology(&cfg)
+                .unwrap_err()
+                .contains("CAIRN_META_SHARDS=1")
+        );
+        cfg.meta_shards = 1;
+        for backend in ["libsql", "turso"] {
+            cfg.meta_backend = backend.to_owned();
+            let error = require_canonical_backup_topology(&cfg).unwrap_err();
+            assert!(error.contains("CAIRN_META_BACKEND=sqlite"), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_manifest_is_completion_marker_and_binds_database_bytes_and_schema() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (snapshot, manifest) = create_complete_empty_snapshot(workspace.path()).await;
+        validate_snapshot(&snapshot)
+            .await
+            .expect("complete manifest and matching image validate");
+
+        std::fs::remove_file(snapshot.join(SNAPSHOT_MANIFEST_FILE)).unwrap();
+        let error = validate_snapshot(&snapshot).await.unwrap_err();
+        assert!(error.contains("completion manifest"), "{error}");
+        write_snapshot_manifest_last(&snapshot, &manifest)
+            .await
+            .unwrap();
+
+        let database = snapshot.join(SNAPSHOT_DATABASE_FILE);
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&database)
+            .unwrap()
+            .write_all(b"tamper")
+            .unwrap();
+        let error = validate_snapshot(&snapshot).await.unwrap_err();
+        assert!(
+            error.contains("size mismatch") || error.contains("SHA-256 mismatch"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_rejects_forward_schema_and_exact_sqlite_sidecars() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (snapshot, mut manifest) = create_complete_empty_snapshot(workspace.path()).await;
+        let manifest_path = snapshot.join(SNAPSHOT_MANIFEST_FILE);
+
+        manifest.metadata.schema_version = cairn_meta::latest_schema_version() + 1;
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        let error = validate_snapshot(&snapshot).await.unwrap_err();
+        assert!(error.contains("newer than this binary"), "{error}");
+
+        manifest.metadata.schema_version = cairn_meta::latest_schema_version();
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let sidecar =
+                super::sqlite_sidecar_path(&snapshot.join(SNAPSHOT_DATABASE_FILE), suffix);
+            std::fs::write(&sidecar, b"forbidden").unwrap();
+            let error = validate_snapshot(&snapshot).await.unwrap_err();
+            assert!(error.contains("forbidden SQLite sidecar"), "{error}");
+            std::fs::remove_file(sidecar).unwrap();
+        }
+        std::fs::write(
+            snapshot.join(SNAPSHOT_BLOB_DIRECTORY).join("cairn.db"),
+            b"must never overwrite target metadata",
+        )
+        .unwrap();
+        let error = validate_snapshot(&snapshot).await.unwrap_err();
+        assert!(error.contains("top-level non-directory"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn snapshot_rejects_symlinked_manifest_database_and_blob_entries() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let (snapshot, manifest) = create_complete_empty_snapshot(workspace.path()).await;
+        let manifest_path = snapshot.join(SNAPSHOT_MANIFEST_FILE);
+        let real_manifest = snapshot.join("real-manifest.json");
+        std::fs::rename(&manifest_path, &real_manifest).unwrap();
+        symlink(&real_manifest, &manifest_path).unwrap();
+        let error = validate_snapshot(&snapshot).await.unwrap_err();
+        assert!(error.contains("non-symlink regular file"), "{error}");
+
+        std::fs::remove_file(&manifest_path).unwrap();
+        std::fs::rename(&real_manifest, &manifest_path).unwrap();
+        let database = snapshot.join(SNAPSHOT_DATABASE_FILE);
+        let real_database = snapshot.join("real-database.sqlite3");
+        std::fs::rename(&database, &real_database).unwrap();
+        symlink(&real_database, &database).unwrap();
+        let error = validate_snapshot(&snapshot).await.unwrap_err();
+        assert!(error.contains("non-symlink regular file"), "{error}");
+
+        std::fs::remove_file(&database).unwrap();
+        std::fs::rename(&real_database, &database).unwrap();
+        let bucket = snapshot.join(SNAPSHOT_BLOB_DIRECTORY).join("bucket");
+        std::fs::create_dir(&bucket).unwrap();
+        symlink(&manifest_path, bucket.join("blob")).unwrap();
+        let error = validate_snapshot(&snapshot).await.unwrap_err();
+        assert!(error.contains("symlink"), "{error}");
+
+        // Keep the compiler aware that the manifest remains the one whose digest matched the
+        // restored regular database after the symlink checks.
+        assert_eq!(manifest.metadata.database_file, SNAPSHOT_DATABASE_FILE);
+    }
+
+    /// `copy_blob_tree` preserves committed objects and durable multipart parts, but excludes
+    /// transient staging files, advisory locks, and only the exact configured DB artifacts.
     #[tokio::test]
     async fn backup_copies_blobs_but_excludes_staging_and_db() {
         let src = tempfile::tempdir().unwrap();
@@ -1263,20 +2773,38 @@ mod tests {
         tokio::fs::write(root.join("bucket-a").join("blob1"), b"committed")
             .await
             .unwrap();
-        tokio::fs::create_dir_all(root.join(".staging"))
+        tokio::fs::create_dir_all(root.join(".staging/multipart/upload-1"))
             .await
             .unwrap();
         tokio::fs::write(root.join(".staging").join("inflight.tmp"), b"partial")
             .await
             .unwrap();
+        tokio::fs::write(
+            root.join(".staging/multipart/upload-1/part-1"),
+            b"durable part",
+        )
+        .await
+        .unwrap();
         tokio::fs::write(root.join("cairn.db"), b"db")
             .await
             .unwrap();
         tokio::fs::write(root.join("cairn.db-wal"), b"wal")
             .await
             .unwrap();
+        tokio::fs::write(root.join(".cairn-data.lock"), b"")
+            .await
+            .unwrap();
+        // A bucket name ending in `.db` is not the configured database and must not be discarded
+        // by a broad suffix filter.
+        tokio::fs::create_dir_all(root.join("archive.db"))
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("archive.db/blob2"), b"bucket")
+            .await
+            .unwrap();
 
-        let copied = copy_blob_tree(root, dst.path()).await.unwrap();
+        let excluded = database_artifact_names(root, &root.join("cairn.db")).unwrap();
+        let copied = copy_blob_tree(root, dst.path(), &excluded).await.unwrap();
 
         assert!(dst.path().join("bucket-a").join("blob1").exists());
         assert_eq!(
@@ -1285,10 +2813,26 @@ mod tests {
                 .unwrap(),
             b"committed"
         );
-        assert!(!dst.path().join(".staging").exists(), "staging excluded");
+        assert!(
+            !dst.path().join(".staging/inflight.tmp").exists(),
+            "transient staging excluded"
+        );
+        assert_eq!(
+            tokio::fs::read(dst.path().join(".staging/multipart/upload-1/part-1"))
+                .await
+                .unwrap(),
+            b"durable part"
+        );
         assert!(!dst.path().join("cairn.db").exists(), "db excluded");
         assert!(!dst.path().join("cairn.db-wal").exists(), "wal excluded");
-        assert_eq!(copied, 1, "only the one bucket directory is copied");
+        assert!(!dst.path().join(".cairn-data.lock").exists());
+        assert_eq!(
+            tokio::fs::read(dst.path().join("archive.db/blob2"))
+                .await
+                .unwrap(),
+            b"bucket"
+        );
+        assert_eq!(copied, 3, "two buckets plus durable multipart staging");
     }
 
     /// A backup of the blob tree, restored into a fresh data dir, reproduces every committed blob
@@ -1318,8 +2862,10 @@ mod tests {
             .await
             .unwrap();
 
-        copy_blob_tree(src.path(), snap.path()).await.unwrap();
-        copy_blob_tree(snap.path(), restored.path()).await.unwrap();
+        copy_blob_tree(src.path(), snap.path(), &[]).await.unwrap();
+        copy_blob_tree(snap.path(), restored.path(), &[])
+            .await
+            .unwrap();
 
         assert_eq!(
             tokio::fs::read(restored.path().join("b1/x")).await.unwrap(),
@@ -1332,6 +2878,276 @@ mod tests {
             b"two"
         );
         assert!(!restored.path().join(".staging").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn blob_copy_rejects_top_level_files_and_source_or_destination_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let source = workspace.path().join("source");
+        let destination = workspace.path().join("destination");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(&destination).unwrap();
+
+        std::fs::write(source.join("cairn.db"), b"must not become a blob").unwrap();
+        let error = copy_blob_tree(&source, &destination, &[])
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("top-level blob entry"),
+            "{error}"
+        );
+        assert!(
+            !destination.join("cairn.db").exists(),
+            "a malicious blobs/cairn.db must never overwrite metadata"
+        );
+
+        std::fs::remove_file(source.join("cairn.db")).unwrap();
+        std::fs::create_dir(source.join("bucket")).unwrap();
+        let outside_source = workspace.path().join("outside-source");
+        std::fs::write(&outside_source, b"secret").unwrap();
+        symlink(&outside_source, source.join("bucket/blob")).unwrap();
+        let error = copy_blob_tree(&source, &destination, &[])
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("symlink"), "{error}");
+
+        std::fs::remove_file(source.join("bucket/blob")).unwrap();
+        std::fs::write(source.join("bucket/blob"), b"snapshot").unwrap();
+        std::fs::remove_dir(destination.join("bucket")).unwrap();
+        let outside_destination = workspace.path().join("outside-destination");
+        std::fs::create_dir(&outside_destination).unwrap();
+        symlink(&outside_destination, destination.join("bucket")).unwrap();
+        let error = copy_blob_tree(&source, &destination, &[])
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("destination path must be a non-symlink directory"),
+            "{error}"
+        );
+        assert!(
+            !outside_destination.join("blob").exists(),
+            "an intermediate destination symlink must not escape the target tree"
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_snapshot_refuses_a_live_writer_and_wal_pinning_reader() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source.db");
+        let destination = root.path().join("snapshot.db");
+        let writer = rusqlite::Connection::open(&source).unwrap();
+        writer.pragma_update(None, "journal_mode", "WAL").unwrap();
+        writer
+            .execute_batch(
+                "CREATE TABLE values_for_backup (v INTEGER NOT NULL);
+                 INSERT INTO values_for_backup VALUES (1);",
+            )
+            .unwrap();
+
+        let reader = rusqlite::Connection::open(&source).unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        assert_eq!(
+            reader
+                .query_row("SELECT COUNT(*) FROM values_for_backup", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            1
+        );
+        writer
+            .execute("INSERT INTO values_for_backup VALUES (2)", [])
+            .unwrap();
+        writer
+            .execute_batch(
+                "BEGIN IMMEDIATE;
+                 INSERT INTO values_for_backup VALUES (3);",
+            )
+            .unwrap();
+
+        let error = snapshot_sqlite_database(&source, &destination)
+            .await
+            .expect_err("a live writer plus pinned WAL reader must be rejected");
+        assert!(
+            error.contains("checkpoint")
+                || error.contains("busy")
+                || error.contains("locked")
+                || error.contains("open source"),
+            "{error}"
+        );
+        assert!(!destination.exists());
+
+        writer.execute_batch("ROLLBACK").unwrap();
+        reader.execute_batch("COMMIT").unwrap();
+        snapshot_sqlite_database(&source, &destination)
+            .await
+            .expect("quiescent SQLite snapshots through VACUUM INTO");
+        validate_snapshot_database(&destination).unwrap();
+        let snapshot = rusqlite::Connection::open(&destination).unwrap();
+        assert_eq!(
+            snapshot
+                .query_row("SELECT COUNT(*) FROM values_for_backup", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            2,
+            "committed rows are present and the rolled-back writer is absent"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_restore_round_trip_validates_every_referenced_file() {
+        let root = tempfile::tempdir().unwrap();
+        let source_db = root.path().join("source.db");
+        let snapshot_db = root.path().join("snapshot.db");
+        let restored_db = root.path().join("restored.db");
+        let source_blobs = root.path().join("source-blobs");
+        let snapshot_blobs = root.path().join("snapshot-blobs");
+        std::fs::create_dir_all(source_blobs.join("bucket")).unwrap();
+        std::fs::create_dir_all(source_blobs.join(".staging/multipart/upload")).unwrap();
+        std::fs::write(source_blobs.join("bucket/object"), b"object").unwrap();
+        std::fs::write(source_blobs.join(".staging/multipart/upload/part"), b"part").unwrap();
+
+        let conn = rusqlite::Connection::open(&source_db).unwrap();
+        conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_migrations (
+                 version INTEGER PRIMARY KEY,
+                 name TEXT NOT NULL,
+                 applied_at INTEGER NOT NULL
+             );
+             INSERT INTO schema_migrations VALUES (1, 'test', 1);
+             CREATE TABLE object_versions (storage_path TEXT);
+             CREATE TABLE multipart_parts (storage_path TEXT NOT NULL);
+             INSERT INTO object_versions VALUES ('bucket/object');
+             INSERT INTO multipart_parts VALUES ('.staging/multipart/upload/part');",
+        )
+        .unwrap();
+        conn.execute(
+            "VACUUM INTO ?1",
+            rusqlite::params![snapshot_db.to_str().unwrap()],
+        )
+        .unwrap();
+        drop(conn);
+        copy_blob_tree(&source_blobs, &snapshot_blobs, &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            verify_snapshot_blob_references(&snapshot_db, &snapshot_blobs).unwrap(),
+            2
+        );
+        let manifest = build_snapshot_manifest(&snapshot_db).await.unwrap();
+        std::fs::write(&restored_db, b"old database generation").unwrap();
+        let staged = stage_snapshot_database(&snapshot_db, &restored_db, &manifest)
+            .await
+            .unwrap();
+        prepare_target_database_for_publish(&restored_db)
+            .await
+            .unwrap();
+        publish_staged_database(staged, &restored_db, &manifest)
+            .await
+            .unwrap();
+        assert!(!super::sqlite_sidecar_path(&restored_db, "-wal").exists());
+        assert!(!super::sqlite_sidecar_path(&restored_db, "-shm").exists());
+        validate_snapshot_database(&restored_db).unwrap();
+        assert_eq!(
+            verify_snapshot_blob_references(&restored_db, &snapshot_blobs).unwrap(),
+            2
+        );
+
+        std::fs::remove_file(snapshot_blobs.join("bucket/object")).unwrap();
+        let error = verify_snapshot_blob_references(&restored_db, &snapshot_blobs).unwrap_err();
+        assert!(error.contains("missing referenced blob"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn database_publication_is_generation_safe_across_both_crash_boundaries() {
+        let root = tempfile::tempdir().unwrap();
+        let old_database = root.path().join("target.db");
+        let new_source = root.path().join("new-source.db");
+        let snapshot_database = root.path().join("new-snapshot.db");
+
+        let old_store =
+            cairn_meta::open(&old_database, &cairn_meta::OpenOptions::default()).unwrap();
+        old_store.checkpoint_and_close().await.unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "tests::sqlite_wal_crash_helper",
+                "--nocapture",
+            ])
+            .env("CAIRN_TEST_WAL_CRASH_PATH", &old_database)
+            .status()
+            .unwrap();
+        assert_eq!(
+            status.code(),
+            Some(17),
+            "WAL crash helper must take the exit path"
+        );
+        assert!(
+            super::sqlite_sidecar_path(&old_database, "-wal").exists(),
+            "crashed SQLite writer must leave a real old-generation WAL for this regression"
+        );
+
+        let new_store = cairn_meta::open(&new_source, &cairn_meta::OpenOptions::default()).unwrap();
+        new_store.checkpoint_and_close().await.unwrap();
+        let new_writer = rusqlite::Connection::open(&new_source).unwrap();
+        new_writer
+            .execute_batch(
+                "CREATE TABLE generation (value TEXT NOT NULL);
+                 INSERT INTO generation VALUES ('new-main');",
+            )
+            .unwrap();
+        drop(new_writer);
+        snapshot_sqlite_database(&new_source, &snapshot_database)
+            .await
+            .unwrap();
+        let manifest = build_snapshot_manifest(&snapshot_database).await.unwrap();
+        let staged = stage_snapshot_database(&snapshot_database, &old_database, &manifest)
+            .await
+            .unwrap();
+
+        prepare_target_database_for_publish(&old_database)
+            .await
+            .unwrap();
+        for suffix in ["-wal", "-shm", "-journal"] {
+            assert!(
+                !super::sqlite_sidecar_path(&old_database, suffix).exists(),
+                "{suffix} must be absent and its directory synced before publication"
+            );
+        }
+
+        // Crash immediately before rename: a copy of the published main file must reopen with the
+        // complete old generation and no help from a sidecar.
+        let crash_before = root.path().join("crash-before.db");
+        std::fs::copy(&old_database, &crash_before).unwrap();
+        let old_reopen = rusqlite::Connection::open(&crash_before).unwrap();
+        assert_eq!(
+            old_reopen
+                .query_row("SELECT value FROM generation", [], |row| row
+                    .get::<_, String>(0))
+                .unwrap(),
+            "old-wal"
+        );
+        drop(old_reopen);
+
+        publish_staged_database(staged, &old_database, &manifest)
+            .await
+            .unwrap();
+        // Crash immediately after rename: the publication name reopens as only the new generation.
+        let new_reopen = rusqlite::Connection::open(&old_database).unwrap();
+        assert_eq!(
+            new_reopen
+                .query_row("SELECT value FROM generation", [], |row| row
+                    .get::<_, String>(0))
+                .unwrap(),
+            "new-main"
+        );
     }
 
     /// Opening the store runs migrations; the schema version is then a positive integer.

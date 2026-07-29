@@ -122,4 +122,18 @@ impl AsyncSqlDriver for LibsqlDriver {
         self.conn.execute_batch(sql).await.map_err(map_err)?;
         Ok(())
     }
+
+    async fn scrub_legacy_share_storage(&self) -> Result<(), MetaError> {
+        self.conn.execute_batch("VACUUM").await.map_err(map_err)?;
+        self.stmts.lock().unwrap().clear();
+        let rows = self
+            .query("PRAGMA wal_checkpoint(TRUNCATE)", vec![])
+            .await?;
+        if rows.first().is_some_and(|row| row.get_i64(0) != 0) {
+            return Err(MetaError::Engine(
+                "legacy share sanitation checkpoint was busy".to_owned(),
+            ));
+        }
+        Ok(())
+    }
 }

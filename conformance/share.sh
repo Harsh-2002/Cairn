@@ -1,21 +1,24 @@
 #!/usr/bin/env bash
-# Conformance gate for object sharing (ARCH 15.8): persistent share tokens and
-# interoperable SigV4 presigned URLs, exercised end to end against a freshly
-# bootstrapped Cairn server with plain curl.
+# Conformance gate for object sharing (ARCH 15.8): one-time persistent-share bearer URLs with
+# stable-id management, plus interoperable SigV4 presigned URLs, exercised end to end against a
+# freshly bootstrapped Cairn server with plain curl.
 #
 # Usage: BIN=target/debug/cairn conformance/share.sh
 set -euo pipefail
 
 BIN="${BIN:-target/debug/cairn}"
 PORT="${PORT:-9078}"
+WEBPORT="${WEBPORT:-9079}"
 DATA="$(mktemp -d)"
 BASE="http://127.0.0.1:$PORT"
+CONTROL="http://127.0.0.1:$WEBPORT"
 
 export CAIRN_DATA_DIR="$DATA/data"
 export CAIRN_DB_PATH="$DATA/data/cairn.db"
 export CAIRN_LISTEN_ADDR="127.0.0.1:$PORT"
-export CAIRN_WEB_ADDR=off
-export CAIRN_MASTER_KEY="$(openssl rand -hex 32)"
+export CAIRN_WEB_ADDR="127.0.0.1:$WEBPORT"
+CAIRN_MASTER_KEY="$(openssl rand -hex 32)"
+export CAIRN_MASTER_KEY
 export CAIRN_LOG_LEVEL="${CAIRN_LOG_LEVEL:-warn}"
 
 BOOT="$("$BIN" bootstrap)"
@@ -39,8 +42,8 @@ ok() { PASS=$((PASS + 1)); echo "ok: $1"; }
 as() { [ "$2" = "$1" ] || fail "$3 (expected $1, got $2)"; ok "$3"; }
 
 B=conf-share
-API="$BASE/api/v1/buckets/$B/objects"
-curl -s "${AUTH[@]}" -X POST "$BASE/api/v1/buckets" -H 'content-type: application/json' -d "{\"name\":\"$B\"}" -o /dev/null
+API="$CONTROL/api/v1/buckets/$B/objects"
+curl -s "${AUTH[@]}" -X POST "$CONTROL/api/v1/buckets" -H 'content-type: application/json' -d "{\"name\":\"$B\"}" -o /dev/null
 printf 'v1-contents' | curl -s "${AUTH[@]}" -X PUT --data-binary @- "$BASE/$B/doc.txt" -o /dev/null
 
 # --- persistent share: create -> fetch 200 + forced-download disposition ---
@@ -48,11 +51,29 @@ SH=$(curl -s "${AUTH[@]}" -X POST "$API/shares" -H 'content-type: application/js
   -d '{"key":"doc.txt","expires_in_secs":3600,"disposition":"attachment","filename":"r.txt"}')
 TOK=$(echo "$SH" | grep -oE '"token":"[^"]+"' | cut -d'"' -f4)
 [ -n "$TOK" ] || fail "share create returned no token"
+SID=$(echo "$SH" | grep -oE '"id":"[^"]+"' | cut -d'"' -f4)
+[ -n "$SID" ] || fail "share create returned no stable id"
+SHURL=$(echo "$SH" | grep -oE '"url":"[^"]+"' | cut -d'"' -f4)
+case "$SHURL" in "$BASE"/share/*) ;; *) fail "share URL was not on the data origin ($SHURL)";; esac
 BODY=$(curl -s "$BASE/share/$TOK")
 [ "$BODY" = "v1-contents" ] || fail "share fetch body mismatch ($BODY)"
 DISP=$(curl -sI "$BASE/share/$TOK" | tr -d '\r' | awk -F': ' 'tolower($1)=="content-disposition"{print $2}')
 [ "$DISP" = 'attachment; filename="r.txt"' ] || fail "disposition mismatch ($DISP)"
 ok "persistent share fetch + forced-download disposition"
+
+# Existing-share management is capability-free: list/get expose the stable id but never the bearer
+# token or a reconstructable URL.
+SLIST=$(curl -s "${AUTH[@]}" "$API/shares?key=doc.txt")
+echo "$SLIST" | grep -q "\"id\":\"$SID\"" || fail "share list omitted stable id"
+case "$SLIST" in *"$TOK"*) fail "share list leaked bearer token";; esac
+echo "$SLIST" | grep -q '"token"' && fail "share list exposed a token field"
+echo "$SLIST" | grep -q '"url"' && fail "share list exposed a URL field"
+SGET=$(curl -s "${AUTH[@]}" "$API/shares/$SID")
+echo "$SGET" | grep -q "\"id\":\"$SID\"" || fail "share get omitted stable id"
+case "$SGET" in *"$TOK"*) fail "share get leaked bearer token";; esac
+echo "$SGET" | grep -q '"token"' && fail "share get exposed a token field"
+echo "$SGET" | grep -q '"url"' && fail "share get exposed a URL field"
+ok "share management uses id and does not expose bearer capability"
 
 # --- forever share ---
 FSH=$(curl -s "${AUTH[@]}" -X POST "$API/shares" -H 'content-type: application/json' -d '{"key":"doc.txt"}')
@@ -61,7 +82,7 @@ FTOK=$(echo "$FSH" | grep -oE '"token":"[^"]+"' | cut -d'"' -f4)
 as 200 "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/share/$FTOK")" "forever share fetches 200"
 
 # --- revoke -> 410; unknown -> 404 ---
-curl -s "${AUTH[@]}" -X DELETE "$API/shares/$TOK" -o /dev/null
+curl -s "${AUTH[@]}" -X DELETE "$API/shares/$SID" -o /dev/null
 as 410 "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/share/$TOK")" "revoked share -> 410"
 as 404 "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/share/deadbeefdeadbeef")" "unknown token -> 404"
 
@@ -81,11 +102,11 @@ printf 'via-presigned-put' | curl -s -X PUT --data-binary @- -o /dev/null "$PPUR
 [ "$(curl -s "${AUTH[@]}" "$BASE/$B/up.bin")" = "via-presigned-put" ] || fail "presigned PUT object missing"
 ok "presigned PUT upload (unauthenticated)"
 
-# --- presigned >7d rejected at mint ---
-as 400 "$(curl -s -o /dev/null -w '%{http_code}' "${AUTH[@]}" -X POST "$API/presign" -H 'content-type: application/json' -d '{"key":"doc.txt","method":"GET","expires_in_secs":700000}')" "presigned >7d -> 400 at mint"
+# --- presigned >12h rejected at mint ---
+as 400 "$(curl -s -o /dev/null -w '%{http_code}' "${AUTH[@]}" -X POST "$API/presign" -H 'content-type: application/json' -d '{"key":"doc.txt","method":"GET","expires_in_secs":43201}')" "presigned >12h -> 400 at mint"
 
 # --- version pinning: pin v1, overwrite v2, pinned share still serves v1 ---
-curl -s "${AUTH[@]}" -X PUT "$BASE/api/v1/buckets/$B/versioning" -H 'content-type: application/json' -d '{"status":"Enabled"}' -o /dev/null
+curl -s "${AUTH[@]}" -X PUT "$CONTROL/api/v1/buckets/$B/versioning" -H 'content-type: application/json' -d '{"status":"Enabled"}' -o /dev/null
 printf 'pinned-v1' | curl -s "${AUTH[@]}" -X PUT --data-binary @- "$BASE/$B/ver.txt" -o /dev/null
 VID=$(curl -sI "${AUTH[@]}" "$BASE/$B/ver.txt" | tr -d '\r' | awk -F': ' 'tolower($1)=="x-amz-version-id"{print $2}')
 [ -n "$VID" ] || fail "no version id returned for ver.txt"

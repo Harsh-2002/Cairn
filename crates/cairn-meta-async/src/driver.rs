@@ -134,6 +134,13 @@ pub trait AsyncSqlDriver: Send + Sync {
     /// control verbs).
     async fn execute_batch(&self, sql: &str) -> Result<(), MetaError>;
 
+    /// Physically remove pre-v25 plaintext share-token remnants after the logical migration.
+    ///
+    /// Called at startup before read connections are opened whenever the durable sanitation marker
+    /// is present. Implementations must either complete their compaction/checkpoint contract or
+    /// return an error; the marker remains on error so a later startup retries.
+    async fn scrub_legacy_share_storage(&self) -> Result<(), MetaError>;
+
     // --- transaction control (the group-commit machinery drives these directly) ---
 
     /// `BEGIN IMMEDIATE`.

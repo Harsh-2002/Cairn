@@ -184,9 +184,10 @@ tgt = s3_client(TGT_EP, TGT_AK, TGT_SK)
 B_PLAIN = "repl-plain"      # the GATED leg: plaintext at the source, re-encrypted at the target
 B_SSE = "repl-sse"          # the PINNED-GAP arm: SSE-S3 / aws:kms at the source
 
-# Encrypted CRNB container trailer: 34 bytes, magic `CRNB` then the version byte; VERSION_ENCRYPTED
-# == 2 (crates/cairn-blob/src/compress.rs). Same shape encryption.py / stress_encrypted.py assert.
-VERSION_ENCRYPTED = 2
+# Encrypted CRNB container trailer: 34 bytes, magic `CRNB` then the version byte. Encrypted v2
+# remains read-compatible, but every fresh write must use current v3 with authenticated metadata.
+# Same current-writer proof encryption.py / stress_encrypted.py assert.
+VERSION_ENCRYPTED_CURRENT = 3
 MARKER = b"PLAINTEXT-MARKER-DO-NOT-FIND-ON-DISK-"
 
 LOCK = threading.Lock()
@@ -674,7 +675,11 @@ def committed_blobs(data_dir, bucket):
 
 
 def trailer_encrypted(blob):
-    return len(blob) >= 34 and blob[-34:-30] == b"CRNB" and blob[-30] == VERSION_ENCRYPTED
+    return (
+        len(blob) >= 34
+        and blob[-34:-30] == b"CRNB"
+        and blob[-30] == VERSION_ENCRYPTED_CURRENT
+    )
 
 
 def scan_blobs(data_dir, bucket, sample):

@@ -6,9 +6,15 @@ use cairn_types::auth::{AuthMethod, Principal, Role};
 use cairn_types::blob::StageOptions;
 use cairn_types::bucket::VersioningState;
 use cairn_types::id::{BucketName, ObjectKey, UserId, VersionId};
-use cairn_types::meta::{Mutation, Precondition};
+use cairn_types::meta::{
+    ImportJobRecord, ImportState, InitialObjectState, ListQuery, Mutation, MutationOutcome,
+    Precondition, ShareDisposition, ShareLookupHash, ShareRow, User, UserRecord,
+};
 use cairn_types::object::ChecksumSet;
-use cairn_types::object::{CompressionDescriptor, ETag, ObjectVersionRow, StorageClass};
+use cairn_types::object::{
+    CompressionDescriptor, ETag, ExplicitObjectLockIntent, ObjectLockMode, ObjectRetention,
+    ObjectVersionRow, StorageClass,
+};
 use cairn_types::testing::{InMemoryBlobStore, InMemoryMetadataStore, StubCrypto, TestClock};
 use cairn_types::traits::{BlobStore, Clock, Crypto, MetadataStore};
 use http::{Method, StatusCode};
@@ -86,10 +92,59 @@ fn json(resp: &ControlResponse) -> serde_json::Value {
     serde_json::from_slice(&resp.body).expect("response body is JSON")
 }
 
+fn session_policy_decision(
+    policy_json: &str,
+    action: cairn_types::Action,
+    key: &str,
+) -> cairn_types::Decision {
+    let policy = cairn_authz::parse_user_policy(policy_json).expect("valid session policy");
+    cairn_authz::evaluate(&cairn_types::AuthzInput {
+        requester: cairn_types::RequesterClass::AuthenticatedMember(UserId("admin".to_owned())),
+        is_session: true,
+        action,
+        resource: cairn_types::Resource::Object {
+            bucket: BucketName::parse("secure-bucket").unwrap(),
+            key: ObjectKey::parse(key).unwrap(),
+        },
+        bucket_owner: UserId("admin".to_owned()),
+        account_bpa: cairn_types::PublicAccessBlock::default(),
+        bucket_bpa: cairn_types::PublicAccessBlock::default(),
+        policy: None,
+        user_policy: Some(policy),
+        bucket_acl: None,
+        object_acl: None,
+        ownership_mode: cairn_types::OwnershipMode::BucketOwnerEnforced,
+        context: cairn_types::RequestContext {
+            source: cairn_types::ClientSource::Direct(std::net::IpAddr::V4(
+                std::net::Ipv4Addr::LOCALHOST,
+            )),
+            secure_transport: true,
+            referer: None,
+            user_agent: None,
+            now: cairn_types::Timestamp(1),
+            prefix: None,
+            delimiter: None,
+            max_keys: None,
+            canned_acl: None,
+            content_sha256: None,
+            version_id: None,
+            existing_tags: Vec::new(),
+            request_tags: Vec::new(),
+        },
+    })
+}
+
 /// Put an object through the metadata + blob doubles, the way the data plane would, so the
 /// overview/counts reflect it.
-async fn put_object(h: &Harness, bucket: &str, key: &str, data: &'static [u8]) {
+async fn put_object_with_lock(
+    h: &Harness,
+    bucket: &str,
+    key: &str,
+    data: &'static [u8],
+    lock_intent: ExplicitObjectLockIntent,
+) -> (VersionId, cairn_types::StoragePath) {
     let bname = BucketName::parse(bucket).unwrap();
+    let bucket_row = h.meta.get_bucket(&bname).await.unwrap().unwrap();
     let staged = h
         .blob
         .stage(
@@ -107,11 +162,16 @@ async fn put_object(h: &Harness, bucket: &str, key: &str, data: &'static [u8]) {
         .await
         .unwrap();
     let now = h.clock.now();
+    let version_id = if bucket_row.versioning == VersioningState::Enabled {
+        VersionId::generate()
+    } else {
+        VersionId::null()
+    };
     let row = ObjectVersionRow {
         id: uuid::Uuid::new_v4().simple().to_string(),
         bucket: bname,
         key: ObjectKey::parse(key).unwrap(),
-        version_id: VersionId::null(),
+        version_id: version_id.clone(),
         is_latest: true,
         is_delete_marker: false,
         size_logical: staged.size_logical,
@@ -141,10 +201,19 @@ async fn put_object(h: &Harness, bucket: &str, key: &str, data: &'static [u8]) {
         .submit(Mutation::PutObjectVersion {
             row: Box::new(row),
             precondition: Precondition::default(),
+            initial_state: InitialObjectState {
+                tags: Vec::new(),
+                lock_intent,
+            },
             replication: Vec::new(),
         })
         .await
         .unwrap();
+    (version_id, staged.storage_path)
+}
+
+async fn put_object(h: &Harness, bucket: &str, key: &str, data: &'static [u8]) {
+    let _ = put_object_with_lock(h, bucket, key, data, ExplicitObjectLockIntent::default()).await;
 }
 
 #[tokio::test]
@@ -255,7 +324,7 @@ async fn admin_bucket_lifecycle() {
         .await;
     assert_eq!(resp.status, StatusCode::NOT_FOUND);
 
-    // Delete -> 204.
+    // Empty bucket deletion succeeds.
     let resp = h
         .svc
         .handle(
@@ -267,9 +336,7 @@ async fn admin_bucket_lifecycle() {
         )
         .await;
     assert_eq!(resp.status, StatusCode::NO_CONTENT);
-    assert!(resp.body.is_empty());
 
-    // Gone now.
     let resp = h
         .svc
         .handle(&Method::GET, "/buckets/photos", &[], Some(&a), Bytes::new())
@@ -278,7 +345,7 @@ async fn admin_bucket_lifecycle() {
 }
 
 #[tokio::test]
-async fn force_delete_empties_populated_bucket() {
+async fn force_delete_removes_unprotected_bucket_and_blobs() {
     let h = harness();
     let a = admin();
     h.svc
@@ -306,7 +373,6 @@ async fn force_delete_empties_populated_bucket() {
         .await;
     assert_eq!(resp.status, StatusCode::NO_CONTENT);
 
-    // Bucket gone, blobs reclaimed.
     assert!(
         h.meta
             .get_bucket(&BucketName::parse("data").unwrap())
@@ -315,6 +381,337 @@ async fn force_delete_empties_populated_bucket() {
             .is_none()
     );
     assert_eq!(h.blob.blob_count(), 0);
+}
+
+#[tokio::test]
+async fn recursive_delete_removes_unprotected_versions_and_blobs() {
+    let h = harness();
+    let a = admin();
+    h.svc
+        .handle(
+            &Method::POST,
+            "/buckets",
+            &[],
+            Some(&a),
+            Bytes::from_static(br#"{"name":"data"}"#),
+        )
+        .await;
+    put_object(&h, "data", "folder/a.txt", b"hello").await;
+    put_object(&h, "data", "folder/b.txt", b"world").await;
+
+    let resp = h
+        .svc
+        .handle(
+            &Method::DELETE,
+            "/buckets/data/objects",
+            &[("prefix".to_owned(), "folder/".to_owned())],
+            Some(&a),
+            Bytes::new(),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::OK);
+    assert_eq!(json(&resp)["deleted"], 2);
+    assert_eq!(json(&resp)["errors"].as_array().unwrap().len(), 0);
+    assert_eq!(json(&resp)["more"], false);
+
+    let page = h
+        .meta
+        .list_versions(
+            &BucketName::parse("data").unwrap(),
+            &ListQuery {
+                limit: 100,
+                ..ListQuery::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.items.len(), 0);
+    assert_eq!(h.blob.blob_count(), 0);
+}
+
+async fn create_lock_bucket(h: &Harness, name: &str, principal: &Principal) {
+    let body = serde_json::json!({ "name": name, "object_lock": true });
+    let response = h
+        .svc
+        .handle(
+            &Method::POST,
+            "/buckets",
+            &[],
+            Some(principal),
+            Bytes::from(serde_json::to_vec(&body).unwrap()),
+        )
+        .await;
+    assert_eq!(
+        response.status,
+        StatusCode::CREATED,
+        "{:?}",
+        json(&response)
+    );
+}
+
+fn retained(mode: ObjectLockMode) -> ExplicitObjectLockIntent {
+    ExplicitObjectLockIntent {
+        retention: Some(ObjectRetention {
+            mode,
+            retain_until: cairn_types::Timestamp(i64::MAX / 2),
+        }),
+        legal_hold: None,
+    }
+}
+
+#[tokio::test]
+async fn force_delete_preserves_every_object_lock_protection_as_root_admin() {
+    let h = harness();
+    let a = admin();
+    create_lock_bucket(&h, "worm", &a).await;
+
+    let (compliance, _) = put_object_with_lock(
+        &h,
+        "worm",
+        "compliance",
+        b"c",
+        retained(ObjectLockMode::Compliance),
+    )
+    .await;
+    let (governance, _) = put_object_with_lock(
+        &h,
+        "worm",
+        "governance",
+        b"g",
+        retained(ObjectLockMode::Governance),
+    )
+    .await;
+    let (held, _) = put_object_with_lock(
+        &h,
+        "worm",
+        "held",
+        b"h",
+        ExplicitObjectLockIntent {
+            retention: None,
+            legal_hold: Some(true),
+        },
+    )
+    .await;
+    let (unlocked, _) = put_object_with_lock(
+        &h,
+        "worm",
+        "z-unlocked",
+        b"u",
+        ExplicitObjectLockIntent::default(),
+    )
+    .await;
+
+    let response = h
+        .svc
+        .handle(
+            &Method::DELETE,
+            "/buckets/worm",
+            &[],
+            Some(&a),
+            Bytes::new(),
+        )
+        .await;
+    assert_eq!(response.status, StatusCode::CONFLICT);
+    assert_eq!(h.blob.blob_count(), 3);
+    assert!(
+        h.meta
+            .get_bucket(&BucketName::parse("worm").unwrap())
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    for (key, version) in [
+        ("compliance", compliance),
+        ("governance", governance),
+        ("held", held),
+    ] {
+        assert!(
+            h.meta
+                .get_version(
+                    &BucketName::parse("worm").unwrap(),
+                    &ObjectKey::parse(key).unwrap(),
+                    &version,
+                )
+                .await
+                .unwrap()
+                .is_some(),
+            "{key} row must survive force delete"
+        );
+        assert!(
+            h.meta
+                .get_object_lock(
+                    &BucketName::parse("worm").unwrap(),
+                    &ObjectKey::parse(key).unwrap(),
+                    &version,
+                )
+                .await
+                .unwrap()
+                .is_protected(h.clock.now()),
+            "{key} lock must survive force delete"
+        );
+    }
+    assert!(
+        h.meta
+            .get_version(
+                &BucketName::parse("worm").unwrap(),
+                &ObjectKey::parse("z-unlocked").unwrap(),
+                &unlocked,
+            )
+            .await
+            .unwrap()
+            .is_none(),
+        "force delete must continue past protected rows and remove the unlocked version"
+    );
+    assert!(
+        h.meta
+            .list_activity(100)
+            .await
+            .unwrap()
+            .iter()
+            .any(|entry| {
+                entry.action == "DeleteBucketContents"
+                    && entry.bucket.as_deref() == Some("worm")
+                    && entry.actor.as_deref() == Some("cairn_admin")
+            }),
+        "the partial destructive write must remain visible in the activity ledger"
+    );
+}
+
+#[tokio::test]
+async fn recursive_delete_reports_protected_and_deletes_later_unlocked_versions() {
+    let h = harness();
+    let a = admin();
+    create_lock_bucket(&h, "worm-prefix", &a).await;
+    let (protected_version, _) = put_object_with_lock(
+        &h,
+        "worm-prefix",
+        "folder/a-protected",
+        b"protected",
+        retained(ObjectLockMode::Compliance),
+    )
+    .await;
+    let (unlocked_version, _) = put_object_with_lock(
+        &h,
+        "worm-prefix",
+        "folder/z-unlocked",
+        b"unlocked",
+        ExplicitObjectLockIntent::default(),
+    )
+    .await;
+
+    let response = h
+        .svc
+        .handle(
+            &Method::DELETE,
+            "/buckets/worm-prefix/objects",
+            &[("prefix".to_owned(), "folder/".to_owned())],
+            Some(&a),
+            Bytes::new(),
+        )
+        .await;
+    assert_eq!(response.status, StatusCode::OK);
+    let body = json(&response);
+    assert_eq!(body["deleted"], 1);
+    assert_eq!(body["more"], true);
+    assert_eq!(body["errors"].as_array().unwrap().len(), 1);
+    assert_eq!(body["errors"][0]["key"], "folder/a-protected");
+    assert_eq!(body["errors"][0]["version_id"], protected_version.as_str());
+
+    let bucket = BucketName::parse("worm-prefix").unwrap();
+    assert!(
+        h.meta
+            .get_version(
+                &bucket,
+                &ObjectKey::parse("folder/a-protected").unwrap(),
+                &protected_version,
+            )
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        h.meta
+            .get_version(
+                &bucket,
+                &ObjectKey::parse("folder/z-unlocked").unwrap(),
+                &unlocked_version,
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(h.blob.blob_count(), 1);
+}
+
+#[tokio::test]
+async fn recursive_delete_pages_past_one_thousand_protected_versions() {
+    let h = harness();
+    let a = admin();
+    create_lock_bucket(&h, "worm-paged", &a).await;
+
+    // One key deliberately spans the whole first page. Advancing requires the paired
+    // (key, version-id) cursor; a key-only continuation would either skip versions or livelock.
+    for _ in 0..1_000 {
+        put_object_with_lock(
+            &h,
+            "worm-paged",
+            "folder/a-protected",
+            b"x",
+            retained(ObjectLockMode::Compliance),
+        )
+        .await;
+    }
+    let (unlocked_version, _) = put_object_with_lock(
+        &h,
+        "worm-paged",
+        "folder/z-unlocked",
+        b"unlocked",
+        ExplicitObjectLockIntent::default(),
+    )
+    .await;
+
+    let response = h
+        .svc
+        .handle(
+            &Method::DELETE,
+            "/buckets/worm-paged/objects",
+            &[("prefix".to_owned(), "folder/".to_owned())],
+            Some(&a),
+            Bytes::new(),
+        )
+        .await;
+    assert_eq!(response.status, StatusCode::OK);
+    let body = json(&response);
+    assert_eq!(body["deleted"], 1, "second-page unlocked row was reached");
+    let errors = body["errors"].as_array().unwrap();
+    assert_eq!(errors.len(), 1_000);
+    assert!(
+        errors
+            .iter()
+            .all(|error| error["key"] == "folder/a-protected")
+    );
+    assert_eq!(
+        errors
+            .iter()
+            .map(|error| error["version_id"].as_str().unwrap())
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        1_000,
+        "every failed version keeps its exact stable identity"
+    );
+    assert_eq!(body["more"], true);
+    assert!(
+        h.meta
+            .get_version(
+                &BucketName::parse("worm-paged").unwrap(),
+                &ObjectKey::parse("folder/z-unlocked").unwrap(),
+                &unlocked_version,
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -384,6 +781,136 @@ async fn create_user_returns_secret_once_and_lists() {
         )
         .await;
     assert_eq!(resp.status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn management_session_boundary_preserves_parent_identity_denies() {
+    let h = harness();
+    let a = admin();
+    h.meta
+        .submit(Mutation::CreateUser(Box::new(UserRecord {
+            user: User {
+                id: a.user_id.clone(),
+                display_name: a.display_name.clone(),
+                access_key_id: a.access_key_id.clone(),
+                sigv4_access_key_id: None,
+                role: Role::Administrator,
+                is_active: true,
+                quota_bytes: None,
+                created_at: cairn_types::Timestamp(0),
+                updated_at: cairn_types::Timestamp(0),
+            },
+            bearer_secret_hash: "unused-in-this-test".to_owned(),
+            sigv4_secret_ciphertext: None,
+            sigv4_secret_nonce: None,
+        })))
+        .await
+        .unwrap();
+    h.meta
+        .submit(Mutation::SetUserPolicy {
+            user_id: a.user_id.clone(),
+            policy: Some(
+                r#"{"Version":"2012-10-17","Statement":[{
+                    "Effect":"Deny",
+                    "Action":"s3:DeleteObject",
+                    "Resource":"arn:aws:s3:::secure-bucket/private/*"
+                }]}"#
+                    .to_owned(),
+            ),
+        })
+        .await
+        .unwrap();
+
+    let response = h
+        .svc
+        .handle(
+            &Method::POST,
+            "/credentials/temporary",
+            &[],
+            Some(&a),
+            Bytes::from_static(
+                br#"{
+                    "duration_secs":900,
+                    "policy":{
+                        "Version":"2012-10-17",
+                        "Statement":[{
+                            "Effect":"Allow",
+                            "Action":["s3:GetObject","s3:DeleteObject"],
+                            "Resource":"arn:aws:s3:::secure-bucket/*"
+                        }]
+                    }
+                }"#,
+            ),
+        )
+        .await;
+    assert_eq!(response.status, StatusCode::OK);
+    let access_key_id = json(&response)["access_key_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let stored = h
+        .meta
+        .user_by_session_key(&access_key_id)
+        .await
+        .unwrap()
+        .expect("minted session row");
+    let policy = stored.inline_policy.expect("bounded policy persisted");
+
+    assert_eq!(
+        session_policy_decision(&policy, cairn_types::Action::DeleteObject, "private/a"),
+        cairn_types::Decision::Deny(cairn_types::DenyReason::ExplicitPolicyDeny),
+        "the management boundary must not erase the parent administrator's Deny"
+    );
+    assert_eq!(
+        session_policy_decision(&policy, cairn_types::Action::GetObject, "private/a"),
+        cairn_types::Decision::Allow,
+        "an action allowed by the boundary and not denied by the parent remains usable"
+    );
+    assert_eq!(
+        session_policy_decision(&policy, cairn_types::Action::DeleteObject, "public/a"),
+        cairn_types::Decision::Allow,
+        "the parent restriction remains scoped to its named resource"
+    );
+}
+
+#[tokio::test]
+async fn management_session_mint_fails_closed_when_parent_policy_read_fails() {
+    let h = harness();
+    let a = admin();
+    h.meta.set_fail_user_policy_reads(true);
+
+    let response = h
+        .svc
+        .handle(
+            &Method::POST,
+            "/credentials/temporary",
+            &[],
+            Some(&a),
+            Bytes::from_static(
+                br#"{
+                    "duration_secs":900,
+                    "policy":{
+                        "Version":"2012-10-17",
+                        "Statement":[{
+                            "Effect":"Allow",
+                            "Action":"s3:GetObject",
+                            "Resource":"arn:aws:s3:::secure-bucket/*"
+                        }]
+                    }
+                }"#,
+            ),
+        )
+        .await;
+    assert_eq!(response.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        h.meta
+            .list_session_credentials(cairn_types::Timestamp(0))
+            .await
+            .unwrap()
+            .len(),
+        0,
+        "a partial credential must not be persisted"
+    );
 }
 
 #[tokio::test]
@@ -659,6 +1186,176 @@ async fn make_bucket(h: &Harness, a: &Principal, name: &str) {
 }
 
 #[tokio::test]
+async fn share_management_uses_stable_id_and_never_exposes_bearer_material() {
+    let h = harness();
+    let a = admin();
+    make_bucket(&h, &a, "shared").await;
+    let sentinel = "control-share-bearer-sentinel-029";
+    h.meta
+        .submit(Mutation::CreateShare(Box::new(ShareRow {
+            id: "share-management-id".to_owned(),
+            token_hash: ShareLookupHash::for_token(sentinel),
+            bucket: BucketName::parse("shared").unwrap(),
+            key: ObjectKey::parse("private.txt").unwrap(),
+            version_id: None,
+            expires_at: None,
+            disposition: ShareDisposition::Inline,
+            filename: None,
+            created_by: a.user_id.clone(),
+            created_at: cairn_types::Timestamp(10),
+            revoked_at: None,
+        })))
+        .await
+        .unwrap();
+
+    for path in [
+        "/buckets/shared/objects/shares",
+        "/buckets/shared/objects/shares/share-management-id",
+    ] {
+        let resp = h
+            .svc
+            .handle(&Method::GET, path, &[], Some(&a), Bytes::new())
+            .await;
+        assert_eq!(resp.status, StatusCode::OK);
+        let body = std::str::from_utf8(&resp.body).unwrap();
+        assert!(body.contains(r#""id":"share-management-id""#));
+        assert!(!body.contains(sentinel));
+        assert!(!body.contains(r#""token""#));
+        assert!(!body.contains(r#""token_hash""#));
+        assert!(!body.contains(r#""url""#));
+    }
+
+    let revoke = h
+        .svc
+        .handle(
+            &Method::DELETE,
+            "/buckets/shared/objects/shares/share-management-id",
+            &[],
+            Some(&a),
+            Bytes::new(),
+        )
+        .await;
+    assert_eq!(revoke.status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        h.meta
+            .get_share_by_id("share-management-id")
+            .await
+            .unwrap()
+            .unwrap()
+            .revoked_at,
+        Some(h.clock.now())
+    );
+}
+
+#[tokio::test]
+async fn webhook_secret_is_write_only_and_sealed_in_raw_metadata() {
+    let h = harness();
+    let a = admin();
+    make_bucket(&h, &a, "hooks").await;
+    let sentinel = "AUD015-raw-plaintext-must-not-survive";
+    let body = format!(
+        r#"{{"endpoints":[{{"id":"audit","url":"https://example.test/hook","events":["s3:ObjectCreated:*"],"secret":"{sentinel}"}}]}}"#
+    );
+
+    let put = h
+        .svc
+        .handle(
+            &Method::PUT,
+            "/buckets/hooks/notifications",
+            &[],
+            Some(&a),
+            Bytes::from(body),
+        )
+        .await;
+    assert_eq!(put.status, StatusCode::NO_CONTENT);
+
+    let bucket = BucketName::parse("hooks").unwrap();
+    let stored = h
+        .meta
+        .get_bucket_config(&bucket, cairn_types::bucket::ConfigAspect::Notification)
+        .await
+        .unwrap()
+        .expect("notification config persisted");
+    assert!(
+        !stored.0.contains(sentinel),
+        "plaintext HMAC key leaked into raw metadata: {}",
+        stored.0
+    );
+    let parsed: cairn_types::NotificationConfig = serde_json::from_str(&stored.0).unwrap();
+    assert!(matches!(
+        parsed.endpoints[0].secret,
+        Some(cairn_types::WebhookSecret::Sealed(_))
+    ));
+    assert!(
+        !format!("{parsed:?}").contains(sentinel),
+        "domain Debug output must remain redacted"
+    );
+
+    let get = h
+        .svc
+        .handle(
+            &Method::GET,
+            "/buckets/hooks/notifications",
+            &[],
+            Some(&a),
+            Bytes::new(),
+        )
+        .await;
+    assert_eq!(get.status, StatusCode::OK);
+    assert_eq!(json(&get)["endpoints"][0]["has_secret"], true);
+    assert!(
+        !String::from_utf8_lossy(&get.body).contains(sentinel),
+        "management response must never echo the write-only key"
+    );
+}
+
+#[tokio::test]
+async fn editing_legacy_webhook_config_migrates_inherited_secret() {
+    let h = harness();
+    let a = admin();
+    make_bucket(&h, &a, "legacy-hooks").await;
+    let bucket = BucketName::parse("legacy-hooks").unwrap();
+    let sentinel = "AUD015-legacy-inherited-secret";
+    h.meta
+        .submit(Mutation::SetBucketConfig {
+            bucket: bucket.clone(),
+            aspect: cairn_types::bucket::ConfigAspect::Notification,
+            doc: Some(cairn_types::bucket::ConfigDoc(format!(
+                r#"{{"endpoints":[{{"id":"audit","url":"https://old.example.test/hook","events":["s3:*"],"secret":"{sentinel}"}}]}}"#
+            ))),
+        })
+        .await
+        .unwrap();
+
+    let edit = h
+        .svc
+        .handle(
+            &Method::PUT,
+            "/buckets/legacy-hooks/notifications",
+            &[],
+            Some(&a),
+            Bytes::from_static(
+                br#"{"endpoints":[{"id":"audit","url":"https://new.example.test/hook","events":["s3:*"]}]}"#,
+            ),
+        )
+        .await;
+    assert_eq!(edit.status, StatusCode::NO_CONTENT);
+
+    let stored = h
+        .meta
+        .get_bucket_config(&bucket, cairn_types::bucket::ConfigAspect::Notification)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!stored.0.contains(sentinel));
+    let parsed: cairn_types::NotificationConfig = serde_json::from_str(&stored.0).unwrap();
+    assert!(matches!(
+        parsed.endpoints[0].secret,
+        Some(cairn_types::WebhookSecret::Sealed(_))
+    ));
+}
+
+#[tokio::test]
 async fn bucket_config_get_reflects_aspects() {
     let h = harness();
     let a = admin();
@@ -803,6 +1500,35 @@ async fn set_versioning_updates_state() {
         )
         .await;
     assert_eq!(resp.status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn object_lock_bucket_versioning_cannot_be_suspended_through_control_plane() {
+    let h = harness();
+    let a = admin();
+    create_lock_bucket(&h, "worm-versioning", &a).await;
+
+    for status in ["Suspended", "Unversioned"] {
+        let response = h
+            .svc
+            .handle(
+                &Method::PUT,
+                "/buckets/worm-versioning/versioning",
+                &[],
+                Some(&a),
+                Bytes::from(serde_json::to_vec(&serde_json::json!({ "status": status })).unwrap()),
+            )
+            .await;
+        assert_eq!(response.status, StatusCode::CONFLICT, "{status}");
+    }
+
+    let bucket = h
+        .meta
+        .get_bucket(&BucketName::parse("worm-versioning").unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(bucket.versioning, VersioningState::Enabled);
 }
 
 #[tokio::test]
@@ -1309,6 +2035,7 @@ async fn failed_replication_reflects_a_planted_terminal_entry() {
         .submit(Mutation::PutObjectVersion {
             row: Box::new(row),
             precondition: Precondition::default(),
+            initial_state: cairn_types::InitialObjectState::default(),
             replication: vec![entry],
         })
         .await
@@ -1750,6 +2477,113 @@ async fn import_job_lifecycle_and_secret_never_echoed() {
 }
 
 #[tokio::test]
+async fn import_history_is_large_safe_and_keyset_paginated() {
+    let h = harness();
+    let a = admin();
+    // One shared millisecond deliberately forces the id tie-breaker to carry every page boundary.
+    // More than the hard ceiling proves the default API response cannot grow with history.
+    for i in 0..1_205 {
+        h.meta
+            .submit(Mutation::CreateImportJob(Box::new(ImportJobRecord {
+                id: format!("job-{i:04}"),
+                source_endpoint: "https://source.example".to_owned(),
+                source_region: "us-east-1".to_owned(),
+                access_key_id: "AKSRC".to_owned(),
+                secret_ciphertext: vec![1, 2, 3],
+                secret_nonce: None,
+                ca_cert_pem: None,
+                insecure_skip_verify: false,
+                workers: 8,
+                state: ImportState::Completed,
+                buckets: Vec::new(),
+                objects_done: i,
+                objects_total: i,
+                bytes_done: i,
+                bytes_total: i,
+                last_error: None,
+                lease_until: None,
+                created_at: cairn_types::Timestamp(1_000),
+                updated_at: cairn_types::Timestamp(2_000),
+            })))
+            .await
+            .unwrap();
+    }
+
+    let first = h
+        .svc
+        .handle(&Method::GET, "/imports", &[], Some(&a), Bytes::new())
+        .await;
+    assert_eq!(first.status, StatusCode::OK);
+    let first = json(&first);
+    assert_eq!(first["jobs"].as_array().unwrap().len(), 1_000);
+    assert!(first["next_cursor"].as_str().is_some());
+
+    let mut cursor: Option<String> = None;
+    let mut ids = Vec::new();
+    for _ in 0..10 {
+        let mut query = vec![("limit".to_owned(), "137".to_owned())];
+        if let Some(cursor) = cursor.take() {
+            query.push(("cursor".to_owned(), cursor));
+        }
+        let response = h
+            .svc
+            .handle(&Method::GET, "/imports", &query, Some(&a), Bytes::new())
+            .await;
+        assert_eq!(response.status, StatusCode::OK);
+        let page = json(&response);
+        let jobs = page["jobs"].as_array().unwrap();
+        assert!(jobs.len() <= 137);
+        ids.extend(
+            jobs.iter()
+                .map(|job| job["id"].as_str().unwrap().to_owned()),
+        );
+        cursor = page["next_cursor"].as_str().map(str::to_owned);
+        if cursor.is_none() {
+            break;
+        }
+    }
+    let expected: Vec<String> = (0..1_205).rev().map(|i| format!("job-{i:04}")).collect();
+    assert_eq!(
+        ids, expected,
+        "keyset pages must neither skip nor repeat ties"
+    );
+
+    for query in [
+        vec![("limit".to_owned(), "0".to_owned())],
+        vec![("limit".to_owned(), "1001".to_owned())],
+        vec![("limit".to_owned(), "not-a-number".to_owned())],
+        vec![("cursor".to_owned(), "malformed".to_owned())],
+    ] {
+        let response = h
+            .svc
+            .handle(&Method::GET, "/imports", &query, Some(&a), Bytes::new())
+            .await;
+        assert_eq!(response.status, StatusCode::BAD_REQUEST);
+    }
+
+    assert_eq!(
+        h.meta
+            .submit(Mutation::PruneImportJobs {
+                before_ms: 3_000,
+                limit: 1_000,
+            })
+            .await
+            .unwrap(),
+        MutationOutcome::ImportJobsPruned(1_000)
+    );
+    let remaining = h
+        .svc
+        .handle(&Method::GET, "/imports", &[], Some(&a), Bytes::new())
+        .await;
+    let remaining = json(&remaining);
+    assert_eq!(remaining["jobs"].as_array().unwrap().len(), 205);
+    assert!(
+        remaining["next_cursor"].is_null(),
+        "one capped prune must leave the over-batch tail for a later heartbeat"
+    );
+}
+
+#[tokio::test]
 async fn probe_source_buckets_validates_and_guards() {
     // The "Fetch buckets" probe reuses the create-import connection validation: it rejects missing
     // fields, the CA-⊕-skip-verify conflict, and an internal endpoint (SSRF) — all before any
@@ -2047,6 +2881,7 @@ async fn replication_retry_endpoint_requeues_failed_for_bucket() {
         .submit(Mutation::PutObjectVersion {
             row: Box::new(row),
             precondition: Precondition::default(),
+            initial_state: cairn_types::InitialObjectState::default(),
             replication: vec![entry],
         })
         .await
@@ -2511,6 +3346,7 @@ async fn forced_resync_requeues_completed_work_while_an_unforced_resync_is_a_no_
         .submit(Mutation::PutObjectVersion {
             row: Box::new(row),
             precondition: Precondition::default(),
+            initial_state: cairn_types::InitialObjectState::default(),
             replication: vec![entry],
         })
         .await

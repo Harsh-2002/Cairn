@@ -1,5 +1,5 @@
-// List and revoke the persistent shares for one object (presigned URLs are
-// stateless and never appear here). Opened from the object actions menu.
+// List and revoke the persistent shares for one object (individual presigned URLs are exact,
+// short-lived capabilities and never appear here). Opened from the object actions menu.
 
 import { useEffect, useState } from "react";
 import { toast } from "sonner";
@@ -13,7 +13,6 @@ import {
   DialogTitle,
 } from "@/components/primitives/dialog";
 import { FieldError } from "@/components/field-error";
-import { CopyField } from "@/components/copy-field";
 import { StatusBadge, type StatusTone } from "@/components/status-badge";
 import { api, errorMessage } from "@/lib/api";
 import { whenMs } from "@/lib/format";
@@ -55,10 +54,10 @@ export function ManageSharesDialog({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, bucket, objectKey]);
 
-  async function revoke(token: string) {
-    setRevoking(token);
+  async function revoke(id: string) {
+    setRevoking(id);
     try {
-      await api.revokeShare(bucket, token);
+      await api.revokeShare(bucket, id);
       toast.success("Share revoked");
       load();
     } catch (e) {
@@ -89,7 +88,7 @@ export function ManageSharesDialog({
         ) : (
           <ul className="max-h-[60vh] space-y-3 overflow-y-auto">
             {shares.map((s) => (
-              <li key={s.token} className="space-y-2 rounded-lg border p-3">
+              <li key={s.id} className="space-y-2 rounded-lg border p-3">
                 <div className="flex items-center justify-between gap-2">
                   <StatusBadge tone={TONE[s.status]}>{s.status}</StatusBadge>
                   {s.status === "active" ? (
@@ -97,17 +96,16 @@ export function ManageSharesDialog({
                       variant="outline"
                       size="sm"
                       className="text-destructive"
-                      disabled={revoking === s.token}
-                      onClick={() => void revoke(s.token)}
+                      disabled={revoking === s.id}
+                      onClick={() => void revoke(s.id)}
                     >
-                      {revoking === s.token ? "Revoking…" : "Revoke"}
+                      {revoking === s.id ? "Revoking…" : "Revoke"}
                     </Button>
                   ) : null}
                 </div>
-                <CopyField
-                  label="Link"
-                  value={window.location.origin + "/share/" + s.token}
-                />
+                <p className="break-all font-mono text-xs text-muted-foreground">
+                  Share ID: {s.id}
+                </p>
                 <p className="text-[13px] text-muted-foreground">
                   {s.disposition === "attachment" ? "Download" : "View"}
                   {s.version_id ? " · pinned version" : ""} ·{" "}

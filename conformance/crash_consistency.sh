@@ -48,13 +48,18 @@ export CAIRN_DATA_DIR="$DATA/data"
 export CAIRN_DB_PATH="$DATA/data/cairn.db"
 export CAIRN_LISTEN_ADDR="127.0.0.1:$PORT"
 export CAIRN_WEB_ADDR=off  # the harness tests the S3 API; no web console listener
-export CAIRN_MASTER_KEY="$(openssl rand -hex 32)"
+CAIRN_MASTER_KEY="$(openssl rand -hex 32)"
+export CAIRN_MASTER_KEY
 export CAIRN_LOG_LEVEL="${CAIRN_LOG_LEVEL:-warn}"
 
 SRV=""
+# Invoked indirectly by the EXIT trap below.
+# shellcheck disable=SC2317
 cleanup() {
-  [ -n "$SRV" ] && kill "$SRV" 2>/dev/null || true
-  [ -n "$SRV" ] && wait "$SRV" 2>/dev/null || true
+  if [ -n "$SRV" ]; then
+    kill "$SRV" 2>/dev/null || true
+    wait "$SRV" 2>/dev/null || true
+  fi
   rm -rf "$DATA"
 }
 trap cleanup EXIT
@@ -62,12 +67,18 @@ trap cleanup EXIT
 note() { printf '  %s\n' "$*"; }
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 
-# --- count the durable (non-staging) blob files under the data dir -----------------------------
+# --- count committed blob files in this harness's bucket ---------------------------------------
 count_blobs() {
-  find "$CAIRN_DATA_DIR" -type f \
-    ! -path "*/.staging/*" \
-    ! -name 'cairn.db' ! -name 'cairn.db-wal' ! -name 'cairn.db-shm' \
-    2>/dev/null | wc -l | tr -d ' '
+  # A StoragePath is `<bucket>/<opaque-id>`, and reconciliation examines regular files directly
+  # inside each bucket directory. Count that exact domain. Root-level node-state files
+  # (`.cairn-data.lock`, `.cairn.db.cairn-db.lock`, and the SQLite files) are durable control
+  # files, not blobs; counting them made a correctly-reconciled fresh store look non-empty.
+  local bucket_dir="$CAIRN_DATA_DIR/$BUCKET"
+  if [ ! -d "$bucket_dir" ]; then
+    printf '0\n'
+    return
+  fi
+  find "$bucket_dir" -mindepth 1 -maxdepth 1 -type f 2>/dev/null | wc -l | tr -d ' '
 }
 
 # --- 1. build -----------------------------------------------------------------------------------
@@ -83,7 +94,9 @@ note "bootstrapping a fresh store at $DATA"
 BOOT="$("$BIN" bootstrap)" || fail "bootstrap failed"
 AKID="$(echo "$BOOT" | awk '/Access Key Id/ {print $NF}')"
 SECRET="$(echo "$BOOT" | awk '/Secret Access Key/ {print $NF}')"
-[ -n "$AKID" ] && [ -n "$SECRET" ] || fail "could not parse bootstrap credentials"
+if [ -z "$AKID" ] || [ -z "$SECRET" ]; then
+  fail "could not parse bootstrap credentials"
+fi
 
 # --- 3. start the server with the seam armed ----------------------------------------------------
 note "starting server with FAILPOINTS=blob_after_durable=panic"
@@ -143,20 +156,23 @@ SRV=""
 # absent. This is the real F-4 verification.
 # ===============================================================================================
 if [ "$ARMED" -eq 1 ]; then
-  orphan_count="$(count_blobs)"
+  blob_count_after_crash="$(count_blobs)"
+  orphan_count=$((blob_count_after_crash - blobs_before))
   [ "$orphan_count" -ge 1 ] || fail "expected an orphan blob after the crash, found none"
-  note "orphan blob present on disk: $orphan_count file(s)"
+  note "orphan blob present on disk: $orphan_count new file(s)"
 
   note "running 'cairn integrity' (reconcile)"
   REPORT="$("$BIN" integrity)" || fail "integrity command failed: $REPORT"
   note "$REPORT"
   reclaimed="$(echo "$REPORT" | sed -n 's/.*orphans_reclaimed=\([0-9]*\).*/\1/p')"
   [ -n "$reclaimed" ] || fail "could not parse orphans_reclaimed from: $REPORT"
-  [ "$reclaimed" -ge 1 ] || fail "reconciliation reclaimed no orphans (orphans_reclaimed=$reclaimed)"
+  [ "$reclaimed" -eq "$orphan_count" ] \
+    || fail "expected reconciliation to reclaim exactly $orphan_count orphan(s), reclaimed $reclaimed"
   note "reconciliation reclaimed $reclaimed orphan(s)"
 
   remaining="$(count_blobs)"
-  [ "$remaining" -eq 0 ] || fail "orphan blob survived reconciliation ($remaining file(s) remain)"
+  [ "$remaining" -eq "$blobs_before" ] \
+    || fail "expected the pre-PUT blob baseline ($blobs_before) after reconciliation, found $remaining"
 
   # The object must be absent: bring the server back (no seam) and a GET must 404.
   "$BIN" serve >"$DATA/server2.log" 2>&1 &

@@ -403,8 +403,11 @@ fn list_multipart_uploads_shape() {
         content_type: "application/octet-stream".to_owned(),
         status: MultipartStatus::Active,
         owner_id: UserId("o".to_owned()),
+        initiated_by: UserId("o".to_owned()),
         intended_acl: None,
         user_metadata: vec![],
+        initial_tags: Vec::new(),
+        lock_intent: cairn_types::ExplicitObjectLockIntent::default(),
         sse_requested: false,
         encrypt_parts: false,
         sse_kms_requested: false,
@@ -447,8 +450,11 @@ fn list_multipart_uploads_truncated_emits_both_markers() {
         content_type: "application/octet-stream".to_owned(),
         status: MultipartStatus::Active,
         owner_id: UserId("o".to_owned()),
+        initiated_by: UserId("o".to_owned()),
         intended_acl: None,
         user_metadata: vec![],
+        initial_tags: Vec::new(),
+        lock_intent: cairn_types::ExplicitObjectLockIntent::default(),
         sse_requested: false,
         encrypt_parts: false,
         sse_kms_requested: false,
@@ -501,8 +507,11 @@ fn list_multipart_uploads_url_encoding_encodes_key_fields() {
         content_type: "application/octet-stream".to_owned(),
         status: MultipartStatus::Active,
         owner_id: UserId("o".to_owned()),
+        initiated_by: UserId("o".to_owned()),
         intended_acl: None,
         user_metadata: vec![],
+        initial_tags: Vec::new(),
+        lock_intent: cairn_types::ExplicitObjectLockIntent::default(),
         sse_requested: false,
         encrypt_parts: false,
         sse_kms_requested: false,
@@ -686,6 +695,76 @@ fn text_split_across_cdata_is_coalesced() {
         </Part></CompleteMultipartUpload>";
     let parts = parse_complete_multipart(mp.as_bytes()).unwrap();
     assert_eq!(parts, vec![(1, "abcdef".to_owned())]);
+}
+
+/// Dependency-regression coverage for RUSTSEC-2026-0194. The patched attribute iterator switches
+/// to a hash pre-filter for large tags, while retaining duplicate-name rejection.
+#[test]
+fn quick_xml_handles_many_attributes_and_rejects_duplicates() {
+    use quick_xml::{Reader, events::Event};
+
+    let mut body = String::from("<Root");
+    for i in 0..4_096 {
+        body.push_str(&format!(" a{i}=\"{i}\""));
+    }
+    body.push_str("/>");
+
+    let mut reader = Reader::from_str(&body);
+    let Event::Empty(start) = reader.read_event().unwrap() else {
+        panic!("expected one empty Root element");
+    };
+    assert_eq!(
+        start
+            .attributes()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .len(),
+        4_096
+    );
+
+    let mut reader = Reader::from_str("<Root repeated=\"one\" repeated=\"two\"/>");
+    let Event::Empty(start) = reader.read_event().unwrap() else {
+        panic!("expected one empty Root element");
+    };
+    assert!(start.attributes().any(|attribute| attribute.is_err()));
+}
+
+/// Dependency-regression coverage for RUSTSEC-2026-0195. NsReader must reject one element with
+/// more than quick-xml's default 256 namespace declarations before growing without bound.
+#[test]
+fn quick_xml_caps_namespace_declarations_per_element() {
+    use quick_xml::reader::NsReader;
+
+    let mut body = String::from("<Root");
+    for i in 0..257 {
+        body.push_str(&format!(" xmlns:p{i}=\"urn:cairn:test:{i}\""));
+    }
+    body.push_str("/>");
+
+    let mut reader = NsReader::from_str(&body);
+    assert!(reader.read_event().is_err());
+}
+
+/// Cairn deliberately uses the plain Reader and local element names. Large attribute/namespace
+/// sets must remain total and must not change the parsed S3 value after the quick-xml upgrade.
+#[test]
+fn s3_parser_is_total_with_adversarial_attributes_and_namespaces() {
+    let mut body = String::from("<s3:Tagging xmlns:s3=\"urn:cairn:s3\"");
+    for i in 0..1_024 {
+        body.push_str(&format!(" a{i}=\"{i}\" xmlns:p{i}=\"urn:cairn:test:{i}\""));
+    }
+    body.push_str(
+        "><s3:TagSet><s3:Tag><s3:Key>env</s3:Key>\
+         <s3:Value>prod &#x2d; 1 &amp; 2</s3:Value></s3:Tag></s3:TagSet></s3:Tagging>",
+    );
+
+    assert_eq!(
+        parse_tagging(body.as_bytes()).unwrap(),
+        vec![("env".to_owned(), "prod - 1 & 2".to_owned())]
+    );
+    assert_malformed(parse_tagging(
+        b"<Tagging><TagSet><Tag><Key>k</Key><Value>&unknown;</Value></Tag></TagSet></Tagging>",
+    ));
 }
 
 #[test]
@@ -1123,6 +1202,70 @@ fn object_lock_configuration_codec_round_trips() {
         parse_object_lock_configuration(xml.as_bytes()).unwrap(),
         enabled_only
     );
+}
+
+#[test]
+fn object_lock_configuration_cannot_encode_disablement() {
+    use cairn_types::Error;
+
+    for body in [
+        "<ObjectLockConfiguration/>",
+        "<ObjectLockConfiguration><Rule/></ObjectLockConfiguration>",
+        "<ObjectLockConfiguration><ObjectLockEnabled/></ObjectLockConfiguration>",
+        "<ObjectLockConfiguration><ObjectLockEnabled>Disabled</ObjectLockEnabled>\
+         </ObjectLockConfiguration>",
+        "<ObjectLockConfiguration><ObjectLockEnabled>true</ObjectLockEnabled>\
+         </ObjectLockConfiguration>",
+    ] {
+        assert!(
+            matches!(
+                parse_object_lock_configuration(body.as_bytes()),
+                Err(Error::MalformedXml)
+            ),
+            "disable-capable Object Lock document was accepted: {body}"
+        );
+    }
+}
+
+#[test]
+fn object_lock_default_retention_enforces_supported_bounds() {
+    use cairn_types::{DefaultRetention, Error, RetentionPeriod};
+
+    for (field, maximum, expected) in [
+        (
+            "Days",
+            DefaultRetention::MAX_DAYS,
+            RetentionPeriod::Days(DefaultRetention::MAX_DAYS),
+        ),
+        (
+            "Years",
+            DefaultRetention::MAX_YEARS,
+            RetentionPeriod::Years(DefaultRetention::MAX_YEARS),
+        ),
+    ] {
+        let body = format!(
+            "<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled>\
+             <Rule><DefaultRetention><Mode>GOVERNANCE</Mode><{field}>{maximum}</{field}>\
+             </DefaultRetention></Rule></ObjectLockConfiguration>"
+        );
+        let parsed = parse_object_lock_configuration(body.as_bytes()).unwrap();
+        assert_eq!(parsed.default_retention.unwrap().period, expected);
+
+        for invalid in [0, maximum + 1] {
+            let body = format!(
+                "<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled>\
+                 <Rule><DefaultRetention><Mode>GOVERNANCE</Mode><{field}>{invalid}</{field}>\
+                 </DefaultRetention></Rule></ObjectLockConfiguration>"
+            );
+            assert!(
+                matches!(
+                    parse_object_lock_configuration(body.as_bytes()),
+                    Err(Error::InvalidArgument(_))
+                ),
+                "{field}={invalid} must be InvalidArgument"
+            );
+        }
+    }
 }
 
 #[test]

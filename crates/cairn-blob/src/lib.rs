@@ -32,6 +32,7 @@ use crate::hash::Hashers;
 use crate::staging::Staging;
 use async_trait::async_trait;
 use bytes::Bytes;
+use cairn_types::SecretKey32;
 use cairn_types::blob::{
     BlobCipher, BlobProbe, BlobReadHandle, ByteRange, ContentRange, PartRef, ReconcileOpts,
     ReconcileReport, StageOptions, StagedBlob, StagedPart, ZeroCopyRead,
@@ -52,6 +53,79 @@ const READ_CHUNK: usize = 64 * 1024;
 /// block size in that case). 64 KiB keeps the per-block GCM-tag overhead negligible (16 bytes per
 /// 65536) while bounding the amount decrypted for a small ranged read.
 const DEFAULT_ENCRYPTED_BLOCK_SIZE: u32 = 64 * 1024;
+
+/// Open an existing regular file for reading without following a final-component symlink.
+///
+/// Snapshot/restore code uses this seam after validating every directory component. Keeping the
+/// no-follow syscall here preserves `cairn-blob` as the filesystem boundary and closes the
+/// check/open race that a separate `symlink_metadata` followed by `File::open` would leave.
+#[cfg(unix)]
+pub fn open_readonly_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
+    use rustix::fs::{Mode, OFlags};
+
+    let fd = rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(std::io::Error::from)?;
+    Ok(fd.into())
+}
+
+/// Portable fallback for targets without `O_NOFOLLOW`.
+#[cfg(not(unix))]
+pub fn open_readonly_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
+    if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("refusing to follow symlink {}", path.display()),
+        ));
+    }
+    std::fs::File::open(path)
+}
+
+/// Open (or create) a node-state lock file without following a final-component symlink.
+#[cfg(unix)]
+pub fn open_lock_file_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
+    use rustix::fs::{Mode, OFlags};
+
+    let fd = rustix::fs::open(
+        path,
+        OFlags::CREATE | OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::from_bits_truncate(0o600),
+    )
+    .map_err(std::io::Error::from)?;
+    Ok(fd.into())
+}
+
+/// Portable fallback for targets without `O_NOFOLLOW`.
+#[cfg(not(unix))]
+pub fn open_lock_file_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
+    if let Ok(metadata) = std::fs::symlink_metadata(path)
+        && metadata.file_type().is_symlink()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("refusing to follow symlink {}", path.display()),
+        ));
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)
+}
+
+/// Acquire a non-waiting exclusive advisory lock on an already-open node-state lock file.
+///
+/// Filesystem syscalls remain centralized in `cairn-blob`; the server retains the returned
+/// [`std::fs::File`] for the lock's lifetime. Contention maps to
+/// [`std::io::ErrorKind::WouldBlock`].
+pub fn try_lock_exclusive(file: &std::fs::File) -> std::io::Result<()> {
+    rustix::fs::flock(file, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+        .map_err(std::io::Error::from)
+}
 
 pub(crate) fn io_err(e: std::io::Error) -> BlobError {
     if e.kind() == std::io::ErrorKind::StorageFull || e.raw_os_error() == Some(28) {
@@ -127,9 +201,19 @@ impl LocalBlobStore {
     /// Returns a [`BlobError`] if the staging directory cannot be created.
     pub async fn open(data_root: impl Into<PathBuf>) -> Result<Self, BlobError> {
         let data_root = data_root.into();
-        tokio::fs::create_dir_all(data_root.join(STAGING).join("multipart"))
+        tokio::fs::create_dir_all(&data_root)
             .await
             .map_err(io_err)?;
+        let staging = data_root.join(STAGING);
+        tokio::fs::create_dir_all(&staging).await.map_err(io_err)?;
+        // `create_dir_all` does not make a new directory entry crash-durable. Persist each parent
+        // before descending so `.staging` and `.staging/multipart` cannot disappear independently
+        // after a successful open/part write (ARCH 8.2).
+        fsync_dir(&data_root).await?;
+        tokio::fs::create_dir_all(staging.join("multipart"))
+            .await
+            .map_err(io_err)?;
+        fsync_dir(&staging).await?;
         Ok(Self {
             data_root: Arc::new(data_root),
             use_uring: cfg!(feature = "io-uring"),
@@ -316,14 +400,14 @@ async fn write_staged(
     // over the plaintext (here, via `hashers`) before any transform, so it is identical with or
     // without compression/encryption (ARCH 21.1, 27).
     let block_pol = compress.or_else(|| {
-        opts.encryption.map(|_| CompressionPolicy {
+        opts.encryption.as_ref().map(|_| CompressionPolicy {
             algorithm: CompressionAlgorithm::None,
             block_size: DEFAULT_ENCRYPTED_BLOCK_SIZE,
         })
     });
 
     if let Some(pol) = block_pol {
-        let mut enc = match opts.encryption {
+        let mut enc = match opts.encryption.clone() {
             Some(dek) => BlockEncoder::new_encrypted(pol.algorithm, pol.block_size, dek),
             None => BlockEncoder::new(pol.algorithm, pol.block_size),
         };
@@ -385,7 +469,7 @@ async fn write_staged(
 fn stream_blob(
     path: &Path,
     compressed: bool,
-    dek: Option<[u8; 32]>,
+    dek: Option<SecretKey32>,
     offset: u64,
     len: u64,
     tx: &tokio::sync::mpsc::Sender<Result<Bytes, BlobError>>,
@@ -441,7 +525,7 @@ enum StreamSrc {
         (
             PathBuf,
             bool,
-            Option<[u8; 32]>,
+            Option<SecretKey32>,
             u64,
             u64,
             tokio::sync::OwnedSemaphorePermit,
@@ -453,7 +537,7 @@ enum StreamSrc {
 fn read_stream(
     path: PathBuf,
     compressed: bool,
-    dek: Option<[u8; 32]>,
+    dek: Option<SecretKey32>,
     offset: u64,
     len: u64,
     permit: tokio::sync::OwnedSemaphorePermit,
@@ -535,7 +619,7 @@ impl LocalBlobStore {
         use tokio::io::AsyncReadExt;
         for part in parts {
             let part_path = self.resolve(&part.storage_path)?;
-            match part.dek {
+            match part.dek.clone() {
                 // Plaintext / pre-v21 part: raw read, unchanged.
                 None => {
                     let mut f = tokio::fs::File::open(&part_path)
@@ -680,6 +764,7 @@ impl BlobStore for LocalBlobStore {
         let small_read_max = self.small_read_max;
         let probe_path = file_path.clone();
         let refused = self.encrypted_without_key.clone();
+        let probe_dek = dek.clone();
         let (compressed, logical_len, reuse_file, whole) = tokio::task::spawn_blocking(
             move || -> Result<(bool, u64, Option<std::fs::File>, Option<Bytes>), BlobError> {
                 use std::io::{Read, Seek, SeekFrom};
@@ -743,7 +828,7 @@ impl BlobStore for LocalBlobStore {
                     // Parse the header for the logical length; the fd is consumed by the reader and
                     // not reused (compressed/encrypted blobs never take the kernel fast path).
                     f.seek(SeekFrom::Start(0)).map_err(io_err)?;
-                    let logical = CompressedReader::open_with_dek(f, dek)?.logical_len();
+                    let logical = CompressedReader::open_with_dek(f, probe_dek)?.logical_len();
                     Ok((true, logical, None, None))
                 } else if file_len <= small_read_max {
                     // Small uncompressed object: read it whole here (one open, one read). The range
@@ -864,10 +949,11 @@ impl BlobStore for LocalBlobStore {
         &self,
         upload: &UploadId,
         part_number: u16,
+        attempt_id: &str,
         body: cairn_types::BodyStream,
         checksums: ChecksumSet,
         size_ceiling: u64,
-        encryption: Option<[u8; 32]>,
+        encryption: Option<SecretKey32>,
     ) -> Result<StagedPart, BlobError> {
         let _permit = self.acquire_io().await?;
         let dir = self
@@ -875,8 +961,15 @@ impl BlobStore for LocalBlobStore {
             .join(STAGING)
             .join("multipart")
             .join(upload.as_str());
+        let multipart_dir = self.data_root.join(STAGING).join("multipart");
         tokio::fs::create_dir_all(&dir).await.map_err(io_err)?;
-        let id = format!("{part_number:05}-{}", uuid::Uuid::new_v4().simple());
+        // The first part creates the session directory. Persist its entry in the multipart parent
+        // before writing/acknowledging any part; syncing only the session directory below makes the
+        // part entry durable but cannot make the session directory itself survive a crash.
+        // Coalescing keeps simultaneous first parts for one/many uploads to one parent fsync batch.
+        self.dir_sync.sync_dir(&multipart_dir).await?;
+        fail::fail_point!("blob_after_multipart_session_dir");
+        let id = multipart_attempt_name(part_number, attempt_id)?;
         let path = dir.join(&id);
         // A part is staged as ciphertext when `encryption` is Some (SSE / bucket-default / at-rest
         // multipart, ARCH 27) so nothing plaintext hits disk; otherwise it is a plaintext intermediate
@@ -924,6 +1017,26 @@ impl BlobStore for LocalBlobStore {
         })
     }
 
+    async fn delete_part_attempt(
+        &self,
+        upload: &UploadId,
+        part_number: u16,
+        attempt_id: &str,
+    ) -> Result<(), BlobError> {
+        let name = multipart_attempt_name(part_number, attempt_id)?;
+        let path = self
+            .data_root
+            .join(STAGING)
+            .join("multipart")
+            .join(upload.as_str())
+            .join(name);
+        match tokio::fs::remove_file(path).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(io_err(error)),
+        }
+    }
+
     async fn assemble(
         &self,
         bucket: &BucketName,
@@ -948,7 +1061,7 @@ impl BlobStore for LocalBlobStore {
         // size. The multipart ETag is computed from the part MD5s by the caller, not from `hasher`,
         // but the plaintext MD5 here is still computed before any transform.
         let block_pol = compress.or_else(|| {
-            opts.encryption.map(|_| CompressionPolicy {
+            opts.encryption.as_ref().map(|_| CompressionPolicy {
                 algorithm: CompressionAlgorithm::None,
                 block_size: DEFAULT_ENCRYPTED_BLOCK_SIZE,
             })
@@ -1058,6 +1171,20 @@ impl BlobStore for LocalBlobStore {
         let now = system_now();
         reconcile_inner(&self.data_root, oracle, opts, now).await
     }
+}
+
+fn multipart_attempt_name(part_number: u16, attempt_id: &str) -> Result<String, BlobError> {
+    if attempt_id.is_empty()
+        || attempt_id.len() > 64
+        || !attempt_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(BlobError::Io(
+            "unsafe multipart part-attempt identifier".to_owned(),
+        ));
+    }
+    Ok(format!("{part_number:05}-{attempt_id}"))
 }
 
 /// The wall-clock now as a [`Timestamp`], saturating at the epoch for clocks set before 1970.
@@ -1244,13 +1371,76 @@ async fn reconcile_staging(
                     .live_session(&upload)
                     .await
                     .map_err(|e| BlobError::Io(e.to_string()))?;
-                if !live && tokio::fs::remove_dir_all(s.path()).await.is_ok() {
+                if live {
+                    reconcile_live_multipart_session(
+                        &s.path(),
+                        &upload,
+                        oracle,
+                        opts.batch_size.max(1),
+                        opts.staging_safety_margin_secs,
+                        now,
+                        report,
+                    )
+                    .await?;
+                } else if tokio::fs::remove_dir_all(s.path()).await.is_ok() {
                     report.sessions_cleaned += 1;
                 }
             }
             // Note: the `multipart` parent itself is left in place. It is recreated on every
             // store open and on each `stage_part`, so pruning it would be pointless churn; only
             // the per-session subdirectories are reclaimed (counted as `sessions_cleaned`).
+        }
+    }
+    Ok(())
+}
+
+async fn reconcile_live_multipart_session(
+    session_dir: &Path,
+    upload: &UploadId,
+    oracle: &dyn ReconcileOracle,
+    batch_size: u32,
+    margin_secs: i64,
+    now: Timestamp,
+    report: &mut ReconcileReport,
+) -> Result<(), BlobError> {
+    let mut entries = tokio::fs::read_dir(session_dir).await.map_err(io_err)?;
+    let mut batch = Vec::new();
+    loop {
+        let next = entries.next_entry().await.map_err(io_err)?;
+        let is_end = next.is_none();
+        if let Some(entry) = next {
+            if entry.file_type().await.map_err(io_err)?.is_file() {
+                let file_name = entry.file_name().to_string_lossy().to_string();
+                let storage_path = StoragePath::from_string(format!(
+                    "{STAGING}/multipart/{}/{}",
+                    upload.as_str(),
+                    file_name
+                ));
+                batch.push((entry, storage_path));
+            }
+        }
+        if (is_end || batch.len() >= batch_size as usize) && !batch.is_empty() {
+            let paths: Vec<_> = batch
+                .iter()
+                .map(|(_, storage_path)| storage_path.clone())
+                .collect();
+            let live = oracle
+                .live_multipart_parts(&paths)
+                .await
+                .map_err(|error| BlobError::Io(error.to_string()))?;
+            for ((entry, _), referenced) in batch.drain(..).zip(live) {
+                if referenced || !staging_artifact_expired(&entry, margin_secs, now).await? {
+                    continue;
+                }
+                if tokio::fs::remove_file(entry.path()).await.is_ok() {
+                    report.staging_cleaned += 1;
+                } else {
+                    report.errors += 1;
+                }
+            }
+        }
+        if is_end {
+            break;
         }
     }
     Ok(())

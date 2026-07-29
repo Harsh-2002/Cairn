@@ -7,9 +7,9 @@ use async_trait::async_trait;
 use cairn_types::bucket::{Bucket, ConfigAspect, ConfigDoc};
 use cairn_types::id::{BucketName, ObjectKey, UserId, VersionId};
 use cairn_types::notification::{EventKind, NotificationConfig, WebhookEndpoint};
-use cairn_types::testing::{InMemoryMetadataStore, TestClock};
-use cairn_types::traits::MetadataStore;
-use cairn_types::{Mutation, WebhookStatus};
+use cairn_types::testing::{InMemoryMetadataStore, StubCrypto, TestClock};
+use cairn_types::traits::{Crypto, MetadataStore};
+use cairn_types::{CryptoError, Mutation, Nonce, Sealed, WebhookSecret, WebhookStatus};
 use std::sync::Mutex;
 
 /// One recorded delivery: `(url, body, signature)`.
@@ -93,13 +93,15 @@ fn entry(endpoint_id: &str) -> WebhookEntry {
 }
 
 fn endpoint(id: &str, secret: Option<&str>) -> WebhookEndpoint {
+    let crypto = StubCrypto;
     WebhookEndpoint {
         id: id.to_owned(),
         url: "http://example.test/hook".to_owned(),
         events: vec!["s3:ObjectCreated:*".to_owned()],
         prefix: None,
         suffix: None,
-        secret: secret.map(str::to_owned),
+        secret: secret
+            .map(|secret| WebhookSecret::from_sealed(crypto.seal(secret.as_bytes()).unwrap())),
     }
 }
 
@@ -113,9 +115,10 @@ async fn delivers_and_marks_done_with_signature() {
 
     let sink = RecordingSink::new(Ok(()));
     let clock = TestClock::at_secs(100);
+    let crypto = StubCrypto;
     let engine = WebhookEngine::new(WebhookOpts::default());
     let report = engine
-        .run_until_idle(&meta, &sink, &clock, 10)
+        .run_until_idle(&meta, &sink, &crypto, &clock, 10)
         .await
         .unwrap();
 
@@ -131,7 +134,7 @@ async fn delivers_and_marks_done_with_signature() {
     // Signature present and equal to the documented HMAC.
     assert_eq!(
         sig.as_deref(),
-        Some(sign("topsecret", br#"{"Records":[]}"#).as_str())
+        Some(sign(b"topsecret", br#"{"Records":[]}"#).as_str())
     );
     // The entry is gone from the due set (marked completed).
     assert!(
@@ -151,8 +154,9 @@ async fn unsigned_when_no_secret() {
         .unwrap();
     let sink = RecordingSink::new(Ok(()));
     let clock = TestClock::at_secs(100);
+    let crypto = StubCrypto;
     WebhookEngine::new(WebhookOpts::default())
-        .run_until_idle(&meta, &sink, &clock, 10)
+        .run_until_idle(&meta, &sink, &crypto, &clock, 10)
         .await
         .unwrap();
     assert_eq!(sink.calls.lock().unwrap()[0].2, None);
@@ -176,10 +180,11 @@ async fn retryable_failure_reschedules_then_parks_failed() {
         max_concurrency: 8,
     };
     let engine = WebhookEngine::new(opts);
+    let crypto = StubCrypto;
 
     // First pass at t=100: attempt 1 fails → rescheduled (not terminal).
     let r1 = engine
-        .run_until_idle(&meta, &sink, &TestClock::at_secs(100), 1)
+        .run_until_idle(&meta, &sink, &crypto, &TestClock::at_secs(100), 1)
         .await
         .unwrap();
     assert_eq!(r1.failed, 1);
@@ -194,7 +199,7 @@ async fn retryable_failure_reschedules_then_parks_failed() {
 
     // Second pass after the backoff: attempt 2 fails → terminal (max_attempts reached).
     let r2 = engine
-        .run_until_idle(&meta, &sink, &TestClock::at_secs(1_000), 1)
+        .run_until_idle(&meta, &sink, &crypto, &TestClock::at_secs(1_000), 1)
         .await
         .unwrap();
     assert_eq!(r2.failed, 1);
@@ -212,8 +217,9 @@ async fn missing_subscription_drops_entry() {
         .await
         .unwrap();
     let sink = RecordingSink::new(Ok(()));
+    let crypto = StubCrypto;
     let report = WebhookEngine::new(WebhookOpts::default())
-        .run_until_idle(&meta, &sink, &TestClock::at_secs(100), 10)
+        .run_until_idle(&meta, &sink, &crypto, &TestClock::at_secs(100), 10)
         .await
         .unwrap();
     assert_eq!(report.dropped, 1);
@@ -221,6 +227,73 @@ async fn missing_subscription_drops_entry() {
     assert!(
         sink.calls.lock().unwrap().is_empty(),
         "no delivery attempted"
+    );
+}
+
+/// A crypto implementation whose opens always fail, used to prove the worker never falls back to
+/// an unsigned request when a stored envelope cannot be authenticated.
+#[derive(Debug)]
+struct FailOpenCrypto;
+
+impl Crypto for FailOpenCrypto {
+    fn seal(&self, _plaintext: &[u8]) -> Result<Sealed, CryptoError> {
+        Err(CryptoError::Encrypt)
+    }
+
+    fn open(
+        &self,
+        _ciphertext: &[u8],
+        _nonce: &Nonce,
+    ) -> Result<zeroize::Zeroizing<Vec<u8>>, CryptoError> {
+        Err(CryptoError::Decrypt)
+    }
+
+    fn ct_eq(&self, a: &[u8], b: &[u8]) -> bool {
+        a == b
+    }
+}
+
+#[tokio::test]
+async fn sealed_secret_open_failure_never_sends_unsigned() {
+    let meta = InMemoryMetadataStore::new();
+    setup(&meta, vec![endpoint("ep1", Some("topsecret"))]).await;
+    meta.submit(Mutation::EnqueueWebhooks(vec![entry("ep1")]))
+        .await
+        .unwrap();
+    let sink = RecordingSink::new(Ok(()));
+
+    let report = WebhookEngine::new(WebhookOpts::default())
+        .run_until_idle(&meta, &sink, &FailOpenCrypto, &TestClock::at_secs(100), 1)
+        .await
+        .unwrap();
+
+    assert_eq!(report.failed, 1);
+    assert!(
+        sink.calls.lock().unwrap().is_empty(),
+        "an unauthenticated secret must withhold the request, never send it unsigned"
+    );
+}
+
+#[tokio::test]
+async fn legacy_plaintext_secret_remains_deliverable_during_online_migration() {
+    let meta = InMemoryMetadataStore::new();
+    let mut legacy = endpoint("ep1", None);
+    legacy.secret = Some(WebhookSecret::LegacyPlaintext("legacy-key".into()));
+    setup(&meta, vec![legacy]).await;
+    meta.submit(Mutation::EnqueueWebhooks(vec![entry("ep1")]))
+        .await
+        .unwrap();
+    let sink = RecordingSink::new(Ok(()));
+
+    let report = WebhookEngine::new(WebhookOpts::default())
+        .run_until_idle(&meta, &sink, &StubCrypto, &TestClock::at_secs(100), 1)
+        .await
+        .unwrap();
+
+    assert_eq!(report.delivered, 1);
+    assert_eq!(
+        sink.calls.lock().unwrap()[0].2.as_deref(),
+        Some(sign(b"legacy-key", br#"{"Records":[]}"#).as_str())
     );
 }
 

@@ -4,6 +4,7 @@
 //! and signature are all exercised end to end.
 
 use crate::crypto_util::{hmac_sha256, parse_amz_date, percent_decode, sha256_hex, uri_encode};
+use cairn_types::SecretKey32;
 use cairn_types::auth::{AuthMethod, ChunkSigningContext, Principal, RequestView};
 use cairn_types::error::AuthError;
 use cairn_types::time::Timestamp;
@@ -14,11 +15,14 @@ const SKEW_SECS: i64 = 900;
 
 /// Derive the SigV4 signing key.
 #[must_use]
-pub fn signing_key(secret: &str, date: &str, region: &str, service: &str) -> [u8; 32] {
-    let k = hmac_sha256(format!("AWS4{secret}").as_bytes(), date.as_bytes());
-    let k = hmac_sha256(&k, region.as_bytes());
-    let k = hmac_sha256(&k, service.as_bytes());
-    hmac_sha256(&k, b"aws4_request")
+pub fn signing_key(secret: &str, date: &str, region: &str, service: &str) -> SecretKey32 {
+    let date_key = SecretKey32::new(hmac_sha256(
+        format!("AWS4{secret}").as_bytes(),
+        date.as_bytes(),
+    ));
+    let region_key = SecretKey32::new(hmac_sha256(date_key.expose_secret(), region.as_bytes()));
+    let service_key = SecretKey32::new(hmac_sha256(region_key.expose_secret(), service.as_bytes()));
+    SecretKey32::new(hmac_sha256(service_key.expose_secret(), b"aws4_request"))
 }
 
 /// Build the canonical request string. `signed` is the sorted (lowercased-name, value) list.
@@ -54,8 +58,8 @@ pub fn string_to_sign(amzdate: &str, scope: &str, canonical_req: &str) -> String
 
 /// Compute the hex signature.
 #[must_use]
-pub fn compute_signature(key: &[u8; 32], string_to_sign: &str) -> String {
-    hex::encode(hmac_sha256(key, string_to_sign.as_bytes()))
+pub fn compute_signature(key: &SecretKey32, string_to_sign: &str) -> String {
+    hex::encode(hmac_sha256(key.expose_secret(), string_to_sign.as_bytes()))
 }
 
 fn collapse_ws(v: &str) -> String {
@@ -508,6 +512,7 @@ pub fn principal(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cairn_types::auth::ClientSource;
 
     // AWS SigV4 test suite: get-vanilla.
     #[test]
@@ -565,7 +570,7 @@ mod tests {
             query,
             headers: &[],
             host: "cairn.example.com",
-            source: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            source: ClientSource::Direct(IpAddr::V4(Ipv4Addr::LOCALHOST)),
             secure_transport: true,
         };
         let (parsed, expires) = parse_presigned(view.query).expect("parses");
@@ -580,7 +585,7 @@ mod tests {
             query,
             headers: &[],
             host: "cairn.example.com",
-            source: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            source: ClientSource::Direct(IpAddr::V4(Ipv4Addr::LOCALHOST)),
             secure_transport: true,
         };
         assert!(verify_presigned(&tampered, &parsed, expires, secret, now).is_err());
@@ -615,7 +620,7 @@ mod tests {
             query,
             headers: &[],
             host: "cairn.example.com",
-            source: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            source: ClientSource::Direct(IpAddr::V4(Ipv4Addr::LOCALHOST)),
             secure_transport: true,
         };
         let (mut parsed, expires) = parse_presigned(view.query).expect("parses");

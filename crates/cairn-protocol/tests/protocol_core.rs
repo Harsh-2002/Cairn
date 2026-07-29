@@ -3,12 +3,13 @@
 
 use bytes::Bytes;
 use cairn_protocol::{S3Body, S3Request, S3Response, S3Service};
-use cairn_types::auth::{AuthMethod, Principal, Role};
-use cairn_types::id::{BucketName, ObjectKey, UserId};
-use cairn_types::traits::{BlobStore, MetadataStore};
+use cairn_types::auth::{AuthMethod, ClientSource, Principal, Role};
+use cairn_types::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
+use cairn_types::traits::{BlobStore, Clock, MetadataStore};
 use http::{Method, StatusCode};
 use std::net::{IpAddr, Ipv4Addr};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 fn admin() -> Principal {
     Principal {
@@ -55,7 +56,7 @@ async fn harness_with_authz(authz: Arc<dyn cairn_types::traits::AuthorizationEng
         Arc::new(cairn_blob::LocalBlobStore::open(dir.path()).await.unwrap());
     let clock = Arc::new(cairn_types::testing::TestClock::default());
     let crypto: Arc<dyn cairn_types::traits::Crypto> =
-        Arc::new(cairn_crypto::SystemCrypto::new([7u8; 32]));
+        Arc::new(cairn_crypto::SystemCrypto::new([7u8; 32].into()));
     let svc = S3Service::new(
         meta.clone(),
         blob.clone(),
@@ -73,6 +74,347 @@ async fn harness_with_authz(authz: Arc<dyn cairn_types::traits::AuthorizationEng
     }
 }
 
+async fn in_memory_harness() -> (Harness, Arc<cairn_types::testing::InMemoryMetadataStore>) {
+    let (harness, meta, _) = in_memory_harness_with_clock().await;
+    (harness, meta)
+}
+
+async fn in_memory_harness_with_clock() -> (
+    Harness,
+    Arc<cairn_types::testing::InMemoryMetadataStore>,
+    Arc<cairn_types::testing::TestClock>,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let concrete = Arc::new(cairn_types::testing::InMemoryMetadataStore::new());
+    let meta: Arc<dyn MetadataStore> = concrete.clone();
+    let blob: Arc<dyn BlobStore> =
+        Arc::new(cairn_blob::LocalBlobStore::open(dir.path()).await.unwrap());
+    let clock = Arc::new(cairn_types::testing::TestClock::default());
+    let crypto: Arc<dyn cairn_types::traits::Crypto> =
+        Arc::new(cairn_crypto::SystemCrypto::new([7u8; 32].into()));
+    let svc = S3Service::new(
+        meta.clone(),
+        blob.clone(),
+        Arc::new(cairn_types::testing::AllowAll),
+        clock.clone(),
+        crypto,
+        "us-east-1".to_owned(),
+        5 * 1024 * 1024 * 1024,
+    );
+    (
+        Harness {
+            svc,
+            meta,
+            blob,
+            _dir: dir,
+        },
+        concrete,
+        clock,
+    )
+}
+
+/// A deterministic model of the AbortMultipart/UploadPart race: bytes become durable, then the
+/// upload row is removed before `S3Service` can submit `RecordPart`. The metadata writer
+/// consequently rejects the mutation as `MultipartNotActive`. The wrapper records the staged path
+/// so the test can prove the protocol reclaimed it on that post-stage failure.
+struct AbortAfterStagePartBlob {
+    inner: Arc<dyn BlobStore>,
+    meta: Arc<dyn MetadataStore>,
+    last_staged: Mutex<Option<StoragePath>>,
+}
+
+impl AbortAfterStagePartBlob {
+    fn new(inner: Arc<dyn BlobStore>, meta: Arc<dyn MetadataStore>) -> Self {
+        Self {
+            inner,
+            meta,
+            last_staged: Mutex::new(None),
+        }
+    }
+
+    fn last_staged(&self) -> StoragePath {
+        self.last_staged
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("stage_part was called")
+    }
+}
+
+#[async_trait::async_trait]
+impl BlobStore for AbortAfterStagePartBlob {
+    async fn stage(
+        &self,
+        bucket: &BucketName,
+        body: cairn_types::BodyStream,
+        opts: cairn_types::blob::StageOptions,
+    ) -> Result<cairn_types::blob::StagedBlob, cairn_types::error::BlobError> {
+        self.inner.stage(bucket, body, opts).await
+    }
+
+    async fn open_raw(
+        &self,
+        path: &StoragePath,
+        range: Option<cairn_types::blob::ByteRange>,
+        cipher: cairn_types::blob::BlobCipher,
+        compression: &cairn_types::object::CompressionDescriptor,
+    ) -> Result<cairn_types::blob::BlobReadHandle, cairn_types::error::BlobError> {
+        self.inner.open_raw(path, range, cipher, compression).await
+    }
+
+    async fn probe(
+        &self,
+        path: &StoragePath,
+    ) -> Result<cairn_types::blob::BlobProbe, cairn_types::error::BlobError> {
+        self.inner.probe(path).await
+    }
+
+    async fn delete(&self, path: &StoragePath) -> Result<(), cairn_types::error::BlobError> {
+        self.inner.delete(path).await
+    }
+
+    async fn stage_part(
+        &self,
+        upload: &UploadId,
+        part_number: u16,
+        attempt_id: &str,
+        body: cairn_types::BodyStream,
+        checksums: cairn_types::object::ChecksumSet,
+        size_ceiling: u64,
+        encryption: Option<cairn_types::SecretKey32>,
+    ) -> Result<cairn_types::blob::StagedPart, cairn_types::error::BlobError> {
+        let staged = self
+            .inner
+            .stage_part(
+                upload,
+                part_number,
+                attempt_id,
+                body,
+                checksums,
+                size_ceiling,
+                encryption,
+            )
+            .await?;
+        *self.last_staged.lock().unwrap() = Some(staged.storage_path.clone());
+        self.meta
+            .submit(cairn_types::Mutation::AbortMultipart(upload.clone()))
+            .await
+            .map_err(|error| {
+                cairn_types::error::BlobError::Io(format!(
+                    "failed to arm post-stage metadata race: {error}"
+                ))
+            })?;
+        Ok(staged)
+    }
+
+    async fn delete_part_attempt(
+        &self,
+        upload: &UploadId,
+        part_number: u16,
+        attempt_id: &str,
+    ) -> Result<(), cairn_types::error::BlobError> {
+        self.inner
+            .delete_part_attempt(upload, part_number, attempt_id)
+            .await
+    }
+
+    async fn assemble(
+        &self,
+        bucket: &BucketName,
+        parts: &[cairn_types::blob::PartRef],
+        opts: cairn_types::blob::StageOptions,
+    ) -> Result<cairn_types::blob::StagedBlob, cairn_types::error::BlobError> {
+        self.inner.assemble(bucket, parts, opts).await
+    }
+
+    async fn delete_session(&self, upload: &UploadId) -> Result<(), cairn_types::error::BlobError> {
+        self.inner.delete_session(upload).await
+    }
+
+    async fn reconcile(
+        &self,
+        oracle: &dyn cairn_types::traits::ReconcileOracle,
+        opts: cairn_types::blob::ReconcileOpts,
+    ) -> Result<cairn_types::blob::ReconcileReport, cairn_types::error::BlobError> {
+        self.inner.reconcile(oracle, opts).await
+    }
+}
+
+async fn harness_abort_after_stage_part() -> (Harness, Arc<AbortAfterStagePartBlob>) {
+    let dir = tempfile::tempdir().unwrap();
+    let meta: Arc<dyn MetadataStore> = Arc::new(cairn_meta::open_in_memory().unwrap());
+    let inner: Arc<dyn BlobStore> =
+        Arc::new(cairn_blob::LocalBlobStore::open(dir.path()).await.unwrap());
+    let fault = Arc::new(AbortAfterStagePartBlob::new(inner, meta.clone()));
+    let blob: Arc<dyn BlobStore> = fault.clone();
+    let svc = S3Service::new(
+        meta.clone(),
+        blob.clone(),
+        Arc::new(cairn_types::testing::AllowAll),
+        Arc::new(cairn_types::testing::TestClock::default()),
+        Arc::new(cairn_crypto::SystemCrypto::new([7u8; 32].into())),
+        "us-east-1".to_owned(),
+        5 * 1024 * 1024 * 1024,
+    );
+    (
+        Harness {
+            svc,
+            meta,
+            blob,
+            _dir: dir,
+        },
+        fault,
+    )
+}
+
+/// Pauses the first multipart assembly after Complete has atomically claimed the session but before
+/// the part files are read. The test can run Abort in that exact window and prove a losing abort
+/// neither returns success nor deletes bytes that the completion owner needs.
+struct AssembleGateBlob {
+    inner: Arc<dyn BlobStore>,
+    pause_next: AtomicBool,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+impl AssembleGateBlob {
+    fn new(inner: Arc<dyn BlobStore>) -> Self {
+        Self {
+            inner,
+            pause_next: AtomicBool::new(true),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        }
+    }
+
+    async fn wait_until_entered(&self) {
+        self.entered.notified().await;
+    }
+
+    fn release(&self) {
+        self.release.notify_one();
+    }
+}
+
+#[async_trait::async_trait]
+impl BlobStore for AssembleGateBlob {
+    async fn stage(
+        &self,
+        bucket: &BucketName,
+        body: cairn_types::BodyStream,
+        opts: cairn_types::blob::StageOptions,
+    ) -> Result<cairn_types::blob::StagedBlob, cairn_types::error::BlobError> {
+        self.inner.stage(bucket, body, opts).await
+    }
+
+    async fn open_raw(
+        &self,
+        path: &StoragePath,
+        range: Option<cairn_types::blob::ByteRange>,
+        cipher: cairn_types::blob::BlobCipher,
+        compression: &cairn_types::object::CompressionDescriptor,
+    ) -> Result<cairn_types::blob::BlobReadHandle, cairn_types::error::BlobError> {
+        self.inner.open_raw(path, range, cipher, compression).await
+    }
+
+    async fn probe(
+        &self,
+        path: &StoragePath,
+    ) -> Result<cairn_types::blob::BlobProbe, cairn_types::error::BlobError> {
+        self.inner.probe(path).await
+    }
+
+    async fn delete(&self, path: &StoragePath) -> Result<(), cairn_types::error::BlobError> {
+        self.inner.delete(path).await
+    }
+
+    async fn stage_part(
+        &self,
+        upload: &UploadId,
+        part_number: u16,
+        attempt_id: &str,
+        body: cairn_types::BodyStream,
+        checksums: cairn_types::object::ChecksumSet,
+        size_ceiling: u64,
+        encryption: Option<cairn_types::SecretKey32>,
+    ) -> Result<cairn_types::blob::StagedPart, cairn_types::error::BlobError> {
+        self.inner
+            .stage_part(
+                upload,
+                part_number,
+                attempt_id,
+                body,
+                checksums,
+                size_ceiling,
+                encryption,
+            )
+            .await
+    }
+
+    async fn delete_part_attempt(
+        &self,
+        upload: &UploadId,
+        part_number: u16,
+        attempt_id: &str,
+    ) -> Result<(), cairn_types::error::BlobError> {
+        self.inner
+            .delete_part_attempt(upload, part_number, attempt_id)
+            .await
+    }
+
+    async fn assemble(
+        &self,
+        bucket: &BucketName,
+        parts: &[cairn_types::blob::PartRef],
+        opts: cairn_types::blob::StageOptions,
+    ) -> Result<cairn_types::blob::StagedBlob, cairn_types::error::BlobError> {
+        if self.pause_next.swap(false, Ordering::AcqRel) {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        self.inner.assemble(bucket, parts, opts).await
+    }
+
+    async fn delete_session(&self, upload: &UploadId) -> Result<(), cairn_types::error::BlobError> {
+        self.inner.delete_session(upload).await
+    }
+
+    async fn reconcile(
+        &self,
+        oracle: &dyn cairn_types::traits::ReconcileOracle,
+        opts: cairn_types::blob::ReconcileOpts,
+    ) -> Result<cairn_types::blob::ReconcileReport, cairn_types::error::BlobError> {
+        self.inner.reconcile(oracle, opts).await
+    }
+}
+
+async fn harness_with_assemble_gate() -> (Harness, Arc<AssembleGateBlob>) {
+    let dir = tempfile::tempdir().unwrap();
+    let meta: Arc<dyn MetadataStore> = Arc::new(cairn_meta::open_in_memory().unwrap());
+    let inner: Arc<dyn BlobStore> =
+        Arc::new(cairn_blob::LocalBlobStore::open(dir.path()).await.unwrap());
+    let gate = Arc::new(AssembleGateBlob::new(inner));
+    let blob: Arc<dyn BlobStore> = gate.clone();
+    let svc = S3Service::new(
+        meta.clone(),
+        blob.clone(),
+        Arc::new(cairn_types::testing::AllowAll),
+        Arc::new(cairn_types::testing::TestClock::default()),
+        Arc::new(cairn_crypto::SystemCrypto::new([7u8; 32].into())),
+        "us-east-1".to_owned(),
+        5 * 1024 * 1024 * 1024,
+    );
+    (
+        Harness {
+            svc,
+            meta,
+            blob,
+            _dir: dir,
+        },
+        gate,
+    )
+}
+
 /// A harness whose metadata store is a [`ShardedMetadataStore`] over `shards` in-memory shards, to
 /// exercise the protocol layer end-to-end under metadata sharding.
 async fn harness_sharded(shards: usize) -> Harness {
@@ -85,7 +427,7 @@ async fn harness_sharded(shards: usize) -> Harness {
         Arc::new(cairn_blob::LocalBlobStore::open(dir.path()).await.unwrap());
     let clock = Arc::new(cairn_types::testing::TestClock::default());
     let crypto: Arc<dyn cairn_types::traits::Crypto> =
-        Arc::new(cairn_crypto::SystemCrypto::new([7u8; 32]));
+        Arc::new(cairn_crypto::SystemCrypto::new([7u8; 32].into()));
     let svc = S3Service::new(
         meta.clone(),
         blob.clone(),
@@ -112,7 +454,7 @@ async fn harness_encrypt_at_rest() -> Harness {
         Arc::new(cairn_blob::LocalBlobStore::open(dir.path()).await.unwrap());
     let clock = Arc::new(cairn_types::testing::TestClock::default());
     let crypto: Arc<dyn cairn_types::traits::Crypto> =
-        Arc::new(cairn_crypto::SystemCrypto::new([7u8; 32]));
+        Arc::new(cairn_crypto::SystemCrypto::new([7u8; 32].into()));
     let svc = S3Service::new(
         meta.clone(),
         blob.clone(),
@@ -151,6 +493,21 @@ fn req_with_principal(
     body: Vec<u8>,
     principal: Principal,
 ) -> (S3Request, cairn_types::BodyStream) {
+    let mut request_headers: Vec<(String, String)> = headers
+        .iter()
+        .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+        .collect();
+    if method == Method::PUT
+        && query.iter().any(|(name, _)| *name == "partNumber")
+        && !request_headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        && !request_headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("x-amz-decoded-content-length"))
+    {
+        request_headers.push(("content-length".to_owned(), body.len().to_string()));
+    }
     let request = S3Request {
         method,
         bucket: bucket.map(|b| BucketName::parse(b).unwrap()),
@@ -159,12 +516,9 @@ fn req_with_principal(
             .iter()
             .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
             .collect(),
-        headers: headers
-            .iter()
-            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
-            .collect(),
+        headers: request_headers,
         principal: Some(principal),
-        source: IpAddr::V4(Ipv4Addr::LOCALHOST),
+        source: ClientSource::Direct(IpAddr::V4(Ipv4Addr::LOCALHOST)),
         secure: false,
         request_id: "req-1".to_owned(),
     };
@@ -231,6 +585,91 @@ impl cairn_types::traits::AuthorizationEngine for DenyGetObjectOn {
             Decision::Allow
         }
     }
+}
+
+struct DenyGovernanceBypass;
+impl cairn_types::traits::AuthorizationEngine for DenyGovernanceBypass {
+    fn evaluate(&self, input: &cairn_types::authz::AuthzInput) -> cairn_types::authz::Decision {
+        use cairn_types::authz::{Action, Decision, DenyReason};
+        if input.action == Action::BypassGovernanceRetention {
+            Decision::Deny(DenyReason::DefaultDeny)
+        } else {
+            Decision::Allow
+        }
+    }
+}
+
+/// Allows object reads only when the protocol propagated the expected typed source provenance into
+/// the authorization context. Setup writes remain allowed.
+struct RequireGetSource(ClientSource);
+impl cairn_types::traits::AuthorizationEngine for RequireGetSource {
+    fn evaluate(&self, input: &cairn_types::authz::AuthzInput) -> cairn_types::authz::Decision {
+        use cairn_types::authz::{Action, Decision, DenyReason};
+        if matches!(input.action, Action::GetObject | Action::GetObjectVersion)
+            && input.context.source != self.0
+        {
+            Decision::Deny(DenyReason::DefaultDeny)
+        } else {
+            Decision::Allow
+        }
+    }
+}
+
+#[tokio::test]
+async fn typed_client_source_reaches_the_authorization_context() {
+    let expected = ClientSource::Forwarded("203.0.113.7".parse().unwrap());
+    let h = harness_with_authz(Arc::new(RequireGetSource(expected))).await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("source-bucket"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("source-bucket"),
+                Some("object"),
+                &[],
+                &[],
+                b"body".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+
+    let (mut forwarded, body) = req(
+        Method::GET,
+        Some("source-bucket"),
+        Some("object"),
+        &[],
+        &[],
+        vec![],
+    );
+    forwarded.source = expected;
+    assert_eq!(
+        drain(send(&h.svc, (forwarded, body)).await).await.0,
+        StatusCode::OK
+    );
+
+    let (mut unavailable, body) = req(
+        Method::GET,
+        Some("source-bucket"),
+        Some("object"),
+        &[],
+        &[],
+        vec![],
+    );
+    unavailable.source = ClientSource::Unavailable;
+    assert_eq!(
+        drain(send(&h.svc, (unavailable, body)).await).await.0,
+        StatusCode::FORBIDDEN
+    );
 }
 
 /// SECURITY regression (Phase-4 tenancy audit): a CopyObject whose source read the requester is NOT
@@ -1682,13 +2121,165 @@ async fn start_upload_with_part(h: &Harness, bucket: &str, key: &str) -> (String
     (upload_id, etag)
 }
 
-/// The abort/complete race fix must NOT OVER-classify. `complete_multipart` answers `NoSuchUpload`
-/// on an assemble failure only when the session has vanished under it (a concurrent AbortMultipart
-/// won the race — that true concurrency case is gated by `conformance/stress_multipart.py` 3a).
-/// Here we prove the complementary invariant deterministically: a GENUINE assembly failure while the
-/// session is STILL present must surface the real error, never be masked as `NoSuchUpload` — masking
-/// it would hide real assembly faults as "the upload vanished". Delete the staged part BYTES (an I/O
-/// failure for assemble) while leaving the session row intact, then Complete.
+/// AUD-026, Complete-first ordering: once Complete has claimed `completing`, an Abort racing while
+/// assembly is paused must lose with NoSuchUpload and, critically, must not remove the staged part
+/// bytes. Releasing the barrier then lets the owning completion commit and the object round-trip.
+#[tokio::test]
+async fn complete_claim_wins_over_abort_without_losing_part_bytes() {
+    let (h, gate) = harness_with_assemble_gate().await;
+    let (upload_id, etag) = start_upload_with_part(&h, "terminal-complete", "obj").await;
+    let complete_xml = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part></CompleteMultipartUpload>"
+    );
+    let complete_svc = h.svc.clone();
+    let complete_upload = upload_id.clone();
+    let complete_task = tokio::spawn(async move {
+        drain(
+            send(
+                &complete_svc,
+                req(
+                    Method::POST,
+                    Some("terminal-complete"),
+                    Some("obj"),
+                    &[("uploadId", complete_upload.as_str())],
+                    &[],
+                    complete_xml.into_bytes(),
+                ),
+            )
+            .await,
+        )
+        .await
+    });
+
+    gate.wait_until_entered().await;
+    let (abort_status, _, abort_body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::DELETE,
+                Some("terminal-complete"),
+                Some("obj"),
+                &[("uploadId", upload_id.as_str())],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(abort_status, StatusCode::NOT_FOUND);
+    assert!(
+        String::from_utf8(abort_body)
+            .unwrap()
+            .contains("NoSuchUpload")
+    );
+
+    gate.release();
+    let (complete_status, _, complete_body) = complete_task.await.unwrap();
+    assert_eq!(
+        complete_status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&complete_body)
+    );
+    let (get_status, _, bytes) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("terminal-complete"),
+                Some("obj"),
+                &[],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(get_status, StatusCode::OK);
+    assert_eq!(bytes, b"hello");
+}
+
+/// AUD-026, Abort-first ordering: hold Complete on its request-body barrier, let Abort consume the
+/// still-active session, then resume Complete. Exactly Abort succeeds and no object can appear.
+#[tokio::test]
+async fn abort_wins_before_complete_claim_and_no_object_is_committed() {
+    let h = harness().await;
+    let (upload_id, etag) = start_upload_with_part(&h, "terminal-abort", "obj").await;
+    let complete_xml = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part></CompleteMultipartUpload>"
+    )
+    .into_bytes();
+    let (body_entered_tx, body_entered_rx) = tokio::sync::oneshot::channel();
+    let (body_release_tx, body_release_rx) = tokio::sync::oneshot::channel();
+    let blocked_body: cairn_types::BodyStream = Box::pin(futures_util::stream::once(async move {
+        let _ = body_entered_tx.send(());
+        body_release_rx
+            .await
+            .map_err(|_| cairn_types::error::BodyError::Transport("test gate closed".into()))?;
+        Ok(Bytes::from(complete_xml))
+    }));
+    let (complete_request, _) = req(
+        Method::POST,
+        Some("terminal-abort"),
+        Some("obj"),
+        &[("uploadId", upload_id.as_str())],
+        &[],
+        vec![],
+    );
+    let complete_svc = h.svc.clone();
+    let complete_task = tokio::spawn(async move {
+        drain(complete_svc.handle(complete_request, blocked_body).await).await
+    });
+
+    body_entered_rx.await.unwrap();
+    let (abort_status, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::DELETE,
+                Some("terminal-abort"),
+                Some("obj"),
+                &[("uploadId", upload_id.as_str())],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(abort_status, StatusCode::NO_CONTENT);
+
+    body_release_tx.send(()).unwrap();
+    let (complete_status, _, complete_body) = complete_task.await.unwrap();
+    assert_eq!(complete_status, StatusCode::NOT_FOUND);
+    assert!(
+        String::from_utf8(complete_body)
+            .unwrap()
+            .contains("NoSuchUpload")
+    );
+    let (get_status, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("terminal-abort"),
+                Some("obj"),
+                &[],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(get_status, StatusCode::NOT_FOUND);
+}
+
+/// A genuine post-claim assembly failure must surface its real error, release `completing` back to
+/// `active`, and permit a corrected retry. Delete the staged part bytes without removing the
+/// session row to inject that failure, then upload the replacement part and complete successfully.
 #[tokio::test]
 async fn assemble_failure_with_the_session_present_is_not_masked_as_no_such_upload() {
     let h = harness().await;
@@ -1724,6 +2315,45 @@ async fn assemble_failure_with_the_session_present_is_not_masked_as_no_such_uplo
         "a genuine assembly failure with the session present must not be masked as NoSuchUpload; \
          got {st} {xml}"
     );
+
+    // The post-claim failure released the session to active. Replace the missing part and retry;
+    // without ReleaseMultipartClaim the second Complete sees `AlreadyClaimed` and returns 404.
+    let (st, headers, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("mpbucket"),
+                Some("obj"),
+                &[("uploadId", upload_id.as_str()), ("partNumber", "1")],
+                &[],
+                b"replacement".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let replacement_etag = header(&headers, "etag").unwrap();
+    let retry = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{replacement_etag}</ETag></Part></CompleteMultipartUpload>"
+    );
+    let (st, _, response) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::POST,
+                Some("mpbucket"),
+                Some("obj"),
+                &[("uploadId", upload_id.as_str())],
+                &[],
+                retry.into_bytes(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{}", String::from_utf8_lossy(&response));
 }
 
 /// Audit 2026-07 (critical): `abort_multipart` never checked that the uploadId belonged to the
@@ -1796,8 +2426,8 @@ async fn abort_multipart_against_wrong_key_is_no_such_upload() {
     assert_eq!(st, StatusCode::OK, "the staged part must still be there");
 }
 
-/// Aborting an unknown uploadId used to return 204: `Mutation::AbortMultipart` is an unconditional
-/// DELETE that cannot distinguish "removed" from "never existed". AWS answers NoSuchUpload.
+/// Aborting an unknown uploadId used to return 204 because the writer could not distinguish
+/// "removed" from "never existed". The typed terminal outcome must preserve AWS's NoSuchUpload.
 #[tokio::test]
 async fn abort_multipart_with_unknown_upload_id_is_no_such_upload() {
     let h = harness().await;
@@ -2051,6 +2681,335 @@ async fn start_upload(h: &Harness, bucket: &str, key: &str) -> String {
         "<UploadId>",
         "</UploadId>",
     )
+}
+
+async fn assert_no_multipart_accounting(h: &Harness, upload_id: &str) {
+    let upload_id = UploadId::from_string(upload_id.to_owned());
+    assert!(
+        h.meta
+            .list_parts(&upload_id, 0, 100)
+            .await
+            .unwrap()
+            .items
+            .is_empty(),
+        "a rejected part must not become authoritative metadata"
+    );
+    assert!(
+        h.meta
+            .enumerate_stale_multipart_reservations(cairn_types::Timestamp(i64::MAX), 100)
+            .await
+            .unwrap()
+            .into_iter()
+            .all(|reservation| reservation.upload_id != upload_id),
+        "a rejected part must release its staging reservation"
+    );
+}
+
+/// AUD-007: UploadPart must present an exact decoded length before Cairn reserves quota or creates
+/// a staging file. This closes the unbounded chunked-upload path where the metadata layer had no
+/// byte amount to reserve.
+#[tokio::test]
+async fn upload_part_without_exact_length_is_rejected_before_staging() {
+    let h = harness().await;
+    let (status, _, _) = drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("part-length"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let upload_id = start_upload(&h, "part-length", "target.bin").await;
+
+    let (mut request, body) = req(
+        Method::PUT,
+        Some("part-length"),
+        Some("target.bin"),
+        &[("uploadId", upload_id.as_str()), ("partNumber", "1")],
+        &[],
+        b"unbounded".to_vec(),
+    );
+    request.headers.retain(|(name, _)| {
+        !name.eq_ignore_ascii_case("content-length")
+            && !name.eq_ignore_ascii_case("x-amz-decoded-content-length")
+    });
+    let (status, _, xml) = drain(send(&h.svc, (request, body)).await).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        String::from_utf8(xml).unwrap().contains("InvalidRequest"),
+        "missing exact length must be an S3 InvalidRequest"
+    );
+    assert_no_multipart_accounting(&h, &upload_id).await;
+    assert!(
+        tokio::fs::metadata(h._dir.path().join(".staging/multipart").join(&upload_id))
+            .await
+            .is_err(),
+        "length validation must happen before the session staging directory is created"
+    );
+}
+
+/// AUD-007: the decoded-length header belongs only to aws-chunked framing. On an ordinary body it
+/// cannot override a larger Content-Length and create a zero-byte reservation for real disk use.
+#[tokio::test]
+async fn non_streaming_upload_part_cannot_under_reserve_with_decoded_length() {
+    let h = harness().await;
+    let (status, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("part-under-reserve"),
+                None,
+                &[],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let upload_id = start_upload(&h, "part-under-reserve", "target.bin").await;
+
+    let body = b"must be fully charged".to_vec();
+    let content_length = body.len().to_string();
+    let (status, _, xml) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("part-under-reserve"),
+                Some("target.bin"),
+                &[("uploadId", upload_id.as_str()), ("partNumber", "1")],
+                &[
+                    ("content-length", content_length.as_str()),
+                    ("x-amz-decoded-content-length", "0"),
+                ],
+                body,
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        String::from_utf8(xml).unwrap().contains("InvalidRequest"),
+        "conflicting ordinary-body lengths must be rejected"
+    );
+    assert_no_multipart_accounting(&h, &upload_id).await;
+    assert!(
+        tokio::fs::metadata(h._dir.path().join(".staging/multipart").join(&upload_id))
+            .await
+            .is_err(),
+        "conflicting decoded length must be rejected before staging"
+    );
+}
+
+/// AUD-007: if the stream exceeds its declared length, the deterministic attempt filename and
+/// reservation token must both be reclaimed. An attacker cannot accumulate one partial artifact
+/// and one charged reservation per failed request.
+#[tokio::test]
+async fn upload_part_declared_length_mismatch_reclaims_attempt_and_reservation() {
+    let h = harness().await;
+    let (status, _, _) = drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("part-mismatch"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let upload_id = start_upload(&h, "part-mismatch", "target.bin").await;
+
+    let (status, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("part-mismatch"),
+                Some("target.bin"),
+                &[("uploadId", upload_id.as_str()), ("partNumber", "1")],
+                &[("content-length", "2")],
+                b"three".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_no_multipart_accounting(&h, &upload_id).await;
+
+    let mut entries =
+        tokio::fs::read_dir(h._dir.path().join(".staging/multipart").join(&upload_id))
+            .await
+            .unwrap();
+    assert!(
+        entries.next_entry().await.unwrap().is_none(),
+        "failed attempt bytes must be removed immediately"
+    );
+}
+
+/// AUD-007: bucket byte quota is reserved transactionally before `stage_part`, so a request that
+/// cannot fit receives InsufficientStorage without creating a multipart artifact.
+#[tokio::test]
+async fn upload_part_quota_failure_happens_before_staging() {
+    let h = harness().await;
+    let (status, _, _) = drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("part-quota"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    h.meta
+        .submit(cairn_types::Mutation::SetBucketQuota {
+            bucket: BucketName::parse("part-quota").unwrap(),
+            quota_bytes: Some(1),
+        })
+        .await
+        .unwrap();
+    let upload_id = start_upload(&h, "part-quota", "target.bin").await;
+
+    let (status, _, xml) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("part-quota"),
+                Some("target.bin"),
+                &[("uploadId", upload_id.as_str()), ("partNumber", "1")],
+                &[],
+                b"too large".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE);
+    assert!(
+        String::from_utf8(xml)
+            .unwrap()
+            .contains("InsufficientStorage"),
+        "quota rejection must use the established S3 storage error"
+    );
+    assert_no_multipart_accounting(&h, &upload_id).await;
+    assert!(
+        tokio::fs::metadata(h._dir.path().join(".staging/multipart").join(&upload_id))
+            .await
+            .is_err(),
+        "quota rejection must happen before stage_part creates a directory"
+    );
+}
+
+async fn assert_failed_part_was_reclaimed(h: &Harness, fault: &AbortAfterStagePartBlob) {
+    let staged = fault.last_staged();
+    assert!(
+        matches!(
+            h.blob.probe(&staged).await,
+            Err(cairn_types::error::BlobError::NotFound)
+        ),
+        "RecordPart failure left durable staged bytes at {}",
+        staged.as_str()
+    );
+}
+
+/// AUD-027: if AbortMultipart wins after the part is durable but before `RecordPart`, the writer's
+/// typed `MultipartNotActive` rejection must surface as `NoSuchUpload` and reclaim the new part.
+/// Retrying this race must not leak one file per request until startup reconciliation.
+#[tokio::test]
+async fn upload_part_record_failure_reclaims_staged_bytes() {
+    let (h, fault) = harness_abort_after_stage_part().await;
+    let (status, _, _) = drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("partfail"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let upload_id = start_upload(&h, "partfail", "target.bin").await;
+
+    let (status, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("partfail"),
+                Some("target.bin"),
+                &[("uploadId", upload_id.as_str()), ("partNumber", "1")],
+                &[],
+                b"durable-but-unowned".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(
+        String::from_utf8(body).unwrap().contains("NoSuchUpload"),
+        "an abort that wins the terminal race must retain the canonical S3 error"
+    );
+    assert_failed_part_was_reclaimed(&h, &fault).await;
+}
+
+/// UploadPartCopy has a distinct `RecordPart` call site and must apply the same post-stage cleanup
+/// rule when the upload disappears between its initial scope check and the writer transaction.
+#[tokio::test]
+async fn upload_part_copy_record_failure_reclaims_staged_bytes() {
+    let (h, fault) = harness_abort_after_stage_part().await;
+    let (status, _, _) = drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("copyfail"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("copyfail"),
+                Some("source.bin"),
+                &[],
+                &[],
+                b"copy-source".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let upload_id = start_upload(&h, "copyfail", "target.bin").await;
+
+    let (status, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("copyfail"),
+                Some("target.bin"),
+                &[("uploadId", upload_id.as_str()), ("partNumber", "1")],
+                &[("x-amz-copy-source", "/copyfail/source.bin")],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(
+        String::from_utf8(body).unwrap().contains("NoSuchUpload"),
+        "an abort that wins the copy-part terminal race must retain the canonical S3 error"
+    );
+    assert_failed_part_was_reclaimed(&h, &fault).await;
 }
 
 /// Audit 2026-07: `list_multipart_uploads` advertised a NextKeyMarker on a truncated page but
@@ -4357,6 +5316,105 @@ async fn bucket_policy_roundtrip() {
     assert_eq!(st, StatusCode::NOT_FOUND);
 }
 
+/// AUD-036: owner/admin privilege is a baseline allow, not an anonymous class. Their stable user id
+/// must survive into the policy engine so named Principal and NotPrincipal explicit denies still
+/// bind exactly the intended privileged identity.
+#[tokio::test]
+async fn named_policy_denies_bind_bucket_owner_and_administrator() {
+    let h = harness_with_authz(Arc::new(cairn_authz::PolicyEngine)).await;
+    let owner = member("named-owner");
+    let administrator = admin();
+
+    let (status, _, _) = drain(
+        send(
+            &h.svc,
+            req_with_principal(
+                Method::PUT,
+                Some("denyid"),
+                None,
+                &[],
+                &[],
+                vec![],
+                owner.clone(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    for key in ["owner-denied", "admin-denied", "not-owner"] {
+        let (status, _, _) = drain(
+            send(
+                &h.svc,
+                req_with_principal(
+                    Method::PUT,
+                    Some("denyid"),
+                    Some(key),
+                    &[],
+                    &[],
+                    key.as_bytes().to_vec(),
+                    owner.clone(),
+                ),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    let policy = br#"{
+      "Version":"2012-10-17",
+      "Statement":[
+        {"Effect":"Deny","Principal":{"AWS":"named-owner"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::denyid/owner-denied"},
+        {"Effect":"Deny","Principal":{"AWS":"admin"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::denyid/admin-denied"},
+        {"Effect":"Deny","NotPrincipal":{"AWS":"named-owner"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::denyid/not-owner"}
+      ]
+    }"#
+    .to_vec();
+    let (status, _, _) = drain(
+        send(
+            &h.svc,
+            req_with_principal(
+                Method::PUT,
+                Some("denyid"),
+                None,
+                &[("policy", "")],
+                &[],
+                policy,
+                owner.clone(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    for (principal, key, expected) in [
+        (owner.clone(), "owner-denied", StatusCode::FORBIDDEN),
+        (administrator.clone(), "admin-denied", StatusCode::FORBIDDEN),
+        (owner, "not-owner", StatusCode::OK),
+        (administrator, "not-owner", StatusCode::FORBIDDEN),
+    ] {
+        let (status, _, _) = drain(
+            send(
+                &h.svc,
+                req_with_principal(
+                    Method::GET,
+                    Some("denyid"),
+                    Some(key),
+                    &[],
+                    &[],
+                    vec![],
+                    principal,
+                ),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, expected, "unexpected decision for {key}");
+    }
+}
+
 #[tokio::test]
 async fn put_object_acl_subresource_does_not_overwrite_body() {
     let h = harness().await;
@@ -6619,7 +7677,7 @@ async fn sse_kms_key_id_allow_list_is_enforced() {
         Arc::new(cairn_blob::LocalBlobStore::open(dir.path()).await.unwrap());
     let clock = Arc::new(cairn_types::testing::TestClock::default());
     let crypto: Arc<dyn cairn_types::traits::Crypto> =
-        Arc::new(cairn_crypto::SystemCrypto::new([7u8; 32]));
+        Arc::new(cairn_crypto::SystemCrypto::new([7u8; 32].into()));
     let svc = S3Service::new(
         meta.clone(),
         blob,
@@ -6766,6 +7824,7 @@ async fn sse_kms_tampered_descriptor_fails_closed() {
         .submit(Mutation::PutObjectVersion {
             row: Box::new(row),
             precondition: Precondition::default(),
+            initial_state: cairn_types::InitialObjectState::default(),
             replication: Vec::new(),
         })
         .await
@@ -8631,9 +9690,8 @@ async fn bulk_delete_duplicate_key_in_suspended_bucket_does_not_race() {
 // Object Lock / WORM / retention / legal hold (ARCH 13/15)
 // ===========================================================================================
 
-/// Create an Object-Lock-enabled bucket, PUT one object, and return its `(version_id)`.
-async fn lock_bucket_with_object(h: &Harness, bucket: &str, key: &str) -> String {
-    let (st, _, _) = drain(
+async fn create_lock_bucket(h: &Harness, bucket: &str) {
+    let (status, _, _) = drain(
         send(
             &h.svc,
             req(
@@ -8648,7 +9706,12 @@ async fn lock_bucket_with_object(h: &Harness, bucket: &str, key: &str) -> String
         .await,
     )
     .await;
-    assert_eq!(st, StatusCode::OK, "create object-lock bucket");
+    assert_eq!(status, StatusCode::OK, "create object-lock bucket");
+}
+
+/// Create an Object-Lock-enabled bucket, PUT one object, and return its `(version_id)`.
+async fn lock_bucket_with_object(h: &Harness, bucket: &str, key: &str) -> String {
+    create_lock_bucket(h, bucket).await;
     let (st, hdrs, _) = drain(
         send(
             &h.svc,
@@ -8673,6 +9736,15 @@ async fn lock_bucket_with_object(h: &Harness, bucket: &str, key: &str) -> String
 fn retention_body(mode: &str, until: &str) -> Vec<u8> {
     format!("<Retention><Mode>{mode}</Mode><RetainUntilDate>{until}</RetainUntilDate></Retention>")
         .into_bytes()
+}
+
+fn default_retention_body(mode: &str, unit: &str, period: u32) -> Vec<u8> {
+    format!(
+        "<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled>\
+         <Rule><DefaultRetention><Mode>{mode}</Mode><{unit}>{period}</{unit}>\
+         </DefaultRetention></Rule></ObjectLockConfiguration>"
+    )
+    .into_bytes()
 }
 
 /// A bucket created with Object Lock is forced to versioning Enabled and reports its lock config.
@@ -8726,6 +9798,241 @@ async fn object_lock_create_forces_versioning_and_reports_config() {
         xml.contains("<ObjectLockEnabled>Enabled</ObjectLockEnabled>"),
         "{xml}"
     );
+}
+
+#[tokio::test]
+async fn object_lock_put_commits_tags_retention_and_legal_hold_together() {
+    let h = harness().await;
+    create_lock_bucket(&h, "olatomic").await;
+
+    let (status, headers, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("olatomic"),
+                Some("protected"),
+                &[],
+                &[
+                    ("x-amz-object-lock-mode", "COMPLIANCE"),
+                    (
+                        "x-amz-object-lock-retain-until-date",
+                        "2099-01-01T00:00:00Z",
+                    ),
+                    ("x-amz-object-lock-legal-hold", "ON"),
+                    ("x-amz-tagging", "class=records"),
+                ],
+                b"payload".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let version = VersionId::from_string(
+        header(&headers, "x-amz-version-id")
+            .expect("version id")
+            .to_owned(),
+    );
+    let bucket = BucketName::parse("olatomic").unwrap();
+    let key = ObjectKey::parse("protected").unwrap();
+    let lock = h
+        .meta
+        .get_object_lock(&bucket, &key, &version)
+        .await
+        .unwrap();
+    assert_eq!(
+        lock.retention.unwrap().mode,
+        cairn_types::ObjectLockMode::Compliance
+    );
+    assert!(lock.legal_hold);
+    assert_eq!(
+        h.meta
+            .get_object_tags(&bucket, &key, &version)
+            .await
+            .unwrap(),
+        vec![("class".to_owned(), "records".to_owned())]
+    );
+
+    // Incomplete explicit retention is rejected before any visible version is installed.
+    let (status, _, response) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("olatomic"),
+                Some("invalid"),
+                &[],
+                &[("x-amz-object-lock-mode", "GOVERNANCE")],
+                b"must-not-commit".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        String::from_utf8(response)
+            .unwrap()
+            .contains("<Code>InvalidRequest</Code>")
+    );
+    assert!(
+        h.meta
+            .current_version(&bucket, &ObjectKey::parse("invalid").unwrap())
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // A bad header token is an InvalidArgument, not MalformedXML (there is no XML body involved).
+    let (status, _, response) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("olatomic"),
+                Some("invalid-mode"),
+                &[],
+                &[
+                    ("x-amz-object-lock-mode", "INVALID"),
+                    (
+                        "x-amz-object-lock-retain-until-date",
+                        "2099-01-01T00:00:00Z",
+                    ),
+                ],
+                b"must-not-commit".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        String::from_utf8(response)
+            .unwrap()
+            .contains("<Code>InvalidArgument</Code>")
+    );
+    assert!(
+        h.meta
+            .current_version(&bucket, &ObjectKey::parse("invalid-mode").unwrap())
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn object_lock_copy_copies_tags_but_never_source_lock_state() {
+    let h = harness().await;
+    create_lock_bucket(&h, "olcopy").await;
+    let (status, source_headers, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("olcopy"),
+                Some("source"),
+                &[],
+                &[
+                    ("x-amz-object-lock-mode", "COMPLIANCE"),
+                    (
+                        "x-amz-object-lock-retain-until-date",
+                        "2099-01-01T00:00:00Z",
+                    ),
+                    ("x-amz-object-lock-legal-hold", "ON"),
+                    ("x-amz-tagging", "source=yes"),
+                ],
+                b"source".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(header(&source_headers, "x-amz-version-id").is_some());
+
+    let (status, copied_headers, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("olcopy"),
+                Some("copied"),
+                &[],
+                &[("x-amz-copy-source", "/olcopy/source")],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let copied_version = VersionId::from_string(
+        header(&copied_headers, "x-amz-version-id")
+            .expect("copy version")
+            .to_owned(),
+    );
+    let bucket = BucketName::parse("olcopy").unwrap();
+    let copied_key = ObjectKey::parse("copied").unwrap();
+    assert_eq!(
+        h.meta
+            .get_object_lock(&bucket, &copied_key, &copied_version)
+            .await
+            .unwrap(),
+        cairn_types::ObjectLockState::default(),
+        "COPY carries tags, not the source version's WORM capability"
+    );
+    assert_eq!(
+        h.meta
+            .get_object_tags(&bucket, &copied_key, &copied_version)
+            .await
+            .unwrap(),
+        vec![("source".to_owned(), "yes".to_owned())]
+    );
+
+    let (status, explicit_headers, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("olcopy"),
+                Some("explicit"),
+                &[],
+                &[
+                    ("x-amz-copy-source", "/olcopy/source"),
+                    ("x-amz-object-lock-mode", "GOVERNANCE"),
+                    (
+                        "x-amz-object-lock-retain-until-date",
+                        "2099-01-01T00:00:00Z",
+                    ),
+                    ("x-amz-object-lock-legal-hold", "ON"),
+                ],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let explicit_version = VersionId::from_string(
+        header(&explicit_headers, "x-amz-version-id")
+            .expect("copy version")
+            .to_owned(),
+    );
+    let state = h
+        .meta
+        .get_object_lock(
+            &bucket,
+            &ObjectKey::parse("explicit").unwrap(),
+            &explicit_version,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        state.retention.unwrap().mode,
+        cairn_types::ObjectLockMode::Governance
+    );
+    assert!(state.legal_hold);
 }
 
 /// COMPLIANCE retention can never be deleted or weakened before it expires — not even with the
@@ -8876,6 +10183,133 @@ async fn object_lock_governance_bypass() {
     assert_eq!(st, StatusCode::NO_CONTENT, "governance delete with bypass");
 }
 
+#[tokio::test]
+async fn denied_bypass_capability_does_not_reject_an_unprotected_delete() {
+    let h = harness_with_authz(Arc::new(DenyGovernanceBypass)).await;
+    create_lock_bucket(&h, "govcap").await;
+
+    let (status, headers, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("govcap"),
+                Some("unlocked"),
+                &[],
+                &[],
+                b"x".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let version = header(&headers, "x-amz-version-id").unwrap();
+    let (status, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::DELETE,
+                Some("govcap"),
+                Some("unlocked"),
+                &[("versionId", version)],
+                &[("x-amz-bypass-governance-retention", "true")],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "an unused, denied bypass capability must not reject an otherwise valid delete"
+    );
+
+    let (status, headers, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("govcap"),
+                Some("bad-header"),
+                &[],
+                &[],
+                b"x".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let version = header(&headers, "x-amz-version-id").unwrap().to_owned();
+    let (status, _, response) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::DELETE,
+                Some("govcap"),
+                Some("bad-header"),
+                &[("versionId", version.as_str())],
+                &[("x-amz-bypass-governance-retention", "not-a-boolean")],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        String::from_utf8(response)
+            .unwrap()
+            .contains("<Code>InvalidArgument</Code>")
+    );
+
+    let (status, headers, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("govcap"),
+                Some("governed"),
+                &[],
+                &[
+                    ("x-amz-object-lock-mode", "GOVERNANCE"),
+                    (
+                        "x-amz-object-lock-retain-until-date",
+                        "2099-01-01T00:00:00Z",
+                    ),
+                ],
+                b"x".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let version = header(&headers, "x-amz-version-id").unwrap();
+    let (status, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::DELETE,
+                Some("govcap"),
+                Some("governed"),
+                &[("versionId", version)],
+                &[("x-amz-bypass-governance-retention", "true")],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "the Writer must consume the denied capability when governance protection is active"
+    );
+}
+
 /// Legal hold blocks a permanent delete regardless of retention, and releasing it re-enables delete.
 #[tokio::test]
 async fn object_lock_legal_hold_blocks_then_releases() {
@@ -8956,6 +10390,185 @@ async fn object_lock_legal_hold_blocks_then_releases() {
         st,
         StatusCode::NO_CONTENT,
         "delete after legal-hold release"
+    );
+}
+
+#[tokio::test]
+async fn object_lock_bulk_delete_reports_protected_versions_per_key() {
+    let h = harness().await;
+    create_lock_bucket(&h, "olbulk").await;
+    let mut versions = Vec::new();
+    for (key, headers) in [
+        (
+            "protected",
+            vec![
+                ("x-amz-object-lock-mode", "COMPLIANCE"),
+                (
+                    "x-amz-object-lock-retain-until-date",
+                    "2099-01-01T00:00:00Z",
+                ),
+            ],
+        ),
+        ("unlocked", Vec::new()),
+    ] {
+        let (status, response_headers, _) = drain(
+            send(
+                &h.svc,
+                req(
+                    Method::PUT,
+                    Some("olbulk"),
+                    Some(key),
+                    &[],
+                    &headers,
+                    b"x".to_vec(),
+                ),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        versions.push((
+            key,
+            header(&response_headers, "x-amz-version-id")
+                .unwrap()
+                .to_owned(),
+        ));
+    }
+    let xml = format!(
+        "<Delete><Object><Key>protected</Key><VersionId>{}</VersionId></Object>\
+         <Object><Key>unlocked</Key><VersionId>{}</VersionId></Object></Delete>",
+        versions[0].1, versions[1].1
+    );
+    let (status, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::POST,
+                Some("olbulk"),
+                None,
+                &[("delete", "")],
+                &[],
+                xml.into_bytes(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let body = String::from_utf8(body).unwrap();
+    assert!(
+        body.contains("<Key>protected</Key>") && body.contains("<Code>AccessDenied</Code>"),
+        "{body}"
+    );
+    assert!(
+        body.contains("<Deleted><Key>unlocked</Key>"),
+        "the unlocked sibling must still be deleted: {body}"
+    );
+
+    let bucket = BucketName::parse("olbulk").unwrap();
+    assert!(
+        h.meta
+            .get_version(
+                &bucket,
+                &ObjectKey::parse("protected").unwrap(),
+                &VersionId::from_string(versions[0].1.clone()),
+            )
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        h.meta
+            .get_version(
+                &bucket,
+                &ObjectKey::parse("unlocked").unwrap(),
+                &VersionId::from_string(versions[1].1.clone()),
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn object_lock_bulk_delete_keeps_corrupt_state_internal_and_opaque() {
+    let (h, concrete_meta) = in_memory_harness().await;
+    create_lock_bucket(&h, "olbulk-corrupt").await;
+    let (status, headers, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("olbulk-corrupt"),
+                Some("protected"),
+                &[],
+                &[],
+                b"x".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let version = header(&headers, "x-amz-version-id").unwrap().to_owned();
+    let bucket = BucketName::parse("olbulk-corrupt").unwrap();
+    concrete_meta.install_raw_object_lock_configuration(
+        &bucket,
+        serde_json::to_string(&cairn_types::ObjectLockConfiguration {
+            enabled: false,
+            default_retention: None,
+        })
+        .unwrap(),
+    );
+
+    let delete = format!(
+        "<Delete><Object><Key>protected</Key><VersionId>{version}</VersionId></Object></Delete>"
+    );
+    let (status, _, response) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::POST,
+                Some("olbulk-corrupt"),
+                None,
+                &[("delete", "")],
+                &[],
+                delete.into_bytes(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "DeleteObjects reports failures per key"
+    );
+    let response = String::from_utf8(response).unwrap();
+    assert!(
+        response.contains("<Code>InternalError</Code>"),
+        "{response}"
+    );
+    assert!(
+        response.contains("We encountered an internal error. Please try again."),
+        "{response}"
+    );
+    assert!(
+        !response.contains("invalid object lock")
+            && !response.contains("invalid stored Object Lock"),
+        "internal durable-state detail leaked: {response}"
+    );
+    assert!(
+        h.meta
+            .get_version(
+                &bucket,
+                &ObjectKey::parse("protected").unwrap(),
+                &VersionId::from_string(version),
+            )
+            .await
+            .unwrap()
+            .is_some(),
+        "corrupt Object Lock state must fail closed"
     );
 }
 
@@ -9070,6 +10683,595 @@ async fn object_lock_default_retention_stamped_and_echoed() {
     assert_eq!(st, StatusCode::FORBIDDEN, "default retention blocks delete");
 }
 
+#[tokio::test]
+async fn object_lock_retention_starts_at_commit_and_expired_explicit_intent_cleans_up() {
+    let (h, _, clock) = in_memory_harness_with_clock().await;
+    create_lock_bucket(&h, "olslow").await;
+    let (status, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("olslow"),
+                None,
+                &[("object-lock", "")],
+                &[],
+                default_retention_body("GOVERNANCE", "Days", 1),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Advance the injected clock while the body is being consumed. The default must start after
+    // staging, when the new version is ready for the Writer, rather than at request admission.
+    let (request, _) = req(
+        Method::PUT,
+        Some("olslow"),
+        Some("defaulted"),
+        &[],
+        &[],
+        Vec::new(),
+    );
+    let body_clock = clock.clone();
+    let body: cairn_types::BodyStream = Box::pin(futures_util::stream::once(async move {
+        body_clock.advance_secs(2 * 86_400);
+        Ok(Bytes::from_static(b"slow upload"))
+    }));
+    let (status, headers, _) = drain(send(&h.svc, (request, body)).await).await;
+    assert_eq!(status, StatusCode::OK);
+    let commit_time = clock.now();
+    let version = VersionId::from_string(
+        header(&headers, "x-amz-version-id")
+            .expect("version id")
+            .to_owned(),
+    );
+    let bucket = BucketName::parse("olslow").unwrap();
+    let lock = h
+        .meta
+        .get_object_lock(&bucket, &ObjectKey::parse("defaulted").unwrap(), &version)
+        .await
+        .unwrap();
+    assert_eq!(
+        lock.retention.unwrap().retain_until,
+        commit_time.plus_secs(86_400),
+        "time spent staging must not consume the default-retention period"
+    );
+
+    // An explicit deadline can be valid when the request begins yet lapse while a slow body is
+    // staged. The Writer rechecks it against the commit timestamp; the protocol returns a typed
+    // client error, installs no version, and removes the rejected staged artifact.
+    let before_files = blob_file_count(h._dir.path());
+    let deadline = cairn_xml::format_iso8601(clock.now().plus_secs(86_400));
+    let (request, _) = req(
+        Method::PUT,
+        Some("olslow"),
+        Some("expired"),
+        &[],
+        &[
+            ("x-amz-object-lock-mode", "GOVERNANCE"),
+            ("x-amz-object-lock-retain-until-date", deadline.as_str()),
+        ],
+        Vec::new(),
+    );
+    let body_clock = clock.clone();
+    let body: cairn_types::BodyStream = Box::pin(futures_util::stream::once(async move {
+        body_clock.advance_secs(2 * 86_400);
+        Ok(Bytes::from_static(b"must not commit"))
+    }));
+    let (status, _, response) = drain(send(&h.svc, (request, body)).await).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        String::from_utf8(response)
+            .unwrap()
+            .contains("<Code>InvalidArgument</Code>")
+    );
+    assert!(
+        h.meta
+            .current_version(&bucket, &ObjectKey::parse("expired").unwrap())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        blob_file_count(h._dir.path()),
+        before_files,
+        "a post-stage retention rejection leaked its staged blob"
+    );
+}
+
+#[tokio::test]
+async fn multipart_completion_atomically_installs_pinned_tags_and_lock_intent() {
+    let h = harness().await;
+    create_lock_bucket(&h, "olmpu").await;
+
+    // Initiation pins explicit legal hold and tags, but deliberately has no explicit retention.
+    // The default configured afterwards must therefore be resolved at completion.
+    let upload_id = initiate(
+        &h.svc,
+        "olmpu",
+        "defaulted",
+        &[
+            ("x-amz-object-lock-legal-hold", "ON"),
+            ("x-amz-tagging", "kind=defaulted"),
+        ],
+    )
+    .await;
+    let (status, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("olmpu"),
+                None,
+                &[("object-lock", "")],
+                &[],
+                default_retention_body("COMPLIANCE", "Days", 2),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let etag = upload_part(
+        &h.svc,
+        "olmpu",
+        "defaulted",
+        &upload_id,
+        1,
+        b"one-part".to_vec(),
+    )
+    .await;
+    let (status, headers, _) =
+        complete(&h.svc, "olmpu", "defaulted", &upload_id, &[(1, &etag)]).await;
+    assert_eq!(status, StatusCode::OK);
+    let version = VersionId::from_string(
+        header(&headers, "x-amz-version-id")
+            .expect("multipart version")
+            .to_owned(),
+    );
+    let bucket = BucketName::parse("olmpu").unwrap();
+    let key = ObjectKey::parse("defaulted").unwrap();
+    let state = h
+        .meta
+        .get_object_lock(&bucket, &key, &version)
+        .await
+        .unwrap();
+    assert_eq!(
+        state.retention.unwrap().mode,
+        cairn_types::ObjectLockMode::Compliance,
+        "the completion-time default is applied"
+    );
+    assert!(state.legal_hold);
+    assert_eq!(
+        h.meta
+            .get_object_tags(&bucket, &key, &version)
+            .await
+            .unwrap(),
+        vec![("kind".to_owned(), "defaulted".to_owned())]
+    );
+
+    // Explicit retention pinned at initiation wins over that bucket default.
+    let explicit_upload = initiate(
+        &h.svc,
+        "olmpu",
+        "explicit",
+        &[
+            ("x-amz-object-lock-mode", "GOVERNANCE"),
+            (
+                "x-amz-object-lock-retain-until-date",
+                "2099-01-01T00:00:00Z",
+            ),
+            ("x-amz-tagging", "kind=explicit"),
+        ],
+    )
+    .await;
+    let explicit_etag = upload_part(
+        &h.svc,
+        "olmpu",
+        "explicit",
+        &explicit_upload,
+        1,
+        b"one-part".to_vec(),
+    )
+    .await;
+    let (status, headers, _) = complete(
+        &h.svc,
+        "olmpu",
+        "explicit",
+        &explicit_upload,
+        &[(1, &explicit_etag)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let version = VersionId::from_string(
+        header(&headers, "x-amz-version-id")
+            .expect("multipart version")
+            .to_owned(),
+    );
+    let state = h
+        .meta
+        .get_object_lock(&bucket, &ObjectKey::parse("explicit").unwrap(), &version)
+        .await
+        .unwrap();
+    assert_eq!(
+        state.retention.unwrap().mode,
+        cairn_types::ObjectLockMode::Governance
+    );
+}
+
+/// Default retention has positive, explicit maxima. Invalid replacements are `InvalidArgument`
+/// and leave the last valid durable configuration unchanged.
+#[tokio::test]
+async fn object_lock_default_retention_bounds_are_atomic() {
+    let h = harness().await;
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("bounds"),
+                None,
+                &[],
+                &[("x-amz-bucket-object-lock-enabled", "true")],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    for (unit, maximum) in [
+        ("Days", cairn_types::DefaultRetention::MAX_DAYS),
+        ("Years", cairn_types::DefaultRetention::MAX_YEARS),
+    ] {
+        let (st, _, _) = drain(
+            send(
+                &h.svc,
+                req(
+                    Method::PUT,
+                    Some("bounds"),
+                    None,
+                    &[("object-lock", "")],
+                    &[],
+                    default_retention_body("GOVERNANCE", unit, maximum),
+                ),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{unit} maximum must be accepted");
+
+        for invalid in [0, maximum + 1] {
+            let (st, _, body) = drain(
+                send(
+                    &h.svc,
+                    req(
+                        Method::PUT,
+                        Some("bounds"),
+                        None,
+                        &[("object-lock", "")],
+                        &[],
+                        default_retention_body("GOVERNANCE", unit, invalid),
+                    ),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(
+                st,
+                StatusCode::BAD_REQUEST,
+                "{unit}={invalid} must be rejected"
+            );
+            let body = String::from_utf8(body).unwrap();
+            assert!(
+                body.contains("<Code>InvalidArgument</Code>"),
+                "wrong S3 error for {unit}={invalid}: {body}"
+            );
+        }
+
+        let (st, _, body) = drain(
+            send(
+                &h.svc,
+                req(
+                    Method::GET,
+                    Some("bounds"),
+                    None,
+                    &[("object-lock", "")],
+                    &[],
+                    vec![],
+                ),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        let body = String::from_utf8(body).unwrap();
+        assert!(
+            body.contains(&format!("<{unit}>{maximum}</{unit}>")),
+            "failed replacement changed the durable config: {body}"
+        );
+    }
+}
+
+/// An unsupported period already present in metadata must block new protected writes and
+/// permanent deletes, but replacing the bucket configuration remains available for repair.
+#[tokio::test]
+async fn invalid_stored_default_retention_fails_closed_and_is_repairable() {
+    let (h, concrete_meta) = in_memory_harness().await;
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("repair"),
+                None,
+                &[],
+                &[("x-amz-bucket-object-lock-enabled", "true")],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    // Create an unlocked historical version before injecting the invalid durable document.
+    let (st, headers, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("repair"),
+                Some("old"),
+                &[],
+                &[],
+                b"old".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let old_version = header(&headers, "x-amz-version-id").unwrap().to_owned();
+
+    let bucket = BucketName::parse("repair").unwrap();
+    let invalid = cairn_types::ObjectLockConfiguration {
+        enabled: true,
+        default_retention: Some(cairn_types::DefaultRetention {
+            mode: cairn_types::ObjectLockMode::Governance,
+            period: cairn_types::RetentionPeriod::Years(u32::MAX),
+        }),
+    };
+    concrete_meta
+        .install_raw_object_lock_configuration(&bucket, serde_json::to_string(&invalid).unwrap());
+
+    let (st, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("repair"),
+                Some("new"),
+                &[],
+                &[],
+                b"must-not-commit".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(
+        String::from_utf8(body)
+            .unwrap()
+            .contains("<Code>InternalError</Code>")
+    );
+    assert!(
+        h.meta
+            .current_version(&bucket, &ObjectKey::parse("new").unwrap())
+            .await
+            .unwrap()
+            .is_none(),
+        "invalid stored retention committed an unlocked object"
+    );
+
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::DELETE,
+                Some("repair"),
+                Some("old"),
+                &[("versionId", &old_version)],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "corrupt lock config must block permanent deletion"
+    );
+    assert!(
+        h.meta
+            .get_version(
+                &bucket,
+                &ObjectKey::parse("old").unwrap(),
+                &cairn_types::VersionId::from_string(old_version.clone()),
+            )
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    // The repair path parses only the replacement, so it is not blocked by the corrupt old doc.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("repair"),
+                None,
+                &[("object-lock", "")],
+                &[],
+                default_retention_body("GOVERNANCE", "Days", 1),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "valid replacement must repair config");
+
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::DELETE,
+                Some("repair"),
+                Some("old"),
+                &[("versionId", &old_version)],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT, "delete works after repair");
+}
+
+#[tokio::test]
+async fn disabled_stored_object_lock_configuration_is_corrupt_not_absent() {
+    let (h, concrete_meta) = in_memory_harness().await;
+    create_lock_bucket(&h, "disabled-row").await;
+    let (status, headers, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("disabled-row"),
+                Some("old"),
+                &[],
+                &[],
+                b"old".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let old_version = header(&headers, "x-amz-version-id").unwrap().to_owned();
+    let bucket = BucketName::parse("disabled-row").unwrap();
+    concrete_meta.install_raw_object_lock_configuration(
+        &bucket,
+        serde_json::to_string(&cairn_types::ObjectLockConfiguration {
+            enabled: false,
+            default_retention: None,
+        })
+        .unwrap(),
+    );
+
+    // A present-but-disabled row is malformed immutable security state. It must never look like a
+    // bucket that simply lacks Object Lock.
+    let (status, _, response) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("disabled-row"),
+                None,
+                &[("object-lock", "")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    let response = String::from_utf8(response).unwrap();
+    assert!(response.contains("<Code>InternalError</Code>"));
+    assert!(!response.contains("invalid stored Object Lock configuration"));
+
+    let (status, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("disabled-row"),
+                Some("new"),
+                &[],
+                &[],
+                b"must-not-commit".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(
+        h.meta
+            .current_version(&bucket, &ObjectKey::parse("new").unwrap())
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let (status, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::DELETE,
+                Some("disabled-row"),
+                Some("old"),
+                &[("versionId", old_version.as_str())],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(
+        h.meta
+            .get_version(
+                &bucket,
+                &ObjectKey::parse("old").unwrap(),
+                &VersionId::from_string(old_version),
+            )
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    // The specialized configuration mutation deliberately remains the repair seam.
+    let (status, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("disabled-row"),
+                None,
+                &[("object-lock", "")],
+                &[],
+                b"<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled>\
+                  </ObjectLockConfiguration>"
+                    .to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
 /// Retention requires a lock-enabled bucket; object-lock config requires versioning.
 #[tokio::test]
 async fn object_lock_guards() {
@@ -9124,7 +11326,25 @@ async fn object_lock_guards() {
         "retention needs a lock-enabled bucket"
     );
 
-    // PUT ?object-lock (enabled) on a non-versioned bucket -> 400.
+    // Object Lock can be enabled only by bucket creation; a later enable attempt is an
+    // InvalidBucketState conflict even if the caller first enabled versioning.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("plain"),
+                None,
+                &[("versioning", "")],
+                &[],
+                b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>"
+                    .to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
     let (st, _, _) = drain(
         send(
             &h.svc,
@@ -9142,7 +11362,87 @@ async fn object_lock_guards() {
         .await,
     )
     .await;
-    assert_eq!(st, StatusCode::BAD_REQUEST, "object-lock needs versioning");
+    assert_eq!(
+        st,
+        StatusCode::CONFLICT,
+        "Object Lock cannot be enabled after bucket creation"
+    );
+}
+
+#[tokio::test]
+async fn object_lock_enablement_and_required_versioning_are_immutable() {
+    let h = harness().await;
+    create_lock_bucket(&h, "olimmutable").await;
+
+    for body in [
+        b"<ObjectLockConfiguration></ObjectLockConfiguration>".to_vec(),
+        b"<ObjectLockConfiguration><ObjectLockEnabled>Disabled</ObjectLockEnabled>\
+          </ObjectLockConfiguration>"
+            .to_vec(),
+    ] {
+        let (status, _, _) = drain(
+            send(
+                &h.svc,
+                req(
+                    Method::PUT,
+                    Some("olimmutable"),
+                    None,
+                    &[("object-lock", "")],
+                    &[],
+                    body,
+                ),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    let (status, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("olimmutable"),
+                None,
+                &[("versioning", "")],
+                &[],
+                b"<VersioningConfiguration><Status>Suspended</Status>\
+                  </VersioningConfiguration>"
+                    .to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(
+        String::from_utf8(body)
+            .unwrap()
+            .contains("<Code>InvalidBucketState</Code>")
+    );
+
+    let (status, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("olimmutable"),
+                None,
+                &[("object-lock", "")],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        String::from_utf8(body)
+            .unwrap()
+            .contains("<ObjectLockEnabled>Enabled</ObjectLockEnabled>")
+    );
 }
 
 // ===========================================================================================
@@ -11228,7 +13528,8 @@ async fn encrypted_object_unopenable_dek_fails_closed() {
             blob.clone(),
             Arc::new(cairn_types::testing::AllowAll),
             clock.clone(),
-            Arc::new(cairn_crypto::SystemCrypto::new(key)) as Arc<dyn cairn_types::traits::Crypto>,
+            Arc::new(cairn_crypto::SystemCrypto::new(key.into()))
+                as Arc<dyn cairn_types::traits::Crypto>,
             "us-east-1".to_owned(),
             5 * 1024 * 1024 * 1024,
         )
@@ -11476,16 +13777,22 @@ fn staged_part_paths(root: &std::path::Path, upload_id: &str) -> Vec<std::path::
     v
 }
 
-/// A CRNB blob's trailer is 34 bytes: magic(4) + version(1) at offset 4. VERSION_ENCRYPTED == 2.
+/// Recognize both legacy v2 and current v3 encrypted CRNB containers via the blob crate's
+/// structural predicate so this protocol regression does not duplicate a format-version constant.
 fn is_version_encrypted(path: &std::path::Path) -> bool {
     let raw = std::fs::read(path).unwrap();
-    raw.len() >= 34 && raw[raw.len() - 34 + 4] == 2
+    let trailer_len = cairn_blob::compress::TRAILER_BYTES;
+    raw.len() >= trailer_len
+        && cairn_blob::compress::is_encrypted_container_trailer(
+            &raw[raw.len() - trailer_len..],
+            raw.len() as u64,
+        )
 }
 
 fn build_svc(meta: Arc<dyn MetadataStore>, blob: Arc<dyn BlobStore>, key: [u8; 32]) -> S3Service {
     let clock = Arc::new(cairn_types::testing::TestClock::default());
     let crypto: Arc<dyn cairn_types::traits::Crypto> =
-        Arc::new(cairn_crypto::SystemCrypto::new(key));
+        Arc::new(cairn_crypto::SystemCrypto::new(key.into()));
     S3Service::new(
         meta,
         blob,
@@ -12033,8 +14340,11 @@ async fn pre_v21_session_completes_legacy() {
         content_type: "application/octet-stream".to_owned(),
         status: cairn_types::meta::MultipartStatus::Active,
         owner_id: UserId("admin".to_owned()),
+        initiated_by: UserId("admin".to_owned()),
         intended_acl: None,
         user_metadata: Vec::new(),
+        initial_tags: Vec::new(),
+        lock_intent: cairn_types::ExplicitObjectLockIntent::default(),
         sse_requested: true,
         encrypt_parts: false,
         sse_kms_requested: false,
@@ -12043,9 +14353,10 @@ async fn pre_v21_session_completes_legacy() {
         created_at: cairn_types::time::Timestamp(0),
         updated_at: cairn_types::time::Timestamp(0),
     };
-    meta.submit(cairn_types::meta::Mutation::CreateMultipart(Box::new(
-        session,
-    )))
+    meta.submit(cairn_types::meta::Mutation::CreateMultipart {
+        session: Box::new(session),
+        limits: cairn_types::meta::MultipartLimits::default(),
+    })
     .await
     .unwrap();
 
@@ -12053,10 +14364,22 @@ async fn pre_v21_session_completes_legacy() {
     let part2 = b"legacy-tail".to_vec();
     let mut etags = Vec::new();
     for (n, body) in [(1u16, part1.clone()), (2u16, part2.clone())] {
+        let attempt_id = format!("legacy-{n}");
+        meta.submit(cairn_types::meta::Mutation::ReserveMultipartPart {
+            upload_id: upload.clone(),
+            part_number: n,
+            attempt_id: attempt_id.clone(),
+            reserved_bytes: body.len() as u64,
+            max_parts_per_upload: 10_000,
+            now: cairn_types::time::Timestamp(1),
+        })
+        .await
+        .unwrap();
         let staged = blob
             .stage_part(
                 &upload,
                 n,
+                &attempt_id,
                 once_body(body),
                 cairn_types::object::ChecksumSet::none(),
                 1 << 30,
@@ -12075,6 +14398,7 @@ async fn pre_v21_session_completes_legacy() {
         etags.push((n, staged.md5_hex.clone()));
         meta.submit(cairn_types::meta::Mutation::RecordPart {
             upload_id: upload.clone(),
+            attempt_id,
             part,
         })
         .await
@@ -12367,7 +14691,7 @@ async fn multipart_kms_unknown_key_id_rejected_at_initiate() {
         Arc::new(cairn_blob::LocalBlobStore::open(dir.path()).await.unwrap());
     let clock = Arc::new(cairn_types::testing::TestClock::default());
     let crypto: Arc<dyn cairn_types::traits::Crypto> =
-        Arc::new(cairn_crypto::SystemCrypto::new([7u8; 32]));
+        Arc::new(cairn_crypto::SystemCrypto::new([7u8; 32].into()));
     let svc = S3Service::new(
         meta.clone(),
         blob,
@@ -12645,8 +14969,11 @@ async fn complete_multipart_encrypted_session_with_plaintext_part_fails_closed()
         content_type: "application/octet-stream".to_owned(),
         status: cairn_types::meta::MultipartStatus::Active,
         owner_id: UserId("admin".to_owned()),
+        initiated_by: UserId("admin".to_owned()),
         intended_acl: None,
         user_metadata: Vec::new(),
+        initial_tags: Vec::new(),
+        lock_intent: cairn_types::ExplicitObjectLockIntent::default(),
         sse_requested: true,
         encrypt_parts: true,
         sse_kms_requested: false,
@@ -12655,9 +14982,10 @@ async fn complete_multipart_encrypted_session_with_plaintext_part_fails_closed()
         created_at: cairn_types::time::Timestamp(0),
         updated_at: cairn_types::time::Timestamp(0),
     };
-    meta.submit(cairn_types::meta::Mutation::CreateMultipart(Box::new(
-        session,
-    )))
+    meta.submit(cairn_types::meta::Mutation::CreateMultipart {
+        session: Box::new(session),
+        limits: cairn_types::meta::MultipartLimits::default(),
+    })
     .await
     .unwrap();
 
@@ -12665,10 +14993,22 @@ async fn complete_multipart_encrypted_session_with_plaintext_part_fails_closed()
     let part2 = b"tail".to_vec();
     let mut etags = Vec::new();
     for (n, bytes) in [(1u16, part1.clone()), (2u16, part2.clone())] {
+        let attempt_id = format!("plaintext-{n}");
+        meta.submit(cairn_types::meta::Mutation::ReserveMultipartPart {
+            upload_id: upload.clone(),
+            part_number: n,
+            attempt_id: attempt_id.clone(),
+            reserved_bytes: bytes.len() as u64,
+            max_parts_per_upload: 10_000,
+            now: cairn_types::time::Timestamp(1),
+        })
+        .await
+        .unwrap();
         let staged = blob
             .stage_part(
                 &upload,
                 n,
+                &attempt_id,
                 once_body(bytes),
                 cairn_types::object::ChecksumSet::none(),
                 1 << 30,
@@ -12687,6 +15027,7 @@ async fn complete_multipart_encrypted_session_with_plaintext_part_fails_closed()
         etags.push((n, staged.md5_hex.clone()));
         meta.submit(cairn_types::meta::Mutation::RecordPart {
             upload_id: upload.clone(),
+            attempt_id,
             part,
         })
         .await

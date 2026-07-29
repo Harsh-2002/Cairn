@@ -59,6 +59,11 @@ type ExecJob = Box<dyn FnOnce(&Connection) + Send>;
 enum Control {
     /// Run a truncating WAL checkpoint and report its frame counts.
     Checkpoint(oneshot::Sender<Result<WalCheckpointStats, MetaError>>),
+    /// Run a final truncating checkpoint, close the owned SQLite connection, then acknowledge.
+    ///
+    /// This is reserved for offline database-generation replacement. The caller must own the only
+    /// live Writer handle; any subsequently queued work is deliberately refused.
+    CheckpointAndShutdown(oneshot::Sender<Result<WalCheckpointStats, MetaError>>),
     /// A liveness probe: the writer simply acks, proving its thread is draining the queue. Used by
     /// the readiness check so `/readyz` reflects a responsive writer, not just a readable pool.
     Probe(oneshot::Sender<()>),
@@ -175,6 +180,19 @@ impl Writer {
         reply_rx.await.map_err(|_| MetaError::WriterClosed)?
     }
 
+    /// Run one final truncating checkpoint and wait until the writer's SQLite connection is closed.
+    ///
+    /// This consumes the handle and is intended only for an offline owner that has already closed
+    /// every read pool and knows no other Writer clone exists.
+    pub async fn checkpoint_and_shutdown(self) -> Result<WalCheckpointStats, MetaError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(Job::Control(Control::CheckpointAndShutdown(reply_tx)))
+            .await
+            .map_err(|_| MetaError::WriterClosed)?;
+        reply_rx.await.map_err(|_| MetaError::WriterClosed)?
+    }
+
     /// Run a write closure on the writer thread (the only owner of the write connection),
     /// serialized with mutations. Used by the master-key re-wrap worker (audit #29, sqlite-only).
     ///
@@ -221,6 +239,12 @@ fn writer_loop(
             break;
         };
         let first = match first {
+            Job::Control(Control::CheckpointAndShutdown(reply)) => {
+                let result = run_checkpoint(&conn);
+                drop(conn);
+                let _ = reply.send(result);
+                return;
+            }
             // A control message that arrives alone is handled directly, with no write batch.
             Job::Control(ctl) => {
                 run_control(&conn, ctl);
@@ -252,7 +276,15 @@ fn writer_loop(
 
         commit_batch(&conn, batch, commit_samples);
         for ctl in deferred {
-            run_control(&conn, ctl);
+            match ctl {
+                Control::CheckpointAndShutdown(reply) => {
+                    let result = run_checkpoint(&conn);
+                    drop(conn);
+                    let _ = reply.send(result);
+                    return;
+                }
+                other => run_control(&conn, other),
+            }
         }
     }
 }
@@ -281,6 +313,8 @@ fn run_control(conn: &Connection, ctl: Control) {
         Control::Checkpoint(reply) => {
             let _ = reply.send(run_checkpoint(conn));
         }
+        // Handled directly by `writer_loop`, which must drop the connection before acknowledging.
+        Control::CheckpointAndShutdown(_) => unreachable!("shutdown is handled by writer_loop"),
         Control::Probe(reply) => {
             let _ = reply.send(());
         }

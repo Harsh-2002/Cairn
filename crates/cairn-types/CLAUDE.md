@@ -8,7 +8,9 @@ freezing this crate freezes the seams. `#![forbid(unsafe_code)]`.
 - `traits.rs` — the spine: the **9 traits** `MetadataStore`, `BlobStore`, `ReconcileOracle`,
   `Authenticator`, `AuthorizationEngine`, `Crypto`, `Clock`, `PublicUrl`, `ReplicationSink`. The
   doc comments here are the contracts (e.g. the durable-commit sequence, fail-closed crypto, the
-  `submit`-is-the-only-write rule). Read the trait doc before changing a method.
+  `submit`-is-the-only-write rule). `MetadataStore::read_probe` is the uncached, constant-row
+  readiness seam: every backend exercises a real read-pool connection without enumerating metadata.
+  Read the trait doc before changing a method.
   - **`BlobStore` read seam (footgun removed).** There is ONE reader,
     `open_raw(path, range, cipher: BlobCipher, compression)`, plus a DEK-free presence probe
     `probe(path) -> BlobProbe`. `BlobCipher` (`blob.rs`, `KnownPlaintext | Dek([u8;32])`,
@@ -23,12 +25,19 @@ freezing this crate freezes the seams. `#![forbid(unsafe_code)]`.
 - `error.rs` — the typed error tree: per-subsystem errors (`BlobError`, `MetaError`, `AuthError`,
   `CryptoError`, `ReplicationError`, `BodyError`, `ConfigError`) **fold into the canonical `Error`**
   via the `From` impls at the bottom. `Error` is the wire-mappable enum the single translator maps
-  totally to S3 XML / control JSON (ARCH 25).
+  totally to S3 XML / control JSON (ARCH 25). `AuthError::PolicyUnavailable` is deliberately an
+  opaque internal error, not `AccessDenied`: it means valid credentials reached a policy
+  read/integrity fault, and callers must stop rather than substitute policy absence.
 - `meta.rs` — the largest module: `Mutation` (the write enum), `ListQuery`/`ListPage`, `OutboxEntry`,
   `WebhookEntry`, and the metadata DTOs/rollups returned by `MetadataStore`. `MultipartSession`
   carries the multipart SSE intent pinned at initiate (`sse_requested`, `encrypt_parts`,
   `sse_kms_requested`/`sse_kms_key_id`/`sse_bucket_key_enabled`) and `PartRecord.part_dek` the
-  per-part DEK label (ARCH 27).
+  per-part DEK label (ARCH 27), plus initial tags and explicit Object Lock intent consumed by the
+  writer at completion. `InitialObjectState` carries the corresponding atomic PUT/Copy inputs;
+  `GovernanceBypass` is a trusted authorization result and deliberately has no default. Import
+  history has its own
+  `ImportJobListQuery`/`ImportJobPage`: every backend enforces the 1,000-row ceiling and the
+  `(created_at, id)` keyset cursor.
 - `id.rs` — validated newtypes: `BucketName`, `ObjectKey`, `StoragePath`, `VersionId`, `UploadId`,
   `UserId`, `InvalidName`. Validation is S3 wire-correctness, **not** path safety — keys never become
   filesystem paths (that lives in `cairn-blob`).
@@ -51,6 +60,14 @@ freezing this crate freezes the seams. `#![forbid(unsafe_code)]`.
   shared read on a trait) MUST be handled in `InMemoryMetadataStore` here, **and** in both
   `cairn-meta/src/apply.rs` and `cairn-meta-async/src/apply.rs`. The in-memory double must stay
   behaviorally faithful — downstream tests trust it as the reference engine.
+- Multipart terminal outcomes are typed and writer-owned: Complete claims `active -> completing`,
+  Abort removes only `active`, a failed completer conditionally releases `completing -> active`,
+  and the final completion accepts only `completing`. The in-memory double must preserve those
+  won/lost outcomes exactly; never turn Abort back into an unconditional acknowledgement.
+- Object Lock policy is writer-owned too. Every double/backend must strictly read persisted
+  bucket/version lock state inside the mutation, reject protected replacement or retention
+  weakening, replace initial tags and lock state atomically with the object and outbox, and preserve
+  immutable enablement/versioning. Do not move those decisions back to a caller-side read.
 - **Keep it engine-free.** NEVER add a dependency on a concrete `cairn-meta`/`cairn-blob`/
   `cairn-crypto`/etc. crate — the dependency arrow points the other way. Only `serde`/`thiserror`/
   `bytes`/`uuid`/`zeroize`-class leaf deps belong here; the `testing` doubles' extras (`md-5`,
@@ -62,5 +79,19 @@ freezing this crate freezes the seams. `#![forbid(unsafe_code)]`.
   (the key id is simply not on the ring — a rotation window) is deliberately DISTINCT from
   `Decrypt` (tampering): callers classify the first as transient and the second as permanent, and
   conflating them lets one rotation pass stamp whole buckets terminally failed.
+- `secret.rs` owns cross-crate plaintext secrets. Use `SecretString` and the non-`Copy`
+  `SecretKey32`; both redact `Debug` and zeroize on drop. Plaintext access must go through the
+  explicitly named `expose_secret` method. Do not reintroduce owned `[u8; 32]` DEKs or ordinary
+  `String` fields for long-lived credentials.
+- `notification.rs` stores webhook signing keys as authenticated `WebhookSecret::Sealed`
+  envelopes. `LegacyPlaintext(SecretString)` is deserialize-only compatibility state for the
+  mandatory pre-bind migration; control-plane writes must never create or preserve it. Opening
+  either representation yields one `Zeroizing<Vec<u8>>`.
+- `RequesterClass::OwnerOrAdmin(UserId)` deliberately retains identity alongside privilege.
+  Resource-policy named-principal Denies need the id even though this class has a baseline allow;
+  do not replace it with an identity-less marker.
+- `ClientSource` is deliberately tri-state: `Direct`, `Forwarded`, or `Unavailable`. Preserve the
+  provenance variant through `RequestView`, `S3Request`, and `RequestContext`; a trusted proxy with
+  unusable forwarding metadata must not be collapsed to its own socket address.
 - Spec: trait spine + metadata model in `docs/metadata.md` (11–12); error model in
   `docs/security-errors.md` (25). See the root `../../CLAUDE.md` for the gate and workspace-wide rules.

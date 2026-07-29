@@ -39,7 +39,12 @@ mod target;
 pub use backoff::next_backoff;
 pub use config::{Destination, Filter, ReplicationConfig, ReplicationRule, parse_replication};
 pub use route::{BucketRoutedSink, SingleSink, SinkRouter};
-pub use sink::{HttpS3Sink, S3SinkConfig, sink_for_target};
+pub use sink::{
+    DEFAULT_REPLICATION_BUFFER_BUDGET_BYTES, DEFAULT_REPLICATION_DELIVERY_TIMEOUT_SECS, HttpS3Sink,
+    MAX_BUFFERED_OBJECT_BYTES, MAX_REPLICATION_BUFFER_BUDGET_BYTES,
+    MAX_REPLICATION_DELIVERY_TIMEOUT_SECS, MAX_RESPONSE_DIAGNOSTIC_BYTES, ReplicationSinkRuntime,
+    S3SinkConfig, sink_for_target,
+};
 pub use target::{
     OpenTarget, RemoteTarget, RemoteTargetInput, open_target, parse_targets, resolve_target,
     seal_target, serialize_targets,
@@ -48,6 +53,7 @@ pub use target::{
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use cairn_types::SecretKey32;
 use cairn_types::blob::ByteRange;
 use cairn_types::error::{BlobError, CryptoError, MetaError, ReplicationError};
 use cairn_types::id::{BucketName, ObjectKey, VersionId};
@@ -492,7 +498,7 @@ impl ReplicationEngine {
         blobs: &Arc<B>,
         row: &ObjectVersionRow,
         tags: Vec<(String, String)>,
-        dek: Option<[u8; 32]>,
+        dek: Option<SecretKey32>,
         client_encrypted: bool,
     ) -> Result<u64, ReplicationError>
     where
@@ -798,12 +804,12 @@ fn map_blob_err(e: BlobError) -> ReplicationError {
 fn resolve_dek(
     crypto: &dyn Crypto,
     row: &ObjectVersionRow,
-) -> Result<(Option<[u8; 32]>, bool), ReplicationError> {
+) -> Result<(Option<SecretKey32>, bool), ReplicationError> {
     match row.sse_descriptor.as_deref() {
         Some(json) => {
             let d = cairn_types::sse::parse_descriptor(json).map_err(map_crypto_err)?;
             let client_encrypted = matches!(d.mode, SseMode::SseS3 | SseMode::Kms);
-            let dek = *cairn_types::sse::open_dek(crypto, &d).map_err(map_crypto_err)?;
+            let dek = cairn_types::sse::open_dek(crypto, &d).map_err(map_crypto_err)?;
             Ok((Some(dek), client_encrypted))
         }
         None => Ok((None, false)),

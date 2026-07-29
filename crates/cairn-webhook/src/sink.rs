@@ -7,7 +7,6 @@ use bytes::Bytes;
 use http::{Method, Request, Uri};
 use http_body_util::{BodyExt, Full, Limited};
 use hyper_util::client::legacy::Client;
-use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 use std::time::Duration;
 
@@ -53,13 +52,10 @@ pub trait WebhookSink: Send + Sync {
 }
 
 /// An HTTP(S) webhook sink built on the same hyper/rustls client stack as the replication sink,
-/// dialing through the SSRF-guarded resolver.
+/// dialing through the SSRF-guarded connector.
 #[derive(Debug)]
 pub struct HttpWebhookSink {
-    client: Client<
-        hyper_rustls::HttpsConnector<HttpConnector<cairn_net::GuardedResolver>>,
-        Full<Bytes>,
-    >,
+    client: Client<hyper_rustls::HttpsConnector<cairn_net::GuardedHttpConnector>, Full<Bytes>>,
     timeout: Duration,
 }
 
@@ -174,6 +170,37 @@ mod sink_timeout_tests {
     use super::{HttpWebhookSink, WebhookError, WebhookSink};
     use std::io::{Read, Write};
     use std::time::Duration;
+
+    /// Exercise the complete hyper-rustls client path, not only `validate_endpoint`: a literal
+    /// loopback address must be rejected by the connector before the listening socket sees a
+    /// connection. The connector-level regression covers both IPv4 and IPv6 parsing.
+    #[tokio::test]
+    async fn guarded_connector_blocks_literal_hosts_before_tcp_connect() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback sentinel");
+        let addr = listener.local_addr().expect("sentinel address");
+        let sink = HttpWebhookSink::with_timeout(
+            Duration::from_secs(1),
+            cairn_net::GuardConfig::new(false),
+        );
+
+        let error = sink
+            .deliver(&format!("http://{addr}/"), b"{}", None)
+            .await
+            .expect_err("internal literal must be rejected");
+        assert!(
+            matches!(error, WebhookError::Retryable(_)),
+            "connector rejection should be a retryable transport failure"
+        );
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err(),
+            "the blocked IPv4 request reached the listening socket"
+        );
+    }
 
     /// Regression (audit 2026-07): a receiver that returns `200` headers then stalls the response
     /// body must NOT pin the delivery future — the timeout has to cover the body drain, not just the

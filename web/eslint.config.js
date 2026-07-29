@@ -3,7 +3,7 @@ import globals from "globals";
 import tseslint from "typescript-eslint";
 import reactHooks from "eslint-plugin-react-hooks";
 import reactRefresh from "eslint-plugin-react-refresh";
-import jsxA11y from "eslint-plugin-jsx-a11y";
+import jsxA11y from "eslint-plugin-jsx-a11y-x";
 
 // Flat-config ESLint for the console (React 19 + TypeScript + Vite). Layered on top of the strict
 // `tsc -b` gate: tsc catches types + unused symbols; ESLint adds React-hooks correctness and
@@ -15,7 +15,7 @@ export default tseslint.config(
   { ignores: ["dist", "node_modules"] },
   js.configs.recommended,
   ...tseslint.configs.recommended,
-  jsxA11y.flatConfigs.recommended,
+  jsxA11y.configs.recommended,
   {
     files: ["**/*.{ts,tsx}"],
     languageOptions: {
@@ -43,7 +43,7 @@ export default tseslint.config(
       ],
       // Our `<label>`s wrap shadcn control *components* (a valid nested association); teach the rule
       // to recognize them as controls instead of flagging correct markup as unassociated.
-      "jsx-a11y/label-has-associated-control": [
+      "jsx-a11y-x/label-has-associated-control": [
         "error",
         {
           controlComponents: [
@@ -60,7 +60,7 @@ export default tseslint.config(
       // The console uses autoFocus only in launcher/filter inputs (the command palette, the
       // folder-name filter) where focusing on open/mount is the expected, correct UX — never on a
       // page-load form. Off rather than per-attribute disables that fight the formatter.
-      "jsx-a11y/no-autofocus": "off",
+      "jsx-a11y-x/no-autofocus": "off",
     },
   },
   {

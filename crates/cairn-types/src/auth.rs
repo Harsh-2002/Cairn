@@ -3,8 +3,43 @@
 
 use crate::error::AuthError;
 use crate::id::UserId;
+use crate::secret::SecretKey32;
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
+
+/// Authenticated provenance for the requester's network address.
+///
+/// A trusted reverse proxy is not itself a safe substitute when it omits or supplies malformed
+/// forwarding metadata. [`Unavailable`](Self::Unavailable) preserves that distinction so
+/// `aws:SourceIp` conditions can fail closed instead of accidentally authorizing the proxy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientSource {
+    /// The requester connected directly; forwarding headers were not consulted.
+    Direct(IpAddr),
+    /// A trusted proxy chain established this client address.
+    Forwarded(IpAddr),
+    /// A trusted peer delivered no usable, unambiguous client-address provenance.
+    Unavailable,
+}
+
+impl ClientSource {
+    /// The established client address, or `None` when trusted-proxy provenance was unavailable.
+    #[must_use]
+    pub const fn address(self) -> Option<IpAddr> {
+        match self {
+            Self::Direct(address) | Self::Forwarded(address) => Some(address),
+            Self::Unavailable => None,
+        }
+    }
+
+    /// Whether this is a directly connected loopback client.
+    ///
+    /// Forwarded loopback claims deliberately do not qualify for the development-auth bypass.
+    #[must_use]
+    pub fn is_direct_loopback(self) -> bool {
+        matches!(self, Self::Direct(address) if address.is_loopback())
+    }
+}
 
 /// A user's role. An administrator is implicitly permitted (subject to an explicit policy
 /// deny); a member's access is governed by bucket policy and ACL.
@@ -44,7 +79,7 @@ pub struct ChunkSigningContext {
     /// The request signature just computed/verified, seeding the per-chunk chain.
     pub seed_signature: String,
     /// The SigV4 streaming signing key derived from the secret, scope date, and region.
-    pub signing_key: [u8; 32],
+    pub signing_key: SecretKey32,
     /// The request `X-Amz-Date` header value (the `amz-date` each chunk is signed under).
     pub amz_date: String,
     /// The credential scope string `<date>/<region>/s3/aws4_request`.
@@ -93,8 +128,9 @@ pub struct Principal {
 /// The class of requester, decided by the pipeline before authorization.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequesterClass {
-    /// The bucket owner or an administrator (implicitly permitted, save explicit deny).
-    OwnerOrAdmin,
+    /// The bucket owner or an administrator (implicitly permitted, save explicit deny), retaining
+    /// the stable user id so named `Principal`/`NotPrincipal` statements still bind this identity.
+    OwnerOrAdmin(UserId),
     /// An authenticated non-owner member.
     AuthenticatedMember(UserId),
     /// An anonymous (unauthenticated) requester.
@@ -126,8 +162,8 @@ pub struct RequestView<'a> {
     pub headers: &'a [(String, String)],
     /// The `Host` header value.
     pub host: &'a str,
-    /// The source address of the requester (post proxy-header resolution).
-    pub source: IpAddr,
+    /// The requester's established client-address provenance.
+    pub source: ClientSource,
     /// Whether the request arrived over a secure transport.
     pub secure_transport: bool,
 }
@@ -140,5 +176,19 @@ impl RequestView<'_> {
             .iter()
             .find(|(k, _)| k == name)
             .map(|(_, v)| v.as_str())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ClientSource;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    #[test]
+    fn only_direct_loopback_qualifies_as_direct_loopback() {
+        let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        assert!(ClientSource::Direct(loopback).is_direct_loopback());
+        assert!(!ClientSource::Forwarded(loopback).is_direct_loopback());
+        assert!(!ClientSource::Unavailable.is_direct_loopback());
     }
 }

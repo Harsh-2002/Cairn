@@ -1,8 +1,8 @@
 // Share one object two ways (ARCH 15.8):
 //  • "Share link" (default): a persistent, revocable Cairn share — pick a duration
-//    or "Never expires", view-in-browser vs force-download, get a /share/{token} link.
+//    or "Never expires", view-in-browser vs force-download, get a data-origin link.
 //  • "S3 link": a standard SigV4 presigned URL (download or upload), interoperable
-//    with any S3 tool, capped at 7 days, stateless (not revocable).
+//    with any S3 tool, backed by a scoped temporary session and capped at 12 hours.
 
 import { useEffect, useId, useState } from "react";
 import { TriangleAlert } from "lucide-react";
@@ -32,7 +32,7 @@ import { api, errorMessage } from "@/lib/api";
 import { whenMs } from "@/lib/format";
 import type { ShareDisposition } from "@/lib/types";
 
-// Persistent durations include "forever"; presigned is capped at 7 days.
+// Persistent durations include "forever"; presigned is capped at 12 hours.
 const SECS = { hour: 3600, day: 86400, week: 604800 } as const;
 
 export function ShareDialog({
@@ -60,7 +60,7 @@ export function ShareDialog({
 
   // --- presigned "S3 link" tab ---
   const [sMethod, setSMethod] = useState<"GET" | "PUT">("GET");
-  const [sExpiry, setSExpiry] = useState("86400");
+  const [sExpiry, setSExpiry] = useState(String(SECS.hour));
   const [sContentType, setSContentType] = useState("");
   const [sBusy, setSBusy] = useState(false);
   const [sLink, setSLink] = useState<{ url: string; expiresAtMs: number } | null>(null);
@@ -73,7 +73,7 @@ export function ShareDialog({
     setPFilename("");
     setPLink(null);
     setSMethod("GET");
-    setSExpiry("86400");
+    setSExpiry(String(SECS.hour));
     setSContentType("");
     setSLink(null);
     setError(null);
@@ -94,7 +94,7 @@ export function ShareDialog({
         version_id: versionId ?? null,
       });
       setPLink({
-        url: window.location.origin + res.url,
+        url: new URL(res.url, window.location.origin).toString(),
         expiresAtMs: res.expires_at_ms,
       });
       toast.success("Share link created");
@@ -225,8 +225,8 @@ export function ShareDialog({
           <TabsContent value="s3" className="space-y-4 pt-3">
             <p className="text-[13px] text-muted-foreground">
               A standard S3 presigned URL — works with any S3 tool or a plain
-              browser. Stateless, so it can’t be revoked or listed, and is capped
-              at 7 days.
+              browser. It uses a short-lived scoped session and is capped at 12
+              hours.
             </p>
             <div className="grid gap-1.5">
               <Label htmlFor={`${idp}-sm`}>Type</Label>
@@ -251,8 +251,8 @@ export function ShareDialog({
                 </SelectTrigger>
                 <SelectContent>
                   <SelectItem value={String(SECS.hour)}>1 hour</SelectItem>
-                  <SelectItem value={String(SECS.day)}>24 hours</SelectItem>
-                  <SelectItem value={String(SECS.week)}>7 days (max)</SelectItem>
+                  <SelectItem value={String(6 * SECS.hour)}>6 hours</SelectItem>
+                  <SelectItem value={String(12 * SECS.hour)}>12 hours (max)</SelectItem>
                 </SelectContent>
               </Select>
             </div>

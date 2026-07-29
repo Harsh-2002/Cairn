@@ -2,10 +2,9 @@
 //! without an HTTP server. `cairn-server` adapts hyper to these; tests construct them directly.
 
 use bytes::Bytes;
-use cairn_types::auth::Principal;
+use cairn_types::auth::{ClientSource, Principal};
 use cairn_types::id::{BucketName, ObjectKey};
 use http::{Method, StatusCode};
-use std::net::IpAddr;
 
 /// An incoming, already-routed S3 request.
 pub struct S3Request {
@@ -21,8 +20,8 @@ pub struct S3Request {
     pub headers: Vec<(String, String)>,
     /// The authenticated principal, or None for anonymous.
     pub principal: Option<Principal>,
-    /// Source address.
-    pub source: IpAddr,
+    /// Established source-address provenance.
+    pub source: ClientSource,
     /// Whether the transport was secure.
     pub secure: bool,
     /// A correlation id echoed in the response and error documents.

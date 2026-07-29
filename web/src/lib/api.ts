@@ -352,8 +352,8 @@ export const api = {
     );
   },
 
-  // Persistent object shares (ARCH 15.8): revocable, optionally forever. `url` is a path
-  // (/share/{token}) the caller turns into an absolute link.
+  // Persistent object shares (ARCH 15.8): revocable, optionally forever. The bearer URL/token is
+  // returned only by create; management thereafter uses the stable, non-secret share id.
   createShare: (name: string, body: CreateShareReq) =>
     request<CreateShareResp>(
       "POST",
@@ -367,10 +367,10 @@ export const api = {
       `/buckets/${enc(name)}/objects/shares${qs}`,
     );
   },
-  revokeShare: (name: string, token: string) =>
+  revokeShare: (name: string, id: string) =>
     request<null>(
       "DELETE",
-      `/buckets/${enc(name)}/objects/shares/${enc(token)}`,
+      `/buckets/${enc(name)}/objects/shares/${enc(id)}`,
     ),
   // Mint an interoperable S3 presigned URL (GET download / PUT upload), returned absolute.
   presignShare: (name: string, body: PresignReq) =>
@@ -490,7 +490,11 @@ export const api = {
     request<FailedReplicationResp>("GET", `/replication/failed?limit=${limit}`),
 
   // --- S3 import jobs (ARCH 27.7): import buckets + objects from another S3 store ---
-  listImports: () => request<ImportListResp>("GET", "/imports"),
+  listImports: (limit = 1000, cursor?: string) =>
+    request<ImportListResp>(
+      "GET",
+      `/imports?limit=${limit}${cursor ? `&cursor=${enc(cursor)}` : ""}`,
+    ),
   getImport: (id: string) =>
     request<ImportJobDetail>("GET", `/imports/${enc(id)}`),
   createImport: (body: CreateImportReq) =>

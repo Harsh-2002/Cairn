@@ -160,7 +160,8 @@ pub struct AuthCache {
     sigv4: Sharded<String, CachedSigv4>,
     bearer: Sharded<String, CachedBearer>,
     /// Keyed by user-id. The inner `Option` distinguishes "user has a (parsed) policy" from "user
-    /// has no policy / a remembered-malformed one"; both are cached so neither re-reads the DB.
+    /// has no policy"; both are cached so neither re-reads the DB. Malformed policies and read
+    /// failures are never cached as absence because absence can widen privileged access.
     policy: Sharded<UserId, Option<Arc<Policy>>>,
 }
 

@@ -3,7 +3,7 @@
 
 use cairn_auth::{AuthCache, AuthChain, compute_signature, hash_bearer_secret, signing_key};
 use cairn_types::Timestamp;
-use cairn_types::auth::{AuthMethod, AuthOutcome, RequestView, Role};
+use cairn_types::auth::{AuthMethod, AuthOutcome, ClientSource, RequestView, Role};
 use cairn_types::meta::{Mutation, User, UserRecord};
 use cairn_types::testing::{InMemoryMetadataStore, StubCrypto, TestClock};
 use cairn_types::traits::{Authenticator, Crypto, MetadataStore};
@@ -16,6 +16,10 @@ const SECRET: &str = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
 const AKID: &str = "AKIDEXAMPLE";
 
 async fn setup() -> (AuthChain, Arc<InMemoryMetadataStore>) {
+    setup_with_role(Role::Member).await
+}
+
+async fn setup_with_role(role: Role) -> (AuthChain, Arc<InMemoryMetadataStore>) {
     let meta = Arc::new(InMemoryMetadataStore::new());
     let crypto = Arc::new(StubCrypto);
     let clock = Arc::new(TestClock::at_secs(1_440_938_160)); // 2015-08-30T12:36:00Z
@@ -27,7 +31,7 @@ async fn setup() -> (AuthChain, Arc<InMemoryMetadataStore>) {
         display_name: "alice".to_owned(),
         access_key_id: "bearer-key".to_owned(),
         sigv4_access_key_id: Some(AKID.to_owned()),
-        role: Role::Member,
+        role,
         is_active: true,
         quota_bytes: None,
         created_at: Timestamp(0),
@@ -115,9 +119,43 @@ fn view<'a>(headers: &'a [(String, String)], host: &'a str) -> RequestView<'a> {
         query: "",
         headers,
         host,
-        source: IpAddr::V4(Ipv4Addr::LOCALHOST),
+        source: ClientSource::Direct(IpAddr::V4(Ipv4Addr::LOCALHOST)),
         secure_transport: false,
     }
+}
+
+#[cfg(feature = "dev-auth")]
+#[tokio::test]
+async fn development_bypass_requires_a_direct_loopback_source() {
+    let meta = Arc::new(InMemoryMetadataStore::new());
+    let cache = Arc::new(AuthCache::new(
+        Duration::from_secs(60),
+        Arc::new(AtomicU64::new(0)),
+    ));
+    let chain = AuthChain::new(
+        meta,
+        Arc::new(StubCrypto),
+        Arc::new(TestClock::at_secs(1_440_938_160)),
+        cache,
+        true,
+    );
+    let mut request = view(&[], "localhost");
+    request.source = ClientSource::Forwarded(IpAddr::V4(Ipv4Addr::LOCALHOST));
+    assert!(matches!(
+        chain.authenticate(&request).await,
+        AuthOutcome::NotApplicable
+    ));
+    request.source = ClientSource::Unavailable;
+    assert!(matches!(
+        chain.authenticate(&request).await,
+        AuthOutcome::NotApplicable
+    ));
+    request.source = ClientSource::Direct(IpAddr::V4(Ipv4Addr::LOCALHOST));
+    assert!(matches!(
+        chain.authenticate(&request).await,
+        AuthOutcome::Authenticated(principal)
+            if principal.method == AuthMethod::Development
+    ));
 }
 
 #[tokio::test]
@@ -289,6 +327,69 @@ async fn bearer_roundtrip_and_anonymous() {
     ));
 }
 
+#[tokio::test]
+async fn sigv4_policy_read_failure_denies_privileged_principal() {
+    // The credential lookup and signature verification still succeed; only the following
+    // identity-policy read fails. Treating that fault as "no policy" would restore an
+    // administrator's baseline allow.
+    let (chain, meta) = setup_with_role(Role::Administrator).await;
+    meta.set_fail_user_policy_reads(true);
+    let host = "s3.example.com";
+    let payload = cairn_auth::sha256_hex(b"");
+    let base = vec![
+        ("host".to_owned(), host.to_owned()),
+        ("x-amz-date".to_owned(), "20150830T123600Z".to_owned()),
+        ("x-amz-content-sha256".to_owned(), payload.clone()),
+    ];
+    let auth = sign("GET", "/bucket/key", &base, &payload);
+    let mut headers = base.clone();
+    headers.push(("authorization".to_owned(), auth));
+    let v = view(&headers, host);
+
+    assert!(matches!(
+        chain.authenticate(&v).await,
+        AuthOutcome::Denied(cairn_types::error::AuthError::PolicyUnavailable)
+    ));
+    // A transient failure is not cached as absence (or as a permanent failure). Once the narrow
+    // fault clears, the same cached credential retries the policy read and authenticates.
+    meta.set_fail_user_policy_reads(false);
+    assert!(matches!(
+        chain.authenticate(&v).await,
+        AuthOutcome::Authenticated(_)
+    ));
+}
+
+#[tokio::test]
+async fn bearer_malformed_stored_policy_denies_privileged_principal() {
+    // Stored metadata is a trust boundary even though the management API validates policy writes.
+    // A malformed document must not be cached or converted to the absence that lets an admin
+    // proceed via the privileged baseline.
+    let (chain, meta) = setup_with_role(Role::Administrator).await;
+    meta.submit(Mutation::SetUserPolicy {
+        user_id: cairn_types::UserId("u1".to_owned()),
+        policy: Some("{not-json".to_owned()),
+    })
+    .await
+    .unwrap();
+    let headers = vec![(
+        "authorization".to_owned(),
+        "Bearer bearer-key.topsecret".to_owned(),
+    )];
+    let v = view(&headers, "s3.example.com");
+
+    assert!(matches!(
+        chain.authenticate(&v).await,
+        AuthOutcome::Denied(cairn_types::error::AuthError::PolicyUnavailable)
+    ));
+    assert!(
+        matches!(
+            chain.authenticate(&v).await,
+            AuthOutcome::Denied(cairn_types::error::AuthError::PolicyUnavailable)
+        ),
+        "malformed policy must not be cached as an absent-policy success"
+    );
+}
+
 // ===========================================================================================
 // STS-style temporary session credentials (ARCH 14)
 // ===========================================================================================
@@ -303,6 +404,14 @@ const SESSION_POLICY: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":"
 const PARENT_POLICY: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:*","Resource":"*"},{"Effect":"Allow","Action":"s3:ListBucket","Resource":"*"}]}"#;
 
 async fn setup_session(expires_at: Timestamp, parent_active: bool) -> AuthChain {
+    setup_session_with_policy(expires_at, parent_active, Some(SESSION_POLICY)).await
+}
+
+async fn setup_session_with_policy(
+    expires_at: Timestamp,
+    parent_active: bool,
+    inline_policy: Option<&str>,
+) -> AuthChain {
     use cairn_types::UserId;
     let meta = Arc::new(InMemoryMetadataStore::new());
     let crypto = Arc::new(StubCrypto);
@@ -342,7 +451,7 @@ async fn setup_session(expires_at: Timestamp, parent_active: bool) -> AuthChain 
             secret_ciphertext: sealed.ciphertext,
             secret_nonce: Some(sealed.nonce.0),
             session_token_hash: cairn_auth::hash_session_token(SESSION_TOKEN),
-            inline_policy: Some(SESSION_POLICY.to_owned()),
+            inline_policy: inline_policy.map(str::to_owned),
             expires_at,
             created_at: Timestamp(0),
         },
@@ -386,7 +495,7 @@ fn session_presigned_view<'a>(buf: &'a mut String, token: Option<&str>) -> Reque
         query,
         headers: &[],
         host: "cairn.example.com",
-        source: IpAddr::V4(Ipv4Addr::LOCALHOST),
+        source: ClientSource::Direct(IpAddr::V4(Ipv4Addr::LOCALHOST)),
         secure_transport: true,
     }
 }
@@ -466,6 +575,22 @@ async fn session_credential_denied_when_parent_deactivated() {
     );
 }
 
+#[tokio::test]
+async fn session_credential_denied_when_inline_policy_is_malformed() {
+    let chain = setup_session_with_policy(
+        Timestamp::from_secs(9_999_999_999),
+        true,
+        Some("{malformed"),
+    )
+    .await;
+    let mut buf = String::new();
+    let view = session_presigned_view(&mut buf, Some(SESSION_TOKEN));
+    assert!(matches!(
+        chain.authenticate(&view).await,
+        AuthOutcome::Denied(cairn_types::error::AuthError::PolicyUnavailable)
+    ));
+}
+
 // -------------------------------------------------------------------------------------------
 // AWS-STS minting auth (`authenticate_sts`, ARCH 14)
 // -------------------------------------------------------------------------------------------
@@ -508,7 +633,7 @@ fn sts_view<'a>(headers: &'a [(String, String)], host: &'a str) -> RequestView<'
         query: "",
         headers,
         host,
-        source: IpAddr::V4(Ipv4Addr::LOCALHOST),
+        source: ClientSource::Direct(IpAddr::V4(Ipv4Addr::LOCALHOST)),
         secure_transport: false,
     }
 }

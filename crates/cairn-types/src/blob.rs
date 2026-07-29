@@ -4,6 +4,7 @@
 use crate::bucket::CompressionPolicy;
 use crate::id::StoragePath;
 use crate::object::{ChecksumSet, ChecksumValue, CompressionDescriptor, ETag};
+use crate::secret::SecretKey32;
 use std::sync::Arc;
 
 /// Options controlling how an object is staged.
@@ -22,7 +23,7 @@ pub struct StageOptions {
     /// so ciphertext incompressibility never inflates a compressed block. `None` stores plaintext
     /// blocks as before; the field is additive and defaults to `None` so existing callers are
     /// unaffected (ARCH 27, SSE-S3).
-    pub encryption: Option<[u8; 32]>,
+    pub encryption: Option<SecretKey32>,
     /// The object's declared content length, when known up front (from the `Content-Length` header
     /// on a non-streaming PUT). `Some` lets the write path preallocate the staging file so the
     /// filesystem places it contiguously and an out-of-space condition surfaces immediately (ARCH
@@ -96,7 +97,7 @@ pub struct PartRef {
     /// The part's raw 32-byte DEK to *decrypt* it on read when it was staged encrypted (ARCH 27);
     /// `None` = a plaintext part (raw read). `assemble` decrypts through the CRNB reader before
     /// hashing + re-encoding under the object DEK.
-    pub dek: Option<[u8; 32]>,
+    pub dek: Option<SecretKey32>,
 }
 
 /// How to read a committed blob: either the blob is known-plaintext, or a raw 32-byte
@@ -108,13 +109,13 @@ pub struct PartRef {
 /// stream an encrypted container's raw ciphertext at exactly the plaintext length — the way
 /// replication and the integrity scrub once shipped ciphertext to mirrors (ARCH 27). Making
 /// the cipher a required, named argument makes that whole class of bug unrepresentable.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum BlobCipher {
     /// The blob was written in the clear. Opening an *encrypted* container this way fails
     /// closed — it errors, it never streams ciphertext (see [`crate::BlobStore::open_raw`]).
     KnownPlaintext,
     /// The blob is AES-256-GCM-encrypted at rest; these are the raw 32 key bytes that open it.
-    Dek([u8; 32]),
+    Dek(SecretKey32),
 }
 
 impl BlobCipher {
@@ -122,7 +123,7 @@ impl BlobCipher {
     /// `None` for an unencrypted version): `None` => [`Self::KnownPlaintext`], `Some(k)` =>
     /// [`Self::Dek`]. Keeps the call sites one line and the intent visible.
     #[must_use]
-    pub fn from_dek(dek: Option<[u8; 32]>) -> Self {
+    pub fn from_dek(dek: Option<SecretKey32>) -> Self {
         match dek {
             Some(k) => Self::Dek(k),
             None => Self::KnownPlaintext,
@@ -133,9 +134,9 @@ impl BlobCipher {
     /// translates the cipher back into the internal `Option<[u8; 32]>` at the exact point it
     /// once consumed the old `dek` argument, so the fail-closed logic below it is unchanged.
     #[must_use]
-    pub fn dek(&self) -> Option<[u8; 32]> {
+    pub fn dek(&self) -> Option<SecretKey32> {
         match self {
-            Self::Dek(k) => Some(*k),
+            Self::Dek(k) => Some(k.clone()),
             Self::KnownPlaintext => None,
         }
     }
@@ -265,12 +266,13 @@ pub struct ReconcileReport {
 #[cfg(test)]
 mod tests {
     use super::BlobCipher;
+    use crate::SecretKey32;
 
     #[test]
     fn blob_cipher_debug_never_prints_key_bytes() {
         // A DEK of a recognisable, non-repeating byte pattern: if any key byte leaked into the
         // Debug output, hex/decimal renderings of these values would appear.
-        let key = [0xABu8; 32];
+        let key = SecretKey32::new([0xABu8; 32]);
         let dbg = format!("{:?}", BlobCipher::Dek(key));
         assert_eq!(dbg, "Dek(<redacted>)");
         assert!(!dbg.contains("171"), "decimal key byte leaked: {dbg}");
@@ -291,10 +293,10 @@ mod tests {
             BlobCipher::from_dek(None),
             BlobCipher::KnownPlaintext
         ));
-        let k = [7u8; 32];
-        assert!(matches!(BlobCipher::from_dek(Some(k)), BlobCipher::Dek(d) if d == k));
+        let k = SecretKey32::new([7u8; 32]);
+        assert!(matches!(BlobCipher::from_dek(Some(k.clone())), BlobCipher::Dek(d) if d == k));
         // Round-trips back to the internal Option at the point an impl consumes it.
         assert_eq!(BlobCipher::KnownPlaintext.dek(), None);
-        assert_eq!(BlobCipher::Dek(k).dek(), Some(k));
+        assert_eq!(BlobCipher::Dek(k.clone()).dek(), Some(k));
     }
 }

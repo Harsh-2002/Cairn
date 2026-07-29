@@ -10,7 +10,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use cairn_import::{DestWriter, ImportError, SourceObject};
 use cairn_protocol::S3Request;
-use cairn_types::auth::{AuthMethod, Principal, Role};
+use cairn_types::auth::{AuthMethod, ClientSource, Principal, Role};
 use cairn_types::error::BodyError;
 use cairn_types::id::{BucketName, ObjectKey, UserId};
 use futures_util::StreamExt;
@@ -61,7 +61,7 @@ impl LocalDestWriter {
             query: Vec::new(),
             headers,
             principal: Some(self.principal.clone()),
-            source: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            source: ClientSource::Direct(IpAddr::V4(Ipv4Addr::LOCALHOST)),
             secure: true,
             request_id: format!("import-{}", cairn_types::id::VersionId::generate().as_str()),
         }

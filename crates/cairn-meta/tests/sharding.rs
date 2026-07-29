@@ -9,6 +9,9 @@ use cairn_types::traits::MetadataStore;
 use cairn_types::*;
 use std::sync::Arc;
 
+#[path = "common/object_lock_races.rs"]
+mod object_lock_races;
+
 fn bucket(name: &str) -> Mutation {
     Mutation::CreateBucket(Box::new(Bucket {
         name: BucketName::parse(name).unwrap(),
@@ -59,6 +62,7 @@ fn put(row: ObjectVersionRow) -> Mutation {
     Mutation::PutObjectVersion {
         row: Box::new(row),
         precondition: Precondition::default(),
+        initial_state: InitialObjectState::default(),
         replication: Vec::new(),
     }
 }
@@ -78,6 +82,13 @@ fn shards(
 const NAMES: &[&str] = &[
     "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf",
 ];
+
+#[tokio::test]
+async fn object_lock_races_remain_serialized_through_shard_routing() {
+    let (store, _) = shards(3);
+    let store: Arc<dyn MetadataStore> = Arc::new(store);
+    object_lock_races::assert_writer_lock_races(store, "sharded-lock-races").await;
+}
 
 #[tokio::test]
 async fn n1_is_a_faithful_passthrough() {
@@ -166,6 +177,133 @@ async fn n3_routes_each_bucket_to_its_owning_shard() {
 }
 
 #[tokio::test]
+async fn n3_share_for_nonzero_bucket_uses_global_hash_and_stable_id() {
+    let n = 3;
+    let (store, inner) = shards(n);
+    let name = *NAMES
+        .iter()
+        .find(|name| cairn_meta::shard_for_bucket(name, n) != 0)
+        .expect("fixture must include a bucket hashing off shard zero");
+    let owner = cairn_meta::shard_for_bucket(name, n);
+    assert_ne!(owner, 0);
+    store.submit(bucket(name)).await.unwrap();
+
+    let raw_token = "nonzero-shard-share-token-sentinel-029";
+    let token_hash = ShareLookupHash::for_token(raw_token);
+    let share = ShareRow {
+        id: "nonzero-share-id".to_owned(),
+        token_hash,
+        bucket: BucketName::parse(name).unwrap(),
+        key: ObjectKey::parse("private.txt").unwrap(),
+        version_id: None,
+        expires_at: None,
+        disposition: ShareDisposition::Inline,
+        filename: None,
+        created_by: UserId("admin".to_owned()),
+        created_at: Timestamp(10),
+        revoked_at: None,
+    };
+    store
+        .submit(Mutation::CreateShare(Box::new(share.clone())))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store.get_share_by_token_hash(&token_hash).await.unwrap(),
+        Some(share.clone())
+    );
+    assert_eq!(
+        store.get_share_by_id("nonzero-share-id").await.unwrap(),
+        Some(share.clone())
+    );
+    assert_eq!(
+        inner[0].get_share_by_id("nonzero-share-id").await.unwrap(),
+        Some(share),
+        "share registry is account-global on shard zero"
+    );
+    for shard in inner.iter().skip(1) {
+        assert!(
+            shard
+                .get_share_by_token_hash(&token_hash)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    store
+        .submit(Mutation::RevokeShare {
+            id: "nonzero-share-id".to_owned(),
+            now: Timestamp(20),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get_share_by_id("nonzero-share-id")
+            .await
+            .unwrap()
+            .unwrap()
+            .revoked_at,
+        Some(Timestamp(20))
+    );
+
+    // Keep a second capability live, then delete/recreate the nonzero-shard bucket. Global cleanup
+    // must remove both management and redemption indexes before the authoritative bucket delete,
+    // so neither a revoked nor a live pre-delete link can target new same-name object bytes.
+    let live_hash = ShareLookupHash::for_token("live-before-delete-sentinel-029");
+    store
+        .submit(Mutation::CreateShare(Box::new(ShareRow {
+            id: "live-before-delete".to_owned(),
+            token_hash: live_hash,
+            bucket: BucketName::parse(name).unwrap(),
+            key: ObjectKey::parse("private.txt").unwrap(),
+            version_id: None,
+            expires_at: None,
+            disposition: ShareDisposition::Inline,
+            filename: None,
+            created_by: UserId("admin".to_owned()),
+            created_at: Timestamp(11),
+            revoked_at: None,
+        })))
+        .await
+        .unwrap();
+    store
+        .submit(Mutation::DeleteBucket(BucketName::parse(name).unwrap()))
+        .await
+        .unwrap();
+    for id in ["nonzero-share-id", "live-before-delete"] {
+        assert!(store.get_share_by_id(id).await.unwrap().is_none());
+    }
+    for hash in [token_hash, live_hash] {
+        assert!(
+            store
+                .get_share_by_token_hash(&hash)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    store.submit(bucket(name)).await.unwrap();
+    assert!(
+        store
+            .get_share_by_token_hash(&live_hash)
+            .await
+            .unwrap()
+            .is_none(),
+        "same-name bucket recreation must not revive the old bearer"
+    );
+    assert!(
+        store
+            .get_share_by_id("live-before-delete")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn n3_multipart_rides_the_bucket_shard_via_encoded_id() {
     let n = 3;
     let (store, inner) = shards(n);
@@ -181,8 +319,11 @@ async fn n3_multipart_rides_the_bucket_shard_via_encoded_id() {
         content_type: "application/octet-stream".to_owned(),
         status: cairn_types::meta::MultipartStatus::Active,
         owner_id: UserId("owner".to_owned()),
+        initiated_by: UserId("owner".to_owned()),
         intended_acl: None,
         user_metadata: Vec::new(),
+        initial_tags: Vec::new(),
+        lock_intent: ExplicitObjectLockIntent::default(),
         sse_requested: false,
         encrypt_parts: false,
         sse_kms_requested: false,
@@ -192,7 +333,10 @@ async fn n3_multipart_rides_the_bucket_shard_via_encoded_id() {
         updated_at: Timestamp(1),
     };
     let outcome = store
-        .submit(Mutation::CreateMultipart(Box::new(session)))
+        .submit(Mutation::CreateMultipart {
+            session: Box::new(session),
+            limits: cairn_types::meta::MultipartLimits::default(),
+        })
         .await
         .unwrap();
     let upload_id = match outcome {
@@ -212,6 +356,34 @@ async fn n3_multipart_rides_the_bucket_shard_via_encoded_id() {
             "multipart session must be only on shard {owner}"
         );
     }
+
+    store
+        .submit(Mutation::ClaimMultipart(upload_id.clone()))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get_multipart(&upload_id)
+            .await
+            .unwrap()
+            .expect("claimed session")
+            .status,
+        cairn_types::meta::MultipartStatus::Completing
+    );
+    store
+        .submit(Mutation::RecoverMultipartClaims)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get_multipart(&upload_id)
+            .await
+            .unwrap()
+            .expect("recovered session")
+            .status,
+        cairn_types::meta::MultipartStatus::Active,
+        "the global recovery mutation must fan out to the upload's non-global shard"
+    );
 }
 
 // A pending replication outbox entry with the source shard encoded in its id, for the fairness test.

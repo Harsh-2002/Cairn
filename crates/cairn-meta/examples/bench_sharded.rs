@@ -9,7 +9,7 @@ use cairn_meta::{OpenOptions, ShardedMetadataStore, open};
 use cairn_types::authz::OwnershipMode;
 use cairn_types::bucket::{Bucket, VersioningState};
 use cairn_types::id::{BucketName, ObjectKey, UserId, VersionId};
-use cairn_types::meta::{Mutation, Precondition};
+use cairn_types::meta::{InitialObjectState, Mutation, Precondition};
 use cairn_types::object::{CompressionDescriptor, ETag, ObjectVersionRow, StorageClass};
 use cairn_types::time::Timestamp;
 use cairn_types::traits::MetadataStore;
@@ -97,6 +97,7 @@ async fn bench(shards: usize, buckets: usize, conc: usize, secs: f64) -> f64 {
                     .submit(Mutation::PutObjectVersion {
                         row: Box::new(row(&b, &k, i)),
                         precondition: Precondition::default(),
+                        initial_state: InitialObjectState::default(),
                         replication: Vec::new(),
                     })
                     .await

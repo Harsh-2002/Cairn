@@ -4,46 +4,69 @@
 //! group-commit machinery (mutations apply atomically under one lock).
 
 use crate::authz::PublicAccessBlock;
-use crate::bucket::{Bucket, ConfigAspect, ConfigDoc};
+use crate::bucket::{
+    Bucket, ConfigAspect, ConfigDoc, DefaultRetention, ObjectLockConfiguration, RetentionPeriod,
+    VersioningState,
+};
 use crate::error::MetaError;
 use crate::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
 use crate::meta::{
-    ActivityEntry, BucketCounts, BucketRequestCount, ClaimOutcome, IfNoneMatch, ImportJob,
-    ImportJobRecord, ImportState, LATENCY_BUCKETS, ListPage, ListQuery, MetricsRange,
-    MultipartSession, MultipartStatus, Mutation, MutationOutcome, ObjectSummary, OpCount,
-    OutboxEntry, PartRecord, Precondition, ReplicationCounts, ReplicationStatus,
-    ReplicationTargetCounts, RequestMetricsSeries, SessionCredentialRecord,
-    SessionCredentialSummary, ShareRow, StatusCount, StoreCounts, TagSummary, TaggedObject,
-    TimePoint, User, UserRecord, UserSessionCredentials, UserSigV4Credentials, UserWithBearerHash,
-    WebhookEntry, WebhookStatus, latency_quantile_ms,
+    ActivityEntry, BucketCounts, BucketRequestCount, ClaimOutcome, ClaimReleaseOutcome,
+    IfNoneMatch, ImportJob, ImportJobListQuery, ImportJobPage, ImportJobRecord, ImportState,
+    LATENCY_BUCKETS, ListPage, ListQuery, MAX_IMPORT_JOB_PRUNE_BATCH, MetricsRange,
+    MultipartCleanup, MultipartReservation, MultipartSession, MultipartStatus,
+    MultipartTerminalOutcome, Mutation, MutationOutcome, ObjectSummary, OpCount, OutboxEntry,
+    PartRecord, Precondition, ReplicationCounts, ReplicationStatus, ReplicationTargetCounts,
+    RequestMetricsSeries, SessionCredentialRecord, SessionCredentialSummary, ShareLookupHash,
+    ShareRow, StatusCount, StoreCounts, TagSummary, TaggedObject, TimePoint, User, UserRecord,
+    UserSessionCredentials, UserSigV4Credentials, UserWithBearerHash, WebhookEntry, WebhookStatus,
+    latency_quantile_ms,
 };
-use crate::object::{ETag, ObjectVersionRow};
+use crate::object::{
+    ETag, ExplicitObjectLockIntent, GovernanceBypass, ObjectLockMode, ObjectLockState,
+    ObjectRetention, ObjectVersionRow,
+};
 use crate::time::Timestamp;
 use crate::traits::{MetadataStore, ReconcileOracle};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 type VKey = (String, String, String); // (bucket, key, version_id)
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredObjectLockConfiguration {
+    enabled: bool,
+    default_retention: Option<StoredDefaultRetention>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredDefaultRetention {
+    mode: ObjectLockMode,
+    period: RetentionPeriod,
+}
 
 #[derive(Default)]
 struct State {
     buckets: BTreeMap<String, Bucket>,
-    /// Per-bucket byte quota (`buckets.quota_bytes`), absent when unlimited. The double does not
-    /// enforce the quota (that lives in the SQLite writer), but it records the configured value so
-    /// `get_bucket_quota` round-trips a `SetBucketQuota`.
-    ///
-    /// The per-user byte quota (`users.quota_bytes`, ARCH 27.5) is likewise enforced only in the
-    /// SQLite writer's commit transaction; like the bucket quota it is not enforced here, and —
-    /// having no `SetUserQuota` mutation or reader on `MetadataStore` — there is nothing for the
-    /// double to round-trip, so no user-quota state is modeled.
+    /// Per-bucket byte quota (`buckets.quota_bytes`), absent when unlimited. Multipart reservations
+    /// enforce this together with the committed logical bytes, mirroring the SQL writer.
     bucket_quotas: HashMap<String, u64>,
     config: HashMap<(String, ConfigAspect), ConfigDoc>,
     account_bpa: PublicAccessBlock,
     versions: BTreeMap<VKey, ObjectVersionRow>,
     tags: HashMap<VKey, Vec<(String, String)>>,
-    locks: HashMap<VKey, crate::object::ObjectLockState>,
+    locks: HashMap<VKey, ObjectLockState>,
+    /// Test-only representation of a structurally corrupt side row. The SQL backends can contain
+    /// partial/unknown legacy rows; the typed double needs an explicit marker to exercise the same
+    /// fail-closed read and mutation behavior.
+    invalid_lock_rows: HashSet<VKey>,
     multipart: BTreeMap<String, MultipartSession>,
     parts: BTreeMap<(String, u16), PartRecord>,
+    multipart_reservations: BTreeMap<String, MultipartReservation>,
+    multipart_cleanups: BTreeMap<String, MultipartCleanup>,
     outbox: Vec<OutboxEntry>,
     webhook_outbox: Vec<WebhookEntry>,
     users: BTreeMap<String, UserRecord>,
@@ -53,8 +76,10 @@ struct State {
     /// shared `UserRecord` type.
     user_policies: BTreeMap<String, String>,
     activity: Vec<ActivityEntry>,
-    /// Object-share tokens (ARCH 15.8), keyed by token.
+    /// Object shares (ARCH 15.8), keyed by stable management id.
     shares: BTreeMap<String, ShareRow>,
+    /// Secondary redemption index from the fixed-width token hash to the stable id.
+    share_ids_by_hash: BTreeMap<ShareLookupHash, String>,
     /// Request-metrics rollup (ARCH 26.5), keyed by (ts_bucket, operation, bucket, status_class).
     request_metrics: BTreeMap<(i64, String, String, String), MetricCell>,
     /// S3 import jobs (ARCH 27), keyed by job id.
@@ -72,6 +97,186 @@ struct MetricCell {
 }
 
 impl State {
+    fn version_key(row: &ObjectVersionRow) -> VKey {
+        (
+            row.bucket.as_str().to_owned(),
+            row.key.as_str().to_owned(),
+            row.version_id.as_str().to_owned(),
+        )
+    }
+
+    fn strict_object_lock_configuration(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<Option<ObjectLockConfiguration>, MetaError> {
+        let Some(doc) = self
+            .config
+            .get(&(bucket.as_str().to_owned(), ConfigAspect::ObjectLock))
+        else {
+            return Ok(None);
+        };
+        if self
+            .buckets
+            .get(bucket.as_str())
+            .is_none_or(|stored| stored.versioning != VersioningState::Enabled)
+        {
+            return Err(MetaError::InvalidBucketState);
+        }
+        let stored: StoredObjectLockConfiguration =
+            serde_json::from_str(&doc.0).map_err(|_| MetaError::InvalidObjectLockState)?;
+        if !stored.enabled {
+            return Err(MetaError::InvalidObjectLockState);
+        }
+        let default_retention = stored.default_retention.map(|default| DefaultRetention {
+            mode: default.mode,
+            period: default.period,
+        });
+        if let Some(default) = default_retention {
+            default
+                .validate()
+                .map_err(|_| MetaError::InvalidObjectLockState)?;
+        }
+        Ok(Some(ObjectLockConfiguration {
+            enabled: true,
+            default_retention,
+        }))
+    }
+
+    fn strict_lock_state(&self, key: &VKey) -> Result<ObjectLockState, MetaError> {
+        if self.invalid_lock_rows.contains(key) {
+            return Err(MetaError::InvalidObjectLockState);
+        }
+        Ok(self.locks.get(key).copied().unwrap_or_default())
+    }
+
+    fn validate_explicit_lock_intent(
+        &self,
+        bucket: &BucketName,
+        intent: ExplicitObjectLockIntent,
+        now: Timestamp,
+        resolve_default: bool,
+    ) -> Result<ObjectLockState, MetaError> {
+        let config = self.strict_object_lock_configuration(bucket)?;
+        let has_explicit_intent = intent.retention.is_some() || intent.legal_hold.is_some();
+        if has_explicit_intent && config.is_none() {
+            return Err(MetaError::InvalidBucketState);
+        }
+        if intent
+            .retention
+            .is_some_and(|retention| retention.retain_until <= now)
+        {
+            return Err(MetaError::InvalidObjectLockState);
+        }
+        let retention = match (intent.retention, resolve_default) {
+            (Some(retention), _) => Some(retention),
+            (None, true) => config
+                .and_then(|config| config.default_retention)
+                .map(|default| {
+                    default
+                        .retain_until(now)
+                        .map(|retain_until| ObjectRetention {
+                            mode: default.mode,
+                            retain_until,
+                        })
+                        .map_err(|_| MetaError::InvalidObjectLockState)
+                })
+                .transpose()?,
+            (None, false) => None,
+        };
+        Ok(ObjectLockState {
+            retention,
+            legal_hold: intent.legal_hold.unwrap_or(false),
+        })
+    }
+
+    fn validate_initial_state(
+        &self,
+        row: &ObjectVersionRow,
+        initial: &crate::meta::InitialObjectState,
+    ) -> Result<ObjectLockState, MetaError> {
+        // A malformed/disabled Object Lock row fails every object creation closed, including a
+        // delete marker. The strict read must happen even when no explicit intent was supplied.
+        let _ = self.strict_object_lock_configuration(&row.bucket)?;
+        if row.is_delete_marker {
+            return Ok(ObjectLockState::default());
+        }
+        self.validate_explicit_lock_intent(&row.bucket, initial.lock_intent, row.created_at, true)
+    }
+
+    fn ensure_version_replacement_unprotected(
+        &self,
+        row: &ObjectVersionRow,
+    ) -> Result<(), MetaError> {
+        let key = Self::version_key(row);
+        let lock = self.strict_lock_state(&key)?;
+        if self.versions.contains_key(&key) && lock.is_protected(row.created_at) {
+            return Err(MetaError::ObjectProtected);
+        }
+        Ok(())
+    }
+
+    fn replace_initial_state(
+        &mut self,
+        key: VKey,
+        tags: Vec<(String, String)>,
+        lock: ObjectLockState,
+    ) {
+        if tags.is_empty() {
+            self.tags.remove(&key);
+        } else {
+            self.tags.insert(key.clone(), tags);
+        }
+        self.replace_lock_state(key, lock);
+    }
+
+    fn replace_lock_state(&mut self, key: VKey, lock: ObjectLockState) {
+        self.invalid_lock_rows.remove(&key);
+        if lock == ObjectLockState::default() {
+            self.locks.remove(&key);
+        } else {
+            self.locks.insert(key, lock);
+        }
+    }
+
+    fn retention_change_is_weakening(
+        current: ObjectRetention,
+        replacement: Option<ObjectRetention>,
+    ) -> bool {
+        let Some(replacement) = replacement else {
+            return true;
+        };
+        replacement.retain_until < current.retain_until
+            || (current.mode == ObjectLockMode::Compliance
+                && replacement.mode != ObjectLockMode::Compliance)
+    }
+
+    fn validate_outbox_inserts(&self, entries: &[OutboxEntry]) -> Result<(), MetaError> {
+        let mut ids = HashSet::with_capacity(entries.len());
+        for entry in entries {
+            if self.outbox.iter().any(|existing| existing.id == entry.id)
+                || !ids.insert(entry.id.as_str())
+            {
+                // Object commits use plain INSERT (unlike the explicitly idempotent
+                // EnqueueReplication mutation), so a duplicate id is a late savepoint conflict in
+                // both SQL engines. Pre-validating under this double's one atomic mutex produces
+                // the same all-or-nothing observable result.
+                return Err(MetaError::Conflict);
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_initial_tags(tags: &[(String, String)]) -> Result<(), MetaError> {
+        let mut keys = HashSet::with_capacity(tags.len());
+        if tags.iter().all(|(key, _)| keys.insert(key.as_str())) {
+            Ok(())
+        } else {
+            // The SQL table's version/tag-key primary key rejects this after the object upsert;
+            // the enclosing savepoint then rolls the complete object commit back.
+            Err(MetaError::Conflict)
+        }
+    }
+
     fn latest(&self, bucket: &str, key: &str) -> Option<&ObjectVersionRow> {
         self.versions
             .values()
@@ -155,12 +360,114 @@ impl State {
         self.versions.insert(vk, row);
         superseded
     }
+
+    fn multipart_staged_for_bucket(&self, bucket: &str) -> u64 {
+        let part_bytes: u64 = self
+            .parts
+            .iter()
+            .filter_map(|((upload, _), part)| {
+                self.multipart
+                    .get(upload)
+                    .filter(|session| session.bucket.as_str() == bucket)
+                    .map(|_| part.size)
+            })
+            .sum();
+        let reservation_bytes: u64 = self
+            .multipart_reservations
+            .values()
+            .filter_map(|reservation| {
+                self.multipart
+                    .get(reservation.upload_id.as_str())
+                    .filter(|session| session.bucket.as_str() == bucket)
+                    .map(|_| reservation.reserved_bytes)
+            })
+            .sum();
+        let cleanup_bytes: u64 = self
+            .multipart_cleanups
+            .values()
+            .filter(|cleanup| cleanup.bucket.as_str() == bucket)
+            .map(|cleanup| cleanup.bytes)
+            .sum();
+        part_bytes
+            .saturating_add(reservation_bytes)
+            .saturating_add(cleanup_bytes)
+    }
+
+    fn multipart_staged_for_principal(&self, principal: &str) -> u64 {
+        let part_bytes: u64 = self
+            .parts
+            .iter()
+            .filter_map(|((upload, _), part)| {
+                self.multipart
+                    .get(upload)
+                    .filter(|session| session.initiated_by.0 == principal)
+                    .map(|_| part.size)
+            })
+            .sum();
+        let reservation_bytes: u64 = self
+            .multipart_reservations
+            .values()
+            .filter_map(|reservation| {
+                self.multipart
+                    .get(reservation.upload_id.as_str())
+                    .filter(|session| session.initiated_by.0 == principal)
+                    .map(|_| reservation.reserved_bytes)
+            })
+            .sum();
+        let cleanup_bytes: u64 = self
+            .multipart_cleanups
+            .values()
+            .filter(|cleanup| cleanup.principal_id.0 == principal)
+            .map(|cleanup| cleanup.bytes)
+            .sum();
+        part_bytes
+            .saturating_add(reservation_bytes)
+            .saturating_add(cleanup_bytes)
+    }
+
+    fn retire_multipart(&mut self, upload_id: &UploadId) -> Result<(), MetaError> {
+        let session = self
+            .multipart
+            .get(upload_id.as_str())
+            .cloned()
+            .ok_or(MetaError::MultipartNotActive)?;
+        let part_bytes: u64 = self
+            .parts
+            .iter()
+            .filter(|((upload, _), _)| upload == upload_id.as_str())
+            .map(|(_, part)| part.size)
+            .sum();
+        let reservation_bytes: u64 = self
+            .multipart_reservations
+            .values()
+            .filter(|reservation| reservation.upload_id == *upload_id)
+            .map(|reservation| reservation.reserved_bytes)
+            .sum();
+        let bytes = part_bytes.saturating_add(reservation_bytes);
+        let cleanup = MultipartCleanup {
+            id: format!("session:{}", upload_id.as_str()),
+            upload_id: upload_id.clone(),
+            bucket: session.bucket,
+            principal_id: session.initiated_by,
+            bytes,
+            storage_path: None,
+            created_at: session.updated_at,
+        };
+        self.multipart_cleanups.insert(cleanup.id.clone(), cleanup);
+        self.multipart.remove(upload_id.as_str());
+        self.parts
+            .retain(|(upload, _), _| upload != upload_id.as_str());
+        self.multipart_reservations
+            .retain(|_, reservation| reservation.upload_id != *upload_id);
+        Ok(())
+    }
 }
 
 /// An in-memory metadata store.
 #[derive(Default)]
 pub struct InMemoryMetadataStore {
     state: Mutex<State>,
+    fail_user_policy_reads: AtomicBool,
 }
 
 impl std::fmt::Debug for InMemoryMetadataStore {
@@ -177,10 +484,47 @@ impl InMemoryMetadataStore {
         Self::default()
     }
 
+    /// Mark one Object Lock side row structurally corrupt.
+    ///
+    /// The in-memory representation is otherwise fully typed, while real databases may contain a
+    /// legacy partial/unknown-mode row. Tests use this seam to require reads and writer mutations to
+    /// fail closed exactly like the SQL backends.
+    pub fn corrupt_object_lock_row(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version: &VersionId,
+    ) {
+        self.state.lock().unwrap().invalid_lock_rows.insert((
+            bucket.as_str().to_owned(),
+            key.as_str().to_owned(),
+            version.as_str().to_owned(),
+        ));
+    }
+
+    /// Install a raw Object Lock configuration document, bypassing the normal writer guard.
+    ///
+    /// This models a legacy/corrupt database row so fail-closed and specialized-repair behavior can
+    /// be tested without weakening [`Mutation::SetBucketConfig`].
+    pub fn install_raw_object_lock_configuration(&self, bucket: &BucketName, document: String) {
+        self.state.lock().unwrap().config.insert(
+            (bucket.as_str().to_owned(), ConfigAspect::ObjectLock),
+            ConfigDoc(document),
+        );
+    }
+
+    /// Make only [`MetadataStore::get_user_policy`] return an engine error. This narrow fault
+    /// injection seam lets authentication/STS tests prove that a credential lookup may succeed
+    /// while the subsequent identity-policy read fails, without making the whole metadata double
+    /// unavailable.
+    pub fn set_fail_user_policy_reads(&self, fail: bool) {
+        self.fail_user_policy_reads.store(fail, Ordering::Release);
+    }
+
     /// Snapshot the set of live storage paths and upload sessions, for building a
     /// [`SetReconcileOracle`].
     #[must_use]
-    pub fn live_set(&self) -> (HashSet<String>, HashSet<String>) {
+    pub fn live_set(&self) -> (HashSet<String>, HashSet<String>, HashSet<String>) {
         let st = self.state.lock().unwrap();
         let paths = st
             .versions
@@ -188,16 +532,22 @@ impl InMemoryMetadataStore {
             .filter_map(|r| r.storage_path.as_ref().map(|p| p.as_str().to_owned()))
             .collect();
         let uploads = st.multipart.keys().cloned().collect();
-        (paths, uploads)
+        let multipart_paths = st
+            .parts
+            .values()
+            .map(|part| part.storage_path.as_str().to_owned())
+            .collect();
+        (paths, uploads, multipart_paths)
     }
 
     /// Build an oracle reflecting the current live set.
     #[must_use]
     pub fn oracle(&self) -> SetReconcileOracle {
-        let (paths, uploads) = self.live_set();
+        let (paths, uploads, multipart_paths) = self.live_set();
         SetReconcileOracle {
             live_paths: paths,
             live_uploads: uploads,
+            live_multipart_paths: multipart_paths,
         }
     }
 }
@@ -394,11 +744,24 @@ impl MetadataStore for InMemoryMetadataStore {
             Mutation::PutObjectVersion {
                 row,
                 precondition,
+                initial_state,
                 replication,
             } => {
                 st.check_precondition(row.bucket.as_str(), row.key.as_str(), &precondition)?;
+                let _ = st.strict_object_lock_configuration(&row.bucket)?;
+                st.ensure_version_replacement_unprotected(&row)?;
+                let lock = st.validate_initial_state(&row, &initial_state)?;
                 let version_id = row.version_id.clone();
+                let version_key = State::version_key(&row);
+                let tags = if row.is_delete_marker {
+                    Vec::new()
+                } else {
+                    initial_state.tags
+                };
+                State::validate_initial_tags(&tags)?;
+                st.validate_outbox_inserts(&replication)?;
                 let superseded = st.upsert_version(*row);
+                st.replace_initial_state(version_key, tags, lock);
                 for entry in replication {
                     st.outbox.push(entry);
                 }
@@ -413,9 +776,9 @@ impl MetadataStore for InMemoryMetadataStore {
                 version_id,
                 owner_id,
                 now,
+                bypass,
                 replication,
             } => {
-                st.demote_all(bucket.as_str(), key.as_str());
                 let row = ObjectVersionRow {
                     id: uuid_like(&version_id),
                     bucket: bucket.clone(),
@@ -446,22 +809,36 @@ impl MetadataStore for InMemoryMetadataStore {
                     created_at: now,
                     updated_at: now,
                 };
-                let vk = (
-                    bucket.as_str().to_owned(),
-                    key.as_str().to_owned(),
-                    version_id.as_str().to_owned(),
-                );
-                st.versions.insert(vk, row);
+                // Presence of a malformed/disabled lock configuration is itself fatal. A generated
+                // marker receives neither tags nor default retention.
+                let _ = st.strict_object_lock_configuration(&bucket)?;
+                let vk = State::version_key(&row);
+                let current_lock = st.strict_lock_state(&vk)?;
+                if st.versions.contains_key(&vk)
+                    && (current_lock.legal_hold
+                        || current_lock.retention.is_some_and(|retention| {
+                            retention.retain_until > now
+                                && (retention.mode == ObjectLockMode::Compliance
+                                    || bypass != GovernanceBypass::Authorized)
+                        }))
+                {
+                    return Ok(MutationOutcome::DeleteProtected);
+                }
+                st.validate_outbox_inserts(&replication)?;
+                let freed = st.upsert_version(row);
+                st.replace_initial_state(vk, Vec::new(), ObjectLockState::default());
                 for entry in replication {
                     st.outbox.push(entry);
                 }
-                Ok(MutationOutcome::DeleteMarker { version_id })
+                Ok(MutationOutcome::DeleteMarker { version_id, freed })
             }
             Mutation::DeleteVersion {
                 bucket,
                 key,
                 version_id,
                 expected_updated_at,
+                now,
+                bypass,
             } => {
                 let vk = (
                     bucket.as_str().to_owned(),
@@ -478,9 +855,27 @@ impl MetadataStore for InMemoryMetadataStore {
                         });
                     }
                 }
+                if !st.versions.contains_key(&vk) {
+                    return Ok(MutationOutcome::Deleted {
+                        freed: None,
+                        promoted_latest: false,
+                    });
+                }
+                let _ = st.strict_object_lock_configuration(&bucket)?;
+                let lock = st.strict_lock_state(&vk)?;
+                let protected = lock.legal_hold
+                    || lock.retention.is_some_and(|retention| {
+                        retention.retain_until > now
+                            && (retention.mode == ObjectLockMode::Compliance
+                                || bypass != GovernanceBypass::Authorized)
+                    });
+                if protected {
+                    return Ok(MutationOutcome::DeleteProtected);
+                }
                 let removed = st.versions.remove(&vk);
                 st.tags.remove(&vk);
                 st.locks.remove(&vk);
+                st.invalid_lock_rows.remove(&vk);
                 let freed = removed.as_ref().and_then(|r| r.storage_path.clone());
                 let was_latest = removed.as_ref().is_some_and(|r| r.is_latest);
                 let mut promoted = false;
@@ -502,16 +897,219 @@ impl MetadataStore for InMemoryMetadataStore {
                     promoted_latest: promoted,
                 })
             }
-            Mutation::CreateMultipart(session) => {
+            Mutation::CreateMultipart { session, limits } => {
+                st.validate_explicit_lock_intent(
+                    &session.bucket,
+                    session.lock_intent,
+                    session.created_at,
+                    false,
+                )?;
+                let bucket_active = st
+                    .multipart
+                    .values()
+                    .filter(|existing| existing.bucket == session.bucket)
+                    .count() as u32;
+                let principal_active = st
+                    .multipart
+                    .values()
+                    .filter(|existing| existing.initiated_by == session.initiated_by)
+                    .count() as u32;
+                if bucket_active >= limits.max_active_uploads_per_bucket
+                    || principal_active >= limits.max_active_uploads_per_principal
+                {
+                    return Err(MetaError::QuotaExceeded);
+                }
                 let id = session.upload_id.clone();
                 st.multipart.insert(id.as_str().to_owned(), *session);
                 Ok(MutationOutcome::MultipartCreated(id))
             }
-            Mutation::RecordPart { upload_id, part } => {
+            Mutation::ReserveMultipartPart {
+                upload_id,
+                part_number,
+                attempt_id,
+                reserved_bytes,
+                max_parts_per_upload,
+                now,
+            } => {
+                let session = st
+                    .multipart
+                    .get(upload_id.as_str())
+                    .filter(|session| session.status == MultipartStatus::Active)
+                    .cloned()
+                    .ok_or(MetaError::MultipartNotActive)?;
+                if let Some(existing) = st.multipart_reservations.get(&attempt_id) {
+                    if existing.upload_id == upload_id
+                        && existing.part_number == part_number
+                        && existing.reserved_bytes == reserved_bytes
+                    {
+                        return Ok(MutationOutcome::MultipartReserved);
+                    }
+                    return Err(MetaError::QuotaExceeded);
+                }
+                if st.multipart_reservations.values().any(|reservation| {
+                    reservation.upload_id == upload_id && reservation.part_number == part_number
+                }) {
+                    return Err(MetaError::QuotaExceeded);
+                }
+                let mut part_numbers: HashSet<u16> = st
+                    .parts
+                    .keys()
+                    .filter(|(upload, _)| upload == upload_id.as_str())
+                    .map(|(_, number)| *number)
+                    .collect();
+                part_numbers.extend(
+                    st.multipart_reservations
+                        .values()
+                        .filter(|reservation| reservation.upload_id == upload_id)
+                        .map(|reservation| reservation.part_number),
+                );
+                if !part_numbers.contains(&part_number)
+                    && part_numbers.len() >= usize::from(max_parts_per_upload)
+                {
+                    return Err(MetaError::QuotaExceeded);
+                }
+
+                if let Some(quota) = st.bucket_quotas.get(session.bucket.as_str()) {
+                    let committed: u64 = st
+                        .versions
+                        .values()
+                        .filter(|version| version.bucket == session.bucket)
+                        .map(|version| version.size_logical)
+                        .sum();
+                    if committed
+                        .saturating_add(st.multipart_staged_for_bucket(session.bucket.as_str()))
+                        .saturating_add(reserved_bytes)
+                        > *quota
+                    {
+                        return Err(MetaError::QuotaExceeded);
+                    }
+                }
+                if let Some(quota) = st
+                    .users
+                    .get(&session.initiated_by.0)
+                    .and_then(|record| record.user.quota_bytes)
+                {
+                    let committed: u64 = st
+                        .versions
+                        .values()
+                        .filter(|version| version.owner_id == session.initiated_by)
+                        .map(|version| version.size_logical)
+                        .sum();
+                    if committed
+                        .saturating_add(st.multipart_staged_for_principal(&session.initiated_by.0))
+                        .saturating_add(reserved_bytes)
+                        > quota
+                    {
+                        return Err(MetaError::QuotaExceeded);
+                    }
+                }
+                if let Some(active) = st.multipart.get_mut(upload_id.as_str()) {
+                    active.updated_at = now;
+                }
+                st.multipart_reservations.insert(
+                    attempt_id.clone(),
+                    MultipartReservation {
+                        attempt_id,
+                        upload_id,
+                        part_number,
+                        reserved_bytes,
+                        created_at: now,
+                    },
+                );
+                Ok(MutationOutcome::MultipartReserved)
+            }
+            Mutation::ReleaseMultipartReservation {
+                upload_id,
+                attempt_id,
+            } => {
+                if st
+                    .multipart_reservations
+                    .get(&attempt_id)
+                    .is_some_and(|reservation| reservation.upload_id == upload_id)
+                {
+                    st.multipart_reservations.remove(&attempt_id);
+                }
+                Ok(MutationOutcome::Ack)
+            }
+            Mutation::RecordPart {
+                upload_id,
+                attempt_id,
+                part,
+            } => {
+                let session = st
+                    .multipart
+                    .get(upload_id.as_str())
+                    .filter(|session| session.status == MultipartStatus::Active)
+                    .cloned()
+                    .ok_or(MetaError::MultipartNotActive)?;
+                let reservation = st
+                    .multipart_reservations
+                    .get(&attempt_id)
+                    .filter(|reservation| reservation.upload_id == upload_id)
+                    .cloned()
+                    .ok_or(MetaError::MultipartNotActive)?;
+                if reservation.part_number != part.part_number
+                    || reservation.reserved_bytes != part.size
+                {
+                    return Err(MetaError::QuotaExceeded);
+                }
                 let pk = (upload_id.as_str().to_owned(), part.part_number);
-                let superseded = st.parts.get(&pk).map(|p| p.storage_path.clone());
+                let cleanup = st.parts.get(&pk).map(|previous| MultipartCleanup {
+                    id: format!("part:{attempt_id}"),
+                    upload_id: upload_id.clone(),
+                    bucket: session.bucket.clone(),
+                    principal_id: session.initiated_by.clone(),
+                    bytes: previous.size,
+                    storage_path: Some(previous.storage_path.clone()),
+                    created_at: reservation.created_at,
+                });
+                if let Some(cleanup) = &cleanup {
+                    st.multipart_cleanups
+                        .insert(cleanup.id.clone(), cleanup.clone());
+                }
                 st.parts.insert(pk, part);
-                Ok(MutationOutcome::PartRecorded { superseded })
+                st.multipart_reservations.remove(&attempt_id);
+                Ok(MutationOutcome::PartRecorded { cleanup })
+            }
+            Mutation::ReleaseMultipartCleanup { cleanup_id } => {
+                st.multipart_cleanups.remove(&cleanup_id);
+                Ok(MutationOutcome::Ack)
+            }
+            Mutation::ReleaseMultipartUploadCleanups { upload_id } => {
+                st.multipart_cleanups
+                    .retain(|_, cleanup| cleanup.upload_id != upload_id);
+                Ok(MutationOutcome::Ack)
+            }
+            Mutation::RecoverMultipartStagingAccounting { limit } => {
+                let limit = limit.clamp(1, 1_000) as usize;
+                let mut reservations: Vec<_> =
+                    st.multipart_reservations.values().cloned().collect();
+                reservations.sort_by(|a, b| {
+                    a.created_at
+                        .cmp(&b.created_at)
+                        .then_with(|| a.attempt_id.cmp(&b.attempt_id))
+                });
+                let mut released = 0u64;
+                for reservation in reservations.into_iter().take(limit) {
+                    st.multipart_reservations.remove(&reservation.attempt_id);
+                    released += 1;
+                }
+                if released < limit as u64 {
+                    let mut cleanups: Vec<_> = st.multipart_cleanups.values().cloned().collect();
+                    cleanups.sort_by(|a, b| {
+                        a.created_at
+                            .cmp(&b.created_at)
+                            .then_with(|| a.id.cmp(&b.id))
+                    });
+                    for cleanup in cleanups
+                        .into_iter()
+                        .take(limit.saturating_sub(released as usize))
+                    {
+                        st.multipart_cleanups.remove(&cleanup.id);
+                        released += 1;
+                    }
+                }
+                Ok(MutationOutcome::MultipartAccountingReleased(released))
             }
             Mutation::ClaimMultipart(upload_id) => {
                 let outcome = match st.multipart.get_mut(upload_id.as_str()) {
@@ -524,35 +1122,114 @@ impl MetadataStore for InMemoryMetadataStore {
                 };
                 Ok(MutationOutcome::MultipartClaim(outcome))
             }
+            Mutation::ReleaseMultipartClaim(upload_id) => {
+                let outcome = match st.multipart.get_mut(upload_id.as_str()) {
+                    Some(s) if s.status == MultipartStatus::Completing => {
+                        s.status = MultipartStatus::Active;
+                        ClaimReleaseOutcome::Released
+                    }
+                    Some(_) | None => ClaimReleaseOutcome::NotOwner,
+                };
+                Ok(MutationOutcome::MultipartClaimRelease(outcome))
+            }
+            Mutation::RecoverMultipartClaims => {
+                for session in st.multipart.values_mut() {
+                    if session.status == MultipartStatus::Completing {
+                        session.status = MultipartStatus::Active;
+                    }
+                }
+                Ok(MutationOutcome::Ack)
+            }
             Mutation::CompleteMultipart {
                 upload_id,
                 row,
                 precondition,
                 replication,
             } => {
+                if !matches!(
+                    st.multipart.get(upload_id.as_str()),
+                    Some(s)
+                        if s.status == MultipartStatus::Completing
+                            && s.bucket == row.bucket
+                            && s.key == row.key
+                ) {
+                    return Ok(MutationOutcome::MultipartTerminal(
+                        MultipartTerminalOutcome::NotOwner,
+                    ));
+                }
+                let session = st
+                    .multipart
+                    .get(upload_id.as_str())
+                    .cloned()
+                    .ok_or(MetaError::MultipartNotActive)?;
+                let initial_state = crate::meta::InitialObjectState {
+                    tags: session.initial_tags,
+                    lock_intent: session.lock_intent,
+                };
                 st.check_precondition(row.bucket.as_str(), row.key.as_str(), &precondition)?;
+                let _ = st.strict_object_lock_configuration(&row.bucket)?;
+                st.ensure_version_replacement_unprotected(&row)?;
+                let lock = st.validate_initial_state(&row, &initial_state)?;
                 let version_id = row.version_id.clone();
+                let version_key = State::version_key(&row);
+                let tags = if row.is_delete_marker {
+                    Vec::new()
+                } else {
+                    initial_state.tags
+                };
+                State::validate_initial_tags(&tags)?;
+                st.validate_outbox_inserts(&replication)?;
                 let superseded = st.upsert_version(*row);
-                st.multipart.remove(upload_id.as_str());
-                st.parts.retain(|(u, _), _| u != upload_id.as_str());
+                st.replace_initial_state(version_key, tags, lock);
+                st.retire_multipart(&upload_id)?;
                 for entry in replication {
                     st.outbox.push(entry);
                 }
-                Ok(MutationOutcome::MultipartCompleted {
-                    superseded,
-                    version_id,
-                })
+                Ok(MutationOutcome::MultipartTerminal(
+                    MultipartTerminalOutcome::Completed {
+                        superseded,
+                        version_id,
+                    },
+                ))
             }
             Mutation::AbortMultipart(upload_id) => {
-                st.multipart.remove(upload_id.as_str());
-                st.parts.retain(|(u, _), _| u != upload_id.as_str());
-                Ok(MutationOutcome::Ack)
+                let active = matches!(
+                    st.multipart.get(upload_id.as_str()),
+                    Some(s) if s.status == MultipartStatus::Active
+                );
+                let outcome = if active {
+                    st.retire_multipart(&upload_id)?;
+                    MultipartTerminalOutcome::Aborted
+                } else {
+                    MultipartTerminalOutcome::NotOwner
+                };
+                Ok(MutationOutcome::MultipartTerminal(outcome))
             }
             Mutation::CreateBucket(bucket) => {
                 if st.buckets.contains_key(bucket.name.as_str()) {
                     return Err(MetaError::Conflict);
                 }
                 st.buckets.insert(bucket.name.as_str().to_owned(), *bucket);
+                Ok(MutationOutcome::Ack)
+            }
+            Mutation::CreateObjectLockBucket(bucket) => {
+                if bucket.versioning != VersioningState::Enabled {
+                    return Err(MetaError::InvalidBucketState);
+                }
+                if st.buckets.contains_key(bucket.name.as_str()) {
+                    return Err(MetaError::Conflict);
+                }
+                let name = bucket.name.as_str().to_owned();
+                let config = ObjectLockConfiguration {
+                    enabled: true,
+                    default_retention: None,
+                };
+                let doc = ConfigDoc(
+                    serde_json::to_string(&config)
+                        .map_err(|error| MetaError::Engine(error.to_string()))?,
+                );
+                st.buckets.insert(name.clone(), *bucket);
+                st.config.insert((name, ConfigAspect::ObjectLock), doc);
                 Ok(MutationOutcome::Ack)
             }
             Mutation::DeleteBucket(name) => {
@@ -576,6 +1253,13 @@ impl MetadataStore for InMemoryMetadataStore {
                 st.bucket_quotas.remove(name.as_str());
                 st.request_metrics
                     .retain(|(_, _, bucket, _), _| bucket.as_str() != name.as_str());
+                st.shares
+                    .retain(|_, share| share.bucket.as_str() != name.as_str());
+                let retained_share_ids: HashSet<String> = st.shares.keys().cloned().collect();
+                st.share_ids_by_hash
+                    .retain(|_, id| retained_share_ids.contains(id));
+                st.config
+                    .retain(|(bucket, _), _| bucket.as_str() != name.as_str());
                 Ok(MutationOutcome::Ack)
             }
             Mutation::SetBucketConfig {
@@ -583,6 +1267,9 @@ impl MetadataStore for InMemoryMetadataStore {
                 aspect,
                 doc,
             } => {
+                if aspect == ConfigAspect::ObjectLock {
+                    return Err(MetaError::InvalidBucketState);
+                }
                 let k = (bucket.as_str().to_owned(), aspect);
                 match doc {
                     Some(d) => {
@@ -594,18 +1281,75 @@ impl MetadataStore for InMemoryMetadataStore {
                 }
                 Ok(MutationOutcome::Ack)
             }
+            Mutation::UpdateObjectLockConfiguration {
+                bucket,
+                default_retention,
+            } => {
+                if let Some(default) = default_retention {
+                    default
+                        .validate()
+                        .map_err(|_| MetaError::InvalidObjectLockState)?;
+                }
+                let key = (bucket.as_str().to_owned(), ConfigAspect::ObjectLock);
+                if !st.config.contains_key(&key)
+                    || st
+                        .buckets
+                        .get(bucket.as_str())
+                        .is_none_or(|stored| stored.versioning != VersioningState::Enabled)
+                {
+                    return Err(MetaError::InvalidBucketState);
+                }
+                let config = ObjectLockConfiguration {
+                    enabled: true,
+                    default_retention,
+                };
+                st.config.insert(
+                    key,
+                    ConfigDoc(
+                        serde_json::to_string(&config)
+                            .map_err(|error| MetaError::Engine(error.to_string()))?,
+                    ),
+                );
+                Ok(MutationOutcome::Ack)
+            }
             Mutation::SetObjectRetention {
                 bucket,
                 key,
                 version_id,
                 retention,
+                now,
+                bypass,
             } => {
                 let vk = (
                     bucket.as_str().to_owned(),
                     key.as_str().to_owned(),
                     version_id.as_str().to_owned(),
                 );
-                st.locks.entry(vk).or_default().retention = retention;
+                if !st.versions.contains_key(&vk) {
+                    return Err(MetaError::ObjectVersionNotFound);
+                }
+                if st.strict_object_lock_configuration(&bucket)?.is_none() {
+                    return Err(MetaError::InvalidBucketState);
+                }
+                if retention.is_some_and(|candidate| candidate.retain_until <= now) {
+                    return Err(MetaError::InvalidObjectLockState);
+                }
+                let mut state = st.strict_lock_state(&vk)?;
+                if let Some(current) = state.retention.filter(|current| current.retain_until > now)
+                {
+                    let weakening = State::retention_change_is_weakening(current, retention);
+                    if current.mode == ObjectLockMode::Compliance && weakening {
+                        return Err(MetaError::ObjectProtected);
+                    }
+                    if current.mode == ObjectLockMode::Governance
+                        && weakening
+                        && bypass != GovernanceBypass::Authorized
+                    {
+                        return Err(MetaError::ObjectProtected);
+                    }
+                }
+                state.retention = retention;
+                st.replace_lock_state(vk, state);
                 Ok(MutationOutcome::Ack)
             }
             Mutation::SetObjectLegalHold {
@@ -619,10 +1363,25 @@ impl MetadataStore for InMemoryMetadataStore {
                     key.as_str().to_owned(),
                     version_id.as_str().to_owned(),
                 );
-                st.locks.entry(vk).or_default().legal_hold = on;
+                if !st.versions.contains_key(&vk) {
+                    return Err(MetaError::ObjectVersionNotFound);
+                }
+                if st.strict_object_lock_configuration(&bucket)?.is_none() {
+                    return Err(MetaError::InvalidBucketState);
+                }
+                let mut state = st.strict_lock_state(&vk)?;
+                state.legal_hold = on;
+                st.replace_lock_state(vk, state);
                 Ok(MutationOutcome::Ack)
             }
             Mutation::SetVersioning { bucket, state } => {
+                if state != VersioningState::Enabled
+                    && st
+                        .config
+                        .contains_key(&(bucket.as_str().to_owned(), ConfigAspect::ObjectLock))
+                {
+                    return Err(MetaError::InvalidBucketState);
+                }
                 if let Some(b) = st.buckets.get_mut(bucket.as_str()) {
                     b.versioning = state;
                 }
@@ -664,12 +1423,12 @@ impl MetadataStore for InMemoryMetadataStore {
                 Ok(MutationOutcome::Ack)
             }
             Mutation::SetUserQuota {
-                user_id: _,
-                quota_bytes: _,
+                user_id,
+                quota_bytes,
             } => {
-                // User-quota enforcement lives in the SQLite writer's commit transaction (like the
-                // bucket quota); the double neither enforces nor — absent a user-quota reader on the
-                // trait — round-trips it, so this is an accepted no-op.
+                if let Some(record) = st.users.get_mut(&user_id.0) {
+                    record.user.quota_bytes = quota_bytes;
+                }
                 Ok(MutationOutcome::Ack)
             }
             Mutation::RetryFailedReplication { bucket, now } => {
@@ -934,14 +1693,24 @@ impl MetadataStore for InMemoryMetadataStore {
                 }
                 Ok(MutationOutcome::Ack)
             }
-            Mutation::PruneImportJobs { before_ms } => {
-                st.import_jobs.retain(|_, j| {
-                    !(matches!(
-                        j.state,
-                        ImportState::Completed | ImportState::Failed | ImportState::Cancelled
-                    ) && j.updated_at.0 < before_ms)
-                });
-                Ok(MutationOutcome::Ack)
+            Mutation::PruneImportJobs { before_ms, limit } => {
+                let limit = limit.clamp(1, MAX_IMPORT_JOB_PRUNE_BATCH) as usize;
+                let ids: Vec<String> = st
+                    .import_jobs
+                    .iter()
+                    .filter(|(_, job)| {
+                        matches!(
+                            job.state,
+                            ImportState::Completed | ImportState::Failed | ImportState::Cancelled
+                        ) && job.updated_at.0 < before_ms
+                    })
+                    .take(limit)
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                for id in &ids {
+                    st.import_jobs.remove(id);
+                }
+                Ok(MutationOutcome::ImportJobsPruned(ids.len() as u64))
             }
             Mutation::DeleteExpiredSessionCredentials { before } => {
                 st.session_creds.retain(|_, r| r.expires_at >= before);
@@ -1172,11 +1941,18 @@ impl MetadataStore for InMemoryMetadataStore {
                 Ok(MutationOutcome::Ack)
             }
             Mutation::CreateShare(s) => {
-                st.shares.insert(s.token.clone(), *s);
+                if st.shares.contains_key(&s.id) || st.share_ids_by_hash.contains_key(&s.token_hash)
+                {
+                    return Err(MetaError::Conflict);
+                }
+                let id = s.id.clone();
+                let token_hash = s.token_hash;
+                st.shares.insert(id.clone(), *s);
+                st.share_ids_by_hash.insert(token_hash, id);
                 Ok(MutationOutcome::Ack)
             }
-            Mutation::RevokeShare { token, now } => {
-                if let Some(s) = st.shares.get_mut(&token) {
+            Mutation::RevokeShare { id, now } => {
+                if let Some(s) = st.shares.get_mut(&id) {
                     if s.revoked_at.is_none() {
                         s.revoked_at = Some(now);
                     }
@@ -1207,6 +1983,17 @@ impl MetadataStore for InMemoryMetadataStore {
                 Ok(MutationOutcome::Ack)
             }
         }
+    }
+
+    async fn read_probe(&self) -> Result<(), MetaError> {
+        // Mirror a real read-pool checkout by acquiring the double's source-of-truth lock. Do not
+        // inspect any collection: readiness cost must be independent of the number of rows.
+        drop(
+            self.state
+                .lock()
+                .map_err(|e| MetaError::Engine(e.to_string()))?,
+        );
+        Ok(())
     }
 
     async fn get_bucket(&self, name: &BucketName) -> Result<Option<Bucket>, MetaError> {
@@ -1384,20 +2171,13 @@ impl MetadataStore for InMemoryMetadataStore {
         bucket: &BucketName,
         key: &ObjectKey,
         version: &VersionId,
-    ) -> Result<crate::object::ObjectLockState, MetaError> {
+    ) -> Result<ObjectLockState, MetaError> {
         let vk = (
             bucket.as_str().to_owned(),
             key.as_str().to_owned(),
             version.as_str().to_owned(),
         );
-        Ok(self
-            .state
-            .lock()
-            .unwrap()
-            .locks
-            .get(&vk)
-            .copied()
-            .unwrap_or_default())
+        self.state.lock().unwrap().strict_lock_state(&vk)
     }
 
     async fn get_multipart(
@@ -1506,13 +2286,59 @@ impl MetadataStore for InMemoryMetadataStore {
         batch: u32,
     ) -> Result<Vec<MultipartSession>, MetaError> {
         let st = self.state.lock().unwrap();
-        Ok(st
+        let mut sessions: Vec<_> = st
             .multipart
             .values()
-            .filter(|s| s.updated_at < older_than)
-            .take(batch as usize)
+            .filter(|session| {
+                session.status == MultipartStatus::Active && session.updated_at < older_than
+            })
             .cloned()
-            .collect())
+            .collect();
+        sessions.sort_by(|a, b| {
+            a.updated_at
+                .cmp(&b.updated_at)
+                .then_with(|| a.upload_id.as_str().cmp(b.upload_id.as_str()))
+        });
+        sessions.truncate(batch.clamp(1, 1_000) as usize);
+        Ok(sessions)
+    }
+
+    async fn enumerate_stale_multipart_reservations(
+        &self,
+        older_than: Timestamp,
+        batch: u32,
+    ) -> Result<Vec<MultipartReservation>, MetaError> {
+        let st = self.state.lock().unwrap();
+        let mut reservations: Vec<_> = st
+            .multipart_reservations
+            .values()
+            .filter(|reservation| reservation.created_at < older_than)
+            .cloned()
+            .collect();
+        reservations.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.attempt_id.cmp(&b.attempt_id))
+        });
+        reservations.truncate(batch.clamp(1, 1_000) as usize);
+        Ok(reservations)
+    }
+
+    async fn list_multipart_cleanups(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<MultipartCleanup>, MetaError> {
+        let st = self.state.lock().unwrap();
+        let mut cleanups: Vec<_> = st.multipart_cleanups.values().cloned().collect();
+        cleanups.sort_by(|a, b| {
+            a.storage_path
+                .is_none()
+                .cmp(&b.storage_path.is_none())
+                .then_with(|| a.created_at.cmp(&b.created_at))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        cleanups.truncate(limit.clamp(1, 1_000) as usize);
+        Ok(cleanups)
     }
 
     async fn object_replication_status(
@@ -1821,6 +2647,11 @@ impl MetadataStore for InMemoryMetadataStore {
     }
 
     async fn get_user_policy(&self, user_id: &UserId) -> Result<Option<String>, MetaError> {
+        if self.fail_user_policy_reads.load(Ordering::Acquire) {
+            return Err(MetaError::Engine(
+                "injected identity-policy read failure".to_owned(),
+            ));
+        }
         Ok(self
             .state
             .lock()
@@ -1830,16 +2661,48 @@ impl MetadataStore for InMemoryMetadataStore {
             .cloned())
     }
 
-    async fn list_import_jobs(&self) -> Result<Vec<ImportJob>, MetaError> {
+    async fn list_import_jobs(
+        &self,
+        query: &ImportJobListQuery,
+    ) -> Result<ImportJobPage, MetaError> {
         let st = self.state.lock().unwrap();
-        let mut jobs: Vec<ImportJob> = st
+        let fetch = query.bounded_limit() as usize + 1;
+        // Keep only the best `limit + 1` references while scanning. The double is already
+        // memory-backed, but its listing must not allocate another history-sized vector.
+        let mut selected: Vec<&ImportJobRecord> = Vec::with_capacity(fetch);
+        for job in st.import_jobs.values() {
+            if query.cursor.as_ref().is_some_and(|cursor| {
+                job.created_at > cursor.created_at
+                    || (job.created_at == cursor.created_at && job.id >= cursor.id)
+            }) {
+                continue;
+            }
+            let pos = selected.partition_point(|other| {
+                other.created_at > job.created_at
+                    || (other.created_at == job.created_at && other.id > job.id)
+            });
+            if pos < fetch {
+                selected.insert(pos, job);
+                if selected.len() > fetch {
+                    selected.pop();
+                }
+            }
+        }
+        let jobs = selected
+            .into_iter()
+            .map(ImportJobRecord::to_summary)
+            .collect();
+        Ok(ImportJobPage::from_overfetch(jobs, query.bounded_limit()))
+    }
+
+    async fn next_import_job_id(&self, state: ImportState) -> Result<Option<String>, MetaError> {
+        let st = self.state.lock().unwrap();
+        Ok(st
             .import_jobs
             .values()
-            .map(ImportJobRecord::to_view)
-            .collect();
-        // Newest first (by creation), matching the SQL stores' `ORDER BY created_at DESC`.
-        jobs.sort_by_key(|j| std::cmp::Reverse(j.created_at.0));
-        Ok(jobs)
+            .filter(|job| job.state == state)
+            .min_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)))
+            .map(|job| job.id.clone()))
     }
 
     async fn get_import_job(&self, id: &str) -> Result<Option<ImportJob>, MetaError> {
@@ -1867,9 +2730,21 @@ impl MetadataStore for InMemoryMetadataStore {
             .collect())
     }
 
-    async fn get_share(&self, token: &str) -> Result<Option<ShareRow>, MetaError> {
+    async fn get_share_by_id(&self, id: &str) -> Result<Option<ShareRow>, MetaError> {
         let st = self.state.lock().unwrap();
-        Ok(st.shares.get(token).cloned())
+        Ok(st.shares.get(id).cloned())
+    }
+
+    async fn get_share_by_token_hash(
+        &self,
+        token_hash: &ShareLookupHash,
+    ) -> Result<Option<ShareRow>, MetaError> {
+        let st = self.state.lock().unwrap();
+        Ok(st
+            .share_ids_by_hash
+            .get(token_hash)
+            .and_then(|id| st.shares.get(id))
+            .cloned())
     }
 
     async fn list_shares(
@@ -2147,6 +3022,8 @@ pub struct SetReconcileOracle {
     pub live_paths: HashSet<String>,
     /// Upload sessions that still exist.
     pub live_uploads: HashSet<String>,
+    /// Multipart part paths a committed part row references.
+    pub live_multipart_paths: HashSet<String>,
 }
 
 #[async_trait::async_trait]
@@ -2160,6 +3037,16 @@ impl ReconcileOracle for SetReconcileOracle {
 
     async fn live_session(&self, upload: &UploadId) -> Result<bool, MetaError> {
         Ok(self.live_uploads.contains(upload.as_str()))
+    }
+
+    async fn live_multipart_parts(
+        &self,
+        candidates: &[StoragePath],
+    ) -> Result<Vec<bool>, MetaError> {
+        Ok(candidates
+            .iter()
+            .map(|path| self.live_multipart_paths.contains(path.as_str()))
+            .collect())
     }
 }
 
@@ -2245,6 +3132,7 @@ mod tests {
                 .submit(Mutation::PutObjectVersion {
                     row: Box::new(list_row(&bucket, k)),
                     precondition: Precondition::default(),
+                    initial_state: crate::meta::InitialObjectState::default(),
                     replication: Vec::new(),
                 })
                 .await
@@ -2315,6 +3203,7 @@ mod tests {
                 .submit(Mutation::PutObjectVersion {
                     row: Box::new(list_row(&bucket, k)),
                     precondition: Precondition::default(),
+                    initial_state: crate::meta::InitialObjectState::default(),
                     replication: Vec::new(),
                 })
                 .await

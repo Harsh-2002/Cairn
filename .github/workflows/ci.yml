@@ -2,9 +2,10 @@ name: CI
 
 # Runs the complete test methodology exactly once per commit — via `pull_request` for a branch under
 # review, via `push` for `main` (see the trigger note below): formatting + lint, unit/integration
-# tests (gnu + musl, default and all-features), doc tests, the boto3 S3 conformance suite, the
-# crash-consistency (durability) harness, a two-node replication soak, the warp-based stress harness,
-# fuzz smoke tests, a benchmark compile check, and coverage. Release artifacts are built by
+# tests (gnu + musl, default and all-features), doc tests, installer shell regressions, the boto3 S3
+# conformance suite, the crash-consistency (durability) harness, a two-node replication soak, the
+# warp-based stress harness, fuzz smoke tests, a benchmark compile check, and coverage. Release
+# artifacts are built by
 # release.yml, not here.
 #
 # Build-once: the `build` job compiles the `cairn` binary a single time and uploads it as a
@@ -46,19 +47,30 @@ permissions:
   contents: read
 
 jobs:
+  # Runs before any package installer and encodes the release trust boundary: immutable actions,
+  # tools and images; exact job permissions; checksum/provenance handoffs before publication.
+  release-policy:
+    name: release workflow trust-boundary policy
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - run: python3 tests/release_policy.py
+
   # Compile the plain debug `cairn` binary ONCE and publish it as a temporary artifact. Every
   # conformance job below that only drives a prebuilt binary downloads this instead of recompiling.
   build:
     name: build cairn (shared binary)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - uses: ./.github/actions/setup   # builds web/dist (embedded into the binary) + toolchain + cache
       - run: cargo build --bin cairn
       # Conformance asserts behaviour, not Rust-level state, so it does not need debug symbols.
       # Stripping shrinks the artifact from ~260 MB to ~25 MB — far faster to upload once + download many.
       - run: strip target/debug/cairn
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: cairn-bin
           path: target/debug/cairn
@@ -67,17 +79,18 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
-  # Lint the console (ESLint flat config: typescript-eslint + react-hooks + jsx-a11y). Node-only, so
-  # it does not pull the Rust toolchain — it runs alongside `fmt + clippy` as the front-end gate,
-  # complementing the strict `tsc -b` type-check that the shared setup action already runs.
+  # Lint the console (ESLint flat config: typescript-eslint + react-hooks + jsx-a11y-x) and audit
+  # both the shipped production tree and the full build/lint tree. Node-only, so it does not pull
+  # the Rust toolchain — it runs alongside `fmt + clippy` as the front-end gate, complementing the
+  # strict `tsc -b` type-check that the shared setup action already runs.
   web-lint:
-    name: web lint (ESLint)
-    runs-on: ubuntu-latest
+    name: web lint + dependency audit
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
-          node-version: "22"
+          node-version: "22.23.2"
           cache: npm
           cache-dependency-path: web/package-lock.json
       - name: Install + lint the console
@@ -85,12 +98,39 @@ jobs:
         run: |
           npm ci
           npm run lint
+          npm audit --omit=dev --audit-level=moderate
+          npm audit --audit-level=high
+
+  rust-audit:
+    name: RustSec dependency audit
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Install pinned cargo-audit
+        env:
+          AUDIT_URL: https://github.com/rustsec/rustsec/releases/download/cargo-audit/v0.22.2/cargo-audit-x86_64-unknown-linux-musl-v0.22.2.tgz
+          AUDIT_SHA256: 7fb9497f8594b389e5fce5ef9b92db08432996895b2e0c5a0167a69ed445c428
+        run: |
+          set -euo pipefail
+          archive="${RUNNER_TEMP}/cargo-audit-v0.22.2.tgz"
+          curl --proto '=https' --tlsv1.2 -fsSL -o "$archive" "$AUDIT_URL"
+          printf '%s  %s\n' "$AUDIT_SHA256" "$archive" | sha256sum -c -
+          tar -xzf "$archive" -C "$RUNNER_TEMP"
+      - run: '"${RUNNER_TEMP}/cargo-audit-x86_64-unknown-linux-musl-v0.22.2/cargo-audit" audit'
+
+  installer:
+    name: installer lint + generation regressions
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - run: shellcheck -s sh install.sh tests/install.sh
+      - run: sh tests/install.sh
 
   lint:
     name: fmt + clippy
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - uses: ./.github/actions/setup
         with:
           components: rustfmt, clippy
@@ -100,7 +140,7 @@ jobs:
 
   test:
     name: test (${{ matrix.target }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -108,39 +148,47 @@ jobs:
           - x86_64-unknown-linux-gnu
           - x86_64-unknown-linux-musl
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - name: Install musl tools
         if: endsWith(matrix.target, 'musl')
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools=1.2.4-2
       - uses: ./.github/actions/setup
         with:
           targets: ${{ matrix.target }}
-      - uses: taiki-e/install-action@nextest
+      - uses: taiki-e/install-action@065d6a08a14e61e89fb0a4c10eecdbdef39c7d8e
+        with:
+          tool: cargo-nextest@0.9.140
+          checksum: true
+          fallback: none
       # The libSQL/Turso backends (cairn-meta-async) bundle C deps that are not static-musl-safe
       # (they SIGSEGV under a fully static musl link). They are optional, glibc-only backends and are
       # NOT part of the default static musl binary (which links only rusqlite), so exclude them from
       # the musl run; the gnu and all-features jobs exercise them on glibc.
       - name: Test
         run: |
-          EXTRA=""
+          EXTRA=()
           case "${{ matrix.target }}" in
-            *musl) EXTRA="--exclude cairn-meta-async" ;;
+            *musl) EXTRA=(--exclude cairn-meta-async) ;;
           esac
-          cargo nextest run --workspace $EXTRA --target ${{ matrix.target }}
-          cargo test --workspace $EXTRA --doc
+          cargo nextest run --workspace "${EXTRA[@]}" --target ${{ matrix.target }}
+          cargo test --workspace "${EXTRA[@]}" --doc
 
   test-all-features:
     name: test (all features)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - name: Free disk space
-        uses: jlumbroso/free-disk-space@v1.3.1
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be
         with:
           tool-cache: false
           large-packages: false
       - uses: ./.github/actions/setup
-      - uses: taiki-e/install-action@nextest
+      - uses: taiki-e/install-action@065d6a08a14e61e89fb0a4c10eecdbdef39c7d8e
+        with:
+          tool: cargo-nextest@0.9.140
+          checksum: true
+          fallback: none
       # Exercises the optional backends (libSQL + Turso) and the fast-io (io_uring + kTLS) paths.
       - run: cargo nextest run --workspace --all-features
 
@@ -149,126 +197,126 @@ jobs:
   conformance:
     name: boto3 conformance
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: cairn-bin
           path: target/debug
       - run: chmod +x target/debug/cairn
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
-          python-version: "3.x"
-      - run: pip install boto3
+          python-version: "3.13.14"
+      - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
       - name: Drive Cairn with the AWS SDK (real SigV4 + aws-chunked streaming, the F-5 path)
         run: BIN=target/debug/cairn PY=python3 bash conformance/run.sh
 
   routing:
     name: routing fall-through guard
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: cairn-bin
           path: target/debug
       - run: chmod +x target/debug/cairn
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
-          python-version: "3.x"
-      - run: pip install boto3
+          python-version: "3.13.14"
+      - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
       - name: An unparseable bucket/key must never re-route to the bucket or root handler
         run: BIN=target/debug/cairn PY=python3 bash conformance/routing.sh
 
   listing:
     name: listing / pagination / versioning semantics
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: cairn-bin
           path: target/debug
       - run: chmod +x target/debug/cairn
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
-          python-version: "3.x"
-      - run: pip install boto3
+          python-version: "3.13.14"
+      - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
       - name: Delimiter/CommonPrefixes, real token-fed pagination loops, delete markers + undelete
         run: BIN=target/debug/cairn PY=python3 bash conformance/listing.sh
 
   multipart:
     name: multipart session-state error codes
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: cairn-bin
           path: target/debug
       - run: chmod +x target/debug/cairn
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
-          python-version: "3.x"
-      - run: pip install boto3
+          python-version: "3.13.14"
+      - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
       - name: Low-level create/upload-part/complete — exact NoSuchUpload/InvalidPart/InvalidPartOrder/EntityTooSmall, and a terminating ListMultipartUploads loop
         run: BIN=target/debug/cairn PY=python3 bash conformance/multipart.sh
 
   objects:
     name: object payload / headers / range
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: cairn-bin
           path: target/debug
       - run: chmod +x target/debug/cairn
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
-          python-version: "3.x"
-      - run: pip install boto3
+          python-version: "3.13.14"
+      - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
       - name: System headers + aws-chunked normalization, copy directives, exact 206/416 ranges, encoded keys, DeleteObjects
         run: BIN=target/debug/cairn PY=python3 bash conformance/objects.sh
 
   buckets:
     name: bucket surface + config subresources
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: cairn-bin
           path: target/debug
       - run: chmod +x target/debug/cairn
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
-          python-version: "3.x"
-      - run: pip install boto3
+          python-version: "3.13.14"
+      - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
       - name: Name validation, DeleteBucket 204/409/404, every subresource PUT->GET->DELETE (bucket survives), real CORS preflight
         run: BIN=target/debug/cairn PY=python3 bash conformance/buckets.sh
 
   authz:
     name: tenant isolation + SigV4 / presigned / anonymous auth
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: cairn-bin
           path: target/debug
       - run: chmod +x target/debug/cairn
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
-          python-version: "3.x"
-      - run: pip install boto3
+          python-version: "3.13.14"
+      - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
       # Mints a second, non-admin identity via `POST /api/v1/users`, so this harness turns the
       # management listener ON itself (UIPORT) — unlike the pure data-plane harnesses above.
       - name: Cross-tenant AccessDenied (before NoSuchKey), SigV4 failure modes, presigned expiry, Block Public Access
@@ -277,170 +325,170 @@ jobs:
   lifecycle:
     name: lifecycle scanner enforcement
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: cairn-bin
           path: target/debug
       - run: chmod +x target/debug/cairn
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
-          python-version: "3.x"
-      - run: pip install boto3
+          python-version: "3.13.14"
+      - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
       - name: Prove the scanner ACTS — expires only matching keys, stays in its bucket, ignores Disabled, delete-marker on versioned
         run: BIN=target/debug/cairn PY=python3 bash conformance/lifecycle.sh
 
   checksums:
     name: modern-SDK flexible checksums
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: cairn-bin
           path: target/debug
       - run: chmod +x target/debug/cairn
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
-          python-version: "3.x"
+          python-version: "3.13.14"
       # botocore[crt] lets boto3 emit CRC32C + CRC64NVME so the harness exercises every algorithm.
-      - run: pip install 'boto3' 'botocore[crt]'
+      - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
       - name: Assert checksums are computed, stored, and echoed on PUT/GET/HEAD (ARCH 21.1)
         run: BIN=target/debug/cairn PY=python3 bash conformance/checksums.sh
 
   encryption:
     name: real-SDK SSE object-body conformance
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: cairn-bin
           path: target/debug
       - run: chmod +x target/debug/cairn
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
-          python-version: "3.x"
-      - run: pip install boto3
+          python-version: "3.13.14"
+      - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
       - name: Assert SSE-S3/aws:kms/at-rest/mandatory/multipart wire contract + on-disk ciphertext + fail-closed (ARCH 27)
         run: BIN=target/debug/cairn PY=python3 bash conformance/encryption.sh
 
   scrub:
     name: integrity scrub (bit-rot detection)
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: cairn-bin
           path: target/debug
       - run: chmod +x target/debug/cairn
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
-          python-version: "3.x"
-      - run: pip install boto3
+          python-version: "3.13.14"
+      - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
       - name: Corrupt a blob (plaintext / at-rest / SSE-S3 / compressed); assert the scrub detects each
         run: BIN=target/debug/cairn PY=python3 bash conformance/scrub.sh
 
   object-lock:
     name: object lock / WORM
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: cairn-bin
           path: target/debug
       - run: chmod +x target/debug/cairn
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
-          python-version: "3.x"
-      - run: pip install boto3
+          python-version: "3.13.14"
+      - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
       - name: COMPLIANCE/GOVERNANCE retention + legal hold enforced via the AWS SDK
         run: BIN=target/debug/cairn PY=python3 bash conformance/object_lock.sh
 
   notifications:
     name: webhook event notifications
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: cairn-bin
           path: target/debug
       - run: chmod +x target/debug/cairn
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
-          python-version: "3.x"
-      - run: pip install boto3
+          python-version: "3.13.14"
+      - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
       - name: Event-notification delivery + HMAC signing (management web console listener on)
         run: BIN=target/debug/cairn PY=python3 bash conformance/notifications.sh
 
   sts:
     name: STS temporary credentials
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: cairn-bin
           path: target/debug
       - run: chmod +x target/debug/cairn
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
-          python-version: "3.x"
-      - run: pip install boto3
+          python-version: "3.13.14"
+      - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
       - name: Mint + enforce scoped session credentials over a real SDK (management web console listener on)
         run: BIN=target/debug/cairn PY=python3 bash conformance/sts.sh
 
   sts-xml:
     name: STS XML wire surface (AssumeRole + GetSessionToken)
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: cairn-bin
           path: target/debug
       - run: chmod +x target/debug/cairn
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
-          python-version: "3.x"
-      - run: pip install boto3
+          python-version: "3.13.14"
+      - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
       - name: A real SDK STS client mints + consumes creds via the AWS-STS XML form POST
         run: BIN=target/debug/cairn PY=python3 bash conformance/sts_xml.sh
 
   console-session:
     name: console session-cookie auth
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: cairn-bin
           path: target/debug
       - run: chmod +x target/debug/cairn
-      # Pure curl (no SDK): the httpOnly cookie flow is plain HTTP. Management web console listener on.
-      - name: httpOnly session-cookie auth + S3 data-plane port isolation (management web console listener on)
+      # Pure curl (no SDK): control-only cookie + browser-shaped presign/CORS transfer.
+      - name: Disjoint listeners + httpOnly cookie + origin-bound console S3 transfer
         run: BIN=target/debug/cairn bash conformance/console_session.sh
 
   error-pages:
     name: browser error-page negotiation (ARCH 25.1.1)
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: cairn-bin
           path: target/debug
@@ -454,10 +502,10 @@ jobs:
   backup-restore:
     name: backup / restore / integrity e2e
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: cairn-bin
           path: target/debug
@@ -468,14 +516,14 @@ jobs:
 
   fast-io-conformance:
     name: fast-io sendfile conformance + keep-alive engagement
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - uses: ./.github/actions/setup
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
-          python-version: "3.x"
-      - run: pip install boto3
+          python-version: "3.13.14"
+      - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
       # The fast path is a build-time feature (off by default), so this job needs its own binary and
       # cannot reuse the shared artifact. Build the experimental zero-copy GET fast path and prove the
       # full S3 lifecycle is correct through it with the fast path maximally engaged (FASTIO_MIN_BYTES=0)...
@@ -490,11 +538,11 @@ jobs:
   mesh:
     name: 5-node full-mesh replication
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: cairn-bin
           path: target/debug
@@ -508,27 +556,27 @@ jobs:
   rotation:
     name: master-key rotation e2e (#29)
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: cairn-bin
           path: target/debug
       - run: chmod +x target/debug/cairn
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
-          python-version: "3.x"
+          python-version: "3.13.14"
       - name: Add a key, re-wrap stored secrets onto it, retire the old key (sharded); assert the fail-closed retire-gate
         run: BIN=target/debug/cairn PY=python3 bash conformance/rotation.sh
 
   share:
     name: object sharing e2e
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: cairn-bin
           path: target/debug
@@ -539,25 +587,25 @@ jobs:
   concurrency:
     name: concurrency contention (single-key races)
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: cairn-bin
           path: target/debug
       - run: chmod +x target/debug/cairn
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
-          python-version: "3.x"
+          python-version: "3.13.14"
       - name: Race N clients on one key (create / CAS / last-writer); assert atomic, no corruption
         run: BIN=target/debug/cairn PY=python3 N=32 bash conformance/concurrency.sh
 
   crash-consistency:
     name: crash consistency (F-4)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - uses: ./.github/actions/setup
       # Self-builds `cairn --features failpoints` (the durability fault seams) — a different binary
       # from the shared artifact, so this job keeps its own compile (warmed by the shared cache).
@@ -566,14 +614,14 @@ jobs:
 
   crash-multipoint:
     name: durability multi-point crash
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - uses: ./.github/actions/setup
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
-          python-version: "3.x"
+          python-version: "3.13.14"
       # Self-builds `cairn --features failpoints` (see crash_multipoint.sh) — keeps its own compile.
       - name: Crash at every blob-commit seam (PutObject + multipart); assert reconcile reclaims each orphan
         run: BIN=target/debug/cairn PY=python3 bash conformance/crash_multipoint.sh
@@ -581,49 +629,49 @@ jobs:
   soak:
     name: replication soak (multi-host)
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: cairn-bin
           path: target/debug
       - run: chmod +x target/debug/cairn
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
-          python-version: "3.x"
-      - run: pip install boto3
+          python-version: "3.13.14"
+      - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
       - name: Two-node replication soak — sustained PUTs, byte-identical verify, RSS leak check
         run: BIN=target/debug/cairn PY=python3 DURATION=90 bash conformance/soak.sh
 
   replication-chaos:
     name: replication chaos (fault injection)
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: cairn-bin
           path: target/debug
       - run: chmod +x target/debug/cairn
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
-          python-version: "3.x"
-      - run: pip install boto3
+          python-version: "3.13.14"
+      - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
       - name: Break replication on purpose (target down, source SIGKILL, rapid overwrite); assert no data loss
         run: BIN=target/debug/cairn PY=python3 bash conformance/replication_chaos.sh
 
   stress:
     name: stress + stability (throughput, escalation, leak)
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: cairn-bin
           path: target/debug
@@ -639,20 +687,20 @@ jobs:
   stress-encrypted:
     name: encrypted-path stress (A/B plaintext vs at-rest)
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: cairn-bin
           path: target/debug
       - run: chmod +x target/debug/cairn
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
-          python-version: "3.x"
+          python-version: "3.13.14"
       # boto3 drives the explicit-SSE correctness arm (warp cannot send SSE headers).
-      - run: pip install boto3
+      - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
       # The same warp profile twice on one box: leg A plaintext, leg B CAIRN_ENCRYPT_AT_REST=true, so
       # every committed blob is a VERSION_ENCRYPTED CRNB container. Encrypted objects are disqualified
       # from BOTH GET fast paths (sendfile zero-copy, small-object inline read), so the read phases
@@ -666,20 +714,20 @@ jobs:
   stress-multipart:
     name: concurrent multipart stress (barrier Complete, fail-closed, races)
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: cairn-bin
           path: target/debug
       - run: chmod +x target/debug/cairn
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
-          python-version: "3.x"
+          python-version: "3.13.14"
       # boto3 IS this harness (low-level multipart + threads); a box without it must go red, not green.
-      - run: pip install boto3
+      - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
       # The concurrent multipart write path: N SSE-KMS CompleteMultipartUpload calls released from one
       # barrier (each assemble holds a blob-write permit across a serial decrypt-then-re-encrypt pass
       # over every part) while a steady single-part PUT stream shares the same 64-permit pool; one
@@ -695,21 +743,21 @@ jobs:
   stress-adversarial:
     name: adversarial limits under load (chunked decoder, quota, pagination, STS, bulk delete)
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: cairn-bin
           path: target/debug
       - run: chmod +x target/debug/cairn
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
-          python-version: "3.x"
+          python-version: "3.13.14"
       # boto3 is half this harness (the malformed-framing scenario is raw sockets + hand-rolled
       # SigV4, but every verification path is boto3); a box without it must go red, not green.
-      - run: pip install boto3
+      - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
       # The REJECTION paths, driven CONCURRENTLY for the first time — everything else probes a limit
       # serially. (1) The aws-chunked streaming decoder (the F-5 ingest component): one barrier
       # releases valid signed/unsigned streaming uploads together with deliberately malformed ones
@@ -730,21 +778,21 @@ jobs:
   stress-replication:
     name: replication under sustained load (two nodes, two master keys)
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: cairn-bin
           path: target/debug
       - run: chmod +x target/debug/cairn
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
-          python-version: "3.x"
+          python-version: "3.13.14"
       # boto3 IS this harness (SSE, versioning, low-level multipart, delete markers, byte-exact
       # verification); a box without it must go red, not green-with-no-coverage.
-      - run: pip install boto3
+      - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
       # TWO nodes with DIFFERENT master keys, wired source -> target through the operator-trusted
       # CAIRN_REPLICATION_ENDPOINT config path (SSRF-guard-exempt, so unlike `mesh` this needs no
       # CAIRN_ALLOW_INTERNAL_ENDPOINTS). The target runs CAIRN_ENCRYPT_AT_REST=true. A fixed-size
@@ -768,21 +816,21 @@ jobs:
   soak-features:
     name: mixed-feature soak (constant load, leak shape)
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: cairn-bin
           path: target/debug
       - run: chmod +x target/debug/cairn
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
-          python-version: "3.x"
+          python-version: "3.13.14"
       # boto3 IS this harness (SSE, versioning, low-level multipart, object lock, STS); a box without
       # it must go red, not green-with-no-coverage.
-      - run: pip install boto3
+      - run: python -m pip install --require-hashes -r .github/requirements/conformance.txt
       # The features RUNNING TOGETHER under a CONSTANT load: SSE-S3/SSE-KMS churn, a versioned bucket
       # accumulating per-version DEKs + delete markers + version deletes, composite-checksum multipart
       # completed AND aborted (plus abandoned sessions for the sweeper), an object-lock bucket whose
@@ -800,37 +848,39 @@ jobs:
   blob-limits:
     name: blob store limits (out-of-space, huge, many)
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: cairn-bin
           path: target/debug
       - run: chmod +x target/debug/cairn
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
-          python-version: "3.x"
+          python-version: "3.13.14"
       - name: Out-of-space 507 on a constrained FS, huge-object round-trip, many objects paginated
         run: BIN=target/debug/cairn PY=python3 bash conformance/blob_limits.sh
 
   fuzz-smoke:
     name: fuzz smoke (decoder, xml, policy, compress, ids)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: nightly-2026-07-28
       # Build cargo-fuzz with the default (stable) toolchain from rust-toolchain.toml — its deps
-      # (rustix) don't compile on the very latest nightly. The fuzz RUN below then uses nightly via
-      # RUSTUP_TOOLCHAIN (which overrides the stable toolchain file) for the -Z sanitizer build, and
-      # that env propagates to cargo-fuzz's nested `cargo build`.
+      # (rustix) don't compile on every nightly. The fuzz RUN below uses the same date-pinned nightly
+      # via RUSTUP_TOOLCHAIN (which overrides the stable toolchain file) for the -Z sanitizer build,
+      # and that env propagates to cargo-fuzz's nested `cargo build`.
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        run: cargo install cargo-fuzz --version 0.13.2 --locked
       # These fuzz targets live in crates that do not embed the web console, so no web console build is needed.
       - name: Fuzz smoke (nightly build)
         env:
-          RUSTUP_TOOLCHAIN: nightly
+          RUSTUP_TOOLCHAIN: nightly-2026-07-28
         run: |
           (cd crates/cairn-protocol   && cargo fuzz run chunked_decoder  -- -max_total_time=45)
           (cd crates/cairn-xml  && cargo fuzz run request_parsers  -- -max_total_time=30)
@@ -840,28 +890,32 @@ jobs:
 
   benches:
     name: benchmarks compile
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - uses: ./.github/actions/setup
       - run: cargo bench --workspace --no-run
 
   coverage:
     name: coverage
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - name: Free disk space
-        uses: jlumbroso/free-disk-space@v1.3.1
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be
         with:
           tool-cache: false
           large-packages: false
       - uses: ./.github/actions/setup
         with:
           components: llvm-tools-preview
-      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: taiki-e/install-action@065d6a08a14e61e89fb0a4c10eecdbdef39c7d8e
+        with:
+          tool: cargo-llvm-cov@0.8.7
+          checksum: true
+          fallback: none
       - run: cargo llvm-cov --workspace --lcov --output-path lcov.info
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: coverage
           path: lcov.info
@@ -872,9 +926,9 @@ jobs:
   # token via `gh api`, no third-party action. NOTE: keep `needs` in sync with the artifact consumers.
   bench-compare:
     name: warp head-to-head vs MinIO
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - uses: ./.github/actions/setup   # web/dist (embedded) + toolchain + cache
       # A throughput comparison needs an OPTIMIZED build. The shared `cairn-bin` artifact is an
       # unstripped DEBUG binary (correct behaviour, but many× slower on hot loops) — benchmarking it
@@ -886,7 +940,7 @@ jobs:
       # faster — a contended runner has large run-to-run throughput variance (docs/benchmarks.md §7).
       - name: Cairn vs MinIO side-by-side (warp)
         run: BIN=target/release/cairn BENCH_CSV=bench.csv BENCH_JSON=bench.json bash conformance/bench_compare.sh
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:
           name: bench-compare-results
@@ -930,7 +984,7 @@ jobs:
       - soak-features
       - blob-limits
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       actions: write   # required to delete a run artifact
     steps:

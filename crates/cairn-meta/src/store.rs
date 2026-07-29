@@ -10,12 +10,14 @@ use cairn_types::authz::PublicAccessBlock;
 use cairn_types::bucket::{Bucket, ConfigAspect, ConfigDoc};
 use cairn_types::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
 use cairn_types::meta::{
-    ActivityEntry, BucketCounts, BucketRequestCount, ImportJob, ImportJobRecord, LATENCY_BUCKETS,
-    ListPage, ListQuery, MetricsRange, MultipartSession, Mutation, MutationOutcome, ObjectSummary,
-    OpCount, OutboxEntry, PartRecord, ReplicationCounts, ReplicationStatus,
-    ReplicationTargetCounts, RequestMetricsSeries, SessionCredentialSummary, ShareRow, StatusCount,
-    StoreCounts, TagSummary, TaggedObject, TimePoint, User, UserSessionCredentials,
-    UserSigV4Credentials, UserWithBearerHash, WebhookEntry, latency_quantile_ms,
+    ActivityEntry, BucketCounts, BucketRequestCount, ImportJob, ImportJobListQuery, ImportJobPage,
+    ImportJobRecord, ImportState, LATENCY_BUCKETS, ListPage, ListQuery, MetricsRange,
+    MultipartCleanup, MultipartReservation, MultipartSession, Mutation, MutationOutcome,
+    ObjectSummary, OpCount, OutboxEntry, PartRecord, ReplicationCounts, ReplicationStatus,
+    ReplicationTargetCounts, RequestMetricsSeries, SessionCredentialSummary, ShareLookupHash,
+    ShareRow, StatusCount, StoreCounts, TagSummary, TaggedObject, TimePoint, User,
+    UserSessionCredentials, UserSigV4Credentials, UserWithBearerHash, WebhookEntry,
+    latency_quantile_ms,
 };
 use cairn_types::object::ObjectVersionRow;
 use cairn_types::time::Timestamp;
@@ -25,6 +27,51 @@ use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{Connection, OptionalExtension, params};
 
 const LIST_BATCH: usize = 1024;
+/// Constant-row query used by readiness to exercise a real read-pool connection without touching
+/// application tables. Keep this independent of metadata cardinality.
+const READ_PROBE_SQL: &str = "SELECT 1";
+
+/// Hex width of the SHA-256 master-key identity stored for every new/updated binding.
+const FULL_KEY_HASH_HEX_LEN: usize = 64;
+/// Hex width used by Cairn versions that stored only a display prefix.
+const LEGACY_KEY_HASH_HEX_LEN: usize = 8;
+
+/// How a persisted master-key identity relates to the configured full SHA-256 hash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyHashBindingMatch {
+    /// The durable row already contains the exact 64-hex SHA-256 hash.
+    Exact,
+    /// The durable row contains a matching legacy eight-hex prefix and must be upgraded.
+    LegacyPrefix,
+    /// The row is malformed or identifies different key material.
+    Mismatch,
+}
+
+fn is_lower_hex(value: &str, len: usize) -> bool {
+    value.len() == len
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Classify a persisted key hash against a configured full SHA-256 binding.
+///
+/// Only the historical eight-hex representation receives prefix compatibility. Once a Writer
+/// upgrades that row to 64 hex, all later comparisons are exact, so a different full hash sharing
+/// the old prefix cannot replace it.
+#[must_use]
+pub fn classify_key_hash_binding(stored: &str, configured_full: &str) -> KeyHashBindingMatch {
+    if !is_lower_hex(configured_full, FULL_KEY_HASH_HEX_LEN) {
+        return KeyHashBindingMatch::Mismatch;
+    }
+    if stored == configured_full {
+        return KeyHashBindingMatch::Exact;
+    }
+    if is_lower_hex(stored, LEGACY_KEY_HASH_HEX_LEN) && configured_full.starts_with(stored) {
+        return KeyHashBindingMatch::LegacyPrefix;
+    }
+    KeyHashBindingMatch::Mismatch
+}
 
 /// The claim-lease length for replication-outbox entries: a claimed entry whose lease elapses
 /// (a stalled worker) becomes eligible for re-claim after this many seconds.
@@ -58,6 +105,49 @@ impl SqliteMetadataStore {
     /// Returns a [`MetaError`] if the writer has shut down or the checkpoint PRAGMA fails.
     pub async fn checkpoint(&self) -> Result<WalCheckpointStats, MetaError> {
         self.writer.checkpoint().await
+    }
+
+    /// Run a final truncating checkpoint and wait until every connection owned by this store is
+    /// closed.
+    ///
+    /// This consumes the store and is only for offline database-generation replacement. The
+    /// caller must ensure that no clone of this store exists.
+    ///
+    /// # Errors
+    /// Returns a [`MetaError`] if the writer is closed or SQLite cannot run the checkpoint.
+    pub async fn checkpoint_and_close(self) -> Result<WalCheckpointStats, MetaError> {
+        let Self {
+            writer,
+            pool,
+            db_path: _,
+        } = self;
+        drop(pool);
+        writer.checkpoint_and_shutdown().await
+    }
+
+    /// Create a transactionally consistent SQLite snapshot with `VACUUM INTO`.
+    ///
+    /// The command runs on the existing single writer connection through its serialized control
+    /// seam; callers must not open a second source write connection for backup. SQLite requires the
+    /// destination not to exist. The path is bound as a SQL parameter rather than interpolated.
+    ///
+    /// # Errors
+    /// Returns [`MetaError`] when the path is not UTF-8, the writer is closed, the destination
+    /// exists, or SQLite cannot create the snapshot.
+    pub async fn vacuum_into_snapshot(
+        &self,
+        destination: std::path::PathBuf,
+    ) -> Result<(), MetaError> {
+        let destination = destination.into_os_string().into_string().map_err(|_| {
+            MetaError::Engine("SQLite snapshot destination must be valid UTF-8".to_owned())
+        })?;
+        self.writer
+            .run_exec(move |conn| {
+                conn.execute("VACUUM INTO ?1", params![destination])
+                    .map_err(engine_err)?;
+                Ok(())
+            })
+            .await
     }
 
     /// The current size in bytes of the write-ahead log (`-wal`) sidecar file.
@@ -222,6 +312,114 @@ impl SqliteMetadataStore {
             .await
     }
 
+    /// Page temporary-session secrets after `cursor` (exclusive), ordered by access-key id.
+    ///
+    /// Session secrets are a durable master-key envelope stream just like long-lived user SigV4
+    /// secrets. The re-wrap worker must cover even credentials near expiry: expiry makes a row
+    /// unusable for authentication, but it does not remove the old-key ciphertext from metadata.
+    pub async fn rewrap_session_credentials_page(
+        &self,
+        cursor: Option<String>,
+        limit: u32,
+    ) -> Result<Vec<RewrapSealedRow>, MetaError> {
+        self.with_read(move |conn| {
+            let cur = cursor.unwrap_or_default();
+            conn.prepare_cached(
+                "SELECT access_key_id, secret_ciphertext, secret_nonce
+                 FROM session_credentials
+                 WHERE access_key_id > ?1
+                 ORDER BY access_key_id
+                 LIMIT ?2",
+            )
+            .map_err(engine_err)?
+            .query_map(params![cur, limit], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .map_err(engine_err)?
+            .collect::<rusqlite::Result<Vec<RewrapSealedRow>>>()
+            .map_err(engine_err)
+        })
+        .await
+    }
+
+    /// Compare-and-swap one temporary-session secret onto the active master key.
+    ///
+    /// The legacy nonce column is cleared for a CRK1 envelope. A concurrent revoke/expiry sweep
+    /// wins by making this update a no-op; the caller then keeps the stream incomplete until a
+    /// later clean pass.
+    pub async fn rewrap_set_session_credential(
+        &self,
+        access_key_id: String,
+        expected: Vec<u8>,
+        ciphertext: Vec<u8>,
+    ) -> Result<bool, MetaError> {
+        self.writer
+            .run_exec(move |conn| {
+                let n = conn
+                    .execute(
+                        "UPDATE session_credentials
+                         SET secret_ciphertext=?1, secret_nonce=NULL
+                         WHERE access_key_id=?2 AND secret_ciphertext=?3",
+                        params![ciphertext, access_key_id, expected],
+                    )
+                    .map_err(engine_err)?;
+                Ok(n > 0)
+            })
+            .await
+    }
+
+    /// Page S3-import source secrets after `cursor` (exclusive), ordered by job id.
+    ///
+    /// Every durable job state is included. A completed/failed/cancelled job still carries its
+    /// sealed source credential until retention pruning deletes the row, so excluding terminal
+    /// history would make key retirement unsafe during that retention window.
+    pub async fn rewrap_import_jobs_page(
+        &self,
+        cursor: Option<String>,
+        limit: u32,
+    ) -> Result<Vec<RewrapSealedRow>, MetaError> {
+        self.with_read(move |conn| {
+            let cur = cursor.unwrap_or_default();
+            conn.prepare_cached(
+                "SELECT id, secret_ciphertext, secret_nonce
+                 FROM import_jobs
+                 WHERE id > ?1
+                 ORDER BY id
+                 LIMIT ?2",
+            )
+            .map_err(engine_err)?
+            .query_map(params![cur, limit], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .map_err(engine_err)?
+            .collect::<rusqlite::Result<Vec<RewrapSealedRow>>>()
+            .map_err(engine_err)
+        })
+        .await
+    }
+
+    /// Compare-and-swap one import source secret onto the active master key.
+    pub async fn rewrap_set_import_job_secret(
+        &self,
+        id: String,
+        expected: Vec<u8>,
+        ciphertext: Vec<u8>,
+    ) -> Result<bool, MetaError> {
+        self.writer
+            .run_exec(move |conn| {
+                let n = conn
+                    .execute(
+                        "UPDATE import_jobs
+                         SET secret_ciphertext=?1, secret_nonce=NULL
+                         WHERE id=?2 AND secret_ciphertext=?3",
+                        params![ciphertext, id, expected],
+                    )
+                    .map_err(engine_err)?;
+                Ok(n > 0)
+            })
+            .await
+    }
+
     /// Compare-and-swap a bucket-config aspect document: replace `aspect`'s doc with `new_doc` only
     /// if it still equals `expected`. Used by the re-wrap worker to update re-sealed replication
     /// targets without clobbering a concurrently-edited target list (audit #29). Returns whether a
@@ -341,23 +539,71 @@ impl SqliteMetadataStore {
         .await
     }
 
-    /// Upsert per-key ring state (id, key-hash prefix, active flag) for operator visibility.
-    pub async fn key_ring_upsert(
+    /// Apply the configured full-SHA-256 key-ring bindings without ever rebinding an existing id.
+    ///
+    /// `key_hash` is a 64-hex durable identity binding, not mutable display metadata. Every
+    /// existing id is checked before the transaction writes anything; a mismatch returns
+    /// [`MetaError::Conflict`] and rolls the transaction back, preserving the original hash. A
+    /// matching historical eight-hex prefix is atomically upgraded to the full hash through this
+    /// Writer transaction. Once full, every comparison is exact. Only `is_active` may otherwise
+    /// change. The server also preflights every shard before calling this method, so a mismatch or
+    /// read failure on a later shard cannot leave an earlier shard partially seeded. If a later
+    /// shard's phase-two write fails, a retry safely accepts both already-full and still-legacy
+    /// matching rows.
+    pub async fn key_ring_apply_config(
         &self,
-        id: u16,
-        key_hash: String,
-        is_active: bool,
+        ring: Vec<(u16, String, bool)>,
         now: i64,
     ) -> Result<(), MetaError> {
         self.writer
             .run_exec(move |conn| {
-                conn.execute(
-                    "INSERT INTO key_ring_state (id, key_hash, is_active, created_at)
-                     VALUES (?1, ?2, ?3, ?4)
-                     ON CONFLICT(id) DO UPDATE SET key_hash=excluded.key_hash, is_active=excluded.is_active",
-                    params![id, key_hash, is_active as i64, now],
-                )
-                .map_err(engine_err)?;
+                let tx = conn.unchecked_transaction().map_err(engine_err)?;
+                let mut legacy_upgrades = Vec::new();
+                for (id, key_hash, _) in &ring {
+                    if !is_lower_hex(key_hash, FULL_KEY_HASH_HEX_LEN) {
+                        return Err(MetaError::Conflict);
+                    }
+                    let existing = tx
+                        .query_row(
+                            "SELECT key_hash FROM key_ring_state WHERE id=?1",
+                            params![i64::from(*id)],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .optional()
+                        .map_err(engine_err)?;
+                    if let Some(stored) = existing {
+                        match classify_key_hash_binding(&stored, key_hash) {
+                            KeyHashBindingMatch::Exact => {}
+                            KeyHashBindingMatch::LegacyPrefix => {
+                                legacy_upgrades.push((*id, stored, key_hash.clone()));
+                            }
+                            KeyHashBindingMatch::Mismatch => return Err(MetaError::Conflict),
+                        }
+                    }
+                }
+                for (id, legacy_hash, full_hash) in legacy_upgrades {
+                    let changed = tx
+                        .execute(
+                            "UPDATE key_ring_state SET key_hash=?2 WHERE id=?1 AND key_hash=?3",
+                            params![i64::from(id), full_hash, legacy_hash],
+                        )
+                        .map_err(engine_err)?;
+                    if changed != 1 {
+                        return Err(MetaError::Conflict);
+                    }
+                }
+                tx.execute("UPDATE key_ring_state SET is_active=0", [])
+                    .map_err(engine_err)?;
+                for (id, key_hash, is_active) in ring {
+                    tx.execute(
+                        "INSERT INTO key_ring_state (id, key_hash, is_active, created_at)
+                         VALUES (?1, ?2, ?3, ?4)
+                         ON CONFLICT(id) DO UPDATE SET is_active=excluded.is_active",
+                        params![i64::from(id), key_hash, is_active as i64, now],
+                    )
+                    .map_err(engine_err)?;
+                }
+                tx.commit().map_err(engine_err)?;
                 Ok(())
             })
             .await
@@ -405,12 +651,18 @@ impl SqliteMetadataStore {
 /// One paged user row for the re-wrap worker: `(user_id, ciphertext, nonce_opt)` (audit #29).
 pub type RewrapUserRow = (String, Vec<u8>, Option<Vec<u8>>);
 
+/// One paged durable sealed-secret row: `(primary_key, ciphertext, legacy_nonce_opt)`.
+pub type RewrapSealedRow = (String, Vec<u8>, Option<Vec<u8>>);
+
 /// A row of `key_ring_state` for the crypto-status endpoint (audit #29).
 #[derive(Debug, Clone)]
 pub struct KeyRingStateRow {
     /// Ring id.
     pub id: u16,
-    /// First 8 hex of SHA-256(key) for operator display (never key material).
+    /// Full 64-hex SHA-256(key) durable identity (never key material).
+    ///
+    /// A legacy database may expose an eight-hex prefix only during startup preflight; the Writer
+    /// upgrades it before the server can bind listeners. APIs abbreviate this value separately.
     pub key_hash: String,
     /// Whether this is the active (sealing) key.
     pub is_active: bool,
@@ -490,7 +742,9 @@ fn list_impl(
 
     // For version listings, a version-id marker resumes strictly after `(cursor_key, marker)`
     // within the marker key. Versions sort `version_id DESC`, so entries already returned for that
-    // key have `version_id >= marker`; we skip exactly those on the first key.
+    // key have `version_id >= marker`. The pair is pushed into every SQL batch below: filtering it
+    // after `LIMIT` can fill a whole batch with already-returned versions when one key has deep
+    // history, leaving the listing unable to advance.
     let vid_marker = if latest_only {
         None
     } else {
@@ -511,6 +765,9 @@ fn list_impl(
             &seek,
             upper.as_deref(),
             latest_only,
+            vid_marker
+                .as_ref()
+                .map(|(key, version)| (key.as_str(), version.as_str())),
             LIST_BATCH + 1,
         )?;
         if rows.is_empty() {
@@ -518,14 +775,6 @@ fn list_impl(
         }
         let exhausted = rows.len() <= LIST_BATCH;
         for summary in rows.into_iter().take(LIST_BATCH) {
-            if let Some((mk, mv)) = &vid_marker {
-                if summary.key.as_str() == mk.as_str() && summary.version_id.as_str() >= mv.as_str()
-                {
-                    // Already returned on the previous page (or is the marker itself); skip it. The
-                    // skipped versions of the marker key are a bounded prefix that fits in one batch.
-                    continue;
-                }
-            }
             if page.items.len() + page.common_prefixes.len() >= limit {
                 page.truncated = true;
                 if latest_only {
@@ -598,6 +847,7 @@ fn fetch_rows(
     seek: &str,
     upper: Option<&str>,
     latest_only: bool,
+    version_marker: Option<(&str, &str)>,
     limit: usize,
 ) -> Result<Vec<ObjectSummary>, MetaError> {
     let mut sql = String::from(
@@ -610,6 +860,12 @@ fn fetch_rows(
     if upper.is_some() {
         sql.push_str(" AND key < ?3");
     }
+    if version_marker.is_some() {
+        // Resume after the ordered `(key ASC, version_id DESC)` pair before LIMIT is applied.
+        // `key >= ?2` retains the prefix/range seek; this predicate removes the returned prefix of
+        // the marker key while leaving every later key eligible.
+        sql.push_str(" AND (key > ?5 OR (key = ?5 AND version_id < ?6))");
+    }
     if latest_only {
         sql.push_str(" ORDER BY key ASC");
     } else {
@@ -620,10 +876,16 @@ fn fetch_rows(
     let mut stmt = conn.prepare_cached(&sql).map_err(engine_err)?;
     let limit = limit as i64;
     let map = model::object_summary_from_row;
-    let rows = if let Some(ub) = upper {
-        stmt.query_map(params![bucket, seek, ub, limit], map)
-    } else {
-        stmt.query_map(params![bucket, seek, rusqlite::types::Null, limit], map)
+    let rows = match (upper, version_marker) {
+        (Some(ub), Some((key, version))) => {
+            stmt.query_map(params![bucket, seek, ub, limit, key, version], map)
+        }
+        (None, Some((key, version))) => stmt.query_map(
+            params![bucket, seek, rusqlite::types::Null, limit, key, version],
+            map,
+        ),
+        (Some(ub), None) => stmt.query_map(params![bucket, seek, ub, limit], map),
+        (None, None) => stmt.query_map(params![bucket, seek, rusqlite::types::Null, limit], map),
     }
     .map_err(engine_err)?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -634,6 +896,14 @@ fn fetch_rows(
 impl MetadataStore for SqliteMetadataStore {
     async fn submit(&self, mutation: Mutation) -> Result<MutationOutcome, MetaError> {
         self.writer.submit(mutation).await
+    }
+
+    async fn read_probe(&self) -> Result<(), MetaError> {
+        self.with_read(|conn| {
+            conn.query_row(READ_PROBE_SQL, [], |_| Ok(()))
+                .map_err(engine_err)
+        })
+        .await
     }
 
     async fn get_bucket(&self, name: &BucketName) -> Result<Option<Bucket>, MetaError> {
@@ -907,15 +1177,8 @@ impl MetadataStore for SqliteMetadataStore {
                 .optional()
                 .map_err(engine_err)?;
             Ok(match row {
-                Some((mode, until, lh)) => {
-                    let retention = match (mode, until) {
-                        (Some(m), Some(u)) => Some(cairn_types::object::ObjectRetention {
-                            mode: crate::model::lock_mode_from(&m),
-                            retain_until: cairn_types::time::Timestamp(u),
-                        }),
-                        _ => None,
-                    };
-                    cairn_types::object::ObjectLockState { retention, legal_hold: lh != 0 }
+                Some((mode, until, legal_hold)) => {
+                    crate::model::object_lock_state_from_columns(mode, until, legal_hold)?
                 }
                 None => cairn_types::object::ObjectLockState::default(),
             })
@@ -1051,9 +1314,14 @@ impl MetadataStore for SqliteMetadataStore {
         older_than: Timestamp,
         batch: u32,
     ) -> Result<Vec<MultipartSession>, MetaError> {
+        let batch = batch.clamp(1, 1_000);
         self.with_read(move |conn| {
             let mut stmt = conn
-                .prepare_cached("SELECT * FROM multipart_uploads WHERE updated_at < ?1 LIMIT ?2")
+                .prepare_cached(
+                    "SELECT * FROM multipart_uploads
+                     WHERE status='active' AND updated_at < ?1
+                     ORDER BY updated_at, id LIMIT ?2",
+                )
                 .map_err(engine_err)?;
             stmt.query_map(
                 params![older_than.0, i64::from(batch)],
@@ -1062,6 +1330,51 @@ impl MetadataStore for SqliteMetadataStore {
             .map_err(engine_err)?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(engine_err)
+        })
+        .await
+    }
+
+    async fn enumerate_stale_multipart_reservations(
+        &self,
+        older_than: Timestamp,
+        batch: u32,
+    ) -> Result<Vec<MultipartReservation>, MetaError> {
+        let batch = batch.clamp(1, 1_000);
+        self.with_read(move |conn| {
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT * FROM multipart_part_reservations
+                     WHERE created_at < ?1
+                     ORDER BY created_at, attempt_id LIMIT ?2",
+                )
+                .map_err(engine_err)?;
+            stmt.query_map(
+                params![older_than.0, i64::from(batch)],
+                model::multipart_reservation_from_row,
+            )
+            .map_err(engine_err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(engine_err)
+        })
+        .await
+    }
+
+    async fn list_multipart_cleanups(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<MultipartCleanup>, MetaError> {
+        let limit = limit.clamp(1, 1_000);
+        self.with_read(move |conn| {
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT * FROM multipart_staging_cleanups
+                     ORDER BY storage_path IS NULL, created_at, id LIMIT ?1",
+                )
+                .map_err(engine_err)?;
+            stmt.query_map(params![i64::from(limit)], model::multipart_cleanup_from_row)
+                .map_err(engine_err)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(engine_err)
         })
         .await
     }
@@ -1454,21 +1767,62 @@ impl MetadataStore for SqliteMetadataStore {
         .await
     }
 
-    async fn list_import_jobs(&self) -> Result<Vec<ImportJob>, MetaError> {
+    async fn list_import_jobs(
+        &self,
+        query: &ImportJobListQuery,
+    ) -> Result<ImportJobPage, MetaError> {
+        let query = query.clone();
         self.with_read(move |conn| {
             // Explicitly excludes secret_ciphertext/secret_nonce so a secret can never be read back.
-            let mut stmt = conn
-                .prepare(
-                    "SELECT id, source_endpoint, source_region, access_key_id, ca_cert_pem, \
-                     insecure_skip_verify, workers, state, buckets_json, objects_done, \
-                     objects_total, bytes_done, bytes_total, last_error, created_at, updated_at \
-                     FROM import_jobs ORDER BY created_at DESC",
+            // Fetch one look-ahead row to derive a keyset cursor without a COUNT/table scan.
+            const COLS: &str = "id, source_endpoint, source_region, access_key_id, ca_cert_pem, \
+                insecure_skip_verify, workers, state, objects_done, objects_total, bytes_done, \
+                bytes_total, last_error, created_at, updated_at";
+            let limit = query.bounded_limit();
+            let fetch = i64::from(limit) + 1;
+            let jobs = if let Some(cursor) = query.cursor {
+                let mut stmt = conn
+                    .prepare(&format!(
+                        "SELECT {COLS} FROM import_jobs \
+                         WHERE created_at < ?1 OR (created_at = ?1 AND id < ?2) \
+                         ORDER BY created_at DESC, id DESC LIMIT ?3"
+                    ))
+                    .map_err(engine_err)?;
+                stmt.query_map(
+                    params![cursor.created_at.0, cursor.id, fetch],
+                    model::import_job_summary_from_row,
                 )
-                .map_err(engine_err)?;
-            stmt.query_map([], model::import_job_from_row)
                 .map_err(engine_err)?
                 .collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(engine_err)
+                .map_err(engine_err)?
+            } else {
+                let mut stmt = conn
+                    .prepare(&format!(
+                        "SELECT {COLS} FROM import_jobs \
+                         ORDER BY created_at DESC, id DESC LIMIT ?1"
+                    ))
+                    .map_err(engine_err)?;
+                stmt.query_map(params![fetch], model::import_job_summary_from_row)
+                    .map_err(engine_err)?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(engine_err)?
+            };
+            Ok(ImportJobPage::from_overfetch(jobs, limit))
+        })
+        .await
+    }
+
+    async fn next_import_job_id(&self, state: ImportState) -> Result<Option<String>, MetaError> {
+        let state = model::import_state_str(state).to_owned();
+        self.with_read(move |conn| {
+            conn.query_row(
+                "SELECT id FROM import_jobs WHERE state=?1 \
+                 ORDER BY created_at ASC, id ASC LIMIT 1",
+                params![state],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(engine_err)
         })
         .await
     }
@@ -1517,12 +1871,29 @@ impl MetadataStore for SqliteMetadataStore {
         .await
     }
 
-    async fn get_share(&self, token: &str) -> Result<Option<ShareRow>, MetaError> {
-        let token = token.to_owned();
+    async fn get_share_by_id(&self, id: &str) -> Result<Option<ShareRow>, MetaError> {
+        let id = id.to_owned();
         self.with_read(move |conn| {
             conn.query_row(
-                "SELECT * FROM object_shares WHERE token=?1",
-                params![token],
+                "SELECT * FROM object_shares WHERE id=?1",
+                params![id],
+                model::share_from_row,
+            )
+            .optional()
+            .map_err(engine_err)
+        })
+        .await
+    }
+
+    async fn get_share_by_token_hash(
+        &self,
+        token_hash: &ShareLookupHash,
+    ) -> Result<Option<ShareRow>, MetaError> {
+        let token_hash = token_hash.as_bytes().to_vec();
+        self.with_read(move |conn| {
+            conn.query_row(
+                "SELECT * FROM object_shares WHERE token_hash=?1",
+                params![token_hash],
                 model::share_from_row,
             )
             .optional()
@@ -1898,5 +2269,86 @@ impl MetadataStore for SqliteMetadataStore {
             })
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod key_hash_binding_tests {
+    use super::*;
+
+    async fn seed_legacy_binding(
+        store: &SqliteMetadataStore,
+        id: u16,
+        legacy_hash: &str,
+        created_at: i64,
+    ) {
+        let legacy_hash = legacy_hash.to_owned();
+        store
+            .writer
+            .run_exec(move |conn| {
+                conn.execute(
+                    "INSERT INTO key_ring_state (id, key_hash, is_active, created_at)
+                     VALUES (?1, ?2, 1, ?3)",
+                    params![i64::from(id), legacy_hash, created_at],
+                )
+                .map_err(engine_err)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn matching_legacy_prefix_is_atomically_upgraded_and_retry_safe() {
+        let store = crate::open_in_memory().unwrap();
+        let full_hash = format!("deadbeef{}", "11".repeat(28));
+        assert_eq!(full_hash.len(), FULL_KEY_HASH_HEX_LEN);
+        seed_legacy_binding(&store, 7, "deadbeef", 10).await;
+
+        store
+            .key_ring_apply_config(vec![(7, full_hash.clone(), true)], 20)
+            .await
+            .unwrap();
+        let upgraded = store.key_ring_states().await.unwrap();
+        assert_eq!(upgraded[0].key_hash, full_hash);
+        assert_eq!(
+            upgraded[0].created_at, 10,
+            "upgrading the identity must preserve when the id was first bound"
+        );
+
+        // A cross-shard phase-two failure can leave this shard already upgraded while another is
+        // still legacy. Retrying the already-full shard is an exact, idempotent match.
+        store
+            .key_ring_apply_config(vec![(7, full_hash.clone(), true)], 30)
+            .await
+            .unwrap();
+        let retried = store.key_ring_states().await.unwrap();
+        assert_eq!(retried[0].key_hash, full_hash);
+        assert_eq!(retried[0].created_at, 10);
+    }
+
+    #[tokio::test]
+    async fn same_legacy_prefix_cannot_replace_the_full_binding_after_upgrade() {
+        let store = crate::open_in_memory().unwrap();
+        let first_full = format!("deadbeef{}", "11".repeat(28));
+        let colliding_prefix = format!("deadbeef{}", "22".repeat(28));
+        seed_legacy_binding(&store, 7, "deadbeef", 10).await;
+
+        store
+            .key_ring_apply_config(vec![(7, first_full.clone(), true)], 20)
+            .await
+            .unwrap();
+        let err = store
+            .key_ring_apply_config(vec![(7, colliding_prefix, true)], 30)
+            .await
+            .expect_err("a full binding must compare all 256 bits after legacy upgrade");
+        assert!(matches!(err, MetaError::Conflict));
+
+        let states = store.key_ring_states().await.unwrap();
+        assert_eq!(
+            states[0].key_hash, first_full,
+            "the rejected same-prefix replacement must preserve the upgraded full identity"
+        );
+        assert_eq!(states[0].created_at, 10);
     }
 }

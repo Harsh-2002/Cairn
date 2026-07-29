@@ -48,10 +48,15 @@ def check(label, cond):
         fails.append(label)
     return cond
 
-# The trailer of an encrypted CRNB block container: 34 bytes, magic `CRNB` then a version byte;
-# VERSION_ENCRYPTED == 2 (crates/cairn-blob/src/compress.rs). We assert the on-disk bytes carry this
-# trailer AND do not contain the known plaintext run — encryption is real, not advertised-only.
-VERSION_ENCRYPTED = 2
+# The trailer of a CRNB block container is 34 bytes: magic `CRNB`, a version byte, and structural
+# metadata. Encrypted v2 is the legacy read-compatible format; the current writer MUST emit v3,
+# which also authenticates the index and trailer. Keep this exact writer-version assertion so the
+# test cannot silently permit a regression to the legacy format. Together with the structural
+# checks below and the absent plaintext marker, this proves encryption is real, not advertised-only.
+CRNB_TRAILER_BYTES = 34
+CRNB_INDEX_ENTRY_BYTES = 9
+CRNB_V3_CURRENT_ENCRYPTED = 3
+CRNB_V3_METADATA_TAG_BYTES = 32
 MARKER = b"PLAINTEXT-MARKER-DO-NOT-FIND-ON-DISK-"
 
 def hh(resp):
@@ -67,7 +72,18 @@ def staged_parts(upload_id):
     return [os.path.join(d, f) for f in sorted(os.listdir(d))] if os.path.isdir(d) else []
 
 def trailer_encrypted(blob):
-    return len(blob) >= 34 and blob[-34:-30] == b"CRNB" and blob[-30] == VERSION_ENCRYPTED
+    if len(blob) < CRNB_TRAILER_BYTES:
+        return False
+    trailer = blob[-CRNB_TRAILER_BYTES:]
+    if trailer[:4] != b"CRNB" or trailer[4] != CRNB_V3_CURRENT_ENCRYPTED:
+        return False
+    block_count = int.from_bytes(trailer[18:22], "little")
+    index_offset = int.from_bytes(trailer[22:30], "little")
+    index_len = int.from_bytes(trailer[30:34], "little")
+    return (
+        index_len == block_count * CRNB_INDEX_ENTRY_BYTES
+        and index_offset + index_len + CRNB_V3_METADATA_TAG_BYTES + CRNB_TRAILER_BYTES == len(blob)
+    )
 
 def assert_encrypted_on_disk(path, label):
     with open(path, "rb") as fh:

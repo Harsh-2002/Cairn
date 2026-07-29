@@ -7,7 +7,8 @@ expired-object-delete-marker removal, and abort-incomplete-multipart.
 ## Layout (`src/`)
 - `config.rs` — `parse_lifecycle` (XML → `Vec<LifecycleRule>`), the `Action`/`Expiration`/`Filter`
   types, and a SAX-style `drive` over quick-xml. Total function: any malformed body folds to
-  `Error::MalformedXml`, never a panic.
+  `Error::MalformedXml`, never a panic. The driver coalesces text/CDATA/reference events and accepts
+  only numeric references plus XML's predefined entities.
 - `scanner.rs` — `LifecycleScanner::run_once` (the periodic apply pass) and `LifecycleReport`.
 - `lib.rs` re-exports; `tests.rs` is the whole suite (against the in-memory doubles).
 
@@ -20,20 +21,28 @@ expired-object-delete-marker removal, and abort-incomplete-multipart.
   so a rerun or interrupted scan reaches the same end state. Current-object expiration in a
   versioned bucket relies on `list_current` excluding delete markers, so the inserted marker hides
   the key and no second marker is added. NEVER add an action that isn't a no-op once applied.
+- Incomplete-upload abort obeys the multipart terminal-owner outcome: reclaim staged parts only
+  after the writer returns `Aborted`. `NotOwner` means a concurrent Complete owns `completing`; it is
+  an expected skip, and deleting that session's bytes would corrupt the winning completion.
 - **Versioned vs not.** Expiring a current object in a versioning-*enabled* bucket inserts a delete
   marker (`CreateDeleteMarker`); unversioned/suspended permanently deletes and reclaims the blob.
-- **Object Lock outranks expiry.** `delete_version` checks `get_object_lock(..).is_protected(now)`
-  and returns `Ok(false)` for a protected version — lifecycle silently skips it (neither expired
-  nor an error), and the rule applies once the lock lapses. NEVER bypass this check.
+- **Object Lock outranks expiry at the Writer.** Lifecycle passes one trusted `now` and
+  `GovernanceBypass::Denied` with every permanent-delete or delete-marker mutation. The Writer
+  evaluates the version's current retention/legal-hold state in the same savepoint as deletion and
+  returns `DeleteProtected`; lifecycle silently skips that outcome (neither expired nor an error),
+  and the rule applies once protection lapses. Never restore a read-then-delete lock check or grant
+  lifecycle a governance bypass.
 - **Transition is rejected at write time**, not silently stored. A `PutBucketLifecycleConfiguration`
   carrying a `<Transition>` is refused with `NotImplemented` in `cairn-protocol` (`service.rs`,
   search `Action::Transition`). The variant is still *parsed* — so the write path can detect/reject
   and the scanner tolerates any pre-existing stored config — but the scanner does **no** data
   movement and does not count it (cold-tier transition, ARCH 19.5, is unimplemented).
 - **Bounded enumeration only.** Page through `list_current` / `list_versions` (`PAGE_LIMIT = 1000`)
-  and `enumerate_stale_sessions` (`SESSION_BATCH`); memory stays flat. `run_once` errors only if an
-  enumeration itself fails — per-item mutation failures are tallied in `report.errors`, never fatal,
-  so one bad item can't stall a bucket.
+  and `enumerate_stale_sessions` (`SESSION_BATCH`). Version scans consume the ordered listing one
+  complete key group at a time, carrying only a key that crosses a page boundary; peak memory is one
+  page plus the largest key's version history, never the bucket. `run_once` errors only if an
+  enumeration itself fails — per-item mutation failures are tallied in `report.errors`, never
+  fatal, so one bad item can't stall a bucket.
 - **Lifecycle delete markers replicate.** `marker_replication` fans a versioned-expiry marker out
   to every matching replication target (1→N) via `cairn-replication`, exactly like a client delete
   (ARCH 20.2/20.3); this is the one cross-crate dependency.

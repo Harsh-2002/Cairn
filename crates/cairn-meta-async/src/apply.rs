@@ -8,10 +8,21 @@
 use crate::driver::{AsyncSqlDriver, Value, query_one};
 use crate::model::{self, opt_text, repl_op_str, repl_status_str, storage_class_str, to_json};
 use cairn_types::MetaError;
+use cairn_types::bucket::{
+    ConfigAspect, DefaultRetention, ObjectLockConfiguration, RetentionPeriod, VersioningState,
+};
 use cairn_types::id::{BucketName, ObjectKey, StoragePath, VersionId};
-use cairn_types::meta::{IfNoneMatch, Mutation, MutationOutcome, OutboxEntry, Precondition};
-use cairn_types::object::{ETag, ObjectVersionRow};
+use cairn_types::meta::{
+    ClaimReleaseOutcome, IfNoneMatch, InitialObjectState, MAX_IMPORT_JOB_PRUNE_BATCH,
+    MultipartCleanup, MultipartTerminalOutcome, Mutation, MutationOutcome, OutboxEntry,
+    Precondition,
+};
+use cairn_types::object::{
+    ETag, ExplicitObjectLockIntent, GovernanceBypass, ObjectLockMode, ObjectLockState,
+    ObjectRetention, ObjectVersionRow,
+};
 use cairn_types::time::Timestamp;
+use serde::Deserialize;
 
 type R<T> = Result<T, MetaError>;
 
@@ -21,20 +32,22 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
         Mutation::PutObjectVersion {
             row,
             precondition,
+            initial_state,
             replication,
-        } => put_version(driver, *row, &precondition, replication).await,
+        } => put_version(driver, *row, &precondition, initial_state, replication).await,
         Mutation::CreateDeleteMarker {
             bucket,
             key,
             version_id,
             owner_id,
             now,
+            bypass,
             replication,
         } => {
             let row = ObjectVersionRow {
                 id: uuid::Uuid::new_v4().simple().to_string(),
-                bucket,
-                key,
+                bucket: bucket.clone(),
+                key: key.clone(),
                 version_id: version_id.clone(),
                 is_latest: true,
                 is_delete_marker: true,
@@ -61,25 +74,76 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
                 created_at: now,
                 updated_at: now,
             };
-            demote_latest(driver, &row.bucket, &row.key).await?;
-            insert_version(driver, &row).await?;
+            if replacement_is_protected(driver, &row.bucket, &row.key, &row.version_id, now, bypass)
+                .await?
+            {
+                return Ok(MutationOutcome::DeleteProtected);
+            }
+            let freed = upsert_version(driver, row).await?;
+            replace_object_tags(driver, &bucket, &key, &version_id, &[]).await?;
+            write_object_lock_state(
+                driver,
+                &bucket,
+                &key,
+                &version_id,
+                ObjectLockState::default(),
+            )
+            .await?;
             for e in &replication {
                 enqueue(driver, e).await?;
             }
-            Ok(MutationOutcome::DeleteMarker { version_id })
+            Ok(MutationOutcome::DeleteMarker { version_id, freed })
         }
         Mutation::DeleteVersion {
             bucket,
             key,
             version_id,
             expected_updated_at,
-        } => delete_version(driver, &bucket, &key, &version_id, expected_updated_at).await,
-        Mutation::CreateMultipart(s) => {
+            now,
+            bypass,
+        } => {
+            delete_version(
+                driver,
+                &bucket,
+                &key,
+                &version_id,
+                expected_updated_at,
+                now,
+                bypass,
+            )
+            .await
+        }
+        Mutation::CreateMultipart { session: s, limits } => {
+            validate_multipart_lock_intent(driver, &s.bucket, s.lock_intent, s.created_at).await?;
+            let bucket_active = multipart_stat(
+                driver,
+                "multipart_bucket_stats",
+                "bucket_name",
+                s.bucket.as_str(),
+                "active_uploads",
+            )
+            .await?;
+            let principal_active = multipart_stat(
+                driver,
+                "multipart_principal_stats",
+                "principal_id",
+                s.initiated_by.0.as_str(),
+                "active_uploads",
+            )
+            .await?;
+            if bucket_active >= i64::from(limits.max_active_uploads_per_bucket)
+                || principal_active >= i64::from(limits.max_active_uploads_per_principal)
+            {
+                return Err(MetaError::QuotaExceeded);
+            }
             driver
                 .execute(
                     "INSERT INTO multipart_uploads
-                     (id, bucket_name, key, content_type, status, owner_id, intended_acl, user_metadata, sse_requested, encrypt_parts, sse_kms_requested, sse_kms_key_id, sse_bucket_key_enabled, created_at, updated_at)
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+                     (id, bucket_name, key, content_type, status, owner_id, intended_acl,
+                      user_metadata, sse_requested, encrypt_parts, sse_kms_requested,
+                      sse_kms_key_id, sse_bucket_key_enabled, created_at, updated_at, initiated_by,
+                      initial_tags, lock_mode, retain_until, legal_hold, object_lock_intent_known)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
                     vec![
                         Value::Text(s.upload_id.as_str().to_owned()),
                         Value::Text(s.bucket.as_str().to_owned()),
@@ -96,78 +160,251 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
                         Value::Int(s.sse_bucket_key_enabled as i64),
                         Value::Int(s.created_at.0),
                         Value::Int(s.updated_at.0),
+                        Value::Text(s.initiated_by.0.clone()),
+                        Value::Text(to_json(&s.initial_tags)),
+                        opt_text(
+                            s.lock_intent
+                                .retention
+                                .map(|retention| model::lock_mode_str(retention.mode).to_owned()),
+                        ),
+                        s.lock_intent.retention.map_or(Value::Null, |retention| {
+                            Value::Int(retention.retain_until.0)
+                        }),
+                        s.lock_intent
+                            .legal_hold
+                            .map_or(Value::Null, |on| Value::Int(on as i64)),
+                        Value::Int(1),
                     ],
                 )
+                .await?;
+            adjust_multipart_stats(driver, s.bucket.as_str(), s.initiated_by.0.as_str(), 1, 0)
                 .await?;
             Ok(MutationOutcome::MultipartCreated(s.upload_id))
         }
-        Mutation::RecordPart { upload_id, part } => {
-            let superseded: Option<String> = query_one(
+        Mutation::ReserveMultipartPart {
+            upload_id,
+            part_number,
+            attempt_id,
+            reserved_bytes,
+            max_parts_per_upload,
+            now,
+        } => {
+            let context = active_multipart_context(driver, &upload_id).await?;
+            if let Some(row) = query_one(
                 driver,
-                "SELECT storage_path FROM multipart_parts WHERE upload_id=?1 AND part_number=?2",
-                vec![
-                    Value::Text(upload_id.as_str().to_owned()),
-                    Value::Int(i64::from(part.part_number)),
-                ],
+                "SELECT upload_id, part_number, reserved_bytes
+                 FROM multipart_part_reservations WHERE attempt_id=?1",
+                vec![Value::Text(attempt_id.clone())],
             )
             .await?
-            .and_then(|r| r.get_opt_text(0));
+            {
+                if row.get_text(0) == upload_id.as_str()
+                    && row.get_i64(1) == i64::from(part_number)
+                    && row.get_i64(2) == reserved_bytes as i64
+                {
+                    return Ok(MutationOutcome::MultipartReserved);
+                }
+                return Err(MetaError::QuotaExceeded);
+            }
+            // Turso does not yet accept a compound SELECT inside EXISTS. Count the two disjoint
+            // sets instead: every committed part, plus reservations whose number is not already
+            // committed. Both reads remain inside this mutation's writer savepoint, so the
+            // cardinality decision and reservation insert are still atomic.
+            let committed = query_one(
+                driver,
+                "SELECT COUNT(*),
+                        COALESCE(MAX(CASE WHEN part_number=?2 THEN 1 ELSE 0 END), 0)
+                 FROM multipart_parts WHERE upload_id=?1",
+                vec![
+                    Value::Text(upload_id.as_str().to_owned()),
+                    Value::Int(i64::from(part_number)),
+                ],
+            )
+            .await?;
+            let reserved_only = query_one(
+                driver,
+                "SELECT COUNT(*),
+                        COALESCE(MAX(CASE WHEN r.part_number=?2 THEN 1 ELSE 0 END), 0)
+                 FROM multipart_part_reservations r
+                 LEFT JOIN multipart_parts p
+                   ON p.upload_id=r.upload_id AND p.part_number=r.part_number
+                 WHERE r.upload_id=?1 AND p.upload_id IS NULL",
+                vec![
+                    Value::Text(upload_id.as_str().to_owned()),
+                    Value::Int(i64::from(part_number)),
+                ],
+            )
+            .await?;
+            let distinct_parts = committed.as_ref().map_or(0, |row| row.get_i64(0))
+                + reserved_only.as_ref().map_or(0, |row| row.get_i64(0));
+            let number_exists = committed.is_some_and(|row| row.get_i64(1) != 0)
+                || reserved_only.is_some_and(|row| row.get_i64(1) != 0);
+            if !number_exists && distinct_parts >= i64::from(max_parts_per_upload) {
+                return Err(MetaError::QuotaExceeded);
+            }
+            enforce_multipart_reservation_quota(driver, &context, reserved_bytes).await?;
             driver
                 .execute(
-                    "INSERT OR REPLACE INTO multipart_parts
-                     (upload_id, part_number, size, etag, storage_path, checksum, part_dek)
-                     VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                    "INSERT INTO multipart_part_reservations
+                     (attempt_id, upload_id, part_number, reserved_bytes, created_at)
+                     VALUES (?1,?2,?3,?4,?5)",
+                    vec![
+                        Value::Text(attempt_id),
+                        Value::Text(upload_id.as_str().to_owned()),
+                        Value::Int(i64::from(part_number)),
+                        Value::Int(reserved_bytes as i64),
+                        Value::Int(now.0),
+                    ],
+                )
+                .await
+                .map_err(|error| match error {
+                    MetaError::Conflict => MetaError::QuotaExceeded,
+                    other => other,
+                })?;
+            driver
+                .execute(
+                    "UPDATE multipart_uploads SET updated_at=?2
+                     WHERE id=?1 AND status='active'",
                     vec![
                         Value::Text(upload_id.as_str().to_owned()),
-                        Value::Int(i64::from(part.part_number)),
-                        Value::Int(part.size as i64),
-                        Value::Text(part.etag.clone()),
-                        Value::Text(part.storage_path.as_str().to_owned()),
-                        opt_text(part.checksum.as_ref().map(to_json)),
-                        opt_text(part.part_dek.clone()),
+                        Value::Int(now.0),
                     ],
                 )
                 .await?;
-            Ok(MutationOutcome::PartRecorded {
-                superseded: superseded.map(StoragePath::from_string),
-            })
+            adjust_multipart_stats(
+                driver,
+                &context.bucket,
+                &context.principal,
+                0,
+                reserved_bytes as i64,
+            )
+            .await?;
+            Ok(MutationOutcome::MultipartReserved)
+        }
+        Mutation::ReleaseMultipartReservation {
+            upload_id,
+            attempt_id,
+        } => {
+            release_multipart_reservation(driver, &upload_id, &attempt_id).await?;
+            Ok(MutationOutcome::Ack)
+        }
+        Mutation::RecordPart {
+            upload_id,
+            attempt_id,
+            part,
+        } => record_part(driver, &upload_id, &attempt_id, part).await,
+        Mutation::ReleaseMultipartCleanup { cleanup_id } => {
+            release_multipart_cleanup(driver, &cleanup_id).await?;
+            Ok(MutationOutcome::Ack)
+        }
+        Mutation::ReleaseMultipartUploadCleanups { upload_id } => {
+            release_multipart_upload_cleanups(driver, &upload_id).await?;
+            Ok(MutationOutcome::Ack)
+        }
+        Mutation::RecoverMultipartStagingAccounting { limit } => {
+            recover_multipart_staging_accounting(driver, limit).await
         }
         Mutation::ClaimMultipart(upload_id) => claim_multipart(driver, &upload_id).await,
+        Mutation::ReleaseMultipartClaim(upload_id) => {
+            let released = driver
+                .execute(
+                    "UPDATE multipart_uploads SET status='active'
+                     WHERE id=?1 AND status='completing'",
+                    vec![Value::Text(upload_id.as_str().to_owned())],
+                )
+                .await?;
+            Ok(MutationOutcome::MultipartClaimRelease(if released == 1 {
+                ClaimReleaseOutcome::Released
+            } else {
+                ClaimReleaseOutcome::NotOwner
+            }))
+        }
+        Mutation::RecoverMultipartClaims => {
+            // Mirrors cairn-meta: a fresh process has no live completion owner, so restore every
+            // transient `completing` claim to a retryable active session.
+            driver
+                .execute(
+                    "UPDATE multipart_uploads SET status='active' WHERE status='completing'",
+                    vec![],
+                )
+                .await?;
+            Ok(MutationOutcome::Ack)
+        }
         Mutation::CompleteMultipart {
             upload_id,
             row,
             precondition,
             replication,
         } => {
+            let Some(initial_state) =
+                multipart_initial_state(driver, &upload_id, &row.bucket, &row.key).await?
+            else {
+                return Ok(MutationOutcome::MultipartTerminal(
+                    MultipartTerminalOutcome::NotOwner,
+                ));
+            };
             let bucket = row.bucket.clone();
             let key = row.key.clone();
             check_precondition(driver, &bucket, &key, &precondition).await?;
             enforce_bucket_quota(driver, &row).await?;
             enforce_user_quota(driver, &row).await?;
-            let version_id = row.version_id.clone();
-            let superseded = upsert_version(driver, *row).await?;
-            driver
-                .execute(
-                    "DELETE FROM multipart_uploads WHERE id=?1",
-                    vec![Value::Text(upload_id.as_str().to_owned())],
+            if replacement_is_protected(
+                driver,
+                &bucket,
+                &key,
+                &row.version_id,
+                row.created_at,
+                GovernanceBypass::Denied,
+            )
+            .await?
+            {
+                return Err(MetaError::ObjectProtected);
+            }
+            let (initial_tags, lock_state) = if row.is_delete_marker {
+                (Vec::new(), ObjectLockState::default())
+            } else {
+                let lock_state = resolve_initial_object_lock(
+                    driver,
+                    &bucket,
+                    initial_state.lock_intent,
+                    row.created_at,
                 )
                 .await?;
+                (initial_state.tags, lock_state)
+            };
+            let version_id = row.version_id.clone();
+            let superseded = upsert_version(driver, *row).await?;
+            replace_object_tags(driver, &bucket, &key, &version_id, &initial_tags).await?;
+            write_object_lock_state(driver, &bucket, &key, &version_id, lock_state).await?;
+            retire_multipart_session(driver, &upload_id).await?;
             for e in &replication {
                 enqueue(driver, e).await?;
             }
-            Ok(MutationOutcome::MultipartCompleted {
-                superseded,
-                version_id,
-            })
+            Ok(MutationOutcome::MultipartTerminal(
+                MultipartTerminalOutcome::Completed {
+                    superseded,
+                    version_id,
+                },
+            ))
         }
         Mutation::AbortMultipart(upload_id) => {
-            driver
-                .execute(
-                    "DELETE FROM multipart_uploads WHERE id=?1",
-                    vec![Value::Text(upload_id.as_str().to_owned())],
-                )
-                .await?;
-            Ok(MutationOutcome::Ack)
+            let active = query_one(
+                driver,
+                "SELECT EXISTS(
+                     SELECT 1 FROM multipart_uploads WHERE id=?1 AND status='active'
+                 )",
+                vec![Value::Text(upload_id.as_str().to_owned())],
+            )
+            .await?
+            .is_some_and(|row| row.get_i64(0) != 0);
+            if active {
+                retire_multipart_session(driver, &upload_id).await?;
+            }
+            Ok(MutationOutcome::MultipartTerminal(if active {
+                MultipartTerminalOutcome::Aborted
+            } else {
+                MultipartTerminalOutcome::NotOwner
+            }))
         }
         Mutation::CreateBucket(b) => {
             // `compression_policy` is the spec column name (ARCH 34.1); `quota_bytes` defaults to
@@ -184,6 +421,41 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
                         Value::Text(model::ownership_str(b.ownership_mode).to_owned()),
                         Value::Text(b.region.clone()),
                         opt_text(b.compression.as_ref().map(to_json)),
+                    ],
+                )
+                .await?;
+            Ok(MutationOutcome::Ack)
+        }
+        Mutation::CreateObjectLockBucket(b) => {
+            if b.versioning != VersioningState::Enabled {
+                return Err(MetaError::InvalidBucketState);
+            }
+            driver
+                .execute(
+                    "INSERT INTO buckets (name, owner_id, created_at, versioning_state, ownership_mode, region, compression_policy)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                    vec![
+                        Value::Text(b.name.as_str().to_owned()),
+                        Value::Text(b.owner_id.0.clone()),
+                        Value::Int(b.created_at.0),
+                        Value::Text(model::versioning_str(b.versioning).to_owned()),
+                        Value::Text(model::ownership_str(b.ownership_mode).to_owned()),
+                        Value::Text(b.region.clone()),
+                        opt_text(b.compression.as_ref().map(to_json)),
+                    ],
+                )
+                .await?;
+            let config = ObjectLockConfiguration {
+                enabled: true,
+                default_retention: None,
+            };
+            driver
+                .execute(
+                    "INSERT INTO bucket_config (bucket_name, aspect, doc)
+                     VALUES (?1,'object_lock',?2)",
+                    vec![
+                        Value::Text(b.name.as_str().to_owned()),
+                        Value::Text(to_json(&config)),
                     ],
                 )
                 .await?;
@@ -236,6 +508,14 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
                     vec![Value::Text(name.as_str().to_owned())],
                 )
                 .await?;
+            // Account-global share rows cannot carry a cross-shard bucket FK. Purge them explicitly
+            // so a later same-name bucket cannot revive a pre-delete bearer capability.
+            driver
+                .execute(
+                    "DELETE FROM object_shares WHERE bucket_name=?1",
+                    vec![Value::Text(name.as_str().to_owned())],
+                )
+                .await?;
             Ok(MutationOutcome::Ack)
         }
         Mutation::SetBucketConfig {
@@ -243,6 +523,9 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
             aspect,
             doc,
         } => {
+            if aspect == ConfigAspect::ObjectLock {
+                return Err(MetaError::InvalidBucketState);
+            }
             let aspect_s = config_aspect_str(aspect);
             match doc {
                 Some(d) => {
@@ -271,34 +554,71 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
             }
             Ok(MutationOutcome::Ack)
         }
+        Mutation::UpdateObjectLockConfiguration {
+            bucket,
+            default_retention,
+        } => {
+            if let Some(default) = default_retention {
+                default
+                    .validate()
+                    .map_err(|_| MetaError::InvalidObjectLockState)?;
+            }
+            let versioning = query_one(
+                driver,
+                "SELECT versioning_state FROM buckets WHERE name=?1",
+                vec![Value::Text(bucket.as_str().to_owned())],
+            )
+            .await?
+            .map(|row| row.get_text(0));
+            if versioning.as_deref() != Some("enabled") {
+                return Err(MetaError::InvalidBucketState);
+            }
+            let exists = query_one(
+                driver,
+                "SELECT EXISTS(
+                     SELECT 1 FROM bucket_config
+                     WHERE bucket_name=?1 AND aspect='object_lock'
+                 )",
+                vec![Value::Text(bucket.as_str().to_owned())],
+            )
+            .await?
+            .is_some_and(|row| row.get_i64(0) != 0);
+            if !exists {
+                return Err(MetaError::InvalidBucketState);
+            }
+            let config = ObjectLockConfiguration {
+                enabled: true,
+                default_retention,
+            };
+            driver
+                .execute(
+                    "UPDATE bucket_config SET doc=?2
+                     WHERE bucket_name=?1 AND aspect='object_lock'",
+                    vec![
+                        Value::Text(bucket.as_str().to_owned()),
+                        Value::Text(to_json(&config)),
+                    ],
+                )
+                .await?;
+            Ok(MutationOutcome::Ack)
+        }
         Mutation::SetObjectRetention {
             bucket,
             key,
             version_id,
             retention,
+            now,
+            bypass,
         } => {
-            let mode = retention
-                .as_ref()
-                .map(|r| model::lock_mode_str(r.mode).to_owned());
-            let until = match retention.as_ref().map(|r| r.retain_until.0) {
-                Some(u) => Value::Int(u),
-                None => Value::Null,
-            };
-            driver
-                .execute(
-                    "INSERT INTO object_locks (bucket_name, key, version_id, lock_mode, retain_until, legal_hold)
-                     VALUES (?1,?2,?3,?4,?5,0)
-                     ON CONFLICT(bucket_name,key,version_id)
-                     DO UPDATE SET lock_mode=excluded.lock_mode, retain_until=excluded.retain_until",
-                    vec![
-                        Value::Text(bucket.as_str().to_owned()),
-                        Value::Text(key.as_str().to_owned()),
-                        Value::Text(version_id.as_str().to_owned()),
-                        opt_text(mode),
-                        until,
-                    ],
-                )
-                .await?;
+            ensure_object_version_exists(driver, &bucket, &key, &version_id).await?;
+            require_object_lock_bucket(driver, &bucket).await?;
+            if retention.is_some_and(|candidate| candidate.retain_until <= now) {
+                return Err(MetaError::InvalidObjectLockState);
+            }
+            let mut state = read_object_lock_state(driver, &bucket, &key, &version_id).await?;
+            enforce_retention_transition(state.retention, retention, now, bypass)?;
+            state.retention = retention;
+            write_object_lock_state(driver, &bucket, &key, &version_id, state).await?;
             Ok(MutationOutcome::Ack)
         }
         Mutation::SetObjectLegalHold {
@@ -307,22 +627,29 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
             version_id,
             on,
         } => {
-            driver
-                .execute(
-                    "INSERT INTO object_locks (bucket_name, key, version_id, lock_mode, retain_until, legal_hold)
-                     VALUES (?1,?2,?3,NULL,NULL,?4)
-                     ON CONFLICT(bucket_name,key,version_id) DO UPDATE SET legal_hold=excluded.legal_hold",
-                    vec![
-                        Value::Text(bucket.as_str().to_owned()),
-                        Value::Text(key.as_str().to_owned()),
-                        Value::Text(version_id.as_str().to_owned()),
-                        Value::Int(on as i64),
-                    ],
-                )
-                .await?;
+            ensure_object_version_exists(driver, &bucket, &key, &version_id).await?;
+            require_object_lock_bucket(driver, &bucket).await?;
+            let mut state = read_object_lock_state(driver, &bucket, &key, &version_id).await?;
+            state.legal_hold = on;
+            write_object_lock_state(driver, &bucket, &key, &version_id, state).await?;
             Ok(MutationOutcome::Ack)
         }
         Mutation::SetVersioning { bucket, state } => {
+            if state != VersioningState::Enabled {
+                let has_object_lock = query_one(
+                    driver,
+                    "SELECT EXISTS(
+                         SELECT 1 FROM bucket_config
+                         WHERE bucket_name=?1 AND aspect='object_lock'
+                     )",
+                    vec![Value::Text(bucket.as_str().to_owned())],
+                )
+                .await?
+                .is_some_and(|row| row.get_i64(0) != 0);
+                if has_object_lock {
+                    return Err(MetaError::InvalidBucketState);
+                }
+            }
             driver
                 .execute(
                     "UPDATE buckets SET versioning_state=?2 WHERE name=?1",
@@ -786,15 +1113,20 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
                 .await?;
             Ok(MutationOutcome::Ack)
         }
-        Mutation::PruneImportJobs { before_ms } => {
-            driver
+        Mutation::PruneImportJobs { before_ms, limit } => {
+            let limit = i64::from(limit.clamp(1, MAX_IMPORT_JOB_PRUNE_BATCH));
+            let rows = driver
                 .execute(
                     "DELETE FROM import_jobs
-                     WHERE state IN ('completed','failed','cancelled') AND updated_at < ?1",
-                    vec![Value::Int(before_ms)],
+                     WHERE id IN (
+                         SELECT id FROM import_jobs
+                         WHERE state IN ('completed','failed','cancelled') AND updated_at < ?1
+                         LIMIT ?2
+                     )",
+                    vec![Value::Int(before_ms), Value::Int(limit)],
                 )
                 .await?;
-            Ok(MutationOutcome::Ack)
+            Ok(MutationOutcome::ImportJobsPruned(rows))
         }
         Mutation::ClaimReplicationBatch {
             limit,
@@ -1037,10 +1369,11 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
             driver
                 .execute(
                     "INSERT INTO object_shares
-                     (token, bucket_name, key, version_id, expires_at, disposition, filename, created_by, created_at, revoked_at)
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                     (id, token_hash, bucket_name, key, version_id, expires_at, disposition, filename, created_by, created_at, revoked_at)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
                     vec![
-                        Value::Text(s.token.clone()),
+                        Value::Text(s.id.clone()),
+                        Value::Blob(s.token_hash.as_bytes().to_vec()),
                         Value::Text(s.bucket.as_str().to_owned()),
                         Value::Text(s.key.as_str().to_owned()),
                         opt_text(s.version_id.as_ref().map(|v| v.as_str().to_owned())),
@@ -1055,11 +1388,11 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
                 .await?;
             Ok(MutationOutcome::Ack)
         }
-        Mutation::RevokeShare { token, now } => {
+        Mutation::RevokeShare { id, now } => {
             driver
                 .execute(
-                    "UPDATE object_shares SET revoked_at=?2 WHERE token=?1 AND revoked_at IS NULL",
-                    vec![Value::Text(token.clone()), Value::Int(now.0)],
+                    "UPDATE object_shares SET revoked_at=?2 WHERE id=?1 AND revoked_at IS NULL",
+                    vec![Value::Text(id.clone()), Value::Int(now.0)],
                 )
                 .await?;
             Ok(MutationOutcome::Ack)
@@ -1119,17 +1452,429 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredObjectLockConfiguration {
+    enabled: bool,
+    default_retention: Option<StoredDefaultRetention>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredDefaultRetention {
+    mode: ObjectLockMode,
+    period: RetentionPeriod,
+}
+
+async fn bucket_object_lock_configuration(
+    driver: &dyn AsyncSqlDriver,
+    bucket: &BucketName,
+) -> R<Option<ObjectLockConfiguration>> {
+    let doc = query_one(
+        driver,
+        "SELECT doc FROM bucket_config
+         WHERE bucket_name=?1 AND aspect='object_lock'",
+        vec![Value::Text(bucket.as_str().to_owned())],
+    )
+    .await?
+    .map(|row| row.get_text(0));
+    let Some(doc) = doc else {
+        return Ok(None);
+    };
+    let versioning = query_one(
+        driver,
+        "SELECT versioning_state FROM buckets WHERE name=?1",
+        vec![Value::Text(bucket.as_str().to_owned())],
+    )
+    .await?
+    .map(|row| row.get_text(0));
+    if versioning.as_deref() != Some("enabled") {
+        return Err(MetaError::InvalidBucketState);
+    }
+    let stored: StoredObjectLockConfiguration =
+        serde_json::from_str(&doc).map_err(|_| MetaError::InvalidObjectLockState)?;
+    if !stored.enabled {
+        return Err(MetaError::InvalidObjectLockState);
+    }
+    let default_retention = stored.default_retention.map(|default| DefaultRetention {
+        mode: default.mode,
+        period: default.period,
+    });
+    if let Some(default) = default_retention {
+        default
+            .validate()
+            .map_err(|_| MetaError::InvalidObjectLockState)?;
+    }
+    Ok(Some(ObjectLockConfiguration {
+        enabled: true,
+        default_retention,
+    }))
+}
+
+async fn require_object_lock_bucket(
+    driver: &dyn AsyncSqlDriver,
+    bucket: &BucketName,
+) -> R<ObjectLockConfiguration> {
+    bucket_object_lock_configuration(driver, bucket)
+        .await?
+        .ok_or(MetaError::InvalidBucketState)
+}
+
+async fn resolve_initial_object_lock(
+    driver: &dyn AsyncSqlDriver,
+    bucket: &BucketName,
+    intent: ExplicitObjectLockIntent,
+    now: Timestamp,
+) -> R<ObjectLockState> {
+    let config = bucket_object_lock_configuration(driver, bucket).await?;
+    let Some(config) = config else {
+        if intent.retention.is_some() || intent.legal_hold.is_some() {
+            return Err(MetaError::InvalidBucketState);
+        }
+        return Ok(ObjectLockState::default());
+    };
+    if intent
+        .retention
+        .is_some_and(|retention| retention.retain_until <= now)
+    {
+        return Err(MetaError::InvalidObjectLockState);
+    }
+    let retention = match (intent.retention, config.default_retention) {
+        (Some(retention), _) => Some(retention),
+        (None, Some(default)) => Some(ObjectRetention {
+            mode: default.mode,
+            retain_until: default
+                .retain_until(now)
+                .map_err(|_| MetaError::InvalidObjectLockState)?,
+        }),
+        (None, None) => None,
+    };
+    Ok(ObjectLockState {
+        retention,
+        legal_hold: intent.legal_hold.unwrap_or(false),
+    })
+}
+
+async fn validate_multipart_lock_intent(
+    driver: &dyn AsyncSqlDriver,
+    bucket: &BucketName,
+    intent: ExplicitObjectLockIntent,
+    now: Timestamp,
+) -> R<()> {
+    let config = bucket_object_lock_configuration(driver, bucket).await?;
+    let Some(_) = config else {
+        return if intent.retention.is_none() && intent.legal_hold.is_none() {
+            Ok(())
+        } else {
+            Err(MetaError::InvalidBucketState)
+        };
+    };
+    if intent
+        .retention
+        .is_some_and(|retention| retention.retain_until <= now)
+    {
+        return Err(MetaError::InvalidObjectLockState);
+    }
+    Ok(())
+}
+
+async fn read_object_lock_state(
+    driver: &dyn AsyncSqlDriver,
+    bucket: &BucketName,
+    key: &ObjectKey,
+    version_id: &VersionId,
+) -> R<ObjectLockState> {
+    let row = query_one(
+        driver,
+        "SELECT lock_mode, retain_until, legal_hold FROM object_locks
+         WHERE bucket_name=?1 AND key=?2 AND version_id=?3",
+        vec![
+            Value::Text(bucket.as_str().to_owned()),
+            Value::Text(key.as_str().to_owned()),
+            Value::Text(version_id.as_str().to_owned()),
+        ],
+    )
+    .await?;
+    row.map_or_else(
+        || Ok(ObjectLockState::default()),
+        |row| {
+            model::object_lock_state_from_columns(
+                row.get_opt_text(0),
+                row.get_opt_i64(1),
+                row.get_i64(2),
+            )
+        },
+    )
+}
+
+async fn write_object_lock_state(
+    driver: &dyn AsyncSqlDriver,
+    bucket: &BucketName,
+    key: &ObjectKey,
+    version_id: &VersionId,
+    state: ObjectLockState,
+) -> R<()> {
+    if state == ObjectLockState::default() {
+        driver
+            .execute(
+                "DELETE FROM object_locks
+                 WHERE bucket_name=?1 AND key=?2 AND version_id=?3",
+                vec![
+                    Value::Text(bucket.as_str().to_owned()),
+                    Value::Text(key.as_str().to_owned()),
+                    Value::Text(version_id.as_str().to_owned()),
+                ],
+            )
+            .await?;
+        return Ok(());
+    }
+    let mode = state
+        .retention
+        .map(|retention| model::lock_mode_str(retention.mode).to_owned());
+    let until = state.retention.map(|retention| retention.retain_until.0);
+    driver
+        .execute(
+            "INSERT INTO object_locks
+             (bucket_name, key, version_id, lock_mode, retain_until, legal_hold)
+             VALUES (?1,?2,?3,?4,?5,?6)
+             ON CONFLICT(bucket_name,key,version_id) DO UPDATE SET
+                 lock_mode=excluded.lock_mode,
+                 retain_until=excluded.retain_until,
+                 legal_hold=excluded.legal_hold",
+            vec![
+                Value::Text(bucket.as_str().to_owned()),
+                Value::Text(key.as_str().to_owned()),
+                Value::Text(version_id.as_str().to_owned()),
+                opt_text(mode),
+                until.map_or(Value::Null, Value::Int),
+                Value::Int(state.legal_hold as i64),
+            ],
+        )
+        .await?;
+    Ok(())
+}
+
+async fn ensure_object_version_exists(
+    driver: &dyn AsyncSqlDriver,
+    bucket: &BucketName,
+    key: &ObjectKey,
+    version_id: &VersionId,
+) -> R<()> {
+    let exists = query_one(
+        driver,
+        "SELECT EXISTS(
+             SELECT 1 FROM object_versions
+             WHERE bucket_name=?1 AND key=?2 AND version_id=?3
+         )",
+        vec![
+            Value::Text(bucket.as_str().to_owned()),
+            Value::Text(key.as_str().to_owned()),
+            Value::Text(version_id.as_str().to_owned()),
+        ],
+    )
+    .await?
+    .is_some_and(|row| row.get_i64(0) != 0);
+    if exists {
+        Ok(())
+    } else {
+        Err(MetaError::ObjectVersionNotFound)
+    }
+}
+
+async fn replacement_is_protected(
+    driver: &dyn AsyncSqlDriver,
+    bucket: &BucketName,
+    key: &ObjectKey,
+    version_id: &VersionId,
+    now: Timestamp,
+    bypass: GovernanceBypass,
+) -> R<bool> {
+    // Parse any durable bucket configuration even when the exact version has no side row. This
+    // makes malformed/disabled legacy Object Lock state fail all object creation paths closed.
+    let _ = bucket_object_lock_configuration(driver, bucket).await?;
+    let state = read_object_lock_state(driver, bucket, key, version_id).await?;
+    if state.legal_hold {
+        return Ok(true);
+    }
+    Ok(match state.retention {
+        Some(retention) if retention.retain_until > now => match retention.mode {
+            ObjectLockMode::Compliance => true,
+            ObjectLockMode::Governance => bypass != GovernanceBypass::Authorized,
+        },
+        _ => false,
+    })
+}
+
+fn enforce_retention_transition(
+    current: Option<ObjectRetention>,
+    requested: Option<ObjectRetention>,
+    now: Timestamp,
+    bypass: GovernanceBypass,
+) -> R<()> {
+    let Some(current) = current.filter(|retention| retention.retain_until > now) else {
+        return Ok(());
+    };
+    let non_weakening = match (current.mode, requested) {
+        (ObjectLockMode::Compliance, Some(next)) => {
+            next.mode == ObjectLockMode::Compliance && next.retain_until >= current.retain_until
+        }
+        (ObjectLockMode::Governance, Some(next)) => next.retain_until >= current.retain_until,
+        (_, None) => false,
+    };
+    if non_weakening
+        || (current.mode == ObjectLockMode::Governance && bypass == GovernanceBypass::Authorized)
+    {
+        Ok(())
+    } else {
+        Err(MetaError::ObjectProtected)
+    }
+}
+
+async fn replace_object_tags(
+    driver: &dyn AsyncSqlDriver,
+    bucket: &BucketName,
+    key: &ObjectKey,
+    version_id: &VersionId,
+    tags: &[(String, String)],
+) -> R<()> {
+    driver
+        .execute(
+            "DELETE FROM object_tags
+             WHERE bucket_name=?1 AND key=?2 AND version_id=?3",
+            vec![
+                Value::Text(bucket.as_str().to_owned()),
+                Value::Text(key.as_str().to_owned()),
+                Value::Text(version_id.as_str().to_owned()),
+            ],
+        )
+        .await?;
+    for (tag_key, tag_value) in tags {
+        driver
+            .execute(
+                "INSERT INTO object_tags
+                 (bucket_name, key, version_id, tag_key, tag_value)
+                 VALUES (?1,?2,?3,?4,?5)",
+                vec![
+                    Value::Text(bucket.as_str().to_owned()),
+                    Value::Text(key.as_str().to_owned()),
+                    Value::Text(version_id.as_str().to_owned()),
+                    Value::Text(tag_key.clone()),
+                    Value::Text(tag_value.clone()),
+                ],
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+async fn multipart_initial_state(
+    driver: &dyn AsyncSqlDriver,
+    upload_id: &cairn_types::UploadId,
+    bucket: &BucketName,
+    key: &ObjectKey,
+) -> R<Option<InitialObjectState>> {
+    let row = query_one(
+        driver,
+        "SELECT initial_tags, lock_mode, retain_until, legal_hold, object_lock_intent_known
+         FROM multipart_uploads
+         WHERE id=?1 AND status='completing' AND bucket_name=?2 AND key=?3",
+        vec![
+            Value::Text(upload_id.as_str().to_owned()),
+            Value::Text(bucket.as_str().to_owned()),
+            Value::Text(key.as_str().to_owned()),
+        ],
+    )
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let intent_known = row.get_i64(4);
+    if intent_known == 0 {
+        if bucket_object_lock_configuration(driver, bucket)
+            .await?
+            .is_some()
+        {
+            return Err(MetaError::InvalidObjectLockState);
+        }
+        let tags: Vec<(String, String)> = serde_json::from_str(&row.get_text(0))
+            .map_err(|_| MetaError::InvalidObjectLockState)?;
+        if !tags.is_empty()
+            || row.get_opt_text(1).is_some()
+            || row.get_opt_i64(2).is_some()
+            || row.get_opt_i64(3).is_some()
+        {
+            return Err(MetaError::InvalidObjectLockState);
+        }
+        return Ok(Some(InitialObjectState::default()));
+    }
+    if intent_known != 1 {
+        return Err(MetaError::InvalidObjectLockState);
+    }
+    let tags = serde_json::from_str(&row.get_text(0))
+        .map_err(|_| MetaError::Engine("invalid multipart initial tags".to_owned()))?;
+    let retention = match (row.get_opt_text(1), row.get_opt_i64(2)) {
+        (None, None) => None,
+        (Some(mode), Some(until)) => Some(ObjectRetention {
+            mode: model::lock_mode_from(&mode)?,
+            retain_until: Timestamp(until),
+        }),
+        _ => return Err(MetaError::InvalidObjectLockState),
+    };
+    let legal_hold = match row.get_opt_i64(3) {
+        None => None,
+        Some(0) => Some(false),
+        Some(1) => Some(true),
+        Some(_) => return Err(MetaError::InvalidObjectLockState),
+    };
+    Ok(Some(InitialObjectState {
+        tags,
+        lock_intent: ExplicitObjectLockIntent {
+            retention,
+            legal_hold,
+        },
+    }))
+}
+
 async fn put_version(
     driver: &dyn AsyncSqlDriver,
     row: ObjectVersionRow,
     precondition: &Precondition,
+    initial_state: InitialObjectState,
     replication: Vec<OutboxEntry>,
 ) -> R<MutationOutcome> {
     check_precondition(driver, &row.bucket, &row.key, precondition).await?;
     enforce_bucket_quota(driver, &row).await?;
     enforce_user_quota(driver, &row).await?;
+    if replacement_is_protected(
+        driver,
+        &row.bucket,
+        &row.key,
+        &row.version_id,
+        row.created_at,
+        GovernanceBypass::Denied,
+    )
+    .await?
+    {
+        return Err(MetaError::ObjectProtected);
+    }
+    let (initial_tags, lock_state) = if row.is_delete_marker {
+        (Vec::new(), ObjectLockState::default())
+    } else {
+        let lock_state = resolve_initial_object_lock(
+            driver,
+            &row.bucket,
+            initial_state.lock_intent,
+            row.created_at,
+        )
+        .await?;
+        (initial_state.tags, lock_state)
+    };
+    let bucket = row.bucket.clone();
+    let key = row.key.clone();
     let version_id = row.version_id.clone();
     let superseded = upsert_version(driver, row).await?;
+    replace_object_tags(driver, &bucket, &key, &version_id, &initial_tags).await?;
+    write_object_lock_state(driver, &bucket, &key, &version_id, lock_state).await?;
     for e in &replication {
         enqueue(driver, e).await?;
     }
@@ -1421,6 +2166,8 @@ async fn delete_version(
     key: &ObjectKey,
     version_id: &VersionId,
     expected_updated_at: Option<Timestamp>,
+    now: Timestamp,
+    bypass: GovernanceBypass,
 ) -> R<MutationOutcome> {
     // Compare-and-delete guard (mirrors cairn-meta): skip the delete when the version's stored
     // updated_at no longer matches the value captured at enumeration — it was overwritten since, so
@@ -1457,14 +2204,22 @@ async fn delete_version(
         ],
     )
     .await?;
-    let (freed, was_latest, removed) = match existing {
-        Some(r) => (
-            r.get_opt_text(0).map(StoragePath::from_string),
-            r.get_i64(1) != 0,
-            Some((r.get_text(2), r.get_i64(3), r.get_i64(4))),
-        ),
-        None => (None, false, None),
+    let Some(existing) = existing else {
+        return Ok(MutationOutcome::Deleted {
+            freed: None,
+            promoted_latest: false,
+        });
     };
+    if replacement_is_protected(driver, bucket, key, version_id, now, bypass).await? {
+        return Ok(MutationOutcome::DeleteProtected);
+    }
+    let freed = existing.get_opt_text(0).map(StoragePath::from_string);
+    let was_latest = existing.get_i64(1) != 0;
+    let removed = (
+        existing.get_text(2),
+        existing.get_i64(3),
+        existing.get_i64(4),
+    );
     driver
         .execute(
             "DELETE FROM object_versions WHERE bucket_name=?1 AND key=?2 AND version_id=?3",
@@ -1498,10 +2253,16 @@ async fn delete_version(
             ],
         )
         .await?;
-    if let Some((owner, sl, sp_bytes)) = removed {
-        // The deleted row leaves the table: subtract its version and bytes from the counters.
-        adjust_stats(driver, bucket.as_str(), &owner, -1, -sl, -sp_bytes).await?;
-    }
+    // The deleted row leaves the table: subtract its version and bytes from the counters.
+    adjust_stats(
+        driver,
+        bucket.as_str(),
+        &removed.0,
+        -1,
+        -removed.1,
+        -removed.2,
+    )
+    .await?;
     let mut promoted = false;
     if was_latest {
         let promote: Option<String> = query_one(
@@ -1528,6 +2289,476 @@ async fn delete_version(
         freed,
         promoted_latest: promoted,
     })
+}
+
+struct MultipartContext {
+    bucket: String,
+    principal: String,
+    updated_at: i64,
+}
+
+async fn active_multipart_context(
+    driver: &dyn AsyncSqlDriver,
+    upload_id: &cairn_types::UploadId,
+) -> R<MultipartContext> {
+    query_one(
+        driver,
+        "SELECT bucket_name, COALESCE(initiated_by, owner_id), updated_at
+         FROM multipart_uploads WHERE id=?1 AND status='active'",
+        vec![Value::Text(upload_id.as_str().to_owned())],
+    )
+    .await?
+    .map(|row| MultipartContext {
+        bucket: row.get_text(0),
+        principal: row.get_text(1),
+        updated_at: row.get_i64(2),
+    })
+    .ok_or(MetaError::MultipartNotActive)
+}
+
+async fn multipart_context(
+    driver: &dyn AsyncSqlDriver,
+    upload_id: &cairn_types::UploadId,
+) -> R<MultipartContext> {
+    query_one(
+        driver,
+        "SELECT bucket_name, COALESCE(initiated_by, owner_id), updated_at
+         FROM multipart_uploads WHERE id=?1",
+        vec![Value::Text(upload_id.as_str().to_owned())],
+    )
+    .await?
+    .map(|row| MultipartContext {
+        bucket: row.get_text(0),
+        principal: row.get_text(1),
+        updated_at: row.get_i64(2),
+    })
+    .ok_or(MetaError::MultipartNotActive)
+}
+
+async fn multipart_stat(
+    driver: &dyn AsyncSqlDriver,
+    table: &str,
+    key_column: &str,
+    key: &str,
+    value_column: &str,
+) -> R<i64> {
+    Ok(query_one(
+        driver,
+        &format!("SELECT {value_column} FROM {table} WHERE {key_column}=?1"),
+        vec![Value::Text(key.to_owned())],
+    )
+    .await?
+    .map_or(0, |row| row.get_i64(0)))
+}
+
+async fn adjust_multipart_stats(
+    driver: &dyn AsyncSqlDriver,
+    bucket: &str,
+    principal: &str,
+    active_delta: i64,
+    bytes_delta: i64,
+) -> R<()> {
+    driver
+        .execute(
+            "INSERT OR IGNORE INTO multipart_bucket_stats
+             (bucket_name, active_uploads, staged_bytes) VALUES (?1,0,0)",
+            vec![Value::Text(bucket.to_owned())],
+        )
+        .await?;
+    driver
+        .execute(
+            "UPDATE multipart_bucket_stats
+             SET active_uploads=active_uploads+?2, staged_bytes=staged_bytes+?3
+             WHERE bucket_name=?1",
+            vec![
+                Value::Text(bucket.to_owned()),
+                Value::Int(active_delta),
+                Value::Int(bytes_delta),
+            ],
+        )
+        .await?;
+    driver
+        .execute(
+            "INSERT OR IGNORE INTO multipart_principal_stats
+             (principal_id, active_uploads, staged_bytes) VALUES (?1,0,0)",
+            vec![Value::Text(principal.to_owned())],
+        )
+        .await?;
+    driver
+        .execute(
+            "UPDATE multipart_principal_stats
+             SET active_uploads=active_uploads+?2, staged_bytes=staged_bytes+?3
+             WHERE principal_id=?1",
+            vec![
+                Value::Text(principal.to_owned()),
+                Value::Int(active_delta),
+                Value::Int(bytes_delta),
+            ],
+        )
+        .await?;
+    Ok(())
+}
+
+async fn enforce_multipart_reservation_quota(
+    driver: &dyn AsyncSqlDriver,
+    context: &MultipartContext,
+    reserved_bytes: u64,
+) -> R<()> {
+    let bucket_quota = query_one(
+        driver,
+        "SELECT quota_bytes FROM buckets WHERE name=?1",
+        vec![Value::Text(context.bucket.clone())],
+    )
+    .await?
+    .and_then(|row| row.get_opt_i64(0));
+    if let Some(quota) = bucket_quota {
+        let committed = multipart_stat(
+            driver,
+            "bucket_stats",
+            "bucket_name",
+            &context.bucket,
+            "logical_bytes",
+        )
+        .await?;
+        let staged = multipart_stat(
+            driver,
+            "multipart_bucket_stats",
+            "bucket_name",
+            &context.bucket,
+            "staged_bytes",
+        )
+        .await?;
+        let projected = u128::from(committed.max(0) as u64)
+            + u128::from(staged.max(0) as u64)
+            + u128::from(reserved_bytes);
+        if projected > u128::from(quota.max(0) as u64) {
+            return Err(MetaError::QuotaExceeded);
+        }
+    }
+
+    let principal_quota = query_one(
+        driver,
+        "SELECT quota_bytes FROM users WHERE id=?1",
+        vec![Value::Text(context.principal.clone())],
+    )
+    .await?
+    .and_then(|row| row.get_opt_i64(0));
+    if let Some(quota) = principal_quota {
+        let committed = multipart_stat(
+            driver,
+            "user_stats",
+            "owner_id",
+            &context.principal,
+            "logical_bytes",
+        )
+        .await?;
+        let staged = multipart_stat(
+            driver,
+            "multipart_principal_stats",
+            "principal_id",
+            &context.principal,
+            "staged_bytes",
+        )
+        .await?;
+        let projected = u128::from(committed.max(0) as u64)
+            + u128::from(staged.max(0) as u64)
+            + u128::from(reserved_bytes);
+        if projected > u128::from(quota.max(0) as u64) {
+            return Err(MetaError::QuotaExceeded);
+        }
+    }
+    Ok(())
+}
+
+async fn release_multipart_reservation(
+    driver: &dyn AsyncSqlDriver,
+    upload_id: &cairn_types::UploadId,
+    attempt_id: &str,
+) -> R<()> {
+    let row = query_one(
+        driver,
+        "SELECT u.bucket_name, COALESCE(u.initiated_by, u.owner_id), r.reserved_bytes
+         FROM multipart_part_reservations r
+         JOIN multipart_uploads u ON u.id=r.upload_id
+         WHERE r.attempt_id=?1 AND r.upload_id=?2",
+        vec![
+            Value::Text(attempt_id.to_owned()),
+            Value::Text(upload_id.as_str().to_owned()),
+        ],
+    )
+    .await?;
+    let Some(row) = row else {
+        return Ok(());
+    };
+    let bucket = row.get_text(0);
+    let principal = row.get_text(1);
+    let bytes = row.get_i64(2);
+    driver
+        .execute(
+            "DELETE FROM multipart_part_reservations
+             WHERE attempt_id=?1 AND upload_id=?2",
+            vec![
+                Value::Text(attempt_id.to_owned()),
+                Value::Text(upload_id.as_str().to_owned()),
+            ],
+        )
+        .await?;
+    adjust_multipart_stats(driver, &bucket, &principal, 0, -bytes).await
+}
+
+async fn record_part(
+    driver: &dyn AsyncSqlDriver,
+    upload_id: &cairn_types::UploadId,
+    attempt_id: &str,
+    part: cairn_types::meta::PartRecord,
+) -> R<MutationOutcome> {
+    let context = active_multipart_context(driver, upload_id).await?;
+    let reservation = query_one(
+        driver,
+        "SELECT part_number, reserved_bytes, created_at
+         FROM multipart_part_reservations
+         WHERE attempt_id=?1 AND upload_id=?2",
+        vec![
+            Value::Text(attempt_id.to_owned()),
+            Value::Text(upload_id.as_str().to_owned()),
+        ],
+    )
+    .await?;
+    let Some(reservation) = reservation else {
+        return Err(MetaError::MultipartNotActive);
+    };
+    let reserved_part = reservation.get_i64(0);
+    let reserved_bytes = reservation.get_i64(1);
+    let reserved_at = reservation.get_i64(2);
+    if reserved_part != i64::from(part.part_number) || part.size != reserved_bytes as u64 {
+        return Err(MetaError::QuotaExceeded);
+    }
+
+    let previous = query_one(
+        driver,
+        "SELECT storage_path, size FROM multipart_parts
+         WHERE upload_id=?1 AND part_number=?2",
+        vec![
+            Value::Text(upload_id.as_str().to_owned()),
+            Value::Int(i64::from(part.part_number)),
+        ],
+    )
+    .await?;
+    let cleanup = previous.map(|row| MultipartCleanup {
+        id: format!("part:{attempt_id}"),
+        upload_id: upload_id.clone(),
+        bucket: BucketName::parse(&context.bucket).expect("stored bucket name is validated"),
+        principal_id: cairn_types::UserId(context.principal.clone()),
+        bytes: row.get_i64(1) as u64,
+        storage_path: Some(StoragePath::from_string(row.get_text(0))),
+        created_at: Timestamp(reserved_at),
+    });
+    if let Some(debt) = &cleanup {
+        driver
+            .execute(
+                "INSERT INTO multipart_staging_cleanups
+                 (id, upload_id, bucket_name, principal_id, bytes, storage_path, created_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                vec![
+                    Value::Text(debt.id.clone()),
+                    Value::Text(debt.upload_id.as_str().to_owned()),
+                    Value::Text(debt.bucket.as_str().to_owned()),
+                    Value::Text(debt.principal_id.0.clone()),
+                    Value::Int(debt.bytes as i64),
+                    opt_text(
+                        debt.storage_path
+                            .as_ref()
+                            .map(|path| path.as_str().to_owned()),
+                    ),
+                    Value::Int(debt.created_at.0),
+                ],
+            )
+            .await?;
+        driver
+            .execute(
+                "UPDATE multipart_parts
+                 SET size=?3, etag=?4, storage_path=?5, checksum=?6, part_dek=?7
+                 WHERE upload_id=?1 AND part_number=?2",
+                vec![
+                    Value::Text(upload_id.as_str().to_owned()),
+                    Value::Int(i64::from(part.part_number)),
+                    Value::Int(part.size as i64),
+                    Value::Text(part.etag.clone()),
+                    Value::Text(part.storage_path.as_str().to_owned()),
+                    opt_text(part.checksum.as_ref().map(to_json)),
+                    opt_text(part.part_dek.clone()),
+                ],
+            )
+            .await?;
+    } else {
+        driver
+            .execute(
+                "INSERT INTO multipart_parts
+                 (upload_id, part_number, size, etag, storage_path, checksum, part_dek)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                vec![
+                    Value::Text(upload_id.as_str().to_owned()),
+                    Value::Int(i64::from(part.part_number)),
+                    Value::Int(part.size as i64),
+                    Value::Text(part.etag.clone()),
+                    Value::Text(part.storage_path.as_str().to_owned()),
+                    opt_text(part.checksum.as_ref().map(to_json)),
+                    opt_text(part.part_dek.clone()),
+                ],
+            )
+            .await?;
+    }
+    driver
+        .execute(
+            "DELETE FROM multipart_part_reservations WHERE attempt_id=?1",
+            vec![Value::Text(attempt_id.to_owned())],
+        )
+        .await?;
+    adjust_multipart_stats(
+        driver,
+        &context.bucket,
+        &context.principal,
+        0,
+        part.size as i64 - reserved_bytes,
+    )
+    .await?;
+    Ok(MutationOutcome::PartRecorded { cleanup })
+}
+
+async fn release_multipart_cleanup(driver: &dyn AsyncSqlDriver, cleanup_id: &str) -> R<()> {
+    let row = query_one(
+        driver,
+        "SELECT bucket_name, principal_id, bytes
+         FROM multipart_staging_cleanups WHERE id=?1",
+        vec![Value::Text(cleanup_id.to_owned())],
+    )
+    .await?;
+    let Some(row) = row else {
+        return Ok(());
+    };
+    let bucket = row.get_text(0);
+    let principal = row.get_text(1);
+    let bytes = row.get_i64(2);
+    driver
+        .execute(
+            "DELETE FROM multipart_staging_cleanups WHERE id=?1",
+            vec![Value::Text(cleanup_id.to_owned())],
+        )
+        .await?;
+    adjust_multipart_stats(driver, &bucket, &principal, 0, -bytes).await
+}
+
+async fn release_multipart_upload_cleanups(
+    driver: &dyn AsyncSqlDriver,
+    upload_id: &cairn_types::UploadId,
+) -> R<()> {
+    let row = query_one(
+        driver,
+        "SELECT bucket_name, principal_id, COALESCE(SUM(bytes),0)
+         FROM multipart_staging_cleanups WHERE upload_id=?1
+         GROUP BY bucket_name, principal_id",
+        vec![Value::Text(upload_id.as_str().to_owned())],
+    )
+    .await?;
+    let Some(row) = row else {
+        return Ok(());
+    };
+    let bucket = row.get_text(0);
+    let principal = row.get_text(1);
+    let bytes = row.get_i64(2);
+    driver
+        .execute(
+            "DELETE FROM multipart_staging_cleanups WHERE upload_id=?1",
+            vec![Value::Text(upload_id.as_str().to_owned())],
+        )
+        .await?;
+    adjust_multipart_stats(driver, &bucket, &principal, 0, -bytes).await
+}
+
+async fn retire_multipart_session(
+    driver: &dyn AsyncSqlDriver,
+    upload_id: &cairn_types::UploadId,
+) -> R<()> {
+    let context = multipart_context(driver, upload_id).await?;
+    let part_bytes = query_one(
+        driver,
+        "SELECT COALESCE(SUM(size),0) FROM multipart_parts WHERE upload_id=?1",
+        vec![Value::Text(upload_id.as_str().to_owned())],
+    )
+    .await?
+    .map_or(0, |row| row.get_i64(0));
+    let reservation_bytes = query_one(
+        driver,
+        "SELECT COALESCE(SUM(reserved_bytes),0)
+         FROM multipart_part_reservations WHERE upload_id=?1",
+        vec![Value::Text(upload_id.as_str().to_owned())],
+    )
+    .await?
+    .map_or(0, |row| row.get_i64(0));
+    let current_bytes = part_bytes + reservation_bytes;
+    // A zero-length part still creates a session artifact. Preserve a retry token even when its
+    // byte charge is zero so a failed directory deletion cannot be forgotten.
+    driver
+        .execute(
+            "INSERT INTO multipart_staging_cleanups
+             (id, upload_id, bucket_name, principal_id, bytes, storage_path, created_at)
+             VALUES (?1,?2,?3,?4,?5,NULL,?6)",
+            vec![
+                Value::Text(format!("session:{}", upload_id.as_str())),
+                Value::Text(upload_id.as_str().to_owned()),
+                Value::Text(context.bucket.clone()),
+                Value::Text(context.principal.clone()),
+                Value::Int(current_bytes),
+                Value::Int(context.updated_at),
+            ],
+        )
+        .await?;
+    driver
+        .execute(
+            "DELETE FROM multipart_uploads WHERE id=?1",
+            vec![Value::Text(upload_id.as_str().to_owned())],
+        )
+        .await?;
+    adjust_multipart_stats(driver, &context.bucket, &context.principal, -1, 0).await
+}
+
+async fn recover_multipart_staging_accounting(
+    driver: &dyn AsyncSqlDriver,
+    limit: u32,
+) -> R<MutationOutcome> {
+    let limit = i64::from(limit.clamp(1, 1_000));
+    let reservations = driver
+        .query(
+            "SELECT attempt_id, upload_id FROM multipart_part_reservations
+             ORDER BY created_at, attempt_id LIMIT ?1",
+            vec![Value::Int(limit)],
+        )
+        .await?;
+    let mut released = 0u64;
+    for row in reservations {
+        release_multipart_reservation(
+            driver,
+            &cairn_types::UploadId::from_string(row.get_text(1)),
+            &row.get_text(0),
+        )
+        .await?;
+        released += 1;
+    }
+    let remaining = limit.saturating_sub(released as i64);
+    if remaining > 0 {
+        let cleanups = driver
+            .query(
+                "SELECT id FROM multipart_staging_cleanups
+                 ORDER BY created_at, id LIMIT ?1",
+                vec![Value::Int(remaining)],
+            )
+            .await?;
+        for row in cleanups {
+            release_multipart_cleanup(driver, &row.get_text(0)).await?;
+            released += 1;
+        }
+    }
+    Ok(MutationOutcome::MultipartAccountingReleased(released))
 }
 
 async fn claim_multipart(

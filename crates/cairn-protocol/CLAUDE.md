@@ -30,6 +30,8 @@ Clock/Crypto>`) — never a concrete engine.
 - **Authorize centrally, before the handler.** `bucket_op`/`object_op` map the request to an
   `Action`, then call `authorize` BEFORE dispatching to the operation. New operations route through
   `bucket_action`/`object_action`; do not add a handler that skips this chokepoint.
+- Preserve `S3Request.source`'s typed direct/forwarded/unavailable provenance unchanged when
+  assembling `RequestContext`; `aws:SourceIp` must never infer an address inside this crate.
 - **An unrecognized subresource MUST NOT fall through to a data-plane handler.** A `PUT object?acl`
   must never overwrite the object body — `unhandled_{object,bucket}_subresource` gates this and
   returns `NotImplemented`. Add new `?subresource` arms *above* those guards (the `?encryption`
@@ -37,8 +39,24 @@ Clock/Crypto>`) — never a concrete engine.
 - **Durability ordering is the contract** (ARCH 8/21.1): stage (fsync file+dir) → verify
   Content-MD5 / signed SHA-256 / client checksums → `meta.submit(Mutation::…)` (the single
   linearization point) → reclaim the superseded blob best-effort. Don't reorder.
-- **Any failure after `blob.stage` MUST delete the staged blob** before returning (`blob.delete`),
-  or you leak an orphan. Every early-return in `put_object`/copy/multipart after staging does this.
+- **Any failure after `blob.stage` or `blob.stage_part` MUST delete the staged artifact** before
+  returning (`blob.delete`), or you leak an orphan. Every early-return in
+  `put_object`/copy/multipart after staging does this, including a `RecordPart` writer failure in
+  both UploadPart and UploadPartCopy.
+- **The Writer is the final Object Lock authority.** PUT/Copy pass validated tags + explicit lock
+  intent in the object commit mutation; capture their creation timestamp after staging so upload
+  duration cannot shorten a bucket default, and let the Writer resolve/revalidate lock state in the
+  same savepoint as the version and outbox. Copy never carries source retention/legal hold.
+  Multipart pins tags/explicit intent at initiate but resolves a default at Complete; every
+  post-claim lock failure deletes the assembled blob and releases the claim. Permanent deletes and
+  sentinel replacements pass `GovernanceBypass::{Denied,Authorized}` and consume it only inside the
+  Writer—no protocol pre-read decides protection. A present malformed/disabled lock configuration
+  fails closed; only the specialized `PUT ?object-lock` mutation may repair it.
+- Abort and Complete have exactly one metadata-writer-owned terminal winner. Complete claims
+  `active -> completing`; Abort removes only `active` and deletes session bytes only on its typed
+  `Aborted` outcome; final completion rechecks ownership in its object-upsert savepoint. Every
+  genuine post-claim failure conditionally releases `completing -> active` so retryability does not
+  weaken the terminal race.
 - **Crypto fails closed** across every SSE seam. `open_sse_dek`/`open_part_dek` return an error on a
   bad/missing key or tampered envelope — never plaintext. SSE-S3, transparent `AtRest`, and SSE-KMS
   are all **label-only** (one master ring seals every DEK, so open is symmetric on `self.crypto`); a
@@ -49,6 +67,9 @@ Clock/Crypto>`) — never a concrete engine.
   client contract, so it is force-upgraded to advertised SSE-S3.
 - **Session credentials never short-circuit.** In `authorize`, `is_session` principals are always
   `AuthenticatedMember` — they get no owner/admin bypass (least-privilege STS, ARCH 14).
+- **Owner/admin privilege retains the user id.** Ordinary privileged principals map to
+  `OwnerOrAdmin(user_id)`, not an identity-less class, so bucket-policy `Principal` and
+  `NotPrincipal` explicit Denies can still name them (ARCH 15.3).
 - **Corrupt security configs fail closed** (ARCH 15.3/15.5): an unparseable BPA/policy/ACL doc
   raises `Internal`, never silently opens access.
 - **Copy / UploadPartCopy authorize the SOURCE read** against the *source* bucket's policy/ACL

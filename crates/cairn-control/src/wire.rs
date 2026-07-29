@@ -2,6 +2,7 @@
 //! stable wire DTOs; the domain types in `cairn-types` are translated into and out of them
 //! here so that the contract never drifts with internal representation changes.
 
+use cairn_types::SecretString;
 use cairn_types::auth::Role;
 use cairn_types::authz::OwnershipMode;
 use cairn_types::bucket::VersioningState;
@@ -321,15 +322,17 @@ pub struct ObjectListResp {
 }
 
 /// `DELETE /buckets/{name}/objects?prefix=P` response: how many versions were permanently
-/// deleted, any per-item failures, and whether more work remains (the page budget was exhausted
-/// while items still matched the prefix, so the caller should re-invoke).
+/// deleted, a bounded list of exact per-version failures, and whether work remains. `more` can
+/// remain true because the page budget was exhausted or because stable protected/error rows remain;
+/// callers must stop automatic retries when a pass deletes nothing.
 #[derive(Debug, Serialize)]
 pub struct DeletePrefixResp {
     /// The number of versions (and delete markers) permanently deleted.
     pub deleted: u64,
     /// Per-item failures encountered; deletion continued past each one.
     pub errors: Vec<DeletePrefixError>,
-    /// `true` when the page budget was exhausted with items still remaining (re-invoke to finish).
+    /// `true` while matching rows remain, including Object Lock protected rows. Re-invoke only
+    /// after a pass made forward progress or the protection/error condition changed.
     pub more: bool,
 }
 
@@ -338,6 +341,8 @@ pub struct DeletePrefixResp {
 pub struct DeletePrefixError {
     /// The object key that failed to delete.
     pub key: String,
+    /// The exact version that failed; multiple versions may share one key.
+    pub version_id: String,
     /// The failure message.
     pub message: String,
 }
@@ -418,7 +423,8 @@ pub struct MintSessionReq {
     /// The credential lifetime in seconds (bounded 900..=43200 server-side).
     pub duration_secs: u64,
     /// The scoped inline policy document (a standard policy JSON object) — required. This is the
-    /// session's entire effective permission set; it carries no implicit access.
+    /// requested permissions boundary; every explicit Deny in the administrator's identity policy
+    /// is also snapshotted into the stored session policy.
     pub policy: serde_json::Value,
 }
 
@@ -428,9 +434,9 @@ pub struct MintSessionResp {
     /// The temporary access-key id (an `CAIRNTMP…` SigV4 key).
     pub access_key_id: String,
     /// The temporary secret access key (sealed at rest server-side; shown once).
-    pub secret_access_key: String,
+    pub secret_access_key: SecretString,
     /// The opaque session token the SDK presents as `X-Amz-Security-Token` (hashed at rest).
-    pub session_token: String,
+    pub session_token: SecretString,
     /// When the credential expires, in epoch seconds.
     pub expiration_epoch_secs: i64,
 }
@@ -480,11 +486,11 @@ pub struct CreateUserResp {
     /// The Bearer access-key id.
     pub bearer_access_key_id: String,
     /// The Bearer secret (shown once; only its hash is retained server-side).
-    pub bearer_secret: String,
+    pub bearer_secret: SecretString,
     /// The SigV4 access-key id — the "S3 access key" a standard S3 client (boto3, aws-cli) uses.
     pub s3_access_key_id: String,
     /// The SigV4 secret — the "S3 secret key", shown exactly once (sealed at rest server-side).
-    pub s3_secret_key: String,
+    pub s3_secret_key: SecretString,
 }
 
 /// `GET /users/{id}` response: the public user view plus its attached identity policy.
@@ -545,8 +551,8 @@ pub struct ActivityListResp {
 /// A persistent object-share, as returned by the management API (ARCH 15.8).
 #[derive(Debug, Serialize)]
 pub struct ShareRecord {
-    /// The opaque token; also the `/share/{token}` path tail.
-    pub token: String,
+    /// Stable, non-secret identifier used by management get/revoke operations.
+    pub id: String,
     /// The shared object's bucket.
     pub bucket: String,
     /// The shared object's key.
@@ -670,7 +676,7 @@ pub struct RotateCredentialsResp {
     /// The Bearer access-key id (unchanged by rotation).
     pub bearer_access_key_id: String,
     /// The freshly minted Bearer secret (shown once).
-    pub bearer_secret: String,
+    pub bearer_secret: SecretString,
 }
 
 /// `PUT /users/{id}/quota` request body. The quota is enforced inside the writer's commit
@@ -722,7 +728,7 @@ pub struct CreateReplicationTargetReq {
     /// The destination access-key id (public; stored in the clear).
     pub access_key: String,
     /// The destination secret access key (plaintext; sealed at rest, never returned).
-    pub secret: String,
+    pub secret: SecretString,
     /// Optional CA certificate (PEM) to trust for an `https://` endpoint signed by a private or
     /// self-signed CA, instead of the public root set. Public material, stored in the clear.
     #[serde(default)]
@@ -784,6 +790,39 @@ pub struct WebhookEndpointView {
     pub suffix: Option<String>,
     /// Whether an HMAC signing secret is configured (the value is never returned).
     pub has_secret: bool,
+}
+
+/// One webhook endpoint accepted by `PUT /buckets/{name}/notifications`.
+///
+/// This wire shape deliberately differs from the persisted domain shape: callers may submit a
+/// plaintext secret once, but may never inject or retrieve a sealed envelope. An omitted secret
+/// preserves the existing value for the same endpoint id; an empty string explicitly clears it.
+#[derive(Debug, Deserialize)]
+pub struct WebhookEndpointInput {
+    /// A stable id, unique within the bucket.
+    pub id: String,
+    /// The destination URL.
+    pub url: String,
+    /// The subscribed event selectors.
+    #[serde(default)]
+    pub events: Vec<String>,
+    /// Optional object-key prefix filter.
+    #[serde(default)]
+    pub prefix: Option<String>,
+    /// Optional object-key suffix filter.
+    #[serde(default)]
+    pub suffix: Option<String>,
+    /// A write-only plaintext HMAC key. Redacted by [`SecretString`]'s `Debug` implementation.
+    #[serde(default)]
+    pub secret: Option<SecretString>,
+}
+
+/// `PUT /buckets/{name}/notifications` request.
+#[derive(Debug, Deserialize)]
+pub struct NotificationsInput {
+    /// The replacement endpoint list.
+    #[serde(default)]
+    pub endpoints: Vec<WebhookEndpointInput>,
 }
 
 impl From<cairn_types::WebhookEndpoint> for WebhookEndpointView {
@@ -935,7 +974,7 @@ pub struct CreateImportReq {
     /// The source admin access key.
     pub access_key: String,
     /// The source admin secret (sealed at rest, never echoed).
-    pub secret: String,
+    pub secret: SecretString,
     /// The buckets to import; empty = all.
     #[serde(default)]
     pub buckets: Vec<ImportBucketMap>,
@@ -969,7 +1008,7 @@ pub struct ProbeSourceReq {
     /// The source admin access key.
     pub access_key: String,
     /// The source admin secret (used to sign the probe, never stored).
-    pub secret: String,
+    pub secret: SecretString,
     /// An optional PEM CA bundle to trust for an https source.
     #[serde(default)]
     pub ca_cert: Option<String>,
@@ -1056,6 +1095,8 @@ pub struct ImportJobDetail {
 pub struct ImportListResp {
     /// The jobs, newest first.
     pub jobs: Vec<ImportJobEntry>,
+    /// Opaque continuation cursor for the next page, or `None` when this is the final page.
+    pub next_cursor: Option<String>,
 }
 
 /// The contract string for an import state.
@@ -1073,6 +1114,28 @@ pub fn import_state_str(s: cairn_types::meta::ImportState) -> &'static str {
 
 impl From<&cairn_types::meta::ImportJob> for ImportJobEntry {
     fn from(j: &cairn_types::meta::ImportJob) -> Self {
+        Self {
+            id: j.id.clone(),
+            source_endpoint: j.source_endpoint.clone(),
+            source_region: j.source_region.clone(),
+            access_key_id: j.access_key_id.clone(),
+            has_ca_cert: j.has_ca_cert,
+            insecure_skip_verify: j.insecure_skip_verify,
+            workers: j.workers,
+            state: import_state_str(j.state).to_owned(),
+            objects_done: j.objects_done,
+            objects_total: j.objects_total,
+            bytes_done: j.bytes_done,
+            bytes_total: j.bytes_total,
+            last_error: j.last_error.clone(),
+            created_at_ms: j.created_at.0,
+            updated_at_ms: j.updated_at.0,
+        }
+    }
+}
+
+impl From<&cairn_types::meta::ImportJobSummary> for ImportJobEntry {
+    fn from(j: &cairn_types::meta::ImportJobSummary) -> Self {
         Self {
             id: j.id.clone(),
             source_endpoint: j.source_endpoint.clone(),

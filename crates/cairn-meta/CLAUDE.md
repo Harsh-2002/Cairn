@@ -15,13 +15,25 @@ metadata commit is **the single linearization point of every mutation** (ARCH 11
   for the TRUNCATE so a reader-contended checkpoint returns `busy` **immediately** (the background
   loop retries next tick) instead of busy-waiting up to 5s and freezing every PUT/DELETE/CompleteMPU.
 - `store.rs` — `SqliteMetadataStore`: the `MetadataStore` trait impl. Writes → `Writer::submit`;
-  reads → `with_read` on the blocking pool. Listing is a half-open range seek (`range.rs`).
+  reads → `with_read` on the blocking pool. Listing is a half-open range seek (`range.rs`);
+  readiness uses `read_probe` (`SELECT 1` through that pool), never `list_buckets`. The SQLite-only
+  master-key re-wrap CAS helpers and atomic `key_ring_apply_config` execute through
+  `Writer::run_exec`; an existing id's full 64-hex `key_hash` is immutable and a mismatch rolls back
+  before any write. A matching historical eight-hex prefix is upgraded atomically; new rows must be
+  full width and every later comparison is exact. `vacuum_into_snapshot` uses that same writer seam
+  for parameterized offline `VACUUM INTO`;
+  never open a second source write connection for backup.
 - `apply.rs` — `Mutation` → SQL. Preconditions are evaluated **here, inside the savepoint**, so
-  check-and-upsert is atomic. **Mirror any change in `cairn-meta-async/src/apply.rs`** (4(+1)-site).
-- `schema.rs` — migrations: **append-only**, monotonic `version` (latest is 23 — multipart SSE
+  check-and-upsert is atomic. Multipart Abort/Complete ownership is evaluated here too: active-only
+  abort, conditional claim release, and final `status='completing'` verification must remain in the
+  writer savepoint. **Mirror any change in `cairn-meta-async/src/apply.rs`** (4(+1)-site).
+- `schema.rs` — migrations: **append-only**, monotonic `version` (latest is 27 — multipart SSE
   columns: `multipart_uploads.sse_requested` v15, `.encrypt_parts` + `multipart_parts.part_dek` v21,
   `.sse_kms_requested`/`sse_kms_key_id`/`sse_bucket_key_enabled` v22; `object_versions.replicated_at`
-  + `idx_outbox_bucket_key` v23); never edit an applied
+  + `idx_outbox_bucket_key` v23; bounded import scheduling/history/retention indexes v24; hash-only
+  object-share capabilities and legacy-token sanitation v25; bounded multipart staging
+  reservations, cleanup debt, and quota/cardinality counters v26; multipart initial tags/Object
+  Lock intent, the legacy-intent proof marker, and orphan-lock cleanup v27); never edit an applied
   migration, never reorder — add a new one.
 - `model.rs` — SQL row ↔ domain-type conversions; complex fields (compression, ACL, checksums,
   user-metadata) are JSON columns. `engine_err` maps constraint violations → `MetaError::Conflict`.
@@ -36,11 +48,17 @@ metadata commit is **the single linearization point of every mutation** (ARCH 11
   caches negatives; `submit` invalidates affected entries (when unsure, the whole bucket).
 - `shard.rs` — `ShardedMetadataStore`: bucket-partitioned routing (`CAIRN_META_SHARDS`, default `1`
   = byte-for-byte pass-through). Account-global tables (users, activity, metrics, shares) live on
-  shard 0; per-bucket tables on `shard_for_bucket`. Read the module header before touching it.
+  shard 0; per-bucket tables on `shard_for_bucket`. The global share table intentionally has no
+  foreign key to shard-local `buckets`. Read the module header before touching it.
 
 ## Notes
 - **Crypto fails closed, but this crate stores ciphertext only** — it never wraps/unwraps secrets;
   `sigv4_secret_ciphertext`/`_nonce` are opaque blobs sealed by `cairn-crypto`. Don't log row contents.
+- **Object Lock fails closed in the writer.** Bucket configuration parsing, same-version
+  replacement protection, delete/retention/legal-hold decisions, default resolution, exact initial
+  tags/lock replacement, and outbox enqueue all belong to one `apply.rs` savepoint. Object Lock
+  configuration row presence is immutable enablement; only its specialized mutation may update the
+  default, and versioning must remain Enabled.
 - The library `OpenOptions::default` is `synchronous=NORMAL` (benchmark/test posture); the **server
   overrides this to FULL** via `CAIRN_META_SYNCHRONOUS`. NORMAL never corrupts the DB — on power loss
   it loses at most the last uncheckpointed txn, which blob-first ordering downgrades to a GC'd orphan.

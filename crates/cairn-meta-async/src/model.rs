@@ -11,14 +11,15 @@ use cairn_types::authz::{Acl, OwnershipMode};
 use cairn_types::bucket::{Bucket, CompressionPolicy, VersioningState};
 use cairn_types::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
 use cairn_types::meta::{
-    ActivityEntry, ImportJob, ImportJobRecord, ImportState, MultipartSession, MultipartStatus,
-    ObjectSummary, OutboxEntry, PartRecord, ReplicationOp, ReplicationStatus, ShareDisposition,
-    ShareRow, User, UserRecord, UserSigV4Credentials, UserWithBearerHash, WebhookEntry,
-    WebhookStatus,
+    ActivityEntry, ImportJob, ImportJobRecord, ImportJobSummary, ImportState, MultipartCleanup,
+    MultipartReservation, MultipartSession, MultipartStatus, ObjectSummary, OutboxEntry,
+    PartRecord, ReplicationOp, ReplicationStatus, ShareDisposition, ShareLookupHash, ShareRow,
+    User, UserRecord, UserSigV4Credentials, UserWithBearerHash, WebhookEntry, WebhookStatus,
 };
 use cairn_types::notification::EventKind;
 use cairn_types::object::{
-    ChecksumValue, CompressionDescriptor, ETag, ObjectVersionRow, StorageClass, UserMetadata,
+    ChecksumValue, CompressionDescriptor, ETag, ExplicitObjectLockIntent, ObjectLockMode,
+    ObjectLockState, ObjectRetention, ObjectVersionRow, StorageClass, UserMetadata,
 };
 use cairn_types::time::Timestamp;
 
@@ -38,7 +39,8 @@ pub const BUCKET_COLS: &str =
 /// `multipart_uploads` columns in mapper order.
 pub const MULTIPART_COLS: &str = "id, bucket_name, key, content_type, status, owner_id, \
      intended_acl, user_metadata, created_at, updated_at, sse_requested, encrypt_parts, \
-     sse_kms_requested, sse_kms_key_id, sse_bucket_key_enabled";
+     sse_kms_requested, sse_kms_key_id, sse_bucket_key_enabled, initiated_by, initial_tags, \
+     lock_mode, retain_until, legal_hold";
 
 /// `multipart_parts` columns in mapper order.
 pub const PART_COLS: &str = "part_number, size, etag, storage_path, checksum, part_dek";
@@ -58,7 +60,7 @@ pub const WEBHOOK_COLS: &str = "id, bucket_name, key, version_id, event_type, en
 
 /// `activity` columns in mapper order.
 pub const ACTIVITY_COLS: &str = "id, action, bucket, key, size, etag, actor, at";
-pub const SHARE_COLS: &str = "token, bucket_name, key, version_id, expires_at, disposition, \
+pub const SHARE_COLS: &str = "id, token_hash, bucket_name, key, version_id, expires_at, disposition, \
      filename, created_by, created_at, revoked_at";
 
 /// `object_summary` listing columns in mapper order.
@@ -141,12 +143,41 @@ pub fn lock_mode_str(m: cairn_types::object::ObjectLockMode) -> &'static str {
         cairn_types::object::ObjectLockMode::Compliance => "COMPLIANCE",
     }
 }
-/// Parse a stored lock-mode string. Unknown values fail safe to the stricter `Compliance`.
-pub fn lock_mode_from(s: &str) -> cairn_types::object::ObjectLockMode {
+/// Strictly parse a stored lock-mode string.
+///
+/// Unknown durable values are corruption. They must fail the request closed because deletion and
+/// retention-weakening rules depend on the exact stored mode.
+pub fn lock_mode_from(s: &str) -> Result<ObjectLockMode, MetaError> {
     match s {
-        "GOVERNANCE" => cairn_types::object::ObjectLockMode::Governance,
-        _ => cairn_types::object::ObjectLockMode::Compliance,
+        "GOVERNANCE" => Ok(ObjectLockMode::Governance),
+        "COMPLIANCE" => Ok(ObjectLockMode::Compliance),
+        _ => Err(MetaError::InvalidObjectLockState),
     }
+}
+
+/// Decode and structurally validate the three durable Object Lock columns.
+pub fn object_lock_state_from_columns(
+    mode: Option<String>,
+    until: Option<i64>,
+    legal_hold: i64,
+) -> Result<ObjectLockState, MetaError> {
+    let retention = match (mode, until) {
+        (None, None) => None,
+        (Some(mode), Some(until)) => Some(ObjectRetention {
+            mode: lock_mode_from(&mode)?,
+            retain_until: Timestamp(until),
+        }),
+        _ => return Err(MetaError::InvalidObjectLockState),
+    };
+    let legal_hold = match legal_hold {
+        0 => false,
+        1 => true,
+        _ => return Err(MetaError::InvalidObjectLockState),
+    };
+    Ok(ObjectLockState {
+        retention,
+        legal_hold,
+    })
 }
 
 pub fn repl_status_str(s: ReplicationStatus) -> &'static str {
@@ -273,15 +304,41 @@ pub fn multipart_from_row(row: &Row) -> Result<MultipartSession, MetaError> {
         None => None,
     };
     let user_metadata: UserMetadata = json_col(&row.get_text(7))?;
+    let owner_id = UserId(row.get_text(5));
+    let initiated_by = row
+        .get_opt_text(15)
+        .map(UserId)
+        .unwrap_or_else(|| owner_id.clone());
+    let initial_tags = json_col(&row.get_text(16))?;
+    let retention = match (row.get_opt_text(17), row.get_opt_i64(18)) {
+        (None, None) => None,
+        (Some(mode), Some(retain_until)) => Some(ObjectRetention {
+            mode: lock_mode_from(&mode)?,
+            retain_until: Timestamp(retain_until),
+        }),
+        _ => return Err(MetaError::InvalidObjectLockState),
+    };
+    let legal_hold = match row.get_opt_i64(19) {
+        None => None,
+        Some(0) => Some(false),
+        Some(1) => Some(true),
+        Some(_) => return Err(MetaError::InvalidObjectLockState),
+    };
     Ok(MultipartSession {
         upload_id: UploadId::from_string(row.get_text(0)),
         bucket: BucketName::parse(&row.get_text(1)).unwrap_or_else(|_| unreachable_bucket()),
         key: ObjectKey::parse(&row.get_text(2)).unwrap_or_else(|_| unreachable_key()),
         content_type: row.get_text(3),
         status: mp_status_from(&row.get_text(4)),
-        owner_id: UserId(row.get_text(5)),
+        owner_id,
+        initiated_by,
         intended_acl,
         user_metadata,
+        initial_tags,
+        lock_intent: ExplicitObjectLockIntent {
+            retention,
+            legal_hold,
+        },
         created_at: Timestamp(row.get_i64(8)),
         updated_at: Timestamp(row.get_i64(9)),
         sse_requested: row.get_i64(10) != 0,
@@ -289,6 +346,28 @@ pub fn multipart_from_row(row: &Row) -> Result<MultipartSession, MetaError> {
         sse_kms_requested: row.get_i64(12) != 0,
         sse_kms_key_id: row.get_opt_text(13),
         sse_bucket_key_enabled: row.get_i64(14) != 0,
+    })
+}
+
+pub fn multipart_reservation_from_row(row: &Row) -> MultipartReservation {
+    MultipartReservation {
+        attempt_id: row.get_text(0),
+        upload_id: UploadId::from_string(row.get_text(1)),
+        part_number: row.get_i64(2) as u16,
+        reserved_bytes: row.get_i64(3) as u64,
+        created_at: Timestamp(row.get_i64(4)),
+    }
+}
+
+pub fn multipart_cleanup_from_row(row: &Row) -> Result<MultipartCleanup, MetaError> {
+    Ok(MultipartCleanup {
+        id: row.get_text(0),
+        upload_id: UploadId::from_string(row.get_text(1)),
+        bucket: BucketName::parse(&row.get_text(2)).unwrap_or_else(|_| unreachable_bucket()),
+        principal_id: UserId(row.get_text(3)),
+        bytes: row.get_i64(4) as u64,
+        storage_path: row.get_opt_text(5).map(StoragePath::from_string),
+        created_at: Timestamp(row.get_i64(6)),
     })
 }
 
@@ -347,6 +426,11 @@ pub fn user_sigv4_from_row(row: &Row) -> Result<Option<UserSigV4Credentials>, Me
 /// the positional order [`import_job_from_row`] expects.
 pub const IMPORT_JOB_COLS: &str = "id, source_endpoint, source_region, access_key_id, ca_cert_pem, \
      insecure_skip_verify, workers, state, buckets_json, objects_done, objects_total, bytes_done, \
+     bytes_total, last_error, created_at, updated_at";
+
+/// The bucket-progress-free import-history projection, in [`import_job_summary_from_row`] order.
+pub const IMPORT_JOB_SUMMARY_COLS: &str = "id, source_endpoint, source_region, access_key_id, \
+     ca_cert_pem, insecure_skip_verify, workers, state, objects_done, objects_total, bytes_done, \
      bytes_total, last_error, created_at, updated_at";
 
 pub fn import_state_str(s: ImportState) -> &'static str {
@@ -420,6 +504,27 @@ pub fn import_job_from_row(row: &Row) -> Result<ImportJob, MetaError> {
         last_error: row.get_opt_text(13),
         created_at: Timestamp(row.get_i64(14)),
         updated_at: Timestamp(row.get_i64(15)),
+    })
+}
+
+/// Map an import-history projection that excludes both secrets and `buckets_json`.
+pub fn import_job_summary_from_row(row: &Row) -> Result<ImportJobSummary, MetaError> {
+    Ok(ImportJobSummary {
+        id: row.get_text(0),
+        source_endpoint: row.get_text(1),
+        source_region: row.get_text(2),
+        access_key_id: row.get_text(3),
+        has_ca_cert: row.get_opt_text(4).is_some(),
+        insecure_skip_verify: row.get_i64(5) != 0,
+        workers: row.get_i64(6) as u32,
+        state: import_state_from(&row.get_text(7)),
+        objects_done: row.get_i64(8) as u64,
+        objects_total: row.get_i64(9) as u64,
+        bytes_done: row.get_i64(10) as u64,
+        bytes_total: row.get_i64(11) as u64,
+        last_error: row.get_opt_text(12),
+        created_at: Timestamp(row.get_i64(13)),
+        updated_at: Timestamp(row.get_i64(14)),
     })
 }
 
@@ -519,17 +624,23 @@ pub fn disposition_from(s: &str) -> ShareDisposition {
 }
 
 pub fn share_from_row(row: &Row) -> Result<ShareRow, MetaError> {
+    let token_hash_bytes = row
+        .get_opt_blob(1)
+        .ok_or_else(|| MetaError::Engine("share token_hash is not a BLOB".to_owned()))?;
+    let token_hash = ShareLookupHash::from_slice(&token_hash_bytes)
+        .ok_or_else(|| MetaError::Engine("share token_hash must be exactly 32 bytes".to_owned()))?;
     Ok(ShareRow {
-        token: row.get_text(0),
-        bucket: BucketName::parse(&row.get_text(1)).unwrap_or_else(|_| unreachable_bucket()),
-        key: ObjectKey::parse(&row.get_text(2)).unwrap_or_else(|_| unreachable_key()),
-        version_id: row.get_opt_text(3).map(VersionId::from_string),
-        expires_at: row.get_opt_i64(4).map(Timestamp),
-        disposition: disposition_from(&row.get_text(5)),
-        filename: row.get_opt_text(6),
-        created_by: UserId(row.get_text(7)),
-        created_at: Timestamp(row.get_i64(8)),
-        revoked_at: row.get_opt_i64(9).map(Timestamp),
+        id: row.get_text(0),
+        token_hash,
+        bucket: BucketName::parse(&row.get_text(2)).unwrap_or_else(|_| unreachable_bucket()),
+        key: ObjectKey::parse(&row.get_text(3)).unwrap_or_else(|_| unreachable_key()),
+        version_id: row.get_opt_text(4).map(VersionId::from_string),
+        expires_at: row.get_opt_i64(5).map(Timestamp),
+        disposition: disposition_from(&row.get_text(6)),
+        filename: row.get_opt_text(7),
+        created_by: UserId(row.get_text(8)),
+        created_at: Timestamp(row.get_i64(9)),
+        revoked_at: row.get_opt_i64(10).map(Timestamp),
     })
 }
 

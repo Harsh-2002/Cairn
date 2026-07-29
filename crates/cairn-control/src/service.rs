@@ -16,9 +16,10 @@ use cairn_types::bucket::{
 };
 use cairn_types::id::{BucketName, ObjectKey, UserId};
 use cairn_types::meta::{
-    ListQuery, MetricsRange, Mutation, MutationOutcome, ShareDisposition, ShareRow, StoreCounts,
-    TagSummary, TaggedObject, User, UserRecord,
+    ImportJobCursor, ImportJobListQuery, ListQuery, MetricsRange, Mutation, MutationOutcome,
+    ShareDisposition, ShareRow, StoreCounts, TagSummary, TaggedObject, User, UserRecord,
 };
+use cairn_types::object::GovernanceBypass;
 use cairn_types::time::Timestamp;
 use cairn_types::traits::{BlobStore, Clock, Crypto, MetadataStore};
 use http::{Method, StatusCode};
@@ -219,6 +220,8 @@ pub struct ControlService {
     /// address at *configuration* time — clear, immediate feedback on top of the connect-time
     /// guarantee in the sinks. Default is enforcing.
     ssrf_guard: cairn_net::GuardConfig,
+    /// Network deadlines for the one-shot import source probe.
+    import_timeouts: cairn_import::ImportTimeouts,
 }
 
 impl std::fmt::Debug for ControlService {
@@ -247,6 +250,7 @@ impl ControlService {
             import_wake: None,
             root_access_key: None,
             ssrf_guard: cairn_net::GuardConfig::default(),
+            import_timeouts: cairn_import::ImportTimeouts::default(),
         }
     }
 
@@ -268,6 +272,13 @@ impl ControlService {
     #[must_use]
     pub fn with_allow_internal_endpoints(mut self, allow_internal: bool) -> Self {
         self.ssrf_guard = cairn_net::GuardConfig::new(allow_internal);
+        self
+    }
+
+    /// Set the import source deadlines used by `POST /imports/source/buckets`.
+    #[must_use]
+    pub fn with_import_timeouts(mut self, timeouts: cairn_import::ImportTimeouts) -> Self {
+        self.import_timeouts = timeouts;
         self
     }
 
@@ -365,11 +376,11 @@ impl ControlService {
             (&Method::GET, ["buckets", name, "objects", "shares"]) => {
                 self.list_object_shares(name, query).await
             }
-            (&Method::GET, ["buckets", name, "objects", "shares", token]) => {
-                self.get_object_share(name, token).await
+            (&Method::GET, ["buckets", name, "objects", "shares", id]) => {
+                self.get_object_share(name, id).await
             }
-            (&Method::DELETE, ["buckets", name, "objects", "shares", token]) => {
-                self.revoke_object_share(name, token, principal).await
+            (&Method::DELETE, ["buckets", name, "objects", "shares", id]) => {
+                self.revoke_object_share(name, id, principal).await
             }
 
             (&Method::GET, ["buckets", name, "config"]) => self.bucket_config(name).await,
@@ -432,7 +443,7 @@ impl ControlService {
             (&Method::POST, ["imports", "source", "buckets"]) => {
                 self.probe_source_buckets(&body).await
             }
-            (&Method::GET, ["imports"]) => self.list_imports().await,
+            (&Method::GET, ["imports"]) => self.list_imports(query).await,
             (&Method::GET, ["imports", id]) => self.import_detail(id).await,
             (&Method::POST, ["imports", id, "resume"]) => self.resume_import(id, principal).await,
             (&Method::DELETE, ["imports", id]) => self.cancel_import(id, principal).await,
@@ -763,34 +774,18 @@ impl ControlService {
             compression: None,
         };
 
-        match self
-            .meta
-            .submit(Mutation::CreateBucket(Box::new(bucket)))
-            .await
-        {
+        let mutation = if req.object_lock {
+            Mutation::CreateObjectLockBucket(Box::new(bucket))
+        } else {
+            Mutation::CreateBucket(Box::new(bucket))
+        };
+        match self.meta.submit(mutation).await {
             Ok(MutationOutcome::Ack) => {}
             Ok(_) => return ControlResponse::error_internal("unexpected create-bucket outcome"),
             Err(cairn_types::error::MetaError::Conflict) => {
                 return ControlResponse::error(StatusCode::CONFLICT, "bucket already exists");
             }
             Err(e) => return ControlResponse::error_internal(&e.to_string()),
-        }
-
-        if req.object_lock {
-            let config = cairn_types::ObjectLockConfiguration {
-                enabled: true,
-                default_retention: None,
-            };
-            if let Ok(text) = serde_json::to_string(&config) {
-                let _ = self
-                    .meta
-                    .submit(Mutation::SetBucketConfig {
-                        bucket: name.clone(),
-                        aspect: ConfigAspect::ObjectLock,
-                        doc: Some(ConfigDoc(text)),
-                    })
-                    .await;
-            }
         }
 
         self.record_activity("CreateBucket", Some(name.as_str()), None, principal)
@@ -886,11 +881,19 @@ impl ControlService {
             Err(e) => return ControlResponse::error_internal(&e.to_string()),
         }
 
-        // Force-empty: page every version (and delete marker), permanently delete each,
-        // reclaiming any referenced blob. We re-list from the start each round because each
-        // deletion removes rows the cursor was anchored against.
+        // Force-empty: page every version (and delete marker) forward exactly once. Protected rows
+        // remain in the index, so restarting from page one would repeat the same protected prefix
+        // forever and could starve later unlocked rows.
+        let now = self.clock.now();
+        let mut cursor = None;
+        let mut version_id_marker = None;
+        let mut protected = false;
+        let mut exhausted = true;
+        let mut deleted_any = false;
         for _ in 0..MAX_PAGES {
             let query = ListQuery {
+                cursor: cursor.clone(),
+                version_id_marker: version_id_marker.clone(),
                 limit: PAGE_LIMIT,
                 ..Default::default()
             };
@@ -899,6 +902,7 @@ impl ControlService {
                 Err(e) => return ControlResponse::error_internal(&e.to_string()),
             };
             if page.items.is_empty() {
+                exhausted = false;
                 break;
             }
             for item in &page.items {
@@ -911,19 +915,61 @@ impl ControlService {
                         key,
                         version_id,
                         expected_updated_at: None,
+                        now,
+                        bypass: GovernanceBypass::Denied,
                     })
                     .await
                 {
                     Ok(MutationOutcome::Deleted { freed, .. }) => {
+                        deleted_any = true;
                         if let Some(path) = freed {
                             // Blob reclamation is best-effort and idempotent.
                             let _ = self.blob.delete(&path).await;
                         }
                     }
-                    Ok(_) => {}
+                    Ok(MutationOutcome::DeleteProtected) => protected = true,
+                    Ok(_) => {
+                        return ControlResponse::error_internal(
+                            "unexpected force-delete mutation outcome",
+                        );
+                    }
                     Err(e) => return ControlResponse::error_internal(&e.to_string()),
                 }
             }
+            if !page.truncated {
+                exhausted = false;
+                break;
+            }
+            match (page.next_cursor, page.next_version_id_marker) {
+                (Some(next), Some(version)) => {
+                    cursor = Some(next);
+                    version_id_marker = Some(version);
+                }
+                _ => {
+                    return ControlResponse::error_internal(
+                        "truncated version page did not provide both continuation markers",
+                    );
+                }
+            }
+        }
+
+        if protected || exhausted {
+            // The bucket itself remains, but this request may already have permanently removed
+            // unlocked versions before reaching protected rows. Preserve that partial destructive
+            // result in the activity ledger rather than emitting no audit event for a real write.
+            if deleted_any {
+                self.record_activity(
+                    "DeleteBucketContents",
+                    Some(bucket_name.as_str()),
+                    None,
+                    principal,
+                )
+                .await;
+            }
+            return ControlResponse::error(
+                StatusCode::CONFLICT,
+                "bucket contains Object Lock protected object versions",
+            );
         }
 
         if let Err(e) = self
@@ -931,6 +977,9 @@ impl ControlService {
             .submit(Mutation::DeleteBucket(bucket_name.clone()))
             .await
         {
+            if matches!(e, cairn_types::MetaError::NotEmpty) {
+                return ControlResponse::error(StatusCode::CONFLICT, "bucket is not empty");
+            }
             return ControlResponse::error_internal(&e.to_string());
         }
 
@@ -942,9 +991,9 @@ impl ControlService {
 
     /// `DELETE /buckets/{name}/objects?prefix=P`: permanently delete every version (and delete
     /// marker) under `prefix` — the proven force-empty path of [`delete_bucket`], scoped to a
-    /// prefix. We re-list from the start each round because each deletion removes the rows the
-    /// cursor was anchored against, so the loop converges. If [`MAX_PAGES`] is exhausted while
-    /// items remain, `more = true` signals the web console to re-invoke.
+    /// prefix. It pages forward so protected rows left in place cannot starve later unlocked rows.
+    /// If protected/errors remain or [`MAX_PAGES`] is exhausted, `more = true` signals a partial
+    /// result; callers must not immediately retry a pass that deleted nothing.
     async fn delete_prefix(
         &self,
         name: &str,
@@ -968,11 +1017,16 @@ impl ControlService {
 
         let mut deleted: u64 = 0;
         let mut errors: Vec<wire::DeletePrefixError> = Vec::new();
+        let now = self.clock.now();
+        let mut cursor = None;
+        let mut version_id_marker = None;
         let mut more = true;
 
         for _ in 0..MAX_PAGES {
             let query = ListQuery {
                 prefix: Some(prefix.to_owned()),
+                cursor: cursor.clone(),
+                version_id_marker: version_id_marker.clone(),
                 limit: PAGE_LIMIT,
                 ..Default::default()
             };
@@ -984,7 +1038,6 @@ impl ControlService {
                 more = false;
                 break;
             }
-            let deleted_before = deleted;
             for item in &page.items {
                 match self
                     .meta
@@ -993,6 +1046,8 @@ impl ControlService {
                         key: item.key.clone(),
                         version_id: item.version_id.clone(),
                         expected_updated_at: None,
+                        now,
+                        bypass: GovernanceBypass::Denied,
                     })
                     .await
                 {
@@ -1003,8 +1058,19 @@ impl ControlService {
                         }
                         deleted += 1;
                     }
+                    Ok(MutationOutcome::DeleteProtected) => {
+                        if errors.len() < MAX_DELETE_PREFIX_ERRORS {
+                            errors.push(wire::DeletePrefixError {
+                                key: item.key.as_str().to_owned(),
+                                version_id: item.version_id.as_str().to_owned(),
+                                message: "object version is protected by Object Lock".to_owned(),
+                            });
+                        }
+                    }
                     Ok(_) => {
-                        deleted += 1;
+                        return ControlResponse::error_internal(
+                            "unexpected recursive-delete mutation outcome",
+                        );
                     }
                     Err(e) => {
                         // Record the per-item failure but keep going so one bad row does not
@@ -1013,17 +1079,27 @@ impl ControlService {
                         if errors.len() < MAX_DELETE_PREFIX_ERRORS {
                             errors.push(wire::DeletePrefixError {
                                 key: item.key.as_str().to_owned(),
+                                version_id: item.version_id.as_str().to_owned(),
                                 message: e.to_string(),
                             });
                         }
                     }
                 }
             }
-            // The list query is re-anchored at the prefix each page, so it only converges when a
-            // page actually deletes rows. A page that deleted nothing (every item errored) would
-            // recur identically until MAX_PAGES — stop early instead of spinning (audit #26).
-            if deleted == deleted_before {
+            if !page.truncated {
+                more = !errors.is_empty();
                 break;
+            }
+            match (page.next_cursor, page.next_version_id_marker) {
+                (Some(next), Some(version)) => {
+                    cursor = Some(next);
+                    version_id_marker = Some(version);
+                }
+                _ => {
+                    return ControlResponse::error_internal(
+                        "truncated version page did not provide both continuation markers",
+                    );
+                }
             }
         }
 
@@ -1217,6 +1293,12 @@ impl ControlService {
             })
             .await
         {
+            if matches!(e, cairn_types::MetaError::InvalidBucketState) {
+                return ControlResponse::error(
+                    StatusCode::CONFLICT,
+                    "Object Lock requires bucket versioning to remain Enabled",
+                );
+            }
             return ControlResponse::error_internal(&e.to_string());
         }
 
@@ -1401,7 +1483,14 @@ impl ControlService {
             .await
         {
             Ok(Some(doc)) => {
-                serde_json::from_str::<cairn_types::NotificationConfig>(&doc.0).unwrap_or_default()
+                match serde_json::from_str::<cairn_types::NotificationConfig>(&doc.0) {
+                    Ok(config) => config,
+                    Err(_) => {
+                        return ControlResponse::error_internal(
+                            "stored notification configuration is invalid",
+                        );
+                    }
+                }
             }
             Ok(None) => cairn_types::NotificationConfig::default(),
             Err(e) => return ControlResponse::error_internal(&e.to_string()),
@@ -1415,9 +1504,9 @@ impl ControlService {
     }
 
     /// `PUT /buckets/{name}/notifications`: replace the bucket's webhook endpoint list. The body is
-    /// a `NotificationConfig` JSON document; each endpoint is validated (non-empty id, http(s) URL,
-    /// at least one event selector) before storing. Secrets are stored as-is (sealed at rest is not
-    /// required — they are HMAC signing keys, not credentials) and never echoed back.
+    /// a [`wire::NotificationsInput`] JSON document; each endpoint is validated (non-empty id,
+    /// http(s) URL, at least one event selector) before storing. A submitted HMAC key is sealed
+    /// under the active master key before metadata commit and is never echoed back.
     async fn set_notifications(
         &self,
         name: &str,
@@ -1428,42 +1517,14 @@ impl ControlService {
             Ok(n) => n,
             Err(resp) => return resp,
         };
-        let mut config: cairn_types::NotificationConfig = match serde_json::from_slice(body) {
-            Ok(c) => c,
+        let input: wire::NotificationsInput = match serde_json::from_slice(body) {
+            Ok(input) => input,
             Err(e) => return ControlResponse::bad_request(&e.to_string()),
         };
-        // Preserve existing signing secrets: since secrets are write-only (GET never returns them)
-        // and a PUT replaces the whole endpoint list, an incoming endpoint that omits its secret
-        // (`null`) inherits the stored secret for the same id — so editing one endpoint's URL does
-        // not silently wipe another's HMAC key. To clear a secret, send an empty string.
-        let existing: Option<cairn_types::NotificationConfig> = match self
-            .meta
-            .get_bucket_config(&bucket_name, ConfigAspect::Notification)
-            .await
-        {
-            Ok(Some(doc)) => serde_json::from_str(&doc.0).ok(),
-            _ => None,
-        };
-        if let Some(prev) = &existing {
-            for ep in &mut config.endpoints {
-                if ep.secret.is_none() {
-                    if let Some(p) = prev.endpoints.iter().find(|p| p.id == ep.id) {
-                        ep.secret = p.secret.clone();
-                    }
-                } else if ep.secret.as_deref() == Some("") {
-                    ep.secret = None; // explicit clear
-                }
-            }
-        } else {
-            for ep in &mut config.endpoints {
-                if ep.secret.as_deref() == Some("") {
-                    ep.secret = None;
-                }
-            }
-        }
-        // Validate every endpoint before storing so a bad config is rejected at the edge.
+
+        // Validate public fields before any secret is sealed or persisted.
         let mut seen = std::collections::HashSet::new();
-        for ep in &config.endpoints {
+        for ep in &input.endpoints {
             if ep.id.trim().is_empty() {
                 return ControlResponse::bad_request("endpoint id must not be empty");
             }
@@ -1482,12 +1543,77 @@ impl ControlService {
                     ep.id
                 ));
             }
-            // SSRF guard (ARCH 27): reject a webhook URL that is an internal IP literal; the webhook
-            // sink's resolver enforces this again at delivery time, including for hostnames.
+            // SSRF guard (ARCH 27): reject a webhook URL that is an internal IP literal; the
+            // webhook sink's resolver enforces this again at delivery time, including hostnames.
             if let Err(e) = cairn_net::validate_endpoint(&ep.url, &self.ssrf_guard) {
                 return ControlResponse::bad_request(&format!("endpoint {:?}: {e}", ep.id));
             }
         }
+
+        // Secrets are write-only. An omitted value inherits the stored envelope for the same id,
+        // so editing a URL does not erase its key; an empty string explicitly clears it. Stored
+        // config read/parse failures abort the replacement rather than risking a silent key loss.
+        let existing = match self
+            .meta
+            .get_bucket_config(&bucket_name, ConfigAspect::Notification)
+            .await
+        {
+            Ok(Some(doc)) => {
+                match serde_json::from_str::<cairn_types::NotificationConfig>(&doc.0) {
+                    Ok(config) => config,
+                    Err(_) => {
+                        return ControlResponse::error_internal(
+                            "stored notification configuration is invalid",
+                        );
+                    }
+                }
+            }
+            Ok(None) => cairn_types::NotificationConfig::default(),
+            Err(e) => return ControlResponse::error_internal(&e.to_string()),
+        };
+
+        let mut endpoints = Vec::with_capacity(input.endpoints.len());
+        for ep in input.endpoints {
+            let secret = match ep.secret {
+                None => match existing
+                    .endpoints
+                    .iter()
+                    .find(|stored| stored.id == ep.id)
+                    .and_then(|stored| stored.secret.as_ref())
+                {
+                    Some(cairn_types::WebhookSecret::LegacyPlaintext(plaintext)) => {
+                        match self.crypto.seal(plaintext.expose_secret().as_bytes()) {
+                            Ok(sealed) => Some(cairn_types::WebhookSecret::from_sealed(sealed)),
+                            Err(_) => {
+                                return ControlResponse::error_internal(
+                                    "webhook signing secret could not be sealed",
+                                );
+                            }
+                        }
+                    }
+                    Some(sealed) => Some(sealed.clone()),
+                    None => None,
+                },
+                Some(secret) if secret.is_empty() => None,
+                Some(secret) => match self.crypto.seal(secret.expose_secret().as_bytes()) {
+                    Ok(sealed) => Some(cairn_types::WebhookSecret::from_sealed(sealed)),
+                    Err(_) => {
+                        return ControlResponse::error_internal(
+                            "webhook signing secret could not be sealed",
+                        );
+                    }
+                },
+            };
+            endpoints.push(cairn_types::WebhookEndpoint {
+                id: ep.id,
+                url: ep.url,
+                events: ep.events,
+                prefix: ep.prefix,
+                suffix: ep.suffix,
+                secret,
+            });
+        }
+        let config = cairn_types::NotificationConfig { endpoints };
         let doc = match serde_json::to_string(&config) {
             Ok(s) => ConfigDoc(s),
             Err(e) => return ControlResponse::error_internal(&e.to_string()),
@@ -1682,6 +1808,34 @@ impl ControlService {
         let Some(parent) = principal.map(|p| p.user_id.clone()) else {
             return ControlResponse::forbidden();
         };
+        // The supplied policy is an additional permissions boundary, not a replacement for the
+        // administrator's identity restrictions. Snapshot every parent Deny into the session row
+        // so the session-only authorization path cannot restore access the parent was denied.
+        let parent_policy = match self.meta.get_user_policy(&parent).await {
+            Ok(policy) => policy,
+            Err(e) => {
+                tracing::warn!(
+                    user_id = %parent,
+                    error = ?e,
+                    "refusing management session mint because the parent policy could not be loaded"
+                );
+                return ControlResponse::error_internal("authorization policy unavailable");
+            }
+        };
+        let policy_json = match cairn_authz::intersect_admin_session_policy(
+            parent_policy.as_deref(),
+            Some(&policy_json),
+        ) {
+            Ok(policy) => policy,
+            Err(e) => {
+                tracing::warn!(
+                    user_id = %parent,
+                    error = ?e,
+                    "refusing management session mint because the parent policy is malformed"
+                );
+                return ControlResponse::error_internal("authorization policy unavailable");
+            }
+        };
 
         let now = self.clock.now();
         let access_key_id = format!(
@@ -1722,8 +1876,8 @@ impl ControlService {
             StatusCode::OK,
             &wire::MintSessionResp {
                 access_key_id,
-                secret_access_key: secret,
-                session_token,
+                secret_access_key: secret.into(),
+                session_token: session_token.into(),
                 expiration_epoch_secs: expires_at.as_secs(),
             },
         )
@@ -1871,9 +2025,9 @@ impl ControlService {
             &wire::CreateUserResp {
                 id: user_id.to_string(),
                 bearer_access_key_id: access_key_id,
-                bearer_secret: secret,
+                bearer_secret: secret.into(),
                 s3_access_key_id: sigv4_access_key_id,
-                s3_secret_key: sigv4_secret,
+                s3_secret_key: sigv4_secret.into(),
             },
         )
     }
@@ -2107,7 +2261,7 @@ impl ControlService {
             StatusCode::OK,
             &wire::RotateCredentialsResp {
                 bearer_access_key_id: access_key_id,
-                bearer_secret: secret,
+                bearer_secret: secret.into(),
             },
         )
     }
@@ -2510,6 +2664,7 @@ impl ControlService {
             ca_cert_pem,
             insecure_skip_verify: req.insecure_skip_verify,
             allow_internal_endpoints: self.ssrf_guard.allow_internal,
+            timeouts: self.import_timeouts,
         }) {
             Ok(s) => s,
             Err(e) => return ControlResponse::bad_request(&e.to_string()),
@@ -2524,13 +2679,36 @@ impl ControlService {
         }
     }
 
-    /// `GET /imports`: list all import jobs (secret-free), newest first.
-    async fn list_imports(&self) -> ControlResponse {
-        match self.meta.list_import_jobs().await {
-            Ok(jobs) => ControlResponse::json(
+    /// `GET /imports`: list one bounded, stable page of import jobs (secret-free), newest first.
+    async fn list_imports(&self, query: &[(String, String)]) -> ControlResponse {
+        let limit = match find_query(query, "limit") {
+            None => PAGE_LIMIT,
+            Some(raw) => match raw.parse::<u32>() {
+                Ok(limit @ 1..=PAGE_LIMIT) => limit,
+                _ => {
+                    return ControlResponse::bad_request(
+                        "limit must be an integer between 1 and 1000",
+                    );
+                }
+            },
+        };
+        let cursor = match find_query(query, "cursor") {
+            None => None,
+            Some(raw) => match decode_import_cursor(raw) {
+                Some(cursor) => Some(cursor),
+                None => return ControlResponse::bad_request("invalid import cursor"),
+            },
+        };
+        match self
+            .meta
+            .list_import_jobs(&ImportJobListQuery { cursor, limit })
+            .await
+        {
+            Ok(page) => ControlResponse::json(
                 StatusCode::OK,
                 &wire::ImportListResp {
-                    jobs: jobs.iter().map(wire::ImportJobEntry::from).collect(),
+                    jobs: page.items.iter().map(wire::ImportJobEntry::from).collect(),
+                    next_cursor: page.next_cursor.as_ref().map(encode_import_cursor),
                 },
             ),
             Err(e) => ControlResponse::error_internal(&e.to_string()),
@@ -3067,39 +3245,38 @@ impl ControlService {
         ControlResponse::json(StatusCode::OK, &wire::ShareListResp { shares: records })
     }
 
-    /// `GET /buckets/{name}/objects/shares/{token}`: one share by token.
-    async fn get_object_share(&self, name: &str, token: &str) -> ControlResponse {
+    /// `GET /buckets/{name}/objects/shares/{id}`: one share by stable management id.
+    async fn get_object_share(&self, name: &str, id: &str) -> ControlResponse {
         if let Err(resp) = self.require_bucket(name).await {
             return resp;
         }
-        match self.meta.get_share(token).await {
+        match self.meta.get_share_by_id(id).await {
             Ok(Some(s)) if s.bucket.as_str() == name => {
                 ControlResponse::json(StatusCode::OK, &share_record(s, self.clock.now()))
             }
             // Absent, or belonging to another bucket: 404 either way — a share is only visible
-            // through its own bucket's path, and we never reveal cross-bucket token existence
+            // through its own bucket's path, and we never reveal cross-bucket id existence
             // (audit #27).
             Ok(_) => ControlResponse::not_found(),
             Err(e) => ControlResponse::error_internal(&e.to_string()),
         }
     }
 
-    /// `DELETE /buckets/{name}/objects/shares/{token}`: revoke a share. Idempotent.
+    /// `DELETE /buckets/{name}/objects/shares/{id}`: revoke a share. Idempotent.
     async fn revoke_object_share(
         &self,
         name: &str,
-        token: &str,
+        id: &str,
         principal: Option<&Principal>,
     ) -> ControlResponse {
         let bucket = match self.require_bucket(name).await {
             Ok(n) => n,
             Err(resp) => return resp,
         };
-        // Scope the token to the path bucket (audit #27): only revoke a share that belongs to this
-        // bucket, so an admin for one bucket cannot revoke another bucket's share by token. A token
-        // that is absent or belongs to another bucket is an idempotent no-op, not a cross-bucket
-        // revoke.
-        match self.meta.get_share(token).await {
+        // Scope the id to the path bucket (audit #27): only revoke a share that belongs to this
+        // bucket, so an admin for one bucket cannot revoke another bucket's share by id. An id that
+        // is absent or belongs to another bucket is an idempotent no-op, not a cross-bucket revoke.
+        match self.meta.get_share_by_id(id).await {
             Ok(Some(s)) if s.bucket.as_str() == name => {}
             Ok(_) => return ControlResponse::no_content(),
             Err(e) => return ControlResponse::error_internal(&e.to_string()),
@@ -3107,7 +3284,7 @@ impl ControlService {
         if let Err(e) = self
             .meta
             .submit(Mutation::RevokeShare {
-                token: token.to_owned(),
+                id: id.to_owned(),
                 now: self.clock.now(),
             })
             .await
@@ -3170,6 +3347,26 @@ fn find_query<'a>(query: &'a [(String, String)], name: &str) -> Option<&'a str> 
         .map(|(_, v)| v.as_str())
 }
 
+/// Encode the import history's stable `(created_at, id)` keyset as an opaque API cursor.
+fn encode_import_cursor(cursor: &ImportJobCursor) -> String {
+    format!("{}:{}", cursor.created_at.0, cursor.id)
+}
+
+/// Decode a cursor produced by [`encode_import_cursor`].
+///
+/// Splitting only the first separator also preserves an id containing `:`. Rejecting an empty id
+/// prevents a timestamp-only cursor from silently changing page boundaries.
+fn decode_import_cursor(raw: &str) -> Option<ImportJobCursor> {
+    let (created_at, id) = raw.split_once(':')?;
+    if id.is_empty() {
+        return None;
+    }
+    Some(ImportJobCursor {
+        created_at: Timestamp(created_at.parse().ok()?),
+        id: id.to_owned(),
+    })
+}
+
 /// Map a stored [`ShareRow`] to the wire view, deriving the `active`/`expired`/`revoked` status.
 fn share_record(s: ShareRow, now: Timestamp) -> wire::ShareRecord {
     let status = if s.revoked_at.is_some() {
@@ -3180,7 +3377,7 @@ fn share_record(s: ShareRow, now: Timestamp) -> wire::ShareRecord {
         "active"
     };
     wire::ShareRecord {
-        token: s.token,
+        id: s.id,
         bucket: s.bucket.as_str().to_owned(),
         key: s.key.as_str().to_owned(),
         version_id: s.version_id.map(|v| v.as_str().to_owned()),

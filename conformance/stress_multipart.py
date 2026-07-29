@@ -123,9 +123,9 @@ s3 = boto3.client(
                   connect_timeout=20, read_timeout=300, max_pool_connections=POOL),
 )
 
-# Encrypted CRNB block-container trailer: 34 bytes, magic `CRNB` then the version byte;
-# VERSION_ENCRYPTED == 2 (crates/cairn-blob/src/compress.rs).
-VERSION_ENCRYPTED = 2
+# Encrypted CRNB block-container trailer: 34 bytes, magic `CRNB` then the version byte. Encrypted v2
+# remains read-compatible, but this current-writer proof must require authenticated-metadata v3.
+VERSION_ENCRYPTED_CURRENT = 3
 MARKER = b"PLAINTEXT-MARKER-DO-NOT-FIND-ON-DISK-"
 
 fails = []
@@ -180,7 +180,11 @@ def staged_parts(upload_id):
 
 
 def trailer_encrypted(blob):
-    return len(blob) >= 34 and blob[-34:-30] == b"CRNB" and blob[-30] == VERSION_ENCRYPTED
+    return (
+        len(blob) >= 34
+        and blob[-34:-30] == b"CRNB"
+        and blob[-30] == VERSION_ENCRYPTED_CURRENT
+    )
 
 
 def err_of(exc):

@@ -565,10 +565,227 @@ ALTER TABLE object_versions ADD COLUMN replicated_at INTEGER;
 CREATE INDEX idx_outbox_bucket_key ON replication_outbox (bucket_name, key);
 "#,
     },
+    Migration {
+        version: 24,
+        name: "bounded import scheduling and history",
+        sql: r#"
+-- The import scheduler selects one oldest pending/running id without reading or decoding the
+-- history-sized buckets_json payload. The id tie-breaker makes equal-millisecond creation times
+-- deterministic and lets the query remain an index-only, constant-row seek.
+CREATE INDEX idx_import_jobs_state_created_id
+    ON import_jobs (state, created_at, id);
+
+-- Management history is keyset-paged newest-first over this exact stable order.
+CREATE INDEX idx_import_jobs_created_id
+    ON import_jobs (created_at DESC, id DESC);
+
+-- Terminal retention filters by lifecycle state and updated_at. Without this index every import
+-- heartbeat scans the complete history merely to discover that nothing is old enough to prune.
+CREATE INDEX idx_import_jobs_state_updated
+    ON import_jobs (state, updated_at);
+"#,
+    },
+    Migration {
+        version: 25,
+        name: "one-time object share capabilities",
+        sql: r#"
+-- Persistent share bearer tokens were historically the table primary key. Revoke every legacy
+-- capability and overwrite its plaintext value before rebuilding the table; secure_delete is
+-- enabled by the migration runner and a successful TRUNCATE checkpoint is forced before startup
+-- opens readers or serves requests.
+UPDATE object_shares
+SET token = lower(hex(randomblob(32))),
+    revoked_at = COALESCE(
+        revoked_at,
+        CAST(strftime('%s', 'now') AS INTEGER) * 1000
+    );
+
+DROP INDEX idx_object_shares_bucket_key;
+DROP INDEX idx_object_shares_created_by;
+ALTER TABLE object_shares RENAME TO object_shares_v24;
+
+CREATE TABLE object_shares (
+    id          TEXT PRIMARY KEY,
+    token_hash  BLOB NOT NULL UNIQUE CHECK (length(token_hash) = 32),
+    bucket_name TEXT NOT NULL,
+    key         TEXT NOT NULL,
+    version_id  TEXT,
+    expires_at  INTEGER,
+    disposition TEXT NOT NULL DEFAULT 'inline',
+    filename    TEXT,
+    created_by  TEXT NOT NULL,
+    created_at  INTEGER NOT NULL,
+    revoked_at  INTEGER
+);
+
+-- Preserve non-capability history for operator visibility. The replacement id/hash are random and
+-- unrelated to the destroyed bearer token; every copied row is already revoked by the UPDATE.
+-- Shares are account-global on shard 0, while buckets are shard-local, so this table deliberately
+-- has no impossible cross-database foreign key to `buckets`.
+INSERT INTO object_shares
+    (id, token_hash, bucket_name, key, version_id, expires_at, disposition, filename,
+     created_by, created_at, revoked_at)
+SELECT
+    'legacy-' || lower(hex(randomblob(16))), randomblob(32), bucket_name, key, version_id,
+    expires_at, disposition, filename, created_by, created_at, revoked_at
+FROM object_shares_v24;
+
+-- A durable one-row marker makes physical sanitation retryable. The migration transaction commits
+-- before the checkpoint can run; if startup dies or the checkpoint is busy, the next startup sees
+-- this row and retries before opening readers. Empty/fresh databases insert no marker.
+CREATE TABLE share_capability_sanitation (
+    id INTEGER PRIMARY KEY CHECK (id = 1)
+);
+INSERT INTO share_capability_sanitation (id)
+SELECT 1 WHERE EXISTS (SELECT 1 FROM object_shares_v24);
+
+DROP TABLE object_shares_v24;
+CREATE INDEX idx_object_shares_bucket_key ON object_shares (bucket_name, key);
+CREATE INDEX idx_object_shares_created_by ON object_shares (created_by);
+"#,
+    },
+    Migration {
+        version: 26,
+        name: "bounded multipart staging reservations",
+        sql: r#"
+-- Attribute staged bytes and active-session cardinality to the authenticated initiator rather
+-- than implicitly to the bucket owner. Existing sessions predate that distinction and therefore
+-- inherit their owner as the safest compatible attribution.
+ALTER TABLE multipart_uploads ADD COLUMN initiated_by TEXT;
+UPDATE multipart_uploads SET initiated_by=owner_id WHERE initiated_by IS NULL;
+
+-- One writer-owned reservation exists before any part-attempt bytes reach durable staging. The
+-- unique (upload, part) key serializes same-part attempts, so concurrent replacements cannot
+-- multiply disk use behind one logical part number.
+CREATE TABLE multipart_part_reservations (
+    attempt_id     TEXT PRIMARY KEY,
+    upload_id      TEXT NOT NULL,
+    part_number    INTEGER NOT NULL CHECK (part_number BETWEEN 1 AND 10000),
+    reserved_bytes INTEGER NOT NULL CHECK (reserved_bytes >= 0),
+    created_at     INTEGER NOT NULL,
+    UNIQUE (upload_id, part_number),
+    FOREIGN KEY (upload_id) REFERENCES multipart_uploads (id) ON DELETE CASCADE
+);
+CREATE INDEX idx_multipart_reservations_created
+    ON multipart_part_reservations (created_at, attempt_id);
+
+-- Bytes remain charged after metadata ownership ends until their exact file (replacement) or
+-- complete session directory (abort/complete) is actually gone. No upload FK is intentional:
+-- terminal cleanup debt must survive deletion of multipart_uploads.
+CREATE TABLE multipart_staging_cleanups (
+    id           TEXT PRIMARY KEY,
+    upload_id    TEXT NOT NULL,
+    bucket_name  TEXT NOT NULL,
+    principal_id TEXT NOT NULL,
+    bytes        INTEGER NOT NULL CHECK (bytes >= 0),
+    storage_path TEXT,
+    created_at   INTEGER NOT NULL
+);
+CREATE INDEX idx_multipart_cleanups_upload ON multipart_staging_cleanups (upload_id);
+CREATE INDEX idx_multipart_cleanups_created ON multipart_staging_cleanups (created_at, id);
+
+-- O(1) quota/cardinality checks maintained inside the same writer savepoint as every multipart
+-- transition. `staged_bytes` includes committed parts, pending reservations, and cleanup debt.
+CREATE TABLE multipart_bucket_stats (
+    bucket_name    TEXT PRIMARY KEY,
+    active_uploads INTEGER NOT NULL DEFAULT 0 CHECK (active_uploads >= 0),
+    staged_bytes   INTEGER NOT NULL DEFAULT 0 CHECK (staged_bytes >= 0)
+);
+CREATE TABLE multipart_principal_stats (
+    principal_id   TEXT PRIMARY KEY,
+    active_uploads INTEGER NOT NULL DEFAULT 0 CHECK (active_uploads >= 0),
+    staged_bytes   INTEGER NOT NULL DEFAULT 0 CHECK (staged_bytes >= 0)
+);
+INSERT INTO multipart_bucket_stats (bucket_name, active_uploads, staged_bytes)
+SELECT u.bucket_name, COUNT(DISTINCT u.id), COALESCE(SUM(p.size), 0)
+FROM multipart_uploads u
+LEFT JOIN multipart_parts p ON p.upload_id=u.id
+GROUP BY u.bucket_name;
+INSERT INTO multipart_principal_stats (principal_id, active_uploads, staged_bytes)
+SELECT COALESCE(u.initiated_by, u.owner_id), COUNT(DISTINCT u.id), COALESCE(SUM(p.size), 0)
+FROM multipart_uploads u
+LEFT JOIN multipart_parts p ON p.upload_id=u.id
+GROUP BY COALESCE(u.initiated_by, u.owner_id);
+"#,
+    },
+    Migration {
+        version: 27,
+        name: "writer-authoritative object lock",
+        sql: r#"
+-- Object Lock enforcement is writer-authoritative. Rebuild the v16 side table with structural
+-- checks and a composite foreign key so a lock can describe exactly one existing version and is
+-- removed only as part of that version's writer-owned terminal mutation. Historical code could
+-- leave an orphan side row after deleting its version; that row protects no bytes and is discarded.
+-- Every row still attached to a version is copied through the constraints, so malformed protection
+-- state fails startup closed rather than being silently weakened.
+ALTER TABLE object_locks RENAME TO object_locks_v16;
+CREATE TABLE object_locks (
+    bucket_name  TEXT NOT NULL,
+    key          TEXT NOT NULL,
+    version_id   TEXT NOT NULL,
+    lock_mode    TEXT CHECK (
+        lock_mode IS NULL OR lock_mode IN ('GOVERNANCE', 'COMPLIANCE')
+    ),
+    retain_until INTEGER,
+    legal_hold   INTEGER NOT NULL DEFAULT 0 CHECK (legal_hold IN (0, 1)),
+    PRIMARY KEY (bucket_name, key, version_id),
+    CHECK (
+        (lock_mode IS NULL AND retain_until IS NULL)
+        OR (lock_mode IS NOT NULL AND retain_until IS NOT NULL)
+    ),
+    FOREIGN KEY (bucket_name, key, version_id)
+        REFERENCES object_versions (bucket_name, key, version_id)
+        ON DELETE CASCADE
+);
+INSERT INTO object_locks
+    (bucket_name, key, version_id, lock_mode, retain_until, legal_hold)
+SELECT locks.bucket_name, locks.key, locks.version_id,
+       locks.lock_mode, locks.retain_until, locks.legal_hold
+FROM object_locks_v16 AS locks
+WHERE EXISTS (
+    SELECT 1
+    FROM object_versions AS versions
+    WHERE versions.bucket_name=locks.bucket_name
+      AND versions.key=locks.key
+      AND versions.version_id=locks.version_id
+);
+DROP TABLE object_locks_v16;
+
+-- Initiation pins tags and only the explicit Object Lock request. NULL legal_hold means the header
+-- was absent (distinct from explicit OFF). Bucket default retention is resolved from the current
+-- strictly-parsed configuration inside CompleteMultipartUpload's writer savepoint.
+ALTER TABLE multipart_uploads
+    ADD COLUMN initial_tags TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE multipart_uploads
+    ADD COLUMN lock_mode TEXT CHECK (
+        lock_mode IS NULL OR lock_mode IN ('GOVERNANCE', 'COMPLIANCE')
+    );
+ALTER TABLE multipart_uploads ADD COLUMN retain_until INTEGER;
+ALTER TABLE multipart_uploads
+    ADD COLUMN legal_hold INTEGER CHECK (
+        legal_hold IS NULL OR legal_hold IN (0, 1)
+    );
+-- Existing sessions cannot prove whether the pre-v27 initiate request carried explicit lock
+-- headers. New writer-created sessions set this to 1; the 0 default makes every migrated legacy
+-- session distinguishable so completion can fail closed on an Object-Lock bucket.
+ALTER TABLE multipart_uploads
+    ADD COLUMN object_lock_intent_known INTEGER NOT NULL DEFAULT 0 CHECK (
+        object_lock_intent_known IN (0, 1)
+    );
+"#,
+    },
 ];
+
+/// Highest schema version understood by this build.
+pub(crate) fn latest_version() -> i64 {
+    MIGRATIONS.last().map_or(0, |migration| migration.version)
+}
 
 /// Run all pending migrations on the write connection, recording each as applied.
 pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
+    // A v25 upgrade destroys legacy plaintext bearer capabilities. This must be enabled before the
+    // UPDATE/table rebuild so deleted b-tree cells are zeroed rather than left in free pages.
+    conn.execute_batch("PRAGMA secure_delete=ON;")?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_migrations (
             version    INTEGER PRIMARY KEY,
@@ -594,7 +811,38 @@ pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
         tx.commit()?;
         tracing::info!(version = m.version, name = m.name, "applied migration");
     }
+    if share_sanitation_pending(conn)? {
+        // No read pool exists yet. Move the scrubbed v25 pages into the main database and truncate
+        // every older WAL frame before the process can redeem a share or expose a raw backup.
+        let busy: i64 = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
+        if busy != 0 {
+            return Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                Some("legacy share sanitation checkpoint was busy".to_owned()),
+            ));
+        }
+        conn.execute("DELETE FROM share_capability_sanitation WHERE id=1", [])?;
+    }
     Ok(())
+}
+
+fn share_sanitation_pending(conn: &Connection) -> rusqlite::Result<bool> {
+    let table_exists: bool = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM sqlite_master
+             WHERE type='table' AND name='share_capability_sanitation'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if !table_exists {
+        return Ok(false);
+    }
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM share_capability_sanitation WHERE id=1)",
+        [],
+        |row| row.get(0),
+    )
 }
 
 fn now_millis() -> i64 {
@@ -792,6 +1040,26 @@ mod tests {
             )
             .unwrap();
         assert_eq!(idx, 1);
+    }
+
+    #[test]
+    fn migration_v24_indexes_bounded_import_reads_and_retention() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        for index in [
+            "idx_import_jobs_state_created_id",
+            "idx_import_jobs_created_id",
+            "idx_import_jobs_state_updated",
+        ] {
+            let present: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?1",
+                    [index],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(present, 1, "missing import index {index}");
+        }
     }
 
     #[test]
@@ -1058,5 +1326,281 @@ mod tests {
             )
             .unwrap();
         assert_eq!(ul, 30, "alice owns 30 logical bytes across versions");
+    }
+
+    #[test]
+    fn migration_v25_revokes_and_physically_scrubs_legacy_share_tokens() {
+        const SENTINEL: &str = "cairn-legacy-share-plaintext-sentinel-029";
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("legacy-share.db");
+
+        // Build the exact v24 share surface with the sentinel checkpointed into the main database,
+        // so the v25 assertion cannot pass merely because the test value lived only in memory.
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 PRAGMA wal_autocheckpoint=0;
+                 PRAGMA foreign_keys=ON;
+                 CREATE TABLE schema_migrations (
+                     version INTEGER PRIMARY KEY,
+                     name TEXT NOT NULL,
+                     applied_at INTEGER NOT NULL
+                 );
+                 INSERT INTO schema_migrations VALUES (24, 'legacy fixture', 0);
+                 CREATE TABLE buckets (name TEXT PRIMARY KEY);
+                 INSERT INTO buckets VALUES ('photos');
+                 CREATE TABLE object_shares (
+                     token TEXT PRIMARY KEY,
+                     bucket_name TEXT NOT NULL,
+                     key TEXT NOT NULL,
+                     version_id TEXT,
+                     expires_at INTEGER,
+                     disposition TEXT NOT NULL DEFAULT 'inline',
+                     filename TEXT,
+                     created_by TEXT NOT NULL,
+                     created_at INTEGER NOT NULL,
+                     revoked_at INTEGER,
+                     FOREIGN KEY (bucket_name) REFERENCES buckets(name) ON DELETE CASCADE
+                 );
+                 CREATE INDEX idx_object_shares_bucket_key
+                     ON object_shares (bucket_name, key);
+                 CREATE INDEX idx_object_shares_created_by
+                     ON object_shares (created_by);
+                 -- Minimal v24-era tables needed by later append-only migrations. This fixture is
+                 -- intentionally sparse because the test targets share sanitation, but every
+                 -- migration after v25 must still be able to advance it to the current schema.
+                 CREATE TABLE multipart_uploads (
+                     id TEXT PRIMARY KEY,
+                     bucket_name TEXT NOT NULL,
+                     key TEXT NOT NULL,
+                     content_type TEXT NOT NULL,
+                     status TEXT NOT NULL,
+                     owner_id TEXT NOT NULL,
+                     user_metadata TEXT NOT NULL,
+                     created_at INTEGER NOT NULL,
+                     updated_at INTEGER NOT NULL
+                 );
+                 CREATE TABLE multipart_parts (
+                     upload_id TEXT NOT NULL,
+                     part_number INTEGER NOT NULL,
+                     size INTEGER NOT NULL,
+                     PRIMARY KEY (upload_id, part_number)
+                 );
+                 CREATE TABLE object_versions (
+                     bucket_name TEXT NOT NULL,
+                     key TEXT NOT NULL,
+                     version_id TEXT NOT NULL,
+                     UNIQUE (bucket_name, key, version_id)
+                 );
+                 CREATE TABLE object_locks (
+                     bucket_name TEXT NOT NULL,
+                     key TEXT NOT NULL,
+                     version_id TEXT NOT NULL,
+                     lock_mode TEXT,
+                     retain_until INTEGER,
+                     legal_hold INTEGER NOT NULL DEFAULT 0,
+                     PRIMARY KEY (bucket_name, key, version_id)
+                 );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO object_shares
+                 (token, bucket_name, key, disposition, created_by, created_at)
+                 VALUES (?1, 'photos', 'private.jpg', 'inline', 'admin', 1)",
+                rusqlite::params![SENTINEL],
+            )
+            .unwrap();
+            let busy: i64 = conn
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(busy, 0);
+        }
+        assert!(
+            std::fs::read(&db_path)
+                .unwrap()
+                .windows(SENTINEL.len())
+                .any(|window| window == SENTINEL.as_bytes()),
+            "fixture must prove the plaintext was physically present before migration"
+        );
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 PRAGMA wal_autocheckpoint=0;
+                 PRAGMA foreign_keys=ON;",
+            )
+            .unwrap();
+            run_migrations(&conn).unwrap();
+
+            assert!(!column_exists(&conn, "object_shares", "token"));
+            assert!(column_exists(&conn, "object_shares", "id"));
+            assert!(column_exists(&conn, "object_shares", "token_hash"));
+            let (id, hash_len, revoked_at): (String, i64, Option<i64>) = conn
+                .query_row(
+                    "SELECT id, length(token_hash), revoked_at FROM object_shares",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert!(id.starts_with("legacy-"));
+            assert_eq!(hash_len, 32);
+            assert!(revoked_at.is_some_and(|at| at > 1));
+
+            let old_hash = cairn_types::ShareLookupHash::for_token(SENTINEL);
+            let redeemable: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM object_shares WHERE token_hash=?1",
+                    rusqlite::params![old_hash.as_bytes().as_slice()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                redeemable, 0,
+                "the legacy capability must no longer resolve"
+            );
+        }
+
+        for path in [db_path.clone(), db_path.with_extension("db-wal")] {
+            let bytes = std::fs::read(&path).unwrap_or_default();
+            assert!(
+                !bytes
+                    .windows(SENTINEL.len())
+                    .any(|window| window == SENTINEL.as_bytes()),
+                "legacy bearer plaintext remained in {}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn migration_v27_constrains_locks_and_pins_multipart_intent() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        run_migrations(&conn).unwrap();
+
+        for column in [
+            "initial_tags",
+            "lock_mode",
+            "retain_until",
+            "legal_hold",
+            "object_lock_intent_known",
+        ] {
+            assert!(
+                column_exists(&conn, "multipart_uploads", column),
+                "v27 multipart column {column} must exist"
+            );
+        }
+
+        conn.execute_batch(
+            "INSERT INTO object_versions
+             (id, bucket_name, key, version_id, is_latest, is_delete_marker, size_logical,
+              size_physical, etag, content_type, compression, storage_class, owner_id,
+              user_metadata, checksums, created_at, updated_at)
+             VALUES ('i','b','k','v',1,0,1,1,'e','text/plain','\"Uncompressed\"','Standard',
+                     'o','[]','[]',0,0);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO object_locks
+             (bucket_name,key,version_id,lock_mode,retain_until,legal_hold)
+             VALUES ('b','k','v','COMPLIANCE',100,1)",
+            [],
+        )
+        .unwrap();
+
+        assert!(
+            conn.execute(
+                "INSERT INTO object_locks
+                 (bucket_name,key,version_id,lock_mode,retain_until,legal_hold)
+                 VALUES ('b','missing','v','GOVERNANCE',100,0)",
+                [],
+            )
+            .is_err(),
+            "a lock may not outlive or precede its object version"
+        );
+        assert!(
+            conn.execute(
+                "UPDATE object_locks SET lock_mode='GOVERNANCE', retain_until=NULL
+                 WHERE bucket_name='b' AND key='k' AND version_id='v'",
+                [],
+            )
+            .is_err(),
+            "retention mode/date must remain a complete pair"
+        );
+
+        conn.execute(
+            "DELETE FROM object_versions
+             WHERE bucket_name='b' AND key='k' AND version_id='v'",
+            [],
+        )
+        .unwrap();
+        let locks: i64 = conn
+            .query_row("SELECT COUNT(*) FROM object_locks", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(locks, 0, "version deletion must cascade its lock side row");
+    }
+
+    #[test]
+    fn migration_v27_discards_only_legacy_orphan_lock_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "PRAGMA foreign_keys=ON;
+             CREATE TABLE schema_migrations (
+                 version INTEGER PRIMARY KEY,
+                 name TEXT NOT NULL,
+                 applied_at INTEGER NOT NULL
+             );
+             INSERT INTO schema_migrations VALUES (26, 'legacy fixture', 0);
+             CREATE TABLE object_versions (
+                 bucket_name TEXT NOT NULL,
+                 key TEXT NOT NULL,
+                 version_id TEXT NOT NULL,
+                 UNIQUE (bucket_name, key, version_id)
+             );
+             INSERT INTO object_versions VALUES ('b','live','v');
+             CREATE TABLE object_locks (
+                 bucket_name TEXT NOT NULL,
+                 key TEXT NOT NULL,
+                 version_id TEXT NOT NULL,
+                 lock_mode TEXT,
+                 retain_until INTEGER,
+                 legal_hold INTEGER NOT NULL DEFAULT 0,
+                 PRIMARY KEY (bucket_name, key, version_id)
+             );
+             INSERT INTO object_locks VALUES ('b','live','v','COMPLIANCE',100,0);
+             INSERT INTO object_locks VALUES ('b','orphan','v','GOVERNANCE',100,1);
+             CREATE TABLE multipart_uploads (id TEXT PRIMARY KEY);
+             INSERT INTO multipart_uploads VALUES ('legacy-upload');",
+        )
+        .unwrap();
+
+        run_migrations(&conn).unwrap();
+        let locks: Vec<(String, String)> = conn
+            .prepare("SELECT key, lock_mode FROM object_locks ORDER BY key")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            locks,
+            vec![("live".to_owned(), "COMPLIANCE".to_owned())],
+            "the attached protection survives while the no-version orphan is cleaned"
+        );
+        let intent_known: i64 = conn
+            .query_row(
+                "SELECT object_lock_intent_known FROM multipart_uploads
+                 WHERE id='legacy-upload'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            intent_known, 0,
+            "a migrated session must remain distinguishable from new writer-pinned intent"
+        );
     }
 }

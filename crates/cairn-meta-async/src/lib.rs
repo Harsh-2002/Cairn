@@ -249,7 +249,11 @@ pub async fn open_turso(
         .ok_or_else(|| MetaError::Engine("db_path is not valid UTF-8".to_owned()))?;
 
     // One Turso Database handle over the file; every connection opens the same file.
-    let db = turso::Builder::new_local(path).build().await.map_err(map)?;
+    let db = turso::Builder::new_local(path)
+        .experimental_vacuum(true)
+        .build()
+        .await
+        .map_err(map)?;
 
     // The single write connection, owned by the writer task.
     let write_conn = db.connect().map_err(map)?;
@@ -284,6 +288,7 @@ pub async fn open_turso_in_memory() -> Result<TursoMetadataStore, MetaError> {
     let map = |e: turso::Error| MetaError::Engine(e.to_string());
 
     let db = turso::Builder::new_local(":memory:")
+        .experimental_vacuum(true)
         .build()
         .await
         .map_err(map)?;

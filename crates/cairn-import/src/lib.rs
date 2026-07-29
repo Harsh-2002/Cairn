@@ -16,9 +16,10 @@
 //! ## Scale is bounded by construction
 //! Enumeration streams (paged `ListObjectsV2`, never list-all-into-memory); each page's objects copy
 //! under a per-bucket `object_workers` fan-out **and** a single global [`Semaphore`] whose permit
-//! ceiling caps total in-flight work across every bucket — so peak memory ≈ `global_max_inflight ×
-//! one streamed body`, independent of object count. Object bodies stream source→dest and are never
-//! buffered whole. Resume is one cursor per `(job, bucket)`, carried in [`BucketPlan`].
+//! ceiling caps total in-flight work across every bucket and every active job — so peak memory ≈
+//! `global_max_inflight × one streamed body`, independent of object count. Object bodies stream
+//! source→dest and are never buffered whole. Resume is one cursor per `(job, bucket)`, carried in
+//! [`BucketPlan`].
 
 mod source;
 
@@ -33,6 +34,47 @@ use async_trait::async_trait;
 use cairn_types::meta::{ImportBucketProgress, ImportState};
 use futures_util::StreamExt;
 use tokio::sync::Semaphore;
+
+/// Deadlines applied by the production import source and engine.
+///
+/// Connect, response-head, and body-idle deadlines protect individual HTTP phases. The whole-object
+/// deadline bounds one complete source GET → destination PUT attempt, including a peer that keeps
+/// sending body bytes just often enough to avoid the idle deadline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImportTimeouts {
+    /// Maximum time to establish the source TCP connection.
+    pub connect: Duration,
+    /// Maximum time from request dispatch until the source response headers arrive.
+    pub response_head: Duration,
+    /// Maximum silence between successive source response-body chunks.
+    pub body_idle: Duration,
+    /// Maximum wall-clock time for one complete object-copy attempt.
+    pub whole_object: Duration,
+}
+
+impl ImportTimeouts {
+    /// Construct deadlines from the environment-facing whole-second values.
+    #[must_use]
+    pub const fn from_secs(
+        connect: u64,
+        response_head: u64,
+        body_idle: u64,
+        whole_object: u64,
+    ) -> Self {
+        Self {
+            connect: Duration::from_secs(connect),
+            response_head: Duration::from_secs(response_head),
+            body_idle: Duration::from_secs(body_idle),
+            whole_object: Duration::from_secs(whole_object),
+        }
+    }
+}
+
+impl Default for ImportTimeouts {
+    fn default() -> Self {
+        Self::from_secs(10, 30, 60, 86_400)
+    }
+}
 
 /// Why a copy step did not succeed. The three classes drive the retry policy, mirroring
 /// `cairn-replication`'s taxonomy: `Retryable`/`Unavailable` back off and retry up to the attempt
@@ -177,8 +219,9 @@ pub struct ImportOpts {
     pub bucket_concurrency: usize,
     /// How many objects to copy concurrently within a bucket's page.
     pub object_workers: usize,
-    /// The authoritative ceiling on total in-flight object copies across ALL buckets. Held below the
-    /// blob-I/O permit pool so an import can't starve the node's live traffic.
+    /// The authoritative ceiling on total in-flight object copies across all buckets. The server
+    /// shares this budget across active jobs. It is held below the blob-I/O permit pool so an import
+    /// cannot starve the node's live traffic.
     pub global_max_inflight: usize,
     /// `ListObjectsV2` page size (max-keys).
     pub list_page_size: u32,
@@ -188,6 +231,8 @@ pub struct ImportOpts {
     pub base_backoff_secs: u64,
     /// Backoff ceiling seconds.
     pub max_backoff_secs: u64,
+    /// Hard deadline for one complete source GET → destination PUT attempt.
+    pub whole_object_timeout: Duration,
 }
 
 impl Default for ImportOpts {
@@ -200,6 +245,7 @@ impl Default for ImportOpts {
             max_attempts: 8,
             base_backoff_secs: 5,
             max_backoff_secs: 900,
+            whole_object_timeout: ImportTimeouts::default().whole_object,
         }
     }
 }
@@ -228,6 +274,7 @@ fn next_backoff(attempt: u32, base_secs: u64, max_secs: u64) -> Duration {
 #[derive(Debug, Clone)]
 pub struct ImportEngine {
     opts: ImportOpts,
+    shared_global: Option<Arc<Semaphore>>,
 }
 
 /// Per-page copy tally, merged into the shared progress once per page (avoids per-object locking).
@@ -243,7 +290,21 @@ impl ImportEngine {
     /// Construct an engine with the given options.
     #[must_use]
     pub fn new(opts: ImportOpts) -> Self {
-        Self { opts }
+        Self {
+            opts,
+            shared_global: None,
+        }
+    }
+
+    /// Share a process-wide in-flight semaphore across multiple concurrently scheduled jobs.
+    ///
+    /// Without this builder, an engine owns a semaphore sized from
+    /// [`ImportOpts::global_max_inflight`], preserving the standalone/test behavior. The server
+    /// supplies one shared semaphore so the configured ceiling remains global when jobs overlap.
+    #[must_use]
+    pub fn with_global_semaphore(mut self, global: Arc<Semaphore>) -> Self {
+        self.shared_global = Some(global);
+        self
     }
 
     /// Run the import: copy every bucket in `plan` from `source` into `dest`, reporting progress via
@@ -274,7 +335,10 @@ impl ImportEngine {
                 })
                 .collect(),
         ));
-        let global = Arc::new(Semaphore::new(self.opts.global_max_inflight.max(1)));
+        let global = self
+            .shared_global
+            .clone()
+            .unwrap_or_else(|| Arc::new(Semaphore::new(self.opts.global_max_inflight.max(1))));
         let cancelled = Arc::new(AtomicBool::new(false));
 
         futures_util::stream::iter(plan.iter().enumerate())
@@ -412,17 +476,31 @@ impl ImportEngine {
         obj: &RemoteObject,
         global: &Arc<Semaphore>,
     ) -> Result<u64, String> {
-        let _permit = global.acquire().await.expect("global semaphore not closed");
         let mut attempt = 0u32;
         loop {
             attempt += 1;
-            let res = async {
+            // Acquire for one attempt only. The owned work future is bounded below, and dropping it
+            // on timeout drops the RAII permit before any retry backoff. A slow source therefore
+            // cannot pin the global budget while sleeping or after cancellation (CAIRN-AUD-019).
+            let permit = global
+                .acquire()
+                .await
+                .map_err(|_| "global import semaphore closed".to_owned())?;
+            let attempt_work = async {
                 let src = source.get_object(src_bucket, &obj.key).await?;
                 let size = src.size;
                 dest.put_object(dest_bucket, src).await?;
                 Ok::<u64, ImportError>(size)
-            }
-            .await;
+            };
+            let res = match tokio::time::timeout(self.opts.whole_object_timeout, attempt_work).await
+            {
+                Ok(result) => result,
+                Err(_) => Err(ImportError::Unavailable(format!(
+                    "object copy timed out after {}s",
+                    self.opts.whole_object_timeout.as_secs()
+                ))),
+            };
+            drop(permit);
             match res {
                 Ok(bytes) => return Ok(bytes),
                 Err(ImportError::Terminal(e)) => return Err(e),

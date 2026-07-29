@@ -9,7 +9,7 @@ use cairn_types::{Nonce, Signature, Timestamp};
 
 #[test]
 fn crypto_is_object_safe_and_round_trips_via_dyn() {
-    let crypto: Box<dyn Crypto> = Box::new(SystemCrypto::new([42u8; 32]));
+    let crypto: Box<dyn Crypto> = Box::new(SystemCrypto::new([42u8; 32].into()));
     let secret = b"AKIA-style-secret-value";
     let sealed = crypto.seal(secret).expect("seal");
     let opened = crypto
@@ -20,7 +20,7 @@ fn crypto_is_object_safe_and_round_trips_via_dyn() {
 
 #[test]
 fn production_and_stub_crypto_agree_on_ct_eq_contract() {
-    let prod: &dyn Crypto = &SystemCrypto::new([0u8; 32]);
+    let prod: &dyn Crypto = &SystemCrypto::new([0u8; 32].into());
     let stub: &dyn Crypto = &StubCrypto;
     for (a, b) in [
         (&b"abc"[..], &b"abc"[..]),
@@ -40,7 +40,7 @@ fn production_and_stub_crypto_agree_on_ct_eq_contract() {
 fn production_crypto_rejects_what_stub_nonce_cannot_open() {
     // A stub-shaped all-zero nonce of the right length still fails AEAD auth against the real
     // cipher when paired with foreign ciphertext.
-    let prod = SystemCrypto::new([9u8; 32]);
+    let prod = SystemCrypto::new([9u8; 32].into());
     let foreign = StubCrypto.seal(b"hello").expect("stub seal");
     let err = prod
         .open(&foreign.ciphertext, &Nonce(vec![0u8; 12]))

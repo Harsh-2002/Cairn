@@ -245,7 +245,7 @@ function RangePicker({
 }) {
   const idx = RANGES.findIndex((r) => r.value === value);
   function onKeyDown(e: React.KeyboardEvent) {
-    let next = idx;
+    let next: number;
     if (e.key === "ArrowRight" || e.key === "ArrowDown")
       next = (idx + 1) % RANGES.length;
     else if (e.key === "ArrowLeft" || e.key === "ArrowUp")
@@ -257,7 +257,7 @@ function RangePicker({
     onChange(RANGES[next].value);
   }
   return (
-    // eslint-disable-next-line jsx-a11y/interactive-supports-focus -- roving-tabindex radiogroup: the radio children carry tabIndex (0 active, -1 otherwise), the correct ARIA pattern; the container is intentionally not focusable
+    // eslint-disable-next-line jsx-a11y-x/interactive-supports-focus -- roving-tabindex radiogroup: the radio children carry tabIndex (0 active, -1 otherwise), the correct ARIA pattern; the container is intentionally not focusable
     <div
       role="radiogroup"
       aria-label="Time range"

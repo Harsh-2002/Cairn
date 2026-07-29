@@ -34,11 +34,16 @@ def check(name, cond, detail=""):
     print(f"  [{'PASS' if cond else 'FAIL'}] {name}" + (f" — {detail}" if detail and not cond else ""), flush=True)
 def note(m): print(f"  {m}", flush=True)
 
-# VERSION_ENCRYPTED == 2 (crates/cairn-blob/src/compress.rs): the CRNB trailer byte that marks an
-# encrypted container. Same on-disk check the SSE conformance harness uses.
-VERSION_ENCRYPTED = 2
+# Encrypted CRNB v2 remains read-compatible, but fresh writes must carry the current authenticated-
+# metadata v3 trailer. Same exact current-writer proof the SSE conformance harness uses.
+VERSION_ENCRYPTED_CURRENT = 3
 def trailer_encrypted(blob):
-    return blob is not None and len(blob) >= 34 and blob[-34:-30] == b"CRNB" and blob[-30] == VERSION_ENCRYPTED
+    return (
+        blob is not None
+        and len(blob) >= 34
+        and blob[-34:-30] == b"CRNB"
+        and blob[-30] == VERSION_ENCRYPTED_CURRENT
+    )
 def orphan_blob_bytes(bucket):
     """The durable orphan blob left under $DATA/data/<bucket>/ by a crash after the blob became
     durable but before the metadata commit (opaque id, never named by key). Fresh data dir per seam,

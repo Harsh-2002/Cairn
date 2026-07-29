@@ -92,4 +92,12 @@ impl AsyncSqlDriver for TursoDriver {
         self.conn.execute_batch(sql).await.map_err(map_err)?;
         Ok(())
     }
+
+    async fn scrub_legacy_share_storage(&self) -> Result<(), MetaError> {
+        // Cairn enables Turso's experimental VACUUM support on every builder before migrations.
+        // Turso owns its native WAL and exposes no external checkpoint contract; VACUUM is the
+        // synchronous database-image rebuild for this backend.
+        self.conn.execute_batch("VACUUM").await.map_err(map_err)?;
+        Ok(())
+    }
 }

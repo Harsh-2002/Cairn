@@ -140,6 +140,34 @@ pub struct ObjectRetention {
     pub retain_until: Timestamp,
 }
 
+/// Whether a permanent-delete or retention mutation is authorized to bypass an active
+/// GOVERNANCE retention.
+///
+/// This is a trusted metadata-writer input, not a raw request header. The protocol/control caller
+/// may construct [`Authorized`](Self::Authorized) only after both the bypass header and
+/// `s3:BypassGovernanceRetention` authorization have succeeded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GovernanceBypass {
+    /// Governance retention remains binding.
+    Denied,
+    /// The caller satisfied the complete governance-bypass authorization contract.
+    Authorized,
+}
+
+/// Object Lock state explicitly requested by one object-creation operation.
+///
+/// `legal_hold: None` means no legal-hold header was supplied and is distinct from
+/// `Some(false)`, which explicitly requests OFF. Bucket default retention is deliberately absent
+/// from this value: the metadata writer resolves it from the current bucket configuration at the
+/// object commit point.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExplicitObjectLockIntent {
+    /// Explicit retention, which takes precedence over a bucket default.
+    pub retention: Option<ObjectRetention>,
+    /// Explicit legal-hold intent: absent, ON, or OFF.
+    pub legal_hold: Option<bool>,
+}
+
 /// The full Object Lock state of one version: an optional retention plus an independent legal hold.
 /// A version is protected from permanent deletion while retention is active OR a legal hold is on.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

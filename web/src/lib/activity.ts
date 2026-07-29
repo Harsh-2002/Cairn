@@ -28,6 +28,7 @@ const ACTION_LABELS: Record<string, string> = {
   PutObject: "Uploaded object",
   DeleteObject: "Deleted object",
   DeleteObjects: "Deleted objects",
+  DeleteBucketContents: "Partially emptied bucket",
   DeletePrefix: "Deleted folder",
   CreateMultipartUpload: "Started multipart upload",
 };
@@ -37,6 +38,7 @@ const ACTION_LABELS: Record<string, string> = {
 // in text, so the colour is reinforcement, never the sole signal (WCAG, Sam).
 const DESTRUCTIVE_ACTIONS = new Set([
   "DeleteBucket",
+  "DeleteBucketContents",
   "DeleteObject",
   "DeleteObjects",
   "DeletePrefix",

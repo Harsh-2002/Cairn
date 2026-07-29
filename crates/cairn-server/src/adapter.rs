@@ -14,11 +14,14 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
 use bytes::{Buf, Bytes};
 use cairn_crypto::{SystemClock, SystemCrypto};
 use cairn_protocol::{S3Body, S3Request, S3Response, error_response};
-use cairn_types::auth::{AuthMethod, AuthOutcome, Principal, RequestView, Role};
+use cairn_types::SecretString;
+use cairn_types::auth::{AuthMethod, AuthOutcome, ClientSource, Principal, RequestView, Role};
 use cairn_types::crypto::Nonce;
 use cairn_types::error::{BodyError, Error};
 use cairn_types::id::{BucketName, InvalidName, MAX_KEY_LEN, ObjectKey, UserId, VersionId};
-use cairn_types::meta::{ActivityEntry, Mutation, ShareDisposition, ShareRow};
+use cairn_types::meta::{
+    ActivityEntry, Mutation, SessionCredentialRecord, ShareDisposition, ShareLookupHash, ShareRow,
+};
 use cairn_types::time::Timestamp;
 use cairn_types::traits::{Clock, Crypto};
 use futures_util::StreamExt;
@@ -43,16 +46,113 @@ pub(crate) fn full_body(bytes: Bytes) -> ResponseBody {
         .boxed_unsync()
 }
 
-/// Handle an S3 (or anonymous) HTTP request end to end.
+/// The immutable route role assigned when a listener is wired.
+///
+/// Keeping this as an enum rather than a boolean makes the trust boundary explicit at every
+/// serving layer: a connection cannot accidentally gain both planes through a fall-through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ListenerRole {
+    /// S3, STS, signed public shares, and infrastructure endpoints.
+    Data,
+    /// The embedded console and versioned management API.
+    Control,
+}
+
+impl ListenerRole {
+    pub(crate) const fn is_data(self) -> bool {
+        matches!(self, Self::Data)
+    }
+
+    pub(crate) const fn is_control(self) -> bool {
+        matches!(self, Self::Control)
+    }
+}
+
+/// Immutable connection provenance supplied by the accept loop.
+///
+/// Keeping the direct peer/TLS facts beside the trusted-proxy policy prevents later consumers from
+/// accepting a forwarded value without also carrying its socket-level trust anchor.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RequestTransport<'a> {
+    peer: IpAddr,
+    direct_secure: bool,
+    trusted_proxies: &'a crate::proxy::TrustedProxies,
+    listener_role: ListenerRole,
+}
+
+impl<'a> RequestTransport<'a> {
+    pub(crate) const fn new(
+        peer: IpAddr,
+        direct_secure: bool,
+        trusted_proxies: &'a crate::proxy::TrustedProxies,
+        listener_role: ListenerRole,
+    ) -> Self {
+        Self {
+            peer,
+            direct_secure,
+            trusted_proxies,
+            listener_role,
+        }
+    }
+}
+
+/// The route family selected before authentication or body processing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListenerRoute {
+    Data,
+    PublicShare,
+    ControlApi,
+    ConsoleAsset,
+    NotFound,
+}
+
+/// Apply the listener route matrix. No branch may fall through from one plane into the other.
+fn listener_route(role: ListenerRole, method: &Method, path: &str) -> ListenerRoute {
+    match role {
+        ListenerRole::Data => {
+            if is_control_path(path) {
+                ListenerRoute::NotFound
+            } else if (*method == Method::GET || *method == Method::HEAD)
+                && path.starts_with("/share/")
+            {
+                ListenerRoute::PublicShare
+            } else {
+                ListenerRoute::Data
+            }
+        }
+        ListenerRole::Control => {
+            if is_control_path(path) {
+                ListenerRoute::ControlApi
+            } else if *method == Method::GET && is_console_asset(path) {
+                ListenerRoute::ConsoleAsset
+            } else {
+                ListenerRoute::NotFound
+            }
+        }
+    }
+}
+
+/// The root shell and concrete files embedded in the console bundle are the entire console route
+/// family. The console uses hash routing, so client-side route fragments never reach the server.
+fn is_console_asset(path: &str) -> bool {
+    if path == "/" {
+        return true;
+    }
+    path.strip_prefix('/')
+        .filter(|relative| !relative.is_empty())
+        .is_some_and(|relative| cairn_web::asset(relative).is_some())
+}
+
+/// Handle one request under the immutable role of the listener that accepted it.
 pub async fn handle(
     stack: std::sync::Arc<AppStack>,
     req: Request<Incoming>,
-    peer: IpAddr,
-    secure: bool,
-    serve_web: bool,
+    transport: RequestTransport<'_>,
     request_id: String,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Response<ResponseBody> {
+    let secure = transport.direct_secure;
+    let listener_role = transport.listener_role;
     let method = req.method().clone();
     let raw_path = req.uri().path().to_owned();
     let query_str = req.uri().query().unwrap_or("").to_owned();
@@ -71,16 +171,42 @@ pub async fn handle(
         .find(|(k, _)| k == "host")
         .map(|(_, v)| v.clone())
         .unwrap_or_default();
+    // Resolve client-address provenance once and carry that typed result through authentication and
+    // authorization. An untrusted peer's forwarding headers are ignored; a trusted peer that omits
+    // or contradicts them produces `Unavailable`, never the proxy's address.
+    let source = request_client_source(transport, &headers);
+    // The socket's TLS state remains authoritative for `aws:SecureTransport`. On a plaintext
+    // control connection, validated forwarding provenance affects only the browser cookie's
+    // externally-visible scheme.
+    let cookie_secure = control_cookie_is_secure(transport, &headers);
+
+    // Enforce the listener boundary before authentication or body collection. In particular this
+    // makes `CAIRN_WEB_ADDR=off` genuinely headless, prevents `/api/v1` from leaking onto the S3
+    // port, and prevents the control port from interpreting an unknown path as S3.
+    let route = listener_route(listener_role, &method, &raw_path);
+    if route == ListenerRoute::NotFound {
+        let response = json_status(404, r#"{"error":"not found"}"#);
+        return drain_or_close(response, request_has_body(&headers), req.into_body()).await;
+    }
+    // A browser preflights the exact presigned data URL with OPTIONS, which cannot itself verify a
+    // signature minted for the eventual GET/PUT/etc. The signed console-origin query marker grants
+    // only CORS metadata (never S3 authorization), so answer this narrow preflight before auth.
+    if listener_role.is_data() && method == Method::OPTIONS {
+        if let Some(response) = console_presign_preflight(&raw_path, &query_str, &headers) {
+            return drain_or_close(response, request_has_body(&headers), req.into_body()).await;
+        }
+    }
 
     // Console session cookie → Bearer. On the web-console listener only, a request carrying the
     // `cairn_session` httpOnly cookie (and no explicit Authorization header) is authenticated as if
     // it sent the Bearer token the cookie holds — so the console never has to keep the credential in
-    // JS-readable storage. Gated on `serve_web` because cookies are NOT port-isolated: a cookie set by
-    // the console on :7374 is also sent to the S3 data plane on :7373, which must keep ignoring it.
+    // JS-readable storage. Gated on the control role because cookies are NOT port-isolated: a cookie
+    // set by the console on :7374 is also sent to the S3 data plane on :7373, which must ignore it.
     // The login endpoint (POST /api/v1/session) is exempt so a stale/invalid cookie cannot turn a
     // fresh sign-in into a 401 before the body credentials are even checked.
     let is_login = method == Method::POST && raw_path == "/api/v1/session";
-    if serve_web && !is_login && !headers.iter().any(|(k, _)| k == "authorization") {
+    if listener_role.is_control() && !is_login && !headers.iter().any(|(k, _)| k == "authorization")
+    {
         if let Some(token) = session_cookie_token(&headers) {
             headers.push(("authorization".to_owned(), format!("Bearer {token}")));
         }
@@ -89,15 +215,15 @@ pub async fn handle(
     // AWS-STS wire surface (ARCH 14): a form `POST /` on the **S3 data plane** carries an STS mint
     // request (`AssumeRole`/`GetSessionToken`). It must be intercepted BEFORE the generic
     // authenticate block, which would reject the `sts`-scoped signature as Malformed. Gated strictly
-    // to the S3 listener (`!serve_web`), the root path, and the form content type, so no normal S3
+    // to the data listener, the root path, and the form content type, so no normal S3
     // request is captured; disabled entirely by `CAIRN_STS_ENABLED=false`.
     if stack.sts_enabled
-        && !serve_web
+        && listener_role.is_data()
         && method == Method::POST
         && raw_path == "/"
         && content_type_is_form(&headers)
     {
-        return handle_sts(&stack, req, headers, host, peer, secure, request_id).await;
+        return handle_sts(&stack, req, headers, host, source, secure, request_id).await;
     }
 
     // Authenticate against a borrowed, library-neutral view.
@@ -108,7 +234,7 @@ pub async fn handle(
             query: &query_str,
             headers: &headers,
             host: &host,
-            source: peer,
+            source,
             secure_transport: secure,
         };
         match stack.auth.authenticate(&view).await {
@@ -130,8 +256,12 @@ pub async fn handle(
         }
     };
 
-    // The management JSON API and the embedded web console share the listener with the S3 surface.
-    if let Some(subpath) = raw_path.strip_prefix("/api/v1") {
+    // The management API exists only on the control listener. `listener_route` already checked the
+    // exact segment boundary, so stripping this prefix cannot capture `/api/v10`.
+    if route == ListenerRoute::ControlApi {
+        let subpath = raw_path
+            .strip_prefix("/api/v1")
+            .expect("control route has the /api/v1 prefix");
         let query = parse_query(&query_str);
         // Bound the management-API request body (audit #11). The whole body is buffered for JSON
         // parsing, so an unbounded request would let a client pin arbitrary server memory. Cap it
@@ -178,7 +308,15 @@ pub async fn handle(
                 .strip_prefix("/buckets/")
                 .and_then(|r| r.strip_suffix("/objects/shares"))
             {
-                return create_share(&stack, bucket, &body_bytes, principal.as_ref()).await;
+                return create_share(
+                    &stack,
+                    bucket,
+                    &body_bytes,
+                    principal.as_ref(),
+                    &host,
+                    secure,
+                )
+                .await;
             }
             // Mint an interoperable S3 presigned URL (GET download / PUT upload). Lives here
             // because it opens the requester's sealed SigV4 secret from the server stack.
@@ -220,14 +358,18 @@ pub async fn handle(
         // cairn-control, because it sets/clears the httpOnly `Set-Cookie` and validates login against
         // the server auth chain — both transport concerns the JSON control plane does not own.
         if subpath == "/session" {
+            let session_transport = SessionTransport {
+                host: &host,
+                source,
+                direct_secure: secure,
+                cookie_secure,
+            };
             return session_endpoint(
                 &stack,
                 &method,
                 &body_bytes,
                 principal.as_ref(),
-                &host,
-                peer,
-                secure,
+                session_transport,
             )
             .await;
         }
@@ -247,11 +389,9 @@ pub async fn handle(
             .body(full_body(Bytes::from(resp.body)))
             .unwrap_or_else(|_| Response::new(full_body(Bytes::new())));
     }
-    // On the web-console listener only, serve the management console at the ROOT path and its embedded
-    // assets BEFORE S3 routing (so `/assets/...` can never be shadowed by a bucket named `assets`).
-    // Any path that is not the root or a known embedded asset falls through to the S3/data routing,
-    // which is what the console's own object operations and the API listener rely on.
-    if serve_web && method == Method::GET {
+    // The control listener serves only the root shell and concrete embedded assets. Unknown paths
+    // were rejected above and can never fall through into S3.
+    if route == ListenerRoute::ConsoleAsset {
         if raw_path == "/" {
             let (content_type, bytes) = cairn_web::spa_shell();
             return web_asset_response(content_type, bytes.into_owned());
@@ -261,16 +401,19 @@ pub async fn handle(
                 return web_asset_response(content_type, bytes.into_owned());
             }
         }
+        // The classifier checked the same immutable embedded bundle; keep a fail-closed fallback in
+        // case that invariant ever changes.
+        return json_status(404, r#"{"error":"not found"}"#);
     }
 
     // Persistent public-read ("share") URLs: GET|HEAD /share/{token} — unauthenticated, resolved by
-    // an opaque registry token (ARCH 15.8). The token is a single path segment.
-    if (method == Method::GET || method == Method::HEAD) && raw_path.starts_with("/share/") {
+    // an opaque registry token (ARCH 15.8). They exist only on the data listener.
+    if route == ListenerRoute::PublicShare {
         let token = &raw_path["/share/".len()..]; // after "/share/"
         if token.is_empty() || token.contains('/') {
             return json_status(404, r#"{"error":"not found"}"#);
         }
-        return serve_share(&stack, token, method, &headers, peer, secure, request_id).await;
+        return serve_share(&stack, token, method, &headers, source, secure, request_id).await;
     }
 
     // Virtual-host-style addressing (ARCH 13.1): when `CAIRN_S3_DOMAIN` is configured and the
@@ -306,6 +449,10 @@ pub async fn handle(
 
     // Decide browser-vs-machine now: the request head moves into `S3Request` on the next line.
     let wants_html = crate::error_page::wants_html_pairs(&method, &headers);
+    let console_cors_origin = principal
+        .as_ref()
+        .filter(|principal| principal.is_session)
+        .and_then(|_| console_actual_cors_origin(&query_str, &headers));
     let s3req = S3Request {
         method,
         bucket,
@@ -313,11 +460,24 @@ pub async fn handle(
         query,
         headers,
         principal,
-        source: peer,
+        source,
         secure,
         request_id,
     };
-    let response = render_negotiated(stack.s3.handle(s3req, body).await, wants_html, &raw_path);
+    let mut response = render_negotiated(stack.s3.handle(s3req, body).await, wants_html, &raw_path);
+    if let Some(origin) = console_cors_origin {
+        if let Ok(value) = origin.parse() {
+            response
+                .headers_mut()
+                .insert("access-control-allow-origin", value);
+        }
+        merge_csv_header(response.headers_mut(), "vary", "Origin");
+        merge_csv_header(
+            response.headers_mut(),
+            "access-control-expose-headers",
+            "ETag, Content-Length, Content-Range, Content-Type, Last-Modified, x-amz-version-id, x-amz-request-id",
+        );
+    }
     // If the service returned before consuming the body — e.g. an UploadPart rejected for an unknown
     // uploadId, scoped ahead of `stage_part` — the unread request bytes are still in flight and would
     // mis-frame the next request on the pooled HTTP/1.1 connection (issue #5). Drain a bounded amount
@@ -325,6 +485,12 @@ pub async fn handle(
     // of mis-framing. A fully-consumed body (the normal PUT path) drains to nothing here and keeps
     // keep-alive intact.
     finish_body_hygiene(response, body_bearing, &shared).await
+}
+
+/// Whether `path` is the versioned management namespace. The segment boundary matters:
+/// `/api/v10` remains an ordinary S3 path rather than being captured as `/api/v1`.
+pub(crate) fn is_control_path(path: &str) -> bool {
+    path == "/api/v1" || path.starts_with("/api/v1/")
 }
 
 /// Whether the request declares an `application/x-www-form-urlencoded` content type — the strict
@@ -354,7 +520,7 @@ async fn handle_sts(
     req: Request<Incoming>,
     headers: Vec<(String, String)>,
     host: String,
-    peer: IpAddr,
+    source: ClientSource,
     secure: bool,
     request_id: String,
 ) -> Response<ResponseBody> {
@@ -389,7 +555,7 @@ async fn handle_sts(
         query: "",
         headers: &headers,
         host: &host,
-        source: peer,
+        source,
         secure_transport: secure,
     };
     let principal = match stack.auth_chain.authenticate_sts(&view, &body_sha256).await {
@@ -490,9 +656,11 @@ fn cookie_value(cookie_header: &str, name: &str) -> Option<String> {
     })
 }
 
-/// `Set-Cookie` value that stores `token` in the httpOnly session cookie. `Secure` is added only on
-/// a secure transport (so a plaintext dev listener can still store it); `SameSite=Strict` keeps the
-/// cookie off every cross-site request, which is the CSRF defense for the cookie-authenticated API.
+/// `Set-Cookie` value that stores `token` in the httpOnly session cookie. `Secure` is added when the
+/// externally-visible control transport is authenticated as HTTPS (direct TLS or validated trusted
+/// proxy provenance); a direct loopback HTTP dev listener can still store it. `SameSite=Strict`
+/// keeps the cookie off every cross-site request, which is the CSRF defense for the
+/// cookie-authenticated API.
 fn set_session_cookie(token: &str, secure: bool) -> String {
     let value = B64URL.encode(token.as_bytes());
     let mut c = format!(
@@ -513,6 +681,32 @@ fn clear_session_cookie(secure: bool) -> String {
     c
 }
 
+fn control_cookie_is_secure(transport: RequestTransport<'_>, headers: &[(String, String)]) -> bool {
+    transport.listener_role.is_control()
+        && crate::proxy::effective_scheme(
+            transport.direct_secure,
+            transport.peer,
+            headers,
+            transport.trusted_proxies,
+        )
+        .is_https()
+}
+
+fn request_client_source(
+    transport: RequestTransport<'_>,
+    headers: &[(String, String)],
+) -> ClientSource {
+    crate::proxy::client_source(transport.peer, headers, transport.trusted_proxies)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SessionTransport<'a> {
+    host: &'a str,
+    source: ClientSource,
+    direct_secure: bool,
+    cookie_secure: bool,
+}
+
 /// The console session endpoint: `POST` signs in (validates `{access_key, secret_key}` via the auth
 /// chain and sets the httpOnly cookie), `GET` reports the current session (so the SPA can decide
 /// whether to show the console or the login screen without ever reading the token), and `DELETE`
@@ -522,9 +716,7 @@ async fn session_endpoint(
     method: &Method,
     body: &Bytes,
     principal: Option<&Principal>,
-    host: &str,
-    peer: IpAddr,
-    secure: bool,
+    transport: SessionTransport<'_>,
 ) -> Response<ResponseBody> {
     match *method {
         Method::POST => {
@@ -545,16 +737,16 @@ async fn session_endpoint(
             let token = format!("{}.{}", req.access_key, req.secret_key);
             let auth_headers = vec![
                 ("authorization".to_owned(), format!("Bearer {token}")),
-                ("host".to_owned(), host.to_owned()),
+                ("host".to_owned(), transport.host.to_owned()),
             ];
             let view = RequestView {
                 method: "POST",
                 path: "/api/v1/session",
                 query: "",
                 headers: &auth_headers,
-                host,
-                source: peer,
-                secure_transport: secure,
+                host: transport.host,
+                source: transport.source,
+                secure_transport: transport.direct_secure,
             };
             match stack.auth.authenticate(&view).await {
                 AuthOutcome::Authenticated(p) if p.role == Role::Administrator => {
@@ -568,7 +760,10 @@ async fn session_endpoint(
                     json_status_with_headers(
                         200,
                         &body,
-                        &[("set-cookie", set_session_cookie(&token, secure))],
+                        &[(
+                            "set-cookie",
+                            set_session_cookie(&token, transport.cookie_secure),
+                        )],
                     )
                 }
                 AuthOutcome::Authenticated(_) => json_status(
@@ -598,7 +793,7 @@ async fn session_endpoint(
         Method::DELETE => json_status_with_headers(
             200,
             r#"{"ok":true}"#,
-            &[("set-cookie", clear_session_cookie(secure))],
+            &[("set-cookie", clear_session_cookie(transport.cookie_secure))],
         ),
         _ => json_status(405, r#"{"error":"method not allowed"}"#),
     }
@@ -612,8 +807,8 @@ fn sanitize_filename(s: &str) -> String {
         .collect()
 }
 
-/// A 256-bit opaque share token (two v4 UUIDs of hex), URL-safe and unguessable. Matches the
-/// bootstrap secret construction; the row's existence is the capability.
+/// A 256-bit opaque token (two v4 UUIDs of hex), URL-safe and unguessable. Persistent-share
+/// callers immediately wrap it in [`SecretString`] and persist only [`ShareLookupHash`].
 fn generate_share_token() -> String {
     format!(
         "{}{}",
@@ -624,12 +819,15 @@ fn generate_share_token() -> String {
 
 /// Mint a persistent public-read ("share") token for an object (ARCH 15.8). Admin-only. Body:
 /// `{"key", "expires_in_secs"?: null=forever, "disposition"?: "inline"|"attachment", "filename"?,
-/// "version_id"?}`. Returns `{"token","url":"/share/{token}","expires_at_ms": ms|null}`.
+/// "version_id"?}`. Returns `{"id","token","url","expires_at_ms"}` exactly once; subsequent
+/// management responses contain only the stable non-secret `id`.
 async fn create_share(
     stack: &AppStack,
     bucket: &str,
     body: &Bytes,
     principal: Option<&Principal>,
+    request_host: &str,
+    secure: bool,
 ) -> Response<ResponseBody> {
     if principal.map(|p| p.role) != Some(Role::Administrator) {
         return json_status(403, r#"{"error":"forbidden"}"#);
@@ -667,9 +865,11 @@ async fn create_share(
         Some("attachment") => ShareDisposition::Attachment,
         _ => ShareDisposition::Inline,
     };
-    let token = generate_share_token();
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    let token = SecretString::new(generate_share_token());
     let row = ShareRow {
-        token: token.clone(),
+        id: id.clone(),
+        token_hash: ShareLookupHash::for_token(token.expose_secret()),
         bucket: bname.clone(),
         key: key.clone(),
         version_id: req.version_id.map(VersionId::from_string),
@@ -704,16 +904,62 @@ async fn create_share(
             at: now,
         })))
         .await;
-    let expires_json = expires_at.map_or_else(|| "null".to_owned(), |t| t.0.to_string());
-    json_status(
-        200,
-        &format!(r#"{{"token":"{token}","url":"/share/{token}","expires_at_ms":{expires_json}}}"#),
-    )
+    let (scheme, data_host) = data_scheme_host(stack, request_host, secure);
+    let url = format!("{scheme}://{data_host}/share/{}", token.expose_secret());
+    #[derive(serde::Serialize)]
+    struct ShareCreateResponse<'a> {
+        id: &'a str,
+        token: &'a SecretString,
+        url: &'a str,
+        expires_at_ms: Option<i64>,
+    }
+    let response = ShareCreateResponse {
+        id: &id,
+        token: &token,
+        url: &url,
+        expires_at_ms: expires_at.map(|t| t.0),
+    };
+    match serde_json::to_string(&response) {
+        Ok(json) => json_status(200, &json),
+        Err(_) => json_status(500, r#"{"error":"could not encode share"}"#),
+    }
 }
 
-/// Mint an interoperable S3 presigned URL (ARCH 14.2). Admin-only. Body: `{"key","method"?:
-/// "GET"|"PUT","expires_in_secs":1..=604800,"version_id"?,"response_content_disposition"?,
-/// "response_content_type"?,"content_type"?}`. Signs with the requester's own SigV4 secret.
+#[derive(serde::Deserialize)]
+struct PresignSessionHandle {
+    access_key_id: String,
+    session_token: SecretString,
+}
+
+#[derive(serde::Serialize)]
+struct PresignSessionResponse {
+    access_key_id: String,
+    session_token: SecretString,
+    expires_at_ms: i64,
+}
+
+#[derive(serde::Serialize)]
+struct PresignResponse {
+    url: String,
+    expires_at_ms: i64,
+    absolute: bool,
+    session: PresignSessionResponse,
+}
+
+struct ConsoleSigningCredential {
+    access_key_id: String,
+    secret: Zeroizing<String>,
+    session_token: SecretString,
+    expires_at: Timestamp,
+}
+
+/// Mint an interoperable S3 presigned URL (ARCH 14.2). Admin-only.
+///
+/// The signing key is a durable, bucket-scoped temporary session credential, never the
+/// administrator's long-lived SigV4 secret. The browser receives only the public access-key id and
+/// opaque session token, which it may return to reuse the same sealed credential; the temporary
+/// signing secret remains server-side. Generic `query`/`headers` fields support the console's S3
+/// calls, while the legacy object-share fields remain accepted by the CLI and share dialog.
 async fn presign(
     stack: &AppStack,
     bucket: &str,
@@ -731,10 +977,19 @@ async fn presign(
     }
     #[derive(serde::Deserialize)]
     struct PresignReq {
+        #[serde(default)]
         key: String,
         #[serde(default)]
         method: Option<String>,
         expires_in_secs: i64,
+        #[serde(default)]
+        query: Vec<(String, String)>,
+        #[serde(default)]
+        headers: Vec<(String, String)>,
+        #[serde(default)]
+        origin: Option<String>,
+        #[serde(default)]
+        session: Option<PresignSessionHandle>,
         #[serde(default)]
         version_id: Option<String>,
         #[serde(default)]
@@ -748,51 +1003,57 @@ async fn presign(
         Ok(r) => r,
         Err(_) => return json_status(400, r#"{"error":"invalid request body"}"#),
     };
-    if req.key.is_empty() {
-        return json_status(400, r#"{"error":"key is required"}"#);
+    // An empty key means a bucket-level request. Object-level callers still receive a normal S3
+    // error if they choose a method/query combination that requires a key.
+    if !req.key.is_empty() && ObjectKey::parse(&req.key).is_err() {
+        return json_status(400, r#"{"error":"key is invalid"}"#);
+    }
+    // WHATWG URL parsing removes literal and percent-encoded `.` / `..` path segments before an
+    // HTTP request is sent. A presigned browser URL for such a key can therefore target a different
+    // canonical path than the one the operator selected. There is no lossless path-style surrogate
+    // in this protocol, so fail closed; direct SDK/CLI S3 requests remain available.
+    if presign_key_has_browser_dot_segment(&req.key) {
+        return json_status(
+            400,
+            r#"{"error":"keys containing '.' or '..' path segments cannot be presigned safely for a browser; use a direct S3 client or the Cairn CLI"}"#,
+        );
     }
     let http_method = req.method.as_deref().unwrap_or("GET").to_ascii_uppercase();
-    if http_method != "GET" && http_method != "PUT" {
-        return json_status(400, r#"{"error":"method must be GET or PUT"}"#);
-    }
-    // Reject over-cap at mint (vs the verifier's silent clamp) so the operator-visible expiry is
-    // the real one; "forever" is only available via persistent shares, never presigned.
-    if !(1..=604_800).contains(&req.expires_in_secs) {
+    if !matches!(
+        http_method.as_str(),
+        "GET" | "HEAD" | "PUT" | "POST" | "DELETE"
+    ) {
         return json_status(
             400,
-            r#"{"error":"expires_in_secs must be between 1 and 604800 (7 days)"}"#,
+            r#"{"error":"method must be GET, HEAD, PUT, POST, or DELETE"}"#,
         );
     }
-    // Open the requesting admin's own SigV4 secret transiently.
-    let users = match stack.meta.list_users().await {
-        Ok(u) => u,
-        Err(_) => return json_status(500, r#"{"error":"internal error"}"#),
-    };
-    let Some(user) = users.into_iter().find(|u| u.id == p.user_id) else {
-        return json_status(403, r#"{"error":"forbidden"}"#);
-    };
-    let Some(sigv4_key) = user.sigv4_access_key_id else {
+    // The backing temporary credential has the same 12-hour ceiling as every other session.
+    if !(1..=43_200).contains(&req.expires_in_secs) {
         return json_status(
             400,
-            r#"{"error":"this user has no S3 (SigV4) credential to sign with"}"#,
+            r#"{"error":"expires_in_secs must be between 1 and 43200 (12 hours)"}"#,
         );
-    };
-    let creds = match stack.meta.user_by_sigv4_key(&sigv4_key).await {
-        Ok(Some(c)) => c,
-        _ => return json_status(500, r#"{"error":"internal error"}"#),
-    };
-    let secret = match stack
-        .crypto
-        .open(&creds.secret_ciphertext, &Nonce(creds.secret_nonce.clone()))
-    {
-        // `open` returns the plaintext already in a zeroizing buffer; wrap the derived String too so
-        // it is scrubbed promptly rather than lingering in freed heap (F-15).
-        Ok(b) => Zeroizing::new(String::from_utf8_lossy(&b).into_owned()),
-        Err(_) => return json_status(500, r#"{"error":"internal error"}"#),
-    };
+    }
 
-    let (scheme, signed_host) = base_scheme_host(stack.public_base_url.as_deref(), host, secure);
-    let mut extra_query: Vec<(String, String)> = Vec::new();
+    if req.query.len() > 32 || req.headers.len() > 16 {
+        return json_status(
+            400,
+            r#"{"error":"too many signed query parameters or headers"}"#,
+        );
+    }
+    let mut extra_query = Vec::with_capacity(req.query.len() + 4);
+    for (name, value) in req.query {
+        if name.is_empty()
+            || name.len() > 128
+            || value.len() > 4096
+            || name.to_ascii_lowercase().starts_with("x-amz-")
+            || name.eq_ignore_ascii_case("x-cairn-console-origin")
+        {
+            return json_status(400, r#"{"error":"invalid signed query parameter"}"#);
+        }
+        extra_query.push((name, value));
+    }
     if let Some(v) = &req.version_id {
         extra_query.push(("versionId".to_owned(), v.clone()));
     }
@@ -804,21 +1065,67 @@ async fn presign(
             extra_query.push(("response-content-type".to_owned(), t.clone()));
         }
     }
-    let mut extra_signed_headers: Vec<(String, String)> = Vec::new();
+    let mut extra_signed_headers = Vec::with_capacity(req.headers.len() + 1);
+    for (name, value) in req.headers {
+        let name = name.to_ascii_lowercase();
+        if !matches!(
+            name.as_str(),
+            "content-type" | "range" | "x-amz-copy-source" | "x-amz-bypass-governance-retention"
+        ) || value.len() > 4096
+            || extra_signed_headers
+                .iter()
+                .any(|(existing, _)| existing == &name)
+        {
+            return json_status(400, r#"{"error":"invalid or duplicate signed header"}"#);
+        }
+        extra_signed_headers.push((name, value));
+    }
     if http_method == "PUT" {
         if let Some(ct) = &req.content_type {
+            if extra_signed_headers
+                .iter()
+                .any(|(name, _)| name == "content-type")
+            {
+                return json_status(400, r#"{"error":"duplicate content-type header"}"#);
+            }
             extra_signed_headers.push(("content-type".to_owned(), ct.clone()));
         }
     }
+
+    let (scheme, signed_host) = data_scheme_host(stack, host, secure);
+    if let Some(origin) = req.origin.as_deref() {
+        let Some(origin) = normalize_origin(origin) else {
+            return json_status(400, r#"{"error":"origin must be an http(s) origin"}"#);
+        };
+        if origin == format!("{scheme}://{signed_host}") {
+            return json_status(
+                400,
+                r#"{"error":"console and data origins must be distinct"}"#,
+            );
+        }
+        extra_query.push(("X-Cairn-Console-Origin".to_owned(), origin));
+    }
+
     let now = SystemClock::new().now();
+    let required_expiry = Timestamp(now.0 + req.expires_in_secs * 1000);
+    let credential =
+        match console_signing_credential(stack, p, bucket, req.session, required_expiry, now).await
+        {
+            Ok(credential) => credential,
+            Err(response) => return response,
+        };
+    extra_query.push((
+        "X-Amz-Security-Token".to_owned(),
+        credential.session_token.expose_secret().to_owned(),
+    ));
     let amz_date = format_amz_date(now);
     let path_query = cairn_auth::mint_presigned(&cairn_auth::PresignRequest {
         method: &http_method,
         host: &signed_host,
         bucket,
         key: &req.key,
-        access_key_id: &sigv4_key,
-        secret: &secret,
+        access_key_id: &credential.access_key_id,
+        secret: &credential.secret,
         region: &stack.region,
         expires_secs: req.expires_in_secs,
         amz_date: &amz_date,
@@ -827,20 +1134,166 @@ async fn presign(
     });
     let expires_at = now.as_millis() + req.expires_in_secs * 1000;
     let url = format!("{scheme}://{signed_host}{path_query}");
-    json_status(
-        200,
-        &format!(r#"{{"url":"{url}","expires_at_ms":{expires_at},"absolute":true}}"#),
-    )
+    let response = PresignResponse {
+        url,
+        expires_at_ms: expires_at,
+        absolute: true,
+        session: PresignSessionResponse {
+            access_key_id: credential.access_key_id,
+            session_token: credential.session_token,
+            expires_at_ms: credential.expires_at.0,
+        },
+    };
+    match serde_json::to_string(&response) {
+        Ok(body) => json_status(200, &body),
+        Err(_) => json_status(500, r#"{"error":"internal error"}"#),
+    }
 }
 
-/// Resolve the `(scheme, host)` for an absolute share/presigned URL: the configured public base URL
-/// when set, else this request's transport + Host.
-fn base_scheme_host(
-    public_base_url: Option<&str>,
-    req_host: &str,
-    secure: bool,
-) -> (String, String) {
-    if let Some(base) = public_base_url {
+async fn console_signing_credential(
+    stack: &AppStack,
+    principal: &Principal,
+    bucket: &str,
+    supplied: Option<PresignSessionHandle>,
+    required_expiry: Timestamp,
+    now: Timestamp,
+) -> Result<ConsoleSigningCredential, Response<ResponseBody>> {
+    // This is an administrator-derived session, so its bucket Allow is only the requested boundary:
+    // retain every current explicit Deny from the parent identity policy. Otherwise an admin with
+    // a Deny boundary could use the console transfer session to escape it (AUD-038).
+    let boundary = console_session_policy(bucket);
+    let policy =
+        crate::sts::administrator_bounded_policy(&stack.meta, &principal.user_id, &boundary)
+            .await
+            .map_err(|_| json_status(500, r#"{"error":"internal error"}"#))?;
+    if let Some(supplied) = supplied {
+        let lookup = stack
+            .meta
+            .user_by_session_key(&supplied.access_key_id)
+            .await
+            .map_err(|_| json_status(500, r#"{"error":"internal error"}"#))?;
+        if let Some(creds) = lookup {
+            let presented_hash =
+                cairn_auth::hash_session_token(supplied.session_token.expose_secret());
+            let token_matches = stack.crypto.ct_eq(
+                presented_hash.as_bytes(),
+                creds.session_token_hash.as_bytes(),
+            );
+            if creds.parent_user_id == principal.user_id
+                && creds.parent_is_active
+                && creds.expires_at >= required_expiry
+                && creds.inline_policy.as_deref() == Some(policy.as_str())
+                && token_matches
+            {
+                let opened = stack
+                    .crypto
+                    .open(&creds.secret_ciphertext, &Nonce(creds.secret_nonce))
+                    .map_err(|_| json_status(500, r#"{"error":"internal error"}"#))?;
+                return Ok(ConsoleSigningCredential {
+                    access_key_id: supplied.access_key_id,
+                    secret: Zeroizing::new(String::from_utf8_lossy(&opened).into_owned()),
+                    session_token: supplied.session_token,
+                    expires_at: creds.expires_at,
+                });
+            }
+        }
+        // An expired/mismatched handle is not an authentication decision — the management request
+        // is already authenticated. Mint a fresh scoped session so a reloaded tab recovers cleanly.
+    }
+
+    let access_key_id = format!(
+        "CAIRNTMP{}",
+        uuid::Uuid::new_v4().simple().to_string().to_uppercase()
+    );
+    let secret = Zeroizing::new(generate_share_token());
+    let session_token = SecretString::new(generate_share_token());
+    let sealed = stack
+        .crypto
+        .seal(secret.as_bytes())
+        .map_err(|_| json_status(500, r#"{"error":"internal error"}"#))?;
+    let minimum_expiry = Timestamp(now.0 + 900_000);
+    let expires_at = std::cmp::max(required_expiry, minimum_expiry);
+    let record = SessionCredentialRecord {
+        access_key_id: access_key_id.clone(),
+        parent_user_id: principal.user_id.clone(),
+        secret_ciphertext: sealed.ciphertext,
+        secret_nonce: None,
+        session_token_hash: cairn_auth::hash_session_token(session_token.expose_secret()),
+        inline_policy: Some(policy),
+        expires_at,
+        created_at: now,
+    };
+    stack
+        .meta
+        .submit(Mutation::CreateSessionCredential(Box::new(record)))
+        .await
+        .map_err(|_| json_status(500, r#"{"error":"internal error"}"#))?;
+    let _ = stack
+        .meta
+        .submit(Mutation::RecordActivity(Box::new(ActivityEntry {
+            id: uuid::Uuid::new_v4().simple().to_string(),
+            action: "MintConsoleTransferSession".to_owned(),
+            bucket: Some(bucket.to_owned()),
+            key: None,
+            size: None,
+            etag: None,
+            actor: Some(principal.access_key_id.clone()),
+            at: now,
+        })))
+        .await;
+    Ok(ConsoleSigningCredential {
+        access_key_id,
+        secret,
+        session_token,
+        expires_at,
+    })
+}
+
+fn console_session_policy(bucket: &str) -> String {
+    serde_json::json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Sid": "CairnConsoleTransfer",
+            "Effect": "Allow",
+            "Action": "s3:*",
+            "Resource": [
+                format!("arn:aws:s3:::{bucket}"),
+                format!("arn:aws:s3:::{bucket}/*")
+            ]
+        }]
+    })
+    .to_string()
+}
+
+/// Whether a raw object key contains a segment a browser can interpret as `.` or `..`.
+///
+/// API callers send raw keys, but reject a small number of percent-encoded aliases too: this keeps
+/// the boundary fail-closed if a caller accidentally submits an encoded path instead of a raw key,
+/// and covers mixed forms such as `.%2e`. Two decoding passes also catch a doubly encoded alias
+/// without attempting unbounded recursive decoding.
+fn presign_key_has_browser_dot_segment(key: &str) -> bool {
+    key.split('/').any(|segment| {
+        let mut candidate = segment.to_owned();
+        for _ in 0..=2 {
+            if matches!(candidate.as_str(), "." | "..") {
+                return true;
+            }
+            let decoded = pct_decode(&candidate);
+            if decoded == candidate {
+                return false;
+            }
+            candidate = decoded;
+        }
+        matches!(candidate.as_str(), "." | "..")
+    })
+}
+
+/// Resolve the data-plane `(scheme, host)` for an absolute share/presigned URL. An explicit public
+/// base URL wins. Otherwise retain the control request's hostname but replace its port with the
+/// configured data-listener port, which makes local/default deployments work without co-locating
+/// object bytes on the console origin.
+fn data_scheme_host(stack: &AppStack, req_host: &str, secure: bool) -> (String, String) {
+    if let Some(base) = stack.public_base_url.as_deref() {
         if let Some(rest) = base.strip_prefix("https://") {
             return (
                 "https".to_owned(),
@@ -854,10 +1307,147 @@ fn base_scheme_host(
             );
         }
     }
+    let host = req_host
+        .parse::<http::uri::Authority>()
+        .ok()
+        .map(|authority| authority.host().to_owned())
+        .filter(|hostname| !hostname.is_empty())
+        .unwrap_or_else(|| stack.data_listen_addr.ip().to_string());
+    let host = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host
+    };
     (
         if secure { "https" } else { "http" }.to_owned(),
-        req_host.to_owned(),
+        format!("{host}:{}", stack.data_listen_addr.port()),
     )
+}
+
+fn normalize_origin(origin: &str) -> Option<String> {
+    let uri = origin.parse::<http::Uri>().ok()?;
+    let scheme = uri.scheme_str()?;
+    if !matches!(scheme, "http" | "https") || uri.query().is_some() {
+        return None;
+    }
+    let authority = uri.authority()?.as_str();
+    if authority.is_empty() || !matches!(uri.path(), "" | "/") {
+        return None;
+    }
+    Some(format!("{scheme}://{authority}"))
+}
+
+/// Extract a console CORS marker only from a complete presigned-session query. The marker itself is
+/// signature-bound on the actual request; merely forging these public parameter names can at most
+/// obtain a preflight response and never authorizes S3 access.
+fn console_origin_query_marker(query: &str) -> Option<String> {
+    let params = parse_query(query);
+    for required in [
+        "X-Amz-Algorithm",
+        "X-Amz-Credential",
+        "X-Amz-Security-Token",
+        "X-Amz-Signature",
+    ] {
+        if !params
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case(required) && !value.is_empty())
+        {
+            return None;
+        }
+    }
+    params
+        .into_iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("X-Cairn-Console-Origin"))
+        .and_then(|(_, value)| normalize_origin(&value))
+}
+
+fn request_header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(header, _)| header.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+}
+
+/// Merge comma-delimited response metadata without discarding a handler's existing value. Console
+/// CORS is applied after S3/error rendering, whose `Vary` and exposed-header entries remain
+/// security/cache contracts of their own.
+fn merge_csv_header(headers: &mut hyper::HeaderMap, name: &'static str, additions: &str) {
+    let mut values = headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map_or_else(Vec::new, |value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .collect()
+        });
+    for addition in additions
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if !values
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case(addition))
+        {
+            values.push(addition.to_owned());
+        }
+    }
+    if let Ok(value) = values.join(", ").parse() {
+        headers.insert(name, value);
+    }
+}
+
+fn console_presign_preflight(
+    path: &str,
+    query: &str,
+    headers: &[(String, String)],
+) -> Option<Response<ResponseBody>> {
+    // Console presigns always target a bucket/key path. Keep the public-share and service roots out
+    // of this special CORS lane even though reflecting CORS headers alone would grant no access.
+    if path == "/" || path.starts_with("/share/") {
+        return None;
+    }
+    let marker = console_origin_query_marker(query)?;
+    let origin = normalize_origin(request_header(headers, "origin")?)?;
+    if marker != origin {
+        return None;
+    }
+    let requested_method = request_header(headers, "access-control-request-method")?
+        .trim()
+        .to_ascii_uppercase();
+    if !matches!(
+        requested_method.as_str(),
+        "GET" | "HEAD" | "PUT" | "POST" | "DELETE"
+    ) {
+        return None;
+    }
+
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header("access-control-allow-origin", origin)
+        .header("access-control-allow-methods", requested_method)
+        .header(
+            "vary",
+            "Origin, Access-Control-Request-Method, Access-Control-Request-Headers",
+        )
+        .header("access-control-max-age", "300");
+    if let Some(requested_headers) = request_header(headers, "access-control-request-headers") {
+        builder = builder.header("access-control-allow-headers", requested_headers);
+    }
+    Some(
+        builder
+            .body(full_body(Bytes::new()))
+            .unwrap_or_else(|_| Response::new(full_body(Bytes::new()))),
+    )
+}
+
+fn console_actual_cors_origin(query: &str, headers: &[(String, String)]) -> Option<String> {
+    let marker = console_origin_query_marker(query)?;
+    let origin = normalize_origin(request_header(headers, "origin")?)?;
+    (marker == origin).then_some(origin)
 }
 
 /// Format an instant as the SigV4 basic date `YYYYMMDDTHHMMSSZ`.
@@ -895,7 +1485,7 @@ async fn serve_share(
     token: &str,
     method: Method,
     in_headers: &[(String, String)],
-    peer: IpAddr,
+    source: ClientSource,
     secure: bool,
     request_id: String,
 ) -> Response<ResponseBody> {
@@ -913,7 +1503,8 @@ async fn serve_share(
         }
     };
 
-    let row = match stack.meta.get_share(token).await {
+    let token_hash = ShareLookupHash::for_token(token);
+    let row = match stack.meta.get_share_by_token_hash(&token_hash).await {
         Ok(Some(r)) => r,
         Ok(None) => return share_err(404, r#"{"error":"not found"}"#),
         Err(_) => return share_err(500, r#"{"error":"internal error"}"#),
@@ -985,7 +1576,7 @@ async fn serve_share(
         query,
         headers,
         principal: Some(principal),
-        source: peer,
+        source,
         secure,
         request_id,
     };
@@ -1015,6 +1606,15 @@ async fn serve_share(
     resp
 }
 
+/// Abbreviate the durable full SHA-256 identity for operator display.
+///
+/// The database keeps all 64 hex characters for collision-resistant same-id binding. This API
+/// deliberately preserves the historical short, non-secret fingerprint and never exposes the
+/// durable comparison value.
+fn key_hash_for_status(durable_hash: &str) -> String {
+    durable_hash.chars().take(8).collect()
+}
+
 /// Build the admin-only `GET /api/v1/system/crypto-status` JSON (audit #29, Phase E): the active
 /// master key, its seal count vs the thresholds, the ring key states (aggregated across shards),
 /// and per-stream re-wrap completion. Contains NO key material — only ids, key-hash prefixes, and
@@ -1031,13 +1631,15 @@ async fn crypto_status_response(
     let mut keys: std::collections::BTreeMap<u16, (String, bool, u64)> =
         std::collections::BTreeMap::new();
     for s in &stack.store {
-        if let Ok(rows) = s.key_ring_states().await {
-            for r in rows {
-                let e = keys.entry(r.id).or_insert((String::new(), false, 0));
-                e.0 = r.key_hash;
-                e.1 = e.1 || r.is_active;
-                e.2 = e.2.max(r.sealed_count);
-            }
+        let rows = match s.key_ring_states().await {
+            Ok(rows) => rows,
+            Err(_) => return json_status(500, r#"{"error":"internal error"}"#),
+        };
+        for r in rows {
+            let e = keys.entry(r.id).or_insert((String::new(), false, 0));
+            e.0 = r.key_hash;
+            e.1 = e.1 || r.is_active;
+            e.2 = e.2.max(r.sealed_count);
         }
     }
     // Per-stream re-wrap completion: a stream is complete ONLY when every shard recorded a full,
@@ -1047,37 +1649,36 @@ async fn crypto_status_response(
     // which do not auto-re-wrap) nothing is verifiable, so nothing is ever reported complete.
     let active = stack.crypto.active_key_id();
     let has_shards = !stack.store.is_empty();
-    let streams = [
-        "object_versions.sse_descriptor",
-        "users.sigv4_secret",
-        "bucket_config.replication_targets",
-    ];
-    let mut complete_by_stream: std::collections::BTreeMap<&str, bool> =
-        streams.iter().map(|s| (*s, has_shards)).collect();
+    let streams = crate::key_rewrap::SEALED_SECRET_STREAMS;
+    let mut complete_by_stream: std::collections::BTreeMap<&str, bool> = streams
+        .iter()
+        .map(|stream| (stream.name(), has_shards))
+        .collect();
     for s in &stack.store {
-        let done: std::collections::HashMap<String, u16> = s
-            .rewrap_done_active_ids()
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
+        let done: std::collections::HashMap<String, u16> = match s.rewrap_done_active_ids().await {
+            Ok(done) => done.into_iter().collect(),
+            Err(_) => return json_status(500, r#"{"error":"internal error"}"#),
+        };
         for stream in streams {
-            if done.get(stream).copied() != Some(active) {
-                complete_by_stream.insert(stream, false);
+            if done.get(stream.name()).copied() != Some(active) {
+                complete_by_stream.insert(stream.name(), false);
             }
         }
     }
     let all_complete = has_shards && complete_by_stream.values().all(|&c| c);
     let rewrap: Vec<_> = streams
         .iter()
-        .map(|stream| serde_json::json!({ "stream": stream, "complete": complete_by_stream[stream] }))
+        .map(|stream| {
+            let name = stream.name();
+            serde_json::json!({ "stream": name, "complete": complete_by_stream[name] })
+        })
         .collect();
     let keys_json: Vec<_> = keys
         .into_iter()
         .map(|(id, (hash, is_active, count))| {
             serde_json::json!({
                 "id": id,
-                "key_hash": hash,
+                "key_hash": key_hash_for_status(&hash),
                 "active": is_active,
                 "sealed_count": count,
                 "retire_eligible": !is_active && all_complete,
@@ -1514,6 +2115,306 @@ mod tests {
     use futures_util::stream;
     use http::StatusCode;
 
+    #[test]
+    fn crypto_status_abbreviates_the_durable_full_key_identity() {
+        let durable = format!("deadbeef{}", "42".repeat(28));
+        assert_eq!(durable.len(), 64);
+        assert_eq!(key_hash_for_status(&durable), "deadbeef");
+    }
+
+    #[test]
+    fn management_namespace_matches_only_the_versioned_path_segment() {
+        assert!(is_control_path("/api/v1"));
+        assert!(is_control_path("/api/v1/session"));
+        assert!(is_control_path("/api/v1/buckets/photos"));
+        assert!(!is_control_path("/api/v10"));
+        assert!(!is_control_path("/api/v1-preview"));
+        assert!(!is_control_path("/photos/api/v1"));
+    }
+
+    #[test]
+    fn data_listener_never_selects_control_or_console_handlers() {
+        let get = Method::GET;
+        assert_eq!(
+            listener_route(ListenerRole::Data, &get, "/api/v1"),
+            ListenerRoute::NotFound
+        );
+        assert_eq!(
+            listener_route(ListenerRole::Data, &get, "/api/v1/buckets"),
+            ListenerRoute::NotFound
+        );
+        // Segment boundaries remain exact: these are ordinary path-style S3 names, not API paths.
+        assert_eq!(
+            listener_route(ListenerRole::Data, &get, "/api/v10"),
+            ListenerRoute::Data
+        );
+        assert_eq!(
+            listener_route(ListenerRole::Data, &get, "/api/v1-preview"),
+            ListenerRoute::Data
+        );
+        // A concrete embedded filename on this port is still data-plane routing. The data listener
+        // never reads or returns the embedded console bundle.
+        assert!(cairn_web::asset("favicon.svg").is_some());
+        assert_eq!(
+            listener_route(ListenerRole::Data, &get, "/favicon.svg"),
+            ListenerRoute::Data
+        );
+        assert_eq!(
+            listener_route(ListenerRole::Data, &get, "/share/token"),
+            ListenerRoute::PublicShare
+        );
+    }
+
+    #[test]
+    fn control_listener_never_falls_through_to_s3_or_public_shares() {
+        let get = Method::GET;
+        assert_eq!(
+            listener_route(ListenerRole::Control, &get, "/api/v1"),
+            ListenerRoute::ControlApi
+        );
+        assert_eq!(
+            listener_route(ListenerRole::Control, &get, "/api/v1/session"),
+            ListenerRoute::ControlApi
+        );
+        assert_eq!(
+            listener_route(ListenerRole::Control, &get, "/"),
+            ListenerRoute::ConsoleAsset
+        );
+        assert_eq!(
+            listener_route(ListenerRole::Control, &get, "/favicon.svg"),
+            ListenerRoute::ConsoleAsset
+        );
+        for path in [
+            "/bucket",
+            "/bucket/key",
+            "/share/token",
+            "/healthz",
+            "/readyz",
+            "/metrics",
+            "/api/v10",
+        ] {
+            assert_eq!(
+                listener_route(ListenerRole::Control, &get, path),
+                ListenerRoute::NotFound,
+                "{path} must not escape the control-plane matrix"
+            );
+        }
+        assert_eq!(
+            listener_route(ListenerRole::Control, &Method::PUT, "/favicon.svg"),
+            ListenerRoute::NotFound
+        );
+    }
+
+    fn console_presign_query(origin: &str) -> String {
+        [
+            ("X-Amz-Algorithm", "AWS4-HMAC-SHA256"),
+            ("X-Amz-Credential", "CAIRNTMP/example"),
+            ("X-Amz-Security-Token", "opaque-token"),
+            ("X-Amz-Signature", "0123456789abcdef"),
+            ("X-Cairn-Console-Origin", origin),
+        ]
+        .into_iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect::<Vec<_>>()
+        .join("&")
+    }
+
+    #[test]
+    fn console_presign_cors_requires_a_matching_signed_origin_marker() {
+        let query = console_presign_query("https://console.example.test:7374");
+        let headers = vec![
+            (
+                "origin".to_owned(),
+                "https://console.example.test:7374".to_owned(),
+            ),
+            ("access-control-request-method".to_owned(), "PUT".to_owned()),
+            (
+                "access-control-request-headers".to_owned(),
+                "content-type,x-amz-copy-source".to_owned(),
+            ),
+        ];
+        let response = console_presign_preflight("/photos/a.jpg", &query, &headers)
+            .expect("complete matching console presign preflight");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .unwrap(),
+            "https://console.example.test:7374"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("access-control-allow-methods")
+                .unwrap(),
+            "PUT"
+        );
+
+        let wrong_origin = vec![
+            (
+                "origin".to_owned(),
+                "https://attacker.example.test".to_owned(),
+            ),
+            ("access-control-request-method".to_owned(), "PUT".to_owned()),
+        ];
+        assert!(console_presign_preflight("/photos/a.jpg", &query, &wrong_origin).is_none());
+        assert!(console_actual_cors_origin(&query, &wrong_origin).is_none());
+    }
+
+    #[test]
+    fn console_presign_cors_rejects_incomplete_or_non_data_requests() {
+        let origin = "https://console.example.test:7374";
+        let headers = vec![
+            ("origin".to_owned(), origin.to_owned()),
+            ("access-control-request-method".to_owned(), "GET".to_owned()),
+        ];
+        let incomplete = format!("X-Cairn-Console-Origin={origin}&X-Amz-Signature=fake");
+        assert!(console_presign_preflight("/photos/a.jpg", &incomplete, &headers).is_none());
+
+        let complete = console_presign_query(origin);
+        assert!(console_presign_preflight("/", &complete, &headers).is_none());
+        assert!(console_presign_preflight("/share/token", &complete, &headers).is_none());
+
+        let actual = vec![("origin".to_owned(), origin.to_owned())];
+        assert_eq!(
+            console_actual_cors_origin(&complete, &actual).as_deref(),
+            Some(origin)
+        );
+    }
+
+    #[test]
+    fn console_origin_is_an_origin_not_an_arbitrary_url() {
+        assert_eq!(
+            normalize_origin("https://console.example.test:7374/").as_deref(),
+            Some("https://console.example.test:7374")
+        );
+        assert!(normalize_origin("javascript:alert(1)").is_none());
+        assert!(normalize_origin("https://console.example.test/app").is_none());
+        assert!(normalize_origin("https://console.example.test/?token=secret").is_none());
+    }
+
+    #[test]
+    fn console_transfer_policy_is_bucket_scoped() {
+        let policy: serde_json::Value =
+            serde_json::from_str(&console_session_policy("photos")).expect("valid policy JSON");
+        let resources = policy["Statement"][0]["Resource"]
+            .as_array()
+            .expect("resource array");
+        assert_eq!(
+            resources,
+            &[
+                serde_json::Value::String("arn:aws:s3:::photos".to_owned()),
+                serde_json::Value::String("arn:aws:s3:::photos/*".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn presign_rejects_browser_normalized_dot_segments_including_encoded_aliases() {
+        for key in [
+            ".",
+            "..",
+            "a/./b",
+            "a/../b",
+            "a/%2e/b",
+            "a/%2E%2e/b",
+            "a/.%2e/b",
+            "a/%252E/b",
+            "a/%252e%252e/b",
+        ] {
+            assert!(
+                presign_key_has_browser_dot_segment(key),
+                "{key:?} can normalize to a different browser path"
+            );
+        }
+        for key in ["", "...", "a/.hidden/b", "a/name../b", "a/%2f/b", "a/%25/b"] {
+            assert!(
+                !presign_key_has_browser_dot_segment(key),
+                "{key:?} is not a pure dot segment"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn console_transfer_boundary_preserves_parent_denies_and_fails_closed() {
+        use cairn_types::traits::MetadataStore;
+
+        let store = std::sync::Arc::new(cairn_types::testing::InMemoryMetadataStore::new());
+        let meta: std::sync::Arc<dyn MetadataStore> = store.clone();
+        meta.submit(Mutation::SetUserPolicy {
+            user_id: UserId("admin".to_owned()),
+            policy: Some(
+                r#"{"Version":"2012-10-17","Statement":[{
+                    "Effect":"Deny",
+                    "Action":"s3:DeleteObject",
+                    "Resource":"arn:aws:s3:::photos/private/*"
+                }]}"#
+                    .to_owned(),
+            ),
+        })
+        .await
+        .expect("store parent policy");
+
+        let policy = crate::sts::administrator_bounded_policy(
+            &meta,
+            &UserId("admin".to_owned()),
+            &console_session_policy("photos"),
+        )
+        .await
+        .expect("compose console boundary");
+        let document: serde_json::Value =
+            serde_json::from_str(&policy).expect("combined policy JSON");
+        let statements = document["Statement"].as_array().expect("statement array");
+        assert!(
+            statements.iter().any(|statement| {
+                statement["Effect"] == "Deny"
+                    && statement["Action"] == "s3:DeleteObject"
+                    && statement["Resource"] == "arn:aws:s3:::photos/private/*"
+            }),
+            "the durable console session policy must retain the parent's explicit Deny"
+        );
+
+        store.set_fail_user_policy_reads(true);
+        assert!(
+            crate::sts::administrator_bounded_policy(
+                &meta,
+                &UserId("admin".to_owned()),
+                &console_session_policy("photos"),
+            )
+            .await
+            .is_err(),
+            "a parent-policy read failure must abort console session minting"
+        );
+    }
+
+    #[test]
+    fn console_cors_metadata_preserves_existing_vary_and_expose_contracts() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            "vary",
+            http::HeaderValue::from_static("accept, sec-fetch-dest"),
+        );
+        headers.insert(
+            "access-control-expose-headers",
+            http::HeaderValue::from_static("x-custom"),
+        );
+        merge_csv_header(&mut headers, "vary", "Origin, Accept");
+        merge_csv_header(
+            &mut headers,
+            "access-control-expose-headers",
+            "ETag, x-custom",
+        );
+        assert_eq!(
+            headers.get("vary").unwrap(),
+            "accept, sec-fetch-dest, Origin"
+        );
+        assert_eq!(
+            headers.get("access-control-expose-headers").unwrap(),
+            "x-custom, ETag"
+        );
+    }
+
     /// A `Stream` response body is forwarded frame-by-frame, not drained into one buffer: the
     /// rendered body yields one HTTP data frame per source chunk and the bytes round-trip
     /// unchanged (ARCH 7.4/7.6/7.8, High #4).
@@ -1595,6 +2496,95 @@ mod tests {
         let cleared = clear_session_cookie(false);
         assert!(cleared.contains("Max-Age=0"));
         assert!(cleared.starts_with("cairn_session=;"));
+    }
+
+    #[test]
+    fn control_cookie_secure_flag_uses_only_authenticated_transport_provenance() {
+        let no_proxies = crate::proxy::TrustedProxies::default();
+        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+        assert!(
+            !control_cookie_is_secure(
+                RequestTransport::new(loopback, false, &no_proxies, ListenerRole::Control),
+                &[],
+            ),
+            "direct loopback plaintext remains usable for explicit local development"
+        );
+        assert!(
+            control_cookie_is_secure(
+                RequestTransport::new(
+                    "203.0.113.9".parse().unwrap(),
+                    true,
+                    &no_proxies,
+                    ListenerRole::Control,
+                ),
+                &[("x-forwarded-proto".to_owned(), "http".to_owned())],
+            ),
+            "direct TLS is authoritative"
+        );
+
+        let trusted = crate::proxy::TrustedProxies::parse(Some("10.0.0.9")).unwrap();
+        let forwarded_https = vec![(
+            "forwarded".to_owned(),
+            "for=203.0.113.7;proto=https".to_owned(),
+        )];
+        assert!(control_cookie_is_secure(
+            RequestTransport::new(
+                "10.0.0.9".parse().unwrap(),
+                false,
+                &trusted,
+                ListenerRole::Control,
+            ),
+            &forwarded_https,
+        ));
+        assert!(
+            !control_cookie_is_secure(
+                RequestTransport::new(
+                    "203.0.113.9".parse().unwrap(),
+                    false,
+                    &trusted,
+                    ListenerRole::Control,
+                ),
+                &forwarded_https,
+            ),
+            "an untrusted immediate peer cannot assert HTTPS"
+        );
+        assert!(
+            !control_cookie_is_secure(
+                RequestTransport::new(
+                    "10.0.0.9".parse().unwrap(),
+                    true,
+                    &trusted,
+                    ListenerRole::Data,
+                ),
+                &forwarded_https,
+            ),
+            "the data listener never owns the administrator cookie"
+        );
+    }
+
+    #[test]
+    fn adapter_source_provenance_never_substitutes_a_trusted_proxy() {
+        let trusted = crate::proxy::TrustedProxies::parse(Some("10.0.0.9")).unwrap();
+        let transport = RequestTransport::new(
+            "10.0.0.9".parse().unwrap(),
+            false,
+            &trusted,
+            ListenerRole::Data,
+        );
+        assert_eq!(
+            request_client_source(transport, &[]),
+            ClientSource::Unavailable
+        );
+        assert_eq!(
+            request_client_source(
+                transport,
+                &[
+                    ("forwarded".to_owned(), "for=203.0.113.7".to_owned()),
+                    ("x-forwarded-for".to_owned(), "203.0.113.7".to_owned(),),
+                ],
+            ),
+            ClientSource::Forwarded("203.0.113.7".parse().unwrap())
+        );
     }
 
     /// Virtual-host addressing: with `CAIRN_S3_DOMAIN` set and a `<bucket>.<domain>` Host, the

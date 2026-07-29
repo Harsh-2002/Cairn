@@ -12,9 +12,10 @@
 //! [`ConfigAspect::ReplicationTargets`](cairn_types) document, a JSON array round-tripped by
 //! [`parse_targets`] / [`serialize_targets`]. At ship time the engine resolves a rule's ARN to a
 //! target with [`resolve_target`] and unseals it with [`open_target`] into an [`OpenTarget`] whose
-//! plaintext secret lives only in a [`Zeroizing`](zeroize::Zeroizing) buffer.
+//! plaintext secret lives only in a redacting, zeroize-on-drop [`SecretString`].
 
 use cairn_crypto::SystemCrypto;
+use cairn_types::SecretString;
 use cairn_types::crypto::Nonce;
 use cairn_types::error::ReplicationError;
 use cairn_types::traits::Crypto;
@@ -68,7 +69,7 @@ pub struct RemoteTargetInput {
     /// The destination access-key id.
     pub access_key_id: String,
     /// The destination secret access key, in plaintext. Sealed at rest by [`seal_target`].
-    pub secret: String,
+    pub secret: SecretString,
     /// Optional PEM CA certificate to trust for an `https://` endpoint with a private/self-signed CA.
     #[serde(default)]
     pub ca_cert_pem: Option<String>,
@@ -78,7 +79,7 @@ pub struct RemoteTargetInput {
 }
 
 /// An **opened** remote target: the same connection parameters as [`RemoteTarget`] but with the
-/// secret unsealed into a [`Zeroizing`] buffer so it is scrubbed on drop. Build one with
+/// secret unsealed into a redacting, zeroize-on-drop owner. Build one with
 /// [`open_target`] and feed it to [`sink_for_target`](crate::sink_for_target).
 #[derive(Debug, Clone)]
 pub struct OpenTarget {
@@ -91,7 +92,7 @@ pub struct OpenTarget {
     /// The destination access-key id.
     pub access_key_id: String,
     /// The unsealed destination secret access key (scrubbed on drop).
-    pub secret: Zeroizing<String>,
+    pub secret: SecretString,
     /// Optional PEM CA certificate to trust for the destination's `https://` endpoint.
     pub ca_cert_pem: Option<String>,
     /// Skip TLS certificate verification (testing only).
@@ -192,7 +193,7 @@ pub fn open_target(
         region: t.region.clone(),
         dest_bucket: t.dest_bucket.clone(),
         access_key_id: t.access_key_id.clone(),
-        secret: Zeroizing::new(secret),
+        secret: SecretString::new(secret),
         ca_cert_pem: t.ca_cert_pem.clone(),
         insecure_skip_verify: t.insecure_skip_verify,
     })
@@ -203,7 +204,7 @@ mod tests {
     use super::*;
 
     fn crypto() -> SystemCrypto {
-        SystemCrypto::new([9u8; 32])
+        SystemCrypto::new([9u8; 32].into())
     }
 
     fn input() -> RemoteTargetInput {
@@ -212,7 +213,7 @@ mod tests {
             region: "us-west-2".to_owned(),
             dest_bucket: "mirror".to_owned(),
             access_key_id: "AKIDPEER".to_owned(),
-            secret: "super-secret-key".to_owned(),
+            secret: "super-secret-key".into(),
             ca_cert_pem: None,
             insecure_skip_verify: false,
         }
@@ -232,7 +233,7 @@ mod tests {
         assert_eq!(t.dest_bucket, "mirror");
 
         let open = open_target(&c, &t).expect("open");
-        assert_eq!(open.secret.as_str(), "super-secret-key");
+        assert_eq!(open.secret.expose_secret(), "super-secret-key");
         assert_eq!(open.endpoint, "https://s3.peer.example.com:9000");
         assert_eq!(open.region, "us-west-2");
         assert_eq!(open.dest_bucket, "mirror");
@@ -282,6 +283,20 @@ mod tests {
     }
 
     #[test]
+    fn plaintext_target_debug_forms_redact_the_secret() {
+        let c = crypto();
+        let input = input();
+        let input_debug = format!("{input:?}");
+        assert!(!input_debug.contains("super-secret-key"));
+
+        let stored = seal_target(&c, input).expect("seal");
+        let opened = open_target(&c, &stored).expect("open");
+        let opened_debug = format!("{opened:?}");
+        assert!(!opened_debug.contains("super-secret-key"));
+        assert!(opened_debug.contains("<redacted>"));
+    }
+
+    #[test]
     fn parse_and_serialize_round_trip() {
         let c = crypto();
         let targets = vec![
@@ -320,7 +335,7 @@ mod tests {
     #[test]
     fn open_with_wrong_key_is_terminal() {
         let t = seal_target(&crypto(), input()).expect("seal");
-        let other = SystemCrypto::new([1u8; 32]);
+        let other = SystemCrypto::new([1u8; 32].into());
         let err = open_target(&other, &t).unwrap_err();
         assert!(matches!(err, ReplicationError::Terminal(_)));
     }

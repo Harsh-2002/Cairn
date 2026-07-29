@@ -7,7 +7,9 @@ plain files under opaque IDs; metadata is someone else's job (`cairn-meta`).
 
 ## Layout (`src/`)
 - `lib.rs` — `LocalBlobStore`, the `BlobStore` + `ReconcileOracle` impls, `reconcile_inner`, the
-  streaming write/read transforms, `resolve` (path-traversal guard), `check_single_filesystem`. The
+  streaming write/read transforms, `resolve` (path-traversal guard), `check_single_filesystem`, and
+  the safe rustix-backed `open_readonly_nofollow`/`open_lock_file_nofollow` and
+  `try_lock_exclusive` syscall seams used by snapshot input and node-local command exclusion. The
   failpoint seams live here.
 - `staging.rs` — `Staging`: the backend-agnostic durable single-object write handle (create tmp →
   stream → `commit` / `abort`). One enum dispatching `tokio::fs` vs. the io_uring backend.
@@ -28,11 +30,21 @@ plain files under opaque IDs; metadata is someone else's job (`cairn-meta`).
 - **A newly-created bucket directory triggers an extra `data_root` fsync** (`ensure_bucket_dir`, F-1):
   the rename is not durable until the parent records the new dir entry. Paid only on the first write
   into a bucket. Don't drop it.
+- **Multipart directory creation is durable before part data is accepted.** `open` creates
+  `.staging/multipart` and fsyncs each newly-mutated parent; the first `stage_part` for an upload
+  creates its session directory and fsyncs `.staging/multipart` before opening the part file. Each
+  completed part is then fsynced before the session directory is fsynced. This parent-to-child
+  ordering is what keeps a power loss from leaving metadata that names a part whose directory entry
+  was never durable.
 - **Crypto fails closed.** A wrong/missing DEK or a tampered block fails GCM auth → `BlobError::Corruption`
   — never plaintext or zeros. The DEK is supplied by the caller (the master-key envelope lives in
   `cairn-crypto`); `compress.rs` types deliberately do **not** derive `Debug` so a DEK can't be logged.
   Compress-then-encrypt (ciphertext is incompressible); the 12-byte nonce is `HMAC-SHA256(DEK,
-  block_index)[..12]` — deterministic, never stored, never reused for a fixed key. See ARCH 27.
+  block_index)[..12]` — deterministic, never stored, never reused for a fixed key. Encrypted CRNB
+  v3 also appends a domain-separated HMAC-SHA256 over the complete plaintext index and trailer,
+  so their algorithm, compression flags, lengths, offsets, and version are authenticated before
+  use. Legacy encrypted v2 remains readable under strict structural and block-output validation;
+  every new or rewritten encrypted blob is v3. See ARCH 27.
 - **The reader seam is `open_raw(path, range, cipher: BlobCipher, compression)` + `probe(path)` —
   there is NO DEK-less `open`.** `BlobCipher` (in `cairn-types`) is `KnownPlaintext | Dek([u8;32])`;
   a caller cannot express a read without naming the cipher, which is what removes the footgun below.
@@ -111,7 +123,8 @@ plain files under opaque IDs; metadata is someone else's job (`cairn-meta`).
   read seam, because that is where the leak lived (a DEK-less read streamed ciphertext). Giving the
   write path the same by-name cipher is a later, separate change; until then the write DEK stays an
   `Option`.
-- Failpoint seams (`--features failpoints`): `blob_after_durable`, `blob_after_assemble` — exercised by
-  `conformance/crash_consistency.sh` and `crash_multipoint.sh`. CRNB-reader fuzz target in `fuzz/`.
+- Failpoint seams (`--features failpoints`): `blob_after_durable`, `blob_after_assemble`,
+  `blob_after_multipart_session_dir` — exercised by crate tests,
+  `conformance/crash_consistency.sh`, and `crash_multipoint.sh`. CRNB-reader fuzz target in `fuzz/`.
 - Tests: unit tests in each module; integration in `tests/blob.rs`. Spec: `docs/storage-durability.md`
   (8–10), SSE-S3 in `docs/security-errors.md` 27. Gate: see the root `../../CLAUDE.md`.

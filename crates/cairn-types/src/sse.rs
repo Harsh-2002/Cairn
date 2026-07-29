@@ -7,13 +7,13 @@
 //! hand-copied in three crates; a consumer that did not know about it read **raw ciphertext** and
 //! shipped it. The format and [`open_dek`] live here so there is exactly one copy.
 
+use crate::SecretKey32;
 use crate::crypto::Nonce;
 use crate::error::CryptoError;
 use crate::traits::Crypto;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use std::collections::BTreeMap;
-use zeroize::Zeroizing;
 
 /// How an object version came to be encrypted, which decides what (if anything) GET/HEAD advertise
 /// to the client. The DEK envelope is identical for all three (CRK1-under-master) — this is a
@@ -95,10 +95,7 @@ pub struct SseDescriptor {
 /// [`CryptoError::Decrypt`] for a malformed envelope, bad base64, a tampered tag, or an unwrapped
 /// key that is not 32 bytes; [`CryptoError::UnknownKeyId`] when the sealing key is simply not on
 /// this node's ring (a rotation window — retryable, not tampering).
-pub fn open_dek(
-    crypto: &dyn Crypto,
-    d: &SseDescriptor,
-) -> Result<Zeroizing<[u8; 32]>, CryptoError> {
+pub fn open_dek(crypto: &dyn Crypto, d: &SseDescriptor) -> Result<SecretKey32, CryptoError> {
     let ciphertext = B64
         .decode(d.wrapped_dek_b64.as_bytes())
         .map_err(|_| CryptoError::Decrypt)?;
@@ -111,11 +108,7 @@ pub fn open_dek(
             .map_err(|_| CryptoError::Decrypt)?
     };
     let raw = crypto.open(&ciphertext, &Nonce(nonce_bytes))?;
-    let key: [u8; 32] = raw
-        .as_slice()
-        .try_into()
-        .map_err(|_| CryptoError::Decrypt)?;
-    Ok(Zeroizing::new(key))
+    SecretKey32::from_slice(raw.as_slice()).ok_or(CryptoError::Decrypt)
 }
 
 /// Parse a stored `sse_descriptor` JSON document.
@@ -178,7 +171,7 @@ mod tests {
         let dek = [7u8; 32];
         let ring_a = RingCrypto(1);
         let d = descriptor_for(&ring_a, &dek);
-        assert_eq!(&open_dek(&ring_a, &d).unwrap()[..], &dek[..]);
+        assert_eq!(open_dek(&ring_a, &d).unwrap().expose_secret(), &dek);
         // A DIFFERENT ring must not yield plaintext, zeros, or partial data — and must say
         // "unknown key id", not "decrypt failure", so callers can treat a rotation window as
         // transient instead of stamping the object permanently corrupt.

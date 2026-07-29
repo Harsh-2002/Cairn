@@ -5,8 +5,9 @@
 
 use crate::driver::{AsyncSqlDriver, Row, Value, query_one};
 use crate::model::{
-    self, ACTIVITY_COLS, BUCKET_COLS, IMPORT_JOB_COLS, IMPORT_JOB_RECORD_COLS, MULTIPART_COLS,
-    OBJECT_VERSION_COLS, OUTBOX_COLS, PART_COLS, SHARE_COLS, SUMMARY_COLS, USER_COLS, WEBHOOK_COLS,
+    self, ACTIVITY_COLS, BUCKET_COLS, IMPORT_JOB_COLS, IMPORT_JOB_RECORD_COLS,
+    IMPORT_JOB_SUMMARY_COLS, MULTIPART_COLS, OBJECT_VERSION_COLS, OUTBOX_COLS, PART_COLS,
+    SHARE_COLS, SUMMARY_COLS, USER_COLS, WEBHOOK_COLS,
 };
 use crate::range::{prefix_upper_bound, successor};
 use crate::writer::Writer;
@@ -15,12 +16,14 @@ use cairn_types::authz::PublicAccessBlock;
 use cairn_types::bucket::{Bucket, ConfigAspect, ConfigDoc};
 use cairn_types::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
 use cairn_types::meta::{
-    ActivityEntry, BucketCounts, BucketRequestCount, ImportJob, ImportJobRecord, LATENCY_BUCKETS,
-    ListPage, ListQuery, MetricsRange, MultipartSession, Mutation, MutationOutcome, ObjectSummary,
-    OpCount, OutboxEntry, PartRecord, ReplicationCounts, ReplicationStatus,
-    ReplicationTargetCounts, RequestMetricsSeries, SessionCredentialSummary, ShareRow, StatusCount,
-    StoreCounts, TagSummary, TaggedObject, TimePoint, User, UserSessionCredentials,
-    UserSigV4Credentials, UserWithBearerHash, WebhookEntry, latency_quantile_ms,
+    ActivityEntry, BucketCounts, BucketRequestCount, ImportJob, ImportJobListQuery, ImportJobPage,
+    ImportJobRecord, ImportState, LATENCY_BUCKETS, ListPage, ListQuery, MetricsRange,
+    MultipartCleanup, MultipartReservation, MultipartSession, Mutation, MutationOutcome,
+    ObjectSummary, OpCount, OutboxEntry, PartRecord, ReplicationCounts, ReplicationStatus,
+    ReplicationTargetCounts, RequestMetricsSeries, SessionCredentialSummary, ShareLookupHash,
+    ShareRow, StatusCount, StoreCounts, TagSummary, TaggedObject, TimePoint, User,
+    UserSessionCredentials, UserSigV4Credentials, UserWithBearerHash, WebhookEntry,
+    latency_quantile_ms,
 };
 use cairn_types::object::ObjectVersionRow;
 use cairn_types::time::Timestamp;
@@ -34,6 +37,9 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 pub(crate) type ReadGuard = OwnedMutexGuard<Arc<dyn AsyncSqlDriver>>;
 
 const LIST_BATCH: usize = 1024;
+/// Constant-row query used by readiness to exercise a real read-pool connection without touching
+/// application tables. Keep this independent of metadata cardinality.
+const READ_PROBE_SQL: &str = "SELECT 1";
 
 /// The claim-lease length for replication-outbox entries: a claimed entry whose lease elapses
 /// (a stalled worker) becomes eligible for re-claim after this many seconds.
@@ -166,7 +172,9 @@ async fn list_impl(
 
     // For version listings, a version-id marker resumes strictly after `(cursor_key, marker)`
     // within the marker key. Versions sort `version_id DESC`, so entries already returned for that
-    // key have `version_id >= marker`; we skip exactly those on the first key.
+    // key have `version_id >= marker`. The pair is pushed into every SQL batch below: filtering it
+    // after `LIMIT` can fill a whole batch with already-returned versions when one key has deep
+    // history, leaving the listing unable to advance.
     let vid_marker = if latest_only {
         None
     } else {
@@ -187,6 +195,9 @@ async fn list_impl(
             &seek,
             upper.as_deref(),
             latest_only,
+            vid_marker
+                .as_ref()
+                .map(|(key, version)| (key.as_str(), version.as_str())),
             LIST_BATCH + 1,
         )
         .await?;
@@ -195,14 +206,6 @@ async fn list_impl(
         }
         let exhausted = rows.len() <= LIST_BATCH;
         for summary in rows.into_iter().take(LIST_BATCH) {
-            if let Some((mk, mv)) = &vid_marker {
-                if summary.key.as_str() == mk.as_str() && summary.version_id.as_str() >= mv.as_str()
-                {
-                    // Already returned on the previous page (or is the marker itself); skip it. The
-                    // skipped versions of the marker key are a bounded prefix that fits in one batch.
-                    continue;
-                }
-            }
             if page.items.len() + page.common_prefixes.len() >= limit {
                 page.truncated = true;
                 if latest_only {
@@ -267,6 +270,7 @@ async fn fetch_rows(
     seek: &str,
     upper: Option<&str>,
     latest_only: bool,
+    version_marker: Option<(&str, &str)>,
     limit: usize,
 ) -> Result<Vec<ObjectSummary>, MetaError> {
     let mut sql =
@@ -277,6 +281,12 @@ async fn fetch_rows(
     if upper.is_some() {
         sql.push_str(" AND key < ?3");
     }
+    if version_marker.is_some() {
+        // Resume after the ordered `(key ASC, version_id DESC)` pair before LIMIT is applied.
+        // `key >= ?2` retains the prefix/range seek; this predicate removes the returned prefix of
+        // the marker key while leaving every later key eligible.
+        sql.push_str(" AND (key > ?5 OR (key = ?5 AND version_id < ?6))");
+    }
     if latest_only {
         sql.push_str(" ORDER BY key ASC");
     } else {
@@ -285,12 +295,16 @@ async fn fetch_rows(
     sql.push_str(" LIMIT ?4");
 
     let limit = limit as i64;
-    let params = vec![
+    let mut params = vec![
         Value::Text(bucket.to_owned()),
         Value::Text(seek.to_owned()),
         upper.map_or(Value::Null, |u| Value::Text(u.to_owned())),
         Value::Int(limit),
     ];
+    if let Some((key, version)) = version_marker {
+        params.push(Value::Text(key.to_owned()));
+        params.push(Value::Text(version.to_owned()));
+    }
     let rows = driver.query(&sql, params).await?;
     rows.iter().map(model::object_summary_from_row).collect()
 }
@@ -299,6 +313,14 @@ async fn fetch_rows(
 impl MetadataStore for AsyncMetadataStore {
     async fn submit(&self, mutation: Mutation) -> Result<MutationOutcome, MetaError> {
         self.writer.submit(mutation).await
+    }
+
+    async fn read_probe(&self) -> Result<(), MetaError> {
+        self.reader()
+            .await
+            .query(READ_PROBE_SQL, Vec::new())
+            .await
+            .map(|_| ())
     }
 
     async fn get_bucket(&self, name: &BucketName) -> Result<Option<Bucket>, MetaError> {
@@ -522,17 +544,7 @@ impl MetadataStore for AsyncMetadataStore {
         let Some(r) = rows.first() else {
             return Ok(cairn_types::object::ObjectLockState::default());
         };
-        // lock_mode and retain_until are written together, so retention is present iff lock_mode is.
-        let retention = r
-            .get_opt_text(0)
-            .map(|m| cairn_types::object::ObjectRetention {
-                mode: model::lock_mode_from(&m),
-                retain_until: cairn_types::time::Timestamp(r.get_i64(1)),
-            });
-        Ok(cairn_types::object::ObjectLockState {
-            retention,
-            legal_hold: r.get_i64(2) != 0,
-        })
+        model::object_lock_state_from_columns(r.get_opt_text(0), r.get_opt_i64(1), r.get_i64(2))
     }
 
     async fn get_multipart(
@@ -667,17 +679,62 @@ impl MetadataStore for AsyncMetadataStore {
         older_than: Timestamp,
         batch: u32,
     ) -> Result<Vec<MultipartSession>, MetaError> {
+        let batch = batch.clamp(1, 1_000);
         let rows = self
             .reader()
             .await
             .query(
                 &format!(
-                    "SELECT {MULTIPART_COLS} FROM multipart_uploads WHERE updated_at < ?1 LIMIT ?2"
+                    "SELECT {MULTIPART_COLS} FROM multipart_uploads
+                     WHERE status='active' AND updated_at < ?1
+                     ORDER BY updated_at, id LIMIT ?2"
                 ),
                 vec![Value::Int(older_than.0), Value::Int(i64::from(batch))],
             )
             .await?;
         rows.iter().map(model::multipart_from_row).collect()
+    }
+
+    async fn enumerate_stale_multipart_reservations(
+        &self,
+        older_than: Timestamp,
+        batch: u32,
+    ) -> Result<Vec<MultipartReservation>, MetaError> {
+        let rows = self
+            .reader()
+            .await
+            .query(
+                "SELECT attempt_id, upload_id, part_number, reserved_bytes, created_at
+                 FROM multipart_part_reservations
+                 WHERE created_at < ?1
+                 ORDER BY created_at, attempt_id LIMIT ?2",
+                vec![
+                    Value::Int(older_than.0),
+                    Value::Int(i64::from(batch.clamp(1, 1_000))),
+                ],
+            )
+            .await?;
+        Ok(rows
+            .iter()
+            .map(model::multipart_reservation_from_row)
+            .collect())
+    }
+
+    async fn list_multipart_cleanups(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<MultipartCleanup>, MetaError> {
+        let rows = self
+            .reader()
+            .await
+            .query(
+                "SELECT id, upload_id, bucket_name, principal_id, bytes, storage_path, created_at
+                 FROM multipart_staging_cleanups
+                 ORDER BY storage_path IS NULL, created_at, id LIMIT ?1",
+                vec![Value::Int(i64::from(limit.clamp(1, 1_000)))],
+            )
+            .await?;
+        rows.iter().map(model::multipart_cleanup_from_row).collect()
     }
 
     async fn object_replication_status(
@@ -1015,16 +1072,51 @@ impl MetadataStore for AsyncMetadataStore {
         Ok(row.and_then(|r| r.get_opt_text(0)))
     }
 
-    async fn list_import_jobs(&self) -> Result<Vec<ImportJob>, MetaError> {
-        let rows = self
-            .reader()
-            .await
-            .query(
-                &format!("SELECT {IMPORT_JOB_COLS} FROM import_jobs ORDER BY created_at DESC"),
-                vec![],
+    async fn list_import_jobs(
+        &self,
+        query: &ImportJobListQuery,
+    ) -> Result<ImportJobPage, MetaError> {
+        let limit = query.bounded_limit();
+        let fetch = i64::from(limit) + 1;
+        let (sql, params) = if let Some(cursor) = &query.cursor {
+            (
+                format!(
+                    "SELECT {IMPORT_JOB_SUMMARY_COLS} FROM import_jobs \
+                     WHERE created_at < ?1 OR (created_at = ?1 AND id < ?2) \
+                     ORDER BY created_at DESC, id DESC LIMIT ?3"
+                ),
+                vec![
+                    Value::Int(cursor.created_at.0),
+                    Value::Text(cursor.id.clone()),
+                    Value::Int(fetch),
+                ],
             )
-            .await?;
-        rows.iter().map(model::import_job_from_row).collect()
+        } else {
+            (
+                format!(
+                    "SELECT {IMPORT_JOB_SUMMARY_COLS} FROM import_jobs \
+                     ORDER BY created_at DESC, id DESC LIMIT ?1"
+                ),
+                vec![Value::Int(fetch)],
+            )
+        };
+        let rows = self.reader().await.query(&sql, params).await?;
+        let jobs = rows
+            .iter()
+            .map(model::import_job_summary_from_row)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ImportJobPage::from_overfetch(jobs, limit))
+    }
+
+    async fn next_import_job_id(&self, state: ImportState) -> Result<Option<String>, MetaError> {
+        let row = query_one(
+            &**self.reader().await,
+            "SELECT id FROM import_jobs WHERE state=?1 \
+             ORDER BY created_at ASC, id ASC LIMIT 1",
+            vec![Value::Text(model::import_state_str(state).to_owned())],
+        )
+        .await?;
+        Ok(row.map(|r| r.get_text(0)))
     }
 
     async fn get_import_job(&self, id: &str) -> Result<Option<ImportJob>, MetaError> {
@@ -1060,13 +1152,28 @@ impl MetadataStore for AsyncMetadataStore {
         rows.iter().map(model::activity_from_row).collect()
     }
 
-    async fn get_share(&self, token: &str) -> Result<Option<ShareRow>, MetaError> {
+    async fn get_share_by_id(&self, id: &str) -> Result<Option<ShareRow>, MetaError> {
         let rows = self
             .reader()
             .await
             .query(
-                &format!("SELECT {SHARE_COLS} FROM object_shares WHERE token=?1"),
-                vec![Value::Text(token.to_owned())],
+                &format!("SELECT {SHARE_COLS} FROM object_shares WHERE id=?1"),
+                vec![Value::Text(id.to_owned())],
+            )
+            .await?;
+        rows.first().map(model::share_from_row).transpose()
+    }
+
+    async fn get_share_by_token_hash(
+        &self,
+        token_hash: &ShareLookupHash,
+    ) -> Result<Option<ShareRow>, MetaError> {
+        let rows = self
+            .reader()
+            .await
+            .query(
+                &format!("SELECT {SHARE_COLS} FROM object_shares WHERE token_hash=?1"),
+                vec![Value::Blob(token_hash.as_bytes().to_vec())],
             )
             .await?;
         rows.first().map(model::share_from_row).transpose()
@@ -1465,5 +1572,24 @@ impl cairn_types::traits::ReconcileOracle for AsyncReconcileOracle {
         )
         .await?;
         Ok(row.is_some_and(|r| r.get_i64(0) != 0))
+    }
+
+    async fn live_multipart_parts(
+        &self,
+        candidates: &[StoragePath],
+    ) -> Result<Vec<bool>, MetaError> {
+        let guard = self.reads.acquire().await;
+        let driver: &dyn AsyncSqlDriver = &**guard;
+        let mut out = Vec::with_capacity(candidates.len());
+        for path in candidates {
+            let row = query_one(
+                driver,
+                "SELECT EXISTS(SELECT 1 FROM multipart_parts WHERE storage_path=?1)",
+                vec![Value::Text(path.as_str().to_owned())],
+            )
+            .await?;
+            out.push(row.is_some_and(|row| row.get_i64(0) != 0));
+        }
+        Ok(out)
     }
 }

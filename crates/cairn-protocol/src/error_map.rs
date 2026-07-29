@@ -28,6 +28,7 @@ pub fn map(err: &Error) -> (StatusCode, &'static str) {
         MalformedPolicy => (StatusCode::BAD_REQUEST, "MalformedPolicy"),
         InvalidArgument(_) => (StatusCode::BAD_REQUEST, "InvalidArgument"),
         InvalidRequest(_) => (StatusCode::BAD_REQUEST, "InvalidRequest"),
+        InvalidBucketState(_) => (StatusCode::CONFLICT, "InvalidBucketState"),
         AccessDenied => (StatusCode::FORBIDDEN, "AccessDenied"),
         InvalidAccessKeyId => (StatusCode::FORBIDDEN, "InvalidAccessKeyId"),
         SignatureDoesNotMatch => (StatusCode::FORBIDDEN, "SignatureDoesNotMatch"),
@@ -88,6 +89,10 @@ mod tests {
             StatusCode::RANGE_NOT_SATISFIABLE
         );
         assert_eq!(map(&Error::AccessDenied).1, "AccessDenied");
+        assert_eq!(
+            map(&Error::InvalidBucketState("Object Lock".to_owned())),
+            (StatusCode::CONFLICT, "InvalidBucketState")
+        );
         assert_eq!(
             map(&Error::Internal("x".into())).0,
             StatusCode::INTERNAL_SERVER_ERROR

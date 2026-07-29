@@ -25,8 +25,19 @@ use std::time::Duration;
 pub use cache::CachedMetadataStore;
 pub use range::{prefix_upper_bound, successor};
 pub use shard::{ShardHandles, ShardedMetadataStore, ShardedReconcileOracle, shard_for_bucket};
-pub use store::{KeyRingStateRow, SqliteMetadataStore};
+pub use store::{
+    KeyHashBindingMatch, KeyRingStateRow, SqliteMetadataStore, classify_key_hash_binding,
+};
 pub use writer::{CommitSample, WalCheckpointStats, Writer};
+
+/// Highest on-disk schema version understood by this build.
+///
+/// Restore uses this ceiling to reject a snapshot produced by a newer Cairn binary before it
+/// mutates the target node.
+#[must_use]
+pub fn latest_schema_version() -> i64 {
+    schema::latest_version()
+}
 
 /// Tuning knobs for opening the store (ARCH 28).
 #[derive(Debug, Clone)]
@@ -235,6 +246,32 @@ impl ReconcileOracle for SqliteReconcileOracle {
             )
             .map(|n| n != 0)
             .map_err(|e| MetaError::Engine(e.to_string()))
+        })
+        .await
+        .map_err(|e| MetaError::Engine(e.to_string()))?
+    }
+
+    async fn live_multipart_parts(
+        &self,
+        candidates: &[StoragePath],
+    ) -> Result<Vec<bool>, MetaError> {
+        let paths: Vec<String> = candidates.iter().map(|p| p.as_str().to_owned()).collect();
+        let pool = self.pool.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = pool.get().map_err(|e| MetaError::Engine(e.to_string()))?;
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT EXISTS(SELECT 1 FROM multipart_parts WHERE storage_path=?1)",
+                )
+                .map_err(|e| MetaError::Engine(e.to_string()))?;
+            paths
+                .iter()
+                .map(|path| {
+                    stmt.query_row([path], |row| row.get::<_, i64>(0))
+                        .map(|count| count != 0)
+                        .map_err(|e| MetaError::Engine(e.to_string()))
+                })
+                .collect()
         })
         .await
         .map_err(|e| MetaError::Engine(e.to_string()))?
