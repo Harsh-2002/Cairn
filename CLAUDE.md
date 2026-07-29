@@ -11,10 +11,14 @@ TLS, async bucket replication, an embedded React console, and a CLI.
 > exact document instead of grepping. Read the relevant doc before any non-trivial change.
 
 **Orientation for agents.** This file is the entry point and covers *how* to work here; `AGENTS.md`
-is a symlink to it, so either filename gets you the same content. Two more things to know:
+is a symlink to it, so either filename gets you the same content. Three more things to know:
 **[`CONTRACT.md`](./CONTRACT.md)** holds the hard architectural ceilings — the things you may not
-decide alone, where the correct move is to stop and ask rather than to build. And every crate and
-major directory carries its own `CLAUDE.md` (e.g. [`crates/cairn-meta/CLAUDE.md`](./crates/cairn-meta/CLAUDE.md),
+decide alone, where the correct move is to stop and ask rather than to build.
+**[`AUDIT.md`](./AUDIT.md)** is the reusable security/architecture review playbook — a living doc with
+a ground-truth register of known-fixed and known-open items and a required GitHub-issue-per-finding
+workflow; read it before starting any security or architecture audit, and update it (don't just
+produce a one-off report) when you finish one. And every crate and major directory carries its own
+`CLAUDE.md` (e.g. [`crates/cairn-meta/CLAUDE.md`](./crates/cairn-meta/CLAUDE.md),
 [`web/CLAUDE.md`](./web/CLAUDE.md), [`conformance/CLAUDE.md`](./conformance/CLAUDE.md)) with
 folder-scoped context; read the nearest one before changing code in that directory.
 
