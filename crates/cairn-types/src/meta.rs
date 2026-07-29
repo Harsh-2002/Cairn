@@ -693,6 +693,10 @@ pub enum MutationOutcome {
         /// Whether a successor was promoted to latest.
         promoted_latest: bool,
     },
+    /// The permanent-delete target was already absent or its compare-and-delete guard no longer
+    /// matched, so no metadata changed. S3 DELETE remains idempotent, while maintenance callers
+    /// can distinguish this lost race from a writer-confirmed deletion.
+    DeleteNotApplied,
     /// A permanent delete or sentinel replacement was denied by Object Lock. No metadata changed.
     DeleteProtected,
     /// A multipart session was created.

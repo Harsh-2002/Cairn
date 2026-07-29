@@ -446,6 +446,7 @@ async fn repair_dangling_rows(
                                 }
                                 dropped += 1;
                             }
+                            Ok(MutationOutcome::DeleteNotApplied) => {}
                             Ok(MutationOutcome::DeleteProtected) => protected += 1,
                             Ok(_) => {
                                 return Err("unexpected integrity-repair delete outcome".to_owned());
@@ -812,25 +813,18 @@ impl HttpReplicaVerifier {
             .storage_path
             .as_ref()
             .ok_or_else(|| "version has no backing blob".to_owned())?;
-        let dek = match row.sse_descriptor.as_deref() {
+        let cipher = match row.sse_descriptor.as_deref() {
             Some(json) => {
                 let d = cairn_types::sse::parse_descriptor(json)
                     .map_err(|e| format!("parsing the sse descriptor: {e}"))?;
-                Some(
-                    cairn_types::sse::open_dek(self.crypto.as_ref(), &d)
-                        .map_err(|e| format!("unsealing the data key: {e}"))?,
-                )
+                cairn_types::sse::open_blob_cipher(self.crypto.as_ref(), &d)
+                    .map_err(|e| format!("unsealing the data key: {e}"))?
             }
-            None => None,
+            None => cairn_types::blob::BlobCipher::KnownPlaintext,
         };
         let handle = self
             .blob
-            .open_raw(
-                path,
-                None,
-                cairn_types::blob::BlobCipher::from_dek(dek),
-                &row.compression,
-            )
+            .open_raw(path, None, cipher, &row.compression)
             .await
             .map_err(|e| format!("reading the source blob: {e}"))?;
         let mut hasher = md5::Md5::new();
@@ -1728,6 +1722,10 @@ fn restore(cfg: Config, dir: &std::path::Path) -> ExitCode {
             .await
         {
             Ok(r) => {
+                if let Err(error) = validate_restore_reconcile_report(&r) {
+                    eprintln!("restore placed files but reconciliation was incomplete: {error}");
+                    return ExitCode::FAILURE;
+                }
                 println!(
                     "restore complete: reconciled scanned={} orphans_reclaimed={}; offline \
                      single-SQLite snapshot verified {} referenced files",
@@ -1741,6 +1739,19 @@ fn restore(cfg: Config, dir: &std::path::Path) -> ExitCode {
             }
         }
     })
+}
+
+fn validate_restore_reconcile_report(
+    report: &cairn_types::blob::ReconcileReport,
+) -> Result<(), String> {
+    if report.errors == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "reconciliation reported {} non-fatal error(s) after scanning {} blob(s)",
+            report.errors, report.blobs_scanned
+        ))
+    }
 }
 
 fn database_artifact_names(
@@ -2211,38 +2222,29 @@ async fn durable_copy_file(
     source: &std::path::Path,
     destination: &std::path::Path,
 ) -> std::io::Result<()> {
-    let source_metadata = std::fs::symlink_metadata(source)?;
-    if source_metadata.file_type().is_symlink() || !source_metadata.is_file() {
-        return Err(invalid_filesystem_entry(format!(
-            "copy source must be a non-symlink regular file: {}",
-            source.display()
-        )));
-    }
-    match tokio::fs::symlink_metadata(destination).await {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
-            return Err(invalid_filesystem_entry(format!(
-                "copy destination must be a non-symlink regular file when it exists: {}",
-                destination.display()
-            )));
-        }
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
-    }
+    let source_file = open_regular_file_nofollow(source, "copy source")?;
+    let opened_metadata = source_file.metadata()?;
     let parent = destination
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| std::path::Path::new("."));
     ensure_safe_destination_directory(parent).await?;
 
-    let source_file = cairn_blob::open_readonly_nofollow(source)?;
-    let opened_metadata = source_file.metadata()?;
-    if !opened_metadata.is_file() {
-        return Err(invalid_filesystem_entry(format!(
-            "opened copy source is not a regular file: {}",
-            source.display()
-        )));
+    match tokio::fs::symlink_metadata(destination).await {
+        Ok(_) => {
+            let destination_file = open_regular_file_nofollow(destination, "copy destination")?;
+            if regular_files_are_byte_identical(source_file, destination_file).await? {
+                // Immutable blob identities may collide across generations. Reuse the existing
+                // inode only when its bytes are exact; replacing even an identical file would
+                // create a crash window in which the old metadata generation loses its blob.
+                return Ok(());
+            }
+            return Err(immutable_blob_collision(source, destination));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
     }
+
     let staged = parent.join(format!(".cairn-copy-{}.tmp", uuid::Uuid::new_v4().simple()));
     let result = async {
         let mut input = tokio::fs::File::from_std(source_file);
@@ -2261,13 +2263,104 @@ async fn durable_copy_file(
         }
         output.sync_all().await?;
         drop(output);
-        tokio::fs::rename(&staged, destination).await
+        publish_staged_copy_no_replace(&staged, destination, parent).await
     }
     .await;
     if result.is_err() {
         let _ = remove_file_if_present(&staged).await;
     }
     result
+}
+
+fn open_regular_file_nofollow(
+    path: &std::path::Path,
+    role: &str,
+) -> std::io::Result<std::fs::File> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(invalid_filesystem_entry(format!(
+            "{role} must be a non-symlink regular file: {}",
+            path.display()
+        )));
+    }
+    let file = cairn_blob::open_readonly_nofollow(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(invalid_filesystem_entry(format!(
+            "opened {role} is not a regular file: {}",
+            path.display()
+        )));
+    }
+    Ok(file)
+}
+
+async fn regular_files_are_byte_identical(
+    mut left: std::fs::File,
+    mut right: std::fs::File,
+) -> std::io::Result<bool> {
+    let left_len = left.metadata()?.len();
+    if right.metadata()?.len() != left_len {
+        return Ok(false);
+    }
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+
+        const COMPARE_BUFFER_BYTES: usize = 64 * 1024;
+        let mut left_buf = vec![0u8; COMPARE_BUFFER_BYTES];
+        let mut right_buf = vec![0u8; COMPARE_BUFFER_BYTES];
+        let mut remaining = left_len;
+        while remaining != 0 {
+            let chunk = usize::try_from(remaining.min(COMPARE_BUFFER_BYTES as u64))
+                .expect("bounded comparison chunk fits usize");
+            left.read_exact(&mut left_buf[..chunk])?;
+            right.read_exact(&mut right_buf[..chunk])?;
+            if left_buf[..chunk] != right_buf[..chunk] {
+                return Ok(false);
+            }
+            remaining -= chunk as u64;
+        }
+        // Detect a concurrent append after the initial fstat instead of accepting a moving file.
+        let mut extra = [0u8; 1];
+        Ok(left.read(&mut extra)? == 0 && right.read(&mut extra)? == 0)
+    })
+    .await
+    .map_err(|error| std::io::Error::other(format!("blob comparison task failed: {error}")))?
+}
+
+fn immutable_blob_collision(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!(
+            "refusing to replace non-identical immutable blob {} with {}",
+            destination.display(),
+            source.display()
+        ),
+    )
+}
+
+async fn publish_staged_copy_no_replace(
+    staged: &std::path::Path,
+    destination: &std::path::Path,
+    parent: &std::path::Path,
+) -> std::io::Result<()> {
+    match tokio::fs::hard_link(staged, destination).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            // An external filesystem actor may have created the name after our initial check.
+            // Re-open both sides without following symlinks and apply the same immutable-collision
+            // rule; never turn this race into a replacing rename.
+            let staged_file = open_regular_file_nofollow(staged, "staged copy")?;
+            let destination_file = open_regular_file_nofollow(destination, "copy destination")?;
+            if !regular_files_are_byte_identical(staged_file, destination_file).await? {
+                return Err(immutable_blob_collision(staged, destination));
+            }
+        }
+        Err(error) => return Err(error),
+    }
+    remove_file_if_present(staged).await?;
+    sync_directory(parent).await
 }
 
 async fn sync_directory(path: &std::path::Path) -> std::io::Result<()> {
@@ -2405,9 +2498,10 @@ mod tests {
     use super::{
         Cli, Config, SNAPSHOT_BLOB_DIRECTORY, SNAPSHOT_DATABASE_FILE, SNAPSHOT_MANIFEST_FILE,
         SnapshotManifest, build_snapshot_manifest, copy_blob_tree, database_artifact_names,
-        prepare_target_database_for_publish, publish_staged_database, repair_dangling_rows,
-        require_canonical_backup_topology, schema_version, snapshot_sqlite_database,
-        stage_snapshot_database, validate_snapshot, validate_snapshot_database,
+        prepare_target_database_for_publish, publish_staged_copy_no_replace,
+        publish_staged_database, repair_dangling_rows, require_canonical_backup_topology,
+        schema_version, snapshot_sqlite_database, stage_snapshot_database,
+        validate_restore_reconcile_report, validate_snapshot, validate_snapshot_database,
         verify_snapshot_blob_references, write_snapshot_manifest_last,
     };
     use clap::Parser;
@@ -2878,6 +2972,113 @@ mod tests {
             b"two"
         );
         assert!(!restored.path().join(".staging").exists());
+    }
+
+    /// Restore may encounter the same immutable storage path in the old and snapshot generations.
+    /// Exact bytes reuse the old inode; different bytes fail without changing the old generation.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restore_blob_copy_reuses_only_byte_identical_collisions() {
+        use std::os::unix::fs::MetadataExt;
+
+        let source = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        tokio::fs::create_dir_all(source.path().join("bucket"))
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(destination.path().join("bucket"))
+            .await
+            .unwrap();
+        let source_blob = source.path().join("bucket/blob");
+        let destination_blob = destination.path().join("bucket/blob");
+        tokio::fs::write(&source_blob, b"same immutable bytes")
+            .await
+            .unwrap();
+        tokio::fs::write(&destination_blob, b"same immutable bytes")
+            .await
+            .unwrap();
+        let original_inode = std::fs::metadata(&destination_blob).unwrap().ino();
+
+        copy_blob_tree(source.path(), destination.path(), &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(&destination_blob).unwrap().ino(),
+            original_inode,
+            "an identical collision must reuse, not replace, the old generation's inode"
+        );
+
+        tokio::fs::write(&source_blob, b"different snapshot bytes")
+            .await
+            .unwrap();
+        let error = copy_blob_tree(source.path(), destination.path(), &[])
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            tokio::fs::read(&destination_blob).await.unwrap(),
+            b"same immutable bytes",
+            "a collision must leave the old generation byte-exact"
+        );
+        assert_eq!(
+            std::fs::metadata(&destination_blob).unwrap().ino(),
+            original_inode,
+            "a differing collision must never replace the destination inode"
+        );
+    }
+
+    /// Atomic no-replace publication re-checks an `AlreadyExists` race. An identical winner is
+    /// accepted without replacement; a different winner remains untouched and fails.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn staged_blob_publish_rechecks_an_already_exists_race() {
+        use std::os::unix::fs::MetadataExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("blob");
+        let different = directory.path().join(".cairn-copy-different.tmp");
+        std::fs::write(&destination, b"winner").unwrap();
+        std::fs::write(&different, b"loser").unwrap();
+        let destination_inode = std::fs::metadata(&destination).unwrap().ino();
+
+        let error = publish_staged_copy_no_replace(&different, &destination, directory.path())
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&destination).unwrap(), b"winner");
+        assert_eq!(
+            std::fs::metadata(&destination).unwrap().ino(),
+            destination_inode
+        );
+
+        let identical = directory.path().join(".cairn-copy-identical.tmp");
+        std::fs::write(&identical, b"winner").unwrap();
+        publish_staged_copy_no_replace(&identical, &destination, directory.path())
+            .await
+            .unwrap();
+        assert!(!identical.exists(), "accepted staged alias is reclaimed");
+        assert_eq!(
+            std::fs::metadata(&destination).unwrap().ino(),
+            destination_inode,
+            "the raced destination is reused rather than replaced"
+        );
+    }
+
+    #[test]
+    fn restore_reconciliation_report_errors_are_fatal() {
+        let clean = cairn_types::ReconcileReport {
+            blobs_scanned: 7,
+            ..Default::default()
+        };
+        assert!(validate_restore_reconcile_report(&clean).is_ok());
+
+        let incomplete = cairn_types::ReconcileReport {
+            blobs_scanned: 7,
+            errors: 1,
+            ..Default::default()
+        };
+        let error = validate_restore_reconcile_report(&incomplete).unwrap_err();
+        assert!(error.contains("1 non-fatal error"), "{error}");
     }
 
     #[cfg(unix)]

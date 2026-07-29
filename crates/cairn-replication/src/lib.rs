@@ -53,8 +53,7 @@ pub use target::{
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use cairn_types::SecretKey32;
-use cairn_types::blob::ByteRange;
+use cairn_types::blob::{BlobCipher, ByteRange};
 use cairn_types::error::{BlobError, CryptoError, MetaError, ReplicationError};
 use cairn_types::id::{BucketName, ObjectKey, VersionId};
 use cairn_types::meta::{Mutation, OutboxEntry, ReplicationOp, ReplicationStatus};
@@ -442,8 +441,8 @@ impl ReplicationEngine {
                             .await;
                     }
                     (Ok(_), Err(e)) => Err(e),
-                    (Ok(tags), Ok((dek, client_encrypted))) => {
-                        self.put_object(sink, blobs, &row, tags, dek, client_encrypted)
+                    (Ok(tags), Ok((cipher, client_encrypted))) => {
+                        self.put_object(sink, blobs, &row, tags, cipher, client_encrypted)
                             .await
                     }
                 }
@@ -498,7 +497,7 @@ impl ReplicationEngine {
         blobs: &Arc<B>,
         row: &ObjectVersionRow,
         tags: Vec<(String, String)>,
-        dek: Option<SecretKey32>,
+        cipher: cairn_types::blob::BlobCipher,
         client_encrypted: bool,
     ) -> Result<u64, ReplicationError>
     where
@@ -512,20 +511,15 @@ impl ReplicationEngine {
             ));
         };
 
-        // Read the whole logical body — through the DEK the caller resolved (see `resolve_dek`). Opening the blob is local I/O: a failure here is
-        // transient (the blob may be momentarily unavailable), so classify it retryable
-        // unless the blob is genuinely gone.
+        // Read the whole logical body through the key + metadata-backed CRNB expectation resolved
+        // by `resolve_dek`. Opening the blob is local I/O: a failure here is transient unless the
+        // blob is genuinely gone or corrupt.
         let range = Some(ByteRange {
             offset: 0,
             length: row.size_logical,
         });
         let handle = blobs
-            .open_raw(
-                path,
-                range,
-                cairn_types::blob::BlobCipher::from_dek(dek),
-                &row.compression,
-            )
+            .open_raw(path, range, cipher, &row.compression)
             .await
             .map_err(map_blob_err)?;
 
@@ -789,13 +783,13 @@ fn map_blob_err(e: BlobError) -> ReplicationError {
     }
 }
 
-/// Resolve the source version's data-encryption key BEFORE a byte of its body is read, together
-/// with whether the encryption was **client-requested**.
+/// Resolve the source version's data-encryption key and metadata-backed CRNB expectation BEFORE a
+/// byte of its body is read, together with whether the encryption was **client-requested**.
 ///
 /// A row carrying an `sse_descriptor` is stored as ciphertext; reading it without the DEK yields
 /// raw ciphertext at exactly the plaintext length, which the destination happily accepts — silent,
-/// unverifiable corruption of the replica. A row with no descriptor is plaintext and reads with
-/// `None`.
+/// unverifiable corruption of the replica. A row with no descriptor is explicitly
+/// [`BlobCipher::KnownPlaintext`].
 ///
 /// The second element is `true` only for [`SseMode::SseS3`]/[`SseMode::Kms`] — encryption the
 /// client asked for, and therefore a contract the sink must not quietly break by putting the
@@ -804,15 +798,15 @@ fn map_blob_err(e: BlobError) -> ReplicationError {
 fn resolve_dek(
     crypto: &dyn Crypto,
     row: &ObjectVersionRow,
-) -> Result<(Option<SecretKey32>, bool), ReplicationError> {
+) -> Result<(BlobCipher, bool), ReplicationError> {
     match row.sse_descriptor.as_deref() {
         Some(json) => {
             let d = cairn_types::sse::parse_descriptor(json).map_err(map_crypto_err)?;
             let client_encrypted = matches!(d.mode, SseMode::SseS3 | SseMode::Kms);
-            let dek = cairn_types::sse::open_dek(crypto, &d).map_err(map_crypto_err)?;
-            Ok((Some(dek), client_encrypted))
+            let cipher = cairn_types::sse::open_blob_cipher(crypto, &d).map_err(map_crypto_err)?;
+            Ok((cipher, client_encrypted))
         }
-        None => Ok((None, false)),
+        None => Ok((BlobCipher::KnownPlaintext, false)),
     }
 }
 

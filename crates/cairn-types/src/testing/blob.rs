@@ -23,21 +23,21 @@ fn md5_hex(data: &[u8]) -> String {
     hex::encode(h.finalize())
 }
 
-/// A stored blob: its plaintext bytes and the optional data-encryption key it was staged under.
-/// The double models SSE-S3 semantics without real cryptography: a blob staged with a DEK can
-/// only be reopened with the *same* DEK, so the wrong-key-fails property is faithful.
+/// A stored blob: its plaintext bytes and declared storage cipher. The double models SSE-S3
+/// semantics without real cryptography: a blob staged with a DEK is a current authenticated-v3
+/// object and can only be reopened with the same key and format expectation.
 #[derive(Debug)]
 struct StoredBlob {
     bytes: Arc<Vec<u8>>,
-    dek: Option<SecretKey32>,
+    cipher: BlobCipher,
 }
 
 type BlobMap = HashMap<String, StoredBlob>;
 /// A staged part: its plaintext bytes and the optional DEK it was staged under. The double models
 /// SSE-S3 part semantics with a key *label* (no real cryptography): `assemble` checks each
-/// `PartRef.dek` against the label a part was staged with, so the wrong-key-fails property is
-/// faithful. All real ciphertext/nonce assertions must run against the on-disk `LocalBlobStore`.
-type PartMap = HashMap<String, (Arc<Vec<u8>>, Option<SecretKey32>)>;
+/// `PartRef.cipher` against the label a part was staged with, so wrong-key and wrong-format failures
+/// are faithful. All real ciphertext/nonce assertions must run against the on-disk `LocalBlobStore`.
+type PartMap = HashMap<String, (Arc<Vec<u8>>, BlobCipher)>;
 
 /// An in-memory blob store.
 #[derive(Debug, Default)]
@@ -101,7 +101,10 @@ impl BlobStore for InMemoryBlobStore {
             path.as_str().to_owned(),
             StoredBlob {
                 bytes: Arc::new(buf),
-                dek: opts.encryption,
+                cipher: match opts.encryption {
+                    Some(dek) => BlobCipher::AuthenticatedV3(dek),
+                    None => BlobCipher::KnownPlaintext,
+                },
             },
         );
         Ok(StagedBlob {
@@ -122,10 +125,6 @@ impl BlobStore for InMemoryBlobStore {
         cipher: BlobCipher,
         _compression: &CompressionDescriptor,
     ) -> Result<BlobReadHandle, BlobError> {
-        // Translate the named cipher back to the internal `Option<[u8; 32]>` at the exact point the
-        // fail-closed check runs: `KnownPlaintext` is `None`, `Dek(k)` is `Some(k)` — so the
-        // wrong/missing-key semantics below are byte-for-byte what the old `dek: Option` did.
-        let dek = cipher.dek();
         // The in-memory double stores logical bytes directly (no CRNB container), so the stored
         // compression descriptor is irrelevant to reads here.
         let data = {
@@ -134,9 +133,9 @@ impl BlobStore for InMemoryBlobStore {
             // Model SSE-S3: a blob staged under a DEK is readable only with the same DEK, and a
             // blob staged in the clear ignores any supplied DEK. A KnownPlaintext open of an
             // encrypted blob fails closed here — never yields the plaintext bytes.
-            if stored.dek != dek && stored.dek.is_some() {
+            if stored.cipher != cipher {
                 return Err(BlobError::Corruption(
-                    "blob is encrypted; wrong or missing data-encryption key".into(),
+                    "blob cipher or format does not match stored metadata".into(),
                 ));
             }
             stored.bytes.clone()
@@ -199,10 +198,16 @@ impl BlobStore for InMemoryBlobStore {
             ".staging/multipart/{}/{part_number:05}-{attempt_id}",
             upload.as_str()
         ));
-        self.parts
-            .lock()
-            .unwrap()
-            .insert(path.as_str().to_owned(), (Arc::new(buf), encryption));
+        self.parts.lock().unwrap().insert(
+            path.as_str().to_owned(),
+            (
+                Arc::new(buf),
+                match encryption {
+                    Some(dek) => BlobCipher::AuthenticatedV3(dek),
+                    None => BlobCipher::KnownPlaintext,
+                },
+            ),
+        );
         // Like `stage`/`assemble` here, the double models storage semantics without computing the
         // supplementary checksums (no hash engine in `cairn-types`); it returns the faithful MD5 and
         // an empty checksum set, so callers exercise the field's plumbing without a real digest.
@@ -241,9 +246,9 @@ impl BlobStore for InMemoryBlobStore {
                 if let Some((bytes, staged_dek)) = parts_map.get(p.storage_path.as_str()) {
                     // Model the decrypt-on-read: a part staged under a DEK is readable only with
                     // the same DEK (mirrors `open_raw`); a wrong/missing key fails closed.
-                    if staged_dek != &p.dek && staged_dek.is_some() {
+                    if staged_dek != &p.cipher {
                         return Err(BlobError::Corruption(
-                            "part is encrypted; wrong or missing data-encryption key".into(),
+                            "part cipher or format does not match staged metadata".into(),
                         ));
                     }
                     buf.extend_from_slice(bytes);
@@ -259,7 +264,10 @@ impl BlobStore for InMemoryBlobStore {
             path.as_str().to_owned(),
             StoredBlob {
                 bytes: Arc::new(buf),
-                dek: _opts.encryption,
+                cipher: match _opts.encryption {
+                    Some(dek) => BlobCipher::AuthenticatedV3(dek),
+                    None => BlobCipher::KnownPlaintext,
+                },
             },
         );
         Ok(StagedBlob {

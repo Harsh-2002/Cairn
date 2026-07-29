@@ -19,13 +19,15 @@
 //! overlapping the range. Format v3 additionally appends a domain-separated HMAC-SHA256 over the
 //! complete index and trailer, under the DEK, so compression flags, lengths, offsets, algorithm,
 //! and version semantics are authenticated before the reader trusts them. Encrypted v2 blobs
-//! (which have no metadata MAC) remain readable with strict structural and post-decompression
-//! checks. Unencrypted blobs keep [`VERSION_PLAIN`] and are byte-for-byte identical to the pre-SSE
-//! format, so old blobs read unchanged.
+//! (which have no metadata MAC) remain readable only when trusted metadata explicitly selects the
+//! legacy reader, with strict structural and post-decompression checks. The on-disk version byte
+//! cannot select its own parser. Unencrypted blobs keep [`VERSION_PLAIN`] and are byte-for-byte
+//! identical to the pre-SSE format, so old blobs read unchanged.
 
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Key, Nonce as GcmNonce};
 use cairn_types::SecretKey32;
+use cairn_types::blob::BlobCipher;
 use cairn_types::bucket::CompressionAlgorithm;
 use cairn_types::error::BlobError;
 use hmac::{Hmac, Mac};
@@ -384,10 +386,12 @@ pub struct CompressedReader<R: Read + Seek> {
 }
 
 impl<R: Read + Seek> CompressedReader<R> {
-    /// Read the trailer and index, supplying an optional DEK for an SSE-S3 blob. An encrypted blob
-    /// opened without (or with the wrong) DEK is accepted here but fails per-block on read; a blob
-    /// flagged encrypted with no DEK supplied fails fast.
-    pub fn open_with_dek(mut inner: R, dek: Option<SecretKey32>) -> Result<Self, BlobError> {
+    /// Read the trailer and index under the caller's metadata-backed cipher declaration.
+    ///
+    /// The expected CRNB version is part of [`BlobCipher`], not inferred from the file: current v3
+    /// metadata can therefore never be downgraded into the legacy-v2 parser by changing on-disk
+    /// framing. A wrong version, absent key, or bad key fails closed before object bytes are returned.
+    pub fn open_with_dek(mut inner: R, cipher: BlobCipher) -> Result<Self, BlobError> {
         let io = |e: std::io::Error| BlobError::Io(e.to_string());
         let total = inner.seek(SeekFrom::End(0)).map_err(io)?;
         if total < TRAILER_LEN {
@@ -402,6 +406,17 @@ impl<R: Read + Seek> CompressedReader<R> {
             return Err(BlobError::Corruption("bad magic".into()));
         }
         let version = t[4];
+        let expected_version = match &cipher {
+            BlobCipher::KnownPlaintext => VERSION_PLAIN,
+            BlobCipher::LegacyV2(_) => VERSION_ENCRYPTED_V2,
+            BlobCipher::AuthenticatedV3(_) => VERSION_ENCRYPTED,
+        };
+        if version != expected_version {
+            return Err(BlobError::Corruption(format!(
+                "blob format version {version} does not match metadata expectation {expected_version}"
+            )));
+        }
+        let dek = cipher.dek();
         let (encrypted, authenticated_metadata) = match version {
             VERSION_PLAIN => (false, false),
             VERSION_ENCRYPTED_V2 => (true, false),
@@ -713,7 +728,7 @@ mod tests {
     #[test]
     fn open_rejects_logical_len_not_covered_by_index() {
         let blob = trailer(VERSION_PLAIN, 1, 100, 1000, 0, 0, 0);
-        let err = CompressedReader::open_with_dek(Cursor::new(blob), None);
+        let err = CompressedReader::open_with_dek(Cursor::new(blob), BlobCipher::KnownPlaintext);
         assert!(
             err.is_err(),
             "logical_len uncovered by the index must be rejected"
@@ -734,7 +749,7 @@ mod tests {
             0,
             block_count * 9,
         );
-        let err = CompressedReader::open_with_dek(Cursor::new(blob), None);
+        let err = CompressedReader::open_with_dek(Cursor::new(blob), BlobCipher::KnownPlaintext);
         assert!(
             err.is_err(),
             "an index larger than the file must be rejected"
@@ -755,7 +770,7 @@ mod tests {
         let over_cap = (MAX_BLOCK_SIZE + 1) as u32;
         blob.extend_from_slice(&trailer(VERSION_PLAIN, 0, over_cap, 1, 1, 1, 9));
         assert!(
-            CompressedReader::open_with_dek(Cursor::new(blob), None).is_err(),
+            CompressedReader::open_with_dek(Cursor::new(blob), BlobCipher::KnownPlaintext).is_err(),
             "a block size over the cap must be rejected"
         );
     }
@@ -773,7 +788,7 @@ mod tests {
         blob.push(0); // index: compressed = false
         blob.extend_from_slice(&trailer(VERSION_PLAIN, 0, 4096, 1, 1, 1, 9));
         assert!(
-            CompressedReader::open_with_dek(Cursor::new(blob), None).is_err(),
+            CompressedReader::open_with_dek(Cursor::new(blob), BlobCipher::KnownPlaintext).is_err(),
             "a block phys_len that overruns the block region must be rejected"
         );
     }
@@ -782,15 +797,24 @@ mod tests {
     #[test]
     fn open_rejects_inconsistent_empty_and_short() {
         let blob = trailer(VERSION_PLAIN, 1, 4096, 0, 3, 0, 27);
-        assert!(CompressedReader::open_with_dek(Cursor::new(blob), None).is_err());
-        assert!(CompressedReader::open_with_dek(Cursor::new(vec![0u8; 10]), None).is_err());
+        assert!(
+            CompressedReader::open_with_dek(Cursor::new(blob), BlobCipher::KnownPlaintext).is_err()
+        );
+        assert!(
+            CompressedReader::open_with_dek(
+                Cursor::new(vec![0u8; 10]),
+                BlobCipher::KnownPlaintext,
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn roundtrip_full_and_ranges() {
         let data: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
         let blob = encode(CompressionAlgorithm::Zstd, 1024, &data);
-        let mut r = CompressedReader::open_with_dek(Cursor::new(blob), None).unwrap();
+        let mut r =
+            CompressedReader::open_with_dek(Cursor::new(blob), BlobCipher::KnownPlaintext).unwrap();
         assert_eq!(r.logical_len(), 5000);
         // full read
         assert_eq!(r.read_range(0, 5000).unwrap(), data);
@@ -811,7 +835,8 @@ mod tests {
         // Only the small index + trailer overhead is added; the block payload never grows.
         let overhead = 4 * INDEX_ENTRY_LEN as u64 + TRAILER_LEN;
         assert!((blob.len() as u64) <= data.len() as u64 + overhead);
-        let mut r = CompressedReader::open_with_dek(Cursor::new(blob), None).unwrap();
+        let mut r =
+            CompressedReader::open_with_dek(Cursor::new(blob), BlobCipher::KnownPlaintext).unwrap();
         assert_eq!(r.read_range(0, 4096).unwrap(), data);
         assert!(r.index.iter().all(|e| e.phys_len <= e.logical_len));
     }
@@ -824,7 +849,8 @@ mod tests {
             (blob.len() as u64) < 10_000,
             "highly compressible data must shrink on disk"
         );
-        let mut r = CompressedReader::open_with_dek(Cursor::new(blob), None).unwrap();
+        let mut r =
+            CompressedReader::open_with_dek(Cursor::new(blob), BlobCipher::KnownPlaintext).unwrap();
         assert_eq!(r.read_range(0, 10_000).unwrap(), data);
     }
 
@@ -832,7 +858,8 @@ mod tests {
     fn lz4_roundtrip() {
         let data = vec![b'x'; 3000];
         let blob = encode(CompressionAlgorithm::Lz4, 1024, &data);
-        let mut r = CompressedReader::open_with_dek(Cursor::new(blob), None).unwrap();
+        let mut r =
+            CompressedReader::open_with_dek(Cursor::new(blob), BlobCipher::KnownPlaintext).unwrap();
         assert_eq!(r.read_range(0, 3000).unwrap(), data);
     }
 
@@ -852,7 +879,11 @@ mod tests {
         let data: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
         let dek = [0x42u8; 32];
         let blob = encode_encrypted(CompressionAlgorithm::Zstd, 1024, dek, &data);
-        let mut r = CompressedReader::open_with_dek(Cursor::new(blob), Some(dek.into())).unwrap();
+        let mut r = CompressedReader::open_with_dek(
+            Cursor::new(blob),
+            BlobCipher::AuthenticatedV3(dek.into()),
+        )
+        .unwrap();
         assert_eq!(r.logical_len(), 5000);
         assert_eq!(r.read_range(0, 5000).unwrap(), data);
         // A range that starts mid-block near the end: only the overlapping blocks are decrypted.
@@ -879,8 +910,11 @@ mod tests {
         assert_eq!(blob[index_offset + 8], 1, "fixture block must compress");
         blob[index_offset + 8] = 0;
 
-        let result = CompressedReader::open_with_dek(Cursor::new(blob), Some(dek.into()))
-            .and_then(|mut reader| reader.read_range(0, data.len() as u64));
+        let result = CompressedReader::open_with_dek(
+            Cursor::new(blob),
+            BlobCipher::AuthenticatedV3(dek.into()),
+        )
+        .and_then(|mut reader| reader.read_range(0, data.len() as u64));
         assert!(
             matches!(result, Err(BlobError::Corruption(_))),
             "metadata-only tampering must never return decrypted compressed bytes"
@@ -905,8 +939,11 @@ mod tests {
         for position in index_offset..blob.len() {
             let mut mutated = blob.clone();
             mutated[position] ^= 1;
-            let result = CompressedReader::open_with_dek(Cursor::new(mutated), Some(dek.into()))
-                .and_then(|mut reader| reader.read_range(0, data.len() as u64));
+            let result = CompressedReader::open_with_dek(
+                Cursor::new(mutated),
+                BlobCipher::AuthenticatedV3(dek.into()),
+            )
+            .and_then(|mut reader| reader.read_range(0, data.len() as u64));
             assert!(
                 matches!(result, Err(BlobError::Corruption(_))),
                 "metadata byte {position} was mutable without a corruption error"
@@ -923,8 +960,11 @@ mod tests {
         let blob = encode_encrypted_v2(CompressionAlgorithm::Zstd, 1024, dek, &data);
         let trailer_start = blob.len() - TRAILER_LEN as usize;
         assert_eq!(blob[trailer_start + 4], VERSION_ENCRYPTED_V2);
-        let mut reader =
-            CompressedReader::open_with_dek(Cursor::new(blob.clone()), Some(dek.into())).unwrap();
+        let mut reader = CompressedReader::open_with_dek(
+            Cursor::new(blob.clone()),
+            BlobCipher::LegacyV2(dek.into()),
+        )
+        .unwrap();
         assert_eq!(reader.read_range(0, data.len() as u64).unwrap(), data);
 
         let index_offset = u64::from_le_bytes(
@@ -935,9 +975,35 @@ mod tests {
         let mut tampered = blob;
         assert_eq!(tampered[index_offset + 8], 1);
         tampered[index_offset + 8] = 0;
-        let result = CompressedReader::open_with_dek(Cursor::new(tampered), Some(dek.into()))
-            .and_then(|mut reader| reader.read_range(0, data.len() as u64));
+        let result = CompressedReader::open_with_dek(
+            Cursor::new(tampered),
+            BlobCipher::LegacyV2(dek.into()),
+        )
+        .and_then(|mut reader| reader.read_range(0, data.len() as u64));
         assert!(matches!(result, Err(BlobError::Corruption(_))));
+    }
+
+    /// The file cannot choose its own compatibility parser. A current object whose persisted
+    /// descriptor requires v3 must reject otherwise-valid legacy framing, and a legacy descriptor
+    /// must not accept a current v3 container.
+    #[test]
+    fn encrypted_format_must_match_metadata_expectation() {
+        let data = vec![b'f'; 2048];
+        let dek = [0x53u8; 32];
+        let v3 = encode_encrypted(CompressionAlgorithm::Zstd, 1024, dek, &data);
+        let v2 = encode_encrypted_v2(CompressionAlgorithm::Zstd, 1024, dek, &data);
+
+        assert!(matches!(
+            CompressedReader::open_with_dek(
+                Cursor::new(v2),
+                BlobCipher::AuthenticatedV3(dek.into()),
+            ),
+            Err(BlobError::Corruption(_))
+        ));
+        assert!(matches!(
+            CompressedReader::open_with_dek(Cursor::new(v3), BlobCipher::LegacyV2(dek.into()),),
+            Err(BlobError::Corruption(_))
+        ));
     }
 
     /// Each encrypted block carries a 16-byte GCM tag, and v3 adds one 32-byte metadata tag before
@@ -958,7 +1024,7 @@ mod tests {
             METADATA_TAG_LEN
         );
         // Opening without a DEK fails fast because the blob is flagged encrypted.
-        let opened = CompressedReader::open_with_dek(Cursor::new(blob), None);
+        let opened = CompressedReader::open_with_dek(Cursor::new(blob), BlobCipher::KnownPlaintext);
         assert!(matches!(opened, Err(BlobError::Corruption(_))));
     }
 
@@ -970,13 +1036,16 @@ mod tests {
         let dek = [1u8; 32];
         let wrong = [2u8; 32];
         let blob = encode_encrypted(CompressionAlgorithm::Lz4, 1024, dek, &data);
-        let result = CompressedReader::open_with_dek(Cursor::new(blob), Some(wrong.into()))
-            .and_then(|mut reader| reader.read_range(0, 4096));
+        let result = CompressedReader::open_with_dek(
+            Cursor::new(blob),
+            BlobCipher::AuthenticatedV3(wrong.into()),
+        )
+        .and_then(|mut reader| reader.read_range(0, 4096));
         assert!(matches!(result, Err(BlobError::Corruption(_))));
     }
 
-    /// An unencrypted (version 1) blob still reads with the plain `open` path and ignores any DEK,
-    /// confirming old blobs read unchanged after the format gains encryption.
+    /// An unencrypted (version 1) blob still reads with the explicit plaintext declaration, while an
+    /// encrypted declaration fails closed instead of silently ignoring its format expectation.
     #[test]
     fn old_plain_blob_reads_unchanged() {
         let data: Vec<u8> = (0..2048u32).map(|i| (i % 211) as u8).collect();
@@ -984,13 +1053,17 @@ mod tests {
         // The version byte is the plaintext version.
         let trailer = &blob[blob.len() - TRAILER_LEN as usize..];
         assert_eq!(trailer[4], VERSION_PLAIN);
-        // Reads with no DEK and, defensively, with a stray DEK both yield the original bytes (a
-        // plain blob never consults the key).
-        let mut r = CompressedReader::open_with_dek(Cursor::new(blob.clone()), None).unwrap();
+        let mut r =
+            CompressedReader::open_with_dek(Cursor::new(blob.clone()), BlobCipher::KnownPlaintext)
+                .unwrap();
         assert_eq!(r.read_range(0, 2048).unwrap(), data);
-        let mut r2 =
-            CompressedReader::open_with_dek(Cursor::new(blob), Some([7u8; 32].into())).unwrap();
-        assert_eq!(r2.read_range(0, 2048).unwrap(), data);
+        assert!(
+            CompressedReader::open_with_dek(
+                Cursor::new(blob),
+                BlobCipher::AuthenticatedV3([7u8; 32].into()),
+            )
+            .is_err()
+        );
     }
 
     /// The per-block nonce is deterministic in `(dek, block_index)` and distinct across blocks, so

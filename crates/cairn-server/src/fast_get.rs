@@ -18,7 +18,7 @@
 //! bytes of an already-authorized response are written. It never serves anything the normal path
 //! would not.
 
-use crate::adapter::{ListenerRole, route_path};
+use crate::adapter::{ListenerRole, route_path, service_worker_scope_for_path};
 use crate::proxy::TrustedProxies;
 use crate::stack::AppStack;
 use cairn_protocol::{S3Body, S3Request};
@@ -201,6 +201,9 @@ fn head_eligible(head: &Head) -> bool {
         && !has("if-match")
         && !has("if-unmodified-since")
         && !has("upgrade")
+        // The normal adapter rejects browser service-worker script fetches before S3 dispatch.
+        // Falling back preserves that security boundary instead of letting sendfile bypass it.
+        && !has("service-worker")
 }
 
 /// Resolve the same client provenance as the hyper adapter, declining the optimized path when a
@@ -227,12 +230,16 @@ fn format_head(
     status: hyper::StatusCode,
     headers: &[(String, String)],
     request_id: &str,
+    request_path: &str,
     keep_alive: bool,
 ) -> String {
     let reason = status.canonical_reason().unwrap_or("OK");
     let mut out = format!("HTTP/1.1 {} {reason}\r\n", status.as_u16());
     for (k, v) in headers {
-        if k.eq_ignore_ascii_case("connection") || k.eq_ignore_ascii_case("x-amz-request-id") {
+        if k.eq_ignore_ascii_case("connection")
+            || k.eq_ignore_ascii_case("x-amz-request-id")
+            || k.eq_ignore_ascii_case("service-worker-allowed")
+        {
             continue;
         }
         out.push_str(k);
@@ -242,6 +249,10 @@ fn format_head(
     }
     out.push_str("x-amz-request-id: ");
     out.push_str(request_id);
+    if let Some(scope) = service_worker_scope_for_path(request_path) {
+        out.push_str("\r\nservice-worker-allowed: ");
+        out.push_str(&scope);
+    }
     out.push_str(if keep_alive {
         "\r\nconnection: keep-alive\r\n\r\n"
     } else {
@@ -466,7 +477,7 @@ pub async fn try_sendfile_get(
         // them to the next iteration when we keep the connection alive.
         let leftover = buf[head_len..].to_vec();
         let resp_bytes = length;
-        let out = format_head(status, &resp.headers, &request_id, keep_alive);
+        let out = format_head(status, &resp.headers, &request_id, &path, keep_alive);
 
         // Write the head + `sendfile` on a blocking thread (the socket must be blocking for
         // `sendfile`). On keep-alive, return the socket — switched back to non-blocking — so the loop
@@ -848,6 +859,10 @@ mod tests {
             &[("if-unmodified-since", "x")]
         )));
         assert!(!head_eligible(&head("GET", &[("upgrade", "h2c")])));
+        assert!(
+            !head_eligible(&head("GET", &[("service-worker", "script")])),
+            "service-worker fetches must fall back to the rejecting adapter"
+        );
     }
 
     #[test]
@@ -861,7 +876,13 @@ mod tests {
             ("x-amz-request-id".to_owned(), "stale".to_owned()),
         ];
         // keep-alive variant: the connection stays open for the next request.
-        let ka = format_head(hyper::StatusCode::OK, &headers, "req-123", true);
+        let ka = format_head(
+            hyper::StatusCode::OK,
+            &headers,
+            "req-123",
+            "/bucket/worker.js",
+            true,
+        );
         assert!(ka.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(ka.contains("content-length: 42\r\n"));
         assert!(ka.contains("etag: \"abc\"\r\n"));
@@ -871,8 +892,17 @@ mod tests {
         assert!(!ka.contains("stale"));
         assert!(ka.contains("connection: keep-alive\r\n"));
         assert_eq!(ka.to_ascii_lowercase().matches("connection:").count(), 1);
+        assert!(ka.contains(
+            "service-worker-allowed: /bucket/worker.js/.cairn-service-worker-disabled/\r\n"
+        ));
         // close variant.
-        let close = format_head(hyper::StatusCode::OK, &headers, "r", false);
+        let close = format_head(
+            hyper::StatusCode::OK,
+            &headers,
+            "r",
+            "/bucket/worker.js",
+            false,
+        );
         assert!(close.contains("connection: close\r\n"));
         assert!(!close.contains("keep-alive"));
     }
@@ -880,7 +910,13 @@ mod tests {
     #[test]
     fn format_head_uses_the_canonical_206_reason_for_ranged_responses() {
         let headers = vec![("content-range".to_owned(), "bytes 0-9/100".to_owned())];
-        let out = format_head(hyper::StatusCode::PARTIAL_CONTENT, &headers, "r", true);
+        let out = format_head(
+            hyper::StatusCode::PARTIAL_CONTENT,
+            &headers,
+            "r",
+            "/bucket/key",
+            true,
+        );
         assert!(out.starts_with("HTTP/1.1 206 Partial Content\r\n"));
         assert!(out.contains("content-range: bytes 0-9/100\r\n"));
     }

@@ -442,6 +442,7 @@ impl LifecycleScanner {
                 .await
             {
                 Ok(MutationOutcome::Deleted { .. }) => report.delete_markers_removed += 1,
+                Ok(MutationOutcome::DeleteNotApplied) => {}
                 Ok(MutationOutcome::DeleteProtected) => {}
                 Ok(_) => report.errors += 1,
                 Err(_) => report.errors += 1,
@@ -450,10 +451,11 @@ impl LifecycleScanner {
         Ok(report)
     }
 
-    /// Abort incomplete multipart uploads (ARCH 19.4). Enumerates stale sessions through the
-    /// bounded sweeper interface and aborts those in this bucket older than the smallest
-    /// `DaysAfterInitiation` of any enabled rule whose prefix matches the session key. Aborting
-    /// removes the session and reclaims its staged parts via the normal abort path.
+    /// Abort incomplete multipart uploads (ARCH 19.4). Pages every active session in this bucket
+    /// through the bounded `(key, upload-id)` listing and aborts those older than the smallest
+    /// `DaysAfterInitiation` of any enabled rule whose prefix matches the session key. Per-bucket
+    /// paging prevents another bucket (or one hot key) from monopolizing a global first batch.
+    /// Aborting removes the session and reclaims its staged parts via the normal abort path.
     async fn abort_incomplete_uploads<M, B>(
         &self,
         meta: &M,
@@ -468,47 +470,69 @@ impl LifecycleScanner {
     {
         let mut report = LifecycleReport::default();
 
-        // `enumerate_stale_sessions(older_than, batch)` returns sessions updated before
-        // `older_than`. Passing `now` yields every session not touched this instant; we then
-        // re-check each against its rule's per-bucket threshold using `created_at`.
-        let sessions: Vec<MultipartSession> =
-            meta.enumerate_stale_sessions(now, SESSION_BATCH).await?;
+        let mut key_marker = None;
+        let mut upload_id_marker = None;
+        loop {
+            let page = meta
+                .list_multipart_uploads(
+                    &bucket.name,
+                    &ListQuery {
+                        cursor: key_marker.clone(),
+                        version_id_marker: upload_id_marker.clone(),
+                        limit: SESSION_BATCH,
+                        ..Default::default()
+                    },
+                )
+                .await?;
 
-        for session in sessions {
-            if session.bucket.as_str() != bucket.name.as_str() {
-                continue;
-            }
-            let Some(days) = self.matching_abort_days(rules, &session) else {
-                continue;
-            };
-            if now.secs_since(session.created_at) < i64::from(days) * 86_400 {
-                continue;
-            }
-            match meta
-                .submit(Mutation::AbortMultipart(session.upload_id.clone()))
-                .await
-            {
-                Ok(MutationOutcome::MultipartTerminal(MultipartTerminalOutcome::Aborted)) => {
-                    // Only the terminal winner owns these bytes. A concurrent Complete that moved
-                    // the session to `completing` returns NotOwner below and keeps its parts.
-                    if blob.delete_session(&session.upload_id).await.is_ok() {
-                        match meta
-                            .submit(Mutation::ReleaseMultipartUploadCleanups {
-                                upload_id: session.upload_id.clone(),
-                            })
-                            .await
-                        {
-                            Ok(MutationOutcome::Ack) => report.uploads_aborted += 1,
-                            Ok(_) | Err(_) => report.errors += 1,
+            for session in page.items {
+                let Some(days) = self.matching_abort_days(rules, &session) else {
+                    continue;
+                };
+                if now.secs_since(session.created_at) < i64::from(days) * 86_400 {
+                    continue;
+                }
+                match meta
+                    .submit(Mutation::AbortMultipart(session.upload_id.clone()))
+                    .await
+                {
+                    Ok(MutationOutcome::MultipartTerminal(MultipartTerminalOutcome::Aborted)) => {
+                        // Only the terminal winner owns these bytes. A concurrent Complete that
+                        // moved the session to `completing` returns NotOwner below and keeps parts.
+                        if blob.delete_session(&session.upload_id).await.is_ok() {
+                            match meta
+                                .submit(Mutation::ReleaseMultipartUploadCleanups {
+                                    upload_id: session.upload_id.clone(),
+                                })
+                                .await
+                            {
+                                Ok(MutationOutcome::Ack) => report.uploads_aborted += 1,
+                                Ok(_) | Err(_) => report.errors += 1,
+                            }
+                        } else {
+                            report.errors += 1;
                         }
-                    } else {
-                        report.errors += 1;
                     }
+                    Ok(MutationOutcome::MultipartTerminal(MultipartTerminalOutcome::NotOwner)) => {
+                        // Expected race: completion owns the session. It reclaims its own parts.
+                    }
+                    Ok(_) | Err(_) => report.errors += 1,
                 }
-                Ok(MutationOutcome::MultipartTerminal(MultipartTerminalOutcome::NotOwner)) => {
-                    // Expected race: completion owns the session. It will reclaim its own parts.
+            }
+
+            if !page.truncated {
+                break;
+            }
+            match (page.next_cursor, page.next_version_id_marker) {
+                (Some(next_key), Some(next_upload)) => {
+                    key_marker = Some(next_key);
+                    upload_id_marker = Some(next_upload);
                 }
-                Ok(_) | Err(_) => report.errors += 1,
+                _ => {
+                    return Err(MetaError::Engine(
+                        "truncated multipart lifecycle page had no tuple cursor".to_owned(),
+                    ));
+                }
             }
         }
         Ok(report)
@@ -702,12 +726,11 @@ impl LifecycleScanner {
             .collect()
     }
 
-    /// Permanently delete a version and reclaim its freed blob (idempotent: a missing version
-    /// or absent blob is success).
-    /// Permanently delete a version, reclaiming its blob. Returns `true` when the version was
-    /// deleted, `false` when it was preserved because Object Lock (retention or legal hold) still
-    /// protects it — lifecycle silently skips a locked version (the WORM guarantee outranks the
-    /// expiry rule) and the rule applies once protection lapses.
+    /// Permanently delete a version, reclaiming its blob. Returns `true` only when the writer
+    /// confirms that the row was deleted, and `false` when Object Lock preserves it or a concurrent
+    /// change made the compare-and-delete guard stale. Lifecycle silently skips both outcomes; a
+    /// protected version becomes eligible once protection lapses, while a lost race is reconsidered
+    /// from fresh metadata on a later scan.
     #[allow(clippy::too_many_arguments)]
     async fn delete_version<M, B>(
         &self,
@@ -745,6 +768,7 @@ impl LifecycleScanner {
                 Ok(true)
             }
             MutationOutcome::Deleted { freed: None, .. } => Ok(true),
+            MutationOutcome::DeleteNotApplied => Ok(false),
             MutationOutcome::DeleteProtected => Ok(false),
             _ => Err(MetaError::Engine(
                 "unexpected lifecycle delete outcome".to_owned(),
@@ -778,4 +802,31 @@ fn filter_matches_marker(filter: &Filter, obj: &ObjectSummary, tags: &[(String, 
         }
     }
     true
+}
+
+#[cfg(test)]
+mod outcome_tests {
+    use super::*;
+    use cairn_types::testing::{InMemoryBlobStore, InMemoryMetadataStore};
+
+    #[tokio::test]
+    async fn delete_not_applied_does_not_advance_lifecycle_counters() {
+        let deleted = LifecycleScanner::new()
+            .delete_version(
+                &InMemoryMetadataStore::new(),
+                &InMemoryBlobStore::new(),
+                &BucketName::parse("missing-bucket").unwrap(),
+                &ObjectKey::parse("missing-key").unwrap(),
+                &VersionId::from_string("missing-version".to_owned()),
+                Timestamp::EPOCH,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !deleted,
+            "a writer no-op must not be reported as a lifecycle deletion"
+        );
+    }
 }

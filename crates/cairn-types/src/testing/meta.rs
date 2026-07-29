@@ -849,17 +849,11 @@ impl MetadataStore for InMemoryMetadataStore {
                 // no longer matches the value the caller captured (overwritten since — audit 2026-07).
                 if let Some(expected) = expected_updated_at {
                     if st.versions.get(&vk).map(|r| r.updated_at) != Some(expected) {
-                        return Ok(MutationOutcome::Deleted {
-                            freed: None,
-                            promoted_latest: false,
-                        });
+                        return Ok(MutationOutcome::DeleteNotApplied);
                     }
                 }
                 if !st.versions.contains_key(&vk) {
-                    return Ok(MutationOutcome::Deleted {
-                        freed: None,
-                        promoted_latest: false,
-                    });
+                    return Ok(MutationOutcome::DeleteNotApplied);
                 }
                 let _ = st.strict_object_lock_configuration(&bucket)?;
                 let lock = st.strict_lock_state(&vk)?;

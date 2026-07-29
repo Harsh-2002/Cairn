@@ -40,6 +40,8 @@ range-seek, same outcomes. `cairn-meta` is left untouched. Selected at runtime b
 - Object Lock is writer-authoritative in both async engines exactly as in `cairn-meta`: strict
   persisted-state parsing, immutable enablement/versioning, protected replacement/delete, retention
   non-weakening, and atomic object/tags/lock/outbox/session updates must not diverge.
+- Permanent-delete outcome parity includes `DeleteNotApplied` for an absent target or stale
+  `expected_updated_at` guard; `Deleted` is reserved for a row actually removed by the writer.
 - Multipart terminal ownership is part of parity, not an implementation detail: Complete claims
   `active -> completing`, Abort deletes only `active`, a failed claim releases only `completing`,
   and final completion rechecks `completing` inside its savepoint before any object upsert.

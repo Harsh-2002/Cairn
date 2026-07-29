@@ -730,14 +730,14 @@ mod tests {
     #[test]
     fn rewrap_preserves_mode_and_kms_key_id() {
         // A master-key rotation must reseal the DEK under the new active key WITHOUT dropping the
-        // `mode`/`kms_key_id` labels — losing them would silently make an at-rest object (which
-        // advertises nothing) start advertising AES256. Increment 0's flatten-preserve guards this.
+        // `mode`/`kms_key_id` labels or the metadata-backed blob format — losing them would silently
+        // change advertising or allow a current object through the legacy CRNB reader.
         let (k1, k2, dek) = ([1u8; 32], [2u8; 32], [7u8; 32]);
         // Seal the DEK under key 1 (key 1 active).
         let old = SystemCrypto::from_ring(vec![(1, k1.into())], 1, 1, 0).unwrap();
         let sealed = old.seal(&dek).unwrap();
         let json = format!(
-            r#"{{"alg":"AES256","wrapped_dek_b64":"{}","nonce_b64":"","mode":"at-rest","kms_key_id":"tenant-A"}}"#,
+            r#"{{"alg":"AES256","wrapped_dek_b64":"{}","nonce_b64":"","mode":"at-rest","kms_key_id":"tenant-A","blob_format_version":3}}"#,
             B64.encode(&sealed.ciphertext)
         );
         // Now key 2 is active (key 1 retained for opening) — the descriptor needs a rewrap.
@@ -751,6 +751,10 @@ mod tests {
         assert_eq!(
             v["kms_key_id"], "tenant-A",
             "kms_key_id dropped on rewrap: {out}"
+        );
+        assert_eq!(
+            v["blob_format_version"], 3,
+            "blob format expectation dropped on rewrap: {out}"
         );
         // The DEK was genuinely resealed under the active key and still round-trips.
         let env = B64.decode(v["wrapped_dek_b64"].as_str().unwrap()).unwrap();

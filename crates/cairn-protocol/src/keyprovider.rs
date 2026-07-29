@@ -16,7 +16,8 @@
 //! The trait is shaped so a real external provider (AWS KMS, Vault) can slot in later without
 //! touching the S3 surface: such a provider would return per-key material from [`crypto_for`] and
 //! enforce genuine isolation and revocation in [`validate_key_id`]. (One exception, documented at
-//! `open_sse_dek`: per-key material would require the open path to resolve crypto via the provider.)
+//! `open_sse_cipher`: per-key material would require the open path to resolve crypto via the
+//! provider.)
 //!
 //! [`crypto_for`]: KeyProvider::crypto_for
 //! [`validate_key_id`]: KeyProvider::validate_key_id
@@ -80,8 +81,8 @@ impl KeyProvider for LocalRingProvider {
     }
 
     fn crypto_for(&self, _key_id: &str) -> Result<Arc<dyn Crypto>, Error> {
-        // Label-only: the same master ring seals every id. The object's `open_sse_dek` path unwraps
-        // under this same ring, so sealing and opening stay symmetric for v1.
+        // Label-only: the same master ring seals every id. The object's `open_sse_cipher` path
+        // unwraps under this same ring, so sealing and opening stay symmetric for v1.
         Ok(self.crypto.clone())
     }
 }

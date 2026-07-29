@@ -471,9 +471,11 @@ pub struct CreateUserReq {
     /// The role (`"administrator"` or `"member"`).
     pub role: String,
     /// When set, attach a canned **replication** identity policy to the new user scoped to this
-    /// destination bucket: it grants `s3:ReplicateObject`, `s3:ReplicateDelete`, `s3:GetObject`,
-    /// and `s3:PutObject` on `arn:aws:s3:::<bucket>/*`. This mints a dedicated destination
-    /// credential in one step (ARCH 20.5). Absent/null leaves the user with no attached policy.
+    /// destination bucket: it grants `s3:ReplicateObject`, `s3:ReplicateDelete`, and the
+    /// `s3:GetObject` readback needed by `replication audit --verify`, all on
+    /// `arn:aws:s3:::<bucket>/*`. This mints a dedicated destination credential in one step
+    /// (ARCH 20.5) without ordinary PutObject/DeleteObject or bucket administration. Absent/null
+    /// leaves the user with no attached policy.
     #[serde(default)]
     pub replication_policy_bucket: Option<String>,
 }

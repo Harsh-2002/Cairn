@@ -55,6 +55,9 @@ def node_env(data, key, port, repl_to=None):
             "CAIRN_REPLICATION_ENDPOINT": ep, "CAIRN_REPLICATION_ACCESS_KEY": ak,
             "CAIRN_REPLICATION_SECRET": sk, "CAIRN_REPLICATION_REGION": REGION,
             "CAIRN_REPLICATION_INTERVAL_SECS": REPL_INTERVAL,
+            # The test topology is deliberately loopback. Production blocks internal
+            # replication destinations unless the operator explicitly opts in.
+            "CAIRN_ALLOW_INTERNAL_ENDPOINTS": "true",
         })
     return e
 

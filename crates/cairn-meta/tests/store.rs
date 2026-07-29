@@ -2040,7 +2040,7 @@ async fn delete_version_compare_and_delete_skips_overwritten_object() {
         .unwrap();
 
     // Delete with the STALE captured updated_at -> no-op; the fresh object survives.
-    store
+    let stale = store
         .submit(Mutation::DeleteVersion {
             bucket: b.clone(),
             key: k.clone(),
@@ -2051,6 +2051,7 @@ async fn delete_version_compare_and_delete_skips_overwritten_object() {
         })
         .await
         .unwrap();
+    assert_eq!(stale, MutationOutcome::DeleteNotApplied);
     let cur = store.current_version(&b, &k).await.unwrap();
     assert_eq!(
         cur.map(|r| r.etag.as_str().to_owned()),
@@ -2058,8 +2059,21 @@ async fn delete_version_compare_and_delete_skips_overwritten_object() {
         "the overwritten object must survive a stale-marker lifecycle delete"
     );
 
+    let missing = store
+        .submit(Mutation::DeleteVersion {
+            bucket: b.clone(),
+            key: k.clone(),
+            version_id: VersionId::from_string("missing".to_owned()),
+            expected_updated_at: None,
+            now: Timestamp(i64::MAX),
+            bypass: GovernanceBypass::Denied,
+        })
+        .await
+        .unwrap();
+    assert_eq!(missing, MutationOutcome::DeleteNotApplied);
+
     // Delete with the CURRENT updated_at -> actually deletes.
-    store
+    let deleted = store
         .submit(Mutation::DeleteVersion {
             bucket: b.clone(),
             key: k.clone(),
@@ -2070,6 +2084,7 @@ async fn delete_version_compare_and_delete_skips_overwritten_object() {
         })
         .await
         .unwrap();
+    assert!(matches!(deleted, MutationOutcome::Deleted { .. }));
     assert!(
         store.current_version(&b, &k).await.unwrap().is_none(),
         "a matching updated_at deletes"

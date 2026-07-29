@@ -11,8 +11,8 @@ Clock/Crypto>`) — never a concrete engine.
   multipart, copy, listing, every subresource incl. `?encryption`), plus the free-function helpers
   below the impl. The central `authorize` and all SSE seal/open live here: `resolve_object_encryption`
   (explicit header > bucket default > transparent `AtRest` > plaintext) mints the object DEK across
-  `SseMode {SseS3, AtRest, Kms}`; `open_sse_dek`/`seal_part_dek`/`open_part_dek` handle read and
-  per-part multipart keys.
+  `SseMode {SseS3, AtRest, Kms}`; `open_sse_cipher`/`seal_part_cipher`/`open_part_cipher` carry the
+  persisted CRNB version declaration together with each read key.
 - `keyprovider.rs` — the SSE-KMS `KeyProvider` trait + `LocalRingProvider` (v1). Maps a KMS key id
   to DEK-sealing crypto and gates writes via the `CAIRN_KMS_KEY_IDS` allow-list. **Label-only**: every
   DEK is sealed under the same node master ring regardless of key id — the id is a label, not
@@ -57,14 +57,17 @@ Clock/Crypto>`) — never a concrete engine.
   `Aborted` outcome; final completion rechecks ownership in its object-upsert savepoint. Every
   genuine post-claim failure conditionally releases `completing -> active` so retryability does not
   weaken the terminal race.
-- **Crypto fails closed** across every SSE seam. `open_sse_dek`/`open_part_dek` return an error on a
-  bad/missing key or tampered envelope — never plaintext. SSE-S3, transparent `AtRest`, and SSE-KMS
-  are all **label-only** (one master ring seals every DEK, so open is symmetric on `self.crypto`); a
-  KMS key id gates writes via the allow-list but is not isolation. Part-level multipart seals a
-  per-part DEK *before* `stage_part` (no fallible step after staging) and `complete_multipart` opens
-  every part key before claiming the session (a bad key leaves the upload retryable). Mandatory-SSE
-  buckets refuse a plaintext client PUT — transparent `AtRest` satisfies the data goal but NOT the
-  client contract, so it is force-upgraded to advertised SSE-S3.
+- **Crypto fails closed** across every SSE seam. `open_sse_cipher`/`open_part_cipher` return an error
+  on a bad/missing key, tampered envelope, unknown format marker, or blob/metadata version mismatch
+  — never plaintext. New object descriptors stamp CRNB v3; new multipart part envelopes use the
+  `crnb3:` prefix. Only an absent object marker or unprefixed legacy part envelope selects v2.
+  SSE-S3, transparent `AtRest`, and SSE-KMS are all **label-only** (one master ring seals every DEK,
+  so open is symmetric on `self.crypto`); a KMS key id gates writes via the allow-list but is not
+  isolation. Part-level multipart seals a per-part DEK *before* `stage_part` (no fallible step after
+  staging) and `complete_multipart` opens every part key before claiming the session (a bad key
+  leaves the upload retryable). Mandatory-SSE buckets refuse a plaintext client PUT — transparent
+  `AtRest` satisfies the data goal but NOT the client contract, so it is force-upgraded to
+  advertised SSE-S3.
 - **Session credentials never short-circuit.** In `authorize`, `is_session` principals are always
   `AuthenticatedMember` — they get no owner/admin bypass (least-privilege STS, ARCH 14).
 - **Owner/admin privilege retains the user id.** Ordinary privileged principals map to
@@ -74,9 +77,11 @@ Clock/Crypto>`) — never a concrete engine.
   raises `Internal`, never silently opens access.
 - **Copy / UploadPartCopy authorize the SOURCE read** against the *source* bucket's policy/ACL
   (audit #1, critical) — owning only the destination must not let you exfiltrate another tenant.
-- **The `x-amz-meta-cairn-replica` marker is Administrator-gated** (audit #16): only a replication
-  principal classifies a write as an inbound `Replica` (skips the outbox, preserves source
-  version id). A normal member's header is ignored and the write replicates normally.
+- **The `x-amz-meta-cairn-replica` marker is replication-action-gated** (audit #16): an exact
+  marker-bearing body PUT or non-versioned DELETE authorizes as `ReplicateObject` or
+  `ReplicateDelete`, and only that successful central authorization classifies it as an inbound
+  `Replica` (skips the outbox, preserves source version id). A normal `PutObject`/`DeleteObject`
+  grant with a forged marker is denied; a dedicated Member replication credential is supported.
 - **5xx messages are generalized** (audit #28): `error_response` logs the real cause but returns an
   opaque `InternalError` body; client 4xx keep their descriptive S3 message.
 - **Version-scoped authz** (audit #33): a `?versionId` request passes that `VersionId` to

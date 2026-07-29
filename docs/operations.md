@@ -316,6 +316,13 @@ re-encrypts under the object DEK, so nothing plaintext is ever on disk for an SS
 pins its encryption intent at `CreateMultipartUpload`; see §7's retirement note for the fail-closed
 window when the master key is retired mid-upload.
 
+The encrypted blob format upgrades lazily. Existing v2 object descriptors have no
+`blob_format_version` field, and existing encrypted multipart-part envelopes are unprefixed; those
+two metadata forms are the only signals that authorize the legacy reader. New writes stamp object
+format v3 and prefix part envelopes with `crnb3:`. No offline conversion is required, but do not
+remove or rewrite those compatibility markers by hand: an unknown marker or a marker/file mismatch
+is reported as corruption before bytes are served.
+
 ### 8.7 Repairing encrypted objects that replicated wrongly (the plaintext-seam incident)
 
 **What happened.** Before release X the replication engine read source blobs with **no data key**
@@ -370,7 +377,11 @@ conclusive check and it transfers every suspect object in full. `--verify` compa
 destination's **current** object (its GET carries no `versionId`), so it **skips non-current source
 versions** and reports them as `skipped_non_current` — comparing a superseded version against the
 destination's current object would report a mismatch for a perfectly healthy mirror. Those versions
-are unrepairable here anyway (trap 2 below).
+are unrepairable here anyway (trap 2 below). Verification reuses the target's stored SigV4
+credential and therefore requires `s3:GetObject` on the destination object ARN. Cairn's canned
+replication-user policy includes that scoped readback alongside `ReplicateObject` and
+`ReplicateDelete`; a hand-written destination policy must add it before `--verify` (ordinary
+replication delivery itself does not read the destination).
 
 On a dashboard, watch `cairn_replication_encrypted_suspect_versions` **and**
 `cairn_replication_encrypted_repair_pending_versions` (plus `…_encrypted_absent_versions` and

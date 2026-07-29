@@ -1207,8 +1207,9 @@ fn encrypted_fixture_dek() -> ([u8; 32], String) {
     let dek = [0x11u8; 32];
     let sealed = StubCrypto.seal(&dek).unwrap();
     let json = format!(
-        r#"{{"alg":"AES256-GCM","wrapped_dek_b64":"{}","nonce_b64":""}}"#,
-        base64::engine::general_purpose::STANDARD.encode(&sealed.ciphertext)
+        r#"{{"alg":"AES256-GCM","wrapped_dek_b64":"{}","nonce_b64":"","blob_format_version":{}}}"#,
+        base64::engine::general_purpose::STANDARD.encode(&sealed.ciphertext),
+        cairn_types::sse::AUTHENTICATED_BLOB_FORMAT_VERSION,
     );
     (dek, json)
 }

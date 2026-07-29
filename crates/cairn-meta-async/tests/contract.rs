@@ -849,6 +849,72 @@ async fn versioning_history_and_promotion_parity() {
 }
 
 #[tokio::test]
+async fn delete_not_applied_parity() {
+    let (a, b) = both().await;
+    for s in [&a as &dyn MetadataStore, &b as &dyn MetadataStore] {
+        let bucket = BucketName::parse("delete-guard").unwrap();
+        let key = ObjectKey::parse("object").unwrap();
+        let version = VersionId::from_string("v1".to_owned());
+        let mut object = row(&bucket, key.as_str(), version.clone(), "etag", 3);
+        object.updated_at = Timestamp(100);
+        s.submit(put(object, Precondition::default()))
+            .await
+            .unwrap();
+
+        let stale = s
+            .submit(Mutation::DeleteVersion {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id: version.clone(),
+                expected_updated_at: Some(Timestamp(99)),
+                now: Timestamp(i64::MAX),
+                bypass: GovernanceBypass::Denied,
+            })
+            .await
+            .unwrap();
+        assert_eq!(stale, MutationOutcome::DeleteNotApplied);
+        assert!(
+            s.get_version(&bucket, &key, &version)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        let missing = s
+            .submit(Mutation::DeleteVersion {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id: VersionId::from_string("missing".to_owned()),
+                expected_updated_at: None,
+                now: Timestamp(i64::MAX),
+                bypass: GovernanceBypass::Denied,
+            })
+            .await
+            .unwrap();
+        assert_eq!(missing, MutationOutcome::DeleteNotApplied);
+
+        let deleted = s
+            .submit(Mutation::DeleteVersion {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id: version.clone(),
+                expected_updated_at: Some(Timestamp(100)),
+                now: Timestamp(i64::MAX),
+                bypass: GovernanceBypass::Denied,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(deleted, MutationOutcome::Deleted { .. }));
+        assert!(
+            s.get_version(&bucket, &key, &version)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
 async fn delete_marker_hides_current_parity() {
     let (a, b) = both().await;
     for s in [&a as &dyn MetadataStore, &b as &dyn MetadataStore] {

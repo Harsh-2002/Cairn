@@ -16,10 +16,10 @@
 #            committed as a VERSION_ENCRYPTED CRNB container under the TARGET's own key.
 #   node-S = SOURCE. Replicates to node-T; runs the constant write workload.
 #
-# WIRING CHOICE — the SOURCE uses the operator-trusted `CAIRN_REPLICATION_ENDPOINT` config path
-# (like `soak.sh`), NOT the management API. That path is exempt from the `cairn-net` SSRF guard, so
-# this harness does NOT need `CAIRN_ALLOW_INTERNAL_ENDPOINTS=true` (which `mesh.py` does need,
-# because it registers targets through the guarded management API). The per-bucket rules still name
+# WIRING CHOICE — the SOURCE uses the `CAIRN_REPLICATION_ENDPOINT` config path (like `soak.sh`),
+# rather than the management API. Both paths are protected by the `cairn-net` SSRF guard; because
+# this test topology deliberately targets loopback, it explicitly sets
+# `CAIRN_ALLOW_INTERNAL_ENDPOINTS=true`. The per-bucket rules still name
 # `arn:aws:s3:::<bucket>`, which `resolve_dest_buckets` maps onto the configured endpoint.
 # The SOURCE's web console listener IS on, but only so the driver can read `GET /api/v1/replication/summary`
 # — exact outbox pending/claimed/failed counts and the true lag, straight from the store.
@@ -236,6 +236,7 @@ env "${source_env[@]}" \
     CAIRN_REPLICATION_ENDPOINT="http://127.0.0.1:$PORT_T" \
     CAIRN_REPLICATION_ACCESS_KEY="$T_AK" \
     CAIRN_REPLICATION_SECRET="$T_SK" \
+    CAIRN_ALLOW_INTERNAL_ENDPOINTS=true \
     "$BIN" serve >"$DATA_S/server.log" 2>&1 &
 SRV_S=$!
 

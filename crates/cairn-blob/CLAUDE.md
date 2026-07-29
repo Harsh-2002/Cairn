@@ -43,20 +43,20 @@ plain files under opaque IDs; metadata is someone else's job (`cairn-meta`).
   block_index)[..12]` — deterministic, never stored, never reused for a fixed key. Encrypted CRNB
   v3 also appends a domain-separated HMAC-SHA256 over the complete plaintext index and trailer,
   so their algorithm, compression flags, lengths, offsets, and version are authenticated before
-  use. Legacy encrypted v2 remains readable under strict structural and block-output validation;
-  every new or rewritten encrypted blob is v3. See ARCH 27.
+  use. Legacy encrypted v2 remains readable only when trusted metadata explicitly identifies a
+  pre-v3 object/part; every new or rewritten encrypted blob is v3. See ARCH 27.
 - **The reader seam is `open_raw(path, range, cipher: BlobCipher, compression)` + `probe(path)` —
-  there is NO DEK-less `open`.** `BlobCipher` (in `cairn-types`) is `KnownPlaintext | Dek([u8;32])`;
-  a caller cannot express a read without naming the cipher, which is what removes the footgun below.
-  `open_raw` translates the cipher to the internal `Option<[u8;32]>` (`KnownPlaintext` => `None`,
-  `Dek(k)` => `Some(k)`) at the top, so every downstream check — the framing decision, the refusal
-  guard, the `CompressedReader::open_with_dek` call (an unrelated internal method — do NOT rename it)
-  — is byte-for-byte unchanged. `probe` answers PRESENCE + physical framing only: one `stat`, no
-  body open, no DEK, no decrypt, so a well-formed ENCRYPTED blob probes `Ok` (present), NOT
-  `Corruption`; absence is `NotFound`. It is what `cairn integrity --repair` uses to tell a dangling
-  row from a healthy encrypted object it holds no key for.
+  there is NO DEK-less `open`.** `BlobCipher` (in `cairn-types`) is
+  `KnownPlaintext | LegacyV2(DEK) | AuthenticatedV3(DEK)`. A caller cannot express an encrypted read
+  without naming both the key and trusted metadata format. `open_raw` preserves that declaration
+  through the framing decision, refusal guard, probe open, lazy stream, and
+  `CompressedReader::open_with_dek` call (the internal method name is stable — do NOT rename it).
+  The compressed reader rejects an on-disk version that differs from the declaration before
+  returning bytes; the file cannot select its own legacy parser. `probe` answers PRESENCE + physical
+  framing only: one `stat`, no body open, no DEK, no decrypt, so a well-formed ENCRYPTED blob probes
+  `Ok` (present), NOT `Corruption`; absence is `NotFound`.
 - **Framing comes from the caller's descriptor + cipher, but a `KnownPlaintext` read of an encrypted
-  blob is REFUSED.** `is_container = dek.is_some() || compressed`, and staging records only the
+  blob is REFUSED.** `is_container = cipher.is_encrypted() || compressed`, and staging records only the
   *logical* compression — so an encrypted-but-**uncompressed** blob is `Uncompressed`, and a caller
   passing `KnownPlaintext` (the old `dek: None`) used to get the raw CRNB container bytes streamed as
   if they were the body (compression is off by default, so this was the default configuration; it is
@@ -114,15 +114,13 @@ plain files under opaque IDs; metadata is someone else's job (`cairn-meta`).
 - Multipart parts are staged as **uncompressed** intermediate artifacts (`fsync_in_place`, no rename);
   compression is applied once at `assemble`. A part is staged **encrypted** (a CRNB `VERSION_ENCRYPTED`
   blob) when `stage_part` is passed a per-part DEK (SSE / bucket-default / at-rest multipart, ARCH 27),
-  so nothing plaintext hits disk; `assemble` decrypts each such part on read (via `PartRef.dek`) before
-  re-encoding under the object DEK. The MD5/ETag is always computed over plaintext (before any
-  encrypt/compress transform), so it's identical with or without any transform.
-- **Known API asymmetry (a decision, not an oversight).** The *read* seam names its cipher
-  (`open_raw` + `BlobCipher`), but the *write* seam does not: `stage`/`stage_part`/`assemble` still
-  take a bare `encryption: Option<[u8;32]>` / `PartRef.dek`. Stage 3 deliberately closed only the
-  read seam, because that is where the leak lived (a DEK-less read streamed ciphertext). Giving the
-  write path the same by-name cipher is a later, separate change; until then the write DEK stays an
-  `Option`.
+  so nothing plaintext hits disk; `assemble` decrypts each such part on read via the typed
+  `PartRef.cipher` before re-encoding under the object DEK. The MD5/ETag is always computed over
+  plaintext (before any transform), so it is identical with or without encryption/compression.
+- **The staging write options remain bare DEKs; every read declaration is typed.** `stage`,
+  `stage_part`, and the assembled-object `StageOptions` take `encryption: Option<SecretKey32>` because
+  current writes always emit v3. `PartRef` is not a write option: it declares how assembly must read
+  an already-staged part, so it carries `BlobCipher` and pins legacy v2 versus authenticated v3.
 - Failpoint seams (`--features failpoints`): `blob_after_durable`, `blob_after_assemble`,
   `blob_after_multipart_session_dir` — exercised by crate tests,
   `conformance/crash_consistency.sh`, and `crash_multipoint.sh`. CRNB-reader fuzz target in `fuzz/`.

@@ -59,6 +59,10 @@ metadata commit is **the single linearization point of every mutation** (ARCH 11
   tags/lock replacement, and outbox enqueue all belong to one `apply.rs` savepoint. Object Lock
   configuration row presence is immutable enablement; only its specialized mutation may update the
   default, and versioning must remain Enabled.
+- `DeleteVersion` returns `DeleteNotApplied` when its target is absent or its
+  `expected_updated_at` compare-and-delete guard is stale. Reserve `Deleted` for a row the writer
+  actually removed, so lifecycle and repair counters remain truthful while S3 DELETE stays
+  idempotent.
 - The library `OpenOptions::default` is `synchronous=NORMAL` (benchmark/test posture); the **server
   overrides this to FULL** via `CAIRN_META_SYNCHRONOUS`. NORMAL never corrupts the DB — on power loss
   it loses at most the last uncheckpointed txn, which blob-first ordering downgrades to a GC'd orphan.

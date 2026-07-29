@@ -2185,10 +2185,7 @@ async fn delete_version(
         .await?
         .map(|r| r.get_i64(0));
         if stored != Some(expected.0) {
-            return Ok(MutationOutcome::Deleted {
-                freed: None,
-                promoted_latest: false,
-            });
+            return Ok(MutationOutcome::DeleteNotApplied);
         }
     }
     // Read the row's blob, latest flag, and owner/byte sizes before deleting, so we can promote a
@@ -2205,10 +2202,7 @@ async fn delete_version(
     )
     .await?;
     let Some(existing) = existing else {
-        return Ok(MutationOutcome::Deleted {
-            freed: None,
-            promoted_latest: false,
-        });
+        return Ok(MutationOutcome::DeleteNotApplied);
     };
     if replacement_is_protected(driver, bucket, key, version_id, now, bypass).await? {
         return Ok(MutationOutcome::DeleteProtected);

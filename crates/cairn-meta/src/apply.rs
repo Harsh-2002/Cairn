@@ -2091,10 +2091,7 @@ fn delete_version(
             .optional()
             .map_err(engine_err)?;
         if stored != Some(expected.0) {
-            return Ok(MutationOutcome::Deleted {
-                freed: None,
-                promoted_latest: false,
-            });
+            return Ok(MutationOutcome::DeleteNotApplied);
         }
     }
     // Read the row's blob, latest flag, and owner/byte sizes before deleting it, so we can both
@@ -2112,10 +2109,7 @@ fn delete_version(
         .optional()
         .map_err(engine_err)?;
     let Some((storage_path, latest, owner, logical, physical)) = existing else {
-        return Ok(MutationOutcome::Deleted {
-            freed: None,
-            promoted_latest: false,
-        });
+        return Ok(MutationOutcome::DeleteNotApplied);
     };
     if replacement_is_protected(conn, bucket, key, version_id, now, bypass)? {
         return Ok(MutationOutcome::DeleteProtected);

@@ -32,13 +32,18 @@ expired-object-delete-marker removal, and abort-incomplete-multipart.
   returns `DeleteProtected`; lifecycle silently skips that outcome (neither expired nor an error),
   and the rule applies once protection lapses. Never restore a read-then-delete lock check or grant
   lifecycle a governance bypass.
+- Lifecycle reports count a permanent deletion only after the writer returns `Deleted`.
+  `DeleteNotApplied` is an expected skip: the row disappeared or its `expected_updated_at` guard
+  lost a concurrent overwrite race, so no metadata changed and no expiration counter advances.
 - **Transition is rejected at write time**, not silently stored. A `PutBucketLifecycleConfiguration`
   carrying a `<Transition>` is refused with `NotImplemented` in `cairn-protocol` (`service.rs`,
   search `Action::Transition`). The variant is still *parsed* — so the write path can detect/reject
   and the scanner tolerates any pre-existing stored config — but the scanner does **no** data
   movement and does not count it (cold-tier transition, ARCH 19.5, is unimplemented).
 - **Bounded enumeration only.** Page through `list_current` / `list_versions` (`PAGE_LIMIT = 1000`)
-  and `enumerate_stale_sessions` (`SESSION_BATCH`). Version scans consume the ordered listing one
+  and each bucket's `list_multipart_uploads` (`SESSION_BATCH`, using the full key/upload-id tuple
+  cursor). Never take one global first-N MPU window: another bucket or a hot key can otherwise
+  starve every later eligible session forever. Version scans consume the ordered listing one
   complete key group at a time, carrying only a key that crosses a page boundary; peak memory is one
   page plus the largest key's version history, never the bucket. `run_once` errors only if an
   enumeration itself fails — per-item mutation failures are tallied in `report.errors`, never

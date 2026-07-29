@@ -166,11 +166,10 @@ pub async fn handle(
             )
         })
         .collect();
-    let host = headers
-        .iter()
-        .find(|(k, _)| k == "host")
-        .map(|(_, v)| v.clone())
-        .unwrap_or_default();
+    // HTTP/1 normally carries the request authority in `Host`, while HTTP/2 carries it in
+    // `:authority` (represented by Hyper as the URI authority) and may omit `Host`. Resolve both
+    // forms once and fail closed on duplicates or disagreement.
+    let host = request_authority(req.uri(), &headers).unwrap_or_default();
     // Resolve client-address provenance once and carry that typed result through authentication and
     // authorization. An untrusted peer's forwarding headers are ignored; a trusted peer that omits
     // or contradicts them produces `Unavailable`, never the proxy's address.
@@ -186,6 +185,21 @@ pub async fn handle(
     let route = listener_route(listener_role, &method, &raw_path);
     if route == ListenerRoute::NotFound {
         let response = json_status(404, r#"{"error":"not found"}"#);
+        return drain_or_close(response, request_has_body(&headers), req.into_body()).await;
+    }
+    // Object bytes are deliberately hosted on an untrusted data origin. They must not become a
+    // persistent network interceptor for that origin: every conforming browser marks a service
+    // worker script fetch with `Service-Worker: script`, so refuse it before S3/share dispatch.
+    // Successful object responses also carry a narrowly scoped Service-Worker-Allowed header below
+    // as defense in depth for clients that do not send the standard request marker.
+    if listener_role.is_data()
+        && request_header(&headers, "service-worker")
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("script"))
+    {
+        let response = json_status(
+            403,
+            r#"{"error":"forbidden","message":"object content cannot be used as a service worker"}"#,
+        );
         return drain_or_close(response, request_has_body(&headers), req.into_body()).await;
     }
     // A browser preflights the exact presigned data URL with OPTIONS, which cannot itself verify a
@@ -205,11 +219,42 @@ pub async fn handle(
     // The login endpoint (POST /api/v1/session) is exempt so a stale/invalid cookie cannot turn a
     // fresh sign-in into a 401 before the body credentials are even checked.
     let is_login = method == Method::POST && raw_path == "/api/v1/session";
+    // Login creates ambient browser authority too. Requiring the exact control origin prevents
+    // same-site object content from replacing a victim's console session with attacker-chosen
+    // credentials (login CSRF/session fixation), independently of whether a stale cookie exists.
+    if listener_role.is_control()
+        && is_login
+        && !cookie_request_has_control_origin(&method, &headers, &host, cookie_secure)
+    {
+        let response = json_status(
+            403,
+            r#"{"error":"forbidden","message":"console sign-in requires a same-origin request"}"#,
+        );
+        return drain_or_close(response, request_has_body(&headers), req.into_body()).await;
+    }
+    let mut authenticated_from_cookie = false;
     if listener_role.is_control() && !is_login && !headers.iter().any(|(k, _)| k == "authorization")
     {
         if let Some(token) = session_cookie_token(&headers) {
             headers.push(("authorization".to_owned(), format!("Bearer {token}")));
+            authenticated_from_cookie = true;
         }
+    }
+
+    // SameSite is a SITE boundary, not an ORIGIN boundary: the data and control listeners on two
+    // ports (and common `data.example` / `console.example` deployments) are cross-origin but
+    // same-site. Active object content could therefore submit a credentialed, "simple" POST to the
+    // control listener unless unsafe cookie-authenticated requests prove they came from this exact
+    // control origin. Explicit Authorization clients do not use the ambient cookie and remain
+    // unaffected.
+    if authenticated_from_cookie
+        && !cookie_request_has_control_origin(&method, &headers, &host, cookie_secure)
+    {
+        let response = json_status(
+            403,
+            r#"{"error":"forbidden","message":"cookie-authenticated changes require a same-origin request"}"#,
+        );
+        return drain_or_close(response, request_has_body(&headers), req.into_body()).await;
     }
 
     // AWS-STS wire surface (ARCH 14): a form `POST /` on the **S3 data plane** carries an STS mint
@@ -413,7 +458,10 @@ pub async fn handle(
         if token.is_empty() || token.contains('/') {
             return json_status(404, r#"{"error":"not found"}"#);
         }
-        return serve_share(&stack, token, method, &headers, source, secure, request_id).await;
+        let mut response =
+            serve_share(&stack, token, method, &headers, source, secure, request_id).await;
+        constrain_service_worker_scope(&mut response, &raw_path);
+        return response;
     }
 
     // Virtual-host-style addressing (ARCH 13.1): when `CAIRN_S3_DOMAIN` is configured and the
@@ -437,6 +485,7 @@ pub async fn handle(
             return drain_or_close(response, body_bearing, req.into_body()).await;
         }
     };
+    let is_object_route = key.is_some();
     let query = parse_query(&query_str);
     // Share the incoming body: the service streams object-PUT bytes out of it during `handle`, but
     // if it returns before consuming the body (an early reject) we still need to reach the leftover
@@ -465,6 +514,9 @@ pub async fn handle(
         request_id,
     };
     let mut response = render_negotiated(stack.s3.handle(s3req, body).await, wants_html, &raw_path);
+    if is_object_route {
+        constrain_service_worker_scope(&mut response, &raw_path);
+    }
     if let Some(origin) = console_cors_origin {
         if let Ok(value) = origin.parse() {
             response
@@ -648,6 +700,84 @@ fn session_cookie_token(headers: &[(String, String)]) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
+/// Resolve the externally visible request authority across HTTP versions.
+///
+/// Hyper exposes HTTP/2 `:authority` through [`http::Uri::authority`], while HTTP/1 origin-form
+/// requests use `Host`. A duplicate Host or disagreement between the two representations is
+/// ambiguous and therefore unusable for routing, signing, or an Origin security decision.
+fn request_authority(uri: &http::Uri, headers: &[(String, String)]) -> Option<String> {
+    let mut hosts = headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("host"))
+        .map(|(_, value)| value.trim());
+    let header = hosts.next();
+    if hosts.next().is_some() {
+        return None;
+    }
+    let uri_authority = uri.authority().map(http::uri::Authority::as_str);
+    match (header, uri_authority) {
+        (Some(host), Some(authority)) if !host.eq_ignore_ascii_case(authority) => None,
+        (Some(host), _) if !host.is_empty() => Some(host.to_owned()),
+        (None, Some(authority)) if !authority.is_empty() => Some(authority.to_owned()),
+        _ => None,
+    }
+}
+
+/// Whether a request authenticated from the ambient console cookie is safe to dispatch.
+///
+/// Reads do not mutate state. Every other method must carry exactly one browser `Origin` equal to
+/// the externally visible control origin. Comparing scheme + host + effective port (rather than
+/// raw strings) treats `https://example.test` and `Host: example.test:443` as the same origin while
+/// still rejecting the same-site data listener on another port or sibling hostname.
+fn cookie_request_has_control_origin(
+    method: &Method,
+    headers: &[(String, String)],
+    host: &str,
+    secure: bool,
+) -> bool {
+    if matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS) {
+        return true;
+    }
+    let mut origins = headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("origin"))
+        .map(|(_, value)| value.as_str());
+    let Some(origin) = origins.next() else {
+        return false;
+    };
+    if origins.next().is_some() {
+        return false;
+    }
+    let expected = format!("{}://{host}", if secure { "https" } else { "http" });
+    origin_identity(origin).is_some_and(|presented| {
+        origin_identity(&expected).is_some_and(|control| presented == control)
+    })
+}
+
+/// Canonical `(scheme, host, port)` identity for an HTTP origin.
+fn origin_identity(origin: &str) -> Option<(String, String, u16)> {
+    let uri = origin.parse::<http::Uri>().ok()?;
+    let scheme = uri.scheme_str()?.to_ascii_lowercase();
+    if !matches!(scheme.as_str(), "http" | "https")
+        || uri.query().is_some()
+        || !matches!(uri.path(), "" | "/")
+    {
+        return None;
+    }
+    let authority = uri.authority()?;
+    if authority.as_str().contains('@') {
+        return None;
+    }
+    let host = authority.host().to_ascii_lowercase();
+    if host.is_empty() {
+        return None;
+    }
+    let port = authority
+        .port_u16()
+        .unwrap_or(if scheme == "https" { 443 } else { 80 });
+    Some((scheme, host, port))
+}
+
 /// Read a single named cookie's value out of a `Cookie:` request-header string.
 fn cookie_value(cookie_header: &str, name: &str) -> Option<String> {
     cookie_header.split(';').find_map(|pair| {
@@ -658,9 +788,9 @@ fn cookie_value(cookie_header: &str, name: &str) -> Option<String> {
 
 /// `Set-Cookie` value that stores `token` in the httpOnly session cookie. `Secure` is added when the
 /// externally-visible control transport is authenticated as HTTPS (direct TLS or validated trusted
-/// proxy provenance); a direct loopback HTTP dev listener can still store it. `SameSite=Strict`
-/// keeps the cookie off every cross-site request, which is the CSRF defense for the
-/// cookie-authenticated API.
+/// proxy provenance); a direct loopback HTTP dev listener can still store it. `SameSite=Strict` is
+/// defense in depth; [`cookie_request_has_control_origin`] is the unsafe-request CSRF boundary
+/// because same-site cross-origin requests can still carry this cookie.
 fn set_session_cookie(token: &str, secure: bool) -> String {
     let value = B64URL.encode(token.as_bytes());
     let mut c = format!(
@@ -679,6 +809,31 @@ fn clear_session_cookie(secure: bool) -> String {
         c.push_str("; Secure");
     }
     c
+}
+
+/// Prevent an object response from claiming the directory-wide default service-worker scope.
+///
+/// A worker script at `/bucket/key.js` would otherwise default to `/bucket/`; every public share
+/// script would default to the shared `/share/` namespace. Pointing the maximum scope into a
+/// synthetic child path makes that default registration fail. The request-side
+/// `Service-Worker: script` rejection is the primary boundary; this response header is independent
+/// defense in depth and is applied to path-style objects, virtual-host-style objects, and shares.
+fn constrain_service_worker_scope(response: &mut Response<ResponseBody>, request_path: &str) {
+    if let Some(scope) = service_worker_scope_for_path(request_path) {
+        let value = http::HeaderValue::from_str(&scope)
+            .expect("validated service-worker scope remains a valid header");
+        response
+            .headers_mut()
+            .insert("service-worker-allowed", value);
+    }
+}
+
+/// A response-header-safe synthetic child scope for one exact object request path.
+pub(crate) fn service_worker_scope_for_path(request_path: &str) -> Option<String> {
+    let base = request_path.trim_end_matches('/');
+    let scope = format!("{base}/.cairn-service-worker-disabled/");
+    http::HeaderValue::from_str(&scope).ok()?;
+    Some(scope)
 }
 
 fn control_cookie_is_secure(transport: RequestTransport<'_>, headers: &[(String, String)]) -> bool {
@@ -2292,6 +2447,160 @@ mod tests {
         assert!(normalize_origin("javascript:alert(1)").is_none());
         assert!(normalize_origin("https://console.example.test/app").is_none());
         assert!(normalize_origin("https://console.example.test/?token=secret").is_none());
+    }
+
+    #[test]
+    fn cookie_authenticated_mutations_require_the_exact_control_origin() {
+        let same_origin = vec![(
+            "origin".to_owned(),
+            "https://console.example.test:7374".to_owned(),
+        )];
+        assert!(cookie_request_has_control_origin(
+            &Method::POST,
+            &same_origin,
+            "console.example.test:7374",
+            true,
+        ));
+        assert!(cookie_request_has_control_origin(
+            &Method::DELETE,
+            &same_origin,
+            "console.example.test:7374",
+            true,
+        ));
+
+        for origin in [
+            "https://console.example.test:7373",
+            "https://data.example.test:7374",
+            "http://console.example.test:7374",
+            "null",
+        ] {
+            assert!(
+                !cookie_request_has_control_origin(
+                    &Method::POST,
+                    &[("origin".to_owned(), origin.to_owned())],
+                    "console.example.test:7374",
+                    true,
+                ),
+                "{origin} is not the control origin"
+            );
+        }
+        assert!(!cookie_request_has_control_origin(
+            &Method::POST,
+            &[],
+            "console.example.test:7374",
+            true,
+        ));
+        assert!(!cookie_request_has_control_origin(
+            &Method::POST,
+            &[
+                (
+                    "origin".to_owned(),
+                    "https://console.example.test:7374".to_owned(),
+                ),
+                (
+                    "origin".to_owned(),
+                    "https://attacker.example.test".to_owned(),
+                ),
+            ],
+            "console.example.test:7374",
+            true,
+        ));
+
+        // Safe reads do not require browser provenance, and default ports compare canonically.
+        assert!(cookie_request_has_control_origin(
+            &Method::GET,
+            &[],
+            "console.example.test:7374",
+            true,
+        ));
+        assert!(cookie_request_has_control_origin(
+            &Method::POST,
+            &[(
+                "origin".to_owned(),
+                "https://console.example.test".to_owned(),
+            )],
+            "console.example.test:443",
+            true,
+        ));
+    }
+
+    #[test]
+    fn request_authority_supports_http2_and_rejects_ambiguity() {
+        let h1: http::Uri = "/api/v1/session".parse().unwrap();
+        assert_eq!(
+            request_authority(
+                &h1,
+                &[("host".to_owned(), "console.example.test:7374".to_owned())]
+            )
+            .as_deref(),
+            Some("console.example.test:7374")
+        );
+
+        let h2: http::Uri = "https://console.example.test:7374/api/v1/session"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            request_authority(&h2, &[]).as_deref(),
+            Some("console.example.test:7374"),
+            "HTTP/2 :authority must work without a Host header"
+        );
+        assert_eq!(
+            request_authority(
+                &h2,
+                &[("host".to_owned(), "console.example.test:7374".to_owned())]
+            )
+            .as_deref(),
+            Some("console.example.test:7374")
+        );
+        assert!(
+            request_authority(
+                &h2,
+                &[("host".to_owned(), "attacker.example.test:7374".to_owned())]
+            )
+            .is_none(),
+            "Host and :authority disagreement must fail closed"
+        );
+        assert!(
+            request_authority(
+                &h1,
+                &[
+                    ("host".to_owned(), "console.example.test:7374".to_owned()),
+                    ("host".to_owned(), "attacker.example.test:7374".to_owned()),
+                ]
+            )
+            .is_none(),
+            "duplicate Host fields must fail closed"
+        );
+    }
+
+    #[test]
+    fn object_and_share_responses_cannot_claim_a_directory_worker_scope() {
+        for (request_path, expected_scope) in [
+            (
+                "/photos/scripts/worker.js",
+                "/photos/scripts/worker.js/.cairn-service-worker-disabled/",
+            ),
+            ("/worker.js", "/worker.js/.cairn-service-worker-disabled/"), // virtual-host style
+            (
+                "/share/0123456789abcdef",
+                "/share/0123456789abcdef/.cairn-service-worker-disabled/",
+            ),
+            (
+                "/photos/trailing/",
+                "/photos/trailing/.cairn-service-worker-disabled/",
+            ),
+        ] {
+            let mut response = json_status(200, "{}");
+            constrain_service_worker_scope(&mut response, request_path);
+            assert_eq!(
+                response.headers().get("service-worker-allowed").unwrap(),
+                expected_scope
+            );
+            assert_ne!(
+                response.headers().get("service-worker-allowed").unwrap(),
+                "/share/"
+            );
+        }
     }
 
     #[test]

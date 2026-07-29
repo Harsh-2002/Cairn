@@ -50,22 +50,21 @@ pub trait BlobStore: Send + Sync {
     ) -> Result<StagedBlob, BlobError>;
 
     /// Open a committed blob for reading, transparently decompressing and — when `cipher` is
-    /// [`BlobCipher::Dek`] — transparently decrypting each AES-256-GCM block with the supplied raw
-    /// 32-byte data-encryption key, optionally for a range expressed in logical (plaintext)
-    /// coordinates.
+    /// [`BlobCipher::LegacyV2`] or [`BlobCipher::AuthenticatedV3`] — transparently decrypting each
+    /// AES-256-GCM block with the supplied raw 32-byte data-encryption key, optionally for a range
+    /// expressed in logical (plaintext) coordinates.
     ///
     /// This is the **one** reader: there is no DEK-less `open`. The caller MUST name the cipher —
-    /// [`BlobCipher::KnownPlaintext`] for a blob written in the clear, [`BlobCipher::Dek`] for an
-    /// encrypted one. That is deliberate. The former `open` forwarded to a DEK of `None`, so any
+    /// [`BlobCipher::KnownPlaintext`] for a blob written in the clear, or one of the two named
+    /// encrypted formats for ciphertext. That is deliberate. The former `open` forwarded to a DEK
+    /// of `None`, so any
     /// caller that forgot the key streamed an encrypted container's raw ciphertext as if it were
     /// the plaintext body — silently, at exactly the plaintext length (it is how replication and
     /// the integrity scrub shipped ciphertext). Requiring the cipher by name removes that footgun.
     ///
     /// **Fail-closed (unchanged, ARCH 27, SSE-S3):** an encrypted blob opened with
-    /// [`BlobCipher::KnownPlaintext`] (or with the wrong DEK) fails with [`BlobError::Corruption`]
-    /// rather than yielding plaintext or ciphertext. `KnownPlaintext` behaves exactly as the old
-    /// `dek: None` did — the fail-closed guard still fires for a plaintext-open of an encrypted
-    /// container.
+    /// [`BlobCipher::KnownPlaintext`] (or with the wrong DEK/format) fails with
+    /// [`BlobError::Corruption`] rather than yielding plaintext or ciphertext.
     ///
     /// `compression` is the object version's stored compression descriptor, the source of truth
     /// for whether the blob is a self-describing CRNB block container. The reader trusts it (and

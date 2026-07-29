@@ -77,9 +77,15 @@ that generation through its canonical Writer, checkpoints and closes every owned
 connection, syncs the old main file, removes the exact sidecars, and syncs the parent directory.
 Only then can the atomic rename publish the staged image. Therefore a crash immediately before the
 rename reopens a complete old generation, while a crash immediately after it reopens only the new
-generation. Immutable blobs are copied before the metadata rename, and reconciliation runs while
-the exclusive node lock remains held; target-side blobs not referenced by restored metadata are
-reclaimed.
+generation. Immutable blobs are copied before the metadata rename with no-replace publication:
+an existing target path is reused only when a no-follow, byte-for-byte comparison proves it
+identical to the snapshot, while a different collision aborts restore without changing the old
+inode. A new path is staged and synced, then published with an atomic hard link; an
+`AlreadyExists` race is re-opened no-follow and subjected to the same identity rule rather than
+replaced. Reconciliation runs while the exclusive node lock remains held; target-side blobs not
+referenced by restored metadata are reclaimed. Any non-zero reconciliation error count makes
+restore fail even when the reconciliation call itself returned a report, matching the pre-bind
+startup gate rather than declaring a partially checked generation ready.
 
 ## Database-path upgrade requirement
 

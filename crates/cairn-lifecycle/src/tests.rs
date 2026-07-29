@@ -208,6 +208,45 @@ async fn make_session(
     upload
 }
 
+async fn make_empty_session(
+    meta: &InMemoryMetadataStore,
+    bucket: &BucketName,
+    principal: &UserId,
+    key: &str,
+    upload_id: String,
+    created_secs: i64,
+    limits: cairn_types::meta::MultipartLimits,
+) -> UploadId {
+    let upload = UploadId::from_string(upload_id);
+    let ts = Timestamp::from_secs(created_secs);
+    meta.submit(Mutation::CreateMultipart {
+        session: Box::new(MultipartSession {
+            upload_id: upload.clone(),
+            bucket: bucket.clone(),
+            key: ObjectKey::parse(key).unwrap(),
+            content_type: "application/octet-stream".to_owned(),
+            status: MultipartStatus::Active,
+            owner_id: principal.clone(),
+            initiated_by: principal.clone(),
+            intended_acl: None,
+            user_metadata: Vec::new(),
+            initial_tags: Vec::new(),
+            lock_intent: cairn_types::ExplicitObjectLockIntent::default(),
+            sse_requested: false,
+            encrypt_parts: false,
+            sse_kms_requested: false,
+            sse_kms_key_id: None,
+            sse_bucket_key_enabled: false,
+            created_at: ts,
+            updated_at: ts,
+        }),
+        limits,
+    })
+    .await
+    .unwrap();
+    upload
+}
+
 fn cfg(rules: Vec<LifecycleRule>) -> Vec<BucketLifecycle> {
     vec![BucketLifecycle::new(bucket_name(), rules)]
 }
@@ -609,6 +648,115 @@ async fn abort_incomplete_multipart_respects_threshold() {
 
     assert_eq!(report.uploads_aborted, 0);
     assert!(meta.get_multipart(&upload).await.unwrap().is_some());
+}
+
+/// Lifecycle MPU cleanup must not share one global first-1,000 window across buckets, and its
+/// per-bucket tuple cursor must advance through more than one page of a single hot key.
+#[tokio::test]
+async fn abort_incomplete_multipart_pages_per_bucket_past_a_hot_prefix() {
+    let meta = InMemoryMetadataStore::new();
+    let blob = InMemoryBlobStore::new();
+    let clock = TestClock::at_secs(8 * DAY);
+    make_bucket(&meta, VersioningState::Unversioned).await;
+
+    let noise_bucket = BucketName::parse("noise-bucket").unwrap();
+    meta.submit(Mutation::CreateBucket(Box::new(Bucket {
+        name: noise_bucket.clone(),
+        owner_id: UserId("noise-owner".to_owned()),
+        created_at: Timestamp::from_secs(0),
+        versioning: VersioningState::Unversioned,
+        ownership_mode: OwnershipMode::BucketOwnerEnforced,
+        region: "us-east-1".to_owned(),
+        compression: None,
+    })))
+    .await
+    .unwrap();
+
+    let noise_principal = UserId("noise-principal".to_owned());
+    let noise_limits = cairn_types::meta::MultipartLimits {
+        max_active_uploads_per_bucket: 1_000,
+        max_active_uploads_per_principal: 1_000,
+        max_parts_per_upload: 10_000,
+    };
+    for i in 0..1_000 {
+        make_empty_session(
+            &meta,
+            &noise_bucket,
+            &noise_principal,
+            "a-hot-prefix/object",
+            format!("noise-{i:04}"),
+            0,
+            noise_limits,
+        )
+        .await;
+    }
+
+    let target_total = 1_001u32;
+    let target_limits = cairn_types::meta::MultipartLimits {
+        max_active_uploads_per_bucket: target_total,
+        max_active_uploads_per_principal: target_total,
+        max_parts_per_upload: 10_000,
+    };
+    for i in 0..target_total {
+        make_empty_session(
+            &meta,
+            &bucket_name(),
+            &owner(),
+            "hot-prefix/object",
+            format!("target-{i:04}"),
+            1,
+            target_limits,
+        )
+        .await;
+    }
+
+    let rule = LifecycleRule {
+        id: "abort-hot".to_owned(),
+        enabled: true,
+        filter: Filter {
+            prefix: Some("hot-prefix/".to_owned()),
+            ..Default::default()
+        },
+        actions: vec![Action::AbortIncompleteMultipartUpload {
+            days_after_initiation: 7,
+        }],
+    };
+    let report = LifecycleScanner::new()
+        .run_once(&meta, &blob, &clock, &cfg(vec![rule]))
+        .await
+        .unwrap();
+
+    assert_eq!(report.uploads_aborted, u64::from(target_total));
+    assert_eq!(report.errors, 0);
+    assert!(
+        meta.list_multipart_uploads(
+            &bucket_name(),
+            &ListQuery {
+                limit: 1_000,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .items
+        .is_empty(),
+        "the tuple cursor must drain the second page of the hot key"
+    );
+    assert_eq!(
+        meta.list_multipart_uploads(
+            &noise_bucket,
+            &ListQuery {
+                limit: 1_000,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .items
+        .len(),
+        1_000,
+        "an unrelated bucket is not part of this lifecycle configuration"
+    );
 }
 
 #[tokio::test]

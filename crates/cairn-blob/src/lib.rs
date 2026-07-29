@@ -33,9 +33,10 @@ use crate::staging::Staging;
 use async_trait::async_trait;
 use bytes::Bytes;
 use cairn_types::SecretKey32;
+pub use cairn_types::blob::BlobCipher;
 use cairn_types::blob::{
-    BlobCipher, BlobProbe, BlobReadHandle, ByteRange, ContentRange, PartRef, ReconcileOpts,
-    ReconcileReport, StageOptions, StagedBlob, StagedPart, ZeroCopyRead,
+    BlobProbe, BlobReadHandle, ByteRange, ContentRange, PartRef, ReconcileOpts, ReconcileReport,
+    StageOptions, StagedBlob, StagedPart, ZeroCopyRead,
 };
 use cairn_types::bucket::{CompressionAlgorithm, CompressionPolicy};
 use cairn_types::error::BlobError;
@@ -469,7 +470,7 @@ async fn write_staged(
 fn stream_blob(
     path: &Path,
     compressed: bool,
-    dek: Option<SecretKey32>,
+    cipher: BlobCipher,
     offset: u64,
     len: u64,
     tx: &tokio::sync::mpsc::Sender<Result<Bytes, BlobError>>,
@@ -477,7 +478,7 @@ fn stream_blob(
     use std::io::{Read, Seek, SeekFrom};
     if compressed {
         let f = std::fs::File::open(path).map_err(io_err)?;
-        let mut reader = CompressedReader::open_with_dek(f, dek)?;
+        let mut reader = CompressedReader::open_with_dek(f, cipher)?;
         let bs = reader.block_size();
         let end = offset.saturating_add(len).min(reader.logical_len());
         if bs == 0 || offset >= end {
@@ -525,7 +526,7 @@ enum StreamSrc {
         (
             PathBuf,
             bool,
-            Option<SecretKey32>,
+            BlobCipher,
             u64,
             u64,
             tokio::sync::OwnedSemaphorePermit,
@@ -537,21 +538,21 @@ enum StreamSrc {
 fn read_stream(
     path: PathBuf,
     compressed: bool,
-    dek: Option<SecretKey32>,
+    cipher: BlobCipher,
     offset: u64,
     len: u64,
     permit: tokio::sync::OwnedSemaphorePermit,
 ) -> cairn_types::BlobStream {
-    let initial = StreamSrc::Pending((path, compressed, dek, offset, len, permit));
+    let initial = StreamSrc::Pending((path, compressed, cipher, offset, len, permit));
     Box::pin(futures_util::stream::unfold(initial, |state| async move {
         let mut rx = match state {
-            StreamSrc::Pending((path, compressed, dek, offset, len, permit)) => {
+            StreamSrc::Pending((path, compressed, cipher, offset, len, permit)) => {
                 let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, BlobError>>(4);
                 tokio::task::spawn_blocking(move || {
                     // The permit is held for the whole transfer so it counts against the blob-I/O
                     // bound (ARCH 7.4), then released when this task ends.
                     let _permit = permit;
-                    if let Err(e) = stream_blob(&path, compressed, dek, offset, len, &tx) {
+                    if let Err(e) = stream_blob(&path, compressed, cipher, offset, len, &tx) {
                         let _ = tx.blocking_send(Err(e));
                     }
                 });
@@ -601,8 +602,9 @@ async fn feed_assembled_chunk(
 impl LocalBlobStore {
     /// Read each part in order, hashing the plaintext, applying the (optional) block
     /// encoder/encrypter, and streaming the physical bytes into the staging sink. A part staged
-    /// encrypted (`PartRef.dek == Some`, ARCH 27) is decrypted on read through the same CRNB reader
-    /// GET uses, so `assemble` always sees plaintext before it re-encodes under the object DEK.
+    /// encrypted (`PartRef.cipher != KnownPlaintext`, ARCH 27) is decrypted on read through the same
+    /// metadata-version-pinned CRNB reader GET uses, so `assemble` always sees plaintext before it
+    /// re-encodes under the object DEK.
     /// Factored out of `assemble` so the caller can `abort` the sink on any error without duplicating
     /// the unlink.
     #[allow(clippy::too_many_arguments)]
@@ -619,9 +621,9 @@ impl LocalBlobStore {
         use tokio::io::AsyncReadExt;
         for part in parts {
             let part_path = self.resolve(&part.storage_path)?;
-            match part.dek.clone() {
+            match part.cipher.clone() {
                 // Plaintext / pre-v21 part: raw read, unchanged.
-                None => {
+                BlobCipher::KnownPlaintext => {
                     let mut f = tokio::fs::File::open(&part_path)
                         .await
                         .map_err(|_| BlobError::NotFound)?;
@@ -648,12 +650,12 @@ impl LocalBlobStore {
                 // wrong/tampered/truncated part fails per-block GCM auth inside `stream_blob` and
                 // surfaces here as `BlobError::Corruption`, which `assemble` turns into a `sink.abort()`
                 // — no orphan, no plaintext, no partial object.
-                Some(dek) => {
+                cipher => {
                     let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<Bytes, BlobError>>(4);
                     let path = part_path.clone();
                     let size = part.size;
                     tokio::task::spawn_blocking(move || {
-                        if let Err(e) = stream_blob(&path, true, Some(dek), 0, size, &tx) {
+                        if let Err(e) = stream_blob(&path, true, cipher, 0, size, &tx) {
                             let _ = tx.blocking_send(Err(e));
                         }
                     });
@@ -740,19 +742,16 @@ impl BlobStore for LocalBlobStore {
         cipher: BlobCipher,
         compression: &CompressionDescriptor,
     ) -> Result<BlobReadHandle, BlobError> {
-        // Translate the named cipher to the internal `Option<[u8; 32]>` once, here, so every use of
-        // `dek` below (the framing decision, the DEK-less refusal guard, the CompressedReader open)
-        // is byte-for-byte what it was: `KnownPlaintext` => `None`, `Dek(k)` => `Some(k)`. The
-        // fail-closed semantics MUST NOT change — a `KnownPlaintext` open of an encrypted container
-        // still hits the refusal guard and errors, never streams ciphertext.
-        let dek = cipher.dek();
+        // The named cipher includes the metadata-backed CRNB format expectation. Keep that typed
+        // declaration intact through both the probe open and the lazy body stream: reducing it to a
+        // bare DEK would let the on-disk version byte choose the legacy parser.
         let file_path = self.resolve(path)?;
         // The blob is a self-describing CRNB block container iff it was compressed OR encrypted at
         // write time (audit #18). Decide that from the caller's stored compression descriptor and
         // the DEK — both authoritative — rather than sniffing the 34-byte trailer magic, which an
         // uncompressed object's own bytes can collide with.
         let is_container =
-            dek.is_some() || !matches!(compression, CompressionDescriptor::Uncompressed);
+            cipher.is_encrypted() || !matches!(compression, CompressionDescriptor::Uncompressed);
         // One open + one fstat handles existence, length, and compression detection together,
         // replacing the prior try_exists + two metadata stats + a separate compression-probe open
         // (Phase 2.5). On the common uncompressed branch the opened fd is handed back to serve the
@@ -764,7 +763,7 @@ impl BlobStore for LocalBlobStore {
         let small_read_max = self.small_read_max;
         let probe_path = file_path.clone();
         let refused = self.encrypted_without_key.clone();
-        let probe_dek = dek.clone();
+        let probe_cipher = cipher.clone();
         let (compressed, logical_len, reuse_file, whole) = tokio::task::spawn_blocking(
             move || -> Result<(bool, u64, Option<std::fs::File>, Option<Bytes>), BlobError> {
                 use std::io::{Read, Seek, SeekFrom};
@@ -828,7 +827,7 @@ impl BlobStore for LocalBlobStore {
                     // Parse the header for the logical length; the fd is consumed by the reader and
                     // not reused (compressed/encrypted blobs never take the kernel fast path).
                     f.seek(SeekFrom::Start(0)).map_err(io_err)?;
-                    let logical = CompressedReader::open_with_dek(f, probe_dek)?.logical_len();
+                    let logical = CompressedReader::open_with_dek(f, probe_cipher)?.logical_len();
                     Ok((true, logical, None, None))
                 } else if file_len <= small_read_max {
                     // Small uncompressed object: read it whole here (one open, one read). The range
@@ -900,7 +899,7 @@ impl BlobStore for LocalBlobStore {
             // Hold a blob-I/O permit for the streamed transfer (ARCH 7.4); released when the read
             // task finishes. (The kernel sendfile fast path below is bounded separately by the server.)
             let permit = self.acquire_io_owned().await?;
-            let body = read_stream(file_path.clone(), compressed, dek, offset, len, permit);
+            let body = read_stream(file_path.clone(), compressed, cipher, offset, len, permit);
             // Uncompressed, plaintext blobs may take the kernel file-to-socket fast path, reusing the
             // fd the probe opened. Encrypted blobs are always block-formatted (so `compressed` is
             // true), so `reuse_file` is `None` for them and the kernel never sees ciphertext.

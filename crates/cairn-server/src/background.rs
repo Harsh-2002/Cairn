@@ -2169,13 +2169,13 @@ async fn scrub_version(
     // Resolve the DEK BEFORE reading a byte: reading an encrypted blob with `None` yields raw
     // ciphertext at exactly the plaintext length, which would hash to a mismatch and be reported as
     // corruption on a perfectly healthy store. Reuses the one shared descriptor module.
-    let dek = match row.sse_descriptor.as_deref() {
-        None => None,
+    let cipher = match row.sse_descriptor.as_deref() {
+        None => cairn_types::blob::BlobCipher::KnownPlaintext,
         Some(json) => {
             let opened = cairn_types::sse::parse_descriptor(json)
-                .and_then(|d| cairn_types::sse::open_dek(crypto, &d));
+                .and_then(|d| cairn_types::sse::open_blob_cipher(crypto, &d));
             match opened {
-                Ok(k) => Some(k),
+                Ok(cipher) => cipher,
                 Err(
                     CryptoError::UnknownKeyId | CryptoError::Key | CryptoError::KeyRotationRequired,
                 ) => {
@@ -2186,15 +2186,7 @@ async fn scrub_version(
         }
     };
 
-    let handle = match blobs
-        .open_raw(
-            path,
-            None,
-            cairn_types::blob::BlobCipher::from_dek(dek),
-            &row.compression,
-        )
-        .await
-    {
+    let handle = match blobs.open_raw(path, None, cipher, &row.compression).await {
         Ok(h) => h,
         // A blob missing from under its row is real damage (`cairn integrity --repair` would drop the
         // dangling row), reported as corruption with its own kind. But a transient FS failure — fd
@@ -2712,6 +2704,7 @@ mod tests {
                 alg: "AES256-GCM".to_owned(),
                 wrapped_dek_b64: base64::engine::general_purpose::STANDARD
                     .encode(&sealed.ciphertext),
+                blob_format_version: Some(cairn_types::sse::AUTHENTICATED_BLOB_FORMAT_VERSION),
                 ..cairn_types::sse::SseDescriptor::default()
             })
             .expect("descriptor serializes")

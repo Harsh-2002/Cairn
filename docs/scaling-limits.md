@@ -98,15 +98,16 @@ zero-downtime upgrades (drain to the peer first). Capacity notes:
   returns. A request/header/body stall is cut off by
   `CAIRN_REPLICATION_DELIVERY_TIMEOUT_SECS` and releases its payload admission before backoff. Watch
   `cairn_replication_unreplicated` so a dashboard never reads "healthy" while objects are owed.
-- **ACLs are replicated** via an admin-gated header; bucket policy / public-access-block / ownership
-  are **not** replicated — set those on each destination.
+- **ACLs are replicated** via a `ReplicateObject`-authorized header; bucket policy /
+  public-access-block / ownership are **not** replicated — set those on each destination.
 
 ## 5. The replica-ACL wire header (size note)
 
-Replicated object ACLs travel as a base64-encoded, admin-gated `x-amz-meta-cairn-replica-acl` header.
-ACLs are tiny in practice; a pathological object with a very large grant list could produce a header
-that an intermediary proxy rejects. If you front replication with a proxy, keep its header-size limit
-generous, or keep ACLs small (prefer bucket policy for broad rules).
+Replicated object ACLs travel as a base64-encoded, `ReplicateObject`-authorized
+`x-amz-meta-cairn-replica-acl` header. ACLs are tiny in practice; a pathological object with a very
+large grant list could produce a header that an intermediary proxy rejects. If you front
+replication with a proxy, keep its header-size limit generous, or keep ACLs small (prefer bucket
+policy for broad rules).
 
 ## 6. WAL growth under long-lived readers
 

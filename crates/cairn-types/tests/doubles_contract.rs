@@ -337,6 +337,39 @@ async fn versioning_keeps_history_and_promotes_latest() {
     // Latest is the third version; deleting it promotes the second.
     let latest = meta.current_version(&bucket, &key).await.unwrap().unwrap();
     assert_eq!(latest.version_id, *versions.last().unwrap());
+    let stale = meta
+        .submit(Mutation::DeleteVersion {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            version_id: versions[2].clone(),
+            expected_updated_at: Some(Timestamp(1)),
+            now: Timestamp::EPOCH,
+            bypass: GovernanceBypass::Denied,
+        })
+        .await
+        .unwrap();
+    assert_eq!(stale, MutationOutcome::DeleteNotApplied);
+    assert_eq!(
+        meta.current_version(&bucket, &key)
+            .await
+            .unwrap()
+            .unwrap()
+            .version_id,
+        versions[2]
+    );
+    let missing = meta
+        .submit(Mutation::DeleteVersion {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            version_id: VersionId::from_string("missing".to_owned()),
+            expected_updated_at: None,
+            now: Timestamp::EPOCH,
+            bypass: GovernanceBypass::Denied,
+        })
+        .await
+        .unwrap();
+    assert_eq!(missing, MutationOutcome::DeleteNotApplied);
+
     let del = meta
         .submit(Mutation::DeleteVersion {
             bucket: bucket.clone(),
@@ -700,7 +733,7 @@ async fn encrypted_blob_read_without_a_dek_fails_closed() {
         .open_raw(
             &staged.storage_path,
             None,
-            BlobCipher::Dek([1u8; 32].into()),
+            BlobCipher::AuthenticatedV3([1u8; 32].into()),
             &staged.compression,
         )
         .await
@@ -715,7 +748,7 @@ async fn encrypted_blob_read_without_a_dek_fails_closed() {
         .open_raw(
             &staged.storage_path,
             None,
-            BlobCipher::Dek(dek.into()),
+            BlobCipher::AuthenticatedV3(dek.into()),
             &staged.compression,
         )
         .await

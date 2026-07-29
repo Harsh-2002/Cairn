@@ -21,7 +21,9 @@ CLI. This is the **only crate that names concrete impls** — everything else is
   uses `VACUUM INTO`, preserves `.staging/multipart`, and publishes a versioned size/SHA-256-bound
   manifest last. Restore rejects snapshot sidecars/symlinks/forward schemas, revalidates its
   target-owned staging inode, and checkpoints/closes/removes+syncs an old generation's exact
-  sidecars before atomic database publication.
+  sidecars before atomic database publication. Blob restore is no-replace: an existing immutable
+  path is accepted only when byte-identical, and new paths publish by hard link with an
+  `AlreadyExists` re-check. A non-zero reconciliation error count makes restore fail.
 - `integrity --repair` uses the ordinary writer deletion gate with a trusted timestamp and denied
   governance bypass. Missing-blob rows that are still retained or legally held remain as explicit
   `protected_unresolved` damage and make the command fail; the repair must never erase WORM

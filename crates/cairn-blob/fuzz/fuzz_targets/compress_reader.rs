@@ -9,13 +9,17 @@
 //! seed the fuzzer mutates from. We open it both without and with a DEK (exercising the encrypted
 //! per-block decrypt path) and drive `read_range` across in-range and just-past-the-end bounds.
 
-use cairn_blob::compress::CompressedReader;
+use cairn_blob::{BlobCipher, compress::CompressedReader};
 use libfuzzer_sys::fuzz_target;
 use std::io::Cursor;
 
 fuzz_target!(|data: &[u8]| {
-    for dek in [None, Some([7u8; 32])] {
-        let Ok(mut reader) = CompressedReader::open_with_dek(Cursor::new(data), dek) else {
+    for cipher in [
+        BlobCipher::KnownPlaintext,
+        BlobCipher::LegacyV2([7u8; 32].into()),
+        BlobCipher::AuthenticatedV3([7u8; 32].into()),
+    ] {
+        let Ok(mut reader) = CompressedReader::open_with_dek(Cursor::new(data), cipher) else {
             continue;
         };
         let ll = reader.logical_len();

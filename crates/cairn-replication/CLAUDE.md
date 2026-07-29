@@ -56,13 +56,14 @@ is cheap to construct and safe to run from many workers at once.
   request forever.
 - **Ordering deferral is not a failure** — `DeferReplication` reschedules without incrementing
   `attempts`.
-- **Ship PLAINTEXT: resolve the version's DEK before reading its body.** `resolve_dek` unseals
-  `row.sse_descriptor` via `cairn_types::sse::open_dek` and `put_object` reads through
-  `open_raw(BlobCipher::from_dek(dek))`. Reading an encrypted version as `BlobCipher::KnownPlaintext`
-  would return the stored **ciphertext at exactly the plaintext length** — the destination cannot
-  tell (it has no Content-MD5 to check, and a multipart source's composite ETag is unverifiable), so
-  the mirror ends up holding intact-looking garbage. The old DEK-less `open` that made this a
-  one-character mistake is deleted (Stage 3); the reader now forces you to name the cipher. Resolve
+- **Ship PLAINTEXT: resolve the version's cipher declaration before reading its body.** `resolve_dek`
+  parses `row.sse_descriptor` via `cairn_types::sse::open_blob_cipher`, producing a DEK plus the
+  metadata-backed CRNB expectation, and `put_object` passes it directly to `open_raw`. Reading an
+  encrypted version as `BlobCipher::KnownPlaintext` would return the stored **ciphertext at exactly
+  the plaintext length** — the destination cannot tell (it has no Content-MD5 to check, and a
+  multipart source's composite ETag is unverifiable), so the mirror ends up holding intact-looking
+  garbage. The reader forces the caller to name plaintext, legacy v2, or authenticated v3, and
+  rejects a file whose version does not match that trusted metadata declaration. Resolve
   per read; never cache a DEK across passes (the re-wrap worker re-seals descriptors underneath us).
 - **A DEK failure is a LOCAL condition and must say so.** DEK resolution happens in `process_entry`
   (not inside `put_object`) precisely so the failure is classified with its cause statically known:

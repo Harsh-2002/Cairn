@@ -2331,7 +2331,8 @@ async fn create_user_with_replication_policy_attaches_it() {
     assert_eq!(resp.status, StatusCode::CREATED);
     let id = json(&resp)["id"].as_str().unwrap().to_owned();
 
-    // The canned replication policy is attached and grants the replication actions on the bucket.
+    // The canned policy grants the two inbound replication actions plus the exact object readback
+    // action used by `replication audit --verify`, all on destination objects.
     let resp = h
         .svc
         .handle(
@@ -2353,14 +2354,17 @@ async fn create_user_with_replication_policy_attaches_it() {
     assert!(actions.contains(&"s3:ReplicateObject"));
     assert!(actions.contains(&"s3:ReplicateDelete"));
     assert!(actions.contains(&"s3:GetObject"));
-    assert!(actions.contains(&"s3:PutObject"));
-    let resources: Vec<&str> = v["policy"]["Statement"][0]["Resource"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|x| x.as_str().unwrap())
-        .collect();
-    assert!(resources.contains(&"arn:aws:s3:::mirror/*"));
+    assert_eq!(
+        actions.len(),
+        3,
+        "a destination credential must not receive ordinary write or bucket-wide authority"
+    );
+    assert!(!actions.contains(&"s3:PutObject"));
+    assert!(!actions.contains(&"s3:DeleteObject"));
+    assert_eq!(
+        v["policy"]["Statement"][0]["Resource"].as_str(),
+        Some("arn:aws:s3:::mirror/*")
+    );
 
     // A bad destination bucket name -> 400 (and no user is half-provisioned).
     let resp = h

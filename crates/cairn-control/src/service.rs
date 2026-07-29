@@ -927,6 +927,7 @@ impl ControlService {
                             let _ = self.blob.delete(&path).await;
                         }
                     }
+                    Ok(MutationOutcome::DeleteNotApplied) => {}
                     Ok(MutationOutcome::DeleteProtected) => protected = true,
                     Ok(_) => {
                         return ControlResponse::error_internal(
@@ -1058,6 +1059,7 @@ impl ControlService {
                         }
                         deleted += 1;
                     }
+                    Ok(MutationOutcome::DeleteNotApplied) => {}
                     Ok(MutationOutcome::DeleteProtected) => {
                         if errors.len() < MAX_DELETE_PREFIX_ERRORS {
                             errors.push(wire::DeletePrefixError {
@@ -3417,9 +3419,11 @@ fn percent_decode(s: &str) -> String {
 }
 
 /// Build the canned **replication** identity-policy JSON for a destination bucket: a Principal-less
-/// per-user policy granting the four actions a dedicated destination credential needs to receive
-/// replicated writes — `s3:ReplicateObject`, `s3:ReplicateDelete`, `s3:GetObject`, `s3:PutObject` —
-/// scoped to `arn:aws:s3:::<bucket>/*` (and the bucket ARN itself, for listing) (ARCH 20.5).
+/// per-user policy granting the two actions a dedicated destination credential needs to receive
+/// replicated writes — `s3:ReplicateObject` and `s3:ReplicateDelete` — plus scoped `s3:GetObject`
+/// for `cairn replication audit --verify` to read back and hash the replica. All three are limited
+/// to `arn:aws:s3:::<bucket>/*` (ARCH 20.5); ordinary PutObject/DeleteObject and bucket-wide
+/// administration remain absent.
 ///
 /// The destination bucket name is validated up front (a `400` on a bad name); the produced JSON is
 /// re-validated through `parse_user_policy` so a future action-spelling drift is caught here rather
@@ -3437,13 +3441,9 @@ fn replication_policy_for_bucket(bucket: &str) -> Result<String, ControlResponse
             "Action": [
                 "s3:ReplicateObject",
                 "s3:ReplicateDelete",
-                "s3:GetObject",
-                "s3:PutObject"
+                "s3:GetObject"
             ],
-            "Resource": [
-                format!("arn:aws:s3:::{b}"),
-                format!("arn:aws:s3:::{b}/*")
-            ]
+            "Resource": format!("arn:aws:s3:::{b}/*")
         }]
     });
     let json = serde_json::to_string(&policy)

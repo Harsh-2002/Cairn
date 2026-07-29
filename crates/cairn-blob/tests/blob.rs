@@ -374,7 +374,10 @@ async fn read_all_dek(
         .open_raw(
             path,
             range,
-            BlobCipher::from_dek(dek.map(Into::into)),
+            match dek {
+                Some(dek) => BlobCipher::AuthenticatedV3(dek.into()),
+                None => BlobCipher::KnownPlaintext,
+            },
             compression,
         )
         .await?;
@@ -456,7 +459,7 @@ async fn encrypted_roundtrip_etag_invariant_and_ranged() {
             .open_raw(
                 &enc.storage_path,
                 None,
-                BlobCipher::Dek(dek.into()),
+                BlobCipher::AuthenticatedV3(dek.into()),
                 &enc.compression
             )
             .await
@@ -530,13 +533,27 @@ async fn encrypted_blob_on_disk_is_encrypted_variant_and_no_zero_copy() {
         "a DEK-less open of an encrypted blob must fail, got {no_dek:?}"
     );
 
-    // (4) An encrypted blob offers no zero-copy hint: ciphertext can never reach the sendfile path.
+    // (4) A legacy metadata declaration cannot downgrade the current v3 container.
+    let wrong_format = store
+        .open_raw(
+            &enc.storage_path,
+            None,
+            BlobCipher::LegacyV2(dek.into()),
+            &enc.compression,
+        )
+        .await;
+    assert!(
+        matches!(wrong_format, Err(BlobError::Corruption(_))),
+        "a current v3 blob must not be accepted through the legacy-v2 declaration"
+    );
+
+    // (5) An encrypted blob offers no zero-copy hint: ciphertext can never reach the sendfile path.
     assert!(
         store
             .open_raw(
                 &enc.storage_path,
                 None,
-                BlobCipher::Dek(dek.into()),
+                BlobCipher::AuthenticatedV3(dek.into()),
                 &enc.compression
             )
             .await
@@ -604,9 +621,9 @@ async fn encrypted_without_compression_and_wrong_dek_fails() {
     );
 }
 
-/// An old-format (unencrypted) blob still reads unchanged through `open_raw` — with both
-/// `KnownPlaintext` and a stray `Dek` refused only where crypto requires — after the format gained
-/// encryption, confirming the version gate keeps backward compatibility.
+/// An old-format (unencrypted) blob still reads unchanged through `open_raw` with
+/// `KnownPlaintext`, while a stray encrypted declaration is refused because metadata and framing
+/// differ, confirming the version gate keeps backward compatibility.
 #[tokio::test]
 async fn old_unencrypted_blob_reads_unchanged() {
     let dir = tempfile::tempdir().unwrap();
@@ -721,13 +738,13 @@ async fn multipart_assembly_roundtrip() {
             part_number: 1,
             storage_path: p1.storage_path.clone(),
             size: p1.size,
-            dek: None,
+            cipher: BlobCipher::KnownPlaintext,
         },
         PartRef {
             part_number: 2,
             storage_path: p2.storage_path.clone(),
             size: p2.size,
-            dek: None,
+            cipher: BlobCipher::KnownPlaintext,
         },
     ];
     let assembled = store
@@ -785,13 +802,13 @@ async fn assemble_enforces_size_ceiling() {
             part_number: 1,
             storage_path: p1.storage_path.clone(),
             size: p1.size,
-            dek: None,
+            cipher: BlobCipher::KnownPlaintext,
         },
         PartRef {
             part_number: 2,
             storage_path: p2.storage_path.clone(),
             size: p2.size,
-            dek: None,
+            cipher: BlobCipher::KnownPlaintext,
         },
     ];
     // The parts total 17 bytes; a 10-byte ceiling must reject the assembly.
@@ -1172,13 +1189,13 @@ async fn assemble_honors_extra_checksums_whole_object() {
             part_number: 1,
             storage_path: p1.storage_path.clone(),
             size: p1.size,
-            dek: None,
+            cipher: BlobCipher::KnownPlaintext,
         },
         PartRef {
             part_number: 2,
             storage_path: p2.storage_path.clone(),
             size: p2.size,
-            dek: None,
+            cipher: BlobCipher::KnownPlaintext,
         },
     ];
     let assemble_opts = StageOptions {
@@ -1373,13 +1390,13 @@ async fn io_uring_compressed_encrypted_and_multipart_roundtrip() {
             part_number: 1,
             storage_path: p1.storage_path.clone(),
             size: p1.size,
-            dek: None,
+            cipher: BlobCipher::KnownPlaintext,
         },
         PartRef {
             part_number: 2,
             storage_path: p2.storage_path.clone(),
             size: p2.size,
-            dek: None,
+            cipher: BlobCipher::KnownPlaintext,
         },
     ];
     let assembled = store
@@ -1535,7 +1552,7 @@ async fn uring_vs_epoll_concurrent_staging() {
 
 // ---------------------------------------------------------------------------------------------
 // Part-level SSE at rest (ARCH 27, Increment 3a). A part staged with a per-part DEK is ciphertext
-// on disk; `assemble` decrypts it on read (via `PartRef.dek`) before hashing + re-encoding. All
+// on disk; `assemble` decrypts it on read (via `PartRef.cipher`) before hashing + re-encoding. All
 // real ciphertext/nonce assertions run here against the on-disk `LocalBlobStore`, never a double.
 // ---------------------------------------------------------------------------------------------
 
@@ -1549,7 +1566,10 @@ fn part_ref(part_number: u16, staged: &StagedPart, dek: Option<[u8; 32]>) -> Par
         part_number,
         storage_path: staged.storage_path.clone(),
         size: staged.size,
-        dek: dek.map(Into::into),
+        cipher: match dek {
+            Some(dek) => BlobCipher::AuthenticatedV3(dek.into()),
+            None => BlobCipher::KnownPlaintext,
+        },
     }
 }
 
@@ -1695,7 +1715,10 @@ async fn staged_part_file_is_ciphertext() {
     );
     // The container refuses to open without a DEK (fails closed).
     let f = std::fs::File::open(dir.path().join(p.storage_path.as_str())).unwrap();
-    assert!(cairn_blob::compress::CompressedReader::open_with_dek(f, None).is_err());
+    assert!(
+        cairn_blob::compress::CompressedReader::open_with_dek(f, BlobCipher::KnownPlaintext)
+            .is_err()
+    );
 }
 
 /// Identical plaintext staged as two parts under two independent random DEKs yields DIFFERENT
@@ -2056,7 +2079,7 @@ async fn encrypted_uncompressed_blob_read_without_a_dek_is_refused() {
         .open_raw(
             &staged.storage_path,
             None,
-            BlobCipher::Dek(dek.into()),
+            BlobCipher::AuthenticatedV3(dek.into()),
             &staged.compression,
         )
         .await

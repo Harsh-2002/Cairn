@@ -38,6 +38,12 @@ fn member(user: &str) -> Principal {
     }
 }
 
+fn member_with_policy(user: &str, policy: &str) -> Principal {
+    let mut principal = member(user);
+    principal.user_policy = Some(Box::new(cairn_authz::parse_user_policy(policy).unwrap()));
+    principal
+}
+
 struct Harness {
     svc: S3Service,
     meta: Arc<dyn MetadataStore>,
@@ -8522,7 +8528,7 @@ async fn system_headers_round_trip_and_response_overrides() {
 
 #[tokio::test]
 async fn inbound_replica_marks_status_and_skips_outbox() {
-    let h = harness().await;
+    let h = harness_with_authz(Arc::new(cairn_authz::PolicyEngine)).await;
     versioned_bucket(&h, "repl").await;
     set_replication(&h, "repl", "", false).await;
 
@@ -8580,9 +8586,13 @@ async fn inbound_replica_marks_status_and_skips_outbox() {
         Some(cairn_types::meta::ReplicationStatus::Replica)
     );
 
-    // Audit #16: a non-admin (member) cannot forge the replica marker. The same header from a
-    // member is ignored, so the write replicates normally and is NOT recorded as a Replica —
-    // closing a replication-evasion / loop-prevention bypass.
+    // Audit #16: an ordinary writer cannot forge the replica marker. A marker-bearing body PUT is
+    // classified as ReplicateObject, so a PutObject-only identity is denied rather than getting to
+    // suppress its own outbox entry.
+    let writer = member_with_policy(
+        "writer",
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:PutObject","Resource":"arn:aws:s3:::repl/*"}]}"#,
+    );
     let (st, _, _) = drain(
         send(
             &h.svc,
@@ -8593,30 +8603,308 @@ async fn inbound_replica_marks_status_and_skips_outbox() {
                 &[],
                 &[("x-amz-meta-cairn-replica", "true")],
                 b"z".to_vec(),
-                member("intruder"),
+                writer,
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let due = h.meta.list_due_replication(100, now).await.unwrap();
+    assert_eq!(
+        due.len(),
+        1,
+        "a forged marker must neither write an object nor alter the outbox"
+    );
+    let key_c = ObjectKey::parse("c").unwrap();
+    assert!(
+        h.meta
+            .current_version(&BucketName::parse("repl").unwrap(), &key_c)
+            .await
+            .unwrap()
+            .is_none(),
+        "the forged replica PUT must not commit"
+    );
+
+    // A least-privilege Member credential carrying only ReplicateObject is the supported
+    // destination identity. Its marker-bearing write is accepted and classified as a Replica.
+    let replicator = member_with_policy(
+        "replicator",
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:ReplicateObject","Resource":"arn:aws:s3:::repl/*"}]}"#,
+    );
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req_with_principal(
+                Method::PUT,
+                Some("repl"),
+                Some("d"),
+                &[],
+                &[("x-amz-meta-cairn-replica", "true")],
+                b"replica".to_vec(),
+                replicator.clone(),
             ),
         )
         .await,
     )
     .await;
     assert_eq!(st, StatusCode::OK);
-    let due = h.meta.list_due_replication(100, now).await.unwrap();
     assert_eq!(
-        due.len(),
-        2,
-        "a member's replica header is ignored, so the write enqueues replication"
+        h.meta.list_due_replication(100, now).await.unwrap().len(),
+        1,
+        "an authorized inbound replica must not enqueue another delivery"
     );
-    let key_c = ObjectKey::parse("c").unwrap();
-    let row_c = h
+    let row_d = h
         .meta
-        .current_version(&BucketName::parse("repl").unwrap(), &key_c)
+        .current_version(
+            &BucketName::parse("repl").unwrap(),
+            &ObjectKey::parse("d").unwrap(),
+        )
         .await
         .unwrap()
         .unwrap();
-    assert_ne!(
-        row_c.replication_status,
+    assert_eq!(
+        row_d.replication_status,
         Some(cairn_types::meta::ReplicationStatus::Replica),
-        "a member must not be able to self-classify a write as a Replica"
+        "the ReplicateObject-authorized write is a genuine inbound replica"
+    );
+
+    // The same dedicated credential cannot turn its replication action into an ordinary client
+    // PUT by omitting the marker.
+    let (st, _, _) = drain(
+        send(
+            &h.svc,
+            req_with_principal(
+                Method::PUT,
+                Some("repl"),
+                Some("e"),
+                &[],
+                &[],
+                b"ordinary".to_vec(),
+                replicator,
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn inbound_replica_delete_requires_replication_action() {
+    let h = harness_with_authz(Arc::new(cairn_authz::PolicyEngine)).await;
+    versioned_bucket(&h, "repldel").await;
+    set_replication(&h, "repldel", "", true).await;
+
+    // Two ordinary source writes establish live keys and two owed outbox deliveries.
+    for key in ["forged", "replica"] {
+        let (status, _, _) = drain(
+            send(
+                &h.svc,
+                req(
+                    Method::PUT,
+                    Some("repldel"),
+                    Some(key),
+                    &[],
+                    &[],
+                    b"value".to_vec(),
+                ),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    let now = cairn_types::Timestamp::from_secs(4_000_000_000);
+    assert_eq!(
+        h.meta.list_due_replication(100, now).await.unwrap().len(),
+        2
+    );
+
+    // DeleteObject permission cannot be upgraded to ReplicateDelete by forging the marker.
+    let writer = member_with_policy(
+        "deleter",
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:DeleteObject","Resource":"arn:aws:s3:::repldel/*"}]}"#,
+    );
+    let (status, _, _) = drain(
+        send(
+            &h.svc,
+            req_with_principal(
+                Method::DELETE,
+                Some("repldel"),
+                Some("forged"),
+                &[],
+                &[("x-amz-meta-cairn-replica", "true")],
+                vec![],
+                writer,
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let bucket = BucketName::parse("repldel").unwrap();
+    assert!(
+        !h.meta
+            .current_version(&bucket, &ObjectKey::parse("forged").unwrap())
+            .await
+            .unwrap()
+            .unwrap()
+            .is_delete_marker
+    );
+
+    // A dedicated Member carrying only ReplicateDelete can propagate the marker and preserve its
+    // source version id without creating another outbox entry.
+    let replicator = member_with_policy(
+        "delete-replicator",
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:ReplicateDelete","Resource":"arn:aws:s3:::repldel/*"}]}"#,
+    );
+    let marker_id = "00000000000000000000000000000def";
+    let (status, _, _) = drain(
+        send(
+            &h.svc,
+            req_with_principal(
+                Method::DELETE,
+                Some("repldel"),
+                Some("replica"),
+                &[],
+                &[
+                    ("x-amz-meta-cairn-replica", "true"),
+                    ("x-amz-meta-cairn-replica-version-id", marker_id),
+                ],
+                vec![],
+                replicator.clone(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        h.meta.list_due_replication(100, now).await.unwrap().len(),
+        2
+    );
+    let marker = h
+        .meta
+        .get_version(
+            &bucket,
+            &ObjectKey::parse("replica").unwrap(),
+            &VersionId::from_string(marker_id.to_owned()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(marker.is_delete_marker);
+    assert_eq!(marker.version_id.as_str(), marker_id);
+    assert_eq!(
+        marker.replication_status,
+        Some(cairn_types::meta::ReplicationStatus::Replica)
+    );
+
+    // Without the wire marker the same credential has no ordinary DeleteObject authority.
+    let (status, _, _) = drain(
+        send(
+            &h.svc,
+            req_with_principal(
+                Method::DELETE,
+                Some("repldel"),
+                Some("forged"),
+                &[],
+                &[],
+                vec![],
+                replicator,
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+/// DeleteObjects is not a replication transport. A replica marker on the bulk request must never
+/// suppress ordinary delete-marker fan-out, even for an administrator; otherwise dispatch would
+/// bypass the per-key DeleteObject authorization and an explicit ReplicateDelete deny.
+#[tokio::test]
+async fn bulk_delete_replica_marker_cannot_bypass_replication_action_policy() {
+    let h = harness_with_authz(Arc::new(cairn_authz::PolicyEngine)).await;
+    versioned_bucket(&h, "replbulk").await;
+    set_replication(&h, "replbulk", "", true).await;
+
+    for key in ["single", "bulk"] {
+        let (status, _, _) = drain(
+            send(
+                &h.svc,
+                req(
+                    Method::PUT,
+                    Some("replbulk"),
+                    Some(key),
+                    &[],
+                    &[],
+                    b"value".to_vec(),
+                ),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    let now = cairn_types::Timestamp::from_secs(4_000_000_000);
+    assert_eq!(
+        h.meta.list_due_replication(100, now).await.unwrap().len(),
+        2
+    );
+
+    let mut denied_admin = admin();
+    denied_admin.user_policy = Some(Box::new(
+        cairn_authz::parse_user_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"s3:ReplicateDelete","Resource":"arn:aws:s3:::replbulk/*"}]}"#,
+        )
+        .unwrap(),
+    ));
+
+    // The single-object replication transport correctly selects ReplicateDelete, so the explicit
+    // deny binds even this administrator.
+    let (status, _, _) = drain(
+        send(
+            &h.svc,
+            req_with_principal(
+                Method::DELETE,
+                Some("replbulk"),
+                Some("single"),
+                &[],
+                &[("x-amz-meta-cairn-replica", "true")],
+                vec![],
+                denied_admin.clone(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // The bulk API authorizes as ordinary DeleteObject. Its replica-looking header is ignored and
+    // the resulting local delete marker is enqueued for the configured destination.
+    let (status, _, body) = drain(
+        send(
+            &h.svc,
+            req_with_principal(
+                Method::POST,
+                Some("replbulk"),
+                None,
+                &[("delete", "")],
+                &[("x-amz-meta-cairn-replica", "true")],
+                b"<Delete><Object><Key>bulk</Key></Object></Delete>".to_vec(),
+                denied_admin,
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        h.meta.list_due_replication(100, now).await.unwrap().len(),
+        3,
+        "the ordinary bulk delete marker must enqueue instead of inheriting replica state"
     );
 }
 
@@ -8922,17 +9210,17 @@ async fn oversize_content_length_is_refused_before_staging() {
     );
 }
 
-/// ACL replication, inbound side (ARCH 20.4): an admin-gated replica PUT applies the SOURCE ACL
-/// carried as a base64(JSON) `x-amz-meta-cairn-replica-acl` header; a malformed header fails OPEN
-/// (no ACL, no 4xx — a 4xx would be terminal at the source and stall that key's outbox); a non-admin
-/// cannot apply one (the replica marker is ignored); and `BucketOwnerEnforced` drops it entirely,
-/// exactly as it drops a client `x-amz-acl`.
+/// ACL replication, inbound side (ARCH 20.4): a ReplicateObject-authorized PUT applies the SOURCE
+/// ACL carried as a base64(JSON) `x-amz-meta-cairn-replica-acl` header; a malformed header fails
+/// OPEN (no ACL, no 4xx — a 4xx would be terminal at the source and stall that key's outbox); an
+/// ordinary writer cannot apply one; and `BucketOwnerEnforced` drops it entirely, exactly as it
+/// drops a client `x-amz-acl`.
 #[tokio::test]
 async fn inbound_replica_applies_acl_fail_open_and_respects_ownership() {
     use base64::Engine as _;
     use cairn_types::authz::{Acl, Grant, Grantee, Permission};
 
-    let h = harness().await;
+    let h = harness_with_authz(Arc::new(cairn_authz::PolicyEngine)).await;
     acl_enabled_bucket(&h, "racl").await;
 
     let acl = Acl {
@@ -9013,8 +9301,8 @@ async fn inbound_replica_applies_acl_fail_open_and_respects_ownership() {
         "a malformed replica ACL header stores no ACL (fail-open)"
     );
 
-    // (3) A non-admin cannot apply a replica ACL: the marker is ignored, and with no x-amz-acl the
-    //     object gets no ACL.
+    // (3) An ordinary PutObject-only member cannot apply a replica ACL: the marker selects the
+    //     distinct ReplicateObject action, so authorization rejects the whole write.
     let (st, _, _) = drain(
         send(
             &h.svc,
@@ -9028,22 +9316,23 @@ async fn inbound_replica_applies_acl_fail_open_and_respects_ownership() {
                     ("x-amz-meta-cairn-replica-acl", acl_b64.as_str()),
                 ],
                 b"x".to_vec(),
-                member("intruder"),
+                member_with_policy(
+                    "intruder",
+                    r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:PutObject","Resource":"arn:aws:s3:::racl/*"}]}"#,
+                ),
             ),
         )
         .await,
     )
     .await;
-    assert_eq!(st, StatusCode::OK);
-    let mem_row = h
-        .meta
-        .current_version(&racl, &ObjectKey::parse("mem").unwrap())
-        .await
-        .unwrap()
-        .unwrap();
+    assert_eq!(st, StatusCode::FORBIDDEN);
     assert!(
-        mem_row.acl.is_none(),
-        "a member's replica ACL header is ignored"
+        h.meta
+            .current_version(&racl, &ObjectKey::parse("mem").unwrap())
+            .await
+            .unwrap()
+            .is_none(),
+        "an unauthorized replica ACL write must not commit"
     );
 
     // (4) Under BucketOwnerEnforced (the default ownership) a replica ACL is dropped, just like a
@@ -9085,7 +9374,7 @@ async fn inbound_replica_applies_acl_fail_open_and_respects_ownership() {
 
 #[tokio::test]
 async fn inbound_replica_preserves_version_id_idempotently() {
-    let h = harness().await;
+    let h = harness_with_authz(Arc::new(cairn_authz::PolicyEngine)).await;
     versioned_bucket(&h, "rvp").await;
     let bkt = BucketName::parse("rvp").unwrap();
     let key = ObjectKey::parse("k").unwrap();
@@ -9145,8 +9434,8 @@ async fn inbound_replica_preserves_version_id_idempotently() {
         "re-delivery did not create a duplicate version"
     );
 
-    // A NON-admin member cannot pin a version id (audit #16): the header is ignored and a fresh id
-    // is minted, so the write is a normal (non-replica) version, not the pinned one.
+    // A PutObject-only member cannot pin a version id (audit #16): the marker selects
+    // ReplicateObject, which its ordinary write grant does not authorize.
     let (st, _, _) = drain(
         send(
             &h.svc,
@@ -9160,27 +9449,23 @@ async fn inbound_replica_preserves_version_id_idempotently() {
                     ("x-amz-meta-cairn-replica-version-id", pinned),
                 ],
                 b"forged".to_vec(),
-                member("intruder"),
+                member_with_policy(
+                    "intruder",
+                    r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:PutObject","Resource":"arn:aws:s3:::rvp/*"}]}"#,
+                ),
             ),
         )
         .await,
     )
     .await;
-    assert_eq!(st, StatusCode::OK);
-    let cur2 = h
-        .meta
-        .current_version(&bkt, &ObjectKey::parse("k2").unwrap())
-        .await
-        .unwrap()
-        .unwrap();
-    assert_ne!(
-        cur2.version_id.as_str(),
-        pinned,
-        "a member must not be able to pin an arbitrary version id"
-    );
-    assert_ne!(
-        cur2.replication_status,
-        Some(cairn_types::meta::ReplicationStatus::Replica)
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    assert!(
+        h.meta
+            .current_version(&bkt, &ObjectKey::parse("k2").unwrap())
+            .await
+            .unwrap()
+            .is_none(),
+        "the forged version-id write must not commit"
     );
 }
 
@@ -13381,6 +13666,11 @@ async fn at_rest_transparent_encryption_stores_encrypted_but_does_not_advertise(
         .await
         .expect("at-rest object stores an sse_descriptor");
     assert_eq!(descriptor_mode(&desc).as_deref(), Some("at-rest"));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&desc).unwrap()["blob_format_version"],
+        cairn_types::sse::AUTHENTICATED_BLOB_FORMAT_VERSION,
+        "new encrypted object metadata must pin the authenticated CRNB reader"
+    );
 
     // GET round-trips the exact bytes and advertises nothing.
     let (st, hdrs, got) = drain(
@@ -14193,6 +14483,10 @@ async fn reupload_part_mints_distinct_dek() {
         .part_dek
         .clone()
         .expect("part 1 has a sealed DEK");
+    assert!(
+        first.starts_with(cairn_types::sse::AUTHENTICATED_PART_DEK_PREFIX),
+        "new multipart parts must pin authenticated CRNB v3 outside the blob"
+    );
 
     upload_part(
         &h.svc,
@@ -14207,6 +14501,10 @@ async fn reupload_part_mints_distinct_dek() {
         .part_dek
         .clone()
         .expect("re-uploaded part 1 has a sealed DEK");
+    assert!(
+        second.starts_with(cairn_types::sse::AUTHENTICATED_PART_DEK_PREFIX),
+        "re-uploaded multipart parts must retain the v3 format marker"
+    );
 
     assert_ne!(first, second, "re-upload must mint a fresh per-part DEK");
 }

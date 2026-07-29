@@ -969,6 +969,7 @@ jobs:
       - sts
       - sts-xml
       - console-session
+      - error-pages
       - backup-restore
       - rotation
       - share

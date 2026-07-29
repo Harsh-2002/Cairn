@@ -13,15 +13,15 @@ freezing this crate freezes the seams. `#![forbid(unsafe_code)]`.
   Read the trait doc before changing a method.
   - **`BlobStore` read seam (footgun removed).** There is ONE reader,
     `open_raw(path, range, cipher: BlobCipher, compression)`, plus a DEK-free presence probe
-    `probe(path) -> BlobProbe`. `BlobCipher` (`blob.rs`, `KnownPlaintext | Dek([u8;32])`,
-    `from_dek(Option<[u8;32]>)` bridges the callers holding an `Option`) makes the caller NAME the
-    cipher — the old default `open` forwarded a `dek: None`, so any caller that forgot the key
-    streamed an encrypted container's ciphertext at the plaintext length (how replication + the
-    scrub shipped ciphertext). `KnownPlaintext` is fail-closed on an encrypted blob exactly as
-    `None` was. `BlobCipher`'s `Debug` is hand-written to redact the key (`Dek(<redacted>)`).
-    **Known asymmetry (deferred, not an oversight):** the *write* seam (`stage`/`stage_part`/
-    `assemble`, `PartRef.dek`) still takes a bare `Option<[u8;32]>`; Stage 3 closed only the read
-    seam, where the leak lived. Giving the write path the same by-name cipher is a later change.
+    `probe(path) -> BlobProbe`. `BlobCipher` (`blob.rs`, `KnownPlaintext | LegacyV2(DEK) |
+    AuthenticatedV3(DEK)`) makes the caller NAME both the cipher and the metadata-backed CRNB
+    version. The old default `open` let a caller forget the key and stream ciphertext; the later
+    DEK-only seam let a mutable on-disk version byte select the legacy parser. Neither choice is
+    representable now: plaintext, legacy v2, and authenticated v3 are distinct declarations, and
+    the file must match exactly. `BlobCipher`'s `Debug` is hand-written to redact every key.
+    The *write* seam (`stage`/`stage_part`/`assemble`) still takes an optional DEK because every
+    encrypted write emits current v3; `PartRef.cipher` carries the persisted version declaration
+    when assembly reads an already-staged part.
 - `error.rs` — the typed error tree: per-subsystem errors (`BlobError`, `MetaError`, `AuthError`,
   `CryptoError`, `ReplicationError`, `BodyError`, `ConfigError`) **fold into the canonical `Error`**
   via the `From` impls at the bottom. `Error` is the wire-mappable enum the single translator maps
@@ -41,15 +41,17 @@ freezing this crate freezes the seams. `#![forbid(unsafe_code)]`.
 - `id.rs` — validated newtypes: `BucketName`, `ObjectKey`, `StoragePath`, `VersionId`, `UploadId`,
   `UserId`, `InvalidName`. Validation is S3 wire-correctness, **not** path safety — keys never become
   filesystem paths (that lives in `cairn-blob`).
-- `sse.rs` — the persisted `sse_descriptor` (`SseDescriptor`/`SseMode`) and `open_dek`: the ONE
-  definition of the DEK envelope layout, shared by `cairn-protocol`, `cairn-server`'s re-wrap worker
-  and `cairn-replication`. It was hand-copied in three places, and the crate that lacked a copy
-  shipped ciphertext. `SseDescriptor.extra` (`#[serde(flatten)]`) is load-bearing: it is what stops
-  a read-modify-write on an older node from erasing a field a newer node wrote.
+- `sse.rs` — the persisted `sse_descriptor` (`SseDescriptor`/`SseMode`) and the shared DEK/cipher
+  helpers: the ONE definition of the envelope layout and metadata-backed CRNB version selection,
+  shared by `cairn-protocol`, `cairn-server`'s re-wrap worker, and `cairn-replication`. An absent
+  object format marker or unprefixed multipart `part_dek` is the explicit legacy-v2 signal; current
+  writes stamp v3, and unknown explicit versions fail closed. `SseDescriptor.extra`
+  (`#[serde(flatten)]`) is load-bearing: it stops an older node's read-modify-write from erasing a
+  field a newer node wrote.
 - `auth.rs` / `authz.rs` / `object.rs` / `bucket.rs` / `blob.rs` / `crypto.rs` / `notification.rs` /
   `replication.rs` / `time.rs` — the per-domain DTOs; `lib.rs` re-exports the most-used items.
-  SSE additions live here too: `blob.rs` `PartRef.dek` (the staged part's DEK), `authz.rs` the
-  `Get`/`PutBucketEncryption` `Action`s.
+  SSE additions live here too: `blob.rs` `PartRef.cipher` (the staged part's DEK plus expected CRNB
+  version), `authz.rs` the `Get`/`PutBucketEncryption` `Action`s.
 - `testing/` — **canonical in-memory doubles** behind `feature = "testing"`: `InMemoryMetadataStore`,
   `InMemoryBlobStore`, `StubCrypto`, `TestClock`, `FakeReplicationSink`, `FixedAuthenticator`,
   `AllowAll`/`DenyAll`. Every other crate enables this as a dev-dependency to unit-test without
@@ -64,6 +66,9 @@ freezing this crate freezes the seams. `#![forbid(unsafe_code)]`.
   Abort removes only `active`, a failed completer conditionally releases `completing -> active`,
   and the final completion accepts only `completing`. The in-memory double must preserve those
   won/lost outcomes exactly; never turn Abort back into an unconditional acknowledgement.
+- Permanent deletion is typed too: `Deleted` means the writer removed a row, while
+  `DeleteNotApplied` means the row was already absent or its `expected_updated_at` guard lost a
+  race. Protocol DELETE treats both as idempotent success; maintenance must count only `Deleted`.
 - Object Lock policy is writer-owned too. Every double/backend must strictly read persisted
   bucket/version lock state inside the mutation, reject protected replacement or retention
   weakening, replace initial tags and lock state atomically with the object and outbox, and preserve

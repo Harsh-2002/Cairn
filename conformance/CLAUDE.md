@@ -72,8 +72,11 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   `<img>`/`fetch()` subresources, `text/htmlx`, a bare java `Accept` and HEAD all stay machine-shaped.
 - `console_session.sh` — console httpOnly session-cookie and origin-bound transfer regression (pure
   curl): `cairn_session` authenticates only `/api/v1` on the control listener; both route matrices
-  reject cross-plane fall-through; a browser-shaped CORS preflight + PUT/GET uses exact data-origin
-  URLs backed by scoped temporary sessions; logout clears the cookie. **Web console listener ON.**
+  reject cross-plane fall-through; unsafe cookie mutations require the exact control `Origin` while
+  explicit Bearer clients remain origin-independent; a browser-shaped CORS preflight + PUT/GET uses
+  exact data-origin URLs backed by scoped temporary sessions; object/share responses reject worker
+  script fetches and narrow `Service-Worker-Allowed`; logout clears the cookie. **Web console
+  listener ON.**
 - `backup_restore.sh` — backup/restore/integrity (pure curl, Bearer): `cairn backup`, corrupt then
   `cairn restore` into a FRESH dir → byte-identical, `cairn integrity --repair` drops exactly the
   dangling row. Asserts the manifest-last `manifest.json` + fixed `metadata.sqlite3` snapshot
@@ -197,8 +200,9 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   boundary**, the gap `soak.sh` leaves (plaintext only, one fixed 64 KiB body, source RSS the only
   signal) and `mesh.sh` leaves (distinct keys, but a handful of objects per scenario, not a load).
   TWO nodes, **different master keys** (derived per node from a label, the `mesh.py` technique), wired
-  through the operator-trusted **`CAIRN_REPLICATION_ENDPOINT` config path** — SSRF-guard-exempt, so
-  unlike `mesh` this needs **no** `CAIRN_ALLOW_INTERNAL_ENDPOINTS`; the source's web console listener is on
+  through the **`CAIRN_REPLICATION_ENDPOINT` config path**. Environment and management replication
+  endpoints share the SSRF guard, so this loopback topology explicitly sets
+  `CAIRN_ALLOW_INTERNAL_ENDPOINTS=true`; the source's web console listener is on
   only so the driver can read `GET /api/v1/replication/summary` (exact outbox counts + true lag). The
   target runs `CAIRN_ENCRYPT_AT_REST=true`, so it re-seals every replica under **its own** key. A
   fixed-size worker pool holds a **CONSTANT** source workload — single-part PUTs, version churn,

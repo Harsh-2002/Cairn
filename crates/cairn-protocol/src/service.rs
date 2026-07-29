@@ -18,7 +18,6 @@ use cairn_types::blob::{ByteRange, PartRef, StageOptions};
 use cairn_types::bucket::{
     Bucket, ConfigAspect, ConfigDoc, ObjectLockConfiguration, VersioningState,
 };
-use cairn_types::crypto::Nonce;
 use cairn_types::error::Error;
 use cairn_types::id::{BucketName, ObjectKey, UploadId, VersionId};
 use cairn_types::meta::{
@@ -398,6 +397,10 @@ impl S3Service {
     async fn object_op(&self, req: S3Request, body: cairn_types::BodyStream) -> Result<S3Response> {
         // Authorize centrally against the object resource.
         let action = object_action(&req)?;
+        // Replica classification is the authorization decision, not a second role check in the
+        // handler. A dedicated Member credential may hold only ReplicateObject/ReplicateDelete;
+        // conversely an ordinary PutObject/DeleteObject grant must not make a forged marker work.
+        let is_replica = matches!(action, Action::ReplicateObject | Action::ReplicateDelete);
         let bucket = self.fetch_bucket(&req).await?;
         let key = req.key.clone().ok_or(Error::NoSuchKey)?;
         // When the request names a `?versionId`, gate version-scoped policy conditions
@@ -459,9 +462,9 @@ impl S3Service {
             // not serve — must never fall through to a data-plane handler (a `PUT object?acl` or
             // `PUT object?attributes` must not overwrite the object body). Answer NotImplemented.
             _ if unhandled_object_subresource(&req) => Err(Error::NotImplemented),
-            Method::PUT => self.put_object(req, body).await,
+            Method::PUT => self.put_object(req, body, is_replica).await,
             Method::GET => self.get_object(&req).await,
-            Method::DELETE => self.delete_object(&req).await,
+            Method::DELETE => self.delete_object(&req, is_replica).await,
             _ => Err(Error::NotImplemented),
         }
     }
@@ -648,6 +651,7 @@ impl S3Service {
         &self,
         req: S3Request,
         raw_body: cairn_types::BodyStream,
+        is_replica: bool,
     ) -> Result<S3Response> {
         let bucket = self.fetch_bucket(&req).await?;
         let key = req.key.clone().expect("key present");
@@ -714,20 +718,12 @@ impl S3Service {
 
         // An inbound replica is a PUT carrying `x-amz-meta-cairn-replica: true` (ARCH 20.4): mark
         // the version a `Replica` so it is never re-replicated, and skip the outbox entirely (loop
-        // prevention). The marker is matched case-insensitively on the value. Only a privileged
-        // replication principal may classify a write as an inbound replica (audit #16): honoring the
-        // bare client header would let any writer mark their write a `Replica` to suppress its own
-        // replication or otherwise downgrade how it is handled. Replication ships under the
-        // destination's Administrator-role credential, so gate the marker on that role; a normal
-        // member's header is ignored and the write replicates normally. Computed up here because the
-        // mandatory-encryption decision below treats a replica differently from a client write.
-        let is_replica = req
-            .header("x-amz-meta-cairn-replica")
-            .is_some_and(|v| v.eq_ignore_ascii_case("true"))
-            && req
-                .principal
-                .as_ref()
-                .is_some_and(|p| p.role == Role::Administrator);
+        // prevention). Only a principal authorized for ReplicateObject may reach this handler with
+        // `is_replica=true` (audit #16): the central classifier maps an exact marker-bearing body
+        // PUT to that distinct action before authorization. An ordinary PutObject grant therefore
+        // cannot suppress replication, while a least-privilege Member replication credential works.
+        // This is resolved before the SSE decision because mandatory encryption treats replicas
+        // differently from client writes.
 
         // SSE-S3 (ARCH 27): when the client requests AES256 server-side encryption, mint a fresh
         // random DEK, hand it to the blob store (which compress-then-encrypts each block), and seal
@@ -832,14 +828,9 @@ impl S3Service {
         let versioned = bucket.versioning == VersioningState::Enabled;
         // An inbound replica is a PUT carrying `x-amz-meta-cairn-replica: true` (ARCH 20.4): mark
         // the version a `Replica` so it is never re-replicated, and skip the outbox entirely (loop
-        // prevention). The marker is matched case-insensitively on the value.
-        // Only a privileged replication principal may classify a write as an inbound replica
-        // (audit #16). Honoring the bare client header would let any writer mark their write a
-        // `Replica` to suppress its own replication (skip the outbox) or otherwise downgrade how
-        // it is handled. Replication ships under the destination's Administrator-role credential,
-        // so gate the marker on that role; a normal member's header is ignored and the write
-        // `is_replica` was resolved before the SSE decision above (mandatory encryption treats a
-        // replica differently); reuse it here for the replication status + version-id handling.
+        // prevention). `is_replica` was resolved by the authorize-vs-dispatch classifier before the
+        // SSE decision above; reuse that ReplicateObject-authorized capability for status and
+        // version-id handling.
         let replication_status =
             is_replica.then_some(cairn_types::meta::ReplicationStatus::Replica);
         // Resolve the object ACL. A normal client PUT honors a canned `x-amz-acl`; an inbound replica
@@ -859,7 +850,8 @@ impl S3Service {
         // Preserve the SOURCE version id for an inbound replica (AWS S3 CRR semantics, ARCH 20.4):
         // a version then has the same identity on every node, and re-delivery is an idempotent
         // upsert on (bucket, key, version_id) rather than a duplicate version. Gated on the same
-        // admin-only replica classification, so a normal client can never pin an arbitrary id.
+        // ReplicateObject-authorized classification, so a normal client can never pin an arbitrary
+        // id.
         let version_id = if !versioned {
             VersionId::null()
         } else {
@@ -995,20 +987,15 @@ impl S3Service {
         }
         let range = parse_range(req.header("range"), row.size_logical)?;
         let storage = row.storage_path.clone().ok_or(Error::NoSuchKey)?;
-        // SSE-S3 (ARCH 27): if the version is encrypted, unwrap its DEK under the master key and
-        // decrypt transparently while reading. An unencrypted version passes `None`.
-        let dek = match row.sse_descriptor.as_deref() {
-            Some(d) => Some(self.open_sse_dek(d)?),
-            None => None,
+        // SSE-S3 (ARCH 27): resolve both the DEK and the persisted CRNB format expectation before
+        // reading. An unencrypted version is explicitly known plaintext.
+        let cipher = match row.sse_descriptor.as_deref() {
+            Some(d) => self.open_sse_cipher(d)?,
+            None => cairn_types::blob::BlobCipher::KnownPlaintext,
         };
         let handle = self
             .blob
-            .open_raw(
-                &storage,
-                range,
-                cairn_types::blob::BlobCipher::from_dek(dek),
-                &row.compression,
-            )
+            .open_raw(&storage, range, cipher, &row.compression)
             .await?;
         let status = if handle.content_range.is_some() {
             StatusCode::PARTIAL_CONTENT
@@ -1094,7 +1081,7 @@ impl S3Service {
         Ok(resp)
     }
 
-    async fn delete_object(&self, req: &S3Request) -> Result<S3Response> {
+    async fn delete_object(&self, req: &S3Request, is_replica: bool) -> Result<S3Response> {
         let bucket = self.fetch_bucket(req).await?;
         let key = req.key.clone().expect("key present");
         // A copy kept for event-notification emission, since `key` is moved into the mutation below.
@@ -1103,19 +1090,8 @@ impl S3Service {
         // An inbound replicated delete-marker propagation carries the loop-prevention marker; the
         // marker it creates must NOT itself be re-enqueued for replication (ARCH 20.4), which
         // matters for two-way replication where the destination bucket also has a rule.
-        // Only a privileged replication principal may classify a write as an inbound replica
-        // (audit #16). Honoring the bare client header would let any writer mark their write a
-        // `Replica` to suppress its own replication (skip the outbox) or otherwise downgrade how
-        // it is handled. Replication ships under the destination's Administrator-role credential,
-        // so gate the marker on that role; a normal member's header is ignored and the write
-        // replicates normally.
-        let is_replica = req
-            .header("x-amz-meta-cairn-replica")
-            .is_some_and(|v| v.eq_ignore_ascii_case("true"))
-            && req
-                .principal
-                .as_ref()
-                .is_some_and(|p| p.role == Role::Administrator);
+        // Only a principal centrally authorized for ReplicateDelete reaches this handler with
+        // `is_replica=true`; an ordinary DeleteObject grant cannot forge loop-prevention state.
 
         // A versioned DELETE (?versionId) permanently removes that version (no delete marker). A
         // plain DELETE in an Enabled bucket inserts a new identified delete marker; in a Suspended
@@ -1155,7 +1131,8 @@ impl S3Service {
                 }) => {
                     let _ = self.blob.delete(&path).await;
                 }
-                Ok(MutationOutcome::Deleted { freed: None, .. }) => {}
+                Ok(MutationOutcome::Deleted { freed: None, .. })
+                | Ok(MutationOutcome::DeleteNotApplied) => {}
                 Ok(MutationOutcome::DeleteProtected) => return Err(Error::AccessDenied),
                 Ok(_) => {
                     return Err(Error::Internal(
@@ -1346,7 +1323,8 @@ impl S3Service {
                     }) => {
                         let _ = self.blob.delete(&path).await;
                     }
-                    Ok(MutationOutcome::Deleted { freed: None, .. }) => {}
+                    Ok(MutationOutcome::Deleted { freed: None, .. })
+                    | Ok(MutationOutcome::DeleteNotApplied) => {}
                     Ok(MutationOutcome::DeleteProtected) => return Err(Error::AccessDenied),
                     Ok(_) => {
                         return Err(Error::Internal(
@@ -1630,7 +1608,7 @@ impl S3Service {
                 let mut dek = [0u8; 32];
                 rand::thread_rng().fill_bytes(&mut dek);
                 let dek = SecretKey32::new(dek);
-                let sealed = self.seal_part_dek(dek.expose_secret())?;
+                let sealed = self.seal_part_cipher(&dek)?;
                 (Some(dek), Some(sealed))
             } else {
                 (None, None)
@@ -1845,18 +1823,13 @@ impl S3Service {
         // Open the source range and feed its logical bytes into the part stager, re-tagging blob
         // read errors as body errors so the source can drive `stage_part`. An SSE-encrypted source
         // is decrypted transparently via its unwrapped DEK (ARCH 27).
-        let src_dek = match src_row.sse_descriptor.as_deref() {
-            Some(d) => Some(self.open_sse_dek(d)?),
-            None => None,
+        let src_cipher = match src_row.sse_descriptor.as_deref() {
+            Some(d) => self.open_sse_cipher(d)?,
+            None => cairn_types::blob::BlobCipher::KnownPlaintext,
         };
         let handle = self
             .blob
-            .open_raw(
-                &src_path,
-                range,
-                cairn_types::blob::BlobCipher::from_dek(src_dek),
-                &src_row.compression,
-            )
+            .open_raw(&src_path, range, src_cipher, &src_row.compression)
             .await?;
         let declared_size = handle.logical_len;
         if declared_size > self.max_object_size {
@@ -1888,7 +1861,7 @@ impl S3Service {
                 let mut dek = [0u8; 32];
                 rand::thread_rng().fill_bytes(&mut dek);
                 let dek = SecretKey32::new(dek);
-                let sealed = self.seal_part_dek(dek.expose_secret())?;
+                let sealed = self.seal_part_cipher(&dek)?;
                 (Some(dek), Some(sealed))
             } else {
                 (None, None)
@@ -2057,9 +2030,10 @@ impl S3Service {
             // Part-level SSE at rest (ARCH 27, Increment 3a): open the sealed per-part DEK BEFORE
             // claiming the session, so a wrong/rotated/retired master key or a tampered envelope fails
             // closed here (a typed error) and leaves the upload retryable (audit #14) rather than
-            // bricking it in `completing`. `assemble` decrypts each ciphertext part via `PartRef.dek`.
-            let dek = match &rec.part_dek {
-                Some(sealed) => Some(self.open_part_dek(sealed)?),
+            // bricking it in `completing`. `assemble` decrypts each ciphertext part via the typed
+            // `PartRef.cipher`, which also pins its legacy-v2/current-v3 reader.
+            let cipher = match &rec.part_dek {
+                Some(sealed) => self.open_part_cipher(sealed)?,
                 None => {
                     // Defense-in-depth: an encrypt-parts session must not carry a plaintext part. The
                     // happy path always couples `part_dek` with the on-disk ciphertext (UploadPart /
@@ -2070,14 +2044,14 @@ impl S3Service {
                             "multipart part: encrypted session has a plaintext part".to_owned(),
                         ));
                     }
-                    None
+                    cairn_types::blob::BlobCipher::KnownPlaintext
                 }
             };
             refs.push(PartRef {
                 part_number: *pn,
                 storage_path: rec.storage_path.clone(),
                 size: rec.size,
-                dek,
+                cipher,
             });
             part_md5s.push(rec.etag.clone());
             part_checksums.push(rec.checksum.clone());
@@ -2573,18 +2547,13 @@ impl S3Service {
         };
 
         // An SSE-encrypted source is decrypted transparently via its unwrapped DEK (ARCH 27).
-        let src_dek = match src_row.sse_descriptor.as_deref() {
-            Some(d) => Some(self.open_sse_dek(d)?),
-            None => None,
+        let src_cipher = match src_row.sse_descriptor.as_deref() {
+            Some(d) => self.open_sse_cipher(d)?,
+            None => cairn_types::blob::BlobCipher::KnownPlaintext,
         };
         let handle = self
             .blob
-            .open_raw(
-                &src_path,
-                None,
-                cairn_types::blob::BlobCipher::from_dek(src_dek),
-                &src_row.compression,
-            )
+            .open_raw(&src_path, None, src_cipher, &src_row.compression)
             .await?;
         // Re-tag the blob read errors as body errors so the source can feed `stage`.
         let src_stream: cairn_types::BodyStream =
@@ -2783,17 +2752,12 @@ impl S3Service {
         let total_keys = keys.len();
         let now = self.clock.now();
 
-        // Request-level replica gate (audit #16), mirroring the single-object DELETE: an
-        // Administrator carrying `x-amz-meta-cairn-replica` is propagating a replicated delete, so
-        // its delete markers must NOT be re-enqueued (loop prevention, ARCH 20.4) — and under
-        // fan-out would otherwise re-ship to every target. A normal member's header is ignored.
-        let is_replica = req
-            .header("x-amz-meta-cairn-replica")
-            .is_some_and(|v| v.eq_ignore_ascii_case("true"))
-            && req
-                .principal
-                .as_ref()
-                .is_some_and(|p| p.role == Role::Administrator);
+        // DeleteObjects is always the ordinary S3 bulk operation. The replication sink never uses
+        // it, and each key below authorizes as DeleteObject/DeleteObjectVersion. Consequently a
+        // replica marker on this request must have no dispatch effect: allowing an administrator
+        // header to suppress the outbox would bypass explicit ReplicateDelete denies. Inbound
+        // delete-marker propagation uses the single-object DELETE path, whose centrally selected
+        // ReplicateDelete action is carried into dispatch.
 
         // Each result entry is (key, version_id, is_delete_marker, delete_marker_version_id) so the
         // response can surface `<DeleteMarker>`/`<DeleteMarkerVersionId>` for a marker insert.
@@ -2915,18 +2879,15 @@ impl S3Service {
                     match bucket.versioning {
                         VersioningState::Enabled => {
                             let mid = VersionId::generate();
-                            let replication = if is_replica {
-                                Vec::new()
-                            } else {
-                                self.replication_outbox(
+                            let replication = self
+                                .replication_outbox(
                                     bucket,
                                     &key,
                                     &mid,
                                     ReplicationOp::DeleteMarker,
                                     &[],
                                 )
-                                .await
-                            };
+                                .await;
                             out.repl_enqueued |= !replication.is_empty();
                             self.meta
                                 .submit(Mutation::CreateDeleteMarker {
@@ -3006,6 +2967,25 @@ impl S3Service {
                         if let Some(p) = freed {
                             let _ = self.blob.delete(&p).await;
                         }
+                        let ev = match &event_version_req {
+                            Some(v) => VersionId::from_string(v.clone()),
+                            None => VersionId::null(),
+                        };
+                        self.emit_events(
+                            &bucket.name,
+                            &event_key,
+                            &ev,
+                            EventKind::ObjectRemovedDelete,
+                            None,
+                            None,
+                            now,
+                        )
+                        .await;
+                        if !quiet {
+                            out.deleted = Some((key_s, version, false, None));
+                        }
+                    }
+                    Ok(MutationOutcome::DeleteNotApplied) => {
                         let ev = match &event_version_req {
                             Some(v) => VersionId::from_string(v.clone()),
                             None => VersionId::null(),
@@ -5296,8 +5276,8 @@ impl S3Service {
     /// discriminator — `SseS3` advertises `AES256`, `AtRest` advertises nothing (transparent operator
     /// encryption), `Kms` advertises `aws:kms` + the key id. `crypto` is the DEK-sealing material
     /// resolved from the key provider; for the v1 local provider it is always the master ring, so the
-    /// sealed envelope is identical across modes (label-only, ARCH 27) and `open_sse_dek` unwraps it
-    /// under the same ring.
+    /// sealed envelope is identical across modes (label-only, ARCH 27) and `open_sse_cipher` unwraps
+    /// it under the same ring while preserving the expected blob format.
     fn new_sse_dek_mode(
         &self,
         crypto: &dyn Crypto,
@@ -5314,13 +5294,16 @@ impl S3Service {
             alg: SSE_DESCRIPTOR_ALG.to_owned(),
             // The CRK1 envelope (audit #29) is self-describing — it carries its own key id and
             // nonce — so the whole envelope goes in `wrapped_dek_b64` and the separate nonce field
-            // is left empty. Legacy descriptors keep a populated `nonce_b64`; `open_sse_dek` routes
-            // on its presence.
+            // is left empty. Legacy descriptors keep a populated `nonce_b64`; the shared descriptor
+            // opener routes on its presence.
             wrapped_dek_b64: base64::engine::general_purpose::STANDARD.encode(&sealed.ciphertext),
             nonce_b64: String::new(),
             mode,
             kms_key_id,
             bucket_key_enabled,
+            // This field is outside the blob on purpose: a read must know that a current object
+            // requires authenticated CRNB v3 before it examines the mutable on-disk version byte.
+            blob_format_version: Some(cairn_types::sse::AUTHENTICATED_BLOB_FORMAT_VERSION),
             extra: std::collections::BTreeMap::new(),
         };
         let json = serde_json::to_string(&descriptor)
@@ -5389,40 +5372,26 @@ impl S3Service {
         }
     }
 
-    /// Unwrap the raw 32-byte DEK from a stored `sse_descriptor` JSON document by opening the
-    /// sealed key under the master key. Delegates to [`cairn_types::sse::open_dek`] — the single
-    /// definition of the envelope layout — and fails CLOSED (a typed error, never plaintext).
-    fn open_sse_dek(&self, descriptor_json: &str) -> Result<SecretKey32> {
+    /// Resolve the raw DEK and metadata-backed CRNB format from a stored `sse_descriptor`.
+    fn open_sse_cipher(&self, descriptor_json: &str) -> Result<cairn_types::blob::BlobCipher> {
         // v1 is label-only: every DEK (SseS3, AtRest, Kms) is sealed under the SAME master ring, so
         // opening on `self.crypto` is correct and symmetric with the seal path. A FUTURE external
         // KeyProvider with per-key material would resolve the crypto via
         // `self.key_provider.crypto_for(d.kms_key_id)` — until then this fails CLOSED.
-        let d = cairn_types::sse::parse_descriptor(descriptor_json)
-            .map_err(|e| Error::Internal(format!("parse sse descriptor: {e}")))?;
-        Ok(cairn_types::sse::open_dek(&*self.crypto, &d)?)
+        cairn_types::sse::parse_and_open_blob_cipher(&*self.crypto, descriptor_json)
+            .map_err(|e| Error::Internal(format!("open sse descriptor: {e}")))
     }
 
-    /// Seal a per-part multipart DEK under the master ring, returning the base64 CRK1 envelope stored
-    /// in `multipart_parts.part_dek` (ARCH 27, Increment 3a). Uses the exact self-framing CRK1 seal
-    /// of `new_sse_dek_mode`/`open_sse_dek` (an empty nonce; the nonce rides inside the envelope), so
-    /// the same master ring — and only that ring — can reopen it. Fails closed on a seal error.
-    fn seal_part_dek(&self, dek: &[u8; 32]) -> Result<String> {
-        Ok(base64::engine::general_purpose::STANDARD.encode(&self.crypto.seal(dek)?.ciphertext))
+    /// Seal a per-part multipart DEK and prefix the stored envelope with its current CRNB version.
+    fn seal_part_cipher(&self, dek: &SecretKey32) -> Result<String> {
+        Ok(cairn_types::sse::seal_part_blob_cipher(&*self.crypto, dek)?)
     }
 
-    /// Unwrap a per-part multipart DEK sealed by [`seal_part_dek`](Self::seal_part_dek). A bad base64,
-    /// a tampered envelope, or a wrong/rotated/retired master key fails closed (a typed error, never
-    /// plaintext); `complete_multipart` opens every part key BEFORE claiming the session so such a
-    /// failure leaves the upload retryable.
-    fn open_part_dek(&self, sealed_b64: &str) -> Result<SecretKey32> {
-        let ct = base64::engine::general_purpose::STANDARD
-            .decode(sealed_b64.as_bytes())
-            .map_err(|_| Error::Internal("multipart part: bad wrapped key base64".to_owned()))?;
-        // CRK1: the nonce is inside the envelope, so `open` ignores this argument (empty nonce).
-        let raw = self.crypto.open(&ct, &Nonce(Vec::new()))?;
-        SecretKey32::from_slice(raw.as_slice()).ok_or_else(|| {
-            Error::Internal("multipart part: unwrapped key is not 32 bytes".to_owned())
-        })
+    /// Open a part's DEK and metadata-backed format. Unprefixed envelopes are legacy v2; new writes
+    /// carry `crnb3:` and unknown prefixes fail before Complete claims the upload.
+    fn open_part_cipher(&self, persisted: &str) -> Result<cairn_types::blob::BlobCipher> {
+        cairn_types::sse::open_part_blob_cipher(&*self.crypto, persisted)
+            .map_err(|e| Error::Internal(format!("open multipart part descriptor: {e}")))
     }
 }
 
@@ -6173,8 +6142,9 @@ fn stored_content_encoding(req: &S3Request) -> Option<String> {
 
 /// The preserved source version id for an inbound replica PUT/marker: the
 /// `x-amz-meta-cairn-replica-version-id` header, but ONLY when this write is an authenticated
-/// replica (`is_replica`, admin-gated). Returns `None` for a normal write or an absent/empty header,
-/// so the caller mints a fresh id. A normal client can never pin a version id this way.
+/// replica (`is_replica`, centrally authorized as ReplicateObject/ReplicateDelete). Returns `None`
+/// for a normal write or an absent/empty header, so the caller mints a fresh id. A normal client can
+/// never pin a version id this way.
 fn replica_version_id(req: &S3Request, is_replica: bool) -> Option<VersionId> {
     if !is_replica {
         return None;
@@ -6187,10 +6157,11 @@ fn replica_version_id(req: &S3Request, is_replica: bool) -> Option<VersionId> {
 
 /// The ACL a destination applies to an inbound replica, read from the `x-amz-meta-cairn-replica-acl`
 /// header (base64 of the JSON `Acl`) the source sink emits (ARCH 20.4). The caller invokes this only
-/// on the admin-gated replica path. It is deliberately **fail-open**: an absent header, or ANY
-/// base64/JSON decode failure, yields `None` (no ACL) plus a warning — never an error. A 4xx here
-/// would be classified terminal by the source sink and would permanently stall that key's outbox, so
-/// a malformed ACL must degrade to "default ownership" rather than block replication.
+/// on the ReplicateObject-authorized replica path. It is deliberately **fail-open**: an absent
+/// header, or ANY base64/JSON decode failure, yields `None` (no ACL) plus a warning — never an
+/// error. A 4xx here would be classified terminal by the source sink and would permanently stall
+/// that key's outbox, so a malformed ACL must degrade to "default ownership" rather than block
+/// replication.
 fn replica_acl(req: &S3Request) -> Option<Acl> {
     let raw = req
         .header("x-amz-meta-cairn-replica-acl")
