@@ -174,6 +174,7 @@ impl MetadataStore for ShardedMetadataStore {
 
             // --- per-bucket object/config mutations: route by the target bucket ---
             Mutation::PutObjectVersion { .. }
+            | Mutation::ResolveObjectWrite { .. }
             | Mutation::CreateDeleteMarker { .. }
             | Mutation::DeleteVersion { .. }
             | Mutation::CreateBucket(_)
@@ -263,23 +264,49 @@ impl MetadataStore for ShardedMetadataStore {
                     })
                     .await
             }
+            Mutation::ResolveMultipartPartWrite {
+                upload_id,
+                part_number,
+                storage_path,
+            } => {
+                self.for_upload(upload_id.as_str())
+                    .submit(Mutation::ResolveMultipartPartWrite {
+                        upload_id,
+                        part_number,
+                        storage_path,
+                    })
+                    .await
+            }
             Mutation::ReleaseMultipartUploadCleanups { upload_id } => {
                 self.for_upload(upload_id.as_str())
                     .submit(Mutation::ReleaseMultipartUploadCleanups { upload_id })
                     .await
             }
-            Mutation::ClaimMultipart(upload_id) => {
+            Mutation::ClaimMultipart {
+                upload_id,
+                claim_token,
+            } => {
                 self.for_upload(upload_id.as_str())
-                    .submit(Mutation::ClaimMultipart(upload_id))
+                    .submit(Mutation::ClaimMultipart {
+                        upload_id,
+                        claim_token,
+                    })
                     .await
             }
-            Mutation::ReleaseMultipartClaim(upload_id) => {
+            Mutation::ReleaseMultipartClaim {
+                upload_id,
+                claim_token,
+            } => {
                 self.for_upload(upload_id.as_str())
-                    .submit(Mutation::ReleaseMultipartClaim(upload_id))
+                    .submit(Mutation::ReleaseMultipartClaim {
+                        upload_id,
+                        claim_token,
+                    })
                     .await
             }
             Mutation::CompleteMultipart {
                 upload_id,
+                claim_token,
                 row,
                 precondition,
                 replication,
@@ -289,6 +316,7 @@ impl MetadataStore for ShardedMetadataStore {
                 self.for_upload(upload_id.as_str())
                     .submit(Mutation::CompleteMultipart {
                         upload_id,
+                        claim_token,
                         row,
                         precondition,
                         replication,
@@ -924,6 +952,7 @@ impl MetadataStore for ShardedMetadataStore {
 fn mutation_bucket(m: &Mutation) -> Option<String> {
     let b = match m {
         Mutation::PutObjectVersion { row, .. } => row.bucket.as_str(),
+        Mutation::ResolveObjectWrite { bucket, .. } => bucket.as_str(),
         Mutation::CreateDeleteMarker { bucket, .. } => bucket.as_str(),
         Mutation::DeleteVersion { bucket, .. } => bucket.as_str(),
         Mutation::CreateBucket(b) => b.name.as_str(),
@@ -952,11 +981,12 @@ fn mutation_bucket(m: &Mutation) -> Option<String> {
         | Mutation::ReserveMultipartPart { .. }
         | Mutation::ReleaseMultipartReservation { .. }
         | Mutation::RecordPart { .. }
+        | Mutation::ResolveMultipartPartWrite { .. }
         | Mutation::ReleaseMultipartCleanup { .. }
         | Mutation::ReleaseMultipartUploadCleanups { .. }
         | Mutation::RecoverMultipartStagingAccounting { .. }
-        | Mutation::ClaimMultipart(_)
-        | Mutation::ReleaseMultipartClaim(_)
+        | Mutation::ClaimMultipart { .. }
+        | Mutation::ReleaseMultipartClaim { .. }
         | Mutation::RecoverMultipartClaims
         | Mutation::CompleteMultipart { .. }
         | Mutation::AbortMultipart(_)
@@ -1144,6 +1174,14 @@ mod tests {
             on: true,
         };
         assert_eq!(mutation_bucket(&per_bucket).as_deref(), Some("charlie"));
+        let recovery_probe = Mutation::ResolveObjectWrite {
+            bucket: BucketName::parse("delta").unwrap(),
+            key: ObjectKey::parse("k").unwrap(),
+            version_id: VersionId::null(),
+            row_id: "row".to_owned(),
+            storage_path: StoragePath::from_string("delta/blob".to_owned()),
+        };
+        assert_eq!(mutation_bucket(&recovery_probe).as_deref(), Some("delta"));
         assert!(mutation_bucket(&Mutation::RecoverClaimedReplication).is_none());
     }
 

@@ -2830,8 +2830,8 @@
         {
           "id": "Panel_033",
           "type": "metric",
-          "title": "Key-less blob reads",
-          "description": "Encrypted reads refused for want of a key. Crypto fails closed: an error, never plaintext or zeros. Non-zero warrants investigation.",
+          "title": "Plaintext length mismatch",
+          "description": "Metadata-declared plaintext reads refused because file and logical lengths differ. Non-zero indicates missing/inconsistent metadata or truncated local storage.",
           "config": {
             "show_legends": false,
             "legends_position": null,
@@ -2878,7 +2878,7 @@
           "queryType": "promql",
           "queries": [
             {
-              "query": "cairn_blob_encrypted_without_key_total",
+              "query": "cairn_blob_plaintext_length_mismatch_total",
               "vrlFunctionQuery": "",
               "customQuery": true,
               "fields": {

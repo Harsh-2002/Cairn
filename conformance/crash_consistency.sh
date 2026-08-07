@@ -2,24 +2,23 @@
 # Crash-consistency harness (ARCH 29.4, F-4; closes GAPS High #8).
 #
 # The durability ordering (fsync file -> rename -> fsync dir -> *then* metadata commit) means a
-# crash in the window between blob durability and the metadata commit leaves an *orphan blob*:
-# a durable file on disk that no metadata row references. The spec's correctness claim is that
-# reconciliation reclaims exactly those orphans. This script makes that claim real instead of
-# merely asserted:
+# failure in the window between blob durability and the metadata commit creates an unreferenced
+# durable path. A task panic leaves the server alive, so retained exact-path cancellation recovery
+# may unlink it immediately; otherwise it remains an orphan for reconciliation. This script makes
+# both safe outcomes real instead of merely asserted:
 #
 #   1. build the `cairn` binary with --features failpoints (arms the cairn-blob `fail` seams);
 #   2. bootstrap a fresh temp store;
 #   3. start the server with FAILPOINTS=blob_after_durable=panic — the seam fires *after* the
 #      blob is durable but *before* the metadata commit;
-#   4. issue an object PUT, which crashes the in-flight task in exactly that window, leaving an
-#      orphan blob and no object row;
+#   4. issue an object PUT, which crashes the in-flight task in exactly that window with no row;
 #   5. stop the server;
 #   6. run `cairn integrity` (reconcile);
-#   7. assert reconciliation reclaimed the orphan (orphans_reclaimed >= 1) and the object is
-#      absent (a fresh GET 404s).
+#   7. assert exact-path recovery already reclaimed the blob or reconciliation reclaims the
+#      observable orphan, and that the object is absent (a fresh GET 404s).
 #
-# Exit status: 0 only if reconciliation demonstrably reclaims the orphan and the object is
-# absent; non-zero on any assertion failure.
+# Exit status: 0 only if the fault seam fires, no unreferenced path remains after recovery, and the
+# object is absent; non-zero on any assertion failure.
 #
 # Runtime arming caveat (see the report accompanying this file): the `fail` crate only honours
 # the FAILPOINTS environment variable once the process calls `fail::setup()` (or
@@ -133,16 +132,23 @@ sleep 0.5
 
 # `blob_after_durable=panic` aborts only the in-flight PUT *task* (after the blob is durable,
 # before the metadata commit); tokio isolates the panic, so the server PROCESS stays up. The
-# reliable arming signal is therefore: the PUT did NOT return 200 (the connection was dropped by
-# the panic) AND a new durable blob appeared since before the PUT (the orphan). A successful PUT
-# returns 200; a missing bucket returns 4xx with no new blob.
+# reliable arming signal is therefore: the PUT did NOT return 200, the process remains alive, and
+# the server log records the injected panic. The retained recovery worker can remove the durable
+# path before this harness counts files, so an observable orphan is no longer required. A successful
+# PUT returns 200; an ordinary rejected request has no injected-panic record.
 blobs_after="$(count_blobs)"
 ARMED=0
-if [ "$put_http" != "200" ] && [ "$blobs_after" -gt "$blobs_before" ]; then
-  note "PUT aborted (HTTP ${put_http:-<none>}) and a new blob appeared — the fault seam fired, leaving an orphan"
+if [ "$put_http" != "200" ] \
+  && kill -0 "$SRV" 2>/dev/null \
+  && grep -Eq 'panicked at|failpoint.*panic|fail point.*panic' "$DATA/server.log"; then
+  if [ "$blobs_after" -gt "$blobs_before" ]; then
+    note "PUT aborted and the injected panic left an observable orphan for reconciliation"
+  else
+    note "PUT aborted and exact-path recovery reclaimed the durable blob before inspection"
+  fi
   ARMED=1
 else
-  note "PUT returned HTTP ${put_http:-<none>} with no new orphan — the env-armed seam did not fire"
+  note "PUT returned HTTP ${put_http:-<none>} without an injected-panic record — the env-armed seam did not fire"
 fi
 
 # --- 5. stop the server -------------------------------------------------------------------------
@@ -152,14 +158,18 @@ wait "$SRV" 2>/dev/null || true
 SRV=""
 
 # ===============================================================================================
-# Live path: the seam fired and left an orphan. Assert reconcile reclaims it and the object is
-# absent. This is the real F-4 verification.
+# Live path: the seam fired. Assert exact-path recovery or reconcile reclaims the durable path and
+# the object is absent. This is the real F-4 verification.
 # ===============================================================================================
 if [ "$ARMED" -eq 1 ]; then
   blob_count_after_crash="$(count_blobs)"
   orphan_count=$((blob_count_after_crash - blobs_before))
-  [ "$orphan_count" -ge 1 ] || fail "expected an orphan blob after the crash, found none"
-  note "orphan blob present on disk: $orphan_count new file(s)"
+  [ "$orphan_count" -ge 0 ] || fail "blob count fell below the pre-PUT baseline"
+  if [ "$orphan_count" -gt 0 ]; then
+    note "orphan blob present on disk: $orphan_count new file(s)"
+  else
+    note "no orphan remains on disk: retained exact-path recovery completed before shutdown"
+  fi
 
   note "running 'cairn integrity' (reconcile)"
   REPORT="$("$BIN" integrity)" || fail "integrity command failed: $REPORT"
@@ -168,7 +178,7 @@ if [ "$ARMED" -eq 1 ]; then
   [ -n "$reclaimed" ] || fail "could not parse orphans_reclaimed from: $REPORT"
   [ "$reclaimed" -eq "$orphan_count" ] \
     || fail "expected reconciliation to reclaim exactly $orphan_count orphan(s), reclaimed $reclaimed"
-  note "reconciliation reclaimed $reclaimed orphan(s)"
+  note "reconciliation reclaimed $reclaimed orphan(s); exact-path recovery handled the remainder"
 
   remaining="$(count_blobs)"
   [ "$remaining" -eq "$blobs_before" ] \
@@ -193,7 +203,7 @@ if [ "$ARMED" -eq 1 ]; then
   fi
   note "post-reconcile GET returned HTTP ${get_http:-<none>} (object absent)"
 
-  printf 'PASS: crash in the durability window left an orphan; reconcile reclaimed it; object absent\n'
+  printf 'PASS: durability-window task panic was recovered; no orphan or object remains\n'
   exit 0
 fi
 

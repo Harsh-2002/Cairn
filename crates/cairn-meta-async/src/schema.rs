@@ -710,6 +710,34 @@ ALTER TABLE multipart_uploads
     );
 "#,
     },
+    Migration {
+        version: 28,
+        name: "current-listing row identity cover",
+        sql: r#"
+-- Lifecycle compare-and-delete uses object_versions.id as the immutable identity of the exact row
+-- returned by a listing. Keep the hot latest-only ListObjects projection index-only after adding
+-- that internal field to ObjectSummary by replacing, rather than editing, migration v11's index.
+DROP INDEX IF EXISTS idx_ov_latest_cover;
+CREATE INDEX idx_ov_latest_cover ON object_versions
+    (bucket_name, key, version_id, id, is_delete_marker, etag, size_logical, updated_at,
+     storage_class, owner_id)
+    WHERE is_latest = 1;
+"#,
+    },
+    Migration {
+        version: 29,
+        name: "multipart completion claim tokens",
+        sql: r#"
+-- Completion ownership must survive a lost writer acknowledgement. A per-attempt token lets
+-- cancellation recovery be armed before ClaimMultipart is acknowledged while remaining unable to
+-- release or complete a newer attempt (the generationless form admitted an ABA race).
+ALTER TABLE multipart_uploads ADD COLUMN completion_claim_token TEXT;
+-- A process performing this migration has no surviving request that owns an old transient claim.
+UPDATE multipart_uploads
+SET status='active', completion_claim_token=NULL
+WHERE status='completing';
+"#,
+    },
 ];
 
 /// Run all pending migrations on the write driver, recording each as applied. Each migration is
@@ -905,11 +933,23 @@ mod tests {
                      PRIMARY KEY (upload_id, part_number)
                  );
                  CREATE TABLE object_versions (
+                     id TEXT PRIMARY KEY,
                      bucket_name TEXT NOT NULL,
                      key TEXT NOT NULL,
                      version_id TEXT NOT NULL,
+                     is_latest INTEGER NOT NULL DEFAULT 1,
+                     is_delete_marker INTEGER NOT NULL DEFAULT 0,
+                     etag TEXT NOT NULL DEFAULT '',
+                     size_logical INTEGER NOT NULL DEFAULT 0,
+                     updated_at INTEGER NOT NULL DEFAULT 0,
+                     storage_class TEXT NOT NULL DEFAULT 'Standard',
+                     owner_id TEXT NOT NULL DEFAULT '',
                      UNIQUE (bucket_name, key, version_id)
                  );
+                 CREATE INDEX idx_ov_latest_cover ON object_versions
+                     (bucket_name, key, version_id, is_delete_marker, etag, size_logical,
+                      updated_at, storage_class, owner_id)
+                     WHERE is_latest = 1;
                  CREATE TABLE object_locks (
                      bucket_name TEXT NOT NULL,
                      key TEXT NOT NULL,
@@ -970,12 +1010,25 @@ mod tests {
                  );
                  INSERT INTO schema_migrations VALUES (26, 'legacy fixture', 0);
                  CREATE TABLE object_versions (
+                     id TEXT PRIMARY KEY,
                      bucket_name TEXT NOT NULL,
                      key TEXT NOT NULL,
                      version_id TEXT NOT NULL,
+                     is_latest INTEGER NOT NULL DEFAULT 1,
+                     is_delete_marker INTEGER NOT NULL DEFAULT 0,
+                     etag TEXT NOT NULL DEFAULT '',
+                     size_logical INTEGER NOT NULL DEFAULT 0,
+                     updated_at INTEGER NOT NULL DEFAULT 0,
+                     storage_class TEXT NOT NULL DEFAULT 'Standard',
+                     owner_id TEXT NOT NULL DEFAULT '',
                      UNIQUE (bucket_name, key, version_id)
                  );
-                 INSERT INTO object_versions VALUES ('b','live','v');
+                 INSERT INTO object_versions (id, bucket_name, key, version_id)
+                     VALUES ('row-live','b','live','v');
+                 CREATE INDEX idx_ov_latest_cover ON object_versions
+                     (bucket_name, key, version_id, is_delete_marker, etag, size_logical,
+                      updated_at, storage_class, owner_id)
+                     WHERE is_latest = 1;
                  CREATE TABLE object_locks (
                      bucket_name TEXT NOT NULL,
                      key TEXT NOT NULL,
@@ -987,8 +1040,11 @@ mod tests {
                  );
                  INSERT INTO object_locks VALUES ('b','live','v','COMPLIANCE',100,0);
                  INSERT INTO object_locks VALUES ('b','orphan','v','GOVERNANCE',100,1);
-                 CREATE TABLE multipart_uploads (id TEXT PRIMARY KEY);
-                 INSERT INTO multipart_uploads VALUES ('legacy-upload');",
+                 CREATE TABLE multipart_uploads (
+                     id TEXT PRIMARY KEY,
+                     status TEXT NOT NULL
+                 );
+                 INSERT INTO multipart_uploads VALUES ('legacy-upload','active');",
             )
             .await
             .unwrap();
@@ -1013,6 +1069,105 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(legacy[0].get_i64(0), 0);
+    }
+
+    async fn assert_v28_adds_row_identity_to_current_listing_cover(driver: &dyn AsyncSqlDriver) {
+        driver
+            .execute_batch(
+                "CREATE TABLE schema_migrations (
+                     version INTEGER PRIMARY KEY,
+                     name TEXT NOT NULL,
+                     applied_at INTEGER NOT NULL
+                 );
+                 INSERT INTO schema_migrations VALUES (27, 'legacy fixture', 0);
+                 CREATE TABLE object_versions (
+                     id TEXT PRIMARY KEY,
+                     bucket_name TEXT NOT NULL,
+                     key TEXT NOT NULL,
+                     version_id TEXT NOT NULL,
+                     is_latest INTEGER NOT NULL,
+                     is_delete_marker INTEGER NOT NULL,
+                     etag TEXT NOT NULL,
+                     size_logical INTEGER NOT NULL,
+                     updated_at INTEGER NOT NULL,
+                     storage_class TEXT NOT NULL,
+                     owner_id TEXT NOT NULL
+                 );
+                 CREATE INDEX idx_ov_latest_cover ON object_versions
+                     (bucket_name, key, version_id, is_delete_marker, etag, size_logical,
+                      updated_at, storage_class, owner_id)
+                     WHERE is_latest = 1;
+                 CREATE TABLE multipart_uploads (
+                     id TEXT PRIMARY KEY,
+                     status TEXT NOT NULL
+                 );",
+            )
+            .await
+            .unwrap();
+
+        run_migrations(driver).await.unwrap();
+        let columns = driver
+            .query(
+                "SELECT name FROM pragma_index_info('idx_ov_latest_cover') ORDER BY seqno",
+                vec![],
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.get_text(0))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            columns,
+            [
+                "bucket_name",
+                "key",
+                "version_id",
+                "id",
+                "is_delete_marker",
+                "etag",
+                "size_logical",
+                "updated_at",
+                "storage_class",
+                "owner_id",
+            ]
+        );
+    }
+
+    async fn assert_v29_resets_unowned_legacy_completion_claims(driver: &dyn AsyncSqlDriver) {
+        driver
+            .execute_batch(
+                "CREATE TABLE schema_migrations (
+                     version INTEGER PRIMARY KEY,
+                     name TEXT NOT NULL,
+                     applied_at INTEGER NOT NULL
+                 );
+                 INSERT INTO schema_migrations VALUES (28, 'legacy fixture', 0);
+                 CREATE TABLE multipart_uploads (
+                     id TEXT PRIMARY KEY,
+                     status TEXT NOT NULL
+                 );
+                 INSERT INTO multipart_uploads VALUES ('active-upload','active');
+                 INSERT INTO multipart_uploads VALUES ('orphaned-completer','completing');",
+            )
+            .await
+            .unwrap();
+
+        run_migrations(driver).await.unwrap();
+        let rows = driver
+            .query(
+                "SELECT id, status, completion_claim_token
+                 FROM multipart_uploads ORDER BY id",
+                vec![],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].get_text(0), "active-upload");
+        assert_eq!(rows[0].get_text(1), "active");
+        assert!(rows[0].get_opt_text(2).is_none());
+        assert_eq!(rows[1].get_text(0), "orphaned-completer");
+        assert_eq!(rows[1].get_text(1), "active");
+        assert!(rows[1].get_opt_text(2).is_none());
     }
 
     #[tokio::test]
@@ -1106,5 +1261,47 @@ mod tests {
         let conn = db.connect().unwrap();
         let driver = TursoDriver::new(conn);
         assert_v27_discards_only_legacy_orphan_lock_rows(&driver).await;
+    }
+
+    #[tokio::test]
+    async fn migration_v28_covers_row_identity_in_libsql() {
+        let name = format!(
+            "file:cairn-libsql-row-id-v28-{}?mode=memory&cache=shared",
+            uuid::Uuid::new_v4().simple()
+        );
+        #[allow(deprecated)]
+        let db = Database::open(name).unwrap();
+        let conn = db.connect().unwrap();
+        let driver = LibsqlDriver::new(conn);
+        assert_v28_adds_row_identity_to_current_listing_cover(&driver).await;
+    }
+
+    #[tokio::test]
+    async fn migration_v28_covers_row_identity_in_turso() {
+        let db = turso::Builder::new_local(":memory:").build().await.unwrap();
+        let conn = db.connect().unwrap();
+        let driver = TursoDriver::new(conn);
+        assert_v28_adds_row_identity_to_current_listing_cover(&driver).await;
+    }
+
+    #[tokio::test]
+    async fn migration_v29_resets_legacy_claims_in_libsql() {
+        let name = format!(
+            "file:cairn-libsql-claim-v29-{}?mode=memory&cache=shared",
+            uuid::Uuid::new_v4().simple()
+        );
+        #[allow(deprecated)]
+        let db = Database::open(name).unwrap();
+        let conn = db.connect().unwrap();
+        let driver = LibsqlDriver::new(conn);
+        assert_v29_resets_unowned_legacy_completion_claims(&driver).await;
+    }
+
+    #[tokio::test]
+    async fn migration_v29_resets_legacy_claims_in_turso() {
+        let db = turso::Builder::new_local(":memory:").build().await.unwrap();
+        let conn = db.connect().unwrap();
+        let driver = TursoDriver::new(conn);
+        assert_v29_resets_unowned_legacy_completion_claims(&driver).await;
     }
 }

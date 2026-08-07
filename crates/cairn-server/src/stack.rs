@@ -60,7 +60,7 @@ pub struct AppStack {
     #[allow(dead_code)]
     pub blob: Arc<dyn BlobStore>,
     /// The same local blob store behind its concrete type, kept so the metrics loop can scrape
-    /// `encrypted_without_key_total()` into `cairn_blob_encrypted_without_key_total` — an inherent
+    /// `plaintext_length_mismatch_total()` into `cairn_blob_plaintext_length_mismatch_total` — an inherent
     /// accessor, not part of the `BlobStore` trait object. Mirrors the `meta_cache` /
     /// `store: Vec<Arc<SqliteMetadataStore>>` concrete-handle-alongside-`dyn` pattern; one extra
     /// startup `Arc` clone, zero per-request cost.
@@ -91,6 +91,11 @@ pub struct AppStack {
     /// Pulsed by the control plane when an import job is created/resumed, so the import worker claims
     /// it immediately instead of waiting its poll heartbeat (mirrors `replication_notify`).
     pub import_notify: Arc<tokio::sync::Notify>,
+    /// Process-local queue that restores multipart `completing` claims and resolves staged
+    /// PUT/Copy blobs when an owning request future is cancelled. Its producers are injected into
+    /// `S3Service`; its single receiver is retained and shutdown-drained by the background
+    /// supervisor.
+    pub multipart_claim_recovery: Arc<crate::multipart_claim_recovery::MultipartClaimRecoveryQueue>,
     /// Short-lived, single-use tickets for the SSE live-update stream (`hash -> (expiry_ms,
     /// minting principal)`). EventSource cannot send an Authorization header, so the browser mints
     /// a ticket with its Bearer token then opens the stream with `?ticket=`. In-process and
@@ -563,6 +568,9 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
     let authz: Arc<dyn AuthorizationEngine> = Arc::new(cairn_authz::PolicyEngine);
     let replication_notify = Arc::new(tokio::sync::Notify::new());
     let import_notify = Arc::new(tokio::sync::Notify::new());
+    let multipart_claim_recovery = Arc::new(
+        crate::multipart_claim_recovery::MultipartClaimRecoveryQueue::new(cfg.concurrency_limit),
+    );
     let s3 = S3Service::new(
         meta.clone(),
         blob.clone(),
@@ -581,7 +589,11 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
     .with_replication_wake({
         let n = replication_notify.clone();
         Arc::new(move || n.notify_one())
-    });
+    })
+    .with_multipart_claim_recovery(multipart_claim_recovery.callback())
+    .with_object_write_recovery(multipart_claim_recovery.object_callback())
+    .with_multipart_part_write_recovery(multipart_claim_recovery.part_callback())
+    .with_storage_recovery_admission(multipart_claim_recovery.admission_callback());
     let update_status = Arc::new(std::sync::RwLock::new(
         cairn_control::UpdateStatus::default(),
     ));
@@ -678,6 +690,7 @@ pub async fn build(cfg: &Config) -> Result<AppStack, String> {
         crypto: system_crypto,
         replication_notify,
         import_notify,
+        multipart_claim_recovery,
         sse_tickets: crate::sse::SseTicketStore::default(),
         blob,
         blob_local,
@@ -760,7 +773,7 @@ fn require_startup_reconciliation(
 #[cfg(test)]
 mod multipart_recovery_tests {
     use super::recover_orphaned_multipart_claims;
-    use cairn_types::id::{BucketName, ObjectKey, UploadId, UserId};
+    use cairn_types::id::{BucketName, MultipartClaimToken, ObjectKey, UploadId, UserId};
     use cairn_types::meta::{
         ClaimOutcome, MultipartSession, MultipartStatus, Mutation, MutationOutcome,
     };
@@ -800,7 +813,10 @@ mod multipart_recovery_tests {
             .unwrap();
         assert!(matches!(
             store
-                .submit(Mutation::ClaimMultipart(upload_id.clone()))
+                .submit(Mutation::ClaimMultipart {
+                    upload_id: upload_id.clone(),
+                    claim_token: MultipartClaimToken::generate(),
+                })
                 .await
                 .unwrap(),
             MutationOutcome::MultipartClaim(ClaimOutcome::Claimed(_))
@@ -818,7 +834,10 @@ mod multipart_recovery_tests {
         );
         assert!(matches!(
             store
-                .submit(Mutation::ClaimMultipart(upload_id))
+                .submit(Mutation::ClaimMultipart {
+                    upload_id,
+                    claim_token: MultipartClaimToken::generate(),
+                })
                 .await
                 .unwrap(),
             MutationOutcome::MultipartClaim(ClaimOutcome::Claimed(_))

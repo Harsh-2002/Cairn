@@ -19,7 +19,9 @@ use cairn_types::bucket::{
     Bucket, ConfigAspect, ConfigDoc, ObjectLockConfiguration, VersioningState,
 };
 use cairn_types::error::Error;
-use cairn_types::id::{BucketName, ObjectKey, UploadId, VersionId};
+use cairn_types::id::{
+    BucketName, MultipartClaimToken, ObjectKey, StoragePath, UploadId, VersionId,
+};
 use cairn_types::meta::{
     ClaimOutcome, ClaimReleaseOutcome, IfNoneMatch, InitialObjectState, ListPage, ListQuery,
     MultipartCleanup, MultipartLimits, MultipartSession, MultipartTerminalOutcome, Mutation,
@@ -34,9 +36,314 @@ use cairn_types::object::{
 use cairn_types::sse::{SseDescriptor, SseMode};
 use cairn_types::traits::{AuthorizationEngine, BlobStore, Clock, Crypto, MetadataStore};
 use http::{Method, StatusCode};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 type Result<T> = std::result::Result<T, Error>;
+
+/// One bounded slot covering a potentially queued storage-commit recovery record.
+///
+/// The server creates this around an owned semaphore permit. Clones share the same underlying
+/// lease, so moving a recovery record from request guard to queue keeps the slot occupied until
+/// the worker finishes and drops its final clone.
+#[derive(Clone)]
+pub struct StorageRecoveryPermit(Arc<dyn Send + Sync>);
+
+impl StorageRecoveryPermit {
+    /// Wrap an opaque runtime-owned lease.
+    pub fn new<T: Send + Sync + 'static>(lease: T) -> Self {
+        Self(Arc::new(lease))
+    }
+}
+
+impl std::fmt::Debug for StorageRecoveryPermit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("StorageRecoveryPermit(<held>)")
+    }
+}
+
+impl PartialEq for StorageRecoveryPermit {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for StorageRecoveryPermit {}
+
+/// Runtime-neutral asynchronous admission to the bounded retained recovery queue.
+pub type StorageRecoveryAdmission = Arc<
+    dyn Fn() -> Pin<Box<dyn Future<Output = Option<StorageRecoveryPermit>> + Send>> + Send + Sync,
+>;
+
+/// One durable staged object whose PUT/Copy writer acknowledgement was cancelled or ambiguous.
+///
+/// Recovery is serialized through the same metadata writer after the original submission. It may
+/// delete `storage_path` only when the exact immutable row id and path are absent; a committed
+/// write, a later unversioned overwrite, and an acknowledgement lost after commit are therefore
+/// distinguished without guessing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObjectWriteRecovery {
+    /// Intended bucket.
+    pub bucket: BucketName,
+    /// Intended key.
+    pub key: ObjectKey,
+    /// Intended version id, including the null unversioned sentinel.
+    pub version_id: VersionId,
+    /// Immutable id minted for the intended metadata row.
+    pub row_id: String,
+    /// Unique durable blob path returned by staging.
+    pub storage_path: StoragePath,
+    /// Bounded queue slot retained until this record is resolved or discarded.
+    pub permit: Option<StorageRecoveryPermit>,
+}
+
+/// Request-local ownership of a staged object until its exact metadata row commits.
+struct ObjectWriteGuard {
+    recovery: Option<ObjectWriteRecovery>,
+    recover: Option<Arc<dyn Fn(ObjectWriteRecovery) -> bool + Send + Sync>>,
+}
+
+impl ObjectWriteGuard {
+    fn new(
+        recovery: ObjectWriteRecovery,
+        recover: Option<Arc<dyn Fn(ObjectWriteRecovery) -> bool + Send + Sync>>,
+    ) -> Self {
+        Self {
+            recovery: Some(recovery),
+            recover,
+        }
+    }
+
+    /// Queue writer-serialized resolution and disarm only when the retained worker accepted it.
+    fn enqueue_recovery(&mut self) -> bool {
+        let (Some(recovery), Some(recover)) = (&self.recovery, &self.recover) else {
+            return false;
+        };
+        if recover(recovery.clone()) {
+            self.recovery = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn record(&self) -> Option<ObjectWriteRecovery> {
+        self.recovery.clone()
+    }
+
+    fn disarm(&mut self) {
+        self.recovery = None;
+    }
+}
+
+impl Drop for ObjectWriteGuard {
+    fn drop(&mut self) {
+        if let (Some(recovery), Some(recover)) = (self.recovery.take(), &self.recover) {
+            let _ = recover(recovery);
+        }
+    }
+}
+
+/// One durable staged multipart part whose `RecordPart` acknowledgement was cancelled or
+/// ambiguous.
+///
+/// The staging path embeds `attempt_id`, making the exact `(upload, part number, path)` probe safe
+/// against a delayed recovery after a later retry supersedes the same part number.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MultipartPartWriteRecovery {
+    /// Multipart session that owns the attempt.
+    pub upload_id: UploadId,
+    /// S3 part number.
+    pub part_number: u16,
+    /// Fresh identifier used to derive the attempt's deterministic staging artifact.
+    pub attempt_id: String,
+    /// Unique durable path returned by staging.
+    pub storage_path: StoragePath,
+    /// Bounded queue slot retained until this record is resolved or discarded.
+    pub permit: Option<StorageRecoveryPermit>,
+}
+
+/// Request-local ownership of a staged multipart part until `RecordPart` is resolved.
+struct MultipartPartWriteGuard {
+    recovery: Option<MultipartPartWriteRecovery>,
+    recover: Option<Arc<dyn Fn(MultipartPartWriteRecovery) -> bool + Send + Sync>>,
+}
+
+impl MultipartPartWriteGuard {
+    fn new(
+        recovery: MultipartPartWriteRecovery,
+        recover: Option<Arc<dyn Fn(MultipartPartWriteRecovery) -> bool + Send + Sync>>,
+    ) -> Self {
+        Self {
+            recovery: Some(recovery),
+            recover,
+        }
+    }
+
+    fn enqueue_recovery(&mut self) -> bool {
+        let (Some(recovery), Some(recover)) = (&self.recovery, &self.recover) else {
+            return false;
+        };
+        if recover(recovery.clone()) {
+            self.recovery = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn record(&self) -> Option<MultipartPartWriteRecovery> {
+        self.recovery.clone()
+    }
+
+    fn disarm(&mut self) {
+        self.recovery = None;
+    }
+}
+
+impl Drop for MultipartPartWriteGuard {
+    fn drop(&mut self) {
+        if let (Some(recovery), Some(recover)) = (self.recovery.take(), &self.recover) {
+            let _ = recover(recovery);
+        }
+    }
+}
+
+/// Work captured synchronously when a multipart completion attempt is dropped.
+///
+/// `assembled_blob` is present once assembly has returned a durable blob but before the metadata
+/// transaction has installed it. The retained server worker may delete that path only when its
+/// conditional claim release returns `Released`; `NotOwner` can mean completion committed and the
+/// path is now live, unless `delete_blob_on_not_owner` records a typed non-commit proof.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MultipartClaimRecovery {
+    /// The upload whose exact-token `completing` state should be conditionally released.
+    pub upload_id: UploadId,
+    /// The exact completion attempt that may be released.
+    pub claim_token: MultipartClaimToken,
+    /// A durable assembled blob that is not yet known to be referenced by metadata.
+    pub assembled_blob: Option<StoragePath>,
+    /// Whether the request has a typed result proving its assembled blob is unreferenced even if a
+    /// later claim-release attempt returns `NotOwner`.
+    pub delete_blob_on_not_owner: bool,
+    /// Bounded queue slot retained until this record is resolved or discarded.
+    pub permit: Option<StorageRecoveryPermit>,
+}
+
+/// Request-local ownership of a claimed multipart completion.
+///
+/// The protocol crate cannot perform async work from `Drop`, so the server injects a synchronous,
+/// non-blocking callback that queues the conditional writer mutation. Once the writer has made the
+/// ownership terminal, [`disarm`](Self::disarm) prevents a redundant recovery request.
+struct MultipartClaimGuard {
+    upload_id: Option<UploadId>,
+    claim_token: Option<MultipartClaimToken>,
+    assembled_blob: Option<StoragePath>,
+    delete_blob_on_not_owner: bool,
+    permit: Option<StorageRecoveryPermit>,
+    recover: Option<Arc<dyn Fn(MultipartClaimRecovery) -> bool + Send + Sync>>,
+}
+
+impl MultipartClaimGuard {
+    fn new(
+        upload_id: UploadId,
+        claim_token: MultipartClaimToken,
+        permit: Option<StorageRecoveryPermit>,
+        recover: Option<Arc<dyn Fn(MultipartClaimRecovery) -> bool + Send + Sync>>,
+    ) -> Self {
+        Self {
+            upload_id: Some(upload_id),
+            claim_token: Some(claim_token),
+            assembled_blob: None,
+            delete_blob_on_not_owner: false,
+            permit,
+            recover,
+        }
+    }
+
+    /// Remember the durable assembled artifact before reaching any later await.
+    fn track_assembled_blob(&mut self, path: StoragePath) {
+        self.assembled_blob = Some(path);
+        self.delete_blob_on_not_owner = false;
+    }
+
+    /// Record request-local proof that this assembled path was not installed by completion.
+    fn mark_assembled_blob_unreferenced(&mut self) {
+        self.delete_blob_on_not_owner = true;
+    }
+
+    /// Queue this attempt's exact-token release and disarm only when enqueue succeeds.
+    fn enqueue_recovery(&mut self) -> bool {
+        let (Some(upload_id), Some(claim_token), Some(recover)) =
+            (&self.upload_id, &self.claim_token, &self.recover)
+        else {
+            return false;
+        };
+        if recover(MultipartClaimRecovery {
+            upload_id: upload_id.clone(),
+            claim_token: claim_token.clone(),
+            assembled_blob: self.assembled_blob.clone(),
+            delete_blob_on_not_owner: self.delete_blob_on_not_owner,
+            permit: self.permit.clone(),
+        }) {
+            self.upload_id = None;
+            self.claim_token = None;
+            self.assembled_blob = None;
+            self.delete_blob_on_not_owner = false;
+            self.permit = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.upload_id = None;
+        self.claim_token = None;
+        self.assembled_blob = None;
+        self.delete_blob_on_not_owner = false;
+        self.permit = None;
+    }
+
+    /// Prevent a failed callback from being tried again around the direct-writer fallback.
+    ///
+    /// Exact-token releases are replay-safe, but the explicit failure path still needs only one
+    /// recovery attempt; startup recovery handles an unavailable retained worker.
+    fn disable_recovery_callback(&mut self) {
+        self.recover = None;
+    }
+
+    fn take_assembled_blob(&mut self) -> Option<StoragePath> {
+        self.assembled_blob.take()
+    }
+
+    fn take_proven_unreferenced_blob(&mut self) -> Option<StoragePath> {
+        if self.delete_blob_on_not_owner {
+            self.assembled_blob.take()
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for MultipartClaimGuard {
+    fn drop(&mut self) {
+        if let (Some(upload_id), Some(claim_token), Some(recover)) = (
+            self.upload_id.take(),
+            self.claim_token.take(),
+            &self.recover,
+        ) {
+            let _ = recover(MultipartClaimRecovery {
+                upload_id,
+                claim_token,
+                assembled_blob: self.assembled_blob.take(),
+                delete_blob_on_not_owner: self.delete_blob_on_not_owner,
+                permit: self.permit.take(),
+            });
+        }
+    }
+}
 
 /// The S3 protocol service, wiring the storage backends behind the trait spine.
 #[derive(Clone)]
@@ -68,6 +375,20 @@ pub struct S3Service {
     /// runtime dependency. Best-effort and optional: when unset (e.g. in unit tests) the worker
     /// still drains on its heartbeat. See [`with_replication_wake`](Self::with_replication_wake).
     replication_wake: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Synchronously queues recovery of a successfully claimed multipart completion when its
+    /// request future is cancelled or dropped at a later await. The server wires this to one
+    /// retained async worker; keeping only a callback here preserves runtime independence.
+    multipart_claim_recovery: Option<Arc<dyn Fn(MultipartClaimRecovery) -> bool + Send + Sync>>,
+    /// Synchronously queues exact-row/path resolution for a staged PUT/Copy whose request future is
+    /// cancelled before a definitive writer acknowledgement.
+    object_write_recovery: Option<Arc<dyn Fn(ObjectWriteRecovery) -> bool + Send + Sync>>,
+    /// Synchronously queues exact part/path resolution for a staged multipart part whose request
+    /// future is cancelled before a definitive `RecordPart` acknowledgement.
+    multipart_part_write_recovery:
+        Option<Arc<dyn Fn(MultipartPartWriteRecovery) -> bool + Send + Sync>>,
+    /// Async admission to one bounded recovery slot, acquired before any stage/claim that can arm
+    /// a drop guard. Absent for callback-free library embedders and tests.
+    storage_recovery_admission: Option<StorageRecoveryAdmission>,
 }
 
 impl std::fmt::Debug for S3Service {
@@ -105,6 +426,10 @@ impl S3Service {
             multipart_limits: MultipartLimits::default(),
             encrypt_at_rest: false,
             replication_wake: None,
+            multipart_claim_recovery: None,
+            object_write_recovery: None,
+            multipart_part_write_recovery: None,
+            storage_recovery_admission: None,
         }
     }
 
@@ -144,11 +469,182 @@ impl S3Service {
         self
     }
 
+    /// Attach the non-blocking multipart-claim recovery callback.
+    ///
+    /// The callback is invoked by explicit post-claim failures and by request-future drop after the
+    /// exact-token guard is armed immediately before Claim submission. It can therefore receive a
+    /// harmless recovery attempt even when Claim never committed, as well as one whose commit
+    /// acknowledgement was lost. Production wiring must synchronously enqueue the record for a
+    /// retained worker and return `true` only when the record was accepted; it must not block or
+    /// start detached async work from the drop path.
+    #[must_use]
+    pub fn with_multipart_claim_recovery(
+        mut self,
+        recover: Arc<dyn Fn(MultipartClaimRecovery) -> bool + Send + Sync>,
+    ) -> Self {
+        self.multipart_claim_recovery = Some(recover);
+        self
+    }
+
+    /// Attach the non-blocking staged-object recovery callback.
+    ///
+    /// Production wiring must retain accepted records until a writer-serialized exact-row/path
+    /// probe proves whether the staged blob committed. The callback is invoked from request-future
+    /// `Drop`, so it must synchronously enqueue and never block or start detached work.
+    #[must_use]
+    pub fn with_object_write_recovery(
+        mut self,
+        recover: Arc<dyn Fn(ObjectWriteRecovery) -> bool + Send + Sync>,
+    ) -> Self {
+        self.object_write_recovery = Some(recover);
+        self
+    }
+
+    /// Attach the non-blocking staged multipart-part recovery callback.
+    ///
+    /// Production wiring must retain accepted records until a writer-serialized exact part/path
+    /// probe proves whether `RecordPart` committed. This can run from request-future `Drop`, so it
+    /// must enqueue synchronously without blocking or spawning detached work.
+    #[must_use]
+    pub fn with_multipart_part_write_recovery(
+        mut self,
+        recover: Arc<dyn Fn(MultipartPartWriteRecovery) -> bool + Send + Sync>,
+    ) -> Self {
+        self.multipart_part_write_recovery = Some(recover);
+        self
+    }
+
+    /// Attach bounded admission for every retained storage-commit recovery record.
+    #[must_use]
+    pub fn with_storage_recovery_admission(mut self, admission: StorageRecoveryAdmission) -> Self {
+        self.storage_recovery_admission = Some(admission);
+        self
+    }
+
+    async fn acquire_storage_recovery_permit(&self) -> Result<Option<StorageRecoveryPermit>> {
+        let Some(admission) = &self.storage_recovery_admission else {
+            return Ok(None);
+        };
+        admission()
+            .await
+            .ok_or_else(|| Error::Internal("storage recovery admission is unavailable".to_owned()))
+            .map(Some)
+    }
+
     /// Wake the replication worker (no-op when no callback is attached). Called after a write that
     /// enqueued at least one replication outbox entry.
     fn pulse_replication(&self) {
         if let Some(w) = &self.replication_wake {
             w();
+        }
+    }
+
+    /// Remove a staged blob that is known not to have reached metadata submission. Keep the guard
+    /// armed across the async unlink: request cancellation during deletion falls back to retained
+    /// exact-row/path recovery.
+    async fn discard_unsubmitted_object(&self, path: &StoragePath, guard: &mut ObjectWriteGuard) {
+        if self.blob.delete(path).await.is_ok() {
+            guard.disarm();
+        } else {
+            let _ = guard.enqueue_recovery();
+        }
+    }
+
+    /// Resolve an unexpected or failed PUT/Copy acknowledgement without guessing whether COMMIT
+    /// landed. Production queues this immediately; callback-free test embedders use the same
+    /// writer-serialized probe directly.
+    async fn recover_object_write(&self, guard: &mut ObjectWriteGuard) {
+        if guard.enqueue_recovery() {
+            return;
+        }
+        let Some(recovery) = guard.record() else {
+            return;
+        };
+        let outcome = self
+            .meta
+            .submit(Mutation::ResolveObjectWrite {
+                bucket: recovery.bucket,
+                key: recovery.key,
+                version_id: recovery.version_id,
+                row_id: recovery.row_id,
+                storage_path: recovery.storage_path.clone(),
+            })
+            .await;
+        match outcome {
+            Ok(MutationOutcome::ObjectWriteResolved { referenced: true }) => guard.disarm(),
+            Ok(MutationOutcome::ObjectWriteResolved { referenced: false }) => {
+                if self.blob.delete(&recovery.storage_path).await.is_ok() {
+                    guard.disarm();
+                }
+            }
+            Ok(_) | Err(_) => {
+                // Ambiguous resolution preserves the blob. The still-armed guard retries through
+                // its callback when available; startup reconciliation is the final fallback.
+            }
+        }
+    }
+
+    /// Delete a staged part that definitively has not been submitted, retaining the guard across
+    /// both unlink and reservation release so cancellation at either await is recoverable.
+    async fn discard_unsubmitted_part(&self, guard: &mut MultipartPartWriteGuard) {
+        let Some(recovery) = guard.record() else {
+            return;
+        };
+        if self
+            .blob
+            .delete_part_attempt(
+                &recovery.upload_id,
+                recovery.part_number,
+                &recovery.attempt_id,
+            )
+            .await
+            .is_err()
+        {
+            let _ = guard.enqueue_recovery();
+            return;
+        }
+        if matches!(
+            self.meta
+                .submit(Mutation::ReleaseMultipartReservation {
+                    upload_id: recovery.upload_id,
+                    attempt_id: recovery.attempt_id,
+                })
+                .await,
+            Ok(MutationOutcome::Ack)
+        ) {
+            guard.disarm();
+        } else {
+            let _ = guard.enqueue_recovery();
+        }
+    }
+
+    /// Resolve an ambiguous/cancelled `RecordPart` acknowledgement through the same FIFO writer.
+    async fn recover_multipart_part_write(&self, guard: &mut MultipartPartWriteGuard) {
+        if guard.enqueue_recovery() {
+            return;
+        }
+        let Some(recovery) = guard.record() else {
+            return;
+        };
+        let outcome = self
+            .meta
+            .submit(Mutation::ResolveMultipartPartWrite {
+                upload_id: recovery.upload_id.clone(),
+                part_number: recovery.part_number,
+                storage_path: recovery.storage_path,
+            })
+            .await;
+        match outcome {
+            Ok(MutationOutcome::MultipartPartWriteResolved { referenced: true }) => {
+                guard.disarm();
+            }
+            Ok(MutationOutcome::MultipartPartWriteResolved { referenced: false }) => {
+                self.discard_unsubmitted_part(guard).await;
+            }
+            Ok(_) | Err(_) => {
+                // Preserve the artifact when ownership is ambiguous. The armed guard retries via
+                // the retained callback when available; startup reconciliation is the fallback.
+            }
         }
     }
 
@@ -774,17 +1270,47 @@ impl S3Service {
             encryption: sse_dek,
             content_length,
         };
+        let recovery_permit = self.acquire_storage_recovery_permit().await?;
         let mut staged = self
             .blob
             .stage(&bucket.name, body, opts)
             .await
             .map_err(map_stage_err)?;
 
+        let versioned = bucket.versioning == VersioningState::Enabled;
+        // Preserve the SOURCE version id for an inbound replica (AWS S3 CRR semantics, ARCH 20.4):
+        // a version then has the same identity on every node, and re-delivery is an idempotent
+        // upsert on (bucket, key, version_id) rather than a duplicate version. Gated on the same
+        // ReplicateObject-authorized classification, so a normal client can never pin an arbitrary
+        // id.
+        let version_id = if !versioned {
+            VersionId::null()
+        } else {
+            replica_version_id(&req, is_replica).unwrap_or_else(VersionId::generate)
+        };
+        let row_id = uuid::Uuid::new_v4().simple().to_string();
+        // From the first instruction after `stage` returns until the writer transaction commits,
+        // request cancellation owns an exact recovery record. The retained worker serializes its
+        // probe behind this put if submission reached the writer; it never deletes on an ambiguous
+        // result.
+        let mut write_guard = ObjectWriteGuard::new(
+            ObjectWriteRecovery {
+                bucket: bucket.name.clone(),
+                key: key.clone(),
+                version_id: version_id.clone(),
+                row_id: row_id.clone(),
+                storage_path: staged.storage_path.clone(),
+                permit: recovery_permit,
+            },
+            self.object_write_recovery.clone(),
+        );
+
         // Verify any client-supplied Content-MD5 (decoded above, before staging) against the computed
         // plaintext MD5. A genuine mismatch is a post-stage failure, so delete the staged blob first.
         if let Some(want) = &content_md5 {
             if hex::decode(staged.md5_hex.as_bytes()).ok().as_deref() != Some(want.as_slice()) {
-                let _ = self.blob.delete(&staged.storage_path).await;
+                self.discard_unsubmitted_object(&staged.storage_path, &mut write_guard)
+                    .await;
                 return Err(Error::BadDigest);
             }
         }
@@ -802,7 +1328,8 @@ impl S3Service {
                 })
                 .map(hex::encode);
             if got_hex.as_deref() != Some(want_hex.as_str()) {
-                let _ = self.blob.delete(&staged.storage_path).await;
+                self.discard_unsubmitted_object(&staged.storage_path, &mut write_guard)
+                    .await;
                 return Err(Error::BadDigest);
             }
             // Drop the verification-only checksum so it is not persisted/advertised unless the
@@ -816,7 +1343,8 @@ impl S3Service {
 
         // Verify any client-supplied x-amz-checksum-* against the computed checksum (21.1).
         if let Err(e) = verify_client_checksums(&req, &staged.checksums) {
-            let _ = self.blob.delete(&staged.storage_path).await;
+            self.discard_unsubmitted_object(&staged.storage_path, &mut write_guard)
+                .await;
             return Err(e);
         }
 
@@ -825,7 +1353,6 @@ impl S3Service {
         // also re-validates explicit retention against it, so time spent staging can neither shorten
         // default WORM protection nor let an explicit deadline expire before the object is visible.
         let now = self.clock.now();
-        let versioned = bucket.versioning == VersioningState::Enabled;
         // An inbound replica is a PUT carrying `x-amz-meta-cairn-replica: true` (ARCH 20.4): mark
         // the version a `Replica` so it is never re-replicated, and skip the outbox entirely (loop
         // prevention). `is_replica` was resolved by the authorize-vs-dispatch classifier before the
@@ -847,21 +1374,11 @@ impl S3Service {
             req.header("x-amz-acl")
                 .and_then(|canned| cairn_authz::expand_canned_acl(canned, &bucket.owner_id))
         };
-        // Preserve the SOURCE version id for an inbound replica (AWS S3 CRR semantics, ARCH 20.4):
-        // a version then has the same identity on every node, and re-delivery is an idempotent
-        // upsert on (bucket, key, version_id) rather than a duplicate version. Gated on the same
-        // ReplicateObject-authorized classification, so a normal client can never pin an arbitrary
-        // id.
-        let version_id = if !versioned {
-            VersionId::null()
-        } else {
-            replica_version_id(&req, is_replica).unwrap_or_else(VersionId::generate)
-        };
         // The system response headers (ARCH 13.4) are stored verbatim from the request — except
         // `content-encoding`, which is normalized to strip the `aws-chunked` transfer coding.
         let header_owned = |name: &str| req.header(name).map(str::to_owned);
         let row = ObjectVersionRow {
-            id: uuid::Uuid::new_v4().simple().to_string(),
+            id: row_id,
             bucket: bucket.name.clone(),
             key: key.clone(),
             version_id: version_id.clone(),
@@ -924,6 +1441,9 @@ impl S3Service {
                 superseded,
                 version_id,
             }) => {
+                // The metadata commit now owns the blob. Disarm before any best-effort post-commit
+                // await so cancellation can never enqueue cleanup for a live object.
+                write_guard.disarm();
                 // Event-driven drain: wake the replication worker now rather than next heartbeat.
                 if enqueued_repl {
                     self.pulse_replication();
@@ -967,11 +1487,11 @@ impl S3Service {
                 Ok(resp)
             }
             Ok(_) => {
-                let _ = self.blob.delete(&staged.storage_path).await;
+                self.recover_object_write(&mut write_guard).await;
                 Err(Error::Internal("unexpected put outcome".to_owned()))
             }
             Err(e) => {
-                let _ = self.blob.delete(&staged.storage_path).await;
+                self.recover_object_write(&mut write_guard).await;
                 Err(map_object_commit_error(e, lock_intent, now))
             }
         }
@@ -995,7 +1515,7 @@ impl S3Service {
         };
         let handle = self
             .blob
-            .open_raw(&storage, range, cipher, &row.compression)
+            .open_raw(&storage, range, cipher, &row.compression, row.size_logical)
             .await?;
         let status = if handle.content_range.is_some() {
             StatusCode::PARTIAL_CONTENT
@@ -1120,7 +1640,9 @@ impl S3Service {
                     bucket: bucket.name.clone(),
                     key,
                     version_id,
+                    expected_row_id: None,
                     expected_updated_at: None,
+                    require_sole_key_version: false,
                     now,
                     bypass,
                 })
@@ -1205,6 +1727,7 @@ impl S3Service {
                             owner_id: bucket.owner_id.clone(),
                             now,
                             bypass: GovernanceBypass::Denied,
+                            expected_current: None,
                             replication,
                         })
                         .await?;
@@ -1261,6 +1784,7 @@ impl S3Service {
                         owner_id: bucket.owner_id.clone(),
                         now,
                         bypass,
+                        expected_current: None,
                         replication,
                     })
                     .await;
@@ -1312,7 +1836,9 @@ impl S3Service {
                         bucket: bucket.name.clone(),
                         key,
                         version_id: VersionId::null(),
+                        expected_row_id: None,
                         expected_updated_at: None,
+                        require_sole_key_version: false,
                         now,
                         bypass,
                     })
@@ -1384,19 +1910,82 @@ impl S3Service {
     ///
     /// The conditional transition runs on the metadata writer. If ownership has disappeared, do
     /// not surface the original error as though this request still controlled the upload.
-    async fn multipart_failure_after_claim(&self, upload_id: &UploadId, error: Error) -> Error {
+    async fn multipart_failure_after_claim(
+        &self,
+        upload_id: &UploadId,
+        claim_token: &MultipartClaimToken,
+        error: Error,
+        claim_guard: &mut MultipartClaimGuard,
+    ) -> Error {
+        // Production uses the retained server queue for both explicit errors and cancellation.
+        // The persisted token makes delayed or duplicate release attempts harmless to newer owners.
+        // Tests/alternate embedders without a callback, or a failed enqueue after worker loss,
+        // retain the direct writer fallback below.
+        if claim_guard.enqueue_recovery() {
+            return error;
+        }
+        claim_guard.disable_recovery_callback();
         match self
             .meta
-            .submit(Mutation::ReleaseMultipartClaim(upload_id.clone()))
+            .submit(Mutation::ReleaseMultipartClaim {
+                upload_id: upload_id.clone(),
+                claim_token: claim_token.clone(),
+            })
             .await
         {
-            Ok(MutationOutcome::MultipartClaimRelease(ClaimReleaseOutcome::Released)) => error,
+            Ok(MutationOutcome::MultipartClaimRelease(ClaimReleaseOutcome::Released)) => {
+                // A confirmed release proves a tracked assembled blob was never installed. This is
+                // only the callback-unavailable fallback; production cleanup runs in the retained
+                // worker from the queued recovery record.
+                if let Some(path) = claim_guard.take_assembled_blob() {
+                    let _ = self.blob.delete(&path).await;
+                }
+                claim_guard.disarm();
+                error
+            }
             Ok(MutationOutcome::MultipartClaimRelease(ClaimReleaseOutcome::NotOwner)) => {
+                if let Some(path) = claim_guard.take_proven_unreferenced_blob() {
+                    let _ = self.blob.delete(&path).await;
+                }
+                claim_guard.disarm();
                 Error::NoSuchUpload
             }
             Ok(_) => Error::Internal("unexpected multipart claim-release outcome".to_owned()),
             Err(release) => release.into(),
         }
+    }
+
+    /// Recover an ownership attempt whose Claim writer acknowledgement was lost.
+    ///
+    /// `NotOwner` is harmless here: it can mean the Claim never reached the writer. Preserve the
+    /// original metadata error rather than translating that outcome into `NoSuchUpload`.
+    async fn multipart_claim_submit_failure(
+        &self,
+        upload_id: &UploadId,
+        claim_token: &MultipartClaimToken,
+        error: Error,
+        claim_guard: &mut MultipartClaimGuard,
+    ) -> Error {
+        if claim_guard.enqueue_recovery() {
+            return error;
+        }
+        claim_guard.disable_recovery_callback();
+        let outcome = self
+            .meta
+            .submit(Mutation::ReleaseMultipartClaim {
+                upload_id: upload_id.clone(),
+                claim_token: claim_token.clone(),
+            })
+            .await;
+        if matches!(
+            outcome,
+            Ok(MutationOutcome::MultipartClaimRelease(
+                ClaimReleaseOutcome::Released | ClaimReleaseOutcome::NotOwner
+            ))
+        ) {
+            claim_guard.disarm();
+        }
+        error
     }
 
     async fn reclaim_part_attempt(&self, upload_id: &UploadId, part_number: u16, attempt_id: &str) {
@@ -1615,6 +2204,7 @@ impl S3Service {
             };
         let body = streaming_body(&req, raw_body, self.max_object_size)?;
         let attempt_id = uuid::Uuid::new_v4().simple().to_string();
+        let recovery_permit = self.acquire_storage_recovery_permit().await?;
         self.meta
             .submit(Mutation::ReserveMultipartPart {
                 upload_id: upload_id.clone(),
@@ -1645,9 +2235,18 @@ impl S3Service {
                 return Err(map_stage_err(error));
             }
         };
+        let mut part_guard = MultipartPartWriteGuard::new(
+            MultipartPartWriteRecovery {
+                upload_id: upload_id.clone(),
+                part_number,
+                attempt_id: attempt_id.clone(),
+                storage_path: staged.storage_path.clone(),
+                permit: recovery_permit,
+            },
+            self.multipart_part_write_recovery.clone(),
+        );
         if staged.size != declared_size {
-            self.reclaim_part_attempt(&upload_id, part_number, &attempt_id)
-                .await;
+            self.discard_unsubmitted_part(&mut part_guard).await;
             return Err(Error::InvalidRequest(
                 "multipart part body length did not match its declared length".to_owned(),
             ));
@@ -1669,8 +2268,7 @@ impl S3Service {
                 })
                 .map(hex::encode);
             if got_hex.as_deref() != Some(want_hex.as_str()) {
-                self.reclaim_part_attempt(&upload_id, part_number, &attempt_id)
-                    .await;
+                self.discard_unsubmitted_part(&mut part_guard).await;
                 return Err(Error::BadDigest);
             }
             if !store_sha256 {
@@ -1683,8 +2281,7 @@ impl S3Service {
         // a BadDigest, and the just-staged part must be deleted BEFORE returning so a rejected upload
         // leaves no orphan (the no-orphan invariant every post-`stage` early return honors).
         if let Err(e) = verify_client_checksums(&req, &staged.checksums) {
-            self.reclaim_part_attempt(&upload_id, part_number, &attempt_id)
-                .await;
+            self.discard_unsubmitted_part(&mut part_guard).await;
             return Err(e);
         }
         let part = cairn_types::meta::PartRecord {
@@ -1707,23 +2304,22 @@ impl S3Service {
         {
             Ok(outcome) => outcome,
             Err(error) => {
-                // The part bytes are already durable, but no metadata row owns them when the
-                // writer rejects RecordPart (for example, AbortMultipart won the race after the
-                // scoped session check). Reclaim before returning the metadata failure; otherwise
-                // every rejected retry leaks one staging artifact until reconciliation.
-                self.reclaim_part_attempt(&upload_id, part_number, &attempt_id)
-                    .await;
+                // The writer may have rejected the mutation, or committed it and lost the
+                // acknowledgement. Resolve the exact path in FIFO writer order before deletion.
+                self.recover_multipart_part_write(&mut part_guard).await;
                 return Err(error.into());
             }
         };
         match outcome {
             MutationOutcome::PartRecorded {
                 cleanup: Some(cleanup),
-            } => self.reclaim_multipart_cleanup(&cleanup).await,
-            MutationOutcome::PartRecorded { cleanup: None } => {}
+            } => {
+                part_guard.disarm();
+                self.reclaim_multipart_cleanup(&cleanup).await;
+            }
+            MutationOutcome::PartRecorded { cleanup: None } => part_guard.disarm(),
             _ => {
-                self.reclaim_part_attempt(&upload_id, part_number, &attempt_id)
-                    .await;
+                self.recover_multipart_part_write(&mut part_guard).await;
                 return Err(Error::Internal(
                     "unexpected multipart part outcome".to_owned(),
                 ));
@@ -1829,7 +2425,13 @@ impl S3Service {
         };
         let handle = self
             .blob
-            .open_raw(&src_path, range, src_cipher, &src_row.compression)
+            .open_raw(
+                &src_path,
+                range,
+                src_cipher,
+                &src_row.compression,
+                src_row.size_logical,
+            )
             .await?;
         let declared_size = handle.logical_len;
         if declared_size > self.max_object_size {
@@ -1867,6 +2469,7 @@ impl S3Service {
                 (None, None)
             };
         let attempt_id = uuid::Uuid::new_v4().simple().to_string();
+        let recovery_permit = self.acquire_storage_recovery_permit().await?;
         self.meta
             .submit(Mutation::ReserveMultipartPart {
                 upload_id: upload_id.clone(),
@@ -1897,9 +2500,18 @@ impl S3Service {
                 return Err(map_stage_err(error));
             }
         };
+        let mut part_guard = MultipartPartWriteGuard::new(
+            MultipartPartWriteRecovery {
+                upload_id: upload_id.clone(),
+                part_number,
+                attempt_id: attempt_id.clone(),
+                storage_path: staged.storage_path.clone(),
+                permit: recovery_permit,
+            },
+            self.multipart_part_write_recovery.clone(),
+        );
         if staged.size != declared_size {
-            self.reclaim_part_attempt(&upload_id, part_number, &attempt_id)
-                .await;
+            self.discard_unsubmitted_part(&mut part_guard).await;
             return Err(Error::InvalidRequest(
                 "copied multipart part length changed while staging".to_owned(),
             ));
@@ -1925,22 +2537,22 @@ impl S3Service {
         {
             Ok(outcome) => outcome,
             Err(error) => {
-                // UploadPartCopy reaches the same post-stage writer race as UploadPart. The copied
-                // bytes are not owned unless RecordPart commits, so reclaim them on every submit
-                // failure before surfacing the error.
-                self.reclaim_part_attempt(&upload_id, part_number, &attempt_id)
-                    .await;
+                // UploadPartCopy reaches the same ambiguous post-stage writer boundary as
+                // UploadPart; exact resolution distinguishes rejection from a lost commit ack.
+                self.recover_multipart_part_write(&mut part_guard).await;
                 return Err(error.into());
             }
         };
         match outcome {
             MutationOutcome::PartRecorded {
                 cleanup: Some(cleanup),
-            } => self.reclaim_multipart_cleanup(&cleanup).await,
-            MutationOutcome::PartRecorded { cleanup: None } => {}
+            } => {
+                part_guard.disarm();
+                self.reclaim_multipart_cleanup(&cleanup).await;
+            }
+            MutationOutcome::PartRecorded { cleanup: None } => part_guard.disarm(),
             _ => {
-                self.reclaim_part_attempt(&upload_id, part_number, &attempt_id)
-                    .await;
+                self.recover_multipart_part_write(&mut part_guard).await;
                 return Err(Error::Internal(
                     "unexpected multipart copy-part outcome".to_owned(),
                 ));
@@ -2063,16 +2675,54 @@ impl S3Service {
         // (mixed present algorithms) fails with InvalidRequest while the upload stays retryable.
         let checksum_plan = plan_multipart_checksum(&req, &part_checksums)?;
 
-        // Every requested part validated: now claim the session (active -> completing) and
-        // assemble. A failure past this point is server-side (assembly/commit), not a client part
-        // error, so the narrow `completing` window is acceptable.
+        // Every requested part validated: mint one ownership token and arm recovery before awaiting
+        // the writer. The submit can commit `active -> completing` and then lose its acknowledgement;
+        // a pre-armed exact-token release closes that cancellation window without touching any
+        // older/newer owner. A failure past this point is server-side (assembly/commit), not a
+        // client part error.
+        let claim_token = MultipartClaimToken::generate();
+        let recovery_permit = self.acquire_storage_recovery_permit().await?;
+        let mut claim_guard = MultipartClaimGuard::new(
+            upload_id.clone(),
+            claim_token.clone(),
+            recovery_permit,
+            self.multipart_claim_recovery.clone(),
+        );
         let session = match self
             .meta
-            .submit(Mutation::ClaimMultipart(upload_id.clone()))
-            .await?
+            .submit(Mutation::ClaimMultipart {
+                upload_id: upload_id.clone(),
+                claim_token: claim_token.clone(),
+            })
+            .await
         {
-            MutationOutcome::MultipartClaim(ClaimOutcome::Claimed(s)) => *s,
-            _ => return Err(Error::NoSuchUpload),
+            Ok(MutationOutcome::MultipartClaim(ClaimOutcome::Claimed(s))) => *s,
+            Ok(MutationOutcome::MultipartClaim(
+                ClaimOutcome::AlreadyClaimed | ClaimOutcome::NotFound,
+            )) => {
+                claim_guard.disarm();
+                return Err(Error::NoSuchUpload);
+            }
+            Ok(_) => {
+                return Err(self
+                    .multipart_claim_submit_failure(
+                        &upload_id,
+                        &claim_token,
+                        Error::Internal("unexpected multipart claim outcome".to_owned()),
+                        &mut claim_guard,
+                    )
+                    .await);
+            }
+            Err(error) => {
+                return Err(self
+                    .multipart_claim_submit_failure(
+                        &upload_id,
+                        &claim_token,
+                        error.into(),
+                        &mut claim_guard,
+                    )
+                    .await);
+            }
         };
 
         // SSE (ARCH 27): resolve the assembled object's encryption exactly like a single-part PUT,
@@ -2099,7 +2749,14 @@ impl S3Service {
         {
             Ok(plan) => plan,
             Err(error) => {
-                return Err(self.multipart_failure_after_claim(&upload_id, error).await);
+                return Err(self
+                    .multipart_failure_after_claim(
+                        &upload_id,
+                        &claim_token,
+                        error,
+                        &mut claim_guard,
+                    )
+                    .await);
             }
         };
         // A multipart complete is an object-create path, so it MUST honour the bucket's mandatory-SSE
@@ -2109,7 +2766,14 @@ impl S3Service {
         let plan = match self.enforce_mandatory_sse(&bucket.name, plan, false).await {
             Ok(plan) => plan,
             Err(error) => {
-                return Err(self.multipart_failure_after_claim(&upload_id, error).await);
+                return Err(self
+                    .multipart_failure_after_claim(
+                        &upload_id,
+                        &claim_token,
+                        error,
+                        &mut claim_guard,
+                    )
+                    .await);
             }
         };
         let sse_dek = plan.dek;
@@ -2138,11 +2802,20 @@ impl S3Service {
             Ok(s) => s,
             Err(e) => {
                 let error = self
-                    .multipart_failure_after_claim(&upload_id, e.into())
+                    .multipart_failure_after_claim(
+                        &upload_id,
+                        &claim_token,
+                        e.into(),
+                        &mut claim_guard,
+                    )
                     .await;
                 return Err(error);
             }
         };
+        // `assemble` returned a durable but not-yet-referenced blob. Record it synchronously,
+        // before the next await, so cancellation recovery can reclaim it if (and only if) releasing
+        // this claim proves the completion transaction did not consume the session.
+        claim_guard.track_assembled_blob(staged.storage_path.clone());
         let etag = multipart_etag(&part_md5s);
 
         // Resolve the object-level checksum to store. A FULL_OBJECT plan takes the whole-object digest
@@ -2155,9 +2828,15 @@ impl S3Service {
                 match staged.checksums.iter().find(|c| c.algorithm == algo) {
                     Some(cv) => {
                         if expected.is_some_and(|e| e != cv.value) {
+                            claim_guard.mark_assembled_blob_unreferenced();
                             let _ = self.blob.delete(&staged.storage_path).await;
                             return Err(self
-                                .multipart_failure_after_claim(&upload_id, Error::BadDigest)
+                                .multipart_failure_after_claim(
+                                    &upload_id,
+                                    &claim_token,
+                                    Error::BadDigest,
+                                    &mut claim_guard,
+                                )
                                 .await);
                         }
                         vec![cv.clone()]
@@ -2225,6 +2904,7 @@ impl S3Service {
             .meta
             .submit(Mutation::CompleteMultipart {
                 upload_id: upload_id.clone(),
+                claim_token: claim_token.clone(),
                 row: Box::new(row),
                 precondition: Precondition::default(),
                 replication,
@@ -2235,6 +2915,9 @@ impl S3Service {
                 superseded,
                 ..
             })) => {
+                // The writer consumed the session: ownership is terminal before any best-effort
+                // cleanup/event/audit await below, so cancellation there must not resurrect it.
+                claim_guard.disarm();
                 // Event-driven drain: wake the replication worker now rather than next heartbeat.
                 if enqueued_repl {
                     self.pulse_replication();
@@ -2287,22 +2970,32 @@ impl S3Service {
                 Ok(resp)
             }
             Ok(MutationOutcome::MultipartTerminal(MultipartTerminalOutcome::NotOwner)) => {
+                // This typed outcome proves our assembled path was not installed. Keep the guard
+                // armed through its fallible cleanup await so cancellation can enqueue an
+                // unconditional path cleanup even though claim release will return `NotOwner`.
+                claim_guard.mark_assembled_blob_unreferenced();
                 let _ = self.blob.delete(&staged.storage_path).await;
+                claim_guard.disarm();
                 Err(Error::NoSuchUpload)
             }
-            Ok(_) => {
-                let _ = self.blob.delete(&staged.storage_path).await;
+            Ok(_) => Err(self
+                .multipart_failure_after_claim(
+                    &upload_id,
+                    &claim_token,
+                    Error::Internal("unexpected completion outcome".to_owned()),
+                    &mut claim_guard,
+                )
+                .await),
+            Err(e) => {
+                let error = map_object_commit_error(e, session.lock_intent, now);
                 Err(self
                     .multipart_failure_after_claim(
                         &upload_id,
-                        Error::Internal("unexpected completion outcome".to_owned()),
+                        &claim_token,
+                        error,
+                        &mut claim_guard,
                     )
                     .await)
-            }
-            Err(e) => {
-                let _ = self.blob.delete(&staged.storage_path).await;
-                let error = map_object_commit_error(e, session.lock_intent, now);
-                Err(self.multipart_failure_after_claim(&upload_id, error).await)
             }
         }
     }
@@ -2553,7 +3246,13 @@ impl S3Service {
         };
         let handle = self
             .blob
-            .open_raw(&src_path, None, src_cipher, &src_row.compression)
+            .open_raw(
+                &src_path,
+                None,
+                src_cipher,
+                &src_row.compression,
+                src_row.size_logical,
+            )
             .await?;
         // Re-tag the blob read errors as body errors so the source can feed `stage`.
         let src_stream: cairn_types::BodyStream =
@@ -2590,6 +3289,7 @@ impl S3Service {
             // The source object's plaintext size is known, so preallocate the destination blob.
             content_length: Some(src_row.size_logical),
         };
+        let recovery_permit = self.acquire_storage_recovery_permit().await?;
         let staged = self.blob.stage(&dest_bucket.name, src_stream, opts).await?;
 
         // Copy may spend an arbitrary amount of time reading and staging the source. Start default
@@ -2602,6 +3302,18 @@ impl S3Service {
         } else {
             VersionId::null()
         };
+        let row_id = uuid::Uuid::new_v4().simple().to_string();
+        let mut write_guard = ObjectWriteGuard::new(
+            ObjectWriteRecovery {
+                bucket: dest_bucket.name.clone(),
+                key: dest_key.clone(),
+                version_id: version_id.clone(),
+                row_id: row_id.clone(),
+                storage_path: staged.storage_path.clone(),
+                permit: recovery_permit,
+            },
+            self.object_write_recovery.clone(),
+        );
         let dest_key_for_event = dest_key.clone();
         // The five optional system response headers (ARCH 13.4) follow the metadata directive too:
         // under COPY they are the source version's stored values, under REPLACE this request's.
@@ -2614,7 +3326,7 @@ impl S3Service {
             }
         };
         let row = ObjectVersionRow {
-            id: uuid::Uuid::new_v4().simple().to_string(),
+            id: row_id,
             bucket: dest_bucket.name.clone(),
             key: dest_key,
             version_id: version_id.clone(),
@@ -2682,6 +3394,9 @@ impl S3Service {
             .await
         {
             Ok(MutationOutcome::Put { superseded, .. }) => {
+                // The exact destination row now owns the staged path. Disarm before any
+                // best-effort post-commit await so cancellation cannot reclaim a live copy.
+                write_guard.disarm();
                 // Event-driven drain: wake the replication worker now rather than next heartbeat.
                 if enqueued_repl {
                     self.pulse_replication();
@@ -2722,11 +3437,11 @@ impl S3Service {
             // Surface the commit's TRUE error (PreconditionFailed, InsufficientStorage, ...) rather
             // than collapsing every failure to Internal(500) (Medium #7).
             Ok(_) => {
-                let _ = self.blob.delete(&staged.storage_path).await;
+                self.recover_object_write(&mut write_guard).await;
                 Err(Error::Internal("unexpected copy outcome".to_owned()))
             }
             Err(e) => {
-                let _ = self.blob.delete(&staged.storage_path).await;
+                self.recover_object_write(&mut write_guard).await;
                 Err(map_object_commit_error(e, lock_intent, now))
             }
         }
@@ -2870,7 +3585,9 @@ impl S3Service {
                             bucket: bucket.name.clone(),
                             key,
                             version_id,
+                            expected_row_id: None,
                             expected_updated_at: None,
+                            require_sole_key_version: false,
                             now,
                             bypass,
                         })
@@ -2897,6 +3614,7 @@ impl S3Service {
                                     owner_id: bucket.owner_id.clone(),
                                     now,
                                     bypass: GovernanceBypass::Denied,
+                                    expected_current: None,
                                     replication,
                                 })
                                 .await
@@ -2927,6 +3645,7 @@ impl S3Service {
                                     owner_id: bucket.owner_id.clone(),
                                     now,
                                     bypass,
+                                    expected_current: None,
                                     replication: Vec::new(),
                                 })
                                 .await
@@ -2954,7 +3673,9 @@ impl S3Service {
                                     bucket: bucket.name.clone(),
                                     key,
                                     version_id: null_version,
+                                    expected_row_id: None,
                                     expected_updated_at: None,
+                                    require_sole_key_version: false,
                                     now,
                                     bypass,
                                 })

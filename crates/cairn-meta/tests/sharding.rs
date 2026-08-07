@@ -358,7 +358,10 @@ async fn n3_multipart_rides_the_bucket_shard_via_encoded_id() {
     }
 
     store
-        .submit(Mutation::ClaimMultipart(upload_id.clone()))
+        .submit(Mutation::ClaimMultipart {
+            upload_id: upload_id.clone(),
+            claim_token: cairn_types::MultipartClaimToken::generate(),
+        })
         .await
         .unwrap();
     assert_eq!(

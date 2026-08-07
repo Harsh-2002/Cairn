@@ -315,7 +315,7 @@ def put_worker(wid, deadline):
         body = unique_body(BODIES[i % len(BODIES)])
         try:
             if i % SSE_EVERY == 0:
-                # --- the PINNED-GAP arm: server-side-encrypted source versions -------------------
+                # --- gated regression arm: server-side-encrypted source versions ----------------
                 sse = "AES256" if (i // SSE_EVERY) % 2 == 0 else "aws:kms"
                 kw = {"ServerSideEncryption": sse}
                 if sse == "aws:kms":

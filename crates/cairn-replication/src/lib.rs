@@ -519,7 +519,7 @@ impl ReplicationEngine {
             length: row.size_logical,
         });
         let handle = blobs
-            .open_raw(path, range, cipher, &row.compression)
+            .open_raw(path, range, cipher, &row.compression, row.size_logical)
             .await
             .map_err(map_blob_err)?;
 

@@ -29,7 +29,7 @@ mod staging;
 
 use crate::compress::{BlockEncoder, CompressedReader, is_precompressed};
 use crate::hash::Hashers;
-use crate::staging::Staging;
+use crate::staging::{Staging, UncommittedBlobCleanup};
 use async_trait::async_trait;
 use bytes::Bytes;
 use cairn_types::SecretKey32;
@@ -169,16 +169,16 @@ pub struct LocalBlobStore {
     ///
     /// [`with_small_read_max`]: LocalBlobStore::with_small_read_max
     small_read_max: u64,
-    /// Cumulative count of reads REFUSED because the blob is a self-consistent encrypted CRNB
-    /// container but the caller supplied no DEK (the fail-closed guard in [`open_raw`]).
+    /// Cumulative count of metadata-declared plaintext reads refused because the file length does
+    /// not equal the authoritative object/part logical length.
     ///
     /// Exposed as state rather than emitted here: `cairn-blob` is an engine crate with no `metrics`
-    /// dependency, so the server mirrors this into `cairn_blob_encrypted_without_key_total` on its
+    /// dependency, so the server mirrors this into `cairn_blob_plaintext_length_mismatch_total` on its
     /// metrics tick — the same expose-and-mirror shape as `writer_queue_depth` and the metadata
     /// cache's `(hits, misses)`. A `tracing::error!` alone is not alertable; this is.
     ///
     /// [`open_raw`]: cairn_types::traits::BlobStore::open_raw
-    encrypted_without_key: Arc<std::sync::atomic::AtomicU64>,
+    plaintext_length_mismatch: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Default upper bound (bytes) for the small-object GET fast path — see [`LocalBlobStore`]'s
@@ -222,22 +222,21 @@ impl LocalBlobStore {
             write_permits: Arc::new(tokio::sync::Semaphore::new(DEFAULT_BLOB_IO_CONCURRENCY)),
             dir_sync: Arc::new(commit::DirSyncCoalescer::spawn()),
             small_read_max: SMALL_READ_MAX,
-            encrypted_without_key: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            plaintext_length_mismatch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 
-    /// Cumulative number of reads refused because the blob is an encrypted CRNB container and the
-    /// caller passed no data key (see the `encrypted_without_key` field). Monotonic for the life of
-    /// the process and shared across clones of the store; the server publishes it as
-    /// `cairn_blob_encrypted_without_key_total`.
+    /// Cumulative number of metadata-declared plaintext reads refused because the file's physical
+    /// length differed from the authoritative logical length. Monotonic for the process lifetime
+    /// and shared across clones; the server publishes it as
+    /// `cairn_blob_plaintext_length_mismatch_total`.
     ///
-    /// A non-zero value means either a caller lost a DEK it should have resolved (the replication
-    /// bug this guard closes) **or** the false-positive class documented in this crate's
-    /// `CLAUDE.md`: an object whose body is the verbatim bytes of somebody else's encrypted blob
-    /// file (an `rclone`/`aws s3 sync` backup of a `CAIRN_DATA_DIR` into a bucket).
+    /// This detects a missing encryption descriptor on the ordinary encrypted/uncompressed layout
+    /// (whose framing adds bytes), as well as truncation or inconsistent plaintext metadata, without
+    /// content-sniffing and rejecting legitimate arbitrary object bytes.
     #[must_use]
-    pub fn encrypted_without_key_total(&self) -> u64 {
-        self.encrypted_without_key
+    pub fn plaintext_length_mismatch_total(&self) -> u64 {
+        self.plaintext_length_mismatch
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -469,16 +468,20 @@ async fn write_staged(
 /// happen only when the stream is actually polled.
 fn stream_blob(
     path: &Path,
-    compressed: bool,
     cipher: BlobCipher,
+    compression: &CompressionDescriptor,
+    expected_logical_len: u64,
     offset: u64,
     len: u64,
     tx: &tokio::sync::mpsc::Sender<Result<Bytes, BlobError>>,
 ) -> Result<(), BlobError> {
     use std::io::{Read, Seek, SeekFrom};
-    if compressed {
+    let is_container =
+        cipher.is_encrypted() || !matches!(compression, CompressionDescriptor::Uncompressed);
+    if is_container {
         let f = std::fs::File::open(path).map_err(io_err)?;
-        let mut reader = CompressedReader::open_with_dek(f, cipher)?;
+        let mut reader =
+            CompressedReader::open_with_dek(f, cipher, compression, expected_logical_len)?;
         let bs = reader.block_size();
         let end = offset.saturating_add(len).min(reader.logical_len());
         if bs == 0 || offset >= end {
@@ -525,8 +528,9 @@ enum StreamSrc {
     Pending(
         (
             PathBuf,
-            bool,
             BlobCipher,
+            CompressionDescriptor,
+            u64,
             u64,
             u64,
             tokio::sync::OwnedSemaphorePermit,
@@ -537,22 +541,47 @@ enum StreamSrc {
 
 fn read_stream(
     path: PathBuf,
-    compressed: bool,
     cipher: BlobCipher,
+    compression: CompressionDescriptor,
+    expected_logical_len: u64,
     offset: u64,
     len: u64,
     permit: tokio::sync::OwnedSemaphorePermit,
 ) -> cairn_types::BlobStream {
-    let initial = StreamSrc::Pending((path, compressed, cipher, offset, len, permit));
+    let initial = StreamSrc::Pending((
+        path,
+        cipher,
+        compression,
+        expected_logical_len,
+        offset,
+        len,
+        permit,
+    ));
     Box::pin(futures_util::stream::unfold(initial, |state| async move {
         let mut rx = match state {
-            StreamSrc::Pending((path, compressed, cipher, offset, len, permit)) => {
+            StreamSrc::Pending((
+                path,
+                cipher,
+                compression,
+                expected_logical_len,
+                offset,
+                len,
+                permit,
+            )) => {
                 let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, BlobError>>(4);
                 tokio::task::spawn_blocking(move || {
                     // The permit is held for the whole transfer so it counts against the blob-I/O
                     // bound (ARCH 7.4), then released when this task ends.
                     let _permit = permit;
-                    if let Err(e) = stream_blob(&path, compressed, cipher, offset, len, &tx) {
+                    if let Err(e) = stream_blob(
+                        &path,
+                        cipher,
+                        &compression,
+                        expected_logical_len,
+                        offset,
+                        len,
+                        &tx,
+                    ) {
                         let _ = tx.blocking_send(Err(e));
                     }
                 });
@@ -655,7 +684,15 @@ impl LocalBlobStore {
                     let path = part_path.clone();
                     let size = part.size;
                     tokio::task::spawn_blocking(move || {
-                        if let Err(e) = stream_blob(&path, true, cipher, 0, size, &tx) {
+                        if let Err(e) = stream_blob(
+                            &path,
+                            cipher,
+                            &CompressionDescriptor::Uncompressed,
+                            size,
+                            0,
+                            size,
+                            &tx,
+                        ) {
                             let _ = tx.blocking_send(Err(e));
                         }
                     });
@@ -699,6 +736,10 @@ impl BlobStore for LocalBlobStore {
         let bucket_dir = self.data_root.join(bucket.as_str());
         let final_path = bucket_dir.join(&id);
         let storage_path = StoragePath::from_string(format!("{}/{}", bucket.as_str(), id));
+        // Keep ownership of both possible names across every await until the `StagedBlob` is
+        // returned. A canceled request therefore cannot strand either the pre-rename tmp or the
+        // post-rename blob before metadata has had a chance to reference it.
+        let mut cleanup = UncommittedBlobCleanup::new(staging.clone(), final_path.clone());
 
         let mut sink = Staging::create(staging, self.use_uring, opts.content_length).await?;
         let outcome = write_staged(&mut sink, body, &opts).await;
@@ -724,7 +765,7 @@ impl BlobStore for LocalBlobStore {
         // metadata row references it yet. A crash here leaves an orphan that reconcile reclaims.
         fail::fail_point!("blob_after_durable");
 
-        Ok(StagedBlob {
+        let staged = StagedBlob {
             storage_path,
             size_logical: logical,
             size_physical: physical,
@@ -732,7 +773,9 @@ impl BlobStore for LocalBlobStore {
             md5_hex: md5,
             checksums,
             compression: descriptor,
-        })
+        };
+        cleanup.disarm();
+        Ok(staged)
     }
 
     async fn open_raw(
@@ -741,6 +784,7 @@ impl BlobStore for LocalBlobStore {
         range: Option<ByteRange>,
         cipher: BlobCipher,
         compression: &CompressionDescriptor,
+        expected_logical_len: u64,
     ) -> Result<BlobReadHandle, BlobError> {
         // The named cipher includes the metadata-backed CRNB format expectation. Keep that typed
         // declaration intact through both the probe open and the lazy body stream: reducing it to a
@@ -762,10 +806,11 @@ impl BlobStore for LocalBlobStore {
         // anyway, so it would never take the zero-copy path). This is the small-object GET fast path.
         let small_read_max = self.small_read_max;
         let probe_path = file_path.clone();
-        let refused = self.encrypted_without_key.clone();
+        let plaintext_length_mismatch = self.plaintext_length_mismatch.clone();
         let probe_cipher = cipher.clone();
-        let (compressed, logical_len, reuse_file, whole) = tokio::task::spawn_blocking(
-            move || -> Result<(bool, u64, Option<std::fs::File>, Option<Bytes>), BlobError> {
+        let probe_compression = compression.clone();
+        let (logical_len, reuse_file, whole) = tokio::task::spawn_blocking(
+            move || -> Result<(u64, Option<std::fs::File>, Option<Bytes>), BlobError> {
                 use std::io::{Read, Seek, SeekFrom};
                 let mut f = match std::fs::File::open(&probe_path) {
                     Ok(f) => f,
@@ -775,70 +820,46 @@ impl BlobStore for LocalBlobStore {
                     Err(e) => return Err(io_err(e)),
                 };
                 let file_len = f.metadata().map_err(io_err)?.len();
-                // Whether this blob is a CRNB block container is authoritative from the caller's
-                // stored descriptor + DEK (`is_container`, audit #18), so there is no trailer sniff
-                // to misfire on an uncompressed object whose own bytes happen to end in "CRNB".
-                let compressed = is_container;
-                // Defence in depth: framing is decided from the DEK ARGUMENT, so a caller that
-                // forgets the key for an encrypted-but-uncompressed blob would otherwise stream raw
-                // ciphertext as if it were the plaintext body — silently, at exactly the right
-                // length. (That is precisely how replication shipped ciphertext to mirrors.) Before
-                // taking the plaintext branch, cross-check the trailer and REFUSE if the blob is
-                // demonstrably an encrypted container. We only ever refuse — never parse as a
-                // container — so a plaintext blob that merely ends in the magic still reads (the
-                // predicate additionally requires the full layout identity to hold).
-                //
-                // The trailer is fetched with ONE POSITIONED read (`pread`) rather than
-                // seek-to-end / read / seek-back: the plaintext branch is the tuned hot path
-                // (including the small-object fast path), so the guard must not cost it two extra
-                // `lseek`s per GET — and, more importantly, the rewind was an *unstated* invariant
-                // that both the `read_to_end` branch and the reused zero-copy fd silently depended
-                // on. A positioned read leaves the file offset untouched, so that dependency is
-                // gone rather than merely satisfied. `read_exact_at` is a safe `std` API, so
-                // `#![forbid(unsafe_code)]` still holds.
-                if !compressed && file_len >= compress::TRAILER_BYTES as u64 {
-                    let mut t = [0u8; compress::TRAILER_BYTES];
-                    let off = file_len - compress::TRAILER_BYTES as u64;
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::FileExt;
-                        f.read_exact_at(&mut t, off).map_err(io_err)?;
-                    }
-                    // Portable fallback (the crate targets unix in practice — `raw_io` keeps the
-                    // same shape). Seek/read/rewind, restoring the offset the branches below want.
-                    #[cfg(not(unix))]
-                    {
-                        f.seek(SeekFrom::Start(off)).map_err(io_err)?;
-                        f.read_exact(&mut t).map_err(io_err)?;
-                        f.seek(SeekFrom::Start(0)).map_err(io_err)?;
-                    }
-                    if compress::is_encrypted_container_trailer(&t, file_len) {
-                        refused.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        tracing::error!(
-                            path = %probe_path.display(),
-                            "refusing to read an encrypted blob without a data key"
-                        );
-                        return Err(BlobError::Corruption(
-                            "encrypted blob read without a data key".into(),
-                        ));
-                    }
+                // Plaintext framing is an authoritative metadata declaration. Validate its one
+                // independent physical invariant instead of sniffing the body: plaintext and
+                // logical lengths must match exactly. This catches the ordinary missing-DEK case
+                // (an encrypted/uncompressed CRNB file has framing overhead), yet preserves S3's
+                // arbitrary-byte contract when a legitimate plaintext object's bytes themselves
+                // happen to form a complete CRNB file.
+                if !is_container && file_len != expected_logical_len {
+                    plaintext_length_mismatch.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    tracing::error!(
+                        path = %probe_path.display(),
+                        file_len,
+                        expected_logical_len,
+                        "metadata-declared plaintext blob length mismatch"
+                    );
+                    return Err(BlobError::Corruption(
+                        "plaintext blob length does not match trusted metadata".into(),
+                    ));
                 }
-                if compressed {
+                if is_container {
                     // Parse the header for the logical length; the fd is consumed by the reader and
                     // not reused (compressed/encrypted blobs never take the kernel fast path).
                     f.seek(SeekFrom::Start(0)).map_err(io_err)?;
-                    let logical = CompressedReader::open_with_dek(f, probe_cipher)?.logical_len();
-                    Ok((true, logical, None, None))
+                    let logical = CompressedReader::open_with_dek(
+                        f,
+                        probe_cipher,
+                        &probe_compression,
+                        expected_logical_len,
+                    )?
+                    .logical_len();
+                    Ok((logical, None, None))
                 } else if file_len <= small_read_max {
                     // Small uncompressed object: read it whole here (one open, one read). The range
                     // is sliced from this buffer below — no second open, no streaming channel.
                     let mut buf = Vec::with_capacity(file_len as usize);
                     f.read_to_end(&mut buf).map_err(io_err)?;
-                    Ok((false, file_len, None, Some(Bytes::from(buf))))
+                    Ok((file_len, None, Some(Bytes::from(buf))))
                 } else {
                     // Larger uncompressed object: the file length is the logical length, and the open
                     // fd is reused as the zero-copy source below.
-                    Ok((false, file_len, Some(f), None))
+                    Ok((file_len, Some(f), None))
                 }
             },
         )
@@ -899,10 +920,18 @@ impl BlobStore for LocalBlobStore {
             // Hold a blob-I/O permit for the streamed transfer (ARCH 7.4); released when the read
             // task finishes. (The kernel sendfile fast path below is bounded separately by the server.)
             let permit = self.acquire_io_owned().await?;
-            let body = read_stream(file_path.clone(), compressed, cipher, offset, len, permit);
+            let body = read_stream(
+                file_path.clone(),
+                cipher,
+                compression.clone(),
+                expected_logical_len,
+                offset,
+                len,
+                permit,
+            );
             // Uncompressed, plaintext blobs may take the kernel file-to-socket fast path, reusing the
-            // fd the probe opened. Encrypted blobs are always block-formatted (so `compressed` is
-            // true), so `reuse_file` is `None` for them and the kernel never sees ciphertext.
+            // fd the probe opened. Encrypted blobs are always block-formatted (`is_container`), so
+            // `reuse_file` is `None` for them and the kernel never sees ciphertext.
             let zero_copy = reuse_file.map(|f| ZeroCopyRead {
                 file: Arc::new(f),
                 offset,
@@ -1050,6 +1079,9 @@ impl BlobStore for LocalBlobStore {
         let bucket_dir = self.data_root.join(bucket.as_str());
         let final_path = bucket_dir.join(&id);
         let storage_path = StoragePath::from_string(format!("{}/{}", bucket.as_str(), id));
+        // Multipart assembly has the same pre-metadata ownership window as a single PUT. Keep a
+        // synchronous Drop guard armed across part reads, rename, and the directory-fsync barrier.
+        let mut cleanup = UncommittedBlobCleanup::new(staging.clone(), final_path.clone());
 
         let compress = match opts.compression {
             Some(pol) if !is_precompressed(&opts.content_type) => Some(pol),
@@ -1135,7 +1167,7 @@ impl BlobStore for LocalBlobStore {
         fail::fail_point!("blob_after_assemble");
 
         let (md5_hex, checksums) = hashers.finalize();
-        Ok(StagedBlob {
+        let staged = StagedBlob {
             storage_path,
             size_logical: logical,
             size_physical: physical,
@@ -1143,7 +1175,9 @@ impl BlobStore for LocalBlobStore {
             md5_hex,
             checksums,
             compression: descriptor,
-        })
+        };
+        cleanup.disarm();
+        Ok(staged)
     }
 
     async fn delete_session(&self, upload: &UploadId) -> Result<(), BlobError> {
@@ -1522,6 +1556,51 @@ mod tests {
         drop(held);
     }
 
+    /// The request-level guard is installed before the staging file is created, not merely around
+    /// the rename. Cancel a real `stage` future while its body is deterministically parked and
+    /// verify the provisional file disappears without waiting for reconciliation.
+    #[tokio::test]
+    async fn canceled_stage_unlinks_its_inflight_tmp() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalBlobStore::open(dir.path()).await.unwrap();
+        let bucket = BucketName::parse("bkt").unwrap();
+        let (polled_tx, polled_rx) = tokio::sync::oneshot::channel();
+        let first = futures_util::stream::once(async move {
+            let _ = polled_tx.send(());
+            Ok::<_, cairn_types::error::BodyError>(Bytes::from_static(b"started"))
+        });
+        let body: cairn_types::BodyStream = Box::pin(first.chain(futures_util::stream::pending()));
+
+        let task = tokio::spawn(async move {
+            store
+                .stage(
+                    &bucket,
+                    body,
+                    StageOptions {
+                        size_ceiling: 1024,
+                        ..StageOptions::default()
+                    },
+                )
+                .await
+        });
+        polled_rx.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+
+        let mut entries = tokio::fs::read_dir(dir.path().join(STAGING)).await.unwrap();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            assert!(
+                !entry.file_type().await.unwrap().is_file(),
+                "canceled stage left provisional file {}",
+                entry.path().display()
+            );
+        }
+        assert!(
+            !dir.path().join("bkt").exists(),
+            "a pre-rename cancellation must not create a final blob"
+        );
+    }
+
     /// The small-object GET fast path (an uncompressed blob at or below `small_read_max`, served
     /// inline from the probe's single read) must hold a read permit for as long as the streamed path
     /// does — otherwise a flood of slow readers requesting small objects bypasses the exact pool this
@@ -1560,6 +1639,7 @@ mod tests {
                 None,
                 BlobCipher::KnownPlaintext,
                 &staged.compression,
+                staged.size_logical,
             )
             .await
             .unwrap();

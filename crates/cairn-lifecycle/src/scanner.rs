@@ -10,7 +10,9 @@
 //! once already performed, so a scan that is interrupted and rerun, or simply run twice,
 //! converges to the same end state. Current-object expiration in a versioned bucket relies on
 //! [`MetadataStore::list_current`] excluding delete markers — once a marker hides a key, the
-//! key no longer appears, so no second marker is inserted.
+//! key no longer appears, so no second marker is inserted. Writer-atomic freshness guards also
+//! make an enumeration-time decision a no-op when a new current version arrives, or when a sole
+//! delete marker gains another version, before the mutation commits.
 //!
 //! Transition to a remote cold tier (ARCH 19.5) is a documented NO-OP placeholder in v1: the
 //! scanner recognizes the action but performs no data movement and does not count it.
@@ -18,9 +20,9 @@
 use crate::config::{Action, Expiration, Filter, LifecycleRule};
 use cairn_types::{BlobStore, MetaError};
 use cairn_types::{
-    Bucket, BucketName, Clock, GovernanceBypass, ListQuery, MetadataStore, MultipartSession,
-    MultipartTerminalOutcome, Mutation, MutationOutcome, ObjectKey, ObjectSummary, StoragePath,
-    Timestamp, VersionId, VersioningState,
+    Bucket, BucketName, Clock, CurrentVersionGuard, GovernanceBypass, ListQuery, MetadataStore,
+    MultipartSession, MultipartTerminalOutcome, Mutation, MutationOutcome, ObjectKey,
+    ObjectSummary, StoragePath, Timestamp, VersionId, VersioningState,
 };
 
 /// The page size used for every bounded enumeration the scanner issues. Memory stays flat
@@ -274,26 +276,16 @@ impl LifecycleScanner {
                 };
                 debug_assert!(rule.enabled);
                 if versioned {
-                    if self
-                        .insert_delete_marker(meta, bucket, &obj.key, now)
-                        .await
-                        .is_ok()
-                    {
-                        report.objects_expired += 1;
-                    } else {
-                        report.errors += 1;
+                    match self.insert_delete_marker(meta, bucket, obj, now).await {
+                        Ok(true) => report.objects_expired += 1,
+                        // Ok(false): the enumerated version was replaced after the scan, or Object
+                        // Lock preserved it. Neither outcome is an expiration or an error.
+                        Ok(false) => {}
+                        Err(_) => report.errors += 1,
                     }
                 } else {
                     match self
-                        .delete_version(
-                            meta,
-                            blob,
-                            &bucket.name,
-                            &obj.key,
-                            &obj.version_id,
-                            now,
-                            Some(obj.last_modified),
-                        )
+                        .delete_version(meta, blob, &bucket.name, obj, now)
                         .await
                     {
                         Ok(true) => report.objects_expired += 1,
@@ -382,15 +374,7 @@ impl LifecycleScanner {
                 continue;
             }
             match self
-                .delete_version(
-                    meta,
-                    blob,
-                    &bucket.name,
-                    &obj.key,
-                    &obj.version_id,
-                    now,
-                    Some(obj.last_modified),
-                )
+                .delete_version(meta, blob, &bucket.name, obj, now)
                 .await
             {
                 Ok(true) => report.versions_expired += 1,
@@ -430,21 +414,9 @@ impl LifecycleScanner {
             }) {
                 continue;
             }
-            match meta
-                .submit(Mutation::DeleteVersion {
-                    bucket: bucket.name.clone(),
-                    key: obj.key.clone(),
-                    version_id: obj.version_id.clone(),
-                    expected_updated_at: None,
-                    now,
-                    bypass: GovernanceBypass::Denied,
-                })
-                .await
-            {
-                Ok(MutationOutcome::Deleted { .. }) => report.delete_markers_removed += 1,
-                Ok(MutationOutcome::DeleteNotApplied) => {}
-                Ok(MutationOutcome::DeleteProtected) => {}
-                Ok(_) => report.errors += 1,
+            match self.delete_expired_marker(meta, bucket, obj, now).await {
+                Ok(true) => report.delete_markers_removed += 1,
+                Ok(false) => {}
                 Err(_) => report.errors += 1,
             }
         }
@@ -652,29 +624,75 @@ impl LifecycleScanner {
 
     /// Insert a delete marker for the current object (versioned-bucket expiration), propagating it
     /// to replicas where the bucket's replication rule calls for it (ARCH 19.3/20.3).
-    async fn insert_delete_marker<M>(
+    pub(crate) async fn insert_delete_marker<M>(
         &self,
         meta: &M,
         bucket: &Bucket,
-        key: &ObjectKey,
+        obj: &ObjectSummary,
         now: Timestamp,
-    ) -> Result<(), MetaError>
+    ) -> Result<bool, MetaError>
     where
         M: MetadataStore + ?Sized,
     {
         let marker_id = VersionId::generate();
-        let replication = Self::marker_replication(meta, bucket, key, &marker_id, now).await;
-        meta.submit(Mutation::CreateDeleteMarker {
-            bucket: bucket.name.clone(),
-            key: key.clone(),
-            version_id: marker_id,
-            owner_id: bucket.owner_id.clone(),
-            now,
-            bypass: GovernanceBypass::Denied,
-            replication,
-        })
-        .await
-        .map(|_| ())
+        let replication = Self::marker_replication(meta, bucket, &obj.key, &marker_id, now).await;
+        let outcome = meta
+            .submit(Mutation::CreateDeleteMarker {
+                bucket: bucket.name.clone(),
+                key: obj.key.clone(),
+                version_id: marker_id,
+                owner_id: bucket.owner_id.clone(),
+                now,
+                bypass: GovernanceBypass::Denied,
+                expected_current: Some(CurrentVersionGuard {
+                    version_id: obj.version_id.clone(),
+                    updated_at: obj.last_modified,
+                }),
+                replication,
+            })
+            .await?;
+        match outcome {
+            MutationOutcome::DeleteMarker { .. } => Ok(true),
+            MutationOutcome::DeleteNotApplied | MutationOutcome::DeleteProtected => Ok(false),
+            _ => Err(MetaError::Engine(
+                "unexpected lifecycle delete-marker outcome".to_owned(),
+            )),
+        }
+    }
+
+    /// Delete a lifecycle-enumerated sole delete marker only while it is still the sole version.
+    ///
+    /// Replication may insert an older noncurrent version after enumeration. The writer guard keeps
+    /// that arrival from being exposed by a stale sole-marker cleanup decision.
+    pub(crate) async fn delete_expired_marker<M>(
+        &self,
+        meta: &M,
+        bucket: &Bucket,
+        obj: &ObjectSummary,
+        now: Timestamp,
+    ) -> Result<bool, MetaError>
+    where
+        M: MetadataStore + ?Sized,
+    {
+        let outcome = meta
+            .submit(Mutation::DeleteVersion {
+                bucket: bucket.name.clone(),
+                key: obj.key.clone(),
+                version_id: obj.version_id.clone(),
+                expected_row_id: Some(obj.row_id.clone()),
+                expected_updated_at: Some(obj.last_modified),
+                require_sole_key_version: true,
+                now,
+                bypass: GovernanceBypass::Denied,
+            })
+            .await?;
+        match outcome {
+            MutationOutcome::Deleted { .. } => Ok(true),
+            MutationOutcome::DeleteNotApplied | MutationOutcome::DeleteProtected => Ok(false),
+            _ => Err(MetaError::Engine(
+                "unexpected expired delete-marker outcome".to_owned(),
+            )),
+        }
     }
 
     /// Build the replication-outbox entries for a lifecycle-created delete marker — one per distinct
@@ -732,30 +750,29 @@ impl LifecycleScanner {
     /// protected version becomes eligible once protection lapses, while a lost race is reconsidered
     /// from fresh metadata on a later scan.
     #[allow(clippy::too_many_arguments)]
-    async fn delete_version<M, B>(
+    pub(crate) async fn delete_version<M, B>(
         &self,
         meta: &M,
         blob: &B,
         bucket: &BucketName,
-        key: &ObjectKey,
-        version_id: &VersionId,
+        obj: &ObjectSummary,
         now: Timestamp,
-        expected_updated_at: Option<Timestamp>,
     ) -> Result<bool, MetaError>
     where
         M: MetadataStore + ?Sized,
         B: BlobStore + ?Sized,
     {
-        // Compare-and-delete on the version's updated_at captured at enumeration: a client overwrite
-        // landing between the scan and here bumps updated_at, so the delete becomes a no-op instead
-        // of destroying the fresh, non-expired object (the current-object-expiration TOCTOU; audit
-        // 2026-07). `expected_updated_at` is threaded from the enumerated object's last_modified.
+        // Compare-and-delete on the immutable row id captured at enumeration. Unversioned writes
+        // reuse the null version sentinel and may share one timestamp tick, but every replacement
+        // gets a new row id. `updated_at` remains a defense-in-depth freshness predicate.
         let outcome = meta
             .submit(Mutation::DeleteVersion {
                 bucket: bucket.clone(),
-                key: key.clone(),
-                version_id: version_id.clone(),
-                expected_updated_at,
+                key: obj.key.clone(),
+                version_id: obj.version_id.clone(),
+                expected_row_id: Some(obj.row_id.clone()),
+                expected_updated_at: Some(obj.last_modified),
+                require_sole_key_version: false,
                 now,
                 bypass: GovernanceBypass::Denied,
             })
@@ -808,6 +825,7 @@ fn filter_matches_marker(filter: &Filter, obj: &ObjectSummary, tags: &[(String, 
 mod outcome_tests {
     use super::*;
     use cairn_types::testing::{InMemoryBlobStore, InMemoryMetadataStore};
+    use cairn_types::{ETag, StorageClass, UserId};
 
     #[tokio::test]
     async fn delete_not_applied_does_not_advance_lifecycle_counters() {
@@ -816,10 +834,19 @@ mod outcome_tests {
                 &InMemoryMetadataStore::new(),
                 &InMemoryBlobStore::new(),
                 &BucketName::parse("missing-bucket").unwrap(),
-                &ObjectKey::parse("missing-key").unwrap(),
-                &VersionId::from_string("missing-version".to_owned()),
+                &ObjectSummary {
+                    row_id: "missing-row".to_owned(),
+                    key: ObjectKey::parse("missing-key").unwrap(),
+                    version_id: VersionId::from_string("missing-version".to_owned()),
+                    is_latest: true,
+                    is_delete_marker: false,
+                    etag: ETag::from_string("missing".to_owned()),
+                    size: 0,
+                    last_modified: Timestamp::EPOCH,
+                    storage_class: StorageClass::Standard,
+                    owner_id: UserId("missing-owner".to_owned()),
+                },
                 Timestamp::EPOCH,
-                None,
             )
             .await
             .unwrap();

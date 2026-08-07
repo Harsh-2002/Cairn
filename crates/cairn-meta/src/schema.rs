@@ -774,6 +774,34 @@ ALTER TABLE multipart_uploads
     );
 "#,
     },
+    Migration {
+        version: 28,
+        name: "current-listing row identity cover",
+        sql: r#"
+-- Lifecycle compare-and-delete uses object_versions.id as the immutable identity of the exact row
+-- returned by a listing. Keep the hot latest-only ListObjects projection index-only after adding
+-- that internal field to ObjectSummary by replacing, rather than editing, migration v11's index.
+DROP INDEX IF EXISTS idx_ov_latest_cover;
+CREATE INDEX idx_ov_latest_cover ON object_versions
+    (bucket_name, key, version_id, id, is_delete_marker, etag, size_logical, updated_at,
+     storage_class, owner_id)
+    WHERE is_latest = 1;
+"#,
+    },
+    Migration {
+        version: 29,
+        name: "multipart completion claim tokens",
+        sql: r#"
+-- Completion ownership must survive a lost writer acknowledgement. A per-attempt token lets
+-- cancellation recovery be armed before ClaimMultipart is acknowledged while remaining unable to
+-- release or complete a newer attempt (the generationless form admitted an ABA race).
+ALTER TABLE multipart_uploads ADD COLUMN completion_claim_token TEXT;
+-- A process performing this migration has no surviving request that owns an old transient claim.
+UPDATE multipart_uploads
+SET status='active', completion_claim_token=NULL
+WHERE status='completing';
+"#,
+    },
 ];
 
 /// Highest schema version understood by this build.
@@ -1389,11 +1417,23 @@ mod tests {
                      PRIMARY KEY (upload_id, part_number)
                  );
                  CREATE TABLE object_versions (
+                     id TEXT PRIMARY KEY,
                      bucket_name TEXT NOT NULL,
                      key TEXT NOT NULL,
                      version_id TEXT NOT NULL,
+                     is_latest INTEGER NOT NULL DEFAULT 1,
+                     is_delete_marker INTEGER NOT NULL DEFAULT 0,
+                     etag TEXT NOT NULL DEFAULT '',
+                     size_logical INTEGER NOT NULL DEFAULT 0,
+                     updated_at INTEGER NOT NULL DEFAULT 0,
+                     storage_class TEXT NOT NULL DEFAULT 'Standard',
+                     owner_id TEXT NOT NULL DEFAULT '',
                      UNIQUE (bucket_name, key, version_id)
                  );
+                 CREATE INDEX idx_ov_latest_cover ON object_versions
+                     (bucket_name, key, version_id, is_delete_marker, etag, size_logical,
+                      updated_at, storage_class, owner_id)
+                     WHERE is_latest = 1;
                  CREATE TABLE object_locks (
                      bucket_name TEXT NOT NULL,
                      key TEXT NOT NULL,
@@ -1555,12 +1595,25 @@ mod tests {
              );
              INSERT INTO schema_migrations VALUES (26, 'legacy fixture', 0);
              CREATE TABLE object_versions (
+                 id TEXT PRIMARY KEY,
                  bucket_name TEXT NOT NULL,
                  key TEXT NOT NULL,
                  version_id TEXT NOT NULL,
+                 is_latest INTEGER NOT NULL DEFAULT 1,
+                 is_delete_marker INTEGER NOT NULL DEFAULT 0,
+                 etag TEXT NOT NULL DEFAULT '',
+                 size_logical INTEGER NOT NULL DEFAULT 0,
+                 updated_at INTEGER NOT NULL DEFAULT 0,
+                 storage_class TEXT NOT NULL DEFAULT 'Standard',
+                 owner_id TEXT NOT NULL DEFAULT '',
                  UNIQUE (bucket_name, key, version_id)
              );
-             INSERT INTO object_versions VALUES ('b','live','v');
+             INSERT INTO object_versions (id, bucket_name, key, version_id)
+                 VALUES ('row-live','b','live','v');
+             CREATE INDEX idx_ov_latest_cover ON object_versions
+                 (bucket_name, key, version_id, is_delete_marker, etag, size_logical, updated_at,
+                  storage_class, owner_id)
+                 WHERE is_latest = 1;
              CREATE TABLE object_locks (
                  bucket_name TEXT NOT NULL,
                  key TEXT NOT NULL,
@@ -1572,8 +1625,11 @@ mod tests {
              );
              INSERT INTO object_locks VALUES ('b','live','v','COMPLIANCE',100,0);
              INSERT INTO object_locks VALUES ('b','orphan','v','GOVERNANCE',100,1);
-             CREATE TABLE multipart_uploads (id TEXT PRIMARY KEY);
-             INSERT INTO multipart_uploads VALUES ('legacy-upload');",
+             CREATE TABLE multipart_uploads (
+                 id TEXT PRIMARY KEY,
+                 status TEXT NOT NULL
+             );
+             INSERT INTO multipart_uploads VALUES ('legacy-upload','active');",
         )
         .unwrap();
 
@@ -1601,6 +1657,128 @@ mod tests {
         assert_eq!(
             intent_known, 0,
             "a migrated session must remain distinguishable from new writer-pinned intent"
+        );
+    }
+
+    #[test]
+    fn migration_v28_adds_row_identity_to_current_listing_cover() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_migrations (
+                 version INTEGER PRIMARY KEY,
+                 name TEXT NOT NULL,
+                 applied_at INTEGER NOT NULL
+             );
+             INSERT INTO schema_migrations VALUES (27, 'legacy fixture', 0);
+             CREATE TABLE object_versions (
+                 id TEXT PRIMARY KEY,
+                 bucket_name TEXT NOT NULL,
+                 key TEXT NOT NULL,
+                 version_id TEXT NOT NULL,
+                 is_latest INTEGER NOT NULL,
+                 is_delete_marker INTEGER NOT NULL,
+                 etag TEXT NOT NULL,
+                 size_logical INTEGER NOT NULL,
+                 updated_at INTEGER NOT NULL,
+                 storage_class TEXT NOT NULL,
+                 owner_id TEXT NOT NULL
+             );
+             CREATE INDEX idx_ov_latest_cover ON object_versions
+                 (bucket_name, key, version_id, is_delete_marker, etag, size_logical, updated_at,
+                  storage_class, owner_id)
+                 WHERE is_latest = 1;
+             CREATE TABLE multipart_uploads (
+                 id TEXT PRIMARY KEY,
+                 status TEXT NOT NULL
+             );",
+        )
+        .unwrap();
+
+        run_migrations(&conn).unwrap();
+        let columns = conn
+            .prepare("SELECT name FROM pragma_index_info('idx_ov_latest_cover') ORDER BY seqno")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            columns,
+            [
+                "bucket_name",
+                "key",
+                "version_id",
+                "id",
+                "is_delete_marker",
+                "etag",
+                "size_logical",
+                "updated_at",
+                "storage_class",
+                "owner_id",
+            ]
+        );
+
+        let plan: String = conn
+            .query_row(
+                "EXPLAIN QUERY PLAN
+                 SELECT key, version_id, is_latest, is_delete_marker, etag, size_logical,
+                        updated_at, storage_class, owner_id, id
+                 FROM object_versions
+                 WHERE bucket_name = 'b' AND key >= '' AND is_latest = 1
+                       AND is_delete_marker = 0
+                 ORDER BY key ASC LIMIT 10",
+                [],
+                |row| row.get(3),
+            )
+            .unwrap();
+        assert!(
+            plan.contains("COVERING INDEX idx_ov_latest_cover"),
+            "row-identity listing must remain index-only, plan was: {plan}"
+        );
+    }
+
+    #[test]
+    fn migration_v29_resets_unowned_legacy_completion_claims() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_migrations (
+                 version INTEGER PRIMARY KEY,
+                 name TEXT NOT NULL,
+                 applied_at INTEGER NOT NULL
+             );
+             INSERT INTO schema_migrations VALUES (28, 'legacy fixture', 0);
+             CREATE TABLE multipart_uploads (
+                 id TEXT PRIMARY KEY,
+                 status TEXT NOT NULL
+             );
+             INSERT INTO multipart_uploads VALUES ('active-upload','active');
+             INSERT INTO multipart_uploads VALUES ('orphaned-completer','completing');",
+        )
+        .unwrap();
+
+        run_migrations(&conn).unwrap();
+        let rows = conn
+            .prepare(
+                "SELECT id, status, completion_claim_token
+                 FROM multipart_uploads ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            [
+                ("active-upload".to_owned(), "active".to_owned(), None),
+                ("orphaned-completer".to_owned(), "active".to_owned(), None),
+            ]
         );
     }
 }

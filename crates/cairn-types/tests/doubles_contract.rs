@@ -201,6 +201,7 @@ async fn put_get_list_delete_roundtrip() {
             None,
             BlobCipher::KnownPlaintext,
             &current.compression,
+            current.size_logical,
         )
         .await
         .unwrap();
@@ -230,7 +231,9 @@ async fn put_get_list_delete_roundtrip() {
             bucket: bucket.clone(),
             key: key2.clone(),
             version_id: VersionId::null(),
+            expected_row_id: None,
             expected_updated_at: None,
+            require_sole_key_version: false,
             now: clock.now(),
             bypass: GovernanceBypass::Denied,
         })
@@ -342,7 +345,9 @@ async fn versioning_keeps_history_and_promotes_latest() {
             bucket: bucket.clone(),
             key: key.clone(),
             version_id: versions[2].clone(),
+            expected_row_id: None,
             expected_updated_at: Some(Timestamp(1)),
+            require_sole_key_version: false,
             now: Timestamp::EPOCH,
             bypass: GovernanceBypass::Denied,
         })
@@ -362,7 +367,9 @@ async fn versioning_keeps_history_and_promotes_latest() {
             bucket: bucket.clone(),
             key: key.clone(),
             version_id: VersionId::from_string("missing".to_owned()),
+            expected_row_id: None,
             expected_updated_at: None,
+            require_sole_key_version: false,
             now: Timestamp::EPOCH,
             bypass: GovernanceBypass::Denied,
         })
@@ -375,7 +382,9 @@ async fn versioning_keeps_history_and_promotes_latest() {
             bucket: bucket.clone(),
             key: key.clone(),
             version_id: versions[2].clone(),
+            expected_row_id: None,
             expected_updated_at: None,
+            require_sole_key_version: false,
             now: Timestamp::EPOCH,
             bypass: GovernanceBypass::Denied,
         })
@@ -390,6 +399,91 @@ async fn versioning_keeps_history_and_promotes_latest() {
     ));
     let new_latest = meta.current_version(&bucket, &key).await.unwrap().unwrap();
     assert_eq!(new_latest.version_id, versions[1]);
+}
+
+#[tokio::test]
+async fn row_identity_guard_rejects_same_timestamp_sentinel_replacement() {
+    let blob = InMemoryBlobStore::new();
+    let meta = InMemoryMetadataStore::new();
+    let bucket = BucketName::parse("row-guard").unwrap();
+    let key = ObjectKey::parse("object").unwrap();
+    let owner = UserId::generate();
+    let timestamp = Timestamp(100);
+
+    let first_blob = blob.stage(&bucket, body(b"old"), opts()).await.unwrap();
+    let first = row_from(
+        &first_blob,
+        &bucket,
+        &key,
+        VersionId::null(),
+        &owner,
+        timestamp,
+    );
+    meta.submit(Mutation::PutObjectVersion {
+        row: Box::new(first),
+        precondition: Precondition::default(),
+        initial_state: InitialObjectState::default(),
+        replication: Vec::new(),
+    })
+    .await
+    .unwrap();
+    let observed = meta
+        .list_current(
+            &bucket,
+            &ListQuery {
+                limit: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .next()
+        .unwrap();
+
+    let replacement_blob = blob.stage(&bucket, body(b"new"), opts()).await.unwrap();
+    let replacement = row_from(
+        &replacement_blob,
+        &bucket,
+        &key,
+        VersionId::null(),
+        &owner,
+        timestamp,
+    );
+    let replacement_id = replacement.id.clone();
+    assert_ne!(replacement_id, observed.row_id);
+    meta.submit(Mutation::PutObjectVersion {
+        row: Box::new(replacement),
+        precondition: Precondition::default(),
+        initial_state: InitialObjectState::default(),
+        replication: Vec::new(),
+    })
+    .await
+    .unwrap();
+
+    let outcome = meta
+        .submit(Mutation::DeleteVersion {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            version_id: VersionId::null(),
+            expected_row_id: Some(observed.row_id),
+            expected_updated_at: Some(timestamp),
+            require_sole_key_version: false,
+            now: Timestamp(i64::MAX),
+            bypass: GovernanceBypass::Denied,
+        })
+        .await
+        .unwrap();
+    assert_eq!(outcome, MutationOutcome::DeleteNotApplied);
+    assert_eq!(
+        meta.current_version(&bucket, &key)
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        replacement_id
+    );
 }
 
 #[tokio::test]
@@ -720,6 +814,7 @@ async fn encrypted_blob_read_without_a_dek_fails_closed() {
             None,
             BlobCipher::KnownPlaintext,
             &staged.compression,
+            staged.size_logical,
         )
         .await
         .expect_err("a KnownPlaintext read of an encrypted blob must fail, not return bytes");
@@ -735,6 +830,7 @@ async fn encrypted_blob_read_without_a_dek_fails_closed() {
             None,
             BlobCipher::AuthenticatedV3([1u8; 32].into()),
             &staged.compression,
+            staged.size_logical,
         )
         .await
         .expect_err("a wrong-key read of an encrypted blob must fail");
@@ -750,6 +846,7 @@ async fn encrypted_blob_read_without_a_dek_fails_closed() {
             None,
             BlobCipher::AuthenticatedV3(dek.into()),
             &staged.compression,
+            staged.size_logical,
         )
         .await
         .unwrap();

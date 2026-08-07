@@ -282,6 +282,7 @@ async fn initial_tags_and_lock_are_atomic_and_protect_replacement_and_delete() {
                 owner_id: UserId("owner".to_owned()),
                 now: Timestamp(200),
                 bypass: GovernanceBypass::Authorized,
+                expected_current: None,
                 replication: Vec::new(),
             })
             .await
@@ -294,7 +295,9 @@ async fn initial_tags_and_lock_are_atomic_and_protect_replacement_and_delete() {
                 bucket,
                 key,
                 version_id: version,
+                expected_row_id: None,
                 expected_updated_at: None,
+                require_sole_key_version: false,
                 now: Timestamp(200),
                 bypass: GovernanceBypass::Authorized,
             })
@@ -497,7 +500,9 @@ async fn governance_legal_hold_retention_updates_and_corrupt_rows_fail_closed() 
                     bucket: bucket.clone(),
                     key: key.clone(),
                     version_id: version.clone(),
+                    expected_row_id: None,
                     expected_updated_at: None,
+                    require_sole_key_version: false,
                     now: Timestamp(20),
                     bypass,
                 })
@@ -546,7 +551,9 @@ async fn governance_legal_hold_retention_updates_and_corrupt_rows_fail_closed() 
                 bucket: bucket.clone(),
                 key: key.clone(),
                 version_id: version.clone(),
+                expected_row_id: None,
                 expected_updated_at: None,
+                require_sole_key_version: false,
                 now: Timestamp(20),
                 bypass: GovernanceBypass::Denied,
             })
@@ -595,7 +602,9 @@ async fn governance_legal_hold_retention_updates_and_corrupt_rows_fail_closed() 
                 bucket,
                 key,
                 version_id: corrupt_version,
+                expected_row_id: None,
                 expected_updated_at: None,
+                require_sole_key_version: false,
                 now: Timestamp(40),
                 bypass: GovernanceBypass::Authorized,
             })
@@ -667,7 +676,9 @@ async fn concurrent_lock_mutations_and_deletes_have_only_safe_serial_orders() {
                     bucket,
                     key,
                     version_id: version,
+                    expected_row_id: None,
                     expected_updated_at: None,
+                    require_sole_key_version: false,
                     now: Timestamp(200),
                     bypass: GovernanceBypass::Authorized,
                 })
@@ -756,7 +767,9 @@ async fn concurrent_lock_mutations_and_deletes_have_only_safe_serial_orders() {
                     bucket,
                     key,
                     version_id: version,
+                    expected_row_id: None,
                     expected_updated_at: None,
+                    require_sole_key_version: false,
                     now: Timestamp(20),
                     bypass: GovernanceBypass::Authorized,
                 })
@@ -956,9 +969,13 @@ async fn corrupt_configuration_is_repairable_and_multipart_defaults_resolve_at_c
         })
         .await
         .unwrap();
+    let claim_token = MultipartClaimToken::generate();
     assert!(matches!(
         store
-            .submit(Mutation::ClaimMultipart(upload.clone()))
+            .submit(Mutation::ClaimMultipart {
+                upload_id: upload.clone(),
+                claim_token: claim_token.clone(),
+            })
             .await
             .unwrap(),
         MutationOutcome::MultipartClaim(ClaimOutcome::Claimed(_))
@@ -967,6 +984,7 @@ async fn corrupt_configuration_is_repairable_and_multipart_defaults_resolve_at_c
     store
         .submit(Mutation::CompleteMultipart {
             upload_id: upload,
+            claim_token,
             row: Box::new(completed.clone()),
             precondition: Precondition::default(),
             replication: Vec::new(),
@@ -1015,14 +1033,19 @@ async fn corrupt_configuration_is_repairable_and_multipart_defaults_resolve_at_c
         })
         .await
         .unwrap();
+    let expiring_claim_token = MultipartClaimToken::generate();
     store
-        .submit(Mutation::ClaimMultipart(expiring.clone()))
+        .submit(Mutation::ClaimMultipart {
+            upload_id: expiring.clone(),
+            claim_token: expiring_claim_token.clone(),
+        })
         .await
         .unwrap();
     assert!(matches!(
         store
             .submit(Mutation::CompleteMultipart {
                 upload_id: expiring.clone(),
+                claim_token: expiring_claim_token,
                 row: Box::new(row(&bucket, "expires", "v-expired", Timestamp(60))),
                 precondition: Precondition::default(),
                 replication: Vec::new(),

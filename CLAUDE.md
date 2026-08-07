@@ -122,12 +122,13 @@ above remain the source of truth.
   `cairn-meta/src/shard.rs` — both `ShardedMetadataStore::submit`'s routing match and
   `mutation_bucket` (both now exhaustive, so the compiler forces this). Schema changes are
   **append-only** migrations in `cairn-meta/src/schema.rs` (never edit an applied migration; latest
-  is v27 — v21 per-part multipart DEKs, v22 multipart KMS intent, v23
+  is v29 — v21 per-part multipart DEKs, v22 multipart KMS intent, v23
   `object_versions.replicated_at` + the outbox `(bucket_name, key)` index, v24 bounded import
   scheduling/history/retention indexes, v25 hash-only one-time object-share capabilities, v26
   bounded multipart staging reservations, cleanup debt, and O(1) quota/cardinality counters, v27
   multipart initial tags/Object Lock intent (including the legacy-intent proof marker) and
-  orphan-lock cleanup).
+  orphan-lock cleanup, v28 lifecycle row identity in the current-listing covering index, v29
+  exact-token multipart completion ownership).
 - **Crypto fails closed.** A missing/wrong key or tampered envelope must return an error — never
   plaintext, zeros, or partial data. Server-side encryption (SSE-S3, transparent at-rest via
   `CAIRN_ENCRYPT_AT_REST`, SSE-KMS via `CAIRN_KMS_KEY_IDS`) is **label-only** in v1: every DEK is

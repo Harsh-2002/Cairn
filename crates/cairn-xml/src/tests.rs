@@ -19,6 +19,7 @@ use cairn_types::{
 
 fn summary(key: &str, etag: &str, size: u64) -> ObjectSummary {
     ObjectSummary {
+        row_id: String::new(),
         key: ObjectKey::parse(key).unwrap(),
         version_id: VersionId::null(),
         is_latest: true,

@@ -441,17 +441,19 @@ impl CachedMetadataStore {
             // `note_user_mutation`, which bumps the shared auth epoch; the config cache holds no
             // user rows, so they are no-ops for *this* cache).
             Mutation::PutObjectVersion { .. }
+            | Mutation::ResolveObjectWrite { .. }
             | Mutation::CreateDeleteMarker { .. }
             | Mutation::DeleteVersion { .. }
             | Mutation::CreateMultipart { .. }
             | Mutation::ReserveMultipartPart { .. }
             | Mutation::ReleaseMultipartReservation { .. }
             | Mutation::RecordPart { .. }
+            | Mutation::ResolveMultipartPartWrite { .. }
             | Mutation::ReleaseMultipartCleanup { .. }
             | Mutation::ReleaseMultipartUploadCleanups { .. }
             | Mutation::RecoverMultipartStagingAccounting { .. }
-            | Mutation::ClaimMultipart(_)
-            | Mutation::ReleaseMultipartClaim(_)
+            | Mutation::ClaimMultipart { .. }
+            | Mutation::ReleaseMultipartClaim { .. }
             | Mutation::RecoverMultipartClaims
             | Mutation::CompleteMultipart { .. }
             | Mutation::AbortMultipart(_)

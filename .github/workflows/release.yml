@@ -9,10 +9,10 @@ on:
 permissions: {}
 
 concurrency:
-  # Release mutation is a repository-wide critical section. A second manual dispatch waits instead
-  # of cancelling a run that may already have staged or published one side of the release.
+  # Release mutation is a repository-wide critical section. Never cancel a running release that
+  # may already have staged or published one side of the handoff.
   group: cairn-production-release
-  queue: max
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -30,6 +30,7 @@ env:
 jobs:
   verify-ci:
     name: require green CI
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     permissions:
       actions: read
@@ -41,10 +42,12 @@ jobs:
     steps:
       - name: Compute immutable release coordinates
         id: release
+        env:
+          REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
           echo "version=$(date -u +v%Y.%m.%d)" >> "$GITHUB_OUTPUT"
-          echo "image=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" \
+          echo "image=ghcr.io/$(printf '%s' "$REPOSITORY" | tr '[:upper:]' '[:lower:]')" \
             >> "$GITHUB_OUTPUT"
       - name: Install checksum-pinned GitHub CLI
         run: |
@@ -57,18 +60,25 @@ jobs:
       - name: Require a successful CI run for this commit
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_REF: ${{ github.ref }}
+          RELEASE_REF_NAME: ${{ github.ref_name }}
+          RELEASE_SHA: ${{ github.sha }}
+          REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
-          if [ "${{ github.ref }}" != "refs/heads/main" ]; then
+          if [ "$RELEASE_REF" != "refs/heads/main" ]; then
             echo "::error::releases may only be dispatched from refs/heads/main"
             exit 1
           fi
           GH="${RUNNER_TEMP}/gh_${GH_VERSION}_linux_amd64/bin/gh"
-          conclusion="$("$GH" run list --repo '${{ github.repository }}' --workflow ci.yml \
-            --branch '${{ github.ref_name }}' --limit 50 \
-            --json headSha,status,conclusion \
-            --jq '[.[] | select(.headSha=="${{ github.sha }}")] | first | (.conclusion // .status // "none")')"
-          echo "CI conclusion for ${{ github.sha }}: $conclusion"
+          conclusion="$(
+            "$GH" run list --repo "$REPOSITORY" --workflow ci.yml \
+              --branch "$RELEASE_REF_NAME" --limit 50 \
+              --json headSha,status,conclusion \
+              | jq -er --arg sha "$RELEASE_SHA" \
+                '[.[] | select(.headSha == $sha)] | first | (.conclusion // .status // "none")'
+          )"
+          echo "CI conclusion for $RELEASE_SHA: $conclusion"
           if [ "$conclusion" != "success" ]; then
             echo "::error::CI has not succeeded for this commit ($conclusion); refusing to release."
             exit 1
@@ -84,8 +94,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { arch: amd64, target: x86_64-unknown-linux-musl }
-          - { arch: arm64, target: aarch64-unknown-linux-musl }
+          - arch: amd64
+            target: x86_64-unknown-linux-musl
+          - arch: arm64
+            target: aarch64-unknown-linux-musl
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -114,7 +126,8 @@ jobs:
       - name: Cross-compile the static release binary
         env:
           CAIRN_RELEASE_VERSION: ${{ needs.verify-ci.outputs.version }}
-        run: cargo zigbuild --release --bin cairn --target ${{ matrix.target }}
+          TARGET: ${{ matrix.target }}
+        run: cargo zigbuild --release --bin cairn --target "$TARGET"
       - name: Stage and bind the binary to this run
         env:
           ARCH: ${{ matrix.arch }}
@@ -583,7 +596,8 @@ jobs:
         env:
           DIGEST: ${{ needs.stage-image.outputs.digest }}
           IMAGE: ${{ needs.verify-ci.outputs.image }}
-        run: '"${RUNNER_TEMP}/cosign" sign --yes "${IMAGE}@${DIGEST}"'
+        run: |
+          "${RUNNER_TEMP}/cosign" sign --yes "${IMAGE}@${DIGEST}"
       - uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763
         with:
           subject-name: ${{ needs.verify-ci.outputs.image }}
@@ -874,11 +888,12 @@ jobs:
         id: release-state
         env:
           GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
           TAG: ${{ needs.verify-ci.outputs.version }}
         run: |
           set -euo pipefail
           export LC_ALL=C
-          REPO="${{ github.repository }}"
+          REPO="$REPOSITORY"
           GH="${RUNNER_TEMP}/gh_${GH_VERSION}_linux_amd64/bin/gh"
           get_status() {
             kind="$1"
@@ -1066,11 +1081,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           IMAGE: ${{ needs.verify-ci.outputs.image }}
           DIGEST: ${{ needs.stage-image.outputs.digest }}
+          REPOSITORY: ${{ github.repository }}
           TAG: ${{ needs.verify-ci.outputs.version }}
         run: |
           set -euo pipefail
           export LC_ALL=C
-          REPO="${{ github.repository }}"
+          REPO="$REPOSITORY"
           GH="${RUNNER_TEMP}/gh_${GH_VERSION}_linux_amd64/bin/gh"
           "$GH" release create "$TAG" --repo "$REPO" --target "$GITHUB_SHA" \
             --title "$TAG" --draft \
@@ -1220,11 +1236,12 @@ jobs:
       - name: Retire and verify every strictly older Cairn CalVer release and tag
         env:
           GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
           TAG: ${{ needs.verify-ci.outputs.version }}
         run: |
           set -euo pipefail
           export LC_ALL=C
-          REPO="${{ github.repository }}"
+          REPO="$REPOSITORY"
           GH="${RUNNER_TEMP}/gh_${GH_VERSION}_linux_amd64/bin/gh"
           releases="${RUNNER_TEMP}/cairn-releases.tsv"
           refs="${RUNNER_TEMP}/cairn-tag-refs.txt"

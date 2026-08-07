@@ -153,6 +153,10 @@ enum WriteCmd {
     Commit {
         final_path: PathBuf,
         reply: oneshot::Sender<Result<(), BlobError>>,
+        /// The caller sends this only after it has observed the successful rename and resumed
+        /// ownership through its request-level cleanup guard. If the caller is canceled while
+        /// awaiting the reply, channel closure tells the executor to unlink the renamed blob.
+        caller_accepted: oneshot::Receiver<()>,
     },
     /// fsync the file in place (no rename); the staging task ends after this.
     FsyncInPlace(oneshot::Sender<Result<(), BlobError>>),
@@ -204,16 +208,22 @@ impl UringStaging {
     /// destination-directory fsync afterward (see [`crate::commit::DirSyncCoalescer`]).
     pub(crate) async fn commit(mut self, final_path: PathBuf) -> Result<(), BlobError> {
         let (reply_tx, reply_rx) = oneshot::channel();
+        let (accepted_tx, accepted_rx) = oneshot::channel();
         self.cmd_tx
             .send(WriteCmd::Commit {
                 final_path,
                 reply: reply_tx,
+                caller_accepted: accepted_rx,
             })
             .await
             .map_err(|_| BlobError::Io("io_uring staging writer stopped".into()))?;
-        let _ = reply_rx
+        reply_rx
             .await
-            .map_err(|_| BlobError::Io("io_uring staging writer dropped the commit".into()))?;
+            .map_err(|_| BlobError::Io("io_uring staging writer dropped the commit".into()))??;
+        // No await separates observing success from this acknowledgement. The request-level
+        // two-path guard remains armed; if cancellation happens during the terminal wait below,
+        // that guard removes the final blob instead.
+        let _ = accepted_tx.send(());
         // Also await the terminal channel so the writer task is fully wound down.
         if let Some(final_rx) = self.final_rx.take() {
             return final_rx
@@ -289,9 +299,30 @@ async fn writer_task(
                     }
                 }
             }
-            WriteCmd::Commit { final_path, reply } => {
+            WriteCmd::Commit {
+                final_path,
+                reply,
+                caller_accepted,
+            } => {
                 let result = commit_on_executor(&staging, file, &final_path).await;
+                let committed = result.is_ok();
                 let _ = reply.send(result.clone_shallow());
+                // The executor-side rename can finish after its caller future has been dropped.
+                // Retain ownership until the caller explicitly observes success; channel closure
+                // means nobody can receive a `StagedBlob`, so the new name must be removed here.
+                if committed && caller_accepted.await.is_err() {
+                    match tokio_uring::fs::remove_file(&final_path).await {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => {
+                            tracing::warn!(
+                                path = %final_path.display(),
+                                %error,
+                                "failed to unlink canceled io_uring blob commit"
+                            );
+                        }
+                    }
+                }
                 let _ = final_tx.send(result);
                 return;
             }

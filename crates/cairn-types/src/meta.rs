@@ -59,6 +59,19 @@ pub struct InitialObjectState {
     pub lock_intent: ExplicitObjectLockIntent,
 }
 
+/// Writer-atomic guard for a lifecycle-created delete marker.
+///
+/// The lifecycle scanner captures the current version at enumeration time. The marker may be
+/// inserted only while that exact version, with the same last-modified timestamp, is still current;
+/// otherwise a concurrent write would be hidden by an expiration decision made against stale data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CurrentVersionGuard {
+    /// Version that was current when lifecycle enumerated the key.
+    pub version_id: VersionId,
+    /// `updated_at` observed for that version.
+    pub updated_at: Timestamp,
+}
+
 // ---------------------------------------------------------------------------------------
 // Mutations (every write goes through the single group-committing writer)
 // ---------------------------------------------------------------------------------------
@@ -79,6 +92,24 @@ pub enum Mutation {
         /// destination target (fan-out); empty when the write does not replicate (ARCH 20).
         replication: Vec<OutboxEntry>,
     },
+    /// Resolve whether one exact staged blob became referenced by its intended object row.
+    ///
+    /// This read is deliberately serialized through the writer after an ambiguous/cancelled PUT
+    /// or Copy acknowledgement. If the original put reached the writer, FIFO ordering makes its
+    /// transaction terminal before this probe; matching row id and path prevents an unversioned
+    /// overwrite from being mistaken for the original write.
+    ResolveObjectWrite {
+        /// Intended bucket.
+        bucket: BucketName,
+        /// Intended key.
+        key: ObjectKey,
+        /// Intended version id (including the unversioned null sentinel).
+        version_id: VersionId,
+        /// Immutable id minted for the intended object-version row.
+        row_id: String,
+        /// Unique durable blob path returned by staging.
+        storage_path: StoragePath,
+    },
     /// Insert a delete marker (a versioned plain delete).
     CreateDeleteMarker {
         /// Target bucket.
@@ -93,6 +124,9 @@ pub enum Mutation {
         now: Timestamp,
         /// Trusted governance-bypass decision for replacing a protected sentinel version.
         bypass: GovernanceBypass,
+        /// Optional lifecycle freshness guard. `None` is an unconditional client delete; `Some`
+        /// inserts the marker only if the enumerated version is still the exact current row.
+        expected_current: Option<CurrentVersionGuard>,
         /// Replication of the marker — one entry per matching target; empty when not replicated.
         replication: Vec<OutboxEntry>,
     },
@@ -104,6 +138,11 @@ pub enum Mutation {
         key: ObjectKey,
         /// The version to remove (sentinel for unversioned).
         version_id: VersionId,
+        /// Optional compare-and-delete guard over the immutable metadata-row identity. Lifecycle
+        /// passes the `row_id` captured by listing so a same-version, same-timestamp sentinel
+        /// replacement cannot be mistaken for the object that was enumerated. `None` preserves
+        /// ordinary client `DeleteObject` semantics.
+        expected_row_id: Option<String>,
         /// Optional compare-and-delete guard: only delete if the stored version's `updated_at` still
         /// equals this value. `None` = unconditional (client `DeleteObject`). The lifecycle scanner
         /// captures a version's `updated_at` at enumeration and passes it here so a concurrent
@@ -111,6 +150,10 @@ pub enum Mutation {
         /// fresh object — the current-object-expiration TOCTOU (audit 2026-07). Evaluated inside the
         /// delete's savepoint, so the check and the delete are atomic.
         expected_updated_at: Option<Timestamp>,
+        /// Require the target to be the sole version for its key, as well as the latest delete
+        /// marker. Lifecycle's expired-delete-marker cleanup sets this after enumerating a sole
+        /// marker so a concurrently arrived older version cannot be exposed by a stale decision.
+        require_sole_key_version: bool,
         /// Trusted current time used to evaluate retention inside the writer savepoint.
         now: Timestamp,
         /// Trusted governance-bypass authorization.
@@ -158,6 +201,20 @@ pub enum Mutation {
         /// The part.
         part: PartRecord,
     },
+    /// Resolve whether one exact staged multipart-part attempt became the current part row.
+    ///
+    /// This probe is deliberately serialized through the writer after an ambiguous/cancelled
+    /// [`Mutation::RecordPart`] acknowledgement. The staging path contains the fresh attempt id,
+    /// so matching `(upload_id, part_number, storage_path)` is also ABA-safe when a later retry
+    /// supersedes the same part number.
+    ResolveMultipartPartWrite {
+        /// The multipart session.
+        upload_id: UploadId,
+        /// The S3 part number.
+        part_number: u16,
+        /// Unique durable path returned by this attempt's staging operation.
+        storage_path: StoragePath,
+    },
     /// Release one exact-path multipart cleanup debt after unlink succeeds.
     ReleaseMultipartCleanup {
         /// The cleanup debt id.
@@ -176,13 +233,23 @@ pub enum Mutation {
         /// Maximum ledger rows to release in this writer transaction.
         limit: u32,
     },
-    /// Atomically claim a session for completion (guards double completion).
-    ClaimMultipart(UploadId),
+    /// Atomically claim a session for one exact completion attempt (guards double completion).
+    ClaimMultipart {
+        /// The session.
+        upload_id: UploadId,
+        /// Fresh ownership token for this completion attempt.
+        claim_token: crate::id::MultipartClaimToken,
+    },
     /// Release a failed completion claim (`completing` -> `active`) so the client can retry.
     ///
-    /// The transition is conditional inside the writer savepoint: a caller that no longer owns a
-    /// `completing` session cannot resurrect an aborted or already-completed upload.
-    ReleaseMultipartClaim(UploadId),
+    /// The transition matches both the session and its persisted ownership token inside the writer
+    /// savepoint, so delayed recovery from an older attempt cannot release a newer completer.
+    ReleaseMultipartClaim {
+        /// The session.
+        upload_id: UploadId,
+        /// The exact completion attempt being released.
+        claim_token: crate::id::MultipartClaimToken,
+    },
     /// Recover every orphaned multipart completion claim (`completing` -> `active`).
     ///
     /// Run once before listeners bind. A newly-started process has no surviving request that could
@@ -193,6 +260,8 @@ pub enum Mutation {
     CompleteMultipart {
         /// The session being completed.
         upload_id: UploadId,
+        /// The exact completion attempt that owns the session.
+        claim_token: crate::id::MultipartClaimToken,
         /// The assembled object version row.
         row: Box<ObjectVersionRow>,
         /// The conditional precondition.
@@ -679,6 +748,13 @@ pub enum MutationOutcome {
         /// The committed version id.
         version_id: VersionId,
     },
+    /// Result of a writer-serialized exact-row/path probe after an object-write acknowledgement was
+    /// cancelled or ambiguous.
+    ObjectWriteResolved {
+        /// `true` only when the exact intended row still references the staged path. `false` proves
+        /// that path is currently unreferenced and may be reclaimed.
+        referenced: bool,
+    },
     /// A delete marker was inserted.
     DeleteMarker {
         /// The marker's version id.
@@ -693,9 +769,9 @@ pub enum MutationOutcome {
         /// Whether a successor was promoted to latest.
         promoted_latest: bool,
     },
-    /// The permanent-delete target was already absent or its compare-and-delete guard no longer
-    /// matched, so no metadata changed. S3 DELETE remains idempotent, while maintenance callers
-    /// can distinguish this lost race from a writer-confirmed deletion.
+    /// A permanent-delete target was absent/stale, or a conditional delete marker's enumerated
+    /// current version no longer matched, so no metadata changed. S3 DELETE remains idempotent,
+    /// while maintenance callers can distinguish this lost race from a writer-confirmed deletion.
     DeleteNotApplied,
     /// A permanent delete or sentinel replacement was denied by Object Lock. No metadata changed.
     DeleteProtected,
@@ -708,6 +784,11 @@ pub enum MutationOutcome {
         /// Any superseded part cleanup debt. Its bytes remain charged until the path is unlinked
         /// and [`Mutation::ReleaseMultipartCleanup`] commits.
         cleanup: Option<MultipartCleanup>,
+    },
+    /// Result of a writer-serialized exact multipart part/path probe.
+    MultipartPartWriteResolved {
+        /// `true` only when the current part row still references this attempt's unique path.
+        referenced: bool,
     },
     /// Rows released by one bounded [`Mutation::RecoverMultipartStagingAccounting`] transaction.
     MultipartAccountingReleased(u64),
@@ -1097,6 +1178,13 @@ impl<T> Default for ListPage<T> {
 /// A summary of one object version for listing output.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObjectSummary {
+    /// Internal immutable identity of the metadata row that produced this summary.
+    ///
+    /// This is a lifecycle compare-and-delete token, not S3 response data. It is deliberately
+    /// omitted from external serialization; metadata backends populate it directly from
+    /// `object_versions.id`.
+    #[serde(skip)]
+    pub row_id: String,
     /// The key.
     pub key: ObjectKey,
     /// The version id.
@@ -1993,5 +2081,33 @@ mod share_lookup_hash_tests {
         let debug = format!("{first:?}");
         assert_eq!(debug, "ShareLookupHash(<redacted>)");
         assert!(!debug.contains(sentinel));
+    }
+}
+
+#[cfg(test)]
+mod object_summary_tests {
+    use super::ObjectSummary;
+    use crate::{ETag, ObjectKey, StorageClass, Timestamp, UserId, VersionId};
+
+    #[test]
+    fn row_identity_is_not_part_of_external_serialization() {
+        let summary = ObjectSummary {
+            row_id: "internal-row-id".to_owned(),
+            key: ObjectKey::parse("key").unwrap(),
+            version_id: VersionId::from_string("version".to_owned()),
+            is_latest: true,
+            is_delete_marker: false,
+            etag: ETag::from_string("etag".to_owned()),
+            size: 1,
+            last_modified: Timestamp(1),
+            storage_class: StorageClass::Standard,
+            owner_id: UserId("owner".to_owned()),
+        };
+
+        let encoded = serde_json::to_value(&summary).unwrap();
+        assert!(encoded.get("row_id").is_none());
+
+        let decoded: ObjectSummary = serde_json::from_value(encoded).unwrap();
+        assert!(decoded.row_id.is_empty());
     }
 }

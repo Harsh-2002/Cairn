@@ -331,7 +331,9 @@ async fn versioning_history_and_promotion_parity() {
                 bucket: bk.clone(),
                 key: k.clone(),
                 version_id: vs[2].clone(),
+                expected_row_id: None,
                 expected_updated_at: None,
+                require_sole_key_version: false,
                 now: Timestamp(i64::MAX),
                 bypass: GovernanceBypass::Denied,
             })
@@ -368,6 +370,73 @@ async fn versioning_history_and_promotion_parity() {
 }
 
 #[tokio::test]
+async fn object_write_resolution_exact_row_path_parity() {
+    let (a, b) = both().await;
+    for store in [&a as &dyn MetadataStore, &b as &dyn MetadataStore] {
+        let bucket_name = BucketName::parse("write-resolution").unwrap();
+        store
+            .submit(Mutation::CreateBucket(Box::new(bucket(
+                "write-resolution",
+                VersioningState::Suspended,
+            ))))
+            .await
+            .unwrap();
+        let key = ObjectKey::parse("object").unwrap();
+        let version_id = VersionId::null();
+        let first = row(&bucket_name, "object", version_id.clone(), "first", 3);
+        let first_id = first.id.clone();
+        let first_path = first.storage_path.clone().unwrap();
+        store
+            .submit(put(first, Precondition::default()))
+            .await
+            .unwrap();
+        let resolve = |row_id: String, storage_path: StoragePath| Mutation::ResolveObjectWrite {
+            bucket: bucket_name.clone(),
+            key: key.clone(),
+            version_id: version_id.clone(),
+            row_id,
+            storage_path,
+        };
+        assert_eq!(
+            store
+                .submit(resolve(first_id.clone(), first_path.clone()))
+                .await
+                .unwrap(),
+            MutationOutcome::ObjectWriteResolved { referenced: true }
+        );
+        assert_eq!(
+            store
+                .submit(resolve("wrong-row".to_owned(), first_path.clone()))
+                .await
+                .unwrap(),
+            MutationOutcome::ObjectWriteResolved { referenced: false }
+        );
+
+        let mut second = row(&bucket_name, "object", version_id.clone(), "second", 4);
+        second.id = "replacement-row".to_owned();
+        second.storage_path = Some(StoragePath::from_string(
+            "write-resolution/replacement-path".to_owned(),
+        ));
+        let second_path = second.storage_path.clone().unwrap();
+        store
+            .submit(put(second, Precondition::default()))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.submit(resolve(first_id, first_path)).await.unwrap(),
+            MutationOutcome::ObjectWriteResolved { referenced: false }
+        );
+        assert_eq!(
+            store
+                .submit(resolve("replacement-row".to_owned(), second_path))
+                .await
+                .unwrap(),
+            MutationOutcome::ObjectWriteResolved { referenced: true }
+        );
+    }
+}
+
+#[tokio::test]
 async fn delete_not_applied_parity() {
     let (a, b) = both().await;
     for s in [&a as &dyn MetadataStore, &b as &dyn MetadataStore] {
@@ -375,23 +444,40 @@ async fn delete_not_applied_parity() {
         let key = ObjectKey::parse("object").unwrap();
         let version = VersionId::from_string("v1".to_owned());
         let mut object = row(&bucket, key.as_str(), version.clone(), "etag", 3);
+        object.id = "observed-row".to_owned();
         object.updated_at = Timestamp(100);
         s.submit(put(object, Precondition::default()))
             .await
             .unwrap();
+        let observed = s
+            .list_current(
+                &bucket,
+                &ListQuery {
+                    limit: 1,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .items
+            .into_iter()
+            .next()
+            .unwrap();
 
-        let stale = s
+        let stale_timestamp = s
             .submit(Mutation::DeleteVersion {
                 bucket: bucket.clone(),
                 key: key.clone(),
                 version_id: version.clone(),
+                expected_row_id: Some(observed.row_id.clone()),
                 expected_updated_at: Some(Timestamp(99)),
+                require_sole_key_version: false,
                 now: Timestamp(i64::MAX),
                 bypass: GovernanceBypass::Denied,
             })
             .await
             .unwrap();
-        assert_eq!(stale, MutationOutcome::DeleteNotApplied);
+        assert_eq!(stale_timestamp, MutationOutcome::DeleteNotApplied);
         assert!(
             s.get_version(&bucket, &key, &version)
                 .await
@@ -399,12 +485,43 @@ async fn delete_not_applied_parity() {
                 .is_some()
         );
 
+        let mut replacement = row(&bucket, key.as_str(), version.clone(), "replacement", 4);
+        replacement.id = "replacement-row".to_owned();
+        replacement.updated_at = Timestamp(100);
+        s.submit(put(replacement, Precondition::default()))
+            .await
+            .unwrap();
+        let stale_row = s
+            .submit(Mutation::DeleteVersion {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id: version.clone(),
+                expected_row_id: Some(observed.row_id),
+                expected_updated_at: Some(Timestamp(100)),
+                require_sole_key_version: false,
+                now: Timestamp(i64::MAX),
+                bypass: GovernanceBypass::Denied,
+            })
+            .await
+            .unwrap();
+        assert_eq!(stale_row, MutationOutcome::DeleteNotApplied);
+        assert_eq!(
+            s.get_version(&bucket, &key, &version)
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            "replacement-row"
+        );
+
         let missing = s
             .submit(Mutation::DeleteVersion {
                 bucket: bucket.clone(),
                 key: key.clone(),
                 version_id: VersionId::from_string("missing".to_owned()),
+                expected_row_id: None,
                 expected_updated_at: None,
+                require_sole_key_version: false,
                 now: Timestamp(i64::MAX),
                 bypass: GovernanceBypass::Denied,
             })
@@ -417,7 +534,9 @@ async fn delete_not_applied_parity() {
                 bucket: bucket.clone(),
                 key: key.clone(),
                 version_id: version.clone(),
+                expected_row_id: Some("replacement-row".to_owned()),
                 expected_updated_at: Some(Timestamp(100)),
+                require_sole_key_version: false,
                 now: Timestamp(i64::MAX),
                 bypass: GovernanceBypass::Denied,
             })
@@ -429,6 +548,262 @@ async fn delete_not_applied_parity() {
                 .await
                 .unwrap()
                 .is_none()
+        );
+    }
+}
+
+#[tokio::test]
+async fn sole_delete_marker_guard_parity() {
+    let (a, b) = both().await;
+    for s in [&a as &dyn MetadataStore, &b as &dyn MetadataStore] {
+        let bucket = BucketName::parse("marker-cleanup").unwrap();
+        s.submit(Mutation::CreateBucket(Box::new(crate::bucket(
+            "marker-cleanup",
+            VersioningState::Enabled,
+        ))))
+        .await
+        .unwrap();
+
+        // The target is latest and is a delete marker, but it has an older sibling: lifecycle's
+        // stale "sole marker" observation must not remove it and reveal the older object.
+        let history_key = ObjectKey::parse("history").unwrap();
+        let history_version = VersionId::from_string("history-v1".to_owned());
+        let mut history = row(
+            &bucket,
+            history_key.as_str(),
+            history_version.clone(),
+            "history",
+            3,
+        );
+        history.updated_at = Timestamp(100);
+        s.submit(put(history, Precondition::default()))
+            .await
+            .unwrap();
+        let history_marker = VersionId::from_string("history-marker".to_owned());
+        s.submit(Mutation::CreateDeleteMarker {
+            bucket: bucket.clone(),
+            key: history_key.clone(),
+            version_id: history_marker.clone(),
+            owner_id: UserId("owner".to_owned()),
+            now: Timestamp(200),
+            bypass: GovernanceBypass::Denied,
+            expected_current: None,
+            replication: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+        let stale_group = s
+            .submit(Mutation::DeleteVersion {
+                bucket: bucket.clone(),
+                key: history_key.clone(),
+                version_id: history_marker.clone(),
+                expected_row_id: None,
+                expected_updated_at: Some(Timestamp(200)),
+                require_sole_key_version: true,
+                now: Timestamp(300),
+                bypass: GovernanceBypass::Denied,
+            })
+            .await
+            .unwrap();
+        assert_eq!(stale_group, MutationOutcome::DeleteNotApplied);
+        assert_eq!(
+            s.current_version(&bucket, &history_key)
+                .await
+                .unwrap()
+                .unwrap()
+                .version_id,
+            history_marker
+        );
+        assert!(
+            s.get_version(&bucket, &history_key, &history_version)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        // The maintenance-only guard never applies to a data row, even when it is the sole/latest
+        // version and its timestamp matches.
+        let data_key = ObjectKey::parse("data").unwrap();
+        let data_version = VersionId::from_string("data-v1".to_owned());
+        let mut data = row(&bucket, data_key.as_str(), data_version.clone(), "data", 4);
+        data.updated_at = Timestamp(400);
+        s.submit(put(data, Precondition::default())).await.unwrap();
+        assert_eq!(
+            s.submit(Mutation::DeleteVersion {
+                bucket: bucket.clone(),
+                key: data_key.clone(),
+                version_id: data_version.clone(),
+                expected_row_id: None,
+                expected_updated_at: Some(Timestamp(400)),
+                require_sole_key_version: true,
+                now: Timestamp(500),
+                bypass: GovernanceBypass::Denied,
+            })
+            .await
+            .unwrap(),
+            MutationOutcome::DeleteNotApplied
+        );
+        assert!(
+            s.get_version(&bucket, &data_key, &data_version)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        // A genuinely sole/latest marker with the matching timestamp is removed.
+        let sole_key = ObjectKey::parse("sole").unwrap();
+        let sole_marker = VersionId::from_string("sole-marker".to_owned());
+        s.submit(Mutation::CreateDeleteMarker {
+            bucket: bucket.clone(),
+            key: sole_key.clone(),
+            version_id: sole_marker.clone(),
+            owner_id: UserId("owner".to_owned()),
+            now: Timestamp(600),
+            bypass: GovernanceBypass::Denied,
+            expected_current: None,
+            replication: Vec::new(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            s.submit(Mutation::DeleteVersion {
+                bucket: bucket.clone(),
+                key: sole_key.clone(),
+                version_id: sole_marker,
+                expected_row_id: None,
+                expected_updated_at: Some(Timestamp(600)),
+                require_sole_key_version: true,
+                now: Timestamp(700),
+                bypass: GovernanceBypass::Denied,
+            })
+            .await
+            .unwrap(),
+            MutationOutcome::Deleted {
+                freed: None,
+                promoted_latest: false,
+            }
+        );
+        assert!(
+            s.current_version(&bucket, &sole_key)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
+async fn guarded_delete_marker_rejects_stale_current_without_side_effects_parity() {
+    let (a, b) = both().await;
+    for s in [&a as &dyn MetadataStore, &b as &dyn MetadataStore] {
+        let bucket = BucketName::parse("marker-guard").unwrap();
+        let key = ObjectKey::parse("object").unwrap();
+        s.submit(Mutation::CreateBucket(Box::new(crate::bucket(
+            "marker-guard",
+            VersioningState::Enabled,
+        ))))
+        .await
+        .unwrap();
+
+        let observed_version = VersionId::from_string("observed".to_owned());
+        let mut observed = row(
+            &bucket,
+            key.as_str(),
+            observed_version.clone(),
+            "observed",
+            3,
+        );
+        observed.created_at = Timestamp(100);
+        observed.updated_at = Timestamp(100);
+        s.submit(put(observed, Precondition::default()))
+            .await
+            .unwrap();
+
+        // A concurrent write becomes current after lifecycle enumerated `observed_version`.
+        let fresh_version = VersionId::from_string("fresh".to_owned());
+        let mut fresh = row(&bucket, key.as_str(), fresh_version.clone(), "fresh", 4);
+        fresh.created_at = Timestamp(200);
+        fresh.updated_at = Timestamp(200);
+        s.submit(put(fresh, Precondition::default())).await.unwrap();
+
+        let outbox = |id: &str, version: &VersionId| OutboxEntry {
+            id: id.to_owned(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            version_id: version.clone(),
+            operation: ReplicationOp::DeleteMarker,
+            rule_id: "lifecycle".to_owned(),
+            target_arn: None,
+            attempts: 0,
+            next_attempt_at: Timestamp(300),
+            status: ReplicationStatus::Pending,
+            last_error: None,
+            priority: 0,
+            lease_until: None,
+            enqueued_at: Timestamp(300),
+        };
+
+        let stale_version_marker = VersionId::from_string("marker-stale-version".to_owned());
+        let stale_version = s
+            .submit(Mutation::CreateDeleteMarker {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id: stale_version_marker.clone(),
+                owner_id: UserId("owner".to_owned()),
+                now: Timestamp(300),
+                bypass: GovernanceBypass::Denied,
+                expected_current: Some(CurrentVersionGuard {
+                    version_id: observed_version,
+                    updated_at: Timestamp(100),
+                }),
+                replication: vec![outbox("marker-stale-version-outbox", &stale_version_marker)],
+            })
+            .await
+            .unwrap();
+        assert_eq!(stale_version, MutationOutcome::DeleteNotApplied);
+
+        // Version identity alone is insufficient: the observed timestamp must still match too.
+        let stale_time_marker = VersionId::from_string("marker-stale-time".to_owned());
+        let stale_time = s
+            .submit(Mutation::CreateDeleteMarker {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id: stale_time_marker.clone(),
+                owner_id: UserId("owner".to_owned()),
+                now: Timestamp(301),
+                bypass: GovernanceBypass::Denied,
+                expected_current: Some(CurrentVersionGuard {
+                    version_id: fresh_version.clone(),
+                    updated_at: Timestamp(199),
+                }),
+                replication: vec![outbox("marker-stale-time-outbox", &stale_time_marker)],
+            })
+            .await
+            .unwrap();
+        assert_eq!(stale_time, MutationOutcome::DeleteNotApplied);
+
+        let current = s.current_version(&bucket, &key).await.unwrap().unwrap();
+        assert_eq!(current.version_id, fresh_version);
+        assert_eq!(current.updated_at, Timestamp(200));
+        assert!(!current.is_delete_marker);
+        assert!(
+            s.get_version(&bucket, &key, &stale_version_marker)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            s.get_version(&bucket, &key, &stale_time_marker)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            s.list_due_replication(10, Timestamp(i64::MAX))
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 }
@@ -452,6 +827,7 @@ async fn delete_marker_hides_current_parity() {
             owner_id: UserId("owner".to_owned()),
             now: Timestamp(2),
             bypass: GovernanceBypass::Denied,
+            expected_current: None,
             replication: Vec::new(),
         })
         .await
@@ -753,6 +1129,62 @@ async fn multipart_lifecycle_parity() {
         }
         let parts = s.list_parts(&upload, 0, 100).await.unwrap();
         assert_eq!(parts.items.len(), 2);
+        let first_path = StoragePath::from_string("bkt/part-1".to_owned());
+        assert_eq!(
+            s.submit(Mutation::ResolveMultipartPartWrite {
+                upload_id: upload.clone(),
+                part_number: 1,
+                storage_path: first_path.clone(),
+            })
+            .await
+            .unwrap(),
+            MutationOutcome::MultipartPartWriteResolved { referenced: true }
+        );
+        let retry_path = StoragePath::from_string("bkt/part-1-retry".to_owned());
+        s.submit(Mutation::ReserveMultipartPart {
+            upload_id: upload.clone(),
+            part_number: 1,
+            attempt_id: "part-1-retry".to_owned(),
+            reserved_bytes: 5 * 1024 * 1024,
+            max_parts_per_upload: 10_000,
+            now: Timestamp(3),
+        })
+        .await
+        .unwrap();
+        s.submit(Mutation::RecordPart {
+            upload_id: upload.clone(),
+            attempt_id: "part-1-retry".to_owned(),
+            part: PartRecord {
+                part_number: 1,
+                size: 5 * 1024 * 1024,
+                etag: "petag1-retry".to_owned(),
+                storage_path: retry_path.clone(),
+                checksum: None,
+                part_dek: None,
+            },
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            s.submit(Mutation::ResolveMultipartPartWrite {
+                upload_id: upload.clone(),
+                part_number: 1,
+                storage_path: first_path,
+            })
+            .await
+            .unwrap(),
+            MutationOutcome::MultipartPartWriteResolved { referenced: false }
+        );
+        assert_eq!(
+            s.submit(Mutation::ResolveMultipartPartWrite {
+                upload_id: upload.clone(),
+                part_number: 1,
+                storage_path: retry_path,
+            })
+            .await
+            .unwrap(),
+            MutationOutcome::MultipartPartWriteResolved { referenced: true }
+        );
 
         let active = s
             .list_multipart_uploads(
@@ -766,8 +1198,12 @@ async fn multipart_lifecycle_parity() {
             .unwrap();
         assert_eq!(active.items.len(), 1);
 
+        let initial_claim_token = MultipartClaimToken::generate();
         let claim = s
-            .submit(Mutation::ClaimMultipart(upload.clone()))
+            .submit(Mutation::ClaimMultipart {
+                upload_id: upload.clone(),
+                claim_token: initial_claim_token,
+            })
             .await
             .unwrap();
         assert!(matches!(
@@ -775,9 +1211,12 @@ async fn multipart_lifecycle_parity() {
             MutationOutcome::MultipartClaim(ClaimOutcome::Claimed(_))
         ));
         assert!(matches!(
-            s.submit(Mutation::ClaimMultipart(upload.clone()))
-                .await
-                .unwrap(),
+            s.submit(Mutation::ClaimMultipart {
+                upload_id: upload.clone(),
+                claim_token: MultipartClaimToken::generate(),
+            })
+            .await
+            .unwrap(),
             MutationOutcome::MultipartClaim(ClaimOutcome::AlreadyClaimed)
         ));
         assert!(matches!(
@@ -796,29 +1235,46 @@ async fn multipart_lifecycle_parity() {
                 .status,
             MultipartStatus::Active
         );
+        let released_claim_token = MultipartClaimToken::generate();
         assert!(matches!(
-            s.submit(Mutation::ClaimMultipart(upload.clone()))
-                .await
-                .unwrap(),
+            s.submit(Mutation::ClaimMultipart {
+                upload_id: upload.clone(),
+                claim_token: released_claim_token.clone(),
+            })
+            .await
+            .unwrap(),
             MutationOutcome::MultipartClaim(ClaimOutcome::Claimed(_))
         ));
         assert!(matches!(
-            s.submit(Mutation::ReleaseMultipartClaim(upload.clone()))
-                .await
-                .unwrap(),
+            s.submit(Mutation::ReleaseMultipartClaim {
+                upload_id: upload.clone(),
+                claim_token: released_claim_token.clone(),
+            })
+            .await
+            .unwrap(),
             MutationOutcome::MultipartClaimRelease(ClaimReleaseOutcome::Released)
         ));
+        let final_claim_token = MultipartClaimToken::generate();
         assert!(matches!(
-            s.submit(Mutation::ReleaseMultipartClaim(upload.clone()))
-                .await
-                .unwrap(),
-            MutationOutcome::MultipartClaimRelease(ClaimReleaseOutcome::NotOwner)
-        ));
-        assert!(matches!(
-            s.submit(Mutation::ClaimMultipart(upload.clone()))
-                .await
-                .unwrap(),
+            s.submit(Mutation::ClaimMultipart {
+                upload_id: upload.clone(),
+                claim_token: final_claim_token.clone(),
+            })
+            .await
+            .unwrap(),
             MutationOutcome::MultipartClaim(ClaimOutcome::Claimed(_))
+        ));
+
+        // A delayed recovery from the released attempt cannot ABA-release or complete the newer
+        // owner. The exact final token remains authoritative until it completes.
+        assert!(matches!(
+            s.submit(Mutation::ReleaseMultipartClaim {
+                upload_id: upload.clone(),
+                claim_token: released_claim_token.clone(),
+            })
+            .await
+            .unwrap(),
+            MutationOutcome::MultipartClaimRelease(ClaimReleaseOutcome::NotOwner)
         ));
 
         let assembled = row(
@@ -828,9 +1284,30 @@ async fn multipart_lifecycle_parity() {
             "final-etag",
             10 * 1024 * 1024,
         );
+        assert!(matches!(
+            s.submit(Mutation::CompleteMultipart {
+                upload_id: upload.clone(),
+                claim_token: released_claim_token,
+                row: Box::new(assembled.clone()),
+                precondition: Precondition::default(),
+                replication: Vec::new(),
+            })
+            .await
+            .unwrap(),
+            MutationOutcome::MultipartTerminal(MultipartTerminalOutcome::NotOwner)
+        ));
+        assert_eq!(
+            s.get_multipart(&upload)
+                .await
+                .unwrap()
+                .expect("newer claimant still owns the session")
+                .status,
+            MultipartStatus::Completing
+        );
         let out = s
             .submit(Mutation::CompleteMultipart {
                 upload_id: upload.clone(),
+                claim_token: final_claim_token,
                 row: Box::new(assembled),
                 precondition: Precondition::default(),
                 replication: Vec::new(),
@@ -884,15 +1361,20 @@ async fn multipart_lifecycle_parity() {
                 .unwrap(),
             MutationOutcome::MultipartTerminal(MultipartTerminalOutcome::Aborted)
         ));
+        let aborted_claim_token = MultipartClaimToken::generate();
         assert!(matches!(
-            s.submit(Mutation::ClaimMultipart(aborted_upload.clone()))
-                .await
-                .unwrap(),
+            s.submit(Mutation::ClaimMultipart {
+                upload_id: aborted_upload.clone(),
+                claim_token: aborted_claim_token.clone(),
+            })
+            .await
+            .unwrap(),
             MutationOutcome::MultipartClaim(ClaimOutcome::NotFound)
         ));
         assert!(matches!(
             s.submit(Mutation::CompleteMultipart {
                 upload_id: aborted_upload,
+                claim_token: aborted_claim_token,
                 row: Box::new(row(
                     &bk,
                     "aborted",
@@ -1821,7 +2303,9 @@ async fn object_lock_parity() {
                 bucket: bk.clone(),
                 key: k.clone(),
                 version_id: v.clone(),
+                expected_row_id: None,
                 expected_updated_at: None,
+                require_sole_key_version: false,
                 now: Timestamp(20),
                 bypass: GovernanceBypass::Authorized,
             })
@@ -1843,7 +2327,9 @@ async fn object_lock_parity() {
                 bucket: bk.clone(),
                 key: k.clone(),
                 version_id: v.clone(),
+                expected_row_id: None,
                 expected_updated_at: None,
+                require_sole_key_version: false,
                 now: Timestamp(20),
                 bypass: GovernanceBypass::Denied,
             })
@@ -1856,7 +2342,9 @@ async fn object_lock_parity() {
                 bucket: bk.clone(),
                 key: k.clone(),
                 version_id: v.clone(),
+                expected_row_id: None,
                 expected_updated_at: None,
+                require_sole_key_version: false,
                 now: Timestamp(20),
                 bypass: GovernanceBypass::Authorized,
             })
@@ -1912,7 +2400,9 @@ async fn object_lock_parity() {
                 bucket: bk.clone(),
                 key: compliance_key.clone(),
                 version_id: compliance_version.clone(),
+                expected_row_id: None,
                 expected_updated_at: None,
+                require_sole_key_version: false,
                 now: Timestamp(200),
                 bypass: GovernanceBypass::Authorized,
             })
@@ -2024,10 +2514,14 @@ async fn object_lock_parity() {
             vec![("source".to_owned(), "multipart".to_owned())]
         );
         assert_eq!(pinned.lock_intent.legal_hold, Some(true));
+        let claim_token = MultipartClaimToken::generate();
         assert!(matches!(
-            s.submit(Mutation::ClaimMultipart(upload.clone()))
-                .await
-                .unwrap(),
+            s.submit(Mutation::ClaimMultipart {
+                upload_id: upload.clone(),
+                claim_token: claim_token.clone(),
+            })
+            .await
+            .unwrap(),
             MutationOutcome::MultipartClaim(ClaimOutcome::Claimed(_))
         ));
         let mut assembled = row(&bk, "multipart", multipart_version.clone(), "e4", 6);
@@ -2036,6 +2530,7 @@ async fn object_lock_parity() {
         assert!(matches!(
             s.submit(Mutation::CompleteMultipart {
                 upload_id: upload,
+                claim_token,
                 row: Box::new(assembled),
                 precondition: Precondition::default(),
                 replication: Vec::new(),
@@ -2122,8 +2617,12 @@ async fn turso_legacy_multipart_intent_fails_closed_and_preserves_session() {
         })
         .await
         .unwrap();
+    let claim_token = MultipartClaimToken::generate();
     store
-        .submit(Mutation::ClaimMultipart(upload_id.clone()))
+        .submit(Mutation::ClaimMultipart {
+            upload_id: upload_id.clone(),
+            claim_token: claim_token.clone(),
+        })
         .await
         .unwrap();
 
@@ -2145,6 +2644,7 @@ async fn turso_legacy_multipart_intent_fails_closed_and_preserves_session() {
         store
             .submit(Mutation::CompleteMultipart {
                 upload_id: upload_id.clone(),
+                claim_token,
                 row: Box::new(row(&bucket_name, key.as_str(), version, "assembled", 1)),
                 precondition: Precondition::default(),
                 replication: Vec::new(),
@@ -2235,7 +2735,9 @@ async fn turso_object_lock_corrupt_configuration_fails_closed() {
                 bucket: bucket_name,
                 key,
                 version_id: version,
+                expected_row_id: None,
                 expected_updated_at: None,
+                require_sole_key_version: false,
                 now: Timestamp(i64::MAX),
                 bypass: GovernanceBypass::Authorized,
             })
@@ -2632,6 +3134,7 @@ async fn requeue_replication_versions_is_key_scoped_parity() {
             owner_id: UserId::generate(),
             now: Timestamp(2),
             bypass: GovernanceBypass::Denied,
+            expected_current: None,
             replication: vec![OutboxEntry {
                 operation: ReplicationOp::DeleteMarker,
                 ..mk("d", &d2, "backfill:r1:d:4")

@@ -23,6 +23,7 @@ mod import_dest;
 mod import_run;
 mod key_rewrap;
 mod metrics_agg;
+mod multipart_claim_recovery;
 mod node_lock;
 mod observability;
 mod proxy;
@@ -432,7 +433,9 @@ async fn repair_dangling_rows(
                                 bucket: bucket.name.clone(),
                                 key: item.key.clone(),
                                 version_id: item.version_id.clone(),
+                                expected_row_id: None,
                                 expected_updated_at: None,
+                                require_sole_key_version: false,
                                 now,
                                 bypass: GovernanceBypass::Denied,
                             })
@@ -824,7 +827,7 @@ impl HttpReplicaVerifier {
         };
         let handle = self
             .blob
-            .open_raw(path, None, cipher, &row.compression)
+            .open_raw(path, None, cipher, &row.compression, row.size_logical)
             .await
             .map_err(|e| format!("reading the source blob: {e}"))?;
         let mut hasher = md5::Md5::new();

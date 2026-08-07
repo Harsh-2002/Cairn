@@ -34,6 +34,32 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             initial_state,
             replication,
         } => put_version(conn, *row, &precondition, initial_state, replication),
+        Mutation::ResolveObjectWrite {
+            bucket,
+            key,
+            version_id,
+            row_id,
+            storage_path,
+        } => {
+            let referenced = conn
+                .query_row(
+                    "SELECT 1 FROM object_versions
+                     WHERE bucket_name=?1 AND key=?2 AND version_id=?3
+                       AND id=?4 AND storage_path=?5",
+                    params![
+                        bucket.as_str(),
+                        key.as_str(),
+                        version_id.as_str(),
+                        row_id,
+                        storage_path.as_str(),
+                    ],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(engine_err)?
+                .is_some();
+            Ok(MutationOutcome::ObjectWriteResolved { referenced })
+        }
         Mutation::CreateDeleteMarker {
             bucket,
             key,
@@ -41,8 +67,30 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             owner_id,
             now,
             bypass,
+            expected_current,
             replication,
         } => {
+            if let Some(expected) = expected_current {
+                let still_current = conn
+                    .query_row(
+                        "SELECT 1 FROM object_versions
+                         WHERE bucket_name=?1 AND key=?2 AND version_id=?3
+                           AND updated_at=?4 AND is_latest=1 AND is_delete_marker=0",
+                        params![
+                            bucket.as_str(),
+                            key.as_str(),
+                            expected.version_id.as_str(),
+                            expected.updated_at.0,
+                        ],
+                        |_| Ok(()),
+                    )
+                    .optional()
+                    .map_err(engine_err)?
+                    .is_some();
+                if !still_current {
+                    return Ok(MutationOutcome::DeleteNotApplied);
+                }
+            }
             let row = ObjectVersionRow {
                 id: uuid::Uuid::new_v4().simple().to_string(),
                 bucket: bucket.clone(),
@@ -89,7 +137,9 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             bucket,
             key,
             version_id,
+            expected_row_id,
             expected_updated_at,
+            require_sole_key_version,
             now,
             bypass,
         } => delete_version(
@@ -97,7 +147,11 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             &bucket,
             &key,
             &version_id,
-            expected_updated_at,
+            DeleteVersionGuard {
+                expected_row_id,
+                expected_updated_at,
+                require_sole_key_version,
+            },
             now,
             bypass,
         ),
@@ -259,6 +313,24 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             attempt_id,
             part,
         } => record_part(conn, &upload_id, &attempt_id, part),
+        Mutation::ResolveMultipartPartWrite {
+            upload_id,
+            part_number,
+            storage_path,
+        } => {
+            let referenced = conn
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM multipart_parts
+                         WHERE upload_id=?1 AND part_number=?2 AND storage_path=?3
+                     )",
+                    params![upload_id.as_str(), part_number, storage_path.as_str()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map(|value| value != 0)
+                .map_err(engine_err)?;
+            Ok(MutationOutcome::MultipartPartWriteResolved { referenced })
+        }
         Mutation::ReleaseMultipartCleanup { cleanup_id } => {
             release_multipart_cleanup(conn, &cleanup_id)?;
             Ok(MutationOutcome::Ack)
@@ -270,13 +342,20 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
         Mutation::RecoverMultipartStagingAccounting { limit } => {
             recover_multipart_staging_accounting(conn, limit)
         }
-        Mutation::ClaimMultipart(upload_id) => claim_multipart(conn, &upload_id),
-        Mutation::ReleaseMultipartClaim(upload_id) => {
+        Mutation::ClaimMultipart {
+            upload_id,
+            claim_token,
+        } => claim_multipart(conn, &upload_id, &claim_token),
+        Mutation::ReleaseMultipartClaim {
+            upload_id,
+            claim_token,
+        } => {
             let released = conn
                 .execute(
-                    "UPDATE multipart_uploads SET status='active'
-                     WHERE id=?1 AND status='completing'",
-                    params![upload_id.as_str()],
+                    "UPDATE multipart_uploads
+                     SET status='active', completion_claim_token=NULL
+                     WHERE id=?1 AND status='completing' AND completion_claim_token=?2",
+                    params![upload_id.as_str(), claim_token.as_str()],
                 )
                 .map_err(engine_err)?;
             Ok(MutationOutcome::MultipartClaimRelease(if released == 1 {
@@ -289,7 +368,9 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             // No request survives a process restart, so every transient completion owner is an
             // orphan. Restore retryability without deleting its durable session or parts.
             conn.execute(
-                "UPDATE multipart_uploads SET status='active' WHERE status='completing'",
+                "UPDATE multipart_uploads
+                 SET status='active', completion_claim_token=NULL
+                 WHERE status='completing'",
                 [],
             )
             .map_err(engine_err)?;
@@ -297,12 +378,13 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
         }
         Mutation::CompleteMultipart {
             upload_id,
+            claim_token,
             row,
             precondition,
             replication,
         } => {
             let Some(initial_state) =
-                multipart_initial_state(conn, &upload_id, &row.bucket, &row.key)?
+                multipart_initial_state(conn, &upload_id, &claim_token, &row.bucket, &row.key)?
             else {
                 return Ok(MutationOutcome::MultipartTerminal(
                     MultipartTerminalOutcome::NotOwner,
@@ -1657,6 +1739,7 @@ fn replace_object_tags(
 fn multipart_initial_state(
     conn: &Connection,
     upload_id: &cairn_types::UploadId,
+    claim_token: &cairn_types::MultipartClaimToken,
     bucket: &BucketName,
     key: &ObjectKey,
 ) -> R<Option<InitialObjectState>> {
@@ -1664,8 +1747,14 @@ fn multipart_initial_state(
         .query_row(
             "SELECT initial_tags, lock_mode, retain_until, legal_hold, object_lock_intent_known
              FROM multipart_uploads
-             WHERE id=?1 AND status='completing' AND bucket_name=?2 AND key=?3",
-            params![upload_id.as_str(), bucket.as_str(), key.as_str()],
+             WHERE id=?1 AND status='completing' AND completion_claim_token=?2
+               AND bucket_name=?3 AND key=?4",
+            params![
+                upload_id.as_str(),
+                claim_token.as_str(),
+                bucket.as_str(),
+                key.as_str()
+            ],
             |row| {
                 Ok((
                     row.get(0)?,
@@ -2067,30 +2156,62 @@ fn insert_version(conn: &Connection, row: &ObjectVersionRow) -> R<()> {
     Ok(())
 }
 
+struct DeleteVersionGuard {
+    expected_row_id: Option<String>,
+    expected_updated_at: Option<Timestamp>,
+    require_sole_key_version: bool,
+}
+
 fn delete_version(
     conn: &Connection,
     bucket: &BucketName,
     key: &ObjectKey,
     version_id: &VersionId,
-    expected_updated_at: Option<Timestamp>,
+    guard: DeleteVersionGuard,
     now: Timestamp,
     bypass: GovernanceBypass,
 ) -> R<MutationOutcome> {
-    // Compare-and-delete guard: if the caller (the lifecycle scanner) captured the version's
-    // updated_at at enumeration, only proceed when the stored value still matches. A concurrent
-    // overwrite (which bumps updated_at) means the object was rewritten since the scan, so deleting
-    // it would destroy fresh, non-expired data — skip it as a no-op (audit 2026-07). Runs inside the
-    // savepoint, so the check and the delete are atomic.
-    if let Some(expected) = expected_updated_at {
-        let stored: Option<i64> = conn
+    // Lifecycle compare-and-delete guards are checked in the writer savepoint. The immutable row id
+    // distinguishes two sentinel versions even when a concurrent overwrite lands in the same
+    // timestamp tick; updated_at remains a defense-in-depth freshness check.
+    if guard.expected_row_id.is_some() || guard.expected_updated_at.is_some() {
+        let stored: Option<(String, i64)> = conn
             .query_row(
-                "SELECT updated_at FROM object_versions WHERE bucket_name=?1 AND key=?2 AND version_id=?3",
+                "SELECT id, updated_at FROM object_versions
+                 WHERE bucket_name=?1 AND key=?2 AND version_id=?3",
                 params![bucket.as_str(), key.as_str(), version_id.as_str()],
-                |r| r.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
             .map_err(engine_err)?;
-        if stored != Some(expected.0) {
+        let matches = stored.as_ref().is_some_and(|(row_id, updated_at)| {
+            guard
+                .expected_row_id
+                .as_ref()
+                .is_none_or(|expected| expected == row_id)
+                && guard
+                    .expected_updated_at
+                    .is_none_or(|expected| expected.0 == *updated_at)
+        });
+        if !matches {
+            return Ok(MutationOutcome::DeleteNotApplied);
+        }
+    }
+    if guard.require_sole_key_version {
+        let (version_count, guarded_marker): (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*),
+                        COALESCE(MAX(CASE
+                            WHEN version_id=?3 AND is_latest=1 AND is_delete_marker=1 THEN 1
+                            ELSE 0
+                        END), 0)
+                 FROM object_versions
+                 WHERE bucket_name=?1 AND key=?2",
+                params![bucket.as_str(), key.as_str(), version_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(engine_err)?;
+        if version_count != 1 || guarded_marker != 1 {
             return Ok(MutationOutcome::DeleteNotApplied);
         }
     }
@@ -2601,7 +2722,11 @@ fn recover_multipart_staging_accounting(conn: &Connection, limit: u32) -> R<Muta
     Ok(MutationOutcome::MultipartAccountingReleased(released))
 }
 
-fn claim_multipart(conn: &Connection, upload_id: &cairn_types::UploadId) -> R<MutationOutcome> {
+fn claim_multipart(
+    conn: &Connection,
+    upload_id: &cairn_types::UploadId,
+    claim_token: &cairn_types::MultipartClaimToken,
+) -> R<MutationOutcome> {
     let status: Option<String> = conn
         .query_row(
             "SELECT status FROM multipart_uploads WHERE id=?1",
@@ -2613,8 +2738,10 @@ fn claim_multipart(conn: &Connection, upload_id: &cairn_types::UploadId) -> R<Mu
     let outcome = match status.as_deref() {
         Some("active") => {
             conn.execute(
-                "UPDATE multipart_uploads SET status='completing', updated_at=updated_at WHERE id=?1",
-                params![upload_id.as_str()],
+                "UPDATE multipart_uploads
+                 SET status='completing', completion_claim_token=?2, updated_at=updated_at
+                 WHERE id=?1",
+                params![upload_id.as_str(), claim_token.as_str()],
             )
             .map_err(engine_err)?;
             let session = conn
@@ -3055,6 +3182,7 @@ mod tests {
                 owner_id: UserId("alice".to_owned()),
                 now: Timestamp(2),
                 bypass: GovernanceBypass::Denied,
+                expected_current: None,
                 replication: Vec::new(),
             },
         )
@@ -3068,7 +3196,9 @@ mod tests {
                 bucket: BucketName::parse("bkt").unwrap(),
                 key: ObjectKey::parse("k1").unwrap(),
                 version_id: VersionId::from_string("v1".to_owned()),
+                expected_row_id: None,
                 expected_updated_at: None,
+                require_sole_key_version: false,
                 now: Timestamp(2),
                 bypass: GovernanceBypass::Denied,
             },
@@ -3083,7 +3213,9 @@ mod tests {
                 bucket: BucketName::parse("bkt").unwrap(),
                 key: ObjectKey::parse("k1").unwrap(),
                 version_id: VersionId::from_string("v3".to_owned()),
+                expected_row_id: None,
                 expected_updated_at: None,
+                require_sole_key_version: false,
                 now: Timestamp(2),
                 bypass: GovernanceBypass::Denied,
             },
@@ -3117,7 +3249,9 @@ mod tests {
                 bucket: BucketName::parse("bkt").unwrap(),
                 key: ObjectKey::parse("k1").unwrap(),
                 version_id: VersionId::from_string("v1".to_owned()),
+                expected_row_id: None,
                 expected_updated_at: None,
+                require_sole_key_version: false,
                 now: Timestamp(2),
                 bypass: GovernanceBypass::Denied,
             },
@@ -3224,6 +3358,7 @@ mod tests {
                 owner_id: UserId("owner".to_owned()),
                 now: Timestamp(2),
                 bypass: GovernanceBypass::Denied,
+                expected_current: None,
                 replication: Vec::new(),
             },
         )
@@ -3373,7 +3508,9 @@ mod tests {
                     bucket: BucketName::parse("repair").unwrap(),
                     key: ObjectKey::parse("k").unwrap(),
                     version_id: VersionId::from_string("v1".to_owned()),
+                    expected_row_id: None,
                     expected_updated_at: None,
+                    require_sole_key_version: false,
                     now: Timestamp(i64::MAX),
                     bypass: GovernanceBypass::Authorized,
                 }
@@ -3395,7 +3532,9 @@ mod tests {
                     bucket: BucketName::parse("repair").unwrap(),
                     key: ObjectKey::parse("k").unwrap(),
                     version_id: VersionId::from_string("v1".to_owned()),
+                    expected_row_id: None,
                     expected_updated_at: None,
+                    require_sole_key_version: false,
                     now: Timestamp(i64::MAX),
                     bypass: GovernanceBypass::Denied,
                 }
@@ -3476,7 +3615,9 @@ mod tests {
                     bucket,
                     key: ObjectKey::parse("live").unwrap(),
                     version_id: VersionId::from_string("v1".to_owned()),
+                    expected_row_id: None,
                     expected_updated_at: None,
+                    require_sole_key_version: false,
                     now: Timestamp(i64::MAX),
                     bypass: GovernanceBypass::Authorized,
                 }
@@ -3538,12 +3679,21 @@ mod tests {
             params![upload_id.as_str()],
         )
         .unwrap();
-        apply_in_savepoint(&conn, Mutation::ClaimMultipart(upload_id.clone())).unwrap();
+        let claim_token = cairn_types::MultipartClaimToken::generate();
+        apply_in_savepoint(
+            &conn,
+            Mutation::ClaimMultipart {
+                upload_id: upload_id.clone(),
+                claim_token: claim_token.clone(),
+            },
+        )
+        .unwrap();
 
         let error = apply_in_savepoint(
             &conn,
             Mutation::CompleteMultipart {
                 upload_id: upload_id.clone(),
+                claim_token,
                 row: Box::new(obj_row(
                     bucket.name.as_str(),
                     key.as_str(),

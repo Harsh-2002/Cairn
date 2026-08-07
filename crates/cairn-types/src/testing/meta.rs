@@ -9,7 +9,9 @@ use crate::bucket::{
     VersioningState,
 };
 use crate::error::MetaError;
-use crate::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
+use crate::id::{
+    BucketName, MultipartClaimToken, ObjectKey, StoragePath, UploadId, UserId, VersionId,
+};
 use crate::meta::{
     ActivityEntry, BucketCounts, BucketRequestCount, ClaimOutcome, ClaimReleaseOutcome,
     IfNoneMatch, ImportJob, ImportJobListQuery, ImportJobPage, ImportJobRecord, ImportState,
@@ -64,6 +66,8 @@ struct State {
     /// fail-closed read and mutation behavior.
     invalid_lock_rows: HashSet<VKey>,
     multipart: BTreeMap<String, MultipartSession>,
+    /// Completion ownership token, present exactly while the corresponding session is completing.
+    multipart_claims: BTreeMap<String, MultipartClaimToken>,
     parts: BTreeMap<(String, u16), PartRecord>,
     multipart_reservations: BTreeMap<String, MultipartReservation>,
     multipart_cleanups: BTreeMap<String, MultipartCleanup>,
@@ -455,6 +459,7 @@ impl State {
         };
         self.multipart_cleanups.insert(cleanup.id.clone(), cleanup);
         self.multipart.remove(upload_id.as_str());
+        self.multipart_claims.remove(upload_id.as_str());
         self.parts
             .retain(|(upload, _), _| upload != upload_id.as_str());
         self.multipart_reservations
@@ -468,6 +473,14 @@ impl State {
 pub struct InMemoryMetadataStore {
     state: Mutex<State>,
     fail_user_policy_reads: AtomicBool,
+    hang_next_claim_ack: AtomicBool,
+    fail_next_complete_ack: AtomicBool,
+    hang_next_replication_config_read: AtomicBool,
+    replication_config_read_hanging: AtomicBool,
+    fail_next_object_put_ack: AtomicBool,
+    fail_next_part_record_ack: AtomicBool,
+    hang_next_part_record_ack: AtomicBool,
+    part_record_ack_hanging: AtomicBool,
 }
 
 impl std::fmt::Debug for InMemoryMetadataStore {
@@ -482,6 +495,153 @@ impl InMemoryMetadataStore {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Apply the next successful multipart claim, then leave its submit future pending forever.
+    ///
+    /// Downstream cancellation tests use this to model a durable writer commit whose
+    /// acknowledgement is lost without coupling the trait spine to an async runtime.
+    pub fn hang_next_multipart_claim_ack(&self) {
+        self.hang_next_claim_ack.store(true, Ordering::Release);
+    }
+
+    /// Apply the next successful multipart completion, then return an acknowledgement error.
+    ///
+    /// This exercises callers that receive a concrete `Err` even though the terminal metadata
+    /// transaction committed.
+    pub fn fail_next_multipart_complete_ack(&self) {
+        self.fail_next_complete_ack.store(true, Ordering::Release);
+    }
+
+    /// Leave the next replication-config read pending forever.
+    ///
+    /// Protocol cancellation tests arm this after staging so dropping the request exercises the
+    /// ordinary object-write guard before metadata submission.
+    pub fn hang_next_replication_config_read(&self) {
+        self.replication_config_read_hanging
+            .store(false, Ordering::Release);
+        self.hang_next_replication_config_read
+            .store(true, Ordering::Release);
+    }
+
+    /// Whether the injected replication-config read has reached its permanent pending point.
+    #[must_use]
+    pub fn replication_config_read_is_hanging(&self) -> bool {
+        self.replication_config_read_hanging.load(Ordering::Acquire)
+    }
+
+    /// Apply the next successful object-version put, then return an acknowledgement error.
+    ///
+    /// Models a durable COMMIT whose response was lost so the protocol must resolve the exact row
+    /// and preserve its live blob rather than eagerly unlinking it.
+    pub fn fail_next_object_put_ack(&self) {
+        self.fail_next_object_put_ack.store(true, Ordering::Release);
+    }
+
+    /// Apply the next successful part record, then return an acknowledgement error.
+    pub fn fail_next_part_record_ack(&self) {
+        self.fail_next_part_record_ack
+            .store(true, Ordering::Release);
+    }
+
+    /// Apply the next successful part record, then leave its acknowledgement pending forever.
+    pub fn hang_next_part_record_ack(&self) {
+        self.part_record_ack_hanging.store(false, Ordering::Release);
+        self.hang_next_part_record_ack
+            .store(true, Ordering::Release);
+    }
+
+    /// Whether the injected part-record acknowledgement reached its permanent pending point.
+    #[must_use]
+    pub fn part_record_ack_is_hanging(&self) -> bool {
+        self.part_record_ack_hanging.load(Ordering::Acquire)
+    }
+
+    async fn submit_record_part(
+        &self,
+        upload_id: UploadId,
+        attempt_id: String,
+        part: PartRecord,
+    ) -> Result<MutationOutcome, MetaError> {
+        let outcome = {
+            let mut st = self.state.lock().unwrap();
+            let session = st
+                .multipart
+                .get(upload_id.as_str())
+                .filter(|session| session.status == MultipartStatus::Active)
+                .cloned()
+                .ok_or(MetaError::MultipartNotActive)?;
+            let reservation = st
+                .multipart_reservations
+                .get(&attempt_id)
+                .filter(|reservation| reservation.upload_id == upload_id)
+                .cloned()
+                .ok_or(MetaError::MultipartNotActive)?;
+            if reservation.part_number != part.part_number
+                || reservation.reserved_bytes != part.size
+            {
+                return Err(MetaError::QuotaExceeded);
+            }
+            let pk = (upload_id.as_str().to_owned(), part.part_number);
+            let cleanup = st.parts.get(&pk).map(|previous| MultipartCleanup {
+                id: format!("part:{attempt_id}"),
+                upload_id: upload_id.clone(),
+                bucket: session.bucket.clone(),
+                principal_id: session.initiated_by.clone(),
+                bytes: previous.size,
+                storage_path: Some(previous.storage_path.clone()),
+                created_at: reservation.created_at,
+            });
+            if let Some(cleanup) = &cleanup {
+                st.multipart_cleanups
+                    .insert(cleanup.id.clone(), cleanup.clone());
+            }
+            st.parts.insert(pk, part);
+            st.multipart_reservations.remove(&attempt_id);
+            MutationOutcome::PartRecorded { cleanup }
+        };
+        let fail = self.fail_next_part_record_ack.swap(false, Ordering::AcqRel);
+        let hang = self.hang_next_part_record_ack.swap(false, Ordering::AcqRel);
+        if hang {
+            self.part_record_ack_hanging.store(true, Ordering::Release);
+            std::future::pending::<()>().await;
+            unreachable!("pending future returned")
+        }
+        if fail {
+            return Err(MetaError::Engine(
+                "multipart part acknowledgement lost".to_owned(),
+            ));
+        }
+        Ok(outcome)
+    }
+
+    async fn submit_multipart_claim(
+        &self,
+        upload_id: UploadId,
+        claim_token: MultipartClaimToken,
+    ) -> Result<MutationOutcome, MetaError> {
+        let outcome = {
+            let mut st = self.state.lock().unwrap();
+            let claimed = match st.multipart.get_mut(upload_id.as_str()) {
+                Some(session) if session.status == MultipartStatus::Active => {
+                    session.status = MultipartStatus::Completing;
+                    session.clone()
+                }
+                Some(_) => {
+                    return Ok(MutationOutcome::MultipartClaim(
+                        ClaimOutcome::AlreadyClaimed,
+                    ));
+                }
+                None => return Ok(MutationOutcome::MultipartClaim(ClaimOutcome::NotFound)),
+            };
+            st.multipart_claims
+                .insert(upload_id.as_str().to_owned(), claim_token);
+            MutationOutcome::MultipartClaim(ClaimOutcome::Claimed(Box::new(claimed)))
+        };
+        if self.hang_next_claim_ack.swap(false, Ordering::AcqRel) {
+            return std::future::pending().await;
+        }
+        Ok(outcome)
     }
 
     /// Mark one Object Lock side row structurally corrupt.
@@ -558,6 +718,7 @@ fn key_after(q: &ListQuery) -> Option<&str> {
 
 fn summarize(r: &ObjectVersionRow) -> ObjectSummary {
     ObjectSummary {
+        row_id: r.id.clone(),
         key: r.key.clone(),
         version_id: r.version_id.clone(),
         is_latest: r.is_latest,
@@ -739,6 +900,20 @@ fn page_rows(
 #[async_trait::async_trait]
 impl MetadataStore for InMemoryMetadataStore {
     async fn submit(&self, mutation: Mutation) -> Result<MutationOutcome, MetaError> {
+        let mutation = match mutation {
+            Mutation::ClaimMultipart {
+                upload_id,
+                claim_token,
+            } => return self.submit_multipart_claim(upload_id, claim_token).await,
+            Mutation::RecordPart {
+                upload_id,
+                attempt_id,
+                part,
+            } => {
+                return self.submit_record_part(upload_id, attempt_id, part).await;
+            }
+            other => other,
+        };
         let mut st = self.state.lock().unwrap();
         match mutation {
             Mutation::PutObjectVersion {
@@ -765,10 +940,33 @@ impl MetadataStore for InMemoryMetadataStore {
                 for entry in replication {
                     st.outbox.push(entry);
                 }
-                Ok(MutationOutcome::Put {
+                let outcome = MutationOutcome::Put {
                     superseded,
                     version_id,
-                })
+                };
+                if self.fail_next_object_put_ack.swap(false, Ordering::AcqRel) {
+                    return Err(MetaError::Engine(
+                        "object put acknowledgement lost".to_owned(),
+                    ));
+                }
+                Ok(outcome)
+            }
+            Mutation::ResolveObjectWrite {
+                bucket,
+                key,
+                version_id,
+                row_id,
+                storage_path,
+            } => {
+                let vk = (
+                    bucket.as_str().to_owned(),
+                    key.as_str().to_owned(),
+                    version_id.as_str().to_owned(),
+                );
+                let referenced = st.versions.get(&vk).is_some_and(|row| {
+                    row.id == row_id && row.storage_path.as_ref() == Some(&storage_path)
+                });
+                Ok(MutationOutcome::ObjectWriteResolved { referenced })
             }
             Mutation::CreateDeleteMarker {
                 bucket,
@@ -777,8 +975,22 @@ impl MetadataStore for InMemoryMetadataStore {
                 owner_id,
                 now,
                 bypass,
+                expected_current,
                 replication,
             } => {
+                if let Some(expected) = expected_current {
+                    let still_current = st.versions.values().any(|row| {
+                        row.bucket == bucket
+                            && row.key == key
+                            && row.version_id == expected.version_id
+                            && row.updated_at == expected.updated_at
+                            && row.is_latest
+                            && !row.is_delete_marker
+                    });
+                    if !still_current {
+                        return Ok(MutationOutcome::DeleteNotApplied);
+                    }
+                }
                 let row = ObjectVersionRow {
                     id: uuid_like(&version_id),
                     bucket: bucket.clone(),
@@ -836,7 +1048,9 @@ impl MetadataStore for InMemoryMetadataStore {
                 bucket,
                 key,
                 version_id,
+                expected_row_id,
                 expected_updated_at,
+                require_sole_key_version,
                 now,
                 bypass,
             } => {
@@ -845,10 +1059,30 @@ impl MetadataStore for InMemoryMetadataStore {
                     key.as_str().to_owned(),
                     version_id.as_str().to_owned(),
                 );
-                // Compare-and-delete guard (mirrors the SQL engines): skip if the stored updated_at
-                // no longer matches the value the caller captured (overwritten since — audit 2026-07).
+                // Compare-and-delete guards (mirrors the SQL engines): lifecycle must still name
+                // the exact metadata row it enumerated. The row id closes the same-version,
+                // same-timestamp sentinel-overwrite gap; the timestamp remains defense in depth.
+                if let Some(expected) = expected_row_id {
+                    if st.versions.get(&vk).map(|r| r.id.as_str()) != Some(expected.as_str()) {
+                        return Ok(MutationOutcome::DeleteNotApplied);
+                    }
+                }
                 if let Some(expected) = expected_updated_at {
                     if st.versions.get(&vk).map(|r| r.updated_at) != Some(expected) {
+                        return Ok(MutationOutcome::DeleteNotApplied);
+                    }
+                }
+                if require_sole_key_version {
+                    let key_versions = st
+                        .versions
+                        .values()
+                        .filter(|row| row.bucket == bucket && row.key == key)
+                        .collect::<Vec<_>>();
+                    let guarded_marker = key_versions.len() == 1
+                        && key_versions[0].version_id == version_id
+                        && key_versions[0].is_latest
+                        && key_versions[0].is_delete_marker;
+                    if !guarded_marker {
                         return Ok(MutationOutcome::DeleteNotApplied);
                     }
                 }
@@ -1025,45 +1259,17 @@ impl MetadataStore for InMemoryMetadataStore {
                 }
                 Ok(MutationOutcome::Ack)
             }
-            Mutation::RecordPart {
+            Mutation::RecordPart { .. } => unreachable!("RecordPart handled before state lock"),
+            Mutation::ResolveMultipartPartWrite {
                 upload_id,
-                attempt_id,
-                part,
+                part_number,
+                storage_path,
             } => {
-                let session = st
-                    .multipart
-                    .get(upload_id.as_str())
-                    .filter(|session| session.status == MultipartStatus::Active)
-                    .cloned()
-                    .ok_or(MetaError::MultipartNotActive)?;
-                let reservation = st
-                    .multipart_reservations
-                    .get(&attempt_id)
-                    .filter(|reservation| reservation.upload_id == upload_id)
-                    .cloned()
-                    .ok_or(MetaError::MultipartNotActive)?;
-                if reservation.part_number != part.part_number
-                    || reservation.reserved_bytes != part.size
-                {
-                    return Err(MetaError::QuotaExceeded);
-                }
-                let pk = (upload_id.as_str().to_owned(), part.part_number);
-                let cleanup = st.parts.get(&pk).map(|previous| MultipartCleanup {
-                    id: format!("part:{attempt_id}"),
-                    upload_id: upload_id.clone(),
-                    bucket: session.bucket.clone(),
-                    principal_id: session.initiated_by.clone(),
-                    bytes: previous.size,
-                    storage_path: Some(previous.storage_path.clone()),
-                    created_at: reservation.created_at,
-                });
-                if let Some(cleanup) = &cleanup {
-                    st.multipart_cleanups
-                        .insert(cleanup.id.clone(), cleanup.clone());
-                }
-                st.parts.insert(pk, part);
-                st.multipart_reservations.remove(&attempt_id);
-                Ok(MutationOutcome::PartRecorded { cleanup })
+                let referenced = st
+                    .parts
+                    .get(&(upload_id.as_str().to_owned(), part_number))
+                    .is_some_and(|part| part.storage_path == storage_path);
+                Ok(MutationOutcome::MultipartPartWriteResolved { referenced })
             }
             Mutation::ReleaseMultipartCleanup { cleanup_id } => {
                 st.multipart_cleanups.remove(&cleanup_id);
@@ -1105,21 +1311,21 @@ impl MetadataStore for InMemoryMetadataStore {
                 }
                 Ok(MutationOutcome::MultipartAccountingReleased(released))
             }
-            Mutation::ClaimMultipart(upload_id) => {
-                let outcome = match st.multipart.get_mut(upload_id.as_str()) {
-                    Some(s) if s.status == MultipartStatus::Active => {
-                        s.status = MultipartStatus::Completing;
-                        ClaimOutcome::Claimed(Box::new(s.clone()))
-                    }
-                    Some(_) => ClaimOutcome::AlreadyClaimed,
-                    None => ClaimOutcome::NotFound,
-                };
-                Ok(MutationOutcome::MultipartClaim(outcome))
+            Mutation::ClaimMultipart { .. } => {
+                unreachable!("multipart claims are handled before locking the general state")
             }
-            Mutation::ReleaseMultipartClaim(upload_id) => {
+            Mutation::ReleaseMultipartClaim {
+                upload_id,
+                claim_token,
+            } => {
+                let owns_claim = st
+                    .multipart_claims
+                    .get(upload_id.as_str())
+                    .is_some_and(|stored| stored == &claim_token);
                 let outcome = match st.multipart.get_mut(upload_id.as_str()) {
-                    Some(s) if s.status == MultipartStatus::Completing => {
+                    Some(s) if s.status == MultipartStatus::Completing && owns_claim => {
                         s.status = MultipartStatus::Active;
+                        st.multipart_claims.remove(upload_id.as_str());
                         ClaimReleaseOutcome::Released
                     }
                     Some(_) | None => ClaimReleaseOutcome::NotOwner,
@@ -1132,18 +1338,25 @@ impl MetadataStore for InMemoryMetadataStore {
                         session.status = MultipartStatus::Active;
                     }
                 }
+                st.multipart_claims.clear();
                 Ok(MutationOutcome::Ack)
             }
             Mutation::CompleteMultipart {
                 upload_id,
+                claim_token,
                 row,
                 precondition,
                 replication,
             } => {
+                let owns_claim = st
+                    .multipart_claims
+                    .get(upload_id.as_str())
+                    .is_some_and(|stored| stored == &claim_token);
                 if !matches!(
                     st.multipart.get(upload_id.as_str()),
                     Some(s)
                         if s.status == MultipartStatus::Completing
+                            && owns_claim
                             && s.bucket == row.bucket
                             && s.key == row.key
                 ) {
@@ -1179,12 +1392,17 @@ impl MetadataStore for InMemoryMetadataStore {
                 for entry in replication {
                     st.outbox.push(entry);
                 }
-                Ok(MutationOutcome::MultipartTerminal(
-                    MultipartTerminalOutcome::Completed {
+                let outcome =
+                    MutationOutcome::MultipartTerminal(MultipartTerminalOutcome::Completed {
                         superseded,
                         version_id,
-                    },
-                ))
+                    });
+                if self.fail_next_complete_ack.swap(false, Ordering::AcqRel) {
+                    return Err(MetaError::Engine(
+                        "multipart completion acknowledgement lost".to_owned(),
+                    ));
+                }
+                Ok(outcome)
             }
             Mutation::AbortMultipart(upload_id) => {
                 let active = matches!(
@@ -2015,6 +2233,15 @@ impl MetadataStore for InMemoryMetadataStore {
         name: &BucketName,
         aspect: ConfigAspect,
     ) -> Result<Option<ConfigDoc>, MetaError> {
+        if aspect == ConfigAspect::Replication
+            && self
+                .hang_next_replication_config_read
+                .swap(false, Ordering::AcqRel)
+        {
+            self.replication_config_read_hanging
+                .store(true, Ordering::Release);
+            return std::future::pending().await;
+        }
         Ok(self
             .state
             .lock()

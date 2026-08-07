@@ -27,6 +27,11 @@ plain files under opaque IDs; metadata is someone else's job (`cairn-meta`).
   reorder: stream → `sync_data` (fdatasync, *not* `sync_all`) the staged file → rename into the bucket
   dir → fsync that dir (via the coalescer) → only then is the blob durable. `stage` returns *before*
   any metadata row references it; a crash here leaves an orphan that reconcile reclaims — that is by design.
+- **Cancellation before `StagedBlob` return reclaims synchronously.** Single-part staging and
+  multipart assembly keep a POSIX unlink-on-drop guard over both their unique `.staging` name and
+  final bucket name through every await, including the post-rename directory fsync. The Tokio and
+  io_uring create/rename handoffs retain matching ownership until the request acknowledges them, so
+  backend work that finishes after request cancellation cannot recreate an orphan behind the guard.
 - **A newly-created bucket directory triggers an extra `data_root` fsync** (`ensure_bucket_dir`, F-1):
   the rename is not durable until the parent records the new dir entry. Paid only on the first write
   into a bucket. Don't drop it.
@@ -45,44 +50,36 @@ plain files under opaque IDs; metadata is someone else's job (`cairn-meta`).
   so their algorithm, compression flags, lengths, offsets, and version are authenticated before
   use. Legacy encrypted v2 remains readable only when trusted metadata explicitly identifies a
   pre-v3 object/part; every new or rewritten encrypted blob is v3. See ARCH 27.
-- **The reader seam is `open_raw(path, range, cipher: BlobCipher, compression)` + `probe(path)` —
+- **The reader seam is
+  `open_raw(path, range, cipher: BlobCipher, compression, expected_logical_len)` + `probe(path)` —
   there is NO DEK-less `open`.** `BlobCipher` (in `cairn-types`) is
   `KnownPlaintext | LegacyV2(DEK) | AuthenticatedV3(DEK)`. A caller cannot express an encrypted read
   without naming both the key and trusted metadata format. `open_raw` preserves that declaration
-  through the framing decision, refusal guard, probe open, lazy stream, and
-  `CompressedReader::open_with_dek` call (the internal method name is stable — do NOT rename it).
-  The compressed reader rejects an on-disk version that differs from the declaration before
-  returning bytes; the file cannot select its own legacy parser. `probe` answers PRESENCE + physical
-  framing only: one `stat`, no body open, no DEK, no decrypt, so a well-formed ENCRYPTED blob probes
-  `Ok` (present), NOT `Corruption`; absence is `NotFound`.
-- **Framing comes from the caller's descriptor + cipher, but a `KnownPlaintext` read of an encrypted
-  blob is REFUSED.** `is_container = cipher.is_encrypted() || compressed`, and staging records only the
-  *logical* compression — so an encrypted-but-**uncompressed** blob is `Uncompressed`, and a caller
-  passing `KnownPlaintext` (the old `dek: None`) used to get the raw CRNB container bytes streamed as
-  if they were the body (compression is off by default, so this was the default configuration; it is
-  how replication mirrored ciphertext). `open_raw`'s probe now cross-checks the trailer and returns
-  `Corruption("encrypted blob read without a data key")` when the blob is a fully self-consistent
-  `VERSION_ENCRYPTED` container. It only ever **refuses** — it never parses as a container — so
-  audit #18's rule (no trailer sniffing to decide framing) still holds, and an uncompressed blob
-  whose bytes merely end in `CRNB` still reads. The trailer is fetched with ONE positioned
-  `read_exact_at` (`#[cfg(unix)]`; a seek/read/rewind fallback elsewhere), so the tuned plaintext
-  read path pays no extra `lseek` and nothing downstream depends on an implicit rewind.
-- **The guard has a KNOWN false-positive class — it is not a random collision.** The four identity
-  checks are satisfied *by construction* by any object whose body is the verbatim bytes of an
-  encrypted blob file, i.e. the "back up `CAIRN_DATA_DIR` by `rclone`/`aws s3 sync`-ing it into a
-  bucket" workflow. Such an object PUTs fine and then reads back as
-  `Corruption("encrypted blob read without a data key")` even though nothing is wrong: the bytes are
-  intact on disk and can still be recovered out-of-band (copy the file out of `data_root`); only the
-  API read is refused. Do **not** weaken the guard to fix this — it closes a real fail-open (shipping
-  ciphertext as a body). The ambiguity is structural: framing is decided from the *caller's*
-  descriptor, and the guard's only input is the bytes. The row-keyed reader in a later ADR stage,
-  which resolves framing from the version row that owns the blob rather than from the file's
-  contents, removes it. Until then the counter below is how an operator tells the two apart.
-- **The refusal is counted, not just logged.** `LocalBlobStore::encrypted_without_key_total()` is a
-  cumulative count of refused DEK-less encrypted reads; the server mirrors it into
-  `cairn_blob_encrypted_without_key_total` on its metrics tick (this crate takes no `metrics`
-  dependency — expose state, let `cairn-server` emit, exactly like `writer_queue_depth`). A
-  `tracing::error!` is not alertable; a counter is.
+  through the framing decision, probe open, lazy stream, and
+  `CompressedReader::open_with_dek` call (the internal method name is stable — do NOT rename it),
+  including the trusted `CompressionDescriptor` and expected logical length from the object row's
+  `size_logical` or multipart `PartRef.size`. The compressed reader rejects an on-disk version
+  that differs from the declaration before returning bytes; the file cannot select its own legacy
+  parser. Because v2 does not authenticate its index/trailer, it additionally requires the trailer
+  algorithm and block size to exactly match that descriptor (`Uncompressed` means algorithm None
+  with the fixed encryption-only block geometry), requires the trailer/index logical total to equal
+  that trusted row/part size, and requires each raw/compressed entry's physical length to agree with
+  the 16-byte GCM overhead. `probe` answers PRESENCE + physical framing only:
+  one `stat`, no body open, no DEK, no decrypt, so a well-formed ENCRYPTED blob probes `Ok` (present),
+  NOT `Corruption`; absence is `NotFound`.
+- **Framing comes only from the caller's authoritative descriptor + cipher; body sniffing never
+  chooses or refuses framing.** `is_container = cipher.is_encrypted() || compressed`. On the
+  metadata-declared plaintext/uncompressed branch, the file length must exactly equal the trusted
+  object/part logical length. An encrypted-but-uncompressed CRNB file passed without its descriptor
+  therefore fails closed because framing adds physical bytes, while a legitimate plaintext object
+  whose body is itself a complete CRNB file (for example a data-directory backup stored in S3)
+  remains arbitrary data and round-trips byte-for-byte. The server mirrors the cumulative mismatch
+  count as `cairn_blob_plaintext_length_mismatch_total`; non-zero means missing/inconsistent
+  metadata or truncated local storage, not a content classification.
+- **Index allocation is bounded before authentication.** Trailer `index_len` is capped at 64 MiB
+  (enough for a 5-GiB object at the minimum supported 1-KiB block size) and its block count must
+  match the independently stored logical size and block geometry before allocation. A corrupt large
+  file therefore cannot make pre-v3 or pre-MAC parsing allocate in proportion to its physical size.
 - **Never resolve a storage path that escapes `data_root`.** `resolve` rejects absolute paths and any
   `..`/root/prefix component → `BlobError::Io("unsafe storage path")`. Object bytes live under opaque
   IDs, never under the user key, so key-based traversal is structurally impossible — keep it that way.

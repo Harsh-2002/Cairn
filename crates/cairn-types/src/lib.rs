@@ -59,15 +59,18 @@ pub use error::{
     AuthError, BlobError, BodyError, ConfigError, CryptoError, Error, MetaError, ReplicationError,
     Result,
 };
-pub use id::{BucketName, InvalidName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
+pub use id::{
+    BucketName, InvalidName, MultipartClaimToken, ObjectKey, StoragePath, UploadId, UserId,
+    VersionId,
+};
 pub use meta::{
     ActivityEntry, BucketCounts, BucketRequestCount, ClaimOutcome, ClaimReleaseOutcome,
-    IfNoneMatch, ImportBucketProgress, ImportJob, ImportJobCursor, ImportJobListQuery,
-    ImportJobPage, ImportJobRecord, ImportJobSummary, ImportState, InitialObjectState,
-    LATENCY_BUCKET_BOUNDS_MS, LATENCY_BUCKETS, ListPage, ListQuery, MAX_IMPORT_JOB_PAGE_SIZE,
-    MAX_IMPORT_JOB_PRUNE_BATCH, MetricsRange, MultipartSession, MultipartStatus,
-    MultipartTerminalOutcome, Mutation, MutationOutcome, ObjectSummary, OpCount, OutboxEntry,
-    PartRecord, Precondition, ReplicationOp, ReplicationStatus, RequestMetricRow,
+    CurrentVersionGuard, IfNoneMatch, ImportBucketProgress, ImportJob, ImportJobCursor,
+    ImportJobListQuery, ImportJobPage, ImportJobRecord, ImportJobSummary, ImportState,
+    InitialObjectState, LATENCY_BUCKET_BOUNDS_MS, LATENCY_BUCKETS, ListPage, ListQuery,
+    MAX_IMPORT_JOB_PAGE_SIZE, MAX_IMPORT_JOB_PRUNE_BATCH, MetricsRange, MultipartSession,
+    MultipartStatus, MultipartTerminalOutcome, Mutation, MutationOutcome, ObjectSummary, OpCount,
+    OutboxEntry, PartRecord, Precondition, ReplicationOp, ReplicationStatus, RequestMetricRow,
     RequestMetricsSeries, SessionCredentialRecord, SessionCredentialSummary, ShareDisposition,
     ShareLookupHash, ShareRow, StatusCount, StoreCounts, TagSummary, TaggedObject, TimePoint, User,
     UserRecord, UserSessionCredentials, UserSigV4Credentials, UserWithBearerHash, WebhookEntry,

@@ -12,12 +12,14 @@ range-seek, same outcomes. `cairn-meta` is left untouched. Selected at runtime b
   against this trait, engine-agnostic.
 - `libsql_driver.rs` / `turso_driver.rs` — the two concrete drivers behind that seam.
 - `apply.rs` — `Mutation` -> SQL. **One of the four mutation sites** (see below).
-- `schema.rs` — the migration table. Must mirror `cairn-meta/src/schema.rs` (latest is v27 — the
+- `schema.rs` — the migration table. Must mirror `cairn-meta/src/schema.rs` (latest is v29 — the
   multipart SSE columns `sse_requested` v15, `encrypt_parts`/`part_dek` v21, `sse_kms_*` v22;
   `object_versions.replicated_at` + `idx_outbox_bucket_key` v23; bounded import
   scheduling/history/retention indexes v24; hash-only object-share capabilities and retryable
   legacy-token sanitation v25; bounded multipart reservations/cleanup accounting v26; multipart
-  initial tags/Object Lock intent, the legacy-intent proof marker, and orphan-lock cleanup v27).
+  initial tags/Object Lock intent, the legacy-intent proof marker, and orphan-lock cleanup v27;
+  lifecycle row identity in the partial current-listing covering index v28; exact multipart
+  completion claim ownership tokens v29).
   Turso
   builders deliberately enable its experimental VACUUM support
   so a pending v25 sanitation marker can compact the local database before readers open.
@@ -40,11 +42,21 @@ range-seek, same outcomes. `cairn-meta` is left untouched. Selected at runtime b
 - Object Lock is writer-authoritative in both async engines exactly as in `cairn-meta`: strict
   persisted-state parsing, immutable enablement/versioning, protected replacement/delete, retention
   non-weakening, and atomic object/tags/lock/outbox/session updates must not diverge.
-- Permanent-delete outcome parity includes `DeleteNotApplied` for an absent target or stale
-  `expected_updated_at` guard; `Deleted` is reserved for a row actually removed by the writer.
+- Lifecycle guard parity is exact: conditional `CreateDeleteMarker` checks the enumerated
+  current version/timestamp before marker or outbox writes, and `DeleteVersion` checks the immutable
+  listed row identity and timestamp and can require the target still to be the sole/latest delete
+  marker. An absent or stale predicate returns `DeleteNotApplied`; `DeleteMarker`/`Deleted` are
+  reserved for rows actually changed by the writer.
+- `ResolveObjectWrite` parity is exact too: it is a writer-serialized bucket-routed probe over the
+  intended version's immutable row id and unique storage path. A match preserves the blob after an
+  acknowledgement loss; only a miss permits cancellation cleanup.
+- `ResolveMultipartPartWrite` has the same SQL and outcome parity for exact
+  `(upload_id, part_number, storage_path)` ownership. The attempt-derived path prevents delayed
+  recovery from matching a superseding retry.
 - Multipart terminal ownership is part of parity, not an implementation detail: Complete claims
-  `active -> completing`, Abort deletes only `active`, a failed claim releases only `completing`,
-  and final completion rechecks `completing` inside its savepoint before any object upsert.
+  `active -> completing` under an exact persisted request token, Abort deletes only `active`, a
+  failed claim releases only its own token, and final completion rechecks both `completing` and
+  that token inside its savepoint before any object upsert.
 - **Migrations are append-only and version-aligned.** Never edit an applied migration. Mirror new
   `cairn-meta` migrations here verbatim, **keeping the same version numbers** — versions **13 and
   14 are intentionally absent** (they are the #29 key-rotation schema the async backend does not

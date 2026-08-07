@@ -25,16 +25,18 @@ metadata commit is **the single linearization point of every mutation** (ARCH 11
   never open a second source write connection for backup.
 - `apply.rs` — `Mutation` → SQL. Preconditions are evaluated **here, inside the savepoint**, so
   check-and-upsert is atomic. Multipart Abort/Complete ownership is evaluated here too: active-only
-  abort, conditional claim release, and final `status='completing'` verification must remain in the
-  writer savepoint. **Mirror any change in `cairn-meta-async/src/apply.rs`** (4(+1)-site).
-- `schema.rs` — migrations: **append-only**, monotonic `version` (latest is 27 — multipart SSE
+  abort, exact-token claim release, and final `status='completing'` plus token verification must
+  remain in the writer savepoint. **Mirror any change in `cairn-meta-async/src/apply.rs`**
+  (4(+1)-site).
+- `schema.rs` — migrations: **append-only**, monotonic `version` (latest is 29 — multipart SSE
   columns: `multipart_uploads.sse_requested` v15, `.encrypt_parts` + `multipart_parts.part_dek` v21,
   `.sse_kms_requested`/`sse_kms_key_id`/`sse_bucket_key_enabled` v22; `object_versions.replicated_at`
   + `idx_outbox_bucket_key` v23; bounded import scheduling/history/retention indexes v24; hash-only
   object-share capabilities and legacy-token sanitation v25; bounded multipart staging
   reservations, cleanup debt, and quota/cardinality counters v26; multipart initial tags/Object
-  Lock intent, the legacy-intent proof marker, and orphan-lock cleanup v27); never edit an applied
-  migration, never reorder — add a new one.
+  Lock intent, the legacy-intent proof marker, and orphan-lock cleanup v27; lifecycle row identity
+  in the partial current-listing covering index v28; exact-token multipart completion ownership
+  v29); never edit an applied migration, never reorder — add a new one.
 - `model.rs` — SQL row ↔ domain-type conversions; complex fields (compression, ACL, checksums,
   user-metadata) are JSON columns. `engine_err` maps constraint violations → `MetaError::Conflict`.
 - `range.rs` — `successor`/`prefix_upper_bound` for the listing range seek (UTF-8 byte order);
@@ -59,10 +61,21 @@ metadata commit is **the single linearization point of every mutation** (ARCH 11
   tags/lock replacement, and outbox enqueue all belong to one `apply.rs` savepoint. Object Lock
   configuration row presence is immutable enablement; only its specialized mutation may update the
   default, and versioning must remain Enabled.
-- `DeleteVersion` returns `DeleteNotApplied` when its target is absent or its
-  `expected_updated_at` compare-and-delete guard is stale. Reserve `Deleted` for a row the writer
-  actually removed, so lifecycle and repair counters remain truthful while S3 DELETE stays
+- Lifecycle freshness is writer-atomic. `CreateDeleteMarker.expected_current` requires the exact
+  enumerated version/timestamp still to be current before marker/outbox writes. `DeleteVersion`
+  returns `DeleteNotApplied` when its target is absent, its immutable `expected_row_id` or
+  `expected_updated_at` is stale, or its optional sole/latest/delete-marker predicate is false.
+  The row identity closes same-timestamp sentinel-replacement races and is projected from the v28
+  covering index. Reserve `DeleteMarker`/`Deleted` for metadata the writer actually changed, so
+  maintenance counters remain truthful while ordinary S3 DELETE stays unconditional and
   idempotent.
+- `ResolveObjectWrite` deliberately runs through this writer even though it only probes state: FIFO
+  makes it a commit barrier behind a possibly-ack-lost PUT/Copy. It returns referenced only for the
+  exact immutable row id and storage path, routes by bucket under sharding, and authorizes cleanup
+  only on an exact miss.
+- `ResolveMultipartPartWrite` is the corresponding FIFO barrier for `RecordPart`. It matches the
+  exact upload, part number, and attempt-derived path; sharding routes by encoded upload id. A
+  same-number retry makes delayed old recovery return false without touching the new attempt.
 - The library `OpenOptions::default` is `synchronous=NORMAL` (benchmark/test posture); the **server
   overrides this to FULL** via `CAIRN_META_SYNCHRONOUS`. NORMAL never corrupts the DB — on power loss
   it loses at most the last uncheckpointed txn, which blob-first ordering downgrades to a GC'd orphan.

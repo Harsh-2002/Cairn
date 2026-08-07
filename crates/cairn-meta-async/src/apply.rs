@@ -11,7 +11,7 @@ use cairn_types::MetaError;
 use cairn_types::bucket::{
     ConfigAspect, DefaultRetention, ObjectLockConfiguration, RetentionPeriod, VersioningState,
 };
-use cairn_types::id::{BucketName, ObjectKey, StoragePath, VersionId};
+use cairn_types::id::{BucketName, MultipartClaimToken, ObjectKey, StoragePath, VersionId};
 use cairn_types::meta::{
     ClaimReleaseOutcome, IfNoneMatch, InitialObjectState, MAX_IMPORT_JOB_PRUNE_BATCH,
     MultipartCleanup, MultipartTerminalOutcome, Mutation, MutationOutcome, OutboxEntry,
@@ -35,6 +35,30 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
             initial_state,
             replication,
         } => put_version(driver, *row, &precondition, initial_state, replication).await,
+        Mutation::ResolveObjectWrite {
+            bucket,
+            key,
+            version_id,
+            row_id,
+            storage_path,
+        } => {
+            let referenced = query_one(
+                driver,
+                "SELECT 1 FROM object_versions
+                 WHERE bucket_name=?1 AND key=?2 AND version_id=?3
+                   AND id=?4 AND storage_path=?5",
+                vec![
+                    Value::Text(bucket.as_str().to_owned()),
+                    Value::Text(key.as_str().to_owned()),
+                    Value::Text(version_id.as_str().to_owned()),
+                    Value::Text(row_id),
+                    Value::Text(storage_path.as_str().to_owned()),
+                ],
+            )
+            .await?
+            .is_some();
+            Ok(MutationOutcome::ObjectWriteResolved { referenced })
+        }
         Mutation::CreateDeleteMarker {
             bucket,
             key,
@@ -42,8 +66,28 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
             owner_id,
             now,
             bypass,
+            expected_current,
             replication,
         } => {
+            if let Some(expected) = expected_current {
+                let still_current = query_one(
+                    driver,
+                    "SELECT 1 FROM object_versions
+                     WHERE bucket_name=?1 AND key=?2 AND version_id=?3
+                       AND updated_at=?4 AND is_latest=1 AND is_delete_marker=0",
+                    vec![
+                        Value::Text(bucket.as_str().to_owned()),
+                        Value::Text(key.as_str().to_owned()),
+                        Value::Text(expected.version_id.as_str().to_owned()),
+                        Value::Int(expected.updated_at.0),
+                    ],
+                )
+                .await?
+                .is_some();
+                if !still_current {
+                    return Ok(MutationOutcome::DeleteNotApplied);
+                }
+            }
             let row = ObjectVersionRow {
                 id: uuid::Uuid::new_v4().simple().to_string(),
                 bucket: bucket.clone(),
@@ -98,7 +142,9 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
             bucket,
             key,
             version_id,
+            expected_row_id,
             expected_updated_at,
+            require_sole_key_version,
             now,
             bypass,
         } => {
@@ -107,7 +153,11 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
                 &bucket,
                 &key,
                 &version_id,
-                expected_updated_at,
+                DeleteVersionGuard {
+                    expected_row_id,
+                    expected_updated_at,
+                    require_sole_key_version,
+                },
                 now,
                 bypass,
             )
@@ -293,6 +343,27 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
             attempt_id,
             part,
         } => record_part(driver, &upload_id, &attempt_id, part).await,
+        Mutation::ResolveMultipartPartWrite {
+            upload_id,
+            part_number,
+            storage_path,
+        } => {
+            let referenced = query_one(
+                driver,
+                "SELECT EXISTS(
+                     SELECT 1 FROM multipart_parts
+                     WHERE upload_id=?1 AND part_number=?2 AND storage_path=?3
+                 )",
+                vec![
+                    Value::Text(upload_id.as_str().to_owned()),
+                    Value::Int(i64::from(part_number)),
+                    Value::Text(storage_path.as_str().to_owned()),
+                ],
+            )
+            .await?
+            .is_some_and(|row| row.get_i64(0) != 0);
+            Ok(MutationOutcome::MultipartPartWriteResolved { referenced })
+        }
         Mutation::ReleaseMultipartCleanup { cleanup_id } => {
             release_multipart_cleanup(driver, &cleanup_id).await?;
             Ok(MutationOutcome::Ack)
@@ -304,13 +375,23 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
         Mutation::RecoverMultipartStagingAccounting { limit } => {
             recover_multipart_staging_accounting(driver, limit).await
         }
-        Mutation::ClaimMultipart(upload_id) => claim_multipart(driver, &upload_id).await,
-        Mutation::ReleaseMultipartClaim(upload_id) => {
+        Mutation::ClaimMultipart {
+            upload_id,
+            claim_token,
+        } => claim_multipart(driver, &upload_id, &claim_token).await,
+        Mutation::ReleaseMultipartClaim {
+            upload_id,
+            claim_token,
+        } => {
             let released = driver
                 .execute(
-                    "UPDATE multipart_uploads SET status='active'
-                     WHERE id=?1 AND status='completing'",
-                    vec![Value::Text(upload_id.as_str().to_owned())],
+                    "UPDATE multipart_uploads
+                     SET status='active', completion_claim_token=NULL
+                     WHERE id=?1 AND status='completing' AND completion_claim_token=?2",
+                    vec![
+                        Value::Text(upload_id.as_str().to_owned()),
+                        Value::Text(claim_token.as_str().to_owned()),
+                    ],
                 )
                 .await?;
             Ok(MutationOutcome::MultipartClaimRelease(if released == 1 {
@@ -324,7 +405,9 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
             // transient `completing` claim to a retryable active session.
             driver
                 .execute(
-                    "UPDATE multipart_uploads SET status='active' WHERE status='completing'",
+                    "UPDATE multipart_uploads
+                     SET status='active', completion_claim_token=NULL
+                     WHERE status='completing'",
                     vec![],
                 )
                 .await?;
@@ -332,12 +415,14 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
         }
         Mutation::CompleteMultipart {
             upload_id,
+            claim_token,
             row,
             precondition,
             replication,
         } => {
             let Some(initial_state) =
-                multipart_initial_state(driver, &upload_id, &row.bucket, &row.key).await?
+                multipart_initial_state(driver, &upload_id, &claim_token, &row.bucket, &row.key)
+                    .await?
             else {
                 return Ok(MutationOutcome::MultipartTerminal(
                     MultipartTerminalOutcome::NotOwner,
@@ -1770,6 +1855,7 @@ async fn replace_object_tags(
 async fn multipart_initial_state(
     driver: &dyn AsyncSqlDriver,
     upload_id: &cairn_types::UploadId,
+    claim_token: &MultipartClaimToken,
     bucket: &BucketName,
     key: &ObjectKey,
 ) -> R<Option<InitialObjectState>> {
@@ -1777,9 +1863,11 @@ async fn multipart_initial_state(
         driver,
         "SELECT initial_tags, lock_mode, retain_until, legal_hold, object_lock_intent_known
          FROM multipart_uploads
-         WHERE id=?1 AND status='completing' AND bucket_name=?2 AND key=?3",
+         WHERE id=?1 AND status='completing' AND completion_claim_token=?2
+           AND bucket_name=?3 AND key=?4",
         vec![
             Value::Text(upload_id.as_str().to_owned()),
+            Value::Text(claim_token.as_str().to_owned()),
             Value::Text(bucket.as_str().to_owned()),
             Value::Text(key.as_str().to_owned()),
         ],
@@ -2160,22 +2248,28 @@ async fn insert_version(driver: &dyn AsyncSqlDriver, row: &ObjectVersionRow) -> 
     Ok(())
 }
 
+struct DeleteVersionGuard {
+    expected_row_id: Option<String>,
+    expected_updated_at: Option<Timestamp>,
+    require_sole_key_version: bool,
+}
+
 async fn delete_version(
     driver: &dyn AsyncSqlDriver,
     bucket: &BucketName,
     key: &ObjectKey,
     version_id: &VersionId,
-    expected_updated_at: Option<Timestamp>,
+    guard: DeleteVersionGuard,
     now: Timestamp,
     bypass: GovernanceBypass,
 ) -> R<MutationOutcome> {
-    // Compare-and-delete guard (mirrors cairn-meta): skip the delete when the version's stored
-    // updated_at no longer matches the value captured at enumeration — it was overwritten since, so
-    // deleting it would destroy fresh data (audit 2026-07).
-    if let Some(expected) = expected_updated_at {
+    // Lifecycle compare-and-delete guards mirror cairn-meta. The immutable row id distinguishes
+    // same-version, same-timestamp sentinel replacements; updated_at remains defense in depth.
+    if guard.expected_row_id.is_some() || guard.expected_updated_at.is_some() {
         let stored = query_one(
             driver,
-            "SELECT updated_at FROM object_versions WHERE bucket_name=?1 AND key=?2 AND version_id=?3",
+            "SELECT id, updated_at FROM object_versions
+             WHERE bucket_name=?1 AND key=?2 AND version_id=?3",
             vec![
                 Value::Text(bucket.as_str().to_owned()),
                 Value::Text(key.as_str().to_owned()),
@@ -2183,8 +2277,40 @@ async fn delete_version(
             ],
         )
         .await?
-        .map(|r| r.get_i64(0));
-        if stored != Some(expected.0) {
+        .map(|row| (row.get_text(0), row.get_i64(1)));
+        let matches = stored.as_ref().is_some_and(|(row_id, updated_at)| {
+            guard
+                .expected_row_id
+                .as_ref()
+                .is_none_or(|expected| expected == row_id)
+                && guard
+                    .expected_updated_at
+                    .is_none_or(|expected| expected.0 == *updated_at)
+        });
+        if !matches {
+            return Ok(MutationOutcome::DeleteNotApplied);
+        }
+    }
+    if guard.require_sole_key_version {
+        let (version_count, guarded_marker) = query_one(
+            driver,
+            "SELECT COUNT(*),
+                    COALESCE(MAX(CASE
+                        WHEN version_id=?3 AND is_latest=1 AND is_delete_marker=1 THEN 1
+                        ELSE 0
+                    END), 0)
+             FROM object_versions
+             WHERE bucket_name=?1 AND key=?2",
+            vec![
+                Value::Text(bucket.as_str().to_owned()),
+                Value::Text(key.as_str().to_owned()),
+                Value::Text(version_id.as_str().to_owned()),
+            ],
+        )
+        .await?
+        .map(|row| (row.get_i64(0), row.get_i64(1)))
+        .unwrap_or_default();
+        if version_count != 1 || guarded_marker != 1 {
             return Ok(MutationOutcome::DeleteNotApplied);
         }
     }
@@ -2758,6 +2884,7 @@ async fn recover_multipart_staging_accounting(
 async fn claim_multipart(
     driver: &dyn AsyncSqlDriver,
     upload_id: &cairn_types::UploadId,
+    claim_token: &MultipartClaimToken,
 ) -> R<MutationOutcome> {
     let status: Option<String> = query_one(
         driver,
@@ -2770,8 +2897,13 @@ async fn claim_multipart(
         Some("active") => {
             driver
                 .execute(
-                    "UPDATE multipart_uploads SET status='completing', updated_at=updated_at WHERE id=?1",
-                    vec![Value::Text(upload_id.as_str().to_owned())],
+                    "UPDATE multipart_uploads
+                     SET status='completing', completion_claim_token=?2, updated_at=updated_at
+                     WHERE id=?1",
+                    vec![
+                        Value::Text(upload_id.as_str().to_owned()),
+                        Value::Text(claim_token.as_str().to_owned()),
+                    ],
                 )
                 .await?;
             let row = query_one(

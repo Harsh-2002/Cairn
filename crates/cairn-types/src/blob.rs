@@ -112,8 +112,9 @@ pub struct PartRef {
 /// the cipher a required, named argument makes that whole class of bug unrepresentable.
 #[derive(Clone, PartialEq, Eq)]
 pub enum BlobCipher {
-    /// The blob was written in the clear. Opening an *encrypted* container this way fails
-    /// closed — it errors, it never streams ciphertext (see [`crate::BlobStore::open_raw`]).
+    /// Authoritative object/part metadata says the blob was written in the clear. The reader
+    /// requires its physical length to equal the trusted logical length, so an ordinary encrypted
+    /// container passed through this variant fails closed without content-sniffing arbitrary bytes.
     KnownPlaintext,
     /// A legacy CRNB v2 blob. Only metadata written before authenticated CRNB v3 existed may select
     /// this reader; the on-disk version byte alone is never authority to downgrade a current blob.

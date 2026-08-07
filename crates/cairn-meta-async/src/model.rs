@@ -65,7 +65,7 @@ pub const SHARE_COLS: &str = "id, token_hash, bucket_name, key, version_id, expi
 
 /// `object_summary` listing columns in mapper order.
 pub const SUMMARY_COLS: &str = "key, version_id, is_latest, is_delete_marker, etag, size_logical, \
-     updated_at, storage_class, owner_id";
+     updated_at, storage_class, owner_id, id";
 
 fn json_col<T: serde::de::DeserializeOwned>(s: &str) -> Result<T, MetaError> {
     serde_json::from_str(s).map_err(|e| MetaError::Engine(format!("json column decode: {e}")))
@@ -269,6 +269,7 @@ pub fn object_version_from_row(row: &Row) -> Result<ObjectVersionRow, MetaError>
 
 pub fn object_summary_from_row(row: &Row) -> Result<ObjectSummary, MetaError> {
     Ok(ObjectSummary {
+        row_id: row.get_text(9),
         key: ObjectKey::parse(&row.get_text(0)).unwrap_or_else(|_| unreachable_key()),
         version_id: VersionId::from_string(row.get_text(1)),
         is_latest: row.get_i64(2) != 0,

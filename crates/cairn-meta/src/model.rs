@@ -293,6 +293,7 @@ pub fn object_version_from_row(row: &Row) -> rusqlite::Result<ObjectVersionRow> 
 
 pub fn object_summary_from_row(row: &Row) -> rusqlite::Result<ObjectSummary> {
     Ok(ObjectSummary {
+        row_id: row.get("id")?,
         key: ObjectKey::parse(&row.get::<_, String>("key")?).unwrap_or_else(|_| unreachable_key()),
         version_id: VersionId::from_string(row.get("version_id")?),
         is_latest: row.get::<_, i64>("is_latest")? != 0,

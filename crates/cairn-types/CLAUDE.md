@@ -12,7 +12,7 @@ freezing this crate freezes the seams. `#![forbid(unsafe_code)]`.
   readiness seam: every backend exercises a real read-pool connection without enumerating metadata.
   Read the trait doc before changing a method.
   - **`BlobStore` read seam (footgun removed).** There is ONE reader,
-    `open_raw(path, range, cipher: BlobCipher, compression)`, plus a DEK-free presence probe
+    `open_raw(path, range, cipher: BlobCipher, compression, expected_logical_len)`, plus a DEK-free presence probe
     `probe(path) -> BlobProbe`. `BlobCipher` (`blob.rs`, `KnownPlaintext | LegacyV2(DEK) |
     AuthenticatedV3(DEK)`) makes the caller NAME both the cipher and the metadata-backed CRNB
     version. The old default `open` let a caller forget the key and stream ciphertext; the later
@@ -62,13 +62,26 @@ freezing this crate freezes the seams. `#![forbid(unsafe_code)]`.
   shared read on a trait) MUST be handled in `InMemoryMetadataStore` here, **and** in both
   `cairn-meta/src/apply.rs` and `cairn-meta-async/src/apply.rs`. The in-memory double must stay
   behaviorally faithful — downstream tests trust it as the reference engine.
-- Multipart terminal outcomes are typed and writer-owned: Complete claims `active -> completing`,
-  Abort removes only `active`, a failed completer conditionally releases `completing -> active`,
-  and the final completion accepts only `completing`. The in-memory double must preserve those
-  won/lost outcomes exactly; never turn Abort back into an unconditional acknowledgement.
-- Permanent deletion is typed too: `Deleted` means the writer removed a row, while
-  `DeleteNotApplied` means the row was already absent or its `expected_updated_at` guard lost a
-  race. Protocol DELETE treats both as idempotent success; maintenance must count only `Deleted`.
+- Multipart terminal outcomes are typed and writer-owned: Complete claims `active -> completing`
+  under a fresh persisted `MultipartClaimToken`, Abort removes only `active`, a failed completer
+  releases only its exact token, and final completion accepts only that same token. The in-memory
+  double must preserve those won/lost outcomes exactly; never turn Abort back into an unconditional
+  acknowledgement. Its acknowledgement-loss hooks exist for deterministic downstream cancellation
+  tests and must apply the mutation before hanging/failing.
+- Ordinary object-write acknowledgement is typed too. `ResolveObjectWrite` is a writer-serialized
+  exact `(bucket,key,version,row_id,storage_path)` probe used after PUT/Copy cancellation or a lost
+  acknowledgement. The double's object-put acknowledgement hooks must apply the put before failing,
+  and resolution must not confuse a newer null-version overwrite with the original row.
+- Multipart-part acknowledgement is typed equivalently. `ResolveMultipartPartWrite` probes exact
+  `(upload_id,part_number,storage_path)` ownership after UploadPart/UploadPartCopy cancellation or
+  lost acknowledgement; the double's part hooks commit before hanging/failing, and same-number
+  retry ABA must match only the new attempt path.
+- Lifecycle deletion is typed too: `DeleteMarker`/`Deleted` mean the writer changed metadata, while
+  `DeleteNotApplied` means the target was absent, the immutable `expected_row_id`,
+  `expected_updated_at`, or sole-marker guard lost a race, or a conditional marker no longer names
+  the current version. Listing summaries carry that internal row identity with serde skipped, so it
+  never becomes S3/control response data. Protocol DELETE keeps unconditional semantics;
+  maintenance must count only writer-confirmed changes.
 - Object Lock policy is writer-owned too. Every double/backend must strictly read persisted
   bucket/version lock state inside the mutation, reject protected replacement or retention
   weakening, replace initial tags and lock state atomically with the object and outbox, and preserve

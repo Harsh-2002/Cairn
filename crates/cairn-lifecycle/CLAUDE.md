@@ -20,7 +20,13 @@ expired-object-delete-marker removal, and abort-incomplete-multipart.
 - **Idempotent — this is the contract** (ARCH 19.2). Every action is a convergent state transition,
   so a rerun or interrupted scan reaches the same end state. Current-object expiration in a
   versioned bucket relies on `list_current` excluding delete markers, so the inserted marker hides
-  the key and no second marker is added. NEVER add an action that isn't a no-op once applied.
+  the key and no second marker is added. It also passes the enumerated current version/timestamp to
+  `CreateDeleteMarker`; the writer returns `DeleteNotApplied` if a newer current version won first.
+  Expired-marker cleanup asks `DeleteVersion` to require that the enumerated marker is still latest
+  and the sole version, while every permanent expiration passes the listing's immutable row id and
+  timestamp. The row id distinguishes an unversioned sentinel replacement even when both writes
+  share one timestamp tick; a concurrently arrived older replica likewise cannot be exposed.
+  NEVER add an action that isn't a no-op once applied.
 - Incomplete-upload abort obeys the multipart terminal-owner outcome: reclaim staged parts only
   after the writer returns `Aborted`. `NotOwner` means a concurrent Complete owns `completing`; it is
   an expected skip, and deleting that session's bytes would corrupt the winning completion.
@@ -32,9 +38,10 @@ expired-object-delete-marker removal, and abort-incomplete-multipart.
   returns `DeleteProtected`; lifecycle silently skips that outcome (neither expired nor an error),
   and the rule applies once protection lapses. Never restore a read-then-delete lock check or grant
   lifecycle a governance bypass.
-- Lifecycle reports count a permanent deletion only after the writer returns `Deleted`.
-  `DeleteNotApplied` is an expected skip: the row disappeared or its `expected_updated_at` guard
-  lost a concurrent overwrite race, so no metadata changed and no expiration counter advances.
+- Lifecycle reports count a marker insertion only after `DeleteMarker` and a permanent deletion
+  only after `Deleted`. `DeleteNotApplied` is an expected skip: the current-version marker guard,
+  immutable row-id/timestamp predicate, or sole-marker guard lost a concurrent race, so no
+  metadata/outbox changed and no expiration counter advances.
 - **Transition is rejected at write time**, not silently stored. A `PutBucketLifecycleConfiguration`
   carrying a `<Transition>` is refused with `NotImplemented` in `cairn-protocol` (`service.rs`,
   search `Action::Transition`). The variant is still *parsed* — so the write path can detect/reject

@@ -266,6 +266,39 @@ impl fmt::Display for UploadId {
     }
 }
 
+/// An opaque, single-attempt ownership token for multipart completion.
+///
+/// The token is persisted while an upload is `completing` and must match for either completion or
+/// claim release. This prevents delayed cancellation recovery from affecting a newer completer.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MultipartClaimToken(String);
+
+impl MultipartClaimToken {
+    /// Mint a fresh completion-attempt token.
+    #[must_use]
+    pub fn generate() -> Self {
+        Self(uuid::Uuid::new_v4().simple().to_string())
+    }
+
+    /// Reconstruct from a stored string.
+    #[must_use]
+    pub fn from_string(s: String) -> Self {
+        Self(s)
+    }
+
+    /// The borrowed string form.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for MultipartClaimToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("MultipartClaimToken([REDACTED])")
+    }
+}
+
 /// Reasons a [`BucketName`] or [`ObjectKey`] failed validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum InvalidName {
@@ -339,5 +372,13 @@ mod tests {
             "uuid v7 must sort by creation time"
         );
         assert!(VersionId::null().is_null());
+    }
+
+    #[test]
+    fn multipart_claim_token_debug_is_redacted() {
+        let token = MultipartClaimToken::generate();
+        let debug = format!("{token:?}");
+        assert!(!debug.contains(token.as_str()));
+        assert!(debug.contains("REDACTED"));
     }
 }

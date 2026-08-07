@@ -9,8 +9,8 @@ use cairn_types::testing::{InMemoryBlobStore, InMemoryMetadataStore, TestClock};
 use cairn_types::{
     BlobStore, Bucket, BucketName, CompressionDescriptor, GovernanceBypass, ListQuery,
     MetadataStore, MultipartSession, MultipartStatus, Mutation, ObjectKey, ObjectVersionRow,
-    OwnershipMode, PartRecord, StorageClass, StoragePath, Timestamp, UploadId, UserId, VersionId,
-    VersioningState,
+    OwnershipMode, PartRecord, ReplicationStatus, StorageClass, StoragePath, Timestamp, UploadId,
+    UserId, VersionId, VersioningState,
 };
 
 // --------------------------------------------------------------------------------------------
@@ -85,7 +85,9 @@ async fn put_object(
         .unwrap();
     let ts = Timestamp::from_secs(created_secs);
     let row = ObjectVersionRow {
-        id: format!("row-{}-{}", key, version_id),
+        // A sentinel version id can be reused by an unversioned overwrite; the metadata-row id
+        // remains replacement-specific, as it is in the production PUT path.
+        id: format!("row-{}", staged.storage_path.as_str()),
         bucket: bucket_name(),
         key: ObjectKey::parse(key).unwrap(),
         version_id,
@@ -363,6 +365,127 @@ async fn current_expiration_versioned_inserts_delete_marker() {
     // The data is NOT destroyed: the original blob is still present.
     assert_eq!(blob.blob_count(), 1, "data retained under versioning");
     assert!(blob.get_bytes(&path).is_some());
+}
+
+#[tokio::test]
+async fn current_expiration_skips_marker_after_concurrent_new_version() {
+    let meta = InMemoryMetadataStore::new();
+    let blob = InMemoryBlobStore::new();
+    make_bucket(&meta, VersioningState::Enabled).await;
+
+    let v1 = VersionId::from_string("00000001".to_owned());
+    put_object(&meta, &blob, "doc.txt", b"old", 0, v1).await;
+    let enumerated = meta
+        .list_current(
+            &bucket_name(),
+            &ListQuery {
+                limit: 10,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .next()
+        .unwrap();
+
+    let v2 = VersionId::from_string("00000002".to_owned());
+    put_object(&meta, &blob, "doc.txt", b"fresh", DAY, v2.clone()).await;
+    let bucket = meta.get_bucket(&bucket_name()).await.unwrap().unwrap();
+    let applied = LifecycleScanner::new()
+        .insert_delete_marker(&meta, &bucket, &enumerated, Timestamp::from_secs(31 * DAY))
+        .await
+        .unwrap();
+
+    assert!(!applied, "a stale expiration must not insert a marker");
+    let current = meta
+        .current_version(&bucket_name(), &ObjectKey::parse("doc.txt").unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.version_id, v2);
+    assert!(!current.is_delete_marker);
+    assert_eq!(count_versions(&meta).await, 2, "no marker was inserted");
+    assert!(
+        meta.list_due_replication(10, Timestamp(i64::MAX))
+            .await
+            .unwrap()
+            .is_empty(),
+        "the rejected marker must not enqueue replication"
+    );
+}
+
+#[tokio::test]
+async fn current_expiration_skips_same_timestamp_unversioned_overwrite() {
+    let meta = InMemoryMetadataStore::new();
+    let blob = InMemoryBlobStore::new();
+    make_bucket(&meta, VersioningState::Unversioned).await;
+
+    put_object(&meta, &blob, "doc.txt", b"old", 0, VersionId::null()).await;
+    let enumerated = meta
+        .list_current(
+            &bucket_name(),
+            &ListQuery {
+                limit: 10,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .next()
+        .unwrap();
+
+    // The replacement deliberately reuses both the unversioned sentinel and the exact same
+    // timestamp. Only the immutable object_versions.id can distinguish it from the stale listing.
+    put_object(&meta, &blob, "doc.txt", b"fresh", 0, VersionId::null()).await;
+    let replacement = meta
+        .list_current(
+            &bucket_name(),
+            &ListQuery {
+                limit: 10,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(replacement.version_id, enumerated.version_id);
+    assert_eq!(replacement.last_modified, enumerated.last_modified);
+    assert_ne!(replacement.row_id, enumerated.row_id);
+
+    let applied = LifecycleScanner::new()
+        .delete_version(
+            &meta,
+            &blob,
+            &bucket_name(),
+            &enumerated,
+            Timestamp::from_secs(31 * DAY),
+        )
+        .await
+        .unwrap();
+
+    assert!(!applied, "a stale lifecycle delete must be a writer no-op");
+    let current = meta
+        .list_current(
+            &bucket_name(),
+            &ListQuery {
+                limit: 10,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(current.row_id, replacement.row_id);
 }
 
 #[tokio::test]
@@ -774,7 +897,9 @@ async fn expired_object_delete_marker_removed_when_sole_version() {
         bucket: bucket_name(),
         key: ObjectKey::parse("ghost.txt").unwrap(),
         version_id: v,
+        expected_row_id: None,
         expected_updated_at: None,
+        require_sole_key_version: false,
         now: Timestamp::from_secs(0),
         bypass: GovernanceBypass::Denied,
     })
@@ -787,6 +912,7 @@ async fn expired_object_delete_marker_removed_when_sole_version() {
         owner_id: owner(),
         now: Timestamp::from_secs(0),
         bypass: GovernanceBypass::Denied,
+        expected_current: None,
         replication: Vec::new(),
     })
     .await
@@ -827,6 +953,7 @@ async fn expired_object_delete_marker_kept_when_other_versions_exist() {
         owner_id: owner(),
         now: Timestamp::from_secs(0),
         bypass: GovernanceBypass::Denied,
+        expected_current: None,
         replication: Vec::new(),
     })
     .await
@@ -849,6 +976,78 @@ async fn expired_object_delete_marker_kept_when_other_versions_exist() {
     assert_eq!(count_versions(&meta).await, 2, "nothing removed");
 }
 
+#[tokio::test]
+async fn expired_delete_marker_cleanup_skips_concurrently_arrived_version() {
+    let meta = InMemoryMetadataStore::new();
+    make_bucket(&meta, VersioningState::Enabled).await;
+    let bucket = meta.get_bucket(&bucket_name()).await.unwrap().unwrap();
+    let key = ObjectKey::parse("ghost.txt").unwrap();
+    let marker_id = VersionId::from_string("00000002".to_owned());
+
+    meta.submit(Mutation::CreateDeleteMarker {
+        bucket: bucket_name(),
+        key: key.clone(),
+        version_id: marker_id.clone(),
+        owner_id: owner(),
+        now: Timestamp::from_secs(200),
+        bypass: GovernanceBypass::Denied,
+        expected_current: None,
+        replication: Vec::new(),
+    })
+    .await
+    .unwrap();
+    let enumerated = meta
+        .list_versions(
+            &bucket_name(),
+            &ListQuery {
+                limit: 10,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .next()
+        .unwrap();
+
+    // The marker was sole at enumeration. An older replica then arrives without replacing it as
+    // current, so an unconditional cleanup would expose data that the marker still hides.
+    let mut replica = meta
+        .current_version(&bucket_name(), &key)
+        .await
+        .unwrap()
+        .unwrap();
+    replica.id = "replica-row".to_owned();
+    replica.version_id = VersionId::from_string("00000001".to_owned());
+    replica.is_delete_marker = false;
+    replica.replication_status = Some(ReplicationStatus::Replica);
+    replica.updated_at = Timestamp::from_secs(150);
+    meta.submit(Mutation::PutObjectVersion {
+        row: Box::new(replica),
+        precondition: cairn_types::Precondition::default(),
+        initial_state: cairn_types::InitialObjectState::default(),
+        replication: Vec::new(),
+    })
+    .await
+    .unwrap();
+
+    let applied = LifecycleScanner::new()
+        .delete_expired_marker(&meta, &bucket, &enumerated, Timestamp::from_secs(300))
+        .await
+        .unwrap();
+
+    assert!(!applied, "a stale sole-marker cleanup must be a no-op");
+    let current = meta
+        .current_version(&bucket_name(), &key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.version_id, marker_id);
+    assert!(current.is_delete_marker);
+    assert_eq!(count_versions(&meta).await, 2);
+}
+
 /// Sole-marker cleanup must stream beyond multiple listing pages without retaining a bucket-wide
 /// count map or skipping keys when earlier-page markers are deleted during the scan.
 #[tokio::test]
@@ -867,6 +1066,7 @@ async fn delete_marker_cleanup_streams_many_listing_pages() {
             owner_id: owner(),
             now: Timestamp::from_secs(ordinal as i64),
             bypass: GovernanceBypass::Denied,
+            expected_current: None,
             replication: Vec::new(),
         })
         .await

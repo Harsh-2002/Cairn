@@ -62,10 +62,18 @@ CLI. This is the **only crate that names concrete impls** — everything else is
   key-state row or allowing bootstrap/migration to seal a secret; every read/write error and
   same-id key replacement is fatal. A matching legacy eight-hex row is upgraded on the Writer, while
   `crypto-status` abbreviates the full durable value separately. Before listener bind, startup recovery
-  changes every orphaned multipart `completing` claim back to `active` and every replication
+  changes every orphaned multipart `completing` claim back to `active`, clears its attempt token,
+  and changes every replication
   `claimed` lease back to `pending`; both mutations broadcast to all physical metadata shards and
-  a failure is fatal. Wires the S3 service's SSE `KeyProvider`
-  (`cairn_protocol::LocalRingProvider` from `CAIRN_KMS_KEY_IDS`) and `with_encrypt_at_rest`.
+  a failure is fatal. Full blob reconciliation follows claim recovery, so an ambiguous live release
+  is resolved before bind. Wires the S3 service's SSE `KeyProvider`
+  (`cairn_protocol::LocalRingProvider` from `CAIRN_KMS_KEY_IDS`), `with_encrypt_at_rest`, and the
+  synchronous multipart-cancellation, multipart-part exact-attempt, and ordinary PUT/Copy
+  exact-row recovery callbacks to the process-local shutdown-retained FIFO queue. Each request
+  acquires one bounded recovery slot before staging/claiming and transfers it through its guard to
+  the worker, so Drop stays nonblocking without an unbounded record population. The worker
+  serializes `ResolveObjectWrite`/`ResolveMultipartPartWrite` behind any original mutation and
+  deletes only an exact unreferenced path; ambiguity falls back to startup reconciliation.
 - `sts.rs` — the **AWS-STS wire surface** (ARCH 14): `Action=AssumeRole` / `Action=GetSessionToken`
   as a form `POST /` on the S3 data-plane port, returning AWS-STS XML. A dedicated `sts`-scoped
   SigV4 verification (`AuthChain::authenticate_sts`, no dev bypass) mints a `CAIRNTMP…` session over
@@ -78,8 +86,9 @@ CLI. This is the **only crate that names concrete impls** — everything else is
 - `server.rs` — the accept/serve loops, the outer middleware (request id, span, concurrency
   `Semaphore`, timeout), graceful shutdown, and `/healthz` `/readyz` `/metrics`. Readiness is
   withdrawn before the shared stop signal. Listener drains return a typed report, force-cancelled
-  connections are awaited, and the retained signal/TLS-reload tasks abort on owner drop. The final
-  `shutdown complete` line is gated on HTTP, workers, final persistence, and auxiliary joins. Each
+  connections are awaited, then the multipart-claim queue receives its FIFO drain sentinel. The
+  retained signal/TLS-reload tasks abort on owner drop. The final `shutdown complete` line is gated
+  on HTTP, ordinary workers, request-tail recovery, final persistence, and auxiliary joins. Each
   accept loop receives an immutable `ListenerRole` (data or control); never infer or widen it per
   request.
 - `proxy.rs` — strict `CAIRN_TRUSTED_PROXIES` IP/CIDR parsing plus the shared, right-to-left
@@ -99,13 +108,21 @@ CLI. This is the **only crate that names concrete impls** — everything else is
   **opt-in, 6-hourly** encrypted-suspect audit pass — spawned only when `CAIRN_REPLICATION_AUDIT_BEFORE`
   is set (unset = the loop never runs, no gauge, no warn, zero cost), and deliberately NOT in
   `metrics_loop`: it is a version-row walk costing one point query per version in a replicating
-  bucket, and `replication_status` has no index — a scrape must never trigger it. `spawn()` returns
-  retained ownership of every loop; shutdown checks precede every new pass/claim batch, one shared
-  deadline joins or aborts-and-joins workers, and only after HTTP plus workers stop does the final
-  request-metrics → seal-counter → SQLite-checkpoint tail run. Never reintroduce a detached spawner
-  or discard a drain/finalization error. `spawn()` creates exactly one `ReplicationSinkRuntime`
-  before the replication worker loop and threads clones through every env/named/stored-target
-  construction path; never move that resource inside a worker or per-drain loop.
+  bucket, and `replication_status` has no index — a scrape must never trigger it. It also retains the
+  Tokio consumer for multipart cancellation releases; unlike periodic workers, that request-tail
+  task stays alive until every HTTP future has returned or been cancelled, drains through a FIFO
+  sentinel, and is joined under its own bound before final persistence. Each command is attempted
+  once: `Released` also reclaims any captured assembled path, `NotOwner` preserves it because
+  completion may have committed, and an ambiguous error is left for restart. Every command carries
+  the persisted attempt token, so delayed/replayed release cannot affect a newer completer.
+  `spawn()` returns retained
+  ownership of every loop; shutdown checks precede every new pass/claim batch, one shared deadline
+  joins or aborts-and-joins ordinary workers, and only after HTTP, workers, and request-tail recovery
+  stop does the final request-metrics → seal-counter → SQLite-checkpoint tail run. Never reintroduce
+  a detached spawner or discard a drain/finalization error. `spawn()` creates exactly one
+  `ReplicationSinkRuntime` before the replication worker loop and threads clones through every
+  env/named/stored-target construction path; never move that resource inside a worker or per-drain
+  loop.
 - `metrics_agg.rs` — sharded in-process request-metrics aggregator (zero DB I/O on the hot path;
   batched flush through the single writer). `observability.rs` — tracing + Prometheus recorder.
 - `key_rewrap.rs` — the #29 re-wrap worker (sqlite-only, one per shard); reseals the DEK onto the
@@ -151,9 +168,10 @@ CLI. This is the **only crate that names concrete impls** — everything else is
 - **Readiness gates real traffic.** `/readyz` stays false until migrations + reconciliation finish
   (the durability ordering in ARCH 8 — don't reorder), then probes each metadata read pool with an
   uncached constant-row query plus every concrete SQLite writer. Shutdown is signal → readiness
-  false → stop accepts/new worker passes → bounded HTTP+worker drain → final metrics/counters/WAL
-  tail. Aborted durable work is safe (leases/cursors recover), but its forced cancellation still
-  makes the current shutdown report incomplete.
+  false → stop accepts/new worker passes → bounded HTTP+ordinary-worker drain → drain/join the
+  multipart cancellation-recovery queue → final metrics/counters/WAL tail. Aborted durable work is
+  safe (leases/cursors recover), but its forced cancellation still makes the current shutdown
+  report incomplete.
 - The multipart sweeper reclaims session bytes only on the writer's typed `Aborted` terminal
   outcome. `NotOwner` means an in-flight Complete owns the `completing` session and its parts; skip
   it without treating the race as a sweep failure.

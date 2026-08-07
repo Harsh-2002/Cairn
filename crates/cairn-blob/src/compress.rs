@@ -28,8 +28,9 @@ use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Key, Nonce as GcmNonce};
 use cairn_types::SecretKey32;
 use cairn_types::blob::BlobCipher;
-use cairn_types::bucket::CompressionAlgorithm;
+pub use cairn_types::bucket::CompressionAlgorithm;
 use cairn_types::error::BlobError;
+pub use cairn_types::object::CompressionDescriptor;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::io::{Read, Seek, SeekFrom};
@@ -51,8 +52,14 @@ const METADATA_MAC_DOMAIN: &[u8] = b"cairn/crnb/v3/metadata";
 /// far above that yet bounds the per-block `read_range`/decompression allocation a corrupt or
 /// bit-rotted trailer could otherwise demand (the read path works one block at a time).
 const MAX_BLOCK_SIZE: u64 = 16 * 1024 * 1024;
+/// Maximum index bytes accepted before authentication. At the S3 5-GiB object ceiling this still
+/// permits the smallest supported 1-KiB compression blocks with ample headroom, while preventing
+/// a corrupt large backing file from driving an allocation proportional to its physical length.
+const MAX_INDEX_LEN: usize = 64 * 1024 * 1024;
 /// The AES-GCM nonce length (96 bits — the recommended GCM nonce size).
 const GCM_NONCE_LEN: usize = 12;
+/// AES-256-GCM appends a 16-byte authentication tag to every encrypted block.
+const GCM_TAG_LEN: u64 = 16;
 
 /// Derive a block's deterministic 96-bit GCM nonce from `(dek, block_index)` as the first 12
 /// bytes of `HMAC-SHA256(dek, block_index_le_u64)`. Distinct blocks get distinct nonces, and the
@@ -331,20 +338,14 @@ impl BlockEncoder {
     }
 }
 
-/// The length of the CRNB trailer, exported so a caller can read exactly the bytes
-/// [`is_encrypted_container_trailer`] needs.
+/// The fixed CRNB trailer length, exported for diagnostics and tests that identify stored
+/// encrypted artifacts without attempting to read their object bytes.
 pub const TRAILER_BYTES: usize = TRAILER_LEN as usize;
 
-/// Whether `trailer` (the last [`TRAILER_BYTES`] bytes of a `total`-byte file) is a **fully
-/// self-consistent** CRNB trailer marking an *encrypted* container.
+/// Return whether a final [`TRAILER_BYTES`]-byte slice is structurally an encrypted CRNB trailer.
 ///
-/// This is deliberately NOT the trailer sniffing audit #18 removed: framing is still decided from
-/// the caller's stored descriptor, and this predicate is only ever used to **refuse** a read — never
-/// to parse a blob as a container. Every field must agree (magic, the encrypted version byte, the
-/// `index_len == block_count * INDEX_ENTRY_LEN` identity, and the
-/// `index_offset + index_len + TRAILER_LEN == total` layout identity), so a plaintext blob whose
-/// bytes merely end in `CRNB` is not matched: the odds of a plaintext blob satisfying all four are
-/// negligible, and the consequence of one is a single refused read, not a misread body.
+/// This helper is diagnostic only. The read path must never use body sniffing to choose framing;
+/// object/part metadata supplies that authority.
 #[must_use]
 pub fn is_encrypted_container_trailer(trailer: &[u8], total: u64) -> bool {
     if trailer.len() != TRAILER_BYTES || total < TRAILER_LEN {
@@ -361,14 +362,12 @@ pub fn is_encrypted_container_trailer(trailer: &[u8], total: u64) -> bool {
     let block_count = u32::from_le_bytes(trailer[18..22].try_into().unwrap()) as u64;
     let index_offset = u64::from_le_bytes(trailer[22..30].try_into().unwrap());
     let index_len = u64::from(u32::from_le_bytes(trailer[30..34].try_into().unwrap()));
-    if index_len != block_count * INDEX_ENTRY_LEN as u64 {
-        return false;
-    }
-    index_offset
-        .checked_add(index_len)
-        .and_then(|n| n.checked_add(metadata_tag_len))
-        .and_then(|n| n.checked_add(TRAILER_LEN))
-        == Some(total)
+    index_len == block_count * INDEX_ENTRY_LEN as u64
+        && index_offset
+            .checked_add(index_len)
+            .and_then(|n| n.checked_add(metadata_tag_len))
+            .and_then(|n| n.checked_add(TRAILER_LEN))
+            == Some(total)
 }
 
 /// A random-access reader over a compressed (and optionally SSE-S3-encrypted) blob file.
@@ -390,8 +389,17 @@ impl<R: Read + Seek> CompressedReader<R> {
     ///
     /// The expected CRNB version is part of [`BlobCipher`], not inferred from the file: current v3
     /// metadata can therefore never be downgraded into the legacy-v2 parser by changing on-disk
-    /// framing. A wrong version, absent key, or bad key fails closed before object bytes are returned.
-    pub fn open_with_dek(mut inner: R, cipher: BlobCipher) -> Result<Self, BlobError> {
+    /// framing. `compression` is the independently stored logical compression descriptor; legacy
+    /// v2 must match its unauthenticated trailer algorithm and geometry to that trusted expectation.
+    /// `expected_logical_len` is likewise trusted object/part metadata and binds v2's unauthenticated
+    /// trailer and index total. A wrong version, size/compression expectation, absent key, or bad key
+    /// fails closed before object bytes are returned.
+    pub fn open_with_dek(
+        mut inner: R,
+        cipher: BlobCipher,
+        compression: &CompressionDescriptor,
+        expected_logical_len: u64,
+    ) -> Result<Self, BlobError> {
         let io = |e: std::io::Error| BlobError::Io(e.to_string());
         let total = inner.seek(SeekFrom::End(0)).map_err(io)?;
         if total < TRAILER_LEN {
@@ -447,6 +455,34 @@ impl<R: Read + Seek> CompressedReader<R> {
         if index_len != expected_index_len {
             return Err(BlobError::Corruption("index length mismatch".into()));
         }
+        if index_len > MAX_INDEX_LEN {
+            return Err(BlobError::Corruption(
+                "index length exceeds the maximum".into(),
+            ));
+        }
+        // The persisted compression descriptor and object/part logical size are independent of
+        // this on-disk trailer. Use them to bound and cross-check the block count before allocating
+        // the unauthenticated index. Besides the absolute cap above, this rejects a corrupt large
+        // file whose trailer invents more entries than the authoritative row can address.
+        let trusted_block_size = match compression {
+            CompressionDescriptor::Uncompressed => crate::DEFAULT_ENCRYPTED_BLOCK_SIZE as u64,
+            CompressionDescriptor::Compressed { block_size, .. } => u64::from(*block_size),
+        };
+        if trusted_block_size == 0 || trusted_block_size > MAX_BLOCK_SIZE {
+            return Err(BlobError::Corruption(
+                "trusted block size is outside the supported range".into(),
+            ));
+        }
+        let trusted_block_count = if expected_logical_len == 0 {
+            0
+        } else {
+            expected_logical_len.div_ceil(trusted_block_size)
+        };
+        if block_count as u64 != trusted_block_count {
+            return Err(BlobError::Corruption(
+                "block count does not match trusted metadata".into(),
+            ));
+        }
         // The index, optional v3 metadata tag, and trailer are contiguous at the end of the file.
         // Validate their exact layout before allocating or seeking. Besides bounding the index
         // allocation by the file, exactness makes changing v3's version byte to legacy v2 fail
@@ -485,6 +521,34 @@ impl<R: Read + Seek> CompressedReader<R> {
         let algo = algo_from(t[5])?;
         let block_size = u32::from_le_bytes(t[6..10].try_into().unwrap()) as u64;
         let logical_len = u64::from_le_bytes(t[10..18].try_into().unwrap());
+        // Legacy v2 authenticates block bytes but not its trailer. Bind the unauthenticated
+        // algorithm and block geometry to the trusted object/part metadata before they can drive
+        // decompression or range mapping. An encrypted-but-logically-uncompressed object/part is
+        // still a CRNB container written with the fixed encryption-only geometry.
+        if version == VERSION_ENCRYPTED_V2 {
+            if logical_len != expected_logical_len {
+                return Err(BlobError::Corruption(
+                    "legacy encrypted blob logical length does not match its trusted metadata expectation"
+                        .into(),
+                ));
+            }
+            let (expected_algo, expected_block_size) = match compression {
+                CompressionDescriptor::Uncompressed => (
+                    CompressionAlgorithm::None,
+                    crate::DEFAULT_ENCRYPTED_BLOCK_SIZE,
+                ),
+                CompressionDescriptor::Compressed {
+                    algorithm,
+                    block_size,
+                } => (*algorithm, *block_size),
+            };
+            if algo != expected_algo || block_size != u64::from(expected_block_size) {
+                return Err(BlobError::Corruption(
+                    "legacy encrypted blob compression metadata does not match its trusted metadata expectation"
+                        .into(),
+                ));
+            }
+        }
         let mut index = Vec::with_capacity(block_count);
         let mut block_offsets = Vec::with_capacity(block_count);
         let mut offset = 0u64;
@@ -581,6 +645,37 @@ impl<R: Read + Seek> CompressedReader<R> {
                 return Err(BlobError::Corruption(
                     "index block length does not match the fixed block geometry".into(),
                 ));
+            }
+        }
+        // V2's compression flag is unauthenticated. Output-length validation alone is insufficient:
+        // some raw byte strings are valid compressed streams that expand to the same length. The
+        // writer's physical-length invariant makes the two representations disjoint even after the
+        // 16-byte GCM tag: raw is exactly logical+tag, while a stored compressed block has a
+        // non-empty compressed payload strictly shorter than its logical bytes.
+        if version == VERSION_ENCRYPTED_V2 {
+            for entry in &index {
+                let encrypted_payload_len = u64::from(entry.phys_len);
+                let payload_len =
+                    encrypted_payload_len
+                        .checked_sub(GCM_TAG_LEN)
+                        .ok_or_else(|| {
+                            BlobError::Corruption(
+                                "legacy encrypted block is shorter than its authentication tag"
+                                    .into(),
+                            )
+                        })?;
+                let logical_len = u64::from(entry.logical_len);
+                let valid = if entry.compressed {
+                    payload_len > 0 && payload_len < logical_len
+                } else {
+                    payload_len == logical_len
+                };
+                if !valid {
+                    return Err(BlobError::Corruption(
+                        "legacy encrypted block physical length contradicts its compression flag"
+                            .into(),
+                    ));
+                }
             }
         }
         Ok(Self {
@@ -728,7 +823,12 @@ mod tests {
     #[test]
     fn open_rejects_logical_len_not_covered_by_index() {
         let blob = trailer(VERSION_PLAIN, 1, 100, 1000, 0, 0, 0);
-        let err = CompressedReader::open_with_dek(Cursor::new(blob), BlobCipher::KnownPlaintext);
+        let err = CompressedReader::open_with_dek(
+            Cursor::new(blob),
+            BlobCipher::KnownPlaintext,
+            &CompressionDescriptor::Uncompressed,
+            1000,
+        );
         assert!(
             err.is_err(),
             "logical_len uncovered by the index must be rejected"
@@ -749,7 +849,12 @@ mod tests {
             0,
             block_count * 9,
         );
-        let err = CompressedReader::open_with_dek(Cursor::new(blob), BlobCipher::KnownPlaintext);
+        let err = CompressedReader::open_with_dek(
+            Cursor::new(blob),
+            BlobCipher::KnownPlaintext,
+            &CompressionDescriptor::Uncompressed,
+            4096,
+        );
         assert!(
             err.is_err(),
             "an index larger than the file must be rejected"
@@ -770,7 +875,13 @@ mod tests {
         let over_cap = (MAX_BLOCK_SIZE + 1) as u32;
         blob.extend_from_slice(&trailer(VERSION_PLAIN, 0, over_cap, 1, 1, 1, 9));
         assert!(
-            CompressedReader::open_with_dek(Cursor::new(blob), BlobCipher::KnownPlaintext).is_err(),
+            CompressedReader::open_with_dek(
+                Cursor::new(blob),
+                BlobCipher::KnownPlaintext,
+                &CompressionDescriptor::Uncompressed,
+                1,
+            )
+            .is_err(),
             "a block size over the cap must be rejected"
         );
     }
@@ -788,7 +899,13 @@ mod tests {
         blob.push(0); // index: compressed = false
         blob.extend_from_slice(&trailer(VERSION_PLAIN, 0, 4096, 1, 1, 1, 9));
         assert!(
-            CompressedReader::open_with_dek(Cursor::new(blob), BlobCipher::KnownPlaintext).is_err(),
+            CompressedReader::open_with_dek(
+                Cursor::new(blob),
+                BlobCipher::KnownPlaintext,
+                &CompressionDescriptor::Uncompressed,
+                1,
+            )
+            .is_err(),
             "a block phys_len that overruns the block region must be rejected"
         );
     }
@@ -798,12 +915,20 @@ mod tests {
     fn open_rejects_inconsistent_empty_and_short() {
         let blob = trailer(VERSION_PLAIN, 1, 4096, 0, 3, 0, 27);
         assert!(
-            CompressedReader::open_with_dek(Cursor::new(blob), BlobCipher::KnownPlaintext).is_err()
+            CompressedReader::open_with_dek(
+                Cursor::new(blob),
+                BlobCipher::KnownPlaintext,
+                &CompressionDescriptor::Uncompressed,
+                0,
+            )
+            .is_err()
         );
         assert!(
             CompressedReader::open_with_dek(
                 Cursor::new(vec![0u8; 10]),
                 BlobCipher::KnownPlaintext,
+                &CompressionDescriptor::Uncompressed,
+                0,
             )
             .is_err()
         );
@@ -813,8 +938,16 @@ mod tests {
     fn roundtrip_full_and_ranges() {
         let data: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
         let blob = encode(CompressionAlgorithm::Zstd, 1024, &data);
-        let mut r =
-            CompressedReader::open_with_dek(Cursor::new(blob), BlobCipher::KnownPlaintext).unwrap();
+        let mut r = CompressedReader::open_with_dek(
+            Cursor::new(blob),
+            BlobCipher::KnownPlaintext,
+            &CompressionDescriptor::Compressed {
+                algorithm: CompressionAlgorithm::Zstd,
+                block_size: 1024,
+            },
+            data.len() as u64,
+        )
+        .unwrap();
         assert_eq!(r.logical_len(), 5000);
         // full read
         assert_eq!(r.read_range(0, 5000).unwrap(), data);
@@ -835,8 +968,16 @@ mod tests {
         // Only the small index + trailer overhead is added; the block payload never grows.
         let overhead = 4 * INDEX_ENTRY_LEN as u64 + TRAILER_LEN;
         assert!((blob.len() as u64) <= data.len() as u64 + overhead);
-        let mut r =
-            CompressedReader::open_with_dek(Cursor::new(blob), BlobCipher::KnownPlaintext).unwrap();
+        let mut r = CompressedReader::open_with_dek(
+            Cursor::new(blob),
+            BlobCipher::KnownPlaintext,
+            &CompressionDescriptor::Compressed {
+                algorithm: CompressionAlgorithm::Zstd,
+                block_size: 1024,
+            },
+            data.len() as u64,
+        )
+        .unwrap();
         assert_eq!(r.read_range(0, 4096).unwrap(), data);
         assert!(r.index.iter().all(|e| e.phys_len <= e.logical_len));
     }
@@ -849,8 +990,16 @@ mod tests {
             (blob.len() as u64) < 10_000,
             "highly compressible data must shrink on disk"
         );
-        let mut r =
-            CompressedReader::open_with_dek(Cursor::new(blob), BlobCipher::KnownPlaintext).unwrap();
+        let mut r = CompressedReader::open_with_dek(
+            Cursor::new(blob),
+            BlobCipher::KnownPlaintext,
+            &CompressionDescriptor::Compressed {
+                algorithm: CompressionAlgorithm::Zstd,
+                block_size: 1024,
+            },
+            data.len() as u64,
+        )
+        .unwrap();
         assert_eq!(r.read_range(0, 10_000).unwrap(), data);
     }
 
@@ -858,8 +1007,16 @@ mod tests {
     fn lz4_roundtrip() {
         let data = vec![b'x'; 3000];
         let blob = encode(CompressionAlgorithm::Lz4, 1024, &data);
-        let mut r =
-            CompressedReader::open_with_dek(Cursor::new(blob), BlobCipher::KnownPlaintext).unwrap();
+        let mut r = CompressedReader::open_with_dek(
+            Cursor::new(blob),
+            BlobCipher::KnownPlaintext,
+            &CompressionDescriptor::Compressed {
+                algorithm: CompressionAlgorithm::Lz4,
+                block_size: 1024,
+            },
+            data.len() as u64,
+        )
+        .unwrap();
         assert_eq!(r.read_range(0, 3000).unwrap(), data);
     }
 
@@ -882,6 +1039,11 @@ mod tests {
         let mut r = CompressedReader::open_with_dek(
             Cursor::new(blob),
             BlobCipher::AuthenticatedV3(dek.into()),
+            &CompressionDescriptor::Compressed {
+                algorithm: CompressionAlgorithm::Zstd,
+                block_size: 1024,
+            },
+            data.len() as u64,
         )
         .unwrap();
         assert_eq!(r.logical_len(), 5000);
@@ -913,6 +1075,11 @@ mod tests {
         let result = CompressedReader::open_with_dek(
             Cursor::new(blob),
             BlobCipher::AuthenticatedV3(dek.into()),
+            &CompressionDescriptor::Compressed {
+                algorithm: CompressionAlgorithm::Zstd,
+                block_size: 1024,
+            },
+            data.len() as u64,
         )
         .and_then(|mut reader| reader.read_range(0, data.len() as u64));
         assert!(
@@ -942,6 +1109,11 @@ mod tests {
             let result = CompressedReader::open_with_dek(
                 Cursor::new(mutated),
                 BlobCipher::AuthenticatedV3(dek.into()),
+                &CompressionDescriptor::Compressed {
+                    algorithm: CompressionAlgorithm::Zstd,
+                    block_size: 1024,
+                },
+                data.len() as u64,
             )
             .and_then(|mut reader| reader.read_range(0, data.len() as u64));
             assert!(
@@ -963,6 +1135,11 @@ mod tests {
         let mut reader = CompressedReader::open_with_dek(
             Cursor::new(blob.clone()),
             BlobCipher::LegacyV2(dek.into()),
+            &CompressionDescriptor::Compressed {
+                algorithm: CompressionAlgorithm::Zstd,
+                block_size: 1024,
+            },
+            data.len() as u64,
         )
         .unwrap();
         assert_eq!(reader.read_range(0, data.len() as u64).unwrap(), data);
@@ -978,9 +1155,150 @@ mod tests {
         let result = CompressedReader::open_with_dek(
             Cursor::new(tampered),
             BlobCipher::LegacyV2(dek.into()),
+            &CompressionDescriptor::Compressed {
+                algorithm: CompressionAlgorithm::Zstd,
+                block_size: 1024,
+            },
+            data.len() as u64,
         )
         .and_then(|mut reader| reader.read_range(0, data.len() as u64));
         assert!(matches!(result, Err(BlobError::Corruption(_))));
+    }
+
+    /// Exact-head regression: these six raw plaintext bytes are also a valid LZ4 stream that
+    /// decompresses to a different six-byte value. Legacy v2 authenticates the bytes but not the
+    /// index flag, so output-length validation alone cannot distinguish the two interpretations.
+    #[test]
+    fn legacy_v2_rejects_same_length_lz4_polyglot_flag_flip() {
+        let data = vec![0x10, b'A', 1, 0, 0x10, b'B'];
+        let alternate = lz4_flex::decompress(&data, data.len()).unwrap();
+        assert_eq!(alternate.len(), data.len());
+        assert_ne!(alternate, data);
+
+        let dek = [0x31u8; 32];
+        let mut blob =
+            encode_encrypted_v2(CompressionAlgorithm::Lz4, data.len() as u32, dek, &data);
+        let trailer_start = blob.len() - TRAILER_LEN as usize;
+        let index_offset = u64::from_le_bytes(
+            blob[trailer_start + 22..trailer_start + 30]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        assert_eq!(
+            blob[index_offset + 8],
+            0,
+            "the legitimate fixture must use its raw fallback"
+        );
+        let descriptor = CompressionDescriptor::Compressed {
+            algorithm: CompressionAlgorithm::Lz4,
+            block_size: data.len() as u32,
+        };
+        let mut reader = CompressedReader::open_with_dek(
+            Cursor::new(blob.clone()),
+            BlobCipher::LegacyV2(dek.into()),
+            &descriptor,
+            data.len() as u64,
+        )
+        .unwrap();
+        assert_eq!(reader.read_range(0, data.len() as u64).unwrap(), data);
+
+        blob[index_offset + 8] = 1;
+        assert!(matches!(
+            CompressedReader::open_with_dek(
+                Cursor::new(blob),
+                BlobCipher::LegacyV2(dek.into()),
+                &descriptor,
+                data.len() as u64,
+            ),
+            Err(BlobError::Corruption(_))
+        ));
+    }
+
+    /// Legacy v2's unauthenticated trailer cannot override the algorithm or logical block geometry
+    /// recorded in trusted metadata. The encryption-only descriptor has one canonical physical
+    /// expectation: algorithm None with the default encrypted block size.
+    #[test]
+    fn legacy_v2_algorithm_and_geometry_must_match_compression_descriptor() {
+        let data = vec![b'g'; 128];
+        let dek = [0x47u8; 32];
+        let blob = encode_encrypted_v2(
+            CompressionAlgorithm::None,
+            crate::DEFAULT_ENCRYPTED_BLOCK_SIZE,
+            dek,
+            &data,
+        );
+        let mut reader = CompressedReader::open_with_dek(
+            Cursor::new(blob.clone()),
+            BlobCipher::LegacyV2(dek.into()),
+            &CompressionDescriptor::Uncompressed,
+            data.len() as u64,
+        )
+        .unwrap();
+        assert_eq!(reader.read_range(0, data.len() as u64).unwrap(), data);
+
+        let trailer_start = blob.len() - TRAILER_LEN as usize;
+        let mut wrong_algorithm = blob.clone();
+        wrong_algorithm[trailer_start + 5] = algo_code(CompressionAlgorithm::Lz4);
+        assert!(matches!(
+            CompressedReader::open_with_dek(
+                Cursor::new(wrong_algorithm),
+                BlobCipher::LegacyV2(dek.into()),
+                &CompressionDescriptor::Uncompressed,
+                data.len() as u64,
+            ),
+            Err(BlobError::Corruption(_))
+        ));
+
+        let mut wrong_geometry = blob;
+        wrong_geometry[trailer_start + 6..trailer_start + 10]
+            .copy_from_slice(&(crate::DEFAULT_ENCRYPTED_BLOCK_SIZE * 2).to_le_bytes());
+        assert!(matches!(
+            CompressedReader::open_with_dek(
+                Cursor::new(wrong_geometry),
+                BlobCipher::LegacyV2(dek.into()),
+                &CompressionDescriptor::Uncompressed,
+                data.len() as u64,
+            ),
+            Err(BlobError::Corruption(_))
+        ));
+
+        // The same binding applies when metadata names an actual compression policy.
+        let compressed = encode_encrypted_v2(CompressionAlgorithm::Zstd, 1024, dek, &data);
+        let descriptor = CompressionDescriptor::Compressed {
+            algorithm: CompressionAlgorithm::Zstd,
+            block_size: 1024,
+        };
+        CompressedReader::open_with_dek(
+            Cursor::new(compressed.clone()),
+            BlobCipher::LegacyV2(dek.into()),
+            &descriptor,
+            data.len() as u64,
+        )
+        .unwrap();
+        let trailer_start = compressed.len() - TRAILER_LEN as usize;
+        let mut wrong_algorithm = compressed.clone();
+        wrong_algorithm[trailer_start + 5] = algo_code(CompressionAlgorithm::Lz4);
+        assert!(
+            CompressedReader::open_with_dek(
+                Cursor::new(wrong_algorithm),
+                BlobCipher::LegacyV2(dek.into()),
+                &descriptor,
+                data.len() as u64,
+            )
+            .is_err()
+        );
+        let mut wrong_geometry = compressed;
+        wrong_geometry[trailer_start + 6..trailer_start + 10]
+            .copy_from_slice(&2048u32.to_le_bytes());
+        assert!(
+            CompressedReader::open_with_dek(
+                Cursor::new(wrong_geometry),
+                BlobCipher::LegacyV2(dek.into()),
+                &descriptor,
+                data.len() as u64,
+            )
+            .is_err()
+        );
     }
 
     /// The file cannot choose its own compatibility parser. A current object whose persisted
@@ -997,11 +1315,24 @@ mod tests {
             CompressedReader::open_with_dek(
                 Cursor::new(v2),
                 BlobCipher::AuthenticatedV3(dek.into()),
+                &CompressionDescriptor::Compressed {
+                    algorithm: CompressionAlgorithm::Zstd,
+                    block_size: 1024,
+                },
+                data.len() as u64,
             ),
             Err(BlobError::Corruption(_))
         ));
         assert!(matches!(
-            CompressedReader::open_with_dek(Cursor::new(v3), BlobCipher::LegacyV2(dek.into()),),
+            CompressedReader::open_with_dek(
+                Cursor::new(v3),
+                BlobCipher::LegacyV2(dek.into()),
+                &CompressionDescriptor::Compressed {
+                    algorithm: CompressionAlgorithm::Zstd,
+                    block_size: 1024,
+                },
+                data.len() as u64,
+            ),
             Err(BlobError::Corruption(_))
         ));
     }
@@ -1024,7 +1355,15 @@ mod tests {
             METADATA_TAG_LEN
         );
         // Opening without a DEK fails fast because the blob is flagged encrypted.
-        let opened = CompressedReader::open_with_dek(Cursor::new(blob), BlobCipher::KnownPlaintext);
+        let opened = CompressedReader::open_with_dek(
+            Cursor::new(blob),
+            BlobCipher::KnownPlaintext,
+            &CompressionDescriptor::Compressed {
+                algorithm: CompressionAlgorithm::Zstd,
+                block_size: 1024,
+            },
+            data.len() as u64,
+        );
         assert!(matches!(opened, Err(BlobError::Corruption(_))));
     }
 
@@ -1039,6 +1378,11 @@ mod tests {
         let result = CompressedReader::open_with_dek(
             Cursor::new(blob),
             BlobCipher::AuthenticatedV3(wrong.into()),
+            &CompressionDescriptor::Compressed {
+                algorithm: CompressionAlgorithm::Lz4,
+                block_size: 1024,
+            },
+            data.len() as u64,
         )
         .and_then(|mut reader| reader.read_range(0, 4096));
         assert!(matches!(result, Err(BlobError::Corruption(_))));
@@ -1053,14 +1397,26 @@ mod tests {
         // The version byte is the plaintext version.
         let trailer = &blob[blob.len() - TRAILER_LEN as usize..];
         assert_eq!(trailer[4], VERSION_PLAIN);
-        let mut r =
-            CompressedReader::open_with_dek(Cursor::new(blob.clone()), BlobCipher::KnownPlaintext)
-                .unwrap();
+        let mut r = CompressedReader::open_with_dek(
+            Cursor::new(blob.clone()),
+            BlobCipher::KnownPlaintext,
+            &CompressionDescriptor::Compressed {
+                algorithm: CompressionAlgorithm::Zstd,
+                block_size: 512,
+            },
+            data.len() as u64,
+        )
+        .unwrap();
         assert_eq!(r.read_range(0, 2048).unwrap(), data);
         assert!(
             CompressedReader::open_with_dek(
                 Cursor::new(blob),
                 BlobCipher::AuthenticatedV3([7u8; 32].into()),
+                &CompressionDescriptor::Compressed {
+                    algorithm: CompressionAlgorithm::Zstd,
+                    block_size: 512,
+                },
+                data.len() as u64,
             )
             .is_err()
         );

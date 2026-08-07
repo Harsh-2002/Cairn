@@ -11,6 +11,69 @@ use cairn_types::error::BlobError;
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncWriteExt, BufWriter};
 
+/// Owns the provisional filesystem names for a blob until the caller has received its
+/// [`cairn_types::blob::StagedBlob`].
+///
+/// Async filesystem operations may continue on their backend after the request future that
+/// awaited them is dropped. Keeping an armed copy in both the request and those detached handoffs
+/// closes both sides of that race: whichever side observes cancellation after creating/renaming
+/// the file unlinks it. The synchronous unlink is deliberate and restricted to this exceptional
+/// `Drop` path; POSIX permits unlinking an open file, so a canceled writer cannot keep a named,
+/// quota-unaccounted artifact behind.
+#[derive(Debug)]
+pub(crate) struct UncommittedBlobCleanup {
+    staging_path: PathBuf,
+    final_path: Option<PathBuf>,
+    armed: bool,
+}
+
+impl UncommittedBlobCleanup {
+    pub(crate) fn new(staging_path: PathBuf, final_path: PathBuf) -> Self {
+        Self {
+            staging_path,
+            final_path: Some(final_path),
+            armed: true,
+        }
+    }
+
+    fn staging_only(staging_path: PathBuf) -> Self {
+        Self {
+            staging_path,
+            final_path: None,
+            armed: true,
+        }
+    }
+
+    /// Transfer ownership of both paths to the caller (or to committed metadata).
+    pub(crate) fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    fn unlink(path: &Path) {
+        if let Err(error) = std::fs::remove_file(path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "failed to unlink canceled provisional blob"
+            );
+        }
+    }
+}
+
+impl Drop for UncommittedBlobCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        Self::unlink(&self.staging_path);
+        if let Some(final_path) = &self.final_path {
+            Self::unlink(final_path);
+        }
+    }
+}
+
 /// The staging writer's internal buffer size. `tokio::io::BufWriter::new` defaults to 8 KiB
 /// (`tokio::io::util::DEFAULT_BUF_SIZE`), tuned for small, interactive writes: for a large object it
 /// flushes to the file roughly every 8 KiB regardless of how large the incoming HTTP chunks are —
@@ -64,17 +127,24 @@ impl Staging {
         }
         let release_len = prealloc.filter(|&n| n >= crate::raw_io::HINT_THRESHOLD);
         // Create the file and apply the placement hints in a single blocking hop, then wrap the
-        // std handle for the async streamed write.
+        // std handle for the async streamed write. `spawn_blocking` itself is not canceled when
+        // its awaiting request is dropped, so its result carries a staging-only cleanup guard. If
+        // the join output has no receiver, dropping that output unlinks the file after creation;
+        // on the ordinary path ownership transfers to the request-level two-path guard.
         let sp = staging_path.clone();
-        let file = tokio::task::spawn_blocking(move || -> Result<std::fs::File, BlobError> {
-            let file = std::fs::File::create(&sp).map_err(io_err)?;
-            if let Some(len) = release_len {
-                crate::raw_io::preallocate_sequential(&file, len);
-            }
-            Ok(file)
-        })
+        let (file, mut create_cleanup) = tokio::task::spawn_blocking(
+            move || -> Result<(std::fs::File, UncommittedBlobCleanup), BlobError> {
+                let cleanup = UncommittedBlobCleanup::staging_only(sp.clone());
+                let file = std::fs::File::create(&sp).map_err(io_err)?;
+                if let Some(len) = release_len {
+                    crate::raw_io::preallocate_sequential(&file, len);
+                }
+                Ok((file, cleanup))
+            },
+        )
         .await
         .map_err(|e| BlobError::Io(e.to_string()))??;
+        create_cleanup.disarm();
         Ok(Staging::Tokio {
             writer: BufWriter::with_capacity(STAGING_WRITE_BUF, tokio::fs::File::from_std(file)),
             staging_path,
@@ -121,9 +191,24 @@ impl Staging {
                     })
                     .await;
                 }
-                tokio::fs::rename(&staging_path, final_path)
-                    .await
-                    .map_err(io_err)?;
+                // Like create, Tokio implements filesystem rename on work that can outlive a
+                // canceled await. Return an armed cleanup guard as the blocking task's output: if
+                // the caller disappears, the abandoned output removes whichever of the tmp/final
+                // names exists after rename; if it receives the output, the request-level guard
+                // resumes ownership through the following directory-fsync await.
+                let rename_source = staging_path.clone();
+                let rename_dest = final_path.to_owned();
+                let mut rename_cleanup = tokio::task::spawn_blocking(
+                    move || -> Result<UncommittedBlobCleanup, BlobError> {
+                        let cleanup =
+                            UncommittedBlobCleanup::new(rename_source.clone(), rename_dest.clone());
+                        std::fs::rename(&rename_source, &rename_dest).map_err(io_err)?;
+                        Ok(cleanup)
+                    },
+                )
+                .await
+                .map_err(|e| BlobError::Io(e.to_string()))??;
+                rename_cleanup.disarm();
                 Ok(())
             }
             #[cfg(feature = "io-uring")]
@@ -158,5 +243,63 @@ impl Staging {
             #[cfg(feature = "io-uring")]
             Staging::Uring(s) => s.abort().await,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn cancel_with_guard(guard: UncommittedBlobCleanup) {
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _guard = guard;
+            let _ = ready_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        ready_rx.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+    }
+
+    /// Dropping a request future cleans the unique artifact on either side of the atomic rename.
+    /// This exercises the exact RAII path used by both `stage` and `assemble`, without timing a
+    /// real filesystem operation or relying on a sleep.
+    #[tokio::test]
+    async fn cancellation_cleanup_covers_pre_and_post_rename_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join("object.tmp");
+        let final_path = dir.path().join("object");
+
+        std::fs::write(&staging, b"pre-rename").unwrap();
+        cancel_with_guard(UncommittedBlobCleanup::new(
+            staging.clone(),
+            final_path.clone(),
+        ))
+        .await;
+        assert!(
+            !staging.exists(),
+            "cancellation must unlink the staging tmp"
+        );
+        assert!(!final_path.exists());
+
+        std::fs::write(&staging, b"post-rename").unwrap();
+        let guard = UncommittedBlobCleanup::new(staging.clone(), final_path.clone());
+        std::fs::rename(&staging, &final_path).unwrap();
+        cancel_with_guard(guard).await;
+        assert!(!staging.exists());
+        assert!(
+            !final_path.exists(),
+            "cancellation after rename must unlink the unreturned final blob"
+        );
+
+        std::fs::write(&final_path, b"returned").unwrap();
+        let mut guard = UncommittedBlobCleanup::new(staging, final_path.clone());
+        guard.disarm();
+        drop(guard);
+        assert!(
+            final_path.exists(),
+            "disarming immediately before success must preserve the returned blob"
+        );
     }
 }

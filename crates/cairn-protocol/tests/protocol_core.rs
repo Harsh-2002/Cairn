@@ -2,7 +2,10 @@
 //! blob), exercising the core bucket/object lifecycle including a SigV4-streaming (chunked) PUT.
 
 use bytes::Bytes;
-use cairn_protocol::{S3Body, S3Request, S3Response, S3Service};
+use cairn_protocol::{
+    MultipartClaimRecovery, MultipartPartWriteRecovery, ObjectWriteRecovery, S3Body, S3Request,
+    S3Response, S3Service,
+};
 use cairn_types::auth::{AuthMethod, ClientSource, Principal, Role};
 use cairn_types::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
 use cairn_types::traits::{BlobStore, Clock, MetadataStore};
@@ -164,8 +167,11 @@ impl BlobStore for AbortAfterStagePartBlob {
         range: Option<cairn_types::blob::ByteRange>,
         cipher: cairn_types::blob::BlobCipher,
         compression: &cairn_types::object::CompressionDescriptor,
+        expected_logical_len: u64,
     ) -> Result<cairn_types::blob::BlobReadHandle, cairn_types::error::BlobError> {
-        self.inner.open_raw(path, range, cipher, compression).await
+        self.inner
+            .open_raw(path, range, cipher, compression, expected_logical_len)
+            .await
     }
 
     async fn probe(
@@ -278,15 +284,31 @@ async fn harness_abort_after_stage_part() -> (Harness, Arc<AbortAfterStagePartBl
 /// neither returns success nor deletes bytes that the completion owner needs.
 struct AssembleGateBlob {
     inner: Arc<dyn BlobStore>,
+    pause_at: BlobGatePoint,
     pause_next: AtomicBool,
     entered: tokio::sync::Notify,
     release: tokio::sync::Notify,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BlobGatePoint {
+    BeforeAssemble,
+    BeforeDelete,
+}
+
 impl AssembleGateBlob {
     fn new(inner: Arc<dyn BlobStore>) -> Self {
+        Self::new_at(inner, BlobGatePoint::BeforeAssemble)
+    }
+
+    fn new_before_delete(inner: Arc<dyn BlobStore>) -> Self {
+        Self::new_at(inner, BlobGatePoint::BeforeDelete)
+    }
+
+    fn new_at(inner: Arc<dyn BlobStore>, pause_at: BlobGatePoint) -> Self {
         Self {
             inner,
+            pause_at,
             pause_next: AtomicBool::new(true),
             entered: tokio::sync::Notify::new(),
             release: tokio::sync::Notify::new(),
@@ -319,8 +341,11 @@ impl BlobStore for AssembleGateBlob {
         range: Option<cairn_types::blob::ByteRange>,
         cipher: cairn_types::blob::BlobCipher,
         compression: &cairn_types::object::CompressionDescriptor,
+        expected_logical_len: u64,
     ) -> Result<cairn_types::blob::BlobReadHandle, cairn_types::error::BlobError> {
-        self.inner.open_raw(path, range, cipher, compression).await
+        self.inner
+            .open_raw(path, range, cipher, compression, expected_logical_len)
+            .await
     }
 
     async fn probe(
@@ -331,6 +356,12 @@ impl BlobStore for AssembleGateBlob {
     }
 
     async fn delete(&self, path: &StoragePath) -> Result<(), cairn_types::error::BlobError> {
+        if self.pause_at == BlobGatePoint::BeforeDelete
+            && self.pause_next.swap(false, Ordering::AcqRel)
+        {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
         self.inner.delete(path).await
     }
 
@@ -374,7 +405,9 @@ impl BlobStore for AssembleGateBlob {
         parts: &[cairn_types::blob::PartRef],
         opts: cairn_types::blob::StageOptions,
     ) -> Result<cairn_types::blob::StagedBlob, cairn_types::error::BlobError> {
-        if self.pause_next.swap(false, Ordering::AcqRel) {
+        if self.pause_at == BlobGatePoint::BeforeAssemble
+            && self.pause_next.swap(false, Ordering::AcqRel)
+        {
             self.entered.notify_one();
             self.release.notified().await;
         }
@@ -395,11 +428,33 @@ impl BlobStore for AssembleGateBlob {
 }
 
 async fn harness_with_assemble_gate() -> (Harness, Arc<AssembleGateBlob>) {
+    harness_with_assemble_gate_and_recovery(None).await
+}
+
+async fn harness_with_assemble_gate_and_recovery(
+    recovery: Option<Arc<dyn Fn(MultipartClaimRecovery) -> bool + Send + Sync>>,
+) -> (Harness, Arc<AssembleGateBlob>) {
+    harness_with_blob_gate_and_recovery(BlobGatePoint::BeforeAssemble, recovery).await
+}
+
+async fn harness_with_delete_gate_and_recovery(
+    recovery: Arc<dyn Fn(MultipartClaimRecovery) -> bool + Send + Sync>,
+) -> (Harness, Arc<AssembleGateBlob>) {
+    harness_with_blob_gate_and_recovery(BlobGatePoint::BeforeDelete, Some(recovery)).await
+}
+
+async fn harness_with_blob_gate_and_recovery(
+    gate_point: BlobGatePoint,
+    recovery: Option<Arc<dyn Fn(MultipartClaimRecovery) -> bool + Send + Sync>>,
+) -> (Harness, Arc<AssembleGateBlob>) {
     let dir = tempfile::tempdir().unwrap();
     let meta: Arc<dyn MetadataStore> = Arc::new(cairn_meta::open_in_memory().unwrap());
     let inner: Arc<dyn BlobStore> =
         Arc::new(cairn_blob::LocalBlobStore::open(dir.path()).await.unwrap());
-    let gate = Arc::new(AssembleGateBlob::new(inner));
+    let gate = Arc::new(match gate_point {
+        BlobGatePoint::BeforeAssemble => AssembleGateBlob::new(inner),
+        BlobGatePoint::BeforeDelete => AssembleGateBlob::new_before_delete(inner),
+    });
     let blob: Arc<dyn BlobStore> = gate.clone();
     let svc = S3Service::new(
         meta.clone(),
@@ -410,6 +465,10 @@ async fn harness_with_assemble_gate() -> (Harness, Arc<AssembleGateBlob>) {
         "us-east-1".to_owned(),
         5 * 1024 * 1024 * 1024,
     );
+    let svc = match recovery {
+        Some(recover) => svc.with_multipart_claim_recovery(recover),
+        None => svc,
+    };
     (
         Harness {
             svc,
@@ -2207,6 +2266,419 @@ async fn complete_claim_wins_over_abort_without_losing_part_bytes() {
     assert_eq!(bytes, b"hello");
 }
 
+/// A request timeout drops the Complete future rather than returning through one of its explicit
+/// error arms. Once the writer's claim has succeeded, that drop must synchronously enqueue the
+/// conditional release so the retained server worker can restore the session to `active`.
+#[tokio::test]
+async fn cancelled_complete_queues_claim_recovery_and_is_retryable() {
+    let (recovery_tx, mut recovery_rx) = tokio::sync::mpsc::unbounded_channel();
+    let recover = Arc::new(move |recovery| {
+        recovery_tx
+            .send(recovery)
+            .expect("test recovery receiver remains alive");
+        true
+    });
+    let (h, gate) = harness_with_assemble_gate_and_recovery(Some(recover)).await;
+    let (upload_id, etag) = start_upload_with_part(&h, "cancelled-complete", "obj").await;
+
+    // An acknowledged ClaimMultipart miss disarms the pre-armed guard. In particular, a guessed
+    // upload id cannot use request cancellation/drop to release another request's ownership.
+    let no_claim_xml = "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber>\
+        <ETag>00000000000000000000000000000000</ETag></Part></CompleteMultipartUpload>";
+    let (no_claim_status, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::POST,
+                Some("cancelled-complete"),
+                Some("obj"),
+                &[("uploadId", "not-a-session")],
+                &[],
+                no_claim_xml.as_bytes().to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(no_claim_status, StatusCode::NOT_FOUND);
+    assert!(matches!(
+        recovery_rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+
+    let complete_xml = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part></CompleteMultipartUpload>"
+    );
+    let complete_svc = h.svc.clone();
+    let complete_upload = upload_id.clone();
+    let complete_task = tokio::spawn(async move {
+        drain(
+            send(
+                &complete_svc,
+                req(
+                    Method::POST,
+                    Some("cancelled-complete"),
+                    Some("obj"),
+                    &[("uploadId", complete_upload.as_str())],
+                    &[],
+                    complete_xml.into_bytes(),
+                ),
+            )
+            .await,
+        )
+        .await
+    });
+
+    // `assemble` is entered only after ClaimMultipart returned `Claimed`, so aborting here exactly
+    // models the outer server request timeout dropping the handler at a post-claim await.
+    gate.wait_until_entered().await;
+    complete_task.abort();
+    assert!(complete_task.await.unwrap_err().is_cancelled());
+    let queued = tokio::time::timeout(std::time::Duration::from_secs(1), recovery_rx.recv())
+        .await
+        .expect("claim recovery must be queued synchronously on future drop")
+        .expect("recovery queue remains open");
+    assert_eq!(queued.upload_id.as_str(), upload_id);
+    assert!(
+        queued.assembled_blob.is_none(),
+        "cancellation before the real assembler starts has no committed blob"
+    );
+    assert!(!queued.delete_blob_on_not_owner);
+    assert_eq!(
+        h.meta
+            .get_multipart(&queued.upload_id)
+            .await
+            .unwrap()
+            .expect("claimed session survives cancellation")
+            .status,
+        cairn_types::MultipartStatus::Completing
+    );
+
+    // Drive the same conditional mutation as the retained server worker, then retry the original
+    // completion. A missing drop guard leaves this receive empty; a missing worker transition
+    // leaves the retry at NoSuchUpload.
+    assert!(matches!(
+        h.meta
+            .submit(cairn_types::Mutation::ReleaseMultipartClaim {
+                upload_id: queued.upload_id.clone(),
+                claim_token: queued.claim_token,
+            })
+            .await
+            .unwrap(),
+        cairn_types::MutationOutcome::MultipartClaimRelease(
+            cairn_types::meta::ClaimReleaseOutcome::Released
+        )
+    ));
+    assert_eq!(
+        h.meta
+            .get_multipart(&queued.upload_id)
+            .await
+            .unwrap()
+            .expect("released session survives")
+            .status,
+        cairn_types::MultipartStatus::Active
+    );
+
+    let retry_xml = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part></CompleteMultipartUpload>"
+    );
+    let (retry_status, _, retry_body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::POST,
+                Some("cancelled-complete"),
+                Some("obj"),
+                &[("uploadId", upload_id.as_str())],
+                &[],
+                retry_xml.into_bytes(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        retry_status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&retry_body)
+    );
+    assert!(
+        matches!(
+            recovery_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ),
+        "terminal completion must disarm the cancellation guard"
+    );
+}
+
+/// The metadata writer may commit ClaimMultipart and lose its acknowledgement before the service
+/// observes `Claimed`. Recovery must already be armed at that await boundary.
+#[tokio::test]
+async fn cancelled_during_claim_ack_queues_exact_token_recovery() {
+    let (recovery_tx, mut recovery_rx) = tokio::sync::mpsc::unbounded_channel();
+    let recover = Arc::new(move |recovery| recovery_tx.send(recovery).is_ok());
+    let (mut h, concrete) = in_memory_harness().await;
+    h.svc = h.svc.clone().with_multipart_claim_recovery(recover);
+    let (upload_id, etag) = start_upload_with_part(&h, "claim-ack-loss", "obj").await;
+    let typed_id = UploadId::from_string(upload_id.clone());
+    concrete.hang_next_multipart_claim_ack();
+
+    let complete_xml = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part></CompleteMultipartUpload>"
+    );
+    let svc = h.svc.clone();
+    let complete_upload = upload_id.clone();
+    let complete_task = tokio::spawn(async move {
+        drain(
+            send(
+                &svc,
+                req(
+                    Method::POST,
+                    Some("claim-ack-loss"),
+                    Some("obj"),
+                    &[("uploadId", complete_upload.as_str())],
+                    &[],
+                    complete_xml.into_bytes(),
+                ),
+            )
+            .await,
+        )
+        .await
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if concrete
+                .get_multipart(&typed_id)
+                .await
+                .unwrap()
+                .is_some_and(|session| session.status == cairn_types::MultipartStatus::Completing)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("claim must be applied before its acknowledgement is withheld");
+
+    complete_task.abort();
+    assert!(complete_task.await.unwrap_err().is_cancelled());
+    let recovery = tokio::time::timeout(std::time::Duration::from_secs(1), recovery_rx.recv())
+        .await
+        .expect("claim-ack cancellation must enqueue recovery")
+        .expect("recovery queue remains open");
+    assert_eq!(recovery.upload_id, typed_id);
+    assert!(recovery.assembled_blob.is_none());
+    assert!(matches!(
+        concrete
+            .submit(cairn_types::Mutation::ReleaseMultipartClaim {
+                upload_id: recovery.upload_id.clone(),
+                claim_token: recovery.claim_token,
+            })
+            .await
+            .unwrap(),
+        cairn_types::MutationOutcome::MultipartClaimRelease(
+            cairn_types::meta::ClaimReleaseOutcome::Released
+        )
+    ));
+    assert_eq!(
+        concrete
+            .get_multipart(&recovery.upload_id)
+            .await
+            .unwrap()
+            .expect("claim recovery preserves the upload")
+            .status,
+        cairn_types::MultipartStatus::Active
+    );
+}
+
+/// A terminal CompleteMultipart transaction may commit even when its caller receives an engine
+/// error. The request must preserve the newly live assembled blob; exact-token recovery then sees
+/// `NotOwner` and cannot mistake the committed object for an orphan.
+#[tokio::test]
+async fn complete_ack_error_preserves_the_committed_object_blob() {
+    let (recovery_tx, mut recovery_rx) = tokio::sync::mpsc::unbounded_channel();
+    let recover = Arc::new(move |recovery| recovery_tx.send(recovery).is_ok());
+    let (mut h, concrete) = in_memory_harness().await;
+    h.svc = h.svc.clone().with_multipart_claim_recovery(recover);
+    let (upload_id, etag) = start_upload_with_part(&h, "complete-ack-loss", "obj").await;
+    concrete.fail_next_multipart_complete_ack();
+
+    let complete_xml = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part></CompleteMultipartUpload>"
+    );
+    let (status, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::POST,
+                Some("complete-ack-loss"),
+                Some("obj"),
+                &[("uploadId", upload_id.as_str())],
+                &[],
+                complete_xml.into_bytes(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+
+    let recovery = tokio::time::timeout(std::time::Duration::from_secs(1), recovery_rx.recv())
+        .await
+        .expect("ambiguous completion must enqueue exact-token recovery")
+        .expect("recovery queue remains open");
+    assert!(!recovery.delete_blob_on_not_owner);
+    let assembled_path = recovery
+        .assembled_blob
+        .clone()
+        .expect("the recovery record carries the assembled path");
+    let bucket = BucketName::parse("complete-ack-loss").unwrap();
+    let key = ObjectKey::parse("obj").unwrap();
+    let committed = concrete
+        .current_version(&bucket, &key)
+        .await
+        .unwrap()
+        .expect("the completion transaction committed");
+    assert_eq!(committed.storage_path.as_ref(), Some(&assembled_path));
+    assert!(h.blob.probe(&assembled_path).await.is_ok());
+    assert!(matches!(
+        concrete
+            .submit(cairn_types::Mutation::ReleaseMultipartClaim {
+                upload_id: recovery.upload_id,
+                claim_token: recovery.claim_token,
+            })
+            .await
+            .unwrap(),
+        cairn_types::MutationOutcome::MultipartClaimRelease(
+            cairn_types::meta::ClaimReleaseOutcome::NotOwner
+        )
+    ));
+
+    let (get_status, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("complete-ack-loss"),
+                Some("obj"),
+                &[],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(get_status, StatusCode::OK);
+    assert_eq!(body, b"hello");
+    assert!(h.blob.probe(&assembled_path).await.is_ok());
+}
+
+/// Once real assembly has returned, cancellation at a later cleanup await must carry the durable
+/// assembled path to recovery. Releasing `completing` proves that blob was never installed, after
+/// which the retained worker can reclaim it instead of leaking one orphan per timed-out request.
+#[tokio::test]
+async fn cancelled_complete_after_real_assembly_recovers_claim_and_blob_path() {
+    let (recovery_tx, mut recovery_rx) = tokio::sync::mpsc::unbounded_channel();
+    let recover = Arc::new(move |recovery| recovery_tx.send(recovery).is_ok());
+    let (h, delete_gate) = harness_with_delete_gate_and_recovery(recover).await;
+    let upload_id = init_mpu(&h, "cancel-after-assembly", "obj").await;
+    let (status, headers, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("cancel-after-assembly"),
+                Some("obj"),
+                &[("uploadId", upload_id.as_str()), ("partNumber", "1")],
+                &[("x-amz-sdk-checksum-algorithm", "CRC64NVME")],
+                b"assembled bytes".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let etag = header(&headers, "etag").unwrap().to_owned();
+    let complete_xml = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part></CompleteMultipartUpload>"
+    );
+    let svc = h.svc.clone();
+    let complete_upload = upload_id.clone();
+    let complete_task = tokio::spawn(async move {
+        drain(
+            send(
+                &svc,
+                req(
+                    Method::POST,
+                    Some("cancel-after-assembly"),
+                    Some("obj"),
+                    &[("uploadId", complete_upload.as_str())],
+                    &[
+                        ("x-amz-checksum-type", "FULL_OBJECT"),
+                        ("x-amz-checksum-crc64nvme", "AAAAAAAAAAA="),
+                    ],
+                    complete_xml.into_bytes(),
+                ),
+            )
+            .await,
+        )
+        .await
+    });
+
+    // The wrong whole-object checksum reaches `blob.delete` only after LocalBlobStore returned a
+    // durable assembled blob and the request guard tracked its path. Drop at that exact await.
+    delete_gate.wait_until_entered().await;
+    complete_task.abort();
+    assert!(complete_task.await.unwrap_err().is_cancelled());
+    let recovery = tokio::time::timeout(std::time::Duration::from_secs(1), recovery_rx.recv())
+        .await
+        .expect("post-assembly cancellation must enqueue recovery")
+        .expect("recovery queue remains open");
+    assert_eq!(recovery.upload_id.as_str(), upload_id);
+    let assembled_path = recovery
+        .assembled_blob
+        .expect("post-assembly cancellation carries the uncommitted blob path");
+    assert!(
+        recovery.delete_blob_on_not_owner,
+        "BadDigest proves this request's assembled path was never installed"
+    );
+    assert!(
+        h.blob.probe(&assembled_path).await.is_ok(),
+        "the injected cancellation happened before the direct cleanup"
+    );
+
+    assert!(matches!(
+        h.meta
+            .submit(cairn_types::Mutation::ReleaseMultipartClaim {
+                upload_id: recovery.upload_id.clone(),
+                claim_token: recovery.claim_token,
+            })
+            .await
+            .unwrap(),
+        cairn_types::MutationOutcome::MultipartClaimRelease(
+            cairn_types::meta::ClaimReleaseOutcome::Released
+        )
+    ));
+    h.blob.delete(&assembled_path).await.unwrap();
+    assert!(matches!(
+        h.blob.probe(&assembled_path).await,
+        Err(cairn_types::error::BlobError::NotFound)
+    ));
+    assert_eq!(
+        h.meta
+            .get_multipart(&recovery.upload_id)
+            .await
+            .unwrap()
+            .expect("released upload remains retryable")
+            .status,
+        cairn_types::MultipartStatus::Active
+    );
+}
+
 /// AUD-026, Abort-first ordering: hold Complete on its request-body barrier, let Abort consume the
 /// still-active session, then resume Complete. Exactly Abort succeeds and no object can appear.
 #[tokio::test]
@@ -2360,6 +2832,129 @@ async fn assemble_failure_with_the_session_present_is_not_masked_as_no_such_uplo
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{}", String::from_utf8_lossy(&response));
+}
+
+/// An explicit post-claim error queues one exact-token release. Even if that recovery were delayed
+/// or replayed, the token must prevent it from releasing a newer retry owner (the historical ABA).
+#[tokio::test]
+async fn explicit_complete_failure_queues_exactly_one_release_without_aba() {
+    let (recovery_tx, mut recovery_rx) = tokio::sync::mpsc::unbounded_channel();
+    let recover = Arc::new(move |recovery| recovery_tx.send(recovery).is_ok());
+    let mut h = harness().await;
+    h.svc = h.svc.clone().with_multipart_claim_recovery(recover);
+    let (upload_id, etag) = start_upload_with_part(&h, "claim-aba", "obj").await;
+    let typed_id = UploadId::from_string(upload_id.clone());
+    h.blob.delete_session(&typed_id).await.unwrap();
+
+    let body = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part></CompleteMultipartUpload>"
+    );
+    let (status, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::POST,
+                Some("claim-aba"),
+                Some("obj"),
+                &[("uploadId", upload_id.as_str())],
+                &[],
+                body.into_bytes(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_ne!(status, StatusCode::OK);
+
+    // Production explicit failures enqueue through the guard instead of first releasing directly.
+    // Until the one queue item is consumed, a retry cannot take ownership.
+    assert!(matches!(
+        h.meta
+            .submit(cairn_types::Mutation::ClaimMultipart {
+                upload_id: typed_id.clone(),
+                claim_token: cairn_types::MultipartClaimToken::generate(),
+            })
+            .await
+            .unwrap(),
+        cairn_types::MutationOutcome::MultipartClaim(
+            cairn_types::meta::ClaimOutcome::AlreadyClaimed
+        )
+    ));
+    let queued = tokio::time::timeout(std::time::Duration::from_secs(1), recovery_rx.recv())
+        .await
+        .expect("explicit failure queues recovery")
+        .expect("recovery queue remains open");
+    assert_eq!(queued.upload_id, typed_id);
+    assert!(
+        queued.assembled_blob.is_none(),
+        "the injected assembly failure never returned a committed blob"
+    );
+    assert!(!queued.delete_blob_on_not_owner);
+    assert!(matches!(
+        h.meta
+            .submit(cairn_types::Mutation::ReleaseMultipartClaim {
+                upload_id: queued.upload_id.clone(),
+                claim_token: queued.claim_token.clone(),
+            })
+            .await
+            .unwrap(),
+        cairn_types::MutationOutcome::MultipartClaimRelease(
+            cairn_types::meta::ClaimReleaseOutcome::Released
+        )
+    ));
+
+    // A retry now owns `completing`. There is no delayed second command from the failed request
+    // that could release this newer owner.
+    let retry_token = cairn_types::MultipartClaimToken::generate();
+    assert!(matches!(
+        h.meta
+            .submit(cairn_types::Mutation::ClaimMultipart {
+                upload_id: typed_id.clone(),
+                claim_token: retry_token.clone(),
+            })
+            .await
+            .unwrap(),
+        cairn_types::MutationOutcome::MultipartClaim(cairn_types::meta::ClaimOutcome::Claimed(_))
+    ));
+    assert!(matches!(
+        recovery_rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+    assert_eq!(
+        h.meta
+            .get_multipart(&typed_id)
+            .await
+            .unwrap()
+            .expect("retry-owned session remains")
+            .status,
+        cairn_types::MultipartStatus::Completing
+    );
+    assert!(matches!(
+        h.meta
+            .submit(cairn_types::Mutation::ReleaseMultipartClaim {
+                upload_id: typed_id.clone(),
+                claim_token: queued.claim_token,
+            })
+            .await
+            .unwrap(),
+        cairn_types::MutationOutcome::MultipartClaimRelease(
+            cairn_types::meta::ClaimReleaseOutcome::NotOwner
+        )
+    ));
+
+    // Leave the fixture retryable for normal test teardown.
+    assert!(matches!(
+        h.meta
+            .submit(cairn_types::Mutation::ReleaseMultipartClaim {
+                upload_id: typed_id,
+                claim_token: retry_token,
+            })
+            .await
+            .unwrap(),
+        cairn_types::MutationOutcome::MultipartClaimRelease(
+            cairn_types::meta::ClaimReleaseOutcome::Released
+        )
+    ));
 }
 
 /// Audit 2026-07 (critical): `abort_multipart` never checked that the uploadId belonged to the
@@ -3016,6 +3611,306 @@ async fn upload_part_copy_record_failure_reclaims_staged_bytes() {
         "an abort that wins the copy-part terminal race must retain the canonical S3 error"
     );
     assert_failed_part_was_reclaimed(&h, &fault).await;
+}
+
+/// `RecordPart` may commit while its acknowledgement is lost. Exact FIFO resolution must preserve
+/// the now-authoritative attempt so the client can still complete the upload after retry/recovery.
+#[tokio::test]
+async fn upload_part_ack_loss_preserves_committed_attempt() {
+    let (mut h, concrete) = in_memory_harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("part-ack-loss"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    let upload_id = start_upload(&h, "part-ack-loss", "object").await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    h.svc = h.svc.clone().with_multipart_part_write_recovery(Arc::new(
+        move |recovery: MultipartPartWriteRecovery| tx.send(recovery).is_ok(),
+    ));
+    concrete.fail_next_part_record_ack();
+
+    let (status, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("part-ack-loss"),
+                Some("object"),
+                &[("uploadId", upload_id.as_str()), ("partNumber", "1")],
+                &[],
+                b"committed part".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    let recovery = rx.recv().await.expect("ambiguous part must queue recovery");
+    assert!(matches!(
+        concrete
+            .submit(cairn_types::Mutation::ResolveMultipartPartWrite {
+                upload_id: recovery.upload_id.clone(),
+                part_number: recovery.part_number,
+                storage_path: recovery.storage_path.clone(),
+            })
+            .await
+            .unwrap(),
+        cairn_types::MutationOutcome::MultipartPartWriteResolved { referenced: true }
+    ));
+    assert!(h.blob.probe(&recovery.storage_path).await.is_ok());
+    let part = concrete
+        .list_parts(&recovery.upload_id, 0, 10)
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .next()
+        .expect("RecordPart committed before acknowledgement loss");
+    let (status, _, _) = complete(
+        &h.svc,
+        "part-ack-loss",
+        "object",
+        &upload_id,
+        &[(1, &part.etag)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+/// UploadPartCopy is a distinct `RecordPart` call site and must preserve the committed attempt on
+/// the same lost-ack boundary.
+#[tokio::test]
+async fn upload_part_copy_ack_loss_preserves_committed_attempt() {
+    let (mut h, concrete) = in_memory_harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("copy-ack-loss"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("copy-ack-loss"),
+                Some("source"),
+                &[],
+                &[],
+                b"copy source part".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    let upload_id = start_upload(&h, "copy-ack-loss", "object").await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    h.svc = h.svc.clone().with_multipart_part_write_recovery(Arc::new(
+        move |recovery: MultipartPartWriteRecovery| tx.send(recovery).is_ok(),
+    ));
+    concrete.fail_next_part_record_ack();
+
+    let (status, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("copy-ack-loss"),
+                Some("object"),
+                &[("uploadId", upload_id.as_str()), ("partNumber", "1")],
+                &[("x-amz-copy-source", "/copy-ack-loss/source")],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    let recovery = rx
+        .recv()
+        .await
+        .expect("ambiguous copy-part must queue recovery");
+    assert!(matches!(
+        concrete
+            .submit(cairn_types::Mutation::ResolveMultipartPartWrite {
+                upload_id: recovery.upload_id.clone(),
+                part_number: recovery.part_number,
+                storage_path: recovery.storage_path.clone(),
+            })
+            .await
+            .unwrap(),
+        cairn_types::MutationOutcome::MultipartPartWriteResolved { referenced: true }
+    ));
+    assert!(h.blob.probe(&recovery.storage_path).await.is_ok());
+    let part = concrete
+        .list_parts(&recovery.upload_id, 0, 10)
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .next()
+        .expect("copy RecordPart committed before acknowledgement loss");
+    let (status, _, _) = complete(
+        &h.svc,
+        "copy-ack-loss",
+        "object",
+        &upload_id,
+        &[(1, &part.etag)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+/// Dropping the request while the committed `RecordPart` acknowledgement is pending transfers the
+/// exact attempt to the synchronous recovery callback before the future disappears.
+#[tokio::test]
+async fn cancelled_upload_part_ack_queues_exact_committed_attempt() {
+    let (mut h, concrete) = in_memory_harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("part-cancel"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    let upload_id = start_upload(&h, "part-cancel", "object").await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    h.svc = h.svc.clone().with_multipart_part_write_recovery(Arc::new(
+        move |recovery: MultipartPartWriteRecovery| tx.send(recovery).is_ok(),
+    ));
+    concrete.hang_next_part_record_ack();
+
+    let svc = h.svc.clone();
+    let upload_for_task = upload_id.clone();
+    let task = tokio::spawn(async move {
+        send(
+            &svc,
+            req(
+                Method::PUT,
+                Some("part-cancel"),
+                Some("object"),
+                &[("uploadId", upload_for_task.as_str()), ("partNumber", "1")],
+                &[],
+                b"cancelled acknowledgement".to_vec(),
+            ),
+        )
+        .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !concrete.part_record_ack_is_hanging() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("RecordPart must commit and enter the lost-ack wait");
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    let recovery = rx
+        .recv()
+        .await
+        .expect("request Drop must enqueue exact part");
+    assert!(matches!(
+        concrete
+            .submit(cairn_types::Mutation::ResolveMultipartPartWrite {
+                upload_id: recovery.upload_id,
+                part_number: recovery.part_number,
+                storage_path: recovery.storage_path,
+            })
+            .await
+            .unwrap(),
+        cairn_types::MutationOutcome::MultipartPartWriteResolved { referenced: true }
+    ));
+}
+
+/// UploadPartCopy has its own post-stage await boundary, so cancellation there must transfer the
+/// exact committed attempt to recovery as well.
+#[tokio::test]
+async fn cancelled_upload_part_copy_ack_queues_exact_committed_attempt() {
+    let (mut h, concrete) = in_memory_harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("copy-part-cancel"),
+                None,
+                &[],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("copy-part-cancel"),
+                Some("source"),
+                &[],
+                &[],
+                b"copy cancellation source".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    let upload_id = start_upload(&h, "copy-part-cancel", "object").await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    h.svc = h.svc.clone().with_multipart_part_write_recovery(Arc::new(
+        move |recovery: MultipartPartWriteRecovery| tx.send(recovery).is_ok(),
+    ));
+    concrete.hang_next_part_record_ack();
+
+    let svc = h.svc.clone();
+    let upload_for_task = upload_id.clone();
+    let task = tokio::spawn(async move {
+        send(
+            &svc,
+            req(
+                Method::PUT,
+                Some("copy-part-cancel"),
+                Some("object"),
+                &[("uploadId", upload_for_task.as_str()), ("partNumber", "1")],
+                &[("x-amz-copy-source", "/copy-part-cancel/source")],
+                vec![],
+            ),
+        )
+        .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !concrete.part_record_ack_is_hanging() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("copy RecordPart must commit and enter the lost-ack wait");
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    let recovery = rx
+        .recv()
+        .await
+        .expect("copy request Drop must enqueue exact part");
+    assert!(matches!(
+        concrete
+            .submit(cairn_types::Mutation::ResolveMultipartPartWrite {
+                upload_id: recovery.upload_id,
+                part_number: recovery.part_number,
+                storage_path: recovery.storage_path,
+            })
+            .await
+            .unwrap(),
+        cairn_types::MutationOutcome::MultipartPartWriteResolved { referenced: true }
+    ));
 }
 
 /// Audit 2026-07: `list_multipart_uploads` advertised a NextKeyMarker on a truncated page but
@@ -6173,6 +7068,278 @@ async fn versioned_bucket(h: &Harness, bucket: &str) {
     )
     .await;
     assert_eq!(st, StatusCode::OK);
+}
+
+/// Wait until the injected replication-config read is pending. Reaching this point proves the
+/// request returned from durable blob staging, armed its object-write guard, and crossed the next
+/// await boundary.
+async fn wait_for_replication_config_read(meta: &cairn_types::testing::InMemoryMetadataStore) {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !meta.replication_config_read_is_hanging() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("post-stage replication-config read must become pending");
+}
+
+/// Cancellation after ordinary PUT staging but before writer submission must synchronously queue
+/// the exact intended row/path. The serialized resolver proves it unreferenced before deletion.
+#[tokio::test]
+async fn cancelled_put_before_metadata_submission_queues_exact_object_recovery() {
+    let (mut h, concrete) = in_memory_harness().await;
+    versioned_bucket(&h, "cancel-put").await;
+    let (recovery_tx, mut recovery_rx) = tokio::sync::mpsc::unbounded_channel();
+    let recover = Arc::new(move |recovery: ObjectWriteRecovery| recovery_tx.send(recovery).is_ok());
+    h.svc = h.svc.clone().with_object_write_recovery(recover);
+    concrete.hang_next_replication_config_read();
+
+    let svc = h.svc.clone();
+    let task = tokio::spawn(async move {
+        send(
+            &svc,
+            req(
+                Method::PUT,
+                Some("cancel-put"),
+                Some("object"),
+                &[],
+                &[],
+                b"cancel after durable stage".to_vec(),
+            ),
+        )
+        .await
+    });
+    wait_for_replication_config_read(&concrete).await;
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+
+    let recovery = tokio::time::timeout(std::time::Duration::from_secs(1), recovery_rx.recv())
+        .await
+        .expect("PUT cancellation must synchronously enqueue recovery")
+        .expect("recovery receiver remains open");
+    assert_eq!(recovery.bucket.as_str(), "cancel-put");
+    assert_eq!(recovery.key.as_str(), "object");
+    assert!(h.blob.probe(&recovery.storage_path).await.is_ok());
+    assert!(
+        concrete
+            .current_version(&recovery.bucket, &recovery.key)
+            .await
+            .unwrap()
+            .is_none(),
+        "cancellation occurred before metadata submission"
+    );
+    assert!(matches!(
+        concrete
+            .submit(cairn_types::Mutation::ResolveObjectWrite {
+                bucket: recovery.bucket,
+                key: recovery.key,
+                version_id: recovery.version_id,
+                row_id: recovery.row_id,
+                storage_path: recovery.storage_path.clone(),
+            })
+            .await
+            .unwrap(),
+        cairn_types::MutationOutcome::ObjectWriteResolved { referenced: false }
+    ));
+    h.blob.delete(&recovery.storage_path).await.unwrap();
+    assert!(h.blob.probe(&recovery.storage_path).await.is_err());
+}
+
+/// CopyObject has the same post-stage cancellation window as PUT. Its destination blob must carry
+/// an exact recovery record and remain deletable only after writer-serialized non-reference proof.
+#[tokio::test]
+async fn cancelled_copy_before_metadata_submission_queues_exact_object_recovery() {
+    let (mut h, concrete) = in_memory_harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("copy-source"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("copy-source"),
+                Some("object"),
+                &[],
+                &[],
+                b"copy source body".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    versioned_bucket(&h, "copy-destination").await;
+    let (recovery_tx, mut recovery_rx) = tokio::sync::mpsc::unbounded_channel();
+    let recover = Arc::new(move |recovery: ObjectWriteRecovery| recovery_tx.send(recovery).is_ok());
+    h.svc = h.svc.clone().with_object_write_recovery(recover);
+    concrete.hang_next_replication_config_read();
+
+    let svc = h.svc.clone();
+    let task = tokio::spawn(async move {
+        send(
+            &svc,
+            req(
+                Method::PUT,
+                Some("copy-destination"),
+                Some("copied"),
+                &[],
+                &[("x-amz-copy-source", "/copy-source/object")],
+                vec![],
+            ),
+        )
+        .await
+    });
+    wait_for_replication_config_read(&concrete).await;
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    let recovery = tokio::time::timeout(std::time::Duration::from_secs(1), recovery_rx.recv())
+        .await
+        .expect("Copy cancellation must synchronously enqueue recovery")
+        .expect("recovery receiver remains open");
+    assert_eq!(recovery.bucket.as_str(), "copy-destination");
+    assert_eq!(recovery.key.as_str(), "copied");
+    assert!(h.blob.probe(&recovery.storage_path).await.is_ok());
+    assert!(matches!(
+        concrete
+            .submit(cairn_types::Mutation::ResolveObjectWrite {
+                bucket: recovery.bucket,
+                key: recovery.key,
+                version_id: recovery.version_id,
+                row_id: recovery.row_id,
+                storage_path: recovery.storage_path.clone(),
+            })
+            .await
+            .unwrap(),
+        cairn_types::MutationOutcome::ObjectWriteResolved { referenced: false }
+    ));
+    h.blob.delete(&recovery.storage_path).await.unwrap();
+    assert!(h.blob.probe(&recovery.storage_path).await.is_err());
+}
+
+/// A PUT transaction can commit while its acknowledgement is lost. The error response must queue
+/// exact resolution and preserve the now-live blob; a delayed resolver remains ABA-safe after a
+/// subsequent unversioned overwrite because both immutable row id and path must match.
+#[tokio::test]
+async fn put_ack_loss_preserves_committed_blob_and_delayed_recovery_is_aba_safe() {
+    let (mut h, concrete) = in_memory_harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("ack-loss"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    let (recovery_tx, mut recovery_rx) = tokio::sync::mpsc::unbounded_channel();
+    let recover = Arc::new(move |recovery: ObjectWriteRecovery| recovery_tx.send(recovery).is_ok());
+    h.svc = h.svc.clone().with_object_write_recovery(recover);
+    concrete.fail_next_object_put_ack();
+
+    let (status, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("ack-loss"),
+                Some("object"),
+                &[],
+                &[],
+                b"committed despite lost ack".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    let recovery = tokio::time::timeout(std::time::Duration::from_secs(1), recovery_rx.recv())
+        .await
+        .expect("ambiguous PUT must enqueue exact recovery")
+        .expect("recovery receiver remains open");
+    let committed = concrete
+        .current_version(&recovery.bucket, &recovery.key)
+        .await
+        .unwrap()
+        .expect("PUT transaction committed before acknowledgement loss");
+    assert_eq!(committed.id, recovery.row_id);
+    assert_eq!(
+        committed.storage_path.as_ref(),
+        Some(&recovery.storage_path)
+    );
+    assert!(h.blob.probe(&recovery.storage_path).await.is_ok());
+    assert!(matches!(
+        concrete
+            .submit(cairn_types::Mutation::ResolveObjectWrite {
+                bucket: recovery.bucket.clone(),
+                key: recovery.key.clone(),
+                version_id: recovery.version_id.clone(),
+                row_id: recovery.row_id.clone(),
+                storage_path: recovery.storage_path.clone(),
+            })
+            .await
+            .unwrap(),
+        cairn_types::MutationOutcome::ObjectWriteResolved { referenced: true }
+    ));
+
+    // A later null-version overwrite replaces the row. Delayed recovery now proves only the old
+    // unique path unreferenced; it cannot delete the current object's different path.
+    let (status, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("ack-loss"),
+                Some("object"),
+                &[],
+                &[],
+                b"new current object".to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let current = concrete
+        .current_version(&recovery.bucket, &recovery.key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(current.id, recovery.row_id);
+    assert_ne!(current.storage_path.as_ref(), Some(&recovery.storage_path));
+    assert!(matches!(
+        concrete
+            .submit(cairn_types::Mutation::ResolveObjectWrite {
+                bucket: recovery.bucket,
+                key: recovery.key,
+                version_id: recovery.version_id,
+                row_id: recovery.row_id,
+                storage_path: recovery.storage_path,
+            })
+            .await
+            .unwrap(),
+        cairn_types::MutationOutcome::ObjectWriteResolved { referenced: false }
+    ));
+    let (status, _, body) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::GET,
+                Some("ack-loss"),
+                Some("object"),
+                &[],
+                &[],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"new current object");
 }
 
 #[tokio::test]

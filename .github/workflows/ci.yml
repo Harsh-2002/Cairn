@@ -116,7 +116,8 @@ jobs:
           curl --proto '=https' --tlsv1.2 -fsSL -o "$archive" "$AUDIT_URL"
           printf '%s  %s\n' "$AUDIT_SHA256" "$archive" | sha256sum -c -
           tar -xzf "$archive" -C "$RUNNER_TEMP"
-      - run: '"${RUNNER_TEMP}/cargo-audit-x86_64-unknown-linux-musl-v0.22.2/cargo-audit" audit'
+      - run: |
+          "${RUNNER_TEMP}/cargo-audit-x86_64-unknown-linux-musl-v0.22.2/cargo-audit" audit
 
   installer:
     name: installer lint + generation regressions
@@ -165,12 +166,14 @@ jobs:
       # NOT part of the default static musl binary (which links only rusqlite), so exclude them from
       # the musl run; the gnu and all-features jobs exercise them on glibc.
       - name: Test
+        env:
+          TARGET: ${{ matrix.target }}
         run: |
           EXTRA=()
-          case "${{ matrix.target }}" in
+          case "$TARGET" in
             *musl) EXTRA=(--exclude cairn-meta-async) ;;
           esac
-          cargo nextest run --workspace "${EXTRA[@]}" --target ${{ matrix.target }}
+          cargo nextest run --workspace "${EXTRA[@]}" --target "$TARGET"
           cargo test --workspace "${EXTRA[@]}" --doc
 
   test-all-features:
@@ -807,9 +810,9 @@ jobs:
       # detector, /healthz never wedging on either node, both alive, per-node 5xx EQUAL to the
       # declared budget, and per-node RSS/fd/thread/WAL ceilings plus a sampler-read-nothing gate.
       # Convergence percentiles, throughput, outbox depth and lag are advisory (debug AES-GCM).
-      # Carries TWO pinned KNOWN GAPS (reported, NOT gated): an SSE-encrypted SOURCE version ships
-      # ciphertext, so single-part ones are refused 400 BadDigest (terminal, never replicate) and
-      # multipart ones are ACCEPTED and silently corrupt on the mirror.
+      # The SSE arm is a hard regression gate for the former ciphertext-shipping defect: every
+      # encrypted single- and multipart source version must arrive byte-exact after source decrypt
+      # and target re-seal under its distinct master key.
       - name: Replicate under constant load across a master-key boundary; assert byte-exact + drain
         run: BIN=target/debug/cairn PY=python3 bash conformance/stress_replication.sh
 
@@ -992,12 +995,14 @@ jobs:
       - name: Delete the cairn-bin artifact
         env:
           GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
-          id="$(gh api "/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts" \
+          id="$(gh api "/repos/${REPOSITORY}/actions/runs/${RUN_ID}/artifacts" \
             --jq '.artifacts[] | select(.name=="cairn-bin") | .id')"
           if [ -n "$id" ]; then
-            gh api -X DELETE "/repos/${{ github.repository }}/actions/artifacts/$id"
+            gh api -X DELETE "/repos/${REPOSITORY}/actions/artifacts/$id"
             echo "deleted cairn-bin artifact (id=$id)"
           else
             echo "no cairn-bin artifact to delete (build skipped/failed, or already removed)"

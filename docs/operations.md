@@ -172,7 +172,8 @@ worker, signal waiter, and optional TLS-reload task is retained and joined; an o
 then joined, never detached. Cancelling an in-flight ship/import/webhook delivery is safe rather than
 lossy: its lease or cursor is durable. Before the next listener bind, Cairn releases orphaned
 replication claims on every metadata shard and resumes import state. It also restores an orphaned
-multipart `completing` claim to `active`, preserving the session and uploaded parts for retry.
+multipart `completing` claim to `active` and clears its attempt token, preserving the session and
+uploaded parts for retry.
 
 Once HTTP and workers are gone, a separate 30-second finalization budget drains request metrics,
 persists the master-key seal counter on every SQLite shard, and then checkpoints every SQLite WAL.
@@ -193,7 +194,11 @@ commit sequence is: stream to staging → fsync the file → rename into place �
 directory** → validate hashes → commit the metadata transaction (the single linearization
 point) → reclaim superseded blobs. A write is acknowledged only after its metadata commit is
 durable. Drive-failure survival is delegated to the storage layer; host-failure survival comes
-from bucket replication.
+from bucket replication. If a PUT/Copy request is cancelled or loses its commit acknowledgement,
+the shutdown-retained recovery worker serializes an exact row/path probe behind the original writer
+submission. It deletes only a writer-proven unreferenced path; an ambiguous result is preserved for
+the mandatory next-start reconciliation. Graceful shutdown drains this queue after HTTP requests
+and before the final WAL checkpoint.
 
 The built-in backup/restore path is **offline and single-SQLite only**: it refuses a live node and
 any configured topology/backend mismatch rather than produce an incomplete snapshot. Its
@@ -319,9 +324,13 @@ window when the master key is retired mid-upload.
 The encrypted blob format upgrades lazily. Existing v2 object descriptors have no
 `blob_format_version` field, and existing encrypted multipart-part envelopes are unprefixed; those
 two metadata forms are the only signals that authorize the legacy reader. New writes stamp object
-format v3 and prefix part envelopes with `crnb3:`. No offline conversion is required, but do not
-remove or rewrite those compatibility markers by hand: an unknown marker or a marker/file mismatch
-is reported as corruption before bytes are served.
+format v3 and prefix part envelopes with `crnb3:`. The v2 reader also requires its unauthenticated
+trailer algorithm/block geometry to match the version row's trusted compression descriptor, its
+trailer/index logical total to match the object row's `size_logical` (or multipart part-row size),
+and its per-block physical lengths to match the raw/compressed writer invariant after GCM overhead. No
+offline conversion is required, but do not remove or rewrite those compatibility markers or
+compression descriptors by hand: an unknown marker, marker/file mismatch, or trusted-compression
+mismatch is reported as corruption before bytes are served.
 
 ### 8.7 Repairing encrypted objects that replicated wrongly (the plaintext-seam incident)
 

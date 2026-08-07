@@ -125,7 +125,9 @@ pub async fn assert_writer_lock_races(store: Arc<dyn MetadataStore>, bucket_labe
                     bucket,
                     key,
                     version_id: version,
+                    expected_row_id: None,
                     expected_updated_at: None,
+                    require_sole_key_version: false,
                     now: Timestamp(200),
                     bypass: GovernanceBypass::Authorized,
                 })
@@ -206,7 +208,9 @@ pub async fn assert_writer_lock_races(store: Arc<dyn MetadataStore>, bucket_labe
                     bucket,
                     key,
                     version_id: version,
+                    expected_row_id: None,
                     expected_updated_at: None,
+                    require_sole_key_version: false,
                     now: Timestamp(20),
                     bypass: GovernanceBypass::Authorized,
                 })

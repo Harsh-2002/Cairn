@@ -852,7 +852,7 @@ fn fetch_rows(
 ) -> Result<Vec<ObjectSummary>, MetaError> {
     let mut sql = String::from(
         "SELECT key, version_id, is_latest, is_delete_marker, etag, size_logical, updated_at, \
-         storage_class, owner_id FROM object_versions WHERE bucket_name = ?1 AND key >= ?2",
+         storage_class, owner_id, id FROM object_versions WHERE bucket_name = ?1 AND key >= ?2",
     );
     if latest_only {
         sql.push_str(" AND is_latest = 1 AND is_delete_marker = 0");

@@ -25,8 +25,10 @@ out source, compile, or execute artifact content. They compare fixed metadata ag
 validate the SLSA v1 predicates produced by the unprivileged build jobs before attesting those
 exact subjects.
 
-Release mutation is one `queue: max` concurrency group, so up to GitHub's 100-run queue cap waits
-without replacing an older pending dispatch. `stage-image` first copies the verified OCI archive
+Release mutation is one concurrency group with `cancel-in-progress: false`, so a newer dispatch
+never interrupts an in-flight run that may already have mutated one side of the release. GitHub
+retains at most one pending run in a concurrency group and may replace an older pending dispatch;
+operators therefore dispatch only when the group has no pending run. `stage-image` first copies the verified OCI archive
 only to `candidate-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT`; signing and attestation target its immutable
 digest, never `:latest`. `publish-release` refuses an orphan/conflicting tag or release/draft bound
 to another commit. It may recover only a same-tag draft whose target and optional lightweight tag
@@ -64,6 +66,15 @@ positive attempt number is no newer than the current rerun.
   `checksum: true` and `fallback: none`.
 - Pin every Docker base and BuildKit driver image to a full `sha256:` digest. Do not add a mutable
   `# syntax=docker/dockerfile:<tag>` frontend.
+- Never interpolate `${{ ... }}` directly into a shell `run:` script. Map each GitHub context,
+  matrix, input, or output value through the step's `env:` block and quote its shell expansion.
+  Shell quotes around the expression itself do not protect the pre-shell expression substitution.
+- Keep workflow shell steps in the policy's canonical YAML subset: plain `run:` keys, plain
+  single-line scripts or block scalars, and no flow-style step mappings, quoted keys, multiline
+  inline scalars, tags, anchors, or aliases. The standard-library policy self-tests these evasions
+  and fails closed on unsupported forms.
+- Release dispatch has a job-level `github.ref == 'refs/heads/main'` gate before any step runs;
+  retain the quoted shell check as defense in depth after context values cross through `env:`.
 - Update an action/tool/image only by resolving its new identifier from the authoritative upstream,
   recording its immutable commit/digest/checksum, and validating the complete handoff again.
 
@@ -73,8 +84,10 @@ release jobs or permissions, authority in build jobs, unchecked or over-broad re
 and missing verify-before-mutate ordering. It also pins the serialized candidate → sign → draft
 release → version/latest promotion → retirement dependency chain, exact-commit draft recovery,
 byte-identical published-release resumption, exact same-run provenance, direct
-binary/predicate/image binding, older-CalVer-only ref retirement, and fatal deletion errors. Also
-run `actionlint` (with a checksum-verified pinned binary) when changing workflow structure.
+binary/predicate/image binding, older-CalVer-only ref retirement, and fatal deletion errors. It also
+rejects direct GitHub expression interpolation in every workflow shell script and rejects YAML
+forms that could hide a script from that check. Run `actionlint` (with a checksum-verified pinned
+binary) when changing workflow structure too.
 
 GitHub-hosted runners are the irreducible non-content-addressable trust root. Keep the explicit
 `ubuntu-24.04` label (never `ubuntu-latest`) and checksum downloaded high-impact tools; `curl`,

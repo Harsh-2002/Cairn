@@ -119,6 +119,12 @@ impl TaskSet {
 }
 
 impl TaskShutdownReport {
+    fn merge(&mut self, other: Self) {
+        self.completed += other.completed;
+        self.cancelled += other.cancelled;
+        self.failed += other.failed;
+    }
+
     fn is_complete(&self) -> bool {
         self.cancelled == 0 && self.failed == 0
     }
@@ -179,6 +185,10 @@ impl FinalizeReport {
 /// every concrete SQLite shard.
 pub(crate) struct BackgroundTasks {
     tasks: TaskSet,
+    /// Workers that must remain alive until every accepted HTTP request has been joined or
+    /// cancelled. In particular, a timed-out CompleteMultipart future enqueues its claim release
+    /// from `Drop`, which can happen at the very end of the HTTP drain.
+    request_tail_tasks: TaskSet,
     stack: Arc<AppStack>,
     request_metrics_retention_secs: Option<i64>,
 }
@@ -186,6 +196,7 @@ pub(crate) struct BackgroundTasks {
 /// A stopped worker set that still owns the resources needed by the ordered final durability tail.
 pub(crate) struct StoppedBackgroundTasks {
     worker_report: TaskShutdownReport,
+    request_tail_tasks: TaskSet,
     stack: Arc<AppStack>,
     request_metrics_retention_secs: Option<i64>,
 }
@@ -206,6 +217,7 @@ impl BackgroundTasks {
     fn new(stack: Arc<AppStack>, request_metrics_retention_secs: Option<i64>) -> Self {
         Self {
             tasks: TaskSet::default(),
+            request_tail_tasks: TaskSet::default(),
             stack,
             request_metrics_retention_secs,
         }
@@ -213,6 +225,14 @@ impl BackgroundTasks {
 
     fn spawn(&mut self, name: impl Into<String>, task: impl Future<Output = ()> + Send + 'static) {
         self.tasks.spawn(name, task);
+    }
+
+    fn spawn_request_tail(
+        &mut self,
+        name: impl Into<String>,
+        task: impl Future<Output = ()> + Send + 'static,
+    ) {
+        self.request_tail_tasks.spawn(name, task);
     }
 
     /// Stop and join/cancel workers, retaining the durability resources needed for the final flush.
@@ -233,6 +253,7 @@ impl BackgroundTasks {
         }
         StoppedBackgroundTasks {
             worker_report: report,
+            request_tail_tasks: self.request_tail_tasks,
             stack: self.stack,
             request_metrics_retention_secs: self.request_metrics_retention_secs,
         }
@@ -240,9 +261,33 @@ impl BackgroundTasks {
 }
 
 impl StoppedBackgroundTasks {
-    /// Run only after both background workers and in-flight HTTP requests have drained. This order
-    /// ensures the request-metrics accumulator cannot receive a late request after its final drain.
-    pub(crate) async fn finalize(self, final_flush_grace: Duration) -> BackgroundShutdownReport {
+    /// Run only after both ordinary background workers and in-flight HTTP requests have drained.
+    /// First join the request-tail workers that consume cancellation callbacks, then run the final
+    /// persistence tail. This order ensures neither multipart ownership nor request metrics can
+    /// change after their final drains.
+    pub(crate) async fn finalize(
+        mut self,
+        request_tail_grace: Duration,
+        final_flush_grace: Duration,
+    ) -> BackgroundShutdownReport {
+        let tail_report = self
+            .request_tail_tasks
+            .join_or_abort(request_tail_grace)
+            .await;
+        if tail_report.is_complete() {
+            tracing::info!(
+                completed = tail_report.completed,
+                "request-tail workers drained cooperatively"
+            );
+        } else {
+            tracing::error!(
+                completed = tail_report.completed,
+                cancelled = tail_report.cancelled,
+                failed = tail_report.failed,
+                "request-tail worker shutdown incomplete"
+            );
+        }
+        self.worker_report.merge(tail_report);
         let finalization = match tokio::time::timeout(
             final_flush_grace,
             finalize_shutdown(&self.stack, self.request_metrics_retention_secs),
@@ -294,6 +339,18 @@ pub(crate) fn spawn(
         .request_metrics_enabled
         .then_some((cfg.request_metrics_retention_days as i64) * 86_400);
     let mut tasks = BackgroundTasks::new(stack.clone(), request_metrics_retention_secs);
+
+    // Unlike periodic workers, storage-commit recovery remains alive through the HTTP drain:
+    // cancelling CompleteMultipart, PUT, or Copy at the request-timeout or shutdown deadline drops
+    // its protocol guard and synchronously queues exact recovery at that moment. After both accept
+    // loops have joined/cancelled every connection, `server::serve` sends the FIFO drain sentinel;
+    // this retained worker is then joined before the final metrics/counter/WAL tail.
+    tasks.spawn_request_tail(
+        "storage commit cancellation recovery",
+        stack
+            .multipart_claim_recovery
+            .worker(stack.meta.clone(), stack.blob.clone()),
+    );
 
     tasks.spawn(
         "multipart sweeper",
@@ -1495,14 +1552,10 @@ async fn metrics_loop(stack: Arc<AppStack>, mut shutdown: watch::Receiver<bool>)
         metrics::counter!("cairn_meta_cache_hits_total").absolute(hits);
         metrics::counter!("cairn_meta_cache_misses_total").absolute(misses);
 
-        // Fail-closed encrypted-read refusals (ARCH 27). `cairn-blob` takes no `metrics` dependency
-        // either, so it exposes a cumulative count we mirror here. Non-zero means a read of an
-        // encrypted blob arrived with no data key — either a caller lost a DEK it should have
-        // resolved (the class of bug that had replication shipping ciphertext), or the documented
-        // false positive: an object whose body IS the verbatim bytes of an encrypted blob file
-        // (a `CAIRN_DATA_DIR` backed up into a bucket). Alertable; a log line is not.
-        metrics::counter!("cairn_blob_encrypted_without_key_total")
-            .absolute(stack.blob_local.encrypted_without_key_total());
+        // A metadata-declared plaintext file must have exactly its trusted logical length. A
+        // mismatch catches missing encryption metadata and truncated/inconsistent local storage.
+        metrics::counter!("cairn_blob_plaintext_length_mismatch_total")
+            .absolute(stack.blob_local.plaintext_length_mismatch_total());
 
         // Replication health (ARCH 20/26) from the uncapped aggregate (no 10k probe cap). Lag is
         // the age of the oldest still-pending *enqueue* (not its backed-off next_attempt_at, which
@@ -2186,7 +2239,10 @@ async fn scrub_version(
         }
     };
 
-    let handle = match blobs.open_raw(path, None, cipher, &row.compression).await {
+    let handle = match blobs
+        .open_raw(path, None, cipher, &row.compression, row.size_logical)
+        .await
+    {
         Ok(h) => h,
         // A blob missing from under its row is real damage (`cairn integrity --repair` would drop the
         // dangling row), reported as corruption with its own kind. But a transient FS failure — fd

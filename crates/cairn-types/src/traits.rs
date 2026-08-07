@@ -62,20 +62,28 @@ pub trait BlobStore: Send + Sync {
     /// the plaintext body — silently, at exactly the plaintext length (it is how replication and
     /// the integrity scrub shipped ciphertext). Requiring the cipher by name removes that footgun.
     ///
-    /// **Fail-closed (unchanged, ARCH 27, SSE-S3):** an encrypted blob opened with
-    /// [`BlobCipher::KnownPlaintext`] (or with the wrong DEK/format) fails with
-    /// [`BlobError::Corruption`] rather than yielding plaintext or ciphertext.
+    /// **Fail-closed (ARCH 27, SSE-S3):** a wrong DEK/format fails with
+    /// [`BlobError::Corruption`] rather than yielding plaintext or ciphertext. A
+    /// [`BlobCipher::KnownPlaintext`] read requires physical length to equal this call's trusted
+    /// logical length; that catches the ordinary encrypted/uncompressed layout without sniffing
+    /// and rejecting legitimate arbitrary plaintext bytes that happen to form a CRNB file.
     ///
     /// `compression` is the object version's stored compression descriptor, the source of truth
     /// for whether the blob is a self-describing CRNB block container. The reader trusts it (and
     /// the cipher — encryption also uses the container) rather than sniffing the trailer magic,
     /// which an uncompressed object's bytes can collide with (audit #18).
+    ///
+    /// `expected_logical_len` is the trusted plaintext size from the object-version row (or
+    /// [`PartRef::size`] for multipart assembly). Legacy encrypted v2 did not authenticate its
+    /// trailer/index, so the reader requires their logical total to equal this value before serving
+    /// bytes. It must never be derived from the CRNB file itself.
     async fn open_raw(
         &self,
         path: &StoragePath,
         range: Option<ByteRange>,
         cipher: BlobCipher,
         compression: &CompressionDescriptor,
+        expected_logical_len: u64,
     ) -> Result<BlobReadHandle, BlobError>;
 
     /// Cheaply answer whether a committed blob is PRESENT, plus basic framing — WITHOUT a DEK and
@@ -210,12 +218,14 @@ pub trait MetadataStore: Send + Sync {
         version: &VersionId,
     ) -> Result<Option<ObjectVersionRow>, MetaError>;
     /// Page current objects under a prefix (half-open range seek), excluding delete markers.
+    /// Each summary carries the internal immutable metadata-row identity used by maintenance
+    /// compare-and-delete; external serializers omit it.
     async fn list_current(
         &self,
         bucket: &BucketName,
         query: &ListQuery,
     ) -> Result<ListPage<ObjectSummary>, MetaError>;
-    /// Page all versions and delete markers under a prefix.
+    /// Page all versions and delete markers under a prefix, with the same internal row identity.
     async fn list_versions(
         &self,
         bucket: &BucketName,

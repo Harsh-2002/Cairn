@@ -914,7 +914,9 @@ impl ControlService {
                         bucket: bucket_name.clone(),
                         key,
                         version_id,
+                        expected_row_id: None,
                         expected_updated_at: None,
+                        require_sole_key_version: false,
                         now,
                         bypass: GovernanceBypass::Denied,
                     })
@@ -1046,7 +1048,9 @@ impl ControlService {
                         bucket: bucket_name.clone(),
                         key: item.key.clone(),
                         version_id: item.version_id.clone(),
+                        expected_row_id: None,
                         expected_updated_at: None,
+                        require_sole_key_version: false,
                         now,
                         bypass: GovernanceBypass::Denied,
                     })

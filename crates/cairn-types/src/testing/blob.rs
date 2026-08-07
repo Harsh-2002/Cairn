@@ -69,6 +69,12 @@ impl InMemoryBlobStore {
             .map(|b| b.bytes.as_ref().clone())
     }
 
+    /// Number of staged multipart-part artifacts (test introspection).
+    #[must_use]
+    pub fn multipart_part_count(&self) -> usize {
+        self.parts.lock().unwrap().len()
+    }
+
     async fn drain(mut body: crate::BodyStream, ceiling: u64) -> Result<Vec<u8>, BlobError> {
         let mut buf = Vec::new();
         while let Some(chunk) = body.next().await {
@@ -124,6 +130,7 @@ impl BlobStore for InMemoryBlobStore {
         range: Option<ByteRange>,
         cipher: BlobCipher,
         _compression: &CompressionDescriptor,
+        expected_logical_len: u64,
     ) -> Result<BlobReadHandle, BlobError> {
         // The in-memory double stores logical bytes directly (no CRNB container), so the stored
         // compression descriptor is irrelevant to reads here.
@@ -141,6 +148,11 @@ impl BlobStore for InMemoryBlobStore {
             stored.bytes.clone()
         };
         let total = data.len() as u64;
+        if total != expected_logical_len {
+            return Err(BlobError::Corruption(
+                "blob logical length does not match trusted metadata".into(),
+            ));
+        }
         let (slice, content_range, logical_len) = match range {
             Some(r) => {
                 let start = r.offset.min(total);

@@ -51,6 +51,10 @@ const INFRA_CONCURRENCY_LIMIT: usize = 4;
 const METRICS_CONCURRENCY_LIMIT: usize = 2;
 /// One shared bound for draining accepted HTTP connections and cooperative background workers.
 const SHUTDOWN_DRAIN_GRACE: Duration = Duration::from_secs(30);
+/// After every request future has been joined or cancelled, give the retained storage-commit
+/// recovery consumer a small separate window to drain cancellation callbacks queued by their
+/// drops. A timeout makes shutdown incomplete; startup recovery is the final fallback.
+const SHUTDOWN_REQUEST_TAIL_GRACE: Duration = Duration::from_secs(5);
 /// A separate bound for the ordered final metrics/counter flush and SQLite checkpoints.
 const SHUTDOWN_FINALIZE_GRACE: Duration = Duration::from_secs(30);
 
@@ -299,7 +303,7 @@ pub async fn serve(
             ListenerRole::Data,
             shutdown_rx.clone(),
         );
-        match web_listener {
+        let report = match web_listener {
             Some(sock) => {
                 let web = accept_loop(
                     sock,
@@ -313,7 +317,13 @@ pub async fn serve(
                 api_report.merge(web_report)
             }
             None => api.await,
-        }
+        };
+        // All accepted request futures have now returned or been force-cancelled, and therefore
+        // every armed multipart or ordinary object-write drop guard has synchronously enqueued its
+        // recovery record. The FIFO sentinel lets the retained consumer process those commands and
+        // exit; it is joined before final persistence below.
+        state.stack.multipart_claim_recovery.finish_requests();
+        report
     };
 
     // Stop accepting/claiming concurrently. Only after BOTH HTTP and workers have drained do the
@@ -330,7 +340,9 @@ pub async fn serve(
         background.stop(SHUTDOWN_DRAIN_GRACE).await
     };
     let (http_report, stopped_background) = tokio::join!(listeners, stop_background);
-    let background_report = stopped_background.finalize(SHUTDOWN_FINALIZE_GRACE).await;
+    let background_report = stopped_background
+        .finalize(SHUTDOWN_REQUEST_TAIL_GRACE, SHUTDOWN_FINALIZE_GRACE)
+        .await;
 
     // Neither auxiliary task is detached. The signal broadcaster has completed by definition; the
     // SIGHUP waiter may still be blocked in `recv`, so cancel and join it explicitly.

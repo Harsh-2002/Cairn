@@ -37,6 +37,231 @@ yaml_files = sorted(
     if path.is_file() and path.suffix in {".yml", ".yaml"}
 )
 
+
+def workflow_shell_violations(text: str) -> list[tuple[int, str]]:
+    """Fail-closed lexical policy for workflow shell scripts and expression placement.
+
+    This repository deliberately accepts only a small canonical YAML subset around `run`. That
+    keeps the pre-installer, standard-library-only check auditable and prevents quoted keys, flow
+    mappings, aliases, or multiline scalars from hiding a shell script from the expression scan.
+    """
+    lines = text.splitlines()
+    scripts: list[tuple[int, str]] = []
+    violations: list[tuple[int, str]] = []
+    run_key = re.compile(r"^(?P<indent> *)(?P<dash>-\s+)?run:\s*(?P<value>.*)$")
+    block_scalar = re.compile(
+        r"[|>](?:(?:[1-9][+-]?)|(?:[+-][1-9]?))?(?:\s+#.*)?"
+    )
+    canonical_expression_value = re.compile(
+        r"^\s*(?:-\s+)?(?P<key>[A-Za-z_][A-Za-z0-9_-]*):\s+.*\$\{\{"
+    )
+    canonical_mapping = re.compile(
+        r"^(?P<indent> *)(?P<dash>-\s+)?[A-Za-z_][A-Za-z0-9_-]*:\s*(?P<value>.*)$"
+    )
+
+    # Every expression must remain on one canonical mapping-value line. This independently rejects
+    # expressions hidden in flow mappings, multiline quoted/plain scalars, block scalars, or
+    # noncanonical/encoded keys before aliasing can make such a value executable.
+    for index, line in enumerate(lines):
+        if "${{" not in line:
+            continue
+        match = canonical_expression_value.match(line)
+        if match is None or match.group("key") == "run":
+            violations.append(
+                (
+                    index + 1,
+                    "GitHub expressions must be canonical non-run mapping values",
+                )
+            )
+
+    # Disallow YAML features that can synthesize or conceal a `run` key/value from a lexical
+    # scanner. Current workflows use none of them; keeping this subset explicit is safer than a
+    # permissive parser whose edge cases silently widen the shell trust boundary.
+    quoted_key = re.compile(r"^\s*(?:-\s+)?(?:'[^']*'|\"[^\"]*\")\s*:")
+    spaced_mapping_key = re.compile(
+        r"^\s*(?:-\s+)?[A-Za-z_][A-Za-z0-9_-]*\s+:"
+    )
+    flow_shell_container = re.compile(
+        r"^\s*(?:-\s+)?(?:jobs|runs|steps|parallel):\s*[\[{]"
+    )
+    yaml_indirection = re.compile(
+        r"(?:^\s*(?:-\s+)?(?:[?&*!]|<<\s*:))|(?::\s*[&*!])"
+    )
+    block_content_lines: set[int] = set()
+    index = 0
+    while index < len(lines):
+        header = canonical_mapping.match(lines[index])
+        if header is None or block_scalar.fullmatch(header.group("value").strip()) is None:
+            index += 1
+            continue
+        key_indent = len(header.group("indent")) + len(header.group("dash") or "")
+        index += 1
+        while index < len(lines):
+            candidate = lines[index]
+            candidate_indent = len(candidate) - len(candidate.lstrip())
+            if candidate.strip() and candidate_indent <= key_indent:
+                break
+            block_content_lines.add(index)
+            index += 1
+
+    for index, line in enumerate(lines):
+        if index in block_content_lines:
+            continue
+        if re.match(r"^\s*(?:-\s*)?[\[{]", line):
+            violations.append((index + 1, "flow-style collections are forbidden"))
+        if quoted_key.match(line):
+            violations.append((index + 1, "quoted workflow mapping keys are forbidden"))
+        if spaced_mapping_key.match(line):
+            violations.append((index + 1, "mapping keys may not contain space before `:`"))
+        if flow_shell_container.match(line):
+            violations.append(
+                (
+                    index + 1,
+                    "jobs, runs, steps, and parallel groups must use block-style collections",
+                )
+            )
+        if yaml_indirection.search(line):
+            violations.append(
+                (index + 1, "YAML explicit keys, tags, anchors, and aliases are forbidden")
+            )
+
+    index = 0
+    while index < len(lines):
+        match = run_key.match(lines[index])
+        if match is None:
+            index += 1
+            continue
+        value = match.group("value")
+        if block_scalar.fullmatch(value.strip()) is None:
+            stripped = value.strip()
+            if not stripped or stripped[0] in "'\"*&!{[?":
+                violations.append(
+                    (
+                        index + 1,
+                        "inline run scripts must be non-empty plain scalars or block scalars",
+                    )
+                )
+            key_indent = len(match.group("indent")) + len(match.group("dash") or "")
+            following = index + 1
+            while following < len(lines) and (
+                not lines[following].strip() or lines[following].lstrip().startswith("#")
+            ):
+                following += 1
+            if following < len(lines):
+                following_indent = len(lines[following]) - len(lines[following].lstrip())
+                if following_indent > key_indent:
+                    violations.append(
+                        (
+                            index + 1,
+                            "inline run scripts may not continue on later YAML lines",
+                        )
+                    )
+            scripts.append((index + 1, value))
+            index += 1
+            continue
+
+        # A compact sequence entry (`- run: |`) places the mapping key after the dash.
+        # Sibling step keys align with that effective key indentation; scalar content does not.
+        key_indent = len(match.group("indent")) + len(match.group("dash") or "")
+        content_start = index + 1
+        index = content_start
+        while index < len(lines):
+            candidate = lines[index]
+            candidate_indent = len(candidate) - len(candidate.lstrip())
+            if candidate.strip() and candidate_indent <= key_indent:
+                break
+            index += 1
+        scripts.append((content_start + 1, "\n".join(lines[content_start:index])))
+    for script_line, script in scripts:
+        for match in re.finditer(r"\$\{\{", script):
+            violations.append(
+                (
+                    script_line + line_number(script, match.start()) - 1,
+                    "GitHub expressions in run scripts must be mapped through env",
+                )
+            )
+    return violations
+
+
+def self_test_workflow_shell_policy() -> None:
+    accepted = """
+steps:
+  - env:
+      REF: ${{ github.ref }}
+    run: |
+      printf '%s\\n' "$REF"
+  - run: cargo test --workspace
+"""
+    if workflow_shell_violations(accepted):
+        raise RuntimeError("workflow shell policy rejected its canonical fixture")
+
+    rejected = {
+        "direct block expression": "steps:\n  - run: |\n      echo '${{ github.ref }}'\n",
+        "quoted run key": "steps:\n  - 'run': echo '${{ github.ref }}'\n",
+        "spaced run key": "steps:\n  - run : echo '${{ github.ref }}'\n",
+        "flow mapping": "steps:\n  - {run: \"echo '${{ github.ref }}'\"}\n",
+        "inline steps flow": "steps: [{run: \"echo '${{ github.ref }}'\"}]\n",
+        "encoded inline steps flow": (
+            "steps: [{run: \"echo '$\\x7b\\x7b github.ref }}'\"}]\n"
+        ),
+        "parallel flow run": (
+            "steps:\n"
+            "  - parallel: [{run: \"echo '${{ github.ref }}'\"}]\n"
+        ),
+        "encoded parallel flow run": (
+            "steps:\n"
+            "  - parallel: [{run: \"echo '$\\x7b\\x7b github.ref }}'\"}]\n"
+        ),
+        "multiline quoted run": (
+            "steps:\n  - run: \"echo safe\n      && echo '${{ github.ref }}'\"\n"
+        ),
+        "aliased run": (
+            "script: &payload \"echo '${{ github.ref }}'\"\nsteps:\n  - run: *payload\n"
+        ),
+        "merged flow run": (
+            "steps:\n  - <<: {\"\\x72un\": \"echo '$\\x7b\\x7b github.ref }}'\"}\n"
+        ),
+        "used flow anchor": (
+            "steps:\n"
+            "  - &payload {run: \"echo '$\\x7b\\x7b github.ref }}'\"}\n"
+            "  - *payload\n"
+        ),
+        "local tag flow run": (
+            "steps:\n"
+            "  - !foo {run: \"echo '$\\x7b\\x7b github.ref }}'\"}\n"
+        ),
+        "tagged flow steps": (
+            "steps: !!seq [{run: \"echo '$\\x7b\\x7b github.ref }}'\"}]\n"
+        ),
+        "verbatim-tagged flow steps": (
+            "steps: !<tag:yaml.org,2002:seq> "
+            "[{run: \"echo '$\\x7b\\x7b github.ref }}'\"}]\n"
+        ),
+        "split flow run": (
+            "steps:\n"
+            "  -\n"
+            "    {run: \"echo '$\\x7b\\x7b github.ref }}'\"}\n"
+        ),
+        "encoded quoted key": (
+            "steps:\n  - \"\\x72un\": \"echo '$\\x7b\\x7b github.ref }}'\"\n"
+        ),
+    }
+    for name, fixture in rejected.items():
+        if not workflow_shell_violations(fixture):
+            raise RuntimeError(f"workflow shell policy missed {name}")
+
+
+self_test_workflow_shell_policy()
+
+
+# GitHub evaluates expressions before invoking the shell, so shell quoting around an expression
+# does not make attacker-influenced refs, matrix values, or context fields safe. Cross that trust
+# boundary through a step environment variable, then quote the ordinary shell expansion.
+for path in yaml_files:
+    text = path.read_text(encoding="utf-8")
+    for line, message in workflow_shell_violations(text):
+        fail(path, line, message)
+
 # Every referenced action is immutable. Local composite actions are repository content and are
 # therefore bound by github.sha; docker:// actions must use a content digest.
 uses_re = re.compile(r"^\s*(?:-\s*)?uses:\s*([^\s#]+)", re.MULTILINE)
@@ -149,17 +374,15 @@ if not re.search(
     r"^concurrency:\s*\n"
     r"(?:\s{2}#[^\n]*\n)*"
     r"\s{2}group:\s*cairn-production-release\s*\n"
-    r"\s{2}queue:\s*max\s*$",
+    r"\s{2}cancel-in-progress:\s*false\s*$",
     release,
     re.MULTILINE,
 ):
     fail(
         RELEASE,
         1,
-        "release workflow must queue serialized dispatches without cancelling running or pending mutation",
+        "release workflow must serialize dispatches without cancelling a running mutation",
     )
-if re.search(r"^\s{2}cancel-in-progress:", release, re.MULTILINE):
-    fail(RELEASE, 1, "queue:max release serialization must not declare cancel-in-progress")
 
 
 def job_blocks(text: str) -> dict[str, tuple[int, str]]:
@@ -223,6 +446,33 @@ for job, expected in expected_permissions.items():
     actual = permissions(block)
     if actual != expected:
         fail(RELEASE, job_line, f"{job} permissions are {actual!r}, expected {expected!r}")
+
+if "verify-ci" in blocks:
+    job_line, verify_ci_block = blocks["verify-ci"]
+    if re.search(
+        r"^    if: github\.ref == 'refs/heads/main'\s*$",
+        verify_ci_block,
+        re.MULTILINE,
+    ) is None:
+        fail(RELEASE, job_line, "verify-ci must have the exact job-level main-branch gate")
+    for required in (
+        "RELEASE_REF: ${{ github.ref }}",
+        "RELEASE_REF_NAME: ${{ github.ref_name }}",
+        "RELEASE_SHA: ${{ github.sha }}",
+        "REPOSITORY: ${{ github.repository }}",
+        'if [ "$RELEASE_REF" != "refs/heads/main" ]',
+        '--repo "$REPOSITORY"',
+        '--branch "$RELEASE_REF_NAME"',
+        "--json headSha,status,conclusion",
+        '--arg sha "$RELEASE_SHA"',
+        ".headSha == $sha",
+    ):
+        if required not in verify_ci_block:
+            fail(
+                RELEASE,
+                job_line,
+                f"verify-ci shell-bound context guard is missing {required!r}",
+            )
 
 expected_needs = {
     "stage-image": {"verify-ci", "image-build"},

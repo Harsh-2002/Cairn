@@ -257,9 +257,9 @@ rp.stat("Failed", "cairn_replication_failed",
 rp.stat("Unreplicated", "cairn_replication_unreplicated",
         desc="Versions with no replica yet.")
 rp.stat("Claimed", "cairn_replication_claimed", desc="Entries currently leased by a worker.")
-rp.stat("Key-less blob reads", "cairn_blob_encrypted_without_key_total",
-        desc="Encrypted reads refused for want of a key. Crypto fails closed: an error, never "
-             "plaintext or zeros. Non-zero warrants investigation.")
+rp.stat("Plaintext length mismatch", "cairn_blob_plaintext_length_mismatch_total",
+        desc="Metadata-declared plaintext reads refused because file and logical lengths differ. "
+             "Non-zero indicates missing/inconsistent metadata or truncated local storage.")
 rp.row()
 rp.line("Replication lag", [("cairn_replication_lag_seconds", "oldest due entry")], unit="seconds",
         decimals=1,

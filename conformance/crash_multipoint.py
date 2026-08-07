@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
 """Multi-point durability crash regression (ARCH 8, F-4). crash_consistency.sh proves the property
 at ONE fault seam (a plain PUT). This drives it at every blob-commit seam the build exposes, so the
-"crash in the durability window leaves a reclaimable orphan, never a half-committed object" contract
-is verified for each write PATH:
+"a failure in the durability window leaves either an eagerly reclaimed blob or a reclaimable
+orphan, never a half-committed object" contract is verified for each write PATH:
 
   blob_after_durable   -> a plain PutObject, crashed after the blob is durable, before metadata commit
   blob_after_assemble  -> a multipart CompleteMultipartUpload, crashed after the assembled blob is
                           durable, before metadata commit
 
-Each seam runs TWICE: plaintext, and again under CAIRN_ENCRYPT_AT_REST=true so the durable orphan is
-an encrypted CRNB container. For the encrypted legs, before reconcile runs we additionally assert the
-orphan blob on disk is VERSION_ENCRYPTED and carries no plaintext — the "nothing plaintext even in
-the crash window" invariant — and that reconcile reclaims the encrypted orphan DEK-FREE (it uses the
+Each seam runs TWICE: plaintext, and again under CAIRN_ENCRYPT_AT_REST=true. A task-level panic leaves
+the server alive, so the retained object-write recovery worker may reclaim the exact staged path
+before shutdown. If the worker has not won that race, the durable encrypted orphan must be a CRNB
+container carrying no plaintext, and startup reconciliation must reclaim it DEK-FREE (using the
 row-less `probe`, never a data key), exactly the Stage-3 reader seam.
 
 For each: arm the seam, run the op (the in-flight task panics; tokio isolates it so the process
-survives), stop, run `cairn integrity`, and assert it reclaimed >= 1 orphan and the object is absent.
+survives), stop, run `cairn integrity`, and assert either eager recovery already removed the blob or
+reconciliation reclaimed it, with the object absent in both cases.
 
 Requires a binary built with --features failpoints. Config via env: BIN, DATA, PORT.
 """
@@ -177,19 +178,31 @@ for seam, opname, op, key, encrypt, marker in SEAMS:
     check(f"[{tag}] the in-flight op did NOT cleanly commit (the seam fired)", status != 200, f"status={status}")
     check(f"[{tag}] the server process survived the task panic", PROC and PROC.poll() is None)
     stop()
-    # For the encrypted legs, prove the durable orphan on disk is a VERSION_ENCRYPTED container with
-    # no plaintext BEFORE reconcile reclaims it: a crash must never expose plaintext, even in the
-    # durability window before the metadata commit.
-    if encrypt:
-        ob = orphan_blob_bytes(BUCKET)
+    # A task panic is cancellation, not a process crash. The retained recovery worker may therefore
+    # resolve and unlink the exact staged path before shutdown. If it has not, inspect the orphan
+    # before startup reconciliation reclaims it.
+    ob = orphan_blob_bytes(BUCKET)
+    eagerly_reclaimed = ob is None
+    note(f"[{tag}] durable final blob was "
+         f"{'already reclaimed by exact-path recovery' if eagerly_reclaimed else 'observable before reconcile'}")
+    if encrypt and ob is not None:
         check(f"[{tag}] the durable orphan blob is a VERSION_ENCRYPTED CRNB container (nothing plaintext mid-crash)",
               trailer_encrypted(ob), f"trailer={ob[-34:-30] if ob else None!r}")
         check(f"[{tag}] the plaintext body ({marker!r}) is ABSENT from the orphan bytes",
-              ob is not None and marker not in ob)
+              marker not in ob)
+    elif encrypt:
+        note(f"[{tag}] exact-path recovery removed the encrypted blob before it could be inspected")
     reclaimed, report = integrity()
     note(f"integrity: {report}")
-    check(f"[{tag}] reconcile reclaimed >= 1 orphan blob{' (encrypted, DEK-free via probe)' if encrypt else ''}",
-          reclaimed is not None and reclaimed >= 1, f"orphans_reclaimed={reclaimed}")
+    recovery_ok = (
+        reclaimed is not None
+        and ((eagerly_reclaimed and reclaimed == 0) or (not eagerly_reclaimed and reclaimed >= 1))
+    )
+    check(f"[{tag}] exact-path recovery or reconcile reclaimed the durable blob"
+          f"{' (encrypted reconcile is DEK-free via probe)' if encrypt else ''}",
+          recovery_ok, f"eagerly_reclaimed={eagerly_reclaimed} orphans_reclaimed={reclaimed}")
+    check(f"[{tag}] no unreferenced final blob remains after recovery",
+          orphan_blob_bytes(BUCKET) is None)
     if serve(tag=f"{tag}_check"):
         st, _, _ = s3("GET", f"/{BUCKET}/{key}", headers={"x-amz-content-sha256": _sha(b"")}, ak=ak, sk=sk)
         check(f"[{tag}] the half-committed object is ABSENT after reconcile (no torn object)", st != 200, f"GET status={st}")
