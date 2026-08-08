@@ -212,6 +212,7 @@ The vocabulary is deliberately small and identical screen to screen. A "Save" bu
 - **Do** use the shared vocabulary: `Page`/`PageHeader`, `Card`, `DataTable`/`SkeletonRows`, `StatCard`, `StatusBadge`, `TextLink`, `FieldError`, `ConfirmDialog`. One button shape, one form-control set, one icon style across every screen.
 - **Do** render `ErrorAlert` above retained content and skeletons only on first load; teach the interface in empty states, never "nothing here."
 - **Do** hold muted and placeholder text to real contrast (≥4.5:1); target AAA (7:1) where it doesn't fight the task. Honor `prefers-reduced-motion` (degrade to instant/crossfade, never gate content).
+- **Do** keep exactly one visible `main` landmark, name repeated navigation/breadcrumb landmarks uniquely, and use ARIA tabs only when every trigger owns a real tabpanel. URL-changing sections are links; in-page filters are buttons. Mobile icon actions and dialog dismiss controls provide a 44px target without inflating their glyphs.
 
 ### Don't:
 - **Don't** use `border-left`/`border-right` greater than 1px as a colored accent stripe on cards, alerts, or list items. Full hairline borders or background tints instead.

@@ -247,7 +247,7 @@ export function Credentials() {
             <div className="max-w-xs space-y-1.5">
               <Label>Lifetime</Label>
               <Select value={duration} onValueChange={setDuration}>
-                <SelectTrigger>
+                <SelectTrigger aria-label="Lifetime">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>

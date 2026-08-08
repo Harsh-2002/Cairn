@@ -161,7 +161,7 @@ export function AppSidebar() {
               <button
                 type="button"
                 aria-label={bucketsOpen ? "Collapse buckets" : "Expand buckets"}
-                className="absolute top-1.5 right-1 flex aspect-square w-5 items-center justify-center rounded-md text-sidebar-foreground/70 ring-sidebar-ring outline-hidden transition-transform hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:ring-2 group-data-[collapsible=icon]:hidden"
+                className="absolute top-0 right-0 flex size-11 items-center justify-center rounded-md text-sidebar-foreground/70 ring-sidebar-ring outline-hidden transition-transform hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:ring-2 md:top-1 md:size-7 group-data-[collapsible=icon]:hidden"
               >
                 <ChevronRight
                   aria-hidden="true"
@@ -270,7 +270,7 @@ export function AppSidebar() {
                 window.dispatchEvent(new Event("cairn:command-palette"))
               }
               aria-label="Open command palette (search)"
-              className="flex h-8 w-full items-center gap-2 rounded-md border border-sidebar-border bg-background px-2 text-sm text-muted-foreground outline-none transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:ring-2 focus-visible:ring-sidebar-ring group-data-[collapsible=icon]:justify-center group-data-[collapsible=icon]:px-0"
+              className="flex h-11 w-full items-center gap-2 rounded-md border border-sidebar-border bg-background px-2 text-sm text-muted-foreground outline-none transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:ring-2 focus-visible:ring-sidebar-ring md:h-8 group-data-[collapsible=icon]:justify-center group-data-[collapsible=icon]:px-0"
             >
               <Search aria-hidden="true" className="size-4 shrink-0" />
               <span className="group-data-[collapsible=icon]:hidden">

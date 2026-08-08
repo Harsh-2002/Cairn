@@ -8,6 +8,11 @@ embeds into the binary and the server serves at the root of the web-console list
 `npm audit --omit=dev --audit-level=moderate` and `npm audit --audit-level=high`; it is not covered
 by cargo (see the root `../CLAUDE.md`).
 
+For a live browser pass against a disposable running node, set `CAIRN_E2E_BASE_URL`,
+`CAIRN_E2E_ACCESS_KEY`, and `CAIRN_E2E_SECRET_KEY`, then run `npm run e2e`. The Chrome/axe harness
+creates isolated bucket/user fixtures, covers every route at desktop and mobile widths, and removes
+those fixtures before exit.
+
 ## Layout (`src/`)
 - `main.tsx` / `app.tsx` / `routes.tsx` — entry, provider shell (`ThemeProvider` → `AuthProvider` →
   router), routing. Add a page here.
@@ -68,8 +73,10 @@ by cargo (see the root `../CLAUDE.md`).
 - Live updates: subscribe a view with `useLiveTopic` (`lib/live.ts`), one multiplexed `EventSource`
   per tab. EventSource can't send headers, so it mints a single-use ticket (`POST /events/ticket`)
   and opens with `?ticket=`. It degrades silently to the per-view Refresh button.
-- The Metrics view is lazy-loaded to code-split `recharts` out of the initial bundle (see the
-  `Suspense` fallback in `routes.tsx`); keep heavy deps off the critical path the same way.
+- Every view is route-lazy in `routes.tsx`; the Metrics view adds a nested `Suspense` boundary in
+  `metrics-route.tsx` to keep `recharts` in its own chunk. Keep page and heavy-dependency code off
+  the initial shell path the same way, and retain the route error boundary for failed deployment
+  chunk loads.
 - Theme: light/dark/`system` via a `.dark` class on `<html>` + `color-scheme` (`theme-provider.tsx`);
   design tokens are oklch CSS vars in `globals.css`.
 - Visual system: `../docs/design.md` (Vercel/Geist minimalism, 1px borders not shadows, neutral

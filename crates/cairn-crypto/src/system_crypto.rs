@@ -372,6 +372,12 @@ mod tests {
         SystemCrypto::new([7u8; KEY_LEN].into())
     }
 
+    fn random_nonce() -> [u8; NONCE_LEN] {
+        let mut nonce = [0u8; NONCE_LEN];
+        rand::thread_rng().fill_bytes(&mut nonce);
+        nonce
+    }
+
     /// A legacy (pre-#29) sealed blob: raw AES-GCM with no AAD and a separately-stored nonce.
     fn legacy_blob(key: [u8; KEY_LEN], nonce: [u8; NONCE_LEN], plaintext: &[u8]) -> Vec<u8> {
         let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
@@ -440,7 +446,7 @@ mod tests {
         // A blob sealed the old way (no magic) opens via the legacy path; the nonce is supplied
         // separately exactly as the old storage held it.
         let key = [7u8; KEY_LEN];
-        let nonce = [9u8; NONCE_LEN];
+        let nonce = random_nonce();
         let ct = legacy_blob(key, nonce, b"legacy secret");
         let c = SystemCrypto::new(key.into()); // legacy_id = 1; key 1 == this key
         let opened = c.open(&ct, &Nonce(nonce.to_vec())).expect("legacy open");
@@ -541,7 +547,7 @@ mod tests {
     #[test]
     fn wrong_legacy_nonce_len_fails() {
         let key = [3u8; KEY_LEN];
-        let nonce = [4u8; NONCE_LEN];
+        let nonce = random_nonce();
         let ct = legacy_blob(key, nonce, b"len");
         let c = SystemCrypto::new(key.into());
         assert!(matches!(

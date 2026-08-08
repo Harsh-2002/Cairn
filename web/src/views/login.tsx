@@ -43,6 +43,7 @@ export function Login() {
 
   const accessKeyRef = useRef<HTMLInputElement>(null);
   useEffect(() => {
+    document.title = "Sign in — Cairn";
     accessKeyRef.current?.focus();
   }, []);
 
