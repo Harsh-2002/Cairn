@@ -4,6 +4,7 @@
 use crate::id::{BucketName, UserId};
 use crate::time::Timestamp;
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 /// A bucket record (the row, without its associated configuration documents).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,9 +69,9 @@ pub enum ConfigAspect {
 /// How long a bucket's default Object Lock retention lasts, as a period from object creation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RetentionPeriod {
-    /// A number of days.
+    /// A positive number of days, at most [`DefaultRetention::MAX_DAYS`].
     Days(u32),
-    /// A number of years (treated as 365 days each).
+    /// A positive number of years, at most [`DefaultRetention::MAX_YEARS`] (365 days each).
     Years(u32),
 }
 
@@ -83,15 +84,72 @@ pub struct DefaultRetention {
     pub period: RetentionPeriod,
 }
 
+/// A default Object Lock retention period or computed deadline is outside Cairn's supported range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum DefaultRetentionError {
+    /// S3 default retention periods must be positive.
+    #[error("default retention period must be greater than zero")]
+    Zero,
+    /// A day-based period exceeds [`DefaultRetention::MAX_DAYS`].
+    #[error("default retention period cannot exceed 36500 days")]
+    DaysTooLarge,
+    /// A year-based period exceeds [`DefaultRetention::MAX_YEARS`].
+    #[error("default retention period cannot exceed 100 years")]
+    YearsTooLarge,
+    /// Adding the validated period to the object creation time exceeded the timestamp range.
+    #[error("default retention date is outside the supported timestamp range")]
+    TimestampOverflow,
+}
+
 impl DefaultRetention {
+    /// Maximum supported day-based default retention (100 365-day years).
+    pub const MAX_DAYS: u32 = 36_500;
+    /// Maximum supported year-based default retention.
+    pub const MAX_YEARS: u32 = 100;
+    const MILLIS_PER_DAY: i64 = 86_400_000;
+
+    /// Validate the positive, bounded default-retention period.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DefaultRetentionError`] for a zero or over-limit period.
+    pub fn validate(&self) -> Result<(), DefaultRetentionError> {
+        match self.period {
+            RetentionPeriod::Days(0) | RetentionPeriod::Years(0) => {
+                Err(DefaultRetentionError::Zero)
+            }
+            RetentionPeriod::Days(days) if days > Self::MAX_DAYS => {
+                Err(DefaultRetentionError::DaysTooLarge)
+            }
+            RetentionPeriod::Years(years) if years > Self::MAX_YEARS => {
+                Err(DefaultRetentionError::YearsTooLarge)
+            }
+            RetentionPeriod::Days(_) | RetentionPeriod::Years(_) => Ok(()),
+        }
+    }
+
     /// The retain-until instant for an object created at `now`.
-    #[must_use]
-    pub fn retain_until(&self, now: Timestamp) -> Timestamp {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DefaultRetentionError`] when the period is invalid or the computed timestamp
+    /// cannot be represented. This operation never saturates or wraps: either the exact deadline
+    /// is returned or the caller must fail closed.
+    pub fn retain_until(&self, now: Timestamp) -> Result<Timestamp, DefaultRetentionError> {
+        self.validate()?;
         let days = match self.period {
             RetentionPeriod::Days(d) => i64::from(d),
-            RetentionPeriod::Years(y) => i64::from(y) * 365,
+            RetentionPeriod::Years(y) => i64::from(y)
+                .checked_mul(365)
+                .ok_or(DefaultRetentionError::TimestampOverflow)?,
         };
-        Timestamp(now.0 + days * 86_400_000)
+        let duration = days
+            .checked_mul(Self::MILLIS_PER_DAY)
+            .ok_or(DefaultRetentionError::TimestampOverflow)?;
+        now.0
+            .checked_add(duration)
+            .map(Timestamp)
+            .ok_or(DefaultRetentionError::TimestampOverflow)
     }
 }
 
@@ -137,4 +195,59 @@ pub enum CompressionAlgorithm {
     Zstd,
     /// LZ4 (faster, lower ratio).
     Lz4,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn retention(period: RetentionPeriod) -> DefaultRetention {
+        DefaultRetention {
+            mode: crate::object::ObjectLockMode::Governance,
+            period,
+        }
+    }
+
+    #[test]
+    fn default_retention_accepts_exact_supported_maxima() {
+        let expected = Timestamp(3_153_600_000_000);
+        assert_eq!(
+            retention(RetentionPeriod::Days(DefaultRetention::MAX_DAYS))
+                .retain_until(Timestamp::EPOCH),
+            Ok(expected)
+        );
+        assert_eq!(
+            retention(RetentionPeriod::Years(DefaultRetention::MAX_YEARS))
+                .retain_until(Timestamp::EPOCH),
+            Ok(expected)
+        );
+    }
+
+    #[test]
+    fn default_retention_rejects_zero_and_over_limit_periods() {
+        for period in [RetentionPeriod::Days(0), RetentionPeriod::Years(0)] {
+            assert_eq!(
+                retention(period).retain_until(Timestamp::EPOCH),
+                Err(DefaultRetentionError::Zero)
+            );
+        }
+        assert_eq!(
+            retention(RetentionPeriod::Days(DefaultRetention::MAX_DAYS + 1))
+                .retain_until(Timestamp::EPOCH),
+            Err(DefaultRetentionError::DaysTooLarge)
+        );
+        assert_eq!(
+            retention(RetentionPeriod::Years(DefaultRetention::MAX_YEARS + 1))
+                .retain_until(Timestamp::EPOCH),
+            Err(DefaultRetentionError::YearsTooLarge)
+        );
+    }
+
+    #[test]
+    fn default_retention_rejects_timestamp_overflow() {
+        assert_eq!(
+            retention(RetentionPeriod::Days(1)).retain_until(Timestamp(i64::MAX)),
+            Err(DefaultRetentionError::TimestampOverflow)
+        );
+    }
 }

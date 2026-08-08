@@ -41,6 +41,7 @@ async fn bench_reads(
     store: Arc<LocalBlobStore>,
     path: StoragePath,
     compression: CompressionDescriptor,
+    expected_logical_len: u64,
     conc: usize,
     secs: f64,
 ) -> f64 {
@@ -55,7 +56,13 @@ async fn bench_reads(
         handles.push(tokio::spawn(async move {
             while Instant::now() < deadline {
                 let handle = store
-                    .open_raw(&path, None, BlobCipher::KnownPlaintext, &compression)
+                    .open_raw(
+                        &path,
+                        None,
+                        BlobCipher::KnownPlaintext,
+                        &compression,
+                        expected_logical_len,
+                    )
                     .await
                     .unwrap();
                 let mut body = handle.body;
@@ -145,6 +152,7 @@ async fn main() {
                     fast.clone(),
                     staged.storage_path.clone(),
                     staged.compression.clone(),
+                    staged.size_logical,
                     conc,
                     secs,
                 )
@@ -155,6 +163,7 @@ async fn main() {
                     slow.clone(),
                     staged.storage_path.clone(),
                     staged.compression.clone(),
+                    staged.size_logical,
                     conc,
                     secs,
                 )

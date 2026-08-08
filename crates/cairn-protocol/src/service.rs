@@ -8,6 +8,7 @@ use crate::httpdate::{http_date, parse_http_date};
 use crate::keyprovider::{KeyProvider, LocalRingProvider};
 use crate::request::{S3Body, S3Request, S3Response};
 use base64::Engine;
+use cairn_types::SecretKey32;
 use cairn_types::auth::{Principal, RequesterClass, Role};
 use cairn_types::authz::{
     Acl, Action, AuthzInput, Decision, Grant, Grantee, OwnershipMode, Permission,
@@ -17,24 +18,332 @@ use cairn_types::blob::{ByteRange, PartRef, StageOptions};
 use cairn_types::bucket::{
     Bucket, ConfigAspect, ConfigDoc, ObjectLockConfiguration, VersioningState,
 };
-use cairn_types::crypto::Nonce;
 use cairn_types::error::Error;
-use cairn_types::id::{BucketName, ObjectKey, UploadId, VersionId};
+use cairn_types::id::{
+    BucketName, MultipartClaimToken, ObjectKey, StoragePath, UploadId, VersionId,
+};
 use cairn_types::meta::{
-    ClaimOutcome, IfNoneMatch, ListPage, ListQuery, MultipartSession, Mutation, MutationOutcome,
-    ObjectSummary, OutboxEntry, Precondition, ReplicationOp, WebhookEntry, WebhookStatus,
+    ClaimOutcome, ClaimReleaseOutcome, IfNoneMatch, InitialObjectState, ListPage, ListQuery,
+    MultipartCleanup, MultipartLimits, MultipartSession, MultipartTerminalOutcome, Mutation,
+    MutationOutcome, ObjectSummary, OutboxEntry, Precondition, ReplicationOp, WebhookEntry,
+    WebhookStatus,
 };
 use cairn_types::notification::{EventKind, NotificationConfig};
 use cairn_types::object::{
-    ChecksumAlgorithm, ChecksumSet, ChecksumValue, CompressionDescriptor, ETag, ObjectLockMode,
-    ObjectRetention, ObjectVersionRow, StorageClass,
+    ChecksumAlgorithm, ChecksumSet, ChecksumValue, CompressionDescriptor, ETag,
+    ExplicitObjectLockIntent, GovernanceBypass, ObjectRetention, ObjectVersionRow, StorageClass,
 };
 use cairn_types::sse::{SseDescriptor, SseMode};
 use cairn_types::traits::{AuthorizationEngine, BlobStore, Clock, Crypto, MetadataStore};
 use http::{Method, StatusCode};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 type Result<T> = std::result::Result<T, Error>;
+
+/// One bounded slot covering a potentially queued storage-commit recovery record.
+///
+/// The server creates this around an owned semaphore permit. Clones share the same underlying
+/// lease, so moving a recovery record from request guard to queue keeps the slot occupied until
+/// the worker finishes and drops its final clone.
+#[derive(Clone)]
+pub struct StorageRecoveryPermit(Arc<dyn Send + Sync>);
+
+impl StorageRecoveryPermit {
+    /// Wrap an opaque runtime-owned lease.
+    pub fn new<T: Send + Sync + 'static>(lease: T) -> Self {
+        Self(Arc::new(lease))
+    }
+}
+
+impl std::fmt::Debug for StorageRecoveryPermit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("StorageRecoveryPermit(<held>)")
+    }
+}
+
+impl PartialEq for StorageRecoveryPermit {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for StorageRecoveryPermit {}
+
+/// Runtime-neutral asynchronous admission to the bounded retained recovery queue.
+pub type StorageRecoveryAdmission = Arc<
+    dyn Fn() -> Pin<Box<dyn Future<Output = Option<StorageRecoveryPermit>> + Send>> + Send + Sync,
+>;
+
+/// One durable staged object whose PUT/Copy writer acknowledgement was cancelled or ambiguous.
+///
+/// Recovery is serialized through the same metadata writer after the original submission. It may
+/// delete `storage_path` only when the exact immutable row id and path are absent; a committed
+/// write, a later unversioned overwrite, and an acknowledgement lost after commit are therefore
+/// distinguished without guessing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObjectWriteRecovery {
+    /// Intended bucket.
+    pub bucket: BucketName,
+    /// Intended key.
+    pub key: ObjectKey,
+    /// Intended version id, including the null unversioned sentinel.
+    pub version_id: VersionId,
+    /// Immutable id minted for the intended metadata row.
+    pub row_id: String,
+    /// Unique durable blob path returned by staging.
+    pub storage_path: StoragePath,
+    /// Bounded queue slot retained until this record is resolved or discarded.
+    pub permit: Option<StorageRecoveryPermit>,
+}
+
+/// Request-local ownership of a staged object until its exact metadata row commits.
+struct ObjectWriteGuard {
+    recovery: Option<ObjectWriteRecovery>,
+    recover: Option<Arc<dyn Fn(ObjectWriteRecovery) -> bool + Send + Sync>>,
+}
+
+impl ObjectWriteGuard {
+    fn new(
+        recovery: ObjectWriteRecovery,
+        recover: Option<Arc<dyn Fn(ObjectWriteRecovery) -> bool + Send + Sync>>,
+    ) -> Self {
+        Self {
+            recovery: Some(recovery),
+            recover,
+        }
+    }
+
+    /// Queue writer-serialized resolution and disarm only when the retained worker accepted it.
+    fn enqueue_recovery(&mut self) -> bool {
+        let (Some(recovery), Some(recover)) = (&self.recovery, &self.recover) else {
+            return false;
+        };
+        if recover(recovery.clone()) {
+            self.recovery = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn record(&self) -> Option<ObjectWriteRecovery> {
+        self.recovery.clone()
+    }
+
+    fn disarm(&mut self) {
+        self.recovery = None;
+    }
+}
+
+impl Drop for ObjectWriteGuard {
+    fn drop(&mut self) {
+        if let (Some(recovery), Some(recover)) = (self.recovery.take(), &self.recover) {
+            let _ = recover(recovery);
+        }
+    }
+}
+
+/// One durable staged multipart part whose `RecordPart` acknowledgement was cancelled or
+/// ambiguous.
+///
+/// The staging path embeds `attempt_id`, making the exact `(upload, part number, path)` probe safe
+/// against a delayed recovery after a later retry supersedes the same part number.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MultipartPartWriteRecovery {
+    /// Multipart session that owns the attempt.
+    pub upload_id: UploadId,
+    /// S3 part number.
+    pub part_number: u16,
+    /// Fresh identifier used to derive the attempt's deterministic staging artifact.
+    pub attempt_id: String,
+    /// Unique durable path returned by staging.
+    pub storage_path: StoragePath,
+    /// Bounded queue slot retained until this record is resolved or discarded.
+    pub permit: Option<StorageRecoveryPermit>,
+}
+
+/// Request-local ownership of a staged multipart part until `RecordPart` is resolved.
+struct MultipartPartWriteGuard {
+    recovery: Option<MultipartPartWriteRecovery>,
+    recover: Option<Arc<dyn Fn(MultipartPartWriteRecovery) -> bool + Send + Sync>>,
+}
+
+impl MultipartPartWriteGuard {
+    fn new(
+        recovery: MultipartPartWriteRecovery,
+        recover: Option<Arc<dyn Fn(MultipartPartWriteRecovery) -> bool + Send + Sync>>,
+    ) -> Self {
+        Self {
+            recovery: Some(recovery),
+            recover,
+        }
+    }
+
+    fn enqueue_recovery(&mut self) -> bool {
+        let (Some(recovery), Some(recover)) = (&self.recovery, &self.recover) else {
+            return false;
+        };
+        if recover(recovery.clone()) {
+            self.recovery = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn record(&self) -> Option<MultipartPartWriteRecovery> {
+        self.recovery.clone()
+    }
+
+    fn disarm(&mut self) {
+        self.recovery = None;
+    }
+}
+
+impl Drop for MultipartPartWriteGuard {
+    fn drop(&mut self) {
+        if let (Some(recovery), Some(recover)) = (self.recovery.take(), &self.recover) {
+            let _ = recover(recovery);
+        }
+    }
+}
+
+/// Work captured synchronously when a multipart completion attempt is dropped.
+///
+/// `assembled_blob` is present once assembly has returned a durable blob but before the metadata
+/// transaction has installed it. The retained server worker may delete that path only when its
+/// conditional claim release returns `Released`; `NotOwner` can mean completion committed and the
+/// path is now live, unless `delete_blob_on_not_owner` records a typed non-commit proof.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MultipartClaimRecovery {
+    /// The upload whose exact-token `completing` state should be conditionally released.
+    pub upload_id: UploadId,
+    /// The exact completion attempt that may be released.
+    pub claim_token: MultipartClaimToken,
+    /// A durable assembled blob that is not yet known to be referenced by metadata.
+    pub assembled_blob: Option<StoragePath>,
+    /// Whether the request has a typed result proving its assembled blob is unreferenced even if a
+    /// later claim-release attempt returns `NotOwner`.
+    pub delete_blob_on_not_owner: bool,
+    /// Bounded queue slot retained until this record is resolved or discarded.
+    pub permit: Option<StorageRecoveryPermit>,
+}
+
+/// Request-local ownership of a claimed multipart completion.
+///
+/// The protocol crate cannot perform async work from `Drop`, so the server injects a synchronous,
+/// non-blocking callback that queues the conditional writer mutation. Once the writer has made the
+/// ownership terminal, [`disarm`](Self::disarm) prevents a redundant recovery request.
+struct MultipartClaimGuard {
+    upload_id: Option<UploadId>,
+    claim_token: Option<MultipartClaimToken>,
+    assembled_blob: Option<StoragePath>,
+    delete_blob_on_not_owner: bool,
+    permit: Option<StorageRecoveryPermit>,
+    recover: Option<Arc<dyn Fn(MultipartClaimRecovery) -> bool + Send + Sync>>,
+}
+
+impl MultipartClaimGuard {
+    fn new(
+        upload_id: UploadId,
+        claim_token: MultipartClaimToken,
+        permit: Option<StorageRecoveryPermit>,
+        recover: Option<Arc<dyn Fn(MultipartClaimRecovery) -> bool + Send + Sync>>,
+    ) -> Self {
+        Self {
+            upload_id: Some(upload_id),
+            claim_token: Some(claim_token),
+            assembled_blob: None,
+            delete_blob_on_not_owner: false,
+            permit,
+            recover,
+        }
+    }
+
+    /// Remember the durable assembled artifact before reaching any later await.
+    fn track_assembled_blob(&mut self, path: StoragePath) {
+        self.assembled_blob = Some(path);
+        self.delete_blob_on_not_owner = false;
+    }
+
+    /// Record request-local proof that this assembled path was not installed by completion.
+    fn mark_assembled_blob_unreferenced(&mut self) {
+        self.delete_blob_on_not_owner = true;
+    }
+
+    /// Queue this attempt's exact-token release and disarm only when enqueue succeeds.
+    fn enqueue_recovery(&mut self) -> bool {
+        let (Some(upload_id), Some(claim_token), Some(recover)) =
+            (&self.upload_id, &self.claim_token, &self.recover)
+        else {
+            return false;
+        };
+        if recover(MultipartClaimRecovery {
+            upload_id: upload_id.clone(),
+            claim_token: claim_token.clone(),
+            assembled_blob: self.assembled_blob.clone(),
+            delete_blob_on_not_owner: self.delete_blob_on_not_owner,
+            permit: self.permit.clone(),
+        }) {
+            self.upload_id = None;
+            self.claim_token = None;
+            self.assembled_blob = None;
+            self.delete_blob_on_not_owner = false;
+            self.permit = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.upload_id = None;
+        self.claim_token = None;
+        self.assembled_blob = None;
+        self.delete_blob_on_not_owner = false;
+        self.permit = None;
+    }
+
+    /// Prevent a failed callback from being tried again around the direct-writer fallback.
+    ///
+    /// Exact-token releases are replay-safe, but the explicit failure path still needs only one
+    /// recovery attempt; startup recovery handles an unavailable retained worker.
+    fn disable_recovery_callback(&mut self) {
+        self.recover = None;
+    }
+
+    fn take_assembled_blob(&mut self) -> Option<StoragePath> {
+        self.assembled_blob.take()
+    }
+
+    fn take_proven_unreferenced_blob(&mut self) -> Option<StoragePath> {
+        if self.delete_blob_on_not_owner {
+            self.assembled_blob.take()
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for MultipartClaimGuard {
+    fn drop(&mut self) {
+        if let (Some(upload_id), Some(claim_token), Some(recover)) = (
+            self.upload_id.take(),
+            self.claim_token.take(),
+            &self.recover,
+        ) {
+            let _ = recover(MultipartClaimRecovery {
+                upload_id,
+                claim_token,
+                assembled_blob: self.assembled_blob.take(),
+                delete_blob_on_not_owner: self.delete_blob_on_not_owner,
+                permit: self.permit.take(),
+            });
+        }
+    }
+}
 
 /// The S3 protocol service, wiring the storage backends behind the trait spine.
 #[derive(Clone)]
@@ -53,6 +362,7 @@ pub struct S3Service {
     key_provider: Arc<dyn KeyProvider>,
     region: String,
     max_object_size: u64,
+    multipart_limits: MultipartLimits,
     /// Whether every committed object is transparently encrypted at rest even when the client did
     /// not ask for SSE and no bucket default applies (`CAIRN_ENCRYPT_AT_REST`, ARCH 27). When set,
     /// `resolve_object_encryption` mints an `AtRest` DEK for an otherwise-plaintext write — stored
@@ -65,6 +375,20 @@ pub struct S3Service {
     /// runtime dependency. Best-effort and optional: when unset (e.g. in unit tests) the worker
     /// still drains on its heartbeat. See [`with_replication_wake`](Self::with_replication_wake).
     replication_wake: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Synchronously queues recovery of a successfully claimed multipart completion when its
+    /// request future is cancelled or dropped at a later await. The server wires this to one
+    /// retained async worker; keeping only a callback here preserves runtime independence.
+    multipart_claim_recovery: Option<Arc<dyn Fn(MultipartClaimRecovery) -> bool + Send + Sync>>,
+    /// Synchronously queues exact-row/path resolution for a staged PUT/Copy whose request future is
+    /// cancelled before a definitive writer acknowledgement.
+    object_write_recovery: Option<Arc<dyn Fn(ObjectWriteRecovery) -> bool + Send + Sync>>,
+    /// Synchronously queues exact part/path resolution for a staged multipart part whose request
+    /// future is cancelled before a definitive `RecordPart` acknowledgement.
+    multipart_part_write_recovery:
+        Option<Arc<dyn Fn(MultipartPartWriteRecovery) -> bool + Send + Sync>>,
+    /// Async admission to one bounded recovery slot, acquired before any stage/claim that can arm
+    /// a drop guard. Absent for callback-free library embedders and tests.
+    storage_recovery_admission: Option<StorageRecoveryAdmission>,
 }
 
 impl std::fmt::Debug for S3Service {
@@ -99,8 +423,13 @@ impl S3Service {
             key_provider,
             region,
             max_object_size,
+            multipart_limits: MultipartLimits::default(),
             encrypt_at_rest: false,
             replication_wake: None,
+            multipart_claim_recovery: None,
+            object_write_recovery: None,
+            multipart_part_write_recovery: None,
+            storage_recovery_admission: None,
         }
     }
 
@@ -123,6 +452,14 @@ impl S3Service {
         self
     }
 
+    /// Set the active-session and distinct-part cardinality ceilings enforced by the metadata
+    /// writer before multipart bytes reach staging.
+    #[must_use]
+    pub fn with_multipart_limits(mut self, limits: MultipartLimits) -> Self {
+        self.multipart_limits = limits;
+        self
+    }
+
     /// Attach a replication-drain wake callback: after a write commits replication outbox entries
     /// the service invokes it so the worker drains promptly (event-driven) rather than waiting for
     /// its poll heartbeat. Best-effort — a missed wake is covered by the heartbeat.
@@ -132,11 +469,182 @@ impl S3Service {
         self
     }
 
+    /// Attach the non-blocking multipart-claim recovery callback.
+    ///
+    /// The callback is invoked by explicit post-claim failures and by request-future drop after the
+    /// exact-token guard is armed immediately before Claim submission. It can therefore receive a
+    /// harmless recovery attempt even when Claim never committed, as well as one whose commit
+    /// acknowledgement was lost. Production wiring must synchronously enqueue the record for a
+    /// retained worker and return `true` only when the record was accepted; it must not block or
+    /// start detached async work from the drop path.
+    #[must_use]
+    pub fn with_multipart_claim_recovery(
+        mut self,
+        recover: Arc<dyn Fn(MultipartClaimRecovery) -> bool + Send + Sync>,
+    ) -> Self {
+        self.multipart_claim_recovery = Some(recover);
+        self
+    }
+
+    /// Attach the non-blocking staged-object recovery callback.
+    ///
+    /// Production wiring must retain accepted records until a writer-serialized exact-row/path
+    /// probe proves whether the staged blob committed. The callback is invoked from request-future
+    /// `Drop`, so it must synchronously enqueue and never block or start detached work.
+    #[must_use]
+    pub fn with_object_write_recovery(
+        mut self,
+        recover: Arc<dyn Fn(ObjectWriteRecovery) -> bool + Send + Sync>,
+    ) -> Self {
+        self.object_write_recovery = Some(recover);
+        self
+    }
+
+    /// Attach the non-blocking staged multipart-part recovery callback.
+    ///
+    /// Production wiring must retain accepted records until a writer-serialized exact part/path
+    /// probe proves whether `RecordPart` committed. This can run from request-future `Drop`, so it
+    /// must enqueue synchronously without blocking or spawning detached work.
+    #[must_use]
+    pub fn with_multipart_part_write_recovery(
+        mut self,
+        recover: Arc<dyn Fn(MultipartPartWriteRecovery) -> bool + Send + Sync>,
+    ) -> Self {
+        self.multipart_part_write_recovery = Some(recover);
+        self
+    }
+
+    /// Attach bounded admission for every retained storage-commit recovery record.
+    #[must_use]
+    pub fn with_storage_recovery_admission(mut self, admission: StorageRecoveryAdmission) -> Self {
+        self.storage_recovery_admission = Some(admission);
+        self
+    }
+
+    async fn acquire_storage_recovery_permit(&self) -> Result<Option<StorageRecoveryPermit>> {
+        let Some(admission) = &self.storage_recovery_admission else {
+            return Ok(None);
+        };
+        admission()
+            .await
+            .ok_or_else(|| Error::Internal("storage recovery admission is unavailable".to_owned()))
+            .map(Some)
+    }
+
     /// Wake the replication worker (no-op when no callback is attached). Called after a write that
     /// enqueued at least one replication outbox entry.
     fn pulse_replication(&self) {
         if let Some(w) = &self.replication_wake {
             w();
+        }
+    }
+
+    /// Remove a staged blob that is known not to have reached metadata submission. Keep the guard
+    /// armed across the async unlink: request cancellation during deletion falls back to retained
+    /// exact-row/path recovery.
+    async fn discard_unsubmitted_object(&self, path: &StoragePath, guard: &mut ObjectWriteGuard) {
+        if self.blob.delete(path).await.is_ok() {
+            guard.disarm();
+        } else {
+            let _ = guard.enqueue_recovery();
+        }
+    }
+
+    /// Resolve an unexpected or failed PUT/Copy acknowledgement without guessing whether COMMIT
+    /// landed. Production queues this immediately; callback-free test embedders use the same
+    /// writer-serialized probe directly.
+    async fn recover_object_write(&self, guard: &mut ObjectWriteGuard) {
+        if guard.enqueue_recovery() {
+            return;
+        }
+        let Some(recovery) = guard.record() else {
+            return;
+        };
+        let outcome = self
+            .meta
+            .submit(Mutation::ResolveObjectWrite {
+                bucket: recovery.bucket,
+                key: recovery.key,
+                version_id: recovery.version_id,
+                row_id: recovery.row_id,
+                storage_path: recovery.storage_path.clone(),
+            })
+            .await;
+        match outcome {
+            Ok(MutationOutcome::ObjectWriteResolved { referenced: true }) => guard.disarm(),
+            Ok(MutationOutcome::ObjectWriteResolved { referenced: false }) => {
+                if self.blob.delete(&recovery.storage_path).await.is_ok() {
+                    guard.disarm();
+                }
+            }
+            Ok(_) | Err(_) => {
+                // Ambiguous resolution preserves the blob. The still-armed guard retries through
+                // its callback when available; startup reconciliation is the final fallback.
+            }
+        }
+    }
+
+    /// Delete a staged part that definitively has not been submitted, retaining the guard across
+    /// both unlink and reservation release so cancellation at either await is recoverable.
+    async fn discard_unsubmitted_part(&self, guard: &mut MultipartPartWriteGuard) {
+        let Some(recovery) = guard.record() else {
+            return;
+        };
+        if self
+            .blob
+            .delete_part_attempt(
+                &recovery.upload_id,
+                recovery.part_number,
+                &recovery.attempt_id,
+            )
+            .await
+            .is_err()
+        {
+            let _ = guard.enqueue_recovery();
+            return;
+        }
+        if matches!(
+            self.meta
+                .submit(Mutation::ReleaseMultipartReservation {
+                    upload_id: recovery.upload_id,
+                    attempt_id: recovery.attempt_id,
+                })
+                .await,
+            Ok(MutationOutcome::Ack)
+        ) {
+            guard.disarm();
+        } else {
+            let _ = guard.enqueue_recovery();
+        }
+    }
+
+    /// Resolve an ambiguous/cancelled `RecordPart` acknowledgement through the same FIFO writer.
+    async fn recover_multipart_part_write(&self, guard: &mut MultipartPartWriteGuard) {
+        if guard.enqueue_recovery() {
+            return;
+        }
+        let Some(recovery) = guard.record() else {
+            return;
+        };
+        let outcome = self
+            .meta
+            .submit(Mutation::ResolveMultipartPartWrite {
+                upload_id: recovery.upload_id.clone(),
+                part_number: recovery.part_number,
+                storage_path: recovery.storage_path,
+            })
+            .await;
+        match outcome {
+            Ok(MutationOutcome::MultipartPartWriteResolved { referenced: true }) => {
+                guard.disarm();
+            }
+            Ok(MutationOutcome::MultipartPartWriteResolved { referenced: false }) => {
+                self.discard_unsubmitted_part(guard).await;
+            }
+            Ok(_) | Err(_) => {
+                // Preserve the artifact when ownership is ambiguous. The armed guard retries via
+                // the retained callback when available; startup reconciliation is the fallback.
+            }
         }
     }
 
@@ -385,6 +893,10 @@ impl S3Service {
     async fn object_op(&self, req: S3Request, body: cairn_types::BodyStream) -> Result<S3Response> {
         // Authorize centrally against the object resource.
         let action = object_action(&req)?;
+        // Replica classification is the authorization decision, not a second role check in the
+        // handler. A dedicated Member credential may hold only ReplicateObject/ReplicateDelete;
+        // conversely an ordinary PutObject/DeleteObject grant must not make a forged marker work.
+        let is_replica = matches!(action, Action::ReplicateObject | Action::ReplicateDelete);
         let bucket = self.fetch_bucket(&req).await?;
         let key = req.key.clone().ok_or(Error::NoSuchKey)?;
         // When the request names a `?versionId`, gate version-scoped policy conditions
@@ -446,9 +958,9 @@ impl S3Service {
             // not serve — must never fall through to a data-plane handler (a `PUT object?acl` or
             // `PUT object?attributes` must not overwrite the object body). Answer NotImplemented.
             _ if unhandled_object_subresource(&req) => Err(Error::NotImplemented),
-            Method::PUT => self.put_object(req, body).await,
+            Method::PUT => self.put_object(req, body, is_replica).await,
             Method::GET => self.get_object(&req).await,
-            Method::DELETE => self.delete_object(&req).await,
+            Method::DELETE => self.delete_object(&req, is_replica).await,
             _ => Err(Error::NotImplemented),
         }
     }
@@ -468,9 +980,15 @@ impl S3Service {
         let name = req.bucket.clone().expect("bucket present");
         // Object Lock can only be turned on at creation (S3 semantics): `x-amz-bucket-object-lock-enabled`
         // forces versioning Enabled and stores an enabled (no default-retention) lock config.
-        let object_lock = req
-            .header("x-amz-bucket-object-lock-enabled")
-            .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+        let object_lock = match req.header("x-amz-bucket-object-lock-enabled") {
+            None => false,
+            Some(value) if value.eq_ignore_ascii_case("true") => true,
+            Some(_) => {
+                return Err(Error::InvalidArgument(
+                    "x-amz-bucket-object-lock-enabled must be true when present".to_owned(),
+                ));
+            }
+        };
         let bucket = Bucket {
             name: name.clone(),
             owner_id: principal.user_id.clone(),
@@ -484,32 +1002,18 @@ impl S3Service {
             region: self.region.clone(),
             compression: None,
         };
-        match self
-            .meta
-            .submit(Mutation::CreateBucket(Box::new(bucket)))
-            .await
-        {
-            Ok(_) => {
-                if object_lock {
-                    let config = ObjectLockConfiguration {
-                        enabled: true,
-                        default_retention: None,
-                    };
-                    let text = serde_json::to_string(&config).map_err(|_| {
-                        Error::Internal("config (de)serialization failed".to_owned())
-                    })?;
-                    self.meta
-                        .submit(Mutation::SetBucketConfig {
-                            bucket: name.clone(),
-                            aspect: ConfigAspect::ObjectLock,
-                            doc: Some(ConfigDoc(text)),
-                        })
-                        .await?;
-                }
-                Ok(S3Response::status(StatusCode::OK)
-                    .with_header("location", format!("/{}", name.as_str()))
-                    .with_header("x-amz-request-id", &req.request_id))
-            }
+        let mutation = if object_lock {
+            Mutation::CreateObjectLockBucket(Box::new(bucket))
+        } else {
+            Mutation::CreateBucket(Box::new(bucket))
+        };
+        match self.meta.submit(mutation).await {
+            Ok(MutationOutcome::Ack) => Ok(S3Response::status(StatusCode::OK)
+                .with_header("location", format!("/{}", name.as_str()))
+                .with_header("x-amz-request-id", &req.request_id)),
+            Ok(_) => Err(Error::Internal(
+                "unexpected create-bucket mutation outcome".to_owned(),
+            )),
             Err(cairn_types::MetaError::Conflict) => Err(Error::BucketAlreadyOwnedByYou),
             Err(e) => Err(e.into()),
         }
@@ -643,9 +1147,17 @@ impl S3Service {
         &self,
         req: S3Request,
         raw_body: cairn_types::BodyStream,
+        is_replica: bool,
     ) -> Result<S3Response> {
         let bucket = self.fetch_bucket(&req).await?;
         let key = req.key.clone().expect("key present");
+        let intent_validation_now = self.clock.now();
+
+        // Parse all explicit WORM state before touching the filesystem. Bucket defaults remain a
+        // Writer-time decision so a concurrent configuration update has one serial outcome.
+        let lock_intent = self
+            .explicit_object_lock_intent(&req, &bucket.name, intent_validation_now)
+            .await?;
 
         if let Some(cl) = req
             .header("content-length")
@@ -692,10 +1204,8 @@ impl S3Service {
         // Reject an invalid inline tag set up front — before any blob is staged — so a bad
         // `x-amz-tagging` header (over the limit, bad charset, duplicate/aws: key) returns
         // `InvalidTag` without leaving an orphaned staged blob (ARCH 17.1).
-        cairn_xml::validate_tags(
-            &parse_tagging_header(req.header("x-amz-tagging")),
-            cairn_xml::MAX_TAGS_OBJECT,
-        )?;
+        let initial_tags = parse_tagging_header(req.header("x-amz-tagging"));
+        cairn_xml::validate_tags(&initial_tags, cairn_xml::MAX_TAGS_OBJECT)?;
 
         // De-frame SigV4 streaming bodies (the F-5 fix); plain bodies pass through. A signed
         // sentinel selects the signature-verifying decoder seeded from the principal's context.
@@ -704,20 +1214,12 @@ impl S3Service {
 
         // An inbound replica is a PUT carrying `x-amz-meta-cairn-replica: true` (ARCH 20.4): mark
         // the version a `Replica` so it is never re-replicated, and skip the outbox entirely (loop
-        // prevention). The marker is matched case-insensitively on the value. Only a privileged
-        // replication principal may classify a write as an inbound replica (audit #16): honoring the
-        // bare client header would let any writer mark their write a `Replica` to suppress its own
-        // replication or otherwise downgrade how it is handled. Replication ships under the
-        // destination's Administrator-role credential, so gate the marker on that role; a normal
-        // member's header is ignored and the write replicates normally. Computed up here because the
-        // mandatory-encryption decision below treats a replica differently from a client write.
-        let is_replica = req
-            .header("x-amz-meta-cairn-replica")
-            .is_some_and(|v| v.eq_ignore_ascii_case("true"))
-            && req
-                .principal
-                .as_ref()
-                .is_some_and(|p| p.role == Role::Administrator);
+        // prevention). Only a principal authorized for ReplicateObject may reach this handler with
+        // `is_replica=true` (audit #16): the central classifier maps an exact marker-bearing body
+        // PUT to that distinct action before authorization. An ordinary PutObject grant therefore
+        // cannot suppress replication, while a least-privilege Member replication credential works.
+        // This is resolved before the SSE decision because mandatory encryption treats replicas
+        // differently from client writes.
 
         // SSE-S3 (ARCH 27): when the client requests AES256 server-side encryption, mint a fresh
         // random DEK, hand it to the blob store (which compress-then-encrypts each block), and seal
@@ -768,17 +1270,47 @@ impl S3Service {
             encryption: sse_dek,
             content_length,
         };
+        let recovery_permit = self.acquire_storage_recovery_permit().await?;
         let mut staged = self
             .blob
             .stage(&bucket.name, body, opts)
             .await
             .map_err(map_stage_err)?;
 
+        let versioned = bucket.versioning == VersioningState::Enabled;
+        // Preserve the SOURCE version id for an inbound replica (AWS S3 CRR semantics, ARCH 20.4):
+        // a version then has the same identity on every node, and re-delivery is an idempotent
+        // upsert on (bucket, key, version_id) rather than a duplicate version. Gated on the same
+        // ReplicateObject-authorized classification, so a normal client can never pin an arbitrary
+        // id.
+        let version_id = if !versioned {
+            VersionId::null()
+        } else {
+            replica_version_id(&req, is_replica).unwrap_or_else(VersionId::generate)
+        };
+        let row_id = uuid::Uuid::new_v4().simple().to_string();
+        // From the first instruction after `stage` returns until the writer transaction commits,
+        // request cancellation owns an exact recovery record. The retained worker serializes its
+        // probe behind this put if submission reached the writer; it never deletes on an ambiguous
+        // result.
+        let mut write_guard = ObjectWriteGuard::new(
+            ObjectWriteRecovery {
+                bucket: bucket.name.clone(),
+                key: key.clone(),
+                version_id: version_id.clone(),
+                row_id: row_id.clone(),
+                storage_path: staged.storage_path.clone(),
+                permit: recovery_permit,
+            },
+            self.object_write_recovery.clone(),
+        );
+
         // Verify any client-supplied Content-MD5 (decoded above, before staging) against the computed
         // plaintext MD5. A genuine mismatch is a post-stage failure, so delete the staged blob first.
         if let Some(want) = &content_md5 {
             if hex::decode(staged.md5_hex.as_bytes()).ok().as_deref() != Some(want.as_slice()) {
-                let _ = self.blob.delete(&staged.storage_path).await;
+                self.discard_unsubmitted_object(&staged.storage_path, &mut write_guard)
+                    .await;
                 return Err(Error::BadDigest);
             }
         }
@@ -796,7 +1328,8 @@ impl S3Service {
                 })
                 .map(hex::encode);
             if got_hex.as_deref() != Some(want_hex.as_str()) {
-                let _ = self.blob.delete(&staged.storage_path).await;
+                self.discard_unsubmitted_object(&staged.storage_path, &mut write_guard)
+                    .await;
                 return Err(Error::BadDigest);
             }
             // Drop the verification-only checksum so it is not persisted/advertised unless the
@@ -810,22 +1343,21 @@ impl S3Service {
 
         // Verify any client-supplied x-amz-checksum-* against the computed checksum (21.1).
         if let Err(e) = verify_client_checksums(&req, &staged.checksums) {
-            let _ = self.blob.delete(&staged.storage_path).await;
+            self.discard_unsubmitted_object(&staged.storage_path, &mut write_guard)
+                .await;
             return Err(e);
         }
 
-        let versioned = bucket.versioning == VersioningState::Enabled;
+        // Retention starts when the version is ready to commit, not when a potentially long body
+        // upload began. The Writer resolves the then-current bucket default from this timestamp and
+        // also re-validates explicit retention against it, so time spent staging can neither shorten
+        // default WORM protection nor let an explicit deadline expire before the object is visible.
         let now = self.clock.now();
         // An inbound replica is a PUT carrying `x-amz-meta-cairn-replica: true` (ARCH 20.4): mark
         // the version a `Replica` so it is never re-replicated, and skip the outbox entirely (loop
-        // prevention). The marker is matched case-insensitively on the value.
-        // Only a privileged replication principal may classify a write as an inbound replica
-        // (audit #16). Honoring the bare client header would let any writer mark their write a
-        // `Replica` to suppress its own replication (skip the outbox) or otherwise downgrade how
-        // it is handled. Replication ships under the destination's Administrator-role credential,
-        // so gate the marker on that role; a normal member's header is ignored and the write
-        // `is_replica` was resolved before the SSE decision above (mandatory encryption treats a
-        // replica differently); reuse it here for the replication status + version-id handling.
+        // prevention). `is_replica` was resolved by the authorize-vs-dispatch classifier before the
+        // SSE decision above; reuse that ReplicateObject-authorized capability for status and
+        // version-id handling.
         let replication_status =
             is_replica.then_some(cairn_types::meta::ReplicationStatus::Replica);
         // Resolve the object ACL. A normal client PUT honors a canned `x-amz-acl`; an inbound replica
@@ -842,20 +1374,11 @@ impl S3Service {
             req.header("x-amz-acl")
                 .and_then(|canned| cairn_authz::expand_canned_acl(canned, &bucket.owner_id))
         };
-        // Preserve the SOURCE version id for an inbound replica (AWS S3 CRR semantics, ARCH 20.4):
-        // a version then has the same identity on every node, and re-delivery is an idempotent
-        // upsert on (bucket, key, version_id) rather than a duplicate version. Gated on the same
-        // admin-only replica classification, so a normal client can never pin an arbitrary id.
-        let version_id = if !versioned {
-            VersionId::null()
-        } else {
-            replica_version_id(&req, is_replica).unwrap_or_else(VersionId::generate)
-        };
         // The system response headers (ARCH 13.4) are stored verbatim from the request — except
         // `content-encoding`, which is normalized to strip the `aws-chunked` transfer coding.
         let header_owned = |name: &str| req.header(name).map(str::to_owned);
         let row = ObjectVersionRow {
-            id: uuid::Uuid::new_v4().simple().to_string(),
+            id: row_id,
             bucket: bucket.name.clone(),
             key: key.clone(),
             version_id: version_id.clone(),
@@ -891,13 +1414,12 @@ impl S3Service {
         let replication = if is_replica {
             Vec::new()
         } else {
-            let inline_tags = parse_tagging_header(req.header("x-amz-tagging"));
             self.replication_outbox(
                 &bucket,
                 &key,
                 &version_id,
                 ReplicationOp::ObjectCreate,
-                &inline_tags,
+                &initial_tags,
             )
             .await
         };
@@ -907,6 +1429,10 @@ impl S3Service {
             .submit(Mutation::PutObjectVersion {
                 row: Box::new(row),
                 precondition: precond,
+                initial_state: InitialObjectState {
+                    tags: initial_tags,
+                    lock_intent,
+                },
                 replication,
             })
             .await
@@ -915,6 +1441,9 @@ impl S3Service {
                 superseded,
                 version_id,
             }) => {
+                // The metadata commit now owns the blob. Disarm before any best-effort post-commit
+                // await so cancellation can never enqueue cleanup for a live object.
+                write_guard.disarm();
                 // Event-driven drain: wake the replication worker now rather than next heartbeat.
                 if enqueued_repl {
                     self.pulse_replication();
@@ -922,24 +1451,6 @@ impl S3Service {
                 if let Some(old) = superseded {
                     let _ = self.blob.delete(&old).await;
                 }
-                // Persist the inline `x-amz-tagging` header as the object's initial tag set
-                // (ARCH 17.1, Medium #5). Tags are a separate mutation; commit them after the
-                // object version exists so they attach to the just-written version.
-                let initial_tags = parse_tagging_header(req.header("x-amz-tagging"));
-                if !initial_tags.is_empty() {
-                    let _ = self
-                        .meta
-                        .submit(Mutation::PutObjectTags {
-                            bucket: bucket.name.clone(),
-                            key: key.clone(),
-                            version_id: version_id.clone(),
-                            tags: initial_tags,
-                        })
-                        .await;
-                }
-                // Stamp Object Lock retention / legal hold onto the new version (default or header).
-                self.apply_object_lock_on_put(&req, &bucket, &key, &version_id, now)
-                    .await?;
                 // Emit an ObjectCreated:Put event notification (best-effort).
                 self.emit_events(
                     &bucket.name,
@@ -976,12 +1487,12 @@ impl S3Service {
                 Ok(resp)
             }
             Ok(_) => {
-                let _ = self.blob.delete(&staged.storage_path).await;
+                self.recover_object_write(&mut write_guard).await;
                 Err(Error::Internal("unexpected put outcome".to_owned()))
             }
             Err(e) => {
-                let _ = self.blob.delete(&staged.storage_path).await;
-                Err(e.into())
+                self.recover_object_write(&mut write_guard).await;
+                Err(map_object_commit_error(e, lock_intent, now))
             }
         }
     }
@@ -996,20 +1507,15 @@ impl S3Service {
         }
         let range = parse_range(req.header("range"), row.size_logical)?;
         let storage = row.storage_path.clone().ok_or(Error::NoSuchKey)?;
-        // SSE-S3 (ARCH 27): if the version is encrypted, unwrap its DEK under the master key and
-        // decrypt transparently while reading. An unencrypted version passes `None`.
-        let dek = match row.sse_descriptor.as_deref() {
-            Some(d) => Some(self.open_sse_dek(d)?),
-            None => None,
+        // SSE-S3 (ARCH 27): resolve both the DEK and the persisted CRNB format expectation before
+        // reading. An unencrypted version is explicitly known plaintext.
+        let cipher = match row.sse_descriptor.as_deref() {
+            Some(d) => self.open_sse_cipher(d)?,
+            None => cairn_types::blob::BlobCipher::KnownPlaintext,
         };
         let handle = self
             .blob
-            .open_raw(
-                &storage,
-                range,
-                cairn_types::blob::BlobCipher::from_dek(dek),
-                &row.compression,
-            )
+            .open_raw(&storage, range, cipher, &row.compression, row.size_logical)
             .await?;
         let status = if handle.content_range.is_some() {
             StatusCode::PARTIAL_CONTENT
@@ -1095,7 +1601,7 @@ impl S3Service {
         Ok(resp)
     }
 
-    async fn delete_object(&self, req: &S3Request) -> Result<S3Response> {
+    async fn delete_object(&self, req: &S3Request, is_replica: bool) -> Result<S3Response> {
         let bucket = self.fetch_bucket(req).await?;
         let key = req.key.clone().expect("key present");
         // A copy kept for event-notification emission, since `key` is moved into the mutation below.
@@ -1104,19 +1610,8 @@ impl S3Service {
         // An inbound replicated delete-marker propagation carries the loop-prevention marker; the
         // marker it creates must NOT itself be re-enqueued for replication (ARCH 20.4), which
         // matters for two-way replication where the destination bucket also has a rule.
-        // Only a privileged replication principal may classify a write as an inbound replica
-        // (audit #16). Honoring the bare client header would let any writer mark their write a
-        // `Replica` to suppress its own replication (skip the outbox) or otherwise downgrade how
-        // it is handled. Replication ships under the destination's Administrator-role credential,
-        // so gate the marker on that role; a normal member's header is ignored and the write
-        // replicates normally.
-        let is_replica = req
-            .header("x-amz-meta-cairn-replica")
-            .is_some_and(|v| v.eq_ignore_ascii_case("true"))
-            && req
-                .principal
-                .as_ref()
-                .is_some_and(|p| p.role == Role::Administrator);
+        // Only a principal centrally authorized for ReplicateDelete reaches this handler with
+        // `is_replica=true`; an ordinary DeleteObject grant cannot forge loop-prevention state.
 
         // A versioned DELETE (?versionId) permanently removes that version (no delete marker). A
         // plain DELETE in an Enabled bucket inserts a new identified delete marker; in a Suspended
@@ -1125,9 +1620,8 @@ impl S3Service {
         // Unversioned bucket it removes the sentinel version.
         if let Some(vid) = req.query("versionId") {
             let version_id = VersionId::from_string(vid.to_owned());
-            // Object Lock: a version still under retention or legal hold cannot be permanently
-            // deleted (a `?versionId` DELETE is the only permanent-removal path for objects).
-            self.enforce_unlocked_for_delete(req, &bucket, &key, &version_id, now)
+            let bypass = self
+                .governance_bypass_capability(req, &bucket, &key, &version_id)
                 .await?;
             // S3 reports on a version-scoped DELETE whether the version it permanently removed was
             // itself a delete marker (`x-amz-delete-marker`). Read that BEFORE the mutation — the
@@ -1146,14 +1640,28 @@ impl S3Service {
                     bucket: bucket.name.clone(),
                     key,
                     version_id,
+                    expected_row_id: None,
                     expected_updated_at: None,
+                    require_sole_key_version: false,
+                    now,
+                    bypass,
                 })
-                .await?;
-            if let MutationOutcome::Deleted {
-                freed: Some(path), ..
-            } = outcome
-            {
-                let _ = self.blob.delete(&path).await;
+                .await;
+            match outcome {
+                Ok(MutationOutcome::Deleted {
+                    freed: Some(path), ..
+                }) => {
+                    let _ = self.blob.delete(&path).await;
+                }
+                Ok(MutationOutcome::Deleted { freed: None, .. })
+                | Ok(MutationOutcome::DeleteNotApplied) => {}
+                Ok(MutationOutcome::DeleteProtected) => return Err(Error::AccessDenied),
+                Ok(_) => {
+                    return Err(Error::Internal(
+                        "unexpected delete-version mutation outcome".to_owned(),
+                    ));
+                }
+                Err(error) => return Err(error.into()),
             }
             self.emit_events(
                 &bucket.name,
@@ -1196,6 +1704,7 @@ impl S3Service {
                         .submit(Mutation::PutObjectVersion {
                             row: Box::new(replica_marker_row(&bucket, &key, &marker_id, now)),
                             precondition: Precondition::default(),
+                            initial_state: InitialObjectState::default(),
                             replication: Vec::new(),
                         })
                         .await?;
@@ -1217,6 +1726,8 @@ impl S3Service {
                             version_id: marker_id.clone(),
                             owner_id: bucket.owner_id.clone(),
                             now,
+                            bypass: GovernanceBypass::Denied,
+                            expected_current: None,
                             replication,
                         })
                         .await?;
@@ -1250,23 +1761,9 @@ impl S3Service {
                     .with_header("x-amz-request-id", &req.request_id))
             }
             VersioningState::Suspended => {
-                // Replace any existing null version with a NULL-version delete marker. Removing the
-                // null version first keeps a single null entry per key without disturbing older
-                // identified versions, and avoids a unique-constraint conflict on the insert.
-                if let Ok(MutationOutcome::Deleted {
-                    freed: Some(path), ..
-                }) = self
-                    .meta
-                    .submit(Mutation::DeleteVersion {
-                        bucket: bucket.name.clone(),
-                        key: key.clone(),
-                        version_id: VersionId::null(),
-                        expected_updated_at: None,
-                    })
-                    .await
-                {
-                    let _ = self.blob.delete(&path).await;
-                }
+                let bypass = self
+                    .governance_bypass_capability(req, &bucket, &key, &VersionId::null())
+                    .await?;
                 // A Suspended bucket inserts a NULL-version marker; replication requires
                 // Enabled versioning, so `replication_outbox` returns None here by construction.
                 let replication = self
@@ -1278,16 +1775,34 @@ impl S3Service {
                         &[],
                     )
                     .await;
-                self.meta
+                let outcome = self
+                    .meta
                     .submit(Mutation::CreateDeleteMarker {
                         bucket: bucket.name.clone(),
                         key,
                         version_id: VersionId::null(),
                         owner_id: bucket.owner_id.clone(),
                         now,
+                        bypass,
+                        expected_current: None,
                         replication,
                     })
-                    .await?;
+                    .await;
+                match outcome {
+                    Ok(MutationOutcome::DeleteMarker {
+                        freed: Some(path), ..
+                    }) => {
+                        let _ = self.blob.delete(&path).await;
+                    }
+                    Ok(MutationOutcome::DeleteMarker { freed: None, .. }) => {}
+                    Ok(MutationOutcome::DeleteProtected) => return Err(Error::AccessDenied),
+                    Ok(_) => {
+                        return Err(Error::Internal(
+                            "unexpected delete-marker mutation outcome".to_owned(),
+                        ));
+                    }
+                    Err(error) => return Err(error.into()),
+                }
                 self.emit_events(
                     &bucket.name,
                     &event_key,
@@ -1312,20 +1827,37 @@ impl S3Service {
                     .with_header("x-amz-request-id", &req.request_id))
             }
             VersioningState::Unversioned => {
+                let bypass = self
+                    .governance_bypass_capability(req, &bucket, &key, &VersionId::null())
+                    .await?;
                 let outcome = self
                     .meta
                     .submit(Mutation::DeleteVersion {
                         bucket: bucket.name.clone(),
                         key,
                         version_id: VersionId::null(),
+                        expected_row_id: None,
                         expected_updated_at: None,
+                        require_sole_key_version: false,
+                        now,
+                        bypass,
                     })
-                    .await?;
-                if let MutationOutcome::Deleted {
-                    freed: Some(path), ..
-                } = outcome
-                {
-                    let _ = self.blob.delete(&path).await;
+                    .await;
+                match outcome {
+                    Ok(MutationOutcome::Deleted {
+                        freed: Some(path), ..
+                    }) => {
+                        let _ = self.blob.delete(&path).await;
+                    }
+                    Ok(MutationOutcome::Deleted { freed: None, .. })
+                    | Ok(MutationOutcome::DeleteNotApplied) => {}
+                    Ok(MutationOutcome::DeleteProtected) => return Err(Error::AccessDenied),
+                    Ok(_) => {
+                        return Err(Error::Internal(
+                            "unexpected unversioned delete mutation outcome".to_owned(),
+                        ));
+                    }
+                    Err(error) => return Err(error.into()),
                 }
                 self.emit_events(
                     &bucket.name,
@@ -1374,11 +1906,140 @@ impl S3Service {
         }
     }
 
+    /// Restore a completion-owned session to `active` after a genuine post-claim failure.
+    ///
+    /// The conditional transition runs on the metadata writer. If ownership has disappeared, do
+    /// not surface the original error as though this request still controlled the upload.
+    async fn multipart_failure_after_claim(
+        &self,
+        upload_id: &UploadId,
+        claim_token: &MultipartClaimToken,
+        error: Error,
+        claim_guard: &mut MultipartClaimGuard,
+    ) -> Error {
+        // Production uses the retained server queue for both explicit errors and cancellation.
+        // The persisted token makes delayed or duplicate release attempts harmless to newer owners.
+        // Tests/alternate embedders without a callback, or a failed enqueue after worker loss,
+        // retain the direct writer fallback below.
+        if claim_guard.enqueue_recovery() {
+            return error;
+        }
+        claim_guard.disable_recovery_callback();
+        match self
+            .meta
+            .submit(Mutation::ReleaseMultipartClaim {
+                upload_id: upload_id.clone(),
+                claim_token: claim_token.clone(),
+            })
+            .await
+        {
+            Ok(MutationOutcome::MultipartClaimRelease(ClaimReleaseOutcome::Released)) => {
+                // A confirmed release proves a tracked assembled blob was never installed. This is
+                // only the callback-unavailable fallback; production cleanup runs in the retained
+                // worker from the queued recovery record.
+                if let Some(path) = claim_guard.take_assembled_blob() {
+                    let _ = self.blob.delete(&path).await;
+                }
+                claim_guard.disarm();
+                error
+            }
+            Ok(MutationOutcome::MultipartClaimRelease(ClaimReleaseOutcome::NotOwner)) => {
+                if let Some(path) = claim_guard.take_proven_unreferenced_blob() {
+                    let _ = self.blob.delete(&path).await;
+                }
+                claim_guard.disarm();
+                Error::NoSuchUpload
+            }
+            Ok(_) => Error::Internal("unexpected multipart claim-release outcome".to_owned()),
+            Err(release) => release.into(),
+        }
+    }
+
+    /// Recover an ownership attempt whose Claim writer acknowledgement was lost.
+    ///
+    /// `NotOwner` is harmless here: it can mean the Claim never reached the writer. Preserve the
+    /// original metadata error rather than translating that outcome into `NoSuchUpload`.
+    async fn multipart_claim_submit_failure(
+        &self,
+        upload_id: &UploadId,
+        claim_token: &MultipartClaimToken,
+        error: Error,
+        claim_guard: &mut MultipartClaimGuard,
+    ) -> Error {
+        if claim_guard.enqueue_recovery() {
+            return error;
+        }
+        claim_guard.disable_recovery_callback();
+        let outcome = self
+            .meta
+            .submit(Mutation::ReleaseMultipartClaim {
+                upload_id: upload_id.clone(),
+                claim_token: claim_token.clone(),
+            })
+            .await;
+        if matches!(
+            outcome,
+            Ok(MutationOutcome::MultipartClaimRelease(
+                ClaimReleaseOutcome::Released | ClaimReleaseOutcome::NotOwner
+            ))
+        ) {
+            claim_guard.disarm();
+        }
+        error
+    }
+
+    async fn reclaim_part_attempt(&self, upload_id: &UploadId, part_number: u16, attempt_id: &str) {
+        if self
+            .blob
+            .delete_part_attempt(upload_id, part_number, attempt_id)
+            .await
+            .is_ok()
+        {
+            let _ = self
+                .meta
+                .submit(Mutation::ReleaseMultipartReservation {
+                    upload_id: upload_id.clone(),
+                    attempt_id: attempt_id.to_owned(),
+                })
+                .await;
+        }
+    }
+
+    async fn reclaim_multipart_cleanup(&self, cleanup: &MultipartCleanup) {
+        let Some(path) = &cleanup.storage_path else {
+            return;
+        };
+        if self.blob.delete(path).await.is_ok() {
+            let _ = self
+                .meta
+                .submit(Mutation::ReleaseMultipartCleanup {
+                    cleanup_id: cleanup.id.clone(),
+                })
+                .await;
+        }
+    }
+
+    async fn reclaim_multipart_session(&self, upload_id: &UploadId) {
+        if self.blob.delete_session(upload_id).await.is_ok() {
+            let _ = self
+                .meta
+                .submit(Mutation::ReleaseMultipartUploadCleanups {
+                    upload_id: upload_id.clone(),
+                })
+                .await;
+        }
+    }
+
     async fn create_multipart(&self, req: &S3Request) -> Result<S3Response> {
         let bucket = self.fetch_bucket(req).await?;
         let key = req.key.clone().expect("key present");
         let upload_id = UploadId::generate();
         let now = self.clock.now();
+        let lock_intent = self
+            .explicit_object_lock_intent(req, &bucket.name, now)
+            .await?;
+        let initial_tags = parse_tagging_header(req.header("x-amz-tagging"));
+        cairn_xml::validate_tags(&initial_tags, cairn_xml::MAX_TAGS_OBJECT)?;
         // Capture the SSE intent now (ARCH 27): the `CompleteMultipartUpload` request carries no SSE
         // header, so an explicit `x-amz-server-side-encryption` here is recorded on the session and
         // applied at assembly, mirroring a single-part PUT. The bucket default (including a KMS
@@ -1430,8 +2091,14 @@ impl S3Service {
                 .to_owned(),
             status: cairn_types::meta::MultipartStatus::Active,
             owner_id: bucket.owner_id.clone(),
+            initiated_by: req.principal.as_ref().map_or_else(
+                || bucket.owner_id.clone(),
+                |principal| principal.user_id.clone(),
+            ),
             intended_acl: None,
             user_metadata: user_metadata(req),
+            initial_tags,
+            lock_intent,
             sse_requested: want_sse,
             encrypt_parts,
             sse_kms_requested,
@@ -1446,7 +2113,10 @@ impl S3Service {
         // upload on the wrong shard (audit #4).
         let upload_id = match self
             .meta
-            .submit(Mutation::CreateMultipart(Box::new(session)))
+            .submit(Mutation::CreateMultipart {
+                session: Box::new(session),
+                limits: self.multipart_limits,
+            })
             .await?
         {
             MutationOutcome::MultipartCreated(id) => id,
@@ -1485,6 +2155,7 @@ impl S3Service {
         let session = self
             .scoped_multipart(&upload_id, &bucket.name, &key)
             .await?;
+        let declared_size = declared_multipart_size(&req, self.max_object_size)?;
         // Compute any supplementary checksum the client requested over this part's plaintext, so a
         // client `x-amz-checksum-*` header can be validated and the per-part digest persisted for
         // composition at CompleteMultipartUpload. Exactly one algorithm may be requested per part —
@@ -1520,29 +2191,66 @@ impl S3Service {
         // under the master ring BEFORE `stage_part` so no fallible step follows staging — a seal error
         // returns with nothing staged to reclaim (the no-orphan invariant). The raw DEK is passed to
         // the stager; the sealed form is persisted on the part record and reopened at Complete.
-        let (part_dek, part_dek_sealed): (Option<[u8; 32]>, Option<String>) =
+        let (part_dek, part_dek_sealed): (Option<SecretKey32>, Option<String>) =
             if session.encrypt_parts {
                 use rand::RngCore;
                 let mut dek = [0u8; 32];
                 rand::thread_rng().fill_bytes(&mut dek);
-                let sealed = self.seal_part_dek(&dek)?;
+                let dek = SecretKey32::new(dek);
+                let sealed = self.seal_part_cipher(&dek)?;
                 (Some(dek), Some(sealed))
             } else {
                 (None, None)
             };
         let body = streaming_body(&req, raw_body, self.max_object_size)?;
-        let mut staged = self
+        let attempt_id = uuid::Uuid::new_v4().simple().to_string();
+        let recovery_permit = self.acquire_storage_recovery_permit().await?;
+        self.meta
+            .submit(Mutation::ReserveMultipartPart {
+                upload_id: upload_id.clone(),
+                part_number,
+                attempt_id: attempt_id.clone(),
+                reserved_bytes: declared_size,
+                max_parts_per_upload: self.multipart_limits.max_parts_per_upload,
+                now: self.clock.now(),
+            })
+            .await?;
+        let mut staged = match self
             .blob
             .stage_part(
                 &upload_id,
                 part_number,
+                &attempt_id,
                 body,
                 stage_checksums,
-                self.max_object_size,
+                declared_size,
                 part_dek,
             )
             .await
-            .map_err(map_stage_err)?;
+        {
+            Ok(staged) => staged,
+            Err(error) => {
+                self.reclaim_part_attempt(&upload_id, part_number, &attempt_id)
+                    .await;
+                return Err(map_stage_err(error));
+            }
+        };
+        let mut part_guard = MultipartPartWriteGuard::new(
+            MultipartPartWriteRecovery {
+                upload_id: upload_id.clone(),
+                part_number,
+                attempt_id: attempt_id.clone(),
+                storage_path: staged.storage_path.clone(),
+                permit: recovery_permit,
+            },
+            self.multipart_part_write_recovery.clone(),
+        );
+        if staged.size != declared_size {
+            self.discard_unsubmitted_part(&mut part_guard).await;
+            return Err(Error::InvalidRequest(
+                "multipart part body length did not match its declared length".to_owned(),
+            ));
+        }
         // Verify the signed SHA-256 (derived above) against the part body just staged — over the
         // PLAINTEXT bytes the client signed (`stage_part` hashes before any at-rest encrypt). A
         // mismatch is a BadDigest, and the staged part is deleted BEFORE returning (the no-orphan
@@ -1560,7 +2268,7 @@ impl S3Service {
                 })
                 .map(hex::encode);
             if got_hex.as_deref() != Some(want_hex.as_str()) {
-                let _ = self.blob.delete(&staged.storage_path).await;
+                self.discard_unsubmitted_part(&mut part_guard).await;
                 return Err(Error::BadDigest);
             }
             if !store_sha256 {
@@ -1573,7 +2281,7 @@ impl S3Service {
         // a BadDigest, and the just-staged part must be deleted BEFORE returning so a rejected upload
         // leaves no orphan (the no-orphan invariant every post-`stage` early return honors).
         if let Err(e) = verify_client_checksums(&req, &staged.checksums) {
-            let _ = self.blob.delete(&staged.storage_path).await;
+            self.discard_unsubmitted_part(&mut part_guard).await;
             return Err(e);
         }
         let part = cairn_types::meta::PartRecord {
@@ -1585,14 +2293,37 @@ impl S3Service {
             checksum: staged.checksums.first().cloned(),
             part_dek: part_dek_sealed,
         };
-        if let MutationOutcome::PartRecorded {
-            superseded: Some(old),
-        } = self
+        let outcome = match self
             .meta
-            .submit(Mutation::RecordPart { upload_id, part })
-            .await?
+            .submit(Mutation::RecordPart {
+                upload_id: upload_id.clone(),
+                attempt_id: attempt_id.clone(),
+                part,
+            })
+            .await
         {
-            let _ = self.blob.delete(&old).await;
+            Ok(outcome) => outcome,
+            Err(error) => {
+                // The writer may have rejected the mutation, or committed it and lost the
+                // acknowledgement. Resolve the exact path in FIFO writer order before deletion.
+                self.recover_multipart_part_write(&mut part_guard).await;
+                return Err(error.into());
+            }
+        };
+        match outcome {
+            MutationOutcome::PartRecorded {
+                cleanup: Some(cleanup),
+            } => {
+                part_guard.disarm();
+                self.reclaim_multipart_cleanup(&cleanup).await;
+            }
+            MutationOutcome::PartRecorded { cleanup: None } => part_guard.disarm(),
+            _ => {
+                self.recover_multipart_part_write(&mut part_guard).await;
+                return Err(Error::Internal(
+                    "unexpected multipart part outcome".to_owned(),
+                ));
+            }
         }
         let mut resp = S3Response::status(StatusCode::OK)
             .with_header("etag", format!("\"{}\"", staged.md5_hex))
@@ -1688,19 +2419,24 @@ impl S3Service {
         // Open the source range and feed its logical bytes into the part stager, re-tagging blob
         // read errors as body errors so the source can drive `stage_part`. An SSE-encrypted source
         // is decrypted transparently via its unwrapped DEK (ARCH 27).
-        let src_dek = match src_row.sse_descriptor.as_deref() {
-            Some(d) => Some(self.open_sse_dek(d)?),
-            None => None,
+        let src_cipher = match src_row.sse_descriptor.as_deref() {
+            Some(d) => self.open_sse_cipher(d)?,
+            None => cairn_types::blob::BlobCipher::KnownPlaintext,
         };
         let handle = self
             .blob
             .open_raw(
                 &src_path,
                 range,
-                cairn_types::blob::BlobCipher::from_dek(src_dek),
+                src_cipher,
                 &src_row.compression,
+                src_row.size_logical,
             )
             .await?;
+        let declared_size = handle.logical_len;
+        if declared_size > self.max_object_size {
+            return Err(Error::EntityTooLarge);
+        }
         let src_stream: cairn_types::BodyStream =
             {
                 use futures_util::StreamExt;
@@ -1721,28 +2457,65 @@ impl S3Service {
         // session stages this copied part as ciphertext under a fresh random per-part DEK, sealed
         // BEFORE `stage_part` so no fallible step follows staging. The copy source is decrypted
         // transparently upstream (`src_stream`), so the stager only ever sees plaintext.
-        let (part_dek, part_dek_sealed): (Option<[u8; 32]>, Option<String>) =
+        let (part_dek, part_dek_sealed): (Option<SecretKey32>, Option<String>) =
             if session.encrypt_parts {
                 use rand::RngCore;
                 let mut dek = [0u8; 32];
                 rand::thread_rng().fill_bytes(&mut dek);
-                let sealed = self.seal_part_dek(&dek)?;
+                let dek = SecretKey32::new(dek);
+                let sealed = self.seal_part_cipher(&dek)?;
                 (Some(dek), Some(sealed))
             } else {
                 (None, None)
             };
-        let staged = self
+        let attempt_id = uuid::Uuid::new_v4().simple().to_string();
+        let recovery_permit = self.acquire_storage_recovery_permit().await?;
+        self.meta
+            .submit(Mutation::ReserveMultipartPart {
+                upload_id: upload_id.clone(),
+                part_number,
+                attempt_id: attempt_id.clone(),
+                reserved_bytes: declared_size,
+                max_parts_per_upload: self.multipart_limits.max_parts_per_upload,
+                now: self.clock.now(),
+            })
+            .await?;
+        let staged = match self
             .blob
             .stage_part(
                 &upload_id,
                 part_number,
+                &attempt_id,
                 src_stream,
                 extra,
-                self.max_object_size,
+                declared_size,
                 part_dek,
             )
             .await
-            .map_err(map_stage_err)?;
+        {
+            Ok(staged) => staged,
+            Err(error) => {
+                self.reclaim_part_attempt(&upload_id, part_number, &attempt_id)
+                    .await;
+                return Err(map_stage_err(error));
+            }
+        };
+        let mut part_guard = MultipartPartWriteGuard::new(
+            MultipartPartWriteRecovery {
+                upload_id: upload_id.clone(),
+                part_number,
+                attempt_id: attempt_id.clone(),
+                storage_path: staged.storage_path.clone(),
+                permit: recovery_permit,
+            },
+            self.multipart_part_write_recovery.clone(),
+        );
+        if staged.size != declared_size {
+            self.discard_unsubmitted_part(&mut part_guard).await;
+            return Err(Error::InvalidRequest(
+                "copied multipart part length changed while staging".to_owned(),
+            ));
+        }
 
         let part = cairn_types::meta::PartRecord {
             part_number,
@@ -1753,14 +2526,37 @@ impl S3Service {
             checksum: staged.checksums.first().cloned(),
             part_dek: part_dek_sealed,
         };
-        if let MutationOutcome::PartRecorded {
-            superseded: Some(old),
-        } = self
+        let outcome = match self
             .meta
-            .submit(Mutation::RecordPart { upload_id, part })
-            .await?
+            .submit(Mutation::RecordPart {
+                upload_id: upload_id.clone(),
+                attempt_id: attempt_id.clone(),
+                part,
+            })
+            .await
         {
-            let _ = self.blob.delete(&old).await;
+            Ok(outcome) => outcome,
+            Err(error) => {
+                // UploadPartCopy reaches the same ambiguous post-stage writer boundary as
+                // UploadPart; exact resolution distinguishes rejection from a lost commit ack.
+                self.recover_multipart_part_write(&mut part_guard).await;
+                return Err(error.into());
+            }
+        };
+        match outcome {
+            MutationOutcome::PartRecorded {
+                cleanup: Some(cleanup),
+            } => {
+                part_guard.disarm();
+                self.reclaim_multipart_cleanup(&cleanup).await;
+            }
+            MutationOutcome::PartRecorded { cleanup: None } => part_guard.disarm(),
+            _ => {
+                self.recover_multipart_part_write(&mut part_guard).await;
+                return Err(Error::Internal(
+                    "unexpected multipart copy-part outcome".to_owned(),
+                ));
+            }
         }
 
         let etag = ETag::from_md5_hex(staged.md5_hex.clone());
@@ -1846,9 +2642,10 @@ impl S3Service {
             // Part-level SSE at rest (ARCH 27, Increment 3a): open the sealed per-part DEK BEFORE
             // claiming the session, so a wrong/rotated/retired master key or a tampered envelope fails
             // closed here (a typed error) and leaves the upload retryable (audit #14) rather than
-            // bricking it in `completing`. `assemble` decrypts each ciphertext part via `PartRef.dek`.
-            let dek = match &rec.part_dek {
-                Some(sealed) => Some(self.open_part_dek(sealed)?),
+            // bricking it in `completing`. `assemble` decrypts each ciphertext part via the typed
+            // `PartRef.cipher`, which also pins its legacy-v2/current-v3 reader.
+            let cipher = match &rec.part_dek {
+                Some(sealed) => self.open_part_cipher(sealed)?,
                 None => {
                     // Defense-in-depth: an encrypt-parts session must not carry a plaintext part. The
                     // happy path always couples `part_dek` with the on-disk ciphertext (UploadPart /
@@ -1859,14 +2656,14 @@ impl S3Service {
                             "multipart part: encrypted session has a plaintext part".to_owned(),
                         ));
                     }
-                    None
+                    cairn_types::blob::BlobCipher::KnownPlaintext
                 }
             };
             refs.push(PartRef {
                 part_number: *pn,
                 storage_path: rec.storage_path.clone(),
                 size: rec.size,
-                dek,
+                cipher,
             });
             part_md5s.push(rec.etag.clone());
             part_checksums.push(rec.checksum.clone());
@@ -1878,16 +2675,54 @@ impl S3Service {
         // (mixed present algorithms) fails with InvalidRequest while the upload stays retryable.
         let checksum_plan = plan_multipart_checksum(&req, &part_checksums)?;
 
-        // Every requested part validated: now claim the session (active -> completing) and
-        // assemble. A failure past this point is server-side (assembly/commit), not a client part
-        // error, so the narrow `completing` window is acceptable.
+        // Every requested part validated: mint one ownership token and arm recovery before awaiting
+        // the writer. The submit can commit `active -> completing` and then lose its acknowledgement;
+        // a pre-armed exact-token release closes that cancellation window without touching any
+        // older/newer owner. A failure past this point is server-side (assembly/commit), not a
+        // client part error.
+        let claim_token = MultipartClaimToken::generate();
+        let recovery_permit = self.acquire_storage_recovery_permit().await?;
+        let mut claim_guard = MultipartClaimGuard::new(
+            upload_id.clone(),
+            claim_token.clone(),
+            recovery_permit,
+            self.multipart_claim_recovery.clone(),
+        );
         let session = match self
             .meta
-            .submit(Mutation::ClaimMultipart(upload_id.clone()))
-            .await?
+            .submit(Mutation::ClaimMultipart {
+                upload_id: upload_id.clone(),
+                claim_token: claim_token.clone(),
+            })
+            .await
         {
-            MutationOutcome::MultipartClaim(ClaimOutcome::Claimed(s)) => *s,
-            _ => return Err(Error::NoSuchUpload),
+            Ok(MutationOutcome::MultipartClaim(ClaimOutcome::Claimed(s))) => *s,
+            Ok(MutationOutcome::MultipartClaim(
+                ClaimOutcome::AlreadyClaimed | ClaimOutcome::NotFound,
+            )) => {
+                claim_guard.disarm();
+                return Err(Error::NoSuchUpload);
+            }
+            Ok(_) => {
+                return Err(self
+                    .multipart_claim_submit_failure(
+                        &upload_id,
+                        &claim_token,
+                        Error::Internal("unexpected multipart claim outcome".to_owned()),
+                        &mut claim_guard,
+                    )
+                    .await);
+            }
+            Err(error) => {
+                return Err(self
+                    .multipart_claim_submit_failure(
+                        &upload_id,
+                        &claim_token,
+                        error.into(),
+                        &mut claim_guard,
+                    )
+                    .await);
+            }
         };
 
         // SSE (ARCH 27): resolve the assembled object's encryption exactly like a single-part PUT,
@@ -1908,16 +2743,39 @@ impl S3Service {
         } else {
             SseRequest::None
         };
-        let plan = self
+        let plan = match self
             .resolve_object_encryption(&bucket.name, requested)
-            .await?;
+            .await
+        {
+            Ok(plan) => plan,
+            Err(error) => {
+                return Err(self
+                    .multipart_failure_after_claim(
+                        &upload_id,
+                        &claim_token,
+                        error,
+                        &mut claim_guard,
+                    )
+                    .await);
+            }
+        };
         // A multipart complete is an object-create path, so it MUST honour the bucket's mandatory-SSE
         // contract exactly as a plain PUT does — otherwise a header-less multipart upload stores
         // plaintext in a bucket the operator mandated must be encrypted (Phase-2 security audit). A
         // multipart upload is never an inbound replica.
-        let plan = self
-            .enforce_mandatory_sse(&bucket.name, plan, false)
-            .await?;
+        let plan = match self.enforce_mandatory_sse(&bucket.name, plan, false).await {
+            Ok(plan) => plan,
+            Err(error) => {
+                return Err(self
+                    .multipart_failure_after_claim(
+                        &upload_id,
+                        &claim_token,
+                        error,
+                        &mut claim_guard,
+                    )
+                    .await);
+            }
+        };
         let sse_dek = plan.dek;
         let sse_descriptor = plan.descriptor_json;
         // A FULL_OBJECT plan (CRC64NVME, or an explicitly-requested whole-object type) needs the
@@ -1936,23 +2794,28 @@ impl S3Service {
             content_type: session.content_type.clone(),
             encryption: sse_dek,
         };
-        // Assemble reads the staged part files. A concurrent AbortMultipartUpload can pull them out
-        // from under us: we hold the session `completing` (claimed above), but abort's teardown is
-        // unconditional, and it commits `AbortMultipart` (the row delete) BEFORE `delete_session`
-        // (the byte delete). So if assemble fails AND the session is now gone, the abort won this
-        // race — answer the AWS-shaped NoSuchUpload, not a 500 for what surfaces as a missing-parts
-        // I/O error. (The mirror case — abort winning the `ClaimMultipart` above — already yields
-        // NoSuchUpload at the claim.) The ordering makes the check reliable: bytes gone ⇒ row gone.
-        // A genuine assembly failure (the session is still present) still propagates as-is.
+        // The completion claim owns the session while assembly reads its part files. Abort can only
+        // remove `active`, so it cannot delete these bytes after the active->completing transition.
+        // A genuine assembly failure releases the claim through the writer before returning, making
+        // the upload retryable without ever resurrecting a terminal session.
         let staged = match self.blob.assemble(&bucket.name, &refs, opts).await {
             Ok(s) => s,
             Err(e) => {
-                if self.meta.get_multipart(&upload_id).await?.is_none() {
-                    return Err(Error::NoSuchUpload);
-                }
-                return Err(e.into());
+                let error = self
+                    .multipart_failure_after_claim(
+                        &upload_id,
+                        &claim_token,
+                        e.into(),
+                        &mut claim_guard,
+                    )
+                    .await;
+                return Err(error);
             }
         };
+        // `assemble` returned a durable but not-yet-referenced blob. Record it synchronously,
+        // before the next await, so cancellation recovery can reclaim it if (and only if) releasing
+        // this claim proves the completion transaction did not consume the session.
+        claim_guard.track_assembled_blob(staged.storage_path.clone());
         let etag = multipart_etag(&part_md5s);
 
         // Resolve the object-level checksum to store. A FULL_OBJECT plan takes the whole-object digest
@@ -1965,8 +2828,16 @@ impl S3Service {
                 match staged.checksums.iter().find(|c| c.algorithm == algo) {
                     Some(cv) => {
                         if expected.is_some_and(|e| e != cv.value) {
+                            claim_guard.mark_assembled_blob_unreferenced();
                             let _ = self.blob.delete(&staged.storage_path).await;
-                            return Err(Error::BadDigest);
+                            return Err(self
+                                .multipart_failure_after_claim(
+                                    &upload_id,
+                                    &claim_token,
+                                    Error::BadDigest,
+                                    &mut claim_guard,
+                                )
+                                .await);
                         }
                         vec![cv.clone()]
                     }
@@ -2017,23 +2888,36 @@ impl S3Service {
         // exactly like a single PUT (ARCH 20.2): one outbox entry per distinct matching target.
         // Multipart uploads are never themselves an inbound replica (replicas always arrive as
         // plain PUTs carrying `x-amz-meta-cairn-replica`), so no replica gate is needed here. The
-        // assembled object carries no inline `x-amz-tagging`, so tag-filtered rules see an empty
-        // tag set (prefix/whole-bucket rules still match).
+        // Tagging and explicit Object Lock intent were pinned at initiation; the Writer installs
+        // both atomically with the version and resolves the bucket default at this completion time.
         let replication = self
-            .replication_outbox(&bucket, &key, &version_id, ReplicationOp::ObjectCreate, &[])
+            .replication_outbox(
+                &bucket,
+                &key,
+                &version_id,
+                ReplicationOp::ObjectCreate,
+                &session.initial_tags,
+            )
             .await;
         let enqueued_repl = !replication.is_empty();
         match self
             .meta
             .submit(Mutation::CompleteMultipart {
                 upload_id: upload_id.clone(),
+                claim_token: claim_token.clone(),
                 row: Box::new(row),
                 precondition: Precondition::default(),
                 replication,
             })
             .await
         {
-            Ok(MutationOutcome::MultipartCompleted { superseded, .. }) => {
+            Ok(MutationOutcome::MultipartTerminal(MultipartTerminalOutcome::Completed {
+                superseded,
+                ..
+            })) => {
+                // The writer consumed the session: ownership is terminal before any best-effort
+                // cleanup/event/audit await below, so cancellation there must not resurrect it.
+                claim_guard.disarm();
                 // Event-driven drain: wake the replication worker now rather than next heartbeat.
                 if enqueued_repl {
                     self.pulse_replication();
@@ -2041,7 +2925,7 @@ impl S3Service {
                 if let Some(old) = superseded {
                     let _ = self.blob.delete(&old).await;
                 }
-                let _ = self.blob.delete_session(&upload_id).await;
+                self.reclaim_multipart_session(&upload_id).await;
                 // Emit an ObjectCreated:CompleteMultipartUpload event (best-effort).
                 self.emit_events(
                     &bucket.name,
@@ -2085,10 +2969,33 @@ impl S3Service {
                 resp = with_sse_headers(resp, sse_descriptor.as_deref());
                 Ok(resp)
             }
-            Ok(_) => Err(Error::Internal("unexpected completion outcome".to_owned())),
-            Err(e) => {
+            Ok(MutationOutcome::MultipartTerminal(MultipartTerminalOutcome::NotOwner)) => {
+                // This typed outcome proves our assembled path was not installed. Keep the guard
+                // armed through its fallible cleanup await so cancellation can enqueue an
+                // unconditional path cleanup even though claim release will return `NotOwner`.
+                claim_guard.mark_assembled_blob_unreferenced();
                 let _ = self.blob.delete(&staged.storage_path).await;
-                Err(e.into())
+                claim_guard.disarm();
+                Err(Error::NoSuchUpload)
+            }
+            Ok(_) => Err(self
+                .multipart_failure_after_claim(
+                    &upload_id,
+                    &claim_token,
+                    Error::Internal("unexpected completion outcome".to_owned()),
+                    &mut claim_guard,
+                )
+                .await),
+            Err(e) => {
+                let error = map_object_commit_error(e, session.lock_intent, now);
+                Err(self
+                    .multipart_failure_after_claim(
+                        &upload_id,
+                        &claim_token,
+                        error,
+                        &mut claim_guard,
+                    )
+                    .await)
             }
         }
     }
@@ -2097,19 +3004,28 @@ impl S3Service {
         let bucket = self.fetch_bucket(req).await?;
         let key = req.key.clone().expect("key present");
         let upload_id = UploadId::from_string(req.query("uploadId").unwrap_or_default().to_owned());
-        // Scope-check BEFORE the destructive submit: `Mutation::AbortMultipart` is an unconditional
-        // `DELETE ... WHERE id=?` that returns `Ack` whether or not a row matched, and
-        // `delete_session` then reclaims the staged part bytes — both irreversible, so a mismatched
-        // or unknown id must be rejected here rather than silently 204'd. This also gives an
-        // unknown uploadId the AWS-correct NoSuchUpload 404 instead of a false success.
+        // Scope-check before the destructive submit. The writer then removes only an `active`
+        // session: once Complete owns `completing`, Abort loses atomically and must not reclaim the
+        // part bytes that completion is reading.
         self.scoped_multipart(&upload_id, &bucket.name, &key)
             .await?;
-        self.meta
+        match self
+            .meta
             .submit(Mutation::AbortMultipart(upload_id.clone()))
-            .await?;
-        let _ = self.blob.delete_session(&upload_id).await;
-        Ok(S3Response::status(StatusCode::NO_CONTENT)
-            .with_header("x-amz-request-id", &req.request_id))
+            .await?
+        {
+            MutationOutcome::MultipartTerminal(MultipartTerminalOutcome::Aborted) => {
+                self.reclaim_multipart_session(&upload_id).await;
+                Ok(S3Response::status(StatusCode::NO_CONTENT)
+                    .with_header("x-amz-request-id", &req.request_id))
+            }
+            MutationOutcome::MultipartTerminal(MultipartTerminalOutcome::NotOwner) => {
+                Err(Error::NoSuchUpload)
+            }
+            _ => Err(Error::Internal(
+                "unexpected multipart abort outcome".to_owned(),
+            )),
+        }
     }
 
     async fn list_parts(&self, req: &S3Request) -> Result<S3Response> {
@@ -2205,6 +3121,10 @@ impl S3Service {
     async fn copy_object(&self, req: &S3Request) -> Result<S3Response> {
         let dest_bucket = self.fetch_bucket(req).await?;
         let dest_key = req.key.clone().expect("key present");
+        let intent_validation_now = self.clock.now();
+        let lock_intent = self
+            .explicit_object_lock_intent(req, &dest_bucket.name, intent_validation_now)
+            .await?;
         let raw_source = req.header("x-amz-copy-source").unwrap_or_default();
         let (src_bucket_s, src_key_s, src_version) = parse_copy_source(raw_source)
             .ok_or_else(|| Error::InvalidArgument("bad copy source".to_owned()))?;
@@ -2320,17 +3240,18 @@ impl S3Service {
         };
 
         // An SSE-encrypted source is decrypted transparently via its unwrapped DEK (ARCH 27).
-        let src_dek = match src_row.sse_descriptor.as_deref() {
-            Some(d) => Some(self.open_sse_dek(d)?),
-            None => None,
+        let src_cipher = match src_row.sse_descriptor.as_deref() {
+            Some(d) => self.open_sse_cipher(d)?,
+            None => cairn_types::blob::BlobCipher::KnownPlaintext,
         };
         let handle = self
             .blob
             .open_raw(
                 &src_path,
                 None,
-                cairn_types::blob::BlobCipher::from_dek(src_dek),
+                src_cipher,
                 &src_row.compression,
+                src_row.size_logical,
             )
             .await?;
         // Re-tag the blob read errors as body errors so the source can feed `stage`.
@@ -2368,15 +3289,31 @@ impl S3Service {
             // The source object's plaintext size is known, so preallocate the destination blob.
             content_length: Some(src_row.size_logical),
         };
+        let recovery_permit = self.acquire_storage_recovery_permit().await?;
         let staged = self.blob.stage(&dest_bucket.name, src_stream, opts).await?;
 
+        // Copy may spend an arbitrary amount of time reading and staging the source. Start default
+        // retention at the destination commit boundary, and let the Writer re-check any explicit
+        // deadline against this fresh timestamp.
+        let now = self.clock.now();
         let versioned = dest_bucket.versioning == VersioningState::Enabled;
         let version_id = if versioned {
             VersionId::generate()
         } else {
             VersionId::null()
         };
-        let now = self.clock.now();
+        let row_id = uuid::Uuid::new_v4().simple().to_string();
+        let mut write_guard = ObjectWriteGuard::new(
+            ObjectWriteRecovery {
+                bucket: dest_bucket.name.clone(),
+                key: dest_key.clone(),
+                version_id: version_id.clone(),
+                row_id: row_id.clone(),
+                storage_path: staged.storage_path.clone(),
+                permit: recovery_permit,
+            },
+            self.object_write_recovery.clone(),
+        );
         let dest_key_for_event = dest_key.clone();
         // The five optional system response headers (ARCH 13.4) follow the metadata directive too:
         // under COPY they are the source version's stored values, under REPLACE this request's.
@@ -2389,7 +3326,7 @@ impl S3Service {
             }
         };
         let row = ObjectVersionRow {
-            id: uuid::Uuid::new_v4().simple().to_string(),
+            id: row_id,
             bucket: dest_bucket.name.clone(),
             key: dest_key,
             version_id: version_id.clone(),
@@ -2448,11 +3385,18 @@ impl S3Service {
             .submit(Mutation::PutObjectVersion {
                 row: Box::new(row),
                 precondition: Precondition::default(),
+                initial_state: InitialObjectState {
+                    tags: dest_tags,
+                    lock_intent,
+                },
                 replication,
             })
             .await
         {
             Ok(MutationOutcome::Put { superseded, .. }) => {
+                // The exact destination row now owns the staged path. Disarm before any
+                // best-effort post-commit await so cancellation cannot reclaim a live copy.
+                write_guard.disarm();
                 // Event-driven drain: wake the replication worker now rather than next heartbeat.
                 if enqueued_repl {
                     self.pulse_replication();
@@ -2460,31 +3404,6 @@ impl S3Service {
                 if let Some(old) = superseded {
                     let _ = self.blob.delete(&old).await;
                 }
-                // Attach the effective tag set to the just-written destination version (ARCH 17.1).
-                // Tags are a separate mutation, committed after the version row exists. Before
-                // audit 2026-07 a copy dropped them entirely under BOTH directives.
-                if !dest_tags.is_empty() {
-                    let _ = self
-                        .meta
-                        .submit(Mutation::PutObjectTags {
-                            bucket: dest_bucket.name.clone(),
-                            key: dest_key_for_event.clone(),
-                            version_id: version_id.clone(),
-                            tags: dest_tags,
-                        })
-                        .await;
-                }
-                // Object Lock: a copy creates a new version like a PUT, so stamp the bucket default
-                // retention / any explicit `x-amz-object-lock-*` headers onto it too (WORM coverage
-                // at EVERY object-creating path).
-                self.apply_object_lock_on_put(
-                    req,
-                    &dest_bucket,
-                    &dest_key_for_event,
-                    &version_id,
-                    now,
-                )
-                .await?;
                 // Emit an ObjectCreated:Copy event for the destination (best-effort).
                 self.emit_events(
                     &dest_bucket.name,
@@ -2518,12 +3437,12 @@ impl S3Service {
             // Surface the commit's TRUE error (PreconditionFailed, InsufficientStorage, ...) rather
             // than collapsing every failure to Internal(500) (Medium #7).
             Ok(_) => {
-                let _ = self.blob.delete(&staged.storage_path).await;
+                self.recover_object_write(&mut write_guard).await;
                 Err(Error::Internal("unexpected copy outcome".to_owned()))
             }
             Err(e) => {
-                let _ = self.blob.delete(&staged.storage_path).await;
-                Err(e.into())
+                self.recover_object_write(&mut write_guard).await;
+                Err(map_object_commit_error(e, lock_intent, now))
             }
         }
     }
@@ -2548,17 +3467,12 @@ impl S3Service {
         let total_keys = keys.len();
         let now = self.clock.now();
 
-        // Request-level replica gate (audit #16), mirroring the single-object DELETE: an
-        // Administrator carrying `x-amz-meta-cairn-replica` is propagating a replicated delete, so
-        // its delete markers must NOT be re-enqueued (loop prevention, ARCH 20.4) — and under
-        // fan-out would otherwise re-ship to every target. A normal member's header is ignored.
-        let is_replica = req
-            .header("x-amz-meta-cairn-replica")
-            .is_some_and(|v| v.eq_ignore_ascii_case("true"))
-            && req
-                .principal
-                .as_ref()
-                .is_some_and(|p| p.role == Role::Administrator);
+        // DeleteObjects is always the ordinary S3 bulk operation. The replication sink never uses
+        // it, and each key below authorizes as DeleteObject/DeleteObjectVersion. Consequently a
+        // replica marker on this request must have no dispatch effect: allowing an administrator
+        // header to suppress the outbox would bypass explicit ReplicateDelete denies. Inbound
+        // delete-marker propagation uses the single-object DELETE path, whose centrally selected
+        // ReplicateDelete action is carried into dispatch.
 
         // Each result entry is (key, version_id, is_delete_marker, delete_marker_version_id) so the
         // response can surface `<DeleteMarker>`/`<DeleteMarkerVersionId>` for a marker insert.
@@ -2568,16 +3482,14 @@ impl S3Service {
         // per-key mutations into far fewer fsync barriers than one awaited commit per key — the
         // delete-heavy path that lost ~3x to MinIO's parallel unlinks. But a DUPLICATE key (the same
         // key listed more than once in one request — permitted by the API and processed idempotently
-        // by other implementations) must NOT run concurrently with itself: a Suspended-versioning
-        // bare-key delete is a DeleteVersion-then-CreateDeleteMarker two-step, and `CreateDeleteMarker`
-        // is a bare INSERT with no upsert (`insert_version`, cairn-meta/src/apply.rs) — two duplicate
-        // entries whose DeleteVersion calls both run before either CreateDeleteMarker would collide on
-        // the `(bucket, key, version_id)` UNIQUE constraint and surface a spurious InternalError for
-        // one of them. So entries are grouped by bare key: each group's own entries are awaited
-        // SEQUENTIALLY (restoring the old deterministic same-key behavior), while distinct keys' groups
-        // still run concurrently. Results are reordered back to the original request order afterward
-        // (grouping/concurrency reorders completion, not the response), so `<Deleted>`/`<Error>` still
-        // matches the request's key order.
+        // by other implementations) must NOT run concurrently with itself. Suspended-versioning
+        // bare-key deletes all target the same null-version row; serializing duplicate entries keeps
+        // their S3 ordering deterministic and prevents same-row races even though replacement is now
+        // one atomic Writer mutation. So entries are grouped by bare key: each group's own entries
+        // are awaited SEQUENTIALLY, while distinct keys' groups still run concurrently. Results are
+        // reordered back to the original request order afterward (grouping/concurrency reorders
+        // completion, not the response), so `<Deleted>`/`<Error>` still matches the request's key
+        // order.
         use futures_util::StreamExt as _;
         struct KeyOutcome {
             deleted: Option<(String, Option<String>, bool, Option<String>)>,
@@ -2632,22 +3544,14 @@ impl S3Service {
                     )
                     .await
                 {
-                    let (_, code) = crate::error_map::map(&e);
-                    out.error = Some((key_s, code.to_owned(), e.to_string()));
+                    let (code, message) = delete_objects_error_fields(
+                        &e,
+                        &req.request_id,
+                        bucket.name.as_str(),
+                        &key_s,
+                    );
+                    out.error = Some((key_s, code, message));
                     return out;
-                }
-                // Object Lock: a permanent version delete of a still-protected version is denied
-                // per-key. A plain delete-marker insert never destroys a locked version.
-                if let Some(v) = &version {
-                    let version_id = VersionId::from_string(v.clone());
-                    if let Err(e) = self
-                        .enforce_unlocked_for_delete(req, bucket, &key, &version_id, now)
-                        .await
-                    {
-                        let (_, code) = crate::error_map::map(&e);
-                        out.error = Some((key_s, code.to_owned(), e.to_string()));
-                        return out;
-                    }
                 }
                 // Event context kept before `key`/`version` are moved into the mutation.
                 let event_key = key.clone();
@@ -2659,30 +3563,48 @@ impl S3Service {
                 //    (NOT a permanent removal — Medium #4 applied to the bulk path);
                 //  - Unversioned: remove the sentinel version outright.
                 let result = if let Some(v) = &version {
+                    let version_id = VersionId::from_string(v.clone());
+                    let bypass = match self
+                        .governance_bypass_capability(req, bucket, &key, &version_id)
+                        .await
+                    {
+                        Ok(capability) => capability,
+                        Err(error) => {
+                            let (code, message) = delete_objects_error_fields(
+                                &error,
+                                &req.request_id,
+                                bucket.name.as_str(),
+                                &key_s,
+                            );
+                            out.error = Some((key_s, code, message));
+                            return out;
+                        }
+                    };
                     self.meta
                         .submit(Mutation::DeleteVersion {
                             bucket: bucket.name.clone(),
                             key,
-                            version_id: VersionId::from_string(v.clone()),
+                            version_id,
+                            expected_row_id: None,
                             expected_updated_at: None,
+                            require_sole_key_version: false,
+                            now,
+                            bypass,
                         })
                         .await
                 } else {
                     match bucket.versioning {
                         VersioningState::Enabled => {
                             let mid = VersionId::generate();
-                            let replication = if is_replica {
-                                Vec::new()
-                            } else {
-                                self.replication_outbox(
+                            let replication = self
+                                .replication_outbox(
                                     bucket,
                                     &key,
                                     &mid,
                                     ReplicationOp::DeleteMarker,
                                     &[],
                                 )
-                                .await
-                            };
+                                .await;
                             out.repl_enqueued |= !replication.is_empty();
                             self.meta
                                 .submit(Mutation::CreateDeleteMarker {
@@ -2691,43 +3613,71 @@ impl S3Service {
                                     version_id: mid,
                                     owner_id: bucket.owner_id.clone(),
                                     now,
+                                    bypass: GovernanceBypass::Denied,
+                                    expected_current: None,
                                     replication,
                                 })
                                 .await
                         }
                         VersioningState::Suspended => {
-                            // Remove any existing null version (reclaiming its blob), then insert
-                            // a null-version delete marker that replaces it.
-                            if let Ok(MutationOutcome::Deleted { freed: Some(p), .. }) = self
-                                .meta
-                                .submit(Mutation::DeleteVersion {
-                                    bucket: bucket.name.clone(),
-                                    key: key.clone(),
-                                    version_id: VersionId::null(),
-                                    expected_updated_at: None,
-                                })
+                            let null_version = VersionId::null();
+                            let bypass = match self
+                                .governance_bypass_capability(req, bucket, &key, &null_version)
                                 .await
                             {
-                                let _ = self.blob.delete(&p).await;
-                            }
+                                Ok(capability) => capability,
+                                Err(error) => {
+                                    let (code, message) = delete_objects_error_fields(
+                                        &error,
+                                        &req.request_id,
+                                        bucket.name.as_str(),
+                                        &key_s,
+                                    );
+                                    out.error = Some((key_s, code, message));
+                                    return out;
+                                }
+                            };
                             self.meta
                                 .submit(Mutation::CreateDeleteMarker {
                                     bucket: bucket.name.clone(),
                                     key,
-                                    version_id: VersionId::null(),
+                                    version_id: null_version,
                                     owner_id: bucket.owner_id.clone(),
                                     now,
+                                    bypass,
+                                    expected_current: None,
                                     replication: Vec::new(),
                                 })
                                 .await
                         }
                         VersioningState::Unversioned => {
+                            let null_version = VersionId::null();
+                            let bypass = match self
+                                .governance_bypass_capability(req, bucket, &key, &null_version)
+                                .await
+                            {
+                                Ok(capability) => capability,
+                                Err(error) => {
+                                    let (code, message) = delete_objects_error_fields(
+                                        &error,
+                                        &req.request_id,
+                                        bucket.name.as_str(),
+                                        &key_s,
+                                    );
+                                    out.error = Some((key_s, code, message));
+                                    return out;
+                                }
+                            };
                             self.meta
                                 .submit(Mutation::DeleteVersion {
                                     bucket: bucket.name.clone(),
                                     key,
-                                    version_id: VersionId::null(),
+                                    version_id: null_version,
+                                    expected_row_id: None,
                                     expected_updated_at: None,
+                                    require_sole_key_version: false,
+                                    now,
+                                    bypass,
                                 })
                                 .await
                         }
@@ -2756,7 +3706,32 @@ impl S3Service {
                             out.deleted = Some((key_s, version, false, None));
                         }
                     }
-                    Ok(MutationOutcome::DeleteMarker { version_id: mv }) => {
+                    Ok(MutationOutcome::DeleteNotApplied) => {
+                        let ev = match &event_version_req {
+                            Some(v) => VersionId::from_string(v.clone()),
+                            None => VersionId::null(),
+                        };
+                        self.emit_events(
+                            &bucket.name,
+                            &event_key,
+                            &ev,
+                            EventKind::ObjectRemovedDelete,
+                            None,
+                            None,
+                            now,
+                        )
+                        .await;
+                        if !quiet {
+                            out.deleted = Some((key_s, version, false, None));
+                        }
+                    }
+                    Ok(MutationOutcome::DeleteMarker {
+                        version_id: mv,
+                        freed,
+                    }) => {
+                        if let Some(path) = freed {
+                            let _ = self.blob.delete(&path).await;
+                        }
                         self.emit_events(
                             &bucket.name,
                             &event_key,
@@ -2774,16 +3749,42 @@ impl S3Service {
                             out.deleted = Some((key_s, None, true, dmv));
                         }
                     }
+                    Ok(MutationOutcome::DeleteProtected) => {
+                        out.error = Some((
+                            key_s,
+                            "AccessDenied".to_owned(),
+                            Error::AccessDenied.to_string(),
+                        ));
+                    }
                     Ok(_) => {
-                        if !quiet {
-                            out.deleted = Some((key_s, version, false, None));
-                        }
+                        let error =
+                            Error::Internal("unexpected delete mutation outcome".to_owned());
+                        let (code, message) = delete_objects_error_fields(
+                            &error,
+                            &req.request_id,
+                            bucket.name.as_str(),
+                            &key_s,
+                        );
+                        out.error = Some((key_s, code, message));
                     }
                     // Map each per-key failure to its TRUE S3 code (Medium #7).
                     Err(e) => {
-                        let err: Error = e.into();
-                        let (_, code) = crate::error_map::map(&err);
-                        out.error = Some((key_s, code.to_owned(), err.to_string()));
+                        let err = match e {
+                            cairn_types::MetaError::ObjectProtected => Error::AccessDenied,
+                            cairn_types::MetaError::InvalidBucketState => {
+                                Error::InvalidBucketState(
+                                    "invalid Object Lock/versioning state".to_owned(),
+                                )
+                            }
+                            other => other.into(),
+                        };
+                        let (code, message) = delete_objects_error_fields(
+                            &err,
+                            &req.request_id,
+                            bucket.name.as_str(),
+                            &key_s,
+                        );
+                        out.error = Some((key_s, code, message));
                     }
                 }
                 out
@@ -2868,22 +3869,27 @@ impl S3Service {
         let bucket = self.fetch_bucket(&req).await?;
         let doc = drain_body(body, 64 * 1024).await?;
         let state = cairn_xml::parse_versioning_configuration(&doc)?;
-        // Object Lock requires versioning to stay Enabled: suspending it would let a null-version
-        // overwrite permanently destroy locked bytes in place, breaking the WORM guarantee. S3
-        // rejects suspending versioning on an Object-Lock-enabled bucket (InvalidBucketState).
-        if state == VersioningState::Suspended
-            && self.bucket_object_lock_config(&bucket.name).await?.enabled
-        {
-            return Err(Error::InvalidRequest(
-                "Cannot suspend versioning on a bucket with Object Lock enabled".to_owned(),
-            ));
-        }
-        self.meta
+        match self
+            .meta
             .submit(Mutation::SetVersioning {
                 bucket: bucket.name,
                 state,
             })
-            .await?;
+            .await
+        {
+            Ok(MutationOutcome::Ack) => {}
+            Ok(_) => {
+                return Err(Error::Internal(
+                    "unexpected versioning mutation outcome".to_owned(),
+                ));
+            }
+            Err(cairn_types::MetaError::InvalidBucketState) => {
+                return Err(Error::InvalidBucketState(
+                    "Object Lock requires bucket versioning to remain Enabled".to_owned(),
+                ));
+            }
+            Err(error) => return Err(error.into()),
+        }
         Ok(S3Response::status(StatusCode::OK).with_header("x-amz-request-id", &req.request_id))
     }
 
@@ -3520,7 +4526,10 @@ impl S3Service {
         }
     }
 
-    /// Read a bucket's Object Lock configuration (default = disabled when unset/corrupt-but-absent).
+    /// Read and validate a bucket's durable Object Lock configuration (default = disabled when
+    /// unset). A syntactically valid but unsupported historical period is corruption, not client
+    /// input: fail closed with an opaque internal error. `PUT ?object-lock` deliberately parses and
+    /// replaces the new document without calling this reader, so the bucket remains repairable.
     async fn bucket_object_lock_config(
         &self,
         bucket: &BucketName,
@@ -3530,10 +4539,97 @@ impl S3Service {
             .get_bucket_config(bucket, ConfigAspect::ObjectLock)
             .await?
         {
-            Some(doc) => serde_json::from_str(&doc.0)
-                .map_err(|_| Error::Internal("config (de)serialization failed".to_owned())),
+            Some(doc) => {
+                let config: ObjectLockConfiguration = serde_json::from_str(&doc.0)
+                    .map_err(|_| Error::Internal("config (de)serialization failed".to_owned()))?;
+                // Row presence is the immutable enablement bit. A historical/tampered row that
+                // says `enabled=false` is corrupt security state, never equivalent to an absent
+                // row: treating it as disabled would suppress lock headers and pre-stage checks.
+                // `PUT ?object-lock` intentionally bypasses this reader so its specialized Writer
+                // mutation can still repair that legacy row.
+                if !config.enabled {
+                    return Err(Error::Internal(
+                        "invalid stored Object Lock configuration".to_owned(),
+                    ));
+                }
+                if let Some(default) = config.default_retention {
+                    default.validate().map_err(|e| {
+                        Error::Internal(format!(
+                            "invalid stored Object Lock default retention: {e}"
+                        ))
+                    })?;
+                }
+                Ok(config)
+            }
             None => Ok(ObjectLockConfiguration::default()),
         }
+    }
+
+    /// Parse and validate only the request's explicit Object Lock intent before staging bytes.
+    ///
+    /// Bucket-default retention is deliberately not resolved here: the Writer resolves the
+    /// currently durable default in the same savepoint that installs the version. The pre-stage
+    /// read still fails closed on a corrupt durable configuration, while the Writer remains the
+    /// final authority if the default changes before commit.
+    async fn explicit_object_lock_intent(
+        &self,
+        req: &S3Request,
+        bucket: &BucketName,
+        now: cairn_types::Timestamp,
+    ) -> Result<ExplicitObjectLockIntent> {
+        let config = self.bucket_object_lock_config(bucket).await?;
+        if let Some(default) = config.default_retention {
+            default.retain_until(now).map_err(|e| {
+                Error::Internal(format!("invalid stored Object Lock default retention: {e}"))
+            })?;
+        }
+
+        let retention = match (
+            req.header("x-amz-object-lock-mode"),
+            req.header("x-amz-object-lock-retain-until-date"),
+        ) {
+            (Some(mode), Some(date)) => {
+                let mode = cairn_xml::parse_lock_mode(mode).map_err(|_| {
+                    Error::InvalidArgument("invalid x-amz-object-lock-mode".to_owned())
+                })?;
+                let retain_until = cairn_xml::parse_iso8601(date).ok_or_else(|| {
+                    Error::InvalidArgument("invalid x-amz-object-lock-retain-until-date".to_owned())
+                })?;
+                if retain_until <= now {
+                    return Err(Error::InvalidArgument(
+                        "x-amz-object-lock-retain-until-date must be in the future".to_owned(),
+                    ));
+                }
+                Some(ObjectRetention { mode, retain_until })
+            }
+            (None, None) => None,
+            _ => {
+                return Err(Error::InvalidRequest(
+                    "x-amz-object-lock-mode and x-amz-object-lock-retain-until-date must be \
+                     supplied together"
+                        .to_owned(),
+                ));
+            }
+        };
+        let legal_hold = match req.header("x-amz-object-lock-legal-hold") {
+            None => None,
+            Some(value) if value.eq_ignore_ascii_case("ON") => Some(true),
+            Some(value) if value.eq_ignore_ascii_case("OFF") => Some(false),
+            Some(_) => {
+                return Err(Error::InvalidArgument(
+                    "x-amz-object-lock-legal-hold must be ON or OFF".to_owned(),
+                ));
+            }
+        };
+        if !config.enabled && (retention.is_some() || legal_hold.is_some()) {
+            return Err(Error::InvalidRequest(
+                "Bucket is missing Object Lock Configuration".to_owned(),
+            ));
+        }
+        Ok(ExplicitObjectLockIntent {
+            retention,
+            legal_hold,
+        })
     }
 
     async fn get_object_retention(&self, req: &S3Request) -> Result<S3Response> {
@@ -3558,12 +4654,6 @@ impl S3Service {
     ) -> Result<S3Response> {
         let bucket = self.fetch_bucket(&req).await?;
         let key = req.key.clone().expect("key present");
-        // Retention can only be set on a bucket that has Object Lock enabled.
-        if !self.bucket_object_lock_config(&bucket.name).await?.enabled {
-            return Err(Error::InvalidRequest(
-                "Bucket is missing Object Lock Configuration".to_owned(),
-            ));
-        }
         let row = self.resolve_lock_target(&bucket.name, &key, &req).await?;
         let doc = drain_body(body, 64 * 1024).await?;
         let new = cairn_xml::parse_retention(&doc)?;
@@ -3575,34 +4665,41 @@ impl S3Service {
                 "x-amz-object-lock retain-until-date must be in the future".to_owned(),
             ));
         }
-        // Lowering or removing an active retention is governed: COMPLIANCE is never weakenable;
-        // GOVERNANCE requires `s3:BypassGovernanceRetention` + the bypass header.
-        let current = self
-            .meta
-            .get_object_lock(&bucket.name, &key, &row.version_id)
+        let bypass = self
+            .governance_bypass_capability(&req, &bucket, &key, &row.version_id)
             .await?;
-        if let Some(cur) = current.retention {
-            if cur.retain_until > now && retention_is_weaker(&cur, &new) {
-                match cur.mode {
-                    ObjectLockMode::Compliance => return Err(Error::AccessDenied),
-                    ObjectLockMode::Governance => {
-                        self.require_governance_bypass(&req, &bucket, &key, &row.version_id)
-                            .await?;
-                    }
-                }
-            }
-        }
         // Captured before the mutation moves `bucket.name`/`key`; audited only on the success path.
         let audit_bucket = bucket.name.as_str().to_owned();
         let audit_key = key.as_str().to_owned();
-        self.meta
+        match self
+            .meta
             .submit(Mutation::SetObjectRetention {
                 bucket: bucket.name,
                 key,
                 version_id: row.version_id,
                 retention: Some(new),
+                now,
+                bypass,
             })
-            .await?;
+            .await
+        {
+            Ok(MutationOutcome::Ack) => {}
+            Ok(_) => {
+                return Err(Error::Internal(
+                    "unexpected retention mutation outcome".to_owned(),
+                ));
+            }
+            Err(cairn_types::MetaError::ObjectProtected) => return Err(Error::AccessDenied),
+            Err(cairn_types::MetaError::ObjectVersionNotFound) => {
+                return Err(Error::NoSuchVersion);
+            }
+            Err(cairn_types::MetaError::InvalidBucketState) => {
+                return Err(Error::InvalidRequest(
+                    "Bucket is missing Object Lock Configuration".to_owned(),
+                ));
+            }
+            Err(error) => return Err(error.into()),
+        }
         // Audit the mutation (ARCH 26.3, best-effort).
         self.audit(
             "PutObjectRetention",
@@ -3638,25 +4735,38 @@ impl S3Service {
     ) -> Result<S3Response> {
         let bucket = self.fetch_bucket(&req).await?;
         let key = req.key.clone().expect("key present");
-        if !self.bucket_object_lock_config(&bucket.name).await?.enabled {
-            return Err(Error::InvalidRequest(
-                "Bucket is missing Object Lock Configuration".to_owned(),
-            ));
-        }
         let row = self.resolve_lock_target(&bucket.name, &key, &req).await?;
         let doc = drain_body(body, 64 * 1024).await?;
         let on = cairn_xml::parse_legal_hold(&doc)?;
         // Captured before the mutation moves `bucket.name`/`key`; audited only on the success path.
         let audit_bucket = bucket.name.as_str().to_owned();
         let audit_key = key.as_str().to_owned();
-        self.meta
+        match self
+            .meta
             .submit(Mutation::SetObjectLegalHold {
                 bucket: bucket.name,
                 key,
                 version_id: row.version_id,
                 on,
             })
-            .await?;
+            .await
+        {
+            Ok(MutationOutcome::Ack) => {}
+            Ok(_) => {
+                return Err(Error::Internal(
+                    "unexpected legal-hold mutation outcome".to_owned(),
+                ));
+            }
+            Err(cairn_types::MetaError::ObjectVersionNotFound) => {
+                return Err(Error::NoSuchVersion);
+            }
+            Err(cairn_types::MetaError::InvalidBucketState) => {
+                return Err(Error::InvalidRequest(
+                    "Bucket is missing Object Lock Configuration".to_owned(),
+                ));
+            }
+            Err(error) => return Err(error.into()),
+        }
         // Audit the mutation (ARCH 26.3, best-effort).
         self.audit(
             "PutObjectLegalHold",
@@ -3670,67 +4780,50 @@ impl S3Service {
         Ok(S3Response::status(StatusCode::OK).with_header("x-amz-request-id", &req.request_id))
     }
 
-    /// Enforce the GOVERNANCE-bypass gate: the `x-amz-bypass-governance-retention: true` header
-    /// AND `s3:BypassGovernanceRetention` on the object. COMPLIANCE retention is never bypassable;
-    /// this path is only ever reached for GOVERNANCE-mode locks.
-    async fn require_governance_bypass(
+    /// Resolve the caller's pre-authorized governance-bypass capability.
+    ///
+    /// The Writer decides whether a mutation actually needs this capability while it holds the
+    /// current lock row in the same savepoint as the destructive change. A denied capability is
+    /// therefore represented as [`GovernanceBypass::Denied`], not as a request-level error:
+    /// an unprotected delete or a non-weakening retention extension must still succeed even when a
+    /// caller sent the bypass header but lacks the separate bypass permission.
+    async fn governance_bypass_capability(
         &self,
         req: &S3Request,
         bucket: &Bucket,
         key: &ObjectKey,
         version: &VersionId,
-    ) -> Result<()> {
-        let header_set = req
-            .header("x-amz-bypass-governance-retention")
-            .is_some_and(|v| v.eq_ignore_ascii_case("true"));
-        if !header_set {
-            return Err(Error::AccessDenied);
-        }
-        self.authorize(
-            req,
-            bucket,
-            Action::BypassGovernanceRetention,
-            Resource::Object {
-                bucket: bucket.name.clone(),
-                key: key.clone(),
-            },
-            Some(version),
-        )
-        .await
-    }
-
-    /// Deny a permanent delete (or permanent overwrite-away) of a still-protected version
-    /// (ARCH 15, WORM). Legal hold always denies; an active COMPLIANCE retention always denies;
-    /// an active GOVERNANCE retention denies unless the request carries `s3:BypassGovernanceRetention`
-    /// plus the `x-amz-bypass-governance-retention: true` header. A version with no active lock
-    /// passes. This is the single chokepoint every permanent-removal path funnels through.
-    async fn enforce_unlocked_for_delete(
-        &self,
-        req: &S3Request,
-        bucket: &Bucket,
-        key: &ObjectKey,
-        version: &VersionId,
-        now: cairn_types::Timestamp,
-    ) -> Result<()> {
-        let lock = self
-            .meta
-            .get_object_lock(&bucket.name, key, version)
-            .await?;
-        if lock.legal_hold {
-            return Err(Error::AccessDenied);
-        }
-        if let Some(ret) = lock.retention {
-            if ret.retain_until > now {
-                match ret.mode {
-                    ObjectLockMode::Compliance => return Err(Error::AccessDenied),
-                    ObjectLockMode::Governance => {
-                        self.require_governance_bypass(req, bucket, key, version)
-                            .await?;
-                    }
-                }
+    ) -> Result<GovernanceBypass> {
+        let header_set = match req.header("x-amz-bypass-governance-retention") {
+            None => false,
+            Some(value) if value.eq_ignore_ascii_case("true") => true,
+            Some(value) if value.eq_ignore_ascii_case("false") => false,
+            Some(_) => {
+                return Err(Error::InvalidArgument(
+                    "x-amz-bypass-governance-retention must be true or false".to_owned(),
+                ));
             }
+        };
+        if !header_set {
+            return Ok(GovernanceBypass::Denied);
         }
-        Ok(())
+        match self
+            .authorize(
+                req,
+                bucket,
+                Action::BypassGovernanceRetention,
+                Resource::Object {
+                    bucket: bucket.name.clone(),
+                    key: key.clone(),
+                },
+                Some(version),
+            )
+            .await
+        {
+            Ok(()) => Ok(GovernanceBypass::Authorized),
+            Err(Error::AccessDenied) => Ok(GovernanceBypass::Denied),
+            Err(error) => Err(error),
+        }
     }
 
     async fn get_bucket_object_lock(&self, req: &S3Request) -> Result<S3Response> {
@@ -3762,94 +4855,33 @@ impl S3Service {
         let bucket = self.fetch_bucket(&req).await?;
         let doc = drain_body(body, 64 * 1024).await?;
         let config = cairn_xml::parse_object_lock_configuration(&doc)?;
-        // Object Lock requires versioning: a WORM guarantee is meaningless if an overwrite can
-        // destroy the protected bytes in place.
-        if config.enabled && bucket.versioning != VersioningState::Enabled {
-            return Err(Error::InvalidRequest(
-                "Object Lock requires bucket versioning to be enabled".to_owned(),
-            ));
-        }
-        let text = serde_json::to_string(&config)
-            .map_err(|_| Error::Internal("config (de)serialization failed".to_owned()))?;
-        self.meta
-            .submit(Mutation::SetBucketConfig {
+        match self
+            .meta
+            .submit(Mutation::UpdateObjectLockConfiguration {
                 bucket: bucket.name,
-                aspect: ConfigAspect::ObjectLock,
-                doc: Some(ConfigDoc(text)),
+                default_retention: config.default_retention,
             })
-            .await?;
-        Ok(S3Response::status(StatusCode::OK).with_header("x-amz-request-id", &req.request_id))
-    }
-
-    /// Apply Object Lock protections to a freshly-written version (ARCH 15): explicit
-    /// `x-amz-object-lock-*` request headers win; otherwise the bucket's default retention (if any)
-    /// is stamped. A no-op (one cached config read) unless the bucket has Object Lock enabled.
-    async fn apply_object_lock_on_put(
-        &self,
-        req: &S3Request,
-        bucket: &Bucket,
-        key: &ObjectKey,
-        version_id: &VersionId,
-        now: cairn_types::Timestamp,
-    ) -> Result<()> {
-        let config = self.bucket_object_lock_config(&bucket.name).await?;
-        if !config.enabled {
-            return Ok(());
-        }
-        // Explicit retention headers take precedence over the bucket default; mode and
-        // retain-until-date must be supplied together.
-        let retention = match (
-            req.header("x-amz-object-lock-mode"),
-            req.header("x-amz-object-lock-retain-until-date"),
-        ) {
-            (Some(m), Some(d)) => {
-                let mode = cairn_xml::parse_lock_mode(m)?;
-                let retain_until = cairn_xml::parse_iso8601(d).ok_or_else(|| {
-                    Error::InvalidArgument("invalid x-amz-object-lock-retain-until-date".to_owned())
-                })?;
-                if retain_until <= now {
-                    return Err(Error::InvalidArgument(
-                        "x-amz-object-lock-retain-until-date must be in the future".to_owned(),
-                    ));
-                }
-                Some(ObjectRetention { mode, retain_until })
-            }
-            (None, None) => config.default_retention.map(|d| ObjectRetention {
-                mode: d.mode,
-                retain_until: d.retain_until(now),
-            }),
-            _ => {
-                return Err(Error::InvalidRequest(
-                    "x-amz-object-lock-mode and x-amz-object-lock-retain-until-date must be \
-                     supplied together"
-                        .to_owned(),
+            .await
+        {
+            Ok(MutationOutcome::Ack) => {}
+            Ok(_) => {
+                return Err(Error::Internal(
+                    "unexpected Object Lock configuration outcome".to_owned(),
                 ));
             }
-        };
-        if let Some(retention) = retention {
-            self.meta
-                .submit(Mutation::SetObjectRetention {
-                    bucket: bucket.name.clone(),
-                    key: key.clone(),
-                    version_id: version_id.clone(),
-                    retention: Some(retention),
-                })
-                .await?;
+            Err(cairn_types::MetaError::InvalidBucketState) => {
+                return Err(Error::InvalidBucketState(
+                    "Object Lock can be enabled only when the bucket is created".to_owned(),
+                ));
+            }
+            Err(cairn_types::MetaError::InvalidObjectLockState) => {
+                return Err(Error::InvalidArgument(
+                    "invalid Object Lock configuration".to_owned(),
+                ));
+            }
+            Err(error) => return Err(error.into()),
         }
-        if req
-            .header("x-amz-object-lock-legal-hold")
-            .is_some_and(|h| h.eq_ignore_ascii_case("ON"))
-        {
-            self.meta
-                .submit(Mutation::SetObjectLegalHold {
-                    bucket: bucket.name.clone(),
-                    key: key.clone(),
-                    version_id: version_id.clone(),
-                    on: true,
-                })
-                .await?;
-        }
-        Ok(())
+        Ok(S3Response::status(StatusCode::OK).with_header("x-amz-request-id", &req.request_id))
     }
 
     /// Append `x-amz-object-lock-*` headers to a GET/HEAD response when the bucket has Object Lock
@@ -4037,7 +5069,7 @@ impl S3Service {
             // short-circuit, so its access is exactly what its scoped policy grants (ARCH 14).
             Some(p) if p.is_session => RequesterClass::AuthenticatedMember(p.user_id.clone()),
             Some(p) if p.role == Role::Administrator || p.user_id == bucket.owner_id => {
-                RequesterClass::OwnerOrAdmin
+                RequesterClass::OwnerOrAdmin(p.user_id.clone())
             }
             Some(p) => RequesterClass::AuthenticatedMember(p.user_id.clone()),
             None => RequesterClass::Anonymous,
@@ -4606,15 +5638,6 @@ fn build_event_payload(
     serde_json::json!({ "Records": [record] }).to_string()
 }
 
-/// Whether replacing `current` retention with `new` weakens protection — a shorter retain-until
-/// date or a `COMPLIANCE`→`GOVERNANCE` mode downgrade. Strengthening (a later date, or
-/// `GOVERNANCE`→`COMPLIANCE`) is always allowed; weakening is governed (ARCH 15).
-fn retention_is_weaker(current: &ObjectRetention, new: &ObjectRetention) -> bool {
-    new.retain_until < current.retain_until
-        || (matches!(current.mode, ObjectLockMode::Compliance)
-            && matches!(new.mode, ObjectLockMode::Governance))
-}
-
 /// Map an object-level request to the S3 action it requires.
 ///
 /// A read or delete that names a `?versionId` maps to the version-scoped action
@@ -4707,7 +5730,7 @@ const SSE_DESCRIPTOR_ALG: &str = "AES256-GCM";
 /// no descriptor). The two are always both-`Some` or both-`None`. Produced by
 /// [`S3Service::resolve_object_encryption`].
 struct EncryptionPlan {
-    dek: Option<[u8; 32]>,
+    dek: Option<SecretKey32>,
     descriptor_json: Option<String>,
 }
 
@@ -4965,7 +5988,7 @@ impl S3Service {
     /// DEK (for staging) and the JSON descriptor string (for the metadata row). Mints an SSE-S3
     /// descriptor (the mode a client explicitly asks for, or a bucket default); the transparent
     /// at-rest path calls [`new_sse_dek_mode`](Self::new_sse_dek_mode) with [`SseMode::AtRest`].
-    fn new_sse_dek(&self) -> Result<([u8; 32], String)> {
+    fn new_sse_dek(&self) -> Result<(SecretKey32, String)> {
         self.new_sse_dek_mode(&*self.crypto, SseMode::SseS3, None, false)
     }
 
@@ -4974,30 +5997,34 @@ impl S3Service {
     /// discriminator — `SseS3` advertises `AES256`, `AtRest` advertises nothing (transparent operator
     /// encryption), `Kms` advertises `aws:kms` + the key id. `crypto` is the DEK-sealing material
     /// resolved from the key provider; for the v1 local provider it is always the master ring, so the
-    /// sealed envelope is identical across modes (label-only, ARCH 27) and `open_sse_dek` unwraps it
-    /// under the same ring.
+    /// sealed envelope is identical across modes (label-only, ARCH 27) and `open_sse_cipher` unwraps
+    /// it under the same ring while preserving the expected blob format.
     fn new_sse_dek_mode(
         &self,
         crypto: &dyn Crypto,
         mode: SseMode,
         kms_key_id: Option<String>,
         bucket_key_enabled: bool,
-    ) -> Result<([u8; 32], String)> {
+    ) -> Result<(SecretKey32, String)> {
         use rand::RngCore;
         let mut dek = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut dek);
-        let sealed = crypto.seal(&dek)?;
+        let dek = SecretKey32::new(dek);
+        let sealed = crypto.seal(dek.expose_secret())?;
         let descriptor = SseDescriptor {
             alg: SSE_DESCRIPTOR_ALG.to_owned(),
             // The CRK1 envelope (audit #29) is self-describing — it carries its own key id and
             // nonce — so the whole envelope goes in `wrapped_dek_b64` and the separate nonce field
-            // is left empty. Legacy descriptors keep a populated `nonce_b64`; `open_sse_dek` routes
-            // on its presence.
+            // is left empty. Legacy descriptors keep a populated `nonce_b64`; the shared descriptor
+            // opener routes on its presence.
             wrapped_dek_b64: base64::engine::general_purpose::STANDARD.encode(&sealed.ciphertext),
             nonce_b64: String::new(),
             mode,
             kms_key_id,
             bucket_key_enabled,
+            // This field is outside the blob on purpose: a read must know that a current object
+            // requires authenticated CRNB v3 before it examines the mutable on-disk version byte.
+            blob_format_version: Some(cairn_types::sse::AUTHENTICATED_BLOB_FORMAT_VERSION),
             extra: std::collections::BTreeMap::new(),
         };
         let json = serde_json::to_string(&descriptor)
@@ -5066,40 +6093,26 @@ impl S3Service {
         }
     }
 
-    /// Unwrap the raw 32-byte DEK from a stored `sse_descriptor` JSON document by opening the
-    /// sealed key under the master key. Delegates to [`cairn_types::sse::open_dek`] — the single
-    /// definition of the envelope layout — and fails CLOSED (a typed error, never plaintext).
-    fn open_sse_dek(&self, descriptor_json: &str) -> Result<[u8; 32]> {
+    /// Resolve the raw DEK and metadata-backed CRNB format from a stored `sse_descriptor`.
+    fn open_sse_cipher(&self, descriptor_json: &str) -> Result<cairn_types::blob::BlobCipher> {
         // v1 is label-only: every DEK (SseS3, AtRest, Kms) is sealed under the SAME master ring, so
         // opening on `self.crypto` is correct and symmetric with the seal path. A FUTURE external
         // KeyProvider with per-key material would resolve the crypto via
         // `self.key_provider.crypto_for(d.kms_key_id)` — until then this fails CLOSED.
-        let d = cairn_types::sse::parse_descriptor(descriptor_json)
-            .map_err(|e| Error::Internal(format!("parse sse descriptor: {e}")))?;
-        Ok(*cairn_types::sse::open_dek(&*self.crypto, &d)?)
+        cairn_types::sse::parse_and_open_blob_cipher(&*self.crypto, descriptor_json)
+            .map_err(|e| Error::Internal(format!("open sse descriptor: {e}")))
     }
 
-    /// Seal a per-part multipart DEK under the master ring, returning the base64 CRK1 envelope stored
-    /// in `multipart_parts.part_dek` (ARCH 27, Increment 3a). Uses the exact self-framing CRK1 seal
-    /// of `new_sse_dek_mode`/`open_sse_dek` (an empty nonce; the nonce rides inside the envelope), so
-    /// the same master ring — and only that ring — can reopen it. Fails closed on a seal error.
-    fn seal_part_dek(&self, dek: &[u8; 32]) -> Result<String> {
-        Ok(base64::engine::general_purpose::STANDARD.encode(&self.crypto.seal(dek)?.ciphertext))
+    /// Seal a per-part multipart DEK and prefix the stored envelope with its current CRNB version.
+    fn seal_part_cipher(&self, dek: &SecretKey32) -> Result<String> {
+        Ok(cairn_types::sse::seal_part_blob_cipher(&*self.crypto, dek)?)
     }
 
-    /// Unwrap a per-part multipart DEK sealed by [`seal_part_dek`](Self::seal_part_dek). A bad base64,
-    /// a tampered envelope, or a wrong/rotated/retired master key fails closed (a typed error, never
-    /// plaintext); `complete_multipart` opens every part key BEFORE claiming the session so such a
-    /// failure leaves the upload retryable.
-    fn open_part_dek(&self, sealed_b64: &str) -> Result<[u8; 32]> {
-        let ct = base64::engine::general_purpose::STANDARD
-            .decode(sealed_b64.as_bytes())
-            .map_err(|_| Error::Internal("multipart part: bad wrapped key base64".to_owned()))?;
-        // CRK1: the nonce is inside the envelope, so `open` ignores this argument (empty nonce).
-        let raw = self.crypto.open(&ct, &Nonce(Vec::new()))?;
-        raw.as_slice().try_into().map_err(|_| {
-            Error::Internal("multipart part: unwrapped key is not 32 bytes".to_owned())
-        })
+    /// Open a part's DEK and metadata-backed format. Unprefixed envelopes are legacy v2; new writes
+    /// carry `crnb3:` and unknown prefixes fail before Complete claims the upload.
+    fn open_part_cipher(&self, persisted: &str) -> Result<cairn_types::blob::BlobCipher> {
+        cairn_types::sse::open_part_blob_cipher(&*self.crypto, persisted)
+            .map_err(|e| Error::Internal(format!("open multipart part descriptor: {e}")))
     }
 }
 
@@ -5320,6 +6333,58 @@ fn parse_copy_source_range(header: Option<&str>, total: u64) -> Result<Option<By
 /// signature chain must be verified.
 const SIGNED_STREAMING_SENTINEL: &str = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD";
 
+/// Translate an Object-Lock-aware object commit failure without conflating corrupt durable state
+/// with a request whose explicit deadline elapsed while its bytes were being staged.
+///
+/// The latter is still client-correctable (`InvalidArgument`); every other malformed lock state
+/// remains an opaque server error through the canonical `MetaError -> Error` mapping.
+fn map_object_commit_error(
+    error: cairn_types::MetaError,
+    intent: ExplicitObjectLockIntent,
+    commit_time: cairn_types::Timestamp,
+) -> Error {
+    match error {
+        cairn_types::MetaError::ObjectProtected => Error::AccessDenied,
+        cairn_types::MetaError::InvalidObjectLockState
+            if intent
+                .retention
+                .is_some_and(|retention| retention.retain_until <= commit_time) =>
+        {
+            Error::InvalidArgument(
+                "x-amz-object-lock-retain-until-date must be in the future".to_owned(),
+            )
+        }
+        other => other.into(),
+    }
+}
+
+/// Render the code/message pair for a `DeleteObjects` per-key error.
+///
+/// A multi-delete response is assembled directly rather than passing through `error_response`, so
+/// it must independently preserve the audit-#28 rule: internal details are logged server-side and
+/// every genuine 5xx gets the same opaque client message as a top-level S3 error.
+fn delete_objects_error_fields(
+    error: &Error,
+    request_id: &str,
+    bucket: &str,
+    key: &str,
+) -> (String, String) {
+    let (status, code) = crate::error_map::map(error);
+    let message = if status.is_server_error() && status != StatusCode::NOT_IMPLEMENTED {
+        tracing::error!(
+            error = %error,
+            request_id,
+            bucket,
+            key,
+            "internal error serving DeleteObjects key"
+        );
+        "We encountered an internal error. Please try again.".to_owned()
+    } else {
+        error.to_string()
+    };
+    (code.to_owned(), message)
+}
+
 /// Map a staging error to an S3 error, surfacing a signed-streaming chunk-signature mismatch as
 /// an authentication failure rather than a generic internal error (the staged blob is already
 /// reclaimed by the stager when its body stream errors).
@@ -5344,9 +6409,7 @@ fn streaming_body(
     max_payload: u64,
 ) -> Result<cairn_types::BodyStream> {
     let sentinel = req.header("x-amz-content-sha256");
-    let streaming = sentinel
-        .map(|v| v.starts_with("STREAMING"))
-        .unwrap_or(false);
+    let streaming = is_streaming_payload(req);
     if !streaming {
         return Ok(raw_body);
     }
@@ -5359,7 +6422,7 @@ fn streaming_body(
             .and_then(|p| p.chunk_signing.as_ref())
             .ok_or(Error::SignatureDoesNotMatch)?;
         let verifier = ChunkVerifier {
-            key: ctx.signing_key,
+            key: ctx.signing_key.clone(),
             amzdate: ctx.amz_date.clone(),
             scope: ctx.scope.clone(),
             prev_signature: ctx.seed_signature.clone(),
@@ -5800,8 +6863,9 @@ fn stored_content_encoding(req: &S3Request) -> Option<String> {
 
 /// The preserved source version id for an inbound replica PUT/marker: the
 /// `x-amz-meta-cairn-replica-version-id` header, but ONLY when this write is an authenticated
-/// replica (`is_replica`, admin-gated). Returns `None` for a normal write or an absent/empty header,
-/// so the caller mints a fresh id. A normal client can never pin a version id this way.
+/// replica (`is_replica`, centrally authorized as ReplicateObject/ReplicateDelete). Returns `None`
+/// for a normal write or an absent/empty header, so the caller mints a fresh id. A normal client can
+/// never pin a version id this way.
 fn replica_version_id(req: &S3Request, is_replica: bool) -> Option<VersionId> {
     if !is_replica {
         return None;
@@ -5814,10 +6878,11 @@ fn replica_version_id(req: &S3Request, is_replica: bool) -> Option<VersionId> {
 
 /// The ACL a destination applies to an inbound replica, read from the `x-amz-meta-cairn-replica-acl`
 /// header (base64 of the JSON `Acl`) the source sink emits (ARCH 20.4). The caller invokes this only
-/// on the admin-gated replica path. It is deliberately **fail-open**: an absent header, or ANY
-/// base64/JSON decode failure, yields `None` (no ACL) plus a warning — never an error. A 4xx here
-/// would be classified terminal by the source sink and would permanently stall that key's outbox, so
-/// a malformed ACL must degrade to "default ownership" rather than block replication.
+/// on the ReplicateObject-authorized replica path. It is deliberately **fail-open**: an absent
+/// header, or ANY base64/JSON decode failure, yields `None` (no ACL) plus a warning — never an
+/// error. A 4xx here would be classified terminal by the source sink and would permanently stall
+/// that key's outbox, so a malformed ACL must degrade to "default ownership" rather than block
+/// replication.
 fn replica_acl(req: &S3Request) -> Option<Acl> {
     let raw = req
         .header("x-amz-meta-cairn-replica-acl")
@@ -6005,6 +7070,53 @@ fn encoding_type(req: &S3Request) -> Result<Option<cairn_xml::EncodingType>> {
 /// legitimately-sized object ever could (audit 2026-07: single-request disk-exhaustion).
 fn clamp_prealloc_len(declared: Option<u64>, ceiling: u64) -> Option<u64> {
     declared.map(|n| n.min(ceiling))
+}
+
+fn declared_multipart_size(req: &S3Request, ceiling: u64) -> Result<u64> {
+    fn parse_length(raw: &str) -> Result<u64> {
+        raw.trim().parse::<u64>().map_err(|_| {
+            Error::InvalidRequest(
+                "multipart part length must be a non-negative decimal integer".to_owned(),
+            )
+        })
+    }
+
+    let size = if is_streaming_payload(req) {
+        // The HTTP Content-Length covers aws-chunked framing, not object bytes. The signed-streaming
+        // contract supplies the exact decoded length separately, and the decoder enforces it.
+        let decoded = req.header("x-amz-decoded-content-length").ok_or_else(|| {
+            Error::InvalidRequest(
+                "streaming UploadPart requires x-amz-decoded-content-length".to_owned(),
+            )
+        })?;
+        parse_length(decoded)?
+    } else {
+        // For an ordinary body Content-Length is authoritative. Never let an unrelated decoded
+        // header lower the pre-stage reservation: accepting decoded=0 beside a large Content-Length
+        // would let concurrent requests fill staging while holding zero quota.
+        let content = req.header("content-length").ok_or_else(|| {
+            Error::InvalidRequest("UploadPart requires an exact Content-Length".to_owned())
+        })?;
+        let content = parse_length(content)?;
+        if let Some(decoded) = req.header("x-amz-decoded-content-length") {
+            if parse_length(decoded)? != content {
+                return Err(Error::InvalidRequest(
+                    "x-amz-decoded-content-length conflicts with Content-Length on a non-streaming UploadPart"
+                        .to_owned(),
+                ));
+            }
+        }
+        content
+    };
+    if size > ceiling {
+        return Err(Error::EntityTooLarge);
+    }
+    Ok(size)
+}
+
+fn is_streaming_payload(req: &S3Request) -> bool {
+    req.header("x-amz-content-sha256")
+        .is_some_and(|value| value.starts_with("STREAMING"))
 }
 
 /// Buffer a (small, XML) request body up to `limit` bytes.

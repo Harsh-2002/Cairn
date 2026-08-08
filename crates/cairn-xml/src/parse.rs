@@ -1,6 +1,8 @@
 //! S3 request-body parsers. Each takes a raw `&[u8]` body and returns a typed result,
 //! folding any malformed input — invalid UTF-8, unbalanced tags, missing required fields,
-//! out-of-range numbers — to [`Error::MalformedXml`]. Parsers never panic.
+//! syntactically invalid numbers — to [`Error::MalformedXml`]. Parsers never panic. A
+//! well-formed value that violates an S3 semantic bound may instead return the corresponding
+//! typed client error (for example, `InvalidArgument` for a zero default-retention period).
 //!
 //! quick-xml's reader rejects *mismatched* end tags (`check_end_names`) but treats a body
 //! that simply ends with elements still open as a clean EOF. To make every parser total we
@@ -43,8 +45,6 @@ where
     // as malformed rather than surfacing mid-parse.
     let s = std::str::from_utf8(body).map_err(|_| malformed())?;
     let mut reader = Reader::from_str(s);
-    let cfg = reader.config_mut();
-    cfg.trim_text(true);
 
     let mut depth: u32 = 0;
     // Coalesce consecutive Text/CData into a single buffer, flushed as ONE `Sax::Text` on the next
@@ -56,8 +56,13 @@ where
     let mut text_buf: Option<String> = None;
     macro_rules! flush_text {
         () => {
-            if let Some(s) = text_buf.take() {
-                on_event(Sax::Text(std::borrow::Cow::Owned(s)))?;
+            if let Some(text) = text_buf.take() {
+                // quick-xml 0.41 splits references out of surrounding text. Trim the complete
+                // logical run, not each fragment, so `a &amp; b` remains `a & b`.
+                let text = text.trim_matches(|ch| matches!(ch, ' ' | '\t' | '\r' | '\n'));
+                if !text.is_empty() {
+                    on_event(Sax::Text(std::borrow::Cow::Owned(text.to_owned())))?;
+                }
             }
         };
     }
@@ -76,8 +81,22 @@ where
                 on_event(Sax::Close(name))?;
             }
             Event::Text(t) => {
-                let text = t.unescape().map_err(|_| malformed())?;
+                let text = t.decode().map_err(|_| malformed())?;
                 text_buf.get_or_insert_with(String::new).push_str(&text);
+            }
+            // quick-xml 0.41 surfaces every entity and character reference as its own
+            // event. Resolve only XML's predefined entities and numeric references; an
+            // undeclared/custom entity is malformed just as it was before the upgrade.
+            Event::GeneralRef(r) => {
+                let buf = text_buf.get_or_insert_with(String::new);
+                if let Some(ch) = r.resolve_char_ref().map_err(|_| malformed())? {
+                    buf.push(ch);
+                } else {
+                    let name = r.decode().map_err(|_| malformed())?;
+                    let replacement =
+                        quick_xml::escape::resolve_xml_entity(&name).ok_or_else(malformed)?;
+                    buf.push_str(replacement);
+                }
             }
             Event::CData(t) => {
                 let text = t.decode().map_err(|_| malformed())?;
@@ -596,9 +615,14 @@ pub fn parse_legal_hold(body: &[u8]) -> Result<bool, Error> {
 /// Parse an `ObjectLockConfiguration` body (the bucket-level config) into the typed configuration.
 ///
 /// # Errors
-/// [`Error::MalformedXml`] if the body is not well-formed or the default retention is partial.
+/// [`Error::MalformedXml`] if the body is not well-formed, does not explicitly enable Object Lock,
+/// attempts to encode a disabled state, or carries a partial default retention; or
+/// [`Error::InvalidArgument`] if its period is zero or exceeds the supported S3 bound.
 pub fn parse_object_lock_configuration(body: &[u8]) -> Result<ObjectLockConfiguration, Error> {
-    let mut enabled = false;
+    // Object Lock enablement is immutable. A bucket-level configuration document is therefore
+    // valid only when it explicitly contains `ObjectLockEnabled=Enabled`; treating an absent,
+    // empty, or unknown value as `enabled=false` turns `PUT ?object-lock` into a disable path.
+    let mut enabled: Option<bool> = None;
     let mut mode: Option<ObjectLockMode> = None;
     let mut days: Option<u32> = None;
     let mut years: Option<u32> = None;
@@ -627,7 +651,10 @@ pub fn parse_object_lock_configuration(body: &[u8]) -> Result<ObjectLockConfigur
             }
             Sax::Close(name) => {
                 if name == b"ObjectLockEnabled" {
-                    enabled = buf.trim() == "Enabled";
+                    enabled = Some(match buf.trim() {
+                        "Enabled" => true,
+                        _ => return Err(malformed()),
+                    });
                 } else if name == b"Mode" {
                     mode = Some(parse_lock_mode(buf.trim())?);
                 } else if name == b"Days" {
@@ -652,6 +679,10 @@ pub fn parse_object_lock_configuration(body: &[u8]) -> Result<ObjectLockConfigur
         (None, None, None) => None,
         _ => return Err(malformed()),
     };
+    if let Some(retention) = default_retention {
+        retention.validate()?;
+    }
+    let enabled = enabled.ok_or_else(malformed)?;
     Ok(ObjectLockConfiguration {
         enabled,
         default_retention,

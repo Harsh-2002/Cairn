@@ -16,10 +16,10 @@
 #            committed as a VERSION_ENCRYPTED CRNB container under the TARGET's own key.
 #   node-S = SOURCE. Replicates to node-T; runs the constant write workload.
 #
-# WIRING CHOICE — the SOURCE uses the operator-trusted `CAIRN_REPLICATION_ENDPOINT` config path
-# (like `soak.sh`), NOT the management API. That path is exempt from the `cairn-net` SSRF guard, so
-# this harness does NOT need `CAIRN_ALLOW_INTERNAL_ENDPOINTS=true` (which `mesh.py` does need,
-# because it registers targets through the guarded management API). The per-bucket rules still name
+# WIRING CHOICE — the SOURCE uses the `CAIRN_REPLICATION_ENDPOINT` config path (like `soak.sh`),
+# rather than the management API. Both paths are protected by the `cairn-net` SSRF guard; because
+# this test topology deliberately targets loopback, it explicitly sets
+# `CAIRN_ALLOW_INTERNAL_ENDPOINTS=true`. The per-bucket rules still name
 # `arn:aws:s3:::<bucket>`, which `resolve_dest_buckets` maps onto the configured endpoint.
 # The SOURCE's web console listener IS on, but only so the driver can read `GET /api/v1/replication/summary`
 # — exact outbox pending/claimed/failed counts and the true lag, straight from the store.
@@ -33,8 +33,7 @@
 #     identity, delete markers with exact `NoSuchKey`, the on-disk re-encryption proof, outbox drain,
 #     /healthz on both nodes) — a non-zero driver exit fails the run;
 #   * BOTH nodes alive at the end;
-#   * HTTP 5xx on EACH node EQUAL to the driver's declared budget (which is 0 for this mix — the one
-#     deliberate rejection in it, the destination refusing an encrypted source version, is a 400);
+#   * HTTP 5xx on EACH node EQUAL to the driver's declared budget (0 for this mix);
 #   * absolute CEILINGS on BOTH nodes: RSS / open fds / threads / summed WAL bytes — same knobs and
 #     defaults as `stress.sh`, so the harnesses agree on what "runaway" means;
 #   * SAMPLER NON-VACUITY: each node must have produced samples and a NON-ZERO peak for RSS, fds,
@@ -50,20 +49,12 @@
 # DRAIN: after writes stop, pending+claimed must reach 0 within a bounded wait, with a no-progress
 # stall detector. A backlog that never comes back down is the failure this harness exists to catch.
 #
-# TWO KNOWN GAPS, PINNED AND REPORTED, NOT GATED (this is a harness-only harness; fixing them is a
-# PRODUCT change). Shared root cause: `ReplicationEngine::put_object` opens the source blob with
-# `BlobStore::open` — with NO DEK — so an SSE-encrypted source version ships raw CIPHERTEXT.
-#   GAP 1, fail-closed: a SINGLE-PART encrypted version's plain MD5 ETag is verified at the
-#     destination, the PUT is refused `400 BadDigest`, and a 4xx is terminal — so the object never
-#     replicates at all. Wrong, but safe.
-#   GAP 2, NOT fail-closed — SILENT CORRUPTION: a MULTIPART-completed encrypted version carries a
-#     COMPOSITE `<md5>-<n>` ETag the destination cannot MD5-verify, so it ACCEPTS the ciphertext. The
-#     replica exists, has the right size, answers 200, and is GARBAGE.
-# The consequence worth knowing: turning on SSE — or `CAIRN_ENCRYPT_AT_REST` — on a replication
-# SOURCE silently stops that bucket replicating, and its multipart objects silently corrupt on the
-# mirror. The driver counts all three outcomes (absent / byte-exact / wrong-bytes) and prints
-# `KNOWN GAPS APPEAR FIXED` if they ever start working — the signal to promote the arm into the
-# gated leg. The fail-closed GATE is therefore scoped to the plaintext leg.
+# THE SSE ARM IS A HARD REGRESSION GATE. Historically `ReplicationEngine::put_object` opened an
+# encrypted source blob without its DEK and shipped raw ciphertext: single-part replicas failed
+# `400 BadDigest`, while composite-ETag multipart replicas could be accepted as right-sized garbage.
+# The engine now resolves the source DEK, reads logical bytes, and lets the target re-seal them under
+# its own key. Every encrypted single- and multipart version must therefore arrive byte-exact; a
+# missing or wrong-byte SSE replica fails this harness. Do not demote this arm back to advisory.
 #
 # Usage:
 #   conformance/stress_replication.sh                              # default profile (~3 min)
@@ -236,6 +227,7 @@ env "${source_env[@]}" \
     CAIRN_REPLICATION_ENDPOINT="http://127.0.0.1:$PORT_T" \
     CAIRN_REPLICATION_ACCESS_KEY="$T_AK" \
     CAIRN_REPLICATION_SECRET="$T_SK" \
+    CAIRN_ALLOW_INTERNAL_ENDPOINTS=true \
     "$BIN" serve >"$DATA_S/server.log" 2>&1 &
 SRV_S=$!
 

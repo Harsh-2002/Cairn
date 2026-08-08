@@ -3,8 +3,10 @@
 The management console: a **React 19 + TypeScript SPA** (Vite, Tailwind v4, shadcn-style
 `radix-ui` components, self-hosted Geist fonts). Built into `web/dist`, which the `cairn-web` crate
 embeds into the binary and the server serves at the root of the web-console listener
-(`CAIRN_WEB_ADDR`, :7374). **Excluded from the cargo workspace** — its gate is `npm run lint` (ESLint) + `npm run build` (strict `tsc` + vite), not
-cargo (see the root `../CLAUDE.md`).
+(`CAIRN_WEB_ADDR`, :7374). **Excluded from the cargo workspace** — its gate is `npm run lint`
+(ESLint 10 with `jsx-a11y-x`) + `npm run build` (strict `tsc` + vite), followed by
+`npm audit --omit=dev --audit-level=moderate` and `npm audit --audit-level=high`; it is not covered
+by cargo (see the root `../CLAUDE.md`).
 
 ## Layout (`src/`)
 - `main.tsx` / `app.tsx` / `routes.tsx` — entry, provider shell (`ThemeProvider` → `AuthProvider` →
@@ -26,21 +28,32 @@ cargo (see the root `../CLAUDE.md`).
 - **The web console is a pure presentation layer** over the control plane (ARCH 23) — it holds no privileged
   logic. Every server call goes through the `api` object in `lib/api.ts` (or `lib/s3.ts` for object
   bytes); **never** hand-roll a `fetch` to `/api/v1` in a view.
-- **Auth is the server's httpOnly session cookie**, set by `POST /session` at sign-in. All requests
-  use `credentials: "same-origin"` and send **no** `Authorization` header; the cookie is never
-  readable from JS — **never** put a token in `localStorage`/`sessionStorage`. The same cookie
-  authorizes the S3 data plane at root (`lib/s3.ts`), so the browser uploads/downloads bytes
-  directly. (The "Bearer" copy in `users`/`user-detail`/`login` views is about the **end-user S3
-  credentials the console mints**, not how the console authenticates — keep them distinct.)
+- **Persistent-share links are one-time output.** `share-dialog.tsx` may show/copy the URL returned
+  by mint, but list/manage views receive only a stable non-secret share id and must never
+  reconstruct `/share/{token}` or offer an existing-link copy action.
+- **Auth is the server's httpOnly session cookie**, set by `POST /session` at sign-in. Management
+  calls use `credentials: "same-origin"` and send **no** `Authorization` header; the cookie is never
+  readable from JS — **never** put a token in `localStorage`/`sessionStorage`. The server honours
+  that cookie only on the control listener. `lib/s3.ts` asks the management API for an exact
+  data-origin SigV4 URL backed by a durable, bucket-scoped temporary session, then sends the raw S3
+  request with `credentials: "omit"`. JavaScript retains only the public session handle in memory;
+  the signing secret never leaves the server. (The "Bearer" copy in
+  `users`/`user-detail`/`login` views is about end-user credentials, not console authentication.)
+- **Browser dot segments fail closed.** WHATWG URL parsing removes literal and percent-encoded `.`
+  / `..` path segments. `lib/s3.ts` and the server presign boundary reject these keys with an
+  SDK/CLI fallback message; never normalize, retarget, or proxy them through the control origin.
 - **Object bytes are never rendered as active content in the console origin.** `object-preview.tsx`
   renders only through inert paths (media elements; a PDF frame whose URL forces
   `response-content-type=application/pdf`, which `nosniff` then pins; text fetched and rendered as
   text — never `innerHTML`, never a same-origin navigation to the object). A stored `text/html` or
   `image/svg+xml` object would otherwise be stored XSS. Do not add a `sandbox` to the PDF frame: it
   breaks the built-in viewer, which is script-driven.
-- **Hash routing on purpose** (`createHashRouter`). The server serves the SPA shell only at `/`;
-  every other path is the S3 data plane, so history-mode routes would collide with `/{bucket}/{key}`.
-  Don't switch to a browser router.
+- **Hash routing on purpose** (`createHashRouter`). The server serves the SPA shell only at `/` and
+  concrete embedded assets; every other control-listener path is a fail-closed 404. Don't switch to
+  a browser router without defining an explicit, non-S3 server route family.
+- **Recursive delete must converge.** A protected Object Lock version can make the control API
+  return `more=true` indefinitely. Stop automatic retries after any zero-deletion pass, and
+  de-duplicate failures by the exact `(key, version_id)` identity across partial passes.
 - **`vite.config.ts` sets `base: "./"`** so assets are referenced relatively (`./assets/index-*`).
   `cairn-web`'s `index_referenced_bundles_are_embedded` test depends on this shape — **don't change
   it**. A real build is required: without `dist/` the crate embeds a placeholder that fails that test.

@@ -511,15 +511,23 @@ export function BucketBrowser() {
     setDeletingFolder(true);
     try {
       let total = 0;
-      let errorCount = 0;
+      // A protected version can be returned again on a later partial pass. Count failures by the
+      // server's stable (key, version-id) identity so the toast never inflates one WORM row into
+      // several failures.
+      const failedVersions = new Set<string>();
       // The endpoint deletes in batches; loop while `more` is true, capped to
       // avoid an unbounded loop if the server keeps reporting more.
       for (let i = 0; i < 50; i++) {
         const r = await api.deletePrefix(name, prefix);
         total += r.deleted;
-        errorCount += r.errors.length;
-        if (!r.more) break;
+        for (const error of r.errors) {
+          failedVersions.add(`${error.key}\u0000${error.version_id}`);
+        }
+        // A protected version is stable until its retention/hold changes. Avoid immediately
+        // retrying the same partial result 50 times when this pass made no forward progress.
+        if (!r.more || r.deleted === 0) break;
       }
+      const errorCount = failedVersions.size;
       if (errorCount > 0) {
         toast.error(
           `Deleted ${total} object${total === 1 ? "" : "s"}, ${errorCount} failed.`,

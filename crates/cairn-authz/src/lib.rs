@@ -17,12 +17,12 @@ mod parse;
 
 pub use acl::{expand_canned_acl, permission_satisfies};
 pub use matching::{resource_arn, resource_matches, wildcard_match};
-pub use parse::{parse_policy, parse_user_policy};
+pub use parse::{intersect_admin_session_policy, parse_policy, parse_user_policy};
 
 use cairn_types::authz::{ActionMatch, ActionPattern, PrincipalSpec, ResourceMatch};
 use cairn_types::{
     Acl, Action, AuthorizationEngine, AuthzInput, Decision, DenyReason, Effect, Grantee,
-    OwnershipMode, Policy, PublicAccessBlock, RequesterClass, Resource, Statement, UserId,
+    OwnershipMode, Policy, PublicAccessBlock, RequesterClass, Resource, Statement,
 };
 
 use condition::conditions_match;
@@ -44,7 +44,7 @@ pub fn evaluate(input: &AuthzInput) -> Decision {
     // (a) Owner / admin: permitted unless an explicit Deny matches — in the bucket policy OR the
     //     requester's own identity policy (an identity Deny binds the principal, even an owner,
     //     matching AWS).
-    if matches!(input.requester, RequesterClass::OwnerOrAdmin) {
+    if matches!(input.requester, RequesterClass::OwnerOrAdmin(_)) {
         if explicit_deny_matches(input) || user_policy_deny_matches(input) {
             return Decision::Deny(DenyReason::ExplicitPolicyDeny);
         }
@@ -270,9 +270,9 @@ fn principal_matches(
                 return false;
             }
             match requester {
-                // Owner/admin is handled before policy allow evaluation, but a named statement
-                // can still reference them (e.g. for the explicit-deny path).
-                RequesterClass::OwnerOrAdmin => false,
+                // Owner/admin is handled before policy allow evaluation, but its identity is
+                // retained because a named explicit Deny must still bind it.
+                RequesterClass::OwnerOrAdmin(uid) => ids.contains(uid),
                 RequesterClass::AuthenticatedMember(uid) => ids.contains(uid),
                 RequesterClass::Anonymous => false,
             }
@@ -281,11 +281,13 @@ fn principal_matches(
         // "not any named user", so the clause covers them — but only when public principals are
         // permitted, so Block Public Access still governs a `NotPrincipal` Allow exactly as it
         // governs a `"*"` Allow (see `policy_grants_public`, which flags both as public).
-        // Authenticated members match when public *or* user principals are permitted and they are
-        // not in the excluded set. Owner/admin is authorised on a separate path and never matched
-        // here, mirroring the positive `Users` arm.
+        // Authenticated requesters match when public *or* user principals are permitted and they
+        // are not in the excluded set. Owner/admin is authorised on a separate path, but retains
+        // its identity here so a named `NotPrincipal` explicit Deny has the correct complement.
         PrincipalSpec::NotUsers(ids) => match requester {
-            RequesterClass::OwnerOrAdmin => false,
+            RequesterClass::OwnerOrAdmin(uid) => {
+                (allow_public_principal || allow_user_principal) && !ids.contains(uid)
+            }
             RequesterClass::Anonymous => allow_public_principal,
             RequesterClass::AuthenticatedMember(uid) => {
                 (allow_public_principal || allow_user_principal) && !ids.contains(uid)
@@ -343,7 +345,7 @@ fn acl_grants(
     allow_public_grantees: bool,
 ) -> bool {
     acl.grants.iter().any(|g| {
-        grantee_matches(&g.grantee, requester, &acl.owner, allow_public_grantees)
+        grantee_matches(&g.grantee, requester, allow_public_grantees)
             && permission_satisfies(g.permission, action, resource)
     })
 }
@@ -357,7 +359,6 @@ fn acl_grants(
 fn grantee_matches(
     grantee: &Grantee,
     requester: &RequesterClass,
-    owner: &UserId,
     allow_public_grantees: bool,
 ) -> bool {
     match grantee {
@@ -370,7 +371,7 @@ fn grantee_matches(
             RequesterClass::AuthenticatedMember(req) => req == uid,
             // An owner/admin is short-circuited earlier; but a user grant to the owner is
             // honoured for completeness.
-            RequesterClass::OwnerOrAdmin => uid == owner,
+            RequesterClass::OwnerOrAdmin(requester) => uid == requester,
             RequesterClass::Anonymous => false,
         },
     }
@@ -379,7 +380,7 @@ fn grantee_matches(
 fn requester_is_authenticated(requester: &RequesterClass) -> bool {
     matches!(
         requester,
-        RequesterClass::AuthenticatedMember(_) | RequesterClass::OwnerOrAdmin
+        RequesterClass::AuthenticatedMember(_) | RequesterClass::OwnerOrAdmin(_)
     )
 }
 

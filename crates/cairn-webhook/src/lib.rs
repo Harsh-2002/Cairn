@@ -18,7 +18,7 @@ mod sink;
 use cairn_types::bucket::ConfigAspect;
 use cairn_types::meta::{Mutation, WebhookEntry};
 use cairn_types::notification::NotificationConfig;
-use cairn_types::traits::{Clock, MetadataStore};
+use cairn_types::traits::{Clock, Crypto, MetadataStore};
 use cairn_types::{MetaError, Timestamp};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -93,9 +93,8 @@ pub fn next_backoff(attempts: u32, base: u64, cap: u64) -> u64 {
 
 /// The hex-encoded HMAC-SHA256 of `body` under `secret` (the `X-Cairn-Signature` value).
 #[must_use]
-pub fn sign(secret: &str, body: &[u8]) -> String {
-    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
-        .expect("HMAC accepts a key of any length");
+pub fn sign(secret: &[u8], body: &[u8]) -> String {
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("HMAC accepts a key of any length");
     mac.update(body);
     hex::encode(mac.finalize().into_bytes())
 }
@@ -115,16 +114,18 @@ impl WebhookEngine {
 
     /// Drain due entries until the outbox is idle or `max_batches` passes have run, whichever comes
     /// first. Each entry is delivered to its endpoint and marked done / rescheduled / failed.
-    pub async fn run_until_idle<M, S, C>(
+    pub async fn run_until_idle<M, S, K, C>(
         &self,
         meta: &M,
         sink: &S,
+        crypto: &K,
         clock: &C,
         max_batches: u32,
     ) -> Result<WebhookReport, MetaError>
     where
         M: MetadataStore + ?Sized,
         S: WebhookSink + ?Sized,
+        K: Crypto + ?Sized,
         C: Clock + ?Sized,
     {
         use futures_util::stream::StreamExt;
@@ -139,7 +140,7 @@ impl WebhookEngine {
             // sink's per-request timeout) can no longer stall the entries behind it.
             let outcomes: Vec<Result<DeliveryOutcome, MetaError>> =
                 futures_util::stream::iter(batch)
-                    .map(|entry| self.deliver_one(meta, sink, clock, entry))
+                    .map(|entry| self.deliver_one(meta, sink, crypto, clock, entry))
                     .buffer_unordered(self.opts.max_concurrency.max(1))
                     .collect()
                     .await;
@@ -154,16 +155,18 @@ impl WebhookEngine {
         Ok(report)
     }
 
-    async fn deliver_one<M, S, C>(
+    async fn deliver_one<M, S, K, C>(
         &self,
         meta: &M,
         sink: &S,
+        crypto: &K,
         clock: &C,
         entry: WebhookEntry,
     ) -> Result<DeliveryOutcome, MetaError>
     where
         M: MetadataStore + ?Sized,
         S: WebhookSink + ?Sized,
+        K: Crypto + ?Sized,
         C: Clock + ?Sized,
     {
         // Resolve the live endpoint (URL + secret) from the bucket's notification config. If the
@@ -179,15 +182,35 @@ impl WebhookEngine {
 
         let signature = endpoint
             .secret
-            .as_deref()
-            .map(|s| sign(s, entry.payload.as_bytes()));
-        let result = sink
-            .deliver(
-                &endpoint.url,
-                entry.payload.as_bytes(),
-                signature.as_deref(),
-            )
-            .await;
+            .as_ref()
+            .map(|secret| {
+                secret
+                    .open(crypto)
+                    .map(|key| sign(&key, entry.payload.as_bytes()))
+            })
+            .transpose();
+        let result = match signature {
+            Ok(signature) => {
+                sink.deliver(
+                    &endpoint.url,
+                    entry.payload.as_bytes(),
+                    signature.as_deref(),
+                )
+                .await
+            }
+            Err(_) => {
+                // Never degrade to an unsigned delivery: a missing key-ring member or tampered
+                // envelope is an availability failure, not permission to weaken authenticity.
+                tracing::warn!(
+                    entry = %entry.id,
+                    endpoint = %endpoint.id,
+                    "webhook signing secret could not be opened; delivery withheld"
+                );
+                Err(WebhookError::Retryable(
+                    "webhook signing secret unavailable".to_owned(),
+                ))
+            }
+        };
 
         match result {
             Ok(()) => {

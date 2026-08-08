@@ -116,7 +116,11 @@ ingress/load balancer in front. If terminating upstream, the S3 endpoint clients
 SigV4 signed (host + scheme) — set `CAIRN_PUBLIC_URL` accordingly.
 
 ## 3. Backups in K8s
-Snapshot per [`backup-restore.md`](./backup-restore.md): a CronJob (or sidecar) runs `cairn backup` to
-a separate volume / object store, database-first then blobs. A PVC VolumeSnapshot alone is acceptable
-only if it is crash-consistent for the whole filesystem at one instant; the `cairn backup` procedure is
-the supported, ordering-correct path.
+Snapshot per [`backup-restore.md`](./backup-restore.md). Built-in backup is offline: first stop/scale
+the Cairn workload to zero, then run a one-shot maintenance Pod with exclusive access to the data
+PVC and a separate backup volume, and restart Cairn only after `cairn backup` succeeds. A live
+sidecar or ordinary concurrent CronJob is not supported; it will contend on Cairn's node lock and
+must fail rather than capture a moving blob tree. Preserve the complete `manifest.json`-last
+directory as one unit. A PVC VolumeSnapshot alone is acceptable only if it is crash-consistent for
+the whole filesystem at one instant; the offline `cairn backup` procedure is the supported,
+ordering-correct path.

@@ -57,13 +57,17 @@ it mirrors `.github/workflows/ci.yml` and must be green before any change is fin
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings        # also run with --all-features
 cargo nextest run --workspace                                # + cargo test --workspace --doc
-(cd web && npm install && npm run lint && npm run build)                      # for any web console change / the embedded console
+cargo audit
+(cd web && npm install && npm run lint && npm run build \
+  && npm audit --omit=dev --audit-level=moderate && npm audit --audit-level=high)
+shellcheck -s sh install.sh tests/install.sh && sh tests/install.sh
 ```
 
 `make check` runs the fast gate (fmt + clippy + nextest + doctests) in order, aborting on the first
-failure; `make check-all` adds the `--all-features` clippy leg and the web console build. `make help` lists
-every target. The `Makefile` is a thin front door over `cargo` and the conformance harnesses — it
-doesn't replace them, and the raw commands above remain the source of truth.
+failure; `make check-all` adds the `--all-features` clippy leg, the web console build, and the
+standalone-installer shell checks. `make help` lists every target. The `Makefile` is a thin front
+door over `cargo` and the conformance harnesses — it doesn't replace them, and the raw commands
+above remain the source of truth.
 
 - Toolchain is pinned in `rust-toolchain.toml` (stable). Warnings are denied; `unsafe_code`, `dbg!`,
   and `todo!` are lints — keep them out of committed code.
@@ -108,7 +112,7 @@ doesn't replace them, and the raw commands above remain the source of truth.
   `crates/cairn-server/src/config.rs` with a doc comment **and** validation (ARCH 28).
 - **Two listeners.** S3 data plane on `:7373` (`CAIRN_LISTEN_ADDR`); web console + `/api/v1` on
   `:7374` (`CAIRN_WEB_ADDR`; set to `off`/`none` for headless). `/healthz`, `/readyz`, `/metrics` are
-  served on the S3 port, ahead of the concurrency limiter. The AWS-STS surface (AssumeRole /
+  served on the S3 port under a small dedicated infrastructure concurrency budget. The AWS-STS surface (AssumeRole /
   GetSessionToken, `cairn-server/src/sts.rs`, `CAIRN_STS_ENABLED`) is a form POST on the S3 port.
 - **All writes go through the single `Writer`** (group-commit, savepoint-isolated batches) in
   `cairn-meta`; reads use the WAL read pool. Never open ad-hoc write connections.
@@ -118,8 +122,13 @@ doesn't replace them, and the raw commands above remain the source of truth.
   `cairn-meta/src/shard.rs` — both `ShardedMetadataStore::submit`'s routing match and
   `mutation_bucket` (both now exhaustive, so the compiler forces this). Schema changes are
   **append-only** migrations in `cairn-meta/src/schema.rs` (never edit an applied migration; latest
-  is v23 — v21 per-part multipart DEKs, v22 multipart KMS intent, v23
-  `object_versions.replicated_at` + the outbox `(bucket_name, key)` index).
+  is v29 — v21 per-part multipart DEKs, v22 multipart KMS intent, v23
+  `object_versions.replicated_at` + the outbox `(bucket_name, key)` index, v24 bounded import
+  scheduling/history/retention indexes, v25 hash-only one-time object-share capabilities, v26
+  bounded multipart staging reservations, cleanup debt, and O(1) quota/cardinality counters, v27
+  multipart initial tags/Object Lock intent (including the legacy-intent proof marker) and
+  orphan-lock cleanup, v28 lifecycle row identity in the current-listing covering index, v29
+  exact-token multipart completion ownership).
 - **Crypto fails closed.** A missing/wrong key or tampered envelope must return an error — never
   plaintext, zeros, or partial data. Server-side encryption (SSE-S3, transparent at-rest via
   `CAIRN_ENCRYPT_AT_REST`, SSE-KMS via `CAIRN_KMS_KEY_IDS`) is **label-only** in v1: every DEK is

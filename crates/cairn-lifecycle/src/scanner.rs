@@ -10,7 +10,9 @@
 //! once already performed, so a scan that is interrupted and rerun, or simply run twice,
 //! converges to the same end state. Current-object expiration in a versioned bucket relies on
 //! [`MetadataStore::list_current`] excluding delete markers — once a marker hides a key, the
-//! key no longer appears, so no second marker is inserted.
+//! key no longer appears, so no second marker is inserted. Writer-atomic freshness guards also
+//! make an enumeration-time decision a no-op when a new current version arrives, or when a sole
+//! delete marker gains another version, before the mutation commits.
 //!
 //! Transition to a remote cold tier (ARCH 19.5) is a documented NO-OP placeholder in v1: the
 //! scanner recognizes the action but performs no data movement and does not count it.
@@ -18,16 +20,109 @@
 use crate::config::{Action, Expiration, Filter, LifecycleRule};
 use cairn_types::{BlobStore, MetaError};
 use cairn_types::{
-    Bucket, BucketName, Clock, ListQuery, MetadataStore, MultipartSession, Mutation, ObjectKey,
+    Bucket, BucketName, Clock, CurrentVersionGuard, GovernanceBypass, ListQuery, MetadataStore,
+    MultipartSession, MultipartTerminalOutcome, Mutation, MutationOutcome, ObjectKey,
     ObjectSummary, StoragePath, Timestamp, VersionId, VersioningState,
 };
 
 /// The page size used for every bounded enumeration the scanner issues. Memory stays flat
 /// regardless of bucket size because each page is processed and dropped before the next.
-const PAGE_LIMIT: u32 = 1000;
+pub(crate) const PAGE_LIMIT: u32 = 1000;
 
 /// The number of stale sessions fetched per `enumerate_stale_sessions` call.
 const SESSION_BATCH: u32 = 1000;
+
+/// An ordered, paged view of a bucket's version listing that yields one complete key group at a
+/// time. A key may span arbitrarily many pages, so the pager retains that one group until the
+/// listing advances to a different key; every other completed group is released immediately.
+///
+/// Peak memory is one metadata page plus the largest single key's version history, never the whole
+/// bucket. Keeping a spanning key intact is also what makes noncurrent rank and sole-delete-marker
+/// decisions correct at page boundaries.
+struct VersionGroupPager<'a, M: MetadataStore + ?Sized> {
+    meta: &'a M,
+    bucket: &'a BucketName,
+    cursor: Option<String>,
+    version_id_marker: Option<String>,
+    page: std::iter::Peekable<std::vec::IntoIter<ObjectSummary>>,
+    finished: bool,
+}
+
+impl<'a, M: MetadataStore + ?Sized> VersionGroupPager<'a, M> {
+    fn new(meta: &'a M, bucket: &'a BucketName) -> Self {
+        Self {
+            meta,
+            bucket,
+            cursor: None,
+            version_id_marker: None,
+            page: Vec::new().into_iter().peekable(),
+            finished: false,
+        }
+    }
+
+    /// Load the next bounded listing page and advance the paired `(key, version-id)` cursor.
+    async fn load_page(&mut self) -> Result<(), MetaError> {
+        let page = self
+            .meta
+            .list_versions(
+                self.bucket,
+                &ListQuery {
+                    cursor: self.cursor.clone(),
+                    version_id_marker: self.version_id_marker.clone(),
+                    limit: PAGE_LIMIT,
+                    ..Default::default()
+                },
+            )
+            .await?;
+
+        if page.truncated {
+            let next_cursor = page.next_cursor.ok_or_else(|| {
+                MetaError::Engine(
+                    "truncated lifecycle version listing omitted its key cursor".to_owned(),
+                )
+            })?;
+            let next_marker = page.next_version_id_marker;
+            if self.cursor.as_deref() == Some(next_cursor.as_str())
+                && self.version_id_marker.as_deref() == next_marker.as_deref()
+            {
+                return Err(MetaError::Engine(
+                    "lifecycle version listing cursor made no progress".to_owned(),
+                ));
+            }
+            self.cursor = Some(next_cursor);
+            self.version_id_marker = next_marker;
+        } else {
+            self.finished = true;
+        }
+        self.page = page.items.into_iter().peekable();
+        Ok(())
+    }
+
+    /// Return the next complete, key-homogeneous group in listing order.
+    async fn next_group(&mut self) -> Result<Option<Vec<ObjectSummary>>, MetaError> {
+        let mut group: Vec<ObjectSummary> = Vec::new();
+        loop {
+            if let Some(next) = self.page.peek() {
+                if group
+                    .first()
+                    .is_some_and(|first| first.key.as_str() != next.key.as_str())
+                {
+                    return Ok(Some(group));
+                }
+                let Some(item) = self.page.next() else {
+                    continue;
+                };
+                group.push(item);
+                continue;
+            }
+
+            if self.finished {
+                return Ok((!group.is_empty()).then_some(group));
+            }
+            self.load_page().await?;
+        }
+    }
+}
 
 /// A tally of the work one scan performed, surfaced as metrics by the caller (ARCH 19.2).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -135,7 +230,7 @@ impl LifecycleScanner {
                     .await?,
             );
             report.merge(
-                self.remove_expired_delete_markers(meta, &bucket, &enabled)
+                self.remove_expired_delete_markers(meta, &bucket, &enabled, now)
                     .await?,
             );
             report.merge(
@@ -181,26 +276,16 @@ impl LifecycleScanner {
                 };
                 debug_assert!(rule.enabled);
                 if versioned {
-                    if self
-                        .insert_delete_marker(meta, bucket, &obj.key, now)
-                        .await
-                        .is_ok()
-                    {
-                        report.objects_expired += 1;
-                    } else {
-                        report.errors += 1;
+                    match self.insert_delete_marker(meta, bucket, obj, now).await {
+                        Ok(true) => report.objects_expired += 1,
+                        // Ok(false): the enumerated version was replaced after the scan, or Object
+                        // Lock preserved it. Neither outcome is an expiration or an error.
+                        Ok(false) => {}
+                        Err(_) => report.errors += 1,
                     }
                 } else {
                     match self
-                        .delete_version(
-                            meta,
-                            blob,
-                            &bucket.name,
-                            &obj.key,
-                            &obj.version_id,
-                            now,
-                            Some(obj.last_modified),
-                        )
+                        .delete_version(meta, blob, &bucket.name, obj, now)
                         .await
                     {
                         Ok(true) => report.objects_expired += 1,
@@ -219,10 +304,11 @@ impl LifecycleScanner {
         Ok(report)
     }
 
-    /// Noncurrent-version expiration (ARCH 19.3). Pages every version, groups by key, and for
-    /// each key deletes the noncurrent (non-latest, non-delete-marker) versions that have been
-    /// noncurrent longer than the rule's `days`, while preserving the newest
-    /// `newer_noncurrent_versions` of them.
+    /// Noncurrent-version expiration (ARCH 19.3). Consumes the ordered version listing one complete
+    /// key group at a time and deletes noncurrent (non-latest, non-delete-marker) versions that
+    /// have been noncurrent longer than the rule's `days`, while preserving the newest
+    /// `newer_noncurrent_versions` of them. A group that crosses page boundaries is carried until
+    /// the next key arrives, so rank and supersession time remain exact without bucket-wide memory.
     async fn expire_noncurrent_versions<M, B>(
         &self,
         meta: &M,
@@ -236,150 +322,90 @@ impl LifecycleScanner {
         B: BlobStore + ?Sized,
     {
         let mut report = LifecycleReport::default();
-
-        // Collect the full version listing one bounded page at a time, then group by key. The
-        // page is the unit of memory; the grouping holds only summaries (no bytes).
-        let mut all: Vec<ObjectSummary> = Vec::new();
-        let mut cursor: Option<String> = None;
-        // A version page resumes on the (key, version-id) PAIR, so thread BOTH the boundary key and
-        // its version-id marker back into the next query. Feeding only the key half re-lists a key
-        // that holds more versions than one page at every boundary and, worst case, never
-        // terminates (issue #7).
-        let mut vmarker: Option<String> = None;
-        loop {
-            let query = ListQuery {
-                cursor: cursor.clone(),
-                version_id_marker: vmarker.clone(),
-                limit: PAGE_LIMIT,
-                ..Default::default()
-            };
-            let page = meta.list_versions(&bucket.name, &query).await?;
-            all.extend(page.items);
-            match page.next_cursor {
-                Some(c) if page.truncated => {
-                    cursor = Some(c);
-                    vmarker = page.next_version_id_marker;
-                }
-                _ => break,
-            }
-        }
-
-        // Group ALL versions by key — including the current version and delete markers — so that for
-        // each noncurrent version we can find the version that SUPERSEDED it (the immediately-newer
-        // one). A version becomes noncurrent exactly when that next version is written, so its
-        // superseding version's creation time is its became-noncurrent time. Ageing from the
-        // version's OWN creation time instead would delete a long-lived version the instant it is
-        // superseded, destroying the recovery window the operator configured (audit 2026-07).
-        let mut by_key: std::collections::BTreeMap<String, Vec<ObjectSummary>> =
-            std::collections::BTreeMap::new();
-        for obj in all {
-            by_key
-                .entry(obj.key.as_str().to_owned())
-                .or_default()
-                .push(obj);
-        }
-
-        for (_key, mut versions) in by_key {
-            // Newest version first (version ids sort by creation time), so index 0 is the current
-            // version / newest delete marker and every noncurrent version sits at index >= 1.
-            versions.sort_by(|a, b| b.version_id.as_str().cmp(a.version_id.as_str()));
-            // Rank among the noncurrent, non-delete-marker versions (for the "keep newest N" rule).
-            let mut noncurrent_rank = 0u32;
-            for idx in 0..versions.len() {
-                let obj = &versions[idx];
-                if obj.is_latest || obj.is_delete_marker {
-                    continue; // only noncurrent object versions expire here
-                }
-                let this_rank = noncurrent_rank;
-                noncurrent_rank += 1;
-                let tags = self.tags_for(meta, bucket, obj).await;
-                let Some((days, keep)) = self.matching_noncurrent_rule(rules, obj, &tags) else {
-                    continue;
-                };
-                // Preserve the configured number of newest noncurrent versions.
-                if let Some(keep) = keep {
-                    if this_rank < keep {
-                        continue;
-                    }
-                }
-                // Became noncurrent when the immediately-newer version (idx-1) was created. idx >= 1
-                // is guaranteed: the newest version is always the current one or a delete marker.
-                let became_noncurrent = versions[idx - 1].last_modified;
-                if now.secs_since(became_noncurrent) < i64::from(days) * 86_400 {
-                    continue;
-                }
-                match self
-                    .delete_version(
-                        meta,
-                        blob,
-                        &bucket.name,
-                        &obj.key,
-                        &obj.version_id,
-                        now,
-                        Some(obj.last_modified),
-                    )
-                    .await
-                {
-                    Ok(true) => report.versions_expired += 1,
-                    // Ok(false): preserved by Object Lock or overwritten since the scan.
-                    Ok(false) => {}
-                    Err(_) => report.errors += 1,
-                }
-            }
+        let mut groups = VersionGroupPager::new(meta, &bucket.name);
+        while let Some(versions) = groups.next_group().await? {
+            report.merge(
+                self.expire_noncurrent_group(meta, blob, bucket, rules, now, &versions)
+                    .await,
+            );
         }
         Ok(report)
     }
 
-    /// Expired-object-delete-marker removal (ARCH 19.3). A delete marker that is the only
-    /// remaining version of its key is removed so fully-expired keys do not accumulate dangling
-    /// markers. Applies when any enabled rule whose filter matches the key carries the action.
+    /// Evaluate one complete newest-first key group for noncurrent-version expiration.
+    async fn expire_noncurrent_group<M, B>(
+        &self,
+        meta: &M,
+        blob: &B,
+        bucket: &Bucket,
+        rules: &[&LifecycleRule],
+        now: Timestamp,
+        versions: &[ObjectSummary],
+    ) -> LifecycleReport
+    where
+        M: MetadataStore + ?Sized,
+        B: BlobStore + ?Sized,
+    {
+        let mut report = LifecycleReport::default();
+        // The listing contract is key ASC, version-id DESC: index 0 is the newest version or
+        // delete marker. A version becomes noncurrent when the immediately-newer entry is created,
+        // so retaining the entire key group preserves its exact supersession timestamp.
+        let mut noncurrent_rank = 0u32;
+        for (idx, obj) in versions.iter().enumerate() {
+            if obj.is_latest || obj.is_delete_marker {
+                continue;
+            }
+            let this_rank = noncurrent_rank;
+            noncurrent_rank += 1;
+            let tags = self.tags_for(meta, bucket, obj).await;
+            let Some((days, keep)) = self.matching_noncurrent_rule(rules, obj, &tags) else {
+                continue;
+            };
+            if keep.is_some_and(|keep| this_rank < keep) {
+                continue;
+            }
+            let Some(newer) = idx.checked_sub(1).and_then(|newer| versions.get(newer)) else {
+                // A non-latest entry at index zero violates the ordered-listing/latest invariant.
+                // Treat corrupt metadata as a per-item error rather than panicking the scanner.
+                report.errors += 1;
+                continue;
+            };
+            if now.secs_since(newer.last_modified) < i64::from(days) * 86_400 {
+                continue;
+            }
+            match self
+                .delete_version(meta, blob, &bucket.name, obj, now)
+                .await
+            {
+                Ok(true) => report.versions_expired += 1,
+                // Ok(false): preserved by Object Lock or overwritten since the scan.
+                Ok(false) => {}
+                Err(_) => report.errors += 1,
+            }
+        }
+        report
+    }
+
+    /// Expired-object-delete-marker removal (ARCH 19.3). The same key-group pager recognizes a
+    /// sole marker as soon as its complete group ends, then releases that group before continuing.
+    /// Applies when any enabled rule whose filter matches the key carries the action.
     async fn remove_expired_delete_markers<M>(
         &self,
         meta: &M,
         bucket: &Bucket,
         rules: &[&LifecycleRule],
+        now: Timestamp,
     ) -> Result<LifecycleReport, MetaError>
     where
         M: MetadataStore + ?Sized,
     {
         let mut report = LifecycleReport::default();
-
-        let mut all: Vec<ObjectSummary> = Vec::new();
-        let mut cursor: Option<String> = None;
-        // A version page resumes on the (key, version-id) PAIR, so thread BOTH the boundary key and
-        // its version-id marker back into the next query. Feeding only the key half re-lists a key
-        // that holds more versions than one page at every boundary and, worst case, never
-        // terminates (issue #7).
-        let mut vmarker: Option<String> = None;
-        loop {
-            let query = ListQuery {
-                cursor: cursor.clone(),
-                version_id_marker: vmarker.clone(),
-                limit: PAGE_LIMIT,
-                ..Default::default()
-            };
-            let page = meta.list_versions(&bucket.name, &query).await?;
-            all.extend(page.items);
-            match page.next_cursor {
-                Some(c) if page.truncated => {
-                    cursor = Some(c);
-                    vmarker = page.next_version_id_marker;
-                }
-                _ => break,
-            }
-        }
-
-        // Count versions per key so a marker can be recognized as the sole remaining version.
-        let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-        for obj in &all {
-            *counts.entry(obj.key.as_str().to_owned()).or_default() += 1;
-        }
-
-        for obj in &all {
-            if !obj.is_delete_marker {
+        let mut groups = VersionGroupPager::new(meta, &bucket.name);
+        while let Some(versions) = groups.next_group().await? {
+            let [obj] = versions.as_slice() else {
                 continue;
-            }
-            if counts.get(obj.key.as_str()).copied().unwrap_or(0) != 1 {
+            };
+            if !obj.is_delete_marker {
                 continue;
             }
             // A delete marker carries no tags worth filtering on, but still honour prefix/size.
@@ -388,26 +414,20 @@ impl LifecycleScanner {
             }) {
                 continue;
             }
-            match meta
-                .submit(Mutation::DeleteVersion {
-                    bucket: bucket.name.clone(),
-                    key: obj.key.clone(),
-                    version_id: obj.version_id.clone(),
-                    expected_updated_at: None,
-                })
-                .await
-            {
-                Ok(_) => report.delete_markers_removed += 1,
+            match self.delete_expired_marker(meta, bucket, obj, now).await {
+                Ok(true) => report.delete_markers_removed += 1,
+                Ok(false) => {}
                 Err(_) => report.errors += 1,
             }
         }
         Ok(report)
     }
 
-    /// Abort incomplete multipart uploads (ARCH 19.4). Enumerates stale sessions through the
-    /// bounded sweeper interface and aborts those in this bucket older than the smallest
-    /// `DaysAfterInitiation` of any enabled rule whose prefix matches the session key. Aborting
-    /// removes the session and reclaims its staged parts via the normal abort path.
+    /// Abort incomplete multipart uploads (ARCH 19.4). Pages every active session in this bucket
+    /// through the bounded `(key, upload-id)` listing and aborts those older than the smallest
+    /// `DaysAfterInitiation` of any enabled rule whose prefix matches the session key. Per-bucket
+    /// paging prevents another bucket (or one hot key) from monopolizing a global first batch.
+    /// Aborting removes the session and reclaims its staged parts via the normal abort path.
     async fn abort_incomplete_uploads<M, B>(
         &self,
         meta: &M,
@@ -422,32 +442,69 @@ impl LifecycleScanner {
     {
         let mut report = LifecycleReport::default();
 
-        // `enumerate_stale_sessions(older_than, batch)` returns sessions updated before
-        // `older_than`. Passing `now` yields every session not touched this instant; we then
-        // re-check each against its rule's per-bucket threshold using `created_at`.
-        let sessions: Vec<MultipartSession> =
-            meta.enumerate_stale_sessions(now, SESSION_BATCH).await?;
+        let mut key_marker = None;
+        let mut upload_id_marker = None;
+        loop {
+            let page = meta
+                .list_multipart_uploads(
+                    &bucket.name,
+                    &ListQuery {
+                        cursor: key_marker.clone(),
+                        version_id_marker: upload_id_marker.clone(),
+                        limit: SESSION_BATCH,
+                        ..Default::default()
+                    },
+                )
+                .await?;
 
-        for session in sessions {
-            if session.bucket.as_str() != bucket.name.as_str() {
-                continue;
+            for session in page.items {
+                let Some(days) = self.matching_abort_days(rules, &session) else {
+                    continue;
+                };
+                if now.secs_since(session.created_at) < i64::from(days) * 86_400 {
+                    continue;
+                }
+                match meta
+                    .submit(Mutation::AbortMultipart(session.upload_id.clone()))
+                    .await
+                {
+                    Ok(MutationOutcome::MultipartTerminal(MultipartTerminalOutcome::Aborted)) => {
+                        // Only the terminal winner owns these bytes. A concurrent Complete that
+                        // moved the session to `completing` returns NotOwner below and keeps parts.
+                        if blob.delete_session(&session.upload_id).await.is_ok() {
+                            match meta
+                                .submit(Mutation::ReleaseMultipartUploadCleanups {
+                                    upload_id: session.upload_id.clone(),
+                                })
+                                .await
+                            {
+                                Ok(MutationOutcome::Ack) => report.uploads_aborted += 1,
+                                Ok(_) | Err(_) => report.errors += 1,
+                            }
+                        } else {
+                            report.errors += 1;
+                        }
+                    }
+                    Ok(MutationOutcome::MultipartTerminal(MultipartTerminalOutcome::NotOwner)) => {
+                        // Expected race: completion owns the session. It reclaims its own parts.
+                    }
+                    Ok(_) | Err(_) => report.errors += 1,
+                }
             }
-            let Some(days) = self.matching_abort_days(rules, &session) else {
-                continue;
-            };
-            if now.secs_since(session.created_at) < i64::from(days) * 86_400 {
-                continue;
+
+            if !page.truncated {
+                break;
             }
-            let aborted = meta
-                .submit(Mutation::AbortMultipart(session.upload_id.clone()))
-                .await
-                .is_ok();
-            // Reclaim staged parts; delete_session is idempotent (absence is success).
-            let parts_cleared = blob.delete_session(&session.upload_id).await.is_ok();
-            if aborted && parts_cleared {
-                report.uploads_aborted += 1;
-            } else {
-                report.errors += 1;
+            match (page.next_cursor, page.next_version_id_marker) {
+                (Some(next_key), Some(next_upload)) => {
+                    key_marker = Some(next_key);
+                    upload_id_marker = Some(next_upload);
+                }
+                _ => {
+                    return Err(MetaError::Engine(
+                        "truncated multipart lifecycle page had no tuple cursor".to_owned(),
+                    ));
+                }
             }
         }
         Ok(report)
@@ -567,28 +624,75 @@ impl LifecycleScanner {
 
     /// Insert a delete marker for the current object (versioned-bucket expiration), propagating it
     /// to replicas where the bucket's replication rule calls for it (ARCH 19.3/20.3).
-    async fn insert_delete_marker<M>(
+    pub(crate) async fn insert_delete_marker<M>(
         &self,
         meta: &M,
         bucket: &Bucket,
-        key: &ObjectKey,
+        obj: &ObjectSummary,
         now: Timestamp,
-    ) -> Result<(), MetaError>
+    ) -> Result<bool, MetaError>
     where
         M: MetadataStore + ?Sized,
     {
         let marker_id = VersionId::generate();
-        let replication = Self::marker_replication(meta, bucket, key, &marker_id, now).await;
-        meta.submit(Mutation::CreateDeleteMarker {
-            bucket: bucket.name.clone(),
-            key: key.clone(),
-            version_id: marker_id,
-            owner_id: bucket.owner_id.clone(),
-            now,
-            replication,
-        })
-        .await
-        .map(|_| ())
+        let replication = Self::marker_replication(meta, bucket, &obj.key, &marker_id, now).await;
+        let outcome = meta
+            .submit(Mutation::CreateDeleteMarker {
+                bucket: bucket.name.clone(),
+                key: obj.key.clone(),
+                version_id: marker_id,
+                owner_id: bucket.owner_id.clone(),
+                now,
+                bypass: GovernanceBypass::Denied,
+                expected_current: Some(CurrentVersionGuard {
+                    version_id: obj.version_id.clone(),
+                    updated_at: obj.last_modified,
+                }),
+                replication,
+            })
+            .await?;
+        match outcome {
+            MutationOutcome::DeleteMarker { .. } => Ok(true),
+            MutationOutcome::DeleteNotApplied | MutationOutcome::DeleteProtected => Ok(false),
+            _ => Err(MetaError::Engine(
+                "unexpected lifecycle delete-marker outcome".to_owned(),
+            )),
+        }
+    }
+
+    /// Delete a lifecycle-enumerated sole delete marker only while it is still the sole version.
+    ///
+    /// Replication may insert an older noncurrent version after enumeration. The writer guard keeps
+    /// that arrival from being exposed by a stale sole-marker cleanup decision.
+    pub(crate) async fn delete_expired_marker<M>(
+        &self,
+        meta: &M,
+        bucket: &Bucket,
+        obj: &ObjectSummary,
+        now: Timestamp,
+    ) -> Result<bool, MetaError>
+    where
+        M: MetadataStore + ?Sized,
+    {
+        let outcome = meta
+            .submit(Mutation::DeleteVersion {
+                bucket: bucket.name.clone(),
+                key: obj.key.clone(),
+                version_id: obj.version_id.clone(),
+                expected_row_id: Some(obj.row_id.clone()),
+                expected_updated_at: Some(obj.last_modified),
+                require_sole_key_version: true,
+                now,
+                bypass: GovernanceBypass::Denied,
+            })
+            .await?;
+        match outcome {
+            MutationOutcome::Deleted { .. } => Ok(true),
+            MutationOutcome::DeleteNotApplied | MutationOutcome::DeleteProtected => Ok(false),
+            _ => Err(MetaError::Engine(
+                "unexpected expired delete-marker outcome".to_owned(),
+            )),
+        }
     }
 
     /// Build the replication-outbox entries for a lifecycle-created delete marker — one per distinct
@@ -640,53 +744,53 @@ impl LifecycleScanner {
             .collect()
     }
 
-    /// Permanently delete a version and reclaim its freed blob (idempotent: a missing version
-    /// or absent blob is success).
-    /// Permanently delete a version, reclaiming its blob. Returns `true` when the version was
-    /// deleted, `false` when it was preserved because Object Lock (retention or legal hold) still
-    /// protects it — lifecycle silently skips a locked version (the WORM guarantee outranks the
-    /// expiry rule) and the rule applies once protection lapses.
+    /// Permanently delete a version, reclaiming its blob. Returns `true` only when the writer
+    /// confirms that the row was deleted, and `false` when Object Lock preserves it or a concurrent
+    /// change made the compare-and-delete guard stale. Lifecycle silently skips both outcomes; a
+    /// protected version becomes eligible once protection lapses, while a lost race is reconsidered
+    /// from fresh metadata on a later scan.
     #[allow(clippy::too_many_arguments)]
-    async fn delete_version<M, B>(
+    pub(crate) async fn delete_version<M, B>(
         &self,
         meta: &M,
         blob: &B,
         bucket: &BucketName,
-        key: &ObjectKey,
-        version_id: &VersionId,
+        obj: &ObjectSummary,
         now: Timestamp,
-        expected_updated_at: Option<Timestamp>,
     ) -> Result<bool, MetaError>
     where
         M: MetadataStore + ?Sized,
         B: BlobStore + ?Sized,
     {
-        if meta
-            .get_object_lock(bucket, key, version_id)
-            .await?
-            .is_protected(now)
-        {
-            return Ok(false);
-        }
-        // Compare-and-delete on the version's updated_at captured at enumeration: a client overwrite
-        // landing between the scan and here bumps updated_at, so the delete becomes a no-op instead
-        // of destroying the fresh, non-expired object (the current-object-expiration TOCTOU; audit
-        // 2026-07). `expected_updated_at` is threaded from the enumerated object's last_modified.
+        // Compare-and-delete on the immutable row id captured at enumeration. Unversioned writes
+        // reuse the null version sentinel and may share one timestamp tick, but every replacement
+        // gets a new row id. `updated_at` remains a defense-in-depth freshness predicate.
         let outcome = meta
             .submit(Mutation::DeleteVersion {
                 bucket: bucket.clone(),
-                key: key.clone(),
-                version_id: version_id.clone(),
-                expected_updated_at,
+                key: obj.key.clone(),
+                version_id: obj.version_id.clone(),
+                expected_row_id: Some(obj.row_id.clone()),
+                expected_updated_at: Some(obj.last_modified),
+                require_sole_key_version: false,
+                now,
+                bypass: GovernanceBypass::Denied,
             })
             .await?;
-        if let cairn_types::MutationOutcome::Deleted {
-            freed: Some(path), ..
-        } = outcome
-        {
-            self.reclaim(blob, &path).await;
+        match outcome {
+            MutationOutcome::Deleted {
+                freed: Some(path), ..
+            } => {
+                self.reclaim(blob, &path).await;
+                Ok(true)
+            }
+            MutationOutcome::Deleted { freed: None, .. } => Ok(true),
+            MutationOutcome::DeleteNotApplied => Ok(false),
+            MutationOutcome::DeleteProtected => Ok(false),
+            _ => Err(MetaError::Engine(
+                "unexpected lifecycle delete outcome".to_owned(),
+            )),
         }
-        Ok(true)
     }
 
     /// Best-effort blob reclamation; a delete failure is logged, not propagated, because the
@@ -715,4 +819,41 @@ fn filter_matches_marker(filter: &Filter, obj: &ObjectSummary, tags: &[(String, 
         }
     }
     true
+}
+
+#[cfg(test)]
+mod outcome_tests {
+    use super::*;
+    use cairn_types::testing::{InMemoryBlobStore, InMemoryMetadataStore};
+    use cairn_types::{ETag, StorageClass, UserId};
+
+    #[tokio::test]
+    async fn delete_not_applied_does_not_advance_lifecycle_counters() {
+        let deleted = LifecycleScanner::new()
+            .delete_version(
+                &InMemoryMetadataStore::new(),
+                &InMemoryBlobStore::new(),
+                &BucketName::parse("missing-bucket").unwrap(),
+                &ObjectSummary {
+                    row_id: "missing-row".to_owned(),
+                    key: ObjectKey::parse("missing-key").unwrap(),
+                    version_id: VersionId::from_string("missing-version".to_owned()),
+                    is_latest: true,
+                    is_delete_marker: false,
+                    etag: ETag::from_string("missing".to_owned()),
+                    size: 0,
+                    last_modified: Timestamp::EPOCH,
+                    storage_class: StorageClass::Standard,
+                    owner_id: UserId("missing-owner".to_owned()),
+                },
+                Timestamp::EPOCH,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !deleted,
+            "a writer no-op must not be reported as a lifecycle deletion"
+        );
+    }
 }

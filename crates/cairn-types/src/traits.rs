@@ -19,14 +19,16 @@ use crate::crypto::{Nonce, Sealed, Signature};
 use crate::error::{BlobError, CryptoError, MetaError, ReplicationError};
 use crate::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
 use crate::meta::{
-    ActivityEntry, BucketCounts, ImportJob, ImportJobRecord, ListPage, ListQuery, MetricsRange,
+    ActivityEntry, BucketCounts, ImportJob, ImportJobListQuery, ImportJobPage, ImportJobRecord,
+    ImportState, ListPage, ListQuery, MetricsRange, MultipartCleanup, MultipartReservation,
     MultipartSession, Mutation, MutationOutcome, ObjectSummary, OutboxEntry, PartRecord,
-    ReplicationCounts, ReplicationStatus, RequestMetricsSeries, SessionCredentialSummary, ShareRow,
-    StoreCounts, TagSummary, TaggedObject, User, UserSessionCredentials, UserSigV4Credentials,
-    UserWithBearerHash, WebhookEntry,
+    ReplicationCounts, ReplicationStatus, RequestMetricsSeries, SessionCredentialSummary,
+    ShareLookupHash, ShareRow, StoreCounts, TagSummary, TaggedObject, User, UserSessionCredentials,
+    UserSigV4Credentials, UserWithBearerHash, WebhookEntry,
 };
 use crate::object::{ChecksumSet, CompressionDescriptor, ObjectVersionRow};
 use crate::replication::ReplicatedObject;
+use crate::secret::SecretKey32;
 use crate::time::Timestamp;
 use async_trait::async_trait;
 use zeroize::Zeroizing;
@@ -48,33 +50,40 @@ pub trait BlobStore: Send + Sync {
     ) -> Result<StagedBlob, BlobError>;
 
     /// Open a committed blob for reading, transparently decompressing and — when `cipher` is
-    /// [`BlobCipher::Dek`] — transparently decrypting each AES-256-GCM block with the supplied raw
-    /// 32-byte data-encryption key, optionally for a range expressed in logical (plaintext)
-    /// coordinates.
+    /// [`BlobCipher::LegacyV2`] or [`BlobCipher::AuthenticatedV3`] — transparently decrypting each
+    /// AES-256-GCM block with the supplied raw 32-byte data-encryption key, optionally for a range
+    /// expressed in logical (plaintext) coordinates.
     ///
     /// This is the **one** reader: there is no DEK-less `open`. The caller MUST name the cipher —
-    /// [`BlobCipher::KnownPlaintext`] for a blob written in the clear, [`BlobCipher::Dek`] for an
-    /// encrypted one. That is deliberate. The former `open` forwarded to a DEK of `None`, so any
+    /// [`BlobCipher::KnownPlaintext`] for a blob written in the clear, or one of the two named
+    /// encrypted formats for ciphertext. That is deliberate. The former `open` forwarded to a DEK
+    /// of `None`, so any
     /// caller that forgot the key streamed an encrypted container's raw ciphertext as if it were
     /// the plaintext body — silently, at exactly the plaintext length (it is how replication and
     /// the integrity scrub shipped ciphertext). Requiring the cipher by name removes that footgun.
     ///
-    /// **Fail-closed (unchanged, ARCH 27, SSE-S3):** an encrypted blob opened with
-    /// [`BlobCipher::KnownPlaintext`] (or with the wrong DEK) fails with [`BlobError::Corruption`]
-    /// rather than yielding plaintext or ciphertext. `KnownPlaintext` behaves exactly as the old
-    /// `dek: None` did — the fail-closed guard still fires for a plaintext-open of an encrypted
-    /// container.
+    /// **Fail-closed (ARCH 27, SSE-S3):** a wrong DEK/format fails with
+    /// [`BlobError::Corruption`] rather than yielding plaintext or ciphertext. A
+    /// [`BlobCipher::KnownPlaintext`] read requires physical length to equal this call's trusted
+    /// logical length; that catches the ordinary encrypted/uncompressed layout without sniffing
+    /// and rejecting legitimate arbitrary plaintext bytes that happen to form a CRNB file.
     ///
     /// `compression` is the object version's stored compression descriptor, the source of truth
     /// for whether the blob is a self-describing CRNB block container. The reader trusts it (and
     /// the cipher — encryption also uses the container) rather than sniffing the trailer magic,
     /// which an uncompressed object's bytes can collide with (audit #18).
+    ///
+    /// `expected_logical_len` is the trusted plaintext size from the object-version row (or
+    /// [`PartRef::size`] for multipart assembly). Legacy encrypted v2 did not authenticate its
+    /// trailer/index, so the reader requires their logical total to equal this value before serving
+    /// bytes. It must never be derived from the CRNB file itself.
     async fn open_raw(
         &self,
         path: &StoragePath,
         range: Option<ByteRange>,
         cipher: BlobCipher,
         compression: &CompressionDescriptor,
+        expected_logical_len: u64,
     ) -> Result<BlobReadHandle, BlobError>;
 
     /// Cheaply answer whether a committed blob is PRESENT, plus basic framing — WITHOUT a DEK and
@@ -98,15 +107,29 @@ pub trait BlobStore: Send + Sync {
     /// `encryption` is `Some`, the part is staged as a CRNB `VERSION_ENCRYPTED` blob under that DEK
     /// (ARCH 27); the MD5/checksums are still computed over the plaintext, so the ETag basis is
     /// unchanged. `None` stages the part in the clear (legacy).
+    #[allow(clippy::too_many_arguments)]
     async fn stage_part(
         &self,
         upload: &UploadId,
         part_number: u16,
+        attempt_id: &str,
         body: crate::BodyStream,
         checksums: ChecksumSet,
         size_ceiling: u64,
-        encryption: Option<[u8; 32]>,
+        encryption: Option<SecretKey32>,
     ) -> Result<StagedPart, BlobError>;
+
+    /// Idempotently delete one deterministically-named multipart part attempt.
+    ///
+    /// The caller reserves `attempt_id` before staging. This exact deletion seam lets cleanup retry
+    /// converge even if [`BlobStore::stage_part`] created the artifact but failed before returning
+    /// its [`StagedPart`].
+    async fn delete_part_attempt(
+        &self,
+        upload: &UploadId,
+        part_number: u16,
+        attempt_id: &str,
+    ) -> Result<(), BlobError>;
 
     /// Assemble ordered parts into one durably-committed blob, applying compression during
     /// the assembly pass.
@@ -138,6 +161,12 @@ pub trait ReconcileOracle: Send + Sync {
 
     /// Whether an upload session still exists.
     async fn live_session(&self, upload: &UploadId) -> Result<bool, MetaError>;
+
+    /// For each candidate multipart-part path, whether a committed part row references it.
+    async fn live_multipart_parts(
+        &self,
+        candidates: &[StoragePath],
+    ) -> Result<Vec<bool>, MetaError>;
 }
 
 /// The source-of-truth metadata store. All writes go through [`submit`](MetadataStore::submit)
@@ -148,6 +177,14 @@ pub trait MetadataStore: Send + Sync {
     /// Submit a mutation to the group-committing writer. The returned future resolves only
     /// after the batch containing this mutation has been made durable.
     async fn submit(&self, mutation: Mutation) -> Result<MutationOutcome, MetaError>;
+
+    /// Probe the snapshot-read path with a constant-cost query.
+    ///
+    /// This is the readiness seam: concrete stores must check out a real read-pool connection and
+    /// execute a trivial query that does not enumerate application rows. Decorators must forward it
+    /// without caching, and a sharded store must probe every bounded shard. Its cost must remain
+    /// independent of bucket and object counts.
+    async fn read_probe(&self) -> Result<(), MetaError>;
 
     // --- buckets ---
     /// Look up a bucket.
@@ -181,12 +218,14 @@ pub trait MetadataStore: Send + Sync {
         version: &VersionId,
     ) -> Result<Option<ObjectVersionRow>, MetaError>;
     /// Page current objects under a prefix (half-open range seek), excluding delete markers.
+    /// Each summary carries the internal immutable metadata-row identity used by maintenance
+    /// compare-and-delete; external serializers omit it.
     async fn list_current(
         &self,
         bucket: &BucketName,
         query: &ListQuery,
     ) -> Result<ListPage<ObjectSummary>, MetaError>;
-    /// Page all versions and delete markers under a prefix.
+    /// Page all versions and delete markers under a prefix, with the same internal row identity.
     async fn list_versions(
         &self,
         bucket: &BucketName,
@@ -238,6 +277,15 @@ pub trait MetadataStore: Send + Sync {
         older_than: Timestamp,
         batch: u32,
     ) -> Result<Vec<MultipartSession>, MetaError>;
+    /// Page abandoned pre-stage part reservations older than `older_than`.
+    async fn enumerate_stale_multipart_reservations(
+        &self,
+        older_than: Timestamp,
+        batch: u32,
+    ) -> Result<Vec<MultipartReservation>, MetaError>;
+    /// List pending filesystem cleanup debts, exact paths first, under a hard row bound.
+    async fn list_multipart_cleanups(&self, limit: u32)
+    -> Result<Vec<MultipartCleanup>, MetaError>;
 
     // --- replication ---
     /// Get an object version's replication status.
@@ -348,9 +396,18 @@ pub trait MetadataStore: Send + Sync {
     async fn get_user_policy(&self, user_id: &UserId) -> Result<Option<String>, MetaError>;
 
     // --- import jobs (ARCH 27) ---
-    /// List all S3 import jobs, newest first, as secret-free [`ImportJob`] views — the source secret
-    /// (ciphertext/nonce) is never returned. For the console's import view and the CLI status list.
-    async fn list_import_jobs(&self) -> Result<Vec<ImportJob>, MetaError>;
+    /// List one bounded, keyset-paginated page of S3 import-job summaries. Neither the source
+    /// secret (ciphertext/nonce) nor per-bucket `buckets_json` is selected. Results have stable
+    /// `(created_at DESC, id DESC)` ordering.
+    async fn list_import_jobs(
+        &self,
+        query: &ImportJobListQuery,
+    ) -> Result<ImportJobPage, MetaError>;
+    /// Select only the id of the oldest job in `state`, or `None` when none exists.
+    ///
+    /// This constant-row, indexed read is the scheduler/recovery primitive: it deliberately does
+    /// not select or decode `buckets_json`, so terminal history cannot amplify worker memory.
+    async fn next_import_job_id(&self, state: ImportState) -> Result<Option<String>, MetaError>;
     /// Fetch a single import job by id (secret-free), or `None` if no such job exists.
     async fn get_import_job(&self, id: &str) -> Result<Option<ImportJob>, MetaError>;
     /// Fetch a single import job's **full record**, including the sealed source secret and per-bucket
@@ -360,9 +417,14 @@ pub trait MetadataStore: Send + Sync {
     async fn get_import_job_record(&self, id: &str) -> Result<Option<ImportJobRecord>, MetaError>;
 
     // --- object shares (ARCH 15.8) ---
-    /// Fetch a share by its token, or `None` if no such token exists. The caller checks
-    /// revoked/expired state; the store returns the row verbatim.
-    async fn get_share(&self, token: &str) -> Result<Option<ShareRow>, MetaError>;
+    /// Fetch a share by its stable, non-secret management id.
+    async fn get_share_by_id(&self, id: &str) -> Result<Option<ShareRow>, MetaError>;
+    /// Fetch a share by the fixed-width lookup hash derived from its bearer token. Redemption uses
+    /// this indexed equality lookup and then checks revoked/expired state.
+    async fn get_share_by_token_hash(
+        &self,
+        token_hash: &ShareLookupHash,
+    ) -> Result<Option<ShareRow>, MetaError>;
     /// List a bucket's shares (most recent first), optionally narrowed to a single key.
     async fn list_shares(
         &self,

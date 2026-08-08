@@ -37,6 +37,68 @@ pub fn parse_user_policy(json: &str) -> Result<Policy, Error> {
     parse_policy_inner(json, false)
 }
 
+/// Compose the policy stored on an administrator-derived session.
+///
+/// An administrator's live S3 baseline is all actions/resources except matching explicit Denies in
+/// their identity policy. `boundary` is an optional additional session permissions boundary:
+/// `None` emits the full-S3 Allow, while `Some` contributes its own statements as the only possible
+/// Allows. In both cases every parent identity Deny is appended, so the ordinary policy evaluator's
+/// deny precedence computes the exact intersection. Parent identity Allows are intentionally
+/// ignored because they do not restrict an administrator's live baseline.
+///
+/// This helper is administrator-specific. It must not be used to approximate intersection for a
+/// member, whose effective grants can come from multiple policy/resource sources.
+///
+/// # Errors
+/// Returns [`Error::MalformedPolicy`] if either input policy is malformed or if the composed policy
+/// does not parse as an identity policy.
+pub fn intersect_admin_session_policy(
+    parent_policy: Option<&str>,
+    boundary: Option<&str>,
+) -> Result<String, Error> {
+    let mut statements = match boundary {
+        Some(raw) => {
+            parse_user_policy(raw)?;
+            raw_statement_values(raw)?
+        }
+        None => vec![serde_json::json!({
+            "Effect": "Allow",
+            "Action": "s3:*",
+            "Resource": "*",
+        })],
+    };
+
+    if let Some(raw) = parent_policy {
+        parse_user_policy(raw)?;
+        statements.extend(
+            raw_statement_values(raw)?.into_iter().filter(|statement| {
+                statement.get("Effect").and_then(Value::as_str) == Some("Deny")
+            }),
+        );
+    }
+
+    let composed = serde_json::json!({
+        "Version": "2012-10-17",
+        "Statement": statements,
+    })
+    .to_string();
+    parse_user_policy(&composed)?;
+    Ok(composed)
+}
+
+fn raw_statement_values(raw: &str) -> Result<Vec<Value>, Error> {
+    let Value::Object(map) =
+        serde_json::from_str::<Value>(raw).map_err(|_| Error::MalformedPolicy)?
+    else {
+        return Err(Error::MalformedPolicy);
+    };
+    match map.get("Statement") {
+        Some(Value::Array(statements)) => Ok(statements.clone()),
+        Some(statement @ Value::Object(_)) => Ok(vec![statement.clone()]),
+        _ => Err(Error::MalformedPolicy),
+    }
+}
+
 fn parse_policy_inner(json: &str, require_principal: bool) -> Result<Policy, Error> {
     let root: Value = serde_json::from_str(json).map_err(|_| Error::MalformedPolicy)?;
     let obj = root.as_object().ok_or(Error::MalformedPolicy)?;
@@ -288,6 +350,24 @@ fn as_string_or_array(v: &Value) -> Result<Vec<String>, Error> {
 mod tests {
     use super::*;
 
+    const ADMIN_PARENT_POLICY: &str = r#"{
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "DoesNotRestrictAdmin",
+                "Effect": "Allow",
+                "Action": "s3:GetObject",
+                "Resource": "arn:aws:s3:::narrow/*"
+            },
+            {
+                "Sid": "ParentDeny",
+                "Effect": "Deny",
+                "Action": "s3:DeleteObject",
+                "Resource": "arn:aws:s3:::protected/*"
+            }
+        ]
+    }"#;
+
     const REPRESENTATIVE: &str = r#"{
         "Version": "2012-10-17",
         "Id": "ExamplePolicy",
@@ -312,6 +392,66 @@ mod tests {
             }
         ]
     }"#;
+
+    #[test]
+    fn administrator_session_baseline_keeps_only_parent_denies() {
+        let composed =
+            intersect_admin_session_policy(Some(ADMIN_PARENT_POLICY), None).expect("compose");
+        let document: Value = serde_json::from_str(&composed).expect("valid JSON");
+        let statements = document["Statement"].as_array().expect("statement array");
+
+        assert_eq!(statements.len(), 2);
+        assert_eq!(statements[0]["Effect"], "Allow");
+        assert_eq!(statements[0]["Action"], "s3:*");
+        assert_eq!(statements[1]["Sid"], "ParentDeny");
+        assert!(
+            statements
+                .iter()
+                .all(|statement| statement["Sid"] != "DoesNotRestrictAdmin"),
+            "an identity Allow does not narrow the live administrator baseline"
+        );
+        parse_user_policy(&composed).expect("composed identity policy");
+    }
+
+    #[test]
+    fn administrator_session_boundary_is_not_union_with_full_access() {
+        let boundary = r#"{
+            "Version": "2012-10-17",
+            "Statement": {
+                "Sid": "BoundaryAllow",
+                "Effect": "Allow",
+                "Action": "s3:GetObject",
+                "Resource": "arn:aws:s3:::protected/*"
+            }
+        }"#;
+        let composed = intersect_admin_session_policy(Some(ADMIN_PARENT_POLICY), Some(boundary))
+            .expect("compose");
+        let document: Value = serde_json::from_str(&composed).expect("valid JSON");
+        let statements = document["Statement"].as_array().expect("statement array");
+
+        assert_eq!(statements.len(), 2);
+        assert_eq!(statements[0]["Sid"], "BoundaryAllow");
+        assert_eq!(statements[1]["Sid"], "ParentDeny");
+        assert!(
+            statements
+                .iter()
+                .all(|statement| statement["Action"] != "s3:*"),
+            "the administrator full-access baseline must not widen a supplied boundary"
+        );
+        parse_user_policy(&composed).expect("composed identity policy");
+    }
+
+    #[test]
+    fn administrator_session_composition_rejects_malformed_inputs() {
+        assert!(matches!(
+            intersect_admin_session_policy(Some("{malformed"), None),
+            Err(Error::MalformedPolicy)
+        ));
+        assert!(matches!(
+            intersect_admin_session_policy(None, Some("{}")),
+            Err(Error::MalformedPolicy)
+        ));
+    }
 
     #[test]
     fn round_trips_representative_policy() {

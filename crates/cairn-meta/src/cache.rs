@@ -35,11 +35,12 @@ use cairn_types::bucket::{Bucket, ConfigAspect, ConfigDoc};
 use cairn_types::error::MetaError;
 use cairn_types::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
 use cairn_types::meta::{
-    ActivityEntry, BucketCounts, ImportJob, ImportJobRecord, ListPage, ListQuery, MetricsRange,
+    ActivityEntry, BucketCounts, ImportJob, ImportJobListQuery, ImportJobPage, ImportJobRecord,
+    ImportState, ListPage, ListQuery, MetricsRange, MultipartCleanup, MultipartReservation,
     MultipartSession, Mutation, MutationOutcome, ObjectSummary, OutboxEntry, PartRecord,
-    ReplicationCounts, ReplicationStatus, RequestMetricsSeries, SessionCredentialSummary, ShareRow,
-    StoreCounts, TagSummary, TaggedObject, User, UserSessionCredentials, UserSigV4Credentials,
-    UserWithBearerHash, WebhookEntry,
+    ReplicationCounts, ReplicationStatus, RequestMetricsSeries, SessionCredentialSummary,
+    ShareLookupHash, ShareRow, StoreCounts, TagSummary, TaggedObject, User, UserSessionCredentials,
+    UserSigV4Credentials, UserWithBearerHash, WebhookEntry,
 };
 use cairn_types::object::ObjectVersionRow;
 use cairn_types::time::Timestamp;
@@ -409,12 +410,18 @@ impl CachedMetadataStore {
         }
         match mutation {
             // --- mutations that change a bucket's row and/or config ---
-            Mutation::CreateBucket(b) => self.invalidate_bucket(&b.name),
+            Mutation::CreateBucket(b) | Mutation::CreateObjectLockBucket(b) => {
+                self.invalidate_bucket(&b.name);
+            }
             Mutation::DeleteBucket(name) => self.invalidate_bucket(name),
             Mutation::SetBucketConfig { bucket, aspect, .. } => {
                 // The exact aspect is known; drop just it, and refresh the bucket row defensively
                 // (PublicAccessBlock-as-config never touches the row, but a stale row never hurts).
                 self.invalidate_bucket_aspect(bucket, *aspect);
+                self.bucket.invalidate(bucket);
+            }
+            Mutation::UpdateObjectLockConfiguration { bucket, .. } => {
+                self.invalidate_bucket_aspect(bucket, ConfigAspect::ObjectLock);
                 self.bucket.invalidate(bucket);
             }
             Mutation::SetVersioning { bucket, .. }
@@ -434,11 +441,20 @@ impl CachedMetadataStore {
             // `note_user_mutation`, which bumps the shared auth epoch; the config cache holds no
             // user rows, so they are no-ops for *this* cache).
             Mutation::PutObjectVersion { .. }
+            | Mutation::ResolveObjectWrite { .. }
             | Mutation::CreateDeleteMarker { .. }
             | Mutation::DeleteVersion { .. }
-            | Mutation::CreateMultipart(_)
+            | Mutation::CreateMultipart { .. }
+            | Mutation::ReserveMultipartPart { .. }
+            | Mutation::ReleaseMultipartReservation { .. }
             | Mutation::RecordPart { .. }
-            | Mutation::ClaimMultipart(_)
+            | Mutation::ResolveMultipartPartWrite { .. }
+            | Mutation::ReleaseMultipartCleanup { .. }
+            | Mutation::ReleaseMultipartUploadCleanups { .. }
+            | Mutation::RecoverMultipartStagingAccounting { .. }
+            | Mutation::ClaimMultipart { .. }
+            | Mutation::ReleaseMultipartClaim { .. }
+            | Mutation::RecoverMultipartClaims
             | Mutation::CompleteMultipart { .. }
             | Mutation::AbortMultipart(_)
             | Mutation::SetUserPolicy { .. }
@@ -498,6 +514,12 @@ impl MetadataStore for CachedMetadataStore {
             self.invalidate_for(&mutation);
         }
         outcome
+    }
+
+    async fn read_probe(&self) -> Result<(), MetaError> {
+        // A readiness probe must exercise the real read pool every time; caching a successful
+        // result would conceal a subsequently wedged or failed backend.
+        self.inner.read_probe().await
     }
 
     // --- cached reads ---
@@ -677,6 +699,23 @@ impl MetadataStore for CachedMetadataStore {
         self.inner.enumerate_stale_sessions(older_than, batch).await
     }
 
+    async fn enumerate_stale_multipart_reservations(
+        &self,
+        older_than: Timestamp,
+        batch: u32,
+    ) -> Result<Vec<MultipartReservation>, MetaError> {
+        self.inner
+            .enumerate_stale_multipart_reservations(older_than, batch)
+            .await
+    }
+
+    async fn list_multipart_cleanups(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<MultipartCleanup>, MetaError> {
+        self.inner.list_multipart_cleanups(limit).await
+    }
+
     async fn object_replication_status(
         &self,
         bucket: &BucketName,
@@ -791,8 +830,15 @@ impl MetadataStore for CachedMetadataStore {
         self.inner.get_user_policy(user_id).await
     }
 
-    async fn list_import_jobs(&self) -> Result<Vec<ImportJob>, MetaError> {
-        self.inner.list_import_jobs().await
+    async fn list_import_jobs(
+        &self,
+        query: &ImportJobListQuery,
+    ) -> Result<ImportJobPage, MetaError> {
+        self.inner.list_import_jobs(query).await
+    }
+
+    async fn next_import_job_id(&self, state: ImportState) -> Result<Option<String>, MetaError> {
+        self.inner.next_import_job_id(state).await
     }
 
     async fn get_import_job(&self, id: &str) -> Result<Option<ImportJob>, MetaError> {
@@ -807,9 +853,16 @@ impl MetadataStore for CachedMetadataStore {
         self.inner.list_activity(limit).await
     }
 
-    async fn get_share(&self, token: &str) -> Result<Option<ShareRow>, MetaError> {
+    async fn get_share_by_id(&self, id: &str) -> Result<Option<ShareRow>, MetaError> {
         // Shares are uncached so a revoke takes effect immediately on the next fetch.
-        self.inner.get_share(token).await
+        self.inner.get_share_by_id(id).await
+    }
+
+    async fn get_share_by_token_hash(
+        &self,
+        token_hash: &ShareLookupHash,
+    ) -> Result<Option<ShareRow>, MetaError> {
+        self.inner.get_share_by_token_hash(token_hash).await
     }
 
     async fn list_shares(
@@ -935,6 +988,7 @@ mod tests {
     /// second inner call.
     struct CountingStore {
         inner: InMemoryMetadataStore,
+        read_probe: AtomicU64,
         get_bucket: AtomicU64,
         get_config: AtomicU64,
         get_bpa: AtomicU64,
@@ -949,6 +1003,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 inner: InMemoryMetadataStore::new(),
+                read_probe: AtomicU64::new(0),
                 get_bucket: AtomicU64::new(0),
                 get_config: AtomicU64::new(0),
                 get_bpa: AtomicU64::new(0),
@@ -969,6 +1024,10 @@ mod tests {
     impl MetadataStore for CountingStore {
         async fn submit(&self, mutation: Mutation) -> Result<MutationOutcome, MetaError> {
             self.inner.submit(mutation).await
+        }
+        async fn read_probe(&self) -> Result<(), MetaError> {
+            self.read_probe.fetch_add(1, Ordering::Relaxed);
+            self.inner.read_probe().await
         }
         async fn get_bucket(&self, name: &BucketName) -> Result<Option<Bucket>, MetaError> {
             self.get_bucket.fetch_add(1, Ordering::Relaxed);
@@ -1084,6 +1143,21 @@ mod tests {
         ) -> Result<Vec<MultipartSession>, MetaError> {
             self.inner.enumerate_stale_sessions(older_than, batch).await
         }
+        async fn enumerate_stale_multipart_reservations(
+            &self,
+            older_than: Timestamp,
+            batch: u32,
+        ) -> Result<Vec<MultipartReservation>, MetaError> {
+            self.inner
+                .enumerate_stale_multipart_reservations(older_than, batch)
+                .await
+        }
+        async fn list_multipart_cleanups(
+            &self,
+            limit: u32,
+        ) -> Result<Vec<MultipartCleanup>, MetaError> {
+            self.inner.list_multipart_cleanups(limit).await
+        }
         async fn object_replication_status(
             &self,
             bucket: &BucketName,
@@ -1181,8 +1255,17 @@ mod tests {
         async fn get_user_policy(&self, user_id: &UserId) -> Result<Option<String>, MetaError> {
             self.inner.get_user_policy(user_id).await
         }
-        async fn list_import_jobs(&self) -> Result<Vec<ImportJob>, MetaError> {
-            self.inner.list_import_jobs().await
+        async fn list_import_jobs(
+            &self,
+            query: &ImportJobListQuery,
+        ) -> Result<ImportJobPage, MetaError> {
+            self.inner.list_import_jobs(query).await
+        }
+        async fn next_import_job_id(
+            &self,
+            state: ImportState,
+        ) -> Result<Option<String>, MetaError> {
+            self.inner.next_import_job_id(state).await
         }
         async fn get_import_job(&self, id: &str) -> Result<Option<ImportJob>, MetaError> {
             self.inner.get_import_job(id).await
@@ -1196,8 +1279,14 @@ mod tests {
         async fn list_activity(&self, limit: u32) -> Result<Vec<ActivityEntry>, MetaError> {
             self.inner.list_activity(limit).await
         }
-        async fn get_share(&self, token: &str) -> Result<Option<ShareRow>, MetaError> {
-            self.inner.get_share(token).await
+        async fn get_share_by_id(&self, id: &str) -> Result<Option<ShareRow>, MetaError> {
+            self.inner.get_share_by_id(id).await
+        }
+        async fn get_share_by_token_hash(
+            &self,
+            token_hash: &ShareLookupHash,
+        ) -> Result<Option<ShareRow>, MetaError> {
+            self.inner.get_share_by_token_hash(token_hash).await
         }
         async fn list_shares(
             &self,
@@ -1259,6 +1348,26 @@ mod tests {
             .submit(Mutation::CreateBucket(Box::new(make_bucket(name))))
             .await
             .expect("create bucket");
+    }
+
+    #[tokio::test]
+    async fn readiness_probe_always_reaches_the_inner_read_path() {
+        let counting = Arc::new(CountingStore::new());
+        let cache = CachedMetadataStore::new(counting.clone(), 64 * 1024);
+
+        cache.read_probe().await.unwrap();
+        cache.read_probe().await.unwrap();
+
+        assert_eq!(
+            counting.read_probe.load(Ordering::Relaxed),
+            2,
+            "a cached readiness success would conceal a later backend failure"
+        );
+        assert_eq!(
+            cache.stats(),
+            (0, 0),
+            "readiness must not participate in the metadata value cache"
+        );
     }
 
     /// (a) A second read of the same config is served from the cache without re-hitting inner.

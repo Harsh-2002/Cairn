@@ -34,7 +34,9 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   (AES256/aws:kms), multipart+SSE incl. UploadPartCopy, cross-policy copy (upgrade/downgrade), and the
   on-disk proofs — committed/staged blobs are VERSION_ENCRYPTED CRNB with the plaintext marker absent,
   a tampered ciphertext byte makes GET fail closed, transparent at-rest (leg 2) advertises nothing.
-- `share.sh` — object sharing (revocable share tokens + interoperable SigV4 presigned URLs), pure curl.
+- `share.sh` — object sharing (one-time data-origin bearer URL, capability-free list/get, stable-id
+  revoke + durable-session-backed interoperable SigV4 presigned URLs), pure curl. **Control listener
+  ON for minting.**
 - `rotation.sh` (+`.py`) — master-key rotation lifecycle (#29), sharded.
 - `soak.sh` (+`.py`) — two-node replication, byte-identical verify + RSS leak check (boto3). For the
   single-node **mixed-feature** soak (and constant-load leak detection generally) see
@@ -54,8 +56,12 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   pass), a zero `cairn_scrub_skipped_total{reason="key_unavailable"}` on a healthy ring, and — arm 4 —
   a non-zero `{reason="composite_etag"}`, pinning that the un-hashable multipart ETag is *counted*
   rather than silently skipped. Do not soften these back to "reported".
-- `object_lock.sh` — Object Lock / WORM: COMPLIANCE immutable, GOVERNANCE yields only to
-  `s3:BypassGovernanceRetention` + bypass header, legal hold, bucket default retention echoed on HEAD.
+- `object_lock.sh` — Object Lock / WORM across both listeners: immutable creation enablement +
+  required versioning; atomic explicit/default PUT, Copy, and multipart state (including
+  completion-time default resolution and no source-lock copy); COMPLIANCE/legal hold immutable,
+  GOVERNANCE yields only to `s3:BypassGovernanceRetention` + bypass header; management force/prefix
+  deletion preserves protected versions while reporting exact partial results. **Control listener
+  ON** for the administrator-delete arm.
 - `notifications.sh` (+`.py`) — webhook event notifications: local sink, bucket endpoint via the
   management API, assert HMAC-signed S3 event records arrive correctly shaped. **web console listener ON.**
 - `sts.sh` (+`.py`) — STS temp creds: mint a scoped session, prove an S3 SDK consumes it
@@ -64,12 +70,17 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   request keeps the byte-identical `application/xml` `<Error><Code>` document (the invariant every
   other harness's `<Code>` assertions rest on), while only a real browser navigation gets HTML;
   `<img>`/`fetch()` subresources, `text/htmlx`, a bare java `Accept` and HEAD all stay machine-shaped.
-- `console_session.sh` — console httpOnly session-cookie auth (pure curl): `cairn_session` from
-  `POST /session` authenticates management API + S3 on the web console port, REJECTED on the S3 port, cleared
-  by `DELETE /session`. **web console listener ON.**
+- `console_session.sh` — console httpOnly session-cookie and origin-bound transfer regression (pure
+  curl): `cairn_session` authenticates only `/api/v1` on the control listener; both route matrices
+  reject cross-plane fall-through; unsafe cookie mutations require the exact control `Origin` while
+  explicit Bearer clients remain origin-independent; a browser-shaped CORS preflight + PUT/GET uses
+  exact data-origin URLs backed by scoped temporary sessions; object/share responses reject worker
+  script fetches and narrow `Service-Worker-Allowed`; logout clears the cookie. **Web console
+  listener ON.**
 - `backup_restore.sh` — backup/restore/integrity (pure curl, Bearer): `cairn backup`, corrupt then
   `cairn restore` into a FRESH dir → byte-identical, `cairn integrity --repair` drops exactly the
-  dangling row. Parses each synchronous CLI's stdout counts — **never sleeps.**
+  dangling row. Asserts the manifest-last `manifest.json` + fixed `metadata.sqlite3` snapshot
+  layout and parses each synchronous CLI's stdout counts — **never sleeps.**
 
 ## regression / limit (where does it break?)
 - `routing.sh` (+`.py`) — **routing fall-through** (audit 2026-07, boto3 + hand-signed raw requests):
@@ -98,8 +109,9 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   the 256 KiB small-object threshold (64 KiB + 1 MiB) because an encrypted object is disqualified from
   **both** GET fast paths (sendfile zero-copy and the inline small-object read) and must fall back to
   the streamed read. The `.py` arm (boto3, threads) is the headline gate: byte-exact round-trips under
-  concurrency plus the on-disk proof (CRNB v2 trailer, plaintext marker absent) for transparent at-rest,
-  explicit `AES256`, and `aws:kms`. GATES are load-independent — correctness, zero op-errors, zero HTTP
+  concurrency plus the on-disk proof (current-writer CRNB v3 trailer, plaintext marker absent; legacy
+  encrypted v2 remains readable) for transparent at-rest, explicit `AES256`, and `aws:kms`. GATES are
+  load-independent — correctness, zero op-errors, zero HTTP
   5xx, liveness, absolute RSS/fd/thread/WAL ceilings (same knobs as `stress.sh`), every phase parsing a
   non-zero throughput, and — **on a release build only** — a *catastrophic* collapse floor
   (`ENC_MIN_RATIO_PCT`, default 10%). On a **debug** binary the enc/plain ratio is **advisory, not
@@ -188,8 +200,9 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   boundary**, the gap `soak.sh` leaves (plaintext only, one fixed 64 KiB body, source RSS the only
   signal) and `mesh.sh` leaves (distinct keys, but a handful of objects per scenario, not a load).
   TWO nodes, **different master keys** (derived per node from a label, the `mesh.py` technique), wired
-  through the operator-trusted **`CAIRN_REPLICATION_ENDPOINT` config path** — SSRF-guard-exempt, so
-  unlike `mesh` this needs **no** `CAIRN_ALLOW_INTERNAL_ENDPOINTS`; the source's web console listener is on
+  through the **`CAIRN_REPLICATION_ENDPOINT` config path**. Environment and management replication
+  endpoints share the SSRF guard, so this loopback topology explicitly sets
+  `CAIRN_ALLOW_INTERNAL_ENDPOINTS=true`; the source's web console listener is on
   only so the driver can read `GET /api/v1/replication/summary` (exact outbox counts + true lag). The
   target runs `CAIRN_ENCRYPT_AT_REST=true`, so it re-seals every replica under **its own** key. A
   fixed-size worker pool holds a **CONSTANT** source workload — single-part PUTs, version churn,

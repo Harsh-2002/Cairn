@@ -7,13 +7,20 @@
 //! hand-copied in three crates; a consumer that did not know about it read **raw ciphertext** and
 //! shipped it. The format and [`open_dek`] live here so there is exactly one copy.
 
+use crate::SecretKey32;
+use crate::blob::BlobCipher;
 use crate::crypto::Nonce;
 use crate::error::CryptoError;
 use crate::traits::Crypto;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use std::collections::BTreeMap;
-use zeroize::Zeroizing;
+
+/// The authenticated encrypted CRNB format emitted by every current write.
+pub const AUTHENTICATED_BLOB_FORMAT_VERSION: u8 = 3;
+/// Prefix on a current multipart part's sealed-DEK metadata. Standard base64 never contains `:`,
+/// so an unprefixed value is unambiguously a legacy CRNB-v2 part.
+pub const AUTHENTICATED_PART_DEK_PREFIX: &str = "crnb3:";
 
 /// How an object version came to be encrypted, which decides what (if anything) GET/HEAD advertise
 /// to the client. The DEK envelope is identical for all three (CRK1-under-master) — this is a
@@ -46,11 +53,10 @@ fn is_false(b: &bool) -> bool {
 /// data-encryption key sealed under the master key (base64), and the wrapping nonce (base64). The
 /// raw DEK is never stored — only this wrapped form (ARCH 27, SSE-S3).
 ///
-/// `mode`/`kms_key_id` are additive (both `#[serde(default)]` and skipped when default), so a legacy
-/// descriptor with neither field deserializes as an ordinary SSE-S3 descriptor and a plain SSE-S3
-/// descriptor still serializes byte-identically. The master-key re-wrap loop (`key_rewrap.rs`)
-/// preserves both across a rotation — dropping them would silently make an `AtRest` object start
-/// advertising `AES256`.
+/// `mode`/`kms_key_id`/`blob_format_version` are additive and skipped when absent/default. In
+/// particular, an absent format marker is the trusted compatibility signal for a descriptor written
+/// before authenticated CRNB v3; current writes persist `3`. The reader requires that metadata-backed
+/// expectation instead of trusting the mutable version byte inside the blob itself.
 ///
 /// [`extra`](Self::extra) is load-bearing, not decoration: the re-wrap worker deserializes,
 /// re-seals, and re-serializes this struct, so any field written by a *newer* node that this binary
@@ -77,6 +83,10 @@ pub struct SseDescriptor {
     /// SSE-S3 descriptor is byte-identical.
     #[serde(default, skip_serializing_if = "is_false")]
     pub bucket_key_enabled: bool,
+    /// Expected encrypted CRNB container version. `None` means a descriptor written by the legacy
+    /// v2 writer; current writes set `Some(3)`. Any other explicit value fails closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blob_format_version: Option<u8>,
     /// Every field this binary does not know about, captured verbatim and re-emitted unchanged so a
     /// re-wrap (or any other read-modify-write) can never drop a label written by a newer node.
     #[serde(flatten)]
@@ -95,10 +105,7 @@ pub struct SseDescriptor {
 /// [`CryptoError::Decrypt`] for a malformed envelope, bad base64, a tampered tag, or an unwrapped
 /// key that is not 32 bytes; [`CryptoError::UnknownKeyId`] when the sealing key is simply not on
 /// this node's ring (a rotation window — retryable, not tampering).
-pub fn open_dek(
-    crypto: &dyn Crypto,
-    d: &SseDescriptor,
-) -> Result<Zeroizing<[u8; 32]>, CryptoError> {
+pub fn open_dek(crypto: &dyn Crypto, d: &SseDescriptor) -> Result<SecretKey32, CryptoError> {
     let ciphertext = B64
         .decode(d.wrapped_dek_b64.as_bytes())
         .map_err(|_| CryptoError::Decrypt)?;
@@ -111,11 +118,78 @@ pub fn open_dek(
             .map_err(|_| CryptoError::Decrypt)?
     };
     let raw = crypto.open(&ciphertext, &Nonce(nonce_bytes))?;
-    let key: [u8; 32] = raw
-        .as_slice()
-        .try_into()
+    SecretKey32::from_slice(raw.as_slice()).ok_or(CryptoError::Decrypt)
+}
+
+/// Open an object's DEK together with the encrypted CRNB format its persisted descriptor authorizes.
+///
+/// A missing marker is deliberately interpreted as legacy v2 for backward compatibility. A marker
+/// can never be inferred from the on-disk trailer: doing so would let a current authenticated blob
+/// select the unauthenticated legacy parser after its framing was modified.
+pub fn open_blob_cipher(crypto: &dyn Crypto, d: &SseDescriptor) -> Result<BlobCipher, CryptoError> {
+    let legacy = match d.blob_format_version {
+        None => true,
+        Some(AUTHENTICATED_BLOB_FORMAT_VERSION) => false,
+        Some(_) => return Err(CryptoError::Decrypt),
+    };
+    let dek = open_dek(crypto, d)?;
+    Ok(if legacy {
+        BlobCipher::LegacyV2(dek)
+    } else {
+        BlobCipher::AuthenticatedV3(dek)
+    })
+}
+
+/// Parse and open an encrypted object's persisted descriptor into the only blob-read declaration
+/// accepted by the storage layer.
+pub fn parse_and_open_blob_cipher(
+    crypto: &dyn Crypto,
+    json: &str,
+) -> Result<BlobCipher, CryptoError> {
+    let descriptor = parse_descriptor(json)?;
+    open_blob_cipher(crypto, &descriptor)
+}
+
+/// Seal a newly-staged multipart part's DEK and stamp the metadata with the current authenticated
+/// CRNB version. Legacy rows contain only the base64 envelope and remain readable as v2.
+pub fn seal_part_blob_cipher(
+    crypto: &dyn Crypto,
+    dek: &SecretKey32,
+) -> Result<String, CryptoError> {
+    let sealed = crypto.seal(dek.expose_secret())?;
+    Ok(format!(
+        "{AUTHENTICATED_PART_DEK_PREFIX}{}",
+        B64.encode(sealed.ciphertext)
+    ))
+}
+
+/// Open a persisted multipart-part DEK and return its metadata-backed CRNB expectation.
+///
+/// Unprefixed standard base64 is the legacy-v2 representation. The current `crnb3:` prefix selects
+/// authenticated v3, while any other colon-bearing prefix is rejected so future/garbled formats
+/// cannot silently fall back to legacy behavior.
+pub fn open_part_blob_cipher(
+    crypto: &dyn Crypto,
+    persisted: &str,
+) -> Result<BlobCipher, CryptoError> {
+    let (encoded, authenticated) =
+        if let Some(encoded) = persisted.strip_prefix(AUTHENTICATED_PART_DEK_PREFIX) {
+            (encoded, true)
+        } else if persisted.contains(':') {
+            return Err(CryptoError::Decrypt);
+        } else {
+            (persisted, false)
+        };
+    let ciphertext = B64
+        .decode(encoded.as_bytes())
         .map_err(|_| CryptoError::Decrypt)?;
-    Ok(Zeroizing::new(key))
+    let raw = crypto.open(&ciphertext, &Nonce(Vec::new()))?;
+    let dek = SecretKey32::from_slice(raw.as_slice()).ok_or(CryptoError::Decrypt)?;
+    Ok(if authenticated {
+        BlobCipher::AuthenticatedV3(dek)
+    } else {
+        BlobCipher::LegacyV2(dek)
+    })
 }
 
 /// Parse a stored `sse_descriptor` JSON document.
@@ -129,7 +203,11 @@ pub fn parse_descriptor(json: &str) -> Result<SseDescriptor, CryptoError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{SseDescriptor, SseMode, open_dek, parse_descriptor};
+    use super::{
+        AUTHENTICATED_BLOB_FORMAT_VERSION, AUTHENTICATED_PART_DEK_PREFIX, SseDescriptor, SseMode,
+        open_blob_cipher, open_dek, open_part_blob_cipher, parse_descriptor, seal_part_blob_cipher,
+    };
+    use crate::blob::BlobCipher;
     use crate::error::CryptoError;
     use crate::traits::Crypto;
 
@@ -178,7 +256,7 @@ mod tests {
         let dek = [7u8; 32];
         let ring_a = RingCrypto(1);
         let d = descriptor_for(&ring_a, &dek);
-        assert_eq!(&open_dek(&ring_a, &d).unwrap()[..], &dek[..]);
+        assert_eq!(open_dek(&ring_a, &d).unwrap().expose_secret(), &dek);
         // A DIFFERENT ring must not yield plaintext, zeros, or partial data — and must say
         // "unknown key id", not "decrypt failure", so callers can treat a rotation window as
         // transient instead of stamping the object permanently corrupt.
@@ -213,7 +291,54 @@ mod tests {
         let json = r#"{"alg":"AES256-GCM","wrapped_dek_b64":"AAAA","nonce_b64":""}"#;
         let d: SseDescriptor = serde_json::from_str(json).unwrap();
         assert_eq!(d.mode, SseMode::SseS3);
+        assert_eq!(d.blob_format_version, None);
         assert_eq!(serde_json::to_string(&d).unwrap(), json);
+    }
+
+    #[test]
+    fn descriptor_marker_selects_one_exact_encrypted_format() {
+        let crypto = RingCrypto(1);
+        let mut d = descriptor_for(&crypto, &[4u8; 32]);
+        assert!(matches!(
+            open_blob_cipher(&crypto, &d),
+            Ok(BlobCipher::LegacyV2(_))
+        ));
+
+        d.blob_format_version = Some(AUTHENTICATED_BLOB_FORMAT_VERSION);
+        assert!(matches!(
+            open_blob_cipher(&crypto, &d),
+            Ok(BlobCipher::AuthenticatedV3(_))
+        ));
+
+        d.blob_format_version = Some(99);
+        assert!(matches!(
+            open_blob_cipher(&crypto, &d),
+            Err(CryptoError::Decrypt)
+        ));
+    }
+
+    #[test]
+    fn multipart_part_marker_is_additive_and_unknown_prefixes_fail_closed() {
+        use base64::Engine;
+
+        let crypto = RingCrypto(1);
+        let dek = crate::SecretKey32::new([8u8; 32]);
+        let current = seal_part_blob_cipher(&crypto, &dek).unwrap();
+        assert!(current.starts_with(AUTHENTICATED_PART_DEK_PREFIX));
+        assert!(matches!(
+            open_part_blob_cipher(&crypto, &current),
+            Ok(BlobCipher::AuthenticatedV3(_))
+        ));
+
+        let legacy = super::B64.encode(crypto.seal(dek.expose_secret()).unwrap().ciphertext);
+        assert!(matches!(
+            open_part_blob_cipher(&crypto, &legacy),
+            Ok(BlobCipher::LegacyV2(_))
+        ));
+        assert!(matches!(
+            open_part_blob_cipher(&crypto, "crnb4:AAAA"),
+            Err(CryptoError::Decrypt)
+        ));
     }
 
     #[test]

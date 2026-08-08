@@ -129,8 +129,8 @@ def node_env(i, master_key):
         "CAIRN_ROOT_ACCESS_KEY": AKID, "CAIRN_ROOT_SECRET_KEY": SECRET,
         "CAIRN_REGION": REGION, "CAIRN_ALLOW_INSECURE": "true",
         # The mesh wires replication targets through the management API, which enforces the
-        # cairn-net SSRF guard; the loopback topology needs the internal-endpoint escape hatch
-        # (soak.sh avoids this by using the operator-trusted CAIRN_REPLICATION_ENDPOINT config path).
+        # cairn-net SSRF guard; the loopback topology needs the internal-endpoint escape hatch.
+        # Environment-configured replication endpoints are guarded the same way.
         "CAIRN_ALLOW_INTERNAL_ENDPOINTS": "true",
         # The SSE convergence scenario replicates client-encrypted objects, which now ship as
         # DECRYPTED plaintext (Stage-1 fix). The Stage-1 gate refuses that over an http:// endpoint

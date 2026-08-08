@@ -4,6 +4,7 @@
 
 use crate::crypto_util::sha256_hex;
 use crate::sigv4::{compute_signature, signing_key};
+use cairn_types::SecretKey32;
 
 const CHUNK_ALGORITHM: &str = "AWS4-HMAC-SHA256-PAYLOAD";
 
@@ -27,7 +28,7 @@ pub fn chunk_string_to_sign(
 /// previous signature, and the chunk's payload bytes.
 #[must_use]
 pub fn next_chunk_signature(
-    key: &[u8; 32],
+    key: &SecretKey32,
     amzdate: &str,
     scope: &str,
     prev_signature: &str,
@@ -39,7 +40,7 @@ pub fn next_chunk_signature(
 
 /// Derive the streaming signing key (same derivation as the header signature).
 #[must_use]
-pub fn streaming_signing_key(secret: &str, date: &str, region: &str) -> [u8; 32] {
+pub fn streaming_signing_key(secret: &str, date: &str, region: &str) -> SecretKey32 {
     signing_key(secret, date, region, "s3")
 }
 

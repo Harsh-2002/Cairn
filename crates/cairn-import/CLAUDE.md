@@ -22,10 +22,13 @@ exercised entirely against in-memory doubles here and wired to real impls by `ca
 
 ## Scale is bounded by construction
 Enumeration streams (paged `ListObjectsV2`, **never** list-all-into-memory); each page's objects
-copy under a per-bucket `object_workers` fan-out **and** a single global `Semaphore` whose permit
-ceiling (`global_max_inflight`) caps total in-flight work across every bucket — held **below** the
-blob-I/O permit pool (`DEFAULT_BLOB_IO_CONCURRENCY`) so a bulk import can never starve the node's
-live GET/PUT traffic. Object bodies stream source→dest and are never buffered whole. Resume is one
+copy under a per-bucket `object_workers` fan-out **and** a single FIFO `Semaphore` whose permit
+ceiling (`global_max_inflight`) caps total in-flight work across every bucket and concurrently
+scheduled job — held **below** the blob-I/O permit pool (`DEFAULT_BLOB_IO_CONCURRENCY`) so a bulk
+import can never starve the node's live GET/PUT traffic. A permit covers one bounded attempt only
+and is released before retry backoff. Object bodies stream source→dest and are never buffered whole.
+Connect, response-head, per-chunk idle, and whole-object deadlines ensure a peer cannot hold a slot
+forever. Resume is one
 cursor per `(job, bucket)`, carried in `BucketPlan` — a billion-object bucket never balloons memory
 or the checkpoint.
 

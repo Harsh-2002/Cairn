@@ -3,11 +3,17 @@
 //! and user/credential records.
 
 use crate::authz::{Acl, OwnershipMode, PublicAccessBlock};
-use crate::bucket::{Bucket, CompressionPolicy, ConfigAspect, ConfigDoc, VersioningState};
+use crate::bucket::{
+    Bucket, CompressionPolicy, ConfigAspect, ConfigDoc, DefaultRetention, VersioningState,
+};
 use crate::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
-use crate::object::{ChecksumValue, ETag, ObjectVersionRow, StorageClass, UserMetadata};
+use crate::object::{
+    ChecksumValue, ETag, ExplicitObjectLockIntent, GovernanceBypass, ObjectVersionRow,
+    StorageClass, UserMetadata,
+};
 use crate::time::Timestamp;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 // ---------------------------------------------------------------------------------------
 // Conditional writes
@@ -40,6 +46,32 @@ pub enum IfNoneMatch {
     ETag(ETag),
 }
 
+/// Tags and explicit Object Lock intent installed atomically with a new object version.
+///
+/// Keeping these side rows inside the object commit mutation prevents a visible version from
+/// escaping without its requested tags/retention/legal hold, and makes a late side-row failure roll
+/// the version and replication outbox back together.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InitialObjectState {
+    /// Initial object tags. Empty means replace the version's tag set with empty.
+    pub tags: Vec<(String, String)>,
+    /// Explicit retention/legal-hold request. Bucket defaults are resolved by the writer.
+    pub lock_intent: ExplicitObjectLockIntent,
+}
+
+/// Writer-atomic guard for a lifecycle-created delete marker.
+///
+/// The lifecycle scanner captures the current version at enumeration time. The marker may be
+/// inserted only while that exact version, with the same last-modified timestamp, is still current;
+/// otherwise a concurrent write would be hidden by an expiration decision made against stale data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CurrentVersionGuard {
+    /// Version that was current when lifecycle enumerated the key.
+    pub version_id: VersionId,
+    /// `updated_at` observed for that version.
+    pub updated_at: Timestamp,
+}
+
 // ---------------------------------------------------------------------------------------
 // Mutations (every write goes through the single group-committing writer)
 // ---------------------------------------------------------------------------------------
@@ -54,9 +86,29 @@ pub enum Mutation {
         row: Box<ObjectVersionRow>,
         /// The conditional precondition.
         precondition: Precondition,
+        /// Tags and explicit Object Lock state committed with the version.
+        initial_state: InitialObjectState,
         /// Replication outbox entries to enqueue in the same transaction — one per matching
         /// destination target (fan-out); empty when the write does not replicate (ARCH 20).
         replication: Vec<OutboxEntry>,
+    },
+    /// Resolve whether one exact staged blob became referenced by its intended object row.
+    ///
+    /// This read is deliberately serialized through the writer after an ambiguous/cancelled PUT
+    /// or Copy acknowledgement. If the original put reached the writer, FIFO ordering makes its
+    /// transaction terminal before this probe; matching row id and path prevents an unversioned
+    /// overwrite from being mistaken for the original write.
+    ResolveObjectWrite {
+        /// Intended bucket.
+        bucket: BucketName,
+        /// Intended key.
+        key: ObjectKey,
+        /// Intended version id (including the unversioned null sentinel).
+        version_id: VersionId,
+        /// Immutable id minted for the intended object-version row.
+        row_id: String,
+        /// Unique durable blob path returned by staging.
+        storage_path: StoragePath,
     },
     /// Insert a delete marker (a versioned plain delete).
     CreateDeleteMarker {
@@ -70,6 +122,11 @@ pub enum Mutation {
         owner_id: UserId,
         /// Creation time.
         now: Timestamp,
+        /// Trusted governance-bypass decision for replacing a protected sentinel version.
+        bypass: GovernanceBypass,
+        /// Optional lifecycle freshness guard. `None` is an unconditional client delete; `Some`
+        /// inserts the marker only if the enumerated version is still the exact current row.
+        expected_current: Option<CurrentVersionGuard>,
         /// Replication of the marker — one entry per matching target; empty when not replicated.
         replication: Vec<OutboxEntry>,
     },
@@ -81,6 +138,11 @@ pub enum Mutation {
         key: ObjectKey,
         /// The version to remove (sentinel for unversioned).
         version_id: VersionId,
+        /// Optional compare-and-delete guard over the immutable metadata-row identity. Lifecycle
+        /// passes the `row_id` captured by listing so a same-version, same-timestamp sentinel
+        /// replacement cannot be mistaken for the object that was enumerated. `None` preserves
+        /// ordinary client `DeleteObject` semantics.
+        expected_row_id: Option<String>,
         /// Optional compare-and-delete guard: only delete if the stored version's `updated_at` still
         /// equals this value. `None` = unconditional (client `DeleteObject`). The lifecycle scanner
         /// captures a version's `updated_at` at enumeration and passes it here so a concurrent
@@ -88,22 +150,118 @@ pub enum Mutation {
         /// fresh object — the current-object-expiration TOCTOU (audit 2026-07). Evaluated inside the
         /// delete's savepoint, so the check and the delete are atomic.
         expected_updated_at: Option<Timestamp>,
+        /// Require the target to be the sole version for its key, as well as the latest delete
+        /// marker. Lifecycle's expired-delete-marker cleanup sets this after enumerating a sole
+        /// marker so a concurrently arrived older version cannot be exposed by a stale decision.
+        require_sole_key_version: bool,
+        /// Trusted current time used to evaluate retention inside the writer savepoint.
+        now: Timestamp,
+        /// Trusted governance-bypass authorization.
+        bypass: GovernanceBypass,
     },
-    /// Create a multipart session.
-    CreateMultipart(Box<MultipartSession>),
-    /// Record (or supersede) a part. Returns any superseded part blob path.
+    /// Create a multipart session, enforcing the active-session limits atomically with the insert.
+    CreateMultipart {
+        /// The session to create.
+        session: Box<MultipartSession>,
+        /// Bounded multipart cardinality limits.
+        limits: MultipartLimits,
+    },
+    /// Reserve quota for one exact multipart-part attempt before any bytes are staged.
+    ///
+    /// `attempt_id` is also the blob store's deterministic part-attempt identifier, so a cleanup
+    /// worker can unlink the intended artifact even when staging fails after file creation but
+    /// before returning a [`StoragePath`].
+    ReserveMultipartPart {
+        /// The session.
+        upload_id: UploadId,
+        /// The S3 part number.
+        part_number: u16,
+        /// Unique identifier for this upload attempt.
+        attempt_id: String,
+        /// Exact declared plaintext payload bytes to reserve.
+        reserved_bytes: u64,
+        /// Maximum distinct part numbers allowed for the session.
+        max_parts_per_upload: u16,
+        /// Reservation creation time.
+        now: Timestamp,
+    },
+    /// Release an uncommitted part reservation after its artifact is proven absent.
+    ReleaseMultipartReservation {
+        /// The session.
+        upload_id: UploadId,
+        /// The attempt reservation.
+        attempt_id: String,
+    },
+    /// Record (or supersede) a part by consuming its pre-stage reservation.
     RecordPart {
         /// The session.
         upload_id: UploadId,
+        /// The reservation/part-attempt identifier.
+        attempt_id: String,
         /// The part.
         part: PartRecord,
     },
-    /// Atomically claim a session for completion (guards double completion).
-    ClaimMultipart(UploadId),
+    /// Resolve whether one exact staged multipart-part attempt became the current part row.
+    ///
+    /// This probe is deliberately serialized through the writer after an ambiguous/cancelled
+    /// [`Mutation::RecordPart`] acknowledgement. The staging path contains the fresh attempt id,
+    /// so matching `(upload_id, part_number, storage_path)` is also ABA-safe when a later retry
+    /// supersedes the same part number.
+    ResolveMultipartPartWrite {
+        /// The multipart session.
+        upload_id: UploadId,
+        /// The S3 part number.
+        part_number: u16,
+        /// Unique durable path returned by this attempt's staging operation.
+        storage_path: StoragePath,
+    },
+    /// Release one exact-path multipart cleanup debt after unlink succeeds.
+    ReleaseMultipartCleanup {
+        /// The cleanup debt id.
+        cleanup_id: String,
+    },
+    /// Release every cleanup debt for one upload after its complete staging directory is removed.
+    ReleaseMultipartUploadCleanups {
+        /// The upload whose directory was removed.
+        upload_id: UploadId,
+    },
+    /// Release a bounded page of crash-orphaned reservations and cleanup debts.
+    ///
+    /// This may run only after a complete, successful filesystem reconciliation. A partial or
+    /// failed walk must never release accounting for bytes it did not prove absent.
+    RecoverMultipartStagingAccounting {
+        /// Maximum ledger rows to release in this writer transaction.
+        limit: u32,
+    },
+    /// Atomically claim a session for one exact completion attempt (guards double completion).
+    ClaimMultipart {
+        /// The session.
+        upload_id: UploadId,
+        /// Fresh ownership token for this completion attempt.
+        claim_token: crate::id::MultipartClaimToken,
+    },
+    /// Release a failed completion claim (`completing` -> `active`) so the client can retry.
+    ///
+    /// The transition matches both the session and its persisted ownership token inside the writer
+    /// savepoint, so delayed recovery from an older attempt cannot release a newer completer.
+    ReleaseMultipartClaim {
+        /// The session.
+        upload_id: UploadId,
+        /// The exact completion attempt being released.
+        claim_token: crate::id::MultipartClaimToken,
+    },
+    /// Recover every orphaned multipart completion claim (`completing` -> `active`).
+    ///
+    /// Run once before listeners bind. A newly-started process has no surviving request that could
+    /// still own a `completing` session, so retaining that transient state would strand the upload
+    /// forever. Global across shards, idempotent, and leaves parts/session metadata intact.
+    RecoverMultipartClaims,
     /// Complete a multipart upload: upsert the object and remove the session in one tx.
     CompleteMultipart {
         /// The session being completed.
         upload_id: UploadId,
+        /// The exact completion attempt that owns the session.
+        claim_token: crate::id::MultipartClaimToken,
         /// The assembled object version row.
         row: Box<ObjectVersionRow>,
         /// The conditional precondition.
@@ -111,10 +269,13 @@ pub enum Mutation {
         /// Replication enqueue — one entry per matching target; empty when not replicated.
         replication: Vec<OutboxEntry>,
     },
-    /// Abort a multipart session.
+    /// Abort an active multipart session. A completion owner (`completing`) wins atomically.
     AbortMultipart(UploadId),
     /// Create a bucket.
     CreateBucket(Box<Bucket>),
+    /// Atomically create an Object-Lock-enabled, versioning-enabled bucket and its immutable
+    /// enabled configuration row.
+    CreateObjectLockBucket(Box<Bucket>),
     /// Delete an (empty) bucket.
     DeleteBucket(BucketName),
     /// Set or clear (None) a bucket configuration aspect.
@@ -126,9 +287,20 @@ pub enum Mutation {
         /// The document, or None to delete.
         doc: Option<ConfigDoc>,
     },
+    /// Update the default retention of an already Object-Lock-enabled bucket.
+    ///
+    /// This specialized mutation deliberately repairs malformed/disabled legacy configuration
+    /// rows but cannot enable Object Lock on a bucket that has no Object Lock row.
+    UpdateObjectLockConfiguration {
+        /// Target bucket.
+        bucket: BucketName,
+        /// The new default retention, or `None` for enabled Object Lock without a default.
+        default_retention: Option<DefaultRetention>,
+    },
     /// Set or clear the Object Lock retention on one object version (preserving any legal hold).
-    /// The protocol layer enforces the retention policy (no shortening COMPLIANCE, governance bypass)
-    /// before submitting this.
+    ///
+    /// The metadata writer is the final authority for future-date validation, COMPLIANCE
+    /// non-weakening, and GOVERNANCE bypass. Callers pass only the trusted authorization result.
     SetObjectRetention {
         /// Target bucket.
         bucket: BucketName,
@@ -138,6 +310,10 @@ pub enum Mutation {
         version_id: VersionId,
         /// The retention to apply, or None to clear it.
         retention: Option<crate::object::ObjectRetention>,
+        /// Trusted current time used for future-date and weakening checks.
+        now: Timestamp,
+        /// Trusted governance-bypass authorization.
+        bypass: GovernanceBypass,
     },
     /// Set the Object Lock legal-hold flag on one object version (preserving any retention).
     SetObjectLegalHold {
@@ -488,12 +664,13 @@ pub enum Mutation {
     },
     /// Append an audit/activity entry.
     RecordActivity(Box<ActivityEntry>),
-    /// Create a persistent object-share token (ARCH 15.8).
+    /// Create a persistent object share whose bearer token has already been reduced to a
+    /// domain-separated lookup hash (ARCH 15.8).
     CreateShare(Box<ShareRow>),
-    /// Revoke a share token (idempotent; sets `revoked_at` if still active).
+    /// Revoke a share by its stable, non-secret management id (idempotent).
     RevokeShare {
-        /// The token to revoke.
-        token: String,
+        /// The stable share id to revoke.
+        id: String,
         /// The revocation time.
         now: Timestamp,
     },
@@ -550,10 +727,14 @@ pub enum Mutation {
         updated_at: Timestamp,
     },
     /// Reclaim finished (`completed`/`failed`/`cancelled`) import jobs whose `updated_at` is before
-    /// `before_ms`, keeping the table bounded. Running/pending jobs are never pruned.
+    /// `before_ms`, keeping the table bounded. Running/pending jobs are never pruned. One mutation
+    /// deletes at most `limit` rows so retention maintenance cannot monopolize the single writer.
     PruneImportJobs {
         /// Delete finished jobs updated before this wall-clock millis.
         before_ms: i64,
+        /// Maximum rows to delete in this writer transaction (backend-clamped to
+        /// [`MAX_IMPORT_JOB_PRUNE_BATCH`]).
+        limit: u32,
     },
 }
 
@@ -567,10 +748,19 @@ pub enum MutationOutcome {
         /// The committed version id.
         version_id: VersionId,
     },
+    /// Result of a writer-serialized exact-row/path probe after an object-write acknowledgement was
+    /// cancelled or ambiguous.
+    ObjectWriteResolved {
+        /// `true` only when the exact intended row still references the staged path. `false` proves
+        /// that path is currently unreferenced and may be reclaimed.
+        referenced: bool,
+    },
     /// A delete marker was inserted.
     DeleteMarker {
         /// The marker's version id.
         version_id: VersionId,
+        /// Any sentinel blob replaced by this marker.
+        freed: Option<StoragePath>,
     },
     /// A version was permanently deleted.
     Deleted {
@@ -579,22 +769,35 @@ pub enum MutationOutcome {
         /// Whether a successor was promoted to latest.
         promoted_latest: bool,
     },
+    /// A permanent-delete target was absent/stale, or a conditional delete marker's enumerated
+    /// current version no longer matched, so no metadata changed. S3 DELETE remains idempotent,
+    /// while maintenance callers can distinguish this lost race from a writer-confirmed deletion.
+    DeleteNotApplied,
+    /// A permanent delete or sentinel replacement was denied by Object Lock. No metadata changed.
+    DeleteProtected,
     /// A multipart session was created.
     MultipartCreated(UploadId),
+    /// Quota was reserved for a multipart part attempt before staging.
+    MultipartReserved,
     /// A part was recorded.
     PartRecorded {
-        /// Any superseded part blob to reclaim.
-        superseded: Option<StoragePath>,
+        /// Any superseded part cleanup debt. Its bytes remain charged until the path is unlinked
+        /// and [`Mutation::ReleaseMultipartCleanup`] commits.
+        cleanup: Option<MultipartCleanup>,
     },
+    /// Result of a writer-serialized exact multipart part/path probe.
+    MultipartPartWriteResolved {
+        /// `true` only when the current part row still references this attempt's unique path.
+        referenced: bool,
+    },
+    /// Rows released by one bounded [`Mutation::RecoverMultipartStagingAccounting`] transaction.
+    MultipartAccountingReleased(u64),
     /// A claim attempt resolved.
     MultipartClaim(ClaimOutcome),
-    /// A multipart completion committed.
-    MultipartCompleted {
-        /// Any superseded object blob to reclaim.
-        superseded: Option<StoragePath>,
-        /// The committed version id.
-        version_id: VersionId,
-    },
+    /// A failed completion claim was released (or rejected because the caller was not its owner).
+    MultipartClaimRelease(ClaimReleaseOutcome),
+    /// An abort or completion terminal transition resolved.
+    MultipartTerminal(MultipartTerminalOutcome),
     /// A batch of due replication entries was claimed.
     ReplicationBatch(Vec<OutboxEntry>),
     /// A batch of due webhook-notification entries was claimed.
@@ -615,6 +818,8 @@ pub enum MutationOutcome {
         /// The last key covered by this batch, or `None` when the page was empty (drained).
         page_end: Option<String>,
     },
+    /// Rows deleted by one bounded [`Mutation::PruneImportJobs`] transaction.
+    ImportJobsPruned(u64),
     /// A generic acknowledgement for mutations with no specific return value.
     Ack,
 }
@@ -746,6 +951,44 @@ pub struct ImportJob {
     pub updated_at: Timestamp,
 }
 
+/// An import job summary for history pages.
+///
+/// Unlike [`ImportJob`], this type deliberately has no per-bucket progress vector. History listing
+/// therefore never selects or decodes `buckets_json`; callers fetch one job's detail explicitly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportJobSummary {
+    /// The job id.
+    pub id: String,
+    /// The remote S3 endpoint base URL.
+    pub source_endpoint: String,
+    /// The SigV4 signing region for the source.
+    pub source_region: String,
+    /// The source admin access-key id.
+    pub access_key_id: String,
+    /// Whether a custom CA certificate is configured (presence flag; the PEM is not returned).
+    pub has_ca_cert: bool,
+    /// Whether TLS verification is skipped for the source.
+    pub insecure_skip_verify: bool,
+    /// The object-worker count.
+    pub workers: u32,
+    /// The job state.
+    pub state: ImportState,
+    /// Aggregate objects copied.
+    pub objects_done: u64,
+    /// Aggregate objects seen.
+    pub objects_total: u64,
+    /// Aggregate bytes copied.
+    pub bytes_done: u64,
+    /// Aggregate bytes seen.
+    pub bytes_total: u64,
+    /// A job-level error/status message, if any.
+    pub last_error: Option<String>,
+    /// When the job was created.
+    pub created_at: Timestamp,
+    /// When the job was last updated.
+    pub updated_at: Timestamp,
+}
+
 impl ImportJobRecord {
     /// The secret-free [`ImportJob`] view: drops the sealed secret material and exposes only a
     /// `has_ca_cert` presence flag. Used by every read path so a secret can never leak to the API.
@@ -769,6 +1012,107 @@ impl ImportJobRecord {
             created_at: self.created_at,
             updated_at: self.updated_at,
         }
+    }
+
+    /// The secret-free, bucket-progress-free history summary.
+    #[must_use]
+    pub fn to_summary(&self) -> ImportJobSummary {
+        ImportJobSummary {
+            id: self.id.clone(),
+            source_endpoint: self.source_endpoint.clone(),
+            source_region: self.source_region.clone(),
+            access_key_id: self.access_key_id.clone(),
+            has_ca_cert: self.ca_cert_pem.is_some(),
+            insecure_skip_verify: self.insecure_skip_verify,
+            workers: self.workers,
+            state: self.state,
+            objects_done: self.objects_done,
+            objects_total: self.objects_total,
+            bytes_done: self.bytes_done,
+            bytes_total: self.bytes_total,
+            last_error: self.last_error.clone(),
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        }
+    }
+}
+
+/// Hard ceiling for one import-history page at the metadata seam.
+///
+/// Enforcing this below the management API keeps every backend bounded even if a future internal
+/// caller forgets to validate its requested limit.
+pub const MAX_IMPORT_JOB_PAGE_SIZE: u32 = 1_000;
+
+/// Hard ceiling on terminal import jobs removed by one writer transaction.
+pub const MAX_IMPORT_JOB_PRUNE_BATCH: u32 = 1_000;
+
+/// Stable keyset cursor for the import history's `(created_at DESC, id DESC)` order.
+///
+/// The id is the tie-breaker: timestamps are millisecond resolution, so creation time alone would
+/// skip or duplicate jobs created in the same millisecond.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportJobCursor {
+    /// Creation time of the last job returned by the previous page.
+    pub created_at: Timestamp,
+    /// Id of the last job returned by the previous page.
+    pub id: String,
+}
+
+/// A bounded import-history listing query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportJobListQuery {
+    /// Resume strictly after this `(created_at, id)` pair in newest-first order.
+    pub cursor: Option<ImportJobCursor>,
+    /// Requested page size. Backends clamp this to [`MAX_IMPORT_JOB_PAGE_SIZE`] and treat zero as
+    /// one, preserving the bounded-read invariant independently of the caller.
+    pub limit: u32,
+}
+
+impl ImportJobListQuery {
+    /// The page size enforced by every metadata backend.
+    #[must_use]
+    pub fn bounded_limit(&self) -> u32 {
+        self.limit.clamp(1, MAX_IMPORT_JOB_PAGE_SIZE)
+    }
+}
+
+impl Default for ImportJobListQuery {
+    fn default() -> Self {
+        Self {
+            cursor: None,
+            limit: MAX_IMPORT_JOB_PAGE_SIZE,
+        }
+    }
+}
+
+/// One keyset-paginated page of secret-free import jobs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportJobPage {
+    /// Jobs in stable `(created_at DESC, id DESC)` order.
+    pub items: Vec<ImportJobSummary>,
+    /// Cursor derived from the last returned item when another page exists.
+    pub next_cursor: Option<ImportJobCursor>,
+}
+
+impl ImportJobPage {
+    /// Build a page from a backend result ordered newest first and fetched at `limit + 1`.
+    ///
+    /// Keeping the truncation/cursor rule here makes SQLite, libSQL/Turso, sharding, cache, and the
+    /// in-memory double expose identical page boundaries.
+    #[must_use]
+    pub fn from_overfetch(mut items: Vec<ImportJobSummary>, limit: u32) -> Self {
+        let limit = limit.clamp(1, MAX_IMPORT_JOB_PAGE_SIZE) as usize;
+        let truncated = items.len() > limit;
+        items.truncate(limit);
+        let next_cursor = if truncated {
+            items.last().map(|last| ImportJobCursor {
+                created_at: last.created_at,
+                id: last.id.clone(),
+            })
+        } else {
+            None
+        };
+        Self { items, next_cursor }
     }
 }
 
@@ -834,6 +1178,13 @@ impl<T> Default for ListPage<T> {
 /// A summary of one object version for listing output.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObjectSummary {
+    /// Internal immutable identity of the metadata row that produced this summary.
+    ///
+    /// This is a lifecycle compare-and-delete token, not S3 response data. It is deliberately
+    /// omitted from external serialization; metadata backends populate it directly from
+    /// `object_versions.id`.
+    #[serde(skip)]
+    pub row_id: String,
     /// The key.
     pub key: ObjectKey,
     /// The version id.
@@ -858,6 +1209,27 @@ pub struct ObjectSummary {
 // Multipart
 // ---------------------------------------------------------------------------------------
 
+/// Writer-enforced cardinality limits for active multipart state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MultipartLimits {
+    /// Maximum active uploads in one bucket.
+    pub max_active_uploads_per_bucket: u32,
+    /// Maximum active uploads attributed to one initiating principal.
+    pub max_active_uploads_per_principal: u32,
+    /// Maximum distinct part numbers in one upload (never above S3's 10,000).
+    pub max_parts_per_upload: u16,
+}
+
+impl Default for MultipartLimits {
+    fn default() -> Self {
+        Self {
+            max_active_uploads_per_bucket: 1_000,
+            max_active_uploads_per_principal: 1_000,
+            max_parts_per_upload: 10_000,
+        }
+    }
+}
+
 /// A multipart upload session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MultipartSession {
@@ -873,10 +1245,22 @@ pub struct MultipartSession {
     pub status: MultipartStatus,
     /// The owner.
     pub owner_id: UserId,
+    /// The authenticated principal that initiated the upload.
+    ///
+    /// This is deliberately distinct from `owner_id`: bucket ownership rules can make the final
+    /// object belong to the bucket owner even when an administrator or delegated writer supplied
+    /// the staged bytes. Multipart session limits and staged-byte user quota are attributed to the
+    /// actual initiator.
+    pub initiated_by: UserId,
     /// The ACL to apply on completion.
     pub intended_acl: Option<Acl>,
     /// The metadata to apply on completion.
     pub user_metadata: UserMetadata,
+    /// Object tags pinned at initiation and installed atomically at completion.
+    pub initial_tags: Vec<(String, String)>,
+    /// Explicit Object Lock intent pinned at initiation. Bucket defaults are deliberately resolved
+    /// from the then-current configuration at completion rather than pinned here.
+    pub lock_intent: ExplicitObjectLockIntent,
     /// Whether SSE-S3 was requested for this upload at initiate (via the request header or the
     /// bucket default-encryption setting). Captured at initiate because the `CompleteMultipartUpload`
     /// request carries no SSE header; honored at completion so the assembled object is encrypted at
@@ -930,13 +1314,59 @@ pub enum ShareDisposition {
     Attachment,
 }
 
-/// A persistent, revocable, optionally-forever object-share token (ARCH 15.8). The token is the
-/// bearer capability served at `GET /share/{token}`; revoking flips `revoked_at` without rotating any
-/// global key. Stored in the `object_shares` table.
+/// Fixed-size lookup key derived from an object-share bearer token.
+///
+/// The domain separator prevents a token hash from being interchangeable with any other SHA-256
+/// use in Cairn. This is an indexed lookup key, not a password verifier: share tokens carry 256
+/// random bits, so a fast hash does not make offline guessing practical. `Debug` is deliberately
+/// redacted so an enclosing domain value cannot disclose even the lookup material.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ShareLookupHash([u8; Self::LEN]);
+
+impl ShareLookupHash {
+    /// Encoded width of the hash stored in SQLite/libSQL/Turso.
+    pub const LEN: usize = 32;
+    const DOMAIN: &'static [u8] = b"cairn:object-share-token:v1\0";
+
+    /// Derive the lookup hash for a raw bearer token.
+    #[must_use]
+    pub fn for_token(token: &str) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(Self::DOMAIN);
+        hasher.update(token.as_bytes());
+        Self(hasher.finalize().into())
+    }
+
+    /// Decode an exact-width database BLOB.
+    #[must_use]
+    pub fn from_slice(bytes: &[u8]) -> Option<Self> {
+        bytes.try_into().ok().map(Self)
+    }
+
+    /// Borrow the fixed-width database representation.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8; Self::LEN] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for ShareLookupHash {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ShareLookupHash(<redacted>)")
+    }
+}
+
+/// A persistent, revocable, optionally-forever object share (ARCH 15.8).
+///
+/// The raw bearer capability is returned only by the mint operation and is never placed in this
+/// row. Redemption hashes `/share/{token}` and performs an indexed lookup by `token_hash`, while
+/// management list/get/revoke operations use the stable non-secret `id`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShareRow {
-    /// The opaque bearer token (base64url of 32 CSPRNG bytes); the table primary key.
-    pub token: String,
+    /// Stable, non-secret management identifier; the table primary key.
+    pub id: String,
+    /// Domain-separated SHA-256 lookup hash of the opaque bearer token.
+    pub token_hash: ShareLookupHash,
     /// The shared object's bucket.
     pub bucket: BucketName,
     /// The shared object's key.
@@ -977,6 +1407,41 @@ pub struct PartRecord {
     pub part_dek: Option<String>,
 }
 
+/// One durable pre-stage multipart byte reservation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultipartReservation {
+    /// Unique attempt identifier, also used by the blob store to name the attempt artifact.
+    pub attempt_id: String,
+    /// The upload session.
+    pub upload_id: UploadId,
+    /// The S3 part number.
+    pub part_number: u16,
+    /// Reserved plaintext bytes.
+    pub reserved_bytes: u64,
+    /// When the reservation was created.
+    pub created_at: Timestamp,
+}
+
+/// Durable accounting debt for multipart bytes whose metadata ownership ended before their
+/// filesystem artifact was successfully reclaimed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultipartCleanup {
+    /// Stable cleanup id.
+    pub id: String,
+    /// The originating upload.
+    pub upload_id: UploadId,
+    /// Bucket charged for the bytes.
+    pub bucket: BucketName,
+    /// Initiating principal charged for the bytes.
+    pub principal_id: UserId,
+    /// Plaintext bytes that remain charged until cleanup succeeds.
+    pub bytes: u64,
+    /// Exact superseded part path, or `None` when the whole upload directory must be removed.
+    pub storage_path: Option<StoragePath>,
+    /// When the debt was created.
+    pub created_at: Timestamp,
+}
+
 /// The outcome of claiming a multipart session for completion.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClaimOutcome {
@@ -986,6 +1451,31 @@ pub enum ClaimOutcome {
     AlreadyClaimed,
     /// No such (active) session.
     NotFound,
+}
+
+/// The outcome of releasing a failed multipart completion claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimReleaseOutcome {
+    /// The owned `completing` session returned to `active` and is retryable.
+    Released,
+    /// The session was absent or was not in `completing`; no state changed.
+    NotOwner,
+}
+
+/// The writer-atomic outcome of a multipart terminal transition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MultipartTerminalOutcome {
+    /// Completion owned the `completing` session, committed the object, and consumed the session.
+    Completed {
+        /// Any superseded object blob to reclaim.
+        superseded: Option<StoragePath>,
+        /// The committed version id.
+        version_id: VersionId,
+    },
+    /// Abort owned and removed an `active` session.
+    Aborted,
+    /// The session was absent or owned by the competing terminal operation; no state changed.
+    NotOwner,
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1214,7 +1704,8 @@ pub struct SessionCredentialRecord {
     /// The hash of the opaque session token the SDK must present (`X-Amz-Security-Token`).
     pub session_token_hash: String,
     /// An optional inline policy JSON scoping the session below the parent (the session's effective
-    /// identity policy). `None` inherits the parent's attached policy.
+    /// identity policy). Current minting paths always store `Some`; a legacy `None` grants nothing
+    /// and never inherits the parent's attached policy.
     pub inline_policy: Option<String>,
     /// When the credential expires (epoch ms); requests after this are denied.
     pub expires_at: Timestamp,
@@ -1241,6 +1732,7 @@ pub struct UserSessionCredentials {
     /// The stored session-token hash to compare (constant-time) against the presented token.
     pub session_token_hash: String,
     /// The optional inline policy JSON scoping the session (the effective identity policy).
+    /// `None` is inert; session authentication never loads the parent's policy.
     pub inline_policy: Option<String>,
     /// When the credential expires (epoch ms).
     pub expires_at: Timestamp,
@@ -1567,4 +2059,55 @@ pub struct TaggedObject {
     pub size: u64,
     /// When the current version was last modified.
     pub last_modified: Timestamp,
+}
+
+#[cfg(test)]
+mod share_lookup_hash_tests {
+    use super::ShareLookupHash;
+
+    #[test]
+    fn share_lookup_hash_is_domain_stable_fixed_width_and_debug_redacted() {
+        let sentinel = "cairn-share-debug-sentinel-029";
+        let first = ShareLookupHash::for_token(sentinel);
+        let second = ShareLookupHash::for_token(sentinel);
+        let other = ShareLookupHash::for_token("another-token");
+
+        assert_eq!(first, second);
+        assert_ne!(first, other);
+        assert_eq!(first.as_bytes().len(), ShareLookupHash::LEN);
+        assert_eq!(ShareLookupHash::from_slice(first.as_bytes()), Some(first));
+        assert!(ShareLookupHash::from_slice(&[0_u8; 31]).is_none());
+
+        let debug = format!("{first:?}");
+        assert_eq!(debug, "ShareLookupHash(<redacted>)");
+        assert!(!debug.contains(sentinel));
+    }
+}
+
+#[cfg(test)]
+mod object_summary_tests {
+    use super::ObjectSummary;
+    use crate::{ETag, ObjectKey, StorageClass, Timestamp, UserId, VersionId};
+
+    #[test]
+    fn row_identity_is_not_part_of_external_serialization() {
+        let summary = ObjectSummary {
+            row_id: "internal-row-id".to_owned(),
+            key: ObjectKey::parse("key").unwrap(),
+            version_id: VersionId::from_string("version".to_owned()),
+            is_latest: true,
+            is_delete_marker: false,
+            etag: ETag::from_string("etag".to_owned()),
+            size: 1,
+            last_modified: Timestamp(1),
+            storage_class: StorageClass::Standard,
+            owner_id: UserId("owner".to_owned()),
+        };
+
+        let encoded = serde_json::to_value(&summary).unwrap();
+        assert!(encoded.get("row_id").is_none());
+
+        let decoded: ObjectSummary = serde_json::from_value(encoded).unwrap();
+        assert!(decoded.row_id.is_empty());
+    }
 }

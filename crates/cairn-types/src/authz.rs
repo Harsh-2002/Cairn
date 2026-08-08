@@ -6,7 +6,6 @@
 use crate::id::{BucketName, ObjectKey, UserId, VersionId};
 use crate::time::Timestamp;
 use serde::{Deserialize, Serialize};
-use std::net::IpAddr;
 
 /// An S3 action that a policy statement can allow or deny, and that each operation maps to.
 /// `as_s3_name`/`from_s3_name` bridge to the `s3:*` namespace used in policy documents.
@@ -363,8 +362,8 @@ pub struct PublicAccessBlock {
 /// The condition/request context the pipeline assembles for evaluation.
 #[derive(Debug, Clone)]
 pub struct RequestContext {
-    /// Source network address.
-    pub source: IpAddr,
+    /// Established source-address provenance.
+    pub source: crate::auth::ClientSource,
     /// Whether the transport was secure.
     pub secure_transport: bool,
     /// The `Referer` header, if present.

@@ -26,8 +26,13 @@ the row done / rescheduled-with-backoff / terminally failed.
 - **Terminal vs retryable is load-bearing.** The engine parks a row as `failed` on a `Terminal`
   error **or** when `attempts + 1 >= max_attempts`; otherwise it reschedules with `next_backoff`.
   A removed/corrupt subscription → `Dropped` (marked done), not retried forever.
-- **Signing.** `sign` returns the bare hex; the sink emits the header as `X-Cairn-Signature:
-  sha256=<hex>`. Only present when the endpoint has a `secret`.
+- **Signing.** Notification HMAC keys are CRK1-sealed under the master ring in metadata. The engine
+  opens a configured key into zeroize-on-drop memory, computes the HMAC, and drops the plaintext
+  before awaiting network I/O. `sign` returns the bare hex; the sink emits the header as
+  `X-Cairn-Signature: sha256=<hex>`. An envelope that cannot be opened is retryable and withholds
+  the request — it must never fall back to an unsigned delivery. The legacy plaintext serde variant
+  exists only so the mandatory pre-bind migration can read an old document and replace it; the
+  periodic rewrap pass is a second repair path for a subsequently restored legacy document.
 - **The 4(+1)-site rule applies.** `EnqueueWebhooks`, `MarkWebhookDone`, `MarkWebhookFailed`, and the
   `claim_webhook_batch` read are mirrored in `cairn-meta/apply.rs`, `cairn-meta-async/apply.rs`, and
   the in-memory double — keep them in lockstep. The claim lease lives in the metadata layer, not here.

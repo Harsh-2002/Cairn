@@ -20,6 +20,7 @@ pub mod meta;
 pub mod notification;
 pub mod object;
 pub mod replication;
+pub mod secret;
 pub mod sse;
 pub mod time;
 pub mod traits;
@@ -38,7 +39,8 @@ pub type BlobStream =
 
 // --- Convenience re-exports of the most-used items ---
 pub use auth::{
-    AuthMethod, AuthOutcome, ChunkSigningContext, Principal, RequestView, RequesterClass, Role,
+    AuthMethod, AuthOutcome, ChunkSigningContext, ClientSource, Principal, RequestView,
+    RequesterClass, Role,
 };
 pub use authz::{
     Acl, Action, AuthzInput, Decision, DenyReason, Effect, Grant, Grantee, OwnershipMode,
@@ -50,31 +52,40 @@ pub use blob::{
 };
 pub use bucket::{
     Bucket, CompressionAlgorithm, CompressionPolicy, ConfigAspect, ConfigDoc, DefaultRetention,
-    ObjectLockConfiguration, RetentionPeriod, VersioningState,
+    DefaultRetentionError, ObjectLockConfiguration, RetentionPeriod, VersioningState,
 };
 pub use crypto::{Nonce, Sealed, Signature};
 pub use error::{
     AuthError, BlobError, BodyError, ConfigError, CryptoError, Error, MetaError, ReplicationError,
     Result,
 };
-pub use id::{BucketName, InvalidName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
-pub use meta::{
-    ActivityEntry, BucketCounts, BucketRequestCount, ClaimOutcome, IfNoneMatch,
-    ImportBucketProgress, ImportJob, ImportJobRecord, ImportState, LATENCY_BUCKET_BOUNDS_MS,
-    LATENCY_BUCKETS, ListPage, ListQuery, MetricsRange, MultipartSession, MultipartStatus,
-    Mutation, MutationOutcome, ObjectSummary, OpCount, OutboxEntry, PartRecord, Precondition,
-    ReplicationOp, ReplicationStatus, RequestMetricRow, RequestMetricsSeries,
-    SessionCredentialRecord, SessionCredentialSummary, ShareDisposition, ShareRow, StatusCount,
-    StoreCounts, TagSummary, TaggedObject, TimePoint, User, UserRecord, UserSessionCredentials,
-    UserSigV4Credentials, UserWithBearerHash, WebhookEntry, WebhookStatus, latency_bucket_index,
-    latency_quantile_ms,
+pub use id::{
+    BucketName, InvalidName, MultipartClaimToken, ObjectKey, StoragePath, UploadId, UserId,
+    VersionId,
 };
-pub use notification::{EventKind, NotificationConfig, WebhookEndpoint};
+pub use meta::{
+    ActivityEntry, BucketCounts, BucketRequestCount, ClaimOutcome, ClaimReleaseOutcome,
+    CurrentVersionGuard, IfNoneMatch, ImportBucketProgress, ImportJob, ImportJobCursor,
+    ImportJobListQuery, ImportJobPage, ImportJobRecord, ImportJobSummary, ImportState,
+    InitialObjectState, LATENCY_BUCKET_BOUNDS_MS, LATENCY_BUCKETS, ListPage, ListQuery,
+    MAX_IMPORT_JOB_PAGE_SIZE, MAX_IMPORT_JOB_PRUNE_BATCH, MetricsRange, MultipartSession,
+    MultipartStatus, MultipartTerminalOutcome, Mutation, MutationOutcome, ObjectSummary, OpCount,
+    OutboxEntry, PartRecord, Precondition, ReplicationOp, ReplicationStatus, RequestMetricRow,
+    RequestMetricsSeries, SessionCredentialRecord, SessionCredentialSummary, ShareDisposition,
+    ShareLookupHash, ShareRow, StatusCount, StoreCounts, TagSummary, TaggedObject, TimePoint, User,
+    UserRecord, UserSessionCredentials, UserSigV4Credentials, UserWithBearerHash, WebhookEntry,
+    WebhookStatus, latency_bucket_index, latency_quantile_ms,
+};
+pub use notification::{
+    EventKind, NotificationConfig, SealedWebhookSecret, WebhookEndpoint, WebhookSecret,
+};
 pub use object::{
-    ChecksumAlgorithm, ChecksumSet, ChecksumValue, CompressionDescriptor, ETag, ObjectLockMode,
-    ObjectLockState, ObjectRetention, ObjectVersionRow, StorageClass, UserMetadata,
+    ChecksumAlgorithm, ChecksumSet, ChecksumValue, CompressionDescriptor, ETag,
+    ExplicitObjectLockIntent, GovernanceBypass, ObjectLockMode, ObjectLockState, ObjectRetention,
+    ObjectVersionRow, StorageClass, UserMetadata,
 };
 pub use replication::ReplicatedObject;
+pub use secret::{SecretKey32, SecretString};
 pub use time::Timestamp;
 pub use traits::{
     Authenticator, AuthorizationEngine, BlobStore, Clock, Crypto, MetadataStore, PublicUrl,

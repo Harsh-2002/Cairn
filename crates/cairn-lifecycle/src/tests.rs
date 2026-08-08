@@ -7,9 +7,10 @@ use crate::{
 };
 use cairn_types::testing::{InMemoryBlobStore, InMemoryMetadataStore, TestClock};
 use cairn_types::{
-    BlobStore, Bucket, BucketName, CompressionDescriptor, ListQuery, MetadataStore,
-    MultipartSession, MultipartStatus, Mutation, ObjectKey, ObjectVersionRow, OwnershipMode,
-    PartRecord, StorageClass, StoragePath, Timestamp, UploadId, UserId, VersionId, VersioningState,
+    BlobStore, Bucket, BucketName, CompressionDescriptor, GovernanceBypass, ListQuery,
+    MetadataStore, MultipartSession, MultipartStatus, Mutation, ObjectKey, ObjectVersionRow,
+    OwnershipMode, PartRecord, ReplicationStatus, StorageClass, StoragePath, Timestamp, UploadId,
+    UserId, VersionId, VersioningState,
 };
 
 // --------------------------------------------------------------------------------------------
@@ -37,6 +38,21 @@ async fn make_bucket(meta: &InMemoryMetadataStore, versioning: VersioningState) 
         compression: None,
     };
     meta.submit(Mutation::CreateBucket(Box::new(bucket)))
+        .await
+        .unwrap();
+}
+
+async fn make_object_lock_bucket(meta: &InMemoryMetadataStore) {
+    let bucket = Bucket {
+        name: bucket_name(),
+        owner_id: owner(),
+        created_at: Timestamp::from_secs(0),
+        versioning: VersioningState::Enabled,
+        ownership_mode: OwnershipMode::BucketOwnerEnforced,
+        region: "us-east-1".to_owned(),
+        compression: None,
+    };
+    meta.submit(Mutation::CreateObjectLockBucket(Box::new(bucket)))
         .await
         .unwrap();
 }
@@ -69,7 +85,9 @@ async fn put_object(
         .unwrap();
     let ts = Timestamp::from_secs(created_secs);
     let row = ObjectVersionRow {
-        id: format!("row-{}-{}", key, version_id),
+        // A sentinel version id can be reused by an unversioned overwrite; the metadata-row id
+        // remains replacement-specific, as it is in the production PUT path.
+        id: format!("row-{}", staged.storage_path.as_str()),
         bucket: bucket_name(),
         key: ObjectKey::parse(key).unwrap(),
         version_id,
@@ -101,6 +119,7 @@ async fn put_object(
     meta.submit(Mutation::PutObjectVersion {
         row: Box::new(row),
         precondition: cairn_types::Precondition::default(),
+        initial_state: cairn_types::InitialObjectState::default(),
         replication: Vec::new(),
     })
     .await
@@ -131,8 +150,11 @@ async fn make_session(
         content_type: "application/octet-stream".to_owned(),
         status: MultipartStatus::Active,
         owner_id: owner(),
+        initiated_by: owner(),
         intended_acl: None,
         user_metadata: Vec::new(),
+        initial_tags: Vec::new(),
+        lock_intent: cairn_types::ExplicitObjectLockIntent::default(),
         sse_requested: false,
         encrypt_parts: false,
         sse_kms_requested: false,
@@ -141,14 +163,29 @@ async fn make_session(
         created_at: ts,
         updated_at: ts,
     };
-    meta.submit(Mutation::CreateMultipart(Box::new(session)))
-        .await
-        .unwrap();
+    meta.submit(Mutation::CreateMultipart {
+        session: Box::new(session),
+        limits: cairn_types::meta::MultipartLimits::default(),
+    })
+    .await
+    .unwrap();
     // Stage a part and record it.
+    let attempt_id = "lifecycle-part".to_owned();
+    meta.submit(Mutation::ReserveMultipartPart {
+        upload_id: upload.clone(),
+        part_number: 1,
+        attempt_id: attempt_id.clone(),
+        reserved_bytes: 16,
+        max_parts_per_upload: 10_000,
+        now: ts,
+    })
+    .await
+    .unwrap();
     let staged = blob
         .stage_part(
             &upload,
             1,
+            &attempt_id,
             once_body(vec![1u8; 16]),
             cairn_types::ChecksumSet::none(),
             1 << 30,
@@ -158,6 +195,7 @@ async fn make_session(
         .unwrap();
     meta.submit(Mutation::RecordPart {
         upload_id: upload.clone(),
+        attempt_id,
         part: PartRecord {
             part_number: 1,
             size: staged.size,
@@ -166,6 +204,45 @@ async fn make_session(
             checksum: None,
             part_dek: None,
         },
+    })
+    .await
+    .unwrap();
+    upload
+}
+
+async fn make_empty_session(
+    meta: &InMemoryMetadataStore,
+    bucket: &BucketName,
+    principal: &UserId,
+    key: &str,
+    upload_id: String,
+    created_secs: i64,
+    limits: cairn_types::meta::MultipartLimits,
+) -> UploadId {
+    let upload = UploadId::from_string(upload_id);
+    let ts = Timestamp::from_secs(created_secs);
+    meta.submit(Mutation::CreateMultipart {
+        session: Box::new(MultipartSession {
+            upload_id: upload.clone(),
+            bucket: bucket.clone(),
+            key: ObjectKey::parse(key).unwrap(),
+            content_type: "application/octet-stream".to_owned(),
+            status: MultipartStatus::Active,
+            owner_id: principal.clone(),
+            initiated_by: principal.clone(),
+            intended_acl: None,
+            user_metadata: Vec::new(),
+            initial_tags: Vec::new(),
+            lock_intent: cairn_types::ExplicitObjectLockIntent::default(),
+            sse_requested: false,
+            encrypt_parts: false,
+            sse_kms_requested: false,
+            sse_kms_key_id: None,
+            sse_bucket_key_enabled: false,
+            created_at: ts,
+            updated_at: ts,
+        }),
+        limits,
     })
     .await
     .unwrap();
@@ -288,6 +365,127 @@ async fn current_expiration_versioned_inserts_delete_marker() {
     // The data is NOT destroyed: the original blob is still present.
     assert_eq!(blob.blob_count(), 1, "data retained under versioning");
     assert!(blob.get_bytes(&path).is_some());
+}
+
+#[tokio::test]
+async fn current_expiration_skips_marker_after_concurrent_new_version() {
+    let meta = InMemoryMetadataStore::new();
+    let blob = InMemoryBlobStore::new();
+    make_bucket(&meta, VersioningState::Enabled).await;
+
+    let v1 = VersionId::from_string("00000001".to_owned());
+    put_object(&meta, &blob, "doc.txt", b"old", 0, v1).await;
+    let enumerated = meta
+        .list_current(
+            &bucket_name(),
+            &ListQuery {
+                limit: 10,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .next()
+        .unwrap();
+
+    let v2 = VersionId::from_string("00000002".to_owned());
+    put_object(&meta, &blob, "doc.txt", b"fresh", DAY, v2.clone()).await;
+    let bucket = meta.get_bucket(&bucket_name()).await.unwrap().unwrap();
+    let applied = LifecycleScanner::new()
+        .insert_delete_marker(&meta, &bucket, &enumerated, Timestamp::from_secs(31 * DAY))
+        .await
+        .unwrap();
+
+    assert!(!applied, "a stale expiration must not insert a marker");
+    let current = meta
+        .current_version(&bucket_name(), &ObjectKey::parse("doc.txt").unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.version_id, v2);
+    assert!(!current.is_delete_marker);
+    assert_eq!(count_versions(&meta).await, 2, "no marker was inserted");
+    assert!(
+        meta.list_due_replication(10, Timestamp(i64::MAX))
+            .await
+            .unwrap()
+            .is_empty(),
+        "the rejected marker must not enqueue replication"
+    );
+}
+
+#[tokio::test]
+async fn current_expiration_skips_same_timestamp_unversioned_overwrite() {
+    let meta = InMemoryMetadataStore::new();
+    let blob = InMemoryBlobStore::new();
+    make_bucket(&meta, VersioningState::Unversioned).await;
+
+    put_object(&meta, &blob, "doc.txt", b"old", 0, VersionId::null()).await;
+    let enumerated = meta
+        .list_current(
+            &bucket_name(),
+            &ListQuery {
+                limit: 10,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .next()
+        .unwrap();
+
+    // The replacement deliberately reuses both the unversioned sentinel and the exact same
+    // timestamp. Only the immutable object_versions.id can distinguish it from the stale listing.
+    put_object(&meta, &blob, "doc.txt", b"fresh", 0, VersionId::null()).await;
+    let replacement = meta
+        .list_current(
+            &bucket_name(),
+            &ListQuery {
+                limit: 10,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(replacement.version_id, enumerated.version_id);
+    assert_eq!(replacement.last_modified, enumerated.last_modified);
+    assert_ne!(replacement.row_id, enumerated.row_id);
+
+    let applied = LifecycleScanner::new()
+        .delete_version(
+            &meta,
+            &blob,
+            &bucket_name(),
+            &enumerated,
+            Timestamp::from_secs(31 * DAY),
+        )
+        .await
+        .unwrap();
+
+    assert!(!applied, "a stale lifecycle delete must be a writer no-op");
+    let current = meta
+        .list_current(
+            &bucket_name(),
+            &ListQuery {
+                limit: 10,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(current.row_id, replacement.row_id);
 }
 
 #[tokio::test]
@@ -444,6 +642,64 @@ async fn noncurrent_expiration_ages_from_becoming_noncurrent_not_creation() {
     );
 }
 
+/// A single key can cross a metadata page boundary. Its newest-noncurrent rank and supersession
+/// timestamps must carry into the continuation rather than resetting per page.
+#[tokio::test]
+async fn noncurrent_expiration_carries_one_key_across_multiple_pages() {
+    let meta = InMemoryMetadataStore::new();
+    let blob = InMemoryBlobStore::new();
+    let clock = TestClock::at_secs(0);
+    make_bucket(&meta, VersioningState::Enabled).await;
+
+    let total = crate::scanner::PAGE_LIMIT as usize * 2 + 49;
+    for ordinal in 0..total {
+        put_object(
+            &meta,
+            &blob,
+            "deep-history",
+            b"x",
+            ordinal as i64 * DAY,
+            VersionId::from_string(format!("version-{ordinal:08}")),
+        )
+        .await;
+    }
+
+    let keep = crate::scanner::PAGE_LIMIT + 1;
+    let rule = LifecycleRule {
+        id: "paged-ncv".to_owned(),
+        enabled: true,
+        filter: Filter::default(),
+        actions: vec![Action::NoncurrentVersionExpiration {
+            days: 1,
+            newer_noncurrent_versions: Some(keep),
+        }],
+    };
+    clock.set(Timestamp::from_secs((total as i64 + 10) * DAY));
+
+    let report = LifecycleScanner::new()
+        .run_once(&meta, &blob, &clock, &cfg(vec![rule]))
+        .await
+        .unwrap();
+
+    let noncurrent = total - 1;
+    let expected_expired = noncurrent - keep as usize;
+    assert_eq!(
+        report.versions_expired, expected_expired as u64,
+        "rank must continue across the page boundary"
+    );
+    assert_eq!(report.errors, 0);
+    assert_eq!(
+        count_versions(&meta).await,
+        keep as usize + 1,
+        "current plus exactly the configured newest noncurrent versions remain"
+    );
+    assert_eq!(
+        blob.blob_count(),
+        keep as usize + 1,
+        "every expired version's blob was reclaimed"
+    );
+}
+
 #[tokio::test]
 async fn abort_incomplete_multipart_removes_session_and_parts() {
     let meta = InMemoryMetadataStore::new();
@@ -517,6 +773,115 @@ async fn abort_incomplete_multipart_respects_threshold() {
     assert!(meta.get_multipart(&upload).await.unwrap().is_some());
 }
 
+/// Lifecycle MPU cleanup must not share one global first-1,000 window across buckets, and its
+/// per-bucket tuple cursor must advance through more than one page of a single hot key.
+#[tokio::test]
+async fn abort_incomplete_multipart_pages_per_bucket_past_a_hot_prefix() {
+    let meta = InMemoryMetadataStore::new();
+    let blob = InMemoryBlobStore::new();
+    let clock = TestClock::at_secs(8 * DAY);
+    make_bucket(&meta, VersioningState::Unversioned).await;
+
+    let noise_bucket = BucketName::parse("noise-bucket").unwrap();
+    meta.submit(Mutation::CreateBucket(Box::new(Bucket {
+        name: noise_bucket.clone(),
+        owner_id: UserId("noise-owner".to_owned()),
+        created_at: Timestamp::from_secs(0),
+        versioning: VersioningState::Unversioned,
+        ownership_mode: OwnershipMode::BucketOwnerEnforced,
+        region: "us-east-1".to_owned(),
+        compression: None,
+    })))
+    .await
+    .unwrap();
+
+    let noise_principal = UserId("noise-principal".to_owned());
+    let noise_limits = cairn_types::meta::MultipartLimits {
+        max_active_uploads_per_bucket: 1_000,
+        max_active_uploads_per_principal: 1_000,
+        max_parts_per_upload: 10_000,
+    };
+    for i in 0..1_000 {
+        make_empty_session(
+            &meta,
+            &noise_bucket,
+            &noise_principal,
+            "a-hot-prefix/object",
+            format!("noise-{i:04}"),
+            0,
+            noise_limits,
+        )
+        .await;
+    }
+
+    let target_total = 1_001u32;
+    let target_limits = cairn_types::meta::MultipartLimits {
+        max_active_uploads_per_bucket: target_total,
+        max_active_uploads_per_principal: target_total,
+        max_parts_per_upload: 10_000,
+    };
+    for i in 0..target_total {
+        make_empty_session(
+            &meta,
+            &bucket_name(),
+            &owner(),
+            "hot-prefix/object",
+            format!("target-{i:04}"),
+            1,
+            target_limits,
+        )
+        .await;
+    }
+
+    let rule = LifecycleRule {
+        id: "abort-hot".to_owned(),
+        enabled: true,
+        filter: Filter {
+            prefix: Some("hot-prefix/".to_owned()),
+            ..Default::default()
+        },
+        actions: vec![Action::AbortIncompleteMultipartUpload {
+            days_after_initiation: 7,
+        }],
+    };
+    let report = LifecycleScanner::new()
+        .run_once(&meta, &blob, &clock, &cfg(vec![rule]))
+        .await
+        .unwrap();
+
+    assert_eq!(report.uploads_aborted, u64::from(target_total));
+    assert_eq!(report.errors, 0);
+    assert!(
+        meta.list_multipart_uploads(
+            &bucket_name(),
+            &ListQuery {
+                limit: 1_000,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .items
+        .is_empty(),
+        "the tuple cursor must drain the second page of the hot key"
+    );
+    assert_eq!(
+        meta.list_multipart_uploads(
+            &noise_bucket,
+            &ListQuery {
+                limit: 1_000,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .items
+        .len(),
+        1_000,
+        "an unrelated bucket is not part of this lifecycle configuration"
+    );
+}
+
 #[tokio::test]
 async fn expired_object_delete_marker_removed_when_sole_version() {
     let meta = InMemoryMetadataStore::new();
@@ -532,7 +897,11 @@ async fn expired_object_delete_marker_removed_when_sole_version() {
         bucket: bucket_name(),
         key: ObjectKey::parse("ghost.txt").unwrap(),
         version_id: v,
+        expected_row_id: None,
         expected_updated_at: None,
+        require_sole_key_version: false,
+        now: Timestamp::from_secs(0),
+        bypass: GovernanceBypass::Denied,
     })
     .await
     .unwrap();
@@ -542,6 +911,8 @@ async fn expired_object_delete_marker_removed_when_sole_version() {
         version_id: VersionId::generate(),
         owner_id: owner(),
         now: Timestamp::from_secs(0),
+        bypass: GovernanceBypass::Denied,
+        expected_current: None,
         replication: Vec::new(),
     })
     .await
@@ -581,6 +952,8 @@ async fn expired_object_delete_marker_kept_when_other_versions_exist() {
         version_id: VersionId::generate(),
         owner_id: owner(),
         now: Timestamp::from_secs(0),
+        bypass: GovernanceBypass::Denied,
+        expected_current: None,
         replication: Vec::new(),
     })
     .await
@@ -601,6 +974,124 @@ async fn expired_object_delete_marker_kept_when_other_versions_exist() {
 
     assert_eq!(report.delete_markers_removed, 0);
     assert_eq!(count_versions(&meta).await, 2, "nothing removed");
+}
+
+#[tokio::test]
+async fn expired_delete_marker_cleanup_skips_concurrently_arrived_version() {
+    let meta = InMemoryMetadataStore::new();
+    make_bucket(&meta, VersioningState::Enabled).await;
+    let bucket = meta.get_bucket(&bucket_name()).await.unwrap().unwrap();
+    let key = ObjectKey::parse("ghost.txt").unwrap();
+    let marker_id = VersionId::from_string("00000002".to_owned());
+
+    meta.submit(Mutation::CreateDeleteMarker {
+        bucket: bucket_name(),
+        key: key.clone(),
+        version_id: marker_id.clone(),
+        owner_id: owner(),
+        now: Timestamp::from_secs(200),
+        bypass: GovernanceBypass::Denied,
+        expected_current: None,
+        replication: Vec::new(),
+    })
+    .await
+    .unwrap();
+    let enumerated = meta
+        .list_versions(
+            &bucket_name(),
+            &ListQuery {
+                limit: 10,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .next()
+        .unwrap();
+
+    // The marker was sole at enumeration. An older replica then arrives without replacing it as
+    // current, so an unconditional cleanup would expose data that the marker still hides.
+    let mut replica = meta
+        .current_version(&bucket_name(), &key)
+        .await
+        .unwrap()
+        .unwrap();
+    replica.id = "replica-row".to_owned();
+    replica.version_id = VersionId::from_string("00000001".to_owned());
+    replica.is_delete_marker = false;
+    replica.replication_status = Some(ReplicationStatus::Replica);
+    replica.updated_at = Timestamp::from_secs(150);
+    meta.submit(Mutation::PutObjectVersion {
+        row: Box::new(replica),
+        precondition: cairn_types::Precondition::default(),
+        initial_state: cairn_types::InitialObjectState::default(),
+        replication: Vec::new(),
+    })
+    .await
+    .unwrap();
+
+    let applied = LifecycleScanner::new()
+        .delete_expired_marker(&meta, &bucket, &enumerated, Timestamp::from_secs(300))
+        .await
+        .unwrap();
+
+    assert!(!applied, "a stale sole-marker cleanup must be a no-op");
+    let current = meta
+        .current_version(&bucket_name(), &key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.version_id, marker_id);
+    assert!(current.is_delete_marker);
+    assert_eq!(count_versions(&meta).await, 2);
+}
+
+/// Sole-marker cleanup must stream beyond multiple listing pages without retaining a bucket-wide
+/// count map or skipping keys when earlier-page markers are deleted during the scan.
+#[tokio::test]
+async fn delete_marker_cleanup_streams_many_listing_pages() {
+    let meta = InMemoryMetadataStore::new();
+    let blob = InMemoryBlobStore::new();
+    let clock = TestClock::at_secs(0);
+    make_bucket(&meta, VersioningState::Enabled).await;
+
+    let total = crate::scanner::PAGE_LIMIT as usize * 2 + 5;
+    for ordinal in 0..total {
+        meta.submit(Mutation::CreateDeleteMarker {
+            bucket: bucket_name(),
+            key: ObjectKey::parse(&format!("ghost-{ordinal:08}")).unwrap(),
+            version_id: VersionId::from_string(format!("marker-{ordinal:08}")),
+            owner_id: owner(),
+            now: Timestamp::from_secs(ordinal as i64),
+            bypass: GovernanceBypass::Denied,
+            expected_current: None,
+            replication: Vec::new(),
+        })
+        .await
+        .unwrap();
+    }
+    assert_eq!(count_versions(&meta).await, total);
+
+    let rule = LifecycleRule {
+        id: "paged-markers".to_owned(),
+        enabled: true,
+        filter: Filter::default(),
+        actions: vec![Action::ExpiredObjectDeleteMarker],
+    };
+    let report = LifecycleScanner::new()
+        .run_once(&meta, &blob, &clock, &cfg(vec![rule]))
+        .await
+        .unwrap();
+
+    assert_eq!(report.delete_markers_removed, total as u64);
+    assert_eq!(report.errors, 0);
+    assert_eq!(
+        count_versions(&meta).await,
+        0,
+        "every page was drained without a cursor gap"
+    );
 }
 
 #[tokio::test]
@@ -958,6 +1449,25 @@ fn parse_lifecycle_rejects_malformed_xml() {
 }
 
 #[test]
+fn parse_lifecycle_coalesces_entities_and_cdata_after_quick_xml_upgrade() {
+    let xml = br#"<LifecycleConfiguration><Rule>
+        <ID>archive<![CDATA[-cold]]>&#x2d;one</ID><Status>Enabled</Status>
+        <Filter><Prefix>logs &#x2f; &amp; /</Prefix></Filter>
+        <Expiration><Days>1</Days></Expiration>
+    </Rule></LifecycleConfiguration>"#;
+    let rules = parse_lifecycle(xml).unwrap();
+    assert_eq!(rules[0].id, "archive-cold-one");
+    assert_eq!(rules[0].filter.prefix.as_deref(), Some("logs / & /"));
+
+    assert!(
+        parse_lifecycle(
+            b"<LifecycleConfiguration><Rule><ID>&unknown;</ID></Rule></LifecycleConfiguration>"
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn filter_matches_semantics() {
     let f = Filter {
         prefix: Some("a/".to_owned()),
@@ -982,7 +1492,7 @@ async fn noncurrent_expiration_preserves_object_locked_version() {
     let meta = InMemoryMetadataStore::new();
     let blob = InMemoryBlobStore::new();
     let clock = TestClock::at_secs(0);
-    make_bucket(&meta, VersioningState::Enabled).await;
+    make_object_lock_bucket(&meta).await;
 
     // Three versions of one key on days 0,1,2 — after the third put, day0 and day1 are noncurrent.
     let mut versions = Vec::new();
@@ -1011,6 +1521,8 @@ async fn noncurrent_expiration_preserves_object_locked_version() {
             mode: cairn_types::object::ObjectLockMode::Compliance,
             retain_until: Timestamp::from_secs(1000 * DAY),
         }),
+        now: Timestamp::from_secs(3 * DAY),
+        bypass: GovernanceBypass::Denied,
     })
     .await
     .unwrap();

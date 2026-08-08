@@ -12,7 +12,8 @@
 #   sudo sh install.sh --uninstall     # remove the service/compose project (keeps data)
 #
 # Flags: --host | --docker, --update, --uninstall, --yes (non-interactive), --version <tag>,
-#        --data-dir <path>, --tls-cert <path>, --tls-key <path>, --no-color, --help.
+#        --data-dir <path>, --tls-cert <path>, --tls-key <path>, --expose-s3,
+#        --expose-console, --acknowledge-public-http, --no-color, --help.
 set -eu
 
 REPO="Harsh-2002/Cairn"
@@ -34,7 +35,13 @@ OPT_VERSION="latest"
 OPT_DATA_DIR="$HOST_DATA_DEFAULT"
 OPT_TLS_CERT=""
 OPT_TLS_KEY=""
+OPT_EXPOSE_S3="0"
+OPT_EXPOSE_CONSOLE="0"
+OPT_ACK_PUBLIC_HTTP="0"
+S3_BIND_HOST="127.0.0.1"
+WEB_BIND_HOST="127.0.0.1"
 USE_COLOR="1"
+C_RESET=''; C_B=''; C_RED=''; C_GRN=''; C_YEL=''; C_BLU=''; C_DIM=''
 
 # ---- output -------------------------------------------------------------------------------------
 setup_color() {
@@ -92,11 +99,16 @@ Usage: sudo sh install.sh [options]
   --data-dir <path>  Host data directory (default: $HOST_DATA_DEFAULT)
   --tls-cert <path>  TLS certificate (enables HTTPS; requires --tls-key)
   --tls-key <path>   TLS private key
+  --expose-s3        Bind/publish the S3 listener on all host interfaces
+  --expose-console   Bind/publish the console on all host interfaces (independent of S3)
+  --acknowledge-public-http
+                     Required with either exposure flag when TLS is disabled
   --yes              Non-interactive; accept defaults
   --no-color         Disable coloured output
   --help             Show this help
 
 With no target flag the script asks; if Docker is present it offers Docker.
+Fresh host and Docker installs keep both listeners on 127.0.0.1 by default, including with TLS.
 EOF
 }
 
@@ -167,6 +179,45 @@ validate_tls() {
   fi
 }
 
+# Prompt independently for public S3 and console exposure. Non-interactive installs retain the
+# loopback defaults unless the corresponding flags were supplied.
+prompt_exposure() {
+  if [ "$OPT_YES" = "1" ] || [ ! -t 0 ]; then return 0; fi
+  if [ "$OPT_EXPOSE_S3" = "0" ] \
+    && confirm "Expose the S3 listener outside this host?" "n"; then
+    OPT_EXPOSE_S3="1"
+  fi
+  if [ "$OPT_EXPOSE_CONSOLE" = "0" ] \
+    && confirm "Expose the web console and management API outside this host?" "n"; then
+    OPT_EXPOSE_CONSOLE="1"
+  fi
+  if [ -z "$OPT_TLS_CERT" ] \
+    && { [ "$OPT_EXPOSE_S3" = "1" ] || [ "$OPT_EXPOSE_CONSOLE" = "1" ]; } \
+    && [ "$OPT_ACK_PUBLIC_HTTP" != "1" ]; then
+    warn "Public HTTP sends credentials, object data, and management traffic without transport encryption."
+    if confirm "I understand the risk and want public plaintext HTTP exposure." "n"; then
+      OPT_ACK_PUBLIC_HTTP="1"
+    else
+      die "public plaintext exposure was not acknowledged; keeping it disabled"
+    fi
+  fi
+}
+
+# Resolve installer exposure choices to host-side addresses. Cairn's own raw configuration defaults
+# remain unchanged; generated host and Compose deployments deliberately override them.
+resolve_exposure() {
+  if [ -z "$OPT_TLS_CERT" ] \
+    && { [ "$OPT_EXPOSE_S3" = "1" ] || [ "$OPT_EXPOSE_CONSOLE" = "1" ]; } \
+    && [ "$OPT_ACK_PUBLIC_HTTP" != "1" ]; then
+    die "public plaintext exposure requires --acknowledge-public-http (or configure TLS)"
+  fi
+
+  S3_BIND_HOST="127.0.0.1"
+  WEB_BIND_HOST="127.0.0.1"
+  if [ "$OPT_EXPOSE_S3" = "1" ]; then S3_BIND_HOST="0.0.0.0"; fi
+  if [ "$OPT_EXPOSE_CONSOLE" = "1" ]; then WEB_BIND_HOST="0.0.0.0"; fi
+}
+
 # Wait for the server to answer /healthz on the S3 port.
 wait_healthy() {
   wh_i=0
@@ -179,10 +230,14 @@ wait_healthy() {
 
 print_access() {
   pa_scheme="http"; [ -n "$OPT_TLS_CERT" ] && pa_scheme="https"
+  pa_s3_host="127.0.0.1"
+  pa_web_host="127.0.0.1"
+  [ "$OPT_EXPOSE_S3" = "1" ] && pa_s3_host="<host>"
+  [ "$OPT_EXPOSE_CONSOLE" = "1" ] && pa_web_host="<host>"
   printf '\n'
   step "Cairn is ready"
-  info "S3 API     ${C_B}$pa_scheme://<host>:$S3_PORT${C_RESET}"
-  info "Console    ${C_B}$pa_scheme://<host>:$WEB_PORT${C_RESET}"
+  info "S3 API     ${C_B}$pa_scheme://$pa_s3_host:$S3_PORT${C_RESET}"
+  info "Console    ${C_B}$pa_scheme://$pa_web_host:$WEB_PORT${C_RESET}"
   info "Access key ${C_B}$ROOT_AK${C_RESET}"
   info "Secret key ${C_B}$ROOT_SK${C_RESET}"
   info "${C_DIM}Keep these and the master key safe. Update later by re-running this script.${C_RESET}"
@@ -219,6 +274,7 @@ ensure_user() {
 }
 
 write_env_file() {
+  resolve_exposure
   umask 077
   mkdir -p "$HOST_ETC"
   {
@@ -227,8 +283,8 @@ write_env_file() {
     printf 'CAIRN_MASTER_KEY=%s\n' "$MASTER_KEY"
     printf 'CAIRN_ROOT_ACCESS_KEY=%s\n' "$ROOT_AK"
     printf 'CAIRN_ROOT_SECRET_KEY=%s\n' "$ROOT_SK"
-    printf 'CAIRN_LISTEN_ADDR=0.0.0.0:%s\n' "$S3_PORT"
-    printf 'CAIRN_WEB_ADDR=0.0.0.0:%s\n' "$WEB_PORT"
+    printf 'CAIRN_LISTEN_ADDR=%s:%s\n' "$S3_BIND_HOST" "$S3_PORT"
+    printf 'CAIRN_WEB_ADDR=%s:%s\n' "$WEB_BIND_HOST" "$WEB_PORT"
     if [ -n "$OPT_TLS_CERT" ]; then
       printf 'CAIRN_TLS_CERT_PATH=%s\n' "$OPT_TLS_CERT"
       printf 'CAIRN_TLS_KEY_PATH=%s\n' "$OPT_TLS_KEY"
@@ -290,13 +346,23 @@ EOF
 install_host() {
   require_linux
   ih_init=$(detect_init)
-  is_update="0"; [ -x "$BIN_PATH" ] && is_update="1"
+  is_update="0"
+  if [ -x "$BIN_PATH" ] && [ -f "$HOST_ENV" ]; then is_update="1"; fi
+
+  if [ "$is_update" = "0" ]; then
+    step "Fresh host installation"
+    prompt_tls
+    validate_tls
+    prompt_exposure
+    resolve_exposure
+    OPT_DATA_DIR=$(ask "Data directory" "$OPT_DATA_DIR")
+  fi
 
   ih_tag=$(resolve_version)
   download_binary "$ih_tag"
   ok "installed binary to $BIN_PATH ($ih_tag)"
 
-  if [ "$is_update" = "1" ] && [ -f "$HOST_ENV" ]; then
+  if [ "$is_update" = "1" ]; then
     step "Updating existing host installation"
     # Restart the running service onto the new binary; config and keys are preserved.
     case "$ih_init" in
@@ -310,9 +376,6 @@ install_host() {
     return 0
   fi
 
-  step "Fresh host installation"
-  prompt_tls; validate_tls
-  OPT_DATA_DIR=$(ask "Data directory" "$OPT_DATA_DIR")
   MASTER_KEY=$(gen_secret)
   ROOT_AK="cairn"
   ROOT_SK=$(gen_secret)
@@ -341,6 +404,7 @@ install_host() {
 
 # ---- docker install / update ---------------------------------------------------------------------
 write_compose() {
+  resolve_exposure
   mkdir -p "$DOCKER_DIR"
   wc_tls=""
   if [ -n "$OPT_TLS_CERT" ]; then
@@ -357,8 +421,8 @@ services:
     container_name: cairn
     restart: unless-stopped
     ports:
-      - "$S3_PORT:7373"
-      - "$WEB_PORT:7374"
+      - "$S3_BIND_HOST:$S3_PORT:7373"
+      - "$WEB_BIND_HOST:$WEB_PORT:7374"
     environment:
       CAIRN_DATA_DIR: /data
       CAIRN_DB_PATH: /data/cairn.db
@@ -405,7 +469,10 @@ install_docker() {
   fi
 
   step "Fresh Docker installation in $DOCKER_DIR"
-  prompt_tls; validate_tls
+  prompt_tls
+  validate_tls
+  prompt_exposure
+  resolve_exposure
   MASTER_KEY=$(gen_secret)
   ROOT_AK="cairn"
   ROOT_SK=$(gen_secret)
@@ -472,24 +539,54 @@ main() {
 }
 
 # ---- argument parsing ---------------------------------------------------------------------------
-while [ "$#" -gt 0 ]; do
-  case "$1" in
-    --host) OPT_TARGET="host" ;;
-    --docker) OPT_TARGET="docker" ;;
-    --update) OPT_MODE="update" ;;
-    --uninstall) OPT_MODE="uninstall" ;;
-    --yes | -y) OPT_YES="1" ;;
-    --no-color) USE_COLOR="0" ;;
-    --version) shift; OPT_VERSION="${1:-latest}" ;;
-    --data-dir) shift; OPT_DATA_DIR="${1:-$HOST_DATA_DEFAULT}" ;;
-    --tls-cert) shift; OPT_TLS_CERT="${1:-}" ;;
-    --tls-key) shift; OPT_TLS_KEY="${1:-}" ;;
-    --help | -h) usage; exit 0 ;;
-    *) printf 'unknown option: %s\n\n' "$1" >&2; usage; exit 2 ;;
-  esac
-  shift
-done
+parse_args() {
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --host) OPT_TARGET="host" ;;
+      --docker) OPT_TARGET="docker" ;;
+      --update) OPT_MODE="update" ;;
+      --uninstall) OPT_MODE="uninstall" ;;
+      --yes | -y) OPT_YES="1" ;;
+      --no-color) USE_COLOR="0" ;;
+      --expose-s3) OPT_EXPOSE_S3="1" ;;
+      --expose-console) OPT_EXPOSE_CONSOLE="1" ;;
+      --acknowledge-public-http) OPT_ACK_PUBLIC_HTTP="1" ;;
+      --version)
+        [ "$#" -ge 2 ] || die "--version requires a value"
+        shift
+        OPT_VERSION="$1"
+        ;;
+      --data-dir)
+        [ "$#" -ge 2 ] || die "--data-dir requires a value"
+        shift
+        OPT_DATA_DIR="$1"
+        ;;
+      --tls-cert)
+        [ "$#" -ge 2 ] || die "--tls-cert requires a value"
+        shift
+        OPT_TLS_CERT="$1"
+        ;;
+      --tls-key)
+        [ "$#" -ge 2 ] || die "--tls-key requires a value"
+        shift
+        OPT_TLS_KEY="$1"
+        ;;
+      --help | -h) usage; exit 0 ;;
+      *) printf 'unknown option: %s\n\n' "$1" >&2; usage; exit 2 ;;
+    esac
+    shift
+  done
+}
 
-setup_color
-require_root "$@"
-main
+run_installer() {
+  parse_args "$@"
+  setup_color
+  require_root "$@"
+  main
+}
+
+# The shell regression harness sources the renderer in-process; normal execution always takes this
+# branch, including curl-to-sh installs.
+if [ "${INSTALLER_SOURCE_ONLY:-0}" != "1" ]; then
+  run_installer "$@"
+fi

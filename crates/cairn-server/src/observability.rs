@@ -107,10 +107,9 @@ fn describe_metrics() {
          consume the attempt budget, so they never surface as failed entries — alert on this."
     );
 
-    // Fail-closed encrypted-read refusals (ARCH 27).
+    // Fail-closed plaintext framing/metadata mismatches (ARCH 27).
     describe_counter!(
-        "cairn_blob_encrypted_without_key_total",
-        "Blob reads refused because the blob is an encrypted container and no data key was \
-         supplied (fail-closed; never streams ciphertext as a body)"
+        "cairn_blob_plaintext_length_mismatch_total",
+        "Metadata-declared plaintext reads refused because file and logical lengths differ"
     );
 }

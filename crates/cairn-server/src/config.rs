@@ -4,11 +4,13 @@
 //! validated on load so an invalid configuration fails fast with a clear message rather than at
 //! first use.
 
+use cairn_types::{SecretKey32, SecretString};
 use figment::Figment;
 use figment::providers::{Env, Serialized};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
+use zeroize::Zeroizing;
 
 /// Whether logs are emitted as human-readable text or machine-readable JSON.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,9 +31,9 @@ pub struct Config {
     /// public-read share URLs (`/share/…`), and the liveness/readiness/metrics endpoints. This is the
     /// data-plane port you expose to S3 clients. Default `0.0.0.0:7373`.
     pub listen_addr: SocketAddr,
-    /// Where the **web console** listener binds (`CAIRN_WEB_ADDR`): the management console served at the
-    /// root path, the management API (`/api/v1`), and the S3 data plane the console drives. This is
-    /// the control-plane port you can firewall off from the internet. Default `0.0.0.0:7374`.
+    /// Where the **web console** listener binds (`CAIRN_WEB_ADDR`): the management console served at
+    /// the root path and the management API (`/api/v1`). It never serves S3 objects or public
+    /// shares. This is the control-plane port you can firewall off. Default `0.0.0.0:7374`.
     /// Set it empty (or `off`/`none`/`disabled`) to run headless with no web console listener.
     pub web_addr: String,
     /// Root of the staging and per-bucket blob directories.
@@ -43,12 +45,17 @@ pub struct Config {
     /// (the pure-Rust SQLite rewrite). The on-disk database file is the same SQLite format for all
     /// three, so the choice is purely which engine drives it.
     pub meta_backend: String,
-    /// External base URL used when generating URLs behind ingress.
+    /// External S3 data-origin base URL used when generating share and presigned URLs behind
+    /// ingress. It must be browser-origin-distinct from the console/management endpoint.
     pub public_base_url: Option<String>,
     /// TLS certificate path (enables built-in TLS when set together with the key).
     pub tls_cert_path: Option<PathBuf>,
     /// TLS private-key path.
     pub tls_key_path: Option<PathBuf>,
+    /// Comma-separated exact IP addresses or canonical CIDR networks for reverse proxies whose
+    /// forwarding metadata Cairn may trust (`CAIRN_TRUSTED_PROXIES`). Unset trusts no peer and
+    /// ignores every `Forwarded`/`X-Forwarded-*` header. Hostnames and `/0` networks are rejected.
+    pub trusted_proxies: Option<String>,
     /// Maximum number of in-flight requests.
     pub concurrency_limit: usize,
     /// Per-request timeout, in seconds.
@@ -71,12 +78,12 @@ pub struct Config {
     /// The 32-byte master key (64 hex chars) for envelope-encrypting secrets at rest. Required
     /// in production; absent, a fixed development key is used (insecure, for local testing).
     /// Ignored when [`master_key_ring`](Self::master_key_ring) is set.
-    pub master_key: Option<String>,
+    pub master_key: Option<SecretString>,
     /// A master-key RING for rotation (`CAIRN_MASTER_KEY_RING`, audit #29): a JSON array of
     /// `{"id":<u16 1..65535>,"key":"<64-hex>"}`. When set it replaces `master_key`; new secrets
     /// seal under the active key id and old keys stay available to open existing data. Leave
     /// unset for a single-key deployment (no new config required).
-    pub master_key_ring: Option<String>,
+    pub master_key_ring: Option<SecretString>,
     /// Which ring id NEW seals use (`CAIRN_MASTER_KEY_ACTIVE_ID`). Defaults to the highest id in
     /// the ring. Must name a key present in [`master_key_ring`](Self::master_key_ring).
     pub master_key_active_id: Option<u16>,
@@ -100,6 +107,15 @@ pub struct Config {
     pub webhook_interval_secs: u64,
     /// How often the multipart sweeper reclaims stale upload sessions, in seconds.
     pub multipart_sweep_interval_secs: u64,
+    /// Maximum active multipart upload sessions in one bucket
+    /// (`CAIRN_MULTIPART_MAX_ACTIVE_UPLOADS_PER_BUCKET`).
+    pub multipart_max_active_uploads_per_bucket: u32,
+    /// Maximum active multipart upload sessions attributed to one authenticated principal
+    /// (`CAIRN_MULTIPART_MAX_ACTIVE_UPLOADS_PER_PRINCIPAL`).
+    pub multipart_max_active_uploads_per_principal: u32,
+    /// Maximum distinct part numbers recorded or reserved in one multipart upload
+    /// (`CAIRN_MULTIPART_MAX_PARTS_PER_UPLOAD`; capped at S3's 10,000).
+    pub multipart_max_parts_per_upload: u16,
     /// How often the background integrity scrub re-reads stored blobs and verifies them against the
     /// recorded ETag, in seconds (`CAIRN_SCRUB_INTERVAL_SECS`, ARCH 8.6/26.4). `0` (default) disables
     /// it. It verifies EVERY version — plaintext, compressed, and encrypted (an encrypted version is
@@ -210,7 +226,7 @@ pub struct Config {
     /// Destination access-key id.
     pub replication_access_key: Option<String>,
     /// Destination secret access key.
-    pub replication_secret: Option<String>,
+    pub replication_secret: Option<SecretString>,
     /// Destination signing region (defaults to `region` when unset).
     pub replication_region: Option<String>,
     /// How often the replication worker drains the outbox, in seconds.
@@ -221,7 +237,7 @@ pub struct Config {
     /// trust (ARCH 20). The single-target `CAIRN_REPLICATION_*` keys above remain as the default
     /// target used for any source bucket that does not match a named target. Each element is a
     /// [`ReplicationTarget`]; parsed with `serde_json` on load.
-    pub replication_targets: Option<String>,
+    pub replication_targets: Option<SecretString>,
     /// How many due outbox entries one replication drain pass claims at once
     /// (`CAIRN_REPLICATION_BATCH_SIZE`).
     pub replication_batch_size: u32,
@@ -229,6 +245,16 @@ pub struct Config {
     /// (`CAIRN_REPLICATION_WORKER_CONCURRENCY`). Per-key, per-target ordering is preserved by the
     /// durable claim lease and the predecessor check regardless of pool size.
     pub replication_worker_concurrency: usize,
+    /// Process-wide byte budget for fully buffered, signed replication PUT payloads
+    /// (`CAIRN_REPLICATION_BUFFER_BUDGET_BYTES`). Every worker and every env/named/stored-target
+    /// sink shares one weighted semaphore, so increasing worker concurrency or target fan-out
+    /// cannot multiply this memory allowance. Default 2 GiB.
+    pub replication_buffer_budget_bytes: u64,
+    /// One wall-clock deadline for a destination delivery
+    /// (`CAIRN_REPLICATION_DELIVERY_TIMEOUT_SECS`), covering the request upload, response head, and
+    /// bounded response-body drain without resetting on progress. Default one hour; capped at one
+    /// day so a typo cannot effectively disable the guard.
+    pub replication_delivery_timeout_secs: u64,
     /// Max delivery attempts before a retryable replication failure becomes terminal
     /// (`CAIRN_REPLICATION_MAX_ATTEMPTS`).
     pub replication_max_attempts: u32,
@@ -289,7 +315,8 @@ pub struct Config {
     pub events_outbox_retention_secs: u64,
 
     /// Whether operator-configured outbound dialers (replication targets, webhook endpoints, S3
-    /// import sources) may connect to an internal address (`CAIRN_ALLOW_INTERNAL_ENDPOINTS`).
+    /// import sources, and the update feed) may connect to an internal address
+    /// (`CAIRN_ALLOW_INTERNAL_ENDPOINTS`).
     /// Default `false`: the SSRF guard refuses a destination that resolves to a loopback, private
     /// (RFC1918), link-local (incl. the cloud-metadata `169.254.169.254`), ULA, or unspecified
     /// address, at connect time (ARCH 27). Set `true` only when Cairn must reach storage on a
@@ -315,10 +342,21 @@ pub struct Config {
     /// Hard cap on an import job's object-worker count (`CAIRN_IMPORT_MAX_WORKERS`); a request asking
     /// for more is clamped. Must be ≥ `import_default_workers`.
     pub import_max_workers: usize,
-    /// The authoritative ceiling on total in-flight object copies across an import job
-    /// (`CAIRN_IMPORT_GLOBAL_MAX_INFLIGHT`). Held **below** the blob-I/O permit pool so a bulk import
-    /// cannot starve the node's live GET/PUT traffic. Validated `< 64`.
+    /// The authoritative process-wide ceiling on total in-flight object copies across all active
+    /// import jobs (`CAIRN_IMPORT_GLOBAL_MAX_INFLIGHT`). Held **below** the blob-I/O permit pool so
+    /// bulk imports cannot starve the node's live GET/PUT traffic. Validated `< 64`.
     pub import_global_max_inflight: usize,
+    /// TCP connect deadline for an S3 import source (`CAIRN_IMPORT_CONNECT_TIMEOUT_SECS`).
+    pub import_connect_timeout_secs: u64,
+    /// Deadline for an S3 import source to return response headers after dispatch
+    /// (`CAIRN_IMPORT_RESPONSE_HEAD_TIMEOUT_SECS`).
+    pub import_response_head_timeout_secs: u64,
+    /// Maximum silence between source response-body chunks
+    /// (`CAIRN_IMPORT_BODY_IDLE_TIMEOUT_SECS`).
+    pub import_body_idle_timeout_secs: u64,
+    /// Maximum wall-clock time for one complete source GET → local PUT attempt
+    /// (`CAIRN_IMPORT_WHOLE_OBJECT_TIMEOUT_SECS`).
+    pub import_whole_object_timeout_secs: u64,
     /// How often the import worker wakes to claim a pending/stale job, in seconds
     /// (`CAIRN_IMPORT_POLL_INTERVAL_SECS`).
     pub import_poll_interval_secs: u64,
@@ -377,7 +415,7 @@ pub struct Config {
     pub root_access_key: String,
     /// The root administrator's secret key (`CAIRN_ROOT_SECRET_KEY`). Paired with
     /// [`root_access_key`](Self::root_access_key); see its docs.
-    pub root_secret_key: String,
+    pub root_secret_key: SecretString,
 
     /// Minimum response size, in bytes, for the experimental `sendfile` GET fast path
     /// (`CAIRN_FASTIO_MIN_BYTES`; only consulted in a `fast-io` build). The fast path now keeps the
@@ -401,6 +439,7 @@ impl Default for Config {
             public_base_url: None,
             tls_cert_path: None,
             tls_key_path: None,
+            trusted_proxies: None,
             concurrency_limit: 1024,
             request_timeout_secs: 300,
             header_read_timeout_secs: 15,
@@ -417,6 +456,9 @@ impl Default for Config {
             lifecycle_interval_secs: 3600,
             webhook_interval_secs: 15,
             multipart_sweep_interval_secs: 3600,
+            multipart_max_active_uploads_per_bucket: 1_000,
+            multipart_max_active_uploads_per_principal: 1_000,
+            multipart_max_parts_per_upload: 10_000,
             scrub_interval_secs: 0,
             key_rewrap_interval_secs: 300,
             key_counter_sync_secs: 60,
@@ -450,6 +492,10 @@ impl Default for Config {
             replication_targets: None,
             replication_batch_size: 64,
             replication_worker_concurrency: 4,
+            replication_buffer_budget_bytes:
+                cairn_replication::DEFAULT_REPLICATION_BUFFER_BUDGET_BYTES,
+            replication_delivery_timeout_secs:
+                cairn_replication::DEFAULT_REPLICATION_DELIVERY_TIMEOUT_SECS,
             replication_max_attempts: 8,
             replication_base_backoff_secs: 5,
             replication_max_backoff_secs: 900,
@@ -470,6 +516,10 @@ impl Default for Config {
             import_default_workers: 8,
             import_max_workers: 32,
             import_global_max_inflight: 24,
+            import_connect_timeout_secs: 10,
+            import_response_head_timeout_secs: 30,
+            import_body_idle_timeout_secs: 60,
+            import_whole_object_timeout_secs: 86_400,
             import_poll_interval_secs: 30,
             import_retention_secs: 604_800,
             request_metrics_enabled: true,
@@ -480,7 +530,7 @@ impl Default for Config {
             encrypt_at_rest: false,
             kms_key_ids: None,
             root_access_key: "cairn".to_owned(),
-            root_secret_key: "cairnadmin".to_owned(),
+            root_secret_key: "cairnadmin".into(),
             fastio_min_bytes: 256 * 1024,
         }
     }
@@ -503,7 +553,7 @@ pub struct ReplicationTarget {
     /// The destination access-key id.
     pub access_key: String,
     /// The destination secret access key.
-    pub secret: String,
+    pub secret: SecretString,
     /// An optional path to a PEM file of CA certificates to trust for this target's TLS endpoint,
     /// instead of the built-in webpki roots. Honoured only for `https://` endpoints.
     #[serde(default)]
@@ -560,6 +610,50 @@ impl Config {
             .map(str::to_owned)
             .collect();
         if ids.is_empty() { None } else { Some(ids) }
+    }
+
+    /// Parse the strict trusted reverse-proxy allow-list.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError::Invalid`] for an empty value, malformed address/network,
+    /// non-canonical CIDR, duplicate, or trust-everything network.
+    pub(crate) fn trusted_proxy_allowlist(
+        &self,
+    ) -> Result<crate::proxy::TrustedProxies, ConfigError> {
+        crate::proxy::TrustedProxies::parse(self.trusted_proxies.as_deref())
+            .map_err(|reason| ConfigError::Invalid(format!("CAIRN_TRUSTED_PROXIES {reason}")))
+    }
+
+    /// Resolve the validated import timeout seconds into the shared runtime representation.
+    #[must_use]
+    pub fn import_timeouts(&self) -> cairn_import::ImportTimeouts {
+        cairn_import::ImportTimeouts::from_secs(
+            self.import_connect_timeout_secs,
+            self.import_response_head_timeout_secs,
+            self.import_body_idle_timeout_secs,
+            self.import_whole_object_timeout_secs,
+        )
+    }
+
+    /// Construct the one process-wide replication resource owner from the already-validated ARCH
+    /// 28 settings. Call this once per process and clone the result into every sink.
+    #[must_use]
+    pub fn replication_sink_runtime(&self) -> cairn_replication::ReplicationSinkRuntime {
+        cairn_replication::ReplicationSinkRuntime::new(
+            self.replication_buffer_budget_bytes,
+            std::time::Duration::from_secs(self.replication_delivery_timeout_secs),
+        )
+        .expect("validated replication resource limits")
+    }
+
+    /// Writer-enforced multipart cardinality ceilings.
+    #[must_use]
+    pub fn multipart_limits(&self) -> cairn_types::meta::MultipartLimits {
+        cairn_types::meta::MultipartLimits {
+            max_active_uploads_per_bucket: self.multipart_max_active_uploads_per_bucket,
+            max_active_uploads_per_principal: self.multipart_max_active_uploads_per_principal,
+            max_parts_per_upload: self.multipart_max_parts_per_upload,
+        }
     }
 }
 
@@ -658,6 +752,15 @@ impl Config {
         }
         if self.db_path.as_os_str().is_empty() {
             return Err(ConfigError::Invalid("db_path must not be empty".into()));
+        }
+        if database_parent_is_strict_descendant(&self.data_dir, &self.db_path)? {
+            return Err(ConfigError::Invalid(format!(
+                "CAIRN_DB_PATH must be directly inside CAIRN_DATA_DIR or outside it; nested \
+                 database paths are unsafe because reconciliation treats their parent as a bucket \
+                 (data_dir={}, db_path={})",
+                self.data_dir.display(),
+                self.db_path.display()
+            )));
         }
         if !matches!(self.meta_backend.as_str(), "sqlite" | "libsql" | "turso") {
             return Err(ConfigError::Invalid(format!(
@@ -768,6 +871,10 @@ impl Config {
             }
             _ => {}
         }
+        // Forwarded headers become transport provenance only after this strict allow-list parses.
+        // Validate at startup so a typo cannot silently make a proxy-backed HTTPS login issue a
+        // non-Secure administrator cookie.
+        self.trusted_proxy_allowlist()?;
         if self.request_timeout_secs == 0 {
             return Err(ConfigError::Invalid(
                 "request_timeout_secs must be positive".into(),
@@ -818,6 +925,22 @@ impl Config {
                 "multipart_sweep_interval_secs must be positive".into(),
             ));
         }
+        if self.multipart_max_active_uploads_per_bucket == 0 {
+            return Err(ConfigError::Invalid(
+                "multipart_max_active_uploads_per_bucket must be positive".into(),
+            ));
+        }
+        if self.multipart_max_active_uploads_per_principal == 0 {
+            return Err(ConfigError::Invalid(
+                "multipart_max_active_uploads_per_principal must be positive".into(),
+            ));
+        }
+        if self.multipart_max_parts_per_upload == 0 || self.multipart_max_parts_per_upload > 10_000
+        {
+            return Err(ConfigError::Invalid(
+                "multipart_max_parts_per_upload must be between 1 and 10000".into(),
+            ));
+        }
         if self.multipart_upload_lifetime_secs == 0 {
             return Err(ConfigError::Invalid(
                 "multipart_upload_lifetime_secs must be positive".into(),
@@ -844,6 +967,29 @@ impl Config {
                 "replication_worker_concurrency must be between 1 and 64".into(),
             ));
         }
+        if !(1..=cairn_replication::MAX_REPLICATION_BUFFER_BUDGET_BYTES)
+            .contains(&self.replication_buffer_budget_bytes)
+        {
+            return Err(ConfigError::Invalid(format!(
+                "replication_buffer_budget_bytes must be between 1 and {}",
+                cairn_replication::MAX_REPLICATION_BUFFER_BUDGET_BYTES
+            )));
+        }
+        if !(1..=cairn_replication::MAX_REPLICATION_DELIVERY_TIMEOUT_SECS)
+            .contains(&self.replication_delivery_timeout_secs)
+        {
+            return Err(ConfigError::Invalid(format!(
+                "replication_delivery_timeout_secs must be between 1 and {}",
+                cairn_replication::MAX_REPLICATION_DELIVERY_TIMEOUT_SECS
+            )));
+        }
+        // The range checks above express the portable operator contract; this catches a narrower
+        // semaphore ceiling on an unusual target architecture before any worker is spawned.
+        cairn_replication::ReplicationSinkRuntime::new(
+            self.replication_buffer_budget_bytes,
+            std::time::Duration::from_secs(self.replication_delivery_timeout_secs),
+        )
+        .map_err(|e| ConfigError::Invalid(format!("invalid replication resource limits: {e}")))?;
         if self.replication_max_attempts == 0 {
             return Err(ConfigError::Invalid(
                 "replication_max_attempts must be positive".into(),
@@ -914,6 +1060,17 @@ impl Config {
         if !(1..64).contains(&self.import_global_max_inflight) {
             return Err(ConfigError::Invalid(
                 "import_global_max_inflight must be between 1 and 63 (below the blob-I/O pool)"
+                    .into(),
+            ));
+        }
+        if self.import_connect_timeout_secs == 0
+            || self.import_response_head_timeout_secs == 0
+            || self.import_body_idle_timeout_secs == 0
+            || self.import_whole_object_timeout_secs == 0
+        {
+            return Err(ConfigError::Invalid(
+                "import connect, response-head, body-idle, and whole-object timeouts must all be \
+                 positive"
                     .into(),
             ));
         }
@@ -990,10 +1147,32 @@ impl Config {
                 ));
             }
         }
+        // Validate every environment-configured outbound endpoint before either listener binds.
+        // The connector repeats the literal check at every dial (and guards DNS results), but this
+        // gives an operator an immediate, setting-specific error instead of a silent background
+        // failure. Validate even a disabled update feed: an inert blocked URL must not become live
+        // merely because the enable knob changes on a later restart.
+        let outbound_guard = cairn_net::GuardConfig::new(self.allow_internal_endpoints);
+        cairn_net::validate_endpoint(&self.update_check_url, &outbound_guard).map_err(|e| {
+            ConfigError::Invalid(format!("CAIRN_UPDATE_CHECK_URL is not permitted: {e}"))
+        })?;
+        if let Some(endpoint) = self.replication_endpoint.as_deref() {
+            cairn_net::validate_endpoint(endpoint, &outbound_guard).map_err(|e| {
+                ConfigError::Invalid(format!("CAIRN_REPLICATION_ENDPOINT is not permitted: {e}"))
+            })?;
+        }
+
         // A malformed replication-targets document is an operator error that must surface at load,
-        // not when the first drain tries to route an object. Reject targets that set both a CA
-        // path and skip-verify, since the two trust knobs are mutually exclusive.
+        // not when the first drain tries to route an object. Reject blocked literal endpoints and
+        // targets that set both a CA path and skip-verify, since the trust knobs are mutually
+        // exclusive.
         for target in self.parse_replication_targets()? {
+            cairn_net::validate_endpoint(&target.endpoint, &outbound_guard).map_err(|e| {
+                ConfigError::Invalid(format!(
+                    "replication target {:?} endpoint is not permitted: {e}",
+                    target.name
+                ))
+            })?;
             if target.ca_path.is_some() && target.insecure_skip_verify {
                 return Err(ConfigError::Invalid(format!(
                     "replication target {:?} sets both ca_path and insecure_skip_verify",
@@ -1015,19 +1194,59 @@ impl Config {
     }
 }
 
+fn database_parent_is_strict_descendant(
+    data_dir: &Path,
+    db_path: &Path,
+) -> Result<bool, ConfigError> {
+    let data_dir = lexical_absolute(data_dir)?;
+    let db_parent = db_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let db_parent = lexical_absolute(db_parent)?;
+    Ok(db_parent != data_dir && db_parent.starts_with(data_dir))
+}
+
+fn lexical_absolute(path: &Path) -> Result<PathBuf, ConfigError> {
+    let absolute = if path.is_absolute() {
+        path.to_owned()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| {
+                ConfigError::Invalid(format!(
+                    "failed to resolve storage paths against the current directory: {error}"
+                ))
+            })?
+            .join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::Normal(value) => normalized.push(value),
+        }
+    }
+    Ok(normalized)
+}
+
 /// One entry of the master-key ring (`CAIRN_MASTER_KEY_RING`, audit #29). Strict like [`Config`]:
 /// an unexpected field (e.g. a typo'd key name) is rejected rather than silently ignored.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct KeySpec {
     id: u16,
-    key: String,
+    key: SecretString,
 }
 
 /// Parse and validate the master-key ring JSON into `(id, 32-byte key)` pairs: non-empty, no id 0,
 /// no duplicate id, each key exactly 64 hex chars. Decoded key bytes are returned to the caller
 /// (and never logged). Returns a human-readable reason on failure.
-pub(crate) fn parse_key_ring(json: &str) -> Result<Vec<(u16, [u8; 32])>, String> {
+pub(crate) fn parse_key_ring(json: &str) -> Result<Vec<(u16, SecretKey32)>, String> {
     let specs: Vec<KeySpec> =
         serde_json::from_str(json).map_err(|e| format!("is not a valid JSON ring: {e}"))?;
     if specs.is_empty() {
@@ -1045,11 +1264,13 @@ pub(crate) fn parse_key_ring(json: &str) -> Result<Vec<(u16, [u8; 32])>, String>
         if s.key.len() != 64 || !s.key.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(format!("key id {} must be 64 hex characters", s.id));
         }
-        let bytes = hex::decode(&s.key).map_err(|_| format!("key id {} has invalid hex", s.id))?;
-        let arr: [u8; 32] = bytes
-            .try_into()
-            .map_err(|_| format!("key id {} must decode to 32 bytes", s.id))?;
-        out.push((s.id, arr));
+        let bytes = Zeroizing::new(
+            hex::decode(s.key.expose_secret())
+                .map_err(|_| format!("key id {} has invalid hex", s.id))?,
+        );
+        let key = SecretKey32::from_slice(&bytes)
+            .ok_or_else(|| format!("key id {} must decode to 32 bytes", s.id))?;
+        out.push((s.id, key));
     }
     Ok(out)
 }
@@ -1082,6 +1303,36 @@ mod tests {
         assert!(base().validate().is_ok());
     }
 
+    #[test]
+    fn rejects_database_strictly_nested_below_data_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("data");
+
+        let mut config = base();
+        config.data_dir = data.clone();
+        config.db_path = data.join("metadata/cairn.db");
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("CAIRN_DB_PATH"), "{error}");
+
+        config.db_path = data.join("cairn.db");
+        assert!(
+            config.validate().is_ok(),
+            "a direct child remains the supported single-filesystem default"
+        );
+
+        config.db_path = root.path().join("metadata/cairn.db");
+        assert!(
+            config.validate().is_ok(),
+            "a database outside the blob root remains supported"
+        );
+
+        config.db_path = data.join("nested/../cairn.db");
+        assert!(
+            config.validate().is_ok(),
+            "lexical aliases must be normalized before classifying the layout"
+        );
+    }
+
     /// The plaintext-SSE-over-http opt-in must be OFF by default — replication now ships DECRYPTED
     /// bodies, and a correctness fix must not silently start putting client-encrypted data on an
     /// unauthenticated link — and must not be able to sit in an environment doing nothing.
@@ -1101,7 +1352,7 @@ mod tests {
         c.replication_endpoint = Some("https://peer.example.com".to_owned());
         assert!(c.validate().is_err());
         // ...unless a target list is configured, whose endpoints are not judged here.
-        c.replication_targets = Some("[]".to_owned());
+        c.replication_targets = Some("[]".into());
         assert!(c.validate().is_ok());
     }
 
@@ -1144,7 +1395,7 @@ mod tests {
         assert_eq!(keys.len(), 2);
         assert_eq!(keys[0].0, 1);
         assert_eq!(keys[1].0, 2);
-        assert_eq!(keys[0].1, [0xabu8; 32]);
+        assert_eq!(keys[0].1.expose_secret(), &[0xabu8; 32]);
     }
 
     #[test]
@@ -1160,7 +1411,7 @@ mod tests {
         );
         let mut c = base();
         c.master_key = None;
-        c.master_key_ring = Some(ring);
+        c.master_key_ring = Some(ring.into());
         // active = the highest id validates.
         c.master_key_active_id = Some(3);
         assert!(c.validate().is_ok(), "active == max ring id is valid");
@@ -1205,11 +1456,11 @@ mod tests {
     #[test]
     fn rejects_active_id_without_a_ring() {
         let mut c = base();
-        c.master_key = Some(hex64(7));
+        c.master_key = Some(hex64(7).into());
         c.master_key_active_id = Some(2);
         assert!(c.validate().is_err(), "active id requires a ring");
         // With a matching ring it validates.
-        c.master_key_ring = Some(format!(r#"[{{"id":2,"key":"{}"}}]"#, hex64(7)));
+        c.master_key_ring = Some(format!(r#"[{{"id":2,"key":"{}"}}]"#, hex64(7)).into());
         assert!(c.validate().is_ok());
         // An active id absent from the ring is rejected.
         c.master_key_active_id = Some(9);
@@ -1229,12 +1480,86 @@ mod tests {
     }
 
     #[test]
+    fn trusted_proxy_allowlist_is_strict_and_validated_at_startup() {
+        let mut c = base();
+        assert!(
+            !c.trusted_proxy_allowlist()
+                .expect("unset means trust none")
+                .contains("127.0.0.1".parse().unwrap())
+        );
+
+        c.trusted_proxies = Some("127.0.0.1,10.42.0.0/16,2001:db8::/32".to_owned());
+        let allowlist = c.trusted_proxy_allowlist().expect("valid allow-list");
+        assert!(allowlist.contains("127.0.0.1".parse().unwrap()));
+        assert!(allowlist.contains("10.42.9.8".parse().unwrap()));
+        assert!(allowlist.contains("2001:db8:1::7".parse().unwrap()));
+        assert!(c.validate().is_ok());
+
+        for invalid in [
+            "",
+            "proxy.internal",
+            "127.0.0.1,",
+            "10.42.9.8/16",
+            "0.0.0.0/0",
+        ] {
+            c.trusted_proxies = Some(invalid.to_owned());
+            let error = c.validate().unwrap_err().to_string();
+            assert!(
+                error.contains("CAIRN_TRUSTED_PROXIES"),
+                "error must name the environment variable: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn load_reads_trusted_proxies_only_from_the_environment() {
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("CAIRN_TRUSTED_PROXIES", "127.0.0.1,10.0.0.0/8");
+            let cfg = Config::load().expect("valid proxy allow-list loads");
+            assert_eq!(cfg.trusted_proxies.as_deref(), Some("127.0.0.1,10.0.0.0/8"));
+            assert!(
+                cfg.trusted_proxy_allowlist()
+                    .expect("parsed")
+                    .contains("10.2.3.4".parse().unwrap())
+            );
+            Ok(())
+        });
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("CAIRN_TRUSTED_PROXIES", "proxy.internal");
+            let error = Config::load().unwrap_err().to_string();
+            assert!(error.contains("CAIRN_TRUSTED_PROXIES"));
+            Ok(())
+        });
+    }
+
+    #[test]
     fn rejects_zero_timeout_and_concurrency() {
         let mut c = base();
         c.request_timeout_secs = 0;
         assert!(c.validate().is_err());
         let mut c = base();
         c.concurrency_limit = 0;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_replication_resource_limits_outside_the_hard_bounds() {
+        let mut c = base();
+        c.replication_buffer_budget_bytes = 0;
+        assert!(c.validate().is_err());
+
+        let mut c = base();
+        c.replication_buffer_budget_bytes =
+            cairn_replication::MAX_REPLICATION_BUFFER_BUDGET_BYTES + 1;
+        assert!(c.validate().is_err());
+
+        let mut c = base();
+        c.replication_delivery_timeout_secs = 0;
+        assert!(c.validate().is_err());
+
+        let mut c = base();
+        c.replication_delivery_timeout_secs =
+            cairn_replication::MAX_REPLICATION_DELIVERY_TIMEOUT_SECS + 1;
         assert!(c.validate().is_err());
     }
 
@@ -1272,6 +1597,37 @@ mod tests {
             mutate(&mut c);
             assert!(c.validate().is_err());
         }
+    }
+
+    #[test]
+    fn multipart_cardinality_limits_are_strict_and_s3_bounded() {
+        let mut c = base();
+        c.multipart_max_active_uploads_per_bucket = 0;
+        assert!(c.validate().is_err());
+
+        let mut c = base();
+        c.multipart_max_active_uploads_per_principal = 0;
+        assert!(c.validate().is_err());
+
+        let mut c = base();
+        c.multipart_max_parts_per_upload = 0;
+        assert!(c.validate().is_err());
+        c.multipart_max_parts_per_upload = 10_001;
+        assert!(c.validate().is_err());
+        c.multipart_max_parts_per_upload = 10_000;
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn multipart_limits_map_to_writer_contract() {
+        let mut c = base();
+        c.multipart_max_active_uploads_per_bucket = 12;
+        c.multipart_max_active_uploads_per_principal = 7;
+        c.multipart_max_parts_per_upload = 345;
+        let limits = c.multipart_limits();
+        assert_eq!(limits.max_active_uploads_per_bucket, 12);
+        assert_eq!(limits.max_active_uploads_per_principal, 7);
+        assert_eq!(limits.max_parts_per_upload, 345);
     }
 
     #[test]
@@ -1572,12 +1928,12 @@ mod tests {
         // Public bind with the built-in dev master key (none) -> refused.
         assert!(public(|_| {}).is_err());
         // A real master key but the default root secret -> still refused.
-        assert!(public(|c| c.master_key = Some("ab".repeat(32))).is_err());
+        assert!(public(|c| c.master_key = Some("ab".repeat(32).into())).is_err());
         // Real key + a non-default root secret -> allowed.
         assert!(
             public(|c| {
-                c.master_key = Some("ab".repeat(32));
-                c.root_secret_key = "a-real-secret".to_owned();
+                c.master_key = Some("ab".repeat(32).into());
+                c.root_secret_key = "a-real-secret".into();
             })
             .is_ok()
         );
@@ -1626,6 +1982,18 @@ mod tests {
             assert_eq!(cfg.replication_interval_secs, 7);
             assert_eq!(cfg.request_metrics_retention_days, 14);
             assert_eq!(cfg.request_metrics_flush_secs, 5);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn load_reads_replication_budget_and_delivery_deadline_from_env() {
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("CAIRN_REPLICATION_BUFFER_BUDGET_BYTES", "1048576");
+            jail.set_env("CAIRN_REPLICATION_DELIVERY_TIMEOUT_SECS", "45");
+            let cfg = Config::load().expect("replication resource limits load");
+            assert_eq!(cfg.replication_buffer_budget_bytes, 1_048_576);
+            assert_eq!(cfg.replication_delivery_timeout_secs, 45);
             Ok(())
         });
     }
@@ -1710,7 +2078,7 @@ mod tests {
         c.replication_targets = Some(
             r#"[{"name":"x","endpoint":"https://e","region":"r","dest_bucket":"d",
                  "access_key":"a","secret":"s","ca_path":"/ca.pem","insecure_skip_verify":true}]"#
-                .to_owned(),
+                .into(),
         );
         assert!(c.validate().is_err());
     }
@@ -1719,6 +2087,75 @@ mod tests {
     #[test]
     fn parse_targets_empty_when_unset() {
         assert!(base().parse_replication_targets().unwrap().is_empty());
+    }
+
+    #[test]
+    fn config_and_typed_target_debug_redact_secret_sentinels() {
+        let mut c = base();
+        c.master_key = Some("master-secret-sentinel".into());
+        c.master_key_ring = Some("ring-secret-sentinel".into());
+        c.root_secret_key = "root-secret-sentinel".into();
+        c.replication_secret = Some("replication-secret-sentinel".into());
+        c.replication_targets = Some(
+            r#"[{"name":"x","endpoint":"https://example.com","region":"r",
+                 "dest_bucket":"d","access_key":"a","secret":"target-secret-sentinel"}]"#
+                .into(),
+        );
+
+        let debug = format!("{c:?}");
+        for sentinel in [
+            "master-secret-sentinel",
+            "ring-secret-sentinel",
+            "root-secret-sentinel",
+            "replication-secret-sentinel",
+            "target-secret-sentinel",
+        ] {
+            assert!(!debug.contains(sentinel), "config Debug leaked {sentinel}");
+        }
+
+        let target = c.parse_replication_targets().unwrap().remove(0);
+        let target_debug = format!("{target:?}");
+        assert!(!target_debug.contains("target-secret-sentinel"));
+        assert!(target_debug.contains("<redacted>"));
+    }
+
+    /// Environment-configured outbound endpoints are rejected at startup when they name an
+    /// internal IP literal. This is operator feedback in addition to the connector's per-dial
+    /// enforcement (CAIRN-AUD-039).
+    #[test]
+    fn rejects_internal_literal_update_and_replication_endpoints() {
+        let mut c = base();
+        c.update_check_url = "http://127.0.0.1:8080/latest".to_owned();
+        let error = c.validate().unwrap_err().to_string();
+        assert!(error.contains("CAIRN_UPDATE_CHECK_URL"), "{error}");
+
+        c.update_check_url = Config::default().update_check_url;
+        c.replication_endpoint = Some("http://169.254.169.254/".to_owned());
+        let error = c.validate().unwrap_err().to_string();
+        assert!(error.contains("CAIRN_REPLICATION_ENDPOINT"), "{error}");
+
+        c.replication_endpoint = None;
+        c.replication_targets = Some(
+            r#"[{"name":"metadata","endpoint":"http://[::1]:9000","region":"r",
+                 "dest_bucket":"d","access_key":"a","secret":"s"}]"#
+                .into(),
+        );
+        let error = c.validate().unwrap_err().to_string();
+        assert!(error.contains("replication target \"metadata\""), "{error}");
+    }
+
+    #[test]
+    fn internal_endpoint_opt_in_applies_to_startup_validation() {
+        let mut c = base();
+        c.update_check_url = "http://127.0.0.1:8080/latest".to_owned();
+        c.replication_endpoint = Some("http://169.254.169.254/".to_owned());
+        c.replication_targets = Some(
+            r#"[{"name":"local","endpoint":"http://[::1]:9000","region":"r",
+                 "dest_bucket":"d","access_key":"a","secret":"s"}]"#
+                .into(),
+        );
+        c.allow_internal_endpoints = true;
+        assert!(c.validate().is_ok());
     }
 
     #[test]
@@ -1744,21 +2181,52 @@ mod tests {
         assert!(c.validate().is_err(), "default must be <= max");
         c.import_default_workers = 8;
         assert!(c.validate().is_ok());
+        // Every network phase is bounded; zero would silently disable that deadline.
+        let clear_timeout: [fn(&mut Config); 4] = [
+            |cfg: &mut Config| cfg.import_connect_timeout_secs = 0,
+            |cfg: &mut Config| cfg.import_response_head_timeout_secs = 0,
+            |cfg: &mut Config| cfg.import_body_idle_timeout_secs = 0,
+            |cfg: &mut Config| cfg.import_whole_object_timeout_secs = 0,
+        ];
+        for clear in clear_timeout {
+            let mut invalid = base();
+            clear(&mut invalid);
+            assert!(
+                invalid.validate().is_err(),
+                "zero import timeout must be rejected"
+            );
+        }
         // Cadences must be positive.
         c.import_poll_interval_secs = 0;
         assert!(c.validate().is_err(), "a zero poll interval busy-spins");
     }
 
     #[test]
+    fn loads_import_timeouts_from_environment() {
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("CAIRN_IMPORT_CONNECT_TIMEOUT_SECS", "11");
+            jail.set_env("CAIRN_IMPORT_RESPONSE_HEAD_TIMEOUT_SECS", "22");
+            jail.set_env("CAIRN_IMPORT_BODY_IDLE_TIMEOUT_SECS", "33");
+            jail.set_env("CAIRN_IMPORT_WHOLE_OBJECT_TIMEOUT_SECS", "44");
+            let cfg = Config::load().expect("import timeout environment loads");
+            assert_eq!(cfg.import_connect_timeout_secs, 11);
+            assert_eq!(cfg.import_response_head_timeout_secs, 22);
+            assert_eq!(cfg.import_body_idle_timeout_secs, 33);
+            assert_eq!(cfg.import_whole_object_timeout_secs, 44);
+            Ok(())
+        });
+    }
+
+    #[test]
     fn rejects_malformed_master_key() {
         let mut c = base();
-        c.master_key = Some("not-hex".to_owned());
+        c.master_key = Some("not-hex".into());
         assert!(c.validate().is_err(), "non-hex master key rejected");
-        c.master_key = Some("ab".repeat(31)); // 62 hex chars — wrong length
+        c.master_key = Some("ab".repeat(31).into()); // 62 hex chars — wrong length
         assert!(c.validate().is_err(), "wrong-length master key rejected");
-        c.master_key = Some("zz".repeat(32)); // 64 chars but not hex digits
+        c.master_key = Some("zz".repeat(32).into()); // 64 chars but not hex digits
         assert!(c.validate().is_err(), "non-hex characters rejected");
-        c.master_key = Some("ab".repeat(32)); // 64 valid hex chars = 32 bytes
+        c.master_key = Some("ab".repeat(32).into()); // 64 valid hex chars = 32 bytes
         assert!(
             c.validate().is_ok(),
             "a valid 64-hex master key is accepted"

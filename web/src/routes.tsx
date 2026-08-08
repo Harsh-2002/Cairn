@@ -17,9 +17,9 @@ import { Tags } from "@/views/tags";
 import { UserDetail } from "@/views/user-detail";
 import { Users } from "@/views/users";
 
-// Hash routing on purpose: the server serves the SPA shell only at `/` on the
-// web console port; every other path is the S3 data plane the console itself uses for
-// object bytes, so history-mode routes would collide with /{bucket}/{key}.
+// Hash routing on purpose: the control listener serves the SPA shell only at `/` plus concrete
+// embedded assets, and fail-closes every other non-API path. A history router would require a new,
+// explicit server route family; it must never fall through into the separate S3 data origin.
 export const router = createHashRouter([
   { path: "/login", element: <Login /> },
   {

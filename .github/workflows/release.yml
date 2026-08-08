@@ -1,49 +1,84 @@
 name: Release
 
-# Calendar-versioned (CalVer) release policy. A release is a deliberate act (run from the Actions tab)
-# that is gated on a green CI for the exact commit being released. It then:
-#   * builds static linux/amd64 + linux/arm64 binaries (musl, real web console embedded);
-#   * publishes a multi-arch image to GHCR built from those exact binaries (:latest, one active image);
-#   * publishes ONE GitHub Release tagged vYYYY.MM.DD (a calendar version) and retires the previous
-#     one — so exactly one release is ever active.
+# Human-dispatched CalVer release. Build and assembly jobs are deliberately unprivileged. Registry
+# publication, OIDC signing/attestation, and GitHub Release mutation are isolated jobs that consume
+# only checksum-bound artifacts from those builds.
 on:
   workflow_dispatch:
 
-permissions:
-  contents: write       # create/delete the GitHub Release and its tag
-  packages: write       # push the image to GHCR
-  actions: read         # read the CI run status for the release gate
-  id-token: write       # keyless (OIDC) cosign signing + provenance attestation
-  attestations: write   # actions/attest-build-provenance
+permissions: {}
+
+concurrency:
+  # Release mutation is a repository-wide critical section. Never cancel a running release that
+  # may already have staged or published one side of the handoff.
+  group: cairn-production-release
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
   CARGO_NET_RETRY: "10"
   CARGO_HTTP_MULTIPLEXING: "false"
+  COSIGN_VERSION: v3.0.6
+  COSIGN_LINUX_AMD64_SHA256: c956e5dfcac53d52bcf058360d579472f0c1d2d9b69f55209e256fe7783f4c74
+  GH_VERSION: "2.96.0"
+  GH_LINUX_AMD64_SHA256: 83d5c2ccad5498f58bf6368acb1ab32588cf43ab3a4b1c301bf36328b1c8bd60
+  ORAS_VERSION: "1.3.3"
+  ORAS_LINUX_AMD64_SHA256: 9ce999f8d2de03fc03968b29d743077a58783e545e5eaa53917ca177352d0e59
+  SYFT_VERSION: "1.50.0"
+  SYFT_LINUX_AMD64_SHA256: bf7b29ff57f06da30918266a0e1c2885a8f99784798d1bdb1628886aa015d788
 
 jobs:
   verify-ci:
     name: require green CI
-    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
     outputs:
-      # The calendar version, computed ONCE here and threaded into both the binaries (baked in as
-      # CAIRN_VERSION) and the release tag below, so `cairn --version` and the release it ships in can
-      # never disagree (and there is no date-rollover race between the two jobs).
-      version: ${{ steps.ver.outputs.version }}
+      # Compute both values once so a UTC date rollover or case normalization cannot make later
+      # jobs disagree about the signed subjects.
+      version: ${{ steps.release.outputs.version }}
+      image: ${{ steps.release.outputs.image }}
     steps:
-      - name: Compute the calendar version (vYYYY.MM.DD)
-        id: ver
-        run: echo "version=$(date -u +v%Y.%m.%d)" >> "$GITHUB_OUTPUT"
+      - name: Compute immutable release coordinates
+        id: release
+        env:
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          echo "version=$(date -u +v%Y.%m.%d)" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/$(printf '%s' "$REPOSITORY" | tr '[:upper:]' '[:lower:]')" \
+            >> "$GITHUB_OUTPUT"
+      - name: Install checksum-pinned GitHub CLI
+        run: |
+          set -euo pipefail
+          archive="${RUNNER_TEMP}/gh_${GH_VERSION}_linux_amd64.tar.gz"
+          curl --proto '=https' --tlsv1.2 -fsSL -o "$archive" \
+            "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz"
+          printf '%s  %s\n' "$GH_LINUX_AMD64_SHA256" "$archive" | sha256sum -c -
+          tar -xzf "$archive" -C "$RUNNER_TEMP"
       - name: Require a successful CI run for this commit
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_REF: ${{ github.ref }}
+          RELEASE_REF_NAME: ${{ github.ref_name }}
+          RELEASE_SHA: ${{ github.sha }}
+          REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
-          conclusion="$(gh run list --repo '${{ github.repository }}' --workflow ci.yml \
-            --branch '${{ github.ref_name }}' --limit 50 \
-            --json headSha,status,conclusion \
-            --jq '[.[] | select(.headSha=="${{ github.sha }}")] | first | (.conclusion // .status // "none")')"
-          echo "CI conclusion for ${{ github.sha }}: $conclusion"
+          if [ "$RELEASE_REF" != "refs/heads/main" ]; then
+            echo "::error::releases may only be dispatched from refs/heads/main"
+            exit 1
+          fi
+          GH="${RUNNER_TEMP}/gh_${GH_VERSION}_linux_amd64/bin/gh"
+          conclusion="$(
+            "$GH" run list --repo "$REPOSITORY" --workflow ci.yml \
+              --branch "$RELEASE_REF_NAME" --limit 50 \
+              --json headSha,status,conclusion \
+              | jq -er --arg sha "$RELEASE_SHA" \
+                '[.[] | select(.headSha == $sha)] | first | (.conclusion // .status // "none")'
+          )"
+          echo "CI conclusion for $RELEASE_SHA: $conclusion"
           if [ "$conclusion" != "success" ]; then
             echo "::error::CI has not succeeded for this commit ($conclusion); refusing to release."
             exit 1
@@ -52,70 +87,236 @@ jobs:
   binaries:
     name: static binary (${{ matrix.arch }})
     needs: verify-ci
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { arch: amd64, target: x86_64-unknown-linux-musl }
-          - { arch: arm64, target: aarch64-unknown-linux-musl }
+          - arch: amd64
+            target: x86_64-unknown-linux-musl
+          - arch: arm64
+            target: aarch64-unknown-linux-musl
     steps:
-      - uses: actions/checkout@v7
-      - uses: ./.github/actions/setup   # builds the real web console bundle + the Rust toolchain
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup
         with:
           targets: ${{ matrix.target }}
-      - run: pip install ziglang
-      - uses: taiki-e/install-action@cargo-zigbuild
-      - name: Cross-compile the static release binary (no QEMU)
-        # Bake the calendar version into the binary so `cairn --version` and `GET /system` report the
-        # release, not the crate's CARGO_PKG_VERSION.
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.13.14"
+      - name: Install checksum-pinned Zig
+        env:
+          ZIG_WHEEL_URL: https://files.pythonhosted.org/packages/3e/ed/7b79023aa27ceb5d461ecf761181e7c33c57bbc1a6256a39535d1c7083d2/ziglang-0.16.0-py3-none-manylinux_2_12_x86_64.manylinux2010_x86_64.musllinux_1_1_x86_64.whl
+          ZIG_WHEEL_SHA256: 9fcda73f62b851dd72a54b710ad40a209896db14cfb13649e62191243556342b
+        run: |
+          set -euo pipefail
+          wheel="${RUNNER_TEMP}/ziglang-0.16.0.whl"
+          curl --proto '=https' --tlsv1.2 -fsSL -o "$wheel" "$ZIG_WHEEL_URL"
+          printf '%s  %s\n' "$ZIG_WHEEL_SHA256" "$wheel" | sha256sum -c -
+          python -m pip install --no-deps --no-index "$wheel"
+      - uses: taiki-e/install-action@065d6a08a14e61e89fb0a4c10eecdbdef39c7d8e
+        with:
+          tool: cargo-zigbuild@0.23.0
+          checksum: true
+          fallback: none
+      - name: Cross-compile the static release binary
         env:
           CAIRN_RELEASE_VERSION: ${{ needs.verify-ci.outputs.version }}
-        run: cargo zigbuild --release --bin cairn --target ${{ matrix.target }}
-      - name: Stage + verify it is fully static
+          TARGET: ${{ matrix.target }}
+        run: cargo zigbuild --release --bin cairn --target "$TARGET"
+      - name: Stage and bind the binary to this run
+        env:
+          ARCH: ${{ matrix.arch }}
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.verify-ci.outputs.version }}
         run: |
+          set -euo pipefail
           mkdir -p dist
-          cp "target/${{ matrix.target }}/release/cairn" "dist/cairn-linux-${{ matrix.arch }}"
-          file "dist/cairn-linux-${{ matrix.arch }}" | grep -qiE "statically linked|static-pie linked" \
-            || { echo "binary is not statically linked"; exit 1; }
-      - name: Verify the baked-in version matches the release tag
-        # The amd64 binary runs natively on the runner; arm64 shares the same build.rs injection, so
-        # verifying one proves the wiring. This is the automated guard against shipping a binary whose
-        # `cairn --version` disagrees with the release it's published under (ARCH 31.6).
+          file_name="cairn-linux-${ARCH}"
+          cp "target/${TARGET}/release/cairn" "dist/${file_name}"
+          file "dist/${file_name}" | grep -qiE "statically linked|static-pie linked" \
+            || { echo "::error::${file_name} is not statically linked"; exit 1; }
+          (
+            cd dist
+            sha256sum "$file_name" > "${file_name}.sha256"
+            printf 'commit %s\nversion %s\ntarget %s\n' \
+              "$GITHUB_SHA" "$VERSION" "$TARGET" > "${file_name}.metadata"
+            jq -n \
+              --arg build_type "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/.github/workflows/release.yml#binaries" \
+              --arg builder_id "${GITHUB_SERVER_URL}/${GITHUB_WORKFLOW_REF}" \
+              --arg invocation "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}" \
+              --arg source "git+${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}@${GITHUB_SHA}" \
+              --arg sha "$GITHUB_SHA" \
+              --arg target "$TARGET" \
+              --arg version "$VERSION" \
+              '{
+                buildDefinition: {
+                  buildType: $build_type,
+                  externalParameters: {target: $target, version: $version},
+                  internalParameters: {
+                    rust: "1.97.1", zig: "0.16.0", cargoZigbuild: "0.23.0"
+                  },
+                  resolvedDependencies: [{uri: $source, digest: {gitCommit: $sha}}]
+                },
+                runDetails: {
+                  builder: {id: $builder_id},
+                  metadata: {invocationId: $invocation}
+                }
+              }' > "${file_name}.provenance.json"
+          )
+      - name: Verify the baked-in version
         if: matrix.arch == 'amd64'
         env:
           WANT: ${{ needs.verify-ci.outputs.version }}
         run: |
+          set -euo pipefail
           got="$(./dist/cairn-linux-amd64 --version | awk '{print $NF}')"
-          echo "cairn --version -> $got (expected $WANT)"
-          [ "$got" = "$WANT" ] || { echo "::error::baked-in version '$got' != release tag '$WANT'"; exit 1; }
-      - uses: actions/upload-artifact@v7
+          [ "$got" = "$WANT" ] \
+            || { echo "::error::baked-in version '$got' != release tag '$WANT'"; exit 1; }
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: cairn-${{ matrix.arch }}
-          path: dist/cairn-linux-${{ matrix.arch }}
+          name: cairn-binary-${{ matrix.arch }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 1
 
-  image:
-    name: multi-arch image -> GHCR
-    needs: binaries
-    runs-on: ubuntu-latest
+  release-assets:
+    name: assemble checksum-bound release assets
+    needs: [verify-ci, binaries]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          pattern: cairn-*
-          path: artifacts
-      - name: Assemble the runtime build context (the exact release binaries)
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          pattern: cairn-binary-*
+          path: rel
+          merge-multiple: true
+      - name: Verify binary checksums and build provenance
+        env:
+          VERSION: ${{ needs.verify-ci.outputs.version }}
         run: |
-          mkdir -p ctx/data
-          cp artifacts/cairn-amd64/cairn-linux-amd64 ctx/
-          cp artifacts/cairn-arm64/cairn-linux-arm64 ctx/
+          set -euo pipefail
+          while read -r arch target; do
+            file_name="cairn-linux-${arch}"
+            (cd rel && sha256sum -c "${file_name}.sha256")
+            test "$(sed -n '1p' "rel/${file_name}.metadata")" = "commit ${GITHUB_SHA}"
+            test "$(sed -n '2p' "rel/${file_name}.metadata")" = "version ${VERSION}"
+            test "$(sed -n '3p' "rel/${file_name}.metadata")" = "target ${target}"
+            jq -e \
+              --arg build_type "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/.github/workflows/release.yml#binaries" \
+              --arg builder "${GITHUB_SERVER_URL}/${GITHUB_WORKFLOW_REF}" \
+              --arg invocation_prefix "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/" \
+              --arg max_attempt "$GITHUB_RUN_ATTEMPT" \
+              --arg source "git+${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}@${GITHUB_SHA}" \
+              --arg sha "$GITHUB_SHA" \
+              --arg target "$target" \
+              --arg version "$VERSION" '
+              .buildDefinition.buildType == $build_type
+              and .buildDefinition.externalParameters == {target: $target, version: $version}
+              and .buildDefinition.internalParameters == {
+                rust: "1.97.1", zig: "0.16.0", cargoZigbuild: "0.23.0"
+              }
+              and .buildDefinition.resolvedDependencies == [
+                {uri: $source, digest: {gitCommit: $sha}}
+              ]
+              and .runDetails.builder == {id: $builder}
+              and (.runDetails.metadata | keys == ["invocationId"])
+              and (.runDetails.metadata.invocationId | startswith($invocation_prefix))
+              and (
+                .runDetails.metadata.invocationId
+                | ltrimstr($invocation_prefix)
+                | test("^[1-9][0-9]*$")
+              )
+              and (
+                (.runDetails.metadata.invocationId | ltrimstr($invocation_prefix) | tonumber)
+                <= ($max_attempt | tonumber)
+              )
+            ' "rel/${file_name}.provenance.json" >/dev/null
+          done <<'TARGETS'
+          amd64 x86_64-unknown-linux-musl
+          arm64 aarch64-unknown-linux-musl
+          TARGETS
+      - name: Generate the exact-version dependency SBOM
+        run: |
+          set -euo pipefail
+          archive="${RUNNER_TEMP}/syft_${SYFT_VERSION}_linux_amd64.tar.gz"
+          curl --proto '=https' --tlsv1.2 -fsSL -o "$archive" \
+            "https://github.com/anchore/syft/releases/download/v${SYFT_VERSION}/syft_${SYFT_VERSION}_linux_amd64.tar.gz"
+          printf '%s  %s\n' "$SYFT_LINUX_AMD64_SHA256" "$archive" | sha256sum -c -
+          tar -xzf "$archive" -C "$RUNNER_TEMP" syft
+          "${RUNNER_TEMP}/syft" scan dir:. --output spdx-json=rel/cairn-sbom.spdx.json
+      - name: Seal the unsigned asset manifest
+        env:
+          VERSION: ${{ needs.verify-ci.outputs.version }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$GITHUB_SHA" > rel/RELEASE-COMMIT
+          printf '%s\n' "$VERSION" > rel/RELEASE-VERSION
+          (
+            cd rel
+            sha256sum cairn-linux-amd64 cairn-linux-arm64 > SHA256SUMS
+            sha256sum \
+              cairn-linux-amd64 cairn-linux-arm64 SHA256SUMS cairn-sbom.spdx.json \
+              cairn-linux-amd64.provenance.json cairn-linux-arm64.provenance.json \
+              RELEASE-COMMIT RELEASE-VERSION > RELEASE-MANIFEST.sha256
+          )
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: cairn-release-unsigned
+          path: |
+            rel/cairn-linux-amd64
+            rel/cairn-linux-arm64
+            rel/SHA256SUMS
+            rel/cairn-sbom.spdx.json
+            rel/cairn-linux-amd64.provenance.json
+            rel/cairn-linux-arm64.provenance.json
+            rel/RELEASE-COMMIT
+            rel/RELEASE-VERSION
+            rel/RELEASE-MANIFEST.sha256
+          if-no-files-found: error
+          retention-days: 1
+
+  image-build:
+    name: build checksum-bound OCI archive
+    needs: [verify-ci, binaries]
+    runs-on: ubuntu-24.04
+    permissions: {}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          pattern: cairn-binary-*
+          path: artifacts
+      - name: Verify binaries and assemble the runtime context
+        env:
+          VERSION: ${{ needs.verify-ci.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p ctx/data image
+          while read -r arch target; do
+            source_dir="artifacts/cairn-binary-${arch}"
+            file_name="cairn-linux-${arch}"
+            (cd "$source_dir" && sha256sum -c "${file_name}.sha256")
+            test "$(sed -n '1p' "${source_dir}/${file_name}.metadata")" = "commit ${GITHUB_SHA}"
+            test "$(sed -n '2p' "${source_dir}/${file_name}.metadata")" = "version ${VERSION}"
+            test "$(sed -n '3p' "${source_dir}/${file_name}.metadata")" = "target ${target}"
+            cp "${source_dir}/${file_name}" ctx/
+          done <<'TARGETS'
+          amd64 x86_64-unknown-linux-musl
+          arm64 aarch64-unknown-linux-musl
+          TARGETS
           chmod +x ctx/cairn-linux-*
           cat > ctx/Dockerfile <<'DOCKER'
-          FROM gcr.io/distroless/static-debian12:nonroot
+          FROM gcr.io/distroless/static-debian12@sha256:f5b485ea962d9bd1186b2f6b3a061191539b905b82ec395de78cbfae51f20e35
           ARG TARGETARCH
           COPY cairn-linux-${TARGETARCH} /usr/local/bin/cairn
-          # /data owned by the nonroot user (65532): a fresh Docker volume mounted here inherits that
-          # ownership, so the nonroot server can create its database and object files. COPY (not RUN)
-          # keeps the multi-arch build emulation-free.
           COPY --chown=65532:65532 data /data
           ENV CAIRN_DATA_DIR=/data CAIRN_DB_PATH=/data/cairn.db
           EXPOSE 7373 7374
@@ -123,102 +324,981 @@ jobs:
           ENTRYPOINT ["/usr/local/bin/cairn"]
           CMD ["serve"]
           DOCKER
-      - name: Image name (lowercased for GHCR)
-        id: m
-        run: echo "image=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
-      - uses: docker/setup-buildx-action@v4
-      - uses: docker/login-action@v4
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v7
-        id: build
+          version: v0.35.0
+          driver-opts: image=moby/buildkit@sha256:2f5adac4ecd194d9f8c10b7b5d7bceb5186853db1b26e5abd3a657af0b7e26ec
+      - name: Build the multi-architecture OCI archive without registry authority
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a
         with:
           context: ctx
           file: ctx/Dockerfile
           platforms: linux/amd64,linux/arm64
-          push: true
-          # One active image: always just :latest (overwrites the previous release's image).
-          tags: ${{ steps.m.outputs.image }}:latest
-      # Keyless (OIDC) signature over the pushed manifest, by immutable digest. A consumer verifies
-      # against the workflow identity + the GitHub OIDC issuer (see SECURITY.md), so a tampered or
-      # substituted image fails `cosign verify` even though `:latest` is mutable.
-      - uses: sigstore/cosign-installer@v3
-      - name: Sign the image (keyless) by digest
+          push: false
+          provenance: false
+          tags: ${{ needs.verify-ci.outputs.image }}:candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          outputs: type=oci,dest=${{ runner.temp }}/cairn-image.tar
+      - name: Verify and record the OCI subject digest
         env:
-          DIGEST: ${{ steps.build.outputs.digest }}
-          IMAGE: ${{ steps.m.outputs.image }}
-        run: cosign sign --yes "${IMAGE}@${DIGEST}"
-      # Native GitHub build-provenance attestation for the image (SLSA), stored in the registry.
-      - uses: actions/attest-build-provenance@v4
+          IMAGE: ${{ needs.verify-ci.outputs.image }}
+          VERSION: ${{ needs.verify-ci.outputs.version }}
+        run: |
+          set -euo pipefail
+          cp "${RUNNER_TEMP}/cairn-image.tar" image/
+          digest="$(tar -xOf image/cairn-image.tar index.json \
+            | jq -er 'if (.manifests | length) == 1 then .manifests[0].digest else error("unexpected OCI index") end')"
+          printf '%s\n' "$digest" | grep -Eq '^sha256:[0-9a-f]{64}$' \
+            || { echo "::error::invalid OCI subject digest: $digest"; exit 1; }
+          digest_hex="${digest#sha256:}"
+          actual="$(tar -xOf image/cairn-image.tar "blobs/sha256/${digest_hex}" | sha256sum | awk '{print $1}')"
+          test "$actual" = "$digest_hex"
+          (cd image && sha256sum cairn-image.tar > cairn-image.tar.sha256)
+          printf '%s\n' "$digest" > image/IMAGE-DIGEST
+          printf '%s\n' "$IMAGE" > image/IMAGE-NAME
+          printf '%s\n' "$GITHUB_SHA" > image/RELEASE-COMMIT
+          printf '%s\n' "$VERSION" > image/RELEASE-VERSION
+          amd64_sha="$(cut -d' ' -f1 artifacts/cairn-binary-amd64/cairn-linux-amd64.sha256)"
+          arm64_sha="$(cut -d' ' -f1 artifacts/cairn-binary-arm64/cairn-linux-arm64.sha256)"
+          jq -n \
+            --arg build_type "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/.github/workflows/release.yml#image-build" \
+            --arg builder_id "${GITHUB_SERVER_URL}/${GITHUB_WORKFLOW_REF}" \
+            --arg invocation "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}" \
+            --arg source "git+${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}@${GITHUB_SHA}" \
+            --arg sha "$GITHUB_SHA" \
+            --arg image "$IMAGE" \
+            --arg version "$VERSION" \
+            --arg amd64 "$amd64_sha" \
+            --arg arm64 "$arm64_sha" \
+            '{
+              buildDefinition: {
+                buildType: $build_type,
+                externalParameters: {
+                  image: $image, platforms: ["linux/amd64", "linux/arm64"], version: $version
+                },
+                internalParameters: {binarySubjects: {amd64: $amd64, arm64: $arm64}},
+                resolvedDependencies: [{uri: $source, digest: {gitCommit: $sha}}]
+              },
+              runDetails: {
+                builder: {id: $builder_id},
+                metadata: {invocationId: $invocation}
+              }
+            }' > image/cairn-image.provenance.json
+          (
+            cd image
+            sha256sum \
+              cairn-image.tar.sha256 IMAGE-DIGEST IMAGE-NAME RELEASE-COMMIT RELEASE-VERSION \
+              cairn-image.provenance.json > IMAGE-METADATA.sha256
+          )
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          subject-name: ${{ steps.m.outputs.image }}
-          subject-digest: ${{ steps.build.outputs.digest }}
+          name: cairn-image-archive
+          path: image/
+          if-no-files-found: error
+          retention-days: 1
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: cairn-image-metadata
+          path: |
+            image/cairn-image.tar.sha256
+            image/IMAGE-DIGEST
+            image/IMAGE-NAME
+            image/RELEASE-COMMIT
+            image/RELEASE-VERSION
+            image/cairn-image.provenance.json
+            image/IMAGE-METADATA.sha256
+          if-no-files-found: error
+          retention-days: 1
+
+  stage-image:
+    name: stage the verified OCI archive under a run-unique tag
+    needs: [verify-ci, image-build]
+    runs-on: ubuntu-24.04
+    permissions:
+      packages: write
+    outputs:
+      candidate: ${{ steps.stage.outputs.candidate }}
+      digest: ${{ steps.stage.outputs.digest }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: cairn-image-archive
+          path: image
+      - name: Verify archive, provenance, and immutable ORAS publisher
+        env:
+          IMAGE: ${{ needs.verify-ci.outputs.image }}
+          VERSION: ${{ needs.verify-ci.outputs.version }}
+        run: |
+          set -euo pipefail
+          test "$(cat image/IMAGE-NAME)" = "$IMAGE"
+          test "$(cat image/RELEASE-COMMIT)" = "$GITHUB_SHA"
+          test "$(cat image/RELEASE-VERSION)" = "$VERSION"
+          (cd image && sha256sum -c IMAGE-METADATA.sha256)
+          (cd image && sha256sum -c cairn-image.tar.sha256)
+          digest="$(cat image/IMAGE-DIGEST)"
+          printf '%s\n' "$digest" | grep -Eq '^sha256:[0-9a-f]{64}$'
+          digest_hex="${digest#sha256:}"
+          actual="$(tar -xOf image/cairn-image.tar "blobs/sha256/${digest_hex}" | sha256sum | awk '{print $1}')"
+          test "$actual" = "$digest_hex"
+          jq -e \
+            --arg build_type "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/.github/workflows/release.yml#image-build" \
+            --arg builder "${GITHUB_SERVER_URL}/${GITHUB_WORKFLOW_REF}" \
+            --arg invocation_prefix "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/" \
+            --arg max_attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg source "git+${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}@${GITHUB_SHA}" \
+            --arg sha "$GITHUB_SHA" \
+            --arg image "$IMAGE" \
+            --arg version "$VERSION" '
+            .buildDefinition.buildType == $build_type
+            and .buildDefinition.externalParameters == {
+              image: $image, platforms: ["linux/amd64", "linux/arm64"], version: $version
+            }
+            and (.buildDefinition.internalParameters | keys == ["binarySubjects"])
+            and (
+              .buildDefinition.internalParameters.binarySubjects
+              | keys == ["amd64", "arm64"]
+            )
+            and (
+              .buildDefinition.internalParameters.binarySubjects.amd64
+              | test("^[0-9a-f]{64}$")
+            )
+            and (
+              .buildDefinition.internalParameters.binarySubjects.arm64
+              | test("^[0-9a-f]{64}$")
+            )
+            and .buildDefinition.resolvedDependencies == [
+              {uri: $source, digest: {gitCommit: $sha}}
+            ]
+            and .runDetails.builder == {id: $builder}
+            and (.runDetails.metadata | keys == ["invocationId"])
+            and (.runDetails.metadata.invocationId | startswith($invocation_prefix))
+            and (
+              .runDetails.metadata.invocationId
+              | ltrimstr($invocation_prefix)
+              | test("^[1-9][0-9]*$")
+            )
+            and (
+              (.runDetails.metadata.invocationId | ltrimstr($invocation_prefix) | tonumber)
+              <= ($max_attempt | tonumber)
+            )
+          ' image/cairn-image.provenance.json >/dev/null
+          archive="${RUNNER_TEMP}/oras_${ORAS_VERSION}_linux_amd64.tar.gz"
+          curl --proto '=https' --tlsv1.2 -fsSL -o "$archive" \
+            "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_amd64.tar.gz"
+          printf '%s  %s\n' "$ORAS_LINUX_AMD64_SHA256" "$archive" | sha256sum -c -
+          tar -xzf "$archive" -C "$RUNNER_TEMP" oras
+      - name: Stage exactly the verified OCI digest
+        id: stage
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE: ${{ needs.verify-ci.outputs.image }}
+        run: |
+          set -euo pipefail
+          digest="$(cat image/IMAGE-DIGEST)"
+          candidate="candidate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          printf '%s' "$GH_TOKEN" \
+            | "${RUNNER_TEMP}/oras" login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          "${RUNNER_TEMP}/oras" cp --from-oci-layout \
+            "image/cairn-image.tar@${digest}" "${IMAGE}:${candidate}"
+          remote="$("${RUNNER_TEMP}/oras" resolve "${IMAGE}:${candidate}")"
+          test "$remote" = "$digest"
+          echo "candidate=$candidate" >> "$GITHUB_OUTPUT"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+  sign-image:
+    name: sign and attest the staged image digest
+    needs: [verify-ci, image-build, stage-image]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: cairn-image-metadata
+          path: image
+      - name: Verify metadata and immutable signing tools
+        env:
+          IMAGE: ${{ needs.verify-ci.outputs.image }}
+          VERSION: ${{ needs.verify-ci.outputs.version }}
+          STAGED_DIGEST: ${{ needs.stage-image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          test "$(cat image/IMAGE-NAME)" = "$IMAGE"
+          test "$(cat image/RELEASE-COMMIT)" = "$GITHUB_SHA"
+          test "$(cat image/RELEASE-VERSION)" = "$VERSION"
+          test "$(cat image/IMAGE-DIGEST)" = "$STAGED_DIGEST"
+          (cd image && sha256sum -c IMAGE-METADATA.sha256)
+          jq -e \
+            --arg build_type "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/.github/workflows/release.yml#image-build" \
+            --arg builder "${GITHUB_SERVER_URL}/${GITHUB_WORKFLOW_REF}" \
+            --arg invocation_prefix "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/" \
+            --arg max_attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg source "git+${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}@${GITHUB_SHA}" \
+            --arg sha "$GITHUB_SHA" \
+            --arg image "$IMAGE" \
+            --arg version "$VERSION" '
+            .buildDefinition.buildType == $build_type
+            and .buildDefinition.externalParameters == {
+              image: $image, platforms: ["linux/amd64", "linux/arm64"], version: $version
+            }
+            and (.buildDefinition.internalParameters | keys == ["binarySubjects"])
+            and (
+              .buildDefinition.internalParameters.binarySubjects
+              | keys == ["amd64", "arm64"]
+            )
+            and (
+              .buildDefinition.internalParameters.binarySubjects.amd64
+              | test("^[0-9a-f]{64}$")
+            )
+            and (
+              .buildDefinition.internalParameters.binarySubjects.arm64
+              | test("^[0-9a-f]{64}$")
+            )
+            and .buildDefinition.resolvedDependencies == [
+              {uri: $source, digest: {gitCommit: $sha}}
+            ]
+            and .runDetails.builder == {id: $builder}
+            and (.runDetails.metadata | keys == ["invocationId"])
+            and (.runDetails.metadata.invocationId | startswith($invocation_prefix))
+            and (
+              .runDetails.metadata.invocationId
+              | ltrimstr($invocation_prefix)
+              | test("^[1-9][0-9]*$")
+            )
+            and (
+              (.runDetails.metadata.invocationId | ltrimstr($invocation_prefix) | tonumber)
+              <= ($max_attempt | tonumber)
+            )
+          ' image/cairn-image.provenance.json >/dev/null
+          archive="${RUNNER_TEMP}/oras_${ORAS_VERSION}_linux_amd64.tar.gz"
+          curl --proto '=https' --tlsv1.2 -fsSL -o "$archive" \
+            "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_amd64.tar.gz"
+          printf '%s  %s\n' "$ORAS_LINUX_AMD64_SHA256" "$archive" | sha256sum -c -
+          tar -xzf "$archive" -C "$RUNNER_TEMP" oras
+          curl --proto '=https' --tlsv1.2 -fsSL -o "${RUNNER_TEMP}/cosign" \
+            "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64"
+          printf '%s  %s\n' "$COSIGN_LINUX_AMD64_SHA256" "${RUNNER_TEMP}/cosign" | sha256sum -c -
+          chmod +x "${RUNNER_TEMP}/cosign"
+      - name: Re-resolve the exact staged digest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE: ${{ needs.verify-ci.outputs.image }}
+          CANDIDATE: ${{ needs.stage-image.outputs.candidate }}
+          STAGED_DIGEST: ${{ needs.stage-image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GH_TOKEN" \
+            | "${RUNNER_TEMP}/oras" login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          test "$("${RUNNER_TEMP}/oras" resolve "${IMAGE}:${CANDIDATE}")" = "$STAGED_DIGEST"
+      - name: Sign the immutable image subject
+        env:
+          DIGEST: ${{ needs.stage-image.outputs.digest }}
+          IMAGE: ${{ needs.verify-ci.outputs.image }}
+        run: |
+          "${RUNNER_TEMP}/cosign" sign --yes "${IMAGE}@${DIGEST}"
+      - uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763
+        with:
+          subject-name: ${{ needs.verify-ci.outputs.image }}
+          subject-digest: ${{ needs.stage-image.outputs.digest }}
+          subject-version: ${{ needs.verify-ci.outputs.version }}
+          predicate-type: https://slsa.dev/provenance/v1
+          predicate-path: image/cairn-image.provenance.json
           push-to-registry: true
 
-  release:
-    name: publish dated release (one active)
-    needs: [verify-ci, binaries, image]
-    runs-on: ubuntu-latest
+  sign-assets:
+    name: sign and attest verified release assets
+    needs: [verify-ci, release-assets, image-build, stage-image]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/checkout@v7   # for the Cargo.lock-based dependency SBOM
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
-          pattern: cairn-*
-          path: artifacts
-      - name: Assemble assets + checksums
+          name: cairn-release-unsigned
+          path: rel
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          pattern: cairn-binary-*
+          path: built
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: cairn-image-metadata
+          path: image
+      - name: Verify asset manifest and build provenance
+        env:
+          IMAGE: ${{ needs.verify-ci.outputs.image }}
+          STAGED_DIGEST: ${{ needs.stage-image.outputs.digest }}
+          VERSION: ${{ needs.verify-ci.outputs.version }}
         run: |
-          mkdir -p rel
-          cp artifacts/cairn-amd64/cairn-linux-amd64 rel/
-          cp artifacts/cairn-arm64/cairn-linux-arm64 rel/
-          ( cd rel && sha256sum cairn-linux-* > SHA256SUMS )
-      # An SPDX SBOM of the Rust dependency tree (read from Cargo.lock), attached to the release.
-      - name: Generate the dependency SBOM
-        uses: anchore/sbom-action@v0
+          set -euo pipefail
+          while read -r arch target; do
+            file_name="cairn-linux-${arch}"
+            source_dir="built/cairn-binary-${arch}"
+            (cd "$source_dir" && sha256sum -c "${file_name}.sha256")
+            test "$(sed -n '1p' "${source_dir}/${file_name}.metadata")" = "commit ${GITHUB_SHA}"
+            test "$(sed -n '2p' "${source_dir}/${file_name}.metadata")" = "version ${VERSION}"
+            test "$(sed -n '3p' "${source_dir}/${file_name}.metadata")" = "target ${target}"
+            jq -e \
+              --arg build_type "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/.github/workflows/release.yml#binaries" \
+              --arg builder "${GITHUB_SERVER_URL}/${GITHUB_WORKFLOW_REF}" \
+              --arg invocation_prefix "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/" \
+              --arg max_attempt "$GITHUB_RUN_ATTEMPT" \
+              --arg source "git+${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}@${GITHUB_SHA}" \
+              --arg sha "$GITHUB_SHA" \
+              --arg target "$target" \
+              --arg version "$VERSION" '
+              .buildDefinition.buildType == $build_type
+              and .buildDefinition.externalParameters == {target: $target, version: $version}
+              and .buildDefinition.internalParameters == {
+                rust: "1.97.1", zig: "0.16.0", cargoZigbuild: "0.23.0"
+              }
+              and .buildDefinition.resolvedDependencies == [
+                {uri: $source, digest: {gitCommit: $sha}}
+              ]
+              and .runDetails.builder == {id: $builder}
+              and (.runDetails.metadata | keys == ["invocationId"])
+              and (.runDetails.metadata.invocationId | startswith($invocation_prefix))
+              and (
+                .runDetails.metadata.invocationId
+                | ltrimstr($invocation_prefix)
+                | test("^[1-9][0-9]*$")
+              )
+              and (
+                (.runDetails.metadata.invocationId | ltrimstr($invocation_prefix) | tonumber)
+                <= ($max_attempt | tonumber)
+              )
+            ' "${source_dir}/${file_name}.provenance.json" >/dev/null
+            cmp -- "${source_dir}/${file_name}" "rel/${file_name}"
+            cmp -- "${source_dir}/${file_name}.provenance.json" \
+              "rel/${file_name}.provenance.json"
+          done <<'TARGETS'
+          amd64 x86_64-unknown-linux-musl
+          arm64 aarch64-unknown-linux-musl
+          TARGETS
+
+          (
+            cd rel
+            sha256sum cairn-linux-amd64 cairn-linux-arm64 \
+              > "${RUNNER_TEMP}/expected-SHA256SUMS"
+            cmp -- "${RUNNER_TEMP}/expected-SHA256SUMS" SHA256SUMS
+            sha256sum -c SHA256SUMS
+          )
+          test "$(cat rel/RELEASE-COMMIT)" = "$GITHUB_SHA"
+          test "$(cat rel/RELEASE-VERSION)" = "$VERSION"
+          (cd rel && sha256sum -c RELEASE-MANIFEST.sha256)
+          test "$(cat image/IMAGE-NAME)" = "$IMAGE"
+          test "$(cat image/RELEASE-COMMIT)" = "$GITHUB_SHA"
+          test "$(cat image/RELEASE-VERSION)" = "$VERSION"
+          test "$(cat image/IMAGE-DIGEST)" = "$STAGED_DIGEST"
+          (cd image && sha256sum -c IMAGE-METADATA.sha256)
+          amd64_sha="$(sha256sum rel/cairn-linux-amd64 | awk '{print $1}')"
+          arm64_sha="$(sha256sum rel/cairn-linux-arm64 | awk '{print $1}')"
+          jq -e \
+            --arg build_type "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/.github/workflows/release.yml#image-build" \
+            --arg builder "${GITHUB_SERVER_URL}/${GITHUB_WORKFLOW_REF}" \
+            --arg invocation_prefix "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/" \
+            --arg max_attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg source "git+${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}@${GITHUB_SHA}" \
+            --arg sha "$GITHUB_SHA" \
+            --arg image "$IMAGE" \
+            --arg version "$VERSION" \
+            --arg amd64 "$amd64_sha" \
+            --arg arm64 "$arm64_sha" '
+            .buildDefinition.buildType == $build_type
+            and .buildDefinition.externalParameters == {
+              image: $image, platforms: ["linux/amd64", "linux/arm64"], version: $version
+            }
+            and .buildDefinition.internalParameters == {
+              binarySubjects: {amd64: $amd64, arm64: $arm64}
+            }
+            and .buildDefinition.resolvedDependencies == [
+              {uri: $source, digest: {gitCommit: $sha}}
+            ]
+            and .runDetails.builder == {id: $builder}
+            and (.runDetails.metadata | keys == ["invocationId"])
+            and (.runDetails.metadata.invocationId | startswith($invocation_prefix))
+            and (
+              .runDetails.metadata.invocationId
+              | ltrimstr($invocation_prefix)
+              | test("^[1-9][0-9]*$")
+            )
+            and (
+              (.runDetails.metadata.invocationId | ltrimstr($invocation_prefix) | tonumber)
+              <= ($max_attempt | tonumber)
+            )
+          ' image/cairn-image.provenance.json >/dev/null
+          cp image/IMAGE-DIGEST rel/IMAGE-DIGEST
+          cp image/cairn-image.provenance.json rel/
+          curl --proto '=https' --tlsv1.2 -fsSL -o "${RUNNER_TEMP}/cosign" \
+            "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64"
+          printf '%s  %s\n' "$COSIGN_LINUX_AMD64_SHA256" "${RUNNER_TEMP}/cosign" | sha256sum -c -
+          chmod +x "${RUNNER_TEMP}/cosign"
+      - name: Attest the amd64 binary with its unprivileged-build predicate
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763
         with:
-          path: .
-          format: spdx-json
-          output-file: rel/cairn-sbom.spdx.json
-      # SLSA build-provenance attestation for the release binaries (verifiable via `gh attestation`).
-      - uses: actions/attest-build-provenance@v4
+          subject-path: rel/cairn-linux-amd64
+          predicate-type: https://slsa.dev/provenance/v1
+          predicate-path: rel/cairn-linux-amd64.provenance.json
+      - name: Attest the arm64 binary with its unprivileged-build predicate
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763
         with:
-          subject-path: |
-            rel/cairn-linux-amd64
-            rel/cairn-linux-arm64
-      # Keyless (OIDC) detached signature bundles over each binary + the checksums. Consumers verify
-      # with `cosign verify-blob` against the workflow identity + the GitHub OIDC issuer (SECURITY.md).
-      - uses: sigstore/cosign-installer@v3
-      - name: Sign the release assets (keyless)
+          subject-path: rel/cairn-linux-arm64
+          predicate-type: https://slsa.dev/provenance/v1
+          predicate-path: rel/cairn-linux-arm64.provenance.json
+      - name: Sign the release subjects
         run: |
           set -euo pipefail
           cd rel
-          for f in cairn-linux-amd64 cairn-linux-arm64 SHA256SUMS; do
-            cosign sign-blob --yes --bundle "${f}.cosign.bundle" "$f"
+          for file in cairn-linux-amd64 cairn-linux-arm64 SHA256SUMS; do
+            "${RUNNER_TEMP}/cosign" sign-blob --yes --bundle "${file}.cosign.bundle" "$file"
           done
-      - name: Publish the calendar-versioned release and retire the previous one
+          sha256sum \
+            cairn-linux-amd64 cairn-linux-arm64 SHA256SUMS cairn-sbom.spdx.json \
+            cairn-linux-amd64.provenance.json cairn-linux-arm64.provenance.json \
+            cairn-image.provenance.json \
+            cairn-linux-amd64.cosign.bundle cairn-linux-arm64.cosign.bundle \
+            SHA256SUMS.cosign.bundle IMAGE-DIGEST RELEASE-COMMIT RELEASE-VERSION \
+            > PUBLISH-MANIFEST.sha256
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: cairn-release-signed
+          path: |
+            rel/cairn-linux-amd64
+            rel/cairn-linux-arm64
+            rel/SHA256SUMS
+            rel/cairn-sbom.spdx.json
+            rel/IMAGE-DIGEST
+            rel/cairn-linux-amd64.provenance.json
+            rel/cairn-linux-arm64.provenance.json
+            rel/cairn-image.provenance.json
+            rel/cairn-linux-amd64.cosign.bundle
+            rel/cairn-linux-arm64.cosign.bundle
+            rel/SHA256SUMS.cosign.bundle
+            rel/RELEASE-COMMIT
+            rel/RELEASE-VERSION
+            rel/PUBLISH-MANIFEST.sha256
+          if-no-files-found: error
+          retention-days: 1
+
+  publish-release:
+    name: publish the signed calendar-versioned release
+    needs: [verify-ci, stage-image, sign-image, sign-assets]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: cairn-release-signed
+          path: rel
+      - name: Verify the complete signed bundle
         env:
-          GH_TOKEN: ${{ github.token }}
+          IMAGE: ${{ needs.verify-ci.outputs.image }}
+          STAGED_DIGEST: ${{ needs.stage-image.outputs.digest }}
+          VERSION: ${{ needs.verify-ci.outputs.version }}
         run: |
           set -euo pipefail
-          # The SAME calendar version baked into the binaries (see verify-ci), so the tag and the
-          # binaries' `cairn --version` always match.
-          TAG="${{ needs.verify-ci.outputs.version }}"
-          REPO="${{ github.repository }}"
-          IMG="ghcr.io/$(echo "$REPO" | tr '[:upper:]' '[:lower:]')"
-          # recreate cleanly if a release for today already exists
-          gh release delete "$TAG" --repo "$REPO" --yes --cleanup-tag 2>/dev/null || true
-          gh release create "$TAG" --repo "$REPO" --target "${{ github.sha }}" \
-            --title "$TAG" --latest \
-            --notes "Calendar-versioned release \`$TAG\` (vYYYY.MM.DD). Static linux binaries (amd64 + arm64) attached below; the multi-arch container image is \`$IMG:latest\` (always current). Binaries and checksums are cosign-keyless-signed (\`*.cosign.bundle\`), an SPDX dependency SBOM is attached, and both the binaries and the image carry SLSA build-provenance attestations — see SECURITY.md for verification." \
+          test "$(cat rel/RELEASE-COMMIT)" = "$GITHUB_SHA"
+          test "$(cat rel/RELEASE-VERSION)" = "$VERSION"
+          test "$(cat rel/IMAGE-DIGEST)" = "$STAGED_DIGEST"
+          printf '%s\n' "$STAGED_DIGEST" | grep -Eq '^sha256:[0-9a-f]{64}$'
+          (cd rel && sha256sum -c PUBLISH-MANIFEST.sha256)
+          while read -r arch target; do
+            file_name="cairn-linux-${arch}"
+            jq -e \
+              --arg build_type "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/.github/workflows/release.yml#binaries" \
+              --arg builder "${GITHUB_SERVER_URL}/${GITHUB_WORKFLOW_REF}" \
+              --arg invocation_prefix "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/" \
+              --arg max_attempt "$GITHUB_RUN_ATTEMPT" \
+              --arg source "git+${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}@${GITHUB_SHA}" \
+              --arg sha "$GITHUB_SHA" \
+              --arg target "$target" \
+              --arg version "$VERSION" '
+              .buildDefinition.buildType == $build_type
+              and .buildDefinition.externalParameters == {target: $target, version: $version}
+              and .buildDefinition.internalParameters == {
+                rust: "1.97.1", zig: "0.16.0", cargoZigbuild: "0.23.0"
+              }
+              and .buildDefinition.resolvedDependencies == [
+                {uri: $source, digest: {gitCommit: $sha}}
+              ]
+              and .runDetails.builder == {id: $builder}
+              and (.runDetails.metadata | keys == ["invocationId"])
+              and (.runDetails.metadata.invocationId | startswith($invocation_prefix))
+              and (
+                .runDetails.metadata.invocationId
+                | ltrimstr($invocation_prefix)
+                | test("^[1-9][0-9]*$")
+              )
+              and (
+                (.runDetails.metadata.invocationId | ltrimstr($invocation_prefix) | tonumber)
+                <= ($max_attempt | tonumber)
+              )
+            ' "rel/${file_name}.provenance.json" >/dev/null
+          done <<'TARGETS'
+          amd64 x86_64-unknown-linux-musl
+          arm64 aarch64-unknown-linux-musl
+          TARGETS
+          amd64_sha="$(sha256sum rel/cairn-linux-amd64 | awk '{print $1}')"
+          arm64_sha="$(sha256sum rel/cairn-linux-arm64 | awk '{print $1}')"
+          jq -e \
+            --arg build_type "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/.github/workflows/release.yml#image-build" \
+            --arg builder "${GITHUB_SERVER_URL}/${GITHUB_WORKFLOW_REF}" \
+            --arg invocation_prefix "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/" \
+            --arg max_attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg source "git+${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}@${GITHUB_SHA}" \
+            --arg sha "$GITHUB_SHA" \
+            --arg image "$IMAGE" \
+            --arg version "$VERSION" \
+            --arg amd64 "$amd64_sha" \
+            --arg arm64 "$arm64_sha" '
+            .buildDefinition.buildType == $build_type
+            and .buildDefinition.externalParameters == {
+              image: $image, platforms: ["linux/amd64", "linux/arm64"], version: $version
+            }
+            and .buildDefinition.internalParameters == {
+              binarySubjects: {amd64: $amd64, arm64: $arm64}
+            }
+            and .buildDefinition.resolvedDependencies == [
+              {uri: $source, digest: {gitCommit: $sha}}
+            ]
+            and .runDetails.builder == {id: $builder}
+            and (.runDetails.metadata | keys == ["invocationId"])
+            and (.runDetails.metadata.invocationId | startswith($invocation_prefix))
+            and (
+              .runDetails.metadata.invocationId
+              | ltrimstr($invocation_prefix)
+              | test("^[1-9][0-9]*$")
+            )
+            and (
+              (.runDetails.metadata.invocationId | ltrimstr($invocation_prefix) | tonumber)
+              <= ($max_attempt | tonumber)
+            )
+          ' rel/cairn-image.provenance.json >/dev/null
+          archive="${RUNNER_TEMP}/gh_${GH_VERSION}_linux_amd64.tar.gz"
+          curl --proto '=https' --tlsv1.2 -fsSL -o "$archive" \
+            "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz"
+          printf '%s  %s\n' "$GH_LINUX_AMD64_SHA256" "$archive" | sha256sum -c -
+          tar -xzf "$archive" -C "$RUNNER_TEMP"
+      - name: Recover only an exact-commit draft and refuse all conflicts
+        id: release-state
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ needs.verify-ci.outputs.version }}
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          REPO="$REPOSITORY"
+          GH="${RUNNER_TEMP}/gh_${GH_VERSION}_linux_amd64/bin/gh"
+          get_status() {
+            kind="$1"
+            url="$2"
+            response="$3"
+            if ! status="$(curl --proto '=https' --tlsv1.2 -sS -o "$response" -w '%{http_code}' \
+                -H "Authorization: Bearer ${GH_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+              "$url")"; then
+              echo "::error::GitHub API request failed while checking ${kind} ${TAG}" >&2
+              return 1
+            fi
+            case "$status" in
+              200|404) printf '%s' "$status" ;;
+              *)
+                echo "::error::GitHub API returned ${status} while checking ${kind} ${TAG}" >&2
+                return 1
+                ;;
+            esac
+          }
+          delete_resource() {
+            kind="$1"
+            url="$2"
+            response="${RUNNER_TEMP}/delete-${kind}.json"
+            if ! status="$(curl --proto '=https' --tlsv1.2 -sS -o "$response" -w '%{http_code}' \
+                --request DELETE \
+                -H "Authorization: Bearer ${GH_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "$url")"; then
+              echo "::error::GitHub API request failed while deleting recoverable ${kind} ${TAG}" >&2
+              return 1
+            fi
+            if [ "$status" != 204 ]; then
+              echo "::error::GitHub API returned ${status} while deleting recoverable ${kind} ${TAG}" >&2
+              return 1
+            fi
+          }
+          list_releases() {
+            "$GH" api --paginate --slurp \
+              "/repos/${REPO}/releases?per_page=100" > "$1"
+          }
+          matching_release_count() {
+            jq -er --arg tag "$TAG" \
+              '[.[][] | select(.tag_name == $tag)] | length' "$1"
+          }
+          refuse_newer_calver() {
+            releases="$1"
+            release_tags="${RUNNER_TEMP}/existing-release-tags.txt"
+            tag_refs="${RUNNER_TEMP}/existing-release-tag-refs.txt"
+            jq -r '.[][] | .tag_name' "$releases" > "$release_tags"
+            while read -r candidate; do
+              [[ "$candidate" =~ ^v[0-9]{4}\.[0-9]{2}\.[0-9]{2}$ ]] || continue
+              if [[ "$candidate" > "$TAG" ]]; then
+                echo "::error::newer CalVer release ${candidate} exists; refusing to promote ${TAG} backward" >&2
+                return 1
+              fi
+            done < "$release_tags"
+            "$GH" api --paginate \
+              "/repos/${REPO}/git/matching-refs/tags/v?per_page=100" \
+              --jq '.[].ref' > "$tag_refs"
+            while read -r ref; do
+              ref_path="${ref#refs/tags/}"
+              [ "$ref_path" != "$ref" ] || continue
+              [[ "$ref_path" =~ ^v[0-9]{4}\.[0-9]{2}\.[0-9]{2}$ ]] || continue
+              if [[ "$ref_path" > "$TAG" ]]; then
+                echo "::error::newer CalVer tag ${ref_path} exists; refusing to promote ${TAG} backward" >&2
+                return 1
+              fi
+            done < "$tag_refs"
+          }
+          verify_exact_tag() {
+            jq -e --arg tag "$TAG" --arg sha "$GITHUB_SHA" '
+              .ref == ("refs/tags/" + $tag)
+              and .object.type == "commit"
+              and .object.sha == $sha
+            ' "$1" >/dev/null
+          }
+          verify_published_assets() {
+            destination="${RUNNER_TEMP}/existing-release-assets"
+            expected="${RUNNER_TEMP}/expected-release-assets.txt"
+            actual="${RUNNER_TEMP}/actual-release-assets.txt"
+            mkdir "$destination"
+            "$GH" release download "$TAG" --repo "$REPO" --dir "$destination"
+            cat > "$expected" <<'ASSETS'
+          IMAGE-DIGEST
+          PUBLISH-MANIFEST.sha256
+          RELEASE-COMMIT
+          RELEASE-VERSION
+          SHA256SUMS
+          SHA256SUMS.cosign.bundle
+          cairn-image.provenance.json
+          cairn-linux-amd64
+          cairn-linux-amd64.cosign.bundle
+          cairn-linux-amd64.provenance.json
+          cairn-linux-arm64
+          cairn-linux-arm64.cosign.bundle
+          cairn-linux-arm64.provenance.json
+          cairn-sbom.spdx.json
+          ASSETS
+            (
+              cd "$destination"
+              printf '%s\n' * | LC_ALL=C sort
+            ) > "$actual"
+            LC_ALL=C sort "$expected" -o "$expected"
+            cmp -- "$expected" "$actual"
+            while read -r asset; do
+              cmp -- "rel/${asset}" "${destination}/${asset}"
+            done < "$expected"
+          }
+
+          releases_json="${RUNNER_TEMP}/existing-releases.json"
+          release_json="${RUNNER_TEMP}/existing-release.json"
+          tag_json="${RUNNER_TEMP}/existing-tag.json"
+          tag_url="${GITHUB_API_URL}/repos/${REPO}/git/ref/tags/${TAG}"
+          list_releases "$releases_json"
+          refuse_newer_calver "$releases_json"
+          release_count="$(matching_release_count "$releases_json")"
+          tag_status="$(get_status tag "$tag_url" "$tag_json")"
+
+          if [ "$release_count" = 0 ]; then
+            if [ "$tag_status" = 200 ]; then
+              echo "::error::tag ${TAG} already exists without a release; refusing to replace it" >&2
+              exit 1
+            fi
+            echo "published=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$release_count" != 1 ]; then
+            echo "::error::found ${release_count} releases named ${TAG}; refusing ambiguous recovery" >&2
+            exit 1
+          fi
+          jq -e --arg tag "$TAG" \
+            '[.[][] | select(.tag_name == $tag)] | .[0]' \
+            "$releases_json" > "$release_json"
+
+          if jq -e --arg tag "$TAG" --arg sha "$GITHUB_SHA" '
+            .draft == false
+            and .prerelease == false
+            and .tag_name == $tag
+            and .target_commitish == $sha
+          ' "$release_json" >/dev/null; then
+            if [ "$tag_status" != 200 ] || ! verify_exact_tag "$tag_json"; then
+              echo "::error::published release ${TAG} is not bound to the exact lightweight tag" >&2
+              exit 1
+            fi
+            verify_published_assets
+            echo "published=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if ! jq -e --arg tag "$TAG" --arg sha "$GITHUB_SHA" '
+            .draft == true
+            and .prerelease == false
+            and .tag_name == $tag
+            and .target_commitish == $sha
+            and (.id | type == "number")
+          ' "$release_json" >/dev/null; then
+            echo "::error::release ${TAG} already exists and is not a recoverable exact-commit draft" >&2
+            exit 1
+          fi
+          release_id="$(jq -er '.id | tostring' "$release_json")"
+
+          if [ "$tag_status" = 200 ]; then
+            if ! verify_exact_tag "$tag_json"; then
+              echo "::error::tag ${TAG} conflicts with the recoverable draft" >&2
+              exit 1
+            fi
+            # Delete the checked lightweight tag first. If draft deletion then fails, a rerun still
+            # sees the exact-commit draft and can safely finish recovery.
+            delete_resource exact-draft-tag \
+              "${GITHUB_API_URL}/repos/${REPO}/git/refs/tags/${TAG}"
+            test "$(get_status tag "$tag_url" "$tag_json")" = 404
+          fi
+
+          delete_resource exact-commit-draft \
+            "${GITHUB_API_URL}/repos/${REPO}/releases/${release_id}"
+          list_releases "$releases_json"
+          test "$(matching_release_count "$releases_json")" = 0
+          echo "published=false" >> "$GITHUB_OUTPUT"
+      - name: Upload and verify a draft release, then publish it at the exact commit
+        if: steps.release-state.outputs.published != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE: ${{ needs.verify-ci.outputs.image }}
+          DIGEST: ${{ needs.stage-image.outputs.digest }}
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ needs.verify-ci.outputs.version }}
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          REPO="$REPOSITORY"
+          GH="${RUNNER_TEMP}/gh_${GH_VERSION}_linux_amd64/bin/gh"
+          "$GH" release create "$TAG" --repo "$REPO" --target "$GITHUB_SHA" \
+            --title "$TAG" --draft \
+            --notes "Calendar-versioned release \`$TAG\` (vYYYY.MM.DD). Static linux binaries (amd64 + arm64) are attached below. The signed immutable multi-arch container subject is \`$IMAGE@$DIGEST\`; after this workflow completes, \`$IMAGE:$TAG\` and \`$IMAGE:latest\` resolve to that same digest. Binaries and checksums are cosign-keyless-signed (\`*.cosign.bundle\`), an SPDX dependency SBOM is attached, and both the binaries and image carry SLSA build-provenance attestations — see SECURITY.md for verification." \
             rel/cairn-linux-amd64 rel/cairn-linux-arm64 rel/SHA256SUMS \
-            rel/cairn-sbom.spdx.json \
-            rel/cairn-linux-amd64.cosign.bundle rel/cairn-linux-arm64.cosign.bundle rel/SHA256SUMS.cosign.bundle
-          # one active release: delete every OTHER release and its tag
-          gh release list --repo "$REPO" --limit 200 --json tagName --jq '.[].tagName' \
-            | while read -r t; do
-                [ -z "$t" ] && continue
-                [ "$t" = "$TAG" ] && continue
-                echo "retiring previous release: $t"
-                gh release delete "$t" --repo "$REPO" --yes --cleanup-tag || true
-              done
+            rel/cairn-sbom.spdx.json rel/IMAGE-DIGEST rel/PUBLISH-MANIFEST.sha256 \
+            rel/cairn-linux-amd64.provenance.json rel/cairn-linux-arm64.provenance.json \
+            rel/cairn-image.provenance.json rel/RELEASE-COMMIT rel/RELEASE-VERSION \
+            rel/cairn-linux-amd64.cosign.bundle rel/cairn-linux-arm64.cosign.bundle \
+            rel/SHA256SUMS.cosign.bundle
+          "$GH" release view "$TAG" --repo "$REPO" --json isDraft,assets --jq '
+            .isDraft
+            and ([.assets[].name] | sort) == ([
+              "IMAGE-DIGEST",
+              "PUBLISH-MANIFEST.sha256",
+              "RELEASE-COMMIT",
+              "RELEASE-VERSION",
+              "SHA256SUMS",
+              "SHA256SUMS.cosign.bundle",
+              "cairn-image.provenance.json",
+              "cairn-linux-amd64",
+              "cairn-linux-amd64.cosign.bundle",
+              "cairn-linux-amd64.provenance.json",
+              "cairn-linux-arm64",
+              "cairn-linux-arm64.cosign.bundle",
+              "cairn-linux-arm64.provenance.json",
+              "cairn-sbom.spdx.json"
+            ] | sort)
+          ' | grep -Fx true
+          "$GH" release edit "$TAG" --repo "$REPO" --draft=false --latest \
+            --target "$GITHUB_SHA"
+          ref="$("$GH" api "/repos/${REPO}/git/ref/tags/${TAG}")"
+          test "$(printf '%s' "$ref" | jq -r '.object.type')" = "commit"
+          test "$(printf '%s' "$ref" | jq -r '.object.sha')" = "$GITHUB_SHA"
+
+  promote-latest:
+    name: promote the signed digest to version and latest tags
+    needs: [verify-ci, stage-image, sign-image, sign-assets, publish-release]
+    runs-on: ubuntu-24.04
+    permissions:
+      packages: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: cairn-image-metadata
+          path: image
+      - name: Verify metadata and immutable promotion tools
+        env:
+          IMAGE: ${{ needs.verify-ci.outputs.image }}
+          STAGED_DIGEST: ${{ needs.stage-image.outputs.digest }}
+          VERSION: ${{ needs.verify-ci.outputs.version }}
+        run: |
+          set -euo pipefail
+          test "$(cat image/IMAGE-NAME)" = "$IMAGE"
+          test "$(cat image/RELEASE-COMMIT)" = "$GITHUB_SHA"
+          test "$(cat image/RELEASE-VERSION)" = "$VERSION"
+          test "$(cat image/IMAGE-DIGEST)" = "$STAGED_DIGEST"
+          (cd image && sha256sum -c IMAGE-METADATA.sha256)
+          jq -e \
+            --arg build_type "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/.github/workflows/release.yml#image-build" \
+            --arg builder "${GITHUB_SERVER_URL}/${GITHUB_WORKFLOW_REF}" \
+            --arg invocation_prefix "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/" \
+            --arg max_attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg source "git+${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}@${GITHUB_SHA}" \
+            --arg sha "$GITHUB_SHA" \
+            --arg image "$IMAGE" \
+            --arg version "$VERSION" '
+            .buildDefinition.buildType == $build_type
+            and .buildDefinition.externalParameters == {
+              image: $image, platforms: ["linux/amd64", "linux/arm64"], version: $version
+            }
+            and (.buildDefinition.internalParameters | keys == ["binarySubjects"])
+            and (
+              .buildDefinition.internalParameters.binarySubjects
+              | keys == ["amd64", "arm64"]
+            )
+            and (
+              .buildDefinition.internalParameters.binarySubjects.amd64
+              | test("^[0-9a-f]{64}$")
+            )
+            and (
+              .buildDefinition.internalParameters.binarySubjects.arm64
+              | test("^[0-9a-f]{64}$")
+            )
+            and .buildDefinition.resolvedDependencies == [
+              {uri: $source, digest: {gitCommit: $sha}}
+            ]
+            and .runDetails.builder == {id: $builder}
+            and (.runDetails.metadata | keys == ["invocationId"])
+            and (.runDetails.metadata.invocationId | startswith($invocation_prefix))
+            and (
+              .runDetails.metadata.invocationId
+              | ltrimstr($invocation_prefix)
+              | test("^[1-9][0-9]*$")
+            )
+            and (
+              (.runDetails.metadata.invocationId | ltrimstr($invocation_prefix) | tonumber)
+              <= ($max_attempt | tonumber)
+            )
+          ' image/cairn-image.provenance.json >/dev/null
+          archive="${RUNNER_TEMP}/oras_${ORAS_VERSION}_linux_amd64.tar.gz"
+          curl --proto '=https' --tlsv1.2 -fsSL -o "$archive" \
+            "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_amd64.tar.gz"
+          printf '%s  %s\n' "$ORAS_LINUX_AMD64_SHA256" "$archive" | sha256sum -c -
+          tar -xzf "$archive" -C "$RUNNER_TEMP" oras
+          curl --proto '=https' --tlsv1.2 -fsSL -o "${RUNNER_TEMP}/cosign" \
+            "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64"
+          printf '%s  %s\n' "$COSIGN_LINUX_AMD64_SHA256" "${RUNNER_TEMP}/cosign" | sha256sum -c -
+          chmod +x "${RUNNER_TEMP}/cosign"
+      - name: Verify the signed candidate and promote immutable digest
+        env:
+          CANDIDATE: ${{ needs.stage-image.outputs.candidate }}
+          DIGEST: ${{ needs.stage-image.outputs.digest }}
+          GH_TOKEN: ${{ github.token }}
+          IMAGE: ${{ needs.verify-ci.outputs.image }}
+          VERSION: ${{ needs.verify-ci.outputs.version }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GH_TOKEN" \
+            | "${RUNNER_TEMP}/oras" login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          test "$("${RUNNER_TEMP}/oras" resolve "${IMAGE}:${CANDIDATE}")" = "$DIGEST"
+          identity="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/.github/workflows/release.yml@${GITHUB_REF}"
+          "${RUNNER_TEMP}/cosign" verify \
+            --certificate-identity "$identity" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "${IMAGE}@${DIGEST}"
+          "${RUNNER_TEMP}/oras" cp "${IMAGE}@${DIGEST}" "${IMAGE}:${VERSION}"
+          test "$("${RUNNER_TEMP}/oras" resolve "${IMAGE}:${VERSION}")" = "$DIGEST"
+          "${RUNNER_TEMP}/oras" cp "${IMAGE}@${DIGEST}" "${IMAGE}:latest"
+          test "$("${RUNNER_TEMP}/oras" resolve "${IMAGE}:latest")" = "$DIGEST"
+
+  retire-prior-releases:
+    name: retire releases older than the promoted release
+    needs: [verify-ci, promote-latest]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Install checksum-pinned GitHub CLI
+        run: |
+          set -euo pipefail
+          archive="${RUNNER_TEMP}/gh_${GH_VERSION}_linux_amd64.tar.gz"
+          curl --proto '=https' --tlsv1.2 -fsSL -o "$archive" \
+            "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz"
+          printf '%s  %s\n' "$GH_LINUX_AMD64_SHA256" "$archive" | sha256sum -c -
+          tar -xzf "$archive" -C "$RUNNER_TEMP"
+      - name: Retire and verify every strictly older Cairn CalVer release and tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ needs.verify-ci.outputs.version }}
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          REPO="$REPOSITORY"
+          GH="${RUNNER_TEMP}/gh_${GH_VERSION}_linux_amd64/bin/gh"
+          releases="${RUNNER_TEMP}/cairn-releases.tsv"
+          refs="${RUNNER_TEMP}/cairn-tag-refs.txt"
+
+          current_release="$("$GH" api "/repos/${REPO}/releases/tags/${TAG}")"
+          printf '%s' "$current_release" | jq -e --arg tag "$TAG" '
+            .tag_name == $tag and .draft == false
+          ' >/dev/null
+          current_ref="$("$GH" api "/repos/${REPO}/git/ref/tags/${TAG}")"
+          printf '%s' "$current_ref" | jq -e --arg sha "$GITHUB_SHA" '
+            .object.type == "commit" and .object.sha == $sha
+          ' >/dev/null
+
+          "$GH" api --paginate "/repos/${REPO}/releases?per_page=100" \
+            --jq '.[] | [.id, .tag_name] | @tsv' > "$releases"
+          while IFS=$'\t' read -r release_id previous; do
+            [[ "$previous" =~ ^v[0-9]{4}\.[0-9]{2}\.[0-9]{2}$ ]] || continue
+            [ "$previous" = "$TAG" ] && continue
+            [[ "$previous" < "$TAG" ]] || continue
+            [[ "$release_id" =~ ^[0-9]+$ ]]
+            echo "retiring prior CalVer release: $previous"
+            "$GH" api --method DELETE "/repos/${REPO}/releases/${release_id}"
+          done < "$releases"
+
+          "$GH" api --paginate \
+            "/repos/${REPO}/git/matching-refs/tags/v?per_page=100" \
+            --jq '.[].ref' > "$refs"
+          while read -r ref; do
+            ref_path="${ref#refs/tags/}"
+            [ "$ref_path" != "$ref" ] || continue
+            [[ "$ref_path" =~ ^v[0-9]{4}\.[0-9]{2}\.[0-9]{2}$ ]] || continue
+            [ "$ref_path" = "$TAG" ] && continue
+            [[ "$ref_path" < "$TAG" ]] || continue
+            echo "retiring prior CalVer tag: $ref_path"
+            "$GH" api --method DELETE \
+              "/repos/${REPO}/git/refs/tags/${ref_path}"
+          done < "$refs"
+
+          "$GH" api --paginate "/repos/${REPO}/releases?per_page=100" \
+            --jq '.[] | [.id, .tag_name] | @tsv' > "$releases"
+          while IFS=$'\t' read -r release_id remaining; do
+            [[ "$remaining" =~ ^v[0-9]{4}\.[0-9]{2}\.[0-9]{2}$ ]] || continue
+            [ "$remaining" = "$TAG" ] && continue
+            [[ "$remaining" < "$TAG" ]] || continue
+            echo "::error::prior CalVer release remains after retirement: ${remaining} (${release_id})" >&2
+            exit 1
+          done < "$releases"
+
+          "$GH" api --paginate \
+            "/repos/${REPO}/git/matching-refs/tags/v?per_page=100" \
+            --jq '.[].ref' > "$refs"
+          while read -r ref; do
+            ref_path="${ref#refs/tags/}"
+            [ "$ref_path" != "$ref" ] || continue
+            [[ "$ref_path" =~ ^v[0-9]{4}\.[0-9]{2}\.[0-9]{2}$ ]] || continue
+            [ "$ref_path" = "$TAG" ] && continue
+            [[ "$ref_path" < "$TAG" ]] || continue
+            echo "::error::prior CalVer tag remains after retirement: ${ref_path}" >&2
+            exit 1
+          done < "$refs"

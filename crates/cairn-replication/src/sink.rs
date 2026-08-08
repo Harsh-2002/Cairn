@@ -12,10 +12,16 @@
 //! (`signing_key`/`canonical_request`/`string_to_sign`/`compute_signature`), with
 //! `x-amz-content-sha256` set to the SHA-256 of the (buffered) payload. The body is read fully
 //! into memory before signing because a signed-payload PUT must hash the bytes; a streaming
-//! `UNSIGNED-PAYLOAD` variant is a future extension.
+//! `UNSIGNED-PAYLOAD` variant is a future extension. This exception to Cairn's normal streaming
+//! data path is bounded twice: 2 GiB per object, and one process-wide weighted byte budget shared
+//! by every sink through [`ReplicationSinkRuntime`].
+//!
+//! One wall-clock delivery deadline covers request upload, response head, and the bounded response
+//! drain. Non-success diagnostics retain at most [`MAX_RESPONSE_DIAGNOSTIC_BYTES`] including an
+//! explicit truncation marker, so a stalled or hostile destination cannot pin or OOM a worker.
 //!
 //! ## Error classification
-//! Network failures and `5xx` responses are [`ReplicationError::Retryable`]; `4xx` responses
+//! Network failures and `5xx` responses are [`ReplicationError::Unavailable`]; `4xx` responses
 //! are [`ReplicationError::Terminal`] except `408 Request Timeout` and `429 Too Many Requests`,
 //! which are transient and therefore retryable. The engine's outbox machinery turns a retryable
 //! failure into a backed-off re-attempt and a terminal one into operator-visible failure.
@@ -52,6 +58,7 @@
 
 use base64::Engine as _;
 use cairn_auth::{canonical_request, compute_signature, sha256_hex, signing_key, string_to_sign};
+use cairn_types::SecretString;
 use cairn_types::error::ReplicationError;
 use cairn_types::id::{BucketName, ObjectKey, VersionId};
 use cairn_types::object::{ChecksumAlgorithm, StorageClass};
@@ -61,9 +68,9 @@ use cairn_types::traits::Clock;
 use futures_util::StreamExt;
 use http::{Method, Request, Uri};
 use http_body_util::{BodyExt, Full};
+use hyper::body::Incoming;
 use hyper_rustls::HttpsConnector;
 use hyper_util::client::legacy::Client;
-use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::aws_lc_rs;
@@ -73,6 +80,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// The S3 service name in the SigV4 credential scope.
 const SERVICE: &str = "s3";
@@ -94,9 +103,136 @@ const REPLICA_ACL_KEY: &str = "cairn-replica-acl";
 /// exhausts memory and OOM-kills the node — and, because the claimed outbox entry is re-leased on
 /// restart, it re-buffers and OOMs again in a permanent crash loop (audit 2026-07). An object past
 /// this cap fails replication terminally (parked, not retried). A future streaming
-/// `UNSIGNED-PAYLOAD` PUT would remove the buffer entirely; until then this is a fixed bound rather
-/// than an operator knob (mirrors the webhook response-body cap).
-const MAX_BUFFERED_BODY_BYTES: usize = 2 * 1024 * 1024 * 1024; // 2 GiB
+/// `UNSIGNED-PAYLOAD` PUT would remove the buffer entirely. Until then this per-object ceiling is
+/// paired with the configurable process-wide [`ReplicationSinkRuntime`] budget.
+pub const MAX_BUFFERED_OBJECT_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
+/// The default process-wide memory budget for buffered replication payloads. One maximum-sized
+/// object fits, but adding workers or destinations does not multiply the allowance.
+pub const DEFAULT_REPLICATION_BUFFER_BUDGET_BYTES: u64 = MAX_BUFFERED_OBJECT_BYTES;
+/// The largest useful aggregate budget: the maximum 64 workers can each hold at most one
+/// [`MAX_BUFFERED_OBJECT_BYTES`] payload. A larger value could never be consumed and is rejected as
+/// an operator typo.
+pub const MAX_REPLICATION_BUFFER_BUDGET_BYTES: u64 = 64 * MAX_BUFFERED_OBJECT_BYTES;
+/// Default wall-clock deadline for one destination delivery, including request upload, response
+/// head, and the bounded response-body drain.
+pub const DEFAULT_REPLICATION_DELIVERY_TIMEOUT_SECS: u64 = 3_600;
+/// Upper validation bound for a destination delivery deadline. Even an operator typo cannot let a
+/// configured peer retain a worker for longer than one day.
+pub const MAX_REPLICATION_DELIVERY_TIMEOUT_SECS: u64 = 86_400;
+/// Maximum bytes retained from a non-success response for operator diagnostics, including the
+/// truncation marker. The peer controls this body, so this is a security boundary rather than a
+/// display preference.
+pub const MAX_RESPONSE_DIAGNOSTIC_BYTES: usize = 8 * 1024;
+const DIAGNOSTIC_TRUNCATED_SUFFIX: &str = " …[truncated]";
+const DIAGNOSTIC_READ_ERROR_SUFFIX: &str = " …[body read failed]";
+const DIAGNOSTIC_SUFFIX_RESERVE: usize = 32;
+
+/// Process-wide resources shared by every production replication sink.
+///
+/// Cloning this value preserves the same weighted byte semaphore. The server constructs exactly one
+/// instance and threads clones through every env, named, and stored-target sink, so worker count and
+/// destination fan-out cannot multiply the configured memory allowance. The delivery timeout is
+/// carried alongside the budget to make it a required part of every construction path.
+#[derive(Clone)]
+pub struct ReplicationSinkRuntime {
+    buffer_budget: Arc<Semaphore>,
+    buffer_budget_bytes: u64,
+    delivery_timeout: Duration,
+}
+
+impl std::fmt::Debug for ReplicationSinkRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReplicationSinkRuntime")
+            .field("buffer_budget_bytes", &self.buffer_budget_bytes)
+            .field("delivery_timeout", &self.delivery_timeout)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ReplicationSinkRuntime {
+    /// Build the shared runtime limits.
+    ///
+    /// # Errors
+    /// Returns [`ReplicationError::Terminal`] when either limit is zero, exceeds its documented
+    /// ceiling, or cannot be represented by Tokio's semaphore on this target architecture.
+    pub fn new(
+        buffer_budget_bytes: u64,
+        delivery_timeout: Duration,
+    ) -> Result<Self, ReplicationError> {
+        if !(1..=MAX_REPLICATION_BUFFER_BUDGET_BYTES).contains(&buffer_budget_bytes) {
+            return Err(ReplicationError::Terminal(format!(
+                "replication buffer budget must be between 1 and \
+                 {MAX_REPLICATION_BUFFER_BUDGET_BYTES} bytes"
+            )));
+        }
+        let permits = usize::try_from(buffer_budget_bytes).map_err(|_| {
+            ReplicationError::Terminal(
+                "replication buffer budget does not fit this target architecture".to_owned(),
+            )
+        })?;
+        if permits > Semaphore::MAX_PERMITS {
+            return Err(ReplicationError::Terminal(format!(
+                "replication buffer budget exceeds this runtime's {}-byte semaphore ceiling",
+                Semaphore::MAX_PERMITS
+            )));
+        }
+        if delivery_timeout.is_zero()
+            || delivery_timeout > Duration::from_secs(MAX_REPLICATION_DELIVERY_TIMEOUT_SECS)
+        {
+            return Err(ReplicationError::Terminal(format!(
+                "replication delivery timeout must be between 1ns and \
+                 {MAX_REPLICATION_DELIVERY_TIMEOUT_SECS} seconds"
+            )));
+        }
+        Ok(Self {
+            buffer_budget: Arc::new(Semaphore::new(permits)),
+            buffer_budget_bytes,
+            delivery_timeout,
+        })
+    }
+
+    /// Reserve the declared logical size before reading any source byte. Tokio's semaphore is
+    /// weighted and fair; the owned permit releases on every success, error, timeout, or task
+    /// cancellation path.
+    async fn reserve_buffer(
+        &self,
+        object_bytes: u64,
+    ) -> Result<Option<OwnedSemaphorePermit>, ReplicationError> {
+        if object_bytes > MAX_BUFFERED_OBJECT_BYTES {
+            return Err(ReplicationError::Terminal(format!(
+                "object body exceeds the {MAX_BUFFERED_OBJECT_BYTES}-byte per-object replication \
+                 buffer cap; this object will not replicate until streaming uploads land"
+            )));
+        }
+        if object_bytes > self.buffer_budget_bytes {
+            return Err(ReplicationError::Terminal(format!(
+                "object body is {object_bytes} bytes, larger than the configured \
+                 {}-byte process-wide replication buffer budget",
+                self.buffer_budget_bytes
+            )));
+        }
+        if object_bytes == 0 {
+            return Ok(None);
+        }
+        // The per-object ceiling is 2 GiB, safely inside `u32`; Tokio's weighted acquisition takes
+        // a `u32` even though the semaphore itself may contain a larger process-wide budget.
+        let permits = u32::try_from(object_bytes).map_err(|_| {
+            ReplicationError::Terminal(
+                "object size cannot be represented by the replication byte budget".to_owned(),
+            )
+        })?;
+        self.buffer_budget
+            .clone()
+            .acquire_many_owned(permits)
+            .await
+            .map(Some)
+            .map_err(|_| {
+                ReplicationError::Retryable(
+                    "process-wide replication buffer budget closed".to_owned(),
+                )
+            })
+    }
+}
 
 /// Connection parameters for a remote S3-compatible replication destination.
 #[derive(Debug, Clone)]
@@ -118,7 +254,7 @@ pub struct S3SinkConfig {
     /// The destination access-key id.
     pub access_key_id: String,
     /// The destination secret access key.
-    pub secret_access_key: String,
+    pub secret_access_key: SecretString,
     /// An optional PEM bundle of CA certificates to trust for a `https://` endpoint, instead of
     /// the built-in webpki roots. Use this to replicate to a peer that presents a certificate
     /// signed by a private CA. Ignored for `http://` endpoints. Mutually exclusive with
@@ -160,14 +296,18 @@ pub struct S3SinkConfig {
 /// destination bucket per request from the source bucket.
 pub struct HttpS3Sink {
     config: S3SinkConfig,
+    /// Process-wide buffer admission and the per-delivery deadline. Every sink in the process must
+    /// receive a clone of the same value; making it constructor-required prevents a target path
+    /// from silently creating an independent budget.
+    runtime: ReplicationSinkRuntime,
     /// The scheme of the endpoint (`http` or `https`), parsed once at construction. Reused when
     /// building each request URI so the connector dials the right transport.
     scheme: String,
     /// The scheme/authority of the endpoint, parsed once at construction (e.g. `s3.example.com:9000`).
     authority: String,
     /// The HTTP(S) client. The TLS-or-plaintext connector serves both schemes, and its HTTP layer
-    /// resolves through the SSRF-guarded resolver.
-    client: Client<HttpsConnector<HttpConnector<cairn_net::GuardedResolver>>, Full<bytes::Bytes>>,
+    /// rejects blocked literal hosts and resolves hostnames through the SSRF-guarded resolver.
+    client: Client<HttpsConnector<cairn_net::GuardedHttpConnector>, Full<bytes::Bytes>>,
     /// The clock supplying the SigV4 request time; injected so signing is deterministic in tests.
     clock: Arc<dyn Clock>,
 }
@@ -180,6 +320,7 @@ impl std::fmt::Debug for HttpS3Sink {
             .field("dest_buckets", &self.config.dest_buckets)
             .field("region", &self.config.region)
             .field("access_key_id", &self.config.access_key_id)
+            .field("runtime", &self.runtime)
             .finish_non_exhaustive()
     }
 }
@@ -192,8 +333,11 @@ impl HttpS3Sink {
     /// Returns [`ReplicationError::Terminal`] if the endpoint URL is malformed or names a scheme
     /// other than `http`/`https`; a misconfiguration is a permanent, operator-actionable problem,
     /// not a transient one.
-    pub fn new(config: S3SinkConfig) -> Result<Self, ReplicationError> {
-        Self::with_clock(config, Arc::new(SystemClock))
+    pub fn new(
+        config: S3SinkConfig,
+        runtime: ReplicationSinkRuntime,
+    ) -> Result<Self, ReplicationError> {
+        Self::with_clock(config, runtime, Arc::new(SystemClock))
     }
 
     /// Construct a sink with an injected [`Clock`]. Tests pass a fixed clock so the signed
@@ -203,6 +347,7 @@ impl HttpS3Sink {
     /// As [`HttpS3Sink::new`].
     pub fn with_clock(
         config: S3SinkConfig,
+        runtime: ReplicationSinkRuntime,
         clock: Arc<dyn Clock>,
     ) -> Result<Self, ReplicationError> {
         let uri: Uri = config
@@ -226,9 +371,9 @@ impl HttpS3Sink {
         // One connector serves both transports: `.https_or_http()` dials plaintext for `http://`
         // and negotiates rustls for `https://`. `enable_http1()` matches the HTTP/1.1 protocol the
         // legacy client speaks. The TLS trust source is per-target (CA path / skip-verify /
-        // webpki); see `build_tls_connector`. The HTTP layer dials through the SSRF-guarded resolver
-        // so a target that resolves to a loopback/private/metadata address is refused at connect
-        // time (ARCH 27), unless the operator set `allow_internal_endpoints`.
+        // webpki); see `build_tls_connector`. The HTTP layer dials through the SSRF-guarded connector
+        // so a target that names or resolves to a loopback/private/metadata address is refused at
+        // connect time (ARCH 27), unless the operator set `allow_internal_endpoints`.
         let builder = build_tls_connector_builder(&config)?;
         let guard = cairn_net::GuardConfig::new(config.allow_internal_endpoints);
         let https = builder
@@ -239,6 +384,7 @@ impl HttpS3Sink {
 
         Ok(Self {
             config,
+            runtime,
             scheme,
             authority,
             client,
@@ -279,28 +425,38 @@ impl HttpS3Sink {
         let request =
             self.build_signed_request(method, dest_bucket, key, body, content_type, user_headers)?;
 
-        // A connection/transport failure means the destination node is unreachable: classify it
-        // `Unavailable` so the entry retries without burning the terminal attempt budget (a target
-        // that is down for hours then returns must auto-resume, not exhaust to terminal).
-        let response = self
-            .client
-            .request(request)
-            .await
-            .map_err(|e| ReplicationError::Unavailable(format!("transport error: {e}")))?;
+        // One wall-clock deadline encloses the upload, waiting for the response head, and the
+        // bounded body drain. A peer that trickles bytes cannot reset it, and cancellation drops
+        // the request body while the caller's RAII buffer reservation is still guaranteed to
+        // release on return.
+        let delivery = async {
+            // A connection/transport failure means the destination node is unreachable: classify it
+            // `Unavailable` so the entry retries without burning the terminal attempt budget (a
+            // target that is down for hours then returns must auto-resume, not exhaust to terminal).
+            let response = self
+                .client
+                .request(request)
+                .await
+                .map_err(|e| ReplicationError::Unavailable(format!("transport error: {e}")))?;
 
-        let status = response.status();
-        if status.is_success() {
-            return Ok(());
-        }
-
-        // Drain the (bounded, error) body so the message can quote it, ignoring read errors.
-        let detail = response
-            .into_body()
-            .collect()
+            let status = response.status();
+            // PUT/DELETE success bodies are normally empty, but still drain them under the same
+            // strict cap and deadline so a compromised peer cannot retain the connection or worker.
+            let detail = read_bounded_diagnostic(response.into_body()).await;
+            if status.is_success() {
+                Ok(())
+            } else {
+                Err(classify_status(status.as_u16(), &detail))
+            }
+        };
+        tokio::time::timeout(self.runtime.delivery_timeout, delivery)
             .await
-            .map(|b| String::from_utf8_lossy(&b.to_bytes()).into_owned())
-            .unwrap_or_default();
-        Err(classify_status(status.as_u16(), &detail))
+            .map_err(|_| {
+                ReplicationError::Unavailable(format!(
+                    "destination delivery exceeded the {:?} deadline",
+                    self.runtime.delivery_timeout
+                ))
+            })?
     }
 
     /// GET the replica of `key` from the destination bucket resolved for `source_bucket` and feed
@@ -333,6 +489,27 @@ impl HttpS3Sink {
         max_bytes: u64,
         on_chunk: &mut (dyn FnMut(&[u8]) + Send),
     ) -> Result<u64, ReplicationError> {
+        let delivery = self.stream_object_with_deadline(source_bucket, key, max_bytes, on_chunk);
+        tokio::time::timeout(self.runtime.delivery_timeout, delivery)
+            .await
+            .map_err(|_| {
+                ReplicationError::Unavailable(format!(
+                    "destination delivery exceeded the {:?} deadline",
+                    self.runtime.delivery_timeout
+                ))
+            })?
+    }
+
+    /// Inner read-back operation. The caller wraps this whole future in the one delivery deadline;
+    /// keeping the timer outside this function makes it impossible for response progress to reset
+    /// the wall-clock bound.
+    async fn stream_object_with_deadline(
+        &self,
+        source_bucket: &str,
+        key: &str,
+        max_bytes: u64,
+        on_chunk: &mut (dyn FnMut(&[u8]) + Send),
+    ) -> Result<u64, ReplicationError> {
         let dest_bucket = self.dest_for(source_bucket).to_owned();
         let request = self.build_signed_request(
             &Method::GET,
@@ -351,11 +528,7 @@ impl HttpS3Sink {
         let status = response.status();
         let mut body = response.into_body();
         if !status.is_success() {
-            let detail = body
-                .collect()
-                .await
-                .map(|b| String::from_utf8_lossy(&b.to_bytes()).into_owned())
-                .unwrap_or_default();
+            let detail = read_bounded_diagnostic(body).await;
             return Err(classify_status(status.as_u16(), &detail));
         }
 
@@ -436,7 +609,7 @@ impl HttpS3Sink {
         let scope = format!("{scope_date}/{}/{SERVICE}/aws4_request", self.config.region);
         let sts = string_to_sign(&amz_date, &scope, &canonical);
         let key_bytes = signing_key(
-            &self.config.secret_access_key,
+            self.config.secret_access_key.expose_secret(),
             scope_date,
             &self.config.region,
             SERVICE,
@@ -483,20 +656,24 @@ pub fn sink_for_target(
     open: &crate::OpenTarget,
     allow_internal_endpoints: bool,
     allow_plaintext_sse_over_http: bool,
+    runtime: ReplicationSinkRuntime,
 ) -> Result<HttpS3Sink, ReplicationError> {
-    HttpS3Sink::new(S3SinkConfig {
-        endpoint: open.endpoint.clone(),
-        dest_bucket: open.dest_bucket.clone(),
-        dest_buckets: HashMap::new(),
-        region: open.region.clone(),
-        access_key_id: open.access_key_id.clone(),
-        secret_access_key: open.secret.as_str().to_owned(),
-        ca_cert_path: None,
-        ca_cert_pem: open.ca_cert_pem.clone(),
-        insecure_skip_verify: open.insecure_skip_verify,
-        allow_internal_endpoints,
-        allow_plaintext_sse_over_http,
-    })
+    HttpS3Sink::new(
+        S3SinkConfig {
+            endpoint: open.endpoint.clone(),
+            dest_bucket: open.dest_bucket.clone(),
+            dest_buckets: HashMap::new(),
+            region: open.region.clone(),
+            access_key_id: open.access_key_id.clone(),
+            secret_access_key: open.secret.clone(),
+            ca_cert_path: None,
+            ca_cert_pem: open.ca_cert_pem.clone(),
+            insecure_skip_verify: open.insecure_skip_verify,
+            allow_internal_endpoints,
+            allow_plaintext_sse_over_http,
+        },
+        runtime,
+    )
 }
 
 /// Build the `hyper-rustls` connector builder for a sink, selecting the TLS trust source from the
@@ -589,6 +766,64 @@ fn load_roots_from_pem(pem: &[u8], source: &str) -> Result<RootCertStore, Replic
         )));
     }
     Ok(roots)
+}
+
+/// Read just enough of a destination response body to produce a useful diagnostic. The body is
+/// controlled by the peer and may be chunked or endless, so stop at a fixed prefix and drop the
+/// remainder. The encompassing delivery timeout lives at the call site and covers this entire
+/// drain, including a peer that sends no frames or trickles forever.
+async fn read_bounded_diagnostic(mut body: Incoming) -> String {
+    let prefix_limit = MAX_RESPONSE_DIAGNOSTIC_BYTES.saturating_sub(DIAGNOSTIC_SUFFIX_RESERVE);
+    let mut bytes = Vec::with_capacity(prefix_limit);
+    let mut suffix = None;
+
+    while let Some(frame) = body.frame().await {
+        let frame = match frame {
+            Ok(frame) => frame,
+            Err(_) => {
+                suffix = Some(DIAGNOSTIC_READ_ERROR_SUFFIX);
+                break;
+            }
+        };
+        let Ok(data) = frame.into_data() else {
+            continue;
+        };
+        let remaining = prefix_limit.saturating_sub(bytes.len());
+        if data.len() >= remaining {
+            bytes.extend_from_slice(&data[..remaining]);
+            // Treat an exactly-full prefix as truncated. Confirming EOF would let a chunked peer
+            // pin the worker after it has already supplied all useful diagnostic bytes.
+            suffix = Some(DIAGNOSTIC_TRUNCATED_SUFFIX);
+            break;
+        }
+        bytes.extend_from_slice(&data);
+    }
+
+    let mut detail = String::from_utf8_lossy(&bytes).into_owned();
+    // Invalid UTF-8 expands to the three-byte replacement character. Re-apply the byte ceiling to
+    // the rendered string so malformed input cannot exceed the diagnostic budget after decoding.
+    if detail.len() > prefix_limit {
+        truncate_string_bytes(&mut detail, prefix_limit);
+        suffix = Some(DIAGNOSTIC_TRUNCATED_SUFFIX);
+    }
+    if let Some(suffix) = suffix {
+        let max_prefix = MAX_RESPONSE_DIAGNOSTIC_BYTES.saturating_sub(suffix.len());
+        truncate_string_bytes(&mut detail, max_prefix);
+        detail.push_str(suffix);
+    }
+    debug_assert!(detail.len() <= MAX_RESPONSE_DIAGNOSTIC_BYTES);
+    detail
+}
+
+fn truncate_string_bytes(value: &mut String, max_bytes: usize) {
+    if value.len() <= max_bytes {
+        return;
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.truncate(end);
 }
 
 /// A [`ServerCertVerifier`] that accepts every certificate and signature without checking
@@ -702,9 +937,18 @@ impl HttpS3Sink {
 
         let dest_bucket = self.dest_for(source_bucket).to_owned();
 
-        // Buffer the logical body so the payload can be hashed for the signed-payload PUT, bounded so
-        // one oversized object cannot OOM the node in a crash loop (audit 2026-07).
-        let body = collect_body(object.body, MAX_BUFFERED_BODY_BYTES).await?;
+        // Admission is based on the metadata store's declared logical size and happens before the
+        // source stream is read. `collect_body` then enforces that exact size, so corrupt metadata
+        // cannot reserve one byte and make us retain a much larger body. Hold the owned permit
+        // through request upload and response drain; every return/cancellation path releases it.
+        let object_size = object.size;
+        let _buffer_reservation = self.runtime.reserve_buffer(object_size).await?;
+        let expected_size = usize::try_from(object_size).map_err(|_| {
+            ReplicationError::Terminal(
+                "object size cannot be represented by this target architecture".to_owned(),
+            )
+        })?;
+        let body = collect_body(object.body, expected_size).await?;
 
         // User metadata becomes `x-amz-meta-*`, plus the loop-prevention marker. The marker is
         // appended unconditionally so a destination that mirrors back recognizes the replica.
@@ -854,30 +1098,38 @@ impl crate::route::BucketRoutedSink for HttpS3Sink {
     }
 }
 
-/// Read a logical-byte blob stream fully into a contiguous buffer, bounded by `max_bytes`. A read
-/// error mid-stream is transient (the source blob may be momentarily unavailable), so it is
-/// retryable. Exceeding `max_bytes` is a *terminal* failure: the signed-payload PUT buffers the whole
-/// body in memory, so an oversized object would OOM the node — and because a claimed outbox entry is
-/// re-leased on restart, a retryable failure would re-buffer and OOM again in a permanent crash loop
-/// (audit 2026-07). Terminal parks the entry for operator attention instead.
+/// Read a logical-byte blob stream fully into one contiguous, exactly-reserved buffer. A read error
+/// mid-stream is transient (the source blob may be momentarily unavailable), so it is retryable. A
+/// stream that differs from the metadata store's declared logical size is terminal: admission was
+/// weighted by that declaration, and accepting more would bypass the process-wide byte budget.
 async fn collect_body(
     mut stream: cairn_types::BlobStream,
-    max_bytes: usize,
+    expected_bytes: usize,
 ) -> Result<bytes::Bytes, ReplicationError> {
-    let mut buf = bytes::BytesMut::new();
+    let mut buf = Vec::new();
+    buf.try_reserve_exact(expected_bytes).map_err(|e| {
+        ReplicationError::Terminal(format!(
+            "unable to reserve the admitted {expected_bytes}-byte replication buffer: {e}"
+        ))
+    })?;
     while let Some(chunk) = stream.next().await {
         let chunk =
             chunk.map_err(|e| ReplicationError::Retryable(format!("reading source body: {e}")))?;
-        if buf.len().saturating_add(chunk.len()) > max_bytes {
+        if buf.len().saturating_add(chunk.len()) > expected_bytes {
             return Err(ReplicationError::Terminal(format!(
-                "object body exceeds the {max_bytes}-byte replication buffer cap; the signed-payload \
-                 PUT buffers the whole body in memory. This object will not replicate until streaming \
-                 uploads land (audit 2026-07)."
+                "source body exceeds its declared {expected_bytes}-byte logical size; refusing to \
+                 exceed the process-wide replication buffer reservation"
             )));
         }
         buf.extend_from_slice(&chunk);
     }
-    Ok(buf.freeze())
+    if buf.len() != expected_bytes {
+        return Err(ReplicationError::Terminal(format!(
+            "source body ended at {} bytes but metadata declares {expected_bytes} bytes",
+            buf.len()
+        )));
+    }
+    Ok(bytes::Bytes::from(buf))
 }
 
 /// The S3 storage-class token for a stored class (mirrors the codec's `storage_class_str`).
@@ -1097,8 +1349,56 @@ mod tests {
         // A body within the cap collects fine.
         let under: Vec<Chunk> = vec![Ok(Bytes::from_static(b"hello"))];
         let stream = Box::pin(futures_util::stream::iter(under));
-        let body = collect_body(stream, 10).await.expect("within cap collects");
+        let body = collect_body(stream, 5).await.expect("exact body collects");
         assert_eq!(&body[..], b"hello");
+
+        // A short body is also rejected: the declared size is the weight admitted against the
+        // global budget and the Content-Length promise made to the destination.
+        let short: Vec<Chunk> = vec![Ok(Bytes::from_static(b"short"))];
+        let stream = Box::pin(futures_util::stream::iter(short));
+        let err = collect_body(stream, 6)
+            .await
+            .expect_err("a short source body must not be sent");
+        assert!(matches!(err, ReplicationError::Terminal(_)));
+    }
+
+    #[tokio::test]
+    async fn cloned_runtime_caps_many_workers_by_aggregate_bytes() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let runtime =
+            ReplicationSinkRuntime::new(10, Duration::from_secs(1)).expect("small test budget");
+        let active = Arc::new(AtomicU64::new(0));
+        let peak = Arc::new(AtomicU64::new(0));
+        let mut workers = Vec::new();
+        for _ in 0..32 {
+            let runtime = runtime.clone();
+            let active = Arc::clone(&active);
+            let peak = Arc::clone(&peak);
+            workers.push(tokio::spawn(async move {
+                let permit = runtime
+                    .reserve_buffer(3)
+                    .await
+                    .expect("budget remains open");
+                let now = active.fetch_add(3, Ordering::SeqCst) + 3;
+                peak.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                active.fetch_sub(3, Ordering::SeqCst);
+                drop(permit);
+            }));
+        }
+        for worker in workers {
+            worker.await.expect("worker completes");
+        }
+        let observed = peak.load(Ordering::SeqCst);
+        assert!(
+            observed <= 10,
+            "32 workers sharing one runtime retained {observed} bytes against a 10-byte budget"
+        );
+        assert!(
+            observed >= 6,
+            "the test must exercise weighted concurrency, observed only {observed} bytes"
+        );
     }
 
     fn cfg_for(endpoint: &str) -> S3SinkConfig {
@@ -1108,7 +1408,7 @@ mod tests {
             dest_buckets: HashMap::new(),
             region: "us-east-1".to_owned(),
             access_key_id: "AKID".to_owned(),
-            secret_access_key: "secret".to_owned(),
+            secret_access_key: "secret".into(),
             ca_cert_path: None,
             ca_cert_pem: None,
             insecure_skip_verify: false,
@@ -1117,11 +1417,20 @@ mod tests {
         }
     }
 
+    fn runtime() -> ReplicationSinkRuntime {
+        ReplicationSinkRuntime::new(
+            DEFAULT_REPLICATION_BUFFER_BUDGET_BYTES,
+            Duration::from_secs(DEFAULT_REPLICATION_DELIVERY_TIMEOUT_SECS),
+        )
+        .expect("valid test runtime")
+    }
+
     #[test]
     fn builds_for_https_endpoint() {
         // An https:// endpoint must construct cleanly now that the TLS connector is wired in
         // (the former terminal https-rejection is gone).
-        let sink = HttpS3Sink::new(cfg_for("https://s3.example.com")).expect("https sink builds");
+        let sink = HttpS3Sink::new(cfg_for("https://s3.example.com"), runtime())
+            .expect("https sink builds");
         assert_eq!(sink.scheme, "https");
         assert_eq!(sink.authority, "s3.example.com");
     }
@@ -1129,20 +1438,20 @@ mod tests {
     #[test]
     fn builds_for_http_endpoint() {
         // The same connector still serves plaintext http:// endpoints.
-        let sink =
-            HttpS3Sink::new(cfg_for("http://s3.example.com:9000")).expect("http sink builds");
+        let sink = HttpS3Sink::new(cfg_for("http://s3.example.com:9000"), runtime())
+            .expect("http sink builds");
         assert_eq!(sink.scheme, "http");
         assert_eq!(sink.authority, "s3.example.com:9000");
     }
 
     #[test]
     fn rejects_malformed_endpoint() {
-        assert!(HttpS3Sink::new(cfg_for("not a url")).is_err());
+        assert!(HttpS3Sink::new(cfg_for("not a url"), runtime()).is_err());
     }
 
     #[test]
     fn rejects_unsupported_scheme() {
-        let err = HttpS3Sink::new(cfg_for("ftp://s3.example.com")).unwrap_err();
+        let err = HttpS3Sink::new(cfg_for("ftp://s3.example.com"), runtime()).unwrap_err();
         assert!(matches!(err, ReplicationError::Terminal(_)));
     }
 
@@ -1157,14 +1466,14 @@ mod tests {
             dest_buckets,
             region: "us-east-1".to_owned(),
             access_key_id: "AKID".to_owned(),
-            secret_access_key: "secret".to_owned(),
+            secret_access_key: "secret".into(),
             ca_cert_path: None,
             ca_cert_pem: None,
             insecure_skip_verify: false,
             allow_internal_endpoints: false,
             allow_plaintext_sse_over_http: false,
         };
-        let sink = HttpS3Sink::new(cfg).unwrap();
+        let sink = HttpS3Sink::new(cfg, runtime()).unwrap();
         // Mapped sources resolve to their explicit destinations.
         assert_eq!(sink.dest_for("logs-src"), "logs-dst");
         assert_eq!(sink.dest_for("media-src"), "media-dst");
@@ -1174,7 +1483,7 @@ mod tests {
 
     #[test]
     fn request_path_uses_resolved_dest_bucket() {
-        let sink = HttpS3Sink::new(cfg_for("http://s3.example.com")).unwrap();
+        let sink = HttpS3Sink::new(cfg_for("http://s3.example.com"), runtime()).unwrap();
         assert_eq!(sink.request_path("dst", "a/b c"), "/dst/a/b%20c");
     }
 
@@ -1208,7 +1517,7 @@ hO1QwFPernIBHXfT8PObpNX2wryLTH1rMSJwHt50++2EPnR0Npi85smSQ4GglyTw\n\
     fn builds_https_with_insecure_skip_verify() {
         let mut cfg = cfg_for("https://self-signed.example.com");
         cfg.insecure_skip_verify = true;
-        let sink = HttpS3Sink::new(cfg).expect("insecure-skip-verify https sink builds");
+        let sink = HttpS3Sink::new(cfg, runtime()).expect("insecure-skip-verify https sink builds");
         assert_eq!(sink.scheme, "https");
         assert_eq!(sink.authority, "self-signed.example.com");
     }
@@ -1229,7 +1538,7 @@ hO1QwFPernIBHXfT8PObpNX2wryLTH1rMSJwHt50++2EPnR0Npi85smSQ4GglyTw\n\
         // And a sink against an https endpoint with that CA constructs.
         let mut cfg = cfg_for("https://peer.example.com");
         cfg.ca_cert_path = Some(ca);
-        let sink = HttpS3Sink::new(cfg).expect("custom-CA https sink builds");
+        let sink = HttpS3Sink::new(cfg, runtime()).expect("custom-CA https sink builds");
         assert_eq!(sink.scheme, "https");
     }
 
@@ -1251,7 +1560,7 @@ hO1QwFPernIBHXfT8PObpNX2wryLTH1rMSJwHt50++2EPnR0Npi85smSQ4GglyTw\n\
         // ...and surfaces through sink construction too.
         let mut cfg = cfg_for("https://peer.example.com");
         cfg.ca_cert_path = Some(PathBuf::from("/no/such/ca.pem"));
-        assert!(HttpS3Sink::new(cfg).is_err());
+        assert!(HttpS3Sink::new(cfg, runtime()).is_err());
     }
 
     /// Setting both a CA path and skip-verify is contradictory and rejected at construction.
@@ -1263,7 +1572,7 @@ hO1QwFPernIBHXfT8PObpNX2wryLTH1rMSJwHt50++2EPnR0Npi85smSQ4GglyTw\n\
         let mut cfg = cfg_for("https://peer.example.com");
         cfg.ca_cert_path = Some(ca);
         cfg.insecure_skip_verify = true;
-        let err = HttpS3Sink::new(cfg).unwrap_err();
+        let err = HttpS3Sink::new(cfg, runtime()).unwrap_err();
         assert!(matches!(err, ReplicationError::Terminal(_)));
     }
 
@@ -1286,7 +1595,8 @@ hO1QwFPernIBHXfT8PObpNX2wryLTH1rMSJwHt50++2EPnR0Npi85smSQ4GglyTw\n\
     /// the default single-target node->node path keeps building exactly as before.
     #[test]
     fn http_endpoint_unaffected_by_trust_defaults() {
-        let sink = HttpS3Sink::new(cfg_for("http://s3.example.com:9000")).expect("http builds");
+        let sink =
+            HttpS3Sink::new(cfg_for("http://s3.example.com:9000"), runtime()).expect("http builds");
         assert_eq!(sink.scheme, "http");
     }
 }

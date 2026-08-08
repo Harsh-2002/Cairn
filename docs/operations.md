@@ -27,7 +27,7 @@ without starting: `cairn validate-config`.
 | S3 API listener | `CAIRN_LISTEN_ADDR` | `0.0.0.0:7373` | S3 data plane, plus `/healthz`, `/readyz`, `/metrics`, and signed `/share/` share URLs. |
 | Web console listener | `CAIRN_WEB_ADDR` | `0.0.0.0:7374` | Management console (root path) + management API (`/api/v1`). Set `off`/`none`/empty to run headless. |
 | Data directory | `CAIRN_DATA_DIR` | `./data` | Root of staging + per-bucket blobs. |
-| Database path | `CAIRN_DB_PATH` | `./data/cairn.db` | SQLite metadata file (same FS as data). |
+| Database path | `CAIRN_DB_PATH` | `./data/cairn.db` | SQLite metadata file (same FS as data); direct child of the data root or outside it, never in a deeper data-root directory. |
 | Region | `CAIRN_REGION` | `us-east-1` | Location label + SigV4 scope. |
 | Master key | `CAIRN_MASTER_KEY` | *(dev key)* | 32-byte hex; AEAD key for secrets at rest. **Set in production.** |
 | TLS cert / key | `CAIRN_TLS_CERT_PATH` / `CAIRN_TLS_KEY_PATH` | unset | Enable built-in TLS when both set. |
@@ -98,6 +98,21 @@ administrator, the signed-in user, and any user that still owns buckets are refu
 leaves objects it had uploaded into other owners' buckets in place (their owner becomes a historical
 id); only its credentials, sessions, and identity policy are removed.
 
+### Upgrading through metadata migration v25
+
+Migration v25 changes persistent object shares to one-time bearer output with hash-only storage.
+For security, every share created by an older binary is automatically revoked: its plaintext token
+is overwritten, the legacy table is rebuilt, and the local database/WAL is compacted or checkpointed
+before readers open. Existing `/share/...` links therefore stop working after this upgrade and
+cannot be recovered. Inventory any links that must survive, notify their recipients, and mint
+replacement shares after the upgraded node is healthy.
+
+The sanitation step is durable and retryable. A marker remains until physical cleanup succeeds, so
+startup fails closed and retries on the next launch rather than serving with a partially sanitized
+database. On a large async-backend database the one-time VACUUM may extend the first startup; budget
+maintenance time and free disk space for compaction. Do not roll back to a pre-v25 binary against
+the migrated database.
+
 ## 4. Deployment shapes
 
 Two first-class shapes:
@@ -116,6 +131,23 @@ web console + management API (`CAIRN_WEB_ADDR`, default `:7374`). Expose the S3 
 keep the console/management port on a trusted interface, firewalled off, or disabled entirely with
 `CAIRN_WEB_ADDR=off`.
 
+The one-command installer is deliberately stricter than the raw server defaults: a fresh host
+configuration binds both listeners to `127.0.0.1`, and generated Compose port mappings publish both
+ports on `127.0.0.1`. This remains true when TLS is configured. Use `--expose-s3` to make the S3
+listener public and, independently, `--expose-console` only when the management surface must be
+reachable outside the host. If either public exposure is selected without `--tls-cert` and
+`--tls-key`, the install also requires `--acknowledge-public-http`; `--yes` never implies that
+acknowledgement. For example:
+
+```sh
+# Public HTTPS S3; console remains loopback-only.
+sudo sh install.sh --host --yes --tls-cert /etc/tls/cert.pem \
+  --tls-key /etc/tls/key.pem --expose-s3
+
+# Public plaintext S3 on an explicitly trusted network; console remains loopback-only.
+sudo sh install.sh --docker --yes --expose-s3 --acknowledge-public-http
+```
+
 The release artifact is one fully static binary (`musl`) containing the server, the management
 web console, and the CLI; it runs in a `scratch`/distroless container.
 
@@ -133,12 +165,23 @@ Prometheus metrics `/metrics`. Signals to watch:
 - **out-of-space (507) rate** vs capacity.
 - **replication lag and failures** — the health of redundancy.
 
-On **shutdown** (SIGTERM), the server drains in-flight HTTP requests within the grace period; the
-replication workers stop *claiming* new outbox work but do not block shutdown waiting for in-flight
-transfers to finish. This is safe, not lossy: a claimed-but-unfinished entry is leased in the durable
-outbox, and on restart the node releases its own stale claims back to pending and resumes them — so a
-sudden stop loses no replication work (it ships when the node is back). Drain to a peer (watch
-replication lag) before a planned stop if you want the peer fully current. See
+On **shutdown** (SIGTERM or SIGINT), Cairn first changes `/readyz` to not-ready, then stops accepting
+connections and tells every worker to stop before its next scan, pass, or claim batch. Existing HTTP
+connections and already-started background work drain concurrently for at most 30 seconds. Every
+worker, signal waiter, and optional TLS-reload task is retained and joined; an overrun is aborted and
+then joined, never detached. Cancelling an in-flight ship/import/webhook delivery is safe rather than
+lossy: its lease or cursor is durable. Before the next listener bind, Cairn releases orphaned
+replication claims on every metadata shard and resumes import state. It also restores an orphaned
+multipart `completing` claim to `active` and clears its attempt token, preserving the session and
+uploaded parts for retry.
+
+Once HTTP and workers are gone, a separate 30-second finalization budget drains request metrics,
+persists the master-key seal counter on every SQLite shard, and then checkpoints every SQLite WAL.
+The last structured log is `shutdown complete` only when HTTP, workers, auxiliary tasks, and this
+final durability tail all completed. A task panic, deadline cancellation, flush error, or
+busy/failed checkpoint instead produces an explicit incomplete-shutdown error; inspect it before
+assuming a planned stop was clean. Drain to a peer (watch replication lag) before a planned stop if
+you want the peer fully current. See
 [`upgrade-rollback.md`](./upgrade-rollback.md) for the upgrade/rollback procedure,
 [`scaling-limits.md`](./scaling-limits.md) for capacity planning, and
 [`troubleshooting.md`](./troubleshooting.md) for symptom→fix.
@@ -151,18 +194,28 @@ commit sequence is: stream to staging → fsync the file → rename into place �
 directory** → validate hashes → commit the metadata transaction (the single linearization
 point) → reclaim superseded blobs. A write is acknowledged only after its metadata commit is
 durable. Drive-failure survival is delegated to the storage layer; host-failure survival comes
-from bucket replication.
+from bucket replication. If a PUT/Copy request is cancelled or loses its commit acknowledgement,
+the shutdown-retained recovery worker serializes an exact row/path probe behind the original writer
+submission. It deletes only a writer-proven unreferenced path; an ambiguous result is preserved for
+the mandatory next-start reconciliation. Graceful shutdown drains this queue after HTTP requests
+and before the final WAL checkpoint.
 
-See [`backup-restore.md`](./backup-restore.md) for the backup procedure and its consistency
-argument.
+The built-in backup/restore path is **offline and single-SQLite only**: it refuses a live node and
+any configured topology/backend mismatch rather than produce an incomplete snapshot. Its
+versioned manifest is written last and binds the sidecar-free database's schema, byte length, and
+SHA-256. Restore makes an old sidecar-owning generation self-contained before the database rename,
+so a crash cannot combine a new main file with an old WAL. See
+[`backup-restore.md`](./backup-restore.md) for the procedure, consistency argument, and mandatory
+upgrade steps for legacy database paths nested more than one level below `CAIRN_DATA_DIR`.
 
 ## 7. Master-key rotation
 
 Secrets at rest — per-object data keys (SSE-S3, `aws:kms`, and transparent at-rest), users' SigV4
-secrets, and replication-target secrets — are sealed under a 32-byte master key. A single key is fine for most deployments
-(`CAIRN_MASTER_KEY`, 64 hex chars). To rotate the master key without re-encrypting object data,
-use a **key ring** and follow this procedure. The whole flow is online; no downtime and no
-re-upload of objects.
+secrets, replication-target credentials, notification HMAC keys, temporary-session signing
+secrets, and S3-import source credentials — are sealed under a 32-byte master key. A single key is
+fine for most deployments (`CAIRN_MASTER_KEY`, 64 hex chars). To rotate the master key without
+re-encrypting object data, use a **key ring** and follow this procedure. The whole flow is online;
+no downtime and no re-upload of objects.
 
 **Config.** A ring is a JSON array set in `CAIRN_MASTER_KEY_RING`, replacing `CAIRN_MASTER_KEY`:
 
@@ -175,31 +228,53 @@ CAIRN_KEY_COUNTER_SYNC_SECS=60        # active-key seal-count flush cadence
 
 Each `id` is a small integer (1–65535); keys are never logged. New seals always use the active
 id; every other id in the ring stays available to **open** existing data, so nothing becomes
-unreadable when you add a key.
+unreadable when you add a key. On the default SQLite backend an id is a durable identity, not a
+reusable slot: Cairn stores the full 64-hex SHA-256 hash as the durable binding for id `N`, and
+configuring different key bytes under `N` is a fatal startup error. The management status response
+shows only an eight-hex fingerprint; that abbreviation is display-only and is never used for the
+identity decision. Add a new id for every rotation; never replace bytes under an existing id on any
+backend.
 
 **Procedure (rotate id 1 → id 2):**
 
 1. **Add the new key, keep the old.** Deploy with the ring above (`id:1` + `id:2`, active `2`).
-   New writes seal under id 2; all existing id-1 data still opens. (A single-key deployment that
-   has never used a ring is just `[{"id":1,"key":"<current CAIRN_MASTER_KEY>"}]`.)
-2. **Let re-wrap run.** A background worker re-seals existing secrets onto the active key,
-   resumably and idempotently. It never deletes or rewrites data it cannot open; it only re-seals.
+   Before any bootstrap/migration can seal a secret, startup reads the durable id→full-hash bindings
+   and every re-wrap completion row on every SQLite shard. A read error or same-id hash mismatch is
+   fatal, and the old binding is never overwritten. Databases created by older Cairn versions may
+   contain an eight-hex binding: startup accepts it only when it matches the configured full-hash
+   prefix, then atomically upgrades it to 64 hex on the single Writer. A retry safely handles some
+   shards already upgraded and others still legacy; after upgrade, every comparison is full and
+   exact. New writes then seal under id 2; all existing id-1 data still opens. (A single-key
+   deployment that has never used a ring is just
+   `[{"id":1,"key":"<current CAIRN_MASTER_KEY>"}]`.)
+2. **Let re-wrap run.** A background worker immediately runs once at startup and then follows the
+   configured cadence. One exhaustive registry drives the worker, startup gate, and status API. It
+   re-seals six durable streams onto the active key: object DEKs, user SigV4 secrets,
+   replication-target credentials, webhook HMAC keys, temporary-session secrets, and import-job
+   source secrets (including terminal import history retained in metadata), resumably and
+   idempotently. Legacy plaintext webhook keys are handled even earlier by a mandatory pre-bind,
+   cross-backend migration, so disabling periodic rewrap cannot leave them exposed. The worker
+   never deletes or rewrites data it cannot open; it only re-seals.
 3. **Wait for completion.** Poll the admin endpoint:
 
    ```
    GET /api/v1/system/crypto-status        # Bearer admin token
    ```
 
-   It reports the active id, the seal count vs the 75%/95% thresholds, per-key state (with a short
-   non-reversible key-hash, never key material), per-stream re-wrap completion, and a
-   `retire_eligible` flag per key. **Wait until the old key shows `retire_eligible: true`** (every
-   stream re-wrapped onto the active key, on every shard, with no failures).
+   It reports the active id, the seal count vs the 75%/95% thresholds, per-key state (with only the
+   short eight-hex display fingerprint, never the durable full hash or key material), per-stream
+   re-wrap completion, and a
+   `retire_eligible` flag per key. **Wait until the old key shows `retire_eligible: true`** (all six
+   registry streams re-wrapped onto the active key, on every shard, with no read/open/write
+   failures or config CAS misses). A status read error returns an opaque 500; it never reports
+   eligibility from partial state.
 4. **Retire the old key.** Remove `id:1` from `CAIRN_MASTER_KEY_RING` and redeploy.
 
 > **Do not remove a key before it is `retire_eligible`.** Startup enforces a **retire-gate**: if a
 > removed key still has data sealed under it, the server **refuses to start** with a diagnostic
-> naming the key id and shard, rather than booting into unreadable data. Restore the key to the
-> ring, wait for re-wrap to finish, then retire it.
+> naming the key id and shard, rather than booting into unreadable data. A gate read error is also
+> fatal; warning-and-continue is forbidden. Restore the key to the ring, wait for re-wrap to finish,
+> then retire it.
 
 > **In-flight multipart uploads and retirement.** A multipart upload seals each part under the
 > master key active when the part was uploaded, and those per-part keys are transient (not covered by
@@ -213,10 +288,11 @@ unreadable when you add a key.
 tracked (and survives restarts). At 75% of the safe ceiling the server logs a "rotate soon"
 warning; at 95% it refuses *new* seals (opens are never blocked) — rotate before then.
 
-**Backend note.** Automatic re-wrap and the durable seal counter are implemented for the default
-`sqlite` backend. The libSQL/Turso backends can rotate and read all data (old keys still open
-everything), but do not auto-re-wrap or persist the counter, so the retire-gate and
-`retire_eligible` are not available there — keep retired keys in the ring on those backends.
+**Backend note.** Automatic re-wrap, the durable id→hash binding/retire gate, and the durable seal
+counter are implemented for the default `sqlite` backend. The libSQL/Turso backends can rotate and
+read all data (old keys still open everything), but do not auto-re-wrap or persist this rotation
+state, so the retire-gate and `retire_eligible` are not available there — keep every historical key
+id in the ring on those backends and never reuse an id for new bytes.
 
 ## 8. Server-side object encryption
 
@@ -244,6 +320,17 @@ Multipart uploads are encrypted per part: each staged part is written encrypted 
 re-encrypts under the object DEK, so nothing plaintext is ever on disk for an SSE upload. An upload
 pins its encryption intent at `CreateMultipartUpload`; see §7's retirement note for the fail-closed
 window when the master key is retired mid-upload.
+
+The encrypted blob format upgrades lazily. Existing v2 object descriptors have no
+`blob_format_version` field, and existing encrypted multipart-part envelopes are unprefixed; those
+two metadata forms are the only signals that authorize the legacy reader. New writes stamp object
+format v3 and prefix part envelopes with `crnb3:`. The v2 reader also requires its unauthenticated
+trailer algorithm/block geometry to match the version row's trusted compression descriptor, its
+trailer/index logical total to match the object row's `size_logical` (or multipart part-row size),
+and its per-block physical lengths to match the raw/compressed writer invariant after GCM overhead. No
+offline conversion is required, but do not remove or rewrite those compatibility markers or
+compression descriptors by hand: an unknown marker, marker/file mismatch, or trusted-compression
+mismatch is reported as corruption before bytes are served.
 
 ### 8.7 Repairing encrypted objects that replicated wrongly (the plaintext-seam incident)
 
@@ -299,7 +386,11 @@ conclusive check and it transfers every suspect object in full. `--verify` compa
 destination's **current** object (its GET carries no `versionId`), so it **skips non-current source
 versions** and reports them as `skipped_non_current` — comparing a superseded version against the
 destination's current object would report a mismatch for a perfectly healthy mirror. Those versions
-are unrepairable here anyway (trap 2 below).
+are unrepairable here anyway (trap 2 below). Verification reuses the target's stored SigV4
+credential and therefore requires `s3:GetObject` on the destination object ARN. Cairn's canned
+replication-user policy includes that scoped readback alongside `ReplicateObject` and
+`ReplicateDelete`; a hand-written destination policy must add it before `--verify` (ordinary
+replication delivery itself does not read the destination).
 
 On a dashboard, watch `cairn_replication_encrypted_suspect_versions` **and**
 `cairn_replication_encrypted_repair_pending_versions` (plus `…_encrypted_absent_versions` and

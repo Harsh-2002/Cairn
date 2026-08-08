@@ -52,6 +52,78 @@ fn row_from(
     }
 }
 
+#[tokio::test]
+async fn object_share_double_uses_hash_for_redemption_and_id_for_management() {
+    let meta = InMemoryMetadataStore::new();
+    let raw_token = "double-share-token-sentinel-029";
+    let token_hash = ShareLookupHash::for_token(raw_token);
+    let row = ShareRow {
+        id: "share-double-id".to_owned(),
+        token_hash,
+        bucket: BucketName::parse("shares").unwrap(),
+        key: ObjectKey::parse("private.txt").unwrap(),
+        version_id: None,
+        expires_at: None,
+        disposition: ShareDisposition::Inline,
+        filename: None,
+        created_by: UserId("admin".to_owned()),
+        created_at: Timestamp(10),
+        revoked_at: None,
+    };
+    meta.submit(Mutation::CreateShare(Box::new(row.clone())))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        meta.get_share_by_id("share-double-id").await.unwrap(),
+        Some(row.clone())
+    );
+    assert_eq!(
+        meta.get_share_by_token_hash(&token_hash).await.unwrap(),
+        Some(row.clone())
+    );
+    assert!(
+        meta.get_share_by_token_hash(&ShareLookupHash::for_token("wrong"))
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let mut duplicate_id = row.clone();
+    duplicate_id.token_hash = ShareLookupHash::for_token("different-token");
+    assert!(matches!(
+        meta.submit(Mutation::CreateShare(Box::new(duplicate_id)))
+            .await,
+        Err(MetaError::Conflict)
+    ));
+    let mut duplicate_hash = row.clone();
+    duplicate_hash.id = "different-id".to_owned();
+    assert!(matches!(
+        meta.submit(Mutation::CreateShare(Box::new(duplicate_hash)))
+            .await,
+        Err(MetaError::Conflict)
+    ));
+    assert_eq!(
+        meta.get_share_by_id("share-double-id").await.unwrap(),
+        Some(row)
+    );
+
+    meta.submit(Mutation::RevokeShare {
+        id: "share-double-id".to_owned(),
+        now: Timestamp(20),
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        meta.get_share_by_id("share-double-id")
+            .await
+            .unwrap()
+            .unwrap()
+            .revoked_at,
+        Some(Timestamp(20))
+    );
+}
+
 async fn read_all(handle: BlobReadHandle) -> Vec<u8> {
     use futures_util::StreamExt;
     let mut out = Vec::new();
@@ -103,6 +175,7 @@ async fn put_get_list_delete_roundtrip() {
             .submit(Mutation::PutObjectVersion {
                 row: Box::new(row),
                 precondition: Precondition::default(),
+                initial_state: InitialObjectState::default(),
                 replication: Vec::new(),
             })
             .await
@@ -128,6 +201,7 @@ async fn put_get_list_delete_roundtrip() {
             None,
             BlobCipher::KnownPlaintext,
             &current.compression,
+            current.size_logical,
         )
         .await
         .unwrap();
@@ -157,7 +231,11 @@ async fn put_get_list_delete_roundtrip() {
             bucket: bucket.clone(),
             key: key2.clone(),
             version_id: VersionId::null(),
+            expected_row_id: None,
             expected_updated_at: None,
+            require_sole_key_version: false,
+            now: clock.now(),
+            bypass: GovernanceBypass::Denied,
         })
         .await
         .unwrap();
@@ -187,6 +265,7 @@ async fn conditional_write_if_none_match_is_atomic() {
     meta.submit(Mutation::PutObjectVersion {
         row: Box::new(row.clone()),
         precondition: Precondition::default(),
+        initial_state: InitialObjectState::default(),
         replication: Vec::new(),
     })
     .await
@@ -200,6 +279,7 @@ async fn conditional_write_if_none_match_is_atomic() {
                 if_match: None,
                 if_none_match: Some(IfNoneMatch::Any),
             },
+            initial_state: InitialObjectState::default(),
             replication: Vec::new(),
         })
         .await
@@ -235,6 +315,7 @@ async fn versioning_keeps_history_and_promotes_latest() {
         meta.submit(Mutation::PutObjectVersion {
             row: Box::new(row),
             precondition: Precondition::default(),
+            initial_state: InitialObjectState::default(),
             replication: Vec::new(),
         })
         .await
@@ -259,12 +340,53 @@ async fn versioning_keeps_history_and_promotes_latest() {
     // Latest is the third version; deleting it promotes the second.
     let latest = meta.current_version(&bucket, &key).await.unwrap().unwrap();
     assert_eq!(latest.version_id, *versions.last().unwrap());
+    let stale = meta
+        .submit(Mutation::DeleteVersion {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            version_id: versions[2].clone(),
+            expected_row_id: None,
+            expected_updated_at: Some(Timestamp(1)),
+            require_sole_key_version: false,
+            now: Timestamp::EPOCH,
+            bypass: GovernanceBypass::Denied,
+        })
+        .await
+        .unwrap();
+    assert_eq!(stale, MutationOutcome::DeleteNotApplied);
+    assert_eq!(
+        meta.current_version(&bucket, &key)
+            .await
+            .unwrap()
+            .unwrap()
+            .version_id,
+        versions[2]
+    );
+    let missing = meta
+        .submit(Mutation::DeleteVersion {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            version_id: VersionId::from_string("missing".to_owned()),
+            expected_row_id: None,
+            expected_updated_at: None,
+            require_sole_key_version: false,
+            now: Timestamp::EPOCH,
+            bypass: GovernanceBypass::Denied,
+        })
+        .await
+        .unwrap();
+    assert_eq!(missing, MutationOutcome::DeleteNotApplied);
+
     let del = meta
         .submit(Mutation::DeleteVersion {
             bucket: bucket.clone(),
             key: key.clone(),
             version_id: versions[2].clone(),
+            expected_row_id: None,
             expected_updated_at: None,
+            require_sole_key_version: false,
+            now: Timestamp::EPOCH,
+            bypass: GovernanceBypass::Denied,
         })
         .await
         .unwrap();
@@ -277,6 +399,91 @@ async fn versioning_keeps_history_and_promotes_latest() {
     ));
     let new_latest = meta.current_version(&bucket, &key).await.unwrap().unwrap();
     assert_eq!(new_latest.version_id, versions[1]);
+}
+
+#[tokio::test]
+async fn row_identity_guard_rejects_same_timestamp_sentinel_replacement() {
+    let blob = InMemoryBlobStore::new();
+    let meta = InMemoryMetadataStore::new();
+    let bucket = BucketName::parse("row-guard").unwrap();
+    let key = ObjectKey::parse("object").unwrap();
+    let owner = UserId::generate();
+    let timestamp = Timestamp(100);
+
+    let first_blob = blob.stage(&bucket, body(b"old"), opts()).await.unwrap();
+    let first = row_from(
+        &first_blob,
+        &bucket,
+        &key,
+        VersionId::null(),
+        &owner,
+        timestamp,
+    );
+    meta.submit(Mutation::PutObjectVersion {
+        row: Box::new(first),
+        precondition: Precondition::default(),
+        initial_state: InitialObjectState::default(),
+        replication: Vec::new(),
+    })
+    .await
+    .unwrap();
+    let observed = meta
+        .list_current(
+            &bucket,
+            &ListQuery {
+                limit: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .next()
+        .unwrap();
+
+    let replacement_blob = blob.stage(&bucket, body(b"new"), opts()).await.unwrap();
+    let replacement = row_from(
+        &replacement_blob,
+        &bucket,
+        &key,
+        VersionId::null(),
+        &owner,
+        timestamp,
+    );
+    let replacement_id = replacement.id.clone();
+    assert_ne!(replacement_id, observed.row_id);
+    meta.submit(Mutation::PutObjectVersion {
+        row: Box::new(replacement),
+        precondition: Precondition::default(),
+        initial_state: InitialObjectState::default(),
+        replication: Vec::new(),
+    })
+    .await
+    .unwrap();
+
+    let outcome = meta
+        .submit(Mutation::DeleteVersion {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            version_id: VersionId::null(),
+            expected_row_id: Some(observed.row_id),
+            expected_updated_at: Some(timestamp),
+            require_sole_key_version: false,
+            now: Timestamp(i64::MAX),
+            bypass: GovernanceBypass::Denied,
+        })
+        .await
+        .unwrap();
+    assert_eq!(outcome, MutationOutcome::DeleteNotApplied);
+    assert_eq!(
+        meta.current_version(&bucket, &key)
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        replacement_id
+    );
 }
 
 #[tokio::test]
@@ -300,6 +507,7 @@ async fn reconcile_reclaims_orphan_blobs() {
     meta.submit(Mutation::PutObjectVersion {
         row: Box::new(row),
         precondition: Precondition::default(),
+        initial_state: InitialObjectState::default(),
         replication: Vec::new(),
     })
     .await
@@ -403,6 +611,7 @@ async fn plant_outbox_entry_at(
     meta.submit(Mutation::PutObjectVersion {
         row: Box::new(row),
         precondition: Precondition::default(),
+        initial_state: InitialObjectState::default(),
         replication: vec![entry],
     })
     .await
@@ -516,6 +725,7 @@ async fn set_object_acl_replaces_the_version_acl() {
     meta.submit(Mutation::PutObjectVersion {
         row: Box::new(row),
         precondition: Precondition::default(),
+        initial_state: InitialObjectState::default(),
         replication: Vec::new(),
     })
     .await
@@ -590,7 +800,7 @@ async fn encrypted_blob_read_without_a_dek_fails_closed() {
             &bucket,
             body(b"top secret"),
             StageOptions {
-                encryption: Some(dek),
+                encryption: Some(dek.into()),
                 ..opts()
             },
         )
@@ -604,6 +814,7 @@ async fn encrypted_blob_read_without_a_dek_fails_closed() {
             None,
             BlobCipher::KnownPlaintext,
             &staged.compression,
+            staged.size_logical,
         )
         .await
         .expect_err("a KnownPlaintext read of an encrypted blob must fail, not return bytes");
@@ -617,8 +828,9 @@ async fn encrypted_blob_read_without_a_dek_fails_closed() {
         .open_raw(
             &staged.storage_path,
             None,
-            BlobCipher::Dek([1u8; 32]),
+            BlobCipher::AuthenticatedV3([1u8; 32].into()),
             &staged.compression,
+            staged.size_logical,
         )
         .await
         .expect_err("a wrong-key read of an encrypted blob must fail");
@@ -632,8 +844,9 @@ async fn encrypted_blob_read_without_a_dek_fails_closed() {
         .open_raw(
             &staged.storage_path,
             None,
-            BlobCipher::Dek(dek),
+            BlobCipher::AuthenticatedV3(dek.into()),
             &staged.compression,
+            staged.size_logical,
         )
         .await
         .unwrap();
@@ -663,7 +876,7 @@ async fn probe_reports_presence_without_a_dek() {
             &bucket,
             body(b"top secret"),
             StageOptions {
-                encryption: Some([9u8; 32]),
+                encryption: Some([9u8; 32].into()),
                 ..opts()
             },
         )
@@ -707,6 +920,7 @@ async fn requeue_replication_versions_double_matches_the_engines() {
     meta.submit(Mutation::PutObjectVersion {
         row: Box::new(enc),
         precondition: Precondition::default(),
+        initial_state: InitialObjectState::default(),
         replication: Vec::new(),
     })
     .await
@@ -791,6 +1005,7 @@ async fn requeue_replication_versions_double_is_key_scoped() {
     meta.submit(Mutation::PutObjectVersion {
         row: Box::new(enc),
         precondition: Precondition::default(),
+        initial_state: InitialObjectState::default(),
         replication: Vec::new(),
     })
     .await
@@ -928,6 +1143,7 @@ async fn requeue_replication_versions_double_never_splits_a_key_across_pages() {
         meta.submit(Mutation::PutObjectVersion {
             row: Box::new(enc),
             precondition: Precondition::default(),
+            initial_state: InitialObjectState::default(),
             replication: Vec::new(),
         })
         .await
@@ -1073,6 +1289,7 @@ async fn mark_replication_done_double_stamps_replicated_at() {
     meta.submit(Mutation::PutObjectVersion {
         row: Box::new(inbound),
         precondition: Precondition::default(),
+        initial_state: InitialObjectState::default(),
         replication: Vec::new(),
     })
     .await
@@ -1125,6 +1342,7 @@ async fn requeue_replication_versions_double_skips_unshippable_non_current_versi
         meta.submit(Mutation::PutObjectVersion {
             row: Box::new(enc),
             precondition: Precondition::default(),
+            initial_state: InitialObjectState::default(),
             replication: Vec::new(),
         })
         .await

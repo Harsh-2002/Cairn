@@ -31,7 +31,13 @@ export CAIRN_MASTER_KEY; CAIRN_MASTER_KEY="$(openssl rand -hex 32)"
 export CAIRN_LOG_LEVEL="${CAIRN_LOG_LEVEL:-warn}"
 
 SRV=""
-cleanup() { [ -n "$SRV" ] && kill "$SRV" 2>/dev/null || true; [ -n "$SRV" ] && wait "$SRV" 2>/dev/null || true; rm -rf "$WORK"; }
+cleanup() {
+  if [ -n "$SRV" ]; then
+    kill "$SRV" 2>/dev/null || true
+    wait "$SRV" 2>/dev/null || true
+  fi
+  rm -rf "$WORK"
+}
 trap cleanup EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 ok() { printf '  ok: %s\n' "$*"; }
@@ -56,8 +62,10 @@ start_node() {
   fail "server did not become healthy in time; log: $(cat "$WORK/server.log")"
 }
 stop_node() {
-  [ -n "$SRV" ] && kill "$SRV" 2>/dev/null || true
-  [ -n "$SRV" ] && wait "$SRV" 2>/dev/null || true
+  if [ -n "$SRV" ]; then
+    kill "$SRV" 2>/dev/null || true
+    wait "$SRV" 2>/dev/null || true
+  fi
   SRV=""
 }
 
@@ -105,11 +113,17 @@ ok "integrity baseline is clean (errors=0)"
 
 OUT="$("$BIN" backup "$BK")" || fail "backup failed: $OUT"
 echo "$OUT" | grep -q "backup complete:" || fail "backup printed no 'backup complete' line: $OUT"
-ENTRIES="$(echo "$OUT" | sed -n 's/.*(\([0-9]*\) blob entries).*/\1/p')"
-[ -n "$ENTRIES" ] && [ "$ENTRIES" -ge 1 ] || fail "backup reported a non-positive blob-entry count: $OUT"
-[ -f "$BK/cairn.db" ] || fail "snapshot is missing the database file"
+ENTRIES="$(echo "$OUT" | sed -n 's/.*(\([0-9][0-9]*\) blob entries.*/\1/p')"
+if ! { [ -n "$ENTRIES" ] && [ "$ENTRIES" -ge 1 ]; }; then
+  fail "backup reported a non-positive blob-entry count: $OUT"
+fi
+[ -f "$BK/metadata.sqlite3" ] || fail "snapshot is missing fixed metadata.sqlite3"
+[ -f "$BK/manifest.json" ] || fail "snapshot is missing the completion manifest"
+grep -q '"complete": true' "$BK/manifest.json" || fail "snapshot manifest is not marked complete"
+grep -q '"database_file": "metadata.sqlite3"' "$BK/manifest.json" \
+  || fail "snapshot manifest does not bind the fixed database filename"
 [ -d "$BK/blobs" ] || fail "snapshot is missing the blobs/ tree"
-ok "backup wrote cairn.db + blobs/ ($ENTRIES blob entries)"
+ok "backup wrote manifest.json last + metadata.sqlite3 + blobs/ ($ENTRIES blob entries)"
 
 # --- 3) corrupt the primary's largest blob AFTER the snapshot ---------------------------------
 victim="$(find "$D1/data" -type f ! -path '*/.staging/*' ! -name '*.db' ! -name '*.db-wal' ! -name '*.db-shm' \
@@ -127,7 +141,7 @@ vbefore="$(md5sum "$victim" | cut -d' ' -f1)"
 # Read the byte that is actually there, XOR it, write it back: always a real change, whatever it was.
 vbyte="$(dd if="$victim" bs=1 skip=1024 count=1 status=none | od -An -tu1 | tr -d ' \n')"
 [ -n "$vbyte" ] || fail "could not read the byte at offset 1024 of $victim"
-printf "$(printf '\\x%02x' "$(( vbyte ^ 0x5A ))")" \
+printf '%b' "$(printf '\\x%02x' "$(( vbyte ^ 0x5A ))")" \
   | dd of="$victim" bs=1 seek=1024 count=1 conv=notrunc status=none \
   || fail "the corrupting write itself failed on $victim"
 sync
@@ -140,7 +154,9 @@ use_data_dir "$D2"
 OUT="$("$BIN" restore "$BK")" || fail "restore failed: $OUT"
 echo "$OUT" | grep -q "restore complete: reconciled scanned=" || fail "restore printed no 'restore complete' line: $OUT"
 SCANNED="$(echo "$OUT" | sed -n 's/.*scanned=\([0-9]*\).*/\1/p')"
-[ -n "$SCANNED" ] && [ "$SCANNED" -ge 1 ] || fail "restore reconcile scanned a non-positive count: $OUT"
+if ! { [ -n "$SCANNED" ] && [ "$SCANNED" -ge 1 ]; }; then
+  fail "restore reconcile scanned a non-positive count: $OUT"
+fi
 ok "restore into a fresh data dir reconciled (scanned=$SCANNED)"
 
 start_node
@@ -160,7 +176,9 @@ rm -f "$victim2"
 OUT="$("$BIN" integrity --repair)" || fail "integrity --repair failed: $OUT"
 echo "$OUT" | grep -q "repair complete: dangling_rows_dropped=" || fail "repair printed no 'repair complete' line: $OUT"
 DROPPED="$(echo "$OUT" | sed -n 's/.*dangling_rows_dropped=\([0-9]*\).*/\1/p')"
-[ -n "$DROPPED" ] && [ "$DROPPED" -ge 1 ] || fail "repair dropped no dangling rows after deleting a blob: $OUT"
+if ! { [ -n "$DROPPED" ] && [ "$DROPPED" -ge 1 ]; }; then
+  fail "repair dropped no dangling rows after deleting a blob: $OUT"
+fi
 ok "integrity --repair dropped the dangling row(s) (dangling_rows_dropped=$DROPPED)"
 
 start_node

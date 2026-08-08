@@ -75,11 +75,26 @@ pub enum MetaError {
     /// A configured byte quota would be exceeded by this mutation.
     #[error("quota exceeded")]
     QuotaExceeded,
+    /// A multipart session or its pre-stage reservation no longer belongs to this operation.
+    #[error("multipart upload is not active")]
+    MultipartNotActive,
     /// A container still holds rows and cannot be deleted (e.g. a bucket with objects or in-progress
     /// multipart uploads), enforced *inside* the commit transaction so the check is atomic with the
     /// delete.
     #[error("container not empty")]
     NotEmpty,
+    /// Object Lock prevents a permanent delete, overwrite, or retention weakening.
+    #[error("object version is protected by object lock")]
+    ObjectProtected,
+    /// A mutation requiring an existing object version named no row.
+    #[error("object version not found")]
+    ObjectVersionNotFound,
+    /// The bucket's versioning/Object Lock state does not permit the requested mutation.
+    #[error("invalid bucket state")]
+    InvalidBucketState,
+    /// Persisted or requested Object Lock state is malformed, incomplete, or inconsistent.
+    #[error("invalid object lock state")]
+    InvalidObjectLockState,
 }
 
 /// Failures of authentication.
@@ -103,6 +118,11 @@ pub enum AuthError {
     /// A streaming chunk signature failed verification.
     #[error("streaming chunk signature mismatch")]
     ChunkSignatureMismatch,
+    /// The authenticated user's identity policy could not be loaded or parsed. This is an
+    /// operational/integrity failure, not a bad client credential: callers deny the request and
+    /// map it to an opaque server error so an absent policy can never widen owner/admin access.
+    #[error("identity policy unavailable")]
+    PolicyUnavailable,
 }
 
 /// Failures of the cryptography facility.
@@ -226,6 +246,11 @@ pub enum Error {
     /// Object Ownership disables ACLs).
     #[error("invalid request: {0}")]
     InvalidRequest(String),
+    /// The requested transition is incompatible with the bucket's durable state, such as
+    /// suspending versioning on an Object-Lock-enabled bucket or enabling Object Lock after
+    /// creation.
+    #[error("invalid bucket state: {0}")]
+    InvalidBucketState(String),
     /// Authorization was denied (policy, ACL, or Block Public Access).
     #[error("access denied")]
     AccessDenied,
@@ -283,6 +308,12 @@ impl From<ConfigError> for Error {
     }
 }
 
+impl From<crate::bucket::DefaultRetentionError> for Error {
+    fn from(e: crate::bucket::DefaultRetentionError) -> Self {
+        Error::InvalidArgument(e.to_string())
+    }
+}
+
 impl From<BlobError> for Error {
     fn from(e: BlobError) -> Self {
         match e {
@@ -315,6 +346,7 @@ impl From<MetaError> for Error {
             // call site.
             MetaError::PreconditionFailed => Error::PreconditionFailed,
             MetaError::QuotaExceeded => Error::InsufficientStorage,
+            MetaError::MultipartNotActive => Error::NoSuchUpload,
             MetaError::NotEmpty => Error::BucketNotEmpty,
             other => Error::Internal(other.to_string()),
         }
@@ -331,6 +363,9 @@ impl From<AuthError> for Error {
             }
             AuthError::SkewedClock => Error::RequestTimeTooSkewed,
             AuthError::Expired => Error::AccessDenied,
+            AuthError::PolicyUnavailable => {
+                Error::Internal("authentication policy unavailable".to_owned())
+            }
         }
     }
 }
@@ -398,5 +433,13 @@ mod tests {
             m.contains("requested operation") && m.contains("server"),
             "the 501 body must name what was refused and by whom, got: {m}"
         );
+    }
+
+    #[test]
+    fn unavailable_identity_policy_is_an_internal_failure() {
+        assert!(matches!(
+            Error::from(AuthError::PolicyUnavailable),
+            Error::Internal(_)
+        ));
     }
 }

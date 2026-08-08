@@ -8,6 +8,7 @@
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Key, Nonce as GcmNonce};
+use cairn_types::SecretKey32;
 use cairn_types::crypto::{Nonce, Sealed};
 use cairn_types::error::CryptoError;
 use cairn_types::traits::Crypto;
@@ -23,6 +24,7 @@ use crate::base64;
 pub const NONCE_LEN: usize = 12;
 
 /// The master-key length in bytes (AES-256).
+#[cfg(test)]
 const KEY_LEN: usize = 32;
 
 /// The `CRK1` envelope magic ("Cairn Rotation Key, v1").
@@ -76,11 +78,14 @@ impl From<KeyError> for CryptoError {
 /// random 96-bit nonce per seal means sealing the same plaintext twice yields distinct
 /// ciphertexts.
 ///
-/// Key material lives only in the per-key ciphers (input key buffers are scrubbed after the
-/// cipher is built); the `Debug` impl never prints key material.
+/// Key material is retained in zeroize-on-drop owners. AES/GHASH schedules are constructed only
+/// for an individual seal/open operation and are dropped immediately afterwards; the workspace
+/// enables the primitives' `zeroize` features so those transient schedules are scrubbed too. The
+/// `Debug` impl never prints key material.
 pub struct SystemCrypto {
-    /// id -> cipher. The active key seals; any ring key can open a blob that names it.
-    ring: HashMap<u16, Aes256Gcm>,
+    /// id -> zeroize-on-drop key owner. The active key seals; any ring key can open a blob that
+    /// names it.
+    ring: HashMap<u16, SecretKey32>,
     /// The id NEW seals use.
     active_id: u16,
     /// The id legacy (no-magic) blobs decrypt under — the single key that existed pre-ring.
@@ -108,9 +113,9 @@ impl SystemCrypto {
     /// Construct from a single raw 32-byte master key — a one-key ring at id 1 (active + legacy).
     /// The key bytes are scrubbed from the caller's move and the intermediate buffer.
     #[must_use]
-    pub fn new(key: [u8; KEY_LEN]) -> Self {
+    pub fn new(key: SecretKey32) -> Self {
         let mut ring = HashMap::with_capacity(1);
-        ring.insert(1u16, cipher_from(key));
+        ring.insert(1u16, key);
         Self {
             ring,
             active_id: 1,
@@ -152,7 +157,7 @@ impl SystemCrypto {
     /// [`KeyError::Malformed`] if the ring is empty, contains id 0 or a duplicate id, or if
     /// `active_id`/`legacy_id` is not present in the ring.
     pub fn from_ring(
-        keys: Vec<(u16, [u8; KEY_LEN])>,
+        keys: Vec<(u16, SecretKey32)>,
         active_id: u16,
         legacy_id: u16,
         seal_count_base: u64,
@@ -165,7 +170,7 @@ impl SystemCrypto {
             if id == 0 {
                 return Err(KeyError::Malformed);
             }
-            if ring.insert(id, cipher_from(key)).is_some() {
+            if ring.insert(id, key).is_some() {
                 return Err(KeyError::Malformed); // duplicate id
             }
         }
@@ -239,11 +244,11 @@ impl SystemCrypto {
         }
     }
 
-    /// Decrypt `ct` under `cipher` with `nonce_bytes` (must be exactly 12 bytes) and optional AAD,
+    /// Decrypt `ct` under `key` with `nonce_bytes` (must be exactly 12 bytes) and optional AAD,
     /// scrubbing the transient plaintext (ARCH 27, F-15). A wrong nonce length fails closed.
     fn decrypt(
         &self,
-        cipher: &Aes256Gcm,
+        key: &SecretKey32,
         ct: &[u8],
         nonce_bytes: &[u8],
         aad: Option<&[u8]>,
@@ -251,6 +256,7 @@ impl SystemCrypto {
         if nonce_bytes.len() != NONCE_LEN {
             return Err(CryptoError::Decrypt);
         }
+        let cipher = cipher_from(key);
         let gcm_nonce = GcmNonce::from_slice(nonce_bytes);
         // Return the plaintext in its zeroizing container rather than copying it out via `to_vec`
         // (which would defeat the scrubbing): callers receive the secret already scoped to scrub on
@@ -266,18 +272,14 @@ impl SystemCrypto {
     }
 }
 
-/// Build an AES-256-GCM cipher from a key, scrubbing the key buffer afterwards.
-fn cipher_from(key: [u8; KEY_LEN]) -> Aes256Gcm {
-    let mut key = Zeroizing::new(key);
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key.as_slice()));
-    key.zeroize();
-    cipher
+/// Build a short-lived AES-256-GCM schedule from a borrowed zeroizing key owner.
+fn cipher_from(key: &SecretKey32) -> Aes256Gcm {
+    Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key.expose_secret()))
 }
 
-/// Copy a decoded buffer into a fixed-size key array, validating the length.
-fn into_key(bytes: &[u8]) -> Result<[u8; KEY_LEN], KeyError> {
-    let arr: [u8; KEY_LEN] = bytes.try_into().map_err(|_| KeyError::WrongLength)?;
-    Ok(arr)
+/// Copy a decoded buffer into a zeroizing fixed-size key owner, validating the length.
+fn into_key(bytes: &[u8]) -> Result<SecretKey32, KeyError> {
+    SecretKey32::from_slice(bytes).ok_or(KeyError::WrongLength)
 }
 
 impl Crypto for SystemCrypto {
@@ -308,7 +310,8 @@ impl Crypto for SystemCrypto {
         env.extend_from_slice(&nonce_bytes);
         // Bind magic ‖ key_id as associated data: a tampered version/key id fails authentication.
         let aad: [u8; HEADER_LEN] = env[..HEADER_LEN].try_into().expect("header is HEADER_LEN");
-        let cipher = self.ring.get(&self.active_id).ok_or(CryptoError::Key)?;
+        let key = self.ring.get(&self.active_id).ok_or(CryptoError::Key)?;
+        let cipher = cipher_from(key);
         let ct = cipher
             .encrypt(
                 GcmNonce::from_slice(&nonce_bytes),
@@ -366,7 +369,7 @@ mod tests {
     use super::*;
 
     fn crypto() -> SystemCrypto {
-        SystemCrypto::new([7u8; KEY_LEN])
+        SystemCrypto::new([7u8; KEY_LEN].into())
     }
 
     /// A legacy (pre-#29) sealed blob: raw AES-GCM with no AAD and a separately-stored nonce.
@@ -439,7 +442,7 @@ mod tests {
         let key = [7u8; KEY_LEN];
         let nonce = [9u8; NONCE_LEN];
         let ct = legacy_blob(key, nonce, b"legacy secret");
-        let c = SystemCrypto::new(key); // legacy_id = 1; key 1 == this key
+        let c = SystemCrypto::new(key.into()); // legacy_id = 1; key 1 == this key
         let opened = c.open(&ct, &Nonce(nonce.to_vec())).expect("legacy open");
         assert_eq!(opened.as_slice(), b"legacy secret");
     }
@@ -448,8 +451,13 @@ mod tests {
     fn aad_binds_key_id_so_repointing_fails() {
         // Two-key ring; seal under id 1, then repoint the envelope's key_id to 2. Decryption
         // under key 2 with the now-mismatched AAD must fail (no silent reinterpretation).
-        let c = SystemCrypto::from_ring(vec![(1, [1u8; KEY_LEN]), (2, [2u8; KEY_LEN])], 1, 1, 0)
-            .expect("ring");
+        let c = SystemCrypto::from_ring(
+            vec![(1, [1u8; KEY_LEN].into()), (2, [2u8; KEY_LEN].into())],
+            1,
+            1,
+            0,
+        )
+        .expect("ring");
         let mut sealed = c.seal(b"bound").expect("seal");
         assert_eq!(sealed.ciphertext[5], 1);
         sealed.ciphertext[5] = 2; // repoint key_id 1 -> 2 (a live ring id)
@@ -535,7 +543,7 @@ mod tests {
         let key = [3u8; KEY_LEN];
         let nonce = [4u8; NONCE_LEN];
         let ct = legacy_blob(key, nonce, b"len");
-        let c = SystemCrypto::new(key);
+        let c = SystemCrypto::new(key.into());
         assert!(matches!(
             c.open(&ct, &Nonce(vec![0u8; NONCE_LEN - 1])),
             Err(CryptoError::Decrypt)
@@ -544,8 +552,8 @@ mod tests {
 
     #[test]
     fn wrong_key_fails() {
-        let a = SystemCrypto::new([1u8; KEY_LEN]);
-        let b = SystemCrypto::new([2u8; KEY_LEN]);
+        let a = SystemCrypto::new([1u8; KEY_LEN].into());
+        let b = SystemCrypto::new([2u8; KEY_LEN].into());
         let sealed = a.seal(b"cross key").expect("seal");
         // b's ring has key id 1 but with different bytes -> tag fails.
         assert!(matches!(
@@ -606,10 +614,13 @@ mod tests {
 
     #[test]
     fn from_ring_validation() {
-        let k = |b: u8| (b as u16 + 1, [b; KEY_LEN]);
-        assert!(SystemCrypto::from_ring(vec![], 1, 1, 0).is_err(), "empty");
+        let k = |b: u8| (b as u16 + 1, SecretKey32::new([b; KEY_LEN]));
         assert!(
-            SystemCrypto::from_ring(vec![(0, [1u8; KEY_LEN])], 0, 0, 0).is_err(),
+            SystemCrypto::from_ring(Vec::new(), 1, 1, 0).is_err(),
+            "empty"
+        );
+        assert!(
+            SystemCrypto::from_ring(vec![(0, [1u8; KEY_LEN].into())], 0, 0, 0).is_err(),
             "id 0"
         );
         assert!(
@@ -632,7 +643,8 @@ mod tests {
         // active=2, legacy=1. New seals carry key_id 2; a legacy blob made with key 1 opens.
         let key1 = [1u8; KEY_LEN];
         let c =
-            SystemCrypto::from_ring(vec![(1, key1), (2, [2u8; KEY_LEN])], 2, 1, 0).expect("ring");
+            SystemCrypto::from_ring(vec![(1, key1.into()), (2, [2u8; KEY_LEN].into())], 2, 1, 0)
+                .expect("ring");
         let sealed = c.seal(b"new").expect("seal");
         assert_eq!(sealed.ciphertext[5], 2, "sealed under active id 2");
         assert_eq!(
@@ -653,8 +665,13 @@ mod tests {
 
     #[test]
     fn debug_redacts_key_material() {
-        let c = SystemCrypto::from_ring(vec![(1, [0xAB; KEY_LEN]), (2, [0xCD; KEY_LEN])], 2, 1, 0)
-            .expect("ring");
+        let c = SystemCrypto::from_ring(
+            vec![(1, [0xAB; KEY_LEN].into()), (2, [0xCD; KEY_LEN].into())],
+            2,
+            1,
+            0,
+        )
+        .expect("ring");
         let s = format!("{c:?}");
         assert!(s.contains("redacted"));
         assert!(
@@ -676,7 +693,7 @@ mod tests {
     fn from_hex_round_trips_and_rejects_bad() {
         let key = [0xABu8; KEY_LEN];
         let c = SystemCrypto::from_hex(&hex::encode(key)).expect("from_hex");
-        let reference = SystemCrypto::new(key);
+        let reference = SystemCrypto::new(key.into());
         let sealed = reference.seal(b"hk").expect("seal");
         assert_eq!(
             c.open(&sealed.ciphertext, &sealed.nonce)
@@ -696,8 +713,13 @@ mod tests {
 
     #[test]
     fn needs_rewrap_detects_stale_keys() {
-        let c = SystemCrypto::from_ring(vec![(1, [1u8; KEY_LEN]), (2, [2u8; KEY_LEN])], 2, 1, 0)
-            .expect("ring");
+        let c = SystemCrypto::from_ring(
+            vec![(1, [1u8; KEY_LEN].into()), (2, [2u8; KEY_LEN].into())],
+            2,
+            1,
+            0,
+        )
+        .expect("ring");
         // A blob sealed under the active key (2) does not need re-wrap.
         let active = c.seal(b"x").expect("seal");
         assert!(!c.needs_rewrap(&active.ciphertext));

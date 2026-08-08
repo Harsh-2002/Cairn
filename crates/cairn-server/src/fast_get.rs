@@ -18,10 +18,11 @@
 //! bytes of an already-authorized response are written. It never serves anything the normal path
 //! would not.
 
-use crate::adapter::route_path;
+use crate::adapter::{ListenerRole, route_path, service_worker_scope_for_path};
+use crate::proxy::TrustedProxies;
 use crate::stack::AppStack;
 use cairn_protocol::{S3Body, S3Request};
-use cairn_types::auth::{AuthOutcome, RequestView};
+use cairn_types::auth::{AuthOutcome, ClientSource, RequestView};
 use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
 use std::pin::Pin;
@@ -41,6 +42,13 @@ const HEAD_TIMEOUT: Duration = Duration::from_secs(15);
 /// How long the blocking sender waits to drain the client's bytes during an orderly close before
 /// giving up, so a stalled peer cannot pin the blocking thread (audit #23).
 const FAST_LINGER: Duration = Duration::from_secs(2);
+
+/// Defense in depth for a peer that stops reading without a process shutdown. Shutdown itself
+/// actively closes a duplicate socket and joins the blocking sender.
+const FAST_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The plaintext `sendfile` takeover is only wired on the S3/data listener.
+const FAST_PATH_LISTENER_ROLE: ListenerRole = ListenerRole::Data;
 
 /// The result of the fast-path connection loop.
 pub enum Fast {
@@ -115,6 +123,54 @@ fn fallback(stream: TcpStream, consumed: Vec<u8>, reason: &'static str) -> Fast 
     }
 }
 
+type BlockingSocketJoin<T> = Result<std::io::Result<T>, tokio::task::JoinError>;
+
+fn shutdown_visible(shutdown: &tokio::sync::watch::Receiver<bool>) -> bool {
+    *shutdown.borrow() || shutdown.has_changed().is_err()
+}
+
+/// Run socket-owning blocking work without allowing its closure to detach on shutdown.
+///
+/// A duplicate fd remains on the async side. Shutdown on that duplicate wakes a blocked
+/// write/sendfile on the shared socket, after which the blocking handle is always awaited. On a
+/// normal keep-alive completion the closure returns the original socket to its caller.
+async fn interruptible_blocking_socket<T, F>(
+    stream: std::net::TcpStream,
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+    operation: F,
+) -> (BlockingSocketJoin<T>, bool)
+where
+    T: Send + 'static,
+    F: FnOnce(std::net::TcpStream) -> std::io::Result<T> + Send + 'static,
+{
+    if shutdown_visible(shutdown) {
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+        return (
+            Ok(Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "server shutdown before blocking socket work",
+            ))),
+            true,
+        );
+    }
+    let interrupt = match stream.try_clone() {
+        Ok(interrupt) => interrupt,
+        Err(error) => return (Ok(Err(error)), false),
+    };
+    let mut task = tokio::task::spawn_blocking(move || operation(stream));
+    tokio::select! {
+        biased;
+        changed = shutdown.changed() => {
+            let _ = changed;
+            let _ = interrupt.shutdown(std::net::Shutdown::Both);
+            // Aborting `spawn_blocking` does not stop a running closure. Join after interrupting
+            // the socket so the HTTP supervisor cannot report completion while it still runs.
+            (task.await, true)
+        }
+        result = &mut task => (result, false),
+    }
+}
+
 /// Index just past the `CRLFCRLF` head terminator, if present in `buf`.
 fn head_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
@@ -145,6 +201,21 @@ fn head_eligible(head: &Head) -> bool {
         && !has("if-match")
         && !has("if-unmodified-since")
         && !has("upgrade")
+        // The normal adapter rejects browser service-worker script fetches before S3 dispatch.
+        // Falling back preserves that security boundary instead of letting sendfile bypass it.
+        && !has("service-worker")
+}
+
+/// Resolve the same client provenance as the hyper adapter, declining the optimized path when a
+/// trusted proxy did not provide an unambiguous address. Hyper then replays and handles the request
+/// with the typed `Unavailable` value; the fast path never risks substituting the proxy address.
+fn fast_path_client_source(
+    peer: SocketAddr,
+    headers: &[(String, String)],
+    trusted_proxies: &TrustedProxies,
+) -> Option<ClientSource> {
+    let source = crate::proxy::client_source(peer.ip(), headers, trusted_proxies);
+    (!matches!(source, ClientSource::Unavailable)).then_some(source)
 }
 
 /// Build the HTTP/1.1 response head for the fast path. `sendfile` writes the body; the response
@@ -159,12 +230,16 @@ fn format_head(
     status: hyper::StatusCode,
     headers: &[(String, String)],
     request_id: &str,
+    request_path: &str,
     keep_alive: bool,
 ) -> String {
     let reason = status.canonical_reason().unwrap_or("OK");
     let mut out = format!("HTTP/1.1 {} {reason}\r\n", status.as_u16());
     for (k, v) in headers {
-        if k.eq_ignore_ascii_case("connection") || k.eq_ignore_ascii_case("x-amz-request-id") {
+        if k.eq_ignore_ascii_case("connection")
+            || k.eq_ignore_ascii_case("x-amz-request-id")
+            || k.eq_ignore_ascii_case("service-worker-allowed")
+        {
             continue;
         }
         out.push_str(k);
@@ -174,6 +249,10 @@ fn format_head(
     }
     out.push_str("x-amz-request-id: ");
     out.push_str(request_id);
+    if let Some(scope) = service_worker_scope_for_path(request_path) {
+        out.push_str("\r\nservice-worker-allowed: ");
+        out.push_str(&scope);
+    }
     out.push_str(if keep_alive {
         "\r\nconnection: keep-alive\r\n\r\n"
     } else {
@@ -252,31 +331,43 @@ pub async fn try_sendfile_get(
     mut stream: TcpStream,
     stack: &AppStack,
     peer: SocketAddr,
+    trusted_proxies: &TrustedProxies,
     request_metrics_enabled: bool,
     min_bytes: u64,
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
 ) -> Fast {
     // Bytes read past one request's head (a pipelined next request) are carried into the next
     // iteration. The fast path only ever fully consumes bodyless GET heads, so `carry` is always a
     // clean request boundary.
     let mut carry: Vec<u8> = Vec::new();
     loop {
+        if shutdown_visible(shutdown) {
+            return Fast::Handled;
+        }
         let start = std::time::Instant::now();
         let mut buf = std::mem::take(&mut carry);
 
         // 1) Read a complete request head (consuming), bounded by HEAD_TIMEOUT — which also serves as
         //    the keep-alive idle timeout between requests on a reused connection.
-        let head_len =
-            match tokio::time::timeout(HEAD_TIMEOUT, read_head(&mut stream, &mut buf)).await {
-                Ok(HeadOutcome::Complete(e)) => e,
-                // A clean close (or idle timeout) with nothing buffered: we are done with this connection.
-                Ok(HeadOutcome::Eof) if buf.is_empty() => return Fast::Handled,
-                Err(_) if buf.is_empty() => return Fast::Handled,
-                // A partial/oversize head, a read error, or a timeout with bytes already read: replay what
-                // we have to hyper, which renders the proper error or frames the request correctly.
-                Ok(HeadOutcome::Eof) | Ok(HeadOutcome::Incomplete) | Err(_) => {
-                    return fallback(stream, buf, "head");
-                }
-            };
+        let head = tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                let _ = changed;
+                return Fast::Handled;
+            }
+            head = tokio::time::timeout(HEAD_TIMEOUT, read_head(&mut stream, &mut buf)) => head,
+        };
+        let head_len = match head {
+            Ok(HeadOutcome::Complete(e)) => e,
+            // A clean close (or idle timeout) with nothing buffered: we are done with this connection.
+            Ok(HeadOutcome::Eof) if buf.is_empty() => return Fast::Handled,
+            Err(_) if buf.is_empty() => return Fast::Handled,
+            // A partial/oversize head, a read error, or a timeout with bytes already read: replay what
+            // we have to hyper, which renders the proper error or frames the request correctly.
+            Ok(HeadOutcome::Eof) | Ok(HeadOutcome::Incomplete) | Err(_) => {
+                return fallback(stream, buf, "head");
+            }
+        };
 
         let Some(head) = parse_head(&buf[..head_len]) else {
             return fallback(stream, buf, "parse");
@@ -298,12 +389,18 @@ pub async fn try_sendfile_get(
         if bucket.is_none() || key.is_none() {
             return fallback(stream, buf, "not_object");
         }
+        if shutdown_visible(shutdown) {
+            return Fast::Handled;
+        }
         let host = head
             .headers
             .iter()
             .find(|(k, _)| k == "host")
             .map(|(_, v)| v.clone())
             .unwrap_or_default();
+        let Some(source) = fast_path_client_source(peer, &head.headers, trusted_proxies) else {
+            return fallback(stream, buf, "source_provenance");
+        };
 
         // Authenticate through the same chain as the normal path; defer any auth error to hyper so it
         // renders the proper S3 error envelope.
@@ -314,7 +411,7 @@ pub async fn try_sendfile_get(
                 query: &query,
                 headers: &head.headers,
                 host: &host,
-                source: peer.ip(),
+                source,
                 secure_transport: false,
             };
             match stack.auth.authenticate(&view).await {
@@ -323,6 +420,9 @@ pub async fn try_sendfile_get(
                 AuthOutcome::Denied(_) => return fallback(stream, buf, "denied"),
             }
         };
+        if shutdown_visible(shutdown) {
+            return Fast::Handled;
+        }
 
         let request_id = uuid::Uuid::new_v4().simple().to_string();
         let s3req = S3Request {
@@ -339,7 +439,7 @@ pub async fn try_sendfile_get(
                 .collect(),
             headers: head.headers.clone(),
             principal,
-            source: peer.ip(),
+            source,
             secure: false,
             request_id: request_id.clone(),
         };
@@ -349,6 +449,9 @@ pub async fn try_sendfile_get(
         // to hyper.
         let empty: cairn_types::BodyStream = Box::pin(futures_util::stream::empty());
         let resp = stack.s3.handle(s3req, empty).await;
+        if shutdown_visible(shutdown) {
+            return Fast::Handled;
+        }
         let status = resp.status;
         let S3Body::ZeroCopy {
             zero_copy, length, ..
@@ -374,7 +477,7 @@ pub async fn try_sendfile_get(
         // them to the next iteration when we keep the connection alive.
         let leftover = buf[head_len..].to_vec();
         let resp_bytes = length;
-        let out = format_head(status, &resp.headers, &request_id, keep_alive);
+        let out = format_head(status, &resp.headers, &request_id, &path, keep_alive);
 
         // Write the head + `sendfile` on a blocking thread (the socket must be blocking for
         // `sendfile`). On keep-alive, return the socket — switched back to non-blocking — so the loop
@@ -384,10 +487,13 @@ pub async fn try_sendfile_get(
             Ok(s) => s,
             Err(_) => return Fast::Handled,
         };
-        let blocking =
-            tokio::task::spawn_blocking(move || -> std::io::Result<Option<std::net::TcpStream>> {
+        let (blocking, interrupted) = interruptible_blocking_socket(
+            std_stream,
+            shutdown,
+            move |std_stream| -> std::io::Result<Option<std::net::TcpStream>> {
                 use std::io::{Read, Write};
                 std_stream.set_nonblocking(false)?;
+                std_stream.set_write_timeout(Some(FAST_WRITE_TIMEOUT))?;
                 let mut s = std_stream;
                 s.write_all(out.as_bytes())?;
                 crate::sendfile::sendfile_all(
@@ -416,10 +522,11 @@ pub async fn try_sendfile_get(
                     }
                     Ok(None)
                 }
-            })
-            .await;
+            },
+        )
+        .await;
 
-        let (reused, ok) = match blocking {
+        let (reused, operation_ok) = match blocking {
             Ok(Ok(reused)) => (reused, true),
             Ok(Err(e)) => {
                 tracing::debug!(error = %e, "sendfile fast path failed mid-write");
@@ -430,9 +537,16 @@ pub async fn try_sendfile_get(
                 (None, false)
             }
         };
+        let ok = operation_ok && !interrupted;
         metrics::counter!(
             "cairn_sendfile_get_total",
-            "result" => if ok { "ok" } else { "error" },
+            "result" => if interrupted {
+                "shutdown"
+            } else if ok {
+                "ok"
+            } else {
+                "error"
+            },
             "transport" => "plain",
         )
         .increment(1);
@@ -477,7 +591,7 @@ fn record_request_metrics(
     elapsed: Duration,
 ) {
     let status_code = status.as_u16();
-    let route = crate::server::classify_route(path);
+    let route = crate::server::classify_route(FAST_PATH_LISTENER_ROLE, path);
     metrics::counter!(
         "cairn_requests_total",
         "method" => "GET",
@@ -497,7 +611,12 @@ fn record_request_metrics(
     if request_metrics_enabled {
         if let Some((op, bucket)) =
             // The sendfile fast path is data-plane only (S3 object GET), never the console listener.
-            crate::server::classify_operation(false, &hyper::Method::GET, path, query)
+            crate::server::classify_operation(
+                FAST_PATH_LISTENER_ROLE,
+                &hyper::Method::GET,
+                path,
+                query,
+            )
         {
             let now_secs = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -518,7 +637,17 @@ fn record_request_metrics(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    struct ExitFlag(Arc<AtomicBool>);
+
+    impl Drop for ExitFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
 
     fn head(method: &str, headers: &[(&str, &str)]) -> Head {
         Head {
@@ -529,6 +658,143 @@ mod tests {
                 .collect(),
             is_get: method == "GET",
         }
+    }
+
+    #[test]
+    fn metrics_classification_is_pinned_to_the_data_listener() {
+        assert_eq!(FAST_PATH_LISTENER_ROLE, ListenerRole::Data);
+        assert_eq!(
+            crate::server::classify_route(FAST_PATH_LISTENER_ROLE, "/photos/cat.jpg"),
+            "s3"
+        );
+        assert_eq!(
+            crate::server::classify_operation(
+                FAST_PATH_LISTENER_ROLE,
+                &hyper::Method::GET,
+                "/photos/cat.jpg",
+                "",
+            ),
+            Some(("GetObject".to_owned(), "photos".to_owned()))
+        );
+    }
+
+    #[test]
+    fn fast_path_uses_resolved_source_and_falls_back_when_it_is_unavailable() {
+        let untrusted_peer: SocketAddr = "203.0.113.9:443".parse().unwrap();
+        let spoofed = head("GET", &[("x-forwarded-for", "192.0.2.1")]);
+        assert_eq!(
+            fast_path_client_source(untrusted_peer, &spoofed.headers, &TrustedProxies::default(),),
+            Some(ClientSource::Direct(untrusted_peer.ip()))
+        );
+
+        let trusted_peer: SocketAddr = "10.0.0.9:443".parse().unwrap();
+        let trusted = TrustedProxies::parse(Some("10.0.0.9")).unwrap();
+        let valid = head(
+            "GET",
+            &[
+                ("forwarded", "for=203.0.113.7"),
+                ("x-forwarded-for", "203.0.113.7"),
+            ],
+        );
+        assert_eq!(
+            fast_path_client_source(trusted_peer, &valid.headers, &trusted),
+            Some(ClientSource::Forwarded("203.0.113.7".parse().unwrap()))
+        );
+
+        let missing = head("GET", &[]);
+        assert_eq!(
+            fast_path_client_source(trusted_peer, &missing.headers, &trusted),
+            None,
+            "a trusted proxy without client provenance must hand off to hyper"
+        );
+        let conflicting = head(
+            "GET",
+            &[
+                ("forwarded", "for=203.0.113.7"),
+                ("x-forwarded-for", "198.51.100.8"),
+            ],
+        );
+        assert_eq!(
+            fast_path_client_source(trusted_peer, &conflicting.headers, &trusted),
+            None,
+            "conflicting header families must never reach fast authorization"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_interrupts_and_joins_a_stalled_blocking_socket_writer() {
+        use std::io::Write;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Keep the client open without reading. Repeated writes must eventually fill the kernel's
+        // send buffer and block the production helper's blocking thread.
+        let _stalled_client = TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let std_stream = server.into_std().unwrap();
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let exited = Arc::new(AtomicBool::new(false));
+        let exited_task = Arc::clone(&exited);
+
+        let helper = tokio::spawn(async move {
+            interruptible_blocking_socket(
+                std_stream,
+                &mut shutdown_rx,
+                move |mut socket| -> std::io::Result<()> {
+                    let _exit = ExitFlag(exited_task);
+                    socket.set_nonblocking(false)?;
+                    socket.set_write_timeout(Some(Duration::from_secs(30)))?;
+                    let _ = started_tx.send(());
+                    let chunk = [0u8; 64 * 1024];
+                    loop {
+                        socket.write_all(&chunk)?;
+                    }
+                },
+            )
+            .await
+        });
+
+        started_rx.await.expect("blocking writer started");
+        shutdown_tx.send(true).unwrap();
+        let (result, interrupted) = tokio::time::timeout(Duration::from_secs(3), helper)
+            .await
+            .expect("socket shutdown must wake the blocking writer")
+            .expect("helper task joins");
+
+        assert!(interrupted);
+        assert!(
+            matches!(result, Ok(Err(_))),
+            "the interrupted socket write must fail, got {result:?}"
+        );
+        assert!(
+            exited.load(Ordering::SeqCst),
+            "helper must await the blocking closure, not only cancel its async wrapper"
+        );
+    }
+
+    #[tokio::test]
+    async fn normal_blocking_socket_completion_returns_the_keep_alive_socket() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _client = TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let std_stream = server.into_std().unwrap();
+        let (_shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let (result, interrupted) =
+            interruptible_blocking_socket(std_stream, &mut shutdown_rx, |socket| {
+                socket.set_nonblocking(true)?;
+                Ok(socket)
+            })
+            .await;
+
+        assert!(!interrupted);
+        let returned = result.unwrap().unwrap();
+        assert!(
+            TcpStream::from_std(returned).is_ok(),
+            "normal keep-alive completion returns the original socket in nonblocking mode"
+        );
     }
 
     #[test]
@@ -593,6 +859,10 @@ mod tests {
             &[("if-unmodified-since", "x")]
         )));
         assert!(!head_eligible(&head("GET", &[("upgrade", "h2c")])));
+        assert!(
+            !head_eligible(&head("GET", &[("service-worker", "script")])),
+            "service-worker fetches must fall back to the rejecting adapter"
+        );
     }
 
     #[test]
@@ -606,7 +876,13 @@ mod tests {
             ("x-amz-request-id".to_owned(), "stale".to_owned()),
         ];
         // keep-alive variant: the connection stays open for the next request.
-        let ka = format_head(hyper::StatusCode::OK, &headers, "req-123", true);
+        let ka = format_head(
+            hyper::StatusCode::OK,
+            &headers,
+            "req-123",
+            "/bucket/worker.js",
+            true,
+        );
         assert!(ka.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(ka.contains("content-length: 42\r\n"));
         assert!(ka.contains("etag: \"abc\"\r\n"));
@@ -616,8 +892,17 @@ mod tests {
         assert!(!ka.contains("stale"));
         assert!(ka.contains("connection: keep-alive\r\n"));
         assert_eq!(ka.to_ascii_lowercase().matches("connection:").count(), 1);
+        assert!(ka.contains(
+            "service-worker-allowed: /bucket/worker.js/.cairn-service-worker-disabled/\r\n"
+        ));
         // close variant.
-        let close = format_head(hyper::StatusCode::OK, &headers, "r", false);
+        let close = format_head(
+            hyper::StatusCode::OK,
+            &headers,
+            "r",
+            "/bucket/worker.js",
+            false,
+        );
         assert!(close.contains("connection: close\r\n"));
         assert!(!close.contains("keep-alive"));
     }
@@ -625,7 +910,13 @@ mod tests {
     #[test]
     fn format_head_uses_the_canonical_206_reason_for_ranged_responses() {
         let headers = vec![("content-range".to_owned(), "bytes 0-9/100".to_owned())];
-        let out = format_head(hyper::StatusCode::PARTIAL_CONTENT, &headers, "r", true);
+        let out = format_head(
+            hyper::StatusCode::PARTIAL_CONTENT,
+            &headers,
+            "r",
+            "/bucket/key",
+            true,
+        );
         assert!(out.starts_with("HTTP/1.1 206 Partial Content\r\n"));
         assert!(out.contains("content-range: bytes 0-9/100\r\n"));
     }

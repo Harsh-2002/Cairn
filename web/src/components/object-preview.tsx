@@ -430,6 +430,37 @@ function Spinner() {
 
 // --- media stages ---------------------------------------------------------------------------------
 
+function usePreviewUrl(
+  bucket: string,
+  item: PreviewItem,
+  opts: { mime?: string; disposition?: "inline" | "attachment" } = {},
+): { url: string | null; failed: boolean } {
+  const [url, setUrl] = useState<string | null>(null);
+  const [failed, setFailed] = useState(false);
+  const mime = opts.mime;
+  const disposition = opts.disposition;
+  useEffect(() => {
+    let cancelled = false;
+    setUrl(null);
+    setFailed(false);
+    previewUrl(bucket, item.key, {
+      mime,
+      disposition,
+      versionId: item.versionId,
+    })
+      .then((value) => {
+        if (!cancelled) setUrl(value);
+      })
+      .catch(() => {
+        if (!cancelled) setFailed(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [bucket, item.key, item.versionId, mime, disposition]);
+  return { url, failed };
+}
+
 function ImageStage({
   bucket,
   item,
@@ -442,7 +473,10 @@ function ImageStage({
   onNaturalSize: (aspect: number | null) => void;
 }) {
   const [errored, setErrored] = useState(false);
-  if (errored) {
+  const preview = usePreviewUrl(bucket, item, {
+    mime: previewMimeOf(item.key),
+  });
+  if (errored || preview.failed) {
     return (
       <StageMessage
         icon={<ImageOff className="size-10" />}
@@ -452,14 +486,13 @@ function ImageStage({
       />
     );
   }
-  const src = previewUrl(bucket, item.key, {
-    mime: previewMimeOf(item.key),
-    versionId: item.versionId,
-  });
+  if (!preview.url) {
+    return <Loader2 className="m-auto size-6 animate-spin text-muted-foreground" />;
+  }
   return (
     <div className="flex w-full items-center justify-center overflow-auto p-4">
       <img
-        src={src}
+        src={preview.url}
         alt={basename(item.key)}
         onError={() => {
           setErrored(true);
@@ -494,7 +527,10 @@ function VideoStage({
   onDownload: () => void;
 }) {
   const [errored, setErrored] = useState(false);
-  if (errored) {
+  const preview = usePreviewUrl(bucket, item, {
+    mime: previewMimeOf(item.key),
+  });
+  if (errored || preview.failed) {
     return (
       <StageMessage
         icon={<TriangleAlert className="size-10" />}
@@ -504,13 +540,13 @@ function VideoStage({
       />
     );
   }
+  if (!preview.url) {
+    return <Loader2 className="m-auto size-6 animate-spin text-muted-foreground" />;
+  }
   return (
     <div className="flex w-full items-center justify-center p-4">
       <video
-        src={previewUrl(bucket, item.key, {
-          mime: previewMimeOf(item.key),
-          versionId: item.versionId,
-        })}
+        src={preview.url}
         controls
         preload="metadata"
         onError={() => setErrored(true)}
@@ -523,6 +559,21 @@ function VideoStage({
 }
 
 function AudioStage({ bucket, item }: { bucket: string; item: PreviewItem }) {
+  const preview = usePreviewUrl(bucket, item, {
+    mime: previewMimeOf(item.key),
+  });
+  if (preview.failed) {
+    return (
+      <StageMessage
+        icon={<TriangleAlert className="size-10" />}
+        title="This audio can't be played here"
+        detail={bytes(item.size)}
+      />
+    );
+  }
+  if (!preview.url) {
+    return <Loader2 className="m-auto size-6 animate-spin text-muted-foreground" />;
+  }
   return (
     <div className="flex w-full flex-col items-center justify-center gap-5 px-8 py-10">
       <div className="flex size-20 items-center justify-center rounded-2xl border bg-background text-muted-foreground">
@@ -534,10 +585,7 @@ function AudioStage({ bucket, item }: { bucket: string; item: PreviewItem }) {
       <audio
         controls
         preload="metadata"
-        src={previewUrl(bucket, item.key, {
-          mime: previewMimeOf(item.key),
-          versionId: item.versionId,
-        })}
+        src={preview.url}
         className="w-full max-w-md"
       >
         <track kind="captions" />
@@ -555,6 +603,10 @@ function PdfStage({
   item: PreviewItem;
   onDownload: () => void;
 }) {
+  const preview = usePreviewUrl(bucket, item, {
+    mime: "application/pdf",
+    disposition: "inline",
+  });
   if (item.size > PDF_MAX_BYTES) {
     return (
       <StageMessage
@@ -564,6 +616,18 @@ function PdfStage({
         onDownload={onDownload}
       />
     );
+  }
+  if (preview.failed) {
+    return (
+      <StageMessage
+        icon={<FileIcon className="size-10" />}
+        title="This PDF couldn't be displayed"
+        onDownload={onDownload}
+      />
+    );
+  }
+  if (!preview.url) {
+    return <Loader2 className="m-auto size-6 animate-spin text-muted-foreground" />;
   }
   // SECURITY (audit #13): the server is FORCED to label this response application/pdf and always
   // stamps x-content-type-options: nosniff (pinned by a server regression test), so an object whose
@@ -579,11 +643,7 @@ function PdfStage({
   return (
     <iframe
       title={`PDF preview: ${basename(item.key)}`}
-      src={previewUrl(bucket, item.key, {
-        mime: "application/pdf",
-        disposition: "inline",
-        versionId: item.versionId,
-      })}
+      src={preview.url}
       className="h-full w-full border-0 bg-white"
     />
   );
@@ -663,7 +723,7 @@ function TextStage({
         className="min-h-0 flex-1 overflow-auto bg-background focus-visible:outline-none"
         /* A focusable, keyboard-scrollable region for long text — a valid WAI-ARIA pattern the lint
            rule doesn't allow-list on role=region. */
-        /* eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex */
+        /* eslint-disable-next-line jsx-a11y-x/no-noninteractive-tabindex */
         tabIndex={0}
         role="region"
         aria-label={basename(item.key)}

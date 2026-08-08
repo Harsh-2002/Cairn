@@ -23,17 +23,36 @@ in-memory doubles).
   that bypasses this gate, and don't add a second unauthenticated path.
 - **Secrets are write-once or never.** Plaintext SigV4/Bearer/session secrets appear in a response
   **only** at mint time (`create_user`, `rotate_credentials`, `mint_session_credential`). SigV4 secrets
-  are sealed via `crypto.seal` (CRK1 envelope — nonce lives inside the ciphertext, store NULL `nonce`,
-  audit #29); only the *hash* of a Bearer secret is persisted. GET/list endpoints return a presence
-  flag, **never** the value (e.g. notification HMAC secrets). Never log or echo key material.
+  and notification HMAC keys are sealed via `crypto.seal` (CRK1 envelope — nonce lives inside the
+  ciphertext, store NULL/empty `nonce`, audit #29); only the *hash* of a Bearer secret is persisted.
+  Notification input uses a separate wire DTO so a caller can submit plaintext once but cannot
+  inject the persisted envelope; omitted keys preserve the stored envelope and `""` clears it.
+  GET/list endpoints return a presence flag, **never** the value. Never log or echo key material.
+  Persistent-share minting likewise returns its bearer token and absolute URL once; share list/get
+  responses contain only the stable non-secret share id and metadata, and revoke addresses that id.
+- **A temporary-session policy is a boundary, not a replacement.** Before storing an
+  administrator-derived session, compose its requested boundary with every Deny in the parent's
+  identity policy via `cairn_authz::intersect_admin_session_policy`. A policy read/parse failure is
+  an opaque 500 and creates no credential; never reinterpret it as no parent policy.
 - **Every mutating handler calls `record_activity(action, bucket, key, principal)`** after the write,
   stamping `actor = principal.access_key_id` — this is the audit trail the console reads. Keep the
   action string and emit it on success.
+- **Administrator is not an Object Lock bypass.** Force-bucket and recursive-prefix deletion pass
+  `GovernanceBypass::Denied` plus one trusted timestamp into the writer and treat
+  `DeleteProtected` as a stable per-version result. Protected rows and blobs stay in place.
+  Continue a version listing with its paired `(key, version-id)` cursor so a protected prefix cannot
+  starve later unlocked rows; return `409` for a bucket that cannot be emptied and include the exact
+  version id in every reported prefix-delete error. If a force-delete removes unlocked versions
+  before returning `409`, record `DeleteBucketContents` so the partial destructive write remains
+  auditable. Object-Lock bucket creation is one
+  `CreateObjectLockBucket` mutation, never create-then-configure.
 - **Self-lockout / break-glass guards** (in `delete_user`/`patch_user`): can't delete the identity
   you're signed in as; the root admin (`with_root_access_key`, re-seeded every startup) is undeletable;
   never remove the last active administrator. Preserve all three when touching user mutations.
 - **All listing is bounded** by `PAGE_LIMIT` (1000) and `delete_prefix` caps its error list (audit #26)
-  — a hostile cursor or huge prefix can never spin forever or OOM. Don't introduce an unbounded loop.
+  — a hostile cursor or huge prefix can never spin forever or OOM. `more` remains true while
+  protected rows remain, but a client must stop auto-retrying when a pass deletes zero rows.
+  Don't introduce an unbounded loop.
 
 ## Contract / how it fits
 - Depends on `cairn-types` (traits + domain types), `cairn-auth` (secret hashing), `cairn-authz`

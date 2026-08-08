@@ -10,6 +10,7 @@
 //! zero-size chunk and an optional trailer section terminated by a blank line.
 
 use bytes::Bytes;
+use cairn_types::SecretKey32;
 use sha2::{Digest, Sha256};
 
 /// Maximum length of a single chunk header line (defense against a non-terminating header).
@@ -19,7 +20,7 @@ const MAX_HEADER_LINE: usize = 16 * 1024;
 #[derive(Clone)]
 pub struct ChunkVerifier {
     /// The derived SigV4 signing key.
-    pub key: [u8; 32],
+    pub key: SecretKey32,
     /// The request timestamp (`amz-date`).
     pub amzdate: String,
     /// The credential scope (`date/region/s3/aws4_request`).

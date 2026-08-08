@@ -9,6 +9,12 @@
 //! subresource, which stays `NotImplemented`.
 
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
+
+use crate::crypto::{Nonce, Sealed};
+use crate::error::CryptoError;
+use crate::secret::SecretString;
+use crate::traits::Crypto;
 
 /// The kind of object event that occurred, in S3's `s3:Type:Detail` taxonomy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,9 +87,82 @@ pub struct WebhookEndpoint {
     /// An optional object-key suffix filter; only keys with this suffix notify.
     #[serde(default)]
     pub suffix: Option<String>,
-    /// An optional HMAC-SHA256 secret; when set, deliveries carry an `X-Cairn-Signature` header.
+    /// An optional sealed HMAC-SHA256 secret; when set, deliveries carry an
+    /// `X-Cairn-Signature` header. New writes always use [`WebhookSecret::Sealed`]. The legacy
+    /// plaintext variant exists only so the key-rewrap migration can read and replace old config
+    /// documents without losing subscriptions.
     #[serde(default)]
-    pub secret: Option<String>,
+    pub secret: Option<WebhookSecret>,
+}
+
+/// The envelope stored for one webhook HMAC signing key.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SealedWebhookSecret {
+    /// Authenticated ciphertext produced by the node master-key ring.
+    pub ciphertext: Vec<u8>,
+    /// Legacy detached nonce. Current CRK1 ciphertext embeds its nonce and stores this empty.
+    #[serde(default)]
+    pub nonce: Vec<u8>,
+}
+
+impl std::fmt::Debug for SealedWebhookSecret {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SealedWebhookSecret")
+            .field("ciphertext", &"<redacted>")
+            .field("nonce", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Stored webhook signing-key representation.
+///
+/// `LegacyPlaintext` is backward-read-only: the control plane never creates it, the worker holds
+/// it in a zeroize-on-drop [`SecretString`], and the master-key rewrap pass replaces it with a
+/// [`Sealed`](WebhookSecret::Sealed) envelope.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum WebhookSecret {
+    /// Current authenticated envelope form.
+    Sealed(SealedWebhookSecret),
+    /// Pre-sealing JSON string, accepted solely for online migration.
+    LegacyPlaintext(SecretString),
+}
+
+impl WebhookSecret {
+    /// Convert the cryptography trait's sealed output into the persisted representation.
+    #[must_use]
+    pub fn from_sealed(sealed: Sealed) -> Self {
+        Self::Sealed(SealedWebhookSecret {
+            ciphertext: sealed.ciphertext,
+            nonce: sealed.nonce.0,
+        })
+    }
+
+    /// Open the signing key into zeroize-on-drop memory.
+    ///
+    /// Legacy plaintext documents are copied into a temporary zeroizing buffer so callers have
+    /// one safe representation regardless of whether the background re-wrap migration has reached
+    /// this bucket yet.
+    pub fn open<C: Crypto + ?Sized>(&self, crypto: &C) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
+        match self {
+            Self::Sealed(sealed) => crypto.open(&sealed.ciphertext, &Nonce(sealed.nonce.clone())),
+            Self::LegacyPlaintext(secret) => {
+                Ok(Zeroizing::new(secret.expose_secret().as_bytes().to_vec()))
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for WebhookSecret {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Sealed(_) => formatter.write_str("WebhookSecret::Sealed(<redacted>)"),
+            Self::LegacyPlaintext(_) => {
+                formatter.write_str("WebhookSecret::LegacyPlaintext(<redacted>)")
+            }
+        }
+    }
 }
 
 impl WebhookEndpoint {

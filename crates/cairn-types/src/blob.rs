@@ -4,6 +4,7 @@
 use crate::bucket::CompressionPolicy;
 use crate::id::StoragePath;
 use crate::object::{ChecksumSet, ChecksumValue, CompressionDescriptor, ETag};
+use crate::secret::SecretKey32;
 use std::sync::Arc;
 
 /// Options controlling how an object is staged.
@@ -22,7 +23,7 @@ pub struct StageOptions {
     /// so ciphertext incompressibility never inflates a compressed block. `None` stores plaintext
     /// blocks as before; the field is additive and defaults to `None` so existing callers are
     /// unaffected (ARCH 27, SSE-S3).
-    pub encryption: Option<[u8; 32]>,
+    pub encryption: Option<SecretKey32>,
     /// The object's declared content length, when known up front (from the `Content-Length` header
     /// on a non-streaming PUT). `Some` lets the write path preallocate the staging file so the
     /// filesystem places it contiguously and an out-of-space condition surfaces immediately (ARCH
@@ -93,51 +94,49 @@ pub struct PartRef {
     pub storage_path: StoragePath,
     /// The plaintext part size.
     pub size: u64,
-    /// The part's raw 32-byte DEK to *decrypt* it on read when it was staged encrypted (ARCH 27);
-    /// `None` = a plaintext part (raw read). `assemble` decrypts through the CRNB reader before
-    /// hashing + re-encoding under the object DEK.
-    pub dek: Option<[u8; 32]>,
+    /// The part's declared storage cipher. A plaintext part is read raw; an encrypted part carries
+    /// both its raw DEK and the metadata-backed CRNB format version that the reader must require.
+    /// `assemble` decrypts through the CRNB reader before hashing + re-encoding under the object DEK.
+    pub cipher: BlobCipher,
 }
 
 /// How to read a committed blob: either the blob is known-plaintext, or a raw 32-byte
-/// data-encryption key opens it. Stating the cipher **by name** is the whole point — it is
-/// the only way to express a read, so a caller cannot ask to "read a blob" without declaring
-/// whether it is plaintext or which key decrypts it.
+/// data-encryption key opens one exact encrypted-container format. Stating both the cipher and
+/// expected format **by name** is the whole point — it is the only way to express a read, so a
+/// caller cannot ask to "read a blob" without declaring whether it is plaintext or which trusted
+/// metadata version and key decrypt it.
 ///
 /// This exists because the previous DEK-less `open` let a caller forget the key and silently
 /// stream an encrypted container's raw ciphertext at exactly the plaintext length — the way
 /// replication and the integrity scrub once shipped ciphertext to mirrors (ARCH 27). Making
 /// the cipher a required, named argument makes that whole class of bug unrepresentable.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum BlobCipher {
-    /// The blob was written in the clear. Opening an *encrypted* container this way fails
-    /// closed — it errors, it never streams ciphertext (see [`crate::BlobStore::open_raw`]).
+    /// Authoritative object/part metadata says the blob was written in the clear. The reader
+    /// requires its physical length to equal the trusted logical length, so an ordinary encrypted
+    /// container passed through this variant fails closed without content-sniffing arbitrary bytes.
     KnownPlaintext,
-    /// The blob is AES-256-GCM-encrypted at rest; these are the raw 32 key bytes that open it.
-    Dek([u8; 32]),
+    /// A legacy CRNB v2 blob. Only metadata written before authenticated CRNB v3 existed may select
+    /// this reader; the on-disk version byte alone is never authority to downgrade a current blob.
+    LegacyV2(SecretKey32),
+    /// A current CRNB v3 blob with an authenticated index and trailer.
+    AuthenticatedV3(SecretKey32),
 }
 
 impl BlobCipher {
-    /// Bridge for the callers that already hold an `Option<[u8; 32]>` (the unwrapped SSE DEK,
-    /// `None` for an unencrypted version): `None` => [`Self::KnownPlaintext`], `Some(k)` =>
-    /// [`Self::Dek`]. Keeps the call sites one line and the intent visible.
+    /// The raw DEK for either encrypted format, else `None`.
     #[must_use]
-    pub fn from_dek(dek: Option<[u8; 32]>) -> Self {
-        match dek {
-            Some(k) => Self::Dek(k),
-            None => Self::KnownPlaintext,
+    pub fn dek(&self) -> Option<SecretKey32> {
+        match self {
+            Self::LegacyV2(k) | Self::AuthenticatedV3(k) => Some(k.clone()),
+            Self::KnownPlaintext => None,
         }
     }
 
-    /// The raw DEK when this is [`Self::Dek`], else `None`. For an implementation that
-    /// translates the cipher back into the internal `Option<[u8; 32]>` at the exact point it
-    /// once consumed the old `dek` argument, so the fail-closed logic below it is unchanged.
+    /// Whether this declaration requires an encrypted CRNB container.
     #[must_use]
-    pub fn dek(&self) -> Option<[u8; 32]> {
-        match self {
-            Self::Dek(k) => Some(*k),
-            Self::KnownPlaintext => None,
-        }
+    pub fn is_encrypted(&self) -> bool {
+        !matches!(self, Self::KnownPlaintext)
     }
 }
 
@@ -147,7 +146,8 @@ impl std::fmt::Debug for BlobCipher {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::KnownPlaintext => f.write_str("KnownPlaintext"),
-            Self::Dek(_) => f.write_str("Dek(<redacted>)"),
+            Self::LegacyV2(_) => f.write_str("LegacyV2(<redacted>)"),
+            Self::AuthenticatedV3(_) => f.write_str("AuthenticatedV3(<redacted>)"),
         }
     }
 }
@@ -265,14 +265,15 @@ pub struct ReconcileReport {
 #[cfg(test)]
 mod tests {
     use super::BlobCipher;
+    use crate::SecretKey32;
 
     #[test]
     fn blob_cipher_debug_never_prints_key_bytes() {
         // A DEK of a recognisable, non-repeating byte pattern: if any key byte leaked into the
         // Debug output, hex/decimal renderings of these values would appear.
-        let key = [0xABu8; 32];
-        let dbg = format!("{:?}", BlobCipher::Dek(key));
-        assert_eq!(dbg, "Dek(<redacted>)");
+        let key = SecretKey32::new([0xABu8; 32]);
+        let dbg = format!("{:?}", BlobCipher::AuthenticatedV3(key));
+        assert_eq!(dbg, "AuthenticatedV3(<redacted>)");
         assert!(!dbg.contains("171"), "decimal key byte leaked: {dbg}");
         assert!(
             !dbg.to_ascii_lowercase().contains("ab"),
@@ -286,15 +287,13 @@ mod tests {
     }
 
     #[test]
-    fn blob_cipher_from_dek_bridges_the_option() {
-        assert!(matches!(
-            BlobCipher::from_dek(None),
-            BlobCipher::KnownPlaintext
-        ));
-        let k = [7u8; 32];
-        assert!(matches!(BlobCipher::from_dek(Some(k)), BlobCipher::Dek(d) if d == k));
-        // Round-trips back to the internal Option at the point an impl consumes it.
+    fn blob_cipher_preserves_the_expected_format_with_the_key() {
+        let k = SecretKey32::new([7u8; 32]);
         assert_eq!(BlobCipher::KnownPlaintext.dek(), None);
-        assert_eq!(BlobCipher::Dek(k).dek(), Some(k));
+        assert_eq!(BlobCipher::LegacyV2(k.clone()).dek(), Some(k.clone()));
+        assert_eq!(BlobCipher::AuthenticatedV3(k.clone()).dek(), Some(k));
+        assert!(!BlobCipher::KnownPlaintext.is_encrypted());
+        assert!(BlobCipher::LegacyV2(SecretKey32::new([1; 32])).is_encrypted());
+        assert!(BlobCipher::AuthenticatedV3(SecretKey32::new([2; 32])).is_encrypted());
     }
 }

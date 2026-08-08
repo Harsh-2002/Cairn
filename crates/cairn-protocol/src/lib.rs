@@ -15,4 +15,7 @@ pub use chunked::{ChunkDecoder, ChunkVerifier, DecodeError};
 pub use error_map::error_response;
 pub use keyprovider::{KeyProvider, LocalRingProvider};
 pub use request::{S3Body, S3Request, S3Response};
-pub use service::S3Service;
+pub use service::{
+    MultipartClaimRecovery, MultipartPartWriteRecovery, ObjectWriteRecovery, S3Service,
+    StorageRecoveryAdmission, StorageRecoveryPermit,
+};

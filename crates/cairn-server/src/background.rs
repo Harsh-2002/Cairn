@@ -9,92 +9,453 @@ use cairn_crypto::SystemClock;
 use cairn_lifecycle::{BucketLifecycle, LifecycleScanner};
 use cairn_replication::{BucketRoutedSink, HttpS3Sink, SinkRouter};
 use cairn_types::bucket::ConfigAspect;
-use cairn_types::error::ReplicationError;
+use cairn_types::error::{MetaError, ReplicationError};
 use cairn_types::id::{BucketName, ObjectKey, VersionId};
-use cairn_types::meta::Mutation;
+use cairn_types::meta::{MultipartTerminalOutcome, Mutation, MutationOutcome};
 use cairn_types::replication::ReplicatedObject;
 use cairn_types::traits::Clock;
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
+
+/// Maximum batches one event-driven drain may claim before yielding to its heartbeat. Shutdown is
+/// checked between every batch, so a signalled worker never starts another claim pass.
+const MAX_DRAIN_PASSES: u32 = 50;
+const MULTIPART_SWEEP_PAGE: u32 = 1_000;
+const MULTIPART_SWEEP_MAX_ITEMS: usize = 10_000;
+const MULTIPART_SWEEP_MAX_DURATION: Duration = Duration::from_secs(30);
+
+struct ManagedTask {
+    name: String,
+    handle: JoinHandle<()>,
+}
+
+#[derive(Default, Debug, PartialEq, Eq)]
+struct TaskShutdownReport {
+    completed: usize,
+    cancelled: usize,
+    failed: usize,
+}
+
+#[derive(Default)]
+struct TaskSet {
+    tasks: Vec<ManagedTask>,
+}
+
+impl Drop for TaskSet {
+    fn drop(&mut self) {
+        // `JoinHandle` detaches when merely dropped. Abort first so cancellation of the outer
+        // server future cannot accidentally orphan a worker outside the retained supervisor.
+        for task in &self.tasks {
+            task.handle.abort();
+        }
+    }
+}
+
+impl TaskSet {
+    fn spawn(&mut self, name: impl Into<String>, task: impl Future<Output = ()> + Send + 'static) {
+        self.tasks.push(ManagedTask {
+            name: name.into(),
+            handle: tokio::spawn(task),
+        });
+    }
+
+    /// Join every cooperative worker until one shared deadline, then abort and join whatever
+    /// remains. Tasks run concurrently while this method awaits them; sequentially observing their
+    /// handles does not serialize their work.
+    async fn join_or_abort(&mut self, grace: Duration) -> TaskShutdownReport {
+        let deadline = tokio::time::Instant::now() + grace;
+        let mut report = TaskShutdownReport::default();
+        let mut joined = 0usize;
+
+        while joined < self.tasks.len() {
+            let task = &mut self.tasks[joined];
+            match tokio::time::timeout_at(deadline, &mut task.handle).await {
+                Ok(Ok(())) => report.completed += 1,
+                Ok(Err(error)) => {
+                    report.failed += 1;
+                    tracing::warn!(
+                        task = %task.name,
+                        error = %error,
+                        "background task exited unexpectedly during shutdown"
+                    );
+                }
+                Err(_) => break,
+            }
+            joined += 1;
+        }
+
+        let remaining = self.tasks.split_off(joined);
+        self.tasks.clear();
+        for task in remaining {
+            let was_running = !task.handle.is_finished();
+            if was_running {
+                task.handle.abort();
+            }
+            match task.handle.await {
+                Ok(()) => report.completed += 1,
+                Err(error) if error.is_cancelled() => {
+                    report.cancelled += 1;
+                    tracing::warn!(
+                        task = %task.name,
+                        "background task exceeded the shutdown deadline and was cancelled"
+                    );
+                }
+                Err(error) => {
+                    report.failed += 1;
+                    tracing::warn!(
+                        task = %task.name,
+                        error = %error,
+                        "background task exited unexpectedly during shutdown"
+                    );
+                }
+            }
+        }
+        report
+    }
+}
+
+impl TaskShutdownReport {
+    fn merge(&mut self, other: Self) {
+        self.completed += other.completed;
+        self.cancelled += other.cancelled;
+        self.failed += other.failed;
+    }
+
+    fn is_complete(&self) -> bool {
+        self.cancelled == 0 && self.failed == 0
+    }
+}
+
+/// Outcome of the ordered final durability tail.
+///
+/// A report is complete only when every enabled flush/checkpoint finished successfully. Keeping
+/// this explicit prevents the process-level shutdown log from claiming success after a best-effort
+/// error or deadline cancellation.
+#[derive(Default, Debug, PartialEq, Eq)]
+pub(crate) struct FinalizeReport {
+    request_metric_flushes: usize,
+    request_metric_failures: usize,
+    seal_counter_flushes: usize,
+    seal_counter_failures: usize,
+    checkpoints: usize,
+    checkpoint_busy: usize,
+    checkpoint_failures: usize,
+    timed_out: bool,
+}
+
+impl FinalizeReport {
+    pub(crate) fn is_complete(&self) -> bool {
+        !self.timed_out
+            && self.request_metric_failures == 0
+            && self.seal_counter_failures == 0
+            && self.checkpoint_busy == 0
+            && self.checkpoint_failures == 0
+    }
+
+    pub(crate) fn log_outcome(&self) {
+        if self.is_complete() {
+            tracing::info!(
+                request_metric_flushes = self.request_metric_flushes,
+                seal_counter_flushes = self.seal_counter_flushes,
+                checkpoints = self.checkpoints,
+                "final metrics/counter flush and SQLite checkpoints complete"
+            );
+        } else {
+            tracing::error!(
+                timed_out = self.timed_out,
+                request_metric_failures = self.request_metric_failures,
+                seal_counter_failures = self.seal_counter_failures,
+                checkpoint_busy = self.checkpoint_busy,
+                checkpoint_failures = self.checkpoint_failures,
+                "final shutdown durability work incomplete"
+            );
+        }
+    }
+}
+
+/// Retained ownership of every task spawned by [`spawn`].
+///
+/// On shutdown, workers first observe the shared signal and stop starting new passes. The
+/// supervisor then joins them under one deadline, cancels any overrun, and only after no worker can
+/// race a final drain does it flush in-memory metrics, persist master-key counters, and checkpoint
+/// every concrete SQLite shard.
+pub(crate) struct BackgroundTasks {
+    tasks: TaskSet,
+    /// Workers that must remain alive until every accepted HTTP request has been joined or
+    /// cancelled. In particular, a timed-out CompleteMultipart future enqueues its claim release
+    /// from `Drop`, which can happen at the very end of the HTTP drain.
+    request_tail_tasks: TaskSet,
+    stack: Arc<AppStack>,
+    request_metrics_retention_secs: Option<i64>,
+}
+
+/// A stopped worker set that still owns the resources needed by the ordered final durability tail.
+pub(crate) struct StoppedBackgroundTasks {
+    worker_report: TaskShutdownReport,
+    request_tail_tasks: TaskSet,
+    stack: Arc<AppStack>,
+    request_metrics_retention_secs: Option<i64>,
+}
+
+/// The complete background-side shutdown result: cooperative worker drain plus final persistence.
+pub(crate) struct BackgroundShutdownReport {
+    worker_report: TaskShutdownReport,
+    finalization: FinalizeReport,
+}
+
+impl BackgroundShutdownReport {
+    pub(crate) fn is_complete(&self) -> bool {
+        self.worker_report.is_complete() && self.finalization.is_complete()
+    }
+}
+
+impl BackgroundTasks {
+    fn new(stack: Arc<AppStack>, request_metrics_retention_secs: Option<i64>) -> Self {
+        Self {
+            tasks: TaskSet::default(),
+            request_tail_tasks: TaskSet::default(),
+            stack,
+            request_metrics_retention_secs,
+        }
+    }
+
+    fn spawn(&mut self, name: impl Into<String>, task: impl Future<Output = ()> + Send + 'static) {
+        self.tasks.spawn(name, task);
+    }
+
+    fn spawn_request_tail(
+        &mut self,
+        name: impl Into<String>,
+        task: impl Future<Output = ()> + Send + 'static,
+    ) {
+        self.request_tail_tasks.spawn(name, task);
+    }
+
+    /// Stop and join/cancel workers, retaining the durability resources needed for the final flush.
+    pub(crate) async fn stop(mut self, worker_grace: Duration) -> StoppedBackgroundTasks {
+        let report = self.tasks.join_or_abort(worker_grace).await;
+        if report.is_complete() {
+            tracing::info!(
+                completed = report.completed,
+                "background workers stopped cooperatively"
+            );
+        } else {
+            tracing::error!(
+                completed = report.completed,
+                cancelled = report.cancelled,
+                failed = report.failed,
+                "background worker shutdown incomplete"
+            );
+        }
+        StoppedBackgroundTasks {
+            worker_report: report,
+            request_tail_tasks: self.request_tail_tasks,
+            stack: self.stack,
+            request_metrics_retention_secs: self.request_metrics_retention_secs,
+        }
+    }
+}
+
+impl StoppedBackgroundTasks {
+    /// Run only after both ordinary background workers and in-flight HTTP requests have drained.
+    /// First join the request-tail workers that consume cancellation callbacks, then run the final
+    /// persistence tail. This order ensures neither multipart ownership nor request metrics can
+    /// change after their final drains.
+    pub(crate) async fn finalize(
+        mut self,
+        request_tail_grace: Duration,
+        final_flush_grace: Duration,
+    ) -> BackgroundShutdownReport {
+        let tail_report = self
+            .request_tail_tasks
+            .join_or_abort(request_tail_grace)
+            .await;
+        if tail_report.is_complete() {
+            tracing::info!(
+                completed = tail_report.completed,
+                "request-tail workers drained cooperatively"
+            );
+        } else {
+            tracing::error!(
+                completed = tail_report.completed,
+                cancelled = tail_report.cancelled,
+                failed = tail_report.failed,
+                "request-tail worker shutdown incomplete"
+            );
+        }
+        self.worker_report.merge(tail_report);
+        let finalization = match tokio::time::timeout(
+            final_flush_grace,
+            finalize_shutdown(&self.stack, self.request_metrics_retention_secs),
+        )
+        .await
+        {
+            Ok(report) => report,
+            Err(_) => {
+                tracing::error!(
+                    timeout_seconds = final_flush_grace.as_secs(),
+                    "final metrics/counter flush and WAL checkpoint exceeded the shutdown deadline"
+                );
+                FinalizeReport {
+                    timed_out: true,
+                    ..FinalizeReport::default()
+                }
+            }
+        };
+        finalization.log_outcome();
+        BackgroundShutdownReport {
+            worker_report: self.worker_report,
+            finalization,
+        }
+    }
+}
 
 /// Spawn the background tasks, reading their intervals and the multipart lifetime from the
-/// configured 28.2 knobs. `shutdown` is the server's graceful-shutdown signal; the replication
-/// worker pool watches it *between* drain passes, so a worker stops claiming NEW work as soon as
-/// shutdown begins. A pass already in flight is not joined on shutdown — the runtime drop may
-/// cancel it mid-ship — but that is safe: an aborted claim is recovered by the outbox lease and the
-/// object re-ships at-least-once on the next start (durability rests on the durable outbox, not on a
-/// clean worker join).
-pub fn spawn(stack: Arc<AppStack>, cfg: &Config, shutdown: tokio::sync::watch::Receiver<bool>) {
+/// configured 28.2 knobs. Every handle is retained in the returned supervisor. `shutdown` is the
+/// server's graceful-shutdown signal; workers check it before starting another pass or claim batch.
+/// A pass that cannot finish within the server's bounded grace is cancelled, leaving its durable
+/// lease/cursor for startup recovery.
+pub(crate) fn spawn(
+    stack: Arc<AppStack>,
+    cfg: &Config,
+    shutdown: watch::Receiver<bool>,
+) -> BackgroundTasks {
     let sweep_interval = Duration::from_secs(cfg.multipart_sweep_interval_secs);
     #[allow(clippy::cast_possible_wrap)]
     let multipart_lifetime_secs = cfg.multipart_upload_lifetime_secs as i64;
+    #[allow(clippy::cast_possible_wrap)]
+    let multipart_reservation_lifetime_secs = cfg
+        .request_timeout_secs
+        .saturating_add(60)
+        .min(i64::MAX as u64) as i64;
     let lifecycle_interval = Duration::from_secs(cfg.lifecycle_interval_secs);
     let checkpoint_interval = Duration::from_secs(cfg.wal_checkpoint_interval_secs);
+    #[allow(clippy::cast_possible_wrap)]
+    let request_metrics_retention_secs = cfg
+        .request_metrics_enabled
+        .then_some((cfg.request_metrics_retention_days as i64) * 86_400);
+    let mut tasks = BackgroundTasks::new(stack.clone(), request_metrics_retention_secs);
 
-    tokio::spawn(sweeper_loop(
-        stack.clone(),
-        sweep_interval,
-        multipart_lifetime_secs,
-    ));
-    tokio::spawn(lifecycle_loop(stack.clone(), lifecycle_interval));
-    tokio::spawn(webhook_loop(
-        stack.clone(),
-        Duration::from_secs(cfg.webhook_interval_secs),
-    ));
+    // Unlike periodic workers, storage-commit recovery remains alive through the HTTP drain:
+    // cancelling CompleteMultipart, PUT, or Copy at the request-timeout or shutdown deadline drops
+    // its protocol guard and synchronously queues exact recovery at that moment. After both accept
+    // loops have joined/cancelled every connection, `server::serve` sends the FIFO drain sentinel;
+    // this retained worker is then joined before the final metrics/counter/WAL tail.
+    tasks.spawn_request_tail(
+        "storage commit cancellation recovery",
+        stack
+            .multipart_claim_recovery
+            .worker(stack.meta.clone(), stack.blob.clone()),
+    );
+
+    tasks.spawn(
+        "multipart sweeper",
+        sweeper_loop(
+            stack.clone(),
+            sweep_interval,
+            multipart_lifetime_secs,
+            multipart_reservation_lifetime_secs,
+            shutdown.clone(),
+        ),
+    );
+    tasks.spawn(
+        "lifecycle scanner",
+        lifecycle_loop(stack.clone(), lifecycle_interval, shutdown.clone()),
+    );
+    tasks.spawn(
+        "webhook delivery",
+        webhook_loop(
+            stack.clone(),
+            Duration::from_secs(cfg.webhook_interval_secs),
+            shutdown.clone(),
+        ),
+    );
     // The S3-import worker: claims pending import jobs and runs them into this node.
-    tokio::spawn(crate::import_run::import_loop(
-        stack.clone(),
-        crate::import_run::ImportLoopConfig {
-            poll_interval_secs: cfg.import_poll_interval_secs,
-            default_workers: cfg.import_default_workers,
-            max_workers: cfg.import_max_workers,
-            global_max_inflight: cfg.import_global_max_inflight,
-            root_access_key: cfg.root_access_key.clone(),
-        },
-        stack.import_notify.clone(),
-        shutdown.clone(),
-    ));
+    tasks.spawn(
+        "S3 import worker",
+        crate::import_run::import_loop(
+            stack.clone(),
+            crate::import_run::ImportLoopConfig {
+                poll_interval_secs: cfg.import_poll_interval_secs,
+                retention_secs: cfg.import_retention_secs,
+                default_workers: cfg.import_default_workers,
+                max_workers: cfg.import_max_workers,
+                global_max_inflight: cfg.import_global_max_inflight,
+                timeouts: cfg.import_timeouts(),
+                root_access_key: cfg.root_access_key.clone(),
+            },
+            stack.import_notify.clone(),
+            shutdown.clone(),
+        ),
+    );
     // The integrity scrub is opt-in (I/O-heavy): only spawned when an interval is configured.
     if cfg.scrub_interval_secs > 0 {
-        tokio::spawn(scrub_loop(
-            stack.clone(),
-            Duration::from_secs(cfg.scrub_interval_secs),
-        ));
+        tasks.spawn(
+            "integrity scrub",
+            scrub_loop(
+                stack.clone(),
+                Duration::from_secs(cfg.scrub_interval_secs),
+                shutdown.clone(),
+            ),
+        );
     }
     // The release update check (ARCH 28): opt-out, best-effort. Dials the configured feed through the
     // SSRF guard on a slow cadence and publishes the result for `GET /system`. Never spawned when off.
     if cfg.update_check_enabled {
-        tokio::spawn(update_check_loop(
-            stack.clone(),
-            cfg.update_check_url.clone(),
-            Duration::from_secs(cfg.update_check_interval_secs),
-            cfg.allow_internal_endpoints,
-        ));
+        tasks.spawn(
+            "release update check",
+            update_check_loop(
+                stack.clone(),
+                cfg.update_check_url.clone(),
+                Duration::from_secs(cfg.update_check_interval_secs),
+                cfg.allow_internal_endpoints,
+                shutdown.clone(),
+            ),
+        );
     }
     // The WAL checkpointer drives inherent methods on the concrete `SqliteMetadataStore`, so it
     // runs only for the `sqlite` backend (where `stack.store` holds one handle per shard). The
     // libSQL and Turso engines self-manage their WAL, so the loop is not spawned for them.
     if !stack.store.is_empty() {
-        tokio::spawn(checkpoint_loop(
-            stack.clone(),
-            checkpoint_interval,
-            cfg.wal_checkpoint_size_bytes,
-        ));
+        tasks.spawn(
+            "WAL checkpointer",
+            checkpoint_loop(
+                stack.clone(),
+                checkpoint_interval,
+                cfg.wal_checkpoint_size_bytes,
+                shutdown.clone(),
+            ),
+        );
         // Master-key re-wrap + seal-count flush (audit #29, Phase D/E), one per sqlite shard,
         // sharing the one master-key ring. Disabled when the interval is 0.
-        for store in &stack.store {
-            crate::key_rewrap::spawn(
-                store.clone(),
-                stack.crypto.clone(),
-                stack.meta_cache.clone(),
-                cfg.key_rewrap_interval_secs,
-            );
-            crate::key_rewrap::spawn_counter_sync(
-                store.clone(),
-                stack.crypto.clone(),
-                cfg.key_counter_sync_secs,
-            );
+        for (shard, store) in stack.store.iter().enumerate() {
+            if cfg.key_rewrap_interval_secs > 0 {
+                tasks.spawn(
+                    format!("master-key re-wrap shard {shard}"),
+                    crate::key_rewrap::rewrap_loop(
+                        store.clone(),
+                        stack.crypto.clone(),
+                        stack.meta_cache.clone(),
+                        cfg.key_rewrap_interval_secs,
+                        shutdown.clone(),
+                    ),
+                );
+            }
+            if cfg.key_counter_sync_secs > 0 {
+                tasks.spawn(
+                    format!("master-key counter sync shard {shard}"),
+                    crate::key_rewrap::counter_sync_loop(
+                        store.clone(),
+                        stack.crypto.clone(),
+                        cfg.key_counter_sync_secs,
+                        shutdown.clone(),
+                    ),
+                );
+            }
         }
     } else {
         tracing::info!(
@@ -124,6 +485,10 @@ pub fn spawn(stack: Arc<AppStack>, cfg: &Config, shutdown: tokio::sync::watch::R
         base_backoff_secs: cfg.replication_base_backoff_secs,
         max_backoff_secs: cfg.replication_max_backoff_secs,
     };
+    // Exactly one process-wide weighted byte budget is created here and cloned through every
+    // worker and sink shape below. Worker count, destination fan-out, and per-drain sink rebuilds
+    // therefore cannot multiply the configured replication memory allowance.
+    let sink_runtime = cfg.replication_sink_runtime();
     let concurrency = cfg.replication_worker_concurrency.max(1);
     let targets = cfg.parse_replication_targets().unwrap_or_default();
     let single_cfg = single_target_sink_cfg(cfg);
@@ -137,35 +502,33 @@ pub fn spawn(stack: Arc<AppStack>, cfg: &Config, shutdown: tokio::sync::watch::R
     for _ in 0..concurrency {
         let notify = stack.replication_notify.clone();
         let sd = shutdown.clone();
+        let worker = ReplicationWorkerRuntime {
+            interval,
+            notify,
+            shutdown: sd,
+            opts,
+            sink_runtime: sink_runtime.clone(),
+        };
         if !targets.is_empty() {
-            tokio::spawn(multi_target_replication_loop(
-                stack.clone(),
-                targets.clone(),
-                single_cfg.clone(),
-                interval,
-                notify,
-                sd,
-                opts,
-            ));
+            tasks.spawn(
+                "replication worker",
+                multi_target_replication_loop(
+                    stack.clone(),
+                    targets.clone(),
+                    single_cfg.clone(),
+                    worker,
+                ),
+            );
         } else if let Some(sink_cfg) = single_cfg.clone() {
-            tokio::spawn(replication_loop(
-                stack.clone(),
-                sink_cfg,
-                interval,
-                notify,
-                sd,
-                opts,
-            ));
+            tasks.spawn(
+                "replication worker",
+                replication_loop(stack.clone(), sink_cfg, worker),
+            );
         } else {
-            tokio::spawn(multi_target_replication_loop(
-                stack.clone(),
-                Vec::new(),
-                None,
-                interval,
-                notify,
-                sd,
-                opts,
-            ));
+            tasks.spawn(
+                "replication worker",
+                multi_target_replication_loop(stack.clone(), Vec::new(), None, worker),
+            );
         }
     }
     tracing::info!(
@@ -176,28 +539,40 @@ pub fn spawn(stack: Arc<AppStack>, cfg: &Config, shutdown: tokio::sync::watch::R
     // Reclaim terminal outbox rows so the table stays a bounded work queue (ARCH 20.3): completed
     // rows carry no further information and would otherwise accumulate one-per-replicated-object
     // forever, and genuinely-stale failures are auto-cleared.
-    tokio::spawn(replication_prune_loop(
-        stack.clone(),
-        cfg.replication_retention_secs,
-    ));
+    tasks.spawn(
+        "replication outbox pruner",
+        replication_prune_loop(
+            stack.clone(),
+            cfg.replication_retention_secs,
+            shutdown.clone(),
+        ),
+    );
     // Reclaim terminally-failed webhook-outbox rows so a dead/misconfigured sink can't bloat the
     // metadata DB without bound (audit 2026-07; ARCH 20.3 bounded-work-queue contract).
-    tokio::spawn(events_outbox_prune_loop(
-        stack.clone(),
-        cfg.events_outbox_retention_secs,
-    ));
+    tasks.spawn(
+        "webhook outbox pruner",
+        events_outbox_prune_loop(
+            stack.clone(),
+            cfg.events_outbox_retention_secs,
+            shutdown.clone(),
+        ),
+    );
     // Request-metrics flush loop (ARCH 26.5). Gated on the subsystem being enabled: when off, the
     // hot path accumulates nothing and there is nothing to flush. Otherwise it periodically drains
     // the in-process aggregator into a batched upsert and prunes rows past the retention horizon.
     if cfg.request_metrics_enabled {
         let flush_interval = Duration::from_secs(cfg.request_metrics_flush_secs.max(1));
-        #[allow(clippy::cast_possible_wrap)]
-        let retention_secs = (cfg.request_metrics_retention_days as i64) * 86_400;
-        tokio::spawn(request_metrics_flush_loop(
-            stack.clone(),
-            flush_interval,
-            retention_secs,
-        ));
+        let retention_secs =
+            request_metrics_retention_secs.expect("enabled request metrics have retention");
+        tasks.spawn(
+            "request metrics flush",
+            request_metrics_flush_loop(
+                stack.clone(),
+                flush_interval,
+                retention_secs,
+                shutdown.clone(),
+            ),
+        );
         tracing::info!("request-metrics ingestion enabled");
     }
 
@@ -226,17 +601,121 @@ pub fn spawn(stack: Arc<AppStack>, cfg: &Config, shutdown: tokio::sync::watch::R
                     created_before = cutoff.0,
                     "encrypted-suspect replication audit enabled"
                 );
-                tokio::spawn(replication_audit_loop(
-                    stack.clone(),
-                    cutoff,
-                    cfg.replication_allow_plaintext_sse_over_http,
-                    cfg.replication_endpoint.clone(),
-                ));
+                tasks.spawn(
+                    "encrypted replication audit",
+                    replication_audit_loop(
+                        stack.clone(),
+                        cutoff,
+                        cfg.replication_allow_plaintext_sse_over_http,
+                        cfg.replication_endpoint.clone(),
+                        shutdown.clone(),
+                    ),
+                );
             }
         },
     }
 
-    tokio::spawn(metrics_loop(stack));
+    tasks.spawn("metrics refresher", metrics_loop(stack, shutdown));
+    tasks
+}
+
+/// Wait for one periodic interval unless shutdown wins. The biased select is deliberate: if the
+/// timer and signal become ready together, shutdown wins and the caller does not start a new pass.
+pub(crate) async fn wait_for_interval_or_shutdown(
+    interval: Duration,
+    shutdown: &mut watch::Receiver<bool>,
+) -> bool {
+    if *shutdown.borrow() {
+        return false;
+    }
+    tokio::select! {
+        biased;
+        changed = shutdown.changed() => {
+            let _ = changed;
+            false
+        }
+        () = tokio::time::sleep(interval) => true,
+    }
+}
+
+/// Drain one request-metrics snapshot through the writer. Background and final shutdown flushes
+/// share this seam so their retention and empty-drain behavior cannot drift.
+async fn flush_request_metrics_once(
+    stack: &AppStack,
+    retention_secs: i64,
+) -> Result<(), MetaError> {
+    let rows = stack.request_metrics.drain();
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let now_secs = SystemClock::new().now().as_secs();
+    stack
+        .meta
+        .submit(Mutation::RecordRequestMetrics {
+            rows,
+            prune_before: Some(now_secs - retention_secs),
+        })
+        .await?;
+    Ok(())
+}
+
+/// The final, ordered durability tail after every worker has joined or been cancelled:
+///
+/// 1. drain request metrics while no periodic flusher can race the accumulator;
+/// 2. persist the active master-key seal counter on every SQLite shard;
+/// 3. checkpoint every SQLite WAL after both preceding writer mutations.
+async fn finalize_shutdown(
+    stack: &AppStack,
+    request_metrics_retention_secs: Option<i64>,
+) -> FinalizeReport {
+    let mut report = FinalizeReport::default();
+    if let Some(retention_secs) = request_metrics_retention_secs {
+        match flush_request_metrics_once(stack, retention_secs).await {
+            Ok(()) => report.request_metric_flushes += 1,
+            Err(error) => {
+                report.request_metric_failures += 1;
+                tracing::error!(%error, "final request-metrics flush failed");
+            }
+        }
+    }
+
+    for (shard, store) in stack.store.iter().enumerate() {
+        match crate::key_rewrap::sync_seal_count(store, &stack.crypto).await {
+            Ok(()) => report.seal_counter_flushes += 1,
+            Err(error) => {
+                report.seal_counter_failures += 1;
+                tracing::error!(%error, shard, "final master-key seal-count flush failed");
+            }
+        }
+    }
+
+    for (shard, store) in stack.store.iter().enumerate() {
+        match store.checkpoint().await {
+            Ok(stats) => {
+                if stats.busy {
+                    report.checkpoint_busy += 1;
+                    tracing::warn!(
+                        shard,
+                        log_frames = stats.log_frames,
+                        checkpointed_frames = stats.checkpointed_frames,
+                        "final SQLite checkpoint remained busy"
+                    );
+                } else {
+                    report.checkpoints += 1;
+                    tracing::info!(
+                        shard,
+                        checkpointed_frames = stats.checkpointed_frames,
+                        "final SQLite checkpoint complete"
+                    );
+                }
+            }
+            Err(error) => {
+                report.checkpoint_failures += 1;
+                tracing::error!(%error, shard, "final SQLite checkpoint failed");
+            }
+        }
+    }
+    report
 }
 
 /// How long after startup the first encrypted-suspect audit pass runs. Long enough that it never
@@ -286,8 +765,11 @@ async fn replication_audit_loop(
     created_before: cairn_types::time::Timestamp,
     allow_plaintext_sse_over_http: bool,
     env_endpoint: Option<String>,
+    mut shutdown: watch::Receiver<bool>,
 ) {
-    tokio::time::sleep(AUDIT_FIRST_PASS_DELAY).await;
+    if !wait_for_interval_or_shutdown(AUDIT_FIRST_PASS_DELAY, &mut shutdown).await {
+        return;
+    }
     loop {
         let started = std::time::Instant::now();
         // `sample_limit = 0`: the gauge path wants counts, and materializes no sample list.
@@ -333,7 +815,9 @@ async fn replication_audit_loop(
             }
             Err(e) => tracing::warn!(error = %e, "replication encrypted-suspect audit failed"),
         }
-        tokio::time::sleep(AUDIT_INTERVAL).await;
+        if !wait_for_interval_or_shutdown(AUDIT_INTERVAL, &mut shutdown).await {
+            return;
+        }
     }
 }
 
@@ -343,23 +827,14 @@ async fn replication_audit_loop(
 /// request-metrics subsystem makes, keeping the request hot path free of any DB I/O. `prune_before`
 /// is always supplied so old rows are reclaimed even on idle ticks, but a submit is skipped entirely
 /// when there is no traffic to flush to avoid a pointless write each interval.
-async fn request_metrics_flush_loop(stack: Arc<AppStack>, interval: Duration, retention_secs: i64) {
-    let clock = SystemClock::new();
-    loop {
-        tokio::time::sleep(interval).await;
-        let rows = stack.request_metrics.drain();
-        let now_secs = clock.now().as_secs();
-        let prune_before = Some(now_secs - retention_secs);
-        // Skip the write on a fully idle tick (no rows). The next tick with traffic carries the
-        // prune, so retention is still bounded; a long-idle table simply prunes a little later.
-        if rows.is_empty() {
-            continue;
-        }
-        if let Err(e) = stack
-            .meta
-            .submit(Mutation::RecordRequestMetrics { rows, prune_before })
-            .await
-        {
+async fn request_metrics_flush_loop(
+    stack: Arc<AppStack>,
+    interval: Duration,
+    retention_secs: i64,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    while wait_for_interval_or_shutdown(interval, &mut shutdown).await {
+        if let Err(e) = flush_request_metrics_once(&stack, retention_secs).await {
             tracing::warn!(error = %e, "request metrics flush failed");
         }
     }
@@ -370,12 +845,15 @@ async fn request_metrics_flush_loop(stack: Arc<AppStack>, interval: Duration, re
 /// forever (ARCH 20.3). Pending/claimed entries are never pruned. Runs on a calm cadence — the table
 /// only needs to stay bounded, not be trimmed instantly — and pruning is idempotent, so a tick missed
 /// on shutdown is harmless.
-async fn replication_prune_loop(stack: Arc<AppStack>, retention_secs: u64) {
+async fn replication_prune_loop(
+    stack: Arc<AppStack>,
+    retention_secs: u64,
+    mut shutdown: watch::Receiver<bool>,
+) {
     let clock = SystemClock::new();
     let interval = Duration::from_secs(retention_secs.clamp(60, 3600));
     let retention_ms = (retention_secs as i64).saturating_mul(1000);
-    loop {
-        tokio::time::sleep(interval).await;
+    while wait_for_interval_or_shutdown(interval, &mut shutdown).await {
         let before_ms = clock.now().as_millis().saturating_sub(retention_ms);
         if let Err(e) = stack
             .meta
@@ -392,12 +870,15 @@ async fn replication_prune_loop(stack: Arc<AppStack>, retention_secs: u64) {
 /// one permanent failed-event row at a time (audit 2026-07; ARCH 20.3). Delivered rows are removed on
 /// delivery and pending/claimed work is never pruned; the same calm-cadence, idempotent design as
 /// [`replication_prune_loop`].
-async fn events_outbox_prune_loop(stack: Arc<AppStack>, retention_secs: u64) {
+async fn events_outbox_prune_loop(
+    stack: Arc<AppStack>,
+    retention_secs: u64,
+    mut shutdown: watch::Receiver<bool>,
+) {
     let clock = SystemClock::new();
     let interval = Duration::from_secs(retention_secs.clamp(60, 3600));
     let retention_ms = (retention_secs as i64).saturating_mul(1000);
-    loop {
-        tokio::time::sleep(interval).await;
+    while wait_for_interval_or_shutdown(interval, &mut shutdown).await {
         let before_ms = clock.now().as_millis().saturating_sub(retention_ms);
         if let Err(e) = stack
             .meta
@@ -454,26 +935,44 @@ fn single_target_sink_cfg(cfg: &Config) -> Option<cairn_replication::S3SinkConfi
 async fn wait_for_drain_trigger(
     interval: Duration,
     notify: &tokio::sync::Notify,
-    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+    shutdown: &mut watch::Receiver<bool>,
 ) -> bool {
     if *shutdown.borrow() {
         return false;
     }
     tokio::select! {
+        biased;
+        changed = shutdown.changed() => {
+            let _ = changed;
+            false
+        }
         () = notify.notified() => true,
         () = tokio::time::sleep(interval) => true,
-        _ = shutdown.changed() => false,
     }
+}
+
+/// Per-worker controls plus clones of the two process-wide resources (notification pulse and sink
+/// runtime). Grouping them keeps every worker shape on exactly the same admission/deadline policy.
+struct ReplicationWorkerRuntime {
+    interval: Duration,
+    notify: Arc<tokio::sync::Notify>,
+    shutdown: watch::Receiver<bool>,
+    opts: cairn_replication::ReplicationOpts,
+    sink_runtime: cairn_replication::ReplicationSinkRuntime,
 }
 
 async fn replication_loop(
     stack: Arc<AppStack>,
     base_cfg: cairn_replication::S3SinkConfig,
-    interval: Duration,
-    notify: Arc<tokio::sync::Notify>,
-    mut shutdown: tokio::sync::watch::Receiver<bool>,
-    opts: cairn_replication::ReplicationOpts,
+    worker: ReplicationWorkerRuntime,
 ) {
+    let ReplicationWorkerRuntime {
+        interval,
+        notify,
+        mut shutdown,
+        opts,
+        sink_runtime,
+    } = worker;
     // The engine unseals each encrypted version's DEK through the shared master ring before
     // reading its body, so the replica receives plaintext rather than raw ciphertext.
     let engine = cairn_replication::ReplicationEngine::new(opts, stack.crypto.clone());
@@ -483,7 +982,8 @@ async fn replication_loop(
         let dest_buckets = resolve_dest_buckets(&stack).await;
         let mut sink_cfg = base_cfg.clone();
         sink_cfg.dest_buckets = dest_buckets;
-        let default_sink = match cairn_replication::HttpS3Sink::new(sink_cfg) {
+        let default_sink = match cairn_replication::HttpS3Sink::new(sink_cfg, sink_runtime.clone())
+        {
             Ok(s) => Some(Arc::new(s)),
             Err(e) => {
                 tracing::error!(error = %e, "replication sink construction failed; skipping drain");
@@ -494,9 +994,9 @@ async fn replication_loop(
         // Build the router for this drain: stored per-bucket remote targets take precedence; any
         // bucket without one falls back to this env-configured default sink (the unchanged
         // node->node path).
-        let stored = resolve_stored_target_sinks(&stack).await;
+        let stored = resolve_stored_target_sinks(&stack, &sink_runtime).await;
         let router = build_router(default_sink, &stored);
-        drain_with_router(&engine, &stack, &router, &clock).await;
+        drain_with_router(&engine, &stack, &router, &clock, &shutdown).await;
     }
 }
 
@@ -551,11 +1051,15 @@ async fn multi_target_replication_loop(
     stack: Arc<AppStack>,
     targets: Vec<ReplicationTarget>,
     default_cfg: Option<cairn_replication::S3SinkConfig>,
-    interval: Duration,
-    notify: Arc<tokio::sync::Notify>,
-    mut shutdown: tokio::sync::watch::Receiver<bool>,
-    opts: cairn_replication::ReplicationOpts,
+    worker: ReplicationWorkerRuntime,
 ) {
+    let ReplicationWorkerRuntime {
+        interval,
+        notify,
+        mut shutdown,
+        opts,
+        sink_runtime,
+    } = worker;
     // The engine unseals each encrypted version's DEK through the shared master ring before
     // reading its body, so the replica receives plaintext rather than raw ciphertext.
     let engine = cairn_replication::ReplicationEngine::new(opts, stack.crypto.clone());
@@ -565,11 +1069,14 @@ async fn multi_target_replication_loop(
     // an unreadable CA bundle, conflicting trust knobs) is logged and dropped; the rest still run.
     let mut target_sinks: Vec<(ReplicationTarget, Arc<HttpS3Sink>)> = Vec::new();
     for target in targets {
-        match HttpS3Sink::new(target_sink_cfg(
-            &target,
-            stack.allow_internal_endpoints,
-            stack.replication_allow_plaintext_sse_over_http,
-        )) {
+        match HttpS3Sink::new(
+            target_sink_cfg(
+                &target,
+                stack.allow_internal_endpoints,
+                stack.replication_allow_plaintext_sse_over_http,
+            ),
+            sink_runtime.clone(),
+        ) {
             Ok(sink) => target_sinks.push((target, Arc::new(sink))),
             Err(e) => {
                 tracing::error!(target = %target.name, error = %e,
@@ -578,7 +1085,7 @@ async fn multi_target_replication_loop(
         }
     }
     let default_sink = match default_cfg {
-        Some(cfg) => match HttpS3Sink::new(cfg) {
+        Some(cfg) => match HttpS3Sink::new(cfg, sink_runtime.clone()) {
             Ok(s) => Some(Arc::new(s)),
             Err(e) => {
                 tracing::error!(error = %e, "default replication sink construction failed");
@@ -598,10 +1105,10 @@ async fn multi_target_replication_loop(
         // Resolve `source bucket -> target sink` from the current bucket rules each drain. Stored
         // per-bucket remote targets are layered on top and win over the env-named targets.
         let routes = resolve_target_routes(&stack, &target_sinks).await;
-        let stored = resolve_stored_target_sinks(&stack).await;
+        let stored = resolve_stored_target_sinks(&stack, &sink_runtime).await;
         // `routes` are the env-named per-source routes; fold them in over the stored ones.
         let router = build_router(default_sink.clone(), &stored).with_env_routes(routes);
-        drain_with_router(&engine, &stack, &router, &clock).await;
+        drain_with_router(&engine, &stack, &router, &clock, &shutdown).await;
     }
 }
 
@@ -612,32 +1119,44 @@ async fn drain_with_router(
     stack: &Arc<AppStack>,
     router: &StoredTargetRouter,
     clock: &SystemClock,
+    shutdown: &watch::Receiver<bool>,
 ) {
-    match engine
-        .run_until_idle(&*stack.meta, router, &stack.blob, clock, 50)
-        .await
-    {
-        Ok(report) if !report.is_idle() => {
-            metrics::counter!("cairn_replication_completed_total")
-                .increment(report.completed as u64);
-            metrics::counter!("cairn_replication_failed_total").increment(report.failed as u64);
-            metrics::counter!("cairn_replication_bytes_total").increment(report.bytes);
-            // Source-DEK resolve failures (ARCH 20/26/27). These are rescheduled as *unavailable*,
-            // which never consumes the attempt budget — so an object whose key id was permanently
-            // removed from the master ring retries forever and NEVER appears in `failed`. This
-            // counter is the only durable signal that such objects exist; a sustained non-zero rate
-            // means replication is silently stalled on local key material, not on the destination.
-            metrics::counter!("cairn_replication_dek_resolve_failed_total")
-                .increment(report.dek_resolve_failures as u64);
-            tracing::info!(
-                completed = report.completed,
-                failed = report.failed,
-                bytes = report.bytes,
-                "replication progressed"
-            );
+    for _ in 0..MAX_DRAIN_PASSES {
+        // A completed batch may have made more work immediately claimable. Re-check the signal
+        // before every subsequent claim so shutdown never starts another batch.
+        if *shutdown.borrow() {
+            return;
         }
-        Ok(_) => {}
-        Err(e) => tracing::warn!(error = %e, "replication run failed"),
+        match engine
+            .run_once(&*stack.meta, router, &stack.blob, clock)
+            .await
+        {
+            Ok(report) if report.is_idle() => return,
+            Ok(report) => {
+                metrics::counter!("cairn_replication_completed_total")
+                    .increment(report.completed as u64);
+                metrics::counter!("cairn_replication_failed_total").increment(report.failed as u64);
+                metrics::counter!("cairn_replication_bytes_total").increment(report.bytes);
+                // Source-DEK resolve failures (ARCH 20/26/27). These are rescheduled as
+                // *unavailable*, which never consumes the attempt budget — so an object whose key
+                // id was permanently removed from the master ring retries forever and NEVER
+                // appears in `failed`. This counter is the only durable signal that such objects
+                // exist; a sustained non-zero rate means replication is silently stalled on local
+                // key material, not on the destination.
+                metrics::counter!("cairn_replication_dek_resolve_failed_total")
+                    .increment(report.dek_resolve_failures as u64);
+                tracing::info!(
+                    completed = report.completed,
+                    failed = report.failed,
+                    bytes = report.bytes,
+                    "replication progressed"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "replication run failed");
+                return;
+            }
+        }
     }
 }
 
@@ -652,7 +1171,10 @@ async fn drain_with_router(
 /// cost) and the target set is small, so this keeps a fresh view of operator edits each pass without
 /// a long-lived cache to invalidate. An entry whose ARN resolves to no sink here is terminated by
 /// the engine (target removed), rather than silently misrouted.
-async fn resolve_stored_target_sinks(stack: &Arc<AppStack>) -> HashMap<String, Arc<HttpS3Sink>> {
+async fn resolve_stored_target_sinks(
+    stack: &Arc<AppStack>,
+    sink_runtime: &cairn_replication::ReplicationSinkRuntime,
+) -> HashMap<String, Arc<HttpS3Sink>> {
     let mut by_arn: HashMap<String, Arc<HttpS3Sink>> = HashMap::new();
     let buckets = match stack.meta.list_buckets(None).await {
         Ok(b) => b,
@@ -700,6 +1222,7 @@ async fn resolve_stored_target_sinks(stack: &Arc<AppStack>) -> HashMap<String, A
                 &open,
                 stack.allow_internal_endpoints,
                 stack.replication_allow_plaintext_sse_over_http,
+                sink_runtime.clone(),
             ) {
                 Ok(sink) => {
                     by_arn.insert(target.arn.clone(), Arc::new(sink));
@@ -892,7 +1415,12 @@ impl BucketRoutedSink for StoredTargetRouter {
 /// latency. `checkpoint()` runs on the writer thread (serialized with mutations, never
 /// contending), and a `busy` result means a reader pinned the log so the truncation was
 /// deferred — that is observable via `cairn_wal_checkpoints_busy_total`.
-async fn checkpoint_loop(stack: Arc<AppStack>, interval: Duration, size_threshold_bytes: u64) {
+async fn checkpoint_loop(
+    stack: Arc<AppStack>,
+    interval: Duration,
+    size_threshold_bytes: u64,
+    mut shutdown: watch::Receiver<bool>,
+) {
     // Only spawned when there is at least one sqlite shard handle; bind them once. Under sharding
     // (Phase 3.2) there is one handle per shard, each with its own WAL to checkpoint.
     let stores = stack.store.clone();
@@ -924,8 +1452,7 @@ async fn checkpoint_loop(stack: Arc<AppStack>, interval: Duration, size_threshol
         interval
     };
     let mut elapsed = Duration::ZERO;
-    loop {
-        tokio::time::sleep(poll).await;
+    while wait_for_interval_or_shutdown(poll, &mut shutdown).await {
         elapsed += poll;
 
         // Probe the total WAL size every tick so the gauge stays live and the size trigger can fire.
@@ -976,15 +1503,14 @@ async fn checkpoint_loop(stack: Arc<AppStack>, interval: Duration, size_threshol
 
 /// Refresh the store gauges (object/bucket/byte counts and compression ratio) from the metadata
 /// aggregate on a short interval, so `/metrics` reflects live state.
-async fn metrics_loop(stack: Arc<AppStack>) {
+async fn metrics_loop(stack: Arc<AppStack>, mut shutdown: watch::Receiver<bool>) {
     let clock = SystemClock::new();
     // The per-target label set emitted last tick. A target that drains to zero falls out of the
     // aggregate's `by_target`, so we must explicitly zero its gauges this tick — otherwise the
     // registry keeps its last (non-zero) value forever and a caught-up destination reads as
     // permanently lagging/failing (audit: stale per-target gauges).
     let mut prev_targets: std::collections::HashSet<String> = std::collections::HashSet::new();
-    loop {
-        tokio::time::sleep(Duration::from_secs(15)).await;
+    while wait_for_interval_or_shutdown(Duration::from_secs(15), &mut shutdown).await {
         if let Ok(c) = stack.meta.aggregate_counts().await {
             metrics::gauge!("cairn_buckets").set(c.buckets as f64);
             metrics::gauge!("cairn_objects").set(c.objects as f64);
@@ -1026,14 +1552,10 @@ async fn metrics_loop(stack: Arc<AppStack>) {
         metrics::counter!("cairn_meta_cache_hits_total").absolute(hits);
         metrics::counter!("cairn_meta_cache_misses_total").absolute(misses);
 
-        // Fail-closed encrypted-read refusals (ARCH 27). `cairn-blob` takes no `metrics` dependency
-        // either, so it exposes a cumulative count we mirror here. Non-zero means a read of an
-        // encrypted blob arrived with no data key — either a caller lost a DEK it should have
-        // resolved (the class of bug that had replication shipping ciphertext), or the documented
-        // false positive: an object whose body IS the verbatim bytes of an encrypted blob file
-        // (a `CAIRN_DATA_DIR` backed up into a bucket). Alertable; a log line is not.
-        metrics::counter!("cairn_blob_encrypted_without_key_total")
-            .absolute(stack.blob_local.encrypted_without_key_total());
+        // A metadata-declared plaintext file must have exactly its trusted logical length. A
+        // mismatch catches missing encryption metadata and truncated/inconsistent local storage.
+        metrics::counter!("cairn_blob_plaintext_length_mismatch_total")
+            .absolute(stack.blob_local.plaintext_length_mismatch_total());
 
         // Replication health (ARCH 20/26) from the uncapped aggregate (no 10k probe cap). Lag is
         // the age of the oldest still-pending *enqueue* (not its backed-off next_attempt_at, which
@@ -1084,29 +1606,44 @@ async fn metrics_loop(stack: Arc<AppStack>) {
 }
 
 /// Periodically abort multipart sessions idle beyond their lifetime and reclaim their parts.
-async fn sweeper_loop(stack: Arc<AppStack>, interval: Duration, lifetime_secs: i64) {
+async fn sweeper_loop(
+    stack: Arc<AppStack>,
+    interval: Duration,
+    lifetime_secs: i64,
+    reservation_lifetime_secs: i64,
+    mut shutdown: watch::Receiver<bool>,
+) {
     let clock = SystemClock::new();
-    loop {
-        tokio::time::sleep(interval).await;
-        let cutoff = clock.now().plus_secs(-lifetime_secs);
-        match stack.meta.enumerate_stale_sessions(cutoff, 1000).await {
-            Ok(stale) => {
-                let n = stale.len();
-                for s in stale {
-                    let _ = stack
-                        .meta
-                        .submit(Mutation::AbortMultipart(s.upload_id.clone()))
-                        .await;
-                    let _ = stack.blob.delete_session(&s.upload_id).await;
-                }
-                if n > 0 {
-                    tracing::info!(aborted = n, "multipart sweeper reclaimed stale uploads");
-                }
-            }
-            Err(e) => tracing::warn!(error = %e, "multipart sweep failed"),
+    while wait_for_interval_or_shutdown(interval, &mut shutdown).await {
+        let result = tokio::time::timeout(
+            MULTIPART_SWEEP_MAX_DURATION,
+            sweep_multipart_once(
+                &stack,
+                clock.now(),
+                lifetime_secs,
+                reservation_lifetime_secs,
+                &shutdown,
+            ),
+        )
+        .await;
+        match result {
+            Ok(report) if report.reclaimed > 0 || report.aborted > 0 => tracing::info!(
+                reclaimed = report.reclaimed,
+                aborted = report.aborted,
+                attempted = report.attempted,
+                "multipart sweeper reclaimed stale staging"
+            ),
+            Ok(_) => {}
+            Err(_) => tracing::warn!(
+                max_seconds = MULTIPART_SWEEP_MAX_DURATION.as_secs(),
+                "multipart sweep reached its fixed time budget"
+            ),
         }
         // Reclaim expired STS-style session credentials on the same cadence (ARCH 14): an expired
         // credential is already denied at auth time, but pruning its row keeps the table bounded.
+        if *shutdown.borrow() {
+            return;
+        }
         let _ = stack
             .meta
             .submit(Mutation::DeleteExpiredSessionCredentials {
@@ -1114,6 +1651,249 @@ async fn sweeper_loop(stack: Arc<AppStack>, interval: Duration, lifetime_secs: i
             })
             .await;
     }
+}
+
+#[derive(Default)]
+struct MultipartSweepReport {
+    attempted: usize,
+    reclaimed: usize,
+    aborted: usize,
+}
+
+async fn sweep_multipart_once(
+    stack: &AppStack,
+    now: cairn_types::Timestamp,
+    lifetime_secs: i64,
+    reservation_lifetime_secs: i64,
+    shutdown: &watch::Receiver<bool>,
+) -> MultipartSweepReport {
+    let mut report = MultipartSweepReport::default();
+
+    // Cleanup debt comes first. Exact superseded-part paths are ordered before whole-session
+    // directories by the metadata store, so cheap unlinks cannot be starved by a large directory.
+    let mut seen_cleanups = std::collections::HashSet::new();
+    loop {
+        if *shutdown.borrow() || report.attempted >= MULTIPART_SWEEP_MAX_ITEMS {
+            return report;
+        }
+        let cleanups = match stack
+            .meta
+            .list_multipart_cleanups(MULTIPART_SWEEP_PAGE)
+            .await
+        {
+            Ok(cleanups) => cleanups,
+            Err(error) => {
+                tracing::warn!(%error, "multipart sweeper could not list cleanup debt");
+                break;
+            }
+        };
+        let page_full = cleanups.len() == MULTIPART_SWEEP_PAGE as usize;
+        let mut discovered = 0usize;
+        for cleanup in cleanups {
+            if *shutdown.borrow() || report.attempted >= MULTIPART_SWEEP_MAX_ITEMS {
+                return report;
+            }
+            if !seen_cleanups.insert(cleanup.id.clone()) {
+                continue;
+            }
+            discovered += 1;
+            report.attempted += 1;
+            let deletion = match &cleanup.storage_path {
+                Some(path) => stack.blob.delete(path).await,
+                None => stack.blob.delete_session(&cleanup.upload_id).await,
+            };
+            if let Err(error) = deletion {
+                tracing::warn!(
+                    cleanup_id = cleanup.id,
+                    upload_id = %cleanup.upload_id,
+                    %error,
+                    "multipart cleanup debt unlink failed"
+                );
+                continue;
+            }
+            let release = match cleanup.storage_path {
+                Some(_) => Mutation::ReleaseMultipartCleanup {
+                    cleanup_id: cleanup.id.clone(),
+                },
+                None => Mutation::ReleaseMultipartUploadCleanups {
+                    upload_id: cleanup.upload_id.clone(),
+                },
+            };
+            match stack.meta.submit(release).await {
+                Ok(MutationOutcome::Ack) => report.reclaimed += 1,
+                Ok(outcome) => tracing::warn!(
+                    ?outcome,
+                    cleanup_id = cleanup.id,
+                    "multipart cleanup release returned an unexpected outcome"
+                ),
+                Err(error) => tracing::warn!(
+                    %error,
+                    cleanup_id = cleanup.id,
+                    "multipart cleanup accounting release failed"
+                ),
+            }
+        }
+        if !page_full || discovered == 0 {
+            break;
+        }
+    }
+
+    // A reservation can outlive a cancelled/timed-out request before RecordPart commits. Its
+    // deterministic attempt name lets the sweep prove the artifact absent before releasing bytes.
+    let reservation_cutoff = now.plus_secs(-reservation_lifetime_secs);
+    let mut seen_reservations = std::collections::HashSet::new();
+    loop {
+        if *shutdown.borrow() || report.attempted >= MULTIPART_SWEEP_MAX_ITEMS {
+            return report;
+        }
+        let reservations = match stack
+            .meta
+            .enumerate_stale_multipart_reservations(reservation_cutoff, MULTIPART_SWEEP_PAGE)
+            .await
+        {
+            Ok(reservations) => reservations,
+            Err(error) => {
+                tracing::warn!(%error, "multipart sweeper could not list stale reservations");
+                break;
+            }
+        };
+        let page_full = reservations.len() == MULTIPART_SWEEP_PAGE as usize;
+        let mut discovered = 0usize;
+        for reservation in reservations {
+            if *shutdown.borrow() || report.attempted >= MULTIPART_SWEEP_MAX_ITEMS {
+                return report;
+            }
+            if !seen_reservations.insert(reservation.attempt_id.clone()) {
+                continue;
+            }
+            discovered += 1;
+            report.attempted += 1;
+            if let Err(error) = stack
+                .blob
+                .delete_part_attempt(
+                    &reservation.upload_id,
+                    reservation.part_number,
+                    &reservation.attempt_id,
+                )
+                .await
+            {
+                tracing::warn!(
+                    attempt_id = reservation.attempt_id,
+                    upload_id = %reservation.upload_id,
+                    %error,
+                    "multipart reservation artifact cleanup failed"
+                );
+                continue;
+            }
+            match stack
+                .meta
+                .submit(Mutation::ReleaseMultipartReservation {
+                    upload_id: reservation.upload_id.clone(),
+                    attempt_id: reservation.attempt_id.clone(),
+                })
+                .await
+            {
+                Ok(MutationOutcome::Ack) => report.reclaimed += 1,
+                Ok(outcome) => tracing::warn!(
+                    ?outcome,
+                    attempt_id = reservation.attempt_id,
+                    "multipart reservation release returned an unexpected outcome"
+                ),
+                Err(error) => tracing::warn!(
+                    %error,
+                    attempt_id = reservation.attempt_id,
+                    "multipart reservation accounting release failed"
+                ),
+            }
+        }
+        if !page_full || discovered == 0 {
+            break;
+        }
+    }
+
+    let session_cutoff = now.plus_secs(-lifetime_secs);
+    let mut seen_sessions = std::collections::HashSet::new();
+    loop {
+        if *shutdown.borrow() || report.attempted >= MULTIPART_SWEEP_MAX_ITEMS {
+            return report;
+        }
+        let sessions = match stack
+            .meta
+            .enumerate_stale_sessions(session_cutoff, MULTIPART_SWEEP_PAGE)
+            .await
+        {
+            Ok(sessions) => sessions,
+            Err(error) => {
+                tracing::warn!(%error, "multipart sweeper could not list stale sessions");
+                break;
+            }
+        };
+        let page_full = sessions.len() == MULTIPART_SWEEP_PAGE as usize;
+        let mut discovered = 0usize;
+        for session in sessions {
+            if *shutdown.borrow() || report.attempted >= MULTIPART_SWEEP_MAX_ITEMS {
+                return report;
+            }
+            if !seen_sessions.insert(session.upload_id.as_str().to_owned()) {
+                continue;
+            }
+            discovered += 1;
+            report.attempted += 1;
+            match stack
+                .meta
+                .submit(Mutation::AbortMultipart(session.upload_id.clone()))
+                .await
+            {
+                Ok(MutationOutcome::MultipartTerminal(MultipartTerminalOutcome::Aborted)) => {
+                    if let Err(error) = stack.blob.delete_session(&session.upload_id).await {
+                        tracing::warn!(
+                            upload_id = %session.upload_id,
+                            %error,
+                            "multipart sweeper failed to reclaim an aborted session"
+                        );
+                        continue;
+                    }
+                    match stack
+                        .meta
+                        .submit(Mutation::ReleaseMultipartUploadCleanups {
+                            upload_id: session.upload_id.clone(),
+                        })
+                        .await
+                    {
+                        Ok(MutationOutcome::Ack) => {
+                            report.reclaimed += 1;
+                            report.aborted += 1;
+                        }
+                        Ok(outcome) => tracing::warn!(
+                            upload_id = %session.upload_id,
+                            ?outcome,
+                            "multipart session cleanup release returned an unexpected outcome"
+                        ),
+                        Err(error) => tracing::warn!(
+                            upload_id = %session.upload_id,
+                            %error,
+                            "multipart session cleanup accounting release failed"
+                        ),
+                    }
+                }
+                Ok(MutationOutcome::MultipartTerminal(MultipartTerminalOutcome::NotOwner)) => {}
+                Ok(outcome) => tracing::warn!(
+                    upload_id = %session.upload_id,
+                    ?outcome,
+                    "multipart sweeper received an unexpected abort outcome"
+                ),
+                Err(error) => tracing::warn!(
+                    upload_id = %session.upload_id,
+                    %error,
+                    "multipart sweeper failed to abort a stale session"
+                ),
+            }
+        }
+        if !page_full || discovered == 0 {
+            break;
+        }
+    }
+    report
 }
 
 /// Why the scrub could not fully verify a version it walked. Every skip is COUNTED and emitted —
@@ -1244,11 +2024,22 @@ async fn update_check_loop(
     url: String,
     interval: Duration,
     allow_internal: bool,
+    mut shutdown: watch::Receiver<bool>,
 ) {
     let mut ticker = tokio::time::interval(interval);
     let attempt_timeout = Duration::from_secs(10);
     loop {
-        ticker.tick().await;
+        tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                let _ = changed;
+                return;
+            }
+            _ = ticker.tick() => {}
+        }
+        if *shutdown.borrow() {
+            return;
+        }
         crate::update_check::run_once(
             &url,
             crate::CAIRN_VERSION,
@@ -1260,10 +2051,9 @@ async fn update_check_loop(
     }
 }
 
-async fn scrub_loop(stack: Arc<AppStack>, interval: Duration) {
+async fn scrub_loop(stack: Arc<AppStack>, interval: Duration, mut shutdown: watch::Receiver<bool>) {
     use cairn_types::meta::ListQuery;
-    loop {
-        tokio::time::sleep(interval).await;
+    while wait_for_interval_or_shutdown(interval, &mut shutdown).await {
         let started = std::time::Instant::now();
         let mut tally = ScrubTally::default();
         // Enumeration failures are coverage lost, not versions verified — count them so a partial
@@ -1282,9 +2072,15 @@ async fn scrub_loop(stack: Arc<AppStack>, interval: Duration) {
             }
         };
         for bucket in &buckets {
+            if *shutdown.borrow() {
+                return;
+            }
             let mut cursor: Option<String> = None;
             let mut vmarker: Option<String> = None;
             loop {
+                if *shutdown.borrow() {
+                    return;
+                }
                 let query = ListQuery {
                     prefix: None,
                     delimiter: None,
@@ -1304,6 +2100,9 @@ async fn scrub_loop(stack: Arc<AppStack>, interval: Duration) {
                     }
                 };
                 for s in &page.items {
+                    if *shutdown.borrow() {
+                        return;
+                    }
                     let outcome = if s.is_delete_marker {
                         ScrubOutcome::Skipped(SkipReason::DeleteMarker)
                     } else {
@@ -1423,13 +2222,13 @@ async fn scrub_version(
     // Resolve the DEK BEFORE reading a byte: reading an encrypted blob with `None` yields raw
     // ciphertext at exactly the plaintext length, which would hash to a mismatch and be reported as
     // corruption on a perfectly healthy store. Reuses the one shared descriptor module.
-    let dek = match row.sse_descriptor.as_deref() {
-        None => None,
+    let cipher = match row.sse_descriptor.as_deref() {
+        None => cairn_types::blob::BlobCipher::KnownPlaintext,
         Some(json) => {
             let opened = cairn_types::sse::parse_descriptor(json)
-                .and_then(|d| cairn_types::sse::open_dek(crypto, &d));
+                .and_then(|d| cairn_types::sse::open_blob_cipher(crypto, &d));
             match opened {
-                Ok(k) => Some(*k),
+                Ok(cipher) => cipher,
                 Err(
                     CryptoError::UnknownKeyId | CryptoError::Key | CryptoError::KeyRotationRequired,
                 ) => {
@@ -1441,12 +2240,7 @@ async fn scrub_version(
     };
 
     let handle = match blobs
-        .open_raw(
-            path,
-            None,
-            cairn_types::blob::BlobCipher::from_dek(dek),
-            &row.compression,
-        )
+        .open_raw(path, None, cipher, &row.compression, row.size_logical)
         .await
     {
         Ok(h) => h,
@@ -1488,11 +2282,17 @@ async fn scrub_version(
 }
 
 /// Periodically apply each bucket's lifecycle rules.
-async fn lifecycle_loop(stack: Arc<AppStack>, interval: Duration) {
+async fn lifecycle_loop(
+    stack: Arc<AppStack>,
+    interval: Duration,
+    mut shutdown: watch::Receiver<bool>,
+) {
     let scanner = LifecycleScanner::new();
     let clock = SystemClock::new();
-    loop {
-        tokio::time::sleep(interval).await;
+    while wait_for_interval_or_shutdown(interval, &mut shutdown).await {
+        if *shutdown.borrow() {
+            return;
+        }
         let buckets = match stack.meta.list_buckets(None).await {
             Ok(b) => b,
             Err(e) => {
@@ -1502,6 +2302,9 @@ async fn lifecycle_loop(stack: Arc<AppStack>, interval: Duration) {
         };
         let mut configs = Vec::new();
         for b in buckets {
+            if *shutdown.borrow() {
+                return;
+            }
             if let Ok(Some(doc)) = stack
                 .meta
                 .get_bucket_config(&b.name, ConfigAspect::Lifecycle)
@@ -1517,6 +2320,9 @@ async fn lifecycle_loop(stack: Arc<AppStack>, interval: Duration) {
         if configs.is_empty() {
             continue;
         }
+        if *shutdown.borrow() {
+            return;
+        }
         match scanner
             .run_once(&*stack.meta, &*stack.blob, &clock, &configs)
             .await
@@ -1530,28 +2336,45 @@ async fn lifecycle_loop(stack: Arc<AppStack>, interval: Duration) {
 /// The webhook event-notification delivery worker: drains the `events_outbox` to the configured
 /// per-bucket endpoints on a fixed interval (ARCH 20-style). The claim is a cheap indexed query, so
 /// the loop is harmless when no bucket has notifications configured (it claims nothing and sleeps).
-async fn webhook_loop(stack: Arc<AppStack>, interval: Duration) {
+async fn webhook_loop(
+    stack: Arc<AppStack>,
+    interval: Duration,
+    mut shutdown: watch::Receiver<bool>,
+) {
     let engine = cairn_webhook::WebhookEngine::new(cairn_webhook::WebhookOpts::default());
     let sink = cairn_webhook::HttpWebhookSink::new(cairn_net::GuardConfig::new(
         stack.allow_internal_endpoints,
     ));
     let clock = SystemClock::new();
-    loop {
-        tokio::time::sleep(interval).await;
-        match engine.run_until_idle(&*stack.meta, &sink, &clock, 50).await {
-            Ok(report) if !report.is_idle() => {
-                metrics::counter!("cairn_webhook_delivered_total").increment(report.delivered);
-                metrics::counter!("cairn_webhook_failed_total").increment(report.failed);
-                metrics::counter!("cairn_webhook_dropped_total").increment(report.dropped);
-                tracing::info!(
-                    delivered = report.delivered,
-                    failed = report.failed,
-                    dropped = report.dropped,
-                    "webhook delivery progressed"
-                );
+    while wait_for_interval_or_shutdown(interval, &mut shutdown).await {
+        let mut delivered = 0u64;
+        let mut failed = 0u64;
+        let mut dropped = 0u64;
+        for _ in 0..MAX_DRAIN_PASSES {
+            if *shutdown.borrow() {
+                break;
             }
-            Ok(_) => {}
-            Err(e) => tracing::warn!(error = %e, "webhook drain failed"),
+            match engine
+                .run_until_idle(&*stack.meta, &sink, &*stack.crypto, &clock, 1)
+                .await
+            {
+                Ok(report) if report.is_idle() => break,
+                Ok(report) => {
+                    delivered += report.delivered;
+                    failed += report.failed;
+                    dropped += report.dropped;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "webhook drain failed");
+                    break;
+                }
+            }
+        }
+        if delivered + failed + dropped > 0 {
+            metrics::counter!("cairn_webhook_delivered_total").increment(delivered);
+            metrics::counter!("cairn_webhook_failed_total").increment(failed);
+            metrics::counter!("cairn_webhook_dropped_total").increment(dropped);
+            tracing::info!(delivered, failed, dropped, "webhook delivery progressed");
         }
     }
 }
@@ -1559,6 +2382,119 @@ async fn webhook_loop(stack: Arc<AppStack>, interval: Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn test_sink_runtime() -> cairn_replication::ReplicationSinkRuntime {
+        Config::default().replication_sink_runtime()
+    }
+
+    #[tokio::test]
+    async fn task_set_joins_cooperative_workers_then_aborts_and_awaits_overruns() {
+        let cooperative_finished = Arc::new(AtomicBool::new(false));
+        let overrun_dropped = Arc::new(AtomicBool::new(false));
+        let (overrun_started_tx, overrun_started_rx) = tokio::sync::oneshot::channel();
+        let mut tasks = TaskSet::default();
+
+        let cooperative_finished_task = Arc::clone(&cooperative_finished);
+        tasks.spawn("cooperative", async move {
+            cooperative_finished_task.store(true, Ordering::SeqCst);
+        });
+        let overrun_dropped_task = Arc::clone(&overrun_dropped);
+        tasks.spawn("overrun", async move {
+            let _drop_flag = DropFlag(overrun_dropped_task);
+            let _ = overrun_started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+
+        overrun_started_rx.await.expect("overrun task started");
+        tokio::task::yield_now().await;
+        assert!(cooperative_finished.load(Ordering::SeqCst));
+
+        // Both tasks have reached deterministic states before the short shared deadline begins.
+        // The overrun's drop flag proves `abort()` was followed by awaiting the cancelled handle.
+        let report = tasks.join_or_abort(Duration::from_millis(10)).await;
+        assert_eq!(
+            report,
+            TaskShutdownReport {
+                completed: 1,
+                cancelled: 1,
+                failed: 0,
+            }
+        );
+        assert!(overrun_dropped.load(Ordering::SeqCst));
+        assert!(tasks.tasks.is_empty(), "no background handle may detach");
+    }
+
+    #[tokio::test]
+    async fn dropping_task_set_aborts_workers_instead_of_detaching_them() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let dropped_task = Arc::clone(&dropped);
+        let mut tasks = TaskSet::default();
+        tasks.spawn("orphan guard", async move {
+            let _drop_flag = DropFlag(dropped_task);
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        started_rx.await.expect("worker started");
+
+        drop(tasks);
+        tokio::task::yield_now().await;
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn interval_wait_never_starts_a_pass_after_shutdown_is_visible() {
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        shutdown_tx.send(true).unwrap();
+
+        assert!(!wait_for_interval_or_shutdown(Duration::from_secs(3_600), &mut shutdown_rx).await);
+    }
+
+    #[test]
+    fn finalization_report_cannot_claim_success_after_any_incomplete_tail() {
+        assert!(FinalizeReport::default().is_complete());
+        assert!(
+            !FinalizeReport {
+                request_metric_failures: 1,
+                ..FinalizeReport::default()
+            }
+            .is_complete()
+        );
+        assert!(
+            !FinalizeReport {
+                checkpoint_busy: 1,
+                ..FinalizeReport::default()
+            }
+            .is_complete()
+        );
+        assert!(
+            !FinalizeReport {
+                timed_out: true,
+                ..FinalizeReport::default()
+            }
+            .is_complete()
+        );
+        assert!(
+            !BackgroundShutdownReport {
+                worker_report: TaskShutdownReport {
+                    cancelled: 1,
+                    ..TaskShutdownReport::default()
+                },
+                finalization: FinalizeReport::default(),
+            }
+            .is_complete(),
+            "a cancelled worker must reach the process-level shutdown result"
+        );
+    }
 
     fn target(name: &str, dest_bucket: &str, endpoint: &str) -> ReplicationTarget {
         ReplicationTarget {
@@ -1567,18 +2503,19 @@ mod tests {
             region: "us-east-1".to_owned(),
             dest_bucket: dest_bucket.to_owned(),
             access_key: "AKID".to_owned(),
-            secret: "secret".to_owned(),
+            secret: "secret".into(),
             ca_path: None,
             insecure_skip_verify: false,
         }
     }
 
     fn sinks(targets: &[ReplicationTarget]) -> Vec<(ReplicationTarget, Arc<HttpS3Sink>)> {
+        let runtime = test_sink_runtime();
         targets
             .iter()
             .map(|t| {
-                let sink =
-                    HttpS3Sink::new(target_sink_cfg(t, false, false)).expect("target sink builds");
+                let sink = HttpS3Sink::new(target_sink_cfg(t, false, false), runtime.clone())
+                    .expect("target sink builds");
                 (t.clone(), Arc::new(sink))
             })
             .collect()
@@ -1636,19 +2573,22 @@ mod tests {
         let built = sinks(&targets);
         let west = Arc::clone(&built[0].1);
         let default = Arc::new(
-            HttpS3Sink::new(cairn_replication::S3SinkConfig {
-                endpoint: "http://default.example:9000".to_owned(),
-                dest_bucket: "fallback".to_owned(),
-                dest_buckets: HashMap::new(),
-                region: "us-east-1".to_owned(),
-                access_key_id: "AKID".to_owned(),
-                secret_access_key: "secret".to_owned(),
-                ca_cert_path: None,
-                ca_cert_pem: None,
-                insecure_skip_verify: false,
-                allow_internal_endpoints: false,
-                allow_plaintext_sse_over_http: false,
-            })
+            HttpS3Sink::new(
+                cairn_replication::S3SinkConfig {
+                    endpoint: "http://default.example:9000".to_owned(),
+                    dest_bucket: "fallback".to_owned(),
+                    dest_buckets: HashMap::new(),
+                    region: "us-east-1".to_owned(),
+                    access_key_id: "AKID".to_owned(),
+                    secret_access_key: "secret".into(),
+                    ca_cert_path: None,
+                    ca_cert_pem: None,
+                    insecure_skip_verify: false,
+                    allow_internal_endpoints: false,
+                    allow_plaintext_sse_over_http: false,
+                },
+                test_sink_runtime(),
+            )
             .unwrap(),
         );
 
@@ -1682,19 +2622,22 @@ mod tests {
 
     fn test_sink(endpoint: &str, dest: &str) -> Arc<HttpS3Sink> {
         Arc::new(
-            HttpS3Sink::new(cairn_replication::S3SinkConfig {
-                endpoint: endpoint.to_owned(),
-                dest_bucket: dest.to_owned(),
-                dest_buckets: HashMap::new(),
-                region: "us-east-1".to_owned(),
-                access_key_id: "AKID".to_owned(),
-                secret_access_key: "secret".to_owned(),
-                ca_cert_path: None,
-                ca_cert_pem: None,
-                insecure_skip_verify: false,
-                allow_internal_endpoints: false,
-                allow_plaintext_sse_over_http: false,
-            })
+            HttpS3Sink::new(
+                cairn_replication::S3SinkConfig {
+                    endpoint: endpoint.to_owned(),
+                    dest_bucket: dest.to_owned(),
+                    dest_buckets: HashMap::new(),
+                    region: "us-east-1".to_owned(),
+                    access_key_id: "AKID".to_owned(),
+                    secret_access_key: "secret".into(),
+                    ca_cert_path: None,
+                    ca_cert_pem: None,
+                    insecure_skip_verify: false,
+                    allow_internal_endpoints: false,
+                    allow_plaintext_sse_over_http: false,
+                },
+                test_sink_runtime(),
+            )
             .unwrap(),
         )
     }
@@ -1777,7 +2720,7 @@ mod tests {
         assert!(single_target_sink_cfg(&cfg).is_none());
         cfg.replication_access_key = Some("AKID".to_owned());
         assert!(single_target_sink_cfg(&cfg).is_none());
-        cfg.replication_secret = Some("secret".to_owned());
+        cfg.replication_secret = Some("secret".into());
         let built = single_target_sink_cfg(&cfg).expect("full triple yields a config");
         assert_eq!(built.endpoint, "http://backup:9000");
         // The TLS trust defaults are the safe webpki path for the single-target node->node case.
@@ -1806,7 +2749,7 @@ mod tests {
         use cairn_types::{CompressionDescriptor, Timestamp, UserId};
 
         fn crypto_with_key_id(id: u16, byte: u8) -> SystemCrypto {
-            SystemCrypto::from_ring(vec![(id, [byte; 32])], id, id, 0).expect("ring builds")
+            SystemCrypto::from_ring(vec![(id, [byte; 32].into())], id, id, 0).expect("ring builds")
         }
 
         /// Seal a DEK into the persisted descriptor exactly as the S3 write path does.
@@ -1817,6 +2760,7 @@ mod tests {
                 alg: "AES256-GCM".to_owned(),
                 wrapped_dek_b64: base64::engine::general_purpose::STANDARD
                     .encode(&sealed.ciphertext),
+                blob_format_version: Some(cairn_types::sse::AUTHENTICATED_BLOB_FORMAT_VERSION),
                 ..cairn_types::sse::SseDescriptor::default()
             })
             .expect("descriptor serializes")
@@ -1865,7 +2809,7 @@ mod tests {
         async fn staged_row(
             blobs: &LocalBlobStore,
             body: &[u8],
-            dek: Option<[u8; 32]>,
+            dek: Option<cairn_types::SecretKey32>,
             descriptor: Option<String>,
             compression: Option<cairn_types::bucket::CompressionPolicy>,
         ) -> ObjectVersionRow {
@@ -1919,7 +2863,7 @@ mod tests {
             let row = staged_row(
                 &blobs,
                 b"encrypted payload that the scrub must actually read",
-                Some(dek),
+                Some(dek.into()),
                 Some(descriptor_for(&crypto, &dek)),
                 None,
             )
@@ -1941,7 +2885,7 @@ mod tests {
             let row = staged_row(
                 &blobs,
                 b"encrypted payload that will be corrupted on disk",
-                Some(dek),
+                Some(dek.into()),
                 Some(descriptor_for(&crypto, &dek)),
                 None,
             )
@@ -2000,7 +2944,7 @@ mod tests {
             let row = staged_row(
                 &blobs,
                 b"sealed under a key this node no longer holds",
-                Some(dek),
+                Some(dek.into()),
                 Some(descriptor_for(&sealing, &dek)),
                 None,
             )
@@ -2021,7 +2965,7 @@ mod tests {
             let blobs = LocalBlobStore::open(dir.path()).await.unwrap();
             let crypto = crypto_with_key_id(1, 0xa1);
             let dek = [4u8; 32];
-            let mut row = staged_row(&blobs, b"body", Some(dek), None, None).await;
+            let mut row = staged_row(&blobs, b"body", Some(dek.into()), None, None).await;
             row.sse_descriptor = Some("{not-json".to_owned());
             assert_eq!(
                 scrub_version(&blobs, &crypto, &row).await,

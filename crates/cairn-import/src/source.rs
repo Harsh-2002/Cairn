@@ -7,22 +7,22 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
 use http::{Method, Request};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper_rustls::HttpsConnector;
 use hyper_util::client::legacy::Client;
-use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 use rustls::ClientConfig;
 use rustls::RootCertStore;
 
 use cairn_auth::{canonical_request, compute_signature, signing_key, string_to_sign, uri_encode};
-use cairn_net::GuardedResolver;
+use cairn_net::GuardedHttpConnector;
+use cairn_types::SecretString;
 
-use crate::{ImportError, ObjectPage, RemoteObject, SourceObject, SourceReader};
+use crate::{ImportError, ImportTimeouts, ObjectPage, RemoteObject, SourceObject, SourceReader};
 
 const SERVICE: &str = "s3";
 /// The sha256 of an empty body (all GETs Cairn issues carry no request body).
@@ -40,16 +40,18 @@ pub struct SourceConfig {
     /// The source access-key id.
     pub access_key_id: String,
     /// The source secret access key.
-    pub secret_access_key: String,
+    pub secret_access_key: SecretString,
     /// An optional PEM CA bundle to trust for an https endpoint (mutually exclusive with skip-verify).
     pub ca_cert_pem: Option<String>,
     /// Accept any TLS certificate (testing only).
     pub insecure_skip_verify: bool,
     /// Whether the SSRF guard permits internal addresses for this source.
     pub allow_internal_endpoints: bool,
+    /// Connect, response-head, body-idle, and whole-object deadlines.
+    pub timeouts: ImportTimeouts,
 }
 
-type SourceClient = Client<HttpsConnector<HttpConnector<GuardedResolver>>, Full<Bytes>>;
+type SourceClient = Client<HttpsConnector<GuardedHttpConnector>, Full<Bytes>>;
 
 /// A signed, streaming S3 read client for a remote source.
 pub struct HttpS3Source {
@@ -76,6 +78,17 @@ impl HttpS3Source {
     /// [`ImportError::Terminal`] if the endpoint is malformed, its scheme is not http/https, or the
     /// TLS knobs conflict.
     pub fn new(config: SourceConfig) -> Result<Self, ImportError> {
+        if config.timeouts.connect.is_zero()
+            || config.timeouts.response_head.is_zero()
+            || config.timeouts.body_idle.is_zero()
+            || config.timeouts.whole_object.is_zero()
+        {
+            return Err(ImportError::Terminal(
+                "source connect, response-head, body-idle, and whole-object timeouts must all be \
+                 positive"
+                    .to_owned(),
+            ));
+        }
         let uri: http::Uri = config
             .endpoint
             .parse()
@@ -133,7 +146,7 @@ impl HttpS3Source {
         let scope = format!("{scope_date}/{}/{SERVICE}/aws4_request", self.config.region);
         let sts = string_to_sign(&amz_date, &scope, &canonical);
         let key = signing_key(
-            &self.config.secret_access_key,
+            self.config.secret_access_key.expose_secret(),
             scope_date,
             &self.config.region,
             SERVICE,
@@ -160,25 +173,60 @@ impl HttpS3Source {
             .body(Full::new(Bytes::new()))
             .map_err(|e| ImportError::Terminal(format!("request build failed: {e}")))?;
 
-        self.client
-            .request(req)
+        tokio::time::timeout(self.config.timeouts.response_head, self.client.request(req))
             .await
+            .map_err(|_| {
+                ImportError::Unavailable(format!(
+                    "source response head timed out after {}s",
+                    self.config.timeouts.response_head.as_secs()
+                ))
+            })?
             .map_err(|e| ImportError::Unavailable(format!("source connection failed: {e}")))
     }
 
     /// Buffer a (small) listing response body, capped so a hostile/huge listing can't OOM us.
-    async fn read_list_body(resp: hyper::Response<Incoming>) -> Result<Bytes, ImportError> {
+    async fn read_list_body(&self, resp: hyper::Response<Incoming>) -> Result<Bytes, ImportError> {
         let status = resp.status();
-        let limited = http_body_util::Limited::new(resp.into_body(), MAX_LIST_BODY);
-        let bytes = limited
-            .collect()
-            .await
-            .map_err(|e| ImportError::Retryable(format!("reading listing body: {e}")))?
-            .to_bytes();
+        let bytes = self
+            .read_bounded_body(resp.into_body(), MAX_LIST_BODY, "listing")
+            .await?;
         if !status.is_success() {
             return Err(classify_status(status.as_u16(), &bytes));
         }
         Ok(bytes)
+    }
+
+    /// Collect a bounded response while resetting an idle deadline after every body chunk.
+    async fn read_bounded_body(
+        &self,
+        body: Incoming,
+        limit: usize,
+        context: &str,
+    ) -> Result<Bytes, ImportError> {
+        let mut stream = body.into_data_stream();
+        let mut out = BytesMut::with_capacity(limit.min(8 * 1024));
+        loop {
+            let next = tokio::time::timeout(self.config.timeouts.body_idle, stream.next())
+                .await
+                .map_err(|_| {
+                    ImportError::Unavailable(format!(
+                        "source {context} body idle timeout after {}s",
+                        self.config.timeouts.body_idle.as_secs()
+                    ))
+                })?;
+            let Some(chunk) = next else {
+                return Ok(out.freeze());
+            };
+            let chunk = chunk.map_err(|e| {
+                ImportError::Retryable(format!("reading source {context} body: {e}"))
+            })?;
+            if chunk.len() > limit.saturating_sub(out.len()) {
+                return Err(ImportError::Retryable(format!(
+                    "source {context} body exceeds {limit} bytes"
+                )));
+            }
+            out.extend_from_slice(&chunk);
+        }
     }
 
     /// Fetch an object's tag set via `GET ?tagging`. An untagged object returns `200` with an empty
@@ -190,7 +238,7 @@ impl HttpS3Source {
     ) -> Result<Vec<(String, String)>, ImportError> {
         let path = format!("/{}/{}", uri_encode(bucket, false), uri_encode(key, false));
         let resp = self.signed_get(&path, "tagging=").await?;
-        let body = Self::read_list_body(resp).await?;
+        let body = self.read_list_body(resp).await?;
         cairn_xml::parse_tagging(&body)
             .map_err(|e| ImportError::Terminal(format!("parsing GetObjectTagging response: {e}")))
     }
@@ -200,7 +248,7 @@ impl HttpS3Source {
 impl SourceReader for HttpS3Source {
     async fn list_buckets(&self) -> Result<Vec<String>, ImportError> {
         let resp = self.signed_get("/", "").await?;
-        let body = Self::read_list_body(resp).await?;
+        let body = self.read_list_body(resp).await?;
         cairn_xml::parse_list_all_my_buckets(&body)
             .map_err(|e| ImportError::Terminal(format!("parsing ListBuckets response: {e}")))
     }
@@ -223,7 +271,7 @@ impl SourceReader for HttpS3Source {
         query.push_str(&max_keys.to_string());
 
         let resp = self.signed_get(&path, &query).await?;
-        let body = Self::read_list_body(resp).await?;
+        let body = self.read_list_body(resp).await?;
         let (objects, next_cursor, is_truncated) = cairn_xml::parse_list_objects_v2(&body)
             .map_err(|e| ImportError::Terminal(format!("parsing ListObjectsV2 response: {e}")))?;
         Ok(ObjectPage {
@@ -237,15 +285,15 @@ impl SourceReader for HttpS3Source {
     }
 
     async fn get_object(&self, bucket: &str, key: &str) -> Result<SourceObject, ImportError> {
+        let whole_started = tokio::time::Instant::now();
         let path = format!("/{}/{}", uri_encode(bucket, false), uri_encode(key, false));
         let resp = self.signed_get(&path, "").await?;
         let status = resp.status();
         if !status.is_success() {
             // Read a bounded slice of the error body for context, then classify.
-            let body = http_body_util::Limited::new(resp.into_body(), 8 * 1024)
-                .collect()
+            let body = self
+                .read_bounded_body(resp.into_body(), 8 * 1024, "error")
                 .await
-                .map(|b| b.to_bytes())
                 .unwrap_or_default();
             return Err(classify_status(status.as_u16(), &body));
         }
@@ -280,11 +328,12 @@ impl SourceReader for HttpS3Source {
         }
 
         // Stream the body straight through — never buffered.
-        let body = resp
-            .into_body()
-            .into_data_stream()
-            .map(|r| r.map_err(|e| cairn_types::error::BlobError::Io(e.to_string())));
-        let body: cairn_types::BlobStream = Box::pin(body);
+        let body = timed_object_body(
+            resp.into_body(),
+            self.config.timeouts.body_idle,
+            whole_started,
+            self.config.timeouts.whole_object,
+        );
 
         // The tag set needs a second call (GetObjectTagging) — S3 does not return tags on a plain
         // GetObject. Not gated on any "does this object have tags" hint from the response: AWS S3
@@ -329,6 +378,61 @@ fn classify_status(status: u16, body: &[u8]) -> ImportError {
     }
 }
 
+/// Convert Hyper's body into Cairn's blob stream while enforcing both a reset-on-progress idle
+/// deadline and the absolute whole-object deadline established before the source GET.
+fn timed_object_body(
+    body: Incoming,
+    body_idle: std::time::Duration,
+    whole_started: tokio::time::Instant,
+    whole_object: std::time::Duration,
+) -> cairn_types::BlobStream {
+    let body = Box::pin(body.into_data_stream());
+    let stream =
+        futures_util::stream::unfold((body, false), move |(mut body, finished)| async move {
+            if finished {
+                return None;
+            }
+            let remaining = whole_object.saturating_sub(whole_started.elapsed());
+            if remaining.is_zero() {
+                return Some((
+                    Err(cairn_types::error::BlobError::Io(format!(
+                        "source object deadline exceeded after {}s",
+                        whole_object.as_secs()
+                    ))),
+                    (body, true),
+                ));
+            }
+            let wait = body_idle.min(remaining);
+            match tokio::time::timeout(wait, body.next()).await {
+                Ok(Some(Ok(chunk))) => Some((Ok(chunk), (body, false))),
+                Ok(Some(Err(e))) => Some((
+                    Err(cairn_types::error::BlobError::Io(e.to_string())),
+                    (body, true),
+                )),
+                Ok(None) => None,
+                Err(_) => {
+                    let whole_expired = whole_started.elapsed() >= whole_object;
+                    let message = if whole_expired {
+                        format!(
+                            "source object deadline exceeded after {}s",
+                            whole_object.as_secs()
+                        )
+                    } else {
+                        format!(
+                            "source object body idle timeout after {}s",
+                            body_idle.as_secs()
+                        )
+                    };
+                    Some((
+                        Err(cairn_types::error::BlobError::Io(message)),
+                        (body, true),
+                    ))
+                }
+            }
+        });
+    Box::pin(stream)
+}
+
 /// Build the hyper client with the SSRF-guarded connector and per-source TLS trust (mirrors the
 /// replication sink's connector).
 fn build_client(config: &SourceConfig) -> Result<SourceClient, ImportError> {
@@ -359,10 +463,12 @@ fn build_client(config: &SourceConfig) -> Result<SourceClient, ImportError> {
         base.with_webpki_roots()
     };
     let guard = cairn_net::GuardConfig::new(config.allow_internal_endpoints);
+    let mut connector = cairn_net::guarded_http_connector(guard);
+    connector.set_connect_timeout(Some(config.timeouts.connect));
     let https = builder
         .https_or_http()
         .enable_http1()
-        .wrap_connector(cairn_net::guarded_http_connector(guard));
+        .wrap_connector(connector);
     Ok(Client::builder(TokioExecutor::new()).build(https))
 }
 

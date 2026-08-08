@@ -6,7 +6,10 @@ use bytes::Bytes;
 use cairn_types::error::BlobError;
 use futures_util::StreamExt;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::time::Duration;
+use tokio::sync::Notify;
 
 fn body_of(data: Vec<u8>) -> cairn_types::BlobStream {
     Box::pin(futures_util::stream::once(async move {
@@ -129,6 +132,24 @@ impl DestWriter for RecordingDest {
             .unwrap()
             .insert((bucket.to_owned(), obj.key), buf);
         Ok(())
+    }
+}
+
+/// Destination double that enters a PUT and then never makes progress. The engine's whole-object
+/// deadline must cancel it and release the shared global permit.
+struct StalledDest {
+    entered: Arc<Notify>,
+}
+
+#[async_trait]
+impl DestWriter for StalledDest {
+    async fn ensure_bucket(&self, _bucket: &str) -> Result<(), ImportError> {
+        Ok(())
+    }
+
+    async fn put_object(&self, _bucket: &str, _obj: SourceObject) -> Result<(), ImportError> {
+        self.entered.notify_one();
+        std::future::pending::<Result<(), ImportError>>().await
     }
 }
 
@@ -308,4 +329,68 @@ async fn cancellation_stops_cleanly() {
     assert!(dest.objects.lock().unwrap().len() < 3);
     let last = progress.snapshots.lock().unwrap().last().unwrap().clone();
     assert_eq!(last[0].state, ImportState::Cancelled);
+}
+
+/// CAIRN-AUD-019 regression: two independently scheduled jobs share one global permit. A timed-out
+/// first job must drop that permit before retry/backoff so the later job completes, and the budget
+/// returns to its full count after both futures finish.
+#[tokio::test]
+async fn timed_out_job_releases_shared_permit_for_later_job() {
+    let global = Arc::new(Semaphore::new(1));
+    let entered = Arc::new(Notify::new());
+    let stalled_source = Arc::new(FakeSource::new(1).with_bucket("slow", &[("stalled", b"x")]));
+    let stalled_dest = Arc::new(StalledDest {
+        entered: entered.clone(),
+    });
+    let stalled_progress = Arc::new(CollectProgress::new());
+    let opts = ImportOpts {
+        object_workers: 1,
+        global_max_inflight: 1,
+        max_attempts: 1,
+        base_backoff_secs: 0,
+        max_backoff_secs: 0,
+        whole_object_timeout: Duration::from_millis(100),
+        ..ImportOpts::default()
+    };
+    let stalled_engine = ImportEngine::new(opts.clone()).with_global_semaphore(global.clone());
+    let first = tokio::spawn(async move {
+        stalled_engine
+            .run(
+                stalled_source.as_ref(),
+                stalled_dest.as_ref(),
+                &[plan("slow", "slow-dest")],
+                stalled_progress.as_ref(),
+            )
+            .await
+    });
+
+    entered.notified().await;
+    assert_eq!(global.available_permits(), 0, "stalled job holds permit");
+
+    let fast_source = FakeSource::new(1).with_bucket("fast", &[("ready", b"ok")]);
+    let fast_dest = RecordingDest::default();
+    let fast_engine = ImportEngine::new(opts).with_global_semaphore(global.clone());
+    let fast_report = tokio::time::timeout(
+        Duration::from_secs(2),
+        fast_engine.run(
+            &fast_source,
+            &fast_dest,
+            &[plan("fast", "fast-dest")],
+            &CollectProgress::new(),
+        ),
+    )
+    .await
+    .expect("later job must progress after the first deadline");
+
+    let _ = first.await.expect("stalled job task joins");
+    assert_eq!(fast_report.objects_copied, 1);
+    assert_eq!(
+        fast_dest.objects.lock().unwrap()[&("fast-dest".to_owned(), "ready".to_owned())],
+        b"ok"
+    );
+    assert_eq!(
+        global.available_permits(),
+        1,
+        "all timeout/copy paths release the shared permit"
+    );
 }

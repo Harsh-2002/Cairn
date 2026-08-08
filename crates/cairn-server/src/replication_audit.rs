@@ -681,6 +681,7 @@ mod tests {
         meta.submit(Mutation::PutObjectVersion {
             row: Box::new(row),
             precondition: Precondition::default(),
+            initial_state: cairn_types::InitialObjectState::default(),
             replication: Vec::new(),
         })
         .await

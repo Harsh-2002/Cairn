@@ -1,13 +1,112 @@
-// Object data plane. The S3 API (served at the root, path-style) shares the console's auth, so the
-// browser can upload, download, preview, and delete object bytes directly — no separate SDK or
-// signing needed. Auth rides the httpOnly session cookie, which the browser attaches automatically
-// to these same-origin requests (the web-console listener accepts the cookie as a Bearer credential).
+// Object data plane. Raw S3 bytes live on the distinct, untrusted data origin, never on the
+// cookie-authenticated console origin. Before each request the management API uses a durable,
+// bucket-scoped temporary session to mint an exact SigV4 presigned URL. The browser keeps only the
+// session's public id + opaque token in memory; neither the administrator's secret nor the
+// temporary signing secret enters JavaScript.
 
-import { ApiError } from "./api";
+import { api, ApiError } from "./api";
+import type { PresignSession } from "./types";
 import type { ReplicationRule } from "./types";
 
 function s3headers(extra?: Record<string, string>): Record<string, string> {
   return { ...extra };
+}
+
+const TRANSFER_URL_TTL_SECS = 300;
+const transferSessions = new Map<string, PresignSession>();
+
+function isBrowserDotSegment(segment: string): boolean {
+  let candidate = segment;
+  for (let pass = 0; pass <= 2; pass += 1) {
+    if (candidate === "." || candidate === "..") return true;
+    try {
+      const decoded = decodeURIComponent(candidate);
+      if (decoded === candidate) return false;
+      candidate = decoded;
+    } catch {
+      return false;
+    }
+  }
+  return candidate === "." || candidate === "..";
+}
+
+function parseDataPath(input: string): {
+  bucket: string;
+  key: string;
+  query: [string, string][];
+} {
+  const q = input.indexOf("?");
+  const encodedPath = (q < 0 ? input : input.slice(0, q)).replace(/^\/+/, "");
+  const encodedQuery = q < 0 ? "" : input.slice(q + 1);
+  const slash = encodedPath.indexOf("/");
+  const bucketPart = slash < 0 ? encodedPath : encodedPath.slice(0, slash);
+  const keyPart = slash < 0 ? "" : encodedPath.slice(slash + 1);
+  try {
+    const key = keyPart
+      ? keyPart
+          .split("/")
+          .map((segment) => decodeURIComponent(segment))
+          .join("/")
+      : "";
+    if (key.split("/").some(isBrowserDotSegment)) {
+      throw new ApiError(
+        "The web console cannot transfer keys containing “.” or “..” path segments because browsers normalize them. Use an S3 client or the Cairn CLI for this key.",
+        400,
+        "UnsupportedConsoleKey",
+      );
+    }
+    return {
+      bucket: decodeURIComponent(bucketPart),
+      key,
+      query: Array.from(new URLSearchParams(encodedQuery).entries()),
+    };
+  } catch (error) {
+    if (error instanceof ApiError) throw error;
+    throw new ApiError("invalid S3 request path", 400);
+  }
+}
+
+async function presignedDataRequest(
+  input: string,
+  init: RequestInit = {},
+): Promise<{ url: string; headers: Headers }> {
+  const { bucket, key, query } = parseDataPath(input);
+  if (!bucket) throw new ApiError("a bucket is required", 400);
+  const headers = new Headers(init.headers);
+  const cached = transferSessions.get(bucket);
+  const reusable =
+    cached && cached.expires_at_ms > Date.now() + (TRANSFER_URL_TTL_SECS + 5) * 1000
+      ? {
+          access_key_id: cached.access_key_id,
+          session_token: cached.session_token,
+        }
+      : undefined;
+  const response = await api.presignShare(bucket, {
+    key,
+    method: (init.method?.toUpperCase() ?? "GET") as
+      | "GET"
+      | "HEAD"
+      | "PUT"
+      | "POST"
+      | "DELETE",
+    expires_in_secs: TRANSFER_URL_TTL_SECS,
+    query,
+    headers: Array.from(headers.entries()),
+    origin: window.location.origin,
+    session: reusable,
+  });
+  transferSessions.set(bucket, response.session);
+  return { url: response.url, headers };
+}
+
+async function dataFetch(input: string, init: RequestInit = {}): Promise<Response> {
+  const signed = await presignedDataRequest(input, init);
+  return fetch(signed.url, {
+    ...init,
+    headers: signed.headers,
+    credentials: "omit",
+    referrerPolicy: "no-referrer",
+  });
 }
 
 /**
@@ -52,7 +151,7 @@ export async function putObject(
   const headers = s3headers({
     "Content-Type": file.type || "application/octet-stream",
   });
-  const res = await fetch(objectPath(bucket, key), {
+  const res = await dataFetch(objectPath(bucket, key), {
     method: "PUT",
     headers,
     body: file,
@@ -70,17 +169,24 @@ export interface UploadProgress {
 // Upload with live progress. fetch() gives no upload-progress events, so this
 // uses XMLHttpRequest (whose upload.onprogress reports loaded/total). The rate
 // is the byte delta over the wall-clock delta between events, lightly smoothed.
-export function putObjectWithProgress(
+export async function putObjectWithProgress(
   bucket: string,
   key: string,
   file: File,
   onProgress: (p: UploadProgress) => void,
   signal?: AbortSignal,
 ): Promise<void> {
+  const headers = s3headers({
+    "Content-Type": file.type || "application/octet-stream",
+  });
+  const signed = await presignedDataRequest(objectPath(bucket, key), {
+    method: "PUT",
+    headers,
+  });
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
-    xhr.open("PUT", objectPath(bucket, key));
-    // Same-origin XHR sends the httpOnly session cookie automatically; no Authorization header.
+    xhr.open("PUT", signed.url);
+    xhr.withCredentials = false;
     xhr.setRequestHeader(
       "Content-Type",
       file.type || "application/octet-stream",
@@ -143,31 +249,36 @@ export async function getObjectBlob(
   versionId?: string,
 ): Promise<Blob> {
   const q = versionId ? `?versionId=${encodeURIComponent(versionId)}` : "";
-  const res = await fetch(objectPath(bucket, key) + q, { headers: s3headers() });
+  const res = await dataFetch(objectPath(bucket, key) + q, { headers: s3headers() });
   if (!res.ok)
     throw await s3Error(res, "download");
   return await res.blob();
 }
 
 /**
- * A same-origin object URL for INLINE preview, carrying the server-side response-header overrides
- * that make it safe to hand to a script-inert element (`<img>`/`<video>`/`<audio>`) or a forced-type
- * `<iframe>` (PDF). `mime` sets `response-content-type` so an object stored as `application/octet-
- * stream` still renders as the right type; the server also stamps `x-content-type-options: nosniff`,
- * so a mistyped/HTML object served as e.g. `application/pdf` is handed to the PDF viewer, never the
- * HTML parser (audit #13). Reuses {@link objectPath} for the audit-#31 dot-segment escaping. Auth
- * rides the httpOnly session cookie automatically on these same-origin requests.
+ * A short-lived data-origin object URL for INLINE preview, carrying response-header overrides that
+ * make it safe to hand to a script-inert element (`<img>`/`<video>`/`<audio>`) or a forced-type
+ * `<iframe>` (PDF). `mime` sets `response-content-type` so an object stored as
+ * `application/octet-stream` still renders as the right type; the server also stamps
+ * `x-content-type-options: nosniff`, so a mistyped/HTML object served as e.g. `application/pdf` is
+ * handed to the PDF viewer, never the HTML parser (audit #13). Reuses {@link objectPath} for the
+ * audit-#31 dot-segment escaping. Authorization is bound into the presigned URL; the console cookie
+ * is neither sent to nor honoured by the data listener.
  */
-export function previewUrl(
+export async function previewUrl(
   bucket: string,
   key: string,
   opts: { mime?: string; disposition?: "inline" | "attachment"; versionId?: string } = {},
-): string {
+): Promise<string> {
   const params = new URLSearchParams();
   if (opts.versionId) params.set("versionId", opts.versionId);
   if (opts.mime) params.set("response-content-type", opts.mime);
   params.set("response-content-disposition", opts.disposition ?? "inline");
-  return `${objectPath(bucket, key)}?${params.toString()}`;
+  return (
+    await presignedDataRequest(
+      `${objectPath(bucket, key)}?${params.toString()}`,
+    )
+  ).url;
 }
 
 export interface TextSlice {
@@ -190,7 +301,7 @@ export async function getObjectText(
 ): Promise<TextSlice> {
   const max = opts.maxBytes ?? 2 * 1024 * 1024;
   const q = opts.versionId ? `?versionId=${encodeURIComponent(opts.versionId)}` : "";
-  const res = await fetch(objectPath(bucket, key) + q, {
+  const res = await dataFetch(objectPath(bucket, key) + q, {
     headers: s3headers({ Range: `bytes=0-${max - 1}` }),
   });
   // A zero-byte object (or an otherwise-unsatisfiable range) comes back 416 — treat as empty.
@@ -212,7 +323,7 @@ export async function deleteObject(
   versionId?: string,
 ): Promise<void> {
   const q = versionId ? `?versionId=${encodeURIComponent(versionId)}` : "";
-  const res = await fetch(objectPath(bucket, key) + q, {
+  const res = await dataFetch(objectPath(bucket, key) + q, {
     method: "DELETE",
     headers: s3headers(),
   });
@@ -227,7 +338,7 @@ export async function createFolder(
   prefix: string,
 ): Promise<void> {
   const key = prefix.endsWith("/") ? prefix : `${prefix}/`;
-  const res = await fetch(objectPath(bucket, key), {
+  const res = await dataFetch(objectPath(bucket, key), {
     method: "PUT",
     headers: s3headers({ "Content-Type": "application/x-directory" }),
     body: new Blob([]),
@@ -244,7 +355,7 @@ export async function copyObject(
   destKey: string,
 ): Promise<void> {
   const source = objectPath(bucket, srcKey); // "/bucket/encoded/key"
-  const res = await fetch(objectPath(bucket, destKey), {
+  const res = await dataFetch(objectPath(bucket, destKey), {
     method: "PUT",
     headers: s3headers({ "x-amz-copy-source": source }),
   });
@@ -295,7 +406,7 @@ export async function listObjectVersions(
   let url = `/${encodeURIComponent(bucket)}?versions`;
   if (prefix) url += `&prefix=${encodeURIComponent(prefix)}`;
   if (delimiter) url += `&delimiter=${encodeURIComponent(delimiter)}`;
-  const res = await fetch(url, { headers: s3headers() });
+  const res = await dataFetch(url, { headers: s3headers() });
   if (!res.ok)
     throw await s3Error(res, "list versions");
   const doc = parseXml(await res.text());
@@ -364,7 +475,7 @@ export async function listMultipartUploads(
     if (opts.uploadIdMarker)
       url += `&upload-id-marker=${encodeURIComponent(opts.uploadIdMarker)}`;
   }
-  const res = await fetch(url, { headers: s3headers() });
+  const res = await dataFetch(url, { headers: s3headers() });
   if (!res.ok)
     throw await s3Error(res, "list uploads");
   const doc = parseXml(await res.text());
@@ -392,7 +503,7 @@ export async function abortMultipartUpload(
   key: string,
   uploadId: string,
 ): Promise<void> {
-  const res = await fetch(
+  const res = await dataFetch(
     objectPath(bucket, key) + `?uploadId=${encodeURIComponent(uploadId)}`,
     { method: "DELETE", headers: s3headers() },
   );
@@ -411,7 +522,7 @@ export async function getObjectTagging(
   bucket: string,
   key: string,
 ): Promise<ObjectTag[]> {
-  const res = await fetch(objectPath(bucket, key) + "?tagging", {
+  const res = await dataFetch(objectPath(bucket, key) + "?tagging", {
     headers: s3headers(),
   });
   if (res.status === 404) return [];
@@ -438,7 +549,7 @@ export async function putObjectTagging(
       )
       .join("") +
     `</TagSet></Tagging>`;
-  const res = await fetch(objectPath(bucket, key) + "?tagging", {
+  const res = await dataFetch(objectPath(bucket, key) + "?tagging", {
     method: "PUT",
     headers: s3headers({ "Content-Type": "application/xml" }),
     body,
@@ -451,7 +562,7 @@ export async function deleteObjectTagging(
   bucket: string,
   key: string,
 ): Promise<void> {
-  const res = await fetch(objectPath(bucket, key) + "?tagging", {
+  const res = await dataFetch(objectPath(bucket, key) + "?tagging", {
     method: "DELETE",
     headers: s3headers(),
   });
@@ -474,7 +585,7 @@ export async function bulkDelete(
     `<Delete>` +
     keys.map((k) => `<Object><Key>${xmlEscape(k)}</Key></Object>`).join("") +
     `</Delete>`;
-  const res = await fetch(`/${encodeURIComponent(bucket)}?delete`, {
+  const res = await dataFetch(`/${encodeURIComponent(bucket)}?delete`, {
     method: "POST",
     headers: s3headers({ "Content-Type": "application/xml" }),
     body,
@@ -502,7 +613,7 @@ export interface PublicAccessBlock {
 export async function getPublicAccessBlock(
   bucket: string,
 ): Promise<PublicAccessBlock | null> {
-  const res = await fetch(`/${encodeURIComponent(bucket)}?publicAccessBlock`, {
+  const res = await dataFetch(`/${encodeURIComponent(bucket)}?publicAccessBlock`, {
     headers: s3headers(),
   });
   if (res.status === 404) return null;
@@ -530,7 +641,7 @@ export async function putPublicAccessBlock(
     `<BlockPublicPolicy>${b.blockPublicPolicy}</BlockPublicPolicy>` +
     `<RestrictPublicBuckets>${b.restrictPublicBuckets}</RestrictPublicBuckets>` +
     `</PublicAccessBlockConfiguration>`;
-  const res = await fetch(`/${encodeURIComponent(bucket)}?publicAccessBlock`, {
+  const res = await dataFetch(`/${encodeURIComponent(bucket)}?publicAccessBlock`, {
     method: "PUT",
     headers: s3headers({ "Content-Type": "application/xml" }),
     body,
@@ -547,7 +658,7 @@ export async function putOwnershipControls(
   mode: string,
 ): Promise<void> {
   const body = `<OwnershipControls><Rule><ObjectOwnership>${mode}</ObjectOwnership></Rule></OwnershipControls>`;
-  const res = await fetch(`/${encodeURIComponent(bucket)}?ownershipControls`, {
+  const res = await dataFetch(`/${encodeURIComponent(bucket)}?ownershipControls`, {
     method: "PUT",
     headers: s3headers({ "Content-Type": "application/xml" }),
     body,
@@ -559,7 +670,7 @@ export async function putOwnershipControls(
 // --- Bucket tagging (?tagging on the bucket) ------------------------------------
 
 export async function getBucketTagging(bucket: string): Promise<ObjectTag[]> {
-  const res = await fetch(`/${encodeURIComponent(bucket)}?tagging`, {
+  const res = await dataFetch(`/${encodeURIComponent(bucket)}?tagging`, {
     headers: s3headers(),
   });
   if (res.status === 404) return [];
@@ -585,7 +696,7 @@ export async function putBucketTagging(
       )
       .join("") +
     `</TagSet></Tagging>`;
-  const res = await fetch(`/${encodeURIComponent(bucket)}?tagging`, {
+  const res = await dataFetch(`/${encodeURIComponent(bucket)}?tagging`, {
     method: "PUT",
     headers: s3headers({ "Content-Type": "application/xml" }),
     body,
@@ -595,7 +706,7 @@ export async function putBucketTagging(
 }
 
 export async function deleteBucketTagging(bucket: string): Promise<void> {
-  const res = await fetch(`/${encodeURIComponent(bucket)}?tagging`, {
+  const res = await dataFetch(`/${encodeURIComponent(bucket)}?tagging`, {
     method: "DELETE",
     headers: s3headers(),
   });
@@ -610,7 +721,7 @@ export async function deleteBucketTagging(bucket: string): Promise<void> {
 export async function getReplication(
   bucket: string,
 ): Promise<ReplicationRule | null> {
-  const res = await fetch(`/${encodeURIComponent(bucket)}?replication`, {
+  const res = await dataFetch(`/${encodeURIComponent(bucket)}?replication`, {
     headers: s3headers(),
   });
   if (res.status === 404) return null;
@@ -651,7 +762,7 @@ export async function putReplication(
     `<Filter><Prefix>${xmlEscape(prefix)}</Prefix></Filter>` +
     `<Destination><Bucket>${xmlEscape(destination)}</Bucket></Destination></Rule>` +
     `</ReplicationConfiguration>`;
-  const res = await fetch(`/${encodeURIComponent(bucket)}?replication`, {
+  const res = await dataFetch(`/${encodeURIComponent(bucket)}?replication`, {
     method: "PUT",
     headers: s3headers({ "Content-Type": "application/xml" }),
     body: xml,
@@ -661,7 +772,7 @@ export async function putReplication(
 }
 
 export async function deleteReplication(bucket: string): Promise<void> {
-  const res = await fetch(`/${encodeURIComponent(bucket)}?replication`, {
+  const res = await dataFetch(`/${encodeURIComponent(bucket)}?replication`, {
     method: "DELETE",
     headers: s3headers(),
   });
@@ -691,7 +802,7 @@ export interface ObjectRetention {
 export async function getObjectLockConfig(
   bucket: string,
 ): Promise<BucketObjectLock> {
-  const res = await fetch(`/${encodeURIComponent(bucket)}?object-lock`, {
+  const res = await dataFetch(`/${encodeURIComponent(bucket)}?object-lock`, {
     headers: s3headers(),
   });
   if (res.status === 404 || res.status === 400) return { enabled: false };
@@ -727,7 +838,7 @@ export async function putObjectLockConfig(
   const xml =
     `<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled>` +
     `${rule}</ObjectLockConfiguration>`;
-  const res = await fetch(`/${encodeURIComponent(bucket)}?object-lock`, {
+  const res = await dataFetch(`/${encodeURIComponent(bucket)}?object-lock`, {
     method: "PUT",
     headers: s3headers({ "Content-Type": "application/xml" }),
     body: xml,
@@ -745,7 +856,7 @@ export async function getObjectRetention(
   key: string,
   versionId?: string,
 ): Promise<ObjectRetention | null> {
-  const res = await fetch(
+  const res = await dataFetch(
     objectPath(bucket, key) + `?retention${versionQuery(versionId)}`,
     { headers: s3headers() },
   );
@@ -775,7 +886,7 @@ export async function putObjectRetention(
   const headers: Record<string, string> = { "Content-Type": "application/xml" };
   if (opts.bypassGovernance)
     headers["x-amz-bypass-governance-retention"] = "true";
-  const res = await fetch(
+  const res = await dataFetch(
     objectPath(bucket, key) + `?retention${versionQuery(opts.versionId)}`,
     { method: "PUT", headers: s3headers(headers), body: xml },
   );
@@ -788,7 +899,7 @@ export async function getObjectLegalHold(
   key: string,
   versionId?: string,
 ): Promise<boolean> {
-  const res = await fetch(
+  const res = await dataFetch(
     objectPath(bucket, key) + `?legal-hold${versionQuery(versionId)}`,
     { headers: s3headers() },
   );
@@ -808,7 +919,7 @@ export async function putObjectLegalHold(
   versionId?: string,
 ): Promise<void> {
   const xml = `<LegalHold><Status>${on ? "ON" : "OFF"}</Status></LegalHold>`;
-  const res = await fetch(
+  const res = await dataFetch(
     objectPath(bucket, key) + `?legal-hold${versionQuery(versionId)}`,
     {
       method: "PUT",
@@ -836,7 +947,7 @@ const textsOf = (parent: Element, tag: string): string[] =>
     .filter(Boolean);
 
 export async function getCors(bucket: string): Promise<CorsRule[]> {
-  const res = await fetch(`/${encodeURIComponent(bucket)}?cors`, {
+  const res = await dataFetch(`/${encodeURIComponent(bucket)}?cors`, {
     headers: s3headers(),
   });
   if (res.status === 404) return [];
@@ -881,7 +992,7 @@ export async function putCors(bucket: string, rules: CorsRule[]): Promise<void> 
       )
       .join("") +
     `</CORSConfiguration>`;
-  const res = await fetch(`/${encodeURIComponent(bucket)}?cors`, {
+  const res = await dataFetch(`/${encodeURIComponent(bucket)}?cors`, {
     method: "PUT",
     headers: s3headers({ "Content-Type": "application/xml" }),
     body,
@@ -891,7 +1002,7 @@ export async function putCors(bucket: string, rules: CorsRule[]): Promise<void> 
 }
 
 export async function deleteCors(bucket: string): Promise<void> {
-  const res = await fetch(`/${encodeURIComponent(bucket)}?cors`, {
+  const res = await dataFetch(`/${encodeURIComponent(bucket)}?cors`, {
     method: "DELETE",
     headers: s3headers(),
   });
@@ -922,7 +1033,7 @@ function intOf(parent: Element, path: string[]): number | undefined {
 }
 
 export async function getLifecycle(bucket: string): Promise<LifecycleRule[]> {
-  const res = await fetch(`/${encodeURIComponent(bucket)}?lifecycle`, {
+  const res = await dataFetch(`/${encodeURIComponent(bucket)}?lifecycle`, {
     headers: s3headers(),
   });
   if (res.status === 404) return [];
@@ -972,7 +1083,7 @@ export async function putLifecycle(
       })
       .join("") +
     `</LifecycleConfiguration>`;
-  const res = await fetch(`/${encodeURIComponent(bucket)}?lifecycle`, {
+  const res = await dataFetch(`/${encodeURIComponent(bucket)}?lifecycle`, {
     method: "PUT",
     headers: s3headers({ "Content-Type": "application/xml" }),
     body,
@@ -982,7 +1093,7 @@ export async function putLifecycle(
 }
 
 export async function deleteLifecycle(bucket: string): Promise<void> {
-  const res = await fetch(`/${encodeURIComponent(bucket)}?lifecycle`, {
+  const res = await dataFetch(`/${encodeURIComponent(bucket)}?lifecycle`, {
     method: "DELETE",
     headers: s3headers(),
   });

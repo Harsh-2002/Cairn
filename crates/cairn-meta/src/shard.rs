@@ -30,11 +30,12 @@ use cairn_types::authz::PublicAccessBlock;
 use cairn_types::bucket::{Bucket, ConfigAspect, ConfigDoc};
 use cairn_types::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
 use cairn_types::meta::{
-    ActivityEntry, BucketCounts, ImportJob, ImportJobRecord, ListPage, ListQuery, MetricsRange,
+    ActivityEntry, BucketCounts, ImportJob, ImportJobListQuery, ImportJobPage, ImportJobRecord,
+    ImportState, ListPage, ListQuery, MetricsRange, MultipartCleanup, MultipartReservation,
     MultipartSession, Mutation, MutationOutcome, ObjectSummary, OutboxEntry, PartRecord,
     ReplicationCounts, ReplicationStatus, ReplicationTargetCounts, RequestMetricsSeries,
-    SessionCredentialSummary, ShareRow, StoreCounts, TagSummary, TaggedObject, User,
-    UserSessionCredentials, UserSigV4Credentials, UserWithBearerHash, WebhookEntry,
+    SessionCredentialSummary, ShareLookupHash, ShareRow, StoreCounts, TagSummary, TaggedObject,
+    User, UserSessionCredentials, UserSigV4Credentials, UserWithBearerHash, WebhookEntry,
 };
 use cairn_types::object::ObjectVersionRow;
 use cairn_types::time::Timestamp;
@@ -155,28 +156,31 @@ impl ShardedMetadataStore {
 impl MetadataStore for ShardedMetadataStore {
     async fn submit(&self, mutation: Mutation) -> Result<MutationOutcome, MetaError> {
         match mutation {
-            // DeleteBucket is per-bucket, but its apply also purges the ACCOUNT-GLOBAL request_metrics
-            // table, which lives only on shard 0. If the bucket routes to a non-zero shard, that
-            // purge misses — so run the delete on shard 0 too. The extra submit is a no-op for the
-            // bucket/config/stats rows (none on shard 0 for this bucket) and only clears the metrics
-            // (audit 2026-07). Sequenced after the authoritative per-bucket delete so an emptiness
-            // rejection there short-circuits before we touch shard 0.
+            // DeleteBucket is per-bucket, but its apply also purges ACCOUNT-GLOBAL request_metrics
+            // and object_shares on shard 0. For a nonzero bucket, clean shard 0 FIRST: this is
+            // deliberately conservative because a crash between two database commits may leave the
+            // bucket in place with its shares removed, but can never leave a deleted bucket's live
+            // capability waiting to revive after same-name recreation. A global cleanup failure
+            // aborts before the authoritative bucket deletion; a later authoritative NotEmpty error
+            // likewise leaves the bucket intact but its capabilities safely invalidated.
             Mutation::DeleteBucket(name) => {
                 let idx = shard_for_bucket(name.as_str(), self.n());
                 let m = Mutation::DeleteBucket(name);
-                let outcome = self.shards[idx].submit(m.clone()).await?;
                 if idx != 0 {
-                    self.global().submit(m).await?;
+                    self.global().submit(m.clone()).await?;
                 }
-                Ok(outcome)
+                self.shards[idx].submit(m).await
             }
 
             // --- per-bucket object/config mutations: route by the target bucket ---
             Mutation::PutObjectVersion { .. }
+            | Mutation::ResolveObjectWrite { .. }
             | Mutation::CreateDeleteMarker { .. }
             | Mutation::DeleteVersion { .. }
             | Mutation::CreateBucket(_)
+            | Mutation::CreateObjectLockBucket(_)
             | Mutation::SetBucketConfig { .. }
+            | Mutation::UpdateObjectLockConfiguration { .. }
             | Mutation::SetVersioning { .. }
             | Mutation::SetOwnership { .. }
             | Mutation::SetBucketQuota { .. }
@@ -206,26 +210,103 @@ impl MetadataStore for ShardedMetadataStore {
             },
 
             // --- multipart: route by the (shard-encoded) upload id; encode it at creation ---
-            Mutation::CreateMultipart(mut s) => {
-                let shard = shard_for_bucket(s.bucket.as_str(), self.n());
-                let encoded = encode_upload_shard(shard, s.upload_id.as_str(), self.n());
-                s.upload_id = UploadId::from_string(encoded);
+            Mutation::CreateMultipart {
+                mut session,
+                limits,
+            } => {
+                let shard = shard_for_bucket(session.bucket.as_str(), self.n());
+                let encoded = encode_upload_shard(shard, session.upload_id.as_str(), self.n());
+                session.upload_id = UploadId::from_string(encoded);
                 self.shards[shard]
-                    .submit(Mutation::CreateMultipart(s))
+                    .submit(Mutation::CreateMultipart { session, limits })
                     .await
             }
-            Mutation::RecordPart { upload_id, part } => {
+            Mutation::ReserveMultipartPart {
+                upload_id,
+                part_number,
+                attempt_id,
+                reserved_bytes,
+                max_parts_per_upload,
+                now,
+            } => {
                 self.for_upload(upload_id.as_str())
-                    .submit(Mutation::RecordPart { upload_id, part })
+                    .submit(Mutation::ReserveMultipartPart {
+                        upload_id,
+                        part_number,
+                        attempt_id,
+                        reserved_bytes,
+                        max_parts_per_upload,
+                        now,
+                    })
                     .await
             }
-            Mutation::ClaimMultipart(upload_id) => {
+            Mutation::ReleaseMultipartReservation {
+                upload_id,
+                attempt_id,
+            } => {
                 self.for_upload(upload_id.as_str())
-                    .submit(Mutation::ClaimMultipart(upload_id))
+                    .submit(Mutation::ReleaseMultipartReservation {
+                        upload_id,
+                        attempt_id,
+                    })
+                    .await
+            }
+            Mutation::RecordPart {
+                upload_id,
+                attempt_id,
+                part,
+            } => {
+                self.for_upload(upload_id.as_str())
+                    .submit(Mutation::RecordPart {
+                        upload_id,
+                        attempt_id,
+                        part,
+                    })
+                    .await
+            }
+            Mutation::ResolveMultipartPartWrite {
+                upload_id,
+                part_number,
+                storage_path,
+            } => {
+                self.for_upload(upload_id.as_str())
+                    .submit(Mutation::ResolveMultipartPartWrite {
+                        upload_id,
+                        part_number,
+                        storage_path,
+                    })
+                    .await
+            }
+            Mutation::ReleaseMultipartUploadCleanups { upload_id } => {
+                self.for_upload(upload_id.as_str())
+                    .submit(Mutation::ReleaseMultipartUploadCleanups { upload_id })
+                    .await
+            }
+            Mutation::ClaimMultipart {
+                upload_id,
+                claim_token,
+            } => {
+                self.for_upload(upload_id.as_str())
+                    .submit(Mutation::ClaimMultipart {
+                        upload_id,
+                        claim_token,
+                    })
+                    .await
+            }
+            Mutation::ReleaseMultipartClaim {
+                upload_id,
+                claim_token,
+            } => {
+                self.for_upload(upload_id.as_str())
+                    .submit(Mutation::ReleaseMultipartClaim {
+                        upload_id,
+                        claim_token,
+                    })
                     .await
             }
             Mutation::CompleteMultipart {
                 upload_id,
+                claim_token,
                 row,
                 precondition,
                 replication,
@@ -235,6 +316,7 @@ impl MetadataStore for ShardedMetadataStore {
                 self.for_upload(upload_id.as_str())
                     .submit(Mutation::CompleteMultipart {
                         upload_id,
+                        claim_token,
                         row,
                         precondition,
                         replication,
@@ -246,6 +328,43 @@ impl MetadataStore for ShardedMetadataStore {
                     .submit(Mutation::AbortMultipart(upload_id))
                     .await
             }
+            Mutation::ReleaseMultipartCleanup { cleanup_id } => {
+                let mut outcome = MutationOutcome::Ack;
+                for shard in &self.shards {
+                    outcome = shard
+                        .submit(Mutation::ReleaseMultipartCleanup {
+                            cleanup_id: cleanup_id.clone(),
+                        })
+                        .await?;
+                }
+                Ok(outcome)
+            }
+            Mutation::RecoverMultipartStagingAccounting { limit } => {
+                let mut remaining = u64::from(limit.clamp(1, 1_000));
+                let mut released = 0u64;
+                for shard in &self.shards {
+                    if remaining == 0 {
+                        break;
+                    }
+                    match shard
+                        .submit(Mutation::RecoverMultipartStagingAccounting {
+                            limit: remaining as u32,
+                        })
+                        .await?
+                    {
+                        MutationOutcome::MultipartAccountingReleased(count) => {
+                            released += count;
+                            remaining = remaining.saturating_sub(count);
+                        }
+                        _ => {
+                            return Err(MetaError::Engine(
+                                "multipart accounting recovery returned wrong outcome".to_owned(),
+                            ));
+                        }
+                    }
+                }
+                Ok(MutationOutcome::MultipartAccountingReleased(released))
+            }
 
             // --- replication/webhook marks/retry: idempotent, so fan out; only the owner's row changes ---
             Mutation::MarkReplicationDone { .. }
@@ -255,6 +374,7 @@ impl MetadataStore for ShardedMetadataStore {
             | Mutation::PruneEventsOutbox { .. }
             | Mutation::DeferReplication { .. }
             | Mutation::RecoverClaimedReplication
+            | Mutation::RecoverMultipartClaims
             | Mutation::MarkWebhookDone(_)
             | Mutation::MarkWebhookFailed { .. } => {
                 let mut outcome = MutationOutcome::Ack;
@@ -289,6 +409,16 @@ impl MetadataStore for ShardedMetadataStore {
             | Mutation::SetImportJobState { .. }
             | Mutation::PruneImportJobs { .. } => self.global().submit(mutation).await,
         }
+    }
+
+    async fn read_probe(&self) -> Result<(), MetaError> {
+        // Readiness covers every configured read pool, not just shard zero. The number of shards
+        // is a validated deployment constant (at most 64), so this remains independent of the
+        // number of buckets and objects stored on them.
+        for shard in &self.shards {
+            shard.read_probe().await?;
+        }
+        Ok(())
     }
 
     // --- buckets ---
@@ -435,11 +565,54 @@ impl MetadataStore for ShardedMetadataStore {
         let mut all = Vec::new();
         for s in &self.shards {
             all.extend(s.enumerate_stale_sessions(older_than, batch).await?);
-            if all.len() >= batch as usize {
-                break;
-            }
         }
+        all.sort_by(|a, b| {
+            a.updated_at
+                .cmp(&b.updated_at)
+                .then_with(|| a.upload_id.as_str().cmp(b.upload_id.as_str()))
+        });
         all.truncate(batch as usize);
+        Ok(all)
+    }
+
+    async fn enumerate_stale_multipart_reservations(
+        &self,
+        older_than: Timestamp,
+        batch: u32,
+    ) -> Result<Vec<MultipartReservation>, MetaError> {
+        let mut all = Vec::new();
+        for shard in &self.shards {
+            all.extend(
+                shard
+                    .enumerate_stale_multipart_reservations(older_than, batch)
+                    .await?,
+            );
+        }
+        all.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.attempt_id.cmp(&b.attempt_id))
+        });
+        all.truncate(batch as usize);
+        Ok(all)
+    }
+
+    async fn list_multipart_cleanups(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<MultipartCleanup>, MetaError> {
+        let mut all = Vec::new();
+        for shard in &self.shards {
+            all.extend(shard.list_multipart_cleanups(limit).await?);
+        }
+        all.sort_by(|a, b| {
+            a.storage_path
+                .is_none()
+                .cmp(&b.storage_path.is_none())
+                .then_with(|| a.created_at.cmp(&b.created_at))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        all.truncate(limit as usize);
         Ok(all)
     }
 
@@ -643,8 +816,15 @@ impl MetadataStore for ShardedMetadataStore {
     }
 
     // --- import jobs (global, shard 0) ---
-    async fn list_import_jobs(&self) -> Result<Vec<ImportJob>, MetaError> {
-        self.global().list_import_jobs().await
+    async fn list_import_jobs(
+        &self,
+        query: &ImportJobListQuery,
+    ) -> Result<ImportJobPage, MetaError> {
+        self.global().list_import_jobs(query).await
+    }
+
+    async fn next_import_job_id(&self, state: ImportState) -> Result<Option<String>, MetaError> {
+        self.global().next_import_job_id(state).await
     }
 
     async fn get_import_job(&self, id: &str) -> Result<Option<ImportJob>, MetaError> {
@@ -656,8 +836,15 @@ impl MetadataStore for ShardedMetadataStore {
     }
 
     // --- object shares (global, shard 0) ---
-    async fn get_share(&self, token: &str) -> Result<Option<ShareRow>, MetaError> {
-        self.global().get_share(token).await
+    async fn get_share_by_id(&self, id: &str) -> Result<Option<ShareRow>, MetaError> {
+        self.global().get_share_by_id(id).await
+    }
+
+    async fn get_share_by_token_hash(
+        &self,
+        token_hash: &ShareLookupHash,
+    ) -> Result<Option<ShareRow>, MetaError> {
+        self.global().get_share_by_token_hash(token_hash).await
     }
 
     async fn list_shares(
@@ -765,11 +952,14 @@ impl MetadataStore for ShardedMetadataStore {
 fn mutation_bucket(m: &Mutation) -> Option<String> {
     let b = match m {
         Mutation::PutObjectVersion { row, .. } => row.bucket.as_str(),
+        Mutation::ResolveObjectWrite { bucket, .. } => bucket.as_str(),
         Mutation::CreateDeleteMarker { bucket, .. } => bucket.as_str(),
         Mutation::DeleteVersion { bucket, .. } => bucket.as_str(),
         Mutation::CreateBucket(b) => b.name.as_str(),
+        Mutation::CreateObjectLockBucket(b) => b.name.as_str(),
         Mutation::DeleteBucket(name) => name.as_str(),
         Mutation::SetBucketConfig { bucket, .. } => bucket.as_str(),
+        Mutation::UpdateObjectLockConfiguration { bucket, .. } => bucket.as_str(),
         Mutation::SetVersioning { bucket, .. } => bucket.as_str(),
         Mutation::SetOwnership { bucket, .. } => bucket.as_str(),
         Mutation::SetBucketQuota { bucket, .. } => bucket.as_str(),
@@ -787,9 +977,17 @@ fn mutation_bucket(m: &Mutation) -> Option<String> {
         // account BPA) lands on shard 0. Listed EXPLICITLY (no wildcard) so a new per-bucket
         // Mutation fails to compile here until it is classified — matching `submit`'s exhaustive
         // routing match, which is the other half of the +routing site (see the root CLAUDE.md).
-        Mutation::CreateMultipart(_)
+        Mutation::CreateMultipart { .. }
+        | Mutation::ReserveMultipartPart { .. }
+        | Mutation::ReleaseMultipartReservation { .. }
         | Mutation::RecordPart { .. }
-        | Mutation::ClaimMultipart(_)
+        | Mutation::ResolveMultipartPartWrite { .. }
+        | Mutation::ReleaseMultipartCleanup { .. }
+        | Mutation::ReleaseMultipartUploadCleanups { .. }
+        | Mutation::RecoverMultipartStagingAccounting { .. }
+        | Mutation::ClaimMultipart { .. }
+        | Mutation::ReleaseMultipartClaim { .. }
+        | Mutation::RecoverMultipartClaims
         | Mutation::CompleteMultipart { .. }
         | Mutation::AbortMultipart(_)
         | Mutation::SetUserPolicy { .. }
@@ -898,6 +1096,53 @@ impl ReconcileOracle for ShardedReconcileOracle {
         }
         Ok(false)
     }
+
+    async fn live_multipart_parts(
+        &self,
+        candidates: &[StoragePath],
+    ) -> Result<Vec<bool>, MetaError> {
+        let n = self.oracles.len();
+        let mut by_shard: Vec<Vec<usize>> = vec![Vec::new(); n];
+        let mut unknown = Vec::new();
+        for (index, path) in candidates.iter().enumerate() {
+            let mut segments = path.as_str().split('/');
+            match (segments.next(), segments.next(), segments.next()) {
+                (Some(".staging"), Some("multipart"), Some(upload)) if !upload.is_empty() => {
+                    by_shard[decode_upload_shard(upload, n)].push(index);
+                }
+                _ => unknown.push(index),
+            }
+        }
+
+        let mut out = vec![false; candidates.len()];
+        for (shard, indices) in by_shard.into_iter().enumerate() {
+            if indices.is_empty() {
+                continue;
+            }
+            let subset: Vec<StoragePath> = indices
+                .iter()
+                .map(|&index| candidates[index].clone())
+                .collect();
+            let answers = self.oracles[shard].live_multipart_parts(&subset).await?;
+            for (offset, &index) in indices.iter().enumerate() {
+                out[index] = answers[offset];
+            }
+        }
+
+        if !unknown.is_empty() {
+            let subset: Vec<StoragePath> = unknown
+                .iter()
+                .map(|&index| candidates[index].clone())
+                .collect();
+            for oracle in &self.oracles {
+                let answers = oracle.live_multipart_parts(&subset).await?;
+                for (offset, &index) in unknown.iter().enumerate() {
+                    out[index] |= answers[offset];
+                }
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// Per-shard typed handles (the `sqlite` backend only) so the server can drive one WAL checkpointer
@@ -929,6 +1174,14 @@ mod tests {
             on: true,
         };
         assert_eq!(mutation_bucket(&per_bucket).as_deref(), Some("charlie"));
+        let recovery_probe = Mutation::ResolveObjectWrite {
+            bucket: BucketName::parse("delta").unwrap(),
+            key: ObjectKey::parse("k").unwrap(),
+            version_id: VersionId::null(),
+            row_id: "row".to_owned(),
+            storage_path: StoragePath::from_string("delta/blob".to_owned()),
+        };
+        assert_eq!(mutation_bucket(&recovery_probe).as_deref(), Some("delta"));
         assert!(mutation_bucket(&Mutation::RecoverClaimedReplication).is_none());
     }
 

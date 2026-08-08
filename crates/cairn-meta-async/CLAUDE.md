@@ -12,10 +12,20 @@ range-seek, same outcomes. `cairn-meta` is left untouched. Selected at runtime b
   against this trait, engine-agnostic.
 - `libsql_driver.rs` / `turso_driver.rs` — the two concrete drivers behind that seam.
 - `apply.rs` — `Mutation` -> SQL. **One of the four mutation sites** (see below).
-- `schema.rs` — the migration table. Must mirror `cairn-meta/src/schema.rs` (latest is v23 — the
+- `schema.rs` — the migration table. Must mirror `cairn-meta/src/schema.rs` (latest is v29 — the
   multipart SSE columns `sse_requested` v15, `encrypt_parts`/`part_dek` v21, `sse_kms_*` v22;
-  `object_versions.replicated_at` + `idx_outbox_bucket_key` v23).
-- `store.rs` — `AsyncMetadataStore` (reads) + `AsyncReconcileOracle`; the read pool.
+  `object_versions.replicated_at` + `idx_outbox_bucket_key` v23; bounded import
+  scheduling/history/retention indexes v24; hash-only object-share capabilities and retryable
+  legacy-token sanitation v25; bounded multipart reservations/cleanup accounting v26; multipart
+  initial tags/Object Lock intent, the legacy-intent proof marker, and orphan-lock cleanup v27;
+  lifecycle row identity in the partial current-listing covering index v28; exact multipart
+  completion claim ownership tokens v29).
+  Turso
+  builders deliberately enable its experimental VACUUM support
+  so a pending v25 sanitation marker can compact the local database before readers open.
+- `store.rs` — `AsyncMetadataStore` (reads) + `AsyncReconcileOracle`; the read pool. Its
+  `read_probe` executes a constant-row query through a checked-out driver connection, matching the
+  default SQLite backend without enumerating application rows.
 - `writer.rs` — the single async group-committing `Writer` task.
 - `model.rs` — `Row`<->domain mappers + the `*_COLS` column lists; enum<->text strings.
 - `range.rs` — listing range-seek helpers (`successor`, `prefix_upper_bound`).
@@ -29,6 +39,24 @@ range-seek, same outcomes. `cairn-meta` is left untouched. Selected at runtime b
 - **The 4(+1)-site rule.** A new `Mutation`/shared read lands in `cairn-meta/src/apply.rs` **and**
   here in `apply.rs` (plus the `cairn-types` in-memory double). This is the "+1": forget it and the
   parity tests fail.
+- Object Lock is writer-authoritative in both async engines exactly as in `cairn-meta`: strict
+  persisted-state parsing, immutable enablement/versioning, protected replacement/delete, retention
+  non-weakening, and atomic object/tags/lock/outbox/session updates must not diverge.
+- Lifecycle guard parity is exact: conditional `CreateDeleteMarker` checks the enumerated
+  current version/timestamp before marker or outbox writes, and `DeleteVersion` checks the immutable
+  listed row identity and timestamp and can require the target still to be the sole/latest delete
+  marker. An absent or stale predicate returns `DeleteNotApplied`; `DeleteMarker`/`Deleted` are
+  reserved for rows actually changed by the writer.
+- `ResolveObjectWrite` parity is exact too: it is a writer-serialized bucket-routed probe over the
+  intended version's immutable row id and unique storage path. A match preserves the blob after an
+  acknowledgement loss; only a miss permits cancellation cleanup.
+- `ResolveMultipartPartWrite` has the same SQL and outcome parity for exact
+  `(upload_id, part_number, storage_path)` ownership. The attempt-derived path prevents delayed
+  recovery from matching a superseding retry.
+- Multipart terminal ownership is part of parity, not an implementation detail: Complete claims
+  `active -> completing` under an exact persisted request token, Abort deletes only `active`, a
+  failed claim releases only its own token, and final completion rechecks both `completing` and
+  that token inside its savepoint before any object upsert.
 - **Migrations are append-only and version-aligned.** Never edit an applied migration. Mirror new
   `cairn-meta` migrations here verbatim, **keeping the same version numbers** — versions **13 and
   14 are intentionally absent** (they are the #29 key-rotation schema the async backend does not
@@ -56,7 +84,9 @@ range-seek, same outcomes. `cairn-meta` is left untouched. Selected at runtime b
   checkpointer, and `wal_autocheckpoint`/`journal_size_limit` are deliberately unset (the W3
   guardrail doesn't apply). libSQL mirrors the rusqlite store: `wal_autocheckpoint=0` + a background
   checkpointer.
-- Auto re-wrap and the durable seal counter (#29) are **not** implemented — rotate-and-read only.
+- Auto re-wrap, durable id→hash binding/retirement gate, and the durable seal counter (#29) are
+  **not** implemented — rotate-and-read only. The SQLite six-stream registry must not be presented
+  as an async-backend retirement guarantee; operators keep every historical key id in the ring.
 - `OpenOptions` mirrors `cairn-meta`: WAL + `synchronous=NORMAL` by default, `FULL` opt-in.
 - Spec: `docs/metadata.md` (11), concurrency model `docs/data-plane.md` (7.2/7.3). See the root
   `../../CLAUDE.md` for the workspace gate and conventions.

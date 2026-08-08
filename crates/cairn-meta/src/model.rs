@@ -6,14 +6,15 @@ use cairn_types::authz::{Acl, OwnershipMode};
 use cairn_types::bucket::{Bucket, CompressionPolicy, VersioningState};
 use cairn_types::id::{BucketName, ObjectKey, StoragePath, UploadId, UserId, VersionId};
 use cairn_types::meta::{
-    ActivityEntry, ImportJob, ImportJobRecord, ImportState, MultipartSession, MultipartStatus,
-    ObjectSummary, OutboxEntry, PartRecord, ReplicationOp, ReplicationStatus, ShareDisposition,
-    ShareRow, User, UserRecord, UserSigV4Credentials, UserWithBearerHash, WebhookEntry,
-    WebhookStatus,
+    ActivityEntry, ImportJob, ImportJobRecord, ImportJobSummary, ImportState, MultipartCleanup,
+    MultipartReservation, MultipartSession, MultipartStatus, ObjectSummary, OutboxEntry,
+    PartRecord, ReplicationOp, ReplicationStatus, ShareDisposition, ShareLookupHash, ShareRow,
+    User, UserRecord, UserSigV4Credentials, UserWithBearerHash, WebhookEntry, WebhookStatus,
 };
 use cairn_types::notification::EventKind;
 use cairn_types::object::{
-    ChecksumValue, CompressionDescriptor, ETag, ObjectVersionRow, StorageClass, UserMetadata,
+    ChecksumValue, CompressionDescriptor, ETag, ExplicitObjectLockIntent, ObjectLockMode,
+    ObjectLockState, ObjectRetention, ObjectVersionRow, StorageClass, UserMetadata,
 };
 use cairn_types::time::Timestamp;
 use rusqlite::Row;
@@ -106,12 +107,56 @@ pub fn lock_mode_str(m: cairn_types::object::ObjectLockMode) -> &'static str {
         cairn_types::object::ObjectLockMode::Compliance => "COMPLIANCE",
     }
 }
-/// Parse a stored lock-mode string. Unknown values fail safe to the stricter `Compliance`.
-pub fn lock_mode_from(s: &str) -> cairn_types::object::ObjectLockMode {
+/// Strictly parse a stored lock-mode string.
+///
+/// Unknown durable values are corruption. They must fail the request closed because deletion and
+/// retention-weakening rules depend on the exact stored mode.
+pub fn lock_mode_from(s: &str) -> Result<ObjectLockMode, cairn_types::MetaError> {
     match s {
-        "GOVERNANCE" => cairn_types::object::ObjectLockMode::Governance,
-        _ => cairn_types::object::ObjectLockMode::Compliance,
+        "GOVERNANCE" => Ok(ObjectLockMode::Governance),
+        "COMPLIANCE" => Ok(ObjectLockMode::Compliance),
+        _ => Err(cairn_types::MetaError::InvalidObjectLockState),
     }
+}
+
+/// Decode and structurally validate the three durable Object Lock columns.
+pub fn object_lock_state_from_columns(
+    mode: Option<String>,
+    until: Option<i64>,
+    legal_hold: i64,
+) -> Result<ObjectLockState, cairn_types::MetaError> {
+    let retention = match (mode, until) {
+        (None, None) => None,
+        (Some(mode), Some(until)) => Some(ObjectRetention {
+            mode: lock_mode_from(&mode)?,
+            retain_until: Timestamp(until),
+        }),
+        _ => return Err(cairn_types::MetaError::InvalidObjectLockState),
+    };
+    let legal_hold = match legal_hold {
+        0 => false,
+        1 => true,
+        _ => return Err(cairn_types::MetaError::InvalidObjectLockState),
+    };
+    Ok(ObjectLockState {
+        retention,
+        legal_hold,
+    })
+}
+
+fn meta_conversion_error(
+    column: usize,
+    value: &'static str,
+    error: cairn_types::MetaError,
+) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        column,
+        Type::Text,
+        Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{value}: {error}"),
+        )),
+    )
 }
 
 pub fn disposition_str(d: ShareDisposition) -> &'static str {
@@ -128,8 +173,17 @@ pub fn disposition_from(s: &str) -> ShareDisposition {
 }
 
 pub fn share_from_row(row: &Row) -> rusqlite::Result<ShareRow> {
+    let token_hash_bytes: Vec<u8> = row.get("token_hash")?;
+    let token_hash = ShareLookupHash::from_slice(&token_hash_bytes).ok_or_else(|| {
+        rusqlite::Error::InvalidColumnType(
+            1,
+            "token_hash must be exactly 32 bytes".to_owned(),
+            rusqlite::types::Type::Blob,
+        )
+    })?;
     Ok(ShareRow {
-        token: row.get("token")?,
+        id: row.get("id")?,
+        token_hash,
         bucket: BucketName::parse(&row.get::<_, String>("bucket_name")?)
             .unwrap_or_else(|_| unreachable_bucket()),
         key: ObjectKey::parse(&row.get::<_, String>("key")?).unwrap_or_else(|_| unreachable_key()),
@@ -239,6 +293,7 @@ pub fn object_version_from_row(row: &Row) -> rusqlite::Result<ObjectVersionRow> 
 
 pub fn object_summary_from_row(row: &Row) -> rusqlite::Result<ObjectSummary> {
     Ok(ObjectSummary {
+        row_id: row.get("id")?,
         key: ObjectKey::parse(&row.get::<_, String>("key")?).unwrap_or_else(|_| unreachable_key()),
         version_id: VersionId::from_string(row.get("version_id")?),
         is_latest: row.get::<_, i64>("is_latest")? != 0,
@@ -276,6 +331,42 @@ pub fn multipart_from_row(row: &Row) -> rusqlite::Result<MultipartSession> {
         None => None,
     };
     let user_metadata: UserMetadata = json_col(&row.get::<_, String>("user_metadata")?)?;
+    let owner_id = UserId(row.get("owner_id")?);
+    let initiated_by = row
+        .get::<_, Option<String>>("initiated_by")?
+        .map(UserId)
+        .unwrap_or_else(|| owner_id.clone());
+    let initial_tags: Vec<(String, String)> = json_col(&row.get::<_, String>("initial_tags")?)?;
+    let retention = match (
+        row.get::<_, Option<String>>("lock_mode")?,
+        row.get::<_, Option<i64>>("retain_until")?,
+    ) {
+        (None, None) => None,
+        (Some(mode), Some(until)) => Some(ObjectRetention {
+            mode: lock_mode_from(&mode)
+                .map_err(|error| meta_conversion_error(17, "multipart lock mode", error))?,
+            retain_until: Timestamp(until),
+        }),
+        _ => {
+            return Err(meta_conversion_error(
+                18,
+                "incomplete multipart retention",
+                cairn_types::MetaError::InvalidObjectLockState,
+            ));
+        }
+    };
+    let legal_hold = match row.get::<_, Option<i64>>("legal_hold")? {
+        None => None,
+        Some(0) => Some(false),
+        Some(1) => Some(true),
+        Some(_) => {
+            return Err(meta_conversion_error(
+                19,
+                "multipart legal hold",
+                cairn_types::MetaError::InvalidObjectLockState,
+            ));
+        }
+    };
     Ok(MultipartSession {
         upload_id: UploadId::from_string(row.get("id")?),
         bucket: BucketName::parse(&row.get::<_, String>("bucket_name")?)
@@ -283,9 +374,15 @@ pub fn multipart_from_row(row: &Row) -> rusqlite::Result<MultipartSession> {
         key: ObjectKey::parse(&row.get::<_, String>("key")?).unwrap_or_else(|_| unreachable_key()),
         content_type: row.get("content_type")?,
         status: mp_status_from(&row.get::<_, String>("status")?),
-        owner_id: UserId(row.get("owner_id")?),
+        owner_id,
+        initiated_by,
         intended_acl,
         user_metadata,
+        initial_tags,
+        lock_intent: ExplicitObjectLockIntent {
+            retention,
+            legal_hold,
+        },
         sse_requested: row.get::<_, i64>("sse_requested")? != 0,
         encrypt_parts: row.get::<_, i64>("encrypt_parts")? != 0,
         sse_kms_requested: row.get::<_, i64>("sse_kms_requested")? != 0,
@@ -293,6 +390,31 @@ pub fn multipart_from_row(row: &Row) -> rusqlite::Result<MultipartSession> {
         sse_bucket_key_enabled: row.get::<_, i64>("sse_bucket_key_enabled")? != 0,
         created_at: Timestamp(row.get("created_at")?),
         updated_at: Timestamp(row.get("updated_at")?),
+    })
+}
+
+pub fn multipart_reservation_from_row(row: &Row) -> rusqlite::Result<MultipartReservation> {
+    Ok(MultipartReservation {
+        attempt_id: row.get("attempt_id")?,
+        upload_id: UploadId::from_string(row.get("upload_id")?),
+        part_number: row.get::<_, i64>("part_number")? as u16,
+        reserved_bytes: row.get::<_, i64>("reserved_bytes")? as u64,
+        created_at: Timestamp(row.get("created_at")?),
+    })
+}
+
+pub fn multipart_cleanup_from_row(row: &Row) -> rusqlite::Result<MultipartCleanup> {
+    Ok(MultipartCleanup {
+        id: row.get("id")?,
+        upload_id: UploadId::from_string(row.get("upload_id")?),
+        bucket: BucketName::parse(&row.get::<_, String>("bucket_name")?)
+            .unwrap_or_else(|_| unreachable_bucket()),
+        principal_id: UserId(row.get("principal_id")?),
+        bytes: row.get::<_, i64>("bytes")? as u64,
+        storage_path: row
+            .get::<_, Option<String>>("storage_path")?
+            .map(StoragePath::from_string),
+        created_at: Timestamp(row.get("created_at")?),
     })
 }
 
@@ -410,6 +532,27 @@ pub fn import_job_from_row(row: &Row) -> rusqlite::Result<ImportJob> {
         workers: row.get::<_, i64>("workers")? as u32,
         state: import_state_from(&row.get::<_, String>("state")?),
         buckets: json_col(&row.get::<_, String>("buckets_json")?)?,
+        objects_done: row.get::<_, i64>("objects_done")? as u64,
+        objects_total: row.get::<_, i64>("objects_total")? as u64,
+        bytes_done: row.get::<_, i64>("bytes_done")? as u64,
+        bytes_total: row.get::<_, i64>("bytes_total")? as u64,
+        last_error: row.get("last_error")?,
+        created_at: Timestamp(row.get("created_at")?),
+        updated_at: Timestamp(row.get("updated_at")?),
+    })
+}
+
+/// Map an import-history projection that excludes both secrets and `buckets_json`.
+pub fn import_job_summary_from_row(row: &Row) -> rusqlite::Result<ImportJobSummary> {
+    Ok(ImportJobSummary {
+        id: row.get("id")?,
+        source_endpoint: row.get("source_endpoint")?,
+        source_region: row.get("source_region")?,
+        access_key_id: row.get("access_key_id")?,
+        has_ca_cert: row.get::<_, Option<String>>("ca_cert_pem")?.is_some(),
+        insecure_skip_verify: row.get::<_, i64>("insecure_skip_verify")? != 0,
+        workers: row.get::<_, i64>("workers")? as u32,
+        state: import_state_from(&row.get::<_, String>("state")?),
         objects_done: row.get::<_, i64>("objects_done")? as u64,
         objects_total: row.get::<_, i64>("objects_total")? as u64,
         bytes_done: row.get::<_, i64>("bytes_done")? as u64,

@@ -32,7 +32,12 @@ both remote) and per-object checksum-verification ledgers are future work.
   unless you genuinely need it; it disables the guard for *all* outbound dialers.
 - Tune the worker pool with `CAIRN_IMPORT_DEFAULT_WORKERS` / `CAIRN_IMPORT_MAX_WORKERS` and the
   node-protection ceiling `CAIRN_IMPORT_GLOBAL_MAX_INFLIGHT` (Section 28). The global cap is held
-  below the blob-I/O pool so a bulk import cannot starve live traffic.
+  below the blob-I/O pool so a bulk import cannot starve live traffic. Concurrent jobs share this
+  one FIFO budget rather than each receiving a separate allowance.
+- Source networking is bounded by `CAIRN_IMPORT_CONNECT_TIMEOUT_SECS`,
+  `CAIRN_IMPORT_RESPONSE_HEAD_TIMEOUT_SECS`, and `CAIRN_IMPORT_BODY_IDLE_TIMEOUT_SECS`; one complete
+  object copy is additionally bounded by `CAIRN_IMPORT_WHOLE_OBJECT_TIMEOUT_SECS`. Raise the
+  whole-object value for very large objects over slow links rather than disabling the idle guard.
 
 ## 3. Run an import (management API)
 
@@ -81,13 +86,16 @@ testing only, `"insecure_skip_verify": true`).
 Watch progress:
 
 ```sh
-curl -s http://127.0.0.1:7374/api/v1/imports        -H 'Authorization: Bearer cairn.cairnadmin'   # list
+curl -s 'http://127.0.0.1:7374/api/v1/imports?limit=100' -H 'Authorization: Bearer cairn.cairnadmin' # list page
 curl -s http://127.0.0.1:7374/api/v1/imports/<job>  -H 'Authorization: Bearer cairn.cairnadmin'   # detail
 ```
 
 The detail shows the job state, aggregate `objects_done/objects_total` and byte counters, and a
 per-bucket breakdown with each bucket's state and most-recent error. Neither the list nor the detail
-ever contains the source secret.
+ever contains the source secret. The list accepts `limit=1..1000` (default 1000) and an opaque
+`cursor` copied verbatim from `next_cursor`; `next_cursor: null` is the final page. Invalid limits or
+cursors return `400` instead of silently changing the requested page. Equal-millisecond jobs remain
+stable because the cursor carries both creation time and job id.
 
 Cancel or resume:
 
@@ -107,9 +115,15 @@ resumes automatically from its cursors.
   from the cursor; a duplicate PUT of an already-copied object simply overwrites identical bytes.
 - A whole-bucket failure (the source bucket is unreachable, or the destination cannot be created)
   marks that bucket failed with the error in the detail; other buckets still complete.
+- A connection, response-head, body-idle, or whole-object timeout is retryable under the job's
+  attempt policy. Its in-flight permit is released before backoff, so another queued object or job
+  can progress while the failed attempt waits.
 - Keys the destination cannot represent (an S3-illegal key the source allowed) are recorded as
   terminal for that object and skipped.
-- Finished job rows are pruned after `CAIRN_IMPORT_RETENTION_SECS` (default 7 days).
+- On startup and each persistent import heartbeat, finished job rows older than
+  `CAIRN_IMPORT_RETENTION_SECS` (default 7 days) are pruned in bounded batches. Pending/running work
+  is never eligible, and a large upgrade backlog drains over later heartbeats without one
+  history-sized writer transaction.
 
 ## 5. Verifying
 

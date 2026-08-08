@@ -9,6 +9,7 @@ use crate::blob::{
 use crate::error::BlobError;
 use crate::id::{BucketName, StoragePath, UploadId};
 use crate::object::{CompressionDescriptor, ETag};
+use crate::secret::SecretKey32;
 use crate::traits::{BlobStore, ReconcileOracle};
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -22,21 +23,21 @@ fn md5_hex(data: &[u8]) -> String {
     hex::encode(h.finalize())
 }
 
-/// A stored blob: its plaintext bytes and the optional data-encryption key it was staged under.
-/// The double models SSE-S3 semantics without real cryptography: a blob staged with a DEK can
-/// only be reopened with the *same* DEK, so the wrong-key-fails property is faithful.
+/// A stored blob: its plaintext bytes and declared storage cipher. The double models SSE-S3
+/// semantics without real cryptography: a blob staged with a DEK is a current authenticated-v3
+/// object and can only be reopened with the same key and format expectation.
 #[derive(Debug)]
 struct StoredBlob {
     bytes: Arc<Vec<u8>>,
-    dek: Option<[u8; 32]>,
+    cipher: BlobCipher,
 }
 
 type BlobMap = HashMap<String, StoredBlob>;
 /// A staged part: its plaintext bytes and the optional DEK it was staged under. The double models
 /// SSE-S3 part semantics with a key *label* (no real cryptography): `assemble` checks each
-/// `PartRef.dek` against the label a part was staged with, so the wrong-key-fails property is
-/// faithful. All real ciphertext/nonce assertions must run against the on-disk `LocalBlobStore`.
-type PartMap = HashMap<(String, u16), (Arc<Vec<u8>>, Option<[u8; 32]>)>;
+/// `PartRef.cipher` against the label a part was staged with, so wrong-key and wrong-format failures
+/// are faithful. All real ciphertext/nonce assertions must run against the on-disk `LocalBlobStore`.
+type PartMap = HashMap<String, (Arc<Vec<u8>>, BlobCipher)>;
 
 /// An in-memory blob store.
 #[derive(Debug, Default)]
@@ -66,6 +67,12 @@ impl InMemoryBlobStore {
             .unwrap()
             .get(path.as_str())
             .map(|b| b.bytes.as_ref().clone())
+    }
+
+    /// Number of staged multipart-part artifacts (test introspection).
+    #[must_use]
+    pub fn multipart_part_count(&self) -> usize {
+        self.parts.lock().unwrap().len()
     }
 
     async fn drain(mut body: crate::BodyStream, ceiling: u64) -> Result<Vec<u8>, BlobError> {
@@ -100,7 +107,10 @@ impl BlobStore for InMemoryBlobStore {
             path.as_str().to_owned(),
             StoredBlob {
                 bytes: Arc::new(buf),
-                dek: opts.encryption,
+                cipher: match opts.encryption {
+                    Some(dek) => BlobCipher::AuthenticatedV3(dek),
+                    None => BlobCipher::KnownPlaintext,
+                },
             },
         );
         Ok(StagedBlob {
@@ -120,11 +130,8 @@ impl BlobStore for InMemoryBlobStore {
         range: Option<ByteRange>,
         cipher: BlobCipher,
         _compression: &CompressionDescriptor,
+        expected_logical_len: u64,
     ) -> Result<BlobReadHandle, BlobError> {
-        // Translate the named cipher back to the internal `Option<[u8; 32]>` at the exact point the
-        // fail-closed check runs: `KnownPlaintext` is `None`, `Dek(k)` is `Some(k)` — so the
-        // wrong/missing-key semantics below are byte-for-byte what the old `dek: Option` did.
-        let dek = cipher.dek();
         // The in-memory double stores logical bytes directly (no CRNB container), so the stored
         // compression descriptor is irrelevant to reads here.
         let data = {
@@ -133,14 +140,19 @@ impl BlobStore for InMemoryBlobStore {
             // Model SSE-S3: a blob staged under a DEK is readable only with the same DEK, and a
             // blob staged in the clear ignores any supplied DEK. A KnownPlaintext open of an
             // encrypted blob fails closed here — never yields the plaintext bytes.
-            if stored.dek != dek && stored.dek.is_some() {
+            if stored.cipher != cipher {
                 return Err(BlobError::Corruption(
-                    "blob is encrypted; wrong or missing data-encryption key".into(),
+                    "blob cipher or format does not match stored metadata".into(),
                 ));
             }
             stored.bytes.clone()
         };
         let total = data.len() as u64;
+        if total != expected_logical_len {
+            return Err(BlobError::Corruption(
+                "blob logical length does not match trusted metadata".into(),
+            ));
+        }
         let (slice, content_range, logical_len) = match range {
             Some(r) => {
                 let start = r.offset.min(total);
@@ -185,18 +197,28 @@ impl BlobStore for InMemoryBlobStore {
         &self,
         upload: &UploadId,
         part_number: u16,
+        attempt_id: &str,
         body: crate::BodyStream,
         _checksums: crate::object::ChecksumSet,
         size_ceiling: u64,
-        encryption: Option<[u8; 32]>,
+        encryption: Option<SecretKey32>,
     ) -> Result<StagedPart, BlobError> {
         let buf = Self::drain(body, size_ceiling).await?;
         let md5 = md5_hex(&buf);
         let size = buf.len() as u64;
-        let path = StoragePath::from_string(format!("{}/part-{}", upload, part_number));
+        let path = StoragePath::from_string(format!(
+            ".staging/multipart/{}/{part_number:05}-{attempt_id}",
+            upload.as_str()
+        ));
         self.parts.lock().unwrap().insert(
-            (upload.as_str().to_owned(), part_number),
-            (Arc::new(buf), encryption),
+            path.as_str().to_owned(),
+            (
+                Arc::new(buf),
+                match encryption {
+                    Some(dek) => BlobCipher::AuthenticatedV3(dek),
+                    None => BlobCipher::KnownPlaintext,
+                },
+            ),
         );
         // Like `stage`/`assemble` here, the double models storage semantics without computing the
         // supplementary checksums (no hash engine in `cairn-types`); it returns the faithful MD5 and
@@ -209,6 +231,20 @@ impl BlobStore for InMemoryBlobStore {
         })
     }
 
+    async fn delete_part_attempt(
+        &self,
+        upload: &UploadId,
+        part_number: u16,
+        attempt_id: &str,
+    ) -> Result<(), BlobError> {
+        let path = format!(
+            ".staging/multipart/{}/{part_number:05}-{attempt_id}",
+            upload.as_str()
+        );
+        self.parts.lock().unwrap().remove(&path);
+        Ok(())
+    }
+
     async fn assemble(
         &self,
         bucket: &BucketName,
@@ -219,22 +255,16 @@ impl BlobStore for InMemoryBlobStore {
         {
             let parts_map = self.parts.lock().unwrap();
             for p in parts {
-                // The double keys parts by (upload, part_number) embedded in the path.
-                let key = p.storage_path.as_str();
-                let pn = key.rsplit('-').next().and_then(|n| n.parse::<u16>().ok());
-                let upload = key.split('/').next().unwrap_or_default().to_owned();
-                if let Some(pn) = pn {
-                    if let Some((bytes, staged_dek)) = parts_map.get(&(upload, pn)) {
-                        // Model the decrypt-on-read: a part staged under a DEK is readable only with
-                        // the same DEK (mirrors `open_raw`); a wrong/missing key fails closed.
-                        if *staged_dek != p.dek && staged_dek.is_some() {
-                            return Err(BlobError::Corruption(
-                                "part is encrypted; wrong or missing data-encryption key".into(),
-                            ));
-                        }
-                        buf.extend_from_slice(bytes);
-                        continue;
+                if let Some((bytes, staged_dek)) = parts_map.get(p.storage_path.as_str()) {
+                    // Model the decrypt-on-read: a part staged under a DEK is readable only with
+                    // the same DEK (mirrors `open_raw`); a wrong/missing key fails closed.
+                    if staged_dek != &p.cipher {
+                        return Err(BlobError::Corruption(
+                            "part cipher or format does not match staged metadata".into(),
+                        ));
                     }
+                    buf.extend_from_slice(bytes);
+                    continue;
                 }
                 return Err(BlobError::NotFound);
             }
@@ -246,7 +276,10 @@ impl BlobStore for InMemoryBlobStore {
             path.as_str().to_owned(),
             StoredBlob {
                 bytes: Arc::new(buf),
-                dek: _opts.encryption,
+                cipher: match _opts.encryption {
+                    Some(dek) => BlobCipher::AuthenticatedV3(dek),
+                    None => BlobCipher::KnownPlaintext,
+                },
             },
         );
         Ok(StagedBlob {
@@ -261,10 +294,11 @@ impl BlobStore for InMemoryBlobStore {
     }
 
     async fn delete_session(&self, upload: &UploadId) -> Result<(), BlobError> {
+        let prefix = format!(".staging/multipart/{}/", upload.as_str());
         self.parts
             .lock()
             .unwrap()
-            .retain(|(u, _), _| u != upload.as_str());
+            .retain(|path, _| !path.starts_with(&prefix));
         Ok(())
     }
 
@@ -291,6 +325,31 @@ impl BlobStore for InMemoryBlobStore {
                 if !is_live {
                     self.blobs.lock().unwrap().remove(path.as_str());
                     report.orphans_reclaimed += 1;
+                }
+            }
+        }
+        let parts: Vec<StoragePath> = self
+            .parts
+            .lock()
+            .unwrap()
+            .keys()
+            .cloned()
+            .map(StoragePath::from_string)
+            .collect();
+        for batch in parts.chunks(opts.batch_size.max(1) as usize) {
+            let live = oracle
+                .live_multipart_parts(batch)
+                .await
+                .map_err(|error| BlobError::Io(error.to_string()))?;
+            for (path, is_live) in batch.iter().zip(live) {
+                let upload = path.as_str().split('/').nth(2).unwrap_or_default();
+                let session_live = oracle
+                    .live_session(&UploadId::from_string(upload.to_owned()))
+                    .await
+                    .map_err(|error| BlobError::Io(error.to_string()))?;
+                if !session_live || !is_live {
+                    self.parts.lock().unwrap().remove(path.as_str());
+                    report.staging_cleaned += 1;
                 }
             }
         }

@@ -7,7 +7,9 @@ use bytes::Bytes;
 use cairn_types::blob::StageOptions;
 use cairn_types::error::BodyError;
 use cairn_types::id::{BucketName, ObjectKey, StoragePath, UserId, VersionId};
-use cairn_types::meta::{Mutation, OutboxEntry, Precondition, ReplicationOp, ReplicationStatus};
+use cairn_types::meta::{
+    InitialObjectState, Mutation, OutboxEntry, Precondition, ReplicationOp, ReplicationStatus,
+};
 use cairn_types::object::{
     ChecksumSet, CompressionDescriptor, ETag, ObjectVersionRow, StorageClass,
 };
@@ -143,6 +145,7 @@ async fn put_with_outbox(
     meta.submit(Mutation::PutObjectVersion {
         row: Box::new(row),
         precondition: Precondition::default(),
+        initial_state: InitialObjectState::default(),
         replication: vec![entry],
     })
     .await
@@ -186,6 +189,7 @@ async fn enqueue_versioned(
     meta.submit(Mutation::PutObjectVersion {
         row: Box::new(row),
         precondition: Precondition::default(),
+        initial_state: InitialObjectState::default(),
         replication: vec![entry],
     })
     .await
@@ -705,6 +709,7 @@ async fn delete_marker_entry_drives_sink_delete_marker() {
     meta.submit(Mutation::PutObjectVersion {
         row: Box::new(row),
         precondition: Precondition::default(),
+        initial_state: InitialObjectState::default(),
         replication: vec![entry],
     })
     .await
@@ -769,6 +774,7 @@ async fn replica_status_is_never_re_replicated() {
     meta.submit(Mutation::PutObjectVersion {
         row: Box::new(row),
         precondition: Precondition::default(),
+        initial_state: InitialObjectState::default(),
         replication: vec![entry],
     })
     .await
@@ -840,6 +846,7 @@ async fn redelivering_completed_version_is_idempotent() {
     meta.submit(Mutation::PutObjectVersion {
         row: Box::new(existing),
         precondition: Precondition::default(),
+        initial_state: InitialObjectState::default(),
         replication: vec![dup],
     })
     .await
@@ -895,6 +902,7 @@ async fn fan_out_ships_every_target_for_one_version() {
     meta.submit(Mutation::PutObjectVersion {
         row: Box::new(existing),
         precondition: Precondition::default(),
+        initial_state: InitialObjectState::default(),
         replication: vec![to_y],
     })
     .await
@@ -988,6 +996,7 @@ async fn run_until_idle_drains_independent_keys() {
         meta.submit(Mutation::PutObjectVersion {
             row: Box::new(row),
             precondition: Precondition::default(),
+            initial_state: InitialObjectState::default(),
             replication: vec![entry],
         })
         .await
@@ -1051,6 +1060,7 @@ async fn completing_replication_does_not_demote_a_newer_version() {
             now,
         )),
         precondition: Precondition::default(),
+        initial_state: InitialObjectState::default(),
         replication: vec![],
     })
     .await
@@ -1197,8 +1207,9 @@ fn encrypted_fixture_dek() -> ([u8; 32], String) {
     let dek = [0x11u8; 32];
     let sealed = StubCrypto.seal(&dek).unwrap();
     let json = format!(
-        r#"{{"alg":"AES256-GCM","wrapped_dek_b64":"{}","nonce_b64":""}}"#,
-        base64::engine::general_purpose::STANDARD.encode(&sealed.ciphertext)
+        r#"{{"alg":"AES256-GCM","wrapped_dek_b64":"{}","nonce_b64":"","blob_format_version":{}}}"#,
+        base64::engine::general_purpose::STANDARD.encode(&sealed.ciphertext),
+        cairn_types::sse::AUTHENTICATED_BLOB_FORMAT_VERSION,
     );
     (dek, json)
 }
@@ -1223,7 +1234,7 @@ async fn put_encrypted_with_outbox(
                 extra_checksums: ChecksumSet::none(),
                 size_ceiling: 1 << 30,
                 content_type: "text/plain".to_owned(),
-                encryption: Some(dek),
+                encryption: Some(dek.into()),
                 content_length: None,
             },
         )
@@ -1255,6 +1266,7 @@ async fn put_encrypted_with_outbox(
     meta.submit(Mutation::PutObjectVersion {
         row: Box::new(row),
         precondition: Precondition::default(),
+        initial_state: InitialObjectState::default(),
         replication: vec![entry],
     })
     .await
@@ -1389,7 +1401,7 @@ async fn client_requested_encryption_is_flagged_to_the_sink_but_at_rest_is_not()
                     extra_checksums: ChecksumSet::none(),
                     size_ceiling: 1 << 30,
                     content_type: "text/plain".to_owned(),
-                    encryption: Some(dek),
+                    encryption: Some(dek.into()),
                     content_length: None,
                 },
             )
@@ -1421,6 +1433,7 @@ async fn client_requested_encryption_is_flagged_to_the_sink_but_at_rest_is_not()
         meta.submit(Mutation::PutObjectVersion {
             row: Box::new(row),
             precondition: Precondition::default(),
+            initial_state: InitialObjectState::default(),
             replication: vec![entry],
         })
         .await
@@ -1522,6 +1535,7 @@ async fn a_malformed_sse_descriptor_is_terminal() {
     meta.submit(Mutation::PutObjectVersion {
         row: Box::new(row),
         precondition: Precondition::default(),
+        initial_state: InitialObjectState::default(),
         replication: vec![entry],
     })
     .await

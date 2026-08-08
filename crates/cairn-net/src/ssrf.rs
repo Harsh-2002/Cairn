@@ -5,7 +5,9 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
+use http::Uri;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::connect::dns::{GaiResolver, Name};
 use tower_service::Service;
@@ -164,14 +166,71 @@ impl Service<Name> for GuardedResolver {
     }
 }
 
-/// Build an [`HttpConnector`] whose DNS goes through the [`GuardedResolver`], ready to be handed to
-/// `hyper_rustls::HttpsConnectorBuilder::…wrap_connector(…)`. `enforce_http(false)` lets the inner
-/// connector accept `https://` URIs (the rustls layer handles TLS on top of it).
+/// An HTTP connector that enforces the outbound-address policy for both kinds of Hyper dial:
+///
+/// - IP-literal URI hosts are checked here, before delegating to [`HttpConnector`].
+/// - Hostnames are checked by the inner [`GuardedResolver`] after DNS resolution.
+///
+/// Hyper may connect an IP-literal URI without invoking its DNS resolver. Keeping this URI-level
+/// wrapper outside the resolver closes that seam while retaining the resolver's DNS-rebinding
+/// protection for hostnames.
+#[derive(Debug, Clone)]
+pub struct GuardedHttpConnector {
+    inner: HttpConnector<GuardedResolver>,
+    cfg: GuardConfig,
+}
+
+impl GuardedHttpConnector {
+    /// Build a connector using the same policy for literal-host and DNS-result checks.
+    #[must_use]
+    pub fn new(cfg: GuardConfig) -> Self {
+        let mut inner = HttpConnector::new_with_resolver(GuardedResolver::new(cfg));
+        // The rustls wrapper handles TLS on top of this connector.
+        inner.enforce_http(false);
+        Self { inner, cfg }
+    }
+
+    /// Set the TCP connection deadline enforced by the underlying Hyper connector.
+    ///
+    /// This remains separate from a caller's response-head deadline: connecting and waiting for
+    /// the remote application to produce headers are distinct failure modes.
+    pub fn set_connect_timeout(&mut self, timeout: Option<Duration>) {
+        self.inner.set_connect_timeout(timeout);
+    }
+}
+
+impl Service<Uri> for GuardedHttpConnector {
+    type Response = <HttpConnector<GuardedResolver> as Service<Uri>>::Response;
+    type Error = io::Error;
+    type Future = Pin<Box<dyn Future<Output = io::Result<Self::Response>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Service::poll_ready(&mut self.inner, cx).map_err(io::Error::other)
+    }
+
+    fn call(&mut self, uri: Uri) -> Self::Future {
+        if let Some((host, ip)) = blocked_literal(&uri, &self.cfg) {
+            return Box::pin(async move {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "refused outbound connection to {host}: blocked internal address {ip} \
+                         (set CAIRN_ALLOW_INTERNAL_ENDPOINTS=true to allow)"
+                    ),
+                ))
+            });
+        }
+
+        let connect = Service::call(&mut self.inner, uri);
+        Box::pin(async move { connect.await.map_err(io::Error::other) })
+    }
+}
+
+/// Build a [`GuardedHttpConnector`], ready to be handed to
+/// `hyper_rustls::HttpsConnectorBuilder::…wrap_connector(…)`.
 #[must_use]
-pub fn guarded_http_connector(cfg: GuardConfig) -> HttpConnector<GuardedResolver> {
-    let mut http = HttpConnector::new_with_resolver(GuardedResolver::new(cfg));
-    http.enforce_http(false);
-    http
+pub fn guarded_http_connector(cfg: GuardConfig) -> GuardedHttpConnector {
+    GuardedHttpConnector::new(cfg)
 }
 
 /// The validate-time layer: reject `endpoint` at configuration time if its host is an **IP literal**
@@ -195,23 +254,27 @@ pub fn validate_endpoint(endpoint: &str, cfg: &GuardConfig) -> Result<(), SsrfEr
     let Ok(uri) = endpoint.parse::<http::Uri>() else {
         return Ok(());
     };
-    let Some(raw_host) = uri.host() else {
-        return Ok(());
-    };
+    if let Some((host, ip)) = blocked_literal(&uri, cfg) {
+        return Err(SsrfError::Blocked { host, ip });
+    }
+    Ok(())
+}
+
+/// Return the blocked literal host and parsed address, or `None` for a hostname/public literal.
+/// Both validate-time feedback and the connect-time wrapper use this helper, so the two checks
+/// cannot drift.
+fn blocked_literal(uri: &Uri, cfg: &GuardConfig) -> Option<(String, IpAddr)> {
+    if cfg.allow_internal {
+        return None;
+    }
+    let raw_host = uri.host()?;
     // `Uri::host()` keeps the brackets on an IPv6 literal (`[::1]`); strip them before parsing.
     let host = raw_host
         .strip_prefix('[')
         .and_then(|h| h.strip_suffix(']'))
         .unwrap_or(raw_host);
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        if ip_is_internal(ip, cfg) {
-            return Err(SsrfError::Blocked {
-                host: host.to_owned(),
-                ip,
-            });
-        }
-    }
-    Ok(())
+    let ip = host.parse::<IpAddr>().ok()?;
+    ip_is_internal(ip, cfg).then(|| (host.to_owned(), ip))
 }
 
 /// A validate-time SSRF rejection.
@@ -345,5 +408,32 @@ mod tests {
     fn validate_endpoint_escape_hatch() {
         let permissive = GuardConfig::new(true);
         assert!(validate_endpoint("http://127.0.0.1:9000", &permissive).is_ok());
+    }
+
+    /// Regression for CAIRN-AUD-039: Hyper may skip DNS resolution for an IP-literal URI. Calling
+    /// the actual connector service must therefore fail immediately for both address families,
+    /// without relying on `validate_endpoint` having run earlier.
+    #[test]
+    fn connector_rejects_ipv4_and_ipv6_literals_before_delegation() {
+        for endpoint in [
+            "http://127.0.0.1:7373/",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://[::1]:7373/",
+            "http://[::ffff:10.0.0.1]:7373/",
+        ] {
+            let mut connector = guarded_http_connector(enforce());
+            let future = Service::call(&mut connector, endpoint.parse().unwrap());
+            let mut future = Box::pin(future);
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            let Poll::Ready(result) = Future::poll(future.as_mut(), &mut cx) else {
+                panic!("{endpoint} was delegated instead of being rejected synchronously");
+            };
+            let error = result.expect_err("internal literal must be rejected");
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert!(
+                error.to_string().contains("blocked internal address"),
+                "{endpoint}: {error}"
+            );
+        }
     }
 }

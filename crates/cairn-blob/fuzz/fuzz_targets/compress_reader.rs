@@ -9,13 +9,55 @@
 //! seed the fuzzer mutates from. We open it both without and with a DEK (exercising the encrypted
 //! per-block decrypt path) and drive `read_range` across in-range and just-past-the-end bounds.
 
-use cairn_blob::compress::CompressedReader;
+use cairn_blob::{
+    compress::{CompressedReader, CompressionAlgorithm, CompressionDescriptor},
+    BlobCipher,
+};
 use libfuzzer_sys::fuzz_target;
 use std::io::Cursor;
 
 fuzz_target!(|data: &[u8]| {
-    for dek in [None, Some([7u8; 32])] {
-        let Ok(mut reader) = CompressedReader::open_with_dek(Cursor::new(data), dek) else {
+    // The production expectation comes from trusted metadata. For parser coverage, mirror any
+    // supported compressed algorithm/block-size pair in the fuzzed trailer; algorithm None maps to
+    // the only valid encryption-only expectation (`Uncompressed` + fixed geometry).
+    let compression = data
+        .len()
+        .checked_sub(34)
+        .and_then(|start| {
+            let trailer = &data[start..];
+            let algorithm = match trailer[5] {
+                1 => CompressionAlgorithm::Zstd,
+                2 => CompressionAlgorithm::Lz4,
+                _ => return None,
+            };
+            let block_size = u32::from_le_bytes(trailer[6..10].try_into().ok()?);
+            Some(CompressionDescriptor::Compressed {
+                algorithm,
+                block_size,
+            })
+        })
+        .unwrap_or(CompressionDescriptor::Uncompressed);
+    // Fuzzing has no metadata row, so mirror the trailer's claimed logical length to reach the
+    // deeper parser. Focused unit/integration regressions exercise mismatched trusted lengths.
+    let expected_logical_len = data
+        .len()
+        .checked_sub(34)
+        .and_then(|start| data[start + 10..start + 18].try_into().ok())
+        .map(u64::from_le_bytes)
+        .unwrap_or(0);
+    for cipher in [
+        BlobCipher::KnownPlaintext,
+        BlobCipher::LegacyV2([7u8; 32].into()),
+        BlobCipher::AuthenticatedV3([7u8; 32].into()),
+    ] {
+        let Ok(mut reader) =
+            CompressedReader::open_with_dek(
+                Cursor::new(data),
+                cipher,
+                &compression,
+                expected_logical_len,
+            )
+        else {
             continue;
         };
         let ll = reader.logical_len();

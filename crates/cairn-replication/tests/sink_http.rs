@@ -13,7 +13,10 @@ use cairn_types::replication::ReplicatedObject;
 use cairn_types::time::Timestamp;
 use cairn_types::traits::Clock;
 
-use cairn_replication::{BucketRoutedSink, HttpS3Sink, S3SinkConfig};
+use cairn_replication::{
+    BucketRoutedSink, DEFAULT_REPLICATION_BUFFER_BUDGET_BYTES, HttpS3Sink,
+    MAX_RESPONSE_DIAGNOSTIC_BYTES, ReplicationSinkRuntime, S3SinkConfig,
+};
 
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
@@ -108,13 +111,116 @@ async fn spawn_server(captured: Arc<Mutex<Vec<Captured>>>, reply: Reply) -> Stri
     authority
 }
 
+/// A destination that accepts the upload but never produces a response head.
+async fn spawn_header_stall_server() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let authority = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+    tokio::spawn(async move {
+        let Ok((stream, _)) = listener.accept().await else {
+            return;
+        };
+        let service = service_fn(|req: Request<Incoming>| async move {
+            let _ = req.into_body().collect().await;
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            Ok::<_, std::convert::Infallible>(Response::new(Full::new(Bytes::new())))
+        });
+        let _ = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
+            .serve_connection(TokioIo::new(stream), service)
+            .await;
+    });
+    authority
+}
+
+/// A destination that returns a non-success head promptly, then emits one byte forever. Progress
+/// must not reset the sink's one wall-clock delivery deadline.
+async fn spawn_trickling_error_server() -> String {
+    use futures_util::stream;
+    use http_body_util::StreamBody;
+    use hyper::body::Frame;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let authority = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+    tokio::spawn(async move {
+        let Ok((stream_io, _)) = listener.accept().await else {
+            return;
+        };
+        let service = service_fn(|req: Request<Incoming>| async move {
+            let _ = req.into_body().collect().await;
+            let frames = stream::unfold((), |()| async {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                Some((
+                    Ok::<_, std::convert::Infallible>(Frame::data(Bytes::from_static(b"x"))),
+                    (),
+                ))
+            });
+            Ok::<_, std::convert::Infallible>(
+                Response::builder()
+                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .body(StreamBody::new(frames))
+                    .unwrap(),
+            )
+        });
+        let _ = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
+            .serve_connection(TokioIo::new(stream_io), service)
+            .await;
+    });
+    authority
+}
+
+/// A chunked 403 whose body is much larger than the diagnostic boundary.
+async fn spawn_giant_chunked_error_server() -> String {
+    use futures_util::stream;
+    use http_body_util::StreamBody;
+    use hyper::body::Frame;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let authority = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+    tokio::spawn(async move {
+        let Ok((stream_io, _)) = listener.accept().await else {
+            return;
+        };
+        let service = service_fn(|req: Request<Incoming>| async move {
+            let _ = req.into_body().collect().await;
+            let frames = stream::iter((0..128).map(|_| {
+                Ok::<_, std::convert::Infallible>(Frame::data(Bytes::from(vec![b'e'; 1024])))
+            }));
+            Ok::<_, std::convert::Infallible>(
+                Response::builder()
+                    .status(StatusCode::FORBIDDEN)
+                    .body(StreamBody::new(frames))
+                    .unwrap(),
+            )
+        });
+        let _ = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
+            .serve_connection(TokioIo::new(stream_io), service)
+            .await;
+    });
+    authority
+}
+
 fn body_stream(bytes: &'static [u8]) -> cairn_types::BlobStream {
     Box::pin(futures_util::stream::once(async move {
         Ok::<Bytes, BlobError>(Bytes::from_static(bytes))
     }))
 }
 
+fn runtime() -> ReplicationSinkRuntime {
+    ReplicationSinkRuntime::new(
+        DEFAULT_REPLICATION_BUFFER_BUDGET_BYTES,
+        std::time::Duration::from_secs(5),
+    )
+    .expect("valid test runtime")
+}
+
 fn sink_for(authority: &str, clock_secs: i64) -> HttpS3Sink {
+    sink_for_with_runtime(authority, clock_secs, runtime())
+}
+
+fn sink_for_with_runtime(
+    authority: &str,
+    clock_secs: i64,
+    runtime: ReplicationSinkRuntime,
+) -> HttpS3Sink {
     HttpS3Sink::with_clock(
         S3SinkConfig {
             endpoint: format!("http://{authority}"),
@@ -122,7 +228,7 @@ fn sink_for(authority: &str, clock_secs: i64) -> HttpS3Sink {
             dest_buckets: std::collections::HashMap::new(),
             region: "us-east-1".to_owned(),
             access_key_id: "AKIDEXAMPLE".to_owned(),
-            secret_access_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_owned(),
+            secret_access_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".into(),
             ca_cert_path: None,
             ca_cert_pem: None,
             insecure_skip_verify: false,
@@ -130,6 +236,7 @@ fn sink_for(authority: &str, clock_secs: i64) -> HttpS3Sink {
             allow_internal_endpoints: true,
             allow_plaintext_sse_over_http: false,
         },
+        runtime,
         Arc::new(FixedClock(clock_secs)),
     )
     .unwrap()
@@ -139,6 +246,28 @@ fn sink_for(authority: &str, clock_secs: i64) -> HttpS3Sink {
 /// routes every source to `dest-bucket`, so the wire path is unaffected by the source name.
 fn src() -> BucketName {
     BucketName::parse("source-bucket").unwrap()
+}
+
+fn object_with_body(key: &str, body: &'static [u8]) -> ReplicatedObject {
+    ReplicatedObject {
+        key: ObjectKey::parse(key).unwrap(),
+        version_id: VersionId::from_string("v1".to_owned()),
+        content_type: "application/octet-stream".to_owned(),
+        user_metadata: Vec::new(),
+        etag: ETag::from_string("\"e\"".to_owned()),
+        size: body.len() as u64,
+        tags: Vec::new(),
+        acl: None,
+        content_encoding: None,
+        cache_control: None,
+        content_disposition: None,
+        content_language: None,
+        expires: None,
+        storage_class: cairn_types::object::StorageClass::Standard,
+        checksums: Vec::new(),
+        client_encrypted: false,
+        body: body_stream(body),
+    }
 }
 
 #[tokio::test]
@@ -504,6 +633,97 @@ async fn server_4xx_is_terminal() {
 }
 
 #[tokio::test]
+async fn response_head_timeout_releases_the_shared_buffer_permit() {
+    let stalled_authority = spawn_header_stall_server().await;
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let healthy_authority = spawn_server(captured.clone(), Reply { status: 200 }).await;
+    let runtime = ReplicationSinkRuntime::new(5, std::time::Duration::from_millis(80))
+        .expect("small shared runtime");
+    let stalled = sink_for_with_runtime(&stalled_authority, 1_700_000_000, runtime.clone());
+    let healthy = sink_for_with_runtime(&healthy_authority, 1_700_000_000, runtime);
+
+    let err = stalled
+        .put_object(&src(), object_with_body("stalled-head", b"12345"))
+        .await
+        .expect_err("a destination that withholds its response head must time out");
+    assert!(
+        matches!(err, ReplicationError::Unavailable(ref m) if m.contains("deadline")),
+        "timeout must be unavailable and operator-readable: {err:?}"
+    );
+
+    // The first request occupied the entire five-byte process budget. A leaked permit would leave
+    // this second sink (which shares the same runtime) blocked before it can read its body.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        healthy.put_object(&src(), object_with_body("after-head-timeout", b"abcde")),
+    )
+    .await
+    .expect("the released permit admits the next sink")
+    .expect("the healthy destination succeeds");
+    assert_eq!(captured.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn trickling_response_body_hits_one_deadline_and_releases_the_permit() {
+    let stalled_authority = spawn_trickling_error_server().await;
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let healthy_authority = spawn_server(captured.clone(), Reply { status: 200 }).await;
+    let runtime = ReplicationSinkRuntime::new(5, std::time::Duration::from_millis(80))
+        .expect("small shared runtime");
+    let stalled = sink_for_with_runtime(&stalled_authority, 1_700_000_000, runtime.clone());
+    let healthy = sink_for_with_runtime(&healthy_authority, 1_700_000_000, runtime);
+
+    let err = stalled
+        .put_object(&src(), object_with_body("trickled-body", b"12345"))
+        .await
+        .expect_err("body progress must not reset the wall-clock deadline");
+    assert!(
+        matches!(err, ReplicationError::Unavailable(ref m) if m.contains("deadline")),
+        "trickle timeout must be unavailable: {err:?}"
+    );
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        healthy.put_object(&src(), object_with_body("after-body-timeout", b"abcde")),
+    )
+    .await
+    .expect("the timed-out body releases its permit")
+    .expect("the healthy destination succeeds");
+    assert_eq!(captured.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn giant_chunked_error_body_is_truncated_to_the_diagnostic_cap() {
+    let authority = spawn_giant_chunked_error_server().await;
+    let sink = sink_for(&authority, 1_700_000_000);
+
+    let err = sink
+        .delete_marker(
+            &src(),
+            &ObjectKey::parse("k").unwrap(),
+            &VersionId::from_string("v1".to_owned()),
+        )
+        .await
+        .expect_err("403 must remain terminal");
+    let message = match err {
+        ReplicationError::Terminal(message) => message,
+        other => panic!("403 must be terminal, got {other:?}"),
+    };
+    let detail = message
+        .strip_prefix("destination returned HTTP 403: ")
+        .expect("status prefix is stable");
+    assert!(
+        detail.len() <= MAX_RESPONSE_DIAGNOSTIC_BYTES,
+        "retained diagnostic was {} bytes",
+        detail.len()
+    );
+    assert!(
+        detail.ends_with("[truncated]"),
+        "an oversized chunked diagnostic must say it was truncated"
+    );
+}
+
+#[tokio::test]
 async fn put_object_routes_to_per_source_destination_bucket() {
     // A sink configured with a source -> dest map must address the request to the destination
     // bucket resolved from the *source* bucket, and fall back to the default for unmapped
@@ -520,7 +740,7 @@ async fn put_object_routes_to_per_source_destination_bucket() {
             dest_buckets,
             region: "us-east-1".to_owned(),
             access_key_id: "AKIDEXAMPLE".to_owned(),
-            secret_access_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_owned(),
+            secret_access_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".into(),
             ca_cert_path: None,
             ca_cert_pem: None,
             insecure_skip_verify: false,
@@ -528,6 +748,7 @@ async fn put_object_routes_to_per_source_destination_bucket() {
             allow_internal_endpoints: true,
             allow_plaintext_sse_over_http: false,
         },
+        runtime(),
         Arc::new(FixedClock(1_440_938_160)),
     )
     .unwrap();
@@ -609,7 +830,7 @@ async fn https_endpoint_negotiates_tls_not_plaintext() {
             dest_buckets: std::collections::HashMap::new(),
             region: "us-east-1".to_owned(),
             access_key_id: "AKIDEXAMPLE".to_owned(),
-            secret_access_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_owned(),
+            secret_access_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".into(),
             ca_cert_path: None,
             ca_cert_pem: None,
             insecure_skip_verify: false,
@@ -617,6 +838,7 @@ async fn https_endpoint_negotiates_tls_not_plaintext() {
             allow_internal_endpoints: true,
             allow_plaintext_sse_over_http: false,
         },
+        runtime(),
         Arc::new(FixedClock(1_440_938_160)),
     )
     .unwrap();
@@ -789,13 +1011,14 @@ async fn the_opt_in_allows_a_client_encrypted_object_over_http() {
             dest_buckets: std::collections::HashMap::new(),
             region: "us-east-1".to_owned(),
             access_key_id: "AKIDEXAMPLE".to_owned(),
-            secret_access_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_owned(),
+            secret_access_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".into(),
             ca_cert_path: None,
             ca_cert_pem: None,
             insecure_skip_verify: false,
             allow_internal_endpoints: true,
             allow_plaintext_sse_over_http: true,
         },
+        runtime(),
         Arc::new(FixedClock(1_440_938_160)),
     )
     .unwrap();

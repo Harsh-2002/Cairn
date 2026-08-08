@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Multi-point durability crash regression (ARCH 8, F-4): crash at every blob-commit seam the build
-# exposes (a plain PutObject and a multipart CompleteMultipartUpload) and assert reconcile reclaims
-# the orphan and the object is absent — for each write path. Complements crash_consistency.sh (one
-# seam). Requires a --features failpoints build (this script builds it unless SKIP_BUILD=1).
+# exposes (a plain PutObject and a multipart CompleteMultipartUpload) and assert either the retained
+# exact-path recovery worker or startup reconciliation reclaims the blob and the object is absent —
+# for each write path. Complements crash_consistency.sh (one seam). Requires a --features failpoints
+# build (this script builds it unless SKIP_BUILD=1).
 #
 # Usage: BIN=target/debug/cairn PY=python3 conformance/crash_multipoint.sh
 set -euo pipefail

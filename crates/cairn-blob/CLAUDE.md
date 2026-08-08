@@ -7,7 +7,9 @@ plain files under opaque IDs; metadata is someone else's job (`cairn-meta`).
 
 ## Layout (`src/`)
 - `lib.rs` — `LocalBlobStore`, the `BlobStore` + `ReconcileOracle` impls, `reconcile_inner`, the
-  streaming write/read transforms, `resolve` (path-traversal guard), `check_single_filesystem`. The
+  streaming write/read transforms, `resolve` (path-traversal guard), `check_single_filesystem`, and
+  the safe rustix-backed `open_readonly_nofollow`/`open_lock_file_nofollow` and
+  `try_lock_exclusive` syscall seams used by snapshot input and node-local command exclusion. The
   failpoint seams live here.
 - `staging.rs` — `Staging`: the backend-agnostic durable single-object write handle (create tmp →
   stream → `commit` / `abort`). One enum dispatching `tokio::fs` vs. the io_uring backend.
@@ -25,52 +27,59 @@ plain files under opaque IDs; metadata is someone else's job (`cairn-meta`).
   reorder: stream → `sync_data` (fdatasync, *not* `sync_all`) the staged file → rename into the bucket
   dir → fsync that dir (via the coalescer) → only then is the blob durable. `stage` returns *before*
   any metadata row references it; a crash here leaves an orphan that reconcile reclaims — that is by design.
+- **Cancellation before `StagedBlob` return reclaims synchronously.** Single-part staging and
+  multipart assembly keep a POSIX unlink-on-drop guard over both their unique `.staging` name and
+  final bucket name through every await, including the post-rename directory fsync. The Tokio and
+  io_uring create/rename handoffs retain matching ownership until the request acknowledges them, so
+  backend work that finishes after request cancellation cannot recreate an orphan behind the guard.
 - **A newly-created bucket directory triggers an extra `data_root` fsync** (`ensure_bucket_dir`, F-1):
   the rename is not durable until the parent records the new dir entry. Paid only on the first write
   into a bucket. Don't drop it.
+- **Multipart directory creation is durable before part data is accepted.** `open` creates
+  `.staging/multipart` and fsyncs each newly-mutated parent; the first `stage_part` for an upload
+  creates its session directory and fsyncs `.staging/multipart` before opening the part file. Each
+  completed part is then fsynced before the session directory is fsynced. This parent-to-child
+  ordering is what keeps a power loss from leaving metadata that names a part whose directory entry
+  was never durable.
 - **Crypto fails closed.** A wrong/missing DEK or a tampered block fails GCM auth → `BlobError::Corruption`
   — never plaintext or zeros. The DEK is supplied by the caller (the master-key envelope lives in
   `cairn-crypto`); `compress.rs` types deliberately do **not** derive `Debug` so a DEK can't be logged.
   Compress-then-encrypt (ciphertext is incompressible); the 12-byte nonce is `HMAC-SHA256(DEK,
-  block_index)[..12]` — deterministic, never stored, never reused for a fixed key. See ARCH 27.
-- **The reader seam is `open_raw(path, range, cipher: BlobCipher, compression)` + `probe(path)` —
-  there is NO DEK-less `open`.** `BlobCipher` (in `cairn-types`) is `KnownPlaintext | Dek([u8;32])`;
-  a caller cannot express a read without naming the cipher, which is what removes the footgun below.
-  `open_raw` translates the cipher to the internal `Option<[u8;32]>` (`KnownPlaintext` => `None`,
-  `Dek(k)` => `Some(k)`) at the top, so every downstream check — the framing decision, the refusal
-  guard, the `CompressedReader::open_with_dek` call (an unrelated internal method — do NOT rename it)
-  — is byte-for-byte unchanged. `probe` answers PRESENCE + physical framing only: one `stat`, no
-  body open, no DEK, no decrypt, so a well-formed ENCRYPTED blob probes `Ok` (present), NOT
-  `Corruption`; absence is `NotFound`. It is what `cairn integrity --repair` uses to tell a dangling
-  row from a healthy encrypted object it holds no key for.
-- **Framing comes from the caller's descriptor + cipher, but a `KnownPlaintext` read of an encrypted
-  blob is REFUSED.** `is_container = dek.is_some() || compressed`, and staging records only the
-  *logical* compression — so an encrypted-but-**uncompressed** blob is `Uncompressed`, and a caller
-  passing `KnownPlaintext` (the old `dek: None`) used to get the raw CRNB container bytes streamed as
-  if they were the body (compression is off by default, so this was the default configuration; it is
-  how replication mirrored ciphertext). `open_raw`'s probe now cross-checks the trailer and returns
-  `Corruption("encrypted blob read without a data key")` when the blob is a fully self-consistent
-  `VERSION_ENCRYPTED` container. It only ever **refuses** — it never parses as a container — so
-  audit #18's rule (no trailer sniffing to decide framing) still holds, and an uncompressed blob
-  whose bytes merely end in `CRNB` still reads. The trailer is fetched with ONE positioned
-  `read_exact_at` (`#[cfg(unix)]`; a seek/read/rewind fallback elsewhere), so the tuned plaintext
-  read path pays no extra `lseek` and nothing downstream depends on an implicit rewind.
-- **The guard has a KNOWN false-positive class — it is not a random collision.** The four identity
-  checks are satisfied *by construction* by any object whose body is the verbatim bytes of an
-  encrypted blob file, i.e. the "back up `CAIRN_DATA_DIR` by `rclone`/`aws s3 sync`-ing it into a
-  bucket" workflow. Such an object PUTs fine and then reads back as
-  `Corruption("encrypted blob read without a data key")` even though nothing is wrong: the bytes are
-  intact on disk and can still be recovered out-of-band (copy the file out of `data_root`); only the
-  API read is refused. Do **not** weaken the guard to fix this — it closes a real fail-open (shipping
-  ciphertext as a body). The ambiguity is structural: framing is decided from the *caller's*
-  descriptor, and the guard's only input is the bytes. The row-keyed reader in a later ADR stage,
-  which resolves framing from the version row that owns the blob rather than from the file's
-  contents, removes it. Until then the counter below is how an operator tells the two apart.
-- **The refusal is counted, not just logged.** `LocalBlobStore::encrypted_without_key_total()` is a
-  cumulative count of refused DEK-less encrypted reads; the server mirrors it into
-  `cairn_blob_encrypted_without_key_total` on its metrics tick (this crate takes no `metrics`
-  dependency — expose state, let `cairn-server` emit, exactly like `writer_queue_depth`). A
-  `tracing::error!` is not alertable; a counter is.
+  block_index)[..12]` — deterministic, never stored, never reused for a fixed key. Encrypted CRNB
+  v3 also appends a domain-separated HMAC-SHA256 over the complete plaintext index and trailer,
+  so their algorithm, compression flags, lengths, offsets, and version are authenticated before
+  use. Legacy encrypted v2 remains readable only when trusted metadata explicitly identifies a
+  pre-v3 object/part; every new or rewritten encrypted blob is v3. See ARCH 27.
+- **The reader seam is
+  `open_raw(path, range, cipher: BlobCipher, compression, expected_logical_len)` + `probe(path)` —
+  there is NO DEK-less `open`.** `BlobCipher` (in `cairn-types`) is
+  `KnownPlaintext | LegacyV2(DEK) | AuthenticatedV3(DEK)`. A caller cannot express an encrypted read
+  without naming both the key and trusted metadata format. `open_raw` preserves that declaration
+  through the framing decision, probe open, lazy stream, and
+  `CompressedReader::open_with_dek` call (the internal method name is stable — do NOT rename it),
+  including the trusted `CompressionDescriptor` and expected logical length from the object row's
+  `size_logical` or multipart `PartRef.size`. The compressed reader rejects an on-disk version
+  that differs from the declaration before returning bytes; the file cannot select its own legacy
+  parser. Because v2 does not authenticate its index/trailer, it additionally requires the trailer
+  algorithm and block size to exactly match that descriptor (`Uncompressed` means algorithm None
+  with the fixed encryption-only block geometry), requires the trailer/index logical total to equal
+  that trusted row/part size, and requires each raw/compressed entry's physical length to agree with
+  the 16-byte GCM overhead. `probe` answers PRESENCE + physical framing only:
+  one `stat`, no body open, no DEK, no decrypt, so a well-formed ENCRYPTED blob probes `Ok` (present),
+  NOT `Corruption`; absence is `NotFound`.
+- **Framing comes only from the caller's authoritative descriptor + cipher; body sniffing never
+  chooses or refuses framing.** `is_container = cipher.is_encrypted() || compressed`. On the
+  metadata-declared plaintext/uncompressed branch, the file length must exactly equal the trusted
+  object/part logical length. An encrypted-but-uncompressed CRNB file passed without its descriptor
+  therefore fails closed because framing adds physical bytes, while a legitimate plaintext object
+  whose body is itself a complete CRNB file (for example a data-directory backup stored in S3)
+  remains arbitrary data and round-trips byte-for-byte. The server mirrors the cumulative mismatch
+  count as `cairn_blob_plaintext_length_mismatch_total`; non-zero means missing/inconsistent
+  metadata or truncated local storage, not a content classification.
+- **Index allocation is bounded before authentication.** Trailer `index_len` is capped at 64 MiB
+  (enough for a 5-GiB object at the minimum supported 1-KiB block size) and its block count must
+  match the independently stored logical size and block geometry before allocation. A corrupt large
+  file therefore cannot make pre-v3 or pre-MAC parsing allocate in proportion to its physical size.
 - **Never resolve a storage path that escapes `data_root`.** `resolve` rejects absolute paths and any
   `..`/root/prefix component → `BlobError::Io("unsafe storage path")`. Object bytes live under opaque
   IDs, never under the user key, so key-based traversal is structurally impossible — keep it that way.
@@ -102,16 +111,15 @@ plain files under opaque IDs; metadata is someone else's job (`cairn-meta`).
 - Multipart parts are staged as **uncompressed** intermediate artifacts (`fsync_in_place`, no rename);
   compression is applied once at `assemble`. A part is staged **encrypted** (a CRNB `VERSION_ENCRYPTED`
   blob) when `stage_part` is passed a per-part DEK (SSE / bucket-default / at-rest multipart, ARCH 27),
-  so nothing plaintext hits disk; `assemble` decrypts each such part on read (via `PartRef.dek`) before
-  re-encoding under the object DEK. The MD5/ETag is always computed over plaintext (before any
-  encrypt/compress transform), so it's identical with or without any transform.
-- **Known API asymmetry (a decision, not an oversight).** The *read* seam names its cipher
-  (`open_raw` + `BlobCipher`), but the *write* seam does not: `stage`/`stage_part`/`assemble` still
-  take a bare `encryption: Option<[u8;32]>` / `PartRef.dek`. Stage 3 deliberately closed only the
-  read seam, because that is where the leak lived (a DEK-less read streamed ciphertext). Giving the
-  write path the same by-name cipher is a later, separate change; until then the write DEK stays an
-  `Option`.
-- Failpoint seams (`--features failpoints`): `blob_after_durable`, `blob_after_assemble` — exercised by
-  `conformance/crash_consistency.sh` and `crash_multipoint.sh`. CRNB-reader fuzz target in `fuzz/`.
+  so nothing plaintext hits disk; `assemble` decrypts each such part on read via the typed
+  `PartRef.cipher` before re-encoding under the object DEK. The MD5/ETag is always computed over
+  plaintext (before any transform), so it is identical with or without encryption/compression.
+- **The staging write options remain bare DEKs; every read declaration is typed.** `stage`,
+  `stage_part`, and the assembled-object `StageOptions` take `encryption: Option<SecretKey32>` because
+  current writes always emit v3. `PartRef` is not a write option: it declares how assembly must read
+  an already-staged part, so it carries `BlobCipher` and pins legacy v2 versus authenticated v3.
+- Failpoint seams (`--features failpoints`): `blob_after_durable`, `blob_after_assemble`,
+  `blob_after_multipart_session_dir` — exercised by crate tests,
+  `conformance/crash_consistency.sh`, and `crash_multipoint.sh`. CRNB-reader fuzz target in `fuzz/`.
 - Tests: unit tests in each module; integration in `tests/blob.rs`. Spec: `docs/storage-durability.md`
   (8–10), SSE-S3 in `docs/security-errors.md` 27. Gate: see the root `../../CLAUDE.md`.

@@ -10,7 +10,7 @@
 
 use bytes::Bytes;
 use cairn_control::UpdateStatus;
-use http_body_util::{BodyExt, Empty};
+use http_body_util::{BodyExt, Empty, Limited};
 use hyper::{Request, Uri};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
@@ -59,14 +59,17 @@ async fn fetch_latest_release(
     if !resp.status().is_success() {
         return None;
     }
-    let collected = tokio::time::timeout(timeout, resp.into_body().collect())
-        .await
-        .ok()?
-        .ok()?;
+    // Apply the limit to the streaming body, before collection. Checking `bytes.len()` after
+    // `collect()` would allow a hostile feed to make us allocate an arbitrarily large response
+    // before discovering that it exceeded the advertised cap (CAIRN-AUD-031).
+    let collected = tokio::time::timeout(
+        timeout,
+        Limited::new(resp.into_body(), MAX_FEED_BYTES).collect(),
+    )
+    .await
+    .ok()?
+    .ok()?;
     let bytes = collected.to_bytes();
-    if bytes.len() > MAX_FEED_BYTES {
-        return None;
-    }
     let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
     let tag = v.get("tag_name")?.as_str()?.trim().to_owned();
     if tag.is_empty() {
@@ -108,7 +111,9 @@ pub async fn run_once(
 
 #[cfg(test)]
 mod tests {
-    use super::compute_update_available;
+    use super::{MAX_FEED_BYTES, compute_update_available, fetch_latest_release};
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn dev_build_never_reports_update() {
@@ -134,5 +139,53 @@ mod tests {
     #[test]
     fn an_empty_or_missing_feed_tag_is_not_an_update() {
         assert!(!compute_update_available("v2026.07.24", ""));
+    }
+
+    /// Regression for CAIRN-AUD-031: the byte ceiling must interrupt collection as soon as a
+    /// chunked feed crosses 1 MiB. The test server deliberately never sends the terminating chunk;
+    /// a post-collection length check would wait for the 30-second fetch timeout, while `Limited`
+    /// returns as soon as the over-limit data frame arrives.
+    #[tokio::test]
+    async fn oversized_chunked_feed_is_rejected_before_eof() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test feed");
+        let addr = listener.local_addr().expect("test feed address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept update check");
+            let mut request = [0u8; 2048];
+            let _ = stream.read(&mut request).await.expect("read request");
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                      Transfer-Encoding: chunked\r\n\r\n",
+                )
+                .await
+                .expect("write response head");
+            stream
+                .write_all(format!("{:x}\r\n", MAX_FEED_BYTES + 1).as_bytes())
+                .await
+                .expect("write chunk length");
+            stream
+                .write_all(&vec![b'x'; MAX_FEED_BYTES + 1])
+                .await
+                .expect("write oversized chunk");
+            stream.write_all(b"\r\n").await.expect("finish chunk");
+            stream.flush().await.expect("flush oversized chunk");
+            // Keep the chunked response incomplete. Only the streaming limit can return promptly.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        let url = format!("http://{addr}/latest");
+        let fetch = fetch_latest_release(
+            &url,
+            true, // the hermetic test server is intentionally on loopback
+            Duration::from_secs(30),
+        );
+        let result = tokio::time::timeout(Duration::from_secs(5), fetch)
+            .await
+            .expect("the streaming size limit must fire before the incomplete body times out");
+        assert!(result.is_none(), "an oversized feed must be rejected");
+        server.abort();
     }
 }

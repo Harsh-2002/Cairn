@@ -5,13 +5,25 @@
 
 use crate::model::{self, engine_err, repl_op_str, repl_status_str, storage_class_str, to_json};
 use cairn_types::MetaError;
+use cairn_types::bucket::{
+    ConfigAspect, DefaultRetention, ObjectLockConfiguration, RetentionPeriod, VersioningState,
+};
 use cairn_types::id::{BucketName, ObjectKey, StoragePath, VersionId};
-use cairn_types::meta::{IfNoneMatch, Mutation, MutationOutcome, OutboxEntry, Precondition};
-use cairn_types::object::{ETag, ObjectVersionRow};
+use cairn_types::meta::{
+    ClaimReleaseOutcome, IfNoneMatch, InitialObjectState, MAX_IMPORT_JOB_PRUNE_BATCH,
+    MultipartCleanup, MultipartTerminalOutcome, Mutation, MutationOutcome, OutboxEntry,
+    Precondition,
+};
+use cairn_types::object::{
+    ETag, ExplicitObjectLockIntent, GovernanceBypass, ObjectLockMode, ObjectLockState,
+    ObjectRetention, ObjectVersionRow,
+};
 use cairn_types::time::Timestamp;
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::Deserialize;
 
 type R<T> = Result<T, MetaError>;
+type MultipartInitialColumns = (String, Option<String>, Option<i64>, Option<i64>, i64);
 
 /// Apply a mutation, returning its typed outcome or a typed error.
 pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
@@ -19,20 +31,70 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
         Mutation::PutObjectVersion {
             row,
             precondition,
+            initial_state,
             replication,
-        } => put_version(conn, *row, &precondition, replication),
+        } => put_version(conn, *row, &precondition, initial_state, replication),
+        Mutation::ResolveObjectWrite {
+            bucket,
+            key,
+            version_id,
+            row_id,
+            storage_path,
+        } => {
+            let referenced = conn
+                .query_row(
+                    "SELECT 1 FROM object_versions
+                     WHERE bucket_name=?1 AND key=?2 AND version_id=?3
+                       AND id=?4 AND storage_path=?5",
+                    params![
+                        bucket.as_str(),
+                        key.as_str(),
+                        version_id.as_str(),
+                        row_id,
+                        storage_path.as_str(),
+                    ],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(engine_err)?
+                .is_some();
+            Ok(MutationOutcome::ObjectWriteResolved { referenced })
+        }
         Mutation::CreateDeleteMarker {
             bucket,
             key,
             version_id,
             owner_id,
             now,
+            bypass,
+            expected_current,
             replication,
         } => {
+            if let Some(expected) = expected_current {
+                let still_current = conn
+                    .query_row(
+                        "SELECT 1 FROM object_versions
+                         WHERE bucket_name=?1 AND key=?2 AND version_id=?3
+                           AND updated_at=?4 AND is_latest=1 AND is_delete_marker=0",
+                        params![
+                            bucket.as_str(),
+                            key.as_str(),
+                            expected.version_id.as_str(),
+                            expected.updated_at.0,
+                        ],
+                        |_| Ok(()),
+                    )
+                    .optional()
+                    .map_err(engine_err)?
+                    .is_some();
+                if !still_current {
+                    return Ok(MutationOutcome::DeleteNotApplied);
+                }
+            }
             let row = ObjectVersionRow {
                 id: uuid::Uuid::new_v4().simple().to_string(),
-                bucket,
-                key,
+                bucket: bucket.clone(),
+                key: key.clone(),
                 version_id: version_id.clone(),
                 is_latest: true,
                 is_delete_marker: true,
@@ -59,24 +121,68 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
                 created_at: now,
                 updated_at: now,
             };
-            demote_latest(conn, &row.bucket, &row.key)?;
-            insert_version(conn, &row)?;
+            if replacement_is_protected(conn, &row.bucket, &row.key, &row.version_id, now, bypass)?
+            {
+                return Ok(MutationOutcome::DeleteProtected);
+            }
+            let freed = upsert_version(conn, row)?;
+            replace_object_tags(conn, &bucket, &key, &version_id, &[])?;
+            write_object_lock_state(conn, &bucket, &key, &version_id, ObjectLockState::default())?;
             for e in &replication {
                 enqueue(conn, e)?;
             }
-            Ok(MutationOutcome::DeleteMarker { version_id })
+            Ok(MutationOutcome::DeleteMarker { version_id, freed })
         }
         Mutation::DeleteVersion {
             bucket,
             key,
             version_id,
+            expected_row_id,
             expected_updated_at,
-        } => delete_version(conn, &bucket, &key, &version_id, expected_updated_at),
-        Mutation::CreateMultipart(s) => {
+            require_sole_key_version,
+            now,
+            bypass,
+        } => delete_version(
+            conn,
+            &bucket,
+            &key,
+            &version_id,
+            DeleteVersionGuard {
+                expected_row_id,
+                expected_updated_at,
+                require_sole_key_version,
+            },
+            now,
+            bypass,
+        ),
+        Mutation::CreateMultipart { session: s, limits } => {
+            validate_multipart_lock_intent(conn, &s.bucket, s.lock_intent, s.created_at)?;
+            let bucket_active = multipart_stat(
+                conn,
+                "multipart_bucket_stats",
+                "bucket_name",
+                s.bucket.as_str(),
+                "active_uploads",
+            )?;
+            let principal_active = multipart_stat(
+                conn,
+                "multipart_principal_stats",
+                "principal_id",
+                s.initiated_by.0.as_str(),
+                "active_uploads",
+            )?;
+            if bucket_active >= i64::from(limits.max_active_uploads_per_bucket)
+                || principal_active >= i64::from(limits.max_active_uploads_per_principal)
+            {
+                return Err(MetaError::QuotaExceeded);
+            }
             conn.execute(
                 "INSERT INTO multipart_uploads
-                 (id, bucket_name, key, content_type, status, owner_id, intended_acl, user_metadata, sse_requested, encrypt_parts, sse_kms_requested, sse_kms_key_id, sse_bucket_key_enabled, created_at, updated_at)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+                 (id, bucket_name, key, content_type, status, owner_id, intended_acl, user_metadata,
+                  sse_requested, encrypt_parts, sse_kms_requested, sse_kms_key_id,
+                  sse_bucket_key_enabled, created_at, updated_at, initiated_by, initial_tags,
+                  lock_mode, retain_until, legal_hold, object_lock_intent_known)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
                 params![
                     s.upload_id.as_str(),
                     s.bucket.as_str(),
@@ -93,89 +199,277 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
                     s.sse_bucket_key_enabled as i64,
                     s.created_at.0,
                     s.updated_at.0,
+                    s.initiated_by.0,
+                    to_json(&s.initial_tags),
+                    s.lock_intent
+                        .retention
+                        .map(|retention| model::lock_mode_str(retention.mode)),
+                    s.lock_intent
+                        .retention
+                        .map(|retention| retention.retain_until.0),
+                    s.lock_intent.legal_hold.map(i64::from),
+                    1_i64,
                 ],
             )
             .map_err(engine_err)?;
+            adjust_multipart_stats(conn, s.bucket.as_str(), s.initiated_by.0.as_str(), 1, 0)?;
             Ok(MutationOutcome::MultipartCreated(s.upload_id))
         }
-        Mutation::RecordPart { upload_id, part } => {
-            let superseded: Option<String> = conn
+        Mutation::ReserveMultipartPart {
+            upload_id,
+            part_number,
+            attempt_id,
+            reserved_bytes,
+            max_parts_per_upload,
+            now,
+        } => {
+            let context = active_multipart_context(conn, &upload_id)?;
+            let existing_attempt: Option<(String, i64, i64)> = conn
                 .query_row(
-                    "SELECT storage_path FROM multipart_parts WHERE upload_id=?1 AND part_number=?2",
-                    params![upload_id.as_str(), part.part_number],
-                    |r| r.get(0),
+                    "SELECT upload_id, part_number, reserved_bytes
+                     FROM multipart_part_reservations WHERE attempt_id=?1",
+                    params![attempt_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .optional()
                 .map_err(engine_err)?;
+            if let Some((existing_upload, existing_part, existing_bytes)) = existing_attempt {
+                if existing_upload == upload_id.as_str()
+                    && existing_part == i64::from(part_number)
+                    && existing_bytes == reserved_bytes as i64
+                {
+                    return Ok(MutationOutcome::MultipartReserved);
+                }
+                return Err(MetaError::QuotaExceeded);
+            }
+            let distinct_parts: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM (
+                         SELECT part_number FROM multipart_parts WHERE upload_id=?1
+                         UNION
+                         SELECT part_number FROM multipart_part_reservations WHERE upload_id=?1
+                     )",
+                    params![upload_id.as_str()],
+                    |row| row.get(0),
+                )
+                .map_err(engine_err)?;
+            let number_exists: bool = conn
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM multipart_parts WHERE upload_id=?1 AND part_number=?2
+                         UNION ALL
+                         SELECT 1 FROM multipart_part_reservations
+                         WHERE upload_id=?1 AND part_number=?2
+                     )",
+                    params![upload_id.as_str(), part_number],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map(|value| value != 0)
+                .map_err(engine_err)?;
+            if !number_exists && distinct_parts >= i64::from(max_parts_per_upload) {
+                return Err(MetaError::QuotaExceeded);
+            }
+            enforce_multipart_reservation_quota(conn, &context, reserved_bytes)?;
             conn.execute(
-                "INSERT OR REPLACE INTO multipart_parts
-                 (upload_id, part_number, size, etag, storage_path, checksum, part_dek)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                "INSERT INTO multipart_part_reservations
+                 (attempt_id, upload_id, part_number, reserved_bytes, created_at)
+                 VALUES (?1,?2,?3,?4,?5)",
                 params![
+                    attempt_id,
                     upload_id.as_str(),
-                    part.part_number,
-                    part.size as i64,
-                    part.etag,
-                    part.storage_path.as_str(),
-                    part.checksum.as_ref().map(to_json),
-                    part.part_dek,
+                    part_number,
+                    reserved_bytes as i64,
+                    now.0,
                 ],
             )
+            .map_err(|error| match engine_err(error) {
+                MetaError::Conflict => MetaError::QuotaExceeded,
+                other => other,
+            })?;
+            conn.execute(
+                "UPDATE multipart_uploads SET updated_at=?2
+                 WHERE id=?1 AND status='active'",
+                params![upload_id.as_str(), now.0],
+            )
             .map_err(engine_err)?;
-            Ok(MutationOutcome::PartRecorded {
-                superseded: superseded.map(StoragePath::from_string),
-            })
+            adjust_multipart_stats(
+                conn,
+                &context.bucket,
+                &context.principal,
+                0,
+                reserved_bytes as i64,
+            )?;
+            Ok(MutationOutcome::MultipartReserved)
         }
-        Mutation::ClaimMultipart(upload_id) => claim_multipart(conn, &upload_id),
+        Mutation::ReleaseMultipartReservation {
+            upload_id,
+            attempt_id,
+        } => {
+            release_multipart_reservation(conn, &upload_id, &attempt_id)?;
+            Ok(MutationOutcome::Ack)
+        }
+        Mutation::RecordPart {
+            upload_id,
+            attempt_id,
+            part,
+        } => record_part(conn, &upload_id, &attempt_id, part),
+        Mutation::ResolveMultipartPartWrite {
+            upload_id,
+            part_number,
+            storage_path,
+        } => {
+            let referenced = conn
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM multipart_parts
+                         WHERE upload_id=?1 AND part_number=?2 AND storage_path=?3
+                     )",
+                    params![upload_id.as_str(), part_number, storage_path.as_str()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map(|value| value != 0)
+                .map_err(engine_err)?;
+            Ok(MutationOutcome::MultipartPartWriteResolved { referenced })
+        }
+        Mutation::ReleaseMultipartCleanup { cleanup_id } => {
+            release_multipart_cleanup(conn, &cleanup_id)?;
+            Ok(MutationOutcome::Ack)
+        }
+        Mutation::ReleaseMultipartUploadCleanups { upload_id } => {
+            release_multipart_upload_cleanups(conn, &upload_id)?;
+            Ok(MutationOutcome::Ack)
+        }
+        Mutation::RecoverMultipartStagingAccounting { limit } => {
+            recover_multipart_staging_accounting(conn, limit)
+        }
+        Mutation::ClaimMultipart {
+            upload_id,
+            claim_token,
+        } => claim_multipart(conn, &upload_id, &claim_token),
+        Mutation::ReleaseMultipartClaim {
+            upload_id,
+            claim_token,
+        } => {
+            let released = conn
+                .execute(
+                    "UPDATE multipart_uploads
+                     SET status='active', completion_claim_token=NULL
+                     WHERE id=?1 AND status='completing' AND completion_claim_token=?2",
+                    params![upload_id.as_str(), claim_token.as_str()],
+                )
+                .map_err(engine_err)?;
+            Ok(MutationOutcome::MultipartClaimRelease(if released == 1 {
+                ClaimReleaseOutcome::Released
+            } else {
+                ClaimReleaseOutcome::NotOwner
+            }))
+        }
+        Mutation::RecoverMultipartClaims => {
+            // No request survives a process restart, so every transient completion owner is an
+            // orphan. Restore retryability without deleting its durable session or parts.
+            conn.execute(
+                "UPDATE multipart_uploads
+                 SET status='active', completion_claim_token=NULL
+                 WHERE status='completing'",
+                [],
+            )
+            .map_err(engine_err)?;
+            Ok(MutationOutcome::Ack)
+        }
         Mutation::CompleteMultipart {
             upload_id,
+            claim_token,
             row,
             precondition,
             replication,
         } => {
+            let Some(initial_state) =
+                multipart_initial_state(conn, &upload_id, &claim_token, &row.bucket, &row.key)?
+            else {
+                return Ok(MutationOutcome::MultipartTerminal(
+                    MultipartTerminalOutcome::NotOwner,
+                ));
+            };
             let bucket = row.bucket.clone();
             let key = row.key.clone();
             check_precondition(conn, &bucket, &key, &precondition)?;
             enforce_bucket_quota(conn, &row)?;
             enforce_user_quota(conn, &row)?;
+            if replacement_is_protected(
+                conn,
+                &bucket,
+                &key,
+                &row.version_id,
+                row.created_at,
+                GovernanceBypass::Denied,
+            )? {
+                return Err(MetaError::ObjectProtected);
+            }
+            let (tags, lock_state) = if row.is_delete_marker {
+                (Vec::new(), ObjectLockState::default())
+            } else {
+                (
+                    initial_state.tags,
+                    resolve_initial_object_lock(
+                        conn,
+                        &bucket,
+                        initial_state.lock_intent,
+                        row.created_at,
+                    )?,
+                )
+            };
             let version_id = row.version_id.clone();
             let superseded = upsert_version(conn, *row)?;
-            conn.execute(
-                "DELETE FROM multipart_uploads WHERE id=?1",
-                params![upload_id.as_str()],
-            )
-            .map_err(engine_err)?;
+            replace_object_tags(conn, &bucket, &key, &version_id, &tags)?;
+            write_object_lock_state(conn, &bucket, &key, &version_id, lock_state)?;
+            retire_multipart_session(conn, &upload_id)?;
             for e in &replication {
                 enqueue(conn, e)?;
             }
-            Ok(MutationOutcome::MultipartCompleted {
-                superseded,
-                version_id,
-            })
+            Ok(MutationOutcome::MultipartTerminal(
+                MultipartTerminalOutcome::Completed {
+                    superseded,
+                    version_id,
+                },
+            ))
         }
         Mutation::AbortMultipart(upload_id) => {
-            conn.execute(
-                "DELETE FROM multipart_uploads WHERE id=?1",
-                params![upload_id.as_str()],
-            )
-            .map_err(engine_err)?;
-            Ok(MutationOutcome::Ack)
+            let active = conn
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM multipart_uploads WHERE id=?1 AND status='active'
+                     )",
+                    params![upload_id.as_str()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map(|value| value != 0)
+                .map_err(engine_err)?;
+            if active {
+                retire_multipart_session(conn, &upload_id)?;
+            }
+            Ok(MutationOutcome::MultipartTerminal(if active {
+                MultipartTerminalOutcome::Aborted
+            } else {
+                MultipartTerminalOutcome::NotOwner
+            }))
         }
         Mutation::CreateBucket(b) => {
-            // `compression_policy` is the spec column name (ARCH 34.1); `quota_bytes` defaults to
-            // NULL (unlimited) since the frozen `Bucket` domain type carries no quota field.
+            insert_bucket(conn, &b)?;
+            Ok(MutationOutcome::Ack)
+        }
+        Mutation::CreateObjectLockBucket(b) => {
+            if b.versioning != VersioningState::Enabled {
+                return Err(MetaError::InvalidBucketState);
+            }
+            insert_bucket(conn, &b)?;
+            let doc = to_json(&ObjectLockConfiguration {
+                enabled: true,
+                default_retention: None,
+            });
             conn.execute(
-                "INSERT INTO buckets (name, owner_id, created_at, versioning_state, ownership_mode, region, compression_policy)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7)",
-                params![
-                    b.name.as_str(),
-                    b.owner_id.0,
-                    b.created_at.0,
-                    model::versioning_str(b.versioning),
-                    model::ownership_str(b.ownership_mode),
-                    b.region,
-                    b.compression.as_ref().map(to_json),
-                ],
+                "INSERT INTO bucket_config (bucket_name, aspect, doc)
+                 VALUES (?1, 'object_lock', ?2)",
+                params![b.name.as_str(), doc],
             )
             .map_err(engine_err)?;
             Ok(MutationOutcome::Ack)
@@ -221,6 +515,15 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
                 params![name.as_str()],
             )
             .map_err(engine_err)?;
+            // Shares are account-global and intentionally have no cross-shard bucket FK. Delete
+            // every capability for the name so deleting/recreating a bucket can never revive an
+            // old link against new object bytes. The sharded adapter executes this same mutation
+            // on shard 0 before the authoritative nonzero-shard bucket delete.
+            conn.execute(
+                "DELETE FROM object_shares WHERE bucket_name=?1",
+                params![name.as_str()],
+            )
+            .map_err(engine_err)?;
             Ok(MutationOutcome::Ack)
         }
         Mutation::SetBucketConfig {
@@ -228,6 +531,12 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             aspect,
             doc,
         } => {
+            if aspect == ConfigAspect::ObjectLock {
+                // Object Lock has specialized writer mutations because enablement is immutable and
+                // coupled atomically to bucket versioning. The generic document seam must never be
+                // able to delete, disable, or install a malformed WORM configuration.
+                return Err(MetaError::InvalidBucketState);
+            }
             let aspect_s = config_aspect_str(aspect);
             match doc {
                 Some(d) => conn.execute(
@@ -242,22 +551,69 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             .map_err(engine_err)?;
             Ok(MutationOutcome::Ack)
         }
+        Mutation::UpdateObjectLockConfiguration {
+            bucket,
+            default_retention,
+        } => {
+            if let Some(default) = default_retention {
+                default
+                    .validate()
+                    .map_err(|_| MetaError::InvalidObjectLockState)?;
+            }
+            let versioning: Option<String> = conn
+                .query_row(
+                    "SELECT versioning_state FROM buckets WHERE name=?1",
+                    params![bucket.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(engine_err)?;
+            if versioning.as_deref() != Some("enabled") {
+                return Err(MetaError::InvalidBucketState);
+            }
+            let exists: bool = conn
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM bucket_config
+                         WHERE bucket_name=?1 AND aspect='object_lock'
+                     )",
+                    params![bucket.as_str()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map(|value| value != 0)
+                .map_err(engine_err)?;
+            if !exists {
+                return Err(MetaError::InvalidBucketState);
+            }
+            let doc = to_json(&ObjectLockConfiguration {
+                enabled: true,
+                default_retention,
+            });
+            conn.execute(
+                "UPDATE bucket_config SET doc=?2
+                 WHERE bucket_name=?1 AND aspect='object_lock'",
+                params![bucket.as_str(), doc],
+            )
+            .map_err(engine_err)?;
+            Ok(MutationOutcome::Ack)
+        }
         Mutation::SetObjectRetention {
             bucket,
             key,
             version_id,
             retention,
+            now,
+            bypass,
         } => {
-            let mode = retention.as_ref().map(|r| model::lock_mode_str(r.mode));
-            let until = retention.as_ref().map(|r| r.retain_until.0);
-            conn.execute(
-                "INSERT INTO object_locks (bucket_name, key, version_id, lock_mode, retain_until, legal_hold)
-                 VALUES (?1,?2,?3,?4,?5,0)
-                 ON CONFLICT(bucket_name,key,version_id)
-                 DO UPDATE SET lock_mode=excluded.lock_mode, retain_until=excluded.retain_until",
-                params![bucket.as_str(), key.as_str(), version_id.as_str(), mode, until],
-            )
-            .map_err(engine_err)?;
+            require_object_version(conn, &bucket, &key, &version_id)?;
+            require_object_lock_enabled(conn, &bucket)?;
+            if retention.is_some_and(|value| value.retain_until <= now) {
+                return Err(MetaError::InvalidObjectLockState);
+            }
+            let mut state = read_object_lock_state(conn, &bucket, &key, &version_id)?;
+            enforce_retention_transition(state.retention, retention, now, bypass)?;
+            state.retention = retention;
+            write_object_lock_state(conn, &bucket, &key, &version_id, state)?;
             Ok(MutationOutcome::Ack)
         }
         Mutation::SetObjectLegalHold {
@@ -266,16 +622,30 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             version_id,
             on,
         } => {
-            conn.execute(
-                "INSERT INTO object_locks (bucket_name, key, version_id, lock_mode, retain_until, legal_hold)
-                 VALUES (?1,?2,?3,NULL,NULL,?4)
-                 ON CONFLICT(bucket_name,key,version_id) DO UPDATE SET legal_hold=excluded.legal_hold",
-                params![bucket.as_str(), key.as_str(), version_id.as_str(), on as i64],
-            )
-            .map_err(engine_err)?;
+            require_object_version(conn, &bucket, &key, &version_id)?;
+            require_object_lock_enabled(conn, &bucket)?;
+            let mut state = read_object_lock_state(conn, &bucket, &key, &version_id)?;
+            state.legal_hold = on;
+            write_object_lock_state(conn, &bucket, &key, &version_id, state)?;
             Ok(MutationOutcome::Ack)
         }
         Mutation::SetVersioning { bucket, state } => {
+            if state != VersioningState::Enabled {
+                let has_object_lock_row: bool = conn
+                    .query_row(
+                        "SELECT EXISTS(
+                             SELECT 1 FROM bucket_config
+                             WHERE bucket_name=?1 AND aspect='object_lock'
+                         )",
+                        params![bucket.as_str()],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .map(|value| value != 0)
+                    .map_err(engine_err)?;
+                if has_object_lock_row {
+                    return Err(MetaError::InvalidBucketState);
+                }
+            }
             conn.execute(
                 "UPDATE buckets SET versioning_state=?2 WHERE name=?1",
                 params![bucket.as_str(), model::versioning_str(state)],
@@ -518,18 +888,7 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             version_id,
             tags,
         } => {
-            conn.execute(
-                "DELETE FROM object_tags WHERE bucket_name=?1 AND key=?2 AND version_id=?3",
-                params![bucket.as_str(), key.as_str(), version_id.as_str()],
-            )
-            .map_err(engine_err)?;
-            for (k, v) in &tags {
-                conn.execute(
-                    "INSERT INTO object_tags (bucket_name, key, version_id, tag_key, tag_value) VALUES (?1,?2,?3,?4,?5)",
-                    params![bucket.as_str(), key.as_str(), version_id.as_str(), k, v],
-                )
-                .map_err(engine_err)?;
-            }
+            replace_object_tags(conn, &bucket, &key, &version_id, &tags)?;
             Ok(MutationOutcome::Ack)
         }
         Mutation::DeleteObjectTags {
@@ -754,14 +1113,20 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             .map_err(engine_err)?;
             Ok(MutationOutcome::Ack)
         }
-        Mutation::PruneImportJobs { before_ms } => {
-            conn.execute(
-                "DELETE FROM import_jobs
-                 WHERE state IN ('completed','failed','cancelled') AND updated_at < ?1",
-                params![before_ms],
-            )
-            .map_err(engine_err)?;
-            Ok(MutationOutcome::Ack)
+        Mutation::PruneImportJobs { before_ms, limit } => {
+            let limit = i64::from(limit.clamp(1, MAX_IMPORT_JOB_PRUNE_BATCH));
+            let rows = conn
+                .execute(
+                    "DELETE FROM import_jobs
+                 WHERE id IN (
+                     SELECT id FROM import_jobs
+                     WHERE state IN ('completed','failed','cancelled') AND updated_at < ?1
+                     LIMIT ?2
+                 )",
+                    params![before_ms, limit],
+                )
+                .map_err(engine_err)?;
+            Ok(MutationOutcome::ImportJobsPruned(rows as u64))
         }
         Mutation::ClaimReplicationBatch {
             limit,
@@ -996,10 +1361,11 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
         Mutation::CreateShare(s) => {
             conn.execute(
                 "INSERT INTO object_shares
-                 (token, bucket_name, key, version_id, expires_at, disposition, filename, created_by, created_at, revoked_at)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                 (id, token_hash, bucket_name, key, version_id, expires_at, disposition, filename, created_by, created_at, revoked_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
                 params![
-                    s.token,
+                    s.id,
+                    s.token_hash.as_bytes().as_slice(),
                     s.bucket.as_str(),
                     s.key.as_str(),
                     s.version_id.as_ref().map(|v| v.as_str()),
@@ -1014,11 +1380,11 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             .map_err(engine_err)?;
             Ok(MutationOutcome::Ack)
         }
-        Mutation::RevokeShare { token, now } => {
-            // Idempotent: revoking an already-revoked or missing token is a no-op.
+        Mutation::RevokeShare { id, now } => {
+            // Idempotent: revoking an already-revoked or missing id is a no-op.
             conn.execute(
-                "UPDATE object_shares SET revoked_at=?2 WHERE token=?1 AND revoked_at IS NULL",
-                params![token, now.0],
+                "UPDATE object_shares SET revoked_at=?2 WHERE id=?1 AND revoked_at IS NULL",
+                params![id, now.0],
             )
             .map_err(engine_err)?;
             Ok(MutationOutcome::Ack)
@@ -1076,17 +1442,436 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredObjectLockConfiguration {
+    enabled: bool,
+    default_retention: Option<StoredDefaultRetention>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredDefaultRetention {
+    mode: ObjectLockMode,
+    period: RetentionPeriod,
+}
+
+fn bucket_object_lock_configuration(
+    conn: &Connection,
+    bucket: &BucketName,
+) -> R<Option<ObjectLockConfiguration>> {
+    let doc: Option<String> = conn
+        .query_row(
+            "SELECT doc FROM bucket_config
+             WHERE bucket_name=?1 AND aspect='object_lock'",
+            params![bucket.as_str()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(engine_err)?;
+    let Some(doc) = doc else {
+        return Ok(None);
+    };
+    let versioning: Option<String> = conn
+        .query_row(
+            "SELECT versioning_state FROM buckets WHERE name=?1",
+            params![bucket.as_str()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(engine_err)?;
+    if versioning.as_deref() != Some("enabled") {
+        return Err(MetaError::InvalidBucketState);
+    }
+    let stored: StoredObjectLockConfiguration =
+        serde_json::from_str(&doc).map_err(|_| MetaError::InvalidObjectLockState)?;
+    if !stored.enabled {
+        return Err(MetaError::InvalidObjectLockState);
+    }
+    let default_retention = stored.default_retention.map(|default| DefaultRetention {
+        mode: default.mode,
+        period: default.period,
+    });
+    if let Some(default) = default_retention {
+        default
+            .validate()
+            .map_err(|_| MetaError::InvalidObjectLockState)?;
+    }
+    Ok(Some(ObjectLockConfiguration {
+        enabled: true,
+        default_retention,
+    }))
+}
+
+fn require_object_lock_enabled(
+    conn: &Connection,
+    bucket: &BucketName,
+) -> R<ObjectLockConfiguration> {
+    bucket_object_lock_configuration(conn, bucket)?.ok_or(MetaError::InvalidBucketState)
+}
+
+fn resolve_initial_object_lock(
+    conn: &Connection,
+    bucket: &BucketName,
+    intent: ExplicitObjectLockIntent,
+    now: Timestamp,
+) -> R<ObjectLockState> {
+    let config = bucket_object_lock_configuration(conn, bucket)?;
+    let Some(config) = config else {
+        if intent.retention.is_some() || intent.legal_hold.is_some() {
+            return Err(MetaError::InvalidBucketState);
+        }
+        return Ok(ObjectLockState::default());
+    };
+    if intent
+        .retention
+        .is_some_and(|retention| retention.retain_until <= now)
+    {
+        return Err(MetaError::InvalidObjectLockState);
+    }
+    let retention = match (intent.retention, config.default_retention) {
+        (Some(retention), _) => Some(retention),
+        (None, Some(default)) => Some(ObjectRetention {
+            mode: default.mode,
+            retain_until: default
+                .retain_until(now)
+                .map_err(|_| MetaError::InvalidObjectLockState)?,
+        }),
+        (None, None) => None,
+    };
+    Ok(ObjectLockState {
+        retention,
+        legal_hold: intent.legal_hold.unwrap_or(false),
+    })
+}
+
+fn validate_multipart_lock_intent(
+    conn: &Connection,
+    bucket: &BucketName,
+    intent: ExplicitObjectLockIntent,
+    now: Timestamp,
+) -> R<()> {
+    let config = bucket_object_lock_configuration(conn, bucket)?;
+    if config.is_none() {
+        return if intent.retention.is_none() && intent.legal_hold.is_none() {
+            Ok(())
+        } else {
+            Err(MetaError::InvalidBucketState)
+        };
+    }
+    if intent
+        .retention
+        .is_some_and(|retention| retention.retain_until <= now)
+    {
+        return Err(MetaError::InvalidObjectLockState);
+    }
+    // The default is intentionally not resolved here. Initiation pins only explicit intent;
+    // CompleteMultipart resolves the then-current default from the completion row's creation time.
+    Ok(())
+}
+
+fn read_object_lock_state(
+    conn: &Connection,
+    bucket: &BucketName,
+    key: &ObjectKey,
+    version_id: &VersionId,
+) -> R<ObjectLockState> {
+    let row: Option<(Option<String>, Option<i64>, i64)> = conn
+        .query_row(
+            "SELECT lock_mode, retain_until, legal_hold FROM object_locks
+             WHERE bucket_name=?1 AND key=?2 AND version_id=?3",
+            params![bucket.as_str(), key.as_str(), version_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(engine_err)?;
+    row.map_or_else(
+        || Ok(ObjectLockState::default()),
+        |(mode, until, legal_hold)| model::object_lock_state_from_columns(mode, until, legal_hold),
+    )
+}
+
+fn write_object_lock_state(
+    conn: &Connection,
+    bucket: &BucketName,
+    key: &ObjectKey,
+    version_id: &VersionId,
+    state: ObjectLockState,
+) -> R<()> {
+    if state == ObjectLockState::default() {
+        conn.execute(
+            "DELETE FROM object_locks
+             WHERE bucket_name=?1 AND key=?2 AND version_id=?3",
+            params![bucket.as_str(), key.as_str(), version_id.as_str()],
+        )
+        .map_err(engine_err)?;
+        return Ok(());
+    }
+    let mode = state
+        .retention
+        .map(|retention| model::lock_mode_str(retention.mode));
+    let until = state.retention.map(|retention| retention.retain_until.0);
+    conn.execute(
+        "INSERT INTO object_locks
+         (bucket_name, key, version_id, lock_mode, retain_until, legal_hold)
+         VALUES (?1,?2,?3,?4,?5,?6)
+         ON CONFLICT(bucket_name,key,version_id) DO UPDATE SET
+             lock_mode=excluded.lock_mode,
+             retain_until=excluded.retain_until,
+             legal_hold=excluded.legal_hold",
+        params![
+            bucket.as_str(),
+            key.as_str(),
+            version_id.as_str(),
+            mode,
+            until,
+            i64::from(state.legal_hold),
+        ],
+    )
+    .map_err(engine_err)?;
+    Ok(())
+}
+
+fn require_object_version(
+    conn: &Connection,
+    bucket: &BucketName,
+    key: &ObjectKey,
+    version_id: &VersionId,
+) -> R<()> {
+    let exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM object_versions
+                 WHERE bucket_name=?1 AND key=?2 AND version_id=?3
+             )",
+            params![bucket.as_str(), key.as_str(), version_id.as_str()],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|value| value != 0)
+        .map_err(engine_err)?;
+    if exists {
+        Ok(())
+    } else {
+        Err(MetaError::ObjectVersionNotFound)
+    }
+}
+
+fn replacement_is_protected(
+    conn: &Connection,
+    bucket: &BucketName,
+    key: &ObjectKey,
+    version_id: &VersionId,
+    now: Timestamp,
+    bypass: GovernanceBypass,
+) -> R<bool> {
+    // A malformed/disabled Object Lock document or an enabled document paired with suspended
+    // versioning makes the bucket's protection policy unknowable. Every destructive/replacement
+    // path fails closed until the specialized repair path restores a valid configuration.
+    bucket_object_lock_configuration(conn, bucket)?;
+    let state = read_object_lock_state(conn, bucket, key, version_id)?;
+    if state.legal_hold {
+        return Ok(true);
+    }
+    Ok(match state.retention {
+        Some(retention) if retention.retain_until > now => match retention.mode {
+            ObjectLockMode::Compliance => true,
+            ObjectLockMode::Governance => bypass != GovernanceBypass::Authorized,
+        },
+        _ => false,
+    })
+}
+
+fn enforce_retention_transition(
+    current: Option<ObjectRetention>,
+    requested: Option<ObjectRetention>,
+    now: Timestamp,
+    bypass: GovernanceBypass,
+) -> R<()> {
+    let Some(current) = current.filter(|retention| retention.retain_until > now) else {
+        return Ok(());
+    };
+    let non_weakening = match (current.mode, requested) {
+        (ObjectLockMode::Compliance, Some(next)) => {
+            next.mode == ObjectLockMode::Compliance && next.retain_until >= current.retain_until
+        }
+        (ObjectLockMode::Governance, Some(next)) => next.retain_until >= current.retain_until,
+        (_, None) => false,
+    };
+    if non_weakening
+        || (current.mode == ObjectLockMode::Governance && bypass == GovernanceBypass::Authorized)
+    {
+        Ok(())
+    } else {
+        Err(MetaError::ObjectProtected)
+    }
+}
+
+fn replace_object_tags(
+    conn: &Connection,
+    bucket: &BucketName,
+    key: &ObjectKey,
+    version_id: &VersionId,
+    tags: &[(String, String)],
+) -> R<()> {
+    conn.execute(
+        "DELETE FROM object_tags WHERE bucket_name=?1 AND key=?2 AND version_id=?3",
+        params![bucket.as_str(), key.as_str(), version_id.as_str()],
+    )
+    .map_err(engine_err)?;
+    for (tag_key, tag_value) in tags {
+        conn.execute(
+            "INSERT INTO object_tags
+             (bucket_name, key, version_id, tag_key, tag_value)
+             VALUES (?1,?2,?3,?4,?5)",
+            params![
+                bucket.as_str(),
+                key.as_str(),
+                version_id.as_str(),
+                tag_key,
+                tag_value,
+            ],
+        )
+        .map_err(engine_err)?;
+    }
+    Ok(())
+}
+
+fn multipart_initial_state(
+    conn: &Connection,
+    upload_id: &cairn_types::UploadId,
+    claim_token: &cairn_types::MultipartClaimToken,
+    bucket: &BucketName,
+    key: &ObjectKey,
+) -> R<Option<InitialObjectState>> {
+    let row: Option<MultipartInitialColumns> = conn
+        .query_row(
+            "SELECT initial_tags, lock_mode, retain_until, legal_hold, object_lock_intent_known
+             FROM multipart_uploads
+             WHERE id=?1 AND status='completing' AND completion_claim_token=?2
+               AND bucket_name=?3 AND key=?4",
+            params![
+                upload_id.as_str(),
+                claim_token.as_str(),
+                bucket.as_str(),
+                key.as_str()
+            ],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(engine_err)?;
+    let Some((tags, mode, until, legal_hold, intent_known)) = row else {
+        return Ok(None);
+    };
+    if intent_known == 0 {
+        // A migrated pre-v27 session cannot prove that no explicit retention/legal-hold header was
+        // supplied. Completion on an Object-Lock bucket must preserve the session and fail closed;
+        // an ordinary bucket may consume only the migration's known-empty defaults.
+        if bucket_object_lock_configuration(conn, bucket)?.is_some() {
+            return Err(MetaError::InvalidObjectLockState);
+        }
+        let tags: Vec<(String, String)> =
+            serde_json::from_str(&tags).map_err(|_| MetaError::InvalidObjectLockState)?;
+        if !tags.is_empty() || mode.is_some() || until.is_some() || legal_hold.is_some() {
+            return Err(MetaError::InvalidObjectLockState);
+        }
+        return Ok(Some(InitialObjectState::default()));
+    }
+    if intent_known != 1 {
+        return Err(MetaError::InvalidObjectLockState);
+    }
+    let tags = serde_json::from_str(&tags)
+        .map_err(|_| MetaError::Engine("invalid multipart initial tags".to_owned()))?;
+    let retention = match (mode, until) {
+        (None, None) => None,
+        (Some(mode), Some(until)) => Some(ObjectRetention {
+            mode: model::lock_mode_from(&mode)?,
+            retain_until: Timestamp(until),
+        }),
+        _ => return Err(MetaError::InvalidObjectLockState),
+    };
+    let legal_hold = match legal_hold {
+        None => None,
+        Some(0) => Some(false),
+        Some(1) => Some(true),
+        Some(_) => return Err(MetaError::InvalidObjectLockState),
+    };
+    Ok(Some(InitialObjectState {
+        tags,
+        lock_intent: ExplicitObjectLockIntent {
+            retention,
+            legal_hold,
+        },
+    }))
+}
+
+fn insert_bucket(conn: &Connection, bucket: &cairn_types::bucket::Bucket) -> R<()> {
+    // `compression_policy` is the spec column name (ARCH 34.1); `quota_bytes` defaults to NULL
+    // (unlimited) because the domain row deliberately carries no quota field.
+    conn.execute(
+        "INSERT INTO buckets
+         (name, owner_id, created_at, versioning_state, ownership_mode, region, compression_policy)
+         VALUES (?1,?2,?3,?4,?5,?6,?7)",
+        params![
+            bucket.name.as_str(),
+            bucket.owner_id.0,
+            bucket.created_at.0,
+            model::versioning_str(bucket.versioning),
+            model::ownership_str(bucket.ownership_mode),
+            bucket.region,
+            bucket.compression.as_ref().map(to_json),
+        ],
+    )
+    .map_err(engine_err)?;
+    Ok(())
+}
+
 fn put_version(
     conn: &Connection,
     row: ObjectVersionRow,
     precondition: &Precondition,
+    initial_state: InitialObjectState,
     replication: Vec<OutboxEntry>,
 ) -> R<MutationOutcome> {
     check_precondition(conn, &row.bucket, &row.key, precondition)?;
     enforce_bucket_quota(conn, &row)?;
     enforce_user_quota(conn, &row)?;
+    if replacement_is_protected(
+        conn,
+        &row.bucket,
+        &row.key,
+        &row.version_id,
+        row.created_at,
+        GovernanceBypass::Denied,
+    )? {
+        return Err(MetaError::ObjectProtected);
+    }
+    let (tags, lock_state) = if row.is_delete_marker {
+        (Vec::new(), ObjectLockState::default())
+    } else {
+        (
+            initial_state.tags,
+            resolve_initial_object_lock(
+                conn,
+                &row.bucket,
+                initial_state.lock_intent,
+                row.created_at,
+            )?,
+        )
+    };
+    let bucket = row.bucket.clone();
+    let key = row.key.clone();
     let version_id = row.version_id.clone();
     let superseded = upsert_version(conn, row)?;
+    replace_object_tags(conn, &bucket, &key, &version_id, &tags)?;
+    write_object_lock_state(conn, &bucket, &key, &version_id, lock_state)?;
     for e in &replication {
         enqueue(conn, e)?;
     }
@@ -1371,32 +2156,63 @@ fn insert_version(conn: &Connection, row: &ObjectVersionRow) -> R<()> {
     Ok(())
 }
 
+struct DeleteVersionGuard {
+    expected_row_id: Option<String>,
+    expected_updated_at: Option<Timestamp>,
+    require_sole_key_version: bool,
+}
+
 fn delete_version(
     conn: &Connection,
     bucket: &BucketName,
     key: &ObjectKey,
     version_id: &VersionId,
-    expected_updated_at: Option<Timestamp>,
+    guard: DeleteVersionGuard,
+    now: Timestamp,
+    bypass: GovernanceBypass,
 ) -> R<MutationOutcome> {
-    // Compare-and-delete guard: if the caller (the lifecycle scanner) captured the version's
-    // updated_at at enumeration, only proceed when the stored value still matches. A concurrent
-    // overwrite (which bumps updated_at) means the object was rewritten since the scan, so deleting
-    // it would destroy fresh, non-expired data — skip it as a no-op (audit 2026-07). Runs inside the
-    // savepoint, so the check and the delete are atomic.
-    if let Some(expected) = expected_updated_at {
-        let stored: Option<i64> = conn
+    // Lifecycle compare-and-delete guards are checked in the writer savepoint. The immutable row id
+    // distinguishes two sentinel versions even when a concurrent overwrite lands in the same
+    // timestamp tick; updated_at remains a defense-in-depth freshness check.
+    if guard.expected_row_id.is_some() || guard.expected_updated_at.is_some() {
+        let stored: Option<(String, i64)> = conn
             .query_row(
-                "SELECT updated_at FROM object_versions WHERE bucket_name=?1 AND key=?2 AND version_id=?3",
+                "SELECT id, updated_at FROM object_versions
+                 WHERE bucket_name=?1 AND key=?2 AND version_id=?3",
                 params![bucket.as_str(), key.as_str(), version_id.as_str()],
-                |r| r.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
             .map_err(engine_err)?;
-        if stored != Some(expected.0) {
-            return Ok(MutationOutcome::Deleted {
-                freed: None,
-                promoted_latest: false,
-            });
+        let matches = stored.as_ref().is_some_and(|(row_id, updated_at)| {
+            guard
+                .expected_row_id
+                .as_ref()
+                .is_none_or(|expected| expected == row_id)
+                && guard
+                    .expected_updated_at
+                    .is_none_or(|expected| expected.0 == *updated_at)
+        });
+        if !matches {
+            return Ok(MutationOutcome::DeleteNotApplied);
+        }
+    }
+    if guard.require_sole_key_version {
+        let (version_count, guarded_marker): (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*),
+                        COALESCE(MAX(CASE
+                            WHEN version_id=?3 AND is_latest=1 AND is_delete_marker=1 THEN 1
+                            ELSE 0
+                        END), 0)
+                 FROM object_versions
+                 WHERE bucket_name=?1 AND key=?2",
+                params![bucket.as_str(), key.as_str(), version_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(engine_err)?;
+        if version_count != 1 || guarded_marker != 1 {
+            return Ok(MutationOutcome::DeleteNotApplied);
         }
     }
     // Read the row's blob, latest flag, and owner/byte sizes before deleting it, so we can both
@@ -1413,14 +2229,14 @@ fn delete_version(
         )
         .optional()
         .map_err(engine_err)?;
-    let (freed, was_latest, removed) = match existing {
-        Some((sp, latest, owner, sl, sp_bytes)) => (
-            sp.map(StoragePath::from_string),
-            latest != 0,
-            Some((owner, sl, sp_bytes)),
-        ),
-        None => (None, false, None),
+    let Some((storage_path, latest, owner, logical, physical)) = existing else {
+        return Ok(MutationOutcome::DeleteNotApplied);
     };
+    if replacement_is_protected(conn, bucket, key, version_id, now, bypass)? {
+        return Ok(MutationOutcome::DeleteProtected);
+    }
+    let freed = storage_path.map(StoragePath::from_string);
+    let was_latest = latest != 0;
     conn.prepare_cached(
         "DELETE FROM object_versions WHERE bucket_name=?1 AND key=?2 AND version_id=?3",
     )
@@ -1446,10 +2262,8 @@ fn delete_version(
     .map_err(engine_err)?
     .execute(params![bucket.as_str(), key.as_str(), version_id.as_str()])
     .map_err(engine_err)?;
-    if let Some((owner, sl, sp_bytes)) = removed {
-        // The deleted row leaves the table: subtract its version and bytes from the counters.
-        adjust_stats(conn, bucket.as_str(), &owner, -1, -sl, -sp_bytes)?;
-    }
+    // The deleted row leaves the table: subtract its version and bytes from the counters.
+    adjust_stats(conn, bucket.as_str(), &owner, -1, -logical, -physical)?;
     let mut promoted = false;
     if was_latest {
         let promote: Option<String> = conn
@@ -1474,7 +2288,445 @@ fn delete_version(
     })
 }
 
-fn claim_multipart(conn: &Connection, upload_id: &cairn_types::UploadId) -> R<MutationOutcome> {
+struct MultipartContext {
+    bucket: String,
+    principal: String,
+    updated_at: i64,
+}
+
+fn active_multipart_context(
+    conn: &Connection,
+    upload_id: &cairn_types::UploadId,
+) -> R<MultipartContext> {
+    conn.query_row(
+        "SELECT bucket_name, COALESCE(initiated_by, owner_id), updated_at
+         FROM multipart_uploads WHERE id=?1 AND status='active'",
+        params![upload_id.as_str()],
+        |row| {
+            Ok(MultipartContext {
+                bucket: row.get(0)?,
+                principal: row.get(1)?,
+                updated_at: row.get(2)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(engine_err)?
+    .ok_or(MetaError::MultipartNotActive)
+}
+
+fn multipart_context(conn: &Connection, upload_id: &cairn_types::UploadId) -> R<MultipartContext> {
+    conn.query_row(
+        "SELECT bucket_name, COALESCE(initiated_by, owner_id), updated_at
+         FROM multipart_uploads WHERE id=?1",
+        params![upload_id.as_str()],
+        |row| {
+            Ok(MultipartContext {
+                bucket: row.get(0)?,
+                principal: row.get(1)?,
+                updated_at: row.get(2)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(engine_err)?
+    .ok_or(MetaError::MultipartNotActive)
+}
+
+fn multipart_stat(
+    conn: &Connection,
+    table: &str,
+    key_column: &str,
+    key: &str,
+    value_column: &str,
+) -> R<i64> {
+    conn.query_row(
+        &format!("SELECT {value_column} FROM {table} WHERE {key_column}=?1"),
+        params![key],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(engine_err)
+    .map(|value| value.unwrap_or(0))
+}
+
+fn adjust_multipart_stats(
+    conn: &Connection,
+    bucket: &str,
+    principal: &str,
+    active_delta: i64,
+    bytes_delta: i64,
+) -> R<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO multipart_bucket_stats
+         (bucket_name, active_uploads, staged_bytes) VALUES (?1,0,0)",
+        params![bucket],
+    )
+    .map_err(engine_err)?;
+    conn.execute(
+        "UPDATE multipart_bucket_stats
+         SET active_uploads=active_uploads+?2, staged_bytes=staged_bytes+?3
+         WHERE bucket_name=?1",
+        params![bucket, active_delta, bytes_delta],
+    )
+    .map_err(engine_err)?;
+    conn.execute(
+        "INSERT OR IGNORE INTO multipart_principal_stats
+         (principal_id, active_uploads, staged_bytes) VALUES (?1,0,0)",
+        params![principal],
+    )
+    .map_err(engine_err)?;
+    conn.execute(
+        "UPDATE multipart_principal_stats
+         SET active_uploads=active_uploads+?2, staged_bytes=staged_bytes+?3
+         WHERE principal_id=?1",
+        params![principal, active_delta, bytes_delta],
+    )
+    .map_err(engine_err)?;
+    Ok(())
+}
+
+fn enforce_multipart_reservation_quota(
+    conn: &Connection,
+    context: &MultipartContext,
+    reserved_bytes: u64,
+) -> R<()> {
+    let bucket_quota: Option<i64> = conn
+        .query_row(
+            "SELECT quota_bytes FROM buckets WHERE name=?1",
+            params![context.bucket],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(engine_err)?
+        .flatten();
+    if let Some(quota) = bucket_quota {
+        let committed = multipart_stat(
+            conn,
+            "bucket_stats",
+            "bucket_name",
+            &context.bucket,
+            "logical_bytes",
+        )?;
+        let staged = multipart_stat(
+            conn,
+            "multipart_bucket_stats",
+            "bucket_name",
+            &context.bucket,
+            "staged_bytes",
+        )?;
+        let projected = u128::from(committed.max(0) as u64)
+            + u128::from(staged.max(0) as u64)
+            + u128::from(reserved_bytes);
+        if projected > u128::from(quota.max(0) as u64) {
+            return Err(MetaError::QuotaExceeded);
+        }
+    }
+
+    let principal_quota: Option<i64> = conn
+        .query_row(
+            "SELECT quota_bytes FROM users WHERE id=?1",
+            params![context.principal],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(engine_err)?
+        .flatten();
+    if let Some(quota) = principal_quota {
+        let committed = multipart_stat(
+            conn,
+            "user_stats",
+            "owner_id",
+            &context.principal,
+            "logical_bytes",
+        )?;
+        let staged = multipart_stat(
+            conn,
+            "multipart_principal_stats",
+            "principal_id",
+            &context.principal,
+            "staged_bytes",
+        )?;
+        let projected = u128::from(committed.max(0) as u64)
+            + u128::from(staged.max(0) as u64)
+            + u128::from(reserved_bytes);
+        if projected > u128::from(quota.max(0) as u64) {
+            return Err(MetaError::QuotaExceeded);
+        }
+    }
+    Ok(())
+}
+
+fn release_multipart_reservation(
+    conn: &Connection,
+    upload_id: &cairn_types::UploadId,
+    attempt_id: &str,
+) -> R<()> {
+    let row: Option<(String, String, i64)> = conn
+        .query_row(
+            "SELECT u.bucket_name, COALESCE(u.initiated_by, u.owner_id), r.reserved_bytes
+             FROM multipart_part_reservations r
+             JOIN multipart_uploads u ON u.id=r.upload_id
+             WHERE r.attempt_id=?1 AND r.upload_id=?2",
+            params![attempt_id, upload_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(engine_err)?;
+    let Some((bucket, principal, bytes)) = row else {
+        return Ok(());
+    };
+    conn.execute(
+        "DELETE FROM multipart_part_reservations WHERE attempt_id=?1 AND upload_id=?2",
+        params![attempt_id, upload_id.as_str()],
+    )
+    .map_err(engine_err)?;
+    adjust_multipart_stats(conn, &bucket, &principal, 0, -bytes)
+}
+
+fn record_part(
+    conn: &Connection,
+    upload_id: &cairn_types::UploadId,
+    attempt_id: &str,
+    part: cairn_types::meta::PartRecord,
+) -> R<MutationOutcome> {
+    let context = active_multipart_context(conn, upload_id)?;
+    let reservation: Option<(i64, i64, i64)> = conn
+        .query_row(
+            "SELECT part_number, reserved_bytes, created_at FROM multipart_part_reservations
+             WHERE attempt_id=?1 AND upload_id=?2",
+            params![attempt_id, upload_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(engine_err)?;
+    let Some((reserved_part, reserved_bytes, reserved_at)) = reservation else {
+        return Err(MetaError::MultipartNotActive);
+    };
+    if reserved_part != i64::from(part.part_number) || part.size != reserved_bytes as u64 {
+        return Err(MetaError::QuotaExceeded);
+    }
+
+    let previous: Option<(String, i64)> = conn
+        .query_row(
+            "SELECT storage_path, size FROM multipart_parts
+             WHERE upload_id=?1 AND part_number=?2",
+            params![upload_id.as_str(), part.part_number],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(engine_err)?;
+    let cleanup = previous.map(|(storage_path, bytes)| MultipartCleanup {
+        id: format!("part:{attempt_id}"),
+        upload_id: upload_id.clone(),
+        bucket: BucketName::parse(&context.bucket).expect("stored bucket name is validated"),
+        principal_id: cairn_types::UserId(context.principal.clone()),
+        bytes: bytes as u64,
+        storage_path: Some(StoragePath::from_string(storage_path)),
+        created_at: Timestamp(reserved_at),
+    });
+    if let Some(debt) = &cleanup {
+        conn.execute(
+            "INSERT INTO multipart_staging_cleanups
+             (id, upload_id, bucket_name, principal_id, bytes, storage_path, created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                debt.id,
+                debt.upload_id.as_str(),
+                debt.bucket.as_str(),
+                debt.principal_id.0,
+                debt.bytes as i64,
+                debt.storage_path.as_ref().map(StoragePath::as_str),
+                debt.created_at.0,
+            ],
+        )
+        .map_err(engine_err)?;
+        conn.execute(
+            "UPDATE multipart_parts
+             SET size=?3, etag=?4, storage_path=?5, checksum=?6, part_dek=?7
+             WHERE upload_id=?1 AND part_number=?2",
+            params![
+                upload_id.as_str(),
+                part.part_number,
+                part.size as i64,
+                part.etag,
+                part.storage_path.as_str(),
+                part.checksum.as_ref().map(to_json),
+                part.part_dek,
+            ],
+        )
+        .map_err(engine_err)?;
+    } else {
+        conn.execute(
+            "INSERT INTO multipart_parts
+             (upload_id, part_number, size, etag, storage_path, checksum, part_dek)
+             VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                upload_id.as_str(),
+                part.part_number,
+                part.size as i64,
+                part.etag,
+                part.storage_path.as_str(),
+                part.checksum.as_ref().map(to_json),
+                part.part_dek,
+            ],
+        )
+        .map_err(engine_err)?;
+    }
+    conn.execute(
+        "DELETE FROM multipart_part_reservations WHERE attempt_id=?1",
+        params![attempt_id],
+    )
+    .map_err(engine_err)?;
+    adjust_multipart_stats(
+        conn,
+        &context.bucket,
+        &context.principal,
+        0,
+        part.size as i64 - reserved_bytes,
+    )?;
+    Ok(MutationOutcome::PartRecorded { cleanup })
+}
+
+fn release_multipart_cleanup(conn: &Connection, cleanup_id: &str) -> R<()> {
+    let row: Option<(String, String, i64)> = conn
+        .query_row(
+            "SELECT bucket_name, principal_id, bytes
+             FROM multipart_staging_cleanups WHERE id=?1",
+            params![cleanup_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(engine_err)?;
+    let Some((bucket, principal, bytes)) = row else {
+        return Ok(());
+    };
+    conn.execute(
+        "DELETE FROM multipart_staging_cleanups WHERE id=?1",
+        params![cleanup_id],
+    )
+    .map_err(engine_err)?;
+    adjust_multipart_stats(conn, &bucket, &principal, 0, -bytes)
+}
+
+fn release_multipart_upload_cleanups(
+    conn: &Connection,
+    upload_id: &cairn_types::UploadId,
+) -> R<()> {
+    let row: Option<(String, String, i64)> = conn
+        .query_row(
+            "SELECT bucket_name, principal_id, COALESCE(SUM(bytes),0)
+             FROM multipart_staging_cleanups WHERE upload_id=?1
+             GROUP BY bucket_name, principal_id",
+            params![upload_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(engine_err)?;
+    let Some((bucket, principal, bytes)) = row else {
+        return Ok(());
+    };
+    conn.execute(
+        "DELETE FROM multipart_staging_cleanups WHERE upload_id=?1",
+        params![upload_id.as_str()],
+    )
+    .map_err(engine_err)?;
+    adjust_multipart_stats(conn, &bucket, &principal, 0, -bytes)
+}
+
+fn retire_multipart_session(conn: &Connection, upload_id: &cairn_types::UploadId) -> R<()> {
+    let context = multipart_context(conn, upload_id)?;
+    let part_bytes: i64 = conn
+        .query_row(
+            "SELECT COALESCE(SUM(size),0) FROM multipart_parts WHERE upload_id=?1",
+            params![upload_id.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(engine_err)?;
+    let reservation_bytes: i64 = conn
+        .query_row(
+            "SELECT COALESCE(SUM(reserved_bytes),0)
+             FROM multipart_part_reservations WHERE upload_id=?1",
+            params![upload_id.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(engine_err)?;
+    let current_bytes = part_bytes + reservation_bytes;
+    // Keep a session-directory cleanup token even when its recorded byte total is zero. A valid
+    // zero-length part still creates a filesystem artifact, and a failed directory deletion must
+    // remain retryable rather than disappearing merely because quota has no bytes to charge.
+    conn.execute(
+        "INSERT INTO multipart_staging_cleanups
+         (id, upload_id, bucket_name, principal_id, bytes, storage_path, created_at)
+         VALUES (?1,?2,?3,?4,?5,NULL,?6)",
+        params![
+            format!("session:{}", upload_id.as_str()),
+            upload_id.as_str(),
+            context.bucket,
+            context.principal,
+            current_bytes,
+            context.updated_at,
+        ],
+    )
+    .map_err(engine_err)?;
+    conn.execute(
+        "DELETE FROM multipart_uploads WHERE id=?1",
+        params![upload_id.as_str()],
+    )
+    .map_err(engine_err)?;
+    adjust_multipart_stats(conn, &context.bucket, &context.principal, -1, 0)
+}
+
+fn recover_multipart_staging_accounting(conn: &Connection, limit: u32) -> R<MutationOutcome> {
+    let limit = i64::from(limit.clamp(1, 1_000));
+    let reservations: Vec<(String, String)> = {
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT attempt_id, upload_id FROM multipart_part_reservations
+                 ORDER BY created_at, attempt_id LIMIT ?1",
+            )
+            .map_err(engine_err)?;
+        stmt.query_map(params![limit], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(engine_err)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(engine_err)?
+    };
+    let mut released = 0u64;
+    for (attempt_id, upload_id) in reservations {
+        release_multipart_reservation(
+            conn,
+            &cairn_types::UploadId::from_string(upload_id),
+            &attempt_id,
+        )?;
+        released += 1;
+    }
+    let remaining = limit.saturating_sub(released as i64);
+    if remaining > 0 {
+        let cleanup_ids: Vec<String> = {
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT id FROM multipart_staging_cleanups
+                     ORDER BY created_at, id LIMIT ?1",
+                )
+                .map_err(engine_err)?;
+            stmt.query_map(params![remaining], |row| row.get(0))
+                .map_err(engine_err)?
+                .collect::<rusqlite::Result<_>>()
+                .map_err(engine_err)?
+        };
+        for cleanup_id in cleanup_ids {
+            release_multipart_cleanup(conn, &cleanup_id)?;
+            released += 1;
+        }
+    }
+    Ok(MutationOutcome::MultipartAccountingReleased(released))
+}
+
+fn claim_multipart(
+    conn: &Connection,
+    upload_id: &cairn_types::UploadId,
+    claim_token: &cairn_types::MultipartClaimToken,
+) -> R<MutationOutcome> {
     let status: Option<String> = conn
         .query_row(
             "SELECT status FROM multipart_uploads WHERE id=?1",
@@ -1486,8 +2738,10 @@ fn claim_multipart(conn: &Connection, upload_id: &cairn_types::UploadId) -> R<Mu
     let outcome = match status.as_deref() {
         Some("active") => {
             conn.execute(
-                "UPDATE multipart_uploads SET status='completing', updated_at=updated_at WHERE id=?1",
-                params![upload_id.as_str()],
+                "UPDATE multipart_uploads
+                 SET status='completing', completion_claim_token=?2, updated_at=updated_at
+                 WHERE id=?1",
+                params![upload_id.as_str(), claim_token.as_str()],
             )
             .map_err(engine_err)?;
             let session = conn
@@ -1801,6 +3055,7 @@ mod tests {
         Mutation::PutObjectVersion {
             row: Box::new(row),
             precondition: Precondition::default(),
+            initial_state: InitialObjectState::default(),
             replication: Vec::new(),
         }
     }
@@ -1926,6 +3181,8 @@ mod tests {
                 version_id: VersionId::from_string("v3".to_owned()),
                 owner_id: UserId("alice".to_owned()),
                 now: Timestamp(2),
+                bypass: GovernanceBypass::Denied,
+                expected_current: None,
                 replication: Vec::new(),
             },
         )
@@ -1939,7 +3196,11 @@ mod tests {
                 bucket: BucketName::parse("bkt").unwrap(),
                 key: ObjectKey::parse("k1").unwrap(),
                 version_id: VersionId::from_string("v1".to_owned()),
+                expected_row_id: None,
                 expected_updated_at: None,
+                require_sole_key_version: false,
+                now: Timestamp(2),
+                bypass: GovernanceBypass::Denied,
             },
         )
         .unwrap();
@@ -1952,7 +3213,11 @@ mod tests {
                 bucket: BucketName::parse("bkt").unwrap(),
                 key: ObjectKey::parse("k1").unwrap(),
                 version_id: VersionId::from_string("v3".to_owned()),
+                expected_row_id: None,
                 expected_updated_at: None,
+                require_sole_key_version: false,
+                now: Timestamp(2),
+                bypass: GovernanceBypass::Denied,
             },
         )
         .unwrap();
@@ -1984,7 +3249,11 @@ mod tests {
                 bucket: BucketName::parse("bkt").unwrap(),
                 key: ObjectKey::parse("k1").unwrap(),
                 version_id: VersionId::from_string("v1".to_owned()),
+                expected_row_id: None,
                 expected_updated_at: None,
+                require_sole_key_version: false,
+                now: Timestamp(2),
+                bypass: GovernanceBypass::Denied,
             },
         )
         .unwrap();
@@ -2088,6 +3357,8 @@ mod tests {
                 version_id: VersionId::from_string("v2".to_owned()),
                 owner_id: UserId("owner".to_owned()),
                 now: Timestamp(2),
+                bypass: GovernanceBypass::Denied,
+                expected_current: None,
                 replication: Vec::new(),
             },
         )
@@ -2163,5 +3434,296 @@ mod tests {
         // user's total is 95 (not 185) and the 100-byte quota is not exceeded.
         apply(&conn, put(obj_row_owned("bkt", "k", "v1", 95, "alice"))).unwrap();
         assert_eq!(user_logical_bytes(&conn, "alice"), 95);
+    }
+
+    fn object_lock_bucket(name: &str, versioning: VersioningState) -> cairn_types::Bucket {
+        cairn_types::Bucket {
+            name: BucketName::parse(name).unwrap(),
+            owner_id: UserId("owner".to_owned()),
+            created_at: Timestamp(1),
+            versioning,
+            ownership_mode: cairn_types::OwnershipMode::BucketOwnerEnforced,
+            region: "us-east-1".to_owned(),
+            compression: None,
+        }
+    }
+
+    #[test]
+    fn object_lock_bucket_creation_and_repair_are_writer_atomic() {
+        let conn = conn_with_schema();
+        let wrong = object_lock_bucket("wrong-state", VersioningState::Suspended);
+        assert!(matches!(
+            apply_in_savepoint(&conn, Mutation::CreateObjectLockBucket(Box::new(wrong))),
+            Err(MetaError::InvalidBucketState)
+        ));
+        let wrong_rows: i64 = conn
+            .query_row(
+                "SELECT
+                     (SELECT COUNT(*) FROM buckets WHERE name='wrong-state')
+                   + (SELECT COUNT(*) FROM bucket_config WHERE bucket_name='wrong-state')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            wrong_rows, 0,
+            "wrong-state create must leave no half bucket"
+        );
+
+        seed_bucket(&conn, "repair", None);
+        conn.execute(
+            "INSERT INTO bucket_config (bucket_name, aspect, doc)
+             VALUES ('repair','object_lock','{\"enabled\":false,\"default_retention\":null}')",
+            [],
+        )
+        .unwrap();
+        assert!(matches!(
+            apply_in_savepoint(&conn, put(obj_row("repair", "k", "v1", 1))),
+            Err(MetaError::InvalidObjectLockState)
+        ));
+        apply_in_savepoint(
+            &conn,
+            Mutation::UpdateObjectLockConfiguration {
+                bucket: BucketName::parse("repair").unwrap(),
+                default_retention: Some(DefaultRetention {
+                    mode: ObjectLockMode::Compliance,
+                    period: RetentionPeriod::Days(1),
+                }),
+            },
+        )
+        .unwrap();
+        apply_in_savepoint(&conn, put(obj_row("repair", "k", "v1", 1))).unwrap();
+
+        conn.execute(
+            "UPDATE bucket_config
+             SET doc='{\"enabled\":true,\"default_retention\":null,\"unknown\":1}'
+             WHERE bucket_name='repair' AND aspect='object_lock'",
+            [],
+        )
+        .unwrap();
+        assert!(matches!(
+            apply_in_savepoint(
+                &conn,
+                Mutation::DeleteVersion {
+                    bucket: BucketName::parse("repair").unwrap(),
+                    key: ObjectKey::parse("k").unwrap(),
+                    version_id: VersionId::from_string("v1".to_owned()),
+                    expected_row_id: None,
+                    expected_updated_at: None,
+                    require_sole_key_version: false,
+                    now: Timestamp(i64::MAX),
+                    bypass: GovernanceBypass::Authorized,
+                }
+            ),
+            Err(MetaError::InvalidObjectLockState)
+        ));
+        apply_in_savepoint(
+            &conn,
+            Mutation::UpdateObjectLockConfiguration {
+                bucket: BucketName::parse("repair").unwrap(),
+                default_retention: None,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            apply_in_savepoint(
+                &conn,
+                Mutation::DeleteVersion {
+                    bucket: BucketName::parse("repair").unwrap(),
+                    key: ObjectKey::parse("k").unwrap(),
+                    version_id: VersionId::from_string("v1".to_owned()),
+                    expected_row_id: None,
+                    expected_updated_at: None,
+                    require_sole_key_version: false,
+                    now: Timestamp(i64::MAX),
+                    bypass: GovernanceBypass::Denied,
+                }
+            ),
+            Ok(MutationOutcome::Deleted { .. })
+        ));
+    }
+
+    #[test]
+    fn object_lock_missing_targets_precede_config_and_corrupt_rows_fail_closed() {
+        let conn = conn_with_schema();
+        seed_bucket(&conn, "strict", None);
+        conn.execute(
+            "INSERT INTO bucket_config (bucket_name, aspect, doc)
+             VALUES ('strict','object_lock','not-json')",
+            [],
+        )
+        .unwrap();
+        let bucket = BucketName::parse("strict").unwrap();
+        let missing_key = ObjectKey::parse("missing").unwrap();
+        let missing_version = VersionId::from_string("v".to_owned());
+        assert!(matches!(
+            apply_in_savepoint(
+                &conn,
+                Mutation::SetObjectRetention {
+                    bucket: bucket.clone(),
+                    key: missing_key.clone(),
+                    version_id: missing_version.clone(),
+                    retention: None,
+                    now: Timestamp(1),
+                    bypass: GovernanceBypass::Denied,
+                }
+            ),
+            Err(MetaError::ObjectVersionNotFound)
+        ));
+        assert!(matches!(
+            apply_in_savepoint(
+                &conn,
+                Mutation::SetObjectLegalHold {
+                    bucket: bucket.clone(),
+                    key: missing_key,
+                    version_id: missing_version,
+                    on: true,
+                }
+            ),
+            Err(MetaError::ObjectVersionNotFound)
+        ));
+
+        conn.execute(
+            "UPDATE bucket_config
+             SET doc='{\"enabled\":true,\"default_retention\":null}'
+             WHERE bucket_name='strict'",
+            [],
+        )
+        .unwrap();
+        apply_in_savepoint(&conn, put(obj_row("strict", "live", "v1", 1))).unwrap();
+        apply_in_savepoint(
+            &conn,
+            Mutation::SetObjectLegalHold {
+                bucket: bucket.clone(),
+                key: ObjectKey::parse("live").unwrap(),
+                version_id: VersionId::from_string("v1".to_owned()),
+                on: true,
+            },
+        )
+        .unwrap();
+        conn.execute_batch(
+            "PRAGMA ignore_check_constraints=ON;
+             UPDATE object_locks SET lock_mode='GOVERNANCE', retain_until=NULL
+             WHERE bucket_name='strict' AND key='live' AND version_id='v1';
+             PRAGMA ignore_check_constraints=OFF;",
+        )
+        .unwrap();
+        assert!(matches!(
+            apply_in_savepoint(
+                &conn,
+                Mutation::DeleteVersion {
+                    bucket,
+                    key: ObjectKey::parse("live").unwrap(),
+                    version_id: VersionId::from_string("v1".to_owned()),
+                    expected_row_id: None,
+                    expected_updated_at: None,
+                    require_sole_key_version: false,
+                    now: Timestamp(i64::MAX),
+                    bypass: GovernanceBypass::Authorized,
+                }
+            ),
+            Err(MetaError::InvalidObjectLockState)
+        ));
+    }
+
+    #[test]
+    fn legacy_multipart_intent_fails_closed_on_an_object_lock_bucket() {
+        let conn = conn_with_schema();
+        let bucket = object_lock_bucket("legacy-mpu-lock", VersioningState::Enabled);
+        apply_in_savepoint(
+            &conn,
+            Mutation::CreateObjectLockBucket(Box::new(bucket.clone())),
+        )
+        .unwrap();
+        let upload_id = cairn_types::UploadId::from_string("legacy-upload".to_owned());
+        let key = ObjectKey::parse("assembled").unwrap();
+        apply_in_savepoint(
+            &conn,
+            Mutation::CreateMultipart {
+                session: Box::new(cairn_types::MultipartSession {
+                    upload_id: upload_id.clone(),
+                    bucket: bucket.name.clone(),
+                    key: key.clone(),
+                    content_type: "application/octet-stream".to_owned(),
+                    status: cairn_types::MultipartStatus::Active,
+                    owner_id: UserId("owner".to_owned()),
+                    initiated_by: UserId("owner".to_owned()),
+                    intended_acl: None,
+                    user_metadata: Vec::new(),
+                    initial_tags: Vec::new(),
+                    lock_intent: ExplicitObjectLockIntent::default(),
+                    sse_requested: false,
+                    encrypt_parts: false,
+                    sse_kms_requested: false,
+                    sse_kms_key_id: None,
+                    sse_bucket_key_enabled: false,
+                    created_at: Timestamp(10),
+                    updated_at: Timestamp(10),
+                }),
+                limits: cairn_types::meta::MultipartLimits::default(),
+            },
+        )
+        .unwrap();
+        let intent_known: i64 = conn
+            .query_row(
+                "SELECT object_lock_intent_known FROM multipart_uploads WHERE id=?1",
+                params![upload_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(intent_known, 1, "new sessions must pin a known intent");
+        // New sessions write 1. Reset it to the migration default to model an in-flight v26 row
+        // whose explicit retention/legal-hold headers were never persisted.
+        conn.execute(
+            "UPDATE multipart_uploads SET object_lock_intent_known=0 WHERE id=?1",
+            params![upload_id.as_str()],
+        )
+        .unwrap();
+        let claim_token = cairn_types::MultipartClaimToken::generate();
+        apply_in_savepoint(
+            &conn,
+            Mutation::ClaimMultipart {
+                upload_id: upload_id.clone(),
+                claim_token: claim_token.clone(),
+            },
+        )
+        .unwrap();
+
+        let error = apply_in_savepoint(
+            &conn,
+            Mutation::CompleteMultipart {
+                upload_id: upload_id.clone(),
+                claim_token,
+                row: Box::new(obj_row(
+                    bucket.name.as_str(),
+                    key.as_str(),
+                    "assembled-v1",
+                    1,
+                )),
+                precondition: Precondition::default(),
+                replication: Vec::new(),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, MetaError::InvalidObjectLockState));
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM multipart_uploads WHERE id=?1",
+                params![upload_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            status, "completing",
+            "the rejected legacy session must remain available for release/abort"
+        );
+        let versions: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM object_versions WHERE bucket_name=?1 AND key=?2",
+                params![bucket.name.as_str(), key.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(versions, 0);
     }
 }

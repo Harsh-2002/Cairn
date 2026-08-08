@@ -13,6 +13,10 @@ is cheap to construct and safe to run from many workers at once.
 - `sink.rs` — `HttpS3Sink`: the production sink; SigV4-signed `PUT`/`DELETE` to a remote
   S3-compatible endpoint over http **or** https (one `https_or_http` connector). Owns error
   classification, per-target TLS trust, per-source→dest bucket routing, and `sink_for_target`.
+  Every constructor requires a clone of the one process-wide `ReplicationSinkRuntime`: its
+  weighted byte semaphore is shared across all workers/targets, and its single delivery deadline
+  spans request upload, response head, and the capped response drain. Never construct one runtime
+  per worker, drain, bucket, or target.
   `stream_object` is the **operator-audit-only** read-back (`cairn replication audit --verify`): the
   drain path never reads what it wrote, and it exists because a corrupt replica is exactly the right
   size and the ETag differs even for a correct one — only the bytes distinguish them. It streams the
@@ -26,6 +30,8 @@ is cheap to construct and safe to run from many workers at once.
   `seal_target`/`open_target`/`parse_targets`/`resolve_target`. The replication secret-at-rest seam.
 - `config.rs` — the S3 `<ReplicationConfiguration>` XML **parser** + `ReplicationRule`/`Filter`/
   `Destination` types. NOT env config — the `CAIRN_REPLICATION_*` knobs live in `cairn-server`.
+  Its quick-xml SAX driver coalesces text/CDATA/reference events and accepts only numeric references
+  plus XML's predefined entities; unknown/custom entities are malformed.
 - `backoff.rs` — `next_backoff`: pure deterministic exponential backoff.
 
 ## Invariants & rules
@@ -50,13 +56,14 @@ is cheap to construct and safe to run from many workers at once.
   request forever.
 - **Ordering deferral is not a failure** — `DeferReplication` reschedules without incrementing
   `attempts`.
-- **Ship PLAINTEXT: resolve the version's DEK before reading its body.** `resolve_dek` unseals
-  `row.sse_descriptor` via `cairn_types::sse::open_dek` and `put_object` reads through
-  `open_raw(BlobCipher::from_dek(dek))`. Reading an encrypted version as `BlobCipher::KnownPlaintext`
-  would return the stored **ciphertext at exactly the plaintext length** — the destination cannot
-  tell (it has no Content-MD5 to check, and a multipart source's composite ETag is unverifiable), so
-  the mirror ends up holding intact-looking garbage. The old DEK-less `open` that made this a
-  one-character mistake is deleted (Stage 3); the reader now forces you to name the cipher. Resolve
+- **Ship PLAINTEXT: resolve the version's cipher declaration before reading its body.** `resolve_dek`
+  parses `row.sse_descriptor` via `cairn_types::sse::open_blob_cipher`, producing a DEK plus the
+  metadata-backed CRNB expectation, and `put_object` passes it directly to `open_raw`. Reading an
+  encrypted version as `BlobCipher::KnownPlaintext` would return the stored **ciphertext at exactly
+  the plaintext length** — the destination cannot tell (it has no Content-MD5 to check, and a
+  multipart source's composite ETag is unverifiable), so the mirror ends up holding intact-looking
+  garbage. The reader forces the caller to name plaintext, legacy v2, or authenticated v3, and
+  rejects a file whose version does not match that trusted metadata declaration. Resolve
   per read; never cache a DEK across passes (the re-wrap worker re-seals descriptors underneath us).
 - **A DEK failure is a LOCAL condition and must say so.** DEK resolution happens in `process_entry`
   (not inside `put_object`) precisely so the failure is classified with its cause statically known:
@@ -121,8 +128,12 @@ is cheap to construct and safe to run from many workers at once.
 
 ## Notes
 - `HttpS3Sink` buffers the whole body in memory to hash it for the signed-payload PUT; streaming
-  `UNSIGNED-PAYLOAD` is a future extension. It does NOT implement `ReplicationSink` (only
-  `BucketRoutedSink`) so the route.rs blanket impl stays coherent.
+  `UNSIGNED-PAYLOAD` is a future extension. The fixed 2 GiB per-object cap is not the aggregate
+  bound: admission is the object's declared logical size against the shared
+  `CAIRN_REPLICATION_BUFFER_BUDGET_BYTES`, and collection must match that size exactly. Hold the
+  owned permit through the bounded response drain so cancellation/timeouts release it by RAII.
+  Destination diagnostics are capped at 8 KiB including the truncation marker. It does NOT
+  implement `ReplicationSink` (only `BucketRoutedSink`) so the route.rs blanket impl stays coherent.
 - `backfill_outbox_entries` stamps `BACKFILL_PLACEHOLDER_BUCKET` — the caller **must** substitute
   the real source bucket before committing.
 - `insecure_skip_verify` defeats TLS auth (testing only); mutually exclusive with a custom CA.

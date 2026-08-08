@@ -24,6 +24,7 @@ rustls = { workspace = true, features = ["aws_lc_rs", "tls12"] }
 tokio = { workspace = true, features = ["time"] }
 http.workspace = true
 http-body-util.workspace = true
+zeroize.workspace = true
 sha2.workspace = true
 hmac.workspace = true
 hex.workspace = true

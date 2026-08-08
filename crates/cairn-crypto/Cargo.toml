@@ -12,6 +12,11 @@ workspace = true
 [dependencies]
 cairn-types.workspace = true
 aes-gcm.workspace = true
+# Feature-unifying edges: AES-GCM's transitive primitives expose independent `zeroize`
+# features. Keeping them direct makes round-key and authentication-state scrubbing explicit.
+aes.workspace = true
+ghash.workspace = true
+polyval.workspace = true
 hmac.workspace = true
 sha2.workspace = true
 subtle.workspace = true

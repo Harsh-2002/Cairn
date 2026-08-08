@@ -7,8 +7,9 @@ network**. Depends only on `cairn-types`; the caller assembles the `AuthzInput`.
 ## Layout (`src/`)
 - `lib.rs` — `PolicyEngine` (the `cairn_types::AuthorizationEngine` impl) + the free `evaluate`
   fn. Owns the **fixed evaluation order** and the BPA gate (`block_public_access_denies`).
-- `parse.rs` — `parse_policy` (bucket policy, principal required) and `parse_user_policy`
-  (identity/per-user policy, principal-less). The `parse_policy` fuzz target. Bad shapes →
+- `parse.rs` — `parse_policy` (bucket policy, principal required), `parse_user_policy`
+  (identity/per-user policy, principal-less), and `intersect_admin_session_policy` (an optional
+  session boundary plus every parent identity Deny). The `parse_policy` fuzz target. Bad shapes →
   `Error::MalformedPolicy`.
 - `condition.rs` — condition operators + key resolution against `RequestContext`.
 - `acl.rs` — `expand_canned_acl` (canned-name → `Acl`) and `permission_satisfies`
@@ -21,6 +22,10 @@ network**. Depends only on `cairn-types`; the caller assembles the `AuthzInput`.
   (a) owner/admin → Allow **unless** an explicit Deny matches (bucket policy OR the requester's
   own identity policy — an identity Deny binds even the owner); (b) BPA gate; (c) explicit Deny
   anywhere → Deny; (d) any Allow (bucket policy, identity policy, or ACL); (e) default Deny.
+- **Privilege never erases identity.** `RequesterClass::OwnerOrAdmin(UserId)` carries the stable id
+  through the baseline-allow path. Named `Principal` Denies match that id, and `NotPrincipal`
+  Denies match its complement exactly; never collapse privileged users into an identity-less
+  class.
 - **Fail-closed by default.** An unrecognised condition key or operator makes the statement
   **not match** — an unknown condition can never broaden access. Default outcome is Deny. An
   *absent* (recognised) key makes a **negated** operator match (AWS semantics, `operator_is_negated`
@@ -47,6 +52,9 @@ network**. Depends only on `cairn-types`; the caller assembles the `AuthzInput`.
   arm here or ACL grants silently won't cover it.
 - A new condition key/operator must be handled in `condition.rs` **and** parse-accepted in
   `parse.rs`, or policies using it fail to parse / silently don't match.
+- `aws:SourceIp` resolves the address inside `ClientSource`; `Unavailable` is a recognized absent
+  key, never a proxy-IP fallback. Preserve the existing absent-key behavior for negated operators
+  so an explicit `Deny` with `NotIpAddress` remains active when provenance is lost.
 - Spec: `docs/auth.md` 15 (15.3 order, 15.5 policy language, 15.6 conditions, 15.7 ACLs).
   Sibling `cairn-auth` does authentication (SigV4/Bearer) and builds the `AuthzInput`.
   See the root `../../CLAUDE.md`.

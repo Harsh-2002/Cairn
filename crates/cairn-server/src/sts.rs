@@ -8,18 +8,19 @@
 //! (`AuthChain::authenticate_sts`, no dev bypass, no session chaining); this module then computes
 //! the session's inline policy, mints the `CAIRNTMP…` credential, and renders the response XML.
 //!
-//! Policy semantics (no policy-intersection engine exists, so nothing here can mint broader than the
-//! caller):
-//! - **`GetSessionToken`** inherits the caller's *effective* access — their identity policy plus a
-//!   synthesized `Allow s3:*` over the buckets they own (never bucket-policy grants to the parent,
-//!   matching the engine's session rule). An Administrator gets a full-S3 policy.
+//! Policy semantics (the stored session policy is a snapshot of the caller's effective identity
+//! boundary, so nothing here can mint broader than the caller):
+//! - **`GetSessionToken`** inherits the caller's effective access — a member's identity policy plus
+//!   synthesized ownership grants; an Administrator gets full S3 **plus every matching identity
+//!   Deny**, which continues to override the broad Allow.
 //! - **`AssumeRole`** requires `RoleArn`/`RoleSessionName` syntactically (recorded for audit only —
-//!   Cairn has no IAM roles); an inline `Policy` becomes the session policy **only** for an
-//!   Administrator, and a non-admin supplying one is denied (fail closed, no subset proof).
+//!   Cairn has no IAM roles); an Administrator's inline `Policy` is an additional permissions
+//!   boundary whose statements are combined with every parent identity Deny. A non-admin supplying
+//!   one is denied (general policy intersection is deliberately not approximated).
 //!
-//! Admin-derived sessions carry `Allow s3:*` but are structurally `is_session` — they never receive
-//! the owner/admin short-circuit (`cairn-protocol`'s authorize step), so a session can never reach
-//! the management API or bypass an explicit Deny.
+//! Admin-derived sessions are structurally `is_session` — they never receive the owner/admin
+//! short-circuit (`cairn-protocol`'s authorize step), so the snapshotted Denies and optional
+//! boundary are the complete grant and a session can never reach the management API.
 
 use crate::stack::AppStack;
 use cairn_crypto::SystemClock;
@@ -58,7 +59,8 @@ impl StsHttpResponse {
 /// A deferred STS failure: the status + code + message, rendered to the wire (with the request id)
 /// at the call site. Lets the pure helpers (`duration_secs`) and the store-touching `mint` signal a
 /// failure without threading the request id through every layer.
-struct StsError {
+#[derive(Debug)]
+pub(crate) struct StsError {
     status: u16,
     code: &'static str,
     message: String,
@@ -79,7 +81,8 @@ impl StsError {
 }
 
 /// Map an authentication failure onto the STS query-protocol error shape (the SDK keys retry/refresh
-/// off these codes). Every case is a client 4xx.
+/// off these codes). Credential failures are client 4xx; an identity-policy integrity/read failure
+/// is an opaque `500 InternalFailure`.
 pub(crate) fn auth_error_response(
     e: &cairn_types::error::AuthError,
     request_id: &str,
@@ -106,6 +109,11 @@ pub(crate) fn auth_error_response(
             400,
             "IncompleteSignature",
             "the request signature is missing or malformed",
+        ),
+        AuthError::PolicyUnavailable => (
+            500,
+            "InternalFailure",
+            "the caller's authorization policy could not be resolved",
         ),
     };
     StsHttpResponse::error(status, code, msg, request_id)
@@ -150,11 +158,11 @@ async fn get_session_token(
         Ok(d) => d,
         Err(e) => return e.render(request_id),
     };
-    let policy_json = if principal.role == Role::Administrator {
-        full_s3_policy()
-    } else {
-        effective_access_policy(&stack.meta, &principal.user_id).await
-    };
+    let policy_json =
+        match effective_access_policy(&stack.meta, &principal.user_id, principal.role).await {
+            Ok(policy) => policy,
+            Err(e) => return e.render(request_id),
+        };
     match mint(stack, principal, &policy_json, duration).await {
         Ok(minted) => StsHttpResponse {
             status: 200,
@@ -214,9 +222,21 @@ async fn assume_role(
 
     let is_admin = principal.role == Role::Administrator;
     let policy_json = match assume_role_policy_outcome(is_admin, form_get(form, "Policy")) {
-        PolicyOutcome::Ready(json) => json,
-        // No policy: inherit the caller's effective access (only reachable for a non-admin here).
-        PolicyOutcome::Effective => effective_access_policy(&stack.meta, &principal.user_id).await,
+        // An administrator's inline policy is an additional boundary, never a replacement for the
+        // parent identity Denies.
+        PolicyOutcome::Ready(json) => {
+            match administrator_bounded_policy(&stack.meta, &principal.user_id, &json).await {
+                Ok(policy) => policy,
+                Err(e) => return e.render(request_id),
+            }
+        }
+        // No policy: inherit the caller's effective access.
+        PolicyOutcome::Effective => {
+            match effective_access_policy(&stack.meta, &principal.user_id, principal.role).await {
+                Ok(policy) => policy,
+                Err(e) => return e.render(request_id),
+            }
+        }
         // A non-admin cannot supply an inline Policy: with no intersection engine we cannot prove it
         // is a subset of their access, so we fail closed rather than risk widening.
         PolicyOutcome::DeniedNonAdminPolicy => {
@@ -348,9 +368,9 @@ async fn mint(
 /// The policy the session receives on `AssumeRole`, decided purely from the admin flag and the
 /// presence of an inline `Policy` (extracted so the escalation guard is unit-testable).
 enum PolicyOutcome {
-    /// A ready inline-policy JSON string (an admin's validated `Policy`, or admin full-S3).
+    /// An administrator's validated inline permissions boundary.
     Ready(String),
-    /// Inherit the caller's effective access (a non-admin with no inline `Policy`).
+    /// Inherit the caller's effective access (either role, no inline `Policy`).
     Effective,
     /// A non-admin supplied an inline `Policy` — denied (fail closed; no subset proof).
     DeniedNonAdminPolicy,
@@ -366,80 +386,189 @@ fn assume_role_policy_outcome(is_admin: bool, inline_policy: Option<&str>) -> Po
             Ok(_) => PolicyOutcome::Ready(raw.to_owned()),
             Err(e) => PolicyOutcome::Malformed(e.to_string()),
         },
-        (true, None) => PolicyOutcome::Ready(full_s3_policy()),
+        (true, None) => PolicyOutcome::Effective,
         (false, Some(_)) => PolicyOutcome::DeniedNonAdminPolicy,
         (false, None) => PolicyOutcome::Effective,
     }
 }
 
-/// The caller's *effective* access as a session inline policy (ARCH 14): the raw identity-policy
-/// statements (if any) plus a synthesized `Allow s3:*` over every bucket the caller owns. It never
-/// widens — every statement is one the caller already holds — and mirrors the engine's session rule
-/// (bucket-policy grants to the parent are NOT inherited). A caller with no identity policy and no
-/// owned buckets gets an empty (inert) statement list, which is the honest reflection of their
-/// session-scoped access.
-async fn effective_access_policy(meta: &Arc<dyn MetadataStore>, user_id: &UserId) -> String {
-    let mut statements: Vec<Value> = Vec::new();
-    // Identity-policy statements, copied verbatim (the store validated them at SetUserPolicy time).
-    if let Ok(Some(raw)) = meta.get_user_policy(user_id).await {
-        if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&raw) {
-            match map.get("Statement") {
-                Some(Value::Array(arr)) => statements.extend(arr.iter().cloned()),
-                Some(obj @ Value::Object(_)) => statements.push(obj.clone()),
-                _ => {}
-            }
-        }
+/// Snapshot the caller's effective access into a session inline policy (ARCH 14).
+///
+/// Members receive their identity-policy statements plus synthesized ownership grants. An
+/// administrator receives the implicit full-S3 baseline as an explicit Allow **plus only the Deny
+/// statements** from their identity policy: ordinary identity Allows do not restrict an
+/// administrator in the live authorization model, while matching Denies do. Bucket-policy/ACL
+/// grants are never inherited by a session.
+async fn effective_access_policy(
+    meta: &Arc<dyn MetadataStore>,
+    user_id: &UserId,
+    role: Role,
+) -> Result<String, StsError> {
+    if role == Role::Administrator {
+        let parent = stored_identity_policy(meta, user_id).await?;
+        return cairn_authz::intersect_admin_session_policy(parent.as_deref(), None).map_err(|e| {
+            tracing::warn!(
+                user_id = %user_id,
+                error = ?e,
+                "refusing session mint because the administrator policy could not be composed"
+            );
+            policy_resolution_error()
+        });
     }
-    // A synthesized owner grant over the caller's owned buckets.
-    if let Some(synth) = owned_buckets_statement(meta, user_id).await {
+
+    let mut statements = stored_identity_statements(meta, user_id).await?;
+    // A synthesized owner grant over the member's owned buckets. Administrators use the shared
+    // full-S3-plus-parent-Denies composer and do not need an ownership listing.
+    if let Some(synth) = owned_buckets_statement(meta, user_id).await? {
         statements.push(synth);
     }
+    render_session_policy(user_id, statements)
+}
+
+/// Apply an administrator's inline `AssumeRole` policy as an additional permissions boundary.
+///
+/// The inline policy supplies the only Allows; every explicit Deny from the administrator's live
+/// identity policy is appended and therefore overrides those Allows in the ordinary policy engine.
+/// Since the administrator baseline is "all S3 except identity Denies", this is the exact
+/// intersection without trying to solve general policy-language intersection for members.
+pub(crate) async fn administrator_bounded_policy(
+    meta: &Arc<dyn MetadataStore>,
+    user_id: &UserId,
+    boundary_json: &str,
+) -> Result<String, StsError> {
+    let parent = stored_identity_policy(meta, user_id).await?;
+    cairn_authz::intersect_admin_session_policy(parent.as_deref(), Some(boundary_json)).map_err(
+        |e| {
+            tracing::warn!(
+                user_id = %user_id,
+                error = ?e,
+                "refusing session mint because the administrator boundary could not be composed"
+            );
+            policy_resolution_error()
+        },
+    )
+}
+
+/// Read the caller's stored identity-policy document. The metadata database is a trust boundary:
+/// a read failure aborts every mint surface and can never be interpreted as policy absence.
+async fn stored_identity_policy(
+    meta: &Arc<dyn MetadataStore>,
+    user_id: &UserId,
+) -> Result<Option<String>, StsError> {
+    meta.get_user_policy(user_id).await.map_err(|e| {
+        tracing::warn!(
+            user_id = %user_id,
+            error = ?e,
+            "refusing session mint because the caller policy could not be loaded"
+        );
+        policy_resolution_error()
+    })
+}
+
+/// Read and validate the caller's stored identity-policy statements. Although the control plane
+/// validates writes, the metadata database is a trust boundary: any read/parse/shape failure aborts
+/// minting, never becomes policy absence.
+async fn stored_identity_statements(
+    meta: &Arc<dyn MetadataStore>,
+    user_id: &UserId,
+) -> Result<Vec<Value>, StsError> {
+    let stored_policy = stored_identity_policy(meta, user_id).await?;
+    let Some(raw) = stored_policy else {
+        return Ok(Vec::new());
+    };
+    cairn_authz::parse_user_policy(&raw).map_err(|e| {
+        tracing::warn!(
+            user_id = %user_id,
+            error = ?e,
+            "refusing session mint because the stored caller policy is malformed"
+        );
+        policy_resolution_error()
+    })?;
+    policy_statement_values(&raw).ok_or_else(|| {
+        tracing::warn!(
+            user_id = %user_id,
+            "refusing session mint because the stored caller policy has an invalid statement shape"
+        );
+        policy_resolution_error()
+    })
+}
+
+/// Extract the raw Statement object(s) from an already-validated identity-policy document.
+fn policy_statement_values(raw: &str) -> Option<Vec<Value>> {
+    let Value::Object(map) = serde_json::from_str::<Value>(raw).ok()? else {
+        return None;
+    };
+    match map.get("Statement") {
+        Some(Value::Array(arr)) => Some(arr.clone()),
+        Some(obj @ Value::Object(_)) => Some(vec![obj.clone()]),
+        _ => None,
+    }
+}
+
+/// Render and defensively validate the one policy persisted on a session row.
+fn render_session_policy(user_id: &UserId, statements: Vec<Value>) -> Result<String, StsError> {
     let doc = serde_json::json!({
         "Version": "2012-10-17",
         "Statement": statements,
     })
     .to_string();
-    // Defensive: the merged document must be a valid user policy (the consumption path parses it). If
-    // an unexpected identity statement broke it, fall back to owned-buckets-only rather than store a
-    // policy that would fail closed to nothing.
-    if cairn_authz::parse_user_policy(&doc).is_ok() {
-        doc
-    } else {
-        let statements: Vec<Value> = owned_buckets_statement(meta, user_id)
-            .await
-            .into_iter()
-            .collect();
-        serde_json::json!({ "Version": "2012-10-17", "Statement": statements }).to_string()
-    }
+    // Defensive: the merged document must remain valid. Falling back to only the synthesized owner
+    // grant would erase identity Denies and widen the minted credential, so any merge failure aborts.
+    cairn_authz::parse_user_policy(&doc).map_err(|e| {
+        tracing::warn!(
+            user_id = %user_id,
+            error = ?e,
+            "refusing session mint because the effective policy could not be synthesized"
+        );
+        policy_resolution_error()
+    })?;
+    Ok(doc)
 }
 
 /// The synthesized `Allow s3:*` statement over the caller's owned buckets (`None` when they own
 /// none), the owner half of the effective-access policy.
-async fn owned_buckets_statement(meta: &Arc<dyn MetadataStore>, user_id: &UserId) -> Option<Value> {
-    let buckets = meta.list_buckets(Some(user_id)).await.ok()?;
+async fn owned_buckets_statement(
+    meta: &Arc<dyn MetadataStore>,
+    user_id: &UserId,
+) -> Result<Option<Value>, StsError> {
+    let buckets = meta.list_buckets(Some(user_id)).await.map_err(|e| {
+        tracing::warn!(
+            user_id = %user_id,
+            error = ?e,
+            "refusing session mint because owned buckets could not be listed"
+        );
+        policy_resolution_error()
+    })?;
     let mut resources: Vec<String> = Vec::with_capacity(buckets.len() * 2);
     for b in &buckets {
         resources.push(format!("arn:aws:s3:::{}", b.name.as_str()));
         resources.push(format!("arn:aws:s3:::{}/*", b.name.as_str()));
     }
     if resources.is_empty() {
-        return None;
+        return Ok(None);
     }
-    Some(serde_json::json!({
+    Ok(Some(serde_json::json!({
         "Effect": "Allow",
         "Action": "s3:*",
         "Resource": resources,
-    }))
+    })))
 }
 
-/// A full-S3 inline policy (`Allow s3:* on *`) for an administrator-derived session. The session is
-/// still structurally `is_session`, so it never gets the owner/admin short-circuit.
+/// Fixed, non-sensitive STS mapping for policy resolution failures. Detailed causes are logged at
+/// the call site; neither metadata engine strings nor stored-policy details cross the wire.
+fn policy_resolution_error() -> StsError {
+    StsError::new(
+        500,
+        "InternalFailure",
+        "the caller's authorization policy could not be resolved",
+    )
+}
+
+/// A full-S3 inline policy (`Allow s3:* on *`) used by the regression tests.
+#[cfg(test)]
 fn full_s3_policy() -> String {
-    serde_json::json!({
-        "Version": "2012-10-17",
-        "Statement": [{ "Effect": "Allow", "Action": "s3:*", "Resource": "*" }],
-    })
-    .to_string()
+    cairn_authz::intersect_admin_session_policy(None, None)
+        .expect("the built-in administrator baseline is valid")
 }
 
 /// Parse `DurationSeconds` (per-action default when absent), enforcing the `900..=43200` bound. A
@@ -596,10 +725,10 @@ mod tests {
             assume_role_policy_outcome(false, None),
             PolicyOutcome::Effective
         ));
-        // An admin without a Policy gets full-S3.
+        // An admin without a Policy inherits effective access so parent Denies are snapshotted.
         assert!(matches!(
             assume_role_policy_outcome(true, None),
-            PolicyOutcome::Ready(_)
+            PolicyOutcome::Effective
         ));
         // An admin with a valid inline Policy uses it verbatim.
         let valid = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*"}]}"#;
@@ -652,7 +781,9 @@ mod tests {
         meta.submit(owned_bucket("theirs", "someone-else"))
             .await
             .unwrap();
-        let policy = effective_access_policy(&meta, &UserId("member".to_owned())).await;
+        let policy = effective_access_policy(&meta, &UserId("member".to_owned()), Role::Member)
+            .await
+            .expect("effective policy");
         let parsed = cairn_authz::parse_user_policy(&policy).expect("valid user policy");
         assert_eq!(
             parsed.statements.len(),
@@ -671,7 +802,9 @@ mod tests {
     async fn effective_access_no_buckets_no_policy_is_inert() {
         let meta: Arc<dyn MetadataStore> =
             Arc::new(cairn_types::testing::InMemoryMetadataStore::new());
-        let policy = effective_access_policy(&meta, &UserId("nobody".to_owned())).await;
+        let policy = effective_access_policy(&meta, &UserId("nobody".to_owned()), Role::Member)
+            .await
+            .expect("effective policy");
         let parsed = cairn_authz::parse_user_policy(&policy).expect("valid user policy");
         assert!(
             parsed.statements.is_empty(),
@@ -693,7 +826,9 @@ mod tests {
         })
         .await
         .unwrap();
-        let policy = effective_access_policy(&meta, &UserId("member".to_owned())).await;
+        let policy = effective_access_policy(&meta, &UserId("member".to_owned()), Role::Member)
+            .await
+            .expect("effective policy");
         let parsed = cairn_authz::parse_user_policy(&policy).expect("valid user policy");
         assert_eq!(
             parsed.statements.len(),
@@ -707,6 +842,245 @@ mod tests {
         assert!(
             policy.contains("arn:aws:s3:::owned/*"),
             "owned-bucket synth present"
+        );
+    }
+
+    const ADMIN_RESTRICTIONS: &str = r#"{
+        "Version":"2012-10-17",
+        "Statement":[
+            {
+                "Effect":"Deny",
+                "Action":"s3:DeleteObject",
+                "Resource":"arn:aws:s3:::secure-bucket/private/*"
+            },
+            {
+                "Effect":"Deny",
+                "Action":"s3:GetObject",
+                "Resource":"arn:aws:s3:::secure-bucket/secret/*"
+            },
+            {
+                "Effect":"Allow",
+                "Action":"s3:GetObject",
+                "Resource":"arn:aws:s3:::only-an-explicit-admin-allow/*"
+            }
+        ]
+    }"#;
+
+    fn session_decision(
+        policy_json: &str,
+        action: cairn_types::Action,
+        key: &str,
+    ) -> cairn_types::Decision {
+        use cairn_types::{
+            AuthzInput, BucketName, ClientSource, ObjectKey, OwnershipMode, PublicAccessBlock,
+            RequestContext, RequesterClass, Resource,
+        };
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let policy = cairn_authz::parse_user_policy(policy_json).expect("valid session policy");
+        cairn_authz::evaluate(&AuthzInput {
+            requester: RequesterClass::AuthenticatedMember(UserId("admin".to_owned())),
+            is_session: true,
+            action,
+            resource: Resource::Object {
+                bucket: BucketName::parse("secure-bucket").unwrap(),
+                key: ObjectKey::parse(key).unwrap(),
+            },
+            bucket_owner: UserId("admin".to_owned()),
+            account_bpa: PublicAccessBlock::default(),
+            bucket_bpa: PublicAccessBlock::default(),
+            policy: None,
+            user_policy: Some(policy),
+            bucket_acl: None,
+            object_acl: None,
+            ownership_mode: OwnershipMode::BucketOwnerEnforced,
+            context: RequestContext {
+                source: ClientSource::Direct(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+                secure_transport: true,
+                referer: None,
+                user_agent: None,
+                now: Timestamp(1),
+                prefix: None,
+                delimiter: None,
+                max_keys: None,
+                canned_acl: None,
+                content_sha256: None,
+                version_id: None,
+                existing_tags: Vec::new(),
+                request_tags: Vec::new(),
+            },
+        })
+    }
+
+    #[tokio::test]
+    async fn get_session_token_admin_effective_policy_preserves_parent_denies() {
+        use cairn_types::{Action, Decision, DenyReason};
+
+        let meta: Arc<dyn MetadataStore> =
+            Arc::new(cairn_types::testing::InMemoryMetadataStore::new());
+        meta.submit(Mutation::SetUserPolicy {
+            user_id: UserId("admin".to_owned()),
+            policy: Some(ADMIN_RESTRICTIONS.to_owned()),
+        })
+        .await
+        .unwrap();
+
+        let policy =
+            effective_access_policy(&meta, &UserId("admin".to_owned()), Role::Administrator)
+                .await
+                .expect("admin effective policy");
+        assert_eq!(
+            session_decision(&policy, Action::DeleteObject, "private/a"),
+            Decision::Deny(DenyReason::ExplicitPolicyDeny),
+            "GetSessionToken must preserve the parent DeleteObject Deny"
+        );
+        assert_eq!(
+            session_decision(&policy, Action::GetObject, "secret/a"),
+            Decision::Deny(DenyReason::ExplicitPolicyDeny),
+            "a distinct action/resource parent Deny must also survive"
+        );
+        assert_eq!(
+            session_decision(&policy, Action::GetObject, "private/a"),
+            Decision::Allow,
+            "the DeleteObject Deny must not spill into GetObject"
+        );
+        assert_eq!(
+            session_decision(&policy, Action::DeleteObject, "public/a"),
+            Decision::Allow,
+            "the private-prefix Deny must not spill outside its resource"
+        );
+    }
+
+    #[tokio::test]
+    async fn assume_role_admin_boundary_cannot_escape_parent_denies() {
+        use cairn_types::{Action, Decision, DenyReason};
+
+        let meta: Arc<dyn MetadataStore> =
+            Arc::new(cairn_types::testing::InMemoryMetadataStore::new());
+        meta.submit(Mutation::SetUserPolicy {
+            user_id: UserId("admin".to_owned()),
+            policy: Some(ADMIN_RESTRICTIONS.to_owned()),
+        })
+        .await
+        .unwrap();
+        let boundary = r#"{
+            "Version":"2012-10-17",
+            "Statement":[{
+                "Effect":"Allow",
+                "Action":["s3:GetObject","s3:DeleteObject"],
+                "Resource":"arn:aws:s3:::secure-bucket/*"
+            }]
+        }"#;
+
+        let policy = administrator_bounded_policy(&meta, &UserId("admin".to_owned()), boundary)
+            .await
+            .expect("bounded admin policy");
+        assert_eq!(
+            session_decision(&policy, Action::DeleteObject, "private/a"),
+            Decision::Deny(DenyReason::ExplicitPolicyDeny),
+            "an inline Allow cannot erase the parent's action/resource Deny"
+        );
+        assert_eq!(
+            session_decision(&policy, Action::GetObject, "secret/a"),
+            Decision::Deny(DenyReason::ExplicitPolicyDeny),
+            "all matching parent Denies are intersected into AssumeRole"
+        );
+        assert_eq!(
+            session_decision(&policy, Action::GetObject, "private/a"),
+            Decision::Allow,
+            "an allowed action inside the boundary remains usable"
+        );
+        assert_eq!(
+            session_decision(&policy, Action::DeleteObject, "public/a"),
+            Decision::Allow,
+            "the parent private-prefix Deny remains resource-scoped"
+        );
+    }
+
+    #[tokio::test]
+    async fn assume_role_admin_boundary_remains_least_privilege_without_parent_policy() {
+        use cairn_types::{Action, Decision, DenyReason};
+
+        let meta: Arc<dyn MetadataStore> =
+            Arc::new(cairn_types::testing::InMemoryMetadataStore::new());
+        let boundary = r#"{
+            "Version":"2012-10-17",
+            "Statement":[{
+                "Effect":"Allow",
+                "Action":"s3:GetObject",
+                "Resource":"arn:aws:s3:::secure-bucket/private/*"
+            }]
+        }"#;
+        let policy = administrator_bounded_policy(&meta, &UserId("admin".to_owned()), boundary)
+            .await
+            .expect("bounded admin policy");
+
+        assert_eq!(
+            session_decision(&policy, Action::GetObject, "private/a"),
+            Decision::Allow
+        );
+        assert_eq!(
+            session_decision(&policy, Action::DeleteObject, "private/a"),
+            Decision::Deny(DenyReason::DefaultDeny),
+            "the administrator full-S3 baseline must not be unioned into an inline boundary"
+        );
+        assert_eq!(
+            session_decision(&policy, Action::GetObject, "public/a"),
+            Decision::Deny(DenyReason::DefaultDeny),
+            "the resource boundary must remain narrow"
+        );
+    }
+
+    #[tokio::test]
+    async fn effective_access_policy_read_failure_aborts_sts_synthesis() {
+        let store = Arc::new(cairn_types::testing::InMemoryMetadataStore::new());
+        store.submit(owned_bucket("owned", "member")).await.unwrap();
+        // Only the policy lookup fails; owned-bucket listing remains healthy. The old behavior
+        // silently dropped the missing identity Deny and returned the synthesized owner grant.
+        store.set_fail_user_policy_reads(true);
+        let meta: Arc<dyn MetadataStore> = store;
+
+        let err = effective_access_policy(&meta, &UserId("member".to_owned()), Role::Member)
+            .await
+            .expect_err("policy read failure must abort STS mint synthesis");
+        assert_eq!(err.status, 500);
+        assert_eq!(err.code, "InternalFailure");
+        assert!(
+            !err.message.contains("injected"),
+            "metadata details must not cross the wire"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_stored_policy_aborts_sts_synthesis() {
+        let meta: Arc<dyn MetadataStore> =
+            Arc::new(cairn_types::testing::InMemoryMetadataStore::new());
+        meta.submit(owned_bucket("owned", "member")).await.unwrap();
+        meta.submit(Mutation::SetUserPolicy {
+            user_id: UserId("member".to_owned()),
+            policy: Some("{malformed".to_owned()),
+        })
+        .await
+        .unwrap();
+
+        let err = effective_access_policy(&meta, &UserId("member".to_owned()), Role::Member)
+            .await
+            .expect_err("malformed identity policy must abort STS mint synthesis");
+        assert_eq!(err.status, 500);
+        assert_eq!(err.code, "InternalFailure");
+    }
+
+    #[test]
+    fn policy_unavailable_auth_error_maps_to_opaque_sts_500() {
+        let response = auth_error_response(
+            &cairn_types::error::AuthError::PolicyUnavailable,
+            "request-id",
+        );
+        assert_eq!(response.status, 500);
+        assert!(response.body.contains("<Code>InternalFailure</Code>"));
+        assert!(
+            !response.body.contains("metadata"),
+            "internal metadata details must remain opaque"
         );
     }
 }

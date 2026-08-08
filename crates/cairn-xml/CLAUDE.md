@@ -23,8 +23,17 @@ domain types to and from the XML wire shapes S3 clients expect. Pure: depends on
 
 ## Notes
 - **Total parsing is the contract.** Every malformed body — bad UTF-8, unbalanced/unclosed tags,
-  missing fields, out-of-range numbers — MUST fold to `Error::MalformedXml`; parsers **never** panic.
-  Keep the protocol layer's error translator total.
+  missing fields, or a syntactically invalid numeric representation — MUST fold to
+  `Error::MalformedXml`; parsers **never** panic. A well-formed value outside a documented semantic
+  bound returns its typed client error instead: bucket default-retention zero/over-limit periods
+  are `InvalidArgument`. Keep the protocol layer's error translator total.
+- **Object Lock has no disable document.** `parse_object_lock_configuration` accepts only an
+  explicit `<ObjectLockEnabled>Enabled</ObjectLockEnabled>` value. Missing, empty, or alternate
+  values are malformed; never map them to `enabled=false`, because bucket enablement is immutable.
+- quick-xml 0.41 emits entity/character references as `Event::GeneralRef`; `drive` resolves only
+  numeric references and XML's five predefined entities, and rejects unknown/custom entities.
+  The unit suite also pins the dependency's large-attribute and namespace-declaration DoS guards
+  (RUSTSEC-2026-0194/-0195).
 - Parsers drive quick-xml through the `Sax`/`drive` helper, **not** `read_event` directly: quick-xml
   treats a body that hits EOF with elements still open as a *clean* EOF, so `drive` tracks element
   depth and rejects an unbalanced body. New parsers MUST go through `drive`.

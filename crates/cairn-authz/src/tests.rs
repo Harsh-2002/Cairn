@@ -5,9 +5,9 @@ use cairn_types::authz::{
     ActionMatch, ActionPattern, Condition, ConditionOperator, PrincipalSpec, ResourceMatch,
 };
 use cairn_types::{
-    Acl, Action, AuthzInput, BucketName, Decision, DenyReason, Effect, Grant, Grantee, ObjectKey,
-    OwnershipMode, Permission, Policy, PublicAccessBlock, RequestContext, RequesterClass, Resource,
-    Statement, Timestamp, UserId,
+    Acl, Action, AuthzInput, BucketName, ClientSource, Decision, DenyReason, Effect, Grant,
+    Grantee, ObjectKey, OwnershipMode, Permission, Policy, PublicAccessBlock, RequestContext,
+    RequesterClass, Resource, Statement, Timestamp, UserId,
 };
 use std::net::{IpAddr, Ipv4Addr};
 
@@ -24,7 +24,7 @@ fn object_resource() -> Resource {
 
 fn ctx() -> RequestContext {
     RequestContext {
-        source: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)),
+        source: ClientSource::Direct(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))),
         secure_transport: true,
         referer: None,
         user_agent: Some("aws-cli/2.0".to_owned()),
@@ -256,7 +256,7 @@ fn user_policy_deny_overrides_bucket_allow() {
 #[test]
 fn admin_full_access_without_user_policy() {
     let mut input = base_input();
-    input.requester = RequesterClass::OwnerOrAdmin;
+    input.requester = RequesterClass::OwnerOrAdmin(uid("admin"));
     input.user_policy = None;
     input.action = Action::PutObject;
     assert_eq!(evaluate(&input), Decision::Allow);
@@ -266,7 +266,7 @@ fn admin_full_access_without_user_policy() {
 fn user_policy_deny_binds_owner() {
     // An identity Deny binds even an owner/admin acting as themselves (AWS semantics).
     let mut input = base_input();
-    input.requester = RequesterClass::OwnerOrAdmin;
+    input.requester = RequesterClass::OwnerOrAdmin(uid("owner"));
     input.user_policy = Some(policy(vec![user_stmt(Effect::Deny, "s3:GetObject")]));
     input.action = Action::GetObject;
     assert_eq!(
@@ -338,14 +338,14 @@ fn parse_user_policy_allows_missing_principal() {
 #[test]
 fn admin_allowed() {
     let mut input = base_input();
-    input.requester = RequesterClass::OwnerOrAdmin;
+    input.requester = RequesterClass::OwnerOrAdmin(uid("admin"));
     assert_eq!(evaluate(&input), Decision::Allow);
 }
 
 #[test]
 fn owner_allowed_even_with_no_policy_or_acl() {
     let mut input = base_input();
-    input.requester = RequesterClass::OwnerOrAdmin;
+    input.requester = RequesterClass::OwnerOrAdmin(uid("owner"));
     input.policy = None;
     assert_eq!(evaluate(&input), Decision::Allow);
 }
@@ -353,11 +353,57 @@ fn owner_allowed_even_with_no_policy_or_acl() {
 #[test]
 fn owner_can_be_locked_out_by_explicit_deny() {
     let mut input = base_input();
-    input.requester = RequesterClass::OwnerOrAdmin;
+    input.requester = RequesterClass::OwnerOrAdmin(uid("owner"));
     input.policy = Some(policy(vec![deny_get_statement(PrincipalSpec::Any)]));
     assert_eq!(
         evaluate(&input),
         Decision::Deny(DenyReason::ExplicitPolicyDeny)
+    );
+}
+
+#[test]
+fn named_principal_deny_binds_owner_or_admin_identity() {
+    let mut input = base_input();
+    input.requester = RequesterClass::OwnerOrAdmin(uid("alice"));
+    input.policy = Some(policy(vec![deny_get_statement(PrincipalSpec::Users(
+        vec![uid("alice")],
+    ))]));
+    assert_eq!(
+        evaluate(&input),
+        Decision::Deny(DenyReason::ExplicitPolicyDeny),
+        "a named Deny must bind the same privileged user"
+    );
+
+    input.policy = Some(policy(vec![deny_get_statement(PrincipalSpec::Users(
+        vec![uid("bob")],
+    ))]));
+    assert_eq!(
+        evaluate(&input),
+        Decision::Allow,
+        "a Deny naming another user must not bind alice"
+    );
+}
+
+#[test]
+fn named_not_principal_deny_uses_privileged_identity() {
+    let mut input = base_input();
+    input.requester = RequesterClass::OwnerOrAdmin(uid("alice"));
+    input.policy = Some(policy(vec![deny_get_statement(PrincipalSpec::NotUsers(
+        vec![uid("bob")],
+    ))]));
+    assert_eq!(
+        evaluate(&input),
+        Decision::Deny(DenyReason::ExplicitPolicyDeny),
+        "alice is not bob, so NotPrincipal bob must bind alice"
+    );
+
+    input.policy = Some(policy(vec![deny_get_statement(PrincipalSpec::NotUsers(
+        vec![uid("alice")],
+    ))]));
+    assert_eq!(
+        evaluate(&input),
+        Decision::Allow,
+        "NotPrincipal alice explicitly excludes alice"
     );
 }
 
@@ -737,7 +783,7 @@ mod props {
 
     fn arb_requester() -> impl Strategy<Value = RequesterClass> {
         prop_oneof![
-            Just(RequesterClass::OwnerOrAdmin),
+            "[a-z]{1,6}".prop_map(|s| RequesterClass::OwnerOrAdmin(uid(&s))),
             Just(RequesterClass::Anonymous),
             "[a-z]{1,6}".prop_map(|s| RequesterClass::AuthenticatedMember(uid(&s))),
         ]

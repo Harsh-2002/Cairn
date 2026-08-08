@@ -76,7 +76,8 @@ export type ShareStatus = "active" | "expired" | "revoked";
 
 /** A persistent object-share (ARCH 15.8). */
 export interface ShareRecord {
-  token: string;
+  /** Stable, non-secret management identifier. The bearer token is returned only at mint. */
+  id: string;
   bucket: string;
   key: string;
   version_id: string | null;
@@ -97,8 +98,11 @@ export interface CreateShareReq {
 }
 
 export interface CreateShareResp {
+  /** Stable identifier used for subsequent get/revoke operations. */
+  id: string;
+  /** Bearer capability returned exactly once; never present in list/get responses. */
   token: string;
-  url: string; // path "/share/{token}"
+  url: string; // absolute data-origin URL
   expires_at_ms: number | null;
 }
 
@@ -107,10 +111,20 @@ export interface ShareListResp {
 }
 
 /** Presigned-URL minting request (interoperable S3 link). */
+export interface PresignSession {
+  access_key_id: string;
+  session_token: string;
+  expires_at_ms: number;
+}
+
 export interface PresignReq {
   key: string;
-  method?: "GET" | "PUT";
-  expires_in_secs: number; // 1..=604800
+  method?: "GET" | "HEAD" | "PUT" | "POST" | "DELETE";
+  expires_in_secs: number; // 1..=43200 (backing temporary-session ceiling)
+  query?: [string, string][];
+  headers?: [string, string][];
+  origin?: string;
+  session?: Pick<PresignSession, "access_key_id" | "session_token">;
   version_id?: string | null;
   response_content_disposition?: string | null;
   response_content_type?: string | null;
@@ -121,6 +135,7 @@ export interface PresignResp {
   url: string; // absolute
   expires_at_ms: number;
   absolute: true;
+  session: PresignSession;
 }
 
 export interface BucketConfigResp {
@@ -409,6 +424,7 @@ export interface ImportJobDetail extends ImportJobEntry {
 
 export interface ImportListResp {
   jobs: ImportJobEntry[];
+  next_cursor: string | null;
 }
 
 // Usage-analytics metrics (the Metrics view). Mirrors the management API's
@@ -465,6 +481,7 @@ export interface RequestMetricsResp {
 
 export interface DeletePrefixError {
   key: string;
+  version_id: string;
   message: string;
 }
 

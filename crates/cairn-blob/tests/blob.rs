@@ -42,7 +42,7 @@ fn opts_encrypted(
         compression,
         size_ceiling: 100 * 1024 * 1024,
         content_type: content_type.to_owned(),
-        encryption: Some(dek),
+        encryption: Some(dek.into()),
         ..StageOptions::default()
     }
 }
@@ -52,10 +52,17 @@ async fn read_all(
     path: &StoragePath,
     range: Option<ByteRange>,
     compression: &CompressionDescriptor,
+    expected_logical_len: u64,
 ) -> Vec<u8> {
     use futures_util::StreamExt;
     let handle = store
-        .open_raw(path, range, BlobCipher::KnownPlaintext, compression)
+        .open_raw(
+            path,
+            range,
+            BlobCipher::KnownPlaintext,
+            compression,
+            expected_logical_len,
+        )
         .await
         .unwrap();
     let mut out = Vec::new();
@@ -82,7 +89,14 @@ async fn uncompressed_roundtrip_and_etag() {
         CompressionDescriptor::Uncompressed
     ));
     assert_eq!(
-        read_all(&store, &staged.storage_path, None, &staged.compression).await,
+        read_all(
+            &store,
+            &staged.storage_path,
+            None,
+            &staged.compression,
+            staged.size_logical,
+        )
+        .await,
         b"hello world"
     );
     // A small uncompressed object is served inline by the small-object fast path (read whole in the
@@ -94,6 +108,7 @@ async fn uncompressed_roundtrip_and_etag() {
             None,
             BlobCipher::KnownPlaintext,
             &staged.compression,
+            staged.size_logical,
         )
         .await
         .unwrap();
@@ -118,7 +133,8 @@ async fn uncompressed_roundtrip_and_etag() {
             &store,
             &staged_big.storage_path,
             None,
-            &staged_big.compression
+            &staged_big.compression,
+            staged_big.size_logical,
         )
         .await,
         big
@@ -129,6 +145,7 @@ async fn uncompressed_roundtrip_and_etag() {
             None,
             BlobCipher::KnownPlaintext,
             &staged_big.compression,
+            staged_big.size_logical,
         )
         .await
         .unwrap();
@@ -165,6 +182,7 @@ async fn small_object_fast_path_ranged_reads_are_exact() {
             None,
             BlobCipher::KnownPlaintext,
             &staged.compression,
+            staged.size_logical,
         )
         .await
         .unwrap();
@@ -187,6 +205,7 @@ async fn small_object_fast_path_ranged_reads_are_exact() {
             &staged.storage_path,
             Some(range),
             &staged.compression,
+            staged.size_logical,
         )
         .await;
         assert_eq!(
@@ -200,6 +219,7 @@ async fn small_object_fast_path_ranged_reads_are_exact() {
                 Some(range),
                 BlobCipher::KnownPlaintext,
                 &staged.compression,
+                staged.size_logical,
             )
             .await
             .unwrap()
@@ -237,7 +257,14 @@ async fn uncompressed_blob_ending_in_crnb_magic_is_not_misdetected() {
         CompressionDescriptor::Uncompressed
     ));
     assert_eq!(
-        read_all(&store, &staged.storage_path, None, &staged.compression).await,
+        read_all(
+            &store,
+            &staged.storage_path,
+            None,
+            &staged.compression,
+            staged.size_logical,
+        )
+        .await,
         data,
         "an uncompressed blob colliding with the CRNB trailer must read back intact"
     );
@@ -267,7 +294,14 @@ async fn preallocated_write_roundtrips_and_size_is_exact() {
         "preallocation must not change the logical size"
     );
     assert_eq!(
-        read_all(&store, &staged.storage_path, None, &staged.compression).await,
+        read_all(
+            &store,
+            &staged.storage_path,
+            None,
+            &staged.compression,
+            staged.size_logical,
+        )
+        .await,
         data,
         "byte-identical round-trip through the preallocated path"
     );
@@ -288,7 +322,14 @@ async fn preallocated_write_roundtrips_and_size_is_exact() {
         "an over-declared content length must not pad the blob"
     );
     assert_eq!(
-        read_all(&store, &staged2.storage_path, None, &staged2.compression).await,
+        read_all(
+            &store,
+            &staged2.storage_path,
+            None,
+            &staged2.compression,
+            staged2.size_logical,
+        )
+        .await,
         short
     );
 }
@@ -334,7 +375,14 @@ async fn compression_is_transparent_and_etag_invariant() {
 
     // Full read is transparent.
     assert_eq!(
-        read_all(&store, &comp.storage_path, None, &comp.compression).await,
+        read_all(
+            &store,
+            &comp.storage_path,
+            None,
+            &comp.compression,
+            comp.size_logical,
+        )
+        .await,
         data
     );
     // A range starting mid-block near the end (the case block compression exists for).
@@ -343,7 +391,14 @@ async fn compression_is_transparent_and_etag_invariant() {
         length: 1234,
     };
     assert_eq!(
-        read_all(&store, &comp.storage_path, Some(range), &comp.compression).await,
+        read_all(
+            &store,
+            &comp.storage_path,
+            Some(range),
+            &comp.compression,
+            comp.size_logical,
+        )
+        .await,
         &data[5000..6234]
     );
     // A compressed read offers no zero-copy hint.
@@ -353,7 +408,8 @@ async fn compression_is_transparent_and_etag_invariant() {
                 &comp.storage_path,
                 Some(range),
                 BlobCipher::KnownPlaintext,
-                &comp.compression
+                &comp.compression,
+                comp.size_logical,
             )
             .await
             .unwrap()
@@ -368,10 +424,20 @@ async fn read_all_dek(
     range: Option<ByteRange>,
     dek: Option<[u8; 32]>,
     compression: &CompressionDescriptor,
+    expected_logical_len: u64,
 ) -> Result<Vec<u8>, cairn_types::error::BlobError> {
     use futures_util::StreamExt;
     let handle = store
-        .open_raw(path, range, BlobCipher::from_dek(dek), compression)
+        .open_raw(
+            path,
+            range,
+            match dek {
+                Some(dek) => BlobCipher::AuthenticatedV3(dek.into()),
+                None => BlobCipher::KnownPlaintext,
+            },
+            compression,
+            expected_logical_len,
+        )
         .await?;
     let mut out = Vec::new();
     let mut body = handle.body;
@@ -423,9 +489,16 @@ async fn encrypted_roundtrip_etag_invariant_and_ranged() {
 
     // Full read with the correct DEK returns the original bytes.
     assert_eq!(
-        read_all_dek(&store, &enc.storage_path, None, Some(dek), &enc.compression)
-            .await
-            .unwrap(),
+        read_all_dek(
+            &store,
+            &enc.storage_path,
+            None,
+            Some(dek),
+            &enc.compression,
+            enc.size_logical,
+        )
+        .await
+        .unwrap(),
         data
     );
     // A ranged read decrypts only the overlapping blocks.
@@ -439,7 +512,8 @@ async fn encrypted_roundtrip_etag_invariant_and_ranged() {
             &enc.storage_path,
             Some(range),
             Some(dek),
-            &enc.compression
+            &enc.compression,
+            enc.size_logical,
         )
         .await
         .unwrap(),
@@ -451,8 +525,9 @@ async fn encrypted_roundtrip_etag_invariant_and_ranged() {
             .open_raw(
                 &enc.storage_path,
                 None,
-                BlobCipher::Dek(dek),
-                &enc.compression
+                BlobCipher::AuthenticatedV3(dek.into()),
+                &enc.compression,
+                enc.size_logical,
             )
             .await
             .unwrap()
@@ -470,9 +545,10 @@ async fn encrypted_roundtrip_etag_invariant_and_ranged() {
 #[tokio::test]
 async fn encrypted_blob_on_disk_is_encrypted_variant_and_no_zero_copy() {
     // The 34-byte CRNB trailer sits at the end of the file; the version byte is at trailer offset 4
-    // and `2` marks the encrypted variant (see `cairn-blob/src/compress.rs`).
+    // and `3` marks the current authenticated-metadata encrypted variant (see
+    // `cairn-blob/src/compress.rs`; legacy encrypted v2 remains readable).
     const TRAILER_LEN: usize = 34;
-    const VERSION_ENCRYPTED: u8 = 2;
+    const VERSION_ENCRYPTED: u8 = 3;
 
     let dir = tempfile::tempdir().unwrap();
     let store = LocalBlobStore::open(dir.path()).await.unwrap();
@@ -500,13 +576,20 @@ async fn encrypted_blob_on_disk_is_encrypted_variant_and_no_zero_copy() {
 
     // (1) Opening with the correct DEK decrypts back to the exact plaintext.
     assert_eq!(
-        read_all_dek(&store, &enc.storage_path, None, Some(dek), &enc.compression)
-            .await
-            .unwrap(),
+        read_all_dek(
+            &store,
+            &enc.storage_path,
+            None,
+            Some(dek),
+            &enc.compression,
+            enc.size_logical,
+        )
+        .await
+        .unwrap(),
         data
     );
 
-    // (2) The stored file on disk is the CRNB encrypted variant (version byte == 2).
+    // (2) The stored file on disk is the current CRNB encrypted variant (version byte == 3).
     let on_disk = dir.path().join(enc.storage_path.as_str());
     let raw = std::fs::read(&on_disk).unwrap();
     let trailer = &raw[raw.len() - TRAILER_LEN..];
@@ -518,20 +601,44 @@ async fn encrypted_blob_on_disk_is_encrypted_variant_and_no_zero_copy() {
 
     // (3) A DEK-less open FAILS — the reader refuses an encrypted container with no key rather than
     // handing back ciphertext or plaintext (fails closed).
-    let no_dek = read_all_dek(&store, &enc.storage_path, None, None, &enc.compression).await;
+    let no_dek = read_all_dek(
+        &store,
+        &enc.storage_path,
+        None,
+        None,
+        &enc.compression,
+        enc.size_logical,
+    )
+    .await;
     assert!(
         matches!(no_dek, Err(cairn_types::error::BlobError::Corruption(_))),
         "a DEK-less open of an encrypted blob must fail, got {no_dek:?}"
     );
 
-    // (4) An encrypted blob offers no zero-copy hint: ciphertext can never reach the sendfile path.
+    // (4) A legacy metadata declaration cannot downgrade the current v3 container.
+    let wrong_format = store
+        .open_raw(
+            &enc.storage_path,
+            None,
+            BlobCipher::LegacyV2(dek.into()),
+            &enc.compression,
+            enc.size_logical,
+        )
+        .await;
+    assert!(
+        matches!(wrong_format, Err(BlobError::Corruption(_))),
+        "a current v3 blob must not be accepted through the legacy-v2 declaration"
+    );
+
+    // (5) An encrypted blob offers no zero-copy hint: ciphertext can never reach the sendfile path.
     assert!(
         store
             .open_raw(
                 &enc.storage_path,
                 None,
-                BlobCipher::Dek(dek),
-                &enc.compression
+                BlobCipher::AuthenticatedV3(dek.into()),
+                &enc.compression,
+                enc.size_logical,
             )
             .await
             .unwrap()
@@ -567,9 +674,16 @@ async fn encrypted_without_compression_and_wrong_dek_fails() {
 
     // Correct DEK reads the original bytes.
     assert_eq!(
-        read_all_dek(&store, &enc.storage_path, None, Some(dek), &enc.compression)
-            .await
-            .unwrap(),
+        read_all_dek(
+            &store,
+            &enc.storage_path,
+            None,
+            Some(dek),
+            &enc.compression,
+            enc.size_logical,
+        )
+        .await
+        .unwrap(),
         data
     );
     // The wrong DEK fails authentication.
@@ -579,6 +693,7 @@ async fn encrypted_without_compression_and_wrong_dek_fails() {
         None,
         Some([0x23u8; 32]),
         &enc.compression,
+        enc.size_logical,
     )
     .await;
     assert!(matches!(
@@ -589,18 +704,26 @@ async fn encrypted_without_compression_and_wrong_dek_fails() {
     // contract (audit #18) had the blob layer trust the caller's signals, so this read returned the
     // raw CRNB-container bytes — "never the plaintext", which was true and beside the point. A
     // caller that got ciphertext back with an `Ok` shipped it: that is exactly how replication
-    // mirrored garbage. The trailer cross-check keeps the descriptor authoritative for *framing*
-    // while making "read an encrypted blob as plaintext" impossible to do silently.
-    let none = read_all_dek(&store, &enc.storage_path, None, None, &enc.compression).await;
+    // mirrored garbage. The independently trusted logical size keeps metadata authoritative for
+    // framing without content-sniffing legitimate plaintext bytes.
+    let none = read_all_dek(
+        &store,
+        &enc.storage_path,
+        None,
+        None,
+        &enc.compression,
+        enc.size_logical,
+    )
+    .await;
     assert!(
-        matches!(&none, Err(cairn_types::error::BlobError::Corruption(m)) if m.contains("without a data key")),
+        matches!(&none, Err(cairn_types::error::BlobError::Corruption(m)) if m.contains("trusted metadata")),
         "a no-DEK read of an encrypted blob must fail closed, got: {none:?}"
     );
 }
 
-/// An old-format (unencrypted) blob still reads unchanged through `open_raw` — with both
-/// `KnownPlaintext` and a stray `Dek` refused only where crypto requires — after the format gained
-/// encryption, confirming the version gate keeps backward compatibility.
+/// An old-format (unencrypted) blob still reads unchanged through `open_raw` with
+/// `KnownPlaintext`, while a stray encrypted declaration is refused because metadata and framing
+/// differ, confirming the version gate keeps backward compatibility.
 #[tokio::test]
 async fn old_unencrypted_blob_reads_unchanged() {
     let dir = tempfile::tempdir().unwrap();
@@ -622,7 +745,14 @@ async fn old_unencrypted_blob_reads_unchanged() {
         .unwrap();
     // Reads via `open_raw(KnownPlaintext)` (twice, once through each helper) both succeed and match.
     assert_eq!(
-        read_all(&store, &staged.storage_path, None, &staged.compression).await,
+        read_all(
+            &store,
+            &staged.storage_path,
+            None,
+            &staged.compression,
+            staged.size_logical,
+        )
+        .await,
         data
     );
     assert_eq!(
@@ -631,7 +761,8 @@ async fn old_unencrypted_blob_reads_unchanged() {
             &staged.storage_path,
             None,
             None,
-            &staged.compression
+            &staged.compression,
+            staged.size_logical,
         )
         .await
         .unwrap(),
@@ -690,6 +821,7 @@ async fn multipart_assembly_roundtrip() {
         .stage_part(
             &upload,
             1,
+            "roundtrip-1",
             body(b"part-one-".to_vec()),
             ChecksumSet::none(),
             1 << 20,
@@ -701,6 +833,7 @@ async fn multipart_assembly_roundtrip() {
         .stage_part(
             &upload,
             2,
+            "roundtrip-2",
             body(b"part-two".to_vec()),
             ChecksumSet::none(),
             1 << 20,
@@ -713,13 +846,13 @@ async fn multipart_assembly_roundtrip() {
             part_number: 1,
             storage_path: p1.storage_path.clone(),
             size: p1.size,
-            dek: None,
+            cipher: BlobCipher::KnownPlaintext,
         },
         PartRef {
             part_number: 2,
             storage_path: p2.storage_path.clone(),
             size: p2.size,
-            dek: None,
+            cipher: BlobCipher::KnownPlaintext,
         },
     ];
     let assembled = store
@@ -732,7 +865,8 @@ async fn multipart_assembly_roundtrip() {
             &store,
             &assembled.storage_path,
             None,
-            &assembled.compression
+            &assembled.compression,
+            assembled.size_logical,
         )
         .await,
         b"part-one-part-two"
@@ -752,6 +886,7 @@ async fn assemble_enforces_size_ceiling() {
         .stage_part(
             &upload,
             1,
+            "bounded-1",
             body(b"part-one-".to_vec()),
             ChecksumSet::none(),
             1 << 20,
@@ -763,6 +898,7 @@ async fn assemble_enforces_size_ceiling() {
         .stage_part(
             &upload,
             2,
+            "bounded-2",
             body(b"part-two".to_vec()),
             ChecksumSet::none(),
             1 << 20,
@@ -775,13 +911,13 @@ async fn assemble_enforces_size_ceiling() {
             part_number: 1,
             storage_path: p1.storage_path.clone(),
             size: p1.size,
-            dek: None,
+            cipher: BlobCipher::KnownPlaintext,
         },
         PartRef {
             part_number: 2,
             storage_path: p2.storage_path.clone(),
             size: p2.size,
-            dek: None,
+            cipher: BlobCipher::KnownPlaintext,
         },
     ];
     // The parts total 17 bytes; a 10-byte ceiling must reject the assembly.
@@ -824,6 +960,7 @@ async fn reconcile_reclaims_orphans_only() {
     let oracle = SetReconcileOracle {
         live_paths: live,
         live_uploads: Default::default(),
+        live_multipart_paths: Default::default(),
     };
 
     let report = store
@@ -839,7 +976,14 @@ async fn reconcile_reclaims_orphans_only() {
     assert_eq!(report.orphans_reclaimed, 1);
     // keep is still readable, orphan is gone.
     assert_eq!(
-        read_all(&store, &keep.storage_path, None, &keep.compression).await,
+        read_all(
+            &store,
+            &keep.storage_path,
+            None,
+            &keep.compression,
+            keep.size_logical,
+        )
+        .await,
         b"keep"
     );
     assert!(matches!(
@@ -848,11 +992,88 @@ async fn reconcile_reclaims_orphans_only() {
                 &orphan.storage_path,
                 None,
                 BlobCipher::KnownPlaintext,
-                &orphan.compression
+                &orphan.compression,
+                orphan.size_logical,
             )
             .await,
         Err(BlobError::NotFound)
     ));
+}
+
+#[tokio::test]
+async fn multipart_attempt_cleanup_is_deterministic_and_live_session_reconcile_is_path_exact() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let upload = UploadId::from_string("live-upload".to_owned());
+    let keep = store
+        .stage_part(
+            &upload,
+            1,
+            "keep-attempt",
+            body(b"keep".to_vec()),
+            ChecksumSet::none(),
+            1024,
+            None,
+        )
+        .await
+        .unwrap();
+    let orphan = store
+        .stage_part(
+            &upload,
+            2,
+            "orphan-attempt",
+            body(b"orphan".to_vec()),
+            ChecksumSet::none(),
+            1024,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let oracle = SetReconcileOracle {
+        live_paths: Default::default(),
+        live_uploads: [upload.as_str().to_owned()].into_iter().collect(),
+        live_multipart_paths: [keep.storage_path.as_str().to_owned()]
+            .into_iter()
+            .collect(),
+    };
+    let report = store
+        .reconcile(
+            &oracle,
+            ReconcileOpts {
+                staging_safety_margin_secs: 0,
+                ..ReconcileOpts::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.sessions_cleaned, 0);
+    assert_eq!(report.staging_cleaned, 1);
+    assert!(
+        tokio::fs::try_exists(dir.path().join(keep.storage_path.as_str()))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !tokio::fs::try_exists(dir.path().join(orphan.storage_path.as_str()))
+            .await
+            .unwrap()
+    );
+
+    store
+        .delete_part_attempt(&upload, 1, "keep-attempt")
+        .await
+        .unwrap();
+    assert!(
+        !tokio::fs::try_exists(dir.path().join(keep.storage_path.as_str()))
+            .await
+            .unwrap()
+    );
+    // Idempotent: a retry after the file is already absent is still success.
+    store
+        .delete_part_attempt(&upload, 1, "keep-attempt")
+        .await
+        .unwrap();
 }
 
 /// A blob younger than the staging safety margin must NOT be reclaimed even when the oracle reports
@@ -870,6 +1091,7 @@ async fn reconcile_skips_recent_orphan_within_safety_margin() {
     let oracle = SetReconcileOracle {
         live_paths: Default::default(),
         live_uploads: Default::default(),
+        live_multipart_paths: Default::default(),
     };
     let report = store
         .reconcile(
@@ -886,7 +1108,14 @@ async fn reconcile_skips_recent_orphan_within_safety_margin() {
         "a blob younger than the safety margin must not be reclaimed"
     );
     assert_eq!(
-        read_all(&store, &orphan.storage_path, None, &orphan.compression).await,
+        read_all(
+            &store,
+            &orphan.storage_path,
+            None,
+            &orphan.compression,
+            orphan.size_logical,
+        )
+        .await,
         b"fresh"
     );
 }
@@ -912,6 +1141,7 @@ async fn reconcile_prunes_emptied_bucket_dir() {
     let oracle = SetReconcileOracle {
         live_paths: live,
         live_uploads: Default::default(),
+        live_multipart_paths: Default::default(),
     };
 
     let report = store
@@ -996,7 +1226,8 @@ async fn delete_is_idempotent_and_paths_are_safe() {
                 &evil,
                 None,
                 BlobCipher::KnownPlaintext,
-                &CompressionDescriptor::Uncompressed
+                &CompressionDescriptor::Uncompressed,
+                0,
             )
             .await
             .is_err()
@@ -1017,6 +1248,7 @@ async fn stage_part_computes_requested_checksum() {
         .stage_part(
             &upload,
             1,
+            "checksum-1",
             body(b"abc".to_vec()),
             ChecksumSet(vec![ChecksumAlgorithm::Crc32]),
             1 << 20,
@@ -1033,6 +1265,7 @@ async fn stage_part_computes_requested_checksum() {
         .stage_part(
             &upload,
             2,
+            "checksum-2",
             body(b"abc".to_vec()),
             ChecksumSet::none(),
             1 << 20,
@@ -1056,6 +1289,7 @@ async fn assemble_honors_extra_checksums_whole_object() {
         .stage_part(
             &upload,
             1,
+            "whole-checksum-1",
             body(b"part-one-".to_vec()),
             ChecksumSet::none(),
             1 << 20,
@@ -1067,6 +1301,7 @@ async fn assemble_honors_extra_checksums_whole_object() {
         .stage_part(
             &upload,
             2,
+            "whole-checksum-2",
             body(b"part-two".to_vec()),
             ChecksumSet::none(),
             1 << 20,
@@ -1079,13 +1314,13 @@ async fn assemble_honors_extra_checksums_whole_object() {
             part_number: 1,
             storage_path: p1.storage_path.clone(),
             size: p1.size,
-            dek: None,
+            cipher: BlobCipher::KnownPlaintext,
         },
         PartRef {
             part_number: 2,
             storage_path: p2.storage_path.clone(),
             size: p2.size,
-            dek: None,
+            cipher: BlobCipher::KnownPlaintext,
         },
     ];
     let assemble_opts = StageOptions {
@@ -1174,7 +1409,8 @@ async fn io_uring_staged_object_reads_back_identically() {
             &uring,
             &via_uring.storage_path,
             None,
-            &via_uring.compression
+            &via_uring.compression,
+            via_uring.size_logical,
         )
         .await,
         data
@@ -1186,7 +1422,8 @@ async fn io_uring_staged_object_reads_back_identically() {
             &epoll,
             &via_uring.storage_path,
             None,
-            &via_uring.compression
+            &via_uring.compression,
+            via_uring.size_logical,
         )
         .await,
         data
@@ -1202,7 +1439,8 @@ async fn io_uring_staged_object_reads_back_identically() {
             &uring,
             &via_uring.storage_path,
             Some(range),
-            &via_uring.compression
+            &via_uring.compression,
+            via_uring.size_logical,
         )
         .await,
         &data[100_000..104_096]
@@ -1243,9 +1481,16 @@ async fn io_uring_compressed_encrypted_and_multipart_roundtrip() {
         .unwrap();
     assert!(enc.size_physical < enc.size_logical, "compressed on disk");
     assert_eq!(
-        read_all_dek(&store, &enc.storage_path, None, Some(dek), &enc.compression)
-            .await
-            .unwrap(),
+        read_all_dek(
+            &store,
+            &enc.storage_path,
+            None,
+            Some(dek),
+            &enc.compression,
+            enc.size_logical,
+        )
+        .await
+        .unwrap(),
         data
     );
 
@@ -1255,6 +1500,7 @@ async fn io_uring_compressed_encrypted_and_multipart_roundtrip() {
         .stage_part(
             &upload,
             1,
+            "uring-1",
             body(b"uring-part-one-".to_vec()),
             ChecksumSet::none(),
             1 << 20,
@@ -1266,6 +1512,7 @@ async fn io_uring_compressed_encrypted_and_multipart_roundtrip() {
         .stage_part(
             &upload,
             2,
+            "uring-2",
             body(b"uring-part-two".to_vec()),
             ChecksumSet::none(),
             1 << 20,
@@ -1278,13 +1525,13 @@ async fn io_uring_compressed_encrypted_and_multipart_roundtrip() {
             part_number: 1,
             storage_path: p1.storage_path.clone(),
             size: p1.size,
-            dek: None,
+            cipher: BlobCipher::KnownPlaintext,
         },
         PartRef {
             part_number: 2,
             storage_path: p2.storage_path.clone(),
             size: p2.size,
-            dek: None,
+            cipher: BlobCipher::KnownPlaintext,
         },
     ];
     let assembled = store
@@ -1296,7 +1543,8 @@ async fn io_uring_compressed_encrypted_and_multipart_roundtrip() {
             &store,
             &assembled.storage_path,
             None,
-            &assembled.compression
+            &assembled.compression,
+            assembled.size_logical,
         )
         .await,
         b"uring-part-one-uring-part-two"
@@ -1440,7 +1688,7 @@ async fn uring_vs_epoll_concurrent_staging() {
 
 // ---------------------------------------------------------------------------------------------
 // Part-level SSE at rest (ARCH 27, Increment 3a). A part staged with a per-part DEK is ciphertext
-// on disk; `assemble` decrypts it on read (via `PartRef.dek`) before hashing + re-encoding. All
+// on disk; `assemble` decrypts it on read (via `PartRef.cipher`) before hashing + re-encoding. All
 // real ciphertext/nonce assertions run here against the on-disk `LocalBlobStore`, never a double.
 // ---------------------------------------------------------------------------------------------
 
@@ -1449,13 +1697,267 @@ fn raw_blob_bytes(dir: &std::path::Path, path: &StoragePath) -> Vec<u8> {
     std::fs::read(dir.join(path.as_str())).unwrap()
 }
 
+/// Convert a current authenticated v3 CRNB fixture to the historical encrypted-v2 layout. Block
+/// ciphertext is unchanged; v2 omitted the 32-byte metadata tag and used trailer version 2.
+fn encrypted_v3_to_legacy_v2(mut raw: Vec<u8>) -> Vec<u8> {
+    const TRAILER_LEN: usize = 34;
+    const METADATA_TAG_LEN: usize = 32;
+    let trailer_start = raw.len() - TRAILER_LEN;
+    assert_eq!(&raw[trailer_start..trailer_start + 4], b"CRNB");
+    assert_eq!(raw[trailer_start + 4], 3);
+    raw.drain(trailer_start - METADATA_TAG_LEN..trailer_start);
+    let trailer_start = raw.len() - TRAILER_LEN;
+    raw[trailer_start + 4] = 2;
+    raw
+}
+
+/// Reproduce the legacy-v2 compressed-to-raw reinterpretation: the encrypted block bytes remain
+/// authenticated, but the unauthenticated index flag and logical lengths are changed so the shorter
+/// compressed payload could otherwise be returned as plaintext.
+fn forge_legacy_v2_compressed_block_as_raw(raw: &mut [u8]) -> u64 {
+    const TRAILER_LEN: usize = 34;
+    const GCM_TAG_LEN: u32 = 16;
+    let trailer_start = raw.len() - TRAILER_LEN;
+    assert_eq!(raw[trailer_start + 4], 2);
+    assert_eq!(
+        u32::from_le_bytes(
+            raw[trailer_start + 18..trailer_start + 22]
+                .try_into()
+                .unwrap()
+        ),
+        1,
+        "fixture must contain exactly one block"
+    );
+    let index_offset = u64::from_le_bytes(
+        raw[trailer_start + 22..trailer_start + 30]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    assert_eq!(
+        u32::from_le_bytes(
+            raw[trailer_start + 30..trailer_start + 34]
+                .try_into()
+                .unwrap()
+        ),
+        9
+    );
+    let physical_len = u32::from_le_bytes(raw[index_offset..index_offset + 4].try_into().unwrap());
+    let forged_logical_len = physical_len
+        .checked_sub(GCM_TAG_LEN)
+        .expect("encrypted block includes its GCM tag");
+    let original_logical_len =
+        u32::from_le_bytes(raw[index_offset + 4..index_offset + 8].try_into().unwrap());
+    assert_eq!(raw[index_offset + 8], 1, "fixture block must compress");
+    assert!(
+        forged_logical_len < original_logical_len,
+        "fixture must have a shorter compressed payload"
+    );
+    raw[index_offset + 4..index_offset + 8].copy_from_slice(&forged_logical_len.to_le_bytes());
+    raw[index_offset + 8] = 0;
+    raw[trailer_start + 10..trailer_start + 18]
+        .copy_from_slice(&u64::from(forged_logical_len).to_le_bytes());
+    u64::from(forged_logical_len)
+}
+
 fn part_ref(part_number: u16, staged: &StagedPart, dek: Option<[u8; 32]>) -> PartRef {
     PartRef {
         part_number,
         storage_path: staged.storage_path.clone(),
         size: staged.size,
-        dek,
+        cipher: match dek {
+            Some(dek) => BlobCipher::AuthenticatedV3(dek.into()),
+            None => BlobCipher::KnownPlaintext,
+        },
     }
+}
+
+/// The store-level GET seam must bind a legacy-v2 file's unauthenticated logical length to the
+/// independently trusted object row. Otherwise an attacker who can edit storage can flip a
+/// compressed block to raw and shrink both unauthenticated length fields, returning authenticated
+/// compressed bytes as object plaintext.
+#[tokio::test]
+async fn legacy_v2_open_raw_rejects_flag_and_logical_length_forgery() {
+    use futures_util::StreamExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let bucket = BucketName::parse("bkt").unwrap();
+    let dek = [0x62u8; 32];
+    let plaintext = vec![b'A'; 1024];
+    let staged = store
+        .stage(
+            &bucket,
+            body(plaintext.clone()),
+            opts_encrypted(
+                Some(CompressionPolicy {
+                    algorithm: CompressionAlgorithm::Zstd,
+                    block_size: 1024,
+                }),
+                "application/octet-stream",
+                dek,
+            ),
+        )
+        .await
+        .unwrap();
+    let disk_path = dir.path().join(staged.storage_path.as_str());
+    let valid_v2 = encrypted_v3_to_legacy_v2(raw_blob_bytes(dir.path(), &staged.storage_path));
+    std::fs::write(&disk_path, &valid_v2).unwrap();
+
+    // Compatibility control: an untampered legacy file remains byte-exact.
+    let mut handle = store
+        .open_raw(
+            &staged.storage_path,
+            None,
+            BlobCipher::LegacyV2(dek.into()),
+            &staged.compression,
+            staged.size_logical,
+        )
+        .await
+        .unwrap();
+    let mut got = Vec::new();
+    while let Some(chunk) = handle.body.next().await {
+        got.extend_from_slice(&chunk.unwrap());
+    }
+    assert_eq!(got, plaintext);
+
+    let mut forged = valid_v2;
+    let forged_len = forge_legacy_v2_compressed_block_as_raw(&mut forged);
+    assert_ne!(forged_len, staged.size_logical);
+    std::fs::write(&disk_path, forged).unwrap();
+    let opened = store
+        .open_raw(
+            &staged.storage_path,
+            None,
+            BlobCipher::LegacyV2(dek.into()),
+            &staged.compression,
+            staged.size_logical,
+        )
+        .await;
+    assert!(
+        matches!(opened, Err(BlobError::Corruption(_))),
+        "trusted object length must reject the compressed-to-raw legacy-v2 forgery"
+    );
+}
+
+/// Multipart assembly must pass each metadata row's trusted part size into the legacy reader.
+/// Historically the stream cap alone could accept a shorter row and silently assemble a truncated
+/// object; the reader must now reject the mismatch before returning any plaintext.
+#[tokio::test]
+async fn legacy_v2_multipart_rejects_part_size_mismatch_instead_of_truncating() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let bucket = BucketName::parse("bkt").unwrap();
+    let upload = UploadId::generate();
+    let dek = [0x73u8; 32];
+    let plaintext = vec![b'P'; 4096];
+    let staged = store
+        .stage_part(
+            &upload,
+            1,
+            "legacy-v2-size",
+            body(plaintext.clone()),
+            ChecksumSet::none(),
+            1 << 30,
+            Some(dek.into()),
+        )
+        .await
+        .unwrap();
+    let disk_path = dir.path().join(staged.storage_path.as_str());
+    let valid_v2 = encrypted_v3_to_legacy_v2(raw_blob_bytes(dir.path(), &staged.storage_path));
+    std::fs::write(&disk_path, valid_v2).unwrap();
+
+    // Compatibility control: the metadata-backed legacy declaration assembles byte-exact.
+    let valid_ref = PartRef {
+        part_number: 1,
+        storage_path: staged.storage_path.clone(),
+        size: staged.size,
+        cipher: BlobCipher::LegacyV2(dek.into()),
+    };
+    let assembled = store
+        .assemble(
+            &bucket,
+            std::slice::from_ref(&valid_ref),
+            opts(None, "application/octet-stream"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        read_all(
+            &store,
+            &assembled.storage_path,
+            None,
+            &assembled.compression,
+            assembled.size_logical,
+        )
+        .await,
+        plaintext
+    );
+
+    let mismatched_ref = PartRef {
+        size: staged.size - 1,
+        ..valid_ref
+    };
+    let result = store
+        .assemble(
+            &bucket,
+            &[mismatched_ref],
+            opts(None, "application/octet-stream"),
+        )
+        .await;
+    assert!(
+        matches!(result, Err(BlobError::Corruption(_))),
+        "trusted multipart size mismatch must fail closed instead of truncating"
+    );
+    let leaked: Vec<_> = std::fs::read_dir(dir.path().join(".staging"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "failed legacy-v2 assembly left an orphan staging file"
+    );
+}
+
+/// The crash-test seam must fire only after the new session directory's entry has been synced in
+/// `.staging/multipart`, and before a part file is created. The failpoint makes that ordering
+/// executable for the remount/power-loss harness instead of leaving it as a comment.
+#[cfg(feature = "failpoints")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn first_part_failpoint_leaves_a_session_directory_but_no_part_file() {
+    let _scenario = fail::FailScenario::setup();
+    fail::cfg("blob_after_multipart_session_dir", "panic").unwrap();
+
+    let root = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(root.path()).await.unwrap();
+    let upload = UploadId::generate();
+    let task_store = store.clone();
+    let task_upload = upload.clone();
+    let task = tokio::spawn(async move {
+        task_store
+            .stage_part(
+                &task_upload,
+                1,
+                "failpoint-1",
+                body(b"must not be written".to_vec()),
+                ChecksumSet::none(),
+                1024,
+                None,
+            )
+            .await
+    });
+
+    let panic = task.await.expect_err("the armed failpoint must panic");
+    assert!(panic.is_panic());
+    fail::remove("blob_after_multipart_session_dir");
+
+    let session = root
+        .path()
+        .join(".staging")
+        .join("multipart")
+        .join(upload.as_str());
+    assert!(session.is_dir());
+    assert_eq!(std::fs::read_dir(session).unwrap().count(), 0);
 }
 
 /// Two encrypted parts assembled with their matching per-part DEKs reproduce the plaintext concat
@@ -1475,10 +1977,11 @@ async fn stage_part_encrypted_roundtrips_via_assemble() {
         .stage_part(
             &upload,
             1,
+            "encrypted-roundtrip-1",
             body(plain1.clone()),
             ChecksumSet::none(),
             1 << 30,
-            Some(dek1),
+            Some(dek1.into()),
         )
         .await
         .unwrap();
@@ -1486,10 +1989,11 @@ async fn stage_part_encrypted_roundtrips_via_assemble() {
         .stage_part(
             &upload,
             2,
+            "encrypted-roundtrip-2",
             body(plain2.clone()),
             ChecksumSet::none(),
             1 << 30,
-            Some(dek2),
+            Some(dek2.into()),
         )
         .await
         .unwrap();
@@ -1506,7 +2010,8 @@ async fn stage_part_encrypted_roundtrips_via_assemble() {
             &store,
             &assembled.storage_path,
             None,
-            &assembled.compression
+            &assembled.compression,
+            assembled.size_logical,
         )
         .await,
         expected
@@ -1537,17 +2042,19 @@ async fn staged_part_file_is_ciphertext() {
         .stage_part(
             &upload,
             1,
+            "wrong-key-1",
             body(plain.clone()),
             ChecksumSet::none(),
             1 << 30,
-            Some(dek),
+            Some(dek.into()),
         )
         .await
         .unwrap();
     let raw = raw_blob_bytes(dir.path(), &p.storage_path);
-    // The CRNB trailer is 34 bytes: magic(4) + version(1) at offset 4. VERSION_ENCRYPTED == 2.
+    // The CRNB trailer is 34 bytes: magic(4) + version(1) at offset 4. Current authenticated
+    // encrypted containers are version 3.
     let ver = raw[raw.len() - 34 + 4];
-    assert_eq!(ver, 2, "staged part trailer must be VERSION_ENCRYPTED");
+    assert_eq!(ver, 3, "staged part trailer must be VERSION_ENCRYPTED");
     // A known plaintext run is absent from the on-disk ciphertext.
     assert!(
         raw.windows(16).all(|w| w != [b'Z'; 16]),
@@ -1555,7 +2062,15 @@ async fn staged_part_file_is_ciphertext() {
     );
     // The container refuses to open without a DEK (fails closed).
     let f = std::fs::File::open(dir.path().join(p.storage_path.as_str())).unwrap();
-    assert!(cairn_blob::compress::CompressedReader::open_with_dek(f, None).is_err());
+    assert!(
+        cairn_blob::compress::CompressedReader::open_with_dek(
+            f,
+            BlobCipher::KnownPlaintext,
+            &CompressionDescriptor::Uncompressed,
+            plain.len() as u64,
+        )
+        .is_err()
+    );
 }
 
 /// Identical plaintext staged as two parts under two independent random DEKs yields DIFFERENT
@@ -1572,10 +2087,11 @@ async fn two_identical_parts_differ_in_block0_ciphertext() {
         .stage_part(
             &upload,
             1,
+            "missing-dek-1",
             body(plain.clone()),
             ChecksumSet::none(),
             1 << 30,
-            Some([1u8; 32]),
+            Some([1u8; 32].into()),
         )
         .await
         .unwrap();
@@ -1583,10 +2099,11 @@ async fn two_identical_parts_differ_in_block0_ciphertext() {
         .stage_part(
             &upload,
             2,
+            "plain-part-2",
             body(plain.clone()),
             ChecksumSet::none(),
             1 << 30,
-            Some([2u8; 32]),
+            Some([2u8; 32].into()),
         )
         .await
         .unwrap();
@@ -1603,10 +2120,11 @@ async fn two_identical_parts_differ_in_block0_ciphertext() {
         .stage_part(
             &upload,
             3,
+            "encrypted-part-3",
             body(plain.clone()),
             ChecksumSet::none(),
             1 << 30,
-            Some([4u8; 32]),
+            Some([4u8; 32].into()),
         )
         .await
         .unwrap();
@@ -1614,10 +2132,11 @@ async fn two_identical_parts_differ_in_block0_ciphertext() {
         .stage_part(
             &upload,
             3,
+            "replacement-part-3",
             body(plain.clone()),
             ChecksumSet::none(),
             1 << 30,
-            Some([5u8; 32]),
+            Some([5u8; 32].into()),
         )
         .await
         .unwrap();
@@ -1643,10 +2162,11 @@ async fn assemble_wrong_part_dek_is_corruption() {
         .stage_part(
             &upload,
             1,
+            "tamper-1",
             body(plain.clone()),
             ChecksumSet::none(),
             1 << 30,
-            Some([1u8; 32]),
+            Some([1u8; 32].into()),
         )
         .await
         .unwrap();
@@ -1687,10 +2207,11 @@ async fn preallocation_holds_for_encrypted_parts() {
         .stage_part(
             &upload,
             1,
+            "mixed-1",
             body(plain1.clone()),
             ChecksumSet::none(),
             1 << 30,
-            Some([1u8; 32]),
+            Some([1u8; 32].into()),
         )
         .await
         .unwrap();
@@ -1698,10 +2219,11 @@ async fn preallocation_holds_for_encrypted_parts() {
         .stage_part(
             &upload,
             2,
+            "mixed-2",
             body(plain2.clone()),
             ChecksumSet::none(),
             1 << 30,
-            Some([2u8; 32]),
+            Some([2u8; 32].into()),
         )
         .await
         .unwrap();
@@ -1723,7 +2245,8 @@ async fn preallocation_holds_for_encrypted_parts() {
             &store,
             &assembled.storage_path,
             None,
-            &assembled.compression
+            &assembled.compression,
+            assembled.size_logical,
         )
         .await,
         expected
@@ -1753,10 +2276,11 @@ async fn stage_part_checksum_and_assemble_checksum_are_over_plaintext() {
         .stage_part(
             &enc_upload,
             1,
+            "parity-encrypted-1",
             body(plain1.clone()),
             ChecksumSet(vec![ChecksumAlgorithm::Crc32]),
             1 << 30,
-            Some(dek1),
+            Some(dek1.into()),
         )
         .await
         .unwrap();
@@ -1764,6 +2288,7 @@ async fn stage_part_checksum_and_assemble_checksum_are_over_plaintext() {
         .stage_part(
             &plain_upload,
             1,
+            "parity-plain-1",
             body(plain1.clone()),
             ChecksumSet(vec![ChecksumAlgorithm::Crc32]),
             1 << 30,
@@ -1775,7 +2300,7 @@ async fn stage_part_checksum_and_assemble_checksum_are_over_plaintext() {
     let enc_raw = raw_blob_bytes(dir.path(), &enc_p1.storage_path);
     assert_eq!(
         enc_raw[enc_raw.len() - 34 + 4],
-        2,
+        3,
         "the encrypted part is ciphertext on disk"
     );
     // ...yet its per-part CRC32 and MD5 are byte-identical to the plaintext staging.
@@ -1794,10 +2319,11 @@ async fn stage_part_checksum_and_assemble_checksum_are_over_plaintext() {
         .stage_part(
             &enc_upload,
             2,
+            "parity-encrypted-2",
             body(plain2.clone()),
             ChecksumSet::none(),
             1 << 30,
-            Some(dek2),
+            Some(dek2.into()),
         )
         .await
         .unwrap();
@@ -1805,6 +2331,7 @@ async fn stage_part_checksum_and_assemble_checksum_are_over_plaintext() {
         .stage_part(
             &plain_upload,
             2,
+            "parity-plain-2",
             body(plain2.clone()),
             ChecksumSet::none(),
             1 << 30,
@@ -1892,11 +2419,12 @@ async fn encrypted_uncompressed_blob_read_without_a_dek_is_refused() {
             None,
             BlobCipher::KnownPlaintext,
             &staged.compression,
+            staged.size_logical,
         )
         .await
         .expect_err("reading an encrypted blob with no DEK must fail, not stream ciphertext");
     assert!(
-        matches!(&err, BlobError::Corruption(m) if m.contains("without a data key")),
+        matches!(&err, BlobError::Corruption(m) if m.contains("trusted metadata")),
         "unexpected error: {err:?}"
     );
 
@@ -1905,8 +2433,9 @@ async fn encrypted_uncompressed_blob_read_without_a_dek_is_refused() {
         .open_raw(
             &staged.storage_path,
             None,
-            BlobCipher::Dek(dek),
+            BlobCipher::AuthenticatedV3(dek.into()),
             &staged.compression,
+            staged.size_logical,
         )
         .await
         .unwrap();
@@ -1923,8 +2452,8 @@ async fn encrypted_uncompressed_blob_read_without_a_dek_is_refused() {
 
 #[tokio::test]
 async fn encrypted_compressed_blob_read_without_a_dek_stays_refused() {
-    // The already-correct arm (the container IS parsed, and `CompressedReader` fails fast). Pinned
-    // so the new trailer cross-check does not change which error a caller sees here.
+    // The container is selected by the stored compression descriptor and its reader fails fast
+    // because an encrypted version has no DEK.
     let dir = tempfile::tempdir().unwrap();
     let store = LocalBlobStore::open(dir.path()).await.unwrap();
     let b = BucketName::parse("bkt").unwrap();
@@ -1951,6 +2480,7 @@ async fn encrypted_compressed_blob_read_without_a_dek_stays_refused() {
             None,
             BlobCipher::KnownPlaintext,
             &staged.compression,
+            staged.size_logical,
         )
         .await
         .expect_err("an encrypted+compressed blob must still refuse a DEK-less read");
@@ -1961,17 +2491,10 @@ async fn encrypted_compressed_blob_read_without_a_dek_stays_refused() {
 }
 
 #[tokio::test]
-async fn the_guards_known_false_positive_class_is_pinned_and_counted() {
-    // The guard has a SYSTEMATIC false positive, not a random collision: an object whose BODY is
-    // the verbatim bytes of an encrypted blob file satisfies all four identity checks by
-    // construction. That is not hypothetical — it is the "back up CAIRN_DATA_DIR by rclone/aws s3
-    // sync-ing it into a bucket" workflow, which stores whole blob files as ordinary objects.
-    //
-    // Pinned rather than fixed: the guard closes a real fail-open (streaming ciphertext as a body)
-    // and must not be weakened. The ambiguity is structural — framing comes from the caller's
-    // descriptor, and the guard's only input is the bytes — and is removed by the row-keyed reader
-    // in a later stage. The bytes are never lost: they are intact on disk, only the API read is
-    // refused. The counter is what lets an operator tell this apart from a caller that lost a DEK.
+async fn plaintext_object_containing_a_complete_encrypted_blob_round_trips() {
+    // Arbitrary S3 object bytes may themselves be a complete CRNB file — for example, when an
+    // operator backs up CAIRN_DATA_DIR into a bucket. Framing comes from authoritative metadata,
+    // not body sniffing, so this plaintext object remains byte-for-byte readable.
     let dir = tempfile::tempdir().unwrap();
     let store = LocalBlobStore::open(dir.path()).await.unwrap();
     let b = BucketName::parse("bkt").unwrap();
@@ -1989,7 +2512,7 @@ async fn the_guards_known_false_positive_class_is_pinned_and_counted() {
         .await
         .expect("read the encrypted blob file back");
 
-    assert_eq!(store.encrypted_without_key_total(), 0);
+    assert_eq!(store.plaintext_length_mismatch_total(), 0);
 
     // PUT those bytes as an ordinary, UNENCRYPTED object — the backup workflow.
     let backup = store
@@ -2005,30 +2528,23 @@ async fn the_guards_known_false_positive_class_is_pinned_and_counted() {
         CompressionDescriptor::Uncompressed
     ));
 
-    // Reading it back is refused, even though nothing is wrong with it.
-    let err = read_all_dek(
+    let round_trip = read_all_dek(
         &store,
         &backup.storage_path,
         None,
         None,
         &backup.compression,
+        backup.size_logical,
     )
     .await
-    .expect_err("the documented false positive: a stored blob file reads back as Corruption");
-    assert!(
-        matches!(&err, BlobError::Corruption(m) if m.contains("without a data key")),
-        "unexpected: {err:?}"
-    );
-
-    // The refusal is COUNTED, not merely logged: a tracing::error! cannot be alerted on, and this
-    // is the signal an operator needs both for this benign class and for the real fail-open.
+    .expect("metadata-declared plaintext CRNB bytes must remain ordinary object bytes");
+    assert_eq!(round_trip, raw);
     assert_eq!(
-        store.encrypted_without_key_total(),
-        1,
-        "the guard must bump cairn_blob_encrypted_without_key_total"
+        store.plaintext_length_mismatch_total(),
+        0,
+        "content sniffing must not classify legitimate plaintext bytes"
     );
 
-    // The bytes are not lost — they are still exactly on disk, recoverable out of band.
     let on_disk = tokio::fs::read(dir.path().join(backup.storage_path.as_str()))
         .await
         .unwrap();
@@ -2076,6 +2592,7 @@ async fn probe_reports_presence_on_the_real_store_without_a_dek() {
             None,
             BlobCipher::KnownPlaintext,
             &enc.compression,
+            enc.size_logical,
         )
         .await
         .expect_err("a KnownPlaintext read of an encrypted blob must fail closed");

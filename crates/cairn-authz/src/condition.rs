@@ -79,7 +79,9 @@ fn resolve_key(key: &str, ctx: &RequestContext, requester: &RequesterClass) -> K
     }
 
     match key {
-        "aws:SourceIp" => KeyValue::Single(ctx.source.to_string()),
+        "aws:SourceIp" => ctx.source.address().map_or(KeyValue::Absent, |address| {
+            KeyValue::Single(address.to_string())
+        }),
         "aws:SecureTransport" => KeyValue::Single(bool_str(ctx.secure_transport)),
         "aws:Referer" => opt(ctx.referer.clone()),
         "aws:UserAgent" => opt(ctx.user_agent.clone()),
@@ -123,7 +125,7 @@ fn bool_str(b: bool) -> String {
 fn principal_type(requester: &RequesterClass) -> &'static str {
     match requester {
         RequesterClass::Anonymous => "Anonymous",
-        RequesterClass::AuthenticatedMember(_) | RequesterClass::OwnerOrAdmin => "User",
+        RequesterClass::AuthenticatedMember(_) | RequesterClass::OwnerOrAdmin(_) => "User",
     }
 }
 
@@ -307,12 +309,12 @@ fn compare(a: f64, b: f64, cmp: NumericOp) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cairn_types::{Timestamp, VersionId};
+    use cairn_types::{ClientSource, Timestamp, VersionId};
     use std::net::{IpAddr, Ipv4Addr};
 
     fn ctx() -> RequestContext {
         RequestContext {
-            source: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)),
+            source: ClientSource::Direct(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))),
             secure_transport: true,
             referer: Some("https://example.com/".to_owned()),
             user_agent: Some("aws-cli/2.0".to_owned()),
@@ -432,6 +434,43 @@ mod tests {
                 &["10.0.0.0/24"]
             ),
             &ctx(),
+            &anon()
+        ));
+    }
+
+    #[test]
+    fn unavailable_source_is_absent_for_source_ip_conditions() {
+        let mut unavailable = ctx();
+        unavailable.source = ClientSource::Unavailable;
+
+        assert!(!condition_matches(
+            &cond(
+                ConditionOperator::IpAddress,
+                "aws:SourceIp",
+                &["10.0.0.0/24"]
+            ),
+            &unavailable,
+            &anon()
+        ));
+        // Negated operators match an absent key. This is load-bearing for the common explicit-Deny
+        // policy `NotIpAddress corporate-cidr`: lost proxy provenance must keep that deny active.
+        assert!(condition_matches(
+            &cond(
+                ConditionOperator::NotIpAddress,
+                "aws:SourceIp",
+                &["10.0.0.0/24"]
+            ),
+            &unavailable,
+            &anon()
+        ));
+        assert!(condition_matches(
+            &cond(ConditionOperator::Null, "aws:SourceIp", &["true"]),
+            &unavailable,
+            &anon()
+        ));
+        assert!(!condition_matches(
+            &cond(ConditionOperator::Null, "aws:SourceIp", &["false"]),
+            &unavailable,
             &anon()
         ));
     }

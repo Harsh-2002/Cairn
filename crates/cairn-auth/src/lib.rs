@@ -223,7 +223,7 @@ impl AuthChain {
     /// expired; the sealed secret must decrypt; the SigV4 signature must verify. The resulting
     /// principal carries the parent's identity (for ownership + audit) but is marked `is_session`
     /// (no owner/admin short-circuit) with role capped to `Member`, governed solely by its scoped
-    /// inline policy — a stored policy that no longer parses yields no grant (default deny).
+    /// inline policy — a stored policy that no longer parses denies authentication.
     async fn authenticate_session(
         &self,
         access_key_id: &str,
@@ -264,12 +264,23 @@ impl AuthChain {
             Err(e) => return Some(AuthOutcome::Denied(e)),
         };
         // The scoped inline policy is the session's effective identity policy. A stored doc that no
-        // longer parses fails closed (no grant); `attach_policy` will NOT load the parent's policy
-        // for a session, so the session can never widen beyond what its own policy grants.
-        let user_policy = creds
-            .inline_policy
-            .as_deref()
-            .and_then(|raw| cairn_authz::parse_user_policy(raw).ok().map(Box::new));
+        // longer parses is an integrity failure: deny authentication rather than converting it to
+        // absence. `attach_policy` will NOT load the parent's policy for a session, so the session
+        // can never widen beyond what its own policy grants.
+        let user_policy = match creds.inline_policy.as_deref() {
+            Some(raw) => match cairn_authz::parse_user_policy(raw) {
+                Ok(policy) => Some(Box::new(policy)),
+                Err(e) => {
+                    tracing::warn!(
+                        access_key_id,
+                        error = ?e,
+                        "refusing session with malformed stored inline policy"
+                    );
+                    return Some(AuthOutcome::Denied(AuthError::PolicyUnavailable));
+                }
+            },
+            None => None,
+        };
         Some(AuthOutcome::Authenticated(Principal {
             user_id: creds.parent_user_id,
             display_name: creds.parent_display_name,
@@ -381,9 +392,10 @@ impl Authenticator for AuthChain {
         // Every successful authentication is funnelled through one chokepoint that loads the user's
         // identity policy, so each auth method (bearer, SigV4 header/presigned, dev) gets it.
         match self.classify(view).await {
-            AuthOutcome::Authenticated(p) => {
-                AuthOutcome::Authenticated(self.attach_policy(p).await)
-            }
+            AuthOutcome::Authenticated(p) => match self.attach_policy(p).await {
+                Ok(p) => AuthOutcome::Authenticated(p),
+                Err(e) => AuthOutcome::Denied(e),
+            },
             other => other,
         }
     }
@@ -417,29 +429,31 @@ impl AuthChain {
             return self.verify_sigv4_presigned(view).await;
         }
         // The development bypass: compiled in only with `dev-auth`, and only on loopback.
-        if cfg!(feature = "dev-auth") && self.dev_enabled && view.source.is_loopback() {
+        if cfg!(feature = "dev-auth") && self.dev_enabled && view.source.is_direct_loopback() {
             return AuthOutcome::Authenticated(dev_principal());
         }
         AuthOutcome::NotApplicable
     }
 
-    /// Load and attach the user's identity (per-user) policy (ARCH 15 / user-centric authz). A
-    /// malformed stored policy, or a load error, fails closed — the principal proceeds with no
-    /// identity policy (no grant), never a silently widened one.
-    async fn attach_policy(&self, mut principal: Principal) -> Principal {
+    /// Load and attach the user's identity (per-user) policy (ARCH 15 / user-centric authz).
+    ///
+    /// A malformed stored policy or metadata read failure is an authentication error, not an
+    /// absent policy. This distinction is load-bearing for owners/administrators: converting an
+    /// explicit Deny to absence would activate their baseline allow and widen access.
+    async fn attach_policy(&self, mut principal: Principal) -> Result<Principal, AuthError> {
         // A session credential already carries its own scoped policy (set in `authenticate_session`);
         // it must NEVER inherit the parent user's identity policy, so skip the load entirely. This
         // is the load-bearing half of the session-scoping guarantee (the other half is the
         // owner/admin short-circuit suppression in the protocol's authorization step).
         if principal.is_session {
-            return principal;
+            return Ok(principal);
         }
         // Cache hit: attach a clone of the shared parsed policy. The downstream `AuthzInput`
         // deep-clones the policy anyway (`.as_deref().cloned()`), so a `Box` clone here costs no
         // more than today while skipping both the metadata read and the JSON parse.
         if let Some(cached) = self.cache.get_policy(&principal.user_id) {
             principal.user_policy = cached.as_ref().map(|p| Box::new((**p).clone()));
-            return principal;
+            return Ok(principal);
         }
         let observed = self.cache.observe_epoch();
         match self.meta.get_user_policy(&principal.user_id).await {
@@ -450,26 +464,30 @@ impl AuthChain {
                         .put_policy(&principal.user_id, Some(arc.clone()), observed);
                     principal.user_policy = Some(Box::new((*arc).clone()));
                 }
-                Err(_) => {
-                    // A malformed stored policy fails closed (no grant) and is remembered as an
-                    // absence so a known-bad doc is not re-parsed every request; an operator fix
-                    // is a `SetUserPolicy` mutation, which bumps the epoch and drops this entry.
+                Err(e) => {
+                    // Never cache malformed as "absent": absence is authorization-significant for
+                    // privileged principals. An operator fix bumps the epoch, but until then every
+                    // request must fail rather than reuse a widening sentinel.
                     tracing::warn!(
                         user_id = %principal.user_id,
-                        "ignoring malformed stored user policy (fail-closed)"
+                        error = ?e,
+                        "refusing authentication with malformed stored user policy"
                     );
-                    self.cache.put_policy(&principal.user_id, None, observed);
+                    return Err(AuthError::PolicyUnavailable);
                 }
             },
             Ok(None) => self.cache.put_policy(&principal.user_id, None, observed),
-            // A transient load error must not poison the cache: proceed with no policy and cache
-            // nothing, so the next request retries the read.
-            Err(e) => tracing::warn!(
-                user_id = %principal.user_id, error = ?e,
-                "failed to load user policy; proceeding with none"
-            ),
+            // A transient load error must not poison the cache and must not become policy absence.
+            // Deny this request; the next request retries the read.
+            Err(e) => {
+                tracing::warn!(
+                    user_id = %principal.user_id, error = ?e,
+                    "refusing authentication because the user policy could not be loaded"
+                );
+                return Err(AuthError::PolicyUnavailable);
+            }
         }
-        principal
+        Ok(principal)
     }
 }
 

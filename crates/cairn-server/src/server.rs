@@ -3,7 +3,7 @@
 //! management families here behind authentication and authorization.
 
 use crate::adapter;
-use crate::adapter::{ResponseBody, full_body};
+use crate::adapter::{ListenerRole, ResponseBody, full_body};
 use crate::config::Config;
 use crate::stack::AppStack;
 use bytes::Bytes;
@@ -14,20 +14,180 @@ use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
 use metrics_exporter_prometheus::PrometheusHandle;
 use std::convert::Infallible;
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::{Semaphore, SemaphorePermit, TryAcquireError, watch};
 use tracing::Instrument;
+
+/// The two socket bindings and their immutable route roles. The optional control binding is absent
+/// in headless mode; the data binding never inherits its routes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ListenerPlan {
+    data_addr: std::net::SocketAddr,
+    control_addr: Option<std::net::SocketAddr>,
+}
+
+fn listener_plan(config: &Config) -> std::io::Result<ListenerPlan> {
+    let control_addr = config.web_listen_addr().map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid control listener configuration: {error}"),
+        )
+    })?;
+    Ok(ListenerPlan {
+        data_addr: config.listen_addr,
+        control_addr,
+    })
+}
+
+/// Infrastructure work has its own small, fixed budget so probes and scrapes stay independent of
+/// saturated S3 traffic without becoming an unbounded unauthenticated work lane. Metrics rendering
+/// has a smaller sub-budget, reserving capacity for health/readiness probes during a scrape flood.
+const INFRA_CONCURRENCY_LIMIT: usize = 4;
+const METRICS_CONCURRENCY_LIMIT: usize = 2;
+/// One shared bound for draining accepted HTTP connections and cooperative background workers.
+const SHUTDOWN_DRAIN_GRACE: Duration = Duration::from_secs(30);
+/// After every request future has been joined or cancelled, give the retained storage-commit
+/// recovery consumer a small separate window to drain cancellation callbacks queued by their
+/// drops. A timeout makes shutdown incomplete; startup recovery is the final fallback.
+const SHUTDOWN_REQUEST_TAIL_GRACE: Duration = Duration::from_secs(5);
+/// A separate bound for the ordered final metrics/counter flush and SQLite checkpoints.
+const SHUTDOWN_FINALIZE_GRACE: Duration = Duration::from_secs(30);
+
+#[derive(Default, Debug, PartialEq, Eq)]
+struct HttpDrainReport {
+    completed: usize,
+    cancelled: usize,
+    failed: usize,
+    deadline_exceeded: bool,
+}
+
+impl HttpDrainReport {
+    fn merge(mut self, other: Self) -> Self {
+        self.completed += other.completed;
+        self.cancelled += other.cancelled;
+        self.failed += other.failed;
+        self.deadline_exceeded |= other.deadline_exceeded;
+        self
+    }
+
+    fn is_complete(&self) -> bool {
+        !self.deadline_exceeded && self.cancelled == 0 && self.failed == 0
+    }
+}
+
+/// A process-lifetime auxiliary task that aborts on unexpected owner drop.
+///
+/// Tokio detaches a plain `JoinHandle` when it is dropped. This wrapper makes both the normal
+/// shutdown path (explicit join) and cancellation of [`serve`] fail closed: the SIGHUP and signal
+/// waiters cannot outlive the server future as orphaned tasks.
+struct RetainedTask {
+    name: &'static str,
+    handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl RetainedTask {
+    fn spawn(name: &'static str, task: impl Future<Output = ()> + Send + 'static) -> Self {
+        Self {
+            name,
+            handle: Some(tokio::spawn(task)),
+        }
+    }
+
+    async fn join(mut self) -> bool {
+        let Some(handle) = self.handle.take() else {
+            return true;
+        };
+        match handle.await {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(task = self.name, %error, "auxiliary task exited unexpectedly");
+                false
+            }
+        }
+    }
+
+    async fn cancel_and_join(mut self) -> bool {
+        let Some(handle) = self.handle.take() else {
+            return true;
+        };
+        handle.abort();
+        match handle.await {
+            Ok(()) => true,
+            Err(error) if error.is_cancelled() => true,
+            Err(error) => {
+                tracing::warn!(task = self.name, %error, "auxiliary task exited unexpectedly");
+                false
+            }
+        }
+    }
+}
+
+impl Drop for RetainedTask {
+    fn drop(&mut self) {
+        if let Some(handle) = &self.handle {
+            handle.abort();
+        }
+    }
+}
+
+/// Independent in-flight budgets for normal traffic and infrastructure endpoints.
+struct RequestBudgets {
+    general: Semaphore,
+    infrastructure: Semaphore,
+    metrics: Semaphore,
+}
+
+/// RAII permits held for a request's whole execution.
+struct RequestPermits<'a> {
+    _request: SemaphorePermit<'a>,
+    _metrics: Option<SemaphorePermit<'a>>,
+}
+
+impl RequestBudgets {
+    fn new(general: usize) -> Self {
+        Self {
+            general: Semaphore::new(general),
+            infrastructure: Semaphore::new(INFRA_CONCURRENCY_LIMIT),
+            metrics: Semaphore::new(METRICS_CONCURRENCY_LIMIT),
+        }
+    }
+
+    /// Acquire without waiting. Metrics requests take both the shared infrastructure permit and a
+    /// metrics sub-permit; therefore at most two of the four infrastructure lanes can render a
+    /// scrape, permanently reserving the others for liveness/readiness.
+    fn try_acquire(
+        &self,
+        infrastructure: bool,
+        metrics: bool,
+    ) -> Result<RequestPermits<'_>, TryAcquireError> {
+        let metrics = if metrics {
+            Some(self.metrics.try_acquire()?)
+        } else {
+            None
+        };
+        let request = if infrastructure {
+            self.infrastructure.try_acquire()?
+        } else {
+            self.general.try_acquire()?
+        };
+        Ok(RequestPermits {
+            _request: request,
+            _metrics: metrics,
+        })
+    }
+}
 
 /// Shared, cheaply-cloneable server state.
 struct AppState {
     /// Readiness gate: false until migrations + reconciliation have completed.
-    ready: AtomicBool,
-    /// Global in-flight concurrency limiter.
-    concurrency: Semaphore,
+    ready: Arc<AtomicBool>,
+    /// Independent normal-request and infrastructure concurrency budgets.
+    budgets: RequestBudgets,
     /// Per-request timeout.
     request_timeout: Duration,
     /// Maximum time allowed to read a connection's complete request head (slowloris guard).
@@ -40,6 +200,9 @@ struct AppState {
     /// Whether the request-metrics usage-analytics subsystem is enabled (`CAIRN_REQUEST_METRICS_*`,
     /// ARCH 26.5). When off, no per-request counters accumulate on the hot path.
     request_metrics_enabled: bool,
+    /// Immediate peers whose validated forwarding metadata may establish control-plane transport
+    /// provenance. It never changes S3 source-IP authorization in this audit phase.
+    trusted_proxies: crate::proxy::TrustedProxies,
     /// Minimum GET-response size for the `sendfile` fast path (`CAIRN_FASTIO_MIN_BYTES`). Only read
     /// in a `fast-io` build; allowed to be dead in the default build where the fast path is cfg'd out.
     #[cfg_attr(not(all(feature = "fast-io", target_os = "linux")), allow(dead_code))]
@@ -57,24 +220,32 @@ pub async fn serve(
     metrics: PrometheusHandle,
     stack: Arc<AppStack>,
 ) -> std::io::Result<()> {
-    let listener = TcpListener::bind(config.listen_addr).await?;
+    let plan = listener_plan(&config)?;
+    let trusted_proxies = config.trusted_proxy_allowlist().map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid trusted-proxy configuration: {error}"),
+        )
+    })?;
+    let listener = TcpListener::bind(plan.data_addr).await?;
     let local = listener.local_addr()?;
-    // The web-console listener is a second, optional socket. It serves the same stack but additionally
-    // serves the management console at the root path, so an operator can firewall it off from the
-    // S3 data-plane port. `None` (CAIRN_WEB_ADDR empty/off) runs headless with only the S3 listener.
-    let web_listener = match config.web_listen_addr().ok().flatten() {
+    // The control listener is a second, optional socket with a disjoint route matrix. `None`
+    // (`CAIRN_WEB_ADDR` empty/off) runs headless: no management socket is bound, and the data
+    // listener's immutable role still rejects the management namespace.
+    let web_listener = match plan.control_addr {
         Some(addr) => Some(TcpListener::bind(addr).await?),
         None => None,
     };
     let web_local = web_listener.as_ref().and_then(|l| l.local_addr().ok());
     let state = Arc::new(AppState {
-        ready: AtomicBool::new(false),
-        concurrency: Semaphore::new(config.concurrency_limit),
+        ready: Arc::new(AtomicBool::new(false)),
+        budgets: RequestBudgets::new(config.concurrency_limit),
         request_timeout: Duration::from_secs(config.request_timeout_secs),
         header_read_timeout: Duration::from_secs(config.header_read_timeout_secs),
         connection_limiter: Arc::new(Semaphore::new(config.max_connections)),
         metrics,
         request_metrics_enabled: config.request_metrics_enabled,
+        trusted_proxies,
         fastio_min_bytes: config.fastio_min_bytes,
         stack,
     });
@@ -83,14 +254,17 @@ pub async fn serve(
     // hot-reload the certificate/key from the same paths without dropping the listener
     // (ARCH 27.2): the accept loop reads the current config per connection, and the reload
     // handler atomically publishes a new one (a bad new cert is logged and the old config kept).
-    let tls_rx = match (&config.tls_cert_path, &config.tls_key_path) {
+    let (tls_rx, tls_reload_task) = match (&config.tls_cert_path, &config.tls_key_path) {
         (Some(cert), Some(key)) => {
             let cfg = crate::tls::load_server_config(cert, key).map_err(std::io::Error::other)?;
             let (tx, rx) = watch::channel(cfg);
-            tokio::spawn(reload_tls_on_sighup(tx, cert.clone(), key.clone()));
-            Some(rx)
+            let task = RetainedTask::spawn(
+                "TLS reload",
+                reload_tls_on_sighup(tx, cert.clone(), key.clone()),
+            );
+            (Some(rx), Some(task))
         }
-        _ => None,
+        _ => (None, None),
     };
 
     // Probe once whether the kernel can offload TLS record crypto (feature `fast-io`, Linux only).
@@ -108,50 +282,108 @@ pub async fn serve(
     // The graceful-shutdown signal, created before the background pool so the replication workers
     // can watch it and stop claiming when shutdown begins.
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    tokio::spawn(wait_for_signal(shutdown_tx));
+    let signal_task = RetainedTask::spawn(
+        "shutdown signal",
+        broadcast_shutdown(wait_for_signal(), Arc::clone(&state.ready), shutdown_tx),
+    );
 
     // Background subsystems: multipart sweeper, lifecycle scanner, WAL checkpointer, metrics, and
     // the replication worker pool (which takes the shutdown receiver).
-    crate::background::spawn(state.stack.clone(), &config, shutdown_rx.clone());
+    let background = crate::background::spawn(state.stack.clone(), &config, shutdown_rx.clone());
     tracing::info!(s3_api = %local, web_console = ?web_local, tls = tls_rx.is_some(), "cairn listening");
 
-    // Run the S3-API accept loop and (optionally) the web-console accept loop concurrently. The web console loop
-    // sets `serve_web = true`, which makes its connections serve the console at the root path.
-    let api = accept_loop(
-        listener,
-        state.clone(),
-        tls_rx.clone(),
-        ktls_ready,
-        false,
-        shutdown_rx.clone(),
-    );
-    match web_listener {
-        Some(sock) => {
-            let web = accept_loop(sock, state.clone(), tls_rx, ktls_ready, true, shutdown_rx);
-            tokio::join!(api, web);
-        }
-        None => api.await,
+    // Run the disjoint data and (optionally) control accept loops concurrently. Their roles are
+    // values captured at wiring time, not a per-request decision.
+    let listeners = async {
+        let api = accept_loop(
+            listener,
+            state.clone(),
+            tls_rx.clone(),
+            ktls_ready,
+            ListenerRole::Data,
+            shutdown_rx.clone(),
+        );
+        let report = match web_listener {
+            Some(sock) => {
+                let web = accept_loop(
+                    sock,
+                    state.clone(),
+                    tls_rx,
+                    ktls_ready,
+                    ListenerRole::Control,
+                    shutdown_rx.clone(),
+                );
+                let (api_report, web_report) = tokio::join!(api, web);
+                api_report.merge(web_report)
+            }
+            None => api.await,
+        };
+        // All accepted request futures have now returned or been force-cancelled, and therefore
+        // every armed multipart or ordinary object-write drop guard has synchronously enqueued its
+        // recovery record. The FIFO sentinel lets the retained consumer process those commands and
+        // exit; it is joined before final persistence below.
+        state.stack.multipart_claim_recovery.finish_requests();
+        report
+    };
+
+    // Stop accepting/claiming concurrently. Only after BOTH HTTP and workers have drained do the
+    // final request-metrics drain, seal-counter persistence, and WAL checkpoints run; otherwise an
+    // in-flight request could increment the accumulator after its supposed final flush.
+    let mut background_shutdown = shutdown_rx.clone();
+    let shutdown_state = state.clone();
+    let stop_background = async move {
+        wait_for_shutdown(&mut background_shutdown).await;
+        // The signal broadcaster withdraws readiness before publishing shutdown. Repeat the store
+        // as a fail-safe for the sender-closed path so an auxiliary-task failure cannot leave a
+        // stopped listener advertised ready.
+        shutdown_state.ready.store(false, Ordering::SeqCst);
+        background.stop(SHUTDOWN_DRAIN_GRACE).await
+    };
+    let (http_report, stopped_background) = tokio::join!(listeners, stop_background);
+    let background_report = stopped_background
+        .finalize(SHUTDOWN_REQUEST_TAIL_GRACE, SHUTDOWN_FINALIZE_GRACE)
+        .await;
+
+    // Neither auxiliary task is detached. The signal broadcaster has completed by definition; the
+    // SIGHUP waiter may still be blocked in `recv`, so cancel and join it explicitly.
+    let signal_joined = signal_task.join().await;
+    let tls_joined = match tls_reload_task {
+        Some(task) => task.cancel_and_join().await,
+        None => true,
+    };
+    if http_report.is_complete() && background_report.is_complete() && signal_joined && tls_joined {
+        tracing::info!("shutdown complete");
+    } else {
+        tracing::error!(
+            http_drain_complete = http_report.is_complete(),
+            background_shutdown_complete = background_report.is_complete(),
+            signal_joined,
+            tls_joined,
+            "server stopped with incomplete shutdown work"
+        );
     }
-    state.ready.store(false, Ordering::SeqCst);
-    tracing::info!("shutdown complete");
     Ok(())
 }
 
 /// Accept and serve connections on one listener until shutdown, then drain in-flight connections
-/// within a bounded grace period. `serve_web` selects the listener's role: `true` adds the web
-/// console at the root path; `false` is the pure S3 data-plane listener.
+/// within a bounded grace period. `role` is fixed when the listener is wired.
 async fn accept_loop(
     listener: TcpListener,
     state: Arc<AppState>,
     tls_rx: Option<watch::Receiver<Arc<rustls::ServerConfig>>>,
     ktls_ready: bool,
-    serve_web: bool,
+    role: ListenerRole,
     shutdown_rx: watch::Receiver<bool>,
-) {
+) -> HttpDrainReport {
     let mut conns = tokio::task::JoinSet::new();
     let mut shutdown = shutdown_rx.clone();
     loop {
+        if *shutdown.borrow() {
+            break;
+        }
         tokio::select! {
+            biased;
+            _ = shutdown.changed() => break,
             accept = listener.accept() => {
                 let (stream, peer) = match accept {
                     Ok(v) => v,
@@ -177,22 +409,78 @@ async fn accept_loop(
                 conns.spawn(async move {
                     let _permit = permit; // released when the connection task ends
                     match tls {
-                        Some(cfg) => serve_tls(stream, cfg, ktls_ready, st, peer, serve_web, conn_shutdown).await,
-                        None => serve_plaintext(stream, st, peer, serve_web, conn_shutdown).await,
+                        Some(cfg) => serve_tls(stream, cfg, ktls_ready, st, peer, role, conn_shutdown).await,
+                        None => serve_plaintext(stream, st, peer, role, conn_shutdown).await,
                     }
                 });
             }
-            _ = shutdown.changed() => break,
         }
     }
 
-    let drain = async { while conns.join_next().await.is_some() {} };
-    if tokio::time::timeout(Duration::from_secs(30), drain)
-        .await
-        .is_err()
-    {
-        conns.shutdown().await;
+    let report = drain_connections(conns, SHUTDOWN_DRAIN_GRACE).await;
+    if report.is_complete() {
+        tracing::info!(
+            ?role,
+            completed = report.completed,
+            "HTTP connections drained"
+        );
+    } else {
+        tracing::error!(
+            ?role,
+            completed = report.completed,
+            cancelled = report.cancelled,
+            failed = report.failed,
+            deadline_exceeded = report.deadline_exceeded,
+            "HTTP connection drain incomplete"
+        );
     }
+    report
+}
+
+async fn drain_connections(
+    mut connections: tokio::task::JoinSet<()>,
+    grace: Duration,
+) -> HttpDrainReport {
+    let mut report = HttpDrainReport::default();
+    let cooperative = async {
+        while let Some(result) = connections.join_next().await {
+            match result {
+                Ok(()) => report.completed += 1,
+                Err(error) if error.is_cancelled() => {
+                    report.cancelled += 1;
+                    tracing::warn!(%error, "HTTP connection task was cancelled during drain");
+                }
+                Err(error) => {
+                    report.failed += 1;
+                    tracing::warn!(%error, "HTTP connection task failed during drain");
+                }
+            }
+        }
+    };
+
+    if tokio::time::timeout(grace, cooperative).await.is_err() {
+        report.deadline_exceeded = true;
+        let remaining = connections.len();
+        tracing::error!(
+            remaining,
+            timeout_seconds = grace.as_secs(),
+            "HTTP connection drain deadline exceeded; aborting remaining tasks"
+        );
+        connections.abort_all();
+        // `abort_all` only requests cancellation. Drain every result so no connection task is
+        // detached and so panics/cancellations are represented in the process-level outcome.
+        while let Some(result) = connections.join_next().await {
+            match result {
+                Ok(()) => report.completed += 1,
+                Err(error) if error.is_cancelled() => report.cancelled += 1,
+                Err(error) => {
+                    report.failed += 1;
+                    tracing::warn!(%error, "HTTP connection task failed while being cancelled");
+                }
+            }
+        }
+    }
+    report
 }
 
 /// Perform the TLS handshake for one accepted connection and serve it.
@@ -221,16 +509,16 @@ async fn serve_tls(
     ktls_ready: bool,
     state: Arc<AppState>,
     peer: std::net::SocketAddr,
-    serve_web: bool,
+    role: ListenerRole,
     conn_shutdown: watch::Receiver<bool>,
 ) {
     // Console courtesy: on the web-console listener, a browser that connects in plaintext to the TLS port
     // gets a `308` to the `https://` URL rather than an opaque handshake failure. Peek the first byte
     // WITHOUT consuming it — a TLS ClientHello is a handshake record (`0x16`); any other first byte is
     // a plaintext HTTP request (`G`/`P`/… are all != 0x16). The S3 data-plane listener
-    // (`serve_web == false`) deliberately skips this and stays TLS-only: redirecting a SigV4 request
+    // (the data role) deliberately skips this and stays TLS-only: redirecting a SigV4 request
     // would require first accepting its `Authorization`/presigned credentials over cleartext.
-    if serve_web {
+    if role.is_control() {
         // Bound the wait for the first byte: a client that connects and never sends one must not pin
         // this task (an unauthenticated slow-loris). A genuine TLS or HTTP client sends immediately,
         // so a short cap is invisible to real traffic and drops idle/hostile sockets.
@@ -273,7 +561,7 @@ async fn serve_tls(
                 Ok(ktls_stream) => {
                     metrics::counter!("cairn_ktls_offload_total", "result" => "ok").increment(1);
                     tracing::debug!(%peer, "kTLS offload engaged");
-                    serve_io(ktls_stream, state, peer, true, serve_web, conn_shutdown).await;
+                    serve_io(ktls_stream, state, peer, true, role, conn_shutdown).await;
                 }
                 Err(e) => {
                     metrics::counter!("cairn_ktls_offload_total", "result" => "error").increment(1);
@@ -288,7 +576,7 @@ async fn serve_tls(
     // Userspace path (feature off, non-Linux, or kTLS unavailable): the original behaviour.
     let _ = ktls_ready;
     match acceptor.accept(stream).await {
-        Ok(tls) => serve_io(tls, state, peer, true, serve_web, conn_shutdown).await,
+        Ok(tls) => serve_io(tls, state, peer, true, role, conn_shutdown).await,
         Err(e) => tracing::debug!(error = %e, "TLS handshake failed"),
     }
 }
@@ -426,30 +714,33 @@ async fn serve_plaintext(
     stream: tokio::net::TcpStream,
     state: Arc<AppState>,
     peer: std::net::SocketAddr,
-    serve_web: bool,
+    role: ListenerRole,
     conn_shutdown: watch::Receiver<bool>,
 ) {
     // The sendfile fast path runs only on the S3 data-plane listener: the web console listener serves console
     // assets at paths that must be matched before S3 routing, so it always goes straight to hyper.
     #[cfg(all(feature = "fast-io", target_os = "linux"))]
-    if !serve_web {
+    if role.is_data() {
+        let mut fast_shutdown = conn_shutdown.clone();
         match crate::fast_get::try_sendfile_get(
             stream,
             state.stack.as_ref(),
             peer,
+            &state.trusted_proxies,
             state.request_metrics_enabled,
             state.fastio_min_bytes,
+            &mut fast_shutdown,
         )
         .await
         {
             crate::fast_get::Fast::Handled => {}
             crate::fast_get::Fast::Fallback { stream } => {
-                serve_io(stream, state, peer, false, serve_web, conn_shutdown).await;
+                serve_io(stream, state, peer, false, role, conn_shutdown).await;
             }
         }
         return;
     }
-    serve_io(stream, state, peer, false, serve_web, conn_shutdown).await;
+    serve_io(stream, state, peer, false, role, conn_shutdown).await;
 }
 
 async fn serve_io<S>(
@@ -457,7 +748,7 @@ async fn serve_io<S>(
     state: Arc<AppState>,
     peer: std::net::SocketAddr,
     secure: bool,
-    serve_web: bool,
+    role: ListenerRole,
     mut conn_shutdown: watch::Receiver<bool>,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -466,16 +757,8 @@ async fn serve_io<S>(
     let svc_shutdown = conn_shutdown.clone();
     // Capture before `state` is moved into the service closure (Duration is Copy).
     let header_read_timeout = state.header_read_timeout;
-    let svc = service_fn(move |req| {
-        handle(
-            state.clone(),
-            peer,
-            secure,
-            serve_web,
-            req,
-            svc_shutdown.clone(),
-        )
-    });
+    let svc =
+        service_fn(move |req| handle(state.clone(), peer, secure, role, req, svc_shutdown.clone()));
     let mut builder = auto::Builder::new(TokioExecutor::new());
     // Install a timer and a header-read timeout so a connection that dribbles or never finishes its
     // request head is dropped instead of pinning a task/FD forever (slowloris; audit 2026-07). The
@@ -487,13 +770,19 @@ async fn serve_io<S>(
         .header_read_timeout(header_read_timeout);
     let conn = builder.serve_connection(io, svc);
     tokio::pin!(conn);
+    if *conn_shutdown.borrow() {
+        conn.as_mut().graceful_shutdown();
+        let _ = conn.await;
+        return;
+    }
     tokio::select! {
-        res = conn.as_mut() => {
-            if let Err(e) = res { tracing::debug!(error = %e, "connection ended"); }
-        }
+        biased;
         _ = conn_shutdown.changed() => {
             conn.as_mut().graceful_shutdown();
             let _ = conn.await;
+        }
+        res = conn.as_mut() => {
+            if let Err(e) = res { tracing::debug!(error = %e, "connection ended"); }
         }
     }
 }
@@ -534,7 +823,7 @@ async fn handle(
     state: Arc<AppState>,
     peer: std::net::SocketAddr,
     secure: bool,
-    serve_web: bool,
+    role: ListenerRole,
     req: Request<Incoming>,
     shutdown: watch::Receiver<bool>,
 ) -> Result<Response<ResponseBody>, Infallible> {
@@ -557,8 +846,9 @@ async fn handle(
         %peer,
     );
 
-    let infra =
-        method == Method::GET && matches!(path.as_str(), "/healthz" | "/readyz" | "/metrics");
+    let infra = role.is_data()
+        && method == Method::GET
+        && matches!(path.as_str(), "/healthz" | "/readyz" | "/metrics");
     // Load-shed and timeout are the two failures a person is most likely to meet under load, and
     // both answer before the request ever reaches the S3 adapter. Decide here, while the head is
     // still in hand, whether this caller is a browser navigating (ARCH 25.1.1); machine clients keep
@@ -578,23 +868,21 @@ async fn handle(
     };
 
     let response = async move {
-        // Infra endpoints (`/healthz`, `/readyz`, `/metrics`) must answer even when the server is
-        // shedding load, so a liveness/readiness probe or scrape never trips the concurrency
-        // limiter and flaps the instance out of rotation (audit #21). Only real S3/web console work takes a
-        // permit; the guard is held for the whole request via the `Option`.
-        let _permit = if infra {
-            None
-        } else {
-            match state.concurrency.try_acquire() {
-                Ok(p) => Some(p),
-                Err(_) => {
-                    return shed_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "TooManyRequests",
-                        shed_wants_html,
-                        &request_id,
-                    );
-                }
+        // Infra endpoints use a small dedicated budget, independent of saturated S3 traffic but
+        // still bounded against unauthenticated probe/scrape floods. Metrics has a sub-budget so
+        // rendering scrapes cannot occupy every infrastructure lane and starve `/readyz`.
+        let _permits = match state
+            .budgets
+            .try_acquire(infra, infra && path == "/metrics")
+        {
+            Ok(permits) => permits,
+            Err(_) => {
+                return shed_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "TooManyRequests",
+                    shed_wants_html,
+                    &request_id,
+                );
             }
         };
         let start = Instant::now();
@@ -605,9 +893,7 @@ async fn handle(
                 adapter::handle(
                     state.stack.clone(),
                     req,
-                    peer.ip(),
-                    secure,
-                    serve_web,
+                    adapter::RequestTransport::new(peer.ip(), secure, &state.trusted_proxies, role),
                     request_id.clone(),
                     shutdown.clone(),
                 )
@@ -628,7 +914,7 @@ async fn handle(
         let elapsed = elapsed_dur.as_secs_f64();
         // A low-cardinality `route` label (ARCH 26): the request is bucketed into a small fixed set
         // of route classes rather than the raw path, so the time series stay bounded.
-        let route = classify_route(&path);
+        let route = classify_route(role, &path);
         metrics::counter!(
             "cairn_requests_total",
             "method" => method.to_string(),
@@ -668,7 +954,7 @@ async fn handle(
                     state.stack.request_metrics.forget_bucket(deleted);
                 }
             }
-            if let Some((op, mut bucket)) = classify_operation(serve_web, &method, &path, &query) {
+            if let Some((op, mut bucket)) = classify_operation(role, &method, &path, &query) {
                 // The raw S3 DeleteBucket request itself: attribute it to the non-bucket sentinel so
                 // it does not re-create a per-bucket row for the bucket just deleted. (The management
                 // delete is already classified as Management/"".)
@@ -720,18 +1006,25 @@ fn content_length(headers: &hyper::HeaderMap) -> u64 {
 
 /// Bucket a request path into a small, fixed set of low-cardinality route classes for the metrics
 /// `route` label (ARCH 26). The raw path (which embeds bucket/key names) would explode the time
-/// series, so it is collapsed to a coarse family: the infra endpoints by name, the management API,
-/// the web console assets, the signed share path, and otherwise the S3 data plane.
-pub(crate) fn classify_route(path: &str) -> &'static str {
-    match path {
-        "/healthz" => "healthz",
-        "/readyz" => "readyz",
-        "/metrics" => "metrics",
-        "/" => "web",
-        _ if path.starts_with("/api/v1") => "api",
-        _ if path.starts_with("/share/") => "share",
-        _ if path.starts_with("/assets/") => "web",
-        _ => "s3",
+/// series, so it is collapsed to a coarse family. The listener role is part of the classification:
+/// the same path can be an S3 bucket on the data listener and a rejected console path on control.
+pub(crate) fn classify_route(role: ListenerRole, path: &str) -> &'static str {
+    match role {
+        ListenerRole::Data => match path {
+            "/healthz" => "healthz",
+            "/readyz" => "readyz",
+            "/metrics" => "metrics",
+            _ if adapter::is_control_path(path) => "rejected",
+            _ if path.starts_with("/share/") => "share",
+            _ => "s3",
+        },
+        ListenerRole::Control => {
+            if adapter::is_control_path(path) {
+                "api"
+            } else {
+                "web"
+            }
+        }
     }
 }
 
@@ -746,33 +1039,25 @@ pub(crate) fn classify_route(path: &str) -> &'static str {
 /// S3 operation name. Virtual-host attribution is out of scope, so a request whose bucket cannot be
 /// read from the path falls back to an empty bucket string.
 ///
-/// `serve_web` is the listener role: on the web-console listener everything that is not `/api/v1` is
-/// the SPA shell or a root-served static asset (e.g. `/favicon.svg`), not S3 traffic (which uses the
-/// data-plane listener), so it is not charted — otherwise a console asset shows up as a phantom
-/// path-style bucket.
+/// On the control listener, exact `/api/v1` requests are management operations and every other path
+/// is console or rejected traffic. On the data listener, control paths, infrastructure, and shares
+/// are excluded; everything else retains normal path-style S3 classification.
 pub(crate) fn classify_operation(
-    serve_web: bool,
+    role: ListenerRole,
     method: &Method,
     path: &str,
     query: &str,
 ) -> Option<(String, String)> {
+    if role.is_control() {
+        return adapter::is_control_path(path).then(|| ("Management".to_owned(), String::new()));
+    }
+
     // Not-counted families. Mirror `classify_route`'s buckets so the two stay consistent.
     match path {
         "/" | "/healthz" | "/readyz" | "/metrics" => return None,
         _ => {}
     }
-    if path.starts_with("/share/") || path.starts_with("/assets/") {
-        return None;
-    }
-    if path.starts_with("/api/v1") {
-        return Some(("Management".to_owned(), String::new()));
-    }
-    // On the web-console listener, anything that is not the management API is the SPA shell or a
-    // static asset served at the root (e.g. `/favicon.svg`) — not an S3 operation. Real S3
-    // data-plane traffic uses the S3 listener, so don't misclassify a console asset as a phantom
-    // path-style bucket — which is exactly how `/favicon.svg` surfaced as a bucket named
-    // "favicon.svg" in the usage analytics.
-    if serve_web {
+    if path.starts_with("/share/") || adapter::is_control_path(path) {
         return None;
     }
 
@@ -895,7 +1180,7 @@ async fn route_infra(state: &AppState, path: &str) -> Response<ResponseBody> {
 
 /// Readiness reflects real state (ARCH 6.4, 26.4): the process is ready only once startup
 /// migrations and reconciliation have completed (the `ready` gate) AND both halves of the store are
-/// responsive — a trivial indexed read on the read pool (`list_buckets(None)`) AND a cheap probe of
+/// responsive — a constant-cost `SELECT 1` through every read pool AND a cheap probe of
 /// the single writer (it must be draining its queue, not wedged). `/healthz` stays pure liveness;
 /// this probe must not falsely report ready when either the read pool or the writer is stuck. The
 /// writer probe is available only for the concrete sqlite backend; the libSQL/Turso engines
@@ -904,7 +1189,7 @@ async fn is_ready(state: &AppState) -> bool {
     if !state.ready.load(Ordering::SeqCst) {
         return false;
     }
-    if state.stack.meta.list_buckets(None).await.is_err() {
+    if state.stack.meta.read_probe().await.is_err() {
         return false;
     }
     // Every sqlite shard's writer must be responsive (one entry when unsharded; none for the
@@ -1009,8 +1294,30 @@ async fn reload_tls_on_sighup(
 ) {
 }
 
-/// Resolve on the first of SIGINT or SIGTERM, broadcasting shutdown.
-async fn wait_for_signal(tx: watch::Sender<bool>) {
+/// Publish a testable shutdown future onto the process-wide watch channel.
+async fn broadcast_shutdown(
+    signal: impl Future<Output = ()>,
+    ready: Arc<AtomicBool>,
+    tx: watch::Sender<bool>,
+) {
+    signal.await;
+    // Ordering is part of the external shutdown contract: load balancers must see not-ready before
+    // listeners stop accepting and workers stop claiming new work from the published watch value.
+    ready.store(false, Ordering::SeqCst);
+    let _ = tx.send(true);
+}
+
+/// Wait until shutdown is signalled or the sole sender exits unexpectedly. Sender closure is
+/// treated as shutdown so workers and listeners cannot remain orphaned if the signal task fails.
+async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
+    if *shutdown.borrow() {
+        return;
+    }
+    let _ = shutdown.changed().await;
+}
+
+/// Resolve on the first of SIGINT or SIGTERM.
+async fn wait_for_signal() {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
@@ -1027,7 +1334,6 @@ async fn wait_for_signal(tx: watch::Sender<bool>) {
     {
         let _ = tokio::signal::ctrl_c().await;
     }
-    let _ = tx.send(true);
 }
 
 // The infra endpoints and S3 dispatch are exercised by the live smoke test and the
@@ -1213,8 +1519,167 @@ mod fast_io_tests {
 }
 
 #[cfg(test)]
+mod request_budget_tests {
+    use super::*;
+
+    #[test]
+    fn infrastructure_budget_is_bounded_independent_and_reserves_probe_lanes() {
+        let budgets = RequestBudgets::new(1);
+
+        // Saturating normal S3/control work does not consume the infrastructure budget.
+        let general = budgets.try_acquire(false, false).unwrap();
+        assert!(budgets.try_acquire(false, false).is_err());
+
+        // A scrape consumes one infrastructure lane plus one of the two metrics sub-lanes.
+        let metrics_a = budgets.try_acquire(true, true).unwrap();
+        let metrics_b = budgets.try_acquire(true, true).unwrap();
+        assert!(
+            budgets.try_acquire(true, true).is_err(),
+            "a third concurrent scrape must fail fast"
+        );
+
+        // Two infrastructure lanes remain available for cheap health/readiness probes even while
+        // both metrics lanes are busy. This prevents a scrape flood from starving `/readyz`.
+        let probe_a = budgets.try_acquire(true, false).unwrap();
+        let probe_b = budgets.try_acquire(true, false).unwrap();
+        assert!(
+            budgets.try_acquire(true, false).is_err(),
+            "the fixed infrastructure budget must fail fast when full"
+        );
+
+        // Releasing any request returns its exact lane immediately.
+        drop(metrics_a);
+        let metrics_c = budgets.try_acquire(true, true).unwrap();
+        drop((metrics_b, metrics_c, probe_a, probe_b, general));
+        assert!(budgets.try_acquire(false, false).is_ok());
+        assert!(budgets.try_acquire(true, false).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_withdraws_readiness_before_waking_listeners_and_workers() {
+        let ready = Arc::new(AtomicBool::new(true));
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let (signal_tx, signal_rx) = tokio::sync::oneshot::channel();
+        let signal_task = RetainedTask::spawn(
+            "test shutdown signal",
+            broadcast_shutdown(
+                async move {
+                    let _ = signal_rx.await;
+                },
+                Arc::clone(&ready),
+                shutdown_tx,
+            ),
+        );
+
+        assert!(ready.load(Ordering::SeqCst));
+        assert!(!*shutdown_rx.borrow());
+        signal_tx.send(()).unwrap();
+        shutdown_rx.changed().await.unwrap();
+
+        // `broadcast_shutdown` stores readiness=false before publishing the watch value. Seeing
+        // that value therefore guarantees every listener/worker also sees readiness withdrawn.
+        assert!(!ready.load(Ordering::SeqCst));
+        assert!(*shutdown_rx.borrow());
+        assert!(signal_task.join().await);
+    }
+
+    #[tokio::test]
+    async fn retained_auxiliary_task_aborts_on_owner_drop_instead_of_detaching() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let dropped_task = Arc::clone(&dropped);
+        let task = RetainedTask::spawn("TLS reload test", async move {
+            let _drop_flag = DropFlag(dropped_task);
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        started_rx.await.expect("auxiliary task started");
+
+        drop(task);
+        tokio::task::yield_now().await;
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn retained_auxiliary_cancel_path_aborts_and_joins() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let dropped_task = Arc::clone(&dropped);
+        let task = RetainedTask::spawn("TLS reload test", async move {
+            let _drop_flag = DropFlag(dropped_task);
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        started_rx.await.expect("auxiliary task started");
+
+        assert!(task.cancel_and_join().await);
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn http_drain_timeout_aborts_awaits_and_reports_remaining_connections() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let mut connections = tokio::task::JoinSet::new();
+        connections.spawn(async {});
+        let dropped_task = Arc::clone(&dropped);
+        connections.spawn(async move {
+            let _drop_flag = DropFlag(dropped_task);
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        started_rx.await.expect("connection task started");
+        tokio::task::yield_now().await;
+
+        let report = drain_connections(connections, Duration::from_millis(10)).await;
+        assert_eq!(
+            report,
+            HttpDrainReport {
+                completed: 1,
+                cancelled: 1,
+                failed: 0,
+                deadline_exceeded: true,
+            }
+        );
+        assert!(!report.is_complete());
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "cancelled connection future must be dropped before drain returns"
+        );
+    }
+}
+
+#[cfg(test)]
 mod delete_label_tests {
     use super::*;
+
+    #[test]
+    fn headless_listener_plan_has_no_control_plane() {
+        let mut config = Config {
+            web_addr: "off".to_owned(),
+            ..Config::default()
+        };
+        let plan = listener_plan(&config).expect("headless plan");
+        assert_eq!(plan.data_addr, config.listen_addr);
+        assert_eq!(plan.control_addr, None);
+
+        config.web_addr = "127.0.0.1:7374".to_owned();
+        let plan = listener_plan(&config).expect("two-listener plan");
+        assert_eq!(plan.control_addr, Some("127.0.0.1:7374".parse().unwrap()));
+    }
 
     #[test]
     fn deleted_bucket_label_recognises_both_delete_paths() {
@@ -1254,19 +1719,56 @@ mod delete_label_tests {
         let get = Method::GET;
         // On the web-console listener, a root-served asset like the favicon must NOT be charted as a
         // path-style S3 bucket named "favicon.svg" (the bug a fresh node made obvious).
-        assert_eq!(classify_operation(true, &get, "/favicon.svg", ""), None);
+        assert_eq!(
+            classify_operation(ListenerRole::Control, &get, "/favicon.svg", ""),
+            None
+        );
         // The SPA shell / any other root path on the console listener is likewise not S3.
-        assert_eq!(classify_operation(true, &get, "/anything", ""), None);
+        assert_eq!(
+            classify_operation(ListenerRole::Control, &get, "/anything", ""),
+            None
+        );
         // Management calls are still charted on the console listener.
         assert_eq!(
-            classify_operation(true, &get, "/api/v1/buckets", ""),
+            classify_operation(ListenerRole::Control, &get, "/api/v1/buckets", ""),
             Some(("Management".to_owned(), String::new()))
         );
         // On the S3 data-plane listener the same path is a real path-style S3 op, unchanged.
         assert_eq!(
-            classify_operation(false, &get, "/photos", ""),
+            classify_operation(ListenerRole::Data, &get, "/photos", ""),
             Some(("ListObjects".to_owned(), "photos".to_owned()))
         );
+        assert_eq!(
+            classify_operation(ListenerRole::Data, &get, "/favicon.svg", ""),
+            Some(("ListObjects".to_owned(), "favicon.svg".to_owned()))
+        );
+        // Segment lookalikes remain S3 names on data; only the exact versioned namespace is blocked.
+        assert_eq!(
+            classify_operation(ListenerRole::Data, &get, "/api/v10", ""),
+            Some(("GetObject".to_owned(), "api".to_owned()))
+        );
+        assert_eq!(
+            classify_operation(ListenerRole::Data, &get, "/api/v1/buckets", ""),
+            None
+        );
+    }
+
+    #[test]
+    fn route_metrics_follow_the_listener_matrix() {
+        assert_eq!(classify_route(ListenerRole::Data, "/"), "s3");
+        assert_eq!(classify_route(ListenerRole::Control, "/"), "web");
+        assert_eq!(
+            classify_route(ListenerRole::Data, "/api/v1/buckets"),
+            "rejected"
+        );
+        assert_eq!(
+            classify_route(ListenerRole::Control, "/api/v1/buckets"),
+            "api"
+        );
+        assert_eq!(classify_route(ListenerRole::Data, "/api/v10"), "s3");
+        assert_eq!(classify_route(ListenerRole::Control, "/api/v10"), "web");
+        assert_eq!(classify_route(ListenerRole::Data, "/healthz"), "healthz");
+        assert_eq!(classify_route(ListenerRole::Control, "/healthz"), "web");
     }
 }
 

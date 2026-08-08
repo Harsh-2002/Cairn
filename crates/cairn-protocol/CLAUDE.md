@@ -11,8 +11,8 @@ Clock/Crypto>`) — never a concrete engine.
   multipart, copy, listing, every subresource incl. `?encryption`), plus the free-function helpers
   below the impl. The central `authorize` and all SSE seal/open live here: `resolve_object_encryption`
   (explicit header > bucket default > transparent `AtRest` > plaintext) mints the object DEK across
-  `SseMode {SseS3, AtRest, Kms}`; `open_sse_dek`/`seal_part_dek`/`open_part_dek` handle read and
-  per-part multipart keys.
+  `SseMode {SseS3, AtRest, Kms}`; `open_sse_cipher`/`seal_part_cipher`/`open_part_cipher` carry the
+  persisted CRNB version declaration together with each read key.
 - `keyprovider.rs` — the SSE-KMS `KeyProvider` trait + `LocalRingProvider` (v1). Maps a KMS key id
   to DEK-sealing crypto and gates writes via the `CAIRN_KMS_KEY_IDS` allow-list. **Label-only**: every
   DEK is sealed under the same node master ring regardless of key id — the id is a label, not
@@ -30,6 +30,8 @@ Clock/Crypto>`) — never a concrete engine.
 - **Authorize centrally, before the handler.** `bucket_op`/`object_op` map the request to an
   `Action`, then call `authorize` BEFORE dispatching to the operation. New operations route through
   `bucket_action`/`object_action`; do not add a handler that skips this chokepoint.
+- Preserve `S3Request.source`'s typed direct/forwarded/unavailable provenance unchanged when
+  assembling `RequestContext`; `aws:SourceIp` must never infer an address inside this crate.
 - **An unrecognized subresource MUST NOT fall through to a data-plane handler.** A `PUT object?acl`
   must never overwrite the object body — `unhandled_{object,bucket}_subresource` gates this and
   returns `NotImplemented`. Add new `?subresource` arms *above* those guards (the `?encryption`
@@ -37,25 +39,64 @@ Clock/Crypto>`) — never a concrete engine.
 - **Durability ordering is the contract** (ARCH 8/21.1): stage (fsync file+dir) → verify
   Content-MD5 / signed SHA-256 / client checksums → `meta.submit(Mutation::…)` (the single
   linearization point) → reclaim the superseded blob best-effort. Don't reorder.
-- **Any failure after `blob.stage` MUST delete the staged blob** before returning (`blob.delete`),
-  or you leak an orphan. Every early-return in `put_object`/copy/multipart after staging does this.
-- **Crypto fails closed** across every SSE seam. `open_sse_dek`/`open_part_dek` return an error on a
-  bad/missing key or tampered envelope — never plaintext. SSE-S3, transparent `AtRest`, and SSE-KMS
-  are all **label-only** (one master ring seals every DEK, so open is symmetric on `self.crypto`); a
-  KMS key id gates writes via the allow-list but is not isolation. Part-level multipart seals a
-  per-part DEK *before* `stage_part` (no fallible step after staging) and `complete_multipart` opens
-  every part key before claiming the session (a bad key leaves the upload retryable). Mandatory-SSE
-  buckets refuse a plaintext client PUT — transparent `AtRest` satisfies the data goal but NOT the
-  client contract, so it is force-upgraded to advertised SSE-S3.
+- **Every artifact returned by `blob.stage` or `blob.stage_part` needs explicit ownership until its
+  metadata commit.** PUT/Copy arm `ObjectWriteGuard` immediately after staging and carry the exact
+  bucket/key/version/immutable-row-id/path through every later await. Cancellation or an ambiguous
+  writer acknowledgement synchronously queues `ResolveObjectWrite` on the retained server worker;
+  only its exact `referenced: false` outcome permits deletion, while a match or metadata error
+  preserves the path. Disarm before the first post-commit await. Definite pre-submit validation
+  failures attempt direct deletion while the guard remains armed across that await. Multipart part
+  parts arm an exact attempt/path guard immediately after staging in both UploadPart and
+  UploadPartCopy. Cancellation or ambiguous `RecordPart` acknowledgement queues
+  `ResolveMultipartPartWrite`; a match or metadata error preserves the artifact, and only an exact
+  miss deletes the attempt and releases its reservation. The attempt-derived path is the ABA token
+  across same-number retries.
+- **The Writer is the final Object Lock authority.** PUT/Copy pass validated tags + explicit lock
+  intent in the object commit mutation; capture their creation timestamp after staging so upload
+  duration cannot shorten a bucket default, and let the Writer resolve/revalidate lock state in the
+  same savepoint as the version and outbox. Copy never carries source retention/legal hold.
+  Multipart pins tags/explicit intent at initiate but resolves a default at Complete; every
+  post-claim lock failure deletes the assembled blob and releases the claim. Permanent deletes and
+  sentinel replacements pass `GovernanceBypass::{Denied,Authorized}` and consume it only inside the
+  Writer—no protocol pre-read decides protection. A present malformed/disabled lock configuration
+  fails closed; only the specialized `PUT ?object-lock` mutation may repair it.
+- Abort and Complete have exactly one metadata-writer-owned terminal winner. Complete claims
+  `active -> completing`; Abort removes only `active` and deletes session bytes only on its typed
+  `Aborted` outcome; final completion rechecks ownership in its object-upsert savepoint. Every
+  genuine post-claim failure conditionally releases `completing -> active` so retryability does not
+  weaken the terminal race. Complete mints a fresh `MultipartClaimToken` and arms its request-local
+  drop guard immediately before awaiting the token-bearing Claim mutation; cancellation can
+  therefore recover even when the writer committed but its acknowledgement was lost. An
+  acknowledged miss disarms the guard. Every release and final completion matches the persisted
+  token, so delayed or duplicate recovery cannot affect a newer owner. Terminal completion disarms
+  before any best-effort cleanup await. Once assembly returns, the guard carries that durable path
+  as well; the server may delete it only after `Released` proves no completion row references it,
+  while `NotOwner` must preserve it unless a typed non-commit result supplied stronger proof.
+- **Crypto fails closed** across every SSE seam. `open_sse_cipher`/`open_part_cipher` return an error
+  on a bad/missing key, tampered envelope, unknown format marker, or blob/metadata version mismatch
+  — never plaintext. New object descriptors stamp CRNB v3; new multipart part envelopes use the
+  `crnb3:` prefix. Only an absent object marker or unprefixed legacy part envelope selects v2.
+  SSE-S3, transparent `AtRest`, and SSE-KMS are all **label-only** (one master ring seals every DEK,
+  so open is symmetric on `self.crypto`); a KMS key id gates writes via the allow-list but is not
+  isolation. Part-level multipart seals a per-part DEK *before* `stage_part` (no fallible step after
+  staging) and `complete_multipart` opens every part key before claiming the session (a bad key
+  leaves the upload retryable). Mandatory-SSE buckets refuse a plaintext client PUT — transparent
+  `AtRest` satisfies the data goal but NOT the client contract, so it is force-upgraded to
+  advertised SSE-S3.
 - **Session credentials never short-circuit.** In `authorize`, `is_session` principals are always
   `AuthenticatedMember` — they get no owner/admin bypass (least-privilege STS, ARCH 14).
+- **Owner/admin privilege retains the user id.** Ordinary privileged principals map to
+  `OwnerOrAdmin(user_id)`, not an identity-less class, so bucket-policy `Principal` and
+  `NotPrincipal` explicit Denies can still name them (ARCH 15.3).
 - **Corrupt security configs fail closed** (ARCH 15.3/15.5): an unparseable BPA/policy/ACL doc
   raises `Internal`, never silently opens access.
 - **Copy / UploadPartCopy authorize the SOURCE read** against the *source* bucket's policy/ACL
   (audit #1, critical) — owning only the destination must not let you exfiltrate another tenant.
-- **The `x-amz-meta-cairn-replica` marker is Administrator-gated** (audit #16): only a replication
-  principal classifies a write as an inbound `Replica` (skips the outbox, preserves source
-  version id). A normal member's header is ignored and the write replicates normally.
+- **The `x-amz-meta-cairn-replica` marker is replication-action-gated** (audit #16): an exact
+  marker-bearing body PUT or non-versioned DELETE authorizes as `ReplicateObject` or
+  `ReplicateDelete`, and only that successful central authorization classifies it as an inbound
+  `Replica` (skips the outbox, preserves source version id). A normal `PutObject`/`DeleteObject`
+  grant with a forged marker is denied; a dedicated Member replication credential is supported.
 - **5xx messages are generalized** (audit #28): `error_response` logs the real cause but returns an
   opaque `InternalError` body; client 4xx keep their descriptive S3 message.
 - **Version-scoped authz** (audit #33): a `?versionId` request passes that `VersionId` to
@@ -64,8 +105,12 @@ Clock/Crypto>`) — never a concrete engine.
 ## Contract / how it fits
 - Depends on `cairn-auth`/`cairn-authz` (policy), `cairn-xml` (codec), `cairn-replication`/
   `cairn-lifecycle` (filters). Holds no SQL and no filesystem syscalls — those are `cairn-meta`/
-  `cairn-blob`. Stays runtime-agnostic: the replication-drain wake is an injected
-  `Fn()` callback (`with_replication_wake`), not a tokio handle.
+  `cairn-blob`. Stays runtime-agnostic: the replication-drain wake, multipart-completion,
+  multipart-part, and ordinary object-write recovery enqueues are injected synchronous callbacks;
+  bounded recovery admission is an injected runtime-neutral async callback. The hooks
+  (`with_replication_wake`, `with_multipart_claim_recovery`,
+  `with_multipart_part_write_recovery`, `with_object_write_recovery`, and
+  `with_storage_recovery_admission`) never expose Tokio handles or detached tasks.
 - All writes go through `meta.submit(Mutation::…)`; never open an ad-hoc write path. A new mutation
   obeys the 4(+1)-site rule (see the root `../../CLAUDE.md`).
 
