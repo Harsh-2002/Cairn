@@ -20,8 +20,11 @@ function titleFor(pathname: string): string {
   const name = seg[0] ?? "overview";
   const map: Record<string, string> = {
     overview: "Overview",
+    metrics: "Metrics",
     buckets: seg[1] ? decodeURIComponent(seg[1]) : "Buckets",
     users: seg[1] ? "User" : "Users",
+    credentials: "Credentials",
+    tags: "Tags",
     activity: "Activity",
     replication: "Replication",
     imports: "Import",

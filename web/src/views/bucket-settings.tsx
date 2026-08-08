@@ -38,11 +38,6 @@ import {
   SelectValue,
 } from "@/components/primitives/select";
 import { Skeleton } from "@/components/primitives/skeleton";
-import {
-  Tabs,
-  TabsList,
-  TabsTrigger,
-} from "@/components/primitives/tabs";
 import { ConfirmDialog } from "@/components/confirm-dialog";
 import { CorsCard } from "@/components/cors-card";
 import { Alert, AlertDescription, AlertTitle } from "@/components/primitives/alert";
@@ -621,15 +616,36 @@ export function BucketSettings() {
           ))}
         </div>
       ) : data && config ? (
-        <Tabs value={tab} onValueChange={setTab}>
-          {/* Scroll the tab row within itself on narrow phones (<=360px) instead of leaking overflow
-              to the document and forcing a horizontal page scroll (audit 2026-07). */}
-          <TabsList className="w-full max-w-full justify-start overflow-x-auto">
-            <TabsTrigger value="general">General</TabsTrigger>
-            <TabsTrigger value="protection">Data protection</TabsTrigger>
-            <TabsTrigger value="access">Access</TabsTrigger>
-            <TabsTrigger value="integrations">Integrations</TabsTrigger>
-          </TabsList>
+        <div>
+          {/* These buttons filter one settings surface rather than switching URL-addressable
+              tabpanels. `aria-pressed` describes that behavior without the broken aria-controls
+              references produced by an ARIA Tabs primitive with no matching TabsContent. */}
+          <div
+            role="group"
+            aria-label="Settings sections"
+            className="flex w-full max-w-full items-center gap-1 overflow-x-auto border-b pb-1"
+          >
+            {[
+              ["general", "General"],
+              ["protection", "Data protection"],
+              ["access", "Access"],
+              ["integrations", "Integrations"],
+            ].map(([value, label]) => (
+              <button
+                key={value}
+                type="button"
+                aria-pressed={tab === value}
+                onClick={() => setTab(value)}
+                className={cn(
+                  "relative shrink-0 rounded-md px-2.5 py-1.5 text-sm font-medium text-muted-foreground transition-colors hover:text-foreground",
+                  "after:absolute after:inset-x-0 after:-bottom-1.5 after:h-0.5 after:bg-foreground after:opacity-0 after:transition-opacity",
+                  tab === value && "text-foreground after:opacity-100",
+                )}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
           <div className="mt-4 space-y-4">
           {/* ---- Versioning ---- */}
           {tab === "general" && (
@@ -1563,7 +1579,7 @@ export function BucketSettings() {
           </SettingsCard>
           )}
           </div>
-        </Tabs>
+        </div>
       ) : null}
 
       <ConfirmDialog

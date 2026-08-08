@@ -268,7 +268,7 @@ export function CommandPalette() {
                           onMouseMove={() => setActive(idx)}
                           onClick={() => go(c.run)}
                           className={cn(
-                            "flex w-full items-center gap-2.5 rounded-md px-2 py-2 text-left text-sm outline-none",
+                            "flex min-h-11 w-full items-center gap-2.5 rounded-md px-2 py-2 text-left text-sm outline-none sm:min-h-9",
                             isActive
                               ? "bg-accent text-accent-foreground"
                               : "text-foreground",

@@ -946,7 +946,7 @@ export function BucketBrowser() {
       {/* Folder breadcrumb: the bucket root plus each path segment. Hidden while a
           tag filter is active, since tag results span every prefix. */}
       {tagFilter ? null : (
-      <Breadcrumb>
+      <Breadcrumb aria-label="Object path">
         <BreadcrumbList className="text-[13px]">
           <BreadcrumbItem>
             {path === "" ? (

@@ -71,4 +71,10 @@ export default tseslint.config(
     files: ["src/components/primitives/**/*.{ts,tsx}"],
     rules: { "react-refresh/only-export-components": "off" },
   },
+  {
+    // Browser regression/E2E drivers execute under the pinned local Node runtime, even though they
+    // drive browser APIs through DevTools.
+    files: ["scripts/**/*.mjs"],
+    languageOptions: { globals: globals.node },
+  },
 );

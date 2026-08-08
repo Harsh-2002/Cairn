@@ -166,14 +166,22 @@
     outline: none !important;
   }
   @media (prefers-reduced-motion: reduce) {
-    *,
-    *::before,
-    *::after {
-      animation-duration: 0.01ms !important;
-      animation-delay: 0ms !important;
-      animation-iteration-count: 1 !important;
-      transition-duration: 0.01ms !important;
-      scroll-behavior: auto !important;
+    html {
+      scroll-behavior: auto;
+    }
+    .animate-enter,
+    .stagger-children > *,
+    [data-slot="dialog-overlay"],
+    [data-slot="dialog-content"],
+    [data-slot="alert-dialog-overlay"],
+    [data-slot="alert-dialog-content"],
+    [data-slot="sheet-overlay"],
+    [data-slot="sheet-content"],
+    [data-slot="dropdown-menu-content"],
+    [data-slot="select-content"],
+    [data-slot="popover-content"],
+    [data-slot="tooltip-content"] {
+      animation: none !important;
     }
   }
 }
@@ -278,4 +286,3 @@
     animation-delay: 175ms;
   }
 }
-

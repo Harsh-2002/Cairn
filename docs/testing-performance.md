@@ -15,7 +15,11 @@ Dependency security is a per-commit gate rather than a periodic manual check. CI
 the shipped console tree, and separately runs `npm audit --audit-level=high` across the full
 build/lint tree. The XML unit suite includes large distinct-attribute and namespace-declaration
 cases that pin the quick-xml denial-of-service remediations without weakening duplicate-attribute
-checks.
+checks. The console additionally has a live Chrome/axe harness (`web/scripts/console-e2e.mjs`) for a
+disposable embedded-binary node: it signs in through the httpOnly-cookie endpoint, creates isolated
+bucket/user fixtures, visits every top-level and nested route at desktop and mobile widths, and
+requires valid landmarks and ARIA relationships, unique ids, correct titles/headings, no horizontal
+overflow, no accessibility violations, and no browser exceptions before removing its fixtures.
 
 ### 29.2 Property-based tests
 
