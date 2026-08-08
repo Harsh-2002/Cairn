@@ -373,9 +373,7 @@ mod tests {
     }
 
     fn random_nonce() -> [u8; NONCE_LEN] {
-        let mut nonce = [0u8; NONCE_LEN];
-        rand::thread_rng().fill_bytes(&mut nonce);
-        nonce
+        rand::random()
     }
 
     /// A legacy (pre-#29) sealed blob: raw AES-GCM with no AAD and a separately-stored nonce.
