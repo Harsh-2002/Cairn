@@ -1,74 +1,108 @@
 # Product
 
-## Register
+<!-- impeccable:product-schema 1 -->
 
-product
+## Platform
+
+web
 
 ## Users
 
-Operators and developers who self-host Cairn, an S3-compatible object store, usually on a single
-node. Many are not storage or IAM experts: they know they need object storage and want to run their
-own instead of paying for S3/R2. In the console they are in a focused admin task: create a bucket,
-upload or share a file, mint a scoped access key for an app, turn on compression or replication,
-check how much is stored. They are trusting this tool with production data, so confidence matters as
-much as capability.
+Cairn serves operators and developers who self-host S3-compatible object storage, most often on a
+single host. They may understand applications and infrastructure without being storage or IAM
+specialists. Their jobs include provisioning buckets, moving and inspecting object data, issuing
+scoped application credentials, configuring data protection and replication, and diagnosing the
+health and activity of a production storage node.
 
 ## Product Purpose
 
-The Cairn admin console: the single browser surface for everything Cairn can do short of the S3 wire
-protocol. Create and configure buckets; browse, preview, upload, download, and share objects; create
-S3-API users scoped by an access policy; tune versioning, quotas, compression, and replication; and
-see storage and compression at a glance. It is the reason a person picks Cairn over MinIO: the wire
-protocol is a commodity, the console is the product. Success is an operator who sets up scoped access
-and manages their storage without reading S3 IAM documentation, and trusts what they see.
+Cairn provides production-oriented S3-compatible object storage without requiring a distributed
+storage cluster or a separate management stack. It combines the S3 data plane, management API,
+browser console, and CLI in one Rust binary. Success means an operator can deploy a node, connect
+unmodified S3 clients, manage access and data safely, and understand the node's state without first
+becoming an expert in S3 IAM or Cairn's internals.
 
-## Brand Personality
+## Positioning
 
-Approachable, reassuring, trustworthy. The console lowers the intimidation of running your own object
-storage. Approachable through clarity, plain language, and breathing room, never through playfulness:
-no mascots, no bounce, no cuteness. The feeling is a calm, competent operator's tool that explains
-itself, not a toy and not a wall of widgets. Quiet confidence over flourish.
+Cairn is the self-contained alternative for workloads that need a trustworthy single-node S3
+endpoint rather than a distributed object-storage cluster. Object bytes remain ordinary files on a
+POSIX filesystem, embedded SQLite is the metadata source of truth, and the optimized React console
+ships inside the same binary. This gives operators a small deployment artifact, inspectable storage,
+crash-consistent metadata semantics, and an approachable control surface while retaining standard S3
+client compatibility.
 
-## Visual Direction
+## Operating Context
 
-Vercel/Geist minimalism, executed with React + shadcn/ui and the Geist Sans/Mono faces. Light mode is
-pure white with hairline `#e5e5e5` borders and near-black ink; dark mode is near-black (`#0a0a0a`)
-with `#2e2e2e` borders. Depth comes from 1px borders, not shadows (only floating layers — menus,
-dialogs — cast one). The primary button is neutral (black on light, white on dark); blue is reserved
-for links and the focus ring; semantic color (green/amber/red) appears only when it means something.
-Identifiers, sizes, and addresses set in Geist Mono with tabular numerals.
+Cairn runs directly as a host service or as a container; Kubernetes deployments use one StatefulSet
+replica with persistent storage. Server configuration is supplied exclusively through validated
+`CAIRN_*` environment variables. The S3 data plane normally listens on port 7373, while the embedded
+console and management API use a separate listener on port 7374 so browser credentials and stored
+object content remain on distinct origins.
 
-## Anti-references
+Operators work through standard S3 SDKs and tools, the browser console, or CLI subcommands. Typical
+flows include bootstrapping the first administrator, creating and configuring buckets, uploading and
+previewing objects, issuing scoped credentials, reviewing activity and metrics, configuring lifecycle
+or replication, and running node-local backup, restore, reconciliation, and integrity operations.
+TLS may terminate in Cairn or at a correctly configured trusted reverse proxy.
 
-- **Consumer-cute / toy-like.** Rounded mascots, playful illustrations, bouncy or elastic motion,
-  emoji-as-web console. Undermines trust for an infrastructure tool.
-- **MinIO's utilitarian density.** The thing we replace: capable but cramped, dated, and uncrafted,
-  every control jammed together with no hierarchy or air. Functional is not the bar; crafted is.
-- Also avoid: the generic AI-SaaS template (gradient hero, purple-everywhere, identical icon+heading
-  card grids) and the heavy enterprise widget-soup dashboard where everything competes at once.
+## Capabilities and Constraints
 
-## Design Principles
+- The S3 surface includes multipart upload, versioning, Object Lock, tagging, policies and ACLs,
+  public-access controls, CORS, lifecycle rules, checksums, range requests, presigned URLs, and
+  persistent object shares. The exact implemented surface is tracked in `docs/s3-api-matrix.md`.
+- The embedded console manages buckets and objects, users and credentials, tags, activity, metrics,
+  replication, imports, and bucket settings. It is a presentation layer over the administrator-gated
+  management API and contains no privileged business logic of its own.
+- Optional transparent compression, SSE-S3, SSE-KMS-compatible request handling, mandatory or
+  transparent encryption at rest, webhooks, imports, and asynchronous bucket replication are part of
+  the production surface. KMS identifiers are labels and allow-list gates in v1, not cryptographic
+  isolation domains.
+- A Cairn node is deliberately single-node: it does not provide consensus, synchronous clustering,
+  or erasure coding. Cross-host redundancy comes from asynchronous replication, while local media
+  redundancy remains the operator's responsibility.
+- The database, staging area, and blob directory must share one POSIX filesystem so atomic rename can
+  preserve the durability protocol. Metadata writes are serialized through the configured SQLite
+  writer; sharding is an explicit scale-up option rather than a distributed control plane.
+- The default metadata backend is bundled SQLite. The libSQL and Turso-compatible backends are
+  selectable alternatives with narrower maturity and platform constraints documented in the
+  engineering specification.
 
-- **Approachable through clarity, not cuteness.** Lower the barrier with plain language, sensible
-  defaults, and room to breathe, not with decoration or whimsy. A first-time self-hoster should feel
-  oriented, not talked down to.
-- **Earn trust at every step.** State plainly what an action will do, especially the irreversible
-  ones (delete a bucket, rotate a key, change a policy, reveal a one-time secret). Confirm before
-  harm; never surprise the operator with their own data.
-- **Make S3 concepts legible.** Translate IAM, policies, versioning, and replication into plain
-  choices. The PermissionBuilder is the model for the whole console: presets and a visual builder up
-  front, raw JSON one click away for experts, the two always in sync.
-- **Spacious, not dense.** The deliberate opposite of MinIO. Let the interface breathe; reserve
-  density for the places data demands it (object lists, tables), and even there keep the hierarchy
-  calm.
-- **The tool disappears into the task.** Familiar product patterns, one consistent component
-  vocabulary across every screen, standard affordances. Delight lives in small reassuring moments,
-  not on every page.
+## Brand Commitments
+
+The product name is Cairn. Its voice is approachable, reassuring, and technically precise: a calm,
+competent operator explaining the system in plain language. It lowers the intimidation of running
+object storage without becoming playful, cute, or casual about production data. Claims must remain
+specific and evidence-backed, especially around durability, security, compatibility, and performance.
+The binding visual language and visual anti-references live in `docs/design.md`.
+
+## Evidence on Hand
+
+- The implemented behavior and architectural contract live in `crates/`, `web/`, `CONTRACT.md`, and
+  the section-numbered engineering specification under `docs/`.
+- `docs/s3-api-matrix.md` records compatibility by operation and condition; `conformance/` contains
+  real-SDK, crash-consistency, replication, stress, and interoperability harnesses.
+- `.github/workflows/ci.yml` is the hosted quality gate, while the root `Makefile` exposes the local
+  formatting, lint, test, web-build, dependency-audit, and installer checks.
+- `docs/benchmarks.md` records reproducible benchmark commands, observed results, and their caveats.
+- No customer testimonials, adoption numbers, certifications, third-party audits, or independent
+  performance claims are established in this repository; future product work must not invent them.
+
+## Product Principles
+
+- **Standard at the boundary, simple inside.** Work with ordinary S3 clients while keeping the node's
+  deployment and storage model inspectable.
+- **Trust is a behavior.** Durability ordering, fail-closed security, bounded resources, explicit
+  warnings, and honest limitations matter more than feature theatre.
+- **Make S3 concepts legible.** Present policies, credentials, versioning, lifecycle, encryption, and
+  replication as understandable operator choices without hiding their consequences.
+- **One capability, multiple honest interfaces.** The S3 API, management API, console, and CLI share
+  the same underlying authority and semantics; the console must not gain a privileged shortcut.
+- **Measure before claiming.** Compatibility and performance statements must point to a repeatable
+  test, conformance harness, or benchmark with its environment and caveats.
 
 ## Accessibility & Inclusion
 
-Target WCAG AAA where it does not fight the task (7:1 contrast for text, generous hit areas), with AA
-as the non-negotiable floor everywhere. Full keyboard navigation with visible focus rings; honor
-`prefers-reduced-motion` (motion conveys state, so it degrades to instant or crossfade, never gates
-content); light and dark themes at contrast parity. Placeholder and muted text held to real contrast,
-not decorative gray.
+WCAG AA is the non-negotiable floor, with AAA contrast targeted where it does not obstruct the task.
+The console supports full keyboard navigation, visible focus, semantic landmarks and controls,
+generous mobile hit areas, reduced-motion preferences, and light/dark themes at contrast parity.
+Muted and placeholder text must remain readable rather than functioning as decorative gray.
