@@ -1,13 +1,43 @@
 {
   "schemaVersion": 2,
-  "generatedAt": "2026-06-18T00:00:00Z",
+  "generatedAt": "2026-08-09T06:20:49Z",
   "title": "Design System: Cairn Console",
   "extensions": {
     "colorMeta": {
+      "paper-white": {
+        "role": "neutral",
+        "displayName": "Paper White",
+        "canonical": "oklch(1 0 0)",
+        "tonalRamp": ["oklch(0.145 0 0)", "oklch(0.205 0 0)", "oklch(0.31 0 0)", "oklch(0.45 0 0)", "oklch(0.708 0 0)", "oklch(0.922 0 0)", "oklch(0.985 0 0)", "oklch(1 0 0)"]
+      },
+      "near-black": {
+        "role": "neutral",
+        "displayName": "Near Black",
+        "canonical": "oklch(0.145 0 0)",
+        "tonalRamp": ["oklch(0.145 0 0)", "oklch(0.205 0 0)", "oklch(0.31 0 0)", "oklch(0.45 0 0)", "oklch(0.708 0 0)", "oklch(0.922 0 0)", "oklch(0.985 0 0)", "oklch(1 0 0)"]
+      },
       "neutral-primary": {
         "role": "primary",
         "displayName": "Neutral Primary",
         "canonical": "oklch(0.205 0 0)",
+        "tonalRamp": ["oklch(0.145 0 0)", "oklch(0.205 0 0)", "oklch(0.31 0 0)", "oklch(0.45 0 0)", "oklch(0.51 0 0)", "oklch(0.708 0 0)", "oklch(0.922 0 0)", "oklch(0.985 0 0)"]
+      },
+      "surface-tint": {
+        "role": "neutral",
+        "displayName": "Surface Tint",
+        "canonical": "oklch(0.985 0 0)",
+        "tonalRamp": ["oklch(0.145 0 0)", "oklch(0.205 0 0)", "oklch(0.31 0 0)", "oklch(0.45 0 0)", "oklch(0.708 0 0)", "oklch(0.922 0 0)", "oklch(0.985 0 0)", "oklch(1 0 0)"]
+      },
+      "hover-fill": {
+        "role": "neutral",
+        "displayName": "Hover Fill",
+        "canonical": "oklch(0.97 0 0)",
+        "tonalRamp": ["oklch(0.145 0 0)", "oklch(0.205 0 0)", "oklch(0.31 0 0)", "oklch(0.45 0 0)", "oklch(0.708 0 0)", "oklch(0.922 0 0)", "oklch(0.97 0 0)", "oklch(1 0 0)"]
+      },
+      "muted-ink": {
+        "role": "neutral",
+        "displayName": "Muted Ink",
+        "canonical": "oklch(0.51 0 0)",
         "tonalRamp": ["oklch(0.145 0 0)", "oklch(0.205 0 0)", "oklch(0.31 0 0)", "oklch(0.45 0 0)", "oklch(0.51 0 0)", "oklch(0.708 0 0)", "oklch(0.922 0 0)", "oklch(0.985 0 0)"]
       },
       "link-blue": {
@@ -16,11 +46,23 @@
         "canonical": "oklch(0.5 0.2 255)",
         "tonalRamp": ["oklch(0.25 0.1 255)", "oklch(0.35 0.15 255)", "oklch(0.43 0.19 255)", "oklch(0.5 0.2 255)", "oklch(0.53 0.2 255)", "oklch(0.62 0.19 255)", "oklch(0.74 0.13 255)", "oklch(0.88 0.06 255)"]
       },
+      "focus-blue": {
+        "role": "primary",
+        "displayName": "Focus Blue",
+        "canonical": "oklch(0.53 0.2 255)",
+        "tonalRamp": ["oklch(0.25 0.1 255)", "oklch(0.35 0.15 255)", "oklch(0.43 0.19 255)", "oklch(0.5 0.2 255)", "oklch(0.53 0.2 255)", "oklch(0.62 0.19 255)", "oklch(0.74 0.13 255)", "oklch(0.88 0.06 255)"]
+      },
       "hairline": {
         "role": "neutral",
         "displayName": "Hairline",
         "canonical": "oklch(0.922 0 0)",
         "tonalRamp": ["oklch(0.145 0 0)", "oklch(0.205 0 0)", "oklch(0.31 0 0)", "oklch(0.51 0 0)", "oklch(0.708 0 0)", "oklch(0.922 0 0)", "oklch(0.97 0 0)", "oklch(1 0 0)"]
+      },
+      "hairline-dark": {
+        "role": "neutral",
+        "displayName": "Dark Hairline",
+        "canonical": "oklch(0.31 0 0)",
+        "tonalRamp": ["oklch(0.145 0 0)", "oklch(0.205 0 0)", "oklch(0.31 0 0)", "oklch(0.45 0 0)", "oklch(0.51 0 0)", "oklch(0.708 0 0)", "oklch(0.922 0 0)", "oklch(0.985 0 0)"]
       },
       "success-green": {
         "role": "tertiary",
@@ -53,8 +95,10 @@
     ],
     "motion": [
       { "name": "ease-out-standard", "value": "cubic-bezier(0.16, 1, 0.3, 1)", "purpose": "Default exponential ease-out for state transitions (hover, open/close, fills). No bounce, no elastic." },
-      { "name": "duration-state", "value": "180ms", "purpose": "State transitions sit in the 150-250ms band; users are in flow, not watching choreography." },
-      { "name": "reduced-motion", "value": "0.01ms", "purpose": "prefers-reduced-motion collapses all animation/transition to instant; motion conveys state, so it degrades, never gates content." }
+      { "name": "duration-state", "value": "150ms", "purpose": "Button, close-control, and other direct state transitions stay brief so operators remain in flow." },
+      { "name": "duration-overlay", "value": "200ms", "purpose": "Dialogs and sheets enter and leave quickly enough to preserve context without feeling abrupt." },
+      { "name": "duration-entrance", "value": "240ms", "purpose": "Route and fresh-content entrances use one restrained fade plus a 4px rise; stagger delay is capped at 175ms." },
+      { "name": "reduced-motion", "value": "animation: none", "purpose": "prefers-reduced-motion disables entrances and floating-layer animation while preserving useful state transitions; motion never gates content." }
     ],
     "breakpoints": [
       { "name": "sm", "value": "640px" },
@@ -69,7 +113,7 @@
       "refersTo": "button-primary",
       "description": "The single top-emphasis action on a screen. Neutral, never blue.",
       "html": "<button class=\"ds-btn-primary\">Save changes</button>",
-      "css": ".ds-btn-primary { display: inline-flex; align-items: center; justify-content: center; gap: 8px; height: 36px; padding: 0 16px; border: none; border-radius: 6px; background: oklch(0.205 0 0); color: oklch(1 0 0); font: 500 0.875rem/1 'Geist Sans', ui-sans-serif, system-ui, sans-serif; cursor: pointer; transition: background 180ms cubic-bezier(0.16,1,0.3,1); } .ds-btn-primary:hover { background: oklch(0.27 0 0); } .ds-btn-primary:focus-visible { outline: 2px solid oklch(0.53 0.2 255); outline-offset: 2px; } .ds-btn-primary:disabled { opacity: 0.5; pointer-events: none; }"
+      "css": ".ds-btn-primary { display: inline-flex; align-items: center; justify-content: center; gap: 8px; height: 36px; padding: 0 16px; border: none; border-radius: 6px; background: oklch(0.205 0 0); color: oklch(1 0 0); font: 500 0.875rem/1 'Geist Sans', ui-sans-serif, system-ui, sans-serif; cursor: pointer; transition: background 150ms cubic-bezier(0.16,1,0.3,1); } .ds-btn-primary:hover { background: oklch(0.27 0 0); } .ds-btn-primary:focus-visible { outline: 2px solid oklch(0.53 0.2 255); outline-offset: 2px; } .ds-btn-primary:disabled { opacity: 0.5; pointer-events: none; }"
     },
     {
       "name": "Outline Button",
@@ -77,7 +121,7 @@
       "refersTo": "button-outline",
       "description": "Secondary actions: a hairline border on the surface, neutral ink.",
       "html": "<button class=\"ds-btn-outline\">Refresh</button>",
-      "css": ".ds-btn-outline { display: inline-flex; align-items: center; justify-content: center; gap: 8px; height: 36px; padding: 0 16px; border: 1px solid oklch(0.922 0 0); border-radius: 6px; background: oklch(1 0 0); color: oklch(0.145 0 0); font: 500 0.875rem/1 'Geist Sans', ui-sans-serif, system-ui, sans-serif; cursor: pointer; transition: background 180ms cubic-bezier(0.16,1,0.3,1); } .ds-btn-outline:hover { background: oklch(0.97 0 0); } .ds-btn-outline:focus-visible { outline: 2px solid oklch(0.53 0.2 255); outline-offset: 2px; }"
+      "css": ".ds-btn-outline { display: inline-flex; align-items: center; justify-content: center; gap: 8px; height: 36px; padding: 0 16px; border: 1px solid oklch(0.922 0 0); border-radius: 6px; background: oklch(1 0 0); color: oklch(0.145 0 0); font: 500 0.875rem/1 'Geist Sans', ui-sans-serif, system-ui, sans-serif; cursor: pointer; transition: background 150ms cubic-bezier(0.16,1,0.3,1); } .ds-btn-outline:hover { background: oklch(0.97 0 0); } .ds-btn-outline:focus-visible { outline: 2px solid oklch(0.53 0.2 255); outline-offset: 2px; }"
     },
     {
       "name": "Destructive-Outline Button",
@@ -85,7 +129,7 @@
       "refersTo": "button-destructive-outline",
       "description": "A destructive-but-secondary action (e.g. Deactivate user). Red is carried by border + text, never text alone.",
       "html": "<button class=\"ds-btn-destructive-outline\">Delete bucket</button>",
-      "css": ".ds-btn-destructive-outline { display: inline-flex; align-items: center; justify-content: center; gap: 8px; height: 36px; padding: 0 16px; border: 1px solid oklch(0.577 0.245 27.3 / 0.4); border-radius: 6px; background: oklch(1 0 0); color: oklch(0.577 0.245 27.3); font: 500 0.875rem/1 'Geist Sans', ui-sans-serif, system-ui, sans-serif; cursor: pointer; transition: background 180ms cubic-bezier(0.16,1,0.3,1); } .ds-btn-destructive-outline:hover { background: oklch(0.577 0.245 27.3 / 0.1); } .ds-btn-destructive-outline:focus-visible { outline: 2px solid oklch(0.577 0.245 27.3 / 0.5); outline-offset: 2px; }"
+      "css": ".ds-btn-destructive-outline { display: inline-flex; align-items: center; justify-content: center; gap: 8px; height: 36px; padding: 0 16px; border: 1px solid oklch(0.577 0.245 27.3 / 0.4); border-radius: 6px; background: oklch(1 0 0); color: oklch(0.577 0.245 27.3); font: 500 0.875rem/1 'Geist Sans', ui-sans-serif, system-ui, sans-serif; cursor: pointer; transition: background 150ms cubic-bezier(0.16,1,0.3,1); } .ds-btn-destructive-outline:hover { background: oklch(0.577 0.245 27.3 / 0.1); } .ds-btn-destructive-outline:focus-visible { outline: 2px solid oklch(0.577 0.245 27.3 / 0.5); outline-offset: 2px; }"
     },
     {
       "name": "Text Input",
@@ -146,7 +190,8 @@
       "Do state plainly what an irreversible action will do before it happens, and confirm before harm.",
       "Do use the shared vocabulary (Page/PageHeader, Card, DataTable/SkeletonRows, StatCard, StatusBadge, TextLink, FieldError, ConfirmDialog): one button shape, one form-control set, one icon style everywhere.",
       "Do render ErrorAlert above retained content and skeletons only on first load; teach the interface in empty states, never 'nothing here.'",
-      "Do hold muted and placeholder text to real contrast (>=4.5:1), targeting AAA where it doesn't fight the task; honor prefers-reduced-motion."
+      "Do hold muted and placeholder text to real contrast (>=4.5:1), targeting AAA where it doesn't fight the task; honor prefers-reduced-motion.",
+      "Do keep exactly one visible main landmark, name repeated navigation and breadcrumb landmarks uniquely, and use ARIA tabs only when every trigger owns a real tabpanel. URL-changing sections are links; in-page filters are buttons. Mobile icon actions and dialog dismiss controls provide a 44px target without inflating their glyphs."
     ],
     "donts": [
       "Don't use border-left/border-right greater than 1px as a colored accent stripe. Full hairline borders or background tints instead.",
