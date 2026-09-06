@@ -704,7 +704,10 @@ impl S3Service {
             return self.cors_preflight(&req).await;
         }
         match (&req.method, req.bucket.is_some(), req.key.is_some()) {
-            (&Method::GET, false, _) => self.list_buckets(&req).await,
+            (&Method::GET, false, _) => {
+                self.authorize_service_action(&req, Action::ListAllMyBuckets, Resource::Service)?;
+                self.list_buckets(&req).await
+            }
             (_, true, false) => self.bucket_op(req, body).await,
             (_, true, true) => self.object_op(req, body).await,
             _ => Err(Error::NotImplemented),
@@ -754,7 +757,11 @@ impl S3Service {
         // Authorize centrally: map the operation to an action, then evaluate the engine.
         let action = bucket_action(&req)?;
         if action == Action::CreateBucket {
-            self.require_principal(&req)?;
+            self.authorize_service_action(
+                &req,
+                action,
+                Resource::Bucket(req.bucket.clone().expect("bucket present")),
+            )?;
         } else {
             let bucket = self.fetch_bucket(&req).await?;
             self.authorize(
@@ -5040,6 +5047,49 @@ impl S3Service {
         req.principal.as_ref().ok_or(Error::AccessDenied)
     }
 
+    /// Authorize an account/service operation that has no existing bucket from which to load a
+    /// resource policy, ACL, ownership mode, or bucket BPA. Long-term authenticated users retain
+    /// Cairn's historical service-operation baseline, but the normal engine still applies any
+    /// matching identity-policy Deny. Sessions deliberately receive no such baseline and need an
+    /// explicit Allow in their scoped policy (ARCH 14/15).
+    fn authorize_service_action(
+        &self,
+        req: &S3Request,
+        action: Action,
+        resource: Resource,
+    ) -> Result<()> {
+        let principal = self.require_principal(req)?;
+        let requester = if principal.is_session {
+            RequesterClass::AuthenticatedMember(principal.user_id.clone())
+        } else {
+            // `OwnerOrAdmin` is the engine's implicit authenticated baseline class. For an
+            // account-level operation there is no bucket owner to distinguish ordinary members
+            // from administrators, and both were historically allowed after authentication.
+            RequesterClass::OwnerOrAdmin(principal.user_id.clone())
+        };
+        let input = AuthzInput {
+            requester,
+            is_session: principal.is_session,
+            action,
+            resource,
+            // No existing bucket owns an account/service resource. The field is irrelevant when
+            // there is no resource policy or ACL, so retain the requester's stable identity.
+            bucket_owner: principal.user_id.clone(),
+            account_bpa: PublicAccessBlock::default(),
+            bucket_bpa: PublicAccessBlock::default(),
+            policy: None,
+            user_policy: principal.user_policy.as_deref().cloned(),
+            bucket_acl: None,
+            object_acl: None,
+            ownership_mode: OwnershipMode::BucketOwnerEnforced,
+            context: build_context(req, self.clock.now()),
+        };
+        match self.authz.evaluate(&input) {
+            Decision::Allow => Ok(()),
+            Decision::Deny(_) => Err(Error::AccessDenied),
+        }
+    }
+
     /// Fetch the target bucket (NoSuchBucket if absent). Authorization is applied centrally in
     /// `bucket_op`/`object_op`, so handlers only fetch.
     async fn fetch_bucket(&self, req: &S3Request) -> Result<Bucket> {
@@ -5115,6 +5165,7 @@ impl S3Service {
             || bucket.ownership_mode != cairn_types::authz::OwnershipMode::BucketOwnerEnforced;
         let acl_row = if needs_object_meta {
             match &resource {
+                Resource::Service => None,
                 Resource::Object { key, .. } => match acl_version {
                     Some(vid) => self.meta.get_version(&bucket.name, key, vid).await?,
                     None => self.meta.current_version(&bucket.name, key).await?,

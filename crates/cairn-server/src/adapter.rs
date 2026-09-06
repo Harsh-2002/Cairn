@@ -106,6 +106,75 @@ enum ListenerRoute {
     NotFound,
 }
 
+/// The largest authenticated management document accepted by the buffered JSON control surface.
+const MAX_API_BODY: usize = 8 * 1024 * 1024;
+/// Console sign-in carries only two machine credentials. Keeping its unauthenticated buffer small
+/// prevents the public login route from multiplying the general request-concurrency budget into a
+/// multi-gigabyte memory commitment.
+const MAX_SESSION_LOGIN_BODY: usize = 4 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlBodyError {
+    Forbidden,
+    TooLarge,
+    Read,
+}
+
+/// Select the body budget before polling the request body. Only the console session endpoint,
+/// health probe, and ticket-authenticated event stream are public. Every other control route must
+/// establish an administrator first, so an anonymous request cannot make the server buffer an 8
+/// MiB document merely to receive the authorization decision the router would eventually return.
+fn control_body_limit(
+    method: &Method,
+    subpath: &str,
+    principal: Option<&Principal>,
+) -> Result<usize, ControlBodyError> {
+    match (method, subpath) {
+        (&Method::POST, "/session") => return Ok(MAX_SESSION_LOGIN_BODY),
+        (&Method::GET | &Method::DELETE, "/session") => return Ok(0),
+        (&Method::GET, "/events/stream") => return Ok(0),
+        // The control router deliberately ignores leading/trailing separators for `/health`;
+        // mirror that existing public-route spelling here so admission cannot accidentally tighten
+        // the GET route. Unsupported health methods do not gain a public exception.
+        (&Method::GET, path) if path.trim_matches('/') == "health" => return Ok(0),
+        _ => {}
+    }
+    if principal.map(|p| p.role) != Some(Role::Administrator) {
+        return Err(ControlBodyError::Forbidden);
+    }
+    Ok(MAX_API_BODY)
+}
+
+/// Apply control-plane admission before collecting a body. Generic over the HTTP body so tests can
+/// prove that a rejected anonymous request is returned without polling attacker-controlled bytes.
+async fn collect_control_body<B>(
+    method: &Method,
+    subpath: &str,
+    principal: Option<&Principal>,
+    declared_content_length: Option<u64>,
+    body: B,
+) -> Result<Bytes, ControlBodyError>
+where
+    B: hyper::body::Body<Data = Bytes> + Unpin,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
+    let limit = control_body_limit(method, subpath, principal)?;
+    if declared_content_length.is_some_and(|length| length > limit as u64) {
+        return Err(ControlBodyError::TooLarge);
+    }
+    match http_body_util::Limited::new(body, limit).collect().await {
+        Ok(collected) => Ok(collected.to_bytes()),
+        Err(error)
+            if error
+                .downcast_ref::<http_body_util::LengthLimitError>()
+                .is_some() =>
+        {
+            Err(ControlBodyError::TooLarge)
+        }
+        Err(_) => Err(ControlBodyError::Read),
+    }
+}
+
 /// Apply the listener route matrix. No branch may fall through from one plane into the other.
 fn listener_route(role: ListenerRole, method: &Method, path: &str) -> ListenerRoute {
     match role {
@@ -308,19 +377,37 @@ pub async fn handle(
             .strip_prefix("/api/v1")
             .expect("control route has the /api/v1 prefix");
         let query = parse_query(&query_str);
-        // Bound the management-API request body (audit #11). The whole body is buffered for JSON
-        // parsing, so an unbounded request would let a client pin arbitrary server memory. Cap it
-        // and refuse oversize bodies with 413 instead of buffering them.
-        const MAX_API_BODY: usize = 8 * 1024 * 1024;
-        let body_bytes = match http_body_util::Limited::new(req.into_body(), MAX_API_BODY)
-            .collect()
-            .await
+        // Decide authorization and a route-specific memory budget before polling the body. Most
+        // routes retain the 8 MiB authenticated document ceiling; the public login route is 4 KiB,
+        // while bodyless public routes accept no payload.
+        let body_bearing = request_has_body(&headers);
+        let declared_content_length = request_header(&headers, "content-length")
+            .and_then(|value| value.trim().parse::<u64>().ok());
+        let body_bytes = match collect_control_body(
+            &method,
+            subpath,
+            principal.as_ref(),
+            declared_content_length,
+            req.into_body(),
+        )
+        .await
         {
-            Ok(c) => c.to_bytes(),
-            Err(e)
-                if e.downcast_ref::<http_body_util::LengthLimitError>()
-                    .is_some() =>
-            {
+            Ok(bytes) => bytes,
+            Err(ControlBodyError::Forbidden) => {
+                // Preserve the control router's standard JSON forbidden envelope. The body was
+                // dropped without being polled; close an HTTP/1 connection that declared one so
+                // unread attacker bytes cannot be interpreted as the next request.
+                let resp = stack
+                    .control
+                    .handle(&method, subpath, &query, principal.as_ref(), Bytes::new())
+                    .await;
+                let mut response = render_control_response(resp);
+                if body_bearing {
+                    set_connection_close(&mut response);
+                }
+                return response;
+            }
+            Err(ControlBodyError::TooLarge) => {
                 let mut builder = Response::builder()
                     .status(http::StatusCode::PAYLOAD_TOO_LARGE)
                     .header("content-type", "application/json")
@@ -338,7 +425,7 @@ pub async fn handle(
             }
             // A transient read error (e.g. the client hung up): preserve the prior behavior of
             // proceeding with an empty body rather than synthesizing a misleading 413.
-            Err(_) => Bytes::new(),
+            Err(ControlBodyError::Read) => Bytes::new(),
         };
         // Master-key rotation status (audit #29, Phase E): an admin-only operator surface served
         // from the server stack because it reads the concrete per-shard handles + the key ring.
@@ -422,17 +509,7 @@ pub async fn handle(
             .control
             .handle(&method, subpath, &query, principal.as_ref(), body_bytes)
             .await;
-        // Emit the per-request id as `x-amz-request-id` on every control response, success or
-        // error, so an operator can correlate a call with logs and the error envelope (ARCH 25.1).
-        let mut builder = Response::builder()
-            .status(resp.status)
-            .header("content-type", "application/json");
-        if let Ok(v) = http::HeaderValue::from_str(&resp.request_id) {
-            builder = builder.header("x-amz-request-id", v);
-        }
-        return builder
-            .body(full_body(Bytes::from(resp.body)))
-            .unwrap_or_else(|_| Response::new(full_body(Bytes::new())));
+        return render_control_response(resp);
     }
     // The control listener serves only the root shell and concrete embedded assets. Unknown paths
     // were rejected above and can never fall through into S3.
@@ -654,7 +731,25 @@ fn web_asset_response(content_type: String, bytes: Vec<u8>) -> Response<Response
     Response::builder()
         .status(200)
         .header("content-type", content_type)
+        // Active object content lives on a distinct but potentially same-site data origin. Refuse
+        // framing so it cannot place the authenticated administrator console under decoy controls
+        // and turn real same-origin console clicks into privileged mutations.
+        .header("content-security-policy", "frame-ancestors 'none'")
+        .header("x-frame-options", "DENY")
         .body(full_body(Bytes::from(bytes)))
+        .unwrap_or_else(|_| Response::new(full_body(Bytes::new())))
+}
+
+/// Render the management service's JSON response and correlation id onto Hyper.
+fn render_control_response(resp: cairn_control::ControlResponse) -> Response<ResponseBody> {
+    let mut builder = Response::builder()
+        .status(resp.status)
+        .header("content-type", "application/json");
+    if let Ok(value) = http::HeaderValue::from_str(&resp.request_id) {
+        builder = builder.header("x-amz-request-id", value);
+    }
+    builder
+        .body(full_body(Bytes::from(resp.body)))
         .unwrap_or_else(|_| Response::new(full_body(Bytes::new())))
 }
 
@@ -1267,7 +1362,7 @@ async fn presign(
         match console_signing_credential(stack, p, bucket, req.session, required_expiry, now).await
         {
             Ok(credential) => credential,
-            Err(response) => return response,
+            Err(()) => return json_status(500, r#"{"error":"internal error"}"#),
         };
     extra_query.push((
         "X-Amz-Security-Token".to_owned(),
@@ -1312,7 +1407,7 @@ async fn console_signing_credential(
     supplied: Option<PresignSessionHandle>,
     required_expiry: Timestamp,
     now: Timestamp,
-) -> Result<ConsoleSigningCredential, Response<ResponseBody>> {
+) -> Result<ConsoleSigningCredential, ()> {
     // This is an administrator-derived session, so its bucket Allow is only the requested boundary:
     // retain every current explicit Deny from the parent identity policy. Otherwise an admin with
     // a Deny boundary could use the console transfer session to escape it (AUD-038).
@@ -1320,13 +1415,13 @@ async fn console_signing_credential(
     let policy =
         crate::sts::administrator_bounded_policy(&stack.meta, &principal.user_id, &boundary)
             .await
-            .map_err(|_| json_status(500, r#"{"error":"internal error"}"#))?;
+            .map_err(|_| ())?;
     if let Some(supplied) = supplied {
         let lookup = stack
             .meta
             .user_by_session_key(&supplied.access_key_id)
             .await
-            .map_err(|_| json_status(500, r#"{"error":"internal error"}"#))?;
+            .map_err(|_| ())?;
         if let Some(creds) = lookup {
             let presented_hash =
                 cairn_auth::hash_session_token(supplied.session_token.expose_secret());
@@ -1343,7 +1438,7 @@ async fn console_signing_credential(
                 let opened = stack
                     .crypto
                     .open(&creds.secret_ciphertext, &Nonce(creds.secret_nonce))
-                    .map_err(|_| json_status(500, r#"{"error":"internal error"}"#))?;
+                    .map_err(|_| ())?;
                 return Ok(ConsoleSigningCredential {
                     access_key_id: supplied.access_key_id,
                     secret: Zeroizing::new(String::from_utf8_lossy(&opened).into_owned()),
@@ -1362,10 +1457,7 @@ async fn console_signing_credential(
     );
     let secret = Zeroizing::new(generate_share_token());
     let session_token = SecretString::new(generate_share_token());
-    let sealed = stack
-        .crypto
-        .seal(secret.as_bytes())
-        .map_err(|_| json_status(500, r#"{"error":"internal error"}"#))?;
+    let sealed = stack.crypto.seal(secret.as_bytes()).map_err(|_| ())?;
     let minimum_expiry = Timestamp(now.0 + 900_000);
     let expires_at = std::cmp::max(required_expiry, minimum_expiry);
     let record = SessionCredentialRecord {
@@ -1382,7 +1474,7 @@ async fn console_signing_credential(
         .meta
         .submit(Mutation::CreateSessionCredential(Box::new(record)))
         .await
-        .map_err(|_| json_status(500, r#"{"error":"internal error"}"#))?;
+        .map_err(|_| ())?;
     let _ = stack
         .meta
         .submit(Mutation::RecordActivity(Box::new(ActivityEntry {
@@ -2266,9 +2358,40 @@ fn hex_val(b: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cairn_types::auth::{AuthMethod, Principal};
     use cairn_types::error::BlobError;
     use futures_util::stream;
     use http::StatusCode;
+    use std::convert::Infallible;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    struct PanicOnPollBody;
+
+    impl hyper::body::Body for PanicOnPollBody {
+        type Data = Bytes;
+        type Error = Infallible;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            panic!("a rejected control request must not poll its body")
+        }
+    }
+
+    fn administrator() -> Principal {
+        Principal {
+            user_id: UserId("admin".to_owned()),
+            display_name: "Administrator".to_owned(),
+            access_key_id: "CAIRNADMIN".to_owned(),
+            role: Role::Administrator,
+            method: AuthMethod::Bearer,
+            chunk_signing: None,
+            user_policy: None,
+            is_session: false,
+        }
+    }
 
     #[test]
     fn crypto_status_abbreviates_the_durable_full_key_identity() {
@@ -2358,6 +2481,98 @@ mod tests {
             listener_route(ListenerRole::Control, &Method::PUT, "/favicon.svg"),
             ListenerRoute::NotFound
         );
+    }
+
+    #[tokio::test]
+    async fn anonymous_control_rejection_never_polls_the_request_body() {
+        let result =
+            collect_control_body(&Method::POST, "/buckets", None, None, PanicOnPollBody).await;
+        assert_eq!(result.unwrap_err(), ControlBodyError::Forbidden);
+    }
+
+    #[tokio::test]
+    async fn control_body_admission_preserves_public_and_explicit_admin_clients() {
+        let login = http_body_util::Full::new(Bytes::from_static(br#"{"access_key":"a"}"#));
+        let login_bytes = collect_control_body(&Method::POST, "/session", None, None, login)
+            .await
+            .expect("the bounded public login remains available");
+        assert_eq!(login_bytes, Bytes::from_static(br#"{"access_key":"a"}"#));
+
+        let health = http_body_util::Full::new(Bytes::new());
+        assert!(
+            collect_control_body(&Method::GET, "/health", None, None, health)
+                .await
+                .expect("the bodyless public health route remains available")
+                .is_empty()
+        );
+        let health_with_trailing_slash = http_body_util::Full::new(Bytes::new());
+        assert!(
+            collect_control_body(
+                &Method::GET,
+                "/health/",
+                None,
+                None,
+                health_with_trailing_slash,
+            )
+            .await
+            .expect("the control router's public trailing-slash health spelling remains available")
+            .is_empty()
+        );
+
+        let admin = administrator();
+        let document = http_body_util::Full::new(Bytes::from_static(br#"{"name":"photos"}"#));
+        let document_bytes =
+            collect_control_body(&Method::POST, "/buckets", Some(&admin), None, document)
+                .await
+                .expect("an explicitly authenticated administrator retains the API body budget");
+        assert_eq!(document_bytes, Bytes::from_static(br#"{"name":"photos"}"#));
+    }
+
+    #[tokio::test]
+    async fn public_control_routes_have_small_route_specific_body_limits() {
+        let oversize_login =
+            http_body_util::Full::new(Bytes::from(vec![b'x'; MAX_SESSION_LOGIN_BODY + 1]));
+        assert_eq!(
+            collect_control_body(&Method::POST, "/session", None, None, oversize_login)
+                .await
+                .unwrap_err(),
+            ControlBodyError::TooLarge
+        );
+
+        let health_with_body = http_body_util::Full::new(Bytes::from_static(b"x"));
+        assert_eq!(
+            collect_control_body(&Method::GET, "/health", None, None, health_with_body)
+                .await
+                .unwrap_err(),
+            ControlBodyError::TooLarge
+        );
+
+        let declared_oversize = collect_control_body(
+            &Method::POST,
+            "/session",
+            None,
+            Some(MAX_SESSION_LOGIN_BODY as u64 + 1),
+            PanicOnPollBody,
+        )
+        .await;
+        assert_eq!(declared_oversize.unwrap_err(), ControlBodyError::TooLarge);
+
+        let unsupported_public_method =
+            collect_control_body(&Method::PUT, "/session", None, Some(0), PanicOnPollBody).await;
+        assert_eq!(
+            unsupported_public_method.unwrap_err(),
+            ControlBodyError::Forbidden
+        );
+    }
+
+    #[test]
+    fn console_assets_refuse_every_framing_context() {
+        let response = web_asset_response("text/html".to_owned(), b"console".to_vec());
+        assert_eq!(
+            response.headers().get("content-security-policy").unwrap(),
+            "frame-ancestors 'none'"
+        );
+        assert_eq!(response.headers().get("x-frame-options").unwrap(), "DENY");
     }
 
     fn console_presign_query(origin: &str) -> String {

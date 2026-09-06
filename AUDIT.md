@@ -134,10 +134,11 @@ path or a precise explanation of why it's reachable.
 ### 4.5 Network / API surface
 - Resource limits on the S3 API — max object size, max header size, max multipart parts, request body
   size caps; missing limits that enable DoS.
-- **Rate limiting — ground truth (2026-07-29): none exists.** `cairn-server` has a concurrency cap
+- **Rate limiting — rechecked 2026-09-06: no per-IP/per-credential attempt limiter exists.** `cairn-server` has a concurrency cap
   (`Semaphore`-based, `server.rs` `concurrency`/`connection_limiter`) that load-sheds with `503` past a
-  fixed in-flight ceiling — that is a concurrency cap, not a request-rate limiter, and infra endpoints
-  (`/healthz`, `/readyz`, `/metrics`) bypass it entirely. **No per-IP or per-credential auth-attempt
+  fixed in-flight ceiling — that is a concurrency cap, not a request-rate limiter. Infrastructure
+  endpoints (`/healthz`, `/readyz`, `/metrics`) have a separate fixed four-request budget, with
+  metrics capped at two lanes; they are not unbounded. **No per-IP or per-credential auth-attempt
   throttling/lockout exists anywhere in `cairn-auth`.** This is a real, currently-open gap (brute-force
   / credential-stuffing exposure on the auth path) — a future run should size the risk and either raise
   an issue or record a documented decision that it's accepted.
@@ -168,10 +169,13 @@ path or a precise explanation of why it's reachable.
   byte-range and multipart part-number handling.
 - Error types — confirm internal errors (DB, IO, path) aren't leaked verbatim into S3 API error
   responses (info disclosure).
-- Dependency audit — **ground truth (2026-07-29): no `deny.toml` exists, and `.github/workflows/ci.yml`
-  runs neither `cargo audit` nor `cargo deny`.** This is a real, currently-open gap in the CI gate, not
-  a hypothetical — either add the check or record why it's deliberately deferred. In the meantime, run
-  `cargo audit` by hand on every audit pass.
+- Dependency audit — **rechecked 2026-09-06:** `.github/workflows/ci.yml` has a checksum-pinned
+  cargo-audit 0.22.2 job and separate production/full-tree npm audit policies. The old missing-audit
+  finding is fixed. A fresh audit remains necessary: this run found RUSTSEC-2026-0258 in h2 0.4.14
+  even though all six GitHub Dependabot alerts were already fixed. The local remediation updates h2
+  to 0.4.16. The final scan has zero reported vulnerabilities; `rustls-pemfile` remains an upstream
+  unmaintained warning and `chacha20 0.10.0` a yanked-version warning. Both need maintenance tracking,
+  not relabeling as reported vulnerabilities; see the linked review's validation section.
 - Async task handling — unbounded per-request spawns without backpressure.
 
 ### 4.7 Container / deployment
@@ -193,6 +197,11 @@ path or a precise explanation of why it's reachable.
   (`NoNewPrivileges=true`, `ProtectSystem=full`, `ProtectHome=true`, scoped `ReadWritePaths`). **The
   generated OpenRC script has no equivalent hardening directives** — only `command_user`. This asymmetry
   is a real gap worth an issue if OpenRC targets (Alpine, etc.) are a supported deployment path.
+- **Release/installer distinction, rechecked 2026-09-06:** the release workflow already signs
+  artifacts and publishes SBOM/provenance with separated job authority (`SECURITY.md`,
+  `tests/release_policy.py`). Do not recommend adding signing as if absent. The installer still
+  does not enforce signature verification and still continues on missing checksums/checksum tools;
+  enforce verification at consumption as well as producing signed artifacts.
 - `docs/deployment-kubernetes.md` — check recommended manifests for `runAsNonRoot`, read-only root
   filesystem, resource limits, `NetworkPolicy` guidance.
 
@@ -223,9 +232,21 @@ delete a row once its status is stable and uncontroversial enough that it belong
 | 2026-07-29 | CORS origin reflection | Clean, correctly scoped | See Section 4.5 |
 | 2026-07-29 | `unsafe` scope | Narrow, justified (sendfile.rs only) | See Section 4.6 |
 | 2026-07-29 | Rate limiting on auth path | **Open gap** — none exists | See Section 4.5 |
-| 2026-07-29 | `cargo audit`/`cargo deny` in CI | **Open gap** — neither runs | See Section 4.6 |
+| 2026-09-06 | Dependency audit in CI | Fixed | Pinned cargo-audit plus both npm audit policies; fresh scans still required. |
 | 2026-07-29 | `install.sh` secret-to-stdout | **Open, untriaged** | See Section 4.1 |
 | 2026-07-29 | OpenRC unit hardening | **Open gap** — systemd hardened, OpenRC not | See Section 4.7 |
+| 2026-09-06 | Original ten CodeQL alerts | Triaged and dismissed | #26–32 retained explicit CLI credential output (`won't fix`); #33–35 field-insensitive configuration taint (`false positive`). These are not ten code fixes. |
+| 2026-09-06 | S3 service-level authorization | Locally fixed and tested; not integrated | ListBuckets/CreateBucket bypassed session scope and identity Denies; see S1 in the linked review. |
+| 2026-09-06 | Control-plane framing/body admission | Locally fixed and tested; not integrated | Anti-framing headers and pre-body admin admission; S2/S3 in the linked review. |
+| 2026-09-06 | h2 dependency | Locally fixed and tested; not integrated | RUSTSEC-2026-0258, h2 0.4.14 → 0.4.16; S4 in the linked review. |
+| 2026-09-06 | Replication ownership and range | Open architecture work | Lease fencing and bounded-memory replication beyond the current 2 GiB ceiling; evidence and acceptance criteria in the linked review. |
+| 2026-09-06 | Replication intent resolution | Open reliability defect | Config read/parse failure is treated as no configuration, allowing an acknowledged write without an outbox entry; fail-closed plan in the linked review. |
+| 2026-09-06 | Release verification | Producer hardened / installer gap remains | Signed releases already exist; installer verification still fails open. |
+
+The [2026-09 review and plan](docs/security-architecture-review-2026-09.md) contains baseline
+locations, exact alert dispositions, new findings, and acceptance criteria. Its new vulnerability
+details remain local pending coordinated remediation/disclosure; it must not be published as an
+unpatched public issue.
 
 ## 6. Filing findings as GitHub issues
 
@@ -245,6 +266,11 @@ bundle unrelated findings into one issue; do link related issues to each other.
    posting comments) is handled in this project: one approval doesn't authorize silent mass-filing in a
    future session. Skip this step only if the session invoking this audit was explicitly told to
    auto-file without review.
+
+For an unpatched security finding, `SECURITY.md` requires private vulnerability reporting. Prepare
+the evidence locally and propose a private advisory/report rather than a public issue. This takes
+precedence over the generic issue template below. Architecture recommendations can be filed as
+ordinary issues after the same candidate-list review; do not include unpatched exploit details.
 
 ### 6.2 Labels
 - `audit-finding` — umbrella label on every issue this playbook produces, so the whole program is one
@@ -303,3 +329,4 @@ Append one row per run. Keep it terse — the detail lives in the issues, not he
 | Date | Scope | Findings filed | Notes |
 |---|---|---|---|
 | 2026-07-29 | Doc created; fact-verification pass only (no full audit run yet) | none | Verified the ground-truth register in Section 5 against current code as the doc's baseline. First full audit run against this playbook is still pending. |
+| 2026-09-06 | CodeQL/Dependabot/PR triage, auth/control review, dependency scan, storage/replication architecture | none; candidate review pending | Baseline a5f7127; three Sol agents. Original ten alerts dismissed with individual reasons. Separate local security fixes and evidence-backed roadmap in docs/security-architecture-review-2026-09.md. Full required gate passed (cargo-audit has two allowed maintenance warnings); 1,253 tests passed, one skipped, two doctests passed, four live conformance harnesses passed. Fixes not integrated or deployed. |
