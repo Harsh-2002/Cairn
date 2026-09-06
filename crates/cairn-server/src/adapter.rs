@@ -1362,7 +1362,7 @@ async fn presign(
         match console_signing_credential(stack, p, bucket, req.session, required_expiry, now).await
         {
             Ok(credential) => credential,
-            Err(response) => return response,
+            Err(()) => return json_status(500, r#"{"error":"internal error"}"#),
         };
     extra_query.push((
         "X-Amz-Security-Token".to_owned(),
@@ -1407,7 +1407,7 @@ async fn console_signing_credential(
     supplied: Option<PresignSessionHandle>,
     required_expiry: Timestamp,
     now: Timestamp,
-) -> Result<ConsoleSigningCredential, Response<ResponseBody>> {
+) -> Result<ConsoleSigningCredential, ()> {
     // This is an administrator-derived session, so its bucket Allow is only the requested boundary:
     // retain every current explicit Deny from the parent identity policy. Otherwise an admin with
     // a Deny boundary could use the console transfer session to escape it (AUD-038).
@@ -1415,13 +1415,13 @@ async fn console_signing_credential(
     let policy =
         crate::sts::administrator_bounded_policy(&stack.meta, &principal.user_id, &boundary)
             .await
-            .map_err(|_| json_status(500, r#"{"error":"internal error"}"#))?;
+            .map_err(|_| ())?;
     if let Some(supplied) = supplied {
         let lookup = stack
             .meta
             .user_by_session_key(&supplied.access_key_id)
             .await
-            .map_err(|_| json_status(500, r#"{"error":"internal error"}"#))?;
+            .map_err(|_| ())?;
         if let Some(creds) = lookup {
             let presented_hash =
                 cairn_auth::hash_session_token(supplied.session_token.expose_secret());
@@ -1438,7 +1438,7 @@ async fn console_signing_credential(
                 let opened = stack
                     .crypto
                     .open(&creds.secret_ciphertext, &Nonce(creds.secret_nonce))
-                    .map_err(|_| json_status(500, r#"{"error":"internal error"}"#))?;
+                    .map_err(|_| ())?;
                 return Ok(ConsoleSigningCredential {
                     access_key_id: supplied.access_key_id,
                     secret: Zeroizing::new(String::from_utf8_lossy(&opened).into_owned()),
@@ -1457,10 +1457,7 @@ async fn console_signing_credential(
     );
     let secret = Zeroizing::new(generate_share_token());
     let session_token = SecretString::new(generate_share_token());
-    let sealed = stack
-        .crypto
-        .seal(secret.as_bytes())
-        .map_err(|_| json_status(500, r#"{"error":"internal error"}"#))?;
+    let sealed = stack.crypto.seal(secret.as_bytes()).map_err(|_| ())?;
     let minimum_expiry = Timestamp(now.0 + 900_000);
     let expires_at = std::cmp::max(required_expiry, minimum_expiry);
     let record = SessionCredentialRecord {
@@ -1477,7 +1474,7 @@ async fn console_signing_credential(
         .meta
         .submit(Mutation::CreateSessionCredential(Box::new(record)))
         .await
-        .map_err(|_| json_status(500, r#"{"error":"internal error"}"#))?;
+        .map_err(|_| ())?;
     let _ = stack
         .meta
         .submit(Mutation::RecordActivity(Box::new(ActivityEntry {
