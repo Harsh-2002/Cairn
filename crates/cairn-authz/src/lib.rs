@@ -320,6 +320,7 @@ fn acl_allows_scoped(input: &AuthzInput, allow_public_grantees: bool) -> bool {
     // OwnerOrAdmin short-circuit), so it must NOT inherit the bucket ACL — otherwise a `public-read`
     // bucket grant would silently expose object *contents* (audit #2).
     let acl = match &input.resource {
+        Resource::Service => None,
         Resource::Object { .. } => input.object_acl.as_ref(),
         Resource::Bucket(_) => input.bucket_acl.as_ref(),
     };

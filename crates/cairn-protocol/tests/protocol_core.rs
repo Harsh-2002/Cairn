@@ -625,6 +625,7 @@ impl cairn_types::traits::AuthorizationEngine for DenyPutObjectOn {
     fn evaluate(&self, input: &cairn_types::authz::AuthzInput) -> cairn_types::authz::Decision {
         use cairn_types::authz::{Action, Decision, DenyReason, Resource};
         let on_target = match &input.resource {
+            Resource::Service => false,
             Resource::Object { bucket, .. } => bucket.as_str() == self.0,
             Resource::Bucket(b) => b.as_str() == self.0,
         };
@@ -13108,6 +13109,269 @@ fn session_of(user: &str, policy: Option<Box<cairn_types::authz::Policy>>) -> Pr
         user_policy: policy,
         is_session: true,
     }
+}
+
+/// Account-level S3 operations still pass through the identity-policy boundary. In particular, a
+/// temporary session has no authenticated-user baseline for listing or creating buckets, while an
+/// explicit scoped grant can authorize exactly those operations. Long-term users retain Cairn's
+/// authenticated baseline, but a matching identity Deny still overrides it (ARCH 14/15).
+#[tokio::test]
+async fn service_actions_honor_session_scope_and_identity_denies() {
+    let h = harness_with_authz(Arc::new(cairn_authz::PolicyEngine)).await;
+
+    let status = |response: (StatusCode, Vec<(String, String)>, Vec<u8>)| response.0;
+
+    // Regression: the old service-level paths checked only that a principal existed, so an
+    // unscoped session could enumerate and create buckets despite its least-privilege contract.
+    assert_eq!(
+        status(
+            drain(
+                send(
+                    &h.svc,
+                    req_with_principal(
+                        Method::GET,
+                        None,
+                        None,
+                        &[],
+                        &[],
+                        vec![],
+                        session_of("parent", None),
+                    ),
+                )
+                .await,
+            )
+            .await,
+        ),
+        StatusCode::FORBIDDEN,
+        "an unscoped session cannot list buckets"
+    );
+    assert_eq!(
+        status(
+            drain(
+                send(
+                    &h.svc,
+                    req_with_principal(
+                        Method::PUT,
+                        Some("session-denied-create"),
+                        None,
+                        &[],
+                        &[],
+                        vec![],
+                        session_of("parent", None),
+                    ),
+                )
+                .await,
+            )
+            .await,
+        ),
+        StatusCode::FORBIDDEN,
+        "an unscoped session cannot create a bucket"
+    );
+    assert!(
+        h.meta
+            .get_bucket(&BucketName::parse("session-denied-create").unwrap())
+            .await
+            .unwrap()
+            .is_none(),
+        "authorization runs before the create mutation"
+    );
+
+    let scoped = cairn_authz::parse_user_policy(
+        r#"{"Version":"2012-10-17","Statement":[
+            {"Effect":"Allow","Action":"s3:ListAllMyBuckets","Resource":"*","Condition":{"IpAddress":{"aws:SourceIp":"127.0.0.1/32"},"Bool":{"aws:SecureTransport":"false"},"DateEquals":{"aws:CurrentTime":"1700000000"}}},
+            {"Effect":"Allow","Action":"s3:CreateBucket","Resource":"arn:aws:s3:::session-allowed-create","Condition":{"IpAddress":{"aws:SourceIp":"127.0.0.1/32"},"Bool":{"aws:SecureTransport":"false"},"DateEquals":{"aws:CurrentTime":"1700000000"}}}
+        ]}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        status(
+            drain(
+                send(
+                    &h.svc,
+                    req_with_principal(
+                        Method::GET,
+                        None,
+                        None,
+                        &[],
+                        &[],
+                        vec![],
+                        session_of("parent", Some(Box::new(scoped.clone()))),
+                    ),
+                )
+                .await,
+            )
+            .await,
+        ),
+        StatusCode::OK,
+        "a session can list when its own policy explicitly grants the service action"
+    );
+    assert_eq!(
+        status(
+            drain(
+                send(
+                    &h.svc,
+                    req_with_principal(
+                        Method::PUT,
+                        Some("session-allowed-create"),
+                        None,
+                        &[],
+                        &[],
+                        vec![],
+                        session_of("parent", Some(Box::new(scoped.clone()))),
+                    ),
+                )
+                .await,
+            )
+            .await,
+        ),
+        StatusCode::OK,
+        "a session can create only the bucket its own policy grants"
+    );
+    assert_eq!(
+        status(
+            drain(
+                send(
+                    &h.svc,
+                    req_with_principal(
+                        Method::PUT,
+                        Some("session-outside-scope"),
+                        None,
+                        &[],
+                        &[],
+                        vec![],
+                        session_of("parent", Some(Box::new(scoped))),
+                    ),
+                )
+                .await,
+            )
+            .await,
+        ),
+        StatusCode::FORBIDDEN,
+        "a CreateBucket allow for one ARN cannot authorize a different bucket"
+    );
+    assert!(
+        h.meta
+            .get_bucket(&BucketName::parse("session-outside-scope").unwrap())
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // Preserve the pre-existing Cairn contract for ordinary long-term credentials: successful
+    // authentication is the service-operation baseline unless an identity Deny matches.
+    let baseline_member = member("baseline-member");
+    assert_eq!(
+        status(
+            drain(
+                send(
+                    &h.svc,
+                    req_with_principal(
+                        Method::GET,
+                        None,
+                        None,
+                        &[],
+                        &[],
+                        vec![],
+                        baseline_member.clone(),
+                    ),
+                )
+                .await,
+            )
+            .await,
+        ),
+        StatusCode::OK
+    );
+    assert_eq!(
+        status(
+            drain(
+                send(
+                    &h.svc,
+                    req_with_principal(
+                        Method::PUT,
+                        Some("baseline-member-create"),
+                        None,
+                        &[],
+                        &[],
+                        vec![],
+                        baseline_member,
+                    ),
+                )
+                .await,
+            )
+            .await,
+        ),
+        StatusCode::OK
+    );
+
+    let member_deny = member_with_policy(
+        "member-denied",
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"s3:ListAllMyBuckets","Resource":"*","Condition":{"IpAddress":{"aws:SourceIp":"127.0.0.1/32"}}}]}"#,
+    );
+    assert_eq!(
+        status(
+            drain(
+                send(
+                    &h.svc,
+                    req_with_principal(Method::GET, None, None, &[], &[], vec![], member_deny,),
+                )
+                .await
+            )
+            .await,
+        ),
+        StatusCode::FORBIDDEN,
+        "a source-conditioned identity Deny binds an ordinary member's authenticated baseline"
+    );
+
+    let mut admin_deny = admin();
+    admin_deny.user_policy = Some(Box::new(
+        cairn_authz::parse_user_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"s3:CreateBucket","Resource":"arn:aws:s3:::admin-denied-create"}]}"#,
+        )
+        .unwrap(),
+    ));
+    assert_eq!(
+        status(
+            drain(
+                send(
+                    &h.svc,
+                    req_with_principal(
+                        Method::PUT,
+                        Some("admin-denied-create"),
+                        None,
+                        &[],
+                        &[],
+                        vec![],
+                        admin_deny,
+                    ),
+                )
+                .await
+            )
+            .await,
+        ),
+        StatusCode::FORBIDDEN,
+        "an identity Deny binds an administrator's authenticated baseline"
+    );
+
+    // Anonymous requests remain denied at the same service-level authorization choke point.
+    let (mut anonymous_list, list_body) = req(Method::GET, None, None, &[], &[], vec![]);
+    anonymous_list.principal = None;
+    assert_eq!(
+        status(drain(h.svc.handle(anonymous_list, list_body).await).await),
+        StatusCode::FORBIDDEN
+    );
+    let (mut anonymous_create, create_body) = req(
+        Method::PUT,
+        Some("anonymous-denied-create"),
+        None,
+        &[],
+        &[],
+        vec![],
+    );
+    anonymous_create.principal = None;
+    assert_eq!(
+        status(drain(h.svc.handle(anonymous_create, create_body).await).await),
+        StatusCode::FORBIDDEN
+    );
 }
 
 /// A session derived from a bucket's owner does NOT inherit the owner short-circuit: with no scoped

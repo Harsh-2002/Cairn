@@ -7,10 +7,12 @@ const S3_ARN_PREFIX: &str = "arn:aws:s3:::";
 
 /// Render a [`Resource`] as the ARN-like string a policy resource pattern matches against.
 ///
-/// A bucket becomes `arn:aws:s3:::bucket`; an object becomes `arn:aws:s3:::bucket/key`.
+/// The S3 service becomes `*`; a bucket becomes `arn:aws:s3:::bucket`; an object becomes
+/// `arn:aws:s3:::bucket/key`.
 #[must_use]
 pub fn resource_arn(resource: &Resource) -> String {
     match resource {
+        Resource::Service => "*".to_owned(),
         Resource::Bucket(b) => format!("{S3_ARN_PREFIX}{}", b.as_str()),
         Resource::Object { bucket, key } => {
             format!("{S3_ARN_PREFIX}{}/{}", bucket.as_str(), key.as_str())
@@ -111,6 +113,7 @@ mod tests {
 
     #[test]
     fn arn_rendering() {
+        assert_eq!(resource_arn(&Resource::Service), "*");
         assert_eq!(resource_arn(&bucket("my-bucket")), "arn:aws:s3:::my-bucket");
         assert_eq!(
             resource_arn(&object("my-bucket", "photos/a.jpg")),
@@ -120,6 +123,9 @@ mod tests {
 
     #[test]
     fn resource_pattern_matching() {
+        assert!(resource_matches("*", &Resource::Service));
+        assert!(!resource_matches("arn:aws:s3:::*", &Resource::Service));
+
         let obj = object("my-bucket", "photos/2026/a.jpg");
         assert!(resource_matches("arn:aws:s3:::my-bucket/*", &obj));
         assert!(resource_matches("arn:aws:s3:::my-bucket/photos/*", &obj));

@@ -135,6 +135,9 @@ impl Action {
 /// A resource an action targets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Resource {
+    /// The account-wide S3 service, used by operations such as `ListAllMyBuckets` whose policy
+    /// resource is the literal wildcard `*` rather than a bucket ARN.
+    Service,
     /// A bucket-level resource.
     Bucket(BucketName),
     /// An object-level resource.

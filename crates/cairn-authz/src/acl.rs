@@ -81,6 +81,11 @@ pub fn expand_canned_acl(name: &str, owner: &UserId) -> Option<Acl> {
 /// * `FullControl` => everything any of the above grant.
 #[must_use]
 pub fn permission_satisfies(permission: Permission, action: Action, resource: &Resource) -> bool {
+    // Service-level operations have no ACL. Keep this helper fail-closed even if a caller
+    // accidentally supplies an ACL alongside a service resource.
+    if matches!(resource, Resource::Service) {
+        return false;
+    }
     let on_object = matches!(resource, Resource::Object { .. });
     match permission {
         // FULL_CONTROL is the union of the four sub-permissions it implies — READ + WRITE +
@@ -341,6 +346,23 @@ mod tests {
                 permission_satisfies(Permission::FullControl, action, &res),
                 "FULL_CONTROL should grant {action:?}"
             );
+        }
+    }
+
+    #[test]
+    fn service_resources_never_consult_acls() {
+        for permission in [
+            Permission::FullControl,
+            Permission::Read,
+            Permission::Write,
+            Permission::ReadAcp,
+            Permission::WriteAcp,
+        ] {
+            assert!(!permission_satisfies(
+                permission,
+                Action::ListAllMyBuckets,
+                &Resource::Service,
+            ));
         }
     }
 }
