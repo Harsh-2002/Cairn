@@ -16,7 +16,8 @@ those fixtures before exit.
 `npm run test:performance` runs bounded Chrome regressions against a temporary Vite server with
 mocked management calls: resource lifecycle/refresh races and 2,000-bucket pagination at desktop
 and mobile widths. It needs Chrome (`CHROME_BIN` overrides the executable), creates no Cairn
-data, and removes its browser profile on exit.
+data, and removes its browser profile on exit, including startup failures. Browser shutdown
+waits two seconds after SIGTERM before falling back to SIGKILL with a second two-second deadline.
 
 ## Layout (`src/`)
 - `main.tsx` / `app.tsx` / `routes.tsx` — entry, provider shell (`ThemeProvider` → `AuthProvider` →
