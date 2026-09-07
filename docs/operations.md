@@ -599,3 +599,18 @@ worker re-seals descriptors underneath a live consumer.
 > version (the backfill only covers current versions), and an `http://` destination (repair ships
 > plaintext and the confidentiality gate refuses it). Rolling back to a pre-fix binary resumes the
 > corruption.
+
+## Installer verification prerequisites
+
+Host installs require a working SHA-256 utility and network access to download and verify the
+release and the installer-pinned Cosign tool. Both the checksum list and executable signature are
+mandatory. Container installs additionally verify the release image's signature and provenance,
+using a pinned GitHub CLI; provide GitHub/registry authentication where its verification flow
+requires it. Missing artifacts, tooling, or verification access stop installation without changing
+the installed binary or running container configuration. There is no insecure fallback.
+
+Container updates retain the generated project's other settings and replace only the Cairn image
+with a verified immutable digest. A customized project without exactly one `cairn` image entry is
+rejected rather than rewritten speculatively. Releases without `IMAGE-DIGEST` and matching
+provenance cannot be installed through this path. See `../SECURITY.md` for trust identities and
+bootstrap assumptions.

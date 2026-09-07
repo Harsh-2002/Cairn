@@ -18,6 +18,8 @@ set -eu
 
 REPO="Harsh-2002/Cairn"
 GHCR_IMAGE="ghcr.io/harsh-2002/cairn:latest"
+RELEASE_IDENTITY="https://github.com/Harsh-2002/Cairn/.github/workflows/release.yml@refs/heads/main"
+RELEASE_ISSUER="https://token.actions.githubusercontent.com"
 BIN_PATH="/usr/local/bin/cairn"
 HOST_DATA_DEFAULT="/var/lib/cairn"
 HOST_ETC="/etc/cairn"
@@ -244,27 +246,116 @@ print_access() {
 }
 
 # ---- host install / update ----------------------------------------------------------------------
-download_binary() {
-  db_arch=$(detect_arch); db_tag="$1"
-  db_tmp=$(mktemp -d)
-  db_url="https://github.com/$REPO/releases/download/$db_tag/cairn-linux-$db_arch"
-  info "downloading cairn $db_tag ($db_arch)"
-  fetch_to "$db_url" "$db_tmp/cairn" || die "download failed: $db_url"
-  # Verify against SHA256SUMS when present and a checksum tool is available.
-  if fetch_to "https://github.com/$REPO/releases/download/$db_tag/SHA256SUMS" "$db_tmp/SHA256SUMS" 2>/dev/null; then
-    if have sha256sum || have shasum; then
-      ( cd "$db_tmp"
-        grep "cairn-linux-$db_arch" SHA256SUMS | sed "s#cairn-linux-$db_arch#cairn#" > sums.check
-        if have sha256sum; then sha256sum -c sums.check >/dev/null 2>&1
-        else shasum -a 256 -c sums.check >/dev/null 2>&1; fi
-      ) || die "checksum verification failed for the downloaded binary"
-      ok "checksum verified"
-    else warn "no sha256sum/shasum available; skipping checksum verification"; fi
-  else warn "SHA256SUMS not found for $db_tag; skipping checksum verification"; fi
-  chmod 0755 "$db_tmp/cairn"
-  install -m 0755 "$db_tmp/cairn" "$BIN_PATH"
-  rm -rf "$db_tmp"
+# Only checksum-pinned verification tools may execute during installation. The script itself,
+# installed system tools, HTTPS roots, and these embedded pins form the bootstrap trust root.
+sha256_file() {
+  if have sha256sum; then sha256sum "$1" | awk '{print $1}'
+  elif have shasum; then shasum -a 256 "$1" | awk '{print $1}'
+  else die "sha256sum or shasum is required; refusing unverified installation"; fi
 }
+
+verify_sha256() {
+  vs_actual=$(sha256_file "$1") || die "could not hash $1"
+  [ "$vs_actual" = "$2" ] || die "checksum verification failed: $1"
+}
+
+manifest_digest() {
+  # Never pass a downloaded manifest to a tool that follows its arbitrary filesystem paths.
+  # Require one exact filename, one lowercase SHA-256, and no duplicate selected entries.
+  awk -v name="$2" '
+    $2 == name { count++; if (NF != 2 || length($1) != 64 || $1 ~ /[^0-9a-f]/) bad=1; hash=$1 }
+    END { if (count != 1 || bad) exit 1; print hash }
+  ' "$1" || die "missing, duplicate, or malformed checksum entry: $2"
+}
+
+bootstrap_cosign() {
+  bc_arch=$(detect_arch)
+  case "$bc_arch" in
+    amd64) bc_hash=c956e5dfcac53d52bcf058360d579472f0c1d2d9b69f55209e256fe7783f4c74 ;;
+    arm64) bc_hash=bedac92e8c3729864e13d4a17048007cfafa79d5deca993a43a90ffe018ef2b8 ;;
+    *) die "no pinned verification tool for $bc_arch" ;;
+  esac
+  COSIGN="$1/cosign"
+  fetch_to "https://github.com/sigstore/cosign/releases/download/v3.0.6/cosign-linux-$bc_arch" "$COSIGN" \
+    || die "could not download pinned Cosign verifier"
+  verify_sha256 "$COSIGN" "$bc_hash"
+  chmod 0700 "$COSIGN" || die "could not prepare verified Cosign"
+}
+
+verify_release_blob() {
+  "$COSIGN" verify-blob --certificate-identity "$RELEASE_IDENTITY" \
+    --certificate-oidc-issuer "$RELEASE_ISSUER" --bundle "$1.cosign.bundle" "$1" \
+    >/dev/null || die "release signature verification failed: $1"
+}
+
+# Verify everything before replacing the installed executable. Subshell-local traps remove only
+# this attempt's temporary files on every error, without disturbing the installer's caller.
+download_binary() (
+  db_arch=$(detect_arch); db_tag="$1"
+  db_tmp=$(mktemp -d) || die "cannot allocate download directory"
+  trap 'rm -rf "$db_tmp"' EXIT
+  trap 'exit 1' HUP INT TERM
+  bootstrap_cosign "$db_tmp"
+  db_base="https://github.com/$REPO/releases/download/$db_tag"
+  for db_asset in "cairn-linux-$db_arch" "cairn-linux-$db_arch.cosign.bundle" SHA256SUMS SHA256SUMS.cosign.bundle; do
+    fetch_to "$db_base/$db_asset" "$db_tmp/$db_asset" \
+      || die "required signed release artifact unavailable: $db_asset (older releases may be unsupported)"
+  done
+  verify_release_blob "$db_tmp/SHA256SUMS"
+  db_hash=$(manifest_digest "$db_tmp/SHA256SUMS" "cairn-linux-$db_arch")
+  verify_sha256 "$db_tmp/cairn-linux-$db_arch" "$db_hash"
+  verify_release_blob "$db_tmp/cairn-linux-$db_arch"
+  install -m 0755 "$db_tmp/cairn-linux-$db_arch" "$BIN_PATH" || die "could not install verified binary"
+  ok "release signature and checksum verified"
+)
+
+bootstrap_gh() {
+  bg_arch=$(detect_arch)
+  case "$bg_arch" in
+    amd64) bg_hash=83d5c2ccad5498f58bf6368acb1ab32588cf43ab3a4b1c301bf36328b1c8bd60 ;;
+    arm64) bg_hash=06f86ec7103d41993b76cd78072f43595c34aaa56506d971d9860e67140bf909 ;;
+    *) die "no pinned attestation verifier for $bg_arch" ;;
+  esac
+  bg_name="gh_2.96.0_linux_$bg_arch"
+  fetch_to "https://github.com/cli/cli/releases/download/v2.96.0/$bg_name.tar.gz" "$1/gh.tar.gz" \
+    || die "could not download pinned GitHub attestation verifier"
+  verify_sha256 "$1/gh.tar.gz" "$bg_hash"
+  tar -xzf "$1/gh.tar.gz" -C "$1" || die "could not unpack verified GitHub CLI"
+  VERIFY_GH="$1/$bg_name/bin/gh"
+}
+
+# stdout contains only the verified immutable image reference, suitable for command substitution.
+verified_image() (
+  vi_tag="$1"
+  vi_tmp=$(mktemp -d) || die "cannot allocate image verification directory"
+  trap 'rm -rf "$vi_tmp"' EXIT
+  trap 'exit 1' HUP INT TERM
+  bootstrap_cosign "$vi_tmp"
+  bootstrap_gh "$vi_tmp"
+  fetch_to "https://github.com/$REPO/releases/download/$vi_tag/IMAGE-DIGEST" "$vi_tmp/IMAGE-DIGEST" \
+    || die "release lacks an image digest; refusing an unbound container installation"
+  vi_digest=$(cat "$vi_tmp/IMAGE-DIGEST")
+  [ "${#vi_digest}" -eq 71 ] || die "invalid image digest"
+  printf '%s\n' "$vi_digest" | grep -Eq '^sha256:[0-9a-f]{64}$' || die "invalid image digest"
+  vi_image="ghcr.io/harsh-2002/cairn@$vi_digest"
+  "$COSIGN" verify --certificate-identity "$RELEASE_IDENTITY" \
+    --certificate-oidc-issuer "$RELEASE_ISSUER" "$vi_image" >/dev/null \
+    || die "container signature verification failed"
+  # Resolve annotated/lightweight tags through the commit API; the authenticated attestation
+  # must bind both this exact commit and this exact release version to the immutable subject.
+  vi_commit=$("$VERIFY_GH" api "repos/$REPO/commits/$vi_tag" --jq .sha) \
+    || die "cannot resolve release commit for provenance verification"
+  [ "${#vi_commit}" -eq 40 ] || die "invalid release commit"
+  printf '%s\n' "$vi_commit" | grep -Eq '^[0-9a-f]{40}$' || die "invalid release commit"
+  vi_versions=$("$VERIFY_GH" attestation verify "oci://$vi_image" --repo "$REPO" \
+    --cert-identity "$RELEASE_IDENTITY" --cert-oidc-issuer "$RELEASE_ISSUER" \
+    --source-digest "$vi_commit" --predicate-type https://slsa.dev/provenance/v1 \
+    --format json --jq '.[].verificationResult.statement.predicate.buildDefinition.externalParameters.version') \
+    || die "container provenance verification failed (GitHub/registry authentication may be required)"
+  printf '%s\n' "$vi_versions" | grep -F -x -- "$vi_tag" >/dev/null \
+    || die "container provenance does not name the requested release"
+  printf '%s\n' "$vi_image"
+)
 
 ensure_user() {
   id "$SVC_USER" >/dev/null 2>&1 && return 0
@@ -456,15 +547,28 @@ compose() {
 
 install_docker() {
   have docker || die "Docker is not installed"
+  id_tag=$(resolve_version)
+  GHCR_IMAGE=$(verified_image "$id_tag") || die "container verification failed; installation unchanged"
   is_update="0"; [ -f "$DOCKER_DIR/docker-compose.yml" ] && is_update="1"
 
   if [ "$is_update" = "1" ]; then
     step "Updating the Docker installation"
-    compose pull
+    # Preserve operator edits and exposure settings; change only the Cairn service image.
+    id_candidate=$(mktemp "$DOCKER_DIR/.compose.XXXXXX") || die "cannot stage Compose update"
+    awk -v image="$GHCR_IMAGE" '
+      /^  cairn:$/ { in_cairn=1; print; next }
+      /^  [^ ]/ { in_cairn=0 }
+      in_cairn && /^    image:/ { print "    image: " image; count++; next }
+      { print }
+      END { if (count != 1) exit 1 }
+    ' "$DOCKER_DIR/docker-compose.yml" > "$id_candidate" \
+      || { rm -f "$id_candidate"; die "cannot identify exactly one Cairn service image"; }
+    docker pull "$GHCR_IMAGE" || { rm -f "$id_candidate"; die "verified image pull failed"; }
+    mv "$id_candidate" "$DOCKER_DIR/docker-compose.yml"
     compose up -d
     ROOT_AK=$(grep '^CAIRN_ROOT_ACCESS_KEY=' "$DOCKER_DIR/.env" 2>/dev/null | cut -d= -f2-)
     ROOT_SK="(unchanged)"
-    ok "pulled the latest image and recreated the container"
+    ok "verified the release image and recreated the container"
     return 0
   fi
 

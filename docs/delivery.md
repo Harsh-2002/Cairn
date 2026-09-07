@@ -69,6 +69,16 @@ GitHub Releases and GHCR are separate services, so no least-privilege workflow c
 
 The remaining platform trust root is GitHub's hosted runner: unlike an OCI base, a hosted-runner filesystem has no repository-selectable content digest. Workflows therefore name `ubuntu-24.04` instead of the moving `ubuntu-latest`, checksum the downloaded high-impact tools (Zig, Syft, ORAS, Cosign, and GitHub CLI), and use the runner's preinstalled `curl`, `tar`, `sha256sum`, `jq`, shell, Git/rustup, compiler/linker, and Docker daemon only as bootstrap/system tools. A deployment that requires a fully content-addressed build environment must supply a hardened, immutable self-hosted runner; the permission split and subject manifests remain required there.
 
+The standalone installer consumes that evidence before changing an installation. Host binaries require
+both a signed `SHA256SUMS` manifest with one exact selected filename and a valid binary signature.
+Container installs require `IMAGE-DIGEST`, its keyless signature, and SLSA provenance binding the
+immutable image to the requested release version and resolved source commit. Certificate identity
+is the release workflow on `refs/heads/main`, with GitHub Actions as the OIDC issuer. Checksum-pinned
+Cosign and GitHub CLI bootstrap the verification; absent or invalid evidence aborts, including for
+older releases. Compose updates preserve other settings and replace only the identified Cairn
+service image with the verified digest. See [`../SECURITY.md`](../SECURITY.md) for bootstrap trust
+assumptions and [`operations.md`](./operations.md) for prerequisites.
+
 The user-facing version is **baked into the binary at build time** and is the single string reported by both `cairn --version` and `GET /system` (hence the console footer). The invariant is that this string equals the release it ships in: the release workflow computes the `vYYYY.MM.DD` value **once** and threads it into both the binaries — as the `CAIRN_RELEASE_VERSION` build variable, which `crates/cairn-server/build.rs` writes to an `OUT_DIR` file that the binary `include_str!`s into the `CAIRN_VERSION` constant — and the git tag, so the two can never disagree and there is no date-rollover race between the two jobs. A local build sets no such variable and instead reports `x.y.z-dev+g<short-sha>`, so a development binary is never mistaken for a release. The version is delivered through a build-output file rather than a `cargo::rustc-env` variable on purpose: a `CAIRN_`-prefixed `rustc-env` also lands in the runtime environment of `cargo run` and `cargo test`, where the server's strict `CAIRN_*` configuration parser (`deny_unknown_fields`, ARCH 28) would reject it as an unknown key. A `tests/version.rs` integration test drives the real binary and asserts the reported version is a qualified release-or-dev string and never the bare crate version — the regression guard for this contract. **Cutting a release therefore includes one verification step: confirm `cairn --version` on a downloaded release asset equals the published tag.**
 
 ---
