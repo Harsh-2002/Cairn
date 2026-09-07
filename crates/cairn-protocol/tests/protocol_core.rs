@@ -17186,6 +17186,14 @@ async fn multipart_replica_intent_is_authorized_persisted_and_idempotent() {
     let h = harness_with_authz(Arc::new(cairn_authz::PolicyEngine)).await;
     versioned_bucket(&h, "replica-mpu").await;
     set_replication(&h, "replica-mpu", "", false).await;
+    h.meta
+        .submit(cairn_types::Mutation::SetBucketConfig {
+            bucket: BucketName::parse("replica-mpu").unwrap(),
+            aspect: cairn_types::ConfigAspect::Encryption,
+            doc: Some(cairn_types::ConfigDoc(r#"{"required":true}"#.to_owned())),
+        })
+        .await
+        .unwrap();
     let writer = member_with_policy(
         "writer",
         r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:PutObject","Resource":"arn:aws:s3:::replica-mpu/*"}]}"#,
@@ -17200,7 +17208,6 @@ async fn multipart_replica_intent_is_authorized_persisted_and_idempotent() {
     let headers = [
         ("x-amz-meta-cairn-replica", "true"),
         ("x-amz-meta-cairn-replica-version-id", source_id.as_str()),
-        ("x-amz-server-side-encryption", "AES256"),
         ("x-amz-checksum-sha256", checksum.as_str()),
         ("x-amz-tagging", "origin=source"),
         ("cache-control", "max-age=120"),

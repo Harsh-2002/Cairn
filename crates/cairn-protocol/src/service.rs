@@ -2165,7 +2165,8 @@ impl S3Service {
         let encrypt_parts = want_sse
             || sse_kms_requested
             || self.bucket_default_sse(&bucket.name).await?.is_some()
-            || self.encrypt_at_rest;
+            || self.encrypt_at_rest
+            || (is_replica && self.bucket_sse_required(&bucket.name).await?);
         let session = MultipartSession {
             upload_id: upload_id.clone(),
             bucket: bucket.name.clone(),
@@ -7110,11 +7111,6 @@ fn stored_content_encoding(req: &S3Request) -> Option<String> {
     (!kept.is_empty()).then(|| kept.join(", "))
 }
 
-/// The preserved source version id for an inbound replica PUT/marker: the
-/// `x-amz-meta-cairn-replica-version-id` header, but ONLY when this write is an authenticated
-/// replica (`is_replica`, centrally authorized as ReplicateObject/ReplicateDelete). Returns `None`
-/// for a normal write or an absent/empty header, so the caller mints a fresh id. A normal client can
-/// never pin a version id this way.
 /// Mirror multipart dispatch precedence before consulting persisted authorization intent.
 fn multipart_session_request(req: &S3Request) -> bool {
     match req.method {
@@ -7133,6 +7129,11 @@ fn replica_marker(req: &S3Request) -> bool {
         .is_some_and(|v| v.eq_ignore_ascii_case("true"))
 }
 
+/// The preserved source version id for an inbound replica PUT/marker: the
+/// `x-amz-meta-cairn-replica-version-id` header, but ONLY when this write is an authenticated
+/// replica (`is_replica`, centrally authorized as ReplicateObject/ReplicateDelete). Returns `None`
+/// for a normal write or an absent/empty header, so the caller mints a fresh id. A normal client can
+/// never pin a version id this way.
 fn replica_version_id(req: &S3Request, is_replica: bool) -> Option<VersionId> {
     if !is_replica {
         return None;
