@@ -93,7 +93,7 @@ startup gate rather than declaring a partially checked generation ready.
 
 The SQLite image preserves complete metadata rows, including historical versions and delete
 markers, tags, ACLs, Object Lock retention/legal hold, sealed object and multipart-part data keys,
-and multipart reservations, cleanup records, and replication outbox work. These are database state;
+and multipart reservations, cleanup records, replication outbox work, and remote multipart journals. These are database state;
 there is no second manifest inventory that can replace them. Restoring the database does not restore
 the external master-key ring or recreate the outcome of an ambiguous remote request.
 
@@ -113,6 +113,21 @@ pauses Complete after durable assembly, kills the process with an exact completi
 and verifies that restoration/restart makes the upload retryable without leaking the assembled blob.
 These checks are distinct from the database-publication unit tests that pin the old/new generations
 on either side of the atomic rename.
+
+Remote multipart journals preserve the exact destination identity and any upload ID received before
+the crash. On startup, the Writer invalidates abandoned delivery and cleanup ownership; existing
+replication workers reclaim known upload IDs using the saved target route. A missing initiation
+receipt is different: the destination may already hold an upload whose ID the source never learned.
+That journal row remains an explicit orphan incident and requires destination lifecycle cleanup;
+a successful retry of the object does not make that old remote upload disappear. Preserve the
+original target configuration until known cleanup debt drains.
+
+The additional `conformance/recovery_remote.py` drill uses a real Cairn destination behind an HTTP
+proxy. It holds successful initiation, part, and (with `--cleanup-lease`) abort responses, kills the
+source, then compares every durable row across offline backup and restore. It checks unknown-ID
+incident retention, known-ID cleanup, startup release of abandoned cleanup ownership, and exact
+native version identity after redelivery. This harness requires the schema-v33 streaming sender;
+all three fault arms passed against the integrated v33 implementation at `eb3a83b`.
 
 ## Database-path upgrade requirement
 

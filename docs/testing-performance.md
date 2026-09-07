@@ -41,6 +41,11 @@ multipart Complete after durable assembly and SIGKILLs the process, then snapsho
 claim before startup recovery. Restored startup clears ownership, removes the assembled orphan,
 and preserves authoritative parts for a successful retry. Missing referenced parts, a live node
 lock, wrong master-key material, and unsupported shard topology are explicit rejection cases.
+The remote multipart recovery drill adds successful initiation/part/abort response loss through a
+bounded forwarding proxy and a real Cairn peer. It compares complete offline journal rows, asserts
+exact origin-token binding, retains unknown-ID orphan incidents, reclaims known IDs, and verifies
+startup invalidates abandoned cleanup claims before exact-version redelivery. Its third abort arm
+uses no timing shortcut or production failpoint.
 
 ### 29.5 Conformance against real clients and the standard suite
 

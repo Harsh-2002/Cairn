@@ -506,6 +506,7 @@ jobs:
     name: backup / restore / integrity e2e
     needs: build
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
@@ -516,6 +517,8 @@ jobs:
       # curl + stdlib Python (Bearer auth, no SDK): snapshot fidelity, durable state and recovery.
       - name: Snapshot fidelity + durable metadata and encrypted multipart recovery
         run: BIN=target/debug/cairn bash conformance/backup_restore.sh
+      - name: Remote multipart response loss, durable cleanup and offline restore
+        run: BIN=target/debug/cairn python3 conformance/recovery_remote.py --cleanup-lease
 
   fast-io-conformance:
     name: fast-io sendfile conformance + keep-alive engagement

@@ -88,6 +88,11 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   real interrupted replication claims, complete-row snapshot comparisons, fail-closed missing-part /
   wrong-key / live-lock / shard checks, and retryable multipart completion after restore. The
   failpoints `crash_multipoint.sh` job runs its `--crash-multipart` exact-claim arm as well.
+- `recovery_remote.py` — real Cairn destination and bounded HTTP fault proxy: lose a successful
+  initiation/part/abort response, SIGKILL source, compare every durable table across snapshot/restore,
+  verify unknown upload-ID incidents versus known-ID cleanup and exact native version redelivery.
+  `--cleanup-lease` includes abandoned abort ownership. Requires the v33 streaming sender and runs
+  in the backup/restore CI gate; no failpoints build or MinIO download is needed.
 
 ## regression / limit (where does it break?)
 - `routing.sh` (+`.py`) — **routing fall-through** (audit 2026-07, boto3 + hand-signed raw requests):
