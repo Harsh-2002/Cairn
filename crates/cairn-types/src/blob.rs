@@ -7,6 +7,51 @@ use crate::object::{ChecksumSet, ChecksumValue, CompressionDescriptor, ETag};
 use crate::secret::SecretKey32;
 use std::sync::Arc;
 
+/// Shared ownership of a caller's read-buffer reservation. Backends with background reads must
+/// retain a clone until the actual I/O work stops, even if the awaiting request is cancelled.
+#[derive(Clone)]
+pub struct ReadBufferLease {
+    _resource: Arc<dyn Send + Sync>,
+}
+
+impl std::fmt::Debug for ReadBufferLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReadBufferLease").finish_non_exhaustive()
+    }
+}
+
+impl ReadBufferLease {
+    /// Retain a shared reservation without exposing its implementation to the blob backend.
+    #[must_use]
+    pub fn new(resource: Arc<dyn Send + Sync>) -> Self {
+        Self {
+            _resource: resource,
+        }
+    }
+
+    /// Keep the reservation through the returned stream's last poll or cancellation.
+    #[must_use]
+    pub fn hold_stream(self, body: crate::BlobStream) -> crate::BlobStream {
+        Box::pin(LeasedReadStream { body, _lease: self })
+    }
+}
+
+struct LeasedReadStream {
+    body: crate::BlobStream,
+    _lease: ReadBufferLease,
+}
+
+impl futures_core::Stream for LeasedReadStream {
+    type Item = Result<bytes::Bytes, crate::BlobError>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.body.as_mut().poll_next(cx)
+    }
+}
+
 /// Options controlling how an object is staged.
 #[derive(Debug, Clone)]
 pub struct StageOptions {

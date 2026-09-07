@@ -127,13 +127,14 @@ counters. It is cheap to construct and safe to run from many workers at once.
   reintroduce string-sniffing on these messages.
 
 ## Notes
-- `HttpS3Sink` buffers the whole body in memory to hash it for the signed-payload PUT; streaming
-  `UNSIGNED-PAYLOAD` is a future extension. The fixed 2 GiB per-object cap is not the aggregate
-  bound: admission is the object's declared logical size against the shared
-  `CAIRN_REPLICATION_BUFFER_BUDGET_BYTES`, and collection must match that size exactly. Hold the
-  owned permit through the bounded response drain so cancellation/timeouts release it by RAII.
-  Destination diagnostics are capped at 8 KiB including the truncation marker. It does NOT
-  implement `ReplicationSink` (only `BucketRoutedSink`) so the route.rs blanket impl stays coherent.
+- `HttpS3Sink` hashes and then reopens each immutable logical source range for signed streaming.
+  Objects above 64 MiB use sequential multipart requests; no whole-object payload buffer is kept.
+  Reserve the source decoder/index/frame allowance plus bounded control XML against the shared
+  `CAIRN_REPLICATION_BUFFER_BUDGET_BYTES`. Hold the permit through response processing and actual blocking-reader exit (including after
+  cancellation). Cap completion XML at 16 MiB inside the 32 MiB control allowance; one
+  deadline spans admission, hashing and every multipart request. Responses are capped at 8 KiB.
+  HTTP 200 with an embedded completion Error must never settle the outbox successfully.
+  It implements only `BucketRoutedSink` to keep the route.rs blanket implementation coherent.
 - `backfill_outbox_entries` stamps `BACKFILL_PLACEHOLDER_BUCKET` — the caller **must** substitute
   the real source bucket before committing.
 - `insecure_skip_verify` defeats TLS auth (testing only); mutually exclusive with a custom CA.
@@ -148,3 +149,13 @@ mutation carries its exact attempt token and a fresh clock; rejected bookkeeping
 The heartbeat is polled by the existing worker, not a detached task. Remove settling entries before
 awaiting final bookkeeping so delayed acknowledgements cannot cause false ownership loss. Keep
 stale/renewal-failure counters observable even on an aborted batch.
+
+Remote multipart uploads have a separate durable journal with no bucket/outbox cascading foreign
+keys. Persist before initiation and before parts; retain missing receipt incidents and accept late
+receipts while rejecting further data I/O after ownership loss. Existing workers claim cleanup
+independently using exact renewed leases; saved endpoint/bucket identity must match current routing.
+
+After remote abort succeeds, verify `ListParts(max-parts=1)` is empty and untruncated (or reports
+`NoSuchUpload`) before retiring its journal. In-flight S3 parts can finish after abort returns;
+visible parts/errors retain debt for another pass. Cleanup DELETE/GET carries the signed replica
+marker; generic S3 credentials also require `s3:ListMultipartUploadParts` for confirmation.

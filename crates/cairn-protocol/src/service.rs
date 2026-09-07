@@ -900,8 +900,9 @@ impl S3Service {
     async fn object_op(&self, req: S3Request, body: cairn_types::BodyStream) -> Result<S3Response> {
         // Authorize centrally against the object resource.
         let mut action = object_action(&req)?;
-        // An upload's classification is immutable. All later operations authorize from persisted
-        // intent, never from headers a part uploader can forge or omit. Read errors fail closed.
+        let mut missing_replica_cleanup = false;
+        // An existing upload's classification is immutable. Later operations authorize from
+        // persisted intent, never headers a part uploader can forge or omit. Read errors fail closed.
         if let Some(id) = req
             .query("uploadId")
             .filter(|_| multipart_session_request(&req))
@@ -924,6 +925,12 @@ impl S3Service {
                 } else if replica_marker(&req) {
                     return Err(Error::AccessDenied);
                 }
+            } else if replica_marker(&req) && matches!(req.method, Method::GET | Method::DELETE) {
+                // A confirmed absent session has no persisted intent left after successful abort.
+                // Let a replication-only principal establish NoSuchUpload, without granting access
+                // to ordinary sessions or re-reading a session that could appear after this miss.
+                action = Action::ReplicateObject;
+                missing_replica_cleanup = true;
             }
         }
         // Replica classification is the authorization decision, not a second role check in the
@@ -948,6 +955,9 @@ impl S3Service {
             req_version.as_ref(),
         )
         .await?;
+        if missing_replica_cleanup {
+            return Err(Error::NoSuchUpload);
+        }
         match req.method {
             // A copy-source part is UploadPartCopy: stage a ranged copy of the source object as a
             // part rather than treating the (empty) request body as the part content.

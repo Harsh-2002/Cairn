@@ -20,6 +20,7 @@ pub mod meta;
 pub mod notification;
 pub mod object;
 pub mod replication;
+pub mod replication_upload;
 pub mod secret;
 pub mod sse;
 pub mod time;

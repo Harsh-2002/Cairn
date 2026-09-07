@@ -124,6 +124,12 @@ writer-confirmed applied/not-applied outcome and validate both token and lease b
 outbox or version-ledger state. Re-claim and startup recovery invalidate every prior token; shard
 fan-out preserves the owning shard's applied result. See Section 20.4 for heartbeat cancellation.
 
+`ReplicationMultipartJournal` is a writer-backed sink callback seam: begin before remote initiate,
+record the receipt before parts, retire after confirmed completion/abort. `ReplicationUpload`
+mutations route by the original source bucket; a bounded global cleanup claim fans out fairly
+across shards and returns leased known receipts plus newly discovered unknown-receipt incidents.
+Schema v33 adds `replication_uploads`, which deliberately survives both source bucket deletion and outbox pruning.
+
 ### 12.6 The cryptography, clock, and public-URL interfaces
 
 A cryptography interface provides the envelope encryption and decryption of SigV4 secrets under the master key, the keyed hashing used for the public-read URL signatures, and the constant-time comparisons used throughout authentication, isolating key handling and algorithm choice. A clock interface provides the current time and is injected wherever time governs behaviour, namely signature skew validation, lifecycle expiry, multipart staleness, and replication backoff, so that those behaviours are tested deterministically with a controllable clock rather than by waiting. A public-URL interface provides the signing and verification of Cairn's signed public-read URLs, which are a Cairn extension rather than an S3 feature, computing a keyed signature over the method, the escaped path, and the expiry and verifying it in constant time with an expiry check. Each of these has a production implementation and a test implementation.

@@ -121,3 +121,7 @@ ordinary and legacy uploads have no replica capability.
 - `ObjectVersionRow.internal_sha256` is an internal nullable plaintext digest (serde-skipped);
   `StagedBlob.internal_sha256` is mandatory for new objects. The in-memory blob double computes
   the same SHA-256 at stage/assembly. Neither field changes ETag or S3 checksum negotiation.
+
+`BlobStore::open_raw_guarded` adds caller-owned `ReadBufferLease` retention to the same read seam.
+The default retains it with the returned stream; any backend that starts blocking/background I/O
+must override it and clone the lease into that work until actual completion, including cancellation.

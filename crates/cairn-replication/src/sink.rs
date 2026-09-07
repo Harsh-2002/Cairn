@@ -10,11 +10,10 @@
 //!
 //! Every request is signed with SigV4 using `cairn_auth`'s signing primitives
 //! (`signing_key`/`canonical_request`/`string_to_sign`/`compute_signature`), with
-//! `x-amz-content-sha256` set to the SHA-256 of the (buffered) payload. The body is read fully
-//! into memory before signing because a signed-payload PUT must hash the bytes; a streaming
-//! `UNSIGNED-PAYLOAD` variant is a future extension. This exception to Cairn's normal streaming
-//! data path is bounded twice: 2 GiB per object, and one process-wide weighted byte budget shared
-//! by every sink through [`ReplicationSinkRuntime`].
+//! `x-amz-content-sha256` set to the SHA-256 of the exact logical range. Hashing and sending
+//! reopen the same immutable source version in two bounded passes. Small objects use one PUT;
+//! larger objects use sequential multipart requests. One process-wide weighted budget accounts
+//! for source decoding and control buffers through [`ReplicationSinkRuntime`].
 //!
 //! One wall-clock delivery deadline covers request upload, response head, and the bounded response
 //! drain. Non-success diagnostics retain at most [`MAX_RESPONSE_DIAGNOSTIC_BYTES`] including an
@@ -59,6 +58,7 @@
 use base64::Engine as _;
 use cairn_auth::{canonical_request, compute_signature, sha256_hex, signing_key, string_to_sign};
 use cairn_types::SecretString;
+use cairn_types::blob::ReadBufferLease;
 use cairn_types::error::ReplicationError;
 use cairn_types::id::{BucketName, ObjectKey, VersionId};
 use cairn_types::object::{ChecksumAlgorithm, StorageClass};
@@ -67,7 +67,8 @@ use cairn_types::time::Timestamp;
 use cairn_types::traits::Clock;
 use futures_util::StreamExt;
 use http::{Method, Request, Uri};
-use http_body_util::{BodyExt, Full};
+use http_body_util::combinators::UnsyncBoxBody;
+use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::Incoming;
 use hyper_rustls::HttpsConnector;
 use hyper_util::client::legacy::Client;
@@ -76,6 +77,7 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::crypto::aws_lc_rs;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
@@ -97,22 +99,12 @@ const REPLICA_VERSION_ID_KEY: &str = "cairn-replica-version-id";
 /// header value. The destination applies it fail-open (a malformed value is ignored, never a 4xx).
 const REPLICA_ACL_KEY: &str = "cairn-replica-acl";
 
-/// The most of a single object's logical body the buffered signed-payload PUT will hold in memory.
-/// `HttpS3Sink` buffers the whole body to hash it for SigV4 signed-payload, so without a bound one
-/// very large object (up to `CAIRN_MAX_OBJECT_SIZE`, default 5 TiB) times the worker concurrency
-/// exhausts memory and OOM-kills the node — and, because the claimed outbox entry is re-leased on
-/// restart, it re-buffers and OOMs again in a permanent crash loop (audit 2026-07). An object past
-/// this cap fails replication terminally (parked, not retried). A future streaming
-/// `UNSIGNED-PAYLOAD` PUT would remove the buffer entirely. Until then this per-object ceiling is
-/// paired with the configurable process-wide [`ReplicationSinkRuntime`] budget.
-pub const MAX_BUFFERED_OBJECT_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
-/// The default process-wide memory budget for buffered replication payloads. One maximum-sized
-/// object fits, but adding workers or destinations does not multiply the allowance.
-pub const DEFAULT_REPLICATION_BUFFER_BUDGET_BYTES: u64 = MAX_BUFFERED_OBJECT_BYTES;
-/// The largest useful aggregate budget: the maximum 64 workers can each hold at most one
-/// [`MAX_BUFFERED_OBJECT_BYTES`] payload. A larger value could never be consumed and is rejected as
-/// an operator typo.
-pub const MAX_REPLICATION_BUFFER_BUDGET_BYTES: u64 = 64 * MAX_BUFFERED_OBJECT_BYTES;
+/// Objects up to this logical size use a single streaming PUT; larger objects use multipart.
+pub const SINGLE_PUT_MAX_BYTES: u64 = 64 * 1024 * 1024;
+/// Default process-wide budget for source decoder, queued-frame and wire buffers.
+pub const DEFAULT_REPLICATION_BUFFER_BUDGET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// Upper bound on the configured shared buffer allowance (128 GiB).
+pub const MAX_REPLICATION_BUFFER_BUDGET_BYTES: u64 = 128 * 1024 * 1024 * 1024;
 /// Default wall-clock deadline for one destination delivery, including request upload, response
 /// head, and the bounded response-body drain.
 pub const DEFAULT_REPLICATION_DELIVERY_TIMEOUT_SECS: u64 = 3_600;
@@ -191,22 +183,16 @@ impl ReplicationSinkRuntime {
         })
     }
 
-    /// Reserve the declared logical size before reading any source byte. Tokio's semaphore is
+    /// Reserve the declared source-buffer allowance before reading any source byte. Tokio's semaphore is
     /// weighted and fair; the owned permit releases on every success, error, timeout, or task
     /// cancellation path.
     async fn reserve_buffer(
         &self,
         object_bytes: u64,
     ) -> Result<Option<OwnedSemaphorePermit>, ReplicationError> {
-        if object_bytes > MAX_BUFFERED_OBJECT_BYTES {
-            return Err(ReplicationError::Terminal(format!(
-                "object body exceeds the {MAX_BUFFERED_OBJECT_BYTES}-byte per-object replication \
-                 buffer cap; this object will not replicate until streaming uploads land"
-            )));
-        }
         if object_bytes > self.buffer_budget_bytes {
             return Err(ReplicationError::Terminal(format!(
-                "object body is {object_bytes} bytes, larger than the configured \
+                "source read buffers need {object_bytes} bytes, larger than the configured \
                  {}-byte process-wide replication buffer budget",
                 self.buffer_budget_bytes
             )));
@@ -214,11 +200,11 @@ impl ReplicationSinkRuntime {
         if object_bytes == 0 {
             return Ok(None);
         }
-        // The per-object ceiling is 2 GiB, safely inside `u32`; Tokio's weighted acquisition takes
-        // a `u32` even though the semaphore itself may contain a larger process-wide budget.
+        // One source reader is bounded well below u32 by the trusted CRNB index/block ceilings.
         let permits = u32::try_from(object_bytes).map_err(|_| {
             ReplicationError::Terminal(
-                "object size cannot be represented by the replication byte budget".to_owned(),
+                "source buffer allowance cannot be represented by the replication byte budget"
+                    .to_owned(),
             )
         })?;
         self.buffer_budget
@@ -307,7 +293,7 @@ pub struct HttpS3Sink {
     authority: String,
     /// The HTTP(S) client. The TLS-or-plaintext connector serves both schemes, and its HTTP layer
     /// rejects blocked literal hosts and resolves hostnames through the SSRF-guarded resolver.
-    client: Client<HttpsConnector<cairn_net::GuardedHttpConnector>, Full<bytes::Bytes>>,
+    client: Client<HttpsConnector<cairn_net::GuardedHttpConnector>, WireBody>,
     /// The clock supplying the SigV4 request time; injected so signing is deterministic in tests.
     clock: Arc<dyn Clock>,
 }
@@ -569,12 +555,49 @@ impl HttpS3Sink {
         body: bytes::Bytes,
         content_type: Option<&str>,
         user_headers: &[(String, String)],
-    ) -> Result<Request<Full<bytes::Bytes>>, ReplicationError> {
+    ) -> Result<Request<WireBody>, ReplicationError> {
+        self.build_signed_payload_request(
+            method,
+            RequestTarget {
+                bucket: dest_bucket,
+                key,
+                query: &[],
+            },
+            SignedPayload::bytes(body),
+            content_type,
+            user_headers,
+        )
+    }
+
+    fn build_signed_payload_request(
+        &self,
+        method: &Method,
+        target: RequestTarget<'_>,
+        payload: SignedPayload,
+        content_type: Option<&str>,
+        user_headers: &[(String, String)],
+    ) -> Result<Request<WireBody>, ReplicationError> {
         let now = self.clock.now();
         let amz_date = format_amz_datetime(now);
         let scope_date = &amz_date[..8];
-        let payload_hash = sha256_hex(&body);
-        let path = self.request_path(dest_bucket, key);
+        let payload_hash = payload.hash;
+        let path = self.request_path(target.bucket, target.key);
+        let mut query = target
+            .query
+            .iter()
+            .map(|(key, value)| {
+                (
+                    uri_encode_path(key).replace('/', "%2F"),
+                    uri_encode_path(value).replace('/', "%2F"),
+                )
+            })
+            .collect::<Vec<_>>();
+        query.sort();
+        let query = query
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>()
+            .join("&");
 
         // Assemble the headers that participate in (and accompany) the request. `host`,
         // `x-amz-content-sha256`, and `x-amz-date` are always signed; the content type and any
@@ -601,7 +624,7 @@ impl HttpS3Sink {
         let canonical = canonical_request(
             method.as_str(),
             &path,
-            "",
+            &query,
             &signed,
             &signed_names,
             &payload_hash,
@@ -623,7 +646,12 @@ impl HttpS3Sink {
 
         // Build the wire request. The endpoint scheme and authority are reused; only the path
         // varies. The scheme (`http`/`https`) selects the transport the connector dials.
-        let uri = format!("{}://{}{path}", self.scheme, self.authority);
+        let suffix = if query.is_empty() {
+            String::new()
+        } else {
+            format!("?{query}")
+        };
+        let uri = format!("{}://{}{path}{suffix}", self.scheme, self.authority);
         let mut builder = Request::builder()
             .method(method.clone())
             .uri(&uri)
@@ -631,7 +659,7 @@ impl HttpS3Sink {
             .header("x-amz-date", &amz_date)
             .header("x-amz-content-sha256", &payload_hash)
             .header(http::header::AUTHORIZATION, &authorization)
-            .header(http::header::CONTENT_LENGTH, body.len());
+            .header(http::header::CONTENT_LENGTH, payload.len);
         if let Some(ct) = content_type {
             builder = builder.header(http::header::CONTENT_TYPE, ct);
         }
@@ -639,7 +667,7 @@ impl HttpS3Sink {
             builder = builder.header(name.as_str(), value);
         }
         builder
-            .body(Full::new(body))
+            .body(payload.body)
             .map_err(|e| ReplicationError::Terminal(format!("failed to build request: {e}")))
     }
 }
@@ -909,7 +937,7 @@ impl HttpS3Sink {
     async fn put_object_routed(
         &self,
         source_bucket: &str,
-        object: ReplicatedObject,
+        object: ReplicatedObject<'_>,
     ) -> Result<(), ReplicationError> {
         // Refuse to put a CLIENT-encrypted object's decrypted body on an unauthenticated link,
         // before a byte is read (so nothing is buffered and nothing is dialled). See
@@ -937,18 +965,19 @@ impl HttpS3Sink {
 
         let dest_bucket = self.dest_for(source_bucket).to_owned();
 
-        // Admission is based on the metadata store's declared logical size and happens before the
-        // source stream is read. `collect_body` then enforces that exact size, so corrupt metadata
-        // cannot reserve one byte and make us retain a much larger body. Hold the owned permit
-        // through request upload and response drain; every return/cancellation path releases it.
-        let object_size = object.size;
-        let _buffer_reservation = self.runtime.reserve_buffer(object_size).await?;
-        let expected_size = usize::try_from(object_size).map_err(|_| {
-            ReplicationError::Terminal(
-                "object size cannot be represented by this target architecture".to_owned(),
-            )
-        })?;
-        let body = collect_body(object.body, expected_size).await?;
+        // Account live buffers before opening either hash or upload pass. Admission never uses
+        // object size; a many-gigabyte source can transfer through a small bounded reader.
+        let buffer_reservation = self
+            .runtime
+            .reserve_buffer(object.source.buffer_bytes.saturating_add(
+                if object.size > SINGLE_PUT_MAX_BYTES {
+                    32 * 1024 * 1024
+                } else {
+                    0
+                },
+            ))
+            .await?;
+        let lease = ReadBufferLease::new(Arc::new(buffer_reservation));
 
         // User metadata becomes `x-amz-meta-*`, plus the loop-prevention marker. The marker is
         // appended unconditionally so a destination that mirrors back recognizes the replica.
@@ -1032,15 +1061,230 @@ impl HttpS3Sink {
             user_headers.push(("x-amz-tagging".to_owned(), tagging));
         }
 
-        self.send_signed(
-            &Method::PUT,
-            &dest_bucket,
-            object.key.as_str(),
-            body,
+        if object.size <= SINGLE_PUT_MAX_BYTES {
+            let payload = signed_range(
+                &object.source,
+                cairn_types::blob::ByteRange {
+                    offset: 0,
+                    length: object.size,
+                },
+                &lease,
+            )
+            .await?;
+            let request = self.build_signed_payload_request(
+                &Method::PUT,
+                RequestTarget {
+                    bucket: &dest_bucket,
+                    key: object.key.as_str(),
+                    query: &[],
+                },
+                payload,
+                Some(&object.content_type),
+                &user_headers,
+            )?;
+            self.exchange(request).await?;
+            Ok(())
+        } else {
+            self.put_multipart(&dest_bucket, &object, &user_headers, &lease)
+                .await
+        }
+    }
+
+    /// Every exchange is inside the caller's single whole-delivery deadline.
+    async fn exchange(
+        &self,
+        request: Request<WireBody>,
+    ) -> Result<(http::HeaderMap, String), ReplicationError> {
+        let response = self
+            .client
+            .request(request)
+            .await
+            .map_err(|e| ReplicationError::Unavailable(format!("transport error: {e}")))?;
+        let (head, body) = response.into_parts();
+        let detail = read_bounded_diagnostic(body).await;
+        if !head.status.is_success() {
+            return Err(classify_status(head.status.as_u16(), &detail));
+        }
+        Ok((head.headers, detail))
+    }
+
+    async fn put_multipart(
+        &self,
+        bucket: &str,
+        object: &ReplicatedObject<'_>,
+        headers: &[(String, String)],
+        lease: &ReadBufferLease,
+    ) -> Result<(), ReplicationError> {
+        let journal = object.journal.ok_or_else(|| {
+            ReplicationError::Unavailable(
+                "multipart replication requires durable upload journaling".to_owned(),
+            )
+        })?;
+        let part_size = multipart_part_size(object.size)?;
+        // S3 multipart supports full-object CRCs. A source SHA whole-object value remains pinned
+        // in Cairn receiver intent; generic S3 chooses its native checksum for that transfer.
+        let full_crc = object.checksums.iter().find(|value| {
+            !is_composite_checksum_value(&value.value)
+                && matches!(
+                    value.algorithm,
+                    ChecksumAlgorithm::Crc32
+                        | ChecksumAlgorithm::Crc32c
+                        | ChecksumAlgorithm::Crc64Nvme
+                )
+        });
+        let mut initiation_headers = headers.to_vec();
+        let mut completion_headers = Vec::new();
+        if let Some(value) = full_crc {
+            let algorithm = match value.algorithm {
+                ChecksumAlgorithm::Crc32 => "CRC32",
+                ChecksumAlgorithm::Crc32c => "CRC32C",
+                _ => "CRC64NVME",
+            };
+            initiation_headers.push(("x-amz-checksum-algorithm".to_owned(), algorithm.to_owned()));
+            initiation_headers.push(("x-amz-checksum-type".to_owned(), "FULL_OBJECT".to_owned()));
+            completion_headers.push(("x-amz-checksum-type".to_owned(), "FULL_OBJECT".to_owned()));
+            completion_headers.push((
+                checksum_header_name(value.algorithm).to_owned(),
+                value.value.clone(),
+            ));
+        }
+        let request = self.build_signed_payload_request(
+            &Method::POST,
+            RequestTarget {
+                bucket,
+                key: object.key.as_str(),
+                query: &[("uploads", "")],
+            },
+            SignedPayload::bytes(bytes::Bytes::new()),
             Some(&object.content_type),
-            &user_headers,
-        )
-        .await
+            &initiation_headers,
+        )?;
+        let attempt = journal.begin(&self.config.endpoint, bucket).await?;
+        let (_, body) = match self.exchange(request).await {
+            Ok(response) => response,
+            Err(error @ (ReplicationError::Terminal(_) | ReplicationError::NotFound(_))) => {
+                // A definitive rejected initiation created no upload. Ambiguous transport/status
+                // failures keep the unknown-receipt incident for destination lifecycle cleanup.
+                journal.retire(&attempt).await?;
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+        let upload_id = multipart_result_field(&body, "InitiateMultipartUploadResult", "UploadId")?;
+        // Persist even a late receipt before parts; ownership loss leaves it for durable cleanup.
+        journal.record_upload_id(&attempt, &upload_id).await?;
+        let transfer = async {
+            // Fixed capacity and checked appends keep even hostile opaque ETags inside admission.
+            let mut parts = String::with_capacity(MAX_COMPLETE_XML_BYTES);
+            parts.push_str("<CompleteMultipartUpload>");
+            let mut offset = 0;
+            let mut part_number = 1u16;
+            while offset < object.size {
+                let length = part_size.min(object.size - offset);
+                let payload = signed_range(
+                    &object.source,
+                    cairn_types::blob::ByteRange { offset, length },
+                    lease,
+                )
+                .await?;
+                let number = part_number.to_string();
+                let request = self.build_signed_payload_request(
+                    &Method::PUT,
+                    RequestTarget {
+                        bucket,
+                        key: object.key.as_str(),
+                        query: &[("partNumber", &number), ("uploadId", &upload_id)],
+                    },
+                    payload,
+                    None,
+                    &[],
+                )?;
+                let (headers, _) = self.exchange(request).await?;
+                let etag = headers
+                    .get(http::header::ETAG)
+                    .and_then(|value| value.to_str().ok())
+                    .filter(|value| !value.is_empty() && value.len() <= 1024)
+                    .ok_or_else(|| {
+                        ReplicationError::Retryable(
+                            "multipart part response lacks a valid ETag".to_owned(),
+                        )
+                    })?;
+                append_completed_part(&mut parts, part_number, etag)?;
+                offset += length;
+                part_number += 1;
+            }
+            parts.push_str("</CompleteMultipartUpload>");
+            let request = self.build_signed_payload_request(
+                &Method::POST,
+                RequestTarget {
+                    bucket,
+                    key: object.key.as_str(),
+                    query: &[("uploadId", &upload_id)],
+                },
+                SignedPayload::bytes(bytes::Bytes::from(parts)),
+                Some("application/xml"),
+                &completion_headers,
+            )?;
+            let (_, body) = self.exchange(request).await?;
+            multipart_result_field(&body, "CompleteMultipartUploadResult", "ETag")?;
+            Ok(())
+        }
+        .await;
+        if transfer.is_ok()
+            || self
+                .abort_upload(bucket, object.key.as_str(), &upload_id)
+                .await
+                .is_ok()
+        {
+            journal.retire(&attempt).await?;
+        }
+        transfer
+    }
+
+    async fn abort_upload(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+    ) -> Result<(), ReplicationError> {
+        let headers = [(
+            format!("x-amz-meta-{REPLICA_MARKER_KEY}"),
+            "true".to_owned(),
+        )];
+        let request = self.build_signed_payload_request(
+            &Method::DELETE,
+            RequestTarget {
+                bucket,
+                key,
+                query: &[("uploadId", upload_id)],
+            },
+            SignedPayload::bytes(bytes::Bytes::new()),
+            None,
+            &headers,
+        )?;
+        match self.exchange(request).await {
+            Err(ReplicationError::NotFound(_)) => return Ok(()),
+            Err(error) => return Err(error),
+            Ok(_) => {}
+        }
+        // An in-flight UploadPart can finish after S3 acknowledges an abort. Keep the durable
+        // receipt until a bounded listing confirms removal; a later cleanup pass retries abort.
+        let request = self.build_signed_payload_request(
+            &Method::GET,
+            RequestTarget {
+                bucket,
+                key,
+                query: &[("max-parts", "1"), ("uploadId", upload_id)],
+            },
+            SignedPayload::bytes(bytes::Bytes::new()),
+            None,
+            &headers,
+        )?;
+        match self.exchange(request).await {
+            Err(ReplicationError::NotFound(_)) => Ok(()),
+            Err(error) => Err(error),
+            Ok((_, body)) => confirm_empty_parts(&body),
+        }
     }
 
     /// DELETE a key in the destination bucket resolved for `source_bucket`.
@@ -1079,12 +1323,55 @@ impl HttpS3Sink {
 
 #[async_trait::async_trait]
 impl crate::route::BucketRoutedSink for HttpS3Sink {
+    async fn abort_multipart(
+        &self,
+        upload: &cairn_types::replication_upload::RemoteMultipartUpload,
+    ) -> Result<(), ReplicationError> {
+        let destination = &upload.destination;
+        if destination.endpoint != self.config.endpoint
+            || destination.destination_bucket != self.dest_for(destination.bucket.as_str())
+        {
+            return Err(ReplicationError::Unavailable(
+                "multipart cleanup destination changed; restore the original target route"
+                    .to_owned(),
+            ));
+        }
+        let upload_id = upload.upload_id.as_deref().ok_or_else(|| {
+            ReplicationError::Unavailable(
+                "multipart initiation receipt unknown; destination lifecycle cleanup required"
+                    .to_owned(),
+            )
+        })?;
+        tokio::time::timeout(
+            self.runtime.delivery_timeout,
+            self.abort_upload(
+                &destination.destination_bucket,
+                destination.key.as_str(),
+                upload_id,
+            ),
+        )
+        .await
+        .map_err(|_| {
+            ReplicationError::Unavailable("multipart cleanup deadline exceeded".to_owned())
+        })?
+    }
+
     async fn put_object(
         &self,
         source_bucket: &BucketName,
-        object: ReplicatedObject,
+        object: ReplicatedObject<'_>,
     ) -> Result<(), ReplicationError> {
-        self.put_object_routed(source_bucket.as_str(), object).await
+        tokio::time::timeout(
+            self.runtime.delivery_timeout,
+            self.put_object_routed(source_bucket.as_str(), object),
+        )
+        .await
+        .map_err(|_| {
+            ReplicationError::Unavailable(format!(
+                "destination delivery exceeded the {:?} deadline",
+                self.runtime.delivery_timeout
+            ))
+        })?
     }
 
     async fn delete_marker(
@@ -1096,40 +1383,6 @@ impl crate::route::BucketRoutedSink for HttpS3Sink {
         self.delete_marker_routed(source_bucket.as_str(), key, version)
             .await
     }
-}
-
-/// Read a logical-byte blob stream fully into one contiguous, exactly-reserved buffer. A read error
-/// mid-stream is transient (the source blob may be momentarily unavailable), so it is retryable. A
-/// stream that differs from the metadata store's declared logical size is terminal: admission was
-/// weighted by that declaration, and accepting more would bypass the process-wide byte budget.
-async fn collect_body(
-    mut stream: cairn_types::BlobStream,
-    expected_bytes: usize,
-) -> Result<bytes::Bytes, ReplicationError> {
-    let mut buf = Vec::new();
-    buf.try_reserve_exact(expected_bytes).map_err(|e| {
-        ReplicationError::Terminal(format!(
-            "unable to reserve the admitted {expected_bytes}-byte replication buffer: {e}"
-        ))
-    })?;
-    while let Some(chunk) = stream.next().await {
-        let chunk =
-            chunk.map_err(|e| ReplicationError::Retryable(format!("reading source body: {e}")))?;
-        if buf.len().saturating_add(chunk.len()) > expected_bytes {
-            return Err(ReplicationError::Terminal(format!(
-                "source body exceeds its declared {expected_bytes}-byte logical size; refusing to \
-                 exceed the process-wide replication buffer reservation"
-            )));
-        }
-        buf.extend_from_slice(&chunk);
-    }
-    if buf.len() != expected_bytes {
-        return Err(ReplicationError::Terminal(format!(
-            "source body ended at {} bytes but metadata declares {expected_bytes} bytes",
-            buf.len()
-        )));
-    }
-    Ok(bytes::Bytes::from(buf))
 }
 
 /// The S3 storage-class token for a stored class (mirrors the codec's `storage_class_str`).
@@ -1239,6 +1492,231 @@ impl Clock for SystemClock {
     }
 }
 
+type WireBody = UnsyncBoxBody<bytes::Bytes, ReplicationError>;
+
+struct RequestTarget<'a> {
+    bucket: &'a str,
+    key: &'a str,
+    query: &'a [(&'a str, &'a str)],
+}
+
+struct SignedPayload {
+    body: WireBody,
+    len: u64,
+    hash: String,
+}
+impl SignedPayload {
+    fn bytes(bytes: bytes::Bytes) -> Self {
+        Self {
+            hash: sha256_hex(&bytes),
+            len: bytes.len() as u64,
+            body: Full::new(bytes)
+                .map_err(|never| match never {})
+                .boxed_unsync(),
+        }
+    }
+}
+
+const MAX_COMPLETE_XML_BYTES: usize = 16 * 1024 * 1024;
+
+fn append_completed_part(
+    parts: &mut String,
+    number: u16,
+    etag: &str,
+) -> Result<(), ReplicationError> {
+    let part = format!(
+        "<Part><PartNumber>{number}</PartNumber><ETag>{}</ETag></Part>",
+        quick_xml::escape::escape(etag)
+    );
+    if parts
+        .len()
+        .saturating_add(part.len())
+        .saturating_add("</CompleteMultipartUpload>".len())
+        > MAX_COMPLETE_XML_BYTES
+    {
+        return Err(ReplicationError::Terminal(
+            "multipart completion XML exceeds its memory bound".to_owned(),
+        ));
+    }
+    parts.push_str(&part);
+    Ok(())
+}
+
+/// S3 has at most 10,000 parts, each at most 5 GiB. Round the larger of 64 MiB and
+/// ceil(size/10000) to MiB without overflow; the final part alone can be smaller.
+pub fn multipart_part_size(size: u64) -> Result<u64, ReplicationError> {
+    const MIB: u64 = 1024 * 1024;
+    let minimum = size.div_ceil(10_000).max(SINGLE_PUT_MAX_BYTES);
+    let part = minimum
+        .div_ceil(MIB)
+        .checked_mul(MIB)
+        .filter(|part| *part <= 5 * 1024 * MIB)
+        .ok_or_else(|| {
+            ReplicationError::Terminal("object exceeds S3 multipart geometry".to_owned())
+        })?;
+    Ok(part)
+}
+
+async fn signed_range(
+    source: &cairn_types::replication::ReplicationSource<'_>,
+    range: cairn_types::blob::ByteRange,
+    lease: &ReadBufferLease,
+) -> Result<SignedPayload, ReplicationError> {
+    let mut stream = (source.open)(range, lease.clone()).await?;
+    let mut hasher = Sha256::new();
+    let mut seen = 0u64;
+    while let Some(chunk) = stream.next().await {
+        let bytes = chunk.map_err(crate::map_blob_err)?;
+        seen = seen.saturating_add(bytes.len() as u64);
+        if bytes.len() as u64 > source.max_frame_bytes || seen > range.length {
+            return Err(ReplicationError::Terminal(
+                "source exceeds signed range or frame bound".to_owned(),
+            ));
+        }
+        hasher.update(&bytes);
+    }
+    if seen != range.length {
+        return Err(ReplicationError::Terminal(
+            "source ended before signed range".to_owned(),
+        ));
+    }
+    // Drop the hash reader before reopening, so only one decoder/channel occupies the budget.
+    drop(stream);
+    let hash = hex::encode(hasher.finalize());
+    let stream = (source.open)(range, lease.clone()).await?;
+    let max_frame = source.max_frame_bytes;
+    let stream = futures_util::stream::unfold(
+        (stream, range.length, false),
+        move |(mut stream, remaining, done)| async move {
+            if done {
+                return None;
+            }
+            match stream.next().await {
+                Some(Ok(bytes))
+                    if bytes.len() as u64 <= remaining && bytes.len() as u64 <= max_frame =>
+                {
+                    let left = remaining - bytes.len() as u64;
+                    Some((Ok(hyper::body::Frame::data(bytes)), (stream, left, false)))
+                }
+                Some(Ok(_)) => Some((
+                    Err(ReplicationError::Terminal(
+                        "source exceeds upload range or frame bound".to_owned(),
+                    )),
+                    (stream, 0, true),
+                )),
+                Some(Err(error)) => Some((Err(crate::map_blob_err(error)), (stream, 0, true))),
+                None if remaining != 0 => Some((
+                    Err(ReplicationError::Terminal(
+                        "source ended before upload range".to_owned(),
+                    )),
+                    (stream, 0, true),
+                )),
+                None => None,
+            }
+        },
+    );
+    Ok(SignedPayload {
+        body: StreamBody::new(stream).boxed_unsync(),
+        len: range.length,
+        hash,
+    })
+}
+
+/// Retire only a complete, untruncated listing with no parts or embedded error.
+fn confirm_empty_parts(xml: &str) -> Result<(), ReplicationError> {
+    if multipart_result_field(xml, "ListPartsResult", "IsTruncated")?.trim() != "false" {
+        return Err(ReplicationError::Retryable(
+            "multipart cleanup listing is truncated".to_owned(),
+        ));
+    }
+    let mut reader = quick_xml::Reader::from_str(xml);
+    loop {
+        match reader.read_event().map_err(|_| {
+            ReplicationError::Retryable("invalid multipart cleanup listing".to_owned())
+        })? {
+            quick_xml::events::Event::Start(event) | quick_xml::events::Event::Empty(event)
+                if matches!(event.local_name().as_ref(), b"Part" | b"Error") =>
+            {
+                return Err(ReplicationError::Retryable(
+                    "multipart parts remain after abort; cleanup retained".to_owned(),
+                ));
+            }
+            quick_xml::events::Event::Eof => return Ok(()),
+            _ => {}
+        }
+    }
+}
+
+/// A successful HTTP status is insufficient: S3 can embed Error inside HTTP 200.
+/// Require one complete expected XML result and one nonempty direct child.
+fn multipart_result_field(
+    xml: &str,
+    expected_root: &str,
+    field: &str,
+) -> Result<String, ReplicationError> {
+    use quick_xml::events::Event;
+    let malformed =
+        || ReplicationError::Retryable("invalid or truncated multipart response".to_owned());
+    let mut reader = quick_xml::Reader::from_str(xml);
+    let mut root = None;
+    let mut depth = 0usize;
+    let mut result = None;
+    let mut closed = false;
+    loop {
+        match reader.read_event().map_err(|_| malformed())? {
+            Event::Start(event) => {
+                if depth == 0 {
+                    if root.is_some() {
+                        return Err(malformed());
+                    }
+                    root = Some(String::from_utf8_lossy(event.local_name().as_ref()).into_owned());
+                }
+                depth += 1;
+                if depth == 2 && event.local_name().as_ref() == field.as_bytes() {
+                    if result.is_some() {
+                        return Err(malformed());
+                    }
+                    let text = reader.read_text(event.name()).map_err(|_| malformed())?;
+                    let text = text.decode().map_err(|_| malformed())?;
+                    result = Some(
+                        quick_xml::escape::unescape(&text)
+                            .map_err(|_| malformed())?
+                            .into_owned(),
+                    );
+                    depth -= 1;
+                }
+            }
+            Event::End(_) => {
+                depth = depth.checked_sub(1).ok_or_else(malformed)?;
+                if depth == 0 {
+                    closed = true;
+                }
+            }
+            Event::DocType(_) => return Err(malformed()),
+            Event::Empty(_) | Event::CData(_) if depth == 0 => return Err(malformed()),
+            Event::Decl(_) if root.is_some() => return Err(malformed()),
+            Event::Eof => break,
+            Event::Text(text)
+                if depth == 0 && !text.as_ref().iter().all(u8::is_ascii_whitespace) =>
+            {
+                return Err(malformed());
+            }
+            _ => {}
+        }
+    }
+    if root.as_deref() == Some("Error") {
+        return Err(ReplicationError::Retryable(
+            "destination returned embedded multipart Error".to_owned(),
+        ));
+    }
+    if !closed || depth != 0 || root.as_deref() != Some(expected_root) {
+        return Err(malformed());
+    }
+    result
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(malformed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1326,40 +1804,80 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn collect_body_caps_oversize_terminally() {
-        use bytes::Bytes;
-        type Chunk = Result<Bytes, cairn_types::error::BlobError>;
-
-        // A body over the cap fails TERMINAL (not Retryable) so the entry parks instead of
-        // re-leasing on restart and OOM-looping (audit 2026-07).
-        let over: Vec<Chunk> = vec![
-            Ok(Bytes::from_static(&[0u8; 8])),
-            Ok(Bytes::from_static(&[0u8; 8])),
-        ];
-        let stream = Box::pin(futures_util::stream::iter(over));
-        let err = collect_body(stream, 10)
-            .await
-            .expect_err("a body over the cap must error");
-        assert!(
-            matches!(err, ReplicationError::Terminal(_)),
-            "over-cap must be Terminal, got {err:?}"
+    #[test]
+    fn opaque_etags_cannot_grow_completion_xml_beyond_admission() {
+        let mut xml = String::with_capacity(MAX_COMPLETE_XML_BYTES);
+        let etag = "\"".repeat(1024);
+        let capacity = xml.capacity();
+        let mut rejected = false;
+        for number in 1..=10_000 {
+            if append_completed_part(&mut xml, number, &etag).is_err() {
+                rejected = true;
+                break;
+            }
+        }
+        assert!(rejected);
+        assert!(xml.len() < MAX_COMPLETE_XML_BYTES);
+        assert_eq!(
+            xml.capacity(),
+            capacity,
+            "the control buffer must never grow"
         );
+    }
 
-        // A body within the cap collects fine.
-        let under: Vec<Chunk> = vec![Ok(Bytes::from_static(b"hello"))];
-        let stream = Box::pin(futures_util::stream::iter(under));
-        let body = collect_body(stream, 5).await.expect("exact body collects");
-        assert_eq!(&body[..], b"hello");
+    #[tokio::test]
+    async fn signed_ranges_validate_both_passes_and_length() {
+        let make = |bytes: &'static [u8]| cairn_types::replication::ReplicationSource {
+            buffer_bytes: 64,
+            max_frame_bytes: 64,
+            open: Box::new(move |_, _lease| {
+                Box::pin(async move {
+                    Ok(Box::pin(futures_util::stream::once(async move {
+                        Ok(bytes::Bytes::from_static(bytes))
+                    })) as cairn_types::BlobStream)
+                })
+            }),
+        };
+        for (bytes, length, succeeds) in [
+            (b"hello".as_slice(), 5, true),
+            (b"short", 6, false),
+            (b"too long", 3, false),
+        ] {
+            let payload = signed_range(
+                &make(bytes),
+                cairn_types::blob::ByteRange { offset: 0, length },
+                &ReadBufferLease::new(Arc::new(())),
+            )
+            .await;
+            if succeeds {
+                let payload = payload.unwrap();
+                assert_eq!(payload.hash, sha256_hex(bytes));
+                assert_eq!(payload.body.collect().await.unwrap().to_bytes(), bytes);
+            } else {
+                assert!(matches!(payload, Err(ReplicationError::Terminal(_))));
+            }
+        }
+    }
 
-        // A short body is also rejected: the declared size is the weight admitted against the
-        // global budget and the Content-Length promise made to the destination.
-        let short: Vec<Chunk> = vec![Ok(Bytes::from_static(b"short"))];
-        let stream = Box::pin(futures_util::stream::iter(short));
-        let err = collect_body(stream, 6)
-            .await
-            .expect_err("a short source body must not be sent");
-        assert!(matches!(err, ReplicationError::Terminal(_)));
+    #[test]
+    fn multipart_geometry_and_embedded_errors() {
+        assert_eq!(
+            multipart_part_size(2 * 1024 * 1024 * 1024 + 1).unwrap(),
+            SINGLE_PUT_MAX_BYTES
+        );
+        assert_eq!(
+            multipart_part_size(5 * 1024_u64.pow(4)).unwrap(),
+            525 * 1024 * 1024
+        );
+        assert!(multipart_part_size(u64::MAX).is_err());
+        assert_eq!(multipart_result_field("<InitiateMultipartUploadResult><UploadId>a&amp;b</UploadId></InitiateMultipartUploadResult>", "InitiateMultipartUploadResult", "UploadId").unwrap(), "a&b");
+        for xml in [
+            "<Error><Code>InternalError</Code></Error>",
+            "<CompleteMultipartUploadResult><ETag>x",
+            "<CompleteMultipartUploadResult><ETag>x</ETag><ETag>y</ETag></CompleteMultipartUploadResult>",
+        ] {
+            assert!(multipart_result_field(xml, "CompleteMultipartUploadResult", "ETag").is_err());
+        }
     }
 
     #[tokio::test]

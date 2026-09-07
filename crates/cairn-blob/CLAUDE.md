@@ -80,9 +80,17 @@ plain files under opaque IDs; metadata is someone else's job (`cairn-meta`).
   (enough for a 5-GiB object at the minimum supported 1-KiB block size) and its block count must
   match the independently stored logical size and block geometry before allocation. A corrupt large
   file therefore cannot make pre-v3 or pre-MAC parsing allocate in proportion to its physical size.
+- **Block allocations obey trusted metadata on every CRNB version.** Trailer algorithm, block
+  size and logical total must match metadata for v1/v2/v3. Every raw payload is exactly logical
+  length and every compressed payload is nonempty and shorter, excluding the encrypted GCM tag.
+  Reject violations during open before `read_range` allocates from an index physical length.
 - **Never resolve a storage path that escapes `data_root`.** `resolve` rejects absolute paths and any
   `..`/root/prefix component → `BlobError::Io("unsafe storage path")`. Object bytes live under opaque
   IDs, never under the user key, so key-based traversal is structurally impossible — keep it that way.
+- **Guarded read reservations follow blocking work.** `open_raw_guarded` keeps the caller's
+  `ReadBufferLease` in both the probe and lazy streaming blocking closures, plus the response body.
+  Request timeout/cancellation cannot return the replication byte budget while those tasks still
+  own decoder/index buffers. Ordinary `open_raw` callers remain unchanged.
 - **One filesystem.** `data_root`, `.staging`, and every bucket dir must share a filesystem or the
   atomic rename fails with `EXDEV`. `check_single_filesystem` is called at startup to fail fast.
 - ENOSPC (errno 28 / `StorageFull`) → `BlobError::OutOfSpace` → HTTP 507. Map it via `io_err`.

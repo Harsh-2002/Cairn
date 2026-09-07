@@ -29,6 +29,14 @@ type R<T> = Result<T, MetaError>;
 /// Apply a mutation, returning its typed outcome or a typed error.
 pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcome> {
     match m {
+        Mutation::ReplicationUpload { bucket, operation } => {
+            crate::replication_upload::apply(driver, &bucket, operation).await
+        }
+        Mutation::ClaimReplicationUploadCleanup {
+            limit,
+            now,
+            lease_secs,
+        } => crate::replication_upload::claim(driver, limit, now, lease_secs).await,
         Mutation::PutObjectVersion {
             row,
             precondition,
@@ -1406,6 +1414,8 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
                     vec![],
                 )
                 .await?;
+            // Startup has no surviving cleanup workers either; invalidate their exact tokens.
+            driver.execute("UPDATE replication_uploads SET cleanup_token=NULL, lease_until=NULL WHERE cleanup_token IS NOT NULL", vec![]).await?;
             Ok(MutationOutcome::Ack)
         }
         Mutation::PruneReplicationOutbox { before_ms } => {

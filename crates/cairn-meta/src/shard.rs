@@ -91,6 +91,8 @@ pub struct ShardedMetadataStore {
     /// low-index shard cannot starve higher shards. `Relaxed`: fairness/liveness only, not a
     /// correctness barrier (per-shard claiming is enforced by the SQL lease).
     replication_claim_cursor: AtomicUsize,
+    /// Independent cleanup cursor: alternating cleanup/delivery claims must not pin even shards.
+    replication_upload_claim_cursor: AtomicUsize,
     /// The same, for the webhook claim fan-out. A separate cursor from replication on purpose: a
     /// single shared cursor degenerates when the two callers alternate against an even shard count.
     webhook_claim_cursor: AtomicUsize,
@@ -118,6 +120,7 @@ impl ShardedMetadataStore {
         Self {
             shards,
             replication_claim_cursor: AtomicUsize::new(0),
+            replication_upload_claim_cursor: AtomicUsize::new(0),
             webhook_claim_cursor: AtomicUsize::new(0),
         }
     }
@@ -163,6 +166,23 @@ impl MetadataStore for ShardedMetadataStore {
             // capability waiting to revive after same-name recreation. A global cleanup failure
             // aborts before the authoritative bucket deletion; a later authoritative NotEmpty error
             // likewise leaves the bucket intact but its capabilities safely invalidated.
+            Mutation::ClaimReplicationUploadCleanup { limit, now, lease_secs } => {
+                let mut batch = cairn_types::replication_upload::ReplicationUploadBatch::default();
+                let mut remaining = limit.clamp(1, 1000);
+                let start = self.rotate_start(&self.replication_upload_claim_cursor);
+                for offset in 0..self.n() {
+                    if remaining == 0 { break; }
+                    match self.shards[(start + offset) % self.n()].submit(Mutation::ClaimReplicationUploadCleanup { limit: remaining, now, lease_secs }).await? {
+                        MutationOutcome::ReplicationUploadBatch(part) => {
+                            remaining -= part.uploads.len() as u32 + part.orphaned;
+                            batch.orphaned += part.orphaned;
+                            batch.uploads.extend(part.uploads);
+                        }
+                        _ => return Err(MetaError::Engine("unexpected remote upload cleanup outcome".to_owned())),
+                    }
+                }
+                Ok(MutationOutcome::ReplicationUploadBatch(batch))
+            }
             Mutation::DeleteBucket(name) => {
                 let idx = shard_for_bucket(name.as_str(), self.n());
                 let m = Mutation::DeleteBucket(name);
@@ -191,6 +211,7 @@ impl MetadataStore for ShardedMetadataStore {
             | Mutation::SetObjectRetention { .. }
             | Mutation::SetObjectLegalHold { .. }
             | Mutation::EnqueueReplication(_)
+            | Mutation::ReplicationUpload { .. }
             // Both of its statements are keyed on `bucket_name`, and every outbox row and version
             // row for a bucket lives on that bucket's shard — so this is a single-shard mutation,
             // NOT a fan-out like the id-keyed `MarkReplication*` marks.
@@ -963,6 +984,7 @@ impl MetadataStore for ShardedMetadataStore {
 /// Extract the target bucket name from a per-bucket mutation, for shard routing.
 fn mutation_bucket(m: &Mutation) -> Option<String> {
     let b = match m {
+        Mutation::ReplicationUpload { bucket, .. } => bucket.as_str(),
         Mutation::PutObjectVersion { row, .. } => row.bucket.as_str(),
         Mutation::ResolveObjectWrite { bucket, .. } => bucket.as_str(),
         Mutation::CreateDeleteMarker { bucket, .. } => bucket.as_str(),
@@ -1020,6 +1042,7 @@ fn mutation_bucket(m: &Mutation) -> Option<String> {
         | Mutation::PruneEventsOutbox { .. }
         | Mutation::DeferReplication { .. }
         | Mutation::RenewReplicationClaim { .. }
+        | Mutation::ClaimReplicationUploadCleanup { .. }
         | Mutation::RecoverClaimedReplication
         | Mutation::EnqueueWebhooks(_)
         | Mutation::ClaimWebhookBatch { .. }

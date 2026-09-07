@@ -1124,11 +1124,18 @@ impl CapturingSink {
 impl cairn_types::traits::ReplicationSink for CapturingSink {
     async fn put_object(
         &self,
-        object: cairn_types::replication::ReplicatedObject,
+        object: cairn_types::replication::ReplicatedObject<'_>,
     ) -> Result<(), cairn_types::error::ReplicationError> {
         use futures_util::StreamExt;
         let key = object.key.as_str().to_owned();
-        let mut body = object.body;
+        let mut body = (object.source.open)(
+            cairn_types::blob::ByteRange {
+                offset: 0,
+                length: object.size,
+            },
+            cairn_types::blob::ReadBufferLease::new(Arc::new(())),
+        )
+        .await?;
         let mut out = Vec::new();
         while let Some(chunk) = body.next().await {
             out.extend_from_slice(
@@ -1625,6 +1632,7 @@ async fn memory_replication_attempts_are_fenced() {
         .unwrap()
         .unwrap();
     cairn_types::testing::assert_replication_claim_fencing(&meta, &object).await;
+    cairn_types::testing::assert_replication_upload_journal(&meta, &object.bucket).await;
 }
 
 struct HeldSink {
@@ -1635,10 +1643,20 @@ struct HeldSink {
 
 #[async_trait::async_trait]
 impl BucketRoutedSink for HeldSink {
+    async fn abort_multipart(
+        &self,
+        _upload: &cairn_types::replication_upload::RemoteMultipartUpload,
+    ) -> Result<(), cairn_types::ReplicationError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.started.notify_one();
+        self.release.acquire().await.unwrap().forget();
+        Ok(())
+    }
+
     async fn put_object(
         &self,
         _bucket: &BucketName,
-        _object: cairn_types::replication::ReplicatedObject,
+        _object: cairn_types::replication::ReplicatedObject<'_>,
     ) -> Result<(), cairn_types::ReplicationError> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.started.notify_one();
@@ -1737,7 +1755,7 @@ impl BucketRoutedSink for ClockJumpSink<'_> {
     async fn put_object(
         &self,
         _bucket: &BucketName,
-        _object: cairn_types::replication::ReplicatedObject,
+        _object: cairn_types::replication::ReplicatedObject<'_>,
     ) -> Result<(), cairn_types::ReplicationError> {
         self.clock.advance_secs(301);
         match self.failure {
@@ -1861,4 +1879,278 @@ async fn settlement_ack_loss_keeps_waiting_leases_alive_until_worker_cancellatio
         "dropping the worker also drops its heartbeat"
     );
     assert_eq!(recovered[0].id, "waiting");
+}
+
+async fn plant_remote_upload(
+    meta: &InMemoryMetadataStore,
+    blobs: &InMemoryBlobStore,
+    now: Timestamp,
+    known: bool,
+) {
+    use cairn_types::replication_upload::{
+        RemoteMultipartDestination, RemoteMultipartUpload, ReplicationUploadMutation as Op,
+    };
+    put_with_outbox(
+        meta,
+        blobs,
+        "remote-origin",
+        "remote-key",
+        b"body",
+        now,
+        now,
+    )
+    .await;
+    let entry = meta
+        .claim_replication_batch(1, now)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let token = entry.claim_token.clone().unwrap();
+    let row = RemoteMultipartUpload {
+        id: "remote-attempt".to_owned(),
+        outbox_id: entry.id.clone(),
+        origin_token: token.clone(),
+        destination: RemoteMultipartDestination {
+            bucket: entry.bucket.clone(),
+            key: entry.key.clone(),
+            target_arn: entry.target_arn.clone(),
+            endpoint: "https://remote.example".to_owned(),
+            destination_bucket: "remote-bucket".to_owned(),
+        },
+        upload_id: None,
+        cleanup_token: None,
+        lease_until: None,
+        next_attempt_at: now,
+        orphan_reported: false,
+        last_error: None,
+    };
+    meta.submit(Mutation::ReplicationUpload {
+        bucket: entry.bucket.clone(),
+        operation: Op::Begin {
+            upload: Box::new(row),
+            now,
+        },
+    })
+    .await
+    .unwrap();
+    if known {
+        meta.submit(Mutation::ReplicationUpload {
+            bucket: entry.bucket.clone(),
+            operation: Op::RecordUploadId {
+                id: "remote-attempt".to_owned(),
+                origin_token: token.clone(),
+                upload_id: "remote-id".to_owned(),
+                now,
+            },
+        })
+        .await
+        .unwrap();
+    }
+    meta.submit(Mutation::MarkReplicationDone {
+        id: entry.id,
+        claim_token: token,
+        now,
+    })
+    .await
+    .unwrap();
+    meta.submit(Mutation::PruneReplicationOutbox {
+        before_ms: now.0 + 1,
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn remote_cleanup_renews_and_cancels_on_expired_ownership() {
+    for lose in [false, true] {
+        let meta = Arc::new(InMemoryMetadataStore::new());
+        let blobs = Arc::new(InMemoryBlobStore::new());
+        let clock = Arc::new(TestClock::at_secs(0));
+        plant_remote_upload(&meta, &blobs, clock.now(), true).await;
+        let sink = Arc::new(HeldSink {
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Semaphore::new(0),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let engine = ReplicationEngine::new(ReplicationOpts::default(), Arc::new(StubCrypto));
+        let task = tokio::spawn({
+            let (meta, blobs, clock, sink, engine) = (
+                meta.clone(),
+                blobs.clone(),
+                clock.clone(),
+                sink.clone(),
+                engine.clone(),
+            );
+            async move { engine.run_once(&*meta, &*sink, &blobs, &*clock).await }
+        });
+        sink.started.notified().await;
+        if lose {
+            clock.advance_secs(301);
+            tokio::time::advance(std::time::Duration::from_secs(60)).await;
+            assert!(task.await.unwrap().is_err());
+            assert_eq!(engine.take_upload_failures(), (0, 1));
+            let cairn_types::MutationOutcome::ReplicationUploadBatch(batch) = meta
+                .submit(Mutation::ClaimReplicationUploadCleanup {
+                    limit: 1,
+                    now: clock.now(),
+                    lease_secs: 300,
+                })
+                .await
+                .unwrap()
+            else {
+                panic!("cleanup batch")
+            };
+            assert_eq!(
+                batch.uploads.len(),
+                1,
+                "cancelled worker leaves recoverable debt"
+            );
+        } else {
+            for _ in 0..7 {
+                clock.advance_secs(60);
+                tokio::time::advance(std::time::Duration::from_secs(60)).await;
+                tokio::task::yield_now().await;
+                let cairn_types::MutationOutcome::ReplicationUploadBatch(batch) = meta
+                    .submit(Mutation::ClaimReplicationUploadCleanup {
+                        limit: 1,
+                        now: clock.now(),
+                        lease_secs: 300,
+                    })
+                    .await
+                    .unwrap()
+                else {
+                    panic!("cleanup batch")
+                };
+                assert!(
+                    batch.uploads.is_empty(),
+                    "active cleanup remains owned beyond initial lease"
+                );
+            }
+            sink.release.add_permits(1);
+            assert!(task.await.unwrap().unwrap().is_idle());
+            assert_eq!(engine.take_upload_failures(), (0, 0));
+        }
+    }
+}
+
+#[tokio::test]
+async fn unknown_remote_receipts_and_removed_targets_stay_observable_after_pruning() {
+    for known in [false, true] {
+        let meta = InMemoryMetadataStore::new();
+        let blobs = Arc::new(InMemoryBlobStore::new());
+        let clock = TestClock::at_secs(0);
+        plant_remote_upload(&meta, &blobs, clock.now(), known).await;
+        let engine = ReplicationEngine::new(ReplicationOpts::default(), Arc::new(StubCrypto));
+        assert!(
+            engine
+                .run_once(&meta, &NoSinkRouter, &blobs, &clock)
+                .await
+                .unwrap()
+                .is_idle()
+        );
+        assert_eq!(
+            engine.take_upload_failures(),
+            if known { (0, 1) } else { (1, 0) }
+        );
+        engine
+            .run_once(&meta, &NoSinkRouter, &blobs, &clock)
+            .await
+            .unwrap();
+        assert_eq!(
+            engine.take_upload_failures(),
+            (0, 0),
+            "retry cadence and incident reporting are bounded"
+        );
+        clock.advance_secs(60);
+        let cairn_types::MutationOutcome::ReplicationUploadBatch(batch) = meta
+            .submit(Mutation::ClaimReplicationUploadCleanup {
+                limit: 1,
+                now: clock.now(),
+                lease_secs: 300,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("cleanup batch")
+        };
+        if known {
+            assert_eq!(batch.uploads.len(), 1);
+            assert!(
+                batch.uploads[0]
+                    .last_error
+                    .as_deref()
+                    .unwrap()
+                    .contains("target removed")
+            );
+        } else {
+            assert!(batch.uploads.is_empty());
+            assert_eq!(batch.orphaned, 0);
+        }
+    }
+}
+
+#[tokio::test]
+async fn plaintext_small_read_frame_survives_signed_http_delivery() {
+    use http_body_util::{BodyExt, Full};
+    use hyper_util::rt::TokioIo;
+    use std::time::Duration;
+    // LocalBlobStore's small-object fast path emits one frame up to 256 KiB. The double
+    // emits the same shape, so the engine's declared source bound must permit that frame.
+    static DATA: [u8; 256 * 1024] = [42; 256 * 1024];
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let peer = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let service = hyper::service::service_fn(
+            |request: http::Request<hyper::body::Incoming>| async move {
+                let body = request.into_body().collect().await.unwrap().to_bytes();
+                assert_eq!(body.as_ref(), &DATA);
+                Ok::<_, std::convert::Infallible>(http::Response::new(Full::new(Bytes::new())))
+            },
+        );
+        let _ = hyper::server::conn::http1::Builder::new()
+            .serve_connection(TokioIo::new(socket), service)
+            .await;
+    });
+    let sink = cairn_replication::HttpS3Sink::new(
+        cairn_replication::S3SinkConfig {
+            endpoint,
+            dest_bucket: "dest".to_owned(),
+            dest_buckets: Default::default(),
+            region: "us-east-1".to_owned(),
+            access_key_id: "AKID".to_owned(),
+            secret_access_key: "test-secret".into(),
+            ca_cert_path: None,
+            ca_cert_pem: None,
+            insecure_skip_verify: false,
+            allow_internal_endpoints: true,
+            allow_plaintext_sse_over_http: false,
+        },
+        cairn_replication::ReplicationSinkRuntime::new(1024 * 1024, Duration::from_secs(5))
+            .unwrap(),
+    )
+    .unwrap();
+    let meta = InMemoryMetadataStore::new();
+    let blobs = Arc::new(InMemoryBlobStore::new());
+    let clock = TestClock::at_secs(2_000);
+    put_with_outbox(
+        &meta,
+        &blobs,
+        "small-frame",
+        "obj/frame",
+        &DATA,
+        clock.now(),
+        clock.now(),
+    )
+    .await;
+    let report = engine()
+        .run_once(&meta, &SingleSink(sink), &blobs, &clock)
+        .await
+        .unwrap();
+    peer.abort();
+    assert_eq!(
+        report.completed, 1,
+        "a legitimate small-read frame must replicate"
+    );
 }

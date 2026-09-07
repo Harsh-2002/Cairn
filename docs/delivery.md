@@ -285,6 +285,15 @@ The schema below is the reference for the SQLite store. Types are given in the e
 | enqueued_at | integer | Not null, default 0; the wall-clock millis an entry was first enqueued, so lag is the age of the oldest still-unreplicated entry's enqueue time rather than its backed-off next-attempt time. A value of 0 (rows predating the column) is treated as unknown by the lag query (migration v19). |
 | Index | | Over status and next-attempt time, for due-entry claiming, and over status and enqueue time, for the per-status aggregate and lag; a third index over (bucket_name, key) on replication_outbox (idx_outbox_bucket_key, migration v23) backing the key-paged forced-resync requeue seek. |
 
+**Remote replication multipart journal.** `replication_uploads` records id (primary key),
+bucket_name (original shard identity), outbox_id, origin_token, destination (strict JSON containing
+source bucket/key, target ARN, endpoint and destination bucket), nullable upload_id, nullable
+cleanup_token/lease_until, next_attempt_at, orphan_reported and nullable last_error. The
+`(orphan_reported, next_attempt_at)` index drives bounded cleanup claiming. It has **no foreign
+keys**: deleting a source bucket or pruning a terminal outbox must preserve remote cleanup debt.
+Only confirmed complete/abort removes a known attempt; unknown initiation receipts remain explicit
+incidents and can be upgraded by an exact late receipt (Section 20.4).
+
 **Object locks (migration v16; writer-authority hardening v27).** Per-version S3 Object Lock
 (WORM) state lives in a side table so the hot object-versions row is untouched; a row exists only
 when retention or legal hold is present. Columns: bucket_name, key, version_id (composite primary

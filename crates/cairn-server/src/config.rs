@@ -244,14 +244,14 @@ pub struct Config {
     /// (`CAIRN_REPLICATION_WORKER_CONCURRENCY`). Per-key, per-target ordering is preserved by the
     /// durable claim lease and the predecessor check regardless of pool size.
     pub replication_worker_concurrency: usize,
-    /// Process-wide byte budget for fully buffered, signed replication PUT payloads
+    /// Process-wide byte budget for replication source readers and multipart control buffers
     /// (`CAIRN_REPLICATION_BUFFER_BUDGET_BYTES`). Every worker and every env/named/stored-target
     /// sink shares one weighted semaphore, so increasing worker concurrency or target fan-out
     /// cannot multiply this memory allowance. Default 2 GiB.
     pub replication_buffer_budget_bytes: u64,
     /// One wall-clock deadline for a destination delivery
-    /// (`CAIRN_REPLICATION_DELIVERY_TIMEOUT_SECS`), covering the request upload, response head, and
-    /// bounded response-body drain without resetting on progress. Default one hour; capped at one
+    /// (`CAIRN_REPLICATION_DELIVERY_TIMEOUT_SECS`), covering admission, hashing, all upload requests, and
+    /// bounded response-body drains without resetting on progress. Default one hour; capped at one
     /// day so a typo cannot effectively disable the guard.
     pub replication_delivery_timeout_secs: u64,
     /// Max delivery attempts before a retryable replication failure becomes terminal

@@ -17,6 +17,13 @@ counts writer-rejected ownership updates, and `cairn_replication_claim_renew_fai
 heartbeat ownership losses or metadata errors. They are emitted even when cancellation prevents a
 normal run report; a sustained increase warrants investigating writer stalls and worker ownership.
 
+Remote multipart cleanup counters carry no object or target labels:
+`cairn_replication_multipart_orphan_initiation_total` counts newly discovered missing initiation
+receipts after originating ownership ends; `cairn_replication_multipart_cleanup_failed_total`
+counts failed aborts and cleanup ownership/heartbeat failures. Workers drain these counters even
+when the pass returns an error. Outstanding debt and its latest reason remain in
+`replication_uploads`; counters are process-lifetime signals, not durable debt totals.
+
 ### 26.3 Audit log
 
 Mutating actions across both the S3 and management surfaces are recorded in an audit log with the actor, the action, the resource, and the salient attributes, retained in the metadata store and surfaced through the management API and web console. This serves both the operational need to see recent activity and the security need to have a record of who changed or accessed what, and it is distinct from the operational metrics in that it is per-event and attributable rather than aggregate.

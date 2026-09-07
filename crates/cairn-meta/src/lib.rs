@@ -8,6 +8,7 @@ mod apply;
 mod cache;
 mod model;
 mod range;
+mod replication_upload;
 mod schema;
 mod shard;
 mod store;

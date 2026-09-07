@@ -7,7 +7,7 @@ use crate::object::{ChecksumValue, ETag, StorageClass, UserMetadata};
 
 /// An object to put at a replication destination. Its body is a logical-byte stream read
 /// from the source blob store.
-pub struct ReplicatedObject {
+pub struct ReplicatedObject<'a> {
     /// The destination key.
     pub key: ObjectKey,
     /// The source version id (the idempotency identity).
@@ -56,11 +56,13 @@ pub struct ReplicatedObject {
     /// contract, so shipping such a body over `http` is no worse than shipping a plaintext object —
     /// gating it would break existing plaintext-endpoint deployments for no security gain.
     pub client_encrypted: bool,
-    /// The logical-byte body stream.
-    pub body: crate::BlobStream,
+    /// Reopenable logical ranges of the exact source version.
+    pub source: ReplicationSource<'a>,
+    /// Durable attempt recorder. Production multipart sinks must reject an absent journal.
+    pub journal: Option<&'a dyn ReplicationMultipartJournal>,
 }
 
-impl std::fmt::Debug for ReplicatedObject {
+impl std::fmt::Debug for ReplicatedObject<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ReplicatedObject")
             .field("key", &self.key)
@@ -70,4 +72,58 @@ impl std::fmt::Debug for ReplicatedObject {
             .field("client_encrypted", &self.client_encrypted)
             .finish_non_exhaustive()
     }
+}
+
+/// Future returned by an exact-version logical range opener.
+pub type ReplicationReadFuture<'a> = std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = Result<crate::BlobStream, crate::ReplicationError>>
+            + Send
+            + 'a,
+    >,
+>;
+
+/// Reopens logical ranges without retaining an object's body. The opener must validate the exact
+/// immutable row/path before each pass and resolve the current key envelope before reading.
+pub struct ReplicationSource<'a> {
+    /// Conservative live read-buffer bound, including decoder index/block and queued frames.
+    pub buffer_bytes: u64,
+    /// Largest logical frame the opener can return.
+    pub max_frame_bytes: u64,
+    /// Open one bounded range; retain the supplied lease until all reader work has ended.
+    /// The returned stream must end at exactly its requested length.
+    pub open: Box<
+        dyn Fn(crate::blob::ByteRange, crate::blob::ReadBufferLease) -> ReplicationReadFuture<'a>
+            + Send
+            + Sync
+            + 'a,
+    >,
+}
+
+impl std::fmt::Debug for ReplicationSource<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReplicationSource")
+            .field("buffer_bytes", &self.buffer_bytes)
+            .field("max_frame_bytes", &self.max_frame_bytes)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Writer-backed journal required before a sink starts a remote multipart upload.
+#[async_trait::async_trait]
+pub trait ReplicationMultipartJournal: Send + Sync {
+    /// Persist a unique attempt before sending initiation. No remote request may precede this.
+    async fn begin(
+        &self,
+        endpoint: &str,
+        destination_bucket: &str,
+    ) -> Result<String, crate::ReplicationError>;
+    /// Persist the receipt before sending parts. A late receipt is saved but ownership loss errors.
+    async fn record_upload_id(
+        &self,
+        attempt: &str,
+        remote_id: &str,
+    ) -> Result<(), crate::ReplicationError>;
+    /// Retire only after confirmed remote completion or abort (including NoSuchUpload).
+    async fn retire(&self, attempt: &str) -> Result<(), crate::ReplicationError>;
 }

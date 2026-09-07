@@ -507,5 +507,117 @@ async fn replication_attempts_are_fenced_on_every_shard() {
         let object = row(name, "key", 1);
         store.submit(put(object.clone())).await.unwrap();
         cairn_types::testing::assert_replication_claim_fencing(&store, &object).await;
+        cairn_types::testing::assert_replication_upload_journal(&store, &object.bucket).await;
     }
+}
+
+#[tokio::test]
+async fn remote_cleanup_and_delivery_use_independent_fairness_cursors() {
+    use cairn_types::replication_upload::{
+        RemoteMultipartDestination, RemoteMultipartUpload, ReplicationUploadMutation as Op,
+    };
+    let (store, inner) = shards(2);
+    for (si, shard) in inner.iter().enumerate() {
+        for j in 0..8 {
+            let entry = outbox(si, j);
+            shard
+                .submit(Mutation::EnqueueReplication(Box::new(entry.clone())))
+                .await
+                .unwrap();
+            let claimed = shard
+                .claim_replication_batch(1, Timestamp(0))
+                .await
+                .unwrap()
+                .pop()
+                .unwrap();
+            let token = claimed.claim_token.unwrap();
+            let id = format!("remote-{}", entry.id);
+            shard
+                .submit(Mutation::ReplicationUpload {
+                    bucket: entry.bucket.clone(),
+                    operation: Op::Begin {
+                        now: Timestamp(0),
+                        upload: Box::new(RemoteMultipartUpload {
+                            id: id.clone(),
+                            outbox_id: entry.id.clone(),
+                            origin_token: token.clone(),
+                            destination: RemoteMultipartDestination {
+                                bucket: entry.bucket.clone(),
+                                key: entry.key.clone(),
+                                target_arn: None,
+                                endpoint: "https://remote.example".to_owned(),
+                                destination_bucket: "destination".to_owned(),
+                            },
+                            upload_id: None,
+                            cleanup_token: None,
+                            lease_until: None,
+                            next_attempt_at: Timestamp(0),
+                            orphan_reported: false,
+                            last_error: None,
+                        }),
+                    },
+                })
+                .await
+                .unwrap();
+            shard
+                .submit(Mutation::ReplicationUpload {
+                    bucket: entry.bucket.clone(),
+                    operation: Op::RecordUploadId {
+                        id,
+                        origin_token: token.clone(),
+                        upload_id: "receipt".to_owned(),
+                        now: Timestamp(0),
+                    },
+                })
+                .await
+                .unwrap();
+            shard
+                .submit(Mutation::MarkReplicationDone {
+                    id: entry.id,
+                    claim_token: token,
+                    now: Timestamp(0),
+                })
+                .await
+                .unwrap();
+        }
+        for j in 100..108 {
+            shard
+                .submit(Mutation::EnqueueReplication(Box::new(outbox(si, j))))
+                .await
+                .unwrap();
+        }
+    }
+    let mut cleanup_hits = [0; 2];
+    let mut delivery_hits = [0; 2];
+    for _ in 0..4 {
+        let MutationOutcome::ReplicationUploadBatch(batch) = store
+            .submit(Mutation::ClaimReplicationUploadCleanup {
+                limit: 1,
+                now: Timestamp(0),
+                lease_secs: 300,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("cleanup batch")
+        };
+        let entry = &batch.uploads[0];
+        let shard: usize = entry.outbox_id[1..entry.outbox_id.find('-').unwrap()]
+            .parse()
+            .unwrap();
+        cleanup_hits[shard] += 1;
+        let batch = store
+            .claim_replication_batch(1, Timestamp(0))
+            .await
+            .unwrap();
+        let entry = &batch[0];
+        let shard: usize = entry.id[1..entry.id.find('-').unwrap()].parse().unwrap();
+        delivery_hits[shard] += 1;
+    }
+    assert_eq!(cleanup_hits, [2, 2]);
+    assert_eq!(
+        delivery_hits,
+        [2, 2],
+        "alternating callers must not pin one parity of shards"
+    );
 }

@@ -34,6 +34,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use cairn_types::SecretKey32;
 pub use cairn_types::blob::BlobCipher;
+use cairn_types::blob::ReadBufferLease;
 use cairn_types::blob::{
     BlobProbe, BlobReadHandle, ByteRange, ContentRange, PartRef, ReconcileOpts, ReconcileReport,
     StageOptions, StagedBlob, StagedPart, ZeroCopyRead,
@@ -535,7 +536,7 @@ enum StreamSrc {
             u64,
             u64,
             u64,
-            tokio::sync::OwnedSemaphorePermit,
+            (tokio::sync::OwnedSemaphorePermit, Option<ReadBufferLease>),
         ),
     ),
     Running(tokio::sync::mpsc::Receiver<Result<Bytes, BlobError>>),
@@ -548,7 +549,7 @@ fn read_stream(
     expected_logical_len: u64,
     offset: u64,
     len: u64,
-    permit: tokio::sync::OwnedSemaphorePermit,
+    permits: (tokio::sync::OwnedSemaphorePermit, Option<ReadBufferLease>),
 ) -> cairn_types::BlobStream {
     let initial = StreamSrc::Pending((
         path,
@@ -557,7 +558,7 @@ fn read_stream(
         expected_logical_len,
         offset,
         len,
-        permit,
+        permits,
     ));
     Box::pin(futures_util::stream::unfold(initial, |state| async move {
         let mut rx = match state {
@@ -568,13 +569,13 @@ fn read_stream(
                 expected_logical_len,
                 offset,
                 len,
-                permit,
+                permits,
             )) => {
                 let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, BlobError>>(4);
                 tokio::task::spawn_blocking(move || {
                     // The permit is held for the whole transfer so it counts against the blob-I/O
                     // bound (ARCH 7.4), then released when this task ends.
-                    let _permit = permit;
+                    let (_permit, _lease) = permits;
                     if let Err(e) = stream_blob(
                         &path,
                         cipher,
@@ -718,76 +719,15 @@ impl LocalBlobStore {
     }
 }
 
-#[async_trait]
-impl BlobStore for LocalBlobStore {
-    async fn stage(
-        &self,
-        bucket: &BucketName,
-        body: cairn_types::BodyStream,
-        opts: StageOptions,
-    ) -> Result<StagedBlob, BlobError> {
-        // Bound concurrent blob *copy* I/O (ARCH 7.4). Held through the data copy and the per-file
-        // durability (fdatasync + rename), then released BEFORE the coalesced directory-fsync
-        // barrier (Phase 2.4) so a PUT awaiting that barrier no longer occupies blob-I/O concurrency
-        // that concurrent GETs need — reads stop queueing behind writers' fsync barriers. The
-        // barrier itself is bounded by the coalescer (one fsync per directory per batch), not by
-        // this semaphore, and a waiter only parks on a oneshot, holding no blocking thread.
-        let copy_permit = self.acquire_io().await?;
-        let id = uuid::Uuid::new_v4().simple().to_string();
-        let staging = self.data_root.join(STAGING).join(format!("{id}.tmp"));
-        let bucket_dir = self.data_root.join(bucket.as_str());
-        let final_path = bucket_dir.join(&id);
-        let storage_path = StoragePath::from_string(format!("{}/{}", bucket.as_str(), id));
-        // Keep ownership of both possible names across every await until the `StagedBlob` is
-        // returned. A canceled request therefore cannot strand either the pre-rename tmp or the
-        // post-rename blob before metadata has had a chance to reference it.
-        let mut cleanup = UncommittedBlobCleanup::new(staging.clone(), final_path.clone());
-
-        let mut sink = Staging::create(staging, self.use_uring, opts.content_length).await?;
-        let outcome = write_staged(&mut sink, body, &opts).await;
-        let (logical, physical, md5, checksums, descriptor, internal_sha256) = match outcome {
-            Ok(v) => v,
-            Err(e) => {
-                sink.abort().await;
-                return Err(e);
-            }
-        };
-        // Create (and fsync the parent of) the bucket directory *before* the rename, so the
-        // commit can rename into an already-durable directory entry (F-1, ARCH 8.2 step 4). The
-        // commit performs: fdatasync the staged file → rename. The destination-directory fsync that
-        // makes the new entry durable is then issued through the coalescer, which batches it with
-        // any concurrent PUTs into the same bucket into a single fsync. `sync_dir` resolves only
-        // after that fsync completes, so the blob is fully durable before we proceed.
-        ensure_bucket_dir(&self.data_root, &bucket_dir).await?;
-        sink.commit(&final_path).await?;
-        // Release the copy permit before parking on the coalesced directory-fsync barrier.
-        drop(copy_permit);
-        self.dir_sync.sync_dir(&bucket_dir).await?;
-        // The crash window the durability ordering protects: the blob is now durable but no
-        // metadata row references it yet. A crash here leaves an orphan that reconcile reclaims.
-        fail::fail_point!("blob_after_durable");
-
-        let staged = StagedBlob {
-            storage_path,
-            size_logical: logical,
-            size_physical: physical,
-            etag: ETag::from_md5_hex(md5.clone()),
-            md5_hex: md5,
-            checksums,
-            internal_sha256,
-            compression: descriptor,
-        };
-        cleanup.disarm();
-        Ok(staged)
-    }
-
-    async fn open_raw(
+impl LocalBlobStore {
+    async fn open_raw_with_lease(
         &self,
         path: &StoragePath,
         range: Option<ByteRange>,
         cipher: BlobCipher,
         compression: &CompressionDescriptor,
         expected_logical_len: u64,
+        lease: Option<ReadBufferLease>,
     ) -> Result<BlobReadHandle, BlobError> {
         // The named cipher includes the metadata-backed CRNB format expectation. Keep that typed
         // declaration intact through both the probe open and the lazy body stream: reducing it to a
@@ -812,8 +752,10 @@ impl BlobStore for LocalBlobStore {
         let plaintext_length_mismatch = self.plaintext_length_mismatch.clone();
         let probe_cipher = cipher.clone();
         let probe_compression = compression.clone();
+        let probe_lease = lease.clone();
         let (logical_len, reuse_file, whole) = tokio::task::spawn_blocking(
             move || -> Result<(u64, Option<std::fs::File>, Option<Bytes>), BlobError> {
+                let _lease = probe_lease;
                 use std::io::{Read, Seek, SeekFrom};
                 let mut f = match std::fs::File::open(&probe_path) {
                     Ok(f) => f,
@@ -930,7 +872,7 @@ impl BlobStore for LocalBlobStore {
                 expected_logical_len,
                 offset,
                 len,
-                permit,
+                (permit, lease.clone()),
             );
             // Uncompressed, plaintext blobs may take the kernel file-to-socket fast path, reusing the
             // fd the probe opened. Encrypted blobs are always block-formatted (`is_container`), so
@@ -943,12 +885,112 @@ impl BlobStore for LocalBlobStore {
             (body, zero_copy)
         };
 
+        let body = match lease {
+            Some(lease) => lease.hold_stream(body),
+            None => body,
+        };
         Ok(BlobReadHandle {
             logical_len: len,
             content_range,
             body,
             zero_copy,
         })
+    }
+}
+
+#[async_trait]
+impl BlobStore for LocalBlobStore {
+    async fn stage(
+        &self,
+        bucket: &BucketName,
+        body: cairn_types::BodyStream,
+        opts: StageOptions,
+    ) -> Result<StagedBlob, BlobError> {
+        // Bound concurrent blob *copy* I/O (ARCH 7.4). Held through the data copy and the per-file
+        // durability (fdatasync + rename), then released BEFORE the coalesced directory-fsync
+        // barrier (Phase 2.4) so a PUT awaiting that barrier no longer occupies blob-I/O concurrency
+        // that concurrent GETs need — reads stop queueing behind writers' fsync barriers. The
+        // barrier itself is bounded by the coalescer (one fsync per directory per batch), not by
+        // this semaphore, and a waiter only parks on a oneshot, holding no blocking thread.
+        let copy_permit = self.acquire_io().await?;
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let staging = self.data_root.join(STAGING).join(format!("{id}.tmp"));
+        let bucket_dir = self.data_root.join(bucket.as_str());
+        let final_path = bucket_dir.join(&id);
+        let storage_path = StoragePath::from_string(format!("{}/{}", bucket.as_str(), id));
+        // Keep ownership of both possible names across every await until the `StagedBlob` is
+        // returned. A canceled request therefore cannot strand either the pre-rename tmp or the
+        // post-rename blob before metadata has had a chance to reference it.
+        let mut cleanup = UncommittedBlobCleanup::new(staging.clone(), final_path.clone());
+
+        let mut sink = Staging::create(staging, self.use_uring, opts.content_length).await?;
+        let outcome = write_staged(&mut sink, body, &opts).await;
+        let (logical, physical, md5, checksums, descriptor, internal_sha256) = match outcome {
+            Ok(v) => v,
+            Err(e) => {
+                sink.abort().await;
+                return Err(e);
+            }
+        };
+        // Create (and fsync the parent of) the bucket directory *before* the rename, so the
+        // commit can rename into an already-durable directory entry (F-1, ARCH 8.2 step 4). The
+        // commit performs: fdatasync the staged file → rename. The destination-directory fsync that
+        // makes the new entry durable is then issued through the coalescer, which batches it with
+        // any concurrent PUTs into the same bucket into a single fsync. `sync_dir` resolves only
+        // after that fsync completes, so the blob is fully durable before we proceed.
+        ensure_bucket_dir(&self.data_root, &bucket_dir).await?;
+        sink.commit(&final_path).await?;
+        // Release the copy permit before parking on the coalesced directory-fsync barrier.
+        drop(copy_permit);
+        self.dir_sync.sync_dir(&bucket_dir).await?;
+        // The crash window the durability ordering protects: the blob is now durable but no
+        // metadata row references it yet. A crash here leaves an orphan that reconcile reclaims.
+        fail::fail_point!("blob_after_durable");
+
+        let staged = StagedBlob {
+            storage_path,
+            size_logical: logical,
+            size_physical: physical,
+            etag: ETag::from_md5_hex(md5.clone()),
+            md5_hex: md5,
+            checksums,
+            internal_sha256,
+            compression: descriptor,
+        };
+        cleanup.disarm();
+        Ok(staged)
+    }
+
+    async fn open_raw(
+        &self,
+        path: &StoragePath,
+        range: Option<ByteRange>,
+        cipher: BlobCipher,
+        compression: &CompressionDescriptor,
+        expected_logical_len: u64,
+    ) -> Result<BlobReadHandle, BlobError> {
+        self.open_raw_with_lease(path, range, cipher, compression, expected_logical_len, None)
+            .await
+    }
+
+    async fn open_raw_guarded(
+        &self,
+        path: &StoragePath,
+        range: Option<ByteRange>,
+        cipher: BlobCipher,
+        compression: &CompressionDescriptor,
+        expected_logical_len: u64,
+        lease: ReadBufferLease,
+    ) -> Result<BlobReadHandle, BlobError> {
+        self.open_raw_with_lease(
+            path,
+            range,
+            cipher,
+            compression,
+            expected_logical_len,
+            Some(lease),
+        )
+        .await
     }
 
     async fn probe(&self, path: &StoragePath) -> Result<BlobProbe, BlobError> {
@@ -1785,5 +1827,106 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = LocalBlobStore::open(dir.path()).await.unwrap();
         store.check_single_filesystem().unwrap();
+    }
+
+    /// A cancelled async caller does not cancel an already queued blocking filesystem read.
+    /// Keep its external memory reservation until that task actually exits, both for the probe
+    /// and for the lazy body reader. A one-thread blocking pool makes the ordering deterministic.
+    #[test]
+    fn cancelled_probe_and_stream_retain_external_buffer_lease() {
+        async fn occupy_blocking_thread()
+        -> (std::sync::mpsc::Sender<()>, tokio::task::JoinHandle<()>) {
+            let (release, wait) = std::sync::mpsc::channel();
+            let (ready, started) = tokio::sync::oneshot::channel();
+            let task = tokio::task::spawn_blocking(move || {
+                ready.send(()).unwrap();
+                wait.recv().unwrap();
+            });
+            started.await.unwrap();
+            (release, task)
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let store = LocalBlobStore::open(dir.path())
+                .await
+                .unwrap()
+                .with_small_read_max(0);
+            let data = Bytes::from(vec![7; 64 * 1024]);
+            let size = data.len() as u64;
+            let staged = store
+                .stage(
+                    &BucketName::parse("bkt").unwrap(),
+                    Box::pin(futures_util::stream::iter([Ok(data)])),
+                    StageOptions::default(),
+                )
+                .await
+                .unwrap();
+
+            for cancel_probe in [true, false] {
+                let owner = Arc::new(());
+                let weak = Arc::downgrade(&owner);
+                let lease = ReadBufferLease::new(owner);
+                let (release, blocker) = if cancel_probe {
+                    let blocking = occupy_blocking_thread().await;
+                    {
+                        let read = store.open_raw_guarded(
+                            &staged.storage_path,
+                            None,
+                            BlobCipher::KnownPlaintext,
+                            &CompressionDescriptor::Uncompressed,
+                            size,
+                            lease,
+                        );
+                        futures_util::pin_mut!(read);
+                        std::future::poll_fn(|cx| {
+                            assert!(std::future::Future::poll(read.as_mut(), cx).is_pending());
+                            std::task::Poll::Ready(())
+                        })
+                        .await;
+                    }
+                    blocking
+                } else {
+                    let mut handle = store
+                        .open_raw_guarded(
+                            &staged.storage_path,
+                            None,
+                            BlobCipher::KnownPlaintext,
+                            &CompressionDescriptor::Uncompressed,
+                            size,
+                            lease,
+                        )
+                        .await
+                        .unwrap();
+                    let blocking = occupy_blocking_thread().await;
+                    {
+                        let next = handle.body.next();
+                        futures_util::pin_mut!(next);
+                        std::future::poll_fn(|cx| {
+                            assert!(std::future::Future::poll(next.as_mut(), cx).is_pending());
+                            std::task::Poll::Ready(())
+                        })
+                        .await;
+                    }
+                    drop(handle);
+                    blocking
+                };
+                // Release before asserting so a failing regression cannot strand the runtime.
+                let retained = weak.upgrade().is_some();
+                release.send(()).unwrap();
+                blocker.await.unwrap();
+                tokio::task::spawn_blocking(|| ()).await.unwrap();
+                assert!(
+                    retained,
+                    "cancelled read released reservation before blocking task exited"
+                );
+                assert!(weak.upgrade().is_none(), "finished read leaked reservation");
+            }
+        });
     }
 }

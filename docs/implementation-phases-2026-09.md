@@ -9,10 +9,10 @@ This is a work tracker; entries must not claim completion until validation passe
 | 1 | Fail-closed replication intent across writes and marker deletes; cleanup and retry tests | Merged in PR #69 |
 | 2 | Exact attempt-token fencing and renewal of active/waiting claims; backend parity | Merged in PR #71 after exact-head CI passed |
 | 4A | Required pinned-verifier signature/checksum checks for host and digest-pinned container installs | Merged in PR #70 |
-| 3A | Authorized persisted replica multipart intent; identity, loop prevention, encryption and locks | Implemented; authorization regression and live crash/restore passed; full gate and PR CI pending |
-| 3B | Reopenable logical ranges, signed two-pass streaming, multipart delivery, durable remote cleanup | Pending |
+| 3A | Authorized persisted replica multipart intent; identity, loop prevention, encryption and locks | Merged in PR #72 after exact-head CI passed |
+| 3B | Reopenable logical ranges, signed two-pass streaming, multipart delivery, durable remote cleanup | Implemented; 111 replication tests, reader/journal tests and final crash/restore drills passed; full gate and real multi-GiB checks pending |
 | 4B | Full-object checksum scrub, persisted internal SHA-256, legacy coverage, opt-in scrub pacing | Implemented in PR #73; 1,282 workspace tests, doctests, both Clippy configurations and live v32 restore passed; exact-head CI pending |
-| 4C | Single-SQLite restore/crash coverage for every new durable field and accurate recovery runbooks | Pending |
+| 4C | Single-SQLite restore/crash coverage for every new durable field and accurate recovery runbooks | Implemented; final v33 full-state restore and all three remote response-loss drills passed; PR and CI pending |
 
 ## Fixed decisions
 
