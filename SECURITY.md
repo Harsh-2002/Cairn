@@ -76,6 +76,23 @@ gh attestation verify cairn-linux-amd64 --repo Harsh-2002/Cairn
 gh attestation verify "oci://${IMAGE}@${DIGEST}" --repo Harsh-2002/Cairn
 ```
 
+## Installer verification
+
+The installer requires SHA-256 tools and verifies both `SHA256SUMS` and the selected binary's
+Cosign signature before replacing the installed executable. It downloads Cosign v3.0.6 using
+architecture-specific SHA-256 pins embedded in the installer; an unverified verifier is never
+executed. The installer script, system tools, and HTTPS roots remain bootstrap trust assumptions.
+There is no skip-verification switch. Missing signatures/checksums or invalid selected manifest
+entries fail the installation, including for older releases without those artifacts.
+
+Container installation and update use the release's immutable `IMAGE-DIGEST`, verify its Cosign
+signature, and verify SLSA provenance with checksum-pinned GitHub CLI v2.96.0. The verified subject
+must bind to the requested release version and its resolved source commit. GitHub API/registry
+access (and authentication where required by GitHub CLI) must be available; verification failure
+leaves the active Compose file and containers unchanged. Generated Compose files pin the verified
+digest instead of `latest`. Existing generated projects retain their other settings on update.
+A release without `IMAGE-DIGEST` and matching provenance is unsupported for this installer path.
+
 ## Supported versions
 
 Cairn is pre-1.0; security fixes land on `main`.
