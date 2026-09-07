@@ -1845,6 +1845,34 @@ async fn aggregate_counts_parity() {
         assert_eq!(c.objects, 2);
         assert_eq!(c.versions, 3);
         assert_eq!(c.logical_bytes, 60);
+        s.submit(Mutation::CreateDeleteMarker {
+            bucket: bk.clone(),
+            key: ObjectKey::parse("k1").unwrap(),
+            version_id: VersionId::from_string("v3".into()),
+            owner_id: UserId("owner".into()),
+            now: Timestamp(3),
+            bypass: GovernanceBypass::Denied,
+            expected_current: None,
+            replication: Vec::new(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(s.aggregate_counts().await.unwrap().objects, 1);
+        assert_eq!(s.bucket_counts().await.unwrap()[0].objects, 1);
+        s.submit(Mutation::DeleteVersion {
+            bucket: bk.clone(),
+            key: ObjectKey::parse("k1").unwrap(),
+            version_id: VersionId::from_string("v3".into()),
+            expected_row_id: None,
+            expected_updated_at: None,
+            require_sole_key_version: false,
+            now: Timestamp(4),
+            bypass: GovernanceBypass::Denied,
+        })
+        .await
+        .unwrap();
+        assert_eq!(s.aggregate_counts().await.unwrap().objects, 2);
+        assert_eq!(s.bucket_counts().await.unwrap()[0].objects, 2);
     }
 }
 

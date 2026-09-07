@@ -122,7 +122,7 @@ above remain the source of truth.
   `cairn-meta/src/shard.rs` — both `ShardedMetadataStore::submit`'s routing match and
   `mutation_bucket` (both now exhaustive, so the compiler forces this). Schema changes are
   **append-only** migrations in `cairn-meta/src/schema.rs` (never edit an applied migration; latest
-  is v33 — v21 per-part multipart DEKs, v22 multipart KMS intent, v23
+  is v34 — v21 per-part multipart DEKs, v22 multipart KMS intent, v23
   `object_versions.replicated_at` + the outbox `(bucket_name, key)` index, v24 bounded import
   scheduling/history/retention indexes, v25 hash-only one-time object-share capabilities, v26
   bounded multipart staging reservations, cleanup debt, and O(1) quota/cardinality counters, v27
@@ -164,3 +164,6 @@ cargo run --bin cairn -- serve               # S3 on :7373, console on :7374
 Replication outbox migration v30 adds exact attempt ownership. Done/fail/defer/renew validate the
 claimed status, token, and lease inside the writer savepoint; every backend and shard fan-out must
 preserve the typed applied result. Recovery invalidates tokens before new workers can claim.
+
+Schema v34 adds writer-maintained current-visible `bucket_stats.objects`; overview counts read
+these roll-ups without scanning object versions. Migration backfills existing databases once.

@@ -68,6 +68,15 @@ decodes terminal jobs' `buckets_json`. Terminal retention seeks `(state, updated
 scanning history on every heartbeat (migration v24), and deletes at most 1,000 rows per writer
 transaction under a fixed per-heartbeat transaction budget.
 
+Migration v34 adds `bucket_stats.objects`, the exact number of current non-delete-marker keys.
+Startup backfills it once from existing versions. Version upsert and deletion capture indexed
+key visibility before and after their change and apply a delta in the same writer savepoint;
+this includes sentinel replacement, replica ordering, marker creation, and predecessor promotion.
+A failed multipart or object commit rolls back its count delta too. Both SQL backends use these
+roll-ups for aggregate and per-bucket counts: overview work scales with buckets, not objects or
+historical versions. Empty buckets still return zeros. Version and byte totals retain their
+all-version semantics. Sharded reads sum the corresponding per-shard results.
+
 ### 11.5 The metadata cache
 
 A concurrent, sharded, size-bounded cache fronts the store for hot reads of bucket metadata and of the small configuration documents consulted on every request, such as a bucket's policy and ACL and CORS and public-access-block settings. Object-version metadata is intentionally not cached; current-version, version, and listing reads go straight through to the read-connection pool. The cache holds reference-counted values, so a hit returns a cheap shared handle rather than copying the record, which removes both the global-lock contention and the per-hit allocation churn of a naive global cache (F-10). It is sized by an approximate byte budget and can be disabled. After any write transaction commits, the writer invalidates the specific entries the transaction affected, and bucket-configuration changes invalidate the relevant configuration entries so the next request sees the new policy or ACL immediately; because the cache holds only hot entries rather than the whole keyspace, even invalidating all object entries of a deleted bucket is bounded work. The cache is a decorator over the store interface, so it composes with any metadata backend and can be tested independently.

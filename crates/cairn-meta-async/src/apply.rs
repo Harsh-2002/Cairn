@@ -2128,8 +2128,6 @@ async fn enforce_user_quota(driver: &dyn AsyncSqlDriver, row: &ObjectVersionRow)
     Ok(())
 }
 
-/// Replace any existing row at (bucket,key,version_id) — capturing its blob for reclamation —
-/// demote the key's other versions, and insert the new latest row.
 /// Apply a signed delta to the maintained roll-up counters (Phase 2.1, ARCH 30) for `bucket` and
 /// `owner`. Byte-identical SQL to the rusqlite store's `adjust_stats`; runs in the same transaction
 /// as the row change so the counters never diverge from `object_versions`.
@@ -2167,7 +2165,48 @@ async fn adjust_stats(
     Ok(())
 }
 
+// Capture visibility by indexed key, never scanning the bucket or its historical versions.
+async fn current_visibility(
+    driver: &dyn AsyncSqlDriver,
+    bucket: &BucketName,
+    key: &ObjectKey,
+) -> R<i64> {
+    Ok(query_one(driver, "SELECT EXISTS(SELECT 1 FROM object_versions WHERE bucket_name=?1 AND key=?2 AND is_latest=1 AND is_delete_marker=0)", vec![Value::Text(bucket.as_str().to_owned()), Value::Text(key.as_str().to_owned())]).await?.map_or(0, |r| r.get_i64(0)))
+}
+
+async fn update_visibility(
+    driver: &dyn AsyncSqlDriver,
+    bucket: &BucketName,
+    key: &ObjectKey,
+    before: i64,
+) -> R<()> {
+    let delta = current_visibility(driver, bucket, key).await? - before;
+    if delta != 0 {
+        driver
+            .execute(
+                "UPDATE bucket_stats SET objects=objects+?2 WHERE bucket_name=?1",
+                vec![Value::Text(bucket.as_str().to_owned()), Value::Int(delta)],
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+/// Replace any existing row at (bucket,key,version_id) — capturing its blob for reclamation —
+/// demote the key's other versions, and insert the new latest row.
 async fn upsert_version(
+    driver: &dyn AsyncSqlDriver,
+    row: ObjectVersionRow,
+) -> R<Option<StoragePath>> {
+    let bucket = row.bucket.clone();
+    let key = row.key.clone();
+    let before = current_visibility(driver, &bucket, &key).await?;
+    let result = upsert_version_inner(driver, row).await?;
+    update_visibility(driver, &bucket, &key, before).await?;
+    Ok(result)
+}
+
+async fn upsert_version_inner(
     driver: &dyn AsyncSqlDriver,
     mut row: ObjectVersionRow,
 ) -> R<Option<StoragePath>> {
@@ -2313,6 +2352,21 @@ struct DeleteVersionGuard {
 }
 
 async fn delete_version(
+    driver: &dyn AsyncSqlDriver,
+    bucket: &BucketName,
+    key: &ObjectKey,
+    version_id: &VersionId,
+    guard: DeleteVersionGuard,
+    now: Timestamp,
+    bypass: GovernanceBypass,
+) -> R<MutationOutcome> {
+    let before = current_visibility(driver, bucket, key).await?;
+    let result = delete_version_inner(driver, bucket, key, version_id, guard, now, bypass).await?;
+    update_visibility(driver, bucket, key, before).await?;
+    Ok(result)
+}
+
+async fn delete_version_inner(
     driver: &dyn AsyncSqlDriver,
     bucket: &BucketName,
     key: &ObjectKey,

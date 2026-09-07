@@ -777,6 +777,17 @@ CREATE TABLE replication_uploads (
 CREATE INDEX idx_replication_upload_due ON replication_uploads(orphan_reported, next_attempt_at);
 "#,
     },
+    Migration {
+        version: 34,
+        name: "maintained current-visible object counts",
+        sql: r#"
+ALTER TABLE bucket_stats ADD COLUMN objects INTEGER NOT NULL DEFAULT 0;
+UPDATE bucket_stats SET objects = (
+    SELECT COUNT(*) FROM object_versions
+    WHERE bucket_name = bucket_stats.bucket_name AND is_latest=1 AND is_delete_marker=0
+);
+"#,
+    },
 ];
 
 /// Run all pending migrations on the write driver, recording each as applied. Each migration is

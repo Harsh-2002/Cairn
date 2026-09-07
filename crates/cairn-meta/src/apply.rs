@@ -2046,9 +2046,45 @@ fn enforce_user_quota(conn: &Connection, row: &ObjectVersionRow) -> R<()> {
     Ok(())
 }
 
+// Capture visibility by indexed key, never scanning the bucket or its historical versions.
+fn current_visibility(conn: &Connection, bucket: &BucketName, key: &ObjectKey) -> R<i64> {
+    conn.prepare_cached(
+        "SELECT EXISTS(SELECT 1 FROM object_versions
+         WHERE bucket_name=?1 AND key=?2 AND is_latest=1 AND is_delete_marker=0)",
+    )
+    .map_err(engine_err)?
+    .query_row(params![bucket.as_str(), key.as_str()], |r| r.get(0))
+    .map_err(engine_err)
+}
+
+fn update_visibility(
+    conn: &Connection,
+    bucket: &BucketName,
+    key: &ObjectKey,
+    before: i64,
+) -> R<()> {
+    let delta = current_visibility(conn, bucket, key)? - before;
+    if delta != 0 {
+        conn.prepare_cached("UPDATE bucket_stats SET objects=objects+?2 WHERE bucket_name=?1")
+            .map_err(engine_err)?
+            .execute(params![bucket.as_str(), delta])
+            .map_err(engine_err)?;
+    }
+    Ok(())
+}
+
 /// Replace any existing row at (bucket,key,version_id) — capturing its blob for reclamation —
 /// demote the key's other versions, and insert the new latest row.
-fn upsert_version(conn: &Connection, mut row: ObjectVersionRow) -> R<Option<StoragePath>> {
+fn upsert_version(conn: &Connection, row: ObjectVersionRow) -> R<Option<StoragePath>> {
+    let bucket = row.bucket.clone();
+    let key = row.key.clone();
+    let before = current_visibility(conn, &bucket, &key)?;
+    let result = upsert_version_inner(conn, row)?;
+    update_visibility(conn, &bucket, &key, before)?;
+    Ok(result)
+}
+
+fn upsert_version_inner(conn: &Connection, mut row: ObjectVersionRow) -> R<Option<StoragePath>> {
     // Read the row this upsert replaces (if any): its blob to reclaim, plus its owner and byte
     // sizes so the roll-up counters can be decremented for it before the replacement is inserted.
     let existing: Option<(Option<String>, String, i64, i64)> = conn
@@ -2130,7 +2166,7 @@ fn demote_latest(conn: &Connection, bucket: &BucketName, key: &ObjectKey) -> R<(
 /// `owner`. One accumulating upsert per table, run in the same transaction as the `object_versions`
 /// row change that produced the delta, so the counters never diverge from the table across a commit
 /// boundary. `versions`/byte totals sum over ALL versions, matching the prior scan semantics; the
-/// current-visible `objects` count is not tracked here (it stays an index-only count).
+/// current-visible `objects` count is updated separately around each version transition.
 fn adjust_stats(
     conn: &Connection,
     bucket: &str,
@@ -2220,6 +2256,21 @@ struct DeleteVersionGuard {
 }
 
 fn delete_version(
+    conn: &Connection,
+    bucket: &BucketName,
+    key: &ObjectKey,
+    version_id: &VersionId,
+    guard: DeleteVersionGuard,
+    now: Timestamp,
+    bypass: GovernanceBypass,
+) -> R<MutationOutcome> {
+    let before = current_visibility(conn, bucket, key)?;
+    let result = delete_version_inner(conn, bucket, key, version_id, guard, now, bypass)?;
+    update_visibility(conn, bucket, key, before)?;
+    Ok(result)
+}
+
+fn delete_version_inner(
     conn: &Connection,
     bucket: &BucketName,
     key: &ObjectKey,
@@ -3161,6 +3212,19 @@ mod tests {
     /// `object_versions` — the global sums catch any over- or under-counting, the per-bucket rows
     /// catch a misattributed delta.
     fn assert_counters_match_scan(conn: &Connection) {
+        let mismatches: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM bucket_stats s WHERE s.objects !=
+             (SELECT COUNT(*) FROM object_versions o WHERE o.bucket_name=s.bucket_name
+              AND o.is_latest=1 AND o.is_delete_marker=0)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            mismatches, 0,
+            "visible counters must match the scan including empty buckets"
+        );
         // Global: the counter sums equal the table's totals.
         let (sv, sl, sp): (i64, i64, i64) = conn
             .query_row(
@@ -3294,6 +3358,32 @@ mod tests {
         )
         .unwrap();
         assert_counters_match_scan(&conn);
+    }
+
+    #[test]
+    fn visible_counter_handles_old_replicas_and_savepoint_rollback() {
+        let conn = conn_with_schema();
+        seed_bucket(&conn, "bkt", None);
+        apply(&conn, put(obj_row("bkt", "key", "v3", 10))).unwrap();
+        let mut older = obj_row("bkt", "key", "v1", 20);
+        older.replication_status = Some(cairn_types::meta::ReplicationStatus::Replica);
+        apply(&conn, put(older)).unwrap();
+        assert_counters_match_scan(&conn);
+        conn.execute_batch("SAVEPOINT late_failure").unwrap();
+        apply(&conn, put(obj_row("bkt", "new-key", "v1", 30))).unwrap();
+        assert_counters_match_scan(&conn);
+        // A later tag/outbox/MPU failure rolls back the enclosing writer savepoint.
+        conn.execute_batch("ROLLBACK TO late_failure; RELEASE late_failure")
+            .unwrap();
+        assert_counters_match_scan(&conn);
+        let visible: i64 = conn
+            .query_row(
+                "SELECT objects FROM bucket_stats WHERE bucket_name='bkt'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(visible, 1);
     }
 
     #[test]

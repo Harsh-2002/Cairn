@@ -841,6 +841,17 @@ CREATE TABLE replication_uploads (
 CREATE INDEX idx_replication_upload_due ON replication_uploads(orphan_reported, next_attempt_at);
 "#,
     },
+    Migration {
+        version: 34,
+        name: "maintained current-visible object counts",
+        sql: r#"
+ALTER TABLE bucket_stats ADD COLUMN objects INTEGER NOT NULL DEFAULT 0;
+UPDATE bucket_stats SET objects = (
+    SELECT COUNT(*) FROM object_versions
+    WHERE bucket_name = bucket_stats.bucket_name AND is_latest=1 AND is_delete_marker=0
+);
+"#,
+    },
 ];
 
 /// Highest schema version understood by this build.
@@ -923,6 +934,40 @@ fn now_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn migration_v34_backfills_visible_counts_and_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at INTEGER NOT NULL);").unwrap();
+        for migration in MIGRATIONS.iter().filter(|m| m.version < 34) {
+            conn.execute_batch(migration.sql).unwrap();
+            conn.execute(
+                "INSERT INTO schema_migrations VALUES (?1, ?2, 0)",
+                rusqlite::params![migration.version, migration.name],
+            )
+            .unwrap();
+        }
+        conn.execute_batch(r#"
+            INSERT INTO object_versions
+            (id,bucket_name,key,version_id,is_latest,is_delete_marker,size_logical,size_physical,etag,content_type,compression,storage_class,owner_id,user_metadata,checksums,created_at,updated_at)
+            VALUES ('1','b','visible','1',0,0,10,10,'e','','"Uncompressed"','Standard','u','[]','[]',0,0),
+                   ('2','b','visible','2',1,0,20,20,'e','','"Uncompressed"','Standard','u','[]','[]',0,0),
+                   ('3','b','hidden','1',0,0,30,30,'e','','"Uncompressed"','Standard','u','[]','[]',0,0),
+                   ('4','b','hidden','2',1,1,0,0,'e','','"Uncompressed"','Standard','u','[]','[]',0,0);
+            INSERT INTO bucket_stats VALUES ('b',4,60,60),('empty',0,0,0);
+        "#).unwrap();
+        for _ in 0..2 {
+            run_migrations(&conn).unwrap();
+            let counts: Vec<(String, i64)> = conn
+                .prepare("SELECT bucket_name,objects FROM bucket_stats ORDER BY bucket_name")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert_eq!(counts, [("b".to_owned(), 1), ("empty".to_owned(), 0)]);
+        }
+    }
 
     #[test]
     fn migrations_apply_once_and_are_idempotent() {
