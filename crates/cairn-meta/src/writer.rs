@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
 type Ack = oneshot::Sender<Result<MutationOutcome, MetaError>>;
-type WriteRequest = (Mutation, Ack);
+type WriteRequest = (Mutation, Ack, Instant);
 
 const MAX_BATCH: usize = 256;
 
@@ -27,7 +27,7 @@ const MAX_COMMIT_SAMPLES: usize = 8192;
 
 /// One group-commit outcome, recorded after the durability barrier and drained by the server into
 /// the writer histograms. Together they show group-commit health under load: `commit_seconds`
-/// climbing is a stall on the fsync barrier; `batch_size` collapsing to 1 under concurrency means
+/// climbing identifies time spent in COMMIT; `batch_size` collapsing to 1 under concurrency means
 /// the batching broke.
 #[derive(Debug, Clone, Copy)]
 pub struct CommitSample {
@@ -36,6 +36,74 @@ pub struct CommitSample {
     /// Wall time of the single `COMMIT` durability barrier (published as
     /// `cairn_writer_commit_seconds`).
     pub commit_seconds: f64,
+}
+
+/// One completed writer stage. Fixed stage names avoid request/bucket label cardinality.
+#[derive(Debug, Clone, Copy)]
+pub struct WriterStageSample {
+    /// admission, queue, begin, apply, commit, or checkpoint.
+    pub stage: &'static str,
+    /// Wall time, including scheduler delays; not an isolated CPU or fsync measurement.
+    pub seconds: f64,
+    /// Whether this stage succeeded; apply also includes expected mutation rejections.
+    pub success: bool,
+}
+
+const MAX_STAGE_SAMPLES: usize = 1024;
+
+#[derive(Debug, Default)]
+struct StageBuffer {
+    rings: [VecDeque<WriterStageSample>; 6],
+    dropped: u64,
+    last_slow_warning: [Option<Instant>; 6],
+}
+
+impl StageBuffer {
+    fn should_warn(&mut self, index: usize, seconds: f64, now: Instant) -> bool {
+        if seconds < 1.0
+            || self.last_slow_warning[index]
+                .is_some_and(|last| now.duration_since(last) < Duration::from_secs(1))
+        {
+            return false;
+        }
+        self.last_slow_warning[index] = Some(now);
+        true
+    }
+}
+
+type StageSamples = Mutex<StageBuffer>;
+
+fn stage_index(stage: &str) -> usize {
+    match stage {
+        "admission" => 0,
+        "queue" => 1,
+        "begin" => 2,
+        "apply" => 3,
+        "commit" => 4,
+        "checkpoint" => 5,
+        _ => unreachable!("writer stages are fixed"),
+    }
+}
+
+fn record_stage(samples: &StageSamples, stage: &'static str, start: Instant, success: bool) {
+    let now = Instant::now();
+    let seconds = now.duration_since(start).as_secs_f64();
+    let mut q = samples.lock().unwrap_or_else(|p| p.into_inner());
+    let index = stage_index(stage);
+    if q.rings[index].len() >= MAX_STAGE_SAMPLES {
+        q.rings[index].pop_front();
+        q.dropped = q.dropped.saturating_add(1);
+    }
+    q.rings[index].push_back(WriterStageSample {
+        stage,
+        seconds,
+        success,
+    });
+    let warn = q.should_warn(index, seconds, now);
+    drop(q);
+    if warn {
+        tracing::warn!(stage, seconds, success, "slow metadata writer stage");
+    }
 }
 
 /// The result of a `PRAGMA wal_checkpoint(TRUNCATE)` run on the writer thread (ARCH 8.4/11.2).
@@ -100,6 +168,7 @@ pub struct Writer {
     /// the fsync barrier: the sample is pushed only after `COMMIT` returns. Mirrors how the config
     /// cache exposes counts the server mirrors into the registry (this crate has no `metrics` dep).
     commit_samples: Arc<Mutex<VecDeque<CommitSample>>>,
+    stage_samples: Arc<StageSamples>,
 }
 
 impl Writer {
@@ -111,14 +180,17 @@ impl Writer {
         let loop_depth = queue_depth.clone();
         let commit_samples = Arc::new(Mutex::new(VecDeque::new()));
         let loop_samples = commit_samples.clone();
+        let stage_samples = Arc::new(Mutex::new(StageBuffer::default()));
+        let loop_stages = stage_samples.clone();
         std::thread::Builder::new()
             .name("cairn-meta-writer".to_owned())
-            .spawn(move || writer_loop(conn, rx, linger, &loop_depth, &loop_samples))
+            .spawn(move || writer_loop(conn, rx, linger, &loop_depth, &loop_samples, &loop_stages))
             .expect("spawn writer thread");
         Writer {
             tx,
             queue_depth,
             commit_samples,
+            stage_samples,
         }
     }
 
@@ -139,17 +211,40 @@ impl Writer {
         q.drain(..).collect()
     }
 
+    /// Drain bounded completed-stage samples on the existing server metrics tick.
+    #[must_use]
+    pub fn drain_stage_samples(&self) -> Vec<WriterStageSample> {
+        self.stage_samples
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .rings
+            .iter_mut()
+            .flat_map(|ring| ring.drain(..))
+            .collect()
+    }
+
+    /// Cumulative evictions from bounded per-stage buffers since this writer started.
+    #[must_use]
+    pub fn dropped_stage_samples(&self) -> u64 {
+        self.stage_samples
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .dropped
+    }
+
     /// Submit a mutation; the returned future resolves only after the batch containing it has
     /// been made durable.
     pub async fn submit(&self, mutation: Mutation) -> Result<MutationOutcome, MetaError> {
         let (ack_tx, ack_rx) = oneshot::channel();
-        // Count the job as queued before it is sent; the writer loop decrements as it drains.
+        let start = Instant::now();
+        // Reserve before incrementing: a cancelled admission must not strand queue-depth counts.
+        let permit = self.tx.reserve().await.map_err(|_| {
+            record_stage(&self.stage_samples, "admission", start, false);
+            MetaError::WriterClosed
+        })?;
+        record_stage(&self.stage_samples, "admission", start, true);
         self.queue_depth.fetch_add(1, Ordering::Relaxed);
-        if self.tx.send(Job::Write((mutation, ack_tx))).await.is_err() {
-            // The send failed (writer gone): the job will never be drained, so undo the increment.
-            self.queue_depth.fetch_sub(1, Ordering::Relaxed);
-            return Err(MetaError::WriterClosed);
-        }
+        permit.send(Job::Write((mutation, ack_tx, Instant::now())));
         ack_rx.await.map_err(|_| MetaError::WriterClosed)?
     }
 
@@ -232,6 +327,7 @@ fn writer_loop(
     linger: Option<Duration>,
     queue_depth: &AtomicUsize,
     commit_samples: &Mutex<VecDeque<CommitSample>>,
+    stage_samples: &StageSamples,
 ) {
     loop {
         // Block for the first job; None means every handle dropped — shut down.
@@ -240,14 +336,14 @@ fn writer_loop(
         };
         let first = match first {
             Job::Control(Control::CheckpointAndShutdown(reply)) => {
-                let result = run_checkpoint(&conn);
+                let result = timed_checkpoint(&conn, stage_samples);
                 drop(conn);
                 let _ = reply.send(result);
                 return;
             }
             // A control message that arrives alone is handled directly, with no write batch.
             Job::Control(ctl) => {
-                run_control(&conn, ctl);
+                run_control(&conn, ctl, stage_samples);
                 continue;
             }
             // This write job is now drained off the inbound queue.
@@ -274,16 +370,16 @@ fn writer_loop(
             }
         }
 
-        commit_batch(&conn, batch, commit_samples);
+        commit_batch(&conn, batch, commit_samples, stage_samples);
         for ctl in deferred {
             match ctl {
                 Control::CheckpointAndShutdown(reply) => {
-                    let result = run_checkpoint(&conn);
+                    let result = timed_checkpoint(&conn, stage_samples);
                     drop(conn);
                     let _ = reply.send(result);
                     return;
                 }
-                other => run_control(&conn, other),
+                other => run_control(&conn, other, stage_samples),
             }
         }
     }
@@ -308,10 +404,10 @@ fn drain_available(
 }
 
 /// Execute a control message on the writer thread, outside any write transaction.
-fn run_control(conn: &Connection, ctl: Control) {
+fn run_control(conn: &Connection, ctl: Control, stage_samples: &StageSamples) {
     match ctl {
         Control::Checkpoint(reply) => {
-            let _ = reply.send(run_checkpoint(conn));
+            let _ = reply.send(timed_checkpoint(conn, stage_samples));
         }
         // Handled directly by `writer_loop`, which must drop the connection before acknowledging.
         Control::CheckpointAndShutdown(_) => unreachable!("shutdown is handled by writer_loop"),
@@ -325,6 +421,16 @@ fn run_control(conn: &Connection, ctl: Control) {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(conn)));
         }
     }
+}
+
+fn timed_checkpoint(
+    conn: &Connection,
+    samples: &StageSamples,
+) -> Result<WalCheckpointStats, MetaError> {
+    let start = Instant::now();
+    let result = run_checkpoint(conn);
+    record_stage(samples, "checkpoint", start, result.is_ok());
+    result
 }
 
 /// Run `PRAGMA wal_checkpoint(TRUNCATE)`, which returns one row of `(busy, log, checkpointed)`.
@@ -359,19 +465,27 @@ fn commit_batch(
     conn: &Connection,
     batch: Vec<WriteRequest>,
     commit_samples: &Mutex<VecDeque<CommitSample>>,
+    stage_samples: &StageSamples,
 ) {
     // The number of mutations coalesced into this batch — the `cairn_writer_batch_size` observation,
     // captured before `batch` is consumed below.
     let batch_size = batch.len();
-    if let Err(e) = conn.execute_batch("BEGIN IMMEDIATE") {
+    for (_, _, enqueued) in &batch {
+        record_stage(stage_samples, "queue", *enqueued, true);
+    }
+    let begin_start = Instant::now();
+    let begin = conn.execute_batch("BEGIN IMMEDIATE");
+    record_stage(stage_samples, "begin", begin_start, begin.is_ok());
+    if let Err(e) = begin {
         // Could not even begin; fail the whole batch.
         let msg = e.to_string();
-        for (_, ack) in batch {
+        for (_, ack, _) in batch {
             let _ = ack.send(Err(MetaError::Engine(msg.clone())));
         }
         return;
     }
 
+    let apply_start = Instant::now();
     let mut acks: Vec<(Ack, Result<MutationOutcome, MetaError>)> = Vec::with_capacity(batch.len());
     let mut iter = batch.into_iter().enumerate();
     // A savepoint RELEASE/ROLLBACK that itself fails (audit #17) leaves the transaction's
@@ -380,7 +494,7 @@ fn commit_batch(
     // error and stop processing, so the block below aborts the WHOLE transaction instead of
     // committing suspect state.
     let abort: Option<String> = loop {
-        let Some((idx, (mutation, ack))) = iter.next() else {
+        let Some((idx, (mutation, ack, _))) = iter.next() else {
             break None;
         };
         let sp = format!("sp{idx}");
@@ -423,6 +537,12 @@ fn commit_batch(
         }
     };
 
+    record_stage(
+        stage_samples,
+        "apply",
+        apply_start,
+        abort.is_none() && acks.iter().all(|(_, r)| r.is_ok()),
+    );
     if let Some(msg) = abort {
         // Abort the entire transaction and fail every submitter — those already applied and those
         // not yet reached (still in `iter`) — rather than commit a transaction whose savepoint
@@ -431,20 +551,22 @@ fn commit_batch(
         for (ack, _) in acks {
             let _ = ack.send(Err(MetaError::Engine(format!("batch aborted: {msg}"))));
         }
-        for (_, (_, ack)) in iter {
+        for (_, (_, ack, _)) in iter {
             let _ = ack.send(Err(MetaError::Engine(format!("batch aborted: {msg}"))));
         }
         return;
     }
 
     // One commit = one durability barrier covering every surviving mutation in the batch. Time only
-    // the barrier itself (the fsync) for `cairn_writer_commit_seconds`.
+    // the COMMIT call (including scheduler and I/O waits) for `cairn_writer_commit_seconds`.
     let commit_start = Instant::now();
-    match conn.execute_batch("COMMIT") {
+    let commit = conn.execute_batch("COMMIT");
+    let commit_seconds = commit_start.elapsed().as_secs_f64();
+    record_stage(stage_samples, "commit", commit_start, commit.is_ok());
+    match commit {
         Ok(()) => {
             // Record the sample off the barrier — the COMMIT has already returned — so metrics never
             // sit on the fsync path. Push the newest, evicting the oldest if the ring is full.
-            let commit_seconds = commit_start.elapsed().as_secs_f64();
             let mut q = lock_samples(commit_samples);
             if q.len() >= MAX_COMMIT_SAMPLES {
                 q.pop_front();
@@ -471,6 +593,192 @@ fn commit_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Small opt-in diagnostic; no S3 listener, disk corpus, or sustained workload.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "bounded writer timing comparison; run explicitly with --nocapture"]
+    async fn bounded_writer_queue_diagnostic() {
+        for delay_ms in [0, 50] {
+            let conn = Connection::open_in_memory().unwrap();
+            crate::schema::run_migrations(&conn).unwrap();
+            let writer = Writer::spawn(conn, None);
+            let (entered_tx, entered_rx) = oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let blocker = writer.clone();
+            let blocked = tokio::spawn(async move {
+                blocker
+                    .run_exec(move |_| {
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                        std::thread::sleep(Duration::from_millis(delay_ms));
+                        Ok(())
+                    })
+                    .await
+                    .unwrap();
+            });
+            entered_rx.await.unwrap();
+            let started = Instant::now();
+            let mut jobs = tokio::task::JoinSet::new();
+            for worker in 0..16 {
+                let writer = writer.clone();
+                jobs.spawn(async move {
+                    for iteration in 0..32 {
+                        let name =
+                            cairn_types::BucketName::parse(&format!("bench-{worker}-{iteration}"))
+                                .unwrap();
+                        writer
+                            .submit(Mutation::CreateBucket(Box::new(
+                                cairn_types::bucket::Bucket {
+                                    name: name.clone(),
+                                    owner_id: cairn_types::UserId("owner".to_owned()),
+                                    created_at: cairn_types::Timestamp(1),
+                                    versioning: cairn_types::bucket::VersioningState::Enabled,
+                                    ownership_mode: cairn_types::OwnershipMode::BucketOwnerEnforced,
+                                    region: "us-east-1".to_owned(),
+                                    compression: None,
+                                },
+                            )))
+                            .await
+                            .unwrap();
+                        writer.submit(Mutation::DeleteBucket(name)).await.unwrap();
+                    }
+                });
+            }
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while writer.queue_depth() < 16 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            release_tx.send(()).unwrap();
+            blocked.await.unwrap();
+            while let Some(result) = jobs.join_next().await {
+                result.unwrap();
+            }
+            let wall = started.elapsed();
+            let samples = writer.drain_stage_samples();
+            let mut queue: Vec<_> = samples
+                .iter()
+                .filter(|s| s.stage == "queue")
+                .map(|s| s.seconds)
+                .collect();
+            queue.sort_by(f64::total_cmp);
+            let max_commit = samples
+                .iter()
+                .filter(|s| s.stage == "commit")
+                .map(|s| s.seconds)
+                .fold(0.0, f64::max);
+            assert_eq!(queue.len(), 1024);
+            assert!(samples.iter().all(|s| s.success));
+            assert_eq!(writer.dropped_stage_samples(), 0);
+            if delay_ms > 0 {
+                assert!(queue[1023] >= 0.050);
+            }
+            eprintln!(
+                "writer diagnostic: delay_ms={delay_ms} mutations=1024 workers=16 wall_ms={:.3} queue_median_ms={:.3} queue_max_ms={:.3} commit_max_ms={:.3}",
+                wall.as_secs_f64() * 1000.0,
+                queue[512] * 1000.0,
+                queue[1023] * 1000.0,
+                max_commit * 1000.0
+            );
+            writer.checkpoint_and_shutdown().await.unwrap();
+        }
+    }
+
+    #[test]
+    fn slow_stage_warnings_survive_sampling_without_flooding_recovery() {
+        let mut buffer = StageBuffer::default();
+        let now = Instant::now();
+        let queue = stage_index("queue");
+        assert!(!buffer.should_warn(queue, 0.5, now));
+        assert!(buffer.should_warn(queue, 5.0, now));
+        for _ in 0..4096 {
+            assert!(!buffer.should_warn(queue, 5.0, now + Duration::from_millis(999)));
+        }
+        // Another stage is independent; draining samples must not reset the warning budget.
+        assert!(buffer.should_warn(stage_index("admission"), 5.0, now));
+        buffer.rings.iter_mut().for_each(VecDeque::clear);
+        assert!(!buffer.should_warn(queue, 5.0, now + Duration::from_millis(999)));
+        assert!(buffer.should_warn(queue, 1.0, now + Duration::from_secs(1)));
+    }
+
+    #[tokio::test]
+    async fn cancelled_admission_does_not_inflate_queue_depth() {
+        let (tx, _rx) = mpsc::channel(1);
+        let writer = Writer {
+            tx,
+            queue_depth: Arc::new(AtomicUsize::new(0)),
+            commit_samples: Arc::new(Mutex::new(VecDeque::new())),
+            stage_samples: Arc::new(Mutex::new(StageBuffer::default())),
+        };
+        let (reply, _) = oneshot::channel();
+        writer
+            .tx
+            .send(Job::Control(Control::Probe(reply)))
+            .await
+            .unwrap();
+        let mutation = Mutation::DeleteBucket(cairn_types::BucketName::parse("absent").unwrap());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), writer.submit(mutation))
+                .await
+                .is_err()
+        );
+        assert_eq!(writer.queue_depth(), 0);
+        assert!(writer.drain_stage_samples().is_empty());
+    }
+
+    #[test]
+    fn stage_samples_remain_bounded_without_evicting_other_stages() {
+        let samples = Mutex::new(StageBuffer::default());
+        record_stage(&samples, "checkpoint", Instant::now(), false);
+        for _ in 0..MAX_STAGE_SAMPLES + 100 {
+            record_stage(&samples, "queue", Instant::now(), true);
+        }
+        let q = samples.lock().unwrap();
+        assert_eq!(q.rings[stage_index("queue")].len(), MAX_STAGE_SAMPLES);
+        assert_eq!(q.rings[stage_index("checkpoint")].len(), 1);
+        assert!(!q.rings[stage_index("checkpoint")][0].success);
+        assert_eq!(q.dropped, 100);
+        assert!(q.rings.iter().map(VecDeque::len).sum::<usize>() <= 6 * MAX_STAGE_SAMPLES);
+    }
+
+    #[tokio::test]
+    async fn queued_delay_is_separate_from_transaction_stages_and_failed_mutations() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::schema::run_migrations(&conn).unwrap();
+        conn.execute_batch("INSERT INTO multipart_uploads
+            (id,bucket_name,key,owner_id,initiated_by,created_at,updated_at,status,content_type,user_metadata)
+            VALUES ('pending','absent','key','owner','owner',0,0,'active','text/plain','[]');").unwrap();
+        let stages = Mutex::new(StageBuffer::default());
+        let commits = Mutex::new(VecDeque::new());
+        let (ack, result) = oneshot::channel();
+        let queued = Instant::now() - Duration::from_millis(20);
+        commit_batch(
+            &conn,
+            vec![(
+                Mutation::DeleteBucket(cairn_types::BucketName::parse("absent").unwrap()),
+                ack,
+                queued,
+            )],
+            &commits,
+            &stages,
+        );
+        assert!(result.await.unwrap().is_err());
+        let guard = stages.lock().unwrap();
+        let q: Vec<_> = guard.rings.iter().flatten().collect();
+        assert_eq!(
+            q.iter().map(|s| s.stage).collect::<Vec<_>>(),
+            vec!["queue", "begin", "apply", "commit"]
+        );
+        assert!(q[0].seconds >= 0.020);
+        assert!(q[1].success);
+        assert!(!q[2].success);
+        assert!(
+            q[3].success,
+            "savepoint failure must not prevent batch commit"
+        );
+    }
 
     #[test]
     fn checkpoint_reports_frames_and_busy_state() {

@@ -12,6 +12,8 @@ The metadata store is the source of truth for every fact about the system that i
 
 The store opens one write connection, owned by the single group-committing writer task (Section 7.2), and a pool of read-only connections for concurrent snapshot reads (Section 7.3). On open, each connection is configured for write-ahead logging, foreign-key enforcement, the chosen synchronous level, a busy timeout as defense in depth even though the single-writer design makes contention rare, and memory-mapping and cache sizing tuned to the working set so that reads touch the kernel as little as possible. Migrations run on the write connection at startup, before any request is served, and are recorded so they apply exactly once and in order. The WAL checkpointer (Section 8.4) runs against the write connection on its schedule.
 
+The writer measures channel admission, admitted queue residence, transaction stages, and checkpoint execution using bounded per-stage sample rings (Section 26.2). Queue depth counts only admitted mutations not yet collected into a batch; cancellation while waiting for admission cannot inflate it. Checkpoint busy-wait prevention and batching policy remain unchanged.
+
 ### 11.3 Entities
 
 The schema is specified field by field in Appendix 34.1; this section describes the entities and the design intent behind them.
@@ -148,3 +150,15 @@ A cryptography interface provides the envelope encryption and decryption of SigV
 The abstraction layer adds indirection, and indirection has a cost in ceremony and sometimes in a virtual call. The cost is justified three times over. It makes the entire engine unit-testable without a disk or a database, so the protocol, authorization, versioning, lifecycle, and replication logic are tested in milliseconds against in-memory doubles, which is the difference between a test suite engineers run constantly and one they avoid. It makes backends swappable, so the io_uring blob engine, the remote cold tier, and a future pure-Rust metadata engine are drop-in rather than rewrites. And it forces clean seams that keep the protocol layer free of storage detail, which is the discipline that keeps the storage model's good instincts intact while everything around them is purpose-built for production. These are the same reasons the boundary is the single most important structural decision in the design (F-21).
 
 ---
+
+### Bounded writer diagnostic
+
+The opt-in ignored test `bounded_writer_queue_diagnostic` exercises a real in-memory Writer with
+16 workers and 512 creates plus 512 deletes per leg. In the September 2026 development-host check,
+a control leg took 67.546 ms (queue median 0.108 ms, maximum 1.599 ms; maximum COMMIT 0.011 ms).
+With a controlled 50 ms writer blockage, the leg took 105.943 ms (queue median 0.098 ms, maximum
+50.596 ms; maximum COMMIT 0.004 ms). All 2,048 mutations succeeded, with no stage-sample eviction.
+This validates queue-versus-transaction attribution under a controlled delay; an in-memory COMMIT
+has no disk durability barrier and these results do not identify the historical five-second stall.
+The diagnostic finishes in under a second and creates no persistent data. Run explicitly with
+`cargo test -p cairn-meta bounded_writer_queue_diagnostic -- --ignored --nocapture`.

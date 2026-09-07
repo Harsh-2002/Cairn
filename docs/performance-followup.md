@@ -6,8 +6,8 @@ Five sequential PRs address the September 2026 capacity campaign findings. Histo
 | --- | --- | --- |
 | 1 | TCP_NODELAY on both accepted listeners | PR #76 merged after green CI; 16 focused server tests passed |
 | 2 | Reap completed connection tasks | PR #77 merged after green CI |
-| 3 | Bounded bucket rendering, coalesced refresh, maintained visible counts | Implemented; focused checks passed; CI gates merge |
-| 4 | Bounded write-stage diagnostics | Pending |
+| 3 | Bounded bucket rendering, coalesced refresh, maintained visible counts | PR #78 merged after green CI |
+| 4 | Bounded write-stage diagnostics | Implemented; focused checks passed; CI gates merge |
 | 5 | Reuse multipart buffers and measure assembly stages | Pending |
 
 ## Phase 1
@@ -41,6 +41,23 @@ and all 23 default-backend migration tests then passed locally. Async-backend pa
 included for CI. The bounded 100,000-row query comparison and its limitations are in
 [benchmarks.md](benchmarks.md#maintained-visible-counts-bounded-query-comparison-2026-09-08).
 Client-side pagination bounds rendering; existing bucket-list API payloads still contain all buckets.
+
+## Phase 4
+
+Six independent 1,024-sample rings distinguish writer admission, queue residence, BEGIN, apply,
+COMMIT and checkpoint execution. Fixed labels and dropped-sample accounting bound diagnostics;
+rare checkpoint samples cannot be evicted by frequent queue samples. Slow-stage warnings are limited to one per stage per writer per second, preserving queue-stall
+evidence even if its sample is evicted while avoiding a per-request log flood. Metrics use the existing
+server collection task; COMMIT wall time is not labelled as isolated fsync time.
+
+Reserving queue capacity before incrementing depth also fixes phantom queued mutations when an
+admission future is cancelled. Focused tests cover cancellation, buffer bounds/rare-stage retention,
+expected mutation rejection, and checkpoint busy-wait prevention. The opt-in real-writer diagnostic
+completed 2,048 mutations and attributed a controlled 50 ms blockage to queue wait (maximum
+50.596 ms), with maximum COMMIT time 0.004 ms in that in-memory leg. See
+[metadata.md](metadata.md#bounded-writer-diagnostic) for method and limitations. The existing dashboard
+is regenerated from its source. This closes attribution gaps without claiming the historical
+five-second stall was reproduced or fixed; ordinary blob-path profiling remains follow-up work.
 
 ## Remaining limitations
 

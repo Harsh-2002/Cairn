@@ -1818,7 +1818,7 @@
           "id": "Panel_022",
           "type": "metric",
           "title": "Writer queue depth",
-          "description": "Mutations submitted but not yet committed. Sustained growth is write saturation.",
+          "description": "Admitted mutations not yet batched. Sustained growth is write saturation.",
           "config": {
             "show_legends": false,
             "legends_position": null,
@@ -2269,6 +2269,88 @@
         {
           "id": "Panel_027",
           "type": "line",
+          "title": "Writer stages (p99)",
+          "description": "Bounded recent completed-stage samples; includes scheduler and I/O waits, not CPU time.",
+          "config": {
+            "show_legends": true,
+            "legends_position": null,
+            "unit": "seconds",
+            "decimals": 5,
+            "line_thickness": 1.5,
+            "top_results_others": false,
+            "axis_border_show": false,
+            "label_option": {
+              "rotate": 0
+            },
+            "show_symbol": false,
+            "line_interpolation": "smooth",
+            "legend_width": {
+              "unit": "px"
+            },
+            "base_map": {
+              "type": "osm"
+            },
+            "map_type": {
+              "type": "world"
+            },
+            "map_view": {
+              "zoom": 1,
+              "lat": 0,
+              "lng": 0
+            },
+            "map_symbol_style": {
+              "size": "by Value",
+              "size_by_value": {
+                "min": 1,
+                "max": 100
+              },
+              "size_fixed": 2
+            },
+            "drilldown": [],
+            "mark_line": [],
+            "connect_nulls": false,
+            "no_value_replacement": "",
+            "wrap_table_cells": false,
+            "table_transpose": false,
+            "table_dynamic_columns": false
+          },
+          "queryType": "promql",
+          "queries": [
+            {
+              "query": "cairn_writer_stage_seconds{quantile=\"0.99\",result=\"ok\"}",
+              "vrlFunctionQuery": "",
+              "customQuery": true,
+              "fields": {
+                "stream": "cairn_requests_total",
+                "stream_type": "metrics",
+                "x": [],
+                "y": [],
+                "z": [],
+                "breakdown": [],
+                "filter": {
+                  "filterType": "group",
+                  "logicalOperator": "AND",
+                  "conditions": []
+                }
+              },
+              "config": {
+                "promql_legend": "{stage}"
+              }
+            }
+          ],
+          "layout": {
+            "x": 24,
+            "y": 4,
+            "w": 24,
+            "h": 9,
+            "i": 27
+          },
+          "htmlContent": "",
+          "markdownContent": ""
+        },
+        {
+          "id": "Panel_028",
+          "type": "line",
           "title": "Group-commit batch size",
           "description": "Mutations coalesced into each fsync \u2014 higher amortises the barrier better.",
           "config": {
@@ -2360,17 +2442,17 @@
             }
           ],
           "layout": {
-            "x": 24,
-            "y": 4,
+            "x": 0,
+            "y": 13,
             "w": 24,
             "h": 9,
-            "i": 27
+            "i": 28
           },
           "htmlContent": "",
           "markdownContent": ""
         },
         {
-          "id": "Panel_028",
+          "id": "Panel_029",
           "type": "line",
           "title": "Metadata cache traffic",
           "description": "Raw hit and miss rates behind the ratio above.",
@@ -2463,17 +2545,17 @@
             }
           ],
           "layout": {
-            "x": 0,
+            "x": 24,
             "y": 13,
             "w": 24,
             "h": 9,
-            "i": 28
+            "i": 29
           },
           "htmlContent": "",
           "markdownContent": ""
         },
         {
-          "id": "Panel_029",
+          "id": "Panel_030",
           "type": "line",
           "title": "WAL checkpoints",
           "description": "Truncating checkpoints are what keep the WAL bounded.",
@@ -2566,11 +2648,11 @@
             }
           ],
           "layout": {
-            "x": 24,
-            "y": 13,
+            "x": 0,
+            "y": 22,
             "w": 24,
             "h": 9,
-            "i": 29
+            "i": 30
           },
           "htmlContent": "",
           "markdownContent": ""
@@ -2582,7 +2664,7 @@
       "name": "Replication & integrity",
       "panels": [
         {
-          "id": "Panel_030",
+          "id": "Panel_031",
           "type": "metric",
           "title": "Failed",
           "description": "Terminally failed outbox entries, after the retry budget. Should be 0.",
@@ -2658,13 +2740,13 @@
             "y": 0,
             "w": 12,
             "h": 4,
-            "i": 30
+            "i": 31
           },
           "htmlContent": "",
           "markdownContent": ""
         },
         {
-          "id": "Panel_031",
+          "id": "Panel_032",
           "type": "metric",
           "title": "Unreplicated",
           "description": "Versions with no replica yet.",
@@ -2740,13 +2822,13 @@
             "y": 0,
             "w": 12,
             "h": 4,
-            "i": 31
+            "i": 32
           },
           "htmlContent": "",
           "markdownContent": ""
         },
         {
-          "id": "Panel_032",
+          "id": "Panel_033",
           "type": "metric",
           "title": "Claimed",
           "description": "Entries currently leased by a worker.",
@@ -2822,13 +2904,13 @@
             "y": 0,
             "w": 12,
             "h": 4,
-            "i": 32
+            "i": 33
           },
           "htmlContent": "",
           "markdownContent": ""
         },
         {
-          "id": "Panel_033",
+          "id": "Panel_034",
           "type": "metric",
           "title": "Plaintext length mismatch",
           "description": "Metadata-declared plaintext reads refused because file and logical lengths differ. Non-zero indicates missing/inconsistent metadata or truncated local storage.",
@@ -2904,13 +2986,13 @@
             "y": 0,
             "w": 12,
             "h": 4,
-            "i": 33
+            "i": 34
           },
           "htmlContent": "",
           "markdownContent": ""
         },
         {
-          "id": "Panel_034",
+          "id": "Panel_035",
           "type": "line",
           "title": "Replication lag",
           "description": "Age of the oldest entry still owed. Cross-host redundancy is asynchronous, so this is the observable window of exposure.",
@@ -2986,13 +3068,13 @@
             "y": 4,
             "w": 24,
             "h": 9,
-            "i": 34
+            "i": 35
           },
           "htmlContent": "",
           "markdownContent": ""
         },
         {
-          "id": "Panel_035",
+          "id": "Panel_036",
           "type": "line",
           "title": "Outbox depth",
           "description": "Entries due for shipping. Draining to zero is healthy; a rising floor is not.",
@@ -3068,7 +3150,7 @@
             "y": 4,
             "w": 24,
             "h": 9,
-            "i": 35
+            "i": 36
           },
           "htmlContent": "",
           "markdownContent": ""

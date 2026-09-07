@@ -221,7 +221,7 @@ st.line("Versions over time", [("cairn_versions", "versions")],
 # ── Metadata engine — the single group-committing writer, the WAL, the cache. ────────────────
 md = Tab("metadata", "Metadata engine")
 md.stat("Writer queue depth", "cairn_writer_queue_depth",
-        desc="Mutations submitted but not yet committed. Sustained growth is write saturation.")
+        desc="Admitted mutations not yet batched. Sustained growth is write saturation.")
 md.stat("Commits/sec", "rate(cairn_writer_commit_seconds_count[5m])", unit="ops", decimals=2,
         desc="Group commits per second — each one is a durability barrier (fsync).")
 md.stat("WAL size", "cairn_wal_bytes", unit="bytes",
@@ -237,6 +237,10 @@ md.line("Group-commit duration",
          ('cairn_writer_commit_seconds{quantile="0.9"}', "p90"),
          ('cairn_writer_commit_seconds{quantile="0.99"}', "p99")],
         unit="seconds", decimals=5, desc="Wall time of one metadata durability barrier.")
+md.line("Writer stages (p99)",
+        [('cairn_writer_stage_seconds{quantile="0.99",result="ok"}', "{stage}")],
+        unit="seconds", decimals=5,
+        desc="Bounded recent completed-stage samples; includes scheduler and I/O waits, not CPU time.")
 md.line("Group-commit batch size",
         [('cairn_writer_batch_size{quantile="0.5"}', "p50"),
          ('cairn_writer_batch_size{quantile="0.99"}', "p99")], decimals=1,

@@ -1554,7 +1554,16 @@ async fn metrics_loop(stack: Arc<AppStack>, mut shutdown: watch::Receiver<bool>)
             // fsync barrier; drain and record each into the histograms. commit_seconds climbing is a
             // stall; batch_size collapsing to 1 under load means the batching broke. Sqlite-only,
             // like the queue-depth gauge — libSQL/Turso self-manage and expose no writer handle.
+            let dropped = stack.store.iter().fold(0_u64, |total, store| {
+                total.saturating_add(store.dropped_writer_stage_samples())
+            });
+            metrics::counter!("cairn_writer_stage_samples_dropped_total").absolute(dropped);
             for s in &stack.store {
+                for sample in s.drain_writer_stage_samples() {
+                    metrics::histogram!("cairn_writer_stage_seconds", "stage" => sample.stage,
+                        "result" => if sample.success { "ok" } else { "error" })
+                    .record(sample.seconds);
+                }
                 for sample in s.drain_writer_commit_samples() {
                     metrics::histogram!("cairn_writer_commit_seconds")
                         .record(sample.commit_seconds);

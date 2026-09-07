@@ -73,12 +73,21 @@ fn describe_metrics() {
     // Writer backpressure (ARCH 26.2).
     describe_gauge!(
         "cairn_writer_queue_depth",
-        "Inbound metadata-writer queue depth (submitted but not yet committed)"
+        "Inbound metadata-writer queue depth (admitted but not yet batched)"
     );
     describe_histogram!(
         "cairn_writer_commit_seconds",
         Unit::Seconds,
-        "Wall time of a single metadata group-commit durability barrier (the fsync)"
+        "Wall time of SQLite COMMIT, including scheduler and I/O waits"
+    );
+    describe_counter!(
+        "cairn_writer_stage_samples_dropped_total",
+        "Completed writer stage samples evicted before collection across SQLite writers"
+    );
+    describe_histogram!(
+        "cairn_writer_stage_seconds",
+        Unit::Seconds,
+        "Completed metadata writer stages, labelled by fixed stage and ok/error result"
     );
     describe_histogram!(
         "cairn_writer_batch_size",
