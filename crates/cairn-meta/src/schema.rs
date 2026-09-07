@@ -1796,10 +1796,24 @@ mod tests {
     #[test]
     fn migration_v30_invalidates_legacy_replication_claims() {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at INTEGER NOT NULL);
-            INSERT INTO schema_migrations VALUES (29, 'legacy fixture', 0);
-            CREATE TABLE replication_outbox (id TEXT PRIMARY KEY, status TEXT NOT NULL, lease_until INTEGER);
-            INSERT INTO replication_outbox VALUES ('pending', 'pending', NULL), ('worker', 'claimed', 900000), ('done', 'completed', NULL);").unwrap();
+        conn.execute_batch("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at INTEGER NOT NULL);").unwrap();
+        // Build the complete historical schema so future migrations can extend this fixture.
+        for migration in MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= 29)
+        {
+            conn.execute_batch(migration.sql).unwrap();
+            conn.execute(
+                "INSERT INTO schema_migrations VALUES (?1, ?2, 0)",
+                rusqlite::params![migration.version, migration.name],
+            )
+            .unwrap();
+        }
+        conn.execute_batch("INSERT INTO replication_outbox
+            (id, bucket_name, key, version_id, operation, rule_id, next_attempt_at, status, lease_until)
+            VALUES ('pending','bucket','key','version','put','rule',0,'pending',NULL),
+                   ('worker','bucket','key','version','put','rule',0,'claimed',900000),
+                   ('done','bucket','key','version','put','rule',0,'completed',NULL);").unwrap();
         run_migrations(&conn).unwrap();
         run_migrations(&conn).unwrap();
         let mut statement = conn
