@@ -87,6 +87,31 @@ referenced by restored metadata are reclaimed. Any non-zero reconciliation error
 restore fail even when the reconciliation call itself returned a report, matching the pre-bind
 startup gate rather than declaring a partially checked generation ready.
 
+## Recovery verification and durable work
+
+The SQLite image preserves complete metadata rows, including historical versions and delete
+markers, tags, ACLs, Object Lock retention/legal hold, sealed object and multipart-part data keys,
+and multipart reservations, cleanup records, and replication outbox work. These are database state;
+there is no second manifest inventory that can replace them. Restoring the database does not restore
+the external master-key ring or recreate the outcome of an ambiguous remote request.
+
+Before serving, startup releases interrupted multipart completion ownership and replication claims
+through the canonical Writer, then reconciles files. A restored active upload must retain its staged
+parts and captured tags/lock/encryption intent so the client can retry Complete. Replication work may
+be attempted again: generic S3 destinations can gain another version after an ambiguous prior
+success. Isolate an old primary before resuming a restored node to avoid two independent sources
+replaying the same backlog.
+
+The live `conformance/backup_restore.sh` gate includes `recovery_state.py`, which writes this state
+through the S3 API, interrupts a real replication request, checks every table's complete rows across
+snapshot/restore, verifies versioned reads and protection, and completes a restored encrypted upload.
+It also rejects backup under a live node lock, sharded topology, a snapshot missing an authoritative
+part, and startup with the wrong master key. The failpoints `crash_multipoint.sh` gate additionally
+pauses Complete after durable assembly, kills the process with an exact completion claim persisted,
+and verifies that restoration/restart makes the upload retryable without leaking the assembled blob.
+These checks are distinct from the database-publication unit tests that pin the old/new generations
+on either side of the atomic rename.
+
 ## Database-path upgrade requirement
 
 `CAIRN_DB_PATH` may be a direct child of `CAIRN_DATA_DIR` (the default) or outside it on the same

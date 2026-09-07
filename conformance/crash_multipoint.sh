@@ -23,3 +23,6 @@ fi
 [ -x "$BIN" ] || { echo "FAIL: binary not found: $BIN"; exit 1; }
 
 BIN="$BIN" DATA="$DATA" PORT="${PORT:-9089}" "$PY" "$(dirname "$0")/crash_multipoint.py"
+
+# Snapshot a real interrupted exact-token Complete and replication lease before startup recovery.
+BIN="$BIN" "$PY" "$ROOT/conformance/recovery_state.py" --crash-multipart

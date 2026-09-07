@@ -16,7 +16,7 @@ A Cairn node has two pieces of state on one filesystem (the one-filesystem invar
 
 | Failure | Protection |
 |---|---|
-| Metadata DB lost or corrupt, disk otherwise intact | Restore the DB from backup, then `cairn integrity --repair` |
+| Metadata DB lost or corrupt, disk otherwise intact | Restore a complete offline SQLite snapshot (database and referenced blobs) |
 | Whole node / disk lost | A **replication destination** (warm copy) or an **off-box backup** (3-2-1) |
 | Single blob bit-rots on disk | The background **scrub** flags it (`cairn_scrub_corruption_total`); re-fetch from a replica/backup |
 | Accidental or malicious overwrite/delete | **Versioning** + **Object Lock/WORM** (replication and RAID do *not* protect against this) |
@@ -57,15 +57,23 @@ Suggested alerts: `cairn_replication_lag_seconds` above your RPO budget for N mi
 
 ### 4.1 Metadata DB lost or corrupt, blobs intact
 
-1. Stop the node.
-2. Restore the most recent DB backup into place (`backup-restore.md`, database-first restore).
-3. Run `cairn integrity --repair`: it cross-checks rows against blobs and **drops exactly the dangling
-   rows** (metadata referencing a blob that no longer exists), reporting the count. Orphan blobs (bytes
-   with no row) are reclaimed by reconciliation.
-4. Start the node and verify a sample of objects `GET` back byte-identical.
+1. Stop the node and any external SQLite/filesystem tools. Preserve the damaged data tree before
+   any operation that can reclaim files.
+2. Restore the latest complete offline snapshot with `cairn restore`, following
+   [`backup-restore.md`](./backup-restore.md). The supported format contains the database and its
+   referenced committed blobs and multipart parts; a raw database-only copy is not this format.
+3. Confirm restore and its reconciliation pass succeed. Do not treat `integrity --repair` as an
+   automatic recovery step: it removes unprotected rows with missing blobs, cannot recreate bytes,
+   and refuses to erase retained or legally held metadata.
+4. Start the node, then verify historical version IDs, delete markers, object tags/ACLs/locks, and
+   encrypted object reads. Resume a saved multipart upload where one exists and check replication
+   backlog recovery before returning clients to the node.
 
-Any object written *after* the restored backup but whose blob still exists on disk is recoverable;
-rows lost since the backup are gone unless also present on a replica.
+Metadata is the namespace authority. A blob written after the snapshot has no recovered key/version
+mapping merely because its bytes survive; reconciliation treats it as an orphan and may reclaim it.
+Post-snapshot writes need an independent replica or newer complete backup. The original master-key
+ring is also required; snapshots deliberately exclude it. Supported native backup/restore is offline
+single SQLite only, never a metadata-engine or shard-count migration.
 
 ### 4.2 Whole node lost — promote a replication destination
 
@@ -88,8 +96,8 @@ endpoints, Object Lock defaults) on the destination — these are configured per
 
 ### 4.3 Whole node lost — restore from an off-box backup (no live replica)
 
-Restore the DB backup and the blob tree to a fresh node per `backup-restore.md`, run
-`cairn integrity --repair`, then start and verify. RPO is the age of the backup. This is the minimum
+Restore the complete snapshot to a fresh node per `backup-restore.md`, confirm its built-in
+validation and reconciliation succeed, then start and verify. RPO is the age of the backup. This is the minimum
 viable DR posture and is sufficient for a backup-target deployment.
 
 ### 4.4 Detected blob corruption (bit-rot)

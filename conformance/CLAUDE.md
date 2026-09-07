@@ -83,7 +83,11 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
 - `backup_restore.sh` — backup/restore/integrity (pure curl, Bearer): `cairn backup`, corrupt then
   `cairn restore` into a FRESH dir → byte-identical, `cairn integrity --repair` drops exactly the
   dangling row. Asserts the manifest-last `manifest.json` + fixed `metadata.sqlite3` snapshot
-  layout and parses each synchronous CLI's stdout counts — **never sleeps.**
+  layout and parses each synchronous CLI's stdout counts. Also runs stdlib `recovery_state.py`:
+  encrypted history/delete markers, ACL/tags/retention/legal hold, active encrypted multipart parts,
+  real interrupted replication claims, complete-row snapshot comparisons, fail-closed missing-part /
+  wrong-key / live-lock / shard checks, and retryable multipart completion after restore. The
+  failpoints `crash_multipoint.sh` job runs its `--crash-multipart` exact-claim arm as well.
 
 ## regression / limit (where does it break?)
 - `routing.sh` (+`.py`) — **routing fall-through** (audit 2026-07, boto3 + hand-signed raw requests):
