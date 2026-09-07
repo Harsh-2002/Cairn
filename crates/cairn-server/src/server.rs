@@ -384,10 +384,10 @@ async fn accept_loop(
         tokio::select! {
             biased;
             _ = shutdown.changed() => break,
-            accept = listener.accept() => {
+            accept = accept_stream(&listener) => {
                 let (stream, peer) = match accept {
                     Ok(v) => v,
-                    Err(e) => { tracing::warn!(error = %e, "accept failed"); continue; }
+                    Err(e) => { tracing::warn!(error = %e, "accept or socket setup failed"); continue; }
                 };
                 // Cap concurrent connections: acquire a permit held for the connection's lifetime, or
                 // drop the connection immediately if we're at the cap. This bounds FD/memory use
@@ -435,6 +435,16 @@ async fn accept_loop(
         );
     }
     report
+}
+
+/// Configure the accepted socket before either listener enters plaintext, TLS, or fast-I/O
+/// handling. Small separately-written headers and bodies must not wait for Nagle/delayed ACK.
+async fn accept_stream(
+    listener: &TcpListener,
+) -> std::io::Result<(tokio::net::TcpStream, std::net::SocketAddr)> {
+    let (stream, peer) = listener.accept().await?;
+    stream.set_nodelay(true)?;
+    Ok((stream, peer))
 }
 
 async fn drain_connections(
@@ -1447,7 +1457,8 @@ mod fast_io_tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            let (sock, _) = listener.accept().await.unwrap();
+            let (sock, _) = accept_stream(&listener).await.unwrap();
+            assert!(sock.nodelay().unwrap());
             serve_one(sock, server_cfg, ktls_ready).await
         });
 
@@ -1659,6 +1670,39 @@ mod shutdown_tests {
             dropped.load(Ordering::SeqCst),
             "cancelled connection future must be dropped before drain returns"
         );
+    }
+}
+
+#[cfg(test)]
+mod socket_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn accepted_socket_disables_nagle_and_preserves_repeated_responses() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = accept_stream(&listener).await.unwrap();
+            assert!(socket.nodelay().unwrap());
+            for _ in 0..2 {
+                let mut request = [0; 4];
+                socket.read_exact(&mut request).await.unwrap();
+                assert_eq!(&request, b"ping");
+                socket.write_all(b"head").await.unwrap();
+                socket.write_all(b"body").await.unwrap();
+            }
+        });
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        for _ in 0..2 {
+            client.write_all(b"ping").await.unwrap();
+            let mut response = [0; 8];
+            tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut response))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(&response, b"headbody");
+        }
+        server.await.unwrap();
     }
 }
 
