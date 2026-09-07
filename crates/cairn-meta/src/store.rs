@@ -4,7 +4,7 @@
 
 use crate::model::{self, engine_err};
 use crate::range::{prefix_upper_bound, successor};
-use crate::writer::{CommitSample, WalCheckpointStats, Writer};
+use crate::writer::{CommitSample, WalCheckpointStats, Writer, WriterStageSample};
 use cairn_types::MetaError;
 use cairn_types::authz::PublicAccessBlock;
 use cairn_types::bucket::{Bucket, ConfigAspect, ConfigDoc};
@@ -188,6 +188,18 @@ impl SqliteMetadataStore {
     #[must_use]
     pub fn drain_writer_commit_samples(&self) -> Vec<CommitSample> {
         self.writer.drain_commit_samples()
+    }
+
+    /// Drain fixed-cardinality, bounded writer-stage observations (ARCH 26.2).
+    #[must_use]
+    pub fn drain_writer_stage_samples(&self) -> Vec<WriterStageSample> {
+        self.writer.drain_stage_samples()
+    }
+
+    /// Cumulative completed-stage observations evicted before metrics collection.
+    #[must_use]
+    pub fn dropped_writer_stage_samples(&self) -> u64 {
+        self.writer.dropped_stage_samples()
     }
 
     /// Probe that the single writer is responsive (its thread is draining the queue). Used by the

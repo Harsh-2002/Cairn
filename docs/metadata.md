@@ -12,6 +12,8 @@ The metadata store is the source of truth for every fact about the system that i
 
 The store opens one write connection, owned by the single group-committing writer task (Section 7.2), and a pool of read-only connections for concurrent snapshot reads (Section 7.3). On open, each connection is configured for write-ahead logging, foreign-key enforcement, the chosen synchronous level, a busy timeout as defense in depth even though the single-writer design makes contention rare, and memory-mapping and cache sizing tuned to the working set so that reads touch the kernel as little as possible. Migrations run on the write connection at startup, before any request is served, and are recorded so they apply exactly once and in order. The WAL checkpointer (Section 8.4) runs against the write connection on its schedule.
 
+The writer measures channel admission, admitted queue residence, transaction stages, and checkpoint execution using bounded per-stage sample rings (Section 26.2). Queue depth counts only admitted mutations not yet collected into a batch; cancellation while waiting for admission cannot inflate it. Checkpoint busy-wait prevention and batching policy remain unchanged.
+
 ### 11.3 Entities
 
 The schema is specified field by field in Appendix 34.1; this section describes the entities and the design intent behind them.

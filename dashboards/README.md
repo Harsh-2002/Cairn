@@ -10,7 +10,7 @@ generator that produces it.
 
 ## What it shows
 
-Five tabs, 35 panels, shaped around Cairn's actual architecture rather than a generic
+Five tabs, 36 panels, shaped around Cairn's actual architecture rather than a generic
 object-store template:
 
 | Tab | Answers |
@@ -18,7 +18,7 @@ object-store template:
 | **Overview** | Is it healthy? Buckets, objects, bytes on disk, compression saved; request rate by route, errors by status, throughput, S3 latency quantiles. |
 | **Requests** | Where is traffic going and what is failing? Rate, error ratio, 5xx, worst p99; breakdowns by method and status, mean latency per route, share-link responses. |
 | **Storage** | What is stored and how efficiently? Noncurrent versions, average object size, compression ratio, logical bytes and version growth. |
-| **Metadata engine** | Cairn's distinctive core: the single group-committing writer. Queue depth, commits/sec, group-commit duration and batch-size quantiles, cache hit ratio, WAL size and checkpoints. |
+| **Metadata engine** | Cairn's distinctive core: the single group-committing writer. Queue depth, completed-stage timings, commits/sec, group-commit duration and batch-size quantiles, cache hit ratio, WAL size and checkpoints. |
 | **Replication & integrity** | Asynchronous redundancy and fail-closed crypto: outbox depth, replication lag, failed/unreplicated entries, and refused key-less encrypted reads. |
 
 Two invariants are enforced by `generate.py` at build time rather than by eye:

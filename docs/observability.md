@@ -24,6 +24,23 @@ counts failed aborts and cleanup ownership/heartbeat failures. Workers drain the
 when the pass returns an error. Outstanding debt and its latest reason remain in
 `replication_uploads`; counters are process-lifetime signals, not durable debt totals.
 
+The SQLite writer additionally exposes `cairn_writer_stage_seconds`, with fixed `stage`
+labels `admission`, `queue`, `begin`, `apply`, `commit`, and `checkpoint`, and `result=ok|error`.
+Admission measures waiting for channel capacity; queue measures admitted-to-batch-start time
+(including group-commit linger); begin/apply/commit isolate transaction stages; checkpoint measures
+execution on the writer rather than its queue wait. A busy checkpoint is a successful PRAGMA result,
+reported separately by the existing busy counter. Each writer retains six independent buffers of at most 1,024 recent samples each (6,144 total).
+A busy stage evicts only its own oldest observations, preserving rarer checkpoint observations
+until the existing 15-second metrics tick drains them. The cumulative
+`cairn_writer_stage_samples_dropped_total` counter sums evictions across SQLite writers.
+Histograms are therefore sampled completed-stage diagnostics, not exact request counts or live
+in-progress timers. Begin/apply/commit/checkpoint stages of at least one second also produce timestamped warnings
+without object labels. Admission and queue stages do not emit per-request slow warnings, avoiding
+a log flood after a stall. `result=error` includes expected apply rejections such as a failed
+precondition or nonempty bucket; it does not always mean a database failure. Cancelled admission contributes neither a completed sample nor phantom queue depth.
+Timings include scheduler delay and I/O waiting; they do not establish CPU leakage or isolate fsync
+from other COMMIT work. Blob assembly/durability timings are documented with the multipart follow-up.
+
 ### 26.3 Audit log
 
 Mutating actions across both the S3 and management surfaces are recorded in an audit log with the actor, the action, the resource, and the salient attributes, retained in the metadata store and surfaced through the management API and web console. This serves both the operational need to see recent activity and the security need to have a record of who changed or accessed what, and it is distinct from the operational metrics in that it is per-event and attributable rather than aggregate.
