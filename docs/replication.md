@@ -49,6 +49,18 @@ upgrade also releases pre-token claimed rows. Tokens never appear in logs or man
 These guards fence local bookkeeping. A remote request accepted before cancellation can still
 finish: generic S3 delivery remains at-least-once and does not promise exactly-once remote ordering.
 
+**Multipart receiver capability.** An initiation carrying the exact replica marker authorizes as
+`ReplicateObject` and requires an enabled-versioning destination and source version identity.
+The session persists that identity and expected full-object checksums, response metadata, ACL,
+tags and encryption/lock intent. Part writes, completion, listing and abort of that session
+require `ReplicateObject` even when subsequent requests omit the marker. An ordinary upload
+cannot be promoted by later headers; unrelated subresource operations retain their normal actions.
+Completion preserves source identity, marks `Replica`, and never consults or enqueues destination
+replication rules. Destination encryption, ownership, BPA and Writer-owned Object Lock still apply.
+Replicas with a source composite checksum omit it because transfer part boundaries may differ;
+whole-object checksums are recomputed and verified over assembled logical bytes. Receiver support
+does not itself change the sender's transfer limits described below.
+
 **The current SigV4 PUT is a bounded streaming exception.** The sink must hash a signed payload before it can send the request, so until streaming SigV4 uploads land it buffers the complete logical object. A fixed 2 GiB per-object cap remains, and all workers plus all env, named, and stored-target sinks share one process-wide weighted byte semaphore (`CAIRN_REPLICATION_BUFFER_BUDGET_BYTES`, default 2 GiB). Admission uses the version's declared logical size before reading a source byte, and collection must end at exactly that size, so corrupt metadata cannot reserve a small weight and retain a larger body. An object larger than the per-object cap or the configured aggregate budget is terminally parked rather than waiting forever; adding workers or destinations never multiplies the memory ceiling. The owned permit is held through the destination response and releases on success, error, timeout, or task cancellation.
 
 Every destination operation also has one non-resetting wall-clock deadline (`CAIRN_REPLICATION_DELIVERY_TIMEOUT_SECS`, default one hour) around request upload, response-head wait, and response-body drain. A peer that never returns headers, stalls after them, or trickles forever therefore becomes *unavailable* and releases its worker and byte permit before backoff. Response bodies are never collected without a bound: only an 8 KiB diagnostic prefix (including an explicit truncation marker) is retained from a non-success answer, and even a success body is drained only to that cap before the remainder is dropped.

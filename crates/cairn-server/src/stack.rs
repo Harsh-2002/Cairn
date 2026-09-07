@@ -796,6 +796,7 @@ mod multipart_recovery_tests {
                     owner_id: UserId("owner".to_owned()),
                     initiated_by: UserId("owner".to_owned()),
                     intended_acl: None,
+                    replica_intent: None,
                     user_metadata: Vec::new(),
                     initial_tags: Vec::new(),
                     lock_intent: cairn_types::ExplicitObjectLockIntent::default(),

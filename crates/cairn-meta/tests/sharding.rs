@@ -321,6 +321,7 @@ async fn n3_multipart_rides_the_bucket_shard_via_encoded_id() {
         owner_id: UserId("owner".to_owned()),
         initiated_by: UserId("owner".to_owned()),
         intended_acl: None,
+        replica_intent: None,
         user_metadata: Vec::new(),
         initial_tags: Vec::new(),
         lock_intent: ExplicitObjectLockIntent::default(),

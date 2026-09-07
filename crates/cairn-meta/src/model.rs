@@ -377,6 +377,10 @@ pub fn multipart_from_row(row: &Row) -> rusqlite::Result<MultipartSession> {
         owner_id,
         initiated_by,
         intended_acl,
+        replica_intent: row
+            .get::<_, Option<String>>("replica_intent")?
+            .map(|value| json_col(&value))
+            .transpose()?,
         user_metadata,
         initial_tags,
         lock_intent: ExplicitObjectLockIntent {

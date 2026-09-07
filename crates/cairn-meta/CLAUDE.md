@@ -91,3 +91,7 @@ metadata commit is **the single linearization point of every mutation** (ARCH 11
 Replication outbox migration v30 adds exact attempt ownership. Done/fail/defer/renew validate the
 claimed status, token, and lease inside the writer savepoint; every backend and shard fan-out must
 preserve the typed applied result. Recovery invalidates tokens before new workers can claim.
+
+Multipart sessions persist nullable `replica_intent` (source identity, response headers and expected
+whole-object checksums). Decode it strictly and preserve it through claim/release/restart recovery;
+ordinary and legacy uploads have no replica capability.

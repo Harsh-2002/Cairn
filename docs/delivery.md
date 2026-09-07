@@ -235,6 +235,7 @@ The schema below is the reference for the SQLite store. Types are given in the e
 | content_type | text | Not null, with a default. |
 | status | text | Not null, one of active, completing, aborted. |
 | completion_claim_token | text | Nullable internal token. Set only while `completing`; exact-match release and completion prevent stale-attempt ABA (migration v29). |
+| replica_intent | text | Nullable authenticated multipart replica identity, response headers and full-object checksums; absent for ordinary/legacy sessions. |
 | owner_id | text | Not null. |
 | initiated_by | text | Not null for writer-created sessions; the principal charged for active-session and staged-byte limits. Pre-v26 rows inherit `owner_id` (migration v26). |
 | intended_acl | text | Nullable; the ACL to apply on completion. |

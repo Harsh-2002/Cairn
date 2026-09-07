@@ -101,6 +101,10 @@ Clock/Crypto>`) — never a concrete engine.
   `ReplicateDelete`, and only that successful central authorization classifies it as an inbound
   `Replica` (skips the outbox, preserves source version id). A normal `PutObject`/`DeleteObject`
   grant with a forged marker is denied; a dedicated Member replication credential is supported.
+  Multipart initiation pins authenticated `replica_intent`; every later session operation reads
+  that immutable capability before authorization. Mirror dispatch precedence so an appended
+  uploadId cannot reclassify tagging/ACL reads. Complete preserves source identity and skips
+  outbox enqueue, while destination encryption/ownership/Object Lock remain enforced.
 - **5xx messages are generalized** (audit #28): `error_response` logs the real cause but returns an
   opaque `InternalError` body; client 4xx keep their descriptive S3 message.
 - **Version-scoped authz** (audit #33): a `?versionId` request passes that `VersionId` to

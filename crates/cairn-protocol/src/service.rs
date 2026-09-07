@@ -899,7 +899,33 @@ impl S3Service {
 
     async fn object_op(&self, req: S3Request, body: cairn_types::BodyStream) -> Result<S3Response> {
         // Authorize centrally against the object resource.
-        let action = object_action(&req)?;
+        let mut action = object_action(&req)?;
+        // An upload's classification is immutable. All later operations authorize from persisted
+        // intent, never from headers a part uploader can forge or omit. Read errors fail closed.
+        if let Some(id) = req
+            .query("uploadId")
+            .filter(|_| multipart_session_request(&req))
+        {
+            if let Some(session) = self
+                .meta
+                .get_multipart(&UploadId::from_string(id.to_owned()))
+                .await?
+            {
+                if session.replica_intent.is_some()
+                    && req.bucket.as_ref() == Some(&session.bucket)
+                    && req.key.as_ref() == Some(&session.key)
+                {
+                    if req.header("x-amz-copy-source").is_some() {
+                        return Err(Error::InvalidRequest(
+                            "replica parts cannot be copied".to_owned(),
+                        ));
+                    }
+                    action = Action::ReplicateObject;
+                } else if replica_marker(&req) {
+                    return Err(Error::AccessDenied);
+                }
+            }
+        }
         // Replica classification is the authorization decision, not a second role check in the
         // handler. A dedicated Member credential may hold only ReplicateObject/ReplicateDelete;
         // conversely an ordinary PutObject/DeleteObject grant must not make a forged marker work.
@@ -954,7 +980,9 @@ impl S3Service {
             // guarded keywords so the method/selector pairs we do NOT serve (`PUT key?uploads`,
             // `DELETE key?attributes`, …) cannot reach `put_object`/`delete_object` and clobber
             // the object — which means the pairs we DO serve have to be matched first.
-            Method::POST if req.has_query("uploads") => self.create_multipart(&req).await,
+            Method::POST if req.has_query("uploads") => {
+                self.create_multipart(&req, is_replica).await
+            }
             Method::POST if req.has_query("uploadId") => self.complete_multipart(req, body).await,
             Method::GET if req.has_query("uploadId") => self.list_parts(&req).await,
             Method::DELETE if req.has_query("uploadId") => self.abort_multipart(&req).await,
@@ -2045,9 +2073,51 @@ impl S3Service {
         }
     }
 
-    async fn create_multipart(&self, req: &S3Request) -> Result<S3Response> {
+    async fn create_multipart(&self, req: &S3Request, is_replica: bool) -> Result<S3Response> {
         let bucket = self.fetch_bucket(req).await?;
         let key = req.key.clone().expect("key present");
+        let replica_intent = if is_replica {
+            if bucket.versioning != VersioningState::Enabled {
+                return Err(Error::InvalidRequest(
+                    "replica multipart requires versioning".to_owned(),
+                ));
+            }
+            let version_id = replica_version_id(req, true)
+                .filter(|id| !id.is_null())
+                .ok_or_else(|| {
+                    Error::InvalidRequest("replica source version id required".to_owned())
+                })?;
+            let checksums = requested_checksums(req)
+                .0
+                .into_iter()
+                .filter_map(|algorithm| {
+                    req.header(checksum_header_name(algorithm))
+                        .map(|value| ChecksumValue {
+                            algorithm,
+                            value: value.to_owned(),
+                        })
+                })
+                .collect::<Vec<_>>();
+            if checksums
+                .iter()
+                .any(|value| checksum_type_str(&value.value) != "FULL_OBJECT")
+            {
+                return Err(Error::InvalidRequest(
+                    "replica multipart requires whole-object checksums".to_owned(),
+                ));
+            }
+            Some(cairn_types::meta::MultipartReplicaIntent {
+                version_id,
+                content_encoding: req.header("content-encoding").map(str::to_owned),
+                cache_control: req.header("cache-control").map(str::to_owned),
+                content_disposition: req.header("content-disposition").map(str::to_owned),
+                content_language: req.header("content-language").map(str::to_owned),
+                expires: req.header("expires").map(str::to_owned),
+                checksums,
+            })
+        } else {
+            None
+        };
         let upload_id = UploadId::generate();
         let now = self.clock.now();
         let lock_intent = self
@@ -2110,7 +2180,14 @@ impl S3Service {
                 || bucket.owner_id.clone(),
                 |principal| principal.user_id.clone(),
             ),
-            intended_acl: None,
+            intended_acl: if is_replica
+                && bucket.ownership_mode != OwnershipMode::BucketOwnerEnforced
+            {
+                replica_acl(req)
+            } else {
+                None
+            },
+            replica_intent,
             user_metadata: user_metadata(req),
             initial_tags,
             lock_intent,
@@ -2689,6 +2766,12 @@ impl S3Service {
         // Complete request. Computed BEFORE claiming the session so a genuinely-inconsistent request
         // (mixed present algorithms) fails with InvalidRequest while the upload stays retryable.
         let checksum_plan = plan_multipart_checksum(&req, &part_checksums)?;
+        let is_replica = scoped.replica_intent.is_some();
+        if is_replica && bucket.versioning != VersioningState::Enabled {
+            return Err(Error::InvalidRequest(
+                "replica multipart requires versioning".to_owned(),
+            ));
+        }
 
         // Every requested part validated: mint one ownership token and arm recovery before awaiting
         // the writer. The submit can commit `active -> completing` and then lose its acknowledgement;
@@ -2777,8 +2860,11 @@ impl S3Service {
         // A multipart complete is an object-create path, so it MUST honour the bucket's mandatory-SSE
         // contract exactly as a plain PUT does — otherwise a header-less multipart upload stores
         // plaintext in a bucket the operator mandated must be encrypted (Phase-2 security audit). A
-        // multipart upload is never an inbound replica.
-        let plan = match self.enforce_mandatory_sse(&bucket.name, plan, false).await {
+        // replica multipart session carries the same authenticated intent as a replica PUT.
+        let plan = match self
+            .enforce_mandatory_sse(&bucket.name, plan, is_replica)
+            .await
+        {
             Ok(plan) => plan,
             Err(error) => {
                 return Err(self
@@ -2796,10 +2882,17 @@ impl S3Service {
         // A FULL_OBJECT plan (CRC64NVME, or an explicitly-requested whole-object type) needs the
         // assembler to recompute the checksum over the concatenated plaintext; a COMPOSITE plan is
         // computed by us from the per-part digests and needs no extra work here.
-        let assemble_checksums = match &checksum_plan {
+        let mut assemble_checksums = match &checksum_plan {
             ChecksumPlan::FullObject { algo, .. } => ChecksumSet(vec![*algo]),
             _ => ChecksumSet::none(),
         };
+        if let Some(intent) = &session.replica_intent {
+            for expected in &intent.checksums {
+                if !assemble_checksums.0.contains(&expected.algorithm) {
+                    assemble_checksums.0.push(expected.algorithm);
+                }
+            }
+        }
         let opts = StageOptions {
             compression: bucket.compression,
             extra_checksums: assemble_checksums,
@@ -2836,7 +2929,7 @@ impl S3Service {
         // Resolve the object-level checksum to store. A FULL_OBJECT plan takes the whole-object digest
         // just recomputed by `assemble`, verifying any client-supplied expected value (BadDigest on
         // mismatch, deleting the assembled blob first so a rejected completion leaves no orphan).
-        let object_checksums = match checksum_plan {
+        let mut object_checksums = match checksum_plan {
             ChecksumPlan::None => Vec::new(),
             ChecksumPlan::Composite(value) => vec![value],
             ChecksumPlan::FullObject { algo, expected } => {
@@ -2861,9 +2954,30 @@ impl S3Service {
             }
         };
 
+        if let Some(intent) = &session.replica_intent {
+            if intent
+                .checksums
+                .iter()
+                .any(|expected| !staged.checksums.contains(expected))
+            {
+                claim_guard.mark_assembled_blob_unreferenced();
+                return Err(self
+                    .multipart_failure_after_claim(
+                        &upload_id,
+                        &claim_token,
+                        Error::BadDigest,
+                        &mut claim_guard,
+                    )
+                    .await);
+            }
+            object_checksums.clone_from(&intent.checksums);
+        }
         let versioned = bucket.versioning == VersioningState::Enabled;
         let version_id = if versioned {
-            VersionId::generate()
+            session
+                .replica_intent
+                .as_ref()
+                .map_or_else(VersionId::generate, |intent| intent.version_id.clone())
         } else {
             VersionId::null()
         };
@@ -2879,41 +2993,57 @@ impl S3Service {
             size_physical: staged.size_physical,
             etag: etag.clone(),
             content_type: session.content_type.clone(),
-            content_encoding: None,
-            cache_control: None,
-            content_disposition: None,
-            content_language: None,
-            expires: None,
+            content_encoding: session
+                .replica_intent
+                .as_ref()
+                .and_then(|intent| intent.content_encoding.clone()),
+            cache_control: session
+                .replica_intent
+                .as_ref()
+                .and_then(|intent| intent.cache_control.clone()),
+            content_disposition: session
+                .replica_intent
+                .as_ref()
+                .and_then(|intent| intent.content_disposition.clone()),
+            content_language: session
+                .replica_intent
+                .as_ref()
+                .and_then(|intent| intent.content_language.clone()),
+            expires: session
+                .replica_intent
+                .as_ref()
+                .and_then(|intent| intent.expires.clone()),
             storage_path: Some(staged.storage_path.clone()),
             compression: staged.compression.clone(),
             storage_class: StorageClass::Standard,
             cold_locator: None,
             owner_id: bucket.owner_id.clone(),
             user_metadata: session.user_metadata.clone(),
-            acl: None,
+            acl: (bucket.ownership_mode != OwnershipMode::BucketOwnerEnforced)
+                .then(|| session.intended_acl.clone())
+                .flatten(),
             checksums: object_checksums.clone(),
             sse_descriptor: sse_descriptor.clone(),
-            replication_status: None,
+            replication_status: is_replica.then_some(cairn_types::meta::ReplicationStatus::Replica),
             replicated_at: None,
             created_at: now,
             updated_at: now,
         };
 
-        // A multipart completion writes a brand-new object version, so it must enqueue replication
-        // exactly like a single PUT (ARCH 20.2): one outbox entry per distinct matching target.
-        // Multipart uploads are never themselves an inbound replica (replicas always arrive as
-        // plain PUTs carrying `x-amz-meta-cairn-replica`), so no replica gate is needed here. The
-        // Tagging and explicit Object Lock intent were pinned at initiation; the Writer installs
-        // both atomically with the version and resolves the bucket default at this completion time.
-        let replication = self
-            .replication_outbox(
+        // Replica completion never consults destination replication configuration or enqueues
+        // another hop. The pinned tags and Object Lock intent still commit through the Writer.
+        let replication = if is_replica {
+            Ok(Vec::new())
+        } else {
+            self.replication_outbox(
                 &bucket,
                 &key,
                 &version_id,
                 ReplicationOp::ObjectCreate,
                 &session.initial_tags,
             )
-            .await;
+            .await
+        };
         let replication = match replication {
             Ok(entries) => entries,
             Err(error) => {
@@ -5805,7 +5935,8 @@ fn object_action(req: &S3Request) -> Result<Action> {
         {
             ReplicateObject
         }
-        // The multipart lifecycle (initiate/complete/upload-part) has no distinct action variant;
+        Method::POST if q("uploads") && replica_marker(req) => ReplicateObject,
+        // The ordinary multipart lifecycle (initiate/complete/upload-part) has no distinct action variant;
         // it maps to PutObject, the closest catalogued action.
         Method::PUT | Method::POST => PutObject,
         Method::GET | Method::HEAD if versioned => GetObjectVersion,
@@ -6984,6 +7115,24 @@ fn stored_content_encoding(req: &S3Request) -> Option<String> {
 /// replica (`is_replica`, centrally authorized as ReplicateObject/ReplicateDelete). Returns `None`
 /// for a normal write or an absent/empty header, so the caller mints a fresh id. A normal client can
 /// never pin a version id this way.
+/// Mirror multipart dispatch precedence before consulting persisted authorization intent.
+fn multipart_session_request(req: &S3Request) -> bool {
+    match req.method {
+        Method::PUT => req.query("partNumber").is_some(),
+        Method::POST => !req.has_query("uploads"),
+        Method::GET => !["tagging", "acl", "retention", "legal-hold", "attributes"]
+            .iter()
+            .any(|name| req.has_query(name)),
+        Method::DELETE => !req.has_query("tagging"),
+        _ => false,
+    }
+}
+
+fn replica_marker(req: &S3Request) -> bool {
+    req.header("x-amz-meta-cairn-replica")
+        .is_some_and(|v| v.eq_ignore_ascii_case("true"))
+}
+
 fn replica_version_id(req: &S3Request, is_replica: bool) -> Option<VersionId> {
     if !is_replica {
         return None;

@@ -1253,6 +1253,27 @@ impl Default for MultipartLimits {
     }
 }
 
+/// Authenticated replica identity and response metadata pinned at multipart initiation.
+/// Only the protocol's ReplicateObject-authorized path creates this intent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MultipartReplicaIntent {
+    /// Source version identity, preserved on a versioned destination.
+    pub version_id: VersionId,
+    /// Stored Content-Encoding.
+    pub content_encoding: Option<String>,
+    /// Stored Cache-Control.
+    pub cache_control: Option<String>,
+    /// Stored Content-Disposition.
+    pub content_disposition: Option<String>,
+    /// Stored Content-Language.
+    pub content_language: Option<String>,
+    /// Stored Expires.
+    pub expires: Option<String>,
+    /// Expected whole-object supplementary checksums (never composite part checksums).
+    pub checksums: Vec<ChecksumValue>,
+}
+
 /// A multipart upload session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MultipartSession {
@@ -1277,6 +1298,8 @@ pub struct MultipartSession {
     pub initiated_by: UserId,
     /// The ACL to apply on completion.
     pub intended_acl: Option<Acl>,
+    /// Persisted replica capability; absent for ordinary and legacy sessions.
+    pub replica_intent: Option<MultipartReplicaIntent>,
     /// The metadata to apply on completion.
     pub user_metadata: UserMetadata,
     /// Object tags pinned at initiation and installed atomically at completion.
