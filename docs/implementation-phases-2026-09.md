@@ -7,7 +7,7 @@ This is a work tracker; entries must not claim completion until validation passe
 | Phase | Deliverable | Status |
 |---|---|---|
 | 1 | Fail-closed replication intent across writes and marker deletes; cleanup and retry tests | Merged in PR #69 |
-| 2 | Exact attempt-token fencing and renewal of active/waiting claims; backend parity | Implemented; 28 engine and 273 backend tests pass; full gate and draft PR CI pending |
+| 2 | Exact attempt-token fencing and renewal of active/waiting claims; backend parity | Merged in PR #71 after exact-head CI passed |
 | 4A | Required pinned-verifier signature/checksum checks for host and digest-pinned container installs | Merged in PR #70 |
 | 3A | Authorized persisted replica multipart intent; identity, loop prevention, encryption and locks | Implemented; authorization regression and live crash/restore passed; full gate and PR CI pending |
 | 3B | Reopenable logical ranges, signed two-pass streaming, multipart delivery, durable remote cleanup | Pending |
