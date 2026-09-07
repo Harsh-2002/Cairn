@@ -130,3 +130,11 @@ resumes automatically from its cursors.
 After a job reports `completed`, list the destination buckets with any S3 client and spot-check a few
 objects for byte-exactness and metadata. A large object is a good check that the streaming path
 round-tripped it without truncation.
+
+## Metadata upgrade: maintained visible-object counts
+
+Schema v34 adds `bucket_stats.objects`, seeded from current non-delete-marker rows before serving
+requests. The one-time backfill scans metadata, so startup upgrade time depends on object cardinality;
+it does not read object payloads. Subsequent overview counts read maintained per-bucket totals. The
+migration is append-only and transactional; a failed upgrade must be corrected and retried before
+serving. There is no down migration. Object/version and byte-count API meanings are unchanged.
