@@ -51,7 +51,9 @@ new snapshot. Source and destination trees may not overlap.
 
 The **master key is deliberately excluded**. Store `CAIRN_MASTER_KEY` or the complete
 `CAIRN_MASTER_KEY_RING` separately in the secret manager and backup system. A database-and-blob
-snapshot without the required key material is intentionally unreadable.
+snapshot without the required key material is intentionally unreadable. Preserve the service's
+effective `CAIRN_*` environment separately as well, including any environment-defined replication
+targets and their credentials; restoring database rows does not recreate that external configuration.
 
 ## Restore
 

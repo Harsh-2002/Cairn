@@ -93,7 +93,8 @@ def main():
 
         def cli(data, *command, succeeds=True, **extra):
             result = subprocess.run([binary, *command], env=env(data, **extra), capture_output=True, text=True, timeout=60)
-            assert (result.returncode == 0) == succeeds, (command, result.stdout, result.stderr)
+            # Bootstrap stdout can contain credentials; never include command output in failures.
+            assert (result.returncode == 0) == succeeds, (command, "unexpected exit status", result.returncode)
             return result
 
         token = next(line.split()[-1] for line in cli(primary, "bootstrap").stdout.splitlines() if "Authorization: Bearer" in line)
@@ -173,7 +174,10 @@ def main():
             # binaries retain baseline coverage without pretending to test the newer field.
             if "replica_intent" in rows(database, "multipart_uploads")[0]:
                 replica_version = secrets.token_hex(16)
+                source_acl = next(row["acl"] for row in rows(database, "object_versions") if not row["is_delete_marker"])
+                assert source_acl
                 replica_headers = {"x-amz-meta-cairn-replica": "true",
+                                   "x-amz-meta-cairn-replica-acl": base64.b64encode(source_acl.encode()).decode(),
                                    "x-amz-meta-cairn-replica-version-id": replica_version,
                                    "cache-control": "max-age=123", "x-amz-tagging": "purpose=replica-recovery",
                                    "x-amz-object-lock-mode": "COMPLIANCE", "x-amz-object-lock-retain-until-date": future,
@@ -225,6 +229,9 @@ def main():
                 same_rows(database, source_db, table)
             for table in ("object_versions", "object_tags", "object_locks", "multipart_uploads", "multipart_parts", "multipart_part_reservations", "replication_outbox"):
                 assert rows(source_db, table), f"vacuous coverage: {table}"
+            assert all(row["lock_mode"] == "COMPLIANCE" and row["legal_hold"] == 1
+                       and row["retain_until"] > int(time.time() * 1000)
+                       for row in rows(source_db, "object_locks"))
             for row in rows(source_db, "object_versions"):
                 if "internal_sha256" in row and not row["is_delete_marker"]:
                     expected_body = dict(versions)[row["version_id"]]
@@ -293,6 +300,11 @@ def main():
                 assert headers["x-amz-version-id"] == replica_version
                 replica_body, headers = request("GET", "/recovery/replica")
                 assert replica_body == part_body and headers["cache-control"] == "max-age=123"
+                replica_tags, _ = request("GET", "/recovery/replica?tagging")
+                assert b"replica-recovery" in replica_tags
+                replica_acl, _ = request("GET", "/recovery/replica?acl")
+                assert b"AllUsers" in replica_acl
+                request("DELETE", "/recovery/replica?" + urllib.parse.urlencode({"versionId": replica_version}), expected=403)
                 assert not any(row["key"] == "replica" for row in rows(restored_db, "replication_outbox"))
                 print("PASS: persisted replica multipart identity and loop prevention survive restore", flush=True)
             stop()

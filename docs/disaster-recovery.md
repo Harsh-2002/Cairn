@@ -26,9 +26,10 @@ namespace even though the blobs survive. **A tested backup of the DB is non-nego
 
 ## 2. RPO and RTO — set expectations honestly
 
-- **RPO (data you can lose)** = the replication lag at the instant the primary is lost, or the age of
-  your last backup if you have no live replica. With async replication, in-flight writes that had not
-  yet shipped are lost. Watch the lag (§3) to know your live RPO.
+- **RPO (data you can lose)** is the unreplicated write window when the primary is lost, or the age
+  of your last backup if you have no live replica. With async replication, in-flight writes that had not
+  yet shipped are absent from the replica. Watch lag together with failed/unreplicated work (§3);
+  lag alone cannot bound data loss when delivery has failed.
 - **RTO (time to restore service)** = manual. There is no automatic promotion; recovery is a deliberate
   operator action (re-point clients at a destination, or restore a backup to a fresh node). Budget
   minutes, not seconds.
@@ -41,7 +42,8 @@ procedures here give a sound recovery posture.
 
 Scrape `/metrics` (S3 port). Replication-health gauges (spec: `replication.md` §20.5):
 
-- `cairn_replication_lag_seconds` — age of the oldest pending entry; **this is your live RPO**.
+- `cairn_replication_lag_seconds` — age of the oldest pending entry; an indicator of delivery
+  delay, not a complete RPO bound when failed work exists.
 - `cairn_replication_unreplicated` — pending + in-flight + terminally-failed; non-zero whenever any
   object is owed or stuck. Alert if it stays non-zero (lag/queue_depth alone fall to 0 once a backlog
   fails out).
@@ -78,10 +80,12 @@ single SQLite only, never a metadata-engine or shard-count migration.
 ### 4.2 Whole node lost — promote a replication destination
 
 If a destination bucket has been receiving replicas, it holds every object that shipped before the
-loss (RPO = the lag at that moment). "Promotion" is operational, not a command:
+loss; failed or unfinished source deliveries remain outside that copy. "Promotion" is operational,
+not a command:
 
-1. Confirm the destination node is healthy and has drained (its own `cairn_replication_*` if it
-   re-replicates; otherwise just that it is serving).
+1. Confirm the destination is healthy and verify the required object versions. Use the last known
+   source backlog/failure state to assess the loss window; the destination's outbound replication
+   metrics do not prove it received every acknowledged source write.
 2. **Re-point clients** (DNS/endpoint/load-balancer) at the destination's S3 endpoint. The destination
    is already a full Cairn node — it serves reads and writes immediately.
 3. If the destination should now replicate onward (e.g. to a new third site), configure its
@@ -156,7 +160,8 @@ read ahead, so pacing is not a physical IOPS limit. A full pass remains I/O- and
   versioning + Object Lock are what protect against logical errors and ransomware.
 - **Test the restore**, not just the backup — a backup you have never restored is a hope, not a plan.
   The `conformance/backup_restore.sh` harness exercises the full backup → corrupt → restore →
-  `integrity --repair` → byte-identical-verify loop.
-- **Monitor replication lag and `unreplicated`** so you know your live RPO at all times.
+  `integrity --repair` → byte-identical-verify loop, plus encrypted history, protected versions,
+  interrupted replication claims, and resumable multipart state.
+- **Monitor replication lag and `unreplicated`** to assess the current delivery backlog and loss window.
 - For irreplaceable data, enable **versioning + Object Lock** so an accidental or malicious delete is
   recoverable even within a single node.
