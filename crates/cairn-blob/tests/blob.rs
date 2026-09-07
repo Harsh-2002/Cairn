@@ -2625,3 +2625,144 @@ async fn probe_reports_presence_on_the_real_store_without_a_dek() {
         Err(BlobError::NotFound)
     ));
 }
+
+/// Unequal plaintext parts around an encrypted part must never copy bytes remaining from the
+/// previous read buffer. Also exercise the final partial read across compression block boundaries.
+#[tokio::test]
+async fn assemble_mixed_parts_reuses_buffer_without_stale_tail_bytes() {
+    use futures_util::StreamExt;
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let bucket = BucketName::parse("mixed-parts").unwrap();
+    let upload = UploadId::generate();
+    let mut expected = Vec::new();
+    let mut refs = Vec::new();
+    for (i, len) in [131_075, 65_537, 3, 65_536, 1].into_iter().enumerate() {
+        let bytes = vec![b'A' + u8::try_from(i).unwrap(); len];
+        expected.extend_from_slice(&bytes);
+        let dek = (i == 1).then_some([13u8; 32]);
+        let number = u16::try_from(i + 1).unwrap();
+        let part = store
+            .stage_part(
+                &upload,
+                number,
+                &format!("mixed-{i}"),
+                body(bytes),
+                ChecksumSet::none(),
+                1 << 20,
+                dek.map(Into::into),
+            )
+            .await
+            .unwrap();
+        refs.push(part_ref(number, &part, dek));
+    }
+    for encrypted in [false, true] {
+        let mut options = opts(
+            Some(CompressionPolicy {
+                algorithm: CompressionAlgorithm::Zstd,
+                block_size: 64 * 1024,
+            }),
+            "text/plain",
+        );
+        options.extra_checksums = ChecksumSet(vec![ChecksumAlgorithm::Crc64Nvme]);
+        options.encryption = encrypted.then_some([17u8; 32].into());
+        let assembled = store
+            .assemble(&bucket, &refs, options.clone())
+            .await
+            .unwrap();
+        let single = store
+            .stage(&bucket, body(expected.clone()), options)
+            .await
+            .unwrap();
+        assert_eq!(assembled.size_logical, expected.len() as u64);
+        assert_eq!(assembled.md5_hex, single.md5_hex);
+        assert_eq!(assembled.internal_sha256, single.internal_sha256);
+        assert_eq!(assembled.checksums, single.checksums);
+        let cipher = if encrypted {
+            BlobCipher::AuthenticatedV3([17u8; 32].into())
+        } else {
+            BlobCipher::KnownPlaintext
+        };
+        for range in [
+            None,
+            Some(ByteRange {
+                offset: 131_073,
+                length: 65_544,
+            }),
+        ] {
+            let mut read = store
+                .open_raw(
+                    &assembled.storage_path,
+                    range,
+                    cipher.clone(),
+                    &assembled.compression,
+                    assembled.size_logical,
+                )
+                .await
+                .unwrap()
+                .body;
+            let mut actual = Vec::new();
+            while let Some(chunk) = read.next().await {
+                actual.extend_from_slice(&chunk.unwrap());
+            }
+            let wanted = range.map_or(expected.as_slice(), |r| {
+                &expected[r.offset as usize..(r.offset + r.length) as usize]
+            });
+            assert_eq!(actual, wanted);
+        }
+        let stages: Vec<_> = store
+            .drain_multipart_timings()
+            .into_iter()
+            .map(|s| s.stage)
+            .collect();
+        assert_eq!(
+            stages,
+            vec![
+                cairn_blob::MultipartStage::PermitWait,
+                cairn_blob::MultipartStage::Assembly,
+                cairn_blob::MultipartStage::Durability
+            ]
+        );
+    }
+}
+
+#[tokio::test]
+async fn missing_part_records_assembly_failure_without_durability_or_leaked_tmp() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalBlobStore::open(dir.path()).await.unwrap();
+    let bucket = BucketName::parse("missing-part").unwrap();
+    let refs = [PartRef {
+        part_number: 1,
+        storage_path: StoragePath::from_string(".staging/multipart/missing/part".to_owned()),
+        size: 7,
+        cipher: BlobCipher::KnownPlaintext,
+    }];
+    assert!(matches!(
+        store
+            .assemble(&bucket, &refs, opts(None, "text/plain"))
+            .await,
+        Err(BlobError::NotFound)
+    ));
+    let stages: Vec<_> = store
+        .drain_multipart_timings()
+        .into_iter()
+        .map(|s| s.stage)
+        .collect();
+    assert_eq!(
+        stages,
+        vec![
+            cairn_blob::MultipartStage::PermitWait,
+            cairn_blob::MultipartStage::Assembly
+        ]
+    );
+    assert!(!dir.path().join(bucket.as_str()).exists());
+    assert!(
+        std::fs::read_dir(dir.path().join(".staging"))
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp"))
+    );
+}
