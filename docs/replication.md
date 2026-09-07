@@ -84,8 +84,13 @@ An upload is eligible only after its originating token is no longer live. Cleanu
 exact token and five-minute lease, renewed every minute by the same worker; lost ownership cancels
 the network operation. Startup invalidates orphaned cleanup tokens alongside outbox claims,
 so crash recovery can reclaim immediately. One upload is claimed per pass, so cleanup cannot consume an entire delivery batch
-and queued cleanup never expires while waiting behind another abort. Confirmed abort (including `NoSuchUpload`) removes the debt; failures
-retain it with a diagnostic and a one-minute retry. Current credentials are used only if the saved
+and queued cleanup never expires while waiting behind another abort. After a successful abort, a signed `ListParts` request with `max-parts=1` must confirm a
+complete, untruncated empty listing or `NoSuchUpload` before the debt is removed. S3 may finish
+in-flight part writes after acknowledging abort. Visible parts, malformed responses and read
+failures retain the debt with a diagnostic and a one-minute retry; the next pass aborts again.
+Generic S3 credentials therefore need `s3:ListMultipartUploadParts` as well as
+`s3:AbortMultipartUpload`. Cairn cleanup requests carry the signed replica marker so scoped
+replica-only credentials can receive `NoSuchUpload` after session deletion. Current credentials are used only if the saved
 endpoint and destination identity match; removed/changed targets remain explicit cleanup debt.
 
 A missing initiation receipt after origin ownership ends is an **unknown remote upload incident**.

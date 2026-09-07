@@ -627,6 +627,15 @@ The destination JSON contains routing identity, never credentials. `upload_id IS
 lifecycle policy to investigate. Do not delete rows to silence an alert: that discards recovery
 information, including the identity needed to accept a delayed receipt. Restore the journal with
 the rest of metadata during disaster recovery, even if source objects/outbox rows were pruned.
+
+A successful remote abort is followed by a bounded `ListParts` check (`max-parts=1`). Cleanup
+remains pending until an empty, untruncated result or `NoSuchUpload` confirms that no parts remain;
+a late part, read error or malformed response keeps the receipt for another abort attempt.
+Generic S3 target policies must allow `s3:ListMultipartUploadParts` in addition to
+`s3:AbortMultipartUpload`; an `AccessDenied` confirmation leaves debt visible rather than silently
+discarding it. Cairn-to-Cairn cleanup retains the existing scoped replication authorization.
+This follows [Amazon S3's abort verification guidance](https://docs.aws.amazon.com/AmazonS3/latest/API/API_AbortMultipartUpload.html).
+
 ## Installer verification prerequisites
 
 Host installs require a working SHA-256 utility and network access to download and verify the

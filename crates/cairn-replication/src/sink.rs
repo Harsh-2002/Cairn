@@ -1247,6 +1247,10 @@ impl HttpS3Sink {
         key: &str,
         upload_id: &str,
     ) -> Result<(), ReplicationError> {
+        let headers = [(
+            format!("x-amz-meta-{REPLICA_MARKER_KEY}"),
+            "true".to_owned(),
+        )];
         let request = self.build_signed_payload_request(
             &Method::DELETE,
             RequestTarget {
@@ -1256,11 +1260,30 @@ impl HttpS3Sink {
             },
             SignedPayload::bytes(bytes::Bytes::new()),
             None,
-            &[],
+            &headers,
         )?;
         match self.exchange(request).await {
-            Ok(_) | Err(ReplicationError::NotFound(_)) => Ok(()),
+            Err(ReplicationError::NotFound(_)) => return Ok(()),
+            Err(error) => return Err(error),
+            Ok(_) => {}
+        }
+        // An in-flight UploadPart can finish after S3 acknowledges an abort. Keep the durable
+        // receipt until a bounded listing confirms removal; a later cleanup pass retries abort.
+        let request = self.build_signed_payload_request(
+            &Method::GET,
+            RequestTarget {
+                bucket,
+                key,
+                query: &[("max-parts", "1"), ("uploadId", upload_id)],
+            },
+            SignedPayload::bytes(bytes::Bytes::new()),
+            None,
+            &headers,
+        )?;
+        match self.exchange(request).await {
+            Err(ReplicationError::NotFound(_)) => Ok(()),
             Err(error) => Err(error),
+            Ok((_, body)) => confirm_empty_parts(&body),
         }
     }
 
@@ -1599,8 +1622,33 @@ async fn signed_range(
     })
 }
 
-/// A successful HTTP status is insufficient for CompleteMultipartUpload: S3 can embed Error
-/// inside HTTP 200. Require one complete expected XML result and one nonempty direct child.
+/// Retire only a complete, untruncated listing with no parts or embedded error.
+fn confirm_empty_parts(xml: &str) -> Result<(), ReplicationError> {
+    if multipart_result_field(xml, "ListPartsResult", "IsTruncated")?.trim() != "false" {
+        return Err(ReplicationError::Retryable(
+            "multipart cleanup listing is truncated".to_owned(),
+        ));
+    }
+    let mut reader = quick_xml::Reader::from_str(xml);
+    loop {
+        match reader.read_event().map_err(|_| {
+            ReplicationError::Retryable("invalid multipart cleanup listing".to_owned())
+        })? {
+            quick_xml::events::Event::Start(event) | quick_xml::events::Event::Empty(event)
+                if matches!(event.local_name().as_ref(), b"Part" | b"Error") =>
+            {
+                return Err(ReplicationError::Retryable(
+                    "multipart parts remain after abort; cleanup retained".to_owned(),
+                ));
+            }
+            quick_xml::events::Event::Eof => return Ok(()),
+            _ => {}
+        }
+    }
+}
+
+/// A successful HTTP status is insufficient: S3 can embed Error inside HTTP 200.
+/// Require one complete expected XML result and one nonempty direct child.
 fn multipart_result_field(
     xml: &str,
     expected_root: &str,
@@ -1645,6 +1693,8 @@ fn multipart_result_field(
                 }
             }
             Event::DocType(_) => return Err(malformed()),
+            Event::Empty(_) | Event::CData(_) if depth == 0 => return Err(malformed()),
+            Event::Decl(_) if root.is_some() => return Err(malformed()),
             Event::Eof => break,
             Event::Text(text)
                 if depth == 0 && !text.as_ref().iter().all(u8::is_ascii_whitespace) =>

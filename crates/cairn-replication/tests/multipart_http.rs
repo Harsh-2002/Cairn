@@ -58,6 +58,23 @@ async fn peer(
     Arc<Mutex<Vec<Observed>>>,
     tokio::task::JoinHandle<()>,
 ) {
+    peer_with_cleanup(
+        error_at_complete,
+        reject_initiation,
+        (404, "<Error><Code>NoSuchUpload</Code></Error>"),
+    )
+    .await
+}
+
+async fn peer_with_cleanup(
+    error_at_complete: bool,
+    reject_initiation: bool,
+    listing: (u16, &'static str),
+) -> (
+    String,
+    Arc<Mutex<Vec<Observed>>>,
+    tokio::task::JoinHandle<()>,
+) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     let observed = Arc::new(Mutex::new(Vec::new()));
@@ -151,8 +168,14 @@ async fn peer(
                         } else if head.method == Method::PUT {
                             ""
                         } else if head.method == Method::DELETE {
+                            assert_eq!(head.headers["x-amz-meta-cairn-replica"], "true");
                             status = 204;
                             ""
+                        } else if head.method == Method::GET {
+                            assert!(query.contains("max-parts=1"));
+                            assert_eq!(head.headers["x-amz-meta-cairn-replica"], "true");
+                            status = listing.0;
+                            listing.1
                         } else {
                             let xml = String::from_utf8(xml).unwrap();
                             assert!(xml.contains("<PartNumber>1</PartNumber>"));
@@ -397,4 +420,104 @@ async fn cancelled_reader_retains_shared_admission_until_its_work_ends() {
             .contains("requires durable upload journaling")
     );
     task.abort();
+}
+
+#[tokio::test]
+async fn abort_keeps_journal_until_bounded_listing_confirms_cleanup() {
+    for (listing, retired) in [
+        (
+            (
+                200,
+                "<ListPartsResult><IsTruncated>false</IsTruncated><Part><PartNumber>1</PartNumber></Part></ListPartsResult>",
+            ),
+            false,
+        ),
+        (
+            (
+                200,
+                "<ListPartsResult><IsTruncated>true</IsTruncated></ListPartsResult>",
+            ),
+            false,
+        ),
+        (
+            (
+                200,
+                "<ListPartsResult><IsTruncated>false</IsTruncated><Part/></ListPartsResult>",
+            ),
+            false,
+        ),
+        (
+            (200, "<ListPartsResult><IsTruncated>false</IsTruncated>"),
+            false,
+        ),
+        ((200, "<Error><Code>InternalError</Code></Error>"), false),
+        (
+            (
+                200,
+                "<ListPartsResult><IsTruncated>false</IsTruncated><Error/></ListPartsResult>",
+            ),
+            false,
+        ),
+        ((200, "<ListPartsResult/>"), false),
+        (
+            (
+                200,
+                "<ListPartsResult><IsTruncated>false</IsTruncated></ListPartsResult><Extra/>",
+            ),
+            false,
+        ),
+        (
+            (
+                200,
+                "<ListPartsResult><IsTruncated>false</IsTruncated></ListPartsResult><![CDATA[extra]]>",
+            ),
+            false,
+        ),
+        ((403, "<Error><Code>AccessDenied</Code></Error>"), false),
+        ((503, "unavailable"), false),
+        (
+            (
+                200,
+                "<ListPartsResult><IsTruncated>false</IsTruncated></ListPartsResult>",
+            ),
+            true,
+        ),
+        ((404, "<Error><Code>NoSuchUpload</Code></Error>"), true),
+    ] {
+        let (endpoint, events, task) = peer_with_cleanup(false, false, listing).await;
+        let sink = sink(endpoint, Duration::from_secs(5));
+        let journal = Journal::default();
+        let mut object = object(
+            cairn_replication::SINGLE_PUT_MAX_BYTES + 1,
+            Arc::new(Mutex::new(Vec::new())),
+            Some(&journal),
+        );
+        // Fail after persisting the receipt, then model a peer that acknowledges abort while a
+        // previously in-flight part remains visible. The journal must survive the first 204.
+        object.source.open = Box::new(|_, _lease| {
+            Box::pin(async {
+                Err(cairn_types::ReplicationError::Retryable(
+                    "source read failed".to_owned(),
+                ))
+            })
+        });
+        assert!(
+            sink.put_object(&BucketName::parse("source").unwrap(), object)
+                .await
+                .is_err()
+        );
+        let expected = if retired {
+            vec!["begin", "receipt", "retire"]
+        } else {
+            vec!["begin", "receipt"]
+        };
+        assert_eq!(*journal.0.lock().unwrap(), expected, "listing: {listing:?}");
+        let events = events.lock().unwrap();
+        assert_eq!(
+            events.iter().map(|e| e.method.clone()).collect::<Vec<_>>(),
+            [Method::POST, Method::DELETE, Method::GET]
+        );
+        drop(events);
+        task.abort();
+    }
 }
