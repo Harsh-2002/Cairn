@@ -3010,6 +3010,18 @@ pub fn aspect_str(a: cairn_types::bucket::ConfigAspect) -> &'static str {
     config_aspect_str(a)
 }
 
+fn owns_replication_claim(
+    conn: &Connection,
+    id: &str,
+    token: &cairn_types::id::ReplicationClaimToken,
+    now: Timestamp,
+) -> R<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM replication_outbox WHERE id=?1 AND status='claimed' AND claim_token=?2 AND lease_until>=?3)",
+        params![id, token.as_str(), now.0], |row| row.get(0),
+    ).map_err(engine_err)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3772,16 +3784,4 @@ mod tests {
             .unwrap();
         assert_eq!(versions, 0);
     }
-}
-
-fn owns_replication_claim(
-    conn: &Connection,
-    id: &str,
-    token: &cairn_types::id::ReplicationClaimToken,
-    now: Timestamp,
-) -> R<bool> {
-    conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM replication_outbox WHERE id=?1 AND status='claimed' AND claim_token=?2 AND lease_until>=?3)",
-        params![id, token.as_str(), now.0], |row| row.get(0),
-    ).map_err(engine_err)
 }
