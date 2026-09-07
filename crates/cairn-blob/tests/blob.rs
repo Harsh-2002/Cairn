@@ -2630,17 +2630,20 @@ async fn probe_reports_presence_on_the_real_store_without_a_dek() {
 /// previous read buffer. Also exercise the final partial read across compression block boundaries.
 #[tokio::test]
 async fn assemble_mixed_parts_reuses_buffer_without_stale_tail_bytes() {
+    use aes_gcm::aead::{KeyInit, OsRng};
     use futures_util::StreamExt;
     let dir = tempfile::tempdir().unwrap();
     let store = LocalBlobStore::open(dir.path()).await.unwrap();
     let bucket = BucketName::parse("mixed-parts").unwrap();
     let upload = UploadId::generate();
+    let part_key: [u8; 32] = aes_gcm::Aes256Gcm::generate_key(&mut OsRng).into();
+    let object_key: [u8; 32] = aes_gcm::Aes256Gcm::generate_key(&mut OsRng).into();
     let mut expected = Vec::new();
     let mut refs = Vec::new();
     for (i, len) in [131_075, 65_537, 3, 65_536, 1].into_iter().enumerate() {
         let bytes = vec![b'A' + u8::try_from(i).unwrap(); len];
         expected.extend_from_slice(&bytes);
-        let dek = (i == 1).then_some([13u8; 32]);
+        let dek = (i == 1).then_some(part_key);
         let number = u16::try_from(i + 1).unwrap();
         let part = store
             .stage_part(
@@ -2665,7 +2668,7 @@ async fn assemble_mixed_parts_reuses_buffer_without_stale_tail_bytes() {
             "text/plain",
         );
         options.extra_checksums = ChecksumSet(vec![ChecksumAlgorithm::Crc64Nvme]);
-        options.encryption = encrypted.then_some([17u8; 32].into());
+        options.encryption = encrypted.then_some(object_key.into());
         let assembled = store
             .assemble(&bucket, &refs, options.clone())
             .await
@@ -2679,7 +2682,7 @@ async fn assemble_mixed_parts_reuses_buffer_without_stale_tail_bytes() {
         assert_eq!(assembled.internal_sha256, single.internal_sha256);
         assert_eq!(assembled.checksums, single.checksums);
         let cipher = if encrypted {
-            BlobCipher::AuthenticatedV3([17u8; 32].into())
+            BlobCipher::AuthenticatedV3(object_key.into())
         } else {
             BlobCipher::KnownPlaintext
         };
