@@ -55,6 +55,20 @@ const MAX_STAGE_SAMPLES: usize = 1024;
 struct StageBuffer {
     rings: [VecDeque<WriterStageSample>; 6],
     dropped: u64,
+    last_slow_warning: [Option<Instant>; 6],
+}
+
+impl StageBuffer {
+    fn should_warn(&mut self, index: usize, seconds: f64, now: Instant) -> bool {
+        if seconds < 1.0
+            || self.last_slow_warning[index]
+                .is_some_and(|last| now.duration_since(last) < Duration::from_secs(1))
+        {
+            return false;
+        }
+        self.last_slow_warning[index] = Some(now);
+        true
+    }
 }
 
 type StageSamples = Mutex<StageBuffer>;
@@ -72,10 +86,8 @@ fn stage_index(stage: &str) -> usize {
 }
 
 fn record_stage(samples: &StageSamples, stage: &'static str, start: Instant, success: bool) {
-    let seconds = start.elapsed().as_secs_f64();
-    if seconds >= 1.0 && !matches!(stage, "admission" | "queue") {
-        tracing::warn!(stage, seconds, success, "slow metadata writer stage");
-    }
+    let now = Instant::now();
+    let seconds = now.duration_since(start).as_secs_f64();
     let mut q = samples.lock().unwrap_or_else(|p| p.into_inner());
     let index = stage_index(stage);
     if q.rings[index].len() >= MAX_STAGE_SAMPLES {
@@ -87,6 +99,11 @@ fn record_stage(samples: &StageSamples, stage: &'static str, start: Instant, suc
         seconds,
         success,
     });
+    let warn = q.should_warn(index, seconds, now);
+    drop(q);
+    if warn {
+        tracing::warn!(stage, seconds, success, "slow metadata writer stage");
+    }
 }
 
 /// The result of a `PRAGMA wal_checkpoint(TRUNCATE)` run on the writer thread (ARCH 8.4/11.2).
@@ -667,6 +684,23 @@ mod tests {
             );
             writer.checkpoint_and_shutdown().await.unwrap();
         }
+    }
+
+    #[test]
+    fn slow_stage_warnings_survive_sampling_without_flooding_recovery() {
+        let mut buffer = StageBuffer::default();
+        let now = Instant::now();
+        let queue = stage_index("queue");
+        assert!(!buffer.should_warn(queue, 0.5, now));
+        assert!(buffer.should_warn(queue, 5.0, now));
+        for _ in 0..4096 {
+            assert!(!buffer.should_warn(queue, 5.0, now + Duration::from_millis(999)));
+        }
+        // Another stage is independent; draining samples must not reset the warning budget.
+        assert!(buffer.should_warn(stage_index("admission"), 5.0, now));
+        buffer.rings.iter_mut().for_each(VecDeque::clear);
+        assert!(!buffer.should_warn(queue, 5.0, now + Duration::from_millis(999)));
+        assert!(buffer.should_warn(queue, 1.0, now + Duration::from_secs(1)));
     }
 
     #[tokio::test]

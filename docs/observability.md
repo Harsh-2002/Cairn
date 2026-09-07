@@ -34,9 +34,9 @@ A busy stage evicts only its own oldest observations, preserving rarer checkpoin
 until the existing 15-second metrics tick drains them. The cumulative
 `cairn_writer_stage_samples_dropped_total` counter sums evictions across SQLite writers.
 Histograms are therefore sampled completed-stage diagnostics, not exact request counts or live
-in-progress timers. Begin/apply/commit/checkpoint stages of at least one second also produce timestamped warnings
-without object labels. Admission and queue stages do not emit per-request slow warnings, avoiding
-a log flood after a stall. `result=error` includes expected apply rejections such as a failed
+in-progress timers. Completed stages of at least one second also produce timestamped warnings
+without object labels, limited to one warning per stage per writer per second. This preserves
+slow-queue evidence even if later traffic evicts its sample, without a log flood after a stall. `result=error` includes expected apply rejections such as a failed
 precondition or nonempty bucket; it does not always mean a database failure. Cancelled admission contributes neither a completed sample nor phantom queue depth.
 Timings include scheduler delay and I/O waiting; they do not establish CPU leakage or isolate fsync
 from other COMMIT work. Blob assembly/durability timings are documented with the multipart follow-up.

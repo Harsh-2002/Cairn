@@ -46,8 +46,8 @@ Client-side pagination bounds rendering; existing bucket-list API payloads still
 
 Six independent 1,024-sample rings distinguish writer admission, queue residence, BEGIN, apply,
 COMMIT and checkpoint execution. Fixed labels and dropped-sample accounting bound diagnostics;
-rare checkpoint samples cannot be evicted by frequent queue samples. Only slow transaction or
-checkpoint stages produce warnings, avoiding a per-request log flood. Metrics use the existing
+rare checkpoint samples cannot be evicted by frequent queue samples. Slow-stage warnings are limited to one per stage per writer per second, preserving queue-stall
+evidence even if its sample is evicted while avoiding a per-request log flood. Metrics use the existing
 server collection task; COMMIT wall time is not labelled as isolated fsync time.
 
 Reserving queue capacity before incrementing depth also fixes phantom queued mutations when an
