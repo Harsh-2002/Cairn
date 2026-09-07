@@ -104,7 +104,10 @@ Clock/Crypto>`) — never a concrete engine.
   Multipart initiation pins authenticated `replica_intent`; every later session operation reads
   that immutable capability before authorization. Mirror dispatch precedence so an appended
   uploadId cannot reclassify tagging/ACL reads. Complete preserves source identity and skips
-  outbox enqueue, while destination encryption/ownership/Object Lock remain enforced.
+  outbox enqueue, while destination encryption/ownership/Object Lock remain enforced. A marked
+  multipart GET/DELETE whose session lookup confirms absence may authorize ReplicateObject only
+  to return NoSuchUpload; do not re-read or dispatch after that authorization. Ordinary sessions,
+  other methods and higher-precedence subresources cannot gain replication cleanup authority.
 - **5xx messages are generalized** (audit #28): `error_response` logs the real cause but returns an
   opaque `InternalError` body; client 4xx keep their descriptive S3 message.
 - **Version-scoped authz** (audit #33): a `?versionId` request passes that `VersionId` to
