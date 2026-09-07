@@ -58,7 +58,7 @@ chacha20 yanked maintenance warnings. Live bucket and multipart conformance pass
 
 ## Integrated local validation — 2026-09-07
 
-Final production Rust matches snapshot `5a9a9b1` and PR #74 head `32a384b`. Complete root gate
+The streaming baseline matches snapshot `5a9a9b1` and PR #74 head `32a384b`. Its complete root gate
 passed: 1,297 workspace tests (two skipped), two doctests, formatting, both Clippy configurations,
 web lint/build/both audits, cargo audit, installer regressions and release-policy checks. Focused
 coverage includes 111 replication, 75 blob and eight journal/backend tests.
@@ -70,6 +70,13 @@ was 47 MiB plaintext and 52.4 MiB encrypted. These compressible fixtures prove a
 transfer sizes and bounded memory, not sustained capacity or incompressible-disk performance.
 Timings were collected on a shared host and are not a performance benchmark. Final recovery
 checks passed all 20 crash cases and the three real remote response-loss scenarios.
+
+The final review added bounded ListParts confirmation after remote abort and authorized missing-session
+cleanup for replication-only credentials (`4b6d012`, `25efbad`). The late-part regression failed
+against the earlier sender and passes after the fix; five multipart HTTP tests and 13 protocol
+replication tests pass. PR #75 also removes unnecessary proxy XML parsing and rejects forwarded
+header line breaks; four wire regressions and all three recovery scenarios pass. Final integrated
+workspace and exact-head CI results are required before merging these follow-up changes.
 
 ## Deferred final phase: capacity, sustained load and regression campaign
 
