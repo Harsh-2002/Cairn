@@ -5068,6 +5068,7 @@ async fn replication_attempts_are_fenced() {
         .await
         .unwrap();
     cairn_types::testing::assert_replication_claim_fencing(&store, &object).await;
+    cairn_types::testing::assert_replication_upload_journal(&store, &object.bucket).await;
 }
 
 #[path = "common/multipart_replica.rs"]

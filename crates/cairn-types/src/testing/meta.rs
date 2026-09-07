@@ -34,6 +34,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[path = "replication_upload.rs"]
+mod replication_upload;
+
 type VKey = (String, String, String); // (bucket, key, version_id)
 
 #[derive(serde::Deserialize)]
@@ -72,6 +75,7 @@ struct State {
     multipart_reservations: BTreeMap<String, MultipartReservation>,
     multipart_cleanups: BTreeMap<String, MultipartCleanup>,
     outbox: Vec<OutboxEntry>,
+    replication_uploads: BTreeMap<String, crate::replication_upload::RemoteMultipartUpload>,
     webhook_outbox: Vec<WebhookEntry>,
     users: BTreeMap<String, UserRecord>,
     session_creds: BTreeMap<String, SessionCredentialRecord>,
@@ -972,6 +976,14 @@ impl MetadataStore for InMemoryMetadataStore {
         };
         let mut st = self.state.lock().unwrap();
         match mutation {
+            Mutation::ReplicationUpload { bucket, operation } => {
+                replication_upload::apply(&mut st, &bucket, operation)
+            }
+            Mutation::ClaimReplicationUploadCleanup {
+                limit,
+                now,
+                lease_secs,
+            } => replication_upload::claim(&mut st, limit, now, lease_secs),
             Mutation::PutObjectVersion {
                 row,
                 precondition,
@@ -2194,6 +2206,10 @@ impl MetadataStore for InMemoryMetadataStore {
                         e.claim_token = None;
                         e.lease_until = None;
                     }
+                }
+                for upload in st.replication_uploads.values_mut() {
+                    upload.cleanup_token = None;
+                    upload.lease_until = None;
                 }
                 Ok(MutationOutcome::Ack)
             }

@@ -18,6 +18,7 @@ mod driver;
 mod libsql_driver;
 mod model;
 mod range;
+mod replication_upload;
 mod schema;
 mod store;
 mod turso_driver;

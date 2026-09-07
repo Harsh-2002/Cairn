@@ -198,10 +198,18 @@ async fn spawn_giant_chunked_error_server() -> String {
     authority
 }
 
-fn body_stream(bytes: &'static [u8]) -> cairn_types::BlobStream {
-    Box::pin(futures_util::stream::once(async move {
-        Ok::<Bytes, BlobError>(Bytes::from_static(bytes))
-    }))
+fn test_source(bytes: &'static [u8]) -> cairn_types::replication::ReplicationSource<'static> {
+    cairn_types::replication::ReplicationSource {
+        buffer_bytes: bytes.len() as u64,
+        max_frame_bytes: bytes.len().max(1) as u64,
+        open: Box::new(move |_, _lease| {
+            Box::pin(async move {
+                Ok(Box::pin(futures_util::stream::once(async move {
+                    Ok::<Bytes, BlobError>(Bytes::from_static(bytes))
+                })) as cairn_types::BlobStream)
+            })
+        }),
+    }
 }
 
 fn runtime() -> ReplicationSinkRuntime {
@@ -248,8 +256,9 @@ fn src() -> BucketName {
     BucketName::parse("source-bucket").unwrap()
 }
 
-fn object_with_body(key: &str, body: &'static [u8]) -> ReplicatedObject {
+fn object_with_body(key: &str, body: &'static [u8]) -> ReplicatedObject<'static> {
     ReplicatedObject {
+        journal: None,
         key: ObjectKey::parse(key).unwrap(),
         version_id: VersionId::from_string("v1".to_owned()),
         content_type: "application/octet-stream".to_owned(),
@@ -266,7 +275,7 @@ fn object_with_body(key: &str, body: &'static [u8]) -> ReplicatedObject {
         storage_class: cairn_types::object::StorageClass::Standard,
         checksums: Vec::new(),
         client_encrypted: false,
-        body: body_stream(body),
+        source: test_source(body),
     }
 }
 
@@ -279,6 +288,7 @@ async fn put_object_issues_well_formed_signed_request() {
     let sink = sink_for(&authority, 1_440_938_160);
 
     let object = ReplicatedObject {
+        journal: None,
         key: ObjectKey::parse("logs/app.log").unwrap(),
         version_id: VersionId::from_string("v1".to_owned()),
         content_type: "text/plain".to_owned(),
@@ -295,7 +305,7 @@ async fn put_object_issues_well_formed_signed_request() {
         storage_class: cairn_types::object::StorageClass::Standard,
         checksums: Vec::new(),
         client_encrypted: false,
-        body: body_stream(b"hello"),
+        source: test_source(b"hello"),
     };
 
     sink.put_object(&src(), object).await.unwrap();
@@ -377,6 +387,7 @@ async fn composite_checksum_is_not_replicated_but_full_object_is() {
     let sink = sink_for(&authority, 1_440_938_160);
 
     let object = ReplicatedObject {
+        journal: None,
         key: ObjectKey::parse("logs/app.log").unwrap(),
         version_id: VersionId::from_string("v1".to_owned()),
         content_type: "text/plain".to_owned(),
@@ -404,7 +415,7 @@ async fn composite_checksum_is_not_replicated_but_full_object_is() {
             },
         ],
         client_encrypted: false,
-        body: body_stream(b"hello"),
+        source: test_source(b"hello"),
     };
 
     sink.put_object(&src(), object).await.unwrap();
@@ -451,6 +462,7 @@ async fn put_object_emits_acl_header_only_when_present() {
     let authority = spawn_server(captured.clone(), Reply { status: 200 }).await;
     let sink = sink_for(&authority, 1_440_938_160);
     let object = ReplicatedObject {
+        journal: None,
         key: ObjectKey::parse("acl/obj").unwrap(),
         version_id: VersionId::from_string("v9".to_owned()),
         content_type: "application/octet-stream".to_owned(),
@@ -467,7 +479,7 @@ async fn put_object_emits_acl_header_only_when_present() {
         storage_class: cairn_types::object::StorageClass::Standard,
         checksums: Vec::new(),
         client_encrypted: false,
-        body: body_stream(b"abc"),
+        source: test_source(b"abc"),
     };
     sink.put_object(&src(), object).await.unwrap();
     let reqs = captured.lock().unwrap().clone();
@@ -488,6 +500,7 @@ async fn put_object_emits_acl_header_only_when_present() {
     let authority2 = spawn_server(captured2.clone(), Reply { status: 200 }).await;
     let sink2 = sink_for(&authority2, 1_440_938_160);
     let object2 = ReplicatedObject {
+        journal: None,
         key: ObjectKey::parse("noacl/obj").unwrap(),
         version_id: VersionId::from_string("v10".to_owned()),
         content_type: "application/octet-stream".to_owned(),
@@ -504,7 +517,7 @@ async fn put_object_emits_acl_header_only_when_present() {
         storage_class: cairn_types::object::StorageClass::Standard,
         checksums: Vec::new(),
         client_encrypted: false,
-        body: body_stream(b""),
+        source: test_source(b""),
     };
     sink2.put_object(&src(), object2).await.unwrap();
     let reqs2 = captured2.lock().unwrap().clone();
@@ -524,6 +537,7 @@ async fn put_object_recomputes_signature_when_a_header_changes() {
     let sink = sink_for(&authority, 1_440_938_160);
 
     let make = |key: &'static str| ReplicatedObject {
+        journal: None,
         key: ObjectKey::parse(key).unwrap(),
         version_id: VersionId::from_string("v1".to_owned()),
         content_type: "text/plain".to_owned(),
@@ -540,7 +554,7 @@ async fn put_object_recomputes_signature_when_a_header_changes() {
         storage_class: cairn_types::object::StorageClass::Standard,
         checksums: Vec::new(),
         client_encrypted: false,
-        body: body_stream(b"hello"),
+        source: test_source(b"hello"),
     };
 
     sink.put_object(&src(), make("a")).await.unwrap();
@@ -587,6 +601,7 @@ async fn server_5xx_is_unavailable() {
     let sink = sink_for(&authority, 1_440_938_160);
 
     let object = ReplicatedObject {
+        journal: None,
         key: ObjectKey::parse("k").unwrap(),
         version_id: VersionId::from_string("v1".to_owned()),
         content_type: "application/octet-stream".to_owned(),
@@ -603,7 +618,7 @@ async fn server_5xx_is_unavailable() {
         storage_class: cairn_types::object::StorageClass::Standard,
         checksums: Vec::new(),
         client_encrypted: false,
-        body: body_stream(b"x"),
+        source: test_source(b"x"),
     };
     let err = sink.put_object(&src(), object).await.unwrap_err();
     assert!(
@@ -754,6 +769,7 @@ async fn put_object_routes_to_per_source_destination_bucket() {
     .unwrap();
 
     let make = |key: &'static str| ReplicatedObject {
+        journal: None,
         key: ObjectKey::parse(key).unwrap(),
         version_id: VersionId::from_string("v1".to_owned()),
         content_type: "text/plain".to_owned(),
@@ -770,7 +786,7 @@ async fn put_object_routes_to_per_source_destination_bucket() {
         storage_class: cairn_types::object::StorageClass::Standard,
         checksums: Vec::new(),
         client_encrypted: false,
-        body: body_stream(b"x"),
+        source: test_source(b"x"),
     };
 
     // Mapped source routes to its destination bucket.
@@ -844,6 +860,7 @@ async fn https_endpoint_negotiates_tls_not_plaintext() {
     .unwrap();
 
     let object = ReplicatedObject {
+        journal: None,
         key: ObjectKey::parse("k").unwrap(),
         version_id: VersionId::from_string("v1".to_owned()),
         content_type: "text/plain".to_owned(),
@@ -860,7 +877,7 @@ async fn https_endpoint_negotiates_tls_not_plaintext() {
         storage_class: cairn_types::object::StorageClass::Standard,
         checksums: Vec::new(),
         client_encrypted: false,
-        body: body_stream(b"x"),
+        source: test_source(b"x"),
     };
     // The handshake fails (server presents no certificate), so the call errors as unavailable.
     let err = sink.put_object(&src(), object).await.unwrap_err();
@@ -887,6 +904,7 @@ async fn put_object_replicates_system_headers_and_checksums() {
     let authority = spawn_server(captured.clone(), Reply { status: 200 }).await;
     let sink = sink_for(&authority, 1_440_938_160);
     let object = ReplicatedObject {
+        journal: None,
         key: ObjectKey::parse("k").unwrap(),
         version_id: VersionId::from_string("v1".to_owned()),
         content_type: "text/plain".to_owned(),
@@ -906,7 +924,7 @@ async fn put_object_replicates_system_headers_and_checksums() {
             value: "aGFzaA==".to_owned(),
         }],
         client_encrypted: false,
-        body: body_stream(b"hello"),
+        source: test_source(b"hello"),
     };
     sink.put_object(&src(), object).await.unwrap();
     let reqs = captured.lock().unwrap().clone();
@@ -928,8 +946,9 @@ async fn put_object_replicates_system_headers_and_checksums() {
 // either never replicated or replicated as ciphertext. It is therefore gated.
 
 /// Build a `ReplicatedObject` carrying `client_encrypted`.
-fn encrypted_object(client_encrypted: bool) -> ReplicatedObject {
+fn encrypted_object(client_encrypted: bool) -> ReplicatedObject<'static> {
     ReplicatedObject {
+        journal: None,
         key: ObjectKey::parse("secret.txt").unwrap(),
         version_id: VersionId::from_string("v1".to_owned()),
         content_type: "text/plain".to_owned(),
@@ -946,7 +965,7 @@ fn encrypted_object(client_encrypted: bool) -> ReplicatedObject {
         storage_class: cairn_types::object::StorageClass::Standard,
         checksums: Vec::new(),
         client_encrypted,
-        body: body_stream(b"hello"),
+        source: test_source(b"hello"),
     }
 }
 

@@ -600,6 +600,33 @@ worker re-seals descriptors underneath a live consumer.
 > plaintext and the confidentiality gate refuses it). Rolling back to a pre-fix binary resumes the
 > corruption.
 
+## 9. Replication multipart cleanup
+
+Configure an incomplete-multipart-upload expiration rule on each replication destination before
+using multipart replication. A lost initiation response can leave a remote upload whose ID the
+source never learned. Cairn retains that incident; destination lifecycle expiration is the
+recovery path for an unknown ID.
+
+Known IDs remain in the source metadata journal until a confirmed abort or completion. The existing
+replication workers retry aborts once per minute after the originating delivery claim ends. A
+removed target or a changed endpoint/destination retains cleanup debt: restore the original route
+and working credentials to let automatic cleanup proceed. Changing a rule does not authorize
+sending old cleanup requests to a new destination.
+
+Inspect a consistent metadata backup using a read-only SQLite connection (inspect each configured
+metadata shard):
+
+```sql
+SELECT id, bucket_name, outbox_id, destination, upload_id, orphan_reported, last_error
+FROM replication_uploads
+ORDER BY next_attempt_at, id;
+```
+
+The destination JSON contains routing identity, never credentials. `upload_id IS NULL` with
+`orphan_reported=1` means the receipt is unknown; use the destination's multipart inventory and
+lifecycle policy to investigate. Do not delete rows to silence an alert: that discards recovery
+information, including the identity needed to accept a delayed receipt. Restore the journal with
+the rest of metadata during disaster recovery, even if source objects/outbox rows were pruned.
 ## Installer verification prerequisites
 
 Host installs require a working SHA-256 utility and network access to download and verify the

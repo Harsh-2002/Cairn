@@ -86,6 +86,25 @@ pub trait BlobStore: Send + Sync {
         expected_logical_len: u64,
     ) -> Result<BlobReadHandle, BlobError>;
 
+    /// Open a read while retaining the caller's buffer reservation. A backend that starts work
+    /// outside this future must override this method and retain a lease clone in that work until
+    /// it exits; merely dropping the returned stream cannot cancel blocking I/O.
+    async fn open_raw_guarded(
+        &self,
+        path: &StoragePath,
+        range: Option<ByteRange>,
+        cipher: BlobCipher,
+        compression: &CompressionDescriptor,
+        expected_logical_len: u64,
+        lease: crate::blob::ReadBufferLease,
+    ) -> Result<BlobReadHandle, BlobError> {
+        let mut handle = self
+            .open_raw(path, range, cipher, compression, expected_logical_len)
+            .await?;
+        handle.body = lease.hold_stream(handle.body);
+        Ok(handle)
+    }
+
     /// Cheaply answer whether a committed blob is PRESENT, plus basic framing — WITHOUT a DEK and
     /// WITHOUT decrypting. It stats the file / reads the fixed container header only; it never
     /// opens the body. Contract: a well-formed *encrypted* blob returns `Ok` (present), NOT
@@ -490,7 +509,7 @@ pub trait AuthorizationEngine: Send + Sync {
 #[async_trait]
 pub trait ReplicationSink: Send + Sync {
     /// Put an object with its metadata, tags, and ACL as the rule dictates.
-    async fn put_object(&self, object: ReplicatedObject) -> Result<(), ReplicationError>;
+    async fn put_object(&self, object: ReplicatedObject<'_>) -> Result<(), ReplicationError>;
 
     /// Propagate a deletion or delete marker.
     async fn delete_marker(

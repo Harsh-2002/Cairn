@@ -30,11 +30,22 @@ use cairn_types::traits::ReplicationSink;
 /// be resolved per request.
 #[async_trait]
 pub trait BucketRoutedSink: Send + Sync {
+    /// Abort a saved remote upload only when current endpoint and bucket identity still match.
+    /// Unsupported/changed routes retain durable cleanup debt rather than silently forgiving it.
+    async fn abort_multipart(
+        &self,
+        _upload: &cairn_types::replication_upload::RemoteMultipartUpload,
+    ) -> Result<(), ReplicationError> {
+        Err(ReplicationError::Unavailable(
+            "remote multipart cleanup unsupported by sink".to_owned(),
+        ))
+    }
+
     /// Put an object that originated in `source_bucket`, choosing the destination from it.
     async fn put_object(
         &self,
         source_bucket: &BucketName,
-        object: ReplicatedObject,
+        object: ReplicatedObject<'_>,
     ) -> Result<(), ReplicationError>;
 
     /// Propagate a deletion/delete marker for a key in `source_bucket`.
@@ -89,7 +100,7 @@ where
     async fn put_object(
         &self,
         _source_bucket: &BucketName,
-        object: ReplicatedObject,
+        object: ReplicatedObject<'_>,
     ) -> Result<(), ReplicationError> {
         ReplicationSink::put_object(self, object).await
     }

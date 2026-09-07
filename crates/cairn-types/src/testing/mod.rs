@@ -54,3 +54,6 @@ impl AuthorizationEngine for DenyAll {
         Decision::Deny(DenyReason::DefaultDeny)
     }
 }
+
+mod replication_upload_contract;
+pub use replication_upload_contract::assert_replication_upload_journal;

@@ -28,6 +28,14 @@ type MultipartInitialColumns = (String, Option<String>, Option<i64>, Option<i64>
 /// Apply a mutation, returning its typed outcome or a typed error.
 pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
     match m {
+        Mutation::ReplicationUpload { bucket, operation } => {
+            crate::replication_upload::apply(conn, &bucket, operation)
+        }
+        Mutation::ClaimReplicationUploadCleanup {
+            limit,
+            now,
+            lease_secs,
+        } => crate::replication_upload::claim(conn, limit, now, lease_secs),
         Mutation::PutObjectVersion {
             row,
             precondition,
@@ -1321,6 +1329,8 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
                 [],
             )
             .map_err(engine_err)?;
+            // Startup has no surviving cleanup workers either; invalidate their exact tokens.
+            conn.execute("UPDATE replication_uploads SET cleanup_token=NULL, lease_until=NULL WHERE cleanup_token IS NOT NULL", []).map_err(engine_err)?;
             Ok(MutationOutcome::Ack)
         }
         Mutation::PruneReplicationOutbox { before_ms } => {

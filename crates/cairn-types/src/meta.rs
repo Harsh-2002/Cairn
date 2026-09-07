@@ -654,6 +654,22 @@ pub enum Mutation {
         /// New lease duration in seconds.
         lease_secs: i64,
     },
+    /// Update one durable remote-upload journal on its original bucket shard.
+    ReplicationUpload {
+        /// Stable original bucket identity, including after bucket deletion.
+        bucket: BucketName,
+        /// Exact attempt operation.
+        operation: crate::replication_upload::ReplicationUploadMutation,
+    },
+    /// Claim independently enumerable remote cleanup debt whose origin claim is no longer live.
+    ClaimReplicationUploadCleanup {
+        /// Maximum known uploads plus newly reported missing receipts.
+        limit: u32,
+        /// Current wall clock.
+        now: Timestamp,
+        /// Cleanup ownership duration.
+        lease_secs: i64,
+    },
     /// Enqueue a batch of event-notification (webhook) outbox entries idempotently (INSERT OR
     /// IGNORE on the deterministic entry id). Emitted by the protocol layer right after an object
     /// commit succeeds; delivery is best-effort at-least-once (a crash in the gap drops the
@@ -764,6 +780,8 @@ pub enum Mutation {
 pub enum MutationOutcome {
     /// Whether a replication update still owned its exact attempt.
     ReplicationClaimUpdated { applied: bool },
+    /// Durable remote-upload cleanup work, independent of originating outbox retention.
+    ReplicationUploadBatch(crate::replication_upload::ReplicationUploadBatch),
     /// A put committed.
     Put {
         /// Any superseded blob to reclaim.

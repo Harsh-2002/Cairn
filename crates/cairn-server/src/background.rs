@@ -1131,6 +1131,11 @@ async fn drain_with_router(
         let result = engine
             .run_once(&*stack.meta, router, &stack.blob, clock)
             .await;
+        let (orphaned, cleanup_failed) = engine.take_upload_failures();
+        metrics::counter!("cairn_replication_multipart_orphan_initiation_total")
+            .increment(orphaned);
+        metrics::counter!("cairn_replication_multipart_cleanup_failed_total")
+            .increment(cleanup_failed);
         let (stale, renewal_failed) = engine.take_claim_failures();
         metrics::counter!("cairn_replication_stale_claim_total").increment(stale);
         metrics::counter!("cairn_replication_claim_renew_failed_total").increment(renewal_failed);
@@ -1391,10 +1396,19 @@ impl SinkRouter for StoredTargetRouter {
 
 #[async_trait::async_trait]
 impl BucketRoutedSink for StoredTargetRouter {
+    async fn abort_multipart(
+        &self,
+        upload: &cairn_types::replication_upload::RemoteMultipartUpload,
+    ) -> Result<(), ReplicationError> {
+        self.sink_for_bucket(upload.destination.bucket.as_str())?
+            .abort_multipart(upload)
+            .await
+    }
+
     async fn put_object(
         &self,
         source_bucket: &BucketName,
-        object: ReplicatedObject,
+        object: ReplicatedObject<'_>,
     ) -> Result<(), ReplicationError> {
         self.sink_for_bucket(source_bucket.as_str())?
             .put_object(source_bucket, object)
@@ -2713,6 +2727,83 @@ mod tests {
         };
         let err = sink.sink_for_bucket("orphan").unwrap_err();
         assert!(matches!(err, ReplicationError::Terminal(_)));
+    }
+
+    #[tokio::test]
+    async fn legacy_router_forwards_exact_remote_upload_cleanup() {
+        use cairn_types::replication_upload::{RemoteMultipartDestination, RemoteMultipartUpload};
+        use http_body_util::Full;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let peer = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let service = hyper::service::service_fn(
+                |request: http::Request<hyper::body::Incoming>| async move {
+                    assert_eq!(request.method(), http::Method::DELETE);
+                    assert_eq!(
+                        request.uri().path_and_query().unwrap().as_str(),
+                        "/dest/key?uploadId=receipt"
+                    );
+                    Ok::<_, std::convert::Infallible>(
+                        http::Response::builder()
+                            .status(204)
+                            .body(Full::new(bytes::Bytes::new()))
+                            .unwrap(),
+                    )
+                },
+            );
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(hyper_util::rt::TokioIo::new(socket), service)
+                .await;
+        });
+        let configured = target("legacy", "dest", &endpoint);
+        let sink = Arc::new(
+            HttpS3Sink::new(
+                target_sink_cfg(&configured, true, false),
+                test_sink_runtime(),
+            )
+            .unwrap(),
+        );
+        let router = StoredTargetRouter {
+            by_arn: HashMap::new(),
+            env_routes: HashMap::new(),
+            default: Some(sink),
+        };
+        let mut upload = RemoteMultipartUpload {
+            id: "attempt".to_owned(),
+            outbox_id: "outbox".to_owned(),
+            origin_token: cairn_types::id::ReplicationClaimToken::generate(),
+            destination: RemoteMultipartDestination {
+                bucket: BucketName::parse("source").unwrap(),
+                key: cairn_types::ObjectKey::parse("key").unwrap(),
+                target_arn: None,
+                endpoint,
+                destination_bucket: "dest".to_owned(),
+            },
+            upload_id: Some("receipt".to_owned()),
+            cleanup_token: None,
+            lease_until: None,
+            next_attempt_at: cairn_types::Timestamp(0),
+            orphan_reported: false,
+            last_error: None,
+        };
+        router
+            .sink_for(None)
+            .unwrap()
+            .abort_multipart(&upload)
+            .await
+            .unwrap();
+        // A changed route must be retained as cleanup debt instead of using credentials elsewhere.
+        upload.destination.destination_bucket = "changed".to_owned();
+        assert!(
+            router
+                .sink_for(None)
+                .unwrap()
+                .abort_multipart(&upload)
+                .await
+                .is_err()
+        );
+        peer.abort();
     }
 
     fn test_sink(endpoint: &str, dest: &str) -> Arc<HttpS3Sink> {

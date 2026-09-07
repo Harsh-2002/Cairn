@@ -35,15 +35,16 @@ mod config;
 mod route;
 mod sink;
 mod target;
+mod upload_journal;
 
 pub use backoff::next_backoff;
 pub use config::{Destination, Filter, ReplicationConfig, ReplicationRule, parse_replication};
 pub use route::{BucketRoutedSink, SingleSink, SinkRouter};
 pub use sink::{
     DEFAULT_REPLICATION_BUFFER_BUDGET_BYTES, DEFAULT_REPLICATION_DELIVERY_TIMEOUT_SECS, HttpS3Sink,
-    MAX_BUFFERED_OBJECT_BYTES, MAX_REPLICATION_BUFFER_BUDGET_BYTES,
-    MAX_REPLICATION_DELIVERY_TIMEOUT_SECS, MAX_RESPONSE_DIAGNOSTIC_BYTES, ReplicationSinkRuntime,
-    S3SinkConfig, sink_for_target,
+    MAX_REPLICATION_BUFFER_BUDGET_BYTES, MAX_REPLICATION_DELIVERY_TIMEOUT_SECS,
+    MAX_RESPONSE_DIAGNOSTIC_BYTES, ReplicationSinkRuntime, S3SinkConfig, SINGLE_PUT_MAX_BYTES,
+    sink_for_target,
 };
 pub use target::{
     OpenTarget, RemoteTarget, RemoteTargetInput, open_target, parse_targets, resolve_target,
@@ -166,6 +167,8 @@ impl std::fmt::Debug for ReplicationEngine {
 #[derive(Default)]
 struct ClaimFailures {
     stale: std::sync::atomic::AtomicU64,
+    orphan_initiation: std::sync::atomic::AtomicU64,
+    cleanup_failed: std::sync::atomic::AtomicU64,
     renewal: std::sync::atomic::AtomicU64,
 }
 
@@ -216,6 +219,19 @@ impl ReplicationEngine {
         )
     }
 
+    /// Drain remote initiation and cleanup failure counters, including aborted worker passes.
+    pub fn take_upload_failures(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering;
+        (
+            self.claim_failures
+                .orphan_initiation
+                .swap(0, Ordering::Relaxed),
+            self.claim_failures
+                .cleanup_failed
+                .swap(0, Ordering::Relaxed),
+        )
+    }
+
     fn check_claim_update(
         &self,
         outcome: cairn_types::meta::MutationOutcome,
@@ -257,6 +273,7 @@ impl ReplicationEngine {
         B: BlobStore + ?Sized,
         C: Clock + ?Sized,
     {
+        self.cleanup_uploads(meta, router, clock).await?;
         let now = clock.now();
         let batch = meta
             .claim_replication_batch(self.opts.batch_size, now)
@@ -583,9 +600,16 @@ impl ReplicationEngine {
                             .await;
                     }
                     (Ok(_), Err(e)) => Err(e),
-                    (Ok(tags), Ok((cipher, client_encrypted))) => {
-                        self.put_object(sink, blobs, &row, tags, cipher, client_encrypted)
-                            .await
+                    (Ok(tags), Ok((_cipher, client_encrypted))) => {
+                        self.put_object(
+                            &upload_journal::UploadJournal { meta, clock, entry },
+                            sink,
+                            blobs,
+                            &row,
+                            tags,
+                            client_encrypted,
+                        )
+                        .await
                     }
                 }
             }
@@ -634,18 +658,21 @@ impl ReplicationEngine {
     /// replicated-bytes metric). `tags` are loaded by the caller from the metadata store (they
     /// live in a separate table, not on the version row) so the replica carries the same tag set
     /// the source rule selected on.
-    async fn put_object<B>(
+    async fn put_object<M, B, C>(
         &self,
+        journal: &upload_journal::UploadJournal<'_, M, C>,
         sink: &dyn BucketRoutedSink,
         blobs: &Arc<B>,
         row: &ObjectVersionRow,
         tags: Vec<(String, String)>,
-        cipher: cairn_types::blob::BlobCipher,
         client_encrypted: bool,
     ) -> Result<u64, ReplicationError>
     where
         B: BlobStore + ?Sized,
+        M: MetadataStore + ?Sized,
+        C: Clock + ?Sized,
     {
+        let meta = journal.meta;
         let Some(path) = row.storage_path.as_ref() else {
             // An ObjectCreate entry must reference a blob; a row without one is malformed and
             // cannot be made to replicate, so it is terminal.
@@ -654,17 +681,86 @@ impl ReplicationEngine {
             ));
         };
 
-        // Read the whole logical body through the key + metadata-backed CRNB expectation resolved
-        // by `resolve_dek`. Opening the blob is local I/O: a failure here is transient unless the
-        // blob is genuinely gone or corrupt.
-        let range = Some(ByteRange {
-            offset: 0,
-            length: row.size_logical,
-        });
-        let handle = blobs
-            .open_raw(path, range, cipher, &row.compression, row.size_logical)
-            .await
-            .map_err(map_blob_err)?;
+        // The reader's index is bounded by CRNB's 64 MiB index ceiling; count its decoded
+        // entries/offsets and the bounded channel plus decrypt/decompress frames before admission.
+        let block_size = match row.compression {
+            cairn_types::CompressionDescriptor::Compressed { block_size, .. } => {
+                u64::from(block_size)
+            }
+            _ => 64 * 1024,
+        };
+        let encoded = row.sse_descriptor.is_some()
+            || !matches!(
+                row.compression,
+                cairn_types::CompressionDescriptor::Uncompressed
+            );
+        let buffer_bytes = if encoded {
+            if block_size == 0 || block_size > 16 * 1024 * 1024 {
+                return Err(ReplicationError::Terminal(
+                    "invalid source block geometry".to_owned(),
+                ));
+            }
+            row.size_logical
+                .div_ceil(block_size)
+                .saturating_mul(32)
+                .saturating_add(block_size.saturating_mul(10))
+                .saturating_add(128 * 1024)
+        } else {
+            1024 * 1024
+        };
+        let expected = row.clone();
+        let source = cairn_types::replication::ReplicationSource {
+            buffer_bytes,
+            // Plain small-object reads may coalesce up to 256 KiB into one frame.
+            max_frame_bytes: if encoded { block_size } else { 1024 * 1024 },
+            open: Box::new(move |range: ByteRange, lease| {
+                let expected = expected.clone();
+                Box::pin(async move {
+                    if range
+                        .offset
+                        .checked_add(range.length)
+                        .is_none_or(|end| end > expected.size_logical)
+                    {
+                        return Err(ReplicationError::Terminal(
+                            "source range exceeds object".to_owned(),
+                        ));
+                    }
+                    let current = meta
+                        .get_version(&expected.bucket, &expected.key, &expected.version_id)
+                        .await
+                        .map_err(|e| {
+                            ReplicationError::Unavailable(format!(
+                                "source metadata unavailable: {e}"
+                            ))
+                        })?
+                        .ok_or_else(|| {
+                            ReplicationError::Terminal("source version disappeared".to_owned())
+                        })?;
+                    if current.id != expected.id
+                        || current.storage_path != expected.storage_path
+                        || current.size_logical != expected.size_logical
+                        || current.compression != expected.compression
+                    {
+                        return Err(ReplicationError::Terminal(
+                            "source version changed between read passes".to_owned(),
+                        ));
+                    }
+                    let (cipher, _) = resolve_dek(&*self.crypto, &current)?;
+                    let handle = blobs
+                        .open_raw_guarded(
+                            path,
+                            Some(range),
+                            cipher,
+                            &current.compression,
+                            current.size_logical,
+                            lease,
+                        )
+                        .await
+                        .map_err(map_blob_err)?;
+                    Ok(handle.body)
+                })
+            }),
+        };
 
         let size = row.size_logical;
         let object = ReplicatedObject {
@@ -684,7 +780,8 @@ impl ReplicationEngine {
             storage_class: row.storage_class,
             checksums: row.checksums.clone(),
             client_encrypted,
-            body: handle.body,
+            source,
+            journal: Some(journal),
         };
 
         sink.put_object(&row.bucket, object).await?;

@@ -389,9 +389,9 @@ impl<R: Read + Seek> CompressedReader<R> {
     ///
     /// The expected CRNB version is part of [`BlobCipher`], not inferred from the file: current v3
     /// metadata can therefore never be downgraded into the legacy-v2 parser by changing on-disk
-    /// framing. `compression` is the independently stored logical compression descriptor; legacy
-    /// v2 must match its unauthenticated trailer algorithm and geometry to that trusted expectation.
-    /// `expected_logical_len` is likewise trusted object/part metadata and binds v2's unauthenticated
+    /// framing. `compression` is the independently stored logical compression descriptor; every format
+    /// must match its trailer algorithm and geometry to that trusted expectation.
+    /// `expected_logical_len` is likewise trusted object/part metadata and binds the
     /// trailer and index total. A wrong version, size/compression expectation, absent key, or bad key
     /// fails closed before object bytes are returned.
     pub fn open_with_dek(
@@ -521,33 +521,27 @@ impl<R: Read + Seek> CompressedReader<R> {
         let algo = algo_from(t[5])?;
         let block_size = u32::from_le_bytes(t[6..10].try_into().unwrap()) as u64;
         let logical_len = u64::from_le_bytes(t[10..18].try_into().unwrap());
-        // Legacy v2 authenticates block bytes but not its trailer. Bind the unauthenticated
-        // algorithm and block geometry to the trusted object/part metadata before they can drive
-        // decompression or range mapping. An encrypted-but-logically-uncompressed object/part is
-        // still a CRNB container written with the fixed encryption-only geometry.
-        if version == VERSION_ENCRYPTED_V2 {
-            if logical_len != expected_logical_len {
-                return Err(BlobError::Corruption(
-                    "legacy encrypted blob logical length does not match its trusted metadata expectation"
-                        .into(),
-                ));
-            }
-            let (expected_algo, expected_block_size) = match compression {
-                CompressionDescriptor::Uncompressed => (
-                    CompressionAlgorithm::None,
-                    crate::DEFAULT_ENCRYPTED_BLOCK_SIZE,
-                ),
-                CompressionDescriptor::Compressed {
-                    algorithm,
-                    block_size,
-                } => (*algorithm, *block_size),
-            };
-            if algo != expected_algo || block_size != u64::from(expected_block_size) {
-                return Err(BlobError::Corruption(
-                    "legacy encrypted blob compression metadata does not match its trusted metadata expectation"
-                        .into(),
-                ));
-            }
+        // Bind every format's geometry to metadata before block-sized allocations. An equal
+        // block count alone permits one forged v1 block to be much larger than the trusted bound.
+        if logical_len != expected_logical_len {
+            return Err(BlobError::Corruption(
+                "blob logical length does not match its trusted metadata expectation".into(),
+            ));
+        }
+        let (expected_algo, expected_block_size) = match compression {
+            CompressionDescriptor::Uncompressed => (
+                CompressionAlgorithm::None,
+                crate::DEFAULT_ENCRYPTED_BLOCK_SIZE,
+            ),
+            CompressionDescriptor::Compressed {
+                algorithm,
+                block_size,
+            } => (*algorithm, *block_size),
+        };
+        if algo != expected_algo || block_size != u64::from(expected_block_size) {
+            return Err(BlobError::Corruption(
+                "blob compression metadata does not match its trusted metadata expectation".into(),
+            ));
         }
         let mut index = Vec::with_capacity(block_count);
         let mut block_offsets = Vec::with_capacity(block_count);
@@ -647,35 +641,26 @@ impl<R: Read + Seek> CompressedReader<R> {
                 ));
             }
         }
-        // V2's compression flag is unauthenticated. Output-length validation alone is insufficient:
-        // some raw byte strings are valid compressed streams that expand to the same length. The
-        // writer's physical-length invariant makes the two representations disjoint even after the
-        // 16-byte GCM tag: raw is exactly logical+tag, while a stored compressed block has a
-        // non-empty compressed payload strictly shorter than its logical bytes.
-        if version == VERSION_ENCRYPTED_V2 {
-            for entry in &index {
-                let encrypted_payload_len = u64::from(entry.phys_len);
-                let payload_len =
-                    encrypted_payload_len
-                        .checked_sub(GCM_TAG_LEN)
-                        .ok_or_else(|| {
-                            BlobError::Corruption(
-                                "legacy encrypted block is shorter than its authentication tag"
-                                    .into(),
-                            )
-                        })?;
-                let logical_len = u64::from(entry.logical_len);
-                let valid = if entry.compressed {
-                    payload_len > 0 && payload_len < logical_len
-                } else {
-                    payload_len == logical_len
-                };
-                if !valid {
-                    return Err(BlobError::Corruption(
-                        "legacy encrypted block physical length contradicts its compression flag"
-                            .into(),
-                    ));
-                }
+        // Every writer stores raw payloads exactly at logical length, or compressed payloads
+        // strictly shorter, plus a GCM tag when encrypted. Enforce this for all formats before
+        // read_range allocates from phys_len; a corrupt v1 file must not bypass memory admission.
+        let tag_len = if encrypted { GCM_TAG_LEN } else { 0 };
+        for entry in &index {
+            let payload_len = u64::from(entry.phys_len)
+                .checked_sub(tag_len)
+                .ok_or_else(|| {
+                    BlobError::Corruption("block is shorter than its authentication tag".into())
+                })?;
+            let logical_len = u64::from(entry.logical_len);
+            let valid = if entry.compressed {
+                payload_len > 0 && payload_len < logical_len
+            } else {
+                payload_len == logical_len
+            };
+            if !valid {
+                return Err(BlobError::Corruption(
+                    "block physical length contradicts its compression flag".into(),
+                ));
             }
         }
         Ok(Self {
@@ -1420,6 +1405,63 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    /// A corrupt plaintext index must not turn one 64-KiB logical block into an allocation sized
+    /// from a much larger physical file. Reject it while opening, before any block payload read.
+    #[test]
+    fn plaintext_oversized_physical_block_is_rejected_before_read() {
+        let logical = 64 * 1024u32;
+        let physical = 8 * 1024 * 1024u32;
+        for compressed in [false, true] {
+            let mut blob = vec![0; physical as usize];
+            blob.extend_from_slice(&physical.to_le_bytes());
+            blob.extend_from_slice(&logical.to_le_bytes());
+            blob.push(u8::from(compressed));
+            blob.extend_from_slice(&trailer(
+                VERSION_PLAIN,
+                algo_code(CompressionAlgorithm::Lz4),
+                logical,
+                u64::from(logical),
+                1,
+                u64::from(physical),
+                INDEX_ENTRY_LEN as u32,
+            ));
+            let result = CompressedReader::open_with_dek(
+                Cursor::new(blob),
+                BlobCipher::KnownPlaintext,
+                &CompressionDescriptor::Compressed {
+                    algorithm: CompressionAlgorithm::Lz4,
+                    block_size: logical,
+                },
+                u64::from(logical),
+            );
+            assert!(matches!(result, Err(BlobError::Corruption(_))));
+        }
+    }
+
+    /// Equal block counts do not prove equal geometry: one forged block can be much larger than
+    /// the caller's trusted block allowance while passing the pre-allocation index count check.
+    #[test]
+    fn plaintext_block_geometry_must_match_trusted_metadata() {
+        let data = vec![1; 128 * 1024];
+        let blob = encode(CompressionAlgorithm::Lz4, 128 * 1024, &data);
+        for (block_size, logical_len, algorithm) in [
+            (64 * 1024, 64 * 1024, CompressionAlgorithm::Lz4),
+            (256 * 1024, 128 * 1024, CompressionAlgorithm::Lz4),
+            (128 * 1024, 128 * 1024, CompressionAlgorithm::Zstd),
+        ] {
+            let result = CompressedReader::open_with_dek(
+                Cursor::new(blob.clone()),
+                BlobCipher::KnownPlaintext,
+                &CompressionDescriptor::Compressed {
+                    algorithm,
+                    block_size,
+                },
+                logical_len,
+            );
+            assert!(matches!(result, Err(BlobError::Corruption(_))));
+        }
     }
 
     /// The per-block nonce is deterministic in `(dek, block_index)` and distinct across blocks, so

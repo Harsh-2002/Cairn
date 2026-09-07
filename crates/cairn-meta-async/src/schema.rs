@@ -756,6 +756,27 @@ UPDATE replication_outbox SET status='pending', lease_until=NULL WHERE status='c
         name: "internal full-object integrity digest",
         sql: "ALTER TABLE object_versions ADD COLUMN internal_sha256 TEXT;",
     },
+    Migration {
+        version: 33,
+        name: "durable remote multipart cleanup",
+        sql: r#"
+-- No foreign keys: cleanup debt survives bucket deletion and outbox retention.
+CREATE TABLE replication_uploads (
+    id TEXT PRIMARY KEY,
+    bucket_name TEXT NOT NULL,
+    outbox_id TEXT NOT NULL,
+    origin_token TEXT NOT NULL,
+    destination TEXT NOT NULL,
+    upload_id TEXT,
+    cleanup_token TEXT,
+    lease_until INTEGER,
+    next_attempt_at INTEGER NOT NULL,
+    orphan_reported INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT
+);
+CREATE INDEX idx_replication_upload_due ON replication_uploads(orphan_reported, next_attempt_at);
+"#,
+    },
 ];
 
 /// Run all pending migrations on the write driver, recording each as applied. Each migration is

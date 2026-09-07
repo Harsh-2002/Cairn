@@ -80,7 +80,7 @@ impl FakeReplicationSink {
 
 #[async_trait::async_trait]
 impl ReplicationSink for FakeReplicationSink {
-    async fn put_object(&self, object: ReplicatedObject) -> Result<(), ReplicationError> {
+    async fn put_object(&self, object: ReplicatedObject<'_>) -> Result<(), ReplicationError> {
         self.check()?;
         self.intents.lock().unwrap().push(RecordedIntent::Put {
             key: object.key.clone(),

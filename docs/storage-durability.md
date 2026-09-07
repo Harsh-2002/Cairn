@@ -88,6 +88,18 @@ Two S3 semantics must survive compression. The object's reported size is its log
 
 Compression is applied per fixed-size logical block rather than as one stream over the whole object, and this is the central design choice that keeps ranged reads efficient. If an object were one compressed stream, serving a range that begins near the end of a large object would require decompressing everything before it, turning a cheap range read into a full-object decompression. By compressing independent blocks of a fixed logical size and recording each compressed block's location in the index trailer (Section 9.3), Cairn can serve a range by reading and decompressing only the blocks that overlap the requested range and then slicing to the exact bounds, so the cost of a ranged read is proportional to the range plus at most one block of overhead, not to the offset. The block scheme also makes decompression parallelisable across blocks for large reads and keeps per-block memory bounded.
 
+All CRNB versions bind trailer algorithm, block size and logical total to the authoritative
+object/part metadata before serving bytes. At open, each raw physical payload must equal its
+logical length and each compressed payload must be nonempty and strictly shorter; encrypted
+entries additionally contain a 16-byte GCM tag. This bounds block-read allocations by trusted
+logical geometry even when an unencrypted index or trailer is damaged. Physical-file length
+alone is not a sufficient allocation bound.
+
+Replication's guarded reader also carries a shared buffer reservation through the probe and
+streaming blocking tasks. Cancelling the HTTP delivery drops its own reference, but the
+reservation remains charged until the underlying filesystem work and returned body release it.
+This prevents a timed-out reader from releasing admission while its decoder buffers remain live.
+
 ### 10.4 Algorithm choice and the incompressibility heuristic
 
 The default algorithm balances ratio and speed and is the modern general-purpose choice; a faster, lower-ratio algorithm is available for throughput-sensitive deployments, and compression can be off even within an otherwise compression-enabled policy. The algorithm and level are part of the per-bucket compression policy. Compressing already-compressed or incompressible data wastes CPU and can slightly enlarge the data, so Cairn applies a heuristic: object content types that are known to be already compressed, such as common image, video, audio, and archive formats, are stored uncompressed regardless of the policy, and for other content the first block is test-compressed and, if it fails to shrink beyond a threshold, the object is stored uncompressed. This keeps compression from ever hurting, at the cost of a small test on ingest. The decision per object is recorded so reads know the truth.

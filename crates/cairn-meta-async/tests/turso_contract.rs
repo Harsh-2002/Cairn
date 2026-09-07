@@ -3697,6 +3697,7 @@ async fn replication_attempts_are_fenced_parity() {
             .await
             .unwrap();
         cairn_types::testing::assert_replication_claim_fencing(s, &object).await;
+        cairn_types::testing::assert_replication_upload_journal(s, &object.bucket).await;
     }
 }
 
