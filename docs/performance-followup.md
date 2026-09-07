@@ -4,8 +4,8 @@ Five sequential PRs address the September 2026 capacity campaign findings. Histo
 
 | Phase | Change | Status |
 | --- | --- | --- |
-| 1 | TCP_NODELAY on both accepted listeners | Implemented; validation pending |
-| 2 | Reap completed connection tasks | Pending |
+| 1 | TCP_NODELAY on both accepted listeners | PR #76 merged after green CI; 16 focused server tests passed |
+| 2 | Reap completed connection tasks | Implemented; focused selector/shutdown tests passed |
 | 3 | Bounded bucket rendering, coalesced refresh, maintained visible counts | Pending |
 | 4 | Bounded write-stage diagnostics | Pending |
 | 5 | Reuse multipart buffers and measure assembly stages | Pending |
@@ -13,6 +13,16 @@ Five sequential PRs address the September 2026 capacity campaign findings. Histo
 ## Phase 1
 
 The shared accept path configures the socket before either listener enters plaintext/TLS/fast-I/O handling. Setup failure drops the socket and logs the error. Regression coverage asserts the socket option and byte-exact repeated exchanges; optional fast-I/O TLS coverage uses the same accept helper. Timing is advisory rather than a CI threshold. The historical matched comparison removed a recurring approximately 40 ms post-header delay; it is not a new measurement of this commit.
+
+## Phase 2
+
+The live listener selector reaps tasks ahead of accepting more sockets, remains pending with an empty
+task set, and gives shutdown priority. Completed, cancelled, and failed task counts carry into the
+final shutdown report. Tests cover idle connection waves, released permits, panic/cancellation,
+new accepts, pending shutdown and sender closure, and forced-drain accounting. The initial 18
+server tests passed; after adding pending-shutdown coverage, all seven focused shutdown tests passed.
+No new RSS comparison was run: removal of completed task retention is structurally tested, while
+allocator/cache retention and other unexplained memory growth remain separate questions.
 
 ## Remaining limitations
 

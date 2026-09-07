@@ -377,47 +377,46 @@ async fn accept_loop(
 ) -> HttpDrainReport {
     let mut conns = tokio::task::JoinSet::new();
     let mut shutdown = shutdown_rx.clone();
-    loop {
-        if *shutdown.borrow() {
-            break;
-        }
-        tokio::select! {
-            biased;
-            _ = shutdown.changed() => break,
-            accept = accept_stream(&listener) => {
-                let (stream, peer) = match accept {
-                    Ok(v) => v,
-                    Err(e) => { tracing::warn!(error = %e, "accept or socket setup failed"); continue; }
-                };
-                // Cap concurrent connections: acquire a permit held for the connection's lifetime, or
-                // drop the connection immediately if we're at the cap. This bounds FD/memory use
-                // against a flood of idle/slow sockets ahead of the per-request limiter (audit
-                // 2026-07). A drop is counted, never silent.
-                let permit = match state.connection_limiter.clone().try_acquire_owned() {
-                    Ok(p) => p,
-                    Err(_) => {
-                        metrics::counter!("cairn_connections_rejected_total").increment(1);
-                        tracing::debug!(%peer, "connection limit reached; dropping connection");
-                        continue;
-                    }
-                };
-                let st = state.clone();
-                let conn_shutdown = shutdown_rx.clone();
-                // Snapshot the *current* TLS config for this connection; a concurrent reload
-                // affects only subsequently-accepted connections.
-                let tls = tls_rx.as_ref().map(|rx| rx.borrow().clone());
-                conns.spawn(async move {
-                    let _permit = permit; // released when the connection task ends
-                    match tls {
-                        Some(cfg) => serve_tls(stream, cfg, ktls_ready, st, peer, role, conn_shutdown).await,
-                        None => serve_plaintext(stream, st, peer, role, conn_shutdown).await,
-                    }
-                });
+    let mut finished = HttpDrainReport::default();
+    while let Some(accept) =
+        next_connection(&listener, &mut conns, &mut finished, &mut shutdown).await
+    {
+        let (stream, peer) = match accept {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "accept or socket setup failed");
+                continue;
             }
-        }
+        };
+        // Cap concurrent connections: acquire a permit held for the connection's lifetime, or
+        // drop the connection immediately if we're at the cap. This bounds FD/memory use
+        // against a flood of idle/slow sockets ahead of the per-request limiter (audit
+        // 2026-07). A drop is counted, never silent.
+        let permit = match state.connection_limiter.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                metrics::counter!("cairn_connections_rejected_total").increment(1);
+                tracing::debug!(%peer, "connection limit reached; dropping connection");
+                continue;
+            }
+        };
+        let st = state.clone();
+        let conn_shutdown = shutdown_rx.clone();
+        // Snapshot the *current* TLS config for this connection; a concurrent reload
+        // affects only subsequently-accepted connections.
+        let tls = tls_rx.as_ref().map(|rx| rx.borrow().clone());
+        conns.spawn(async move {
+            let _permit = permit; // released when the connection task ends
+            match tls {
+                Some(cfg) => {
+                    serve_tls(stream, cfg, ktls_ready, st, peer, role, conn_shutdown).await
+                }
+                None => serve_plaintext(stream, st, peer, role, conn_shutdown).await,
+            }
+        });
     }
 
-    let report = drain_connections(conns, SHUTDOWN_DRAIN_GRACE).await;
+    let report = finished.merge(drain_connections(conns, SHUTDOWN_DRAIN_GRACE).await);
     if report.is_complete() {
         tracing::info!(
             ?role,
@@ -435,6 +434,41 @@ async fn accept_loop(
         );
     }
     report
+}
+
+/// Reap completed tasks even when no new clients arrive. Shutdown wins over ready completions;
+/// the nonempty guard keeps an idle listener from spinning on `join_next` returning `None`.
+async fn next_connection(
+    listener: &TcpListener,
+    conns: &mut tokio::task::JoinSet<()>,
+    finished: &mut HttpDrainReport,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Option<std::io::Result<(tokio::net::TcpStream, std::net::SocketAddr)>> {
+    loop {
+        if *shutdown.borrow() {
+            return None;
+        }
+        tokio::select! {
+            biased;
+            _ = shutdown.changed() => return None,
+            result = conns.join_next(), if !conns.is_empty() => {
+                if let Some(result) = result {
+                    match result {
+                        Ok(()) => finished.completed += 1,
+                        Err(error) if error.is_cancelled() => {
+                            finished.cancelled += 1;
+                            tracing::warn!(%error, "HTTP connection task was cancelled while serving");
+                        }
+                        Err(error) => {
+                            finished.failed += 1;
+                            tracing::warn!(%error, "HTTP connection task failed while serving");
+                        }
+                    }
+                }
+            }
+            accept = accept_stream(listener) => return Some(accept),
+        }
+    }
 }
 
 /// Configure the accepted socket before either listener enters plaintext, TLS, or fast-I/O
@@ -1570,6 +1604,118 @@ mod request_budget_tests {
 #[cfg(test)]
 mod shutdown_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn idle_listener_reaps_connection_waves_and_preserves_failure_accounting() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (_tx, mut shutdown) = watch::channel(false);
+        let mut conns = tokio::task::JoinSet::new();
+        let mut finished = HttpDrainReport::default();
+        let permits = Arc::new(Semaphore::new(32));
+        for wave in 1..=4 {
+            for _ in 0..32 {
+                let permit = permits.clone().acquire_owned().await.unwrap();
+                conns.spawn(async move {
+                    drop(permit);
+                });
+            }
+            // With no client arriving, the real accept selector must reap then remain pending.
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_millis(100),
+                    next_connection(&listener, &mut conns, &mut finished, &mut shutdown)
+                )
+                .await
+                .is_err()
+            );
+            assert!(conns.is_empty());
+            assert_eq!(finished.completed, wave * 32);
+            assert_eq!(permits.available_permits(), 32);
+        }
+        conns.spawn(async { panic!("test connection failure") });
+        let cancelled = conns.spawn(std::future::pending());
+        cancelled.abort();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                next_connection(&listener, &mut conns, &mut finished, &mut shutdown)
+            )
+            .await
+            .is_err()
+        );
+        assert!(conns.is_empty());
+        let report = finished.merge(drain_connections(conns, Duration::from_secs(1)).await);
+        assert_eq!(report.completed, 128);
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.cancelled, 1);
+        assert!(!report.is_complete());
+    }
+
+    #[tokio::test]
+    async fn connection_selector_accepts_and_prioritizes_shutdown() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (tx, mut shutdown) = watch::channel(false);
+        let mut conns = tokio::task::JoinSet::new();
+        let mut finished = HttpDrainReport::default();
+        let _client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            next_connection(&listener, &mut conns, &mut finished, &mut shutdown)
+                .await
+                .unwrap()
+                .is_ok()
+        );
+        conns.spawn(async {});
+        tx.send(true).unwrap();
+        assert!(
+            next_connection(&listener, &mut conns, &mut finished, &mut shutdown)
+                .await
+                .is_none()
+        );
+        assert_eq!(finished.completed, 0);
+        let report = finished.merge(drain_connections(conns, Duration::from_secs(1)).await);
+        assert_eq!(report.completed, 1);
+        assert!(report.is_complete());
+    }
+
+    #[tokio::test]
+    async fn pending_connection_selector_wakes_on_shutdown_or_sender_closure() {
+        for close_sender in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let (tx, mut shutdown) = watch::channel(false);
+            let mut conns = tokio::task::JoinSet::new();
+            let mut finished = HttpDrainReport::default();
+            let mut selector = Box::pin(next_connection(
+                &listener,
+                &mut conns,
+                &mut finished,
+                &mut shutdown,
+            ));
+            // Poll once before publishing shutdown: this exercises the registered watch
+            // waiter, rather than only the loop's already-shutdown early return.
+            assert!(
+                std::future::poll_fn(|cx| {
+                    std::task::Poll::Ready(std::future::Future::poll(selector.as_mut(), cx))
+                })
+                .await
+                .is_pending()
+            );
+            if close_sender {
+                drop(tx);
+            } else {
+                tx.send(true).unwrap();
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_secs(1), selector)
+                    .await
+                    .expect("shutdown must wake an idle listener")
+                    .is_none()
+            );
+            assert!(conns.is_empty());
+            assert_eq!(finished.completed, 0);
+        }
+    }
 
     struct DropFlag(Arc<AtomicBool>);
 
