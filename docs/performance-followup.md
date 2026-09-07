@@ -35,7 +35,9 @@ forced browser termination also clean up test profiles/listeners.
 Schema v34 backfills exact current-visible counters once. Both SQL backends update visibility
 inside writer savepoints; overview reads use per-bucket rollups while byte/version meanings stay
 unchanged. Focused local validation passed: four counter tests, populated migration/idempotence,
-nine sharding tests, console lint/build/audits and browser tests. Async-backend parity tests are
+nine sharding tests, console lint/build/audits and browser tests. CI exposed legacy migration
+fixtures missing pre-existing rollup tables; those fixtures were corrected in both SQL backends,
+and all 23 default-backend migration tests then passed locally. Async-backend parity tests are
 included for CI. The bounded 100,000-row query comparison and its limitations are in
 [benchmarks.md](benchmarks.md#maintained-visible-counts-bounded-query-comparison-2026-09-08).
 Client-side pagination bounds rendering; existing bucket-list API payloads still contain all buckets.

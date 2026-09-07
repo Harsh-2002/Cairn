@@ -943,6 +943,9 @@ mod tests {
                      applied_at INTEGER NOT NULL
                  );
                  INSERT INTO schema_migrations VALUES (24, 'legacy fixture', 0);
+                 CREATE TABLE bucket_stats (bucket_name TEXT PRIMARY KEY,
+                     versions INTEGER NOT NULL DEFAULT 0, logical_bytes INTEGER NOT NULL DEFAULT 0,
+                     physical_bytes INTEGER NOT NULL DEFAULT 0);
                  CREATE TABLE replication_outbox (id TEXT PRIMARY KEY, status TEXT NOT NULL, lease_until INTEGER);
                  CREATE TABLE buckets (name TEXT PRIMARY KEY);
                  INSERT INTO buckets VALUES ('photos');
@@ -1060,6 +1063,9 @@ mod tests {
                      applied_at INTEGER NOT NULL
                  );
                  INSERT INTO schema_migrations VALUES (26, 'legacy fixture', 0);
+                 CREATE TABLE bucket_stats (bucket_name TEXT PRIMARY KEY,
+                     versions INTEGER NOT NULL DEFAULT 0, logical_bytes INTEGER NOT NULL DEFAULT 0,
+                     physical_bytes INTEGER NOT NULL DEFAULT 0);
                  CREATE TABLE replication_outbox (id TEXT PRIMARY KEY, status TEXT NOT NULL, lease_until INTEGER);
                  CREATE TABLE object_versions (
                      id TEXT PRIMARY KEY,
@@ -1132,6 +1138,9 @@ mod tests {
                      applied_at INTEGER NOT NULL
                  );
                  INSERT INTO schema_migrations VALUES (27, 'legacy fixture', 0);
+                 CREATE TABLE bucket_stats (bucket_name TEXT PRIMARY KEY,
+                     versions INTEGER NOT NULL DEFAULT 0, logical_bytes INTEGER NOT NULL DEFAULT 0,
+                     physical_bytes INTEGER NOT NULL DEFAULT 0);
                  CREATE TABLE replication_outbox (id TEXT PRIMARY KEY, status TEXT NOT NULL, lease_until INTEGER);
                  CREATE TABLE object_versions (
                      id TEXT PRIMARY KEY,
@@ -1195,7 +1204,11 @@ mod tests {
                      applied_at INTEGER NOT NULL
                  );
                  INSERT INTO schema_migrations VALUES (28, 'legacy fixture', 0);
-                 CREATE TABLE object_versions (id TEXT PRIMARY KEY);
+                 CREATE TABLE object_versions (id TEXT PRIMARY KEY, bucket_name TEXT NOT NULL,
+                     is_latest INTEGER NOT NULL DEFAULT 1, is_delete_marker INTEGER NOT NULL DEFAULT 0);
+                 CREATE TABLE bucket_stats (bucket_name TEXT PRIMARY KEY,
+                     versions INTEGER NOT NULL DEFAULT 0, logical_bytes INTEGER NOT NULL DEFAULT 0,
+                     physical_bytes INTEGER NOT NULL DEFAULT 0);
                  CREATE TABLE replication_outbox (id TEXT PRIMARY KEY, status TEXT NOT NULL, lease_until INTEGER);
                  CREATE TABLE multipart_uploads (
                      id TEXT PRIMARY KEY,

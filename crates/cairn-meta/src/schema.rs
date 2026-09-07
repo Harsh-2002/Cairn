@@ -1557,7 +1557,10 @@ mod tests {
                  PRAGMA foreign_keys=ON;",
             )
             .unwrap();
-            conn.execute_batch("CREATE TABLE replication_outbox (id TEXT PRIMARY KEY, status TEXT NOT NULL, lease_until INTEGER);").unwrap();
+            conn.execute_batch("CREATE TABLE bucket_stats (bucket_name TEXT PRIMARY KEY,
+                     versions INTEGER NOT NULL DEFAULT 0, logical_bytes INTEGER NOT NULL DEFAULT 0,
+                     physical_bytes INTEGER NOT NULL DEFAULT 0);
+                 CREATE TABLE replication_outbox (id TEXT PRIMARY KEY, status TEXT NOT NULL, lease_until INTEGER);").unwrap();
             run_migrations(&conn).unwrap();
 
             assert!(!column_exists(&conn, "object_shares", "token"));
@@ -1718,7 +1721,10 @@ mod tests {
         )
         .unwrap();
 
-        conn.execute_batch("CREATE TABLE replication_outbox (id TEXT PRIMARY KEY, status TEXT NOT NULL, lease_until INTEGER);").unwrap();
+        conn.execute_batch("CREATE TABLE bucket_stats (bucket_name TEXT PRIMARY KEY,
+                     versions INTEGER NOT NULL DEFAULT 0, logical_bytes INTEGER NOT NULL DEFAULT 0,
+                     physical_bytes INTEGER NOT NULL DEFAULT 0);
+                 CREATE TABLE replication_outbox (id TEXT PRIMARY KEY, status TEXT NOT NULL, lease_until INTEGER);").unwrap();
         run_migrations(&conn).unwrap();
         let locks: Vec<(String, String)> = conn
             .prepare("SELECT key, lock_mode FROM object_locks ORDER BY key")
@@ -1780,7 +1786,10 @@ mod tests {
         )
         .unwrap();
 
-        conn.execute_batch("CREATE TABLE replication_outbox (id TEXT PRIMARY KEY, status TEXT NOT NULL, lease_until INTEGER);").unwrap();
+        conn.execute_batch("CREATE TABLE bucket_stats (bucket_name TEXT PRIMARY KEY,
+                     versions INTEGER NOT NULL DEFAULT 0, logical_bytes INTEGER NOT NULL DEFAULT 0,
+                     physical_bytes INTEGER NOT NULL DEFAULT 0);
+                 CREATE TABLE replication_outbox (id TEXT PRIMARY KEY, status TEXT NOT NULL, lease_until INTEGER);").unwrap();
         run_migrations(&conn).unwrap();
         let columns = conn
             .prepare("SELECT name FROM pragma_index_info('idx_ov_latest_cover') ORDER BY seqno")
@@ -1834,7 +1843,8 @@ mod tests {
                  applied_at INTEGER NOT NULL
              );
              INSERT INTO schema_migrations VALUES (28, 'legacy fixture', 0);
-                 CREATE TABLE object_versions (id TEXT PRIMARY KEY);
+                 CREATE TABLE object_versions (id TEXT PRIMARY KEY, bucket_name TEXT NOT NULL,
+                     is_latest INTEGER NOT NULL DEFAULT 1, is_delete_marker INTEGER NOT NULL DEFAULT 0);
              CREATE TABLE multipart_uploads (
                  id TEXT PRIMARY KEY,
                  status TEXT NOT NULL
@@ -1844,7 +1854,10 @@ mod tests {
         )
         .unwrap();
 
-        conn.execute_batch("CREATE TABLE replication_outbox (id TEXT PRIMARY KEY, status TEXT NOT NULL, lease_until INTEGER);").unwrap();
+        conn.execute_batch("CREATE TABLE bucket_stats (bucket_name TEXT PRIMARY KEY,
+                     versions INTEGER NOT NULL DEFAULT 0, logical_bytes INTEGER NOT NULL DEFAULT 0,
+                     physical_bytes INTEGER NOT NULL DEFAULT 0);
+                 CREATE TABLE replication_outbox (id TEXT PRIMARY KEY, status TEXT NOT NULL, lease_until INTEGER);").unwrap();
         run_migrations(&conn).unwrap();
         let rows = conn
             .prepare(
