@@ -154,3 +154,8 @@ Remote multipart uploads have a separate durable journal with no bucket/outbox c
 keys. Persist before initiation and before parts; retain missing receipt incidents and accept late
 receipts while rejecting further data I/O after ownership loss. Existing workers claim cleanup
 independently using exact renewed leases; saved endpoint/bucket identity must match current routing.
+
+After remote abort succeeds, verify `ListParts(max-parts=1)` is empty and untruncated (or reports
+`NoSuchUpload`) before retiring its journal. In-flight S3 parts can finish after abort returns;
+visible parts/errors retain debt for another pass. Cleanup DELETE/GET carries the signed replica
+marker; generic S3 credentials also require `s3:ListMultipartUploadParts` for confirmation.

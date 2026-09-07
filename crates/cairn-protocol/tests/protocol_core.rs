@@ -17566,3 +17566,190 @@ async fn put_and_copy_persist_internal_plaintext_digest_without_checksum_headers
         assert!(header(&headers, "x-amz-checksum-sha256").is_none());
     }
 }
+
+#[tokio::test]
+async fn missing_replica_multipart_cleanup_requires_replication_authority() {
+    let h = harness_with_authz(Arc::new(cairn_authz::PolicyEngine)).await;
+    versioned_bucket(&h, "cleanup-replica").await;
+    let replicator = member_with_policy(
+        "replicator",
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:ReplicateObject","Resource":"arn:aws:s3:::cleanup-replica/*"}]}"#,
+    );
+    let ordinary = member_with_policy(
+        "ordinary",
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:PutObject","s3:ListMultipartUploadParts","s3:AbortMultipartUpload"],"Resource":"arn:aws:s3:::cleanup-replica/*"}]}"#,
+    );
+    let marker = [("x-amz-meta-cairn-replica", "true")];
+    let source_version = VersionId::generate();
+    let (_, _, body) = drain(
+        send(
+            &h.svc,
+            req_with_principal(
+                Method::POST,
+                Some("cleanup-replica"),
+                Some("key"),
+                &[("uploads", "")],
+                &[
+                    ("x-amz-meta-cairn-replica", "true"),
+                    (
+                        "x-amz-meta-cairn-replica-version-id",
+                        source_version.as_str(),
+                    ),
+                ],
+                vec![],
+                replicator.clone(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    let upload = between(
+        &String::from_utf8(body).unwrap(),
+        "<UploadId>",
+        "</UploadId>",
+    );
+    let (status, _, _) = drain(
+        send(
+            &h.svc,
+            req_with_principal(
+                Method::DELETE,
+                Some("cleanup-replica"),
+                Some("key"),
+                &[("uploadId", &upload)],
+                &marker,
+                vec![],
+                replicator.clone(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    for method in [Method::GET, Method::DELETE] {
+        for (principal, headers, expected) in [
+            (replicator.clone(), marker.as_slice(), StatusCode::NOT_FOUND),
+            (replicator.clone(), &[][..], StatusCode::FORBIDDEN),
+            (ordinary.clone(), marker.as_slice(), StatusCode::FORBIDDEN),
+            (ordinary.clone(), &[][..], StatusCode::NOT_FOUND),
+        ] {
+            let (status, _, body) = drain(
+                send(
+                    &h.svc,
+                    req_with_principal(
+                        method.clone(),
+                        Some("cleanup-replica"),
+                        Some("key"),
+                        &[("uploadId", &upload), ("max-parts", "1")],
+                        headers,
+                        vec![],
+                        principal,
+                    ),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(
+                status,
+                expected,
+                "{method}: {}",
+                String::from_utf8_lossy(&body)
+            );
+            if expected == StatusCode::NOT_FOUND {
+                assert!(String::from_utf8_lossy(&body).contains("<Code>NoSuchUpload</Code>"));
+            }
+        }
+        // A higher-precedence tagging request cannot become a cleanup probe by appending uploadId.
+        let (status, _, _) = drain(
+            send(
+                &h.svc,
+                req_with_principal(
+                    method.clone(),
+                    Some("cleanup-replica"),
+                    Some("key"),
+                    &[("uploadId", &upload), ("tagging", "")],
+                    &marker,
+                    vec![],
+                    replicator.clone(),
+                ),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+    let (status, _, body) = drain(
+        send(
+            &h.svc,
+            req_with_principal(
+                Method::POST,
+                Some("cleanup-replica"),
+                Some("ordinary"),
+                &[("uploads", "")],
+                &[],
+                vec![],
+                ordinary.clone(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let ordinary_upload = between(
+        &String::from_utf8(body).unwrap(),
+        "<UploadId>",
+        "</UploadId>",
+    );
+    for method in [Method::GET, Method::DELETE] {
+        let (status, _, _) = drain(
+            send(
+                &h.svc,
+                req_with_principal(
+                    method,
+                    Some("cleanup-replica"),
+                    Some("ordinary"),
+                    &[("uploadId", &ordinary_upload)],
+                    &marker,
+                    vec![],
+                    replicator.clone(),
+                ),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a marker cannot promote an ordinary session"
+        );
+    }
+    assert!(
+        h.meta
+            .get_multipart(&UploadId::from_string(ordinary_upload))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    for method in [Method::PUT, Method::POST] {
+        let (status, _, _) = drain(
+            send(
+                &h.svc,
+                req_with_principal(
+                    method,
+                    Some("cleanup-replica"),
+                    Some("key"),
+                    &[("uploadId", &upload), ("partNumber", "1")],
+                    &marker,
+                    vec![],
+                    replicator.clone(),
+                ),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "missing-session authority only covers cleanup probes"
+        );
+    }
+}
