@@ -78,7 +78,7 @@ fn describe_metrics() {
     describe_histogram!(
         "cairn_writer_commit_seconds",
         Unit::Seconds,
-        "Wall time of a single metadata group-commit durability barrier (the fsync)"
+        "Wall time of SQLite COMMIT, including scheduler and I/O waits"
     );
     describe_counter!(
         "cairn_writer_stage_samples_dropped_total",

@@ -27,7 +27,7 @@ const MAX_COMMIT_SAMPLES: usize = 8192;
 
 /// One group-commit outcome, recorded after the durability barrier and drained by the server into
 /// the writer histograms. Together they show group-commit health under load: `commit_seconds`
-/// climbing is a stall on the fsync barrier; `batch_size` collapsing to 1 under concurrency means
+/// climbing identifies time spent in COMMIT; `batch_size` collapsing to 1 under concurrency means
 /// the batching broke.
 #[derive(Debug, Clone, Copy)]
 pub struct CommitSample {
@@ -541,7 +541,7 @@ fn commit_batch(
     }
 
     // One commit = one durability barrier covering every surviving mutation in the batch. Time only
-    // the barrier itself (the fsync) for `cairn_writer_commit_seconds`.
+    // the COMMIT call (including scheduler and I/O waits) for `cairn_writer_commit_seconds`.
     let commit_start = Instant::now();
     let commit = conn.execute_batch("COMMIT");
     let commit_seconds = commit_start.elapsed().as_secs_f64();
