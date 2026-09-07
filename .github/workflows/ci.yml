@@ -930,8 +930,14 @@ jobs:
   bench-compare:
     name: warp head-to-head vs MinIO
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Free disk space for multipart staging and MinIO replicas
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be
+        with:
+          tool-cache: false
+          large-packages: false
       - uses: ./.github/actions/setup   # web/dist (embedded) + toolchain + cache
       # A throughput comparison needs an OPTIMIZED build. The shared `cairn-bin` artifact is an
       # unstripped DEBUG binary (correct behaviour, but many× slower on hot loops) — benchmarking it
@@ -943,6 +949,10 @@ jobs:
       # faster — a contended runner has large run-to-run throughput variance (docs/benchmarks.md §7).
       - name: Cairn vs MinIO side-by-side (warp)
         run: BIN=target/release/cairn BENCH_CSV=bench.csv BENCH_JSON=bench.json bash conformance/bench_compare.sh
+      # Reuse the optimized binary. Actual encrypted logical sizes cross both removed transport
+      # ceilings, with streamed fixture/hash I/O, exact native version identity and bounded RSS.
+      - name: Real encrypted >2 GiB and >5 GiB replication to Cairn and MinIO
+        run: BIN=target/release/cairn LARGE_ENCRYPT=true LARGE_REPORT=replication-large.json bash conformance/replication_large.sh
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:
@@ -950,6 +960,7 @@ jobs:
           path: |
             bench.csv
             bench.json
+            replication-large.json
           retention-days: 14
           if-no-files-found: warn
 

@@ -279,6 +279,15 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   ops/s, Complete wall times, CPU-s/GiB, expirations observed — is advisory (CI drives the debug
   artifact); `SOAK_OUT=` writes it all as JSON.
 - `warp.sh` — the MinIO `warp` macro benchmark (get/put/mixed); downloads `warp` once. Gates on errors.
+- `replication_large.sh` (+`.py`) — real 2 GiB + 17 and 5 GiB + 17 logical-byte replication to
+  native Cairn and a SHA-pinned MinIO binary. Multipart source generation and all download hashing
+  use bounded MiB chunks that differ at every offset; source compression is asserted. Native version
+  identity, generic S3 at-least-once semantics, empty healthy upload journals, no remote MPUs and
+  a 512 MiB source RSS ceiling are gates. JSON reports size/hash/version/time/RSS evidence. Use an
+  optimized binary; `--smoke` is only a 65 MiB wiring check. `LARGE_ENCRYPT=true` covers encrypted
+  source/receiver staging; the existing release-build benchmark CI job runs that full-size arm.
+  Allow at least 16 GiB working space for native multipart staging plus MinIO replicas. Crash/debt coverage is
+  tracked separately in Phase 4C; this harness covers healthy delivery, not real AWS credentials.
 - `bench_compare.sh` — **Cairn vs MinIO head-to-head**: boots Cairn AND a pinned MinIO server on one
   host and drives warp against each side-by-side (PUT/GET/STAT/DELETE/LIST/MIXED). Runs per push
   (`bench-compare` CI job → job-summary table + CSV/JSON artifact). **Report-not-gate**: the signal is
