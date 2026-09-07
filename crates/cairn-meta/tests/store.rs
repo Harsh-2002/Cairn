@@ -649,6 +649,7 @@ fn multipart(bucket: &BucketName, key: &str, id: &str) -> Mutation {
             owner_id: UserId("owner".to_owned()),
             initiated_by: UserId("owner".to_owned()),
             intended_acl: None,
+            replica_intent: None,
             user_metadata: Vec::new(),
             initial_tags: Vec::new(),
             lock_intent: ExplicitObjectLockIntent::default(),
@@ -1633,6 +1634,7 @@ async fn delete_bucket_rejects_nonempty_inside_the_savepoint() {
         owner_id: UserId("owner".to_owned()),
         initiated_by: UserId("owner".to_owned()),
         intended_acl: None,
+        replica_intent: None,
         user_metadata: Vec::new(),
         initial_tags: Vec::new(),
         lock_intent: ExplicitObjectLockIntent::default(),
@@ -4054,6 +4056,7 @@ async fn multipart_reservations_bound_quota_cardinality_and_cleanup_debt() {
         owner_id: principal.clone(),
         initiated_by: principal.clone(),
         intended_acl: None,
+        replica_intent: None,
         user_metadata: Vec::new(),
         initial_tags: Vec::new(),
         lock_intent: ExplicitObjectLockIntent::default(),
@@ -4626,6 +4629,7 @@ async fn multipart_completion_resolves_current_default_and_commits_tags_and_lock
                 owner_id: UserId("owner".to_owned()),
                 initiated_by: UserId("owner".to_owned()),
                 intended_acl: None,
+                replica_intent: None,
                 user_metadata: Vec::new(),
                 initial_tags: vec![("source".to_owned(), "multipart".to_owned())],
                 lock_intent: ExplicitObjectLockIntent {
@@ -4919,6 +4923,7 @@ async fn multipart_explicit_lock_survives_late_failure_and_retry() {
                 owner_id: UserId("owner".to_owned()),
                 initiated_by: UserId("owner".to_owned()),
                 intended_acl: None,
+                replica_intent: None,
                 user_metadata: Vec::new(),
                 initial_tags: vec![("retry".to_owned(), "preserved".to_owned())],
                 lock_intent: ExplicitObjectLockIntent {
@@ -5062,4 +5067,14 @@ async fn replication_attempts_are_fenced() {
         .await
         .unwrap();
     cairn_types::testing::assert_replication_claim_fencing(&store, &object).await;
+}
+
+#[path = "common/multipart_replica.rs"]
+mod multipart_replica;
+
+#[tokio::test]
+async fn multipart_replica_intent_survives_claim_recovery() {
+    let store = cairn_meta::open_in_memory().unwrap();
+    multipart_replica::preserves_replica_intent(&store).await;
+    multipart_replica::preserves_replica_intent(&cairn_types::testing::InMemoryMetadataStore::new()).await;
 }

@@ -94,3 +94,7 @@ range-seek, same outcomes. `cairn-meta` is left untouched. Selected at runtime b
 Replication outbox migration v30 adds exact attempt ownership. Done/fail/defer/renew validate the
 claimed status, token, and lease inside the writer savepoint; every backend and shard fan-out must
 preserve the typed applied result. Recovery invalidates tokens before new workers can claim.
+
+Multipart sessions persist nullable `replica_intent` (source identity, response headers and expected
+whole-object checksums). Decode it strictly and preserve it through claim/release/restart recovery;
+ordinary and legacy uploads have no replica capability.

@@ -16071,6 +16071,7 @@ async fn pre_v21_session_completes_legacy() {
         owner_id: UserId("admin".to_owned()),
         initiated_by: UserId("admin".to_owned()),
         intended_acl: None,
+        replica_intent: None,
         user_metadata: Vec::new(),
         initial_tags: Vec::new(),
         lock_intent: cairn_types::ExplicitObjectLockIntent::default(),
@@ -16700,6 +16701,7 @@ async fn complete_multipart_encrypted_session_with_plaintext_part_fails_closed()
         owner_id: UserId("admin".to_owned()),
         initiated_by: UserId("admin".to_owned()),
         intended_acl: None,
+        replica_intent: None,
         user_metadata: Vec::new(),
         initial_tags: Vec::new(),
         lock_intent: cairn_types::ExplicitObjectLockIntent::default(),
@@ -17171,6 +17173,299 @@ async fn replication_intent_errors_prevent_commits_and_preserve_multipart_retry(
                 .unwrap()
                 .len(),
             1
+        );
+    }
+}
+
+/// A replica upload's capability is pinned at initiate, persists through every part, and cannot
+/// be acquired by supplying replica headers to an ordinary upload. Retry keeps source identity.
+#[tokio::test]
+async fn multipart_replica_intent_is_authorized_persisted_and_idempotent() {
+    use base64::Engine as _;
+    use sha2::Digest as _;
+    let h = harness_with_authz(Arc::new(cairn_authz::PolicyEngine)).await;
+    versioned_bucket(&h, "replica-mpu").await;
+    set_replication(&h, "replica-mpu", "", false).await;
+    h.meta
+        .submit(cairn_types::Mutation::SetBucketConfig {
+            bucket: BucketName::parse("replica-mpu").unwrap(),
+            aspect: cairn_types::ConfigAspect::Encryption,
+            doc: Some(cairn_types::ConfigDoc(r#"{"required":true}"#.to_owned())),
+        })
+        .await
+        .unwrap();
+    let writer = member_with_policy(
+        "writer",
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:PutObject","Resource":"arn:aws:s3:::replica-mpu/*"}]}"#,
+    );
+    let replicator = member_with_policy(
+        "replicator",
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:ReplicateObject","Resource":"arn:aws:s3:::replica-mpu/*"}]}"#,
+    );
+    let source_id = VersionId::generate();
+    let bytes = b"authenticated multipart replica";
+    let checksum = base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(bytes));
+    let headers = [
+        ("x-amz-meta-cairn-replica", "true"),
+        ("x-amz-meta-cairn-replica-version-id", source_id.as_str()),
+        ("x-amz-checksum-sha256", checksum.as_str()),
+        ("x-amz-tagging", "origin=source"),
+        ("cache-control", "max-age=120"),
+        ("content-language", "en"),
+        ("x-amz-meta-note", "preserved"),
+    ];
+    let (status, _, _) = drain(
+        send(
+            &h.svc,
+            req_with_principal(
+                Method::POST,
+                Some("replica-mpu"),
+                Some("key"),
+                &[("uploads", "")],
+                &headers,
+                vec![],
+                writer.clone(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "ordinary writer cannot initiate replica intent"
+    );
+
+    // A forged marker on an ordinary session cannot promote it, even with a replication principal.
+    let (_, _, body) = drain(
+        send(
+            &h.svc,
+            req_with_principal(
+                Method::POST,
+                Some("replica-mpu"),
+                Some("ordinary"),
+                &[("uploads", "")],
+                &[],
+                vec![],
+                writer.clone(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    let ordinary = between(
+        &String::from_utf8(body).unwrap(),
+        "<UploadId>",
+        "</UploadId>",
+    );
+    let (status, _, _) = drain(
+        send(
+            &h.svc,
+            req_with_principal(
+                Method::PUT,
+                Some("replica-mpu"),
+                Some("ordinary"),
+                &[("uploadId", &ordinary), ("partNumber", "1")],
+                &headers,
+                bytes.to_vec(),
+                replicator.clone(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(
+        h.meta
+            .get_multipart(&UploadId::from_string(ordinary))
+            .await
+            .unwrap()
+            .unwrap()
+            .replica_intent
+            .is_none()
+    );
+
+    for attempt in 0..2 {
+        let (status, _, body) = drain(
+            send(
+                &h.svc,
+                req_with_principal(
+                    Method::POST,
+                    Some("replica-mpu"),
+                    Some("key"),
+                    &[("uploads", "")],
+                    &headers,
+                    vec![],
+                    replicator.clone(),
+                ),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "replication-only credential can initiate: {body:?}"
+        );
+        let upload = between(
+            &String::from_utf8(body).unwrap(),
+            "<UploadId>",
+            "</UploadId>",
+        );
+        let session = h
+            .meta
+            .get_multipart(&UploadId::from_string(upload.clone()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            session.replica_intent.as_ref().unwrap().version_id,
+            source_id
+        );
+        assert!(session.encrypt_parts);
+        for (method, query) in [
+            (
+                Method::PUT,
+                vec![("uploadId", upload.as_str()), ("partNumber", "1")],
+            ),
+            (Method::POST, vec![("uploadId", upload.as_str())]),
+            (Method::DELETE, vec![("uploadId", upload.as_str())]),
+        ] {
+            let (status, _, _) = drain(
+                send(
+                    &h.svc,
+                    req_with_principal(
+                        method,
+                        Some("replica-mpu"),
+                        Some("key"),
+                        &query,
+                        &[],
+                        vec![],
+                        writer.clone(),
+                    ),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "writer cannot mutate a replica session"
+            );
+        }
+        // Appended uploadId must never turn a metadata GET into a replication operation.
+        let (status, _, _) = drain(
+            send(
+                &h.svc,
+                req_with_principal(
+                    Method::GET,
+                    Some("replica-mpu"),
+                    Some("key"),
+                    &[("uploadId", &upload), ("tagging", "")],
+                    &[],
+                    vec![],
+                    replicator.clone(),
+                ),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, part_headers, _) = drain(
+            send(
+                &h.svc,
+                req_with_principal(
+                    Method::PUT,
+                    Some("replica-mpu"),
+                    Some("key"),
+                    &[("uploadId", &upload), ("partNumber", "1")],
+                    &[],
+                    bytes.to_vec(),
+                    replicator.clone(),
+                ),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let etag = header(&part_headers, "etag").unwrap();
+        let complete = format!(
+            "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part></CompleteMultipartUpload>"
+        );
+        let (status, result_headers, body) = drain(
+            send(
+                &h.svc,
+                req_with_principal(
+                    Method::POST,
+                    Some("replica-mpu"),
+                    Some("key"),
+                    &[("uploadId", &upload)],
+                    &[],
+                    complete.into_bytes(),
+                    replicator.clone(),
+                ),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "attempt {attempt}: {body:?}");
+        assert_eq!(
+            header(&result_headers, "x-amz-version-id"),
+            Some(source_id.as_str())
+        );
+        let (status, get_headers, actual) = drain(
+            send(
+                &h.svc,
+                req(
+                    Method::GET,
+                    Some("replica-mpu"),
+                    Some("key"),
+                    &[],
+                    &[("x-amz-checksum-mode", "ENABLED")],
+                    vec![],
+                ),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(actual, bytes);
+        assert_eq!(header(&get_headers, "cache-control"), Some("max-age=120"));
+        assert_eq!(header(&get_headers, "content-language"), Some("en"));
+        assert_eq!(
+            header(&get_headers, "x-amz-server-side-encryption"),
+            Some("AES256")
+        );
+        assert_eq!(
+            header(&get_headers, "x-amz-checksum-sha256"),
+            Some(checksum.as_str())
+        );
+        let bucket = BucketName::parse("replica-mpu").unwrap();
+        let key = ObjectKey::parse("key").unwrap();
+        let row = h
+            .meta
+            .current_version(&bucket, &key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.version_id, source_id);
+        assert_eq!(
+            row.replication_status,
+            Some(cairn_types::meta::ReplicationStatus::Replica)
+        );
+        assert_eq!(
+            h.meta
+                .get_object_tags(&bucket, &key, &source_id)
+                .await
+                .unwrap(),
+            vec![("origin".to_owned(), "source".to_owned())]
+        );
+        assert!(
+            h.meta
+                .list_due_replication(100, cairn_types::Timestamp::from_secs(4_000_000_000))
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 }

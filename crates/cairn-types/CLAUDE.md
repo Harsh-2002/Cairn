@@ -113,3 +113,7 @@ freezing this crate freezes the seams. `#![forbid(unsafe_code)]`.
   unusable forwarding metadata must not be collapsed to its own socket address.
 - Spec: trait spine + metadata model in `docs/metadata.md` (11–12); error model in
   `docs/security-errors.md` (25). See the root `../../CLAUDE.md` for the gate and workspace-wide rules.
+
+Multipart sessions persist nullable `replica_intent` (source identity, response headers and expected
+whole-object checksums). Decode it strictly and preserve it through claim/release/restart recovery;
+ordinary and legacy uploads have no replica capability.

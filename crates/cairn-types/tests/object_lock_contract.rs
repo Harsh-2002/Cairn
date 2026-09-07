@@ -116,6 +116,7 @@ fn session(
         owner_id: UserId("owner".to_owned()),
         initiated_by: UserId("writer".to_owned()),
         intended_acl: None,
+        replica_intent: None,
         user_metadata: Vec::new(),
         initial_tags: tags,
         lock_intent,

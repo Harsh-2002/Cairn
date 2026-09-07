@@ -1,14 +1,15 @@
 # Replication and recovery implementation phases
 
 Approved implementation plan, based on main `34c78e3`. Deliver independently gated PRs in this
-order. This is a work tracker; entries must not claim completion until validation passes.
+order, except independent integrity migration v32 lands before remote-cleanup migration v33.
+This is a work tracker; entries must not claim completion until validation passes.
 
 | Phase | Deliverable | Status |
 |---|---|---|
 | 1 | Fail-closed replication intent across writes and marker deletes; cleanup and retry tests | Merged in PR #69 |
-| 2 | Exact attempt-token fencing and renewal of active/waiting claims; backend parity | Implemented; 28 engine and 273 backend tests pass; full gate and draft PR CI pending |
+| 2 | Exact attempt-token fencing and renewal of active/waiting claims; backend parity | Merged in PR #71 after exact-head CI passed |
 | 4A | Required pinned-verifier signature/checksum checks for host and digest-pinned container installs | Merged in PR #70 |
-| 3A | Authorized persisted replica multipart intent; identity, loop prevention, encryption and locks | Pending |
+| 3A | Authorized persisted replica multipart intent; identity, loop prevention, encryption and locks | Implemented; authorization regression and live crash/restore passed; full gate and PR CI pending |
 | 3B | Reopenable logical ranges, signed two-pass streaming, multipart delivery, durable remote cleanup | Pending |
 | 4B | Full-object checksum scrub, persisted internal SHA-256, legacy coverage, opt-in scrub pacing | Pending |
 | 4C | Single-SQLite restore/crash coverage for every new durable field and accurate recovery runbooks | Pending |
@@ -26,7 +27,8 @@ order. This is a work tracker; entries must not claim completion until validatio
   unknown initiation outcomes require explicit orphan reporting and destination lifecycle cleanup.
 - Require cryptographic installer verification without a bypass, including older artifact rejection.
 - Native recovery remains offline single SQLite. No clustering, external store, multi-shard backup,
-  down-migrations, releases, deployments, or automatic merges.
+  down-migrations, releases, or deployments. The user authorized merging each reviewed PR once
+  its exact-head CI passes.
 - Every shared mutation/read mirrors SQLite, async backends, in-memory doubles, and routing. Schema
   migrations are append-only and numbered from the actual current tip.
 

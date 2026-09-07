@@ -746,6 +746,11 @@ ALTER TABLE replication_outbox ADD COLUMN claim_token TEXT;
 UPDATE replication_outbox SET status='pending', lease_until=NULL WHERE status='claimed';
 "#,
     },
+    Migration {
+        version: 31,
+        name: "authenticated multipart replica intent",
+        sql: "ALTER TABLE multipart_uploads ADD COLUMN replica_intent TEXT;",
+    },
 ];
 
 /// Run all pending migrations on the write driver, recording each as applied. Each migration is

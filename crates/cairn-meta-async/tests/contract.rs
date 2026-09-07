@@ -288,6 +288,7 @@ async fn writer_owned_object_lock_parity() {
                 owner_id: UserId("owner".to_owned()),
                 initiated_by: UserId("owner".to_owned()),
                 intended_acl: None,
+                replica_intent: None,
                 user_metadata: Vec::new(),
                 initial_tags: vec![("kind".to_owned(), "multipart".to_owned())],
                 lock_intent: ExplicitObjectLockIntent::default(),
@@ -418,6 +419,7 @@ async fn libsql_legacy_multipart_intent_fails_closed_and_preserves_session() {
                 owner_id: UserId("owner".to_owned()),
                 initiated_by: UserId("owner".to_owned()),
                 intended_acl: None,
+                replica_intent: None,
                 user_metadata: Vec::new(),
                 initial_tags: Vec::new(),
                 lock_intent: ExplicitObjectLockIntent::default(),
@@ -1678,6 +1680,7 @@ async fn multipart_lifecycle_parity() {
             owner_id: UserId("owner".to_owned()),
             initiated_by: UserId("owner".to_owned()),
             intended_acl: None,
+            replica_intent: None,
             user_metadata: Vec::new(),
             initial_tags: Vec::new(),
             lock_intent: ExplicitObjectLockIntent::default(),
@@ -1815,6 +1818,7 @@ async fn multipart_lifecycle_parity() {
                 owner_id: UserId("owner".to_owned()),
                 initiated_by: UserId("owner".to_owned()),
                 intended_acl: None,
+                replica_intent: None,
                 user_metadata: Vec::new(),
                 initial_tags: Vec::new(),
                 lock_intent: ExplicitObjectLockIntent::default(),
@@ -2018,6 +2022,7 @@ async fn multipart_lifecycle_parity() {
                 owner_id: UserId("owner".to_owned()),
                 initiated_by: UserId("owner".to_owned()),
                 intended_acl: None,
+                replica_intent: None,
                 user_metadata: Vec::new(),
                 initial_tags: Vec::new(),
                 lock_intent: ExplicitObjectLockIntent::default(),
@@ -2094,6 +2099,7 @@ async fn multipart_part_encryption_parity() {
             owner_id: UserId("owner".to_owned()),
             initiated_by: UserId("owner".to_owned()),
             intended_acl: None,
+            replica_intent: None,
             user_metadata: Vec::new(),
             initial_tags: Vec::new(),
             lock_intent: ExplicitObjectLockIntent::default(),
@@ -2200,6 +2206,7 @@ async fn multipart_kms_intent_parity() {
             owner_id: UserId("owner".to_owned()),
             initiated_by: UserId("owner".to_owned()),
             intended_acl: None,
+            replica_intent: None,
             user_metadata: Vec::new(),
             initial_tags: Vec::new(),
             lock_intent: ExplicitObjectLockIntent::default(),
@@ -3548,4 +3555,13 @@ async fn replication_attempts_are_fenced_parity() {
             .unwrap();
         cairn_types::testing::assert_replication_claim_fencing(s, &object).await;
     }
+}
+
+#[path = "../../cairn-meta/tests/common/multipart_replica.rs"]
+mod multipart_replica;
+
+#[tokio::test]
+async fn multipart_replica_intent_survives_claim_recovery() {
+    let store = cairn_meta_async::open_libsql_in_memory().await.unwrap();
+    multipart_replica::preserves_replica_intent(&store).await;
 }
