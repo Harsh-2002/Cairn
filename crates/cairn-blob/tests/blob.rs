@@ -1354,6 +1354,17 @@ async fn assemble_honors_extra_checksums_whole_object() {
         .find(|c| c.algorithm == ChecksumAlgorithm::Crc64Nvme)
         .expect("crc64nvme present");
     assert_eq!(assembled_crc.value, single_crc.value);
+    use sha2::{Digest, Sha256};
+    assert_eq!(
+        assembled.internal_sha256,
+        hex::encode(Sha256::digest(b"part-one-part-two"))
+    );
+    assert_eq!(assembled.internal_sha256, single.internal_sha256);
+    assert_eq!(
+        single.checksums.len(),
+        1,
+        "internal SHA256 must not become a client checksum"
+    );
 }
 
 /// An object staged through the io_uring write path reads back byte-for-byte identically and with
@@ -2382,6 +2393,12 @@ async fn stage_part_checksum_and_assemble_checksum_are_over_plaintext() {
         enc_asm.md5_hex, plain_asm.md5_hex,
         "whole-object MD5 over plaintext"
     );
+    assert_eq!(enc_asm.internal_sha256, plain_asm.internal_sha256);
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    digest.update(&plain1);
+    digest.update(&plain2);
+    assert_eq!(enc_asm.internal_sha256, hex::encode(digest.finalize()));
 }
 
 #[tokio::test]

@@ -117,3 +117,7 @@ freezing this crate freezes the seams. `#![forbid(unsafe_code)]`.
 Multipart sessions persist nullable `replica_intent` (source identity, response headers and expected
 whole-object checksums). Decode it strictly and preserve it through claim/release/restart recovery;
 ordinary and legacy uploads have no replica capability.
+
+- `ObjectVersionRow.internal_sha256` is an internal nullable plaintext digest (serde-skipped);
+  `StagedBlob.internal_sha256` is mandatory for new objects. The in-memory blob double computes
+  the same SHA-256 at stage/assembly. Neither field changes ETag or S3 checksum negotiation.

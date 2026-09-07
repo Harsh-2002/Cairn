@@ -12,7 +12,7 @@ range-seek, same outcomes. `cairn-meta` is left untouched. Selected at runtime b
   against this trait, engine-agnostic.
 - `libsql_driver.rs` / `turso_driver.rs` — the two concrete drivers behind that seam.
 - `apply.rs` — `Mutation` -> SQL. **One of the four mutation sites** (see below).
-- `schema.rs` — the migration table. Must mirror `cairn-meta/src/schema.rs` (latest is v30 — the
+- `schema.rs` — the migration table. Must mirror `cairn-meta/src/schema.rs` (latest is v32 — the
   multipart SSE columns `sse_requested` v15, `encrypt_parts`/`part_dek` v21, `sse_kms_*` v22;
   `object_versions.replicated_at` + `idx_outbox_bucket_key` v23; bounded import
   scheduling/history/retention indexes v24; hash-only object-share capabilities and retryable
@@ -95,6 +95,9 @@ Replication outbox migration v30 adds exact attempt ownership. Done/fail/defer/r
 claimed status, token, and lease inside the writer savepoint; every backend and shard fan-out must
 preserve the typed applied result. Recovery invalidates tokens before new workers can claim.
 
-Multipart sessions persist nullable `replica_intent` (source identity, response headers and expected
+Migration v31 adds nullable multipart `replica_intent` (source identity, response headers and expected
 whole-object checksums). Decode it strictly and preserve it through claim/release/restart recovery;
 ordinary and legacy uploads have no replica capability.
+
+- The append-only v32 internal-integrity migration adds nullable `object_versions.internal_sha256`.
+  Preserve it on every object read/write and snapshot; legacy NULL is intentionally not backfilled.

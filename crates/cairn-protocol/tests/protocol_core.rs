@@ -2031,6 +2031,24 @@ async fn multipart_lifecycle() {
     expected.extend_from_slice(&part2);
     assert_eq!(got.len(), expected.len());
     assert_eq!(got, expected);
+    use sha2::{Digest, Sha256};
+    let row = h
+        .meta
+        .current_version(
+            &BucketName::parse("mpb").unwrap(),
+            &ObjectKey::parse("big.bin").unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.internal_sha256,
+        Some(hex::encode(Sha256::digest(&expected)))
+    );
+    assert!(
+        row.checksums.is_empty(),
+        "internal digest must not become an S3 checksum"
+    );
 }
 
 /// Audit 2026-07: an uploadId is scoped to its (bucket, key). Completing it against a different key
@@ -17467,5 +17485,84 @@ async fn multipart_replica_intent_is_authorized_persisted_and_idempotent() {
                 .unwrap()
                 .is_empty()
         );
+    }
+}
+
+#[tokio::test]
+async fn put_and_copy_persist_internal_plaintext_digest_without_checksum_headers() {
+    use sha2::{Digest, Sha256};
+    let h = harness().await;
+    drain(
+        send(
+            &h.svc,
+            req(Method::PUT, Some("digest-bkt"), None, &[], &[], vec![]),
+        )
+        .await,
+    )
+    .await;
+    let content = b"plaintext digest for put and copy";
+    let expected = hex::encode(Sha256::digest(content));
+    let (status, headers, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("digest-bkt"),
+                Some("source"),
+                &[],
+                &[],
+                content.to_vec(),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(header(&headers, "x-amz-checksum-sha256").is_none());
+    let (status, _, _) = drain(
+        send(
+            &h.svc,
+            req(
+                Method::PUT,
+                Some("digest-bkt"),
+                Some("copy"),
+                &[],
+                &[("x-amz-copy-source", "/digest-bkt/source")],
+                vec![],
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    for key in ["source", "copy"] {
+        let row = h
+            .meta
+            .current_version(
+                &BucketName::parse("digest-bkt").unwrap(),
+                &ObjectKey::parse(key).unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.internal_sha256, Some(expected.clone()));
+        assert!(row.checksums.is_empty());
+        let (status, headers, _) = drain(
+            send(
+                &h.svc,
+                req(
+                    Method::HEAD,
+                    Some("digest-bkt"),
+                    Some(key),
+                    &[],
+                    &[("x-amz-checksum-mode", "ENABLED")],
+                    vec![],
+                ),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(header(&headers, "x-amz-checksum-sha256").is_none());
     }
 }

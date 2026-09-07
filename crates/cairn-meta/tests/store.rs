@@ -43,6 +43,7 @@ fn row(
         checksums: Vec::new(),
         sse_descriptor: None,
         replication_status: None,
+        internal_sha256: None,
         replicated_at: None,
         created_at: Timestamp(1),
         updated_at: Timestamp(1),
@@ -5077,4 +5078,28 @@ async fn multipart_replica_intent_survives_claim_recovery() {
     let store = cairn_meta::open_in_memory().unwrap();
     multipart_replica::preserves_replica_intent(&store).await;
     multipart_replica::preserves_replica_intent(&cairn_types::testing::InMemoryMetadataStore::new()).await;
+}
+
+#[tokio::test]
+async fn internal_integrity_digest_round_trips_through_writer() {
+    let store = cairn_meta::open_in_memory().unwrap();
+    let b = BucketName::parse("digest-bucket").unwrap();
+    for digest in [
+        None,
+        Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".to_owned()),
+    ] {
+        let mut version = row(&b, "key", VersionId::null(), "etag-2", true);
+        version.internal_sha256 = digest.clone();
+        store
+            .submit(put(version, Precondition::default()))
+            .await
+            .unwrap();
+        let got = store
+            .current_version(&b, &ObjectKey::parse("key").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.internal_sha256, digest);
+        assert!(got.checksums.is_empty());
+    }
 }

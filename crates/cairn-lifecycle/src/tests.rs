@@ -112,6 +112,7 @@ async fn put_object(
         checksums: Vec::new(),
         sse_descriptor: None,
         replication_status: None,
+        internal_sha256: None,
         replicated_at: None,
         created_at: ts,
         updated_at: ts,

@@ -13,6 +13,7 @@ use crate::secret::SecretKey32;
 use crate::traits::{BlobStore, ReconcileOracle};
 use bytes::Bytes;
 use futures_util::StreamExt;
+use sha2::Digest;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -101,6 +102,7 @@ impl BlobStore for InMemoryBlobStore {
         // as the real store computes it pre-transform — so the ETag is identical with or without a
         // DEK (ARCH 21.1, SSE-S3).
         let md5 = md5_hex(&buf);
+        let internal_sha256 = hex::encode(sha2::Sha256::digest(&buf));
         let path = StoragePath::generate(bucket);
         let len = buf.len() as u64;
         self.blobs.lock().unwrap().insert(
@@ -120,6 +122,7 @@ impl BlobStore for InMemoryBlobStore {
             etag: ETag::from_md5_hex(md5.clone()),
             md5_hex: md5,
             checksums: Vec::new(),
+            internal_sha256,
             compression: CompressionDescriptor::Uncompressed,
         })
     }
@@ -270,6 +273,7 @@ impl BlobStore for InMemoryBlobStore {
             }
         }
         let md5 = md5_hex(&buf);
+        let internal_sha256 = hex::encode(sha2::Sha256::digest(&buf));
         let path = StoragePath::generate(bucket);
         let len = buf.len() as u64;
         self.blobs.lock().unwrap().insert(
@@ -289,6 +293,7 @@ impl BlobStore for InMemoryBlobStore {
             etag: ETag::from_md5_hex(md5.clone()),
             md5_hex: md5,
             checksums: Vec::new(),
+            internal_sha256,
             compression: CompressionDescriptor::Uncompressed,
         })
     }

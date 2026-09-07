@@ -116,17 +116,16 @@ pub struct Config {
     /// Maximum distinct part numbers recorded or reserved in one multipart upload
     /// (`CAIRN_MULTIPART_MAX_PARTS_PER_UPLOAD`; capped at S3's 10,000).
     pub multipart_max_parts_per_upload: u16,
-    /// How often the background integrity scrub re-reads stored blobs and verifies them against the
-    /// recorded ETag, in seconds (`CAIRN_SCRUB_INTERVAL_SECS`, ARCH 8.6/26.4). `0` (default) disables
-    /// it. It verifies EVERY version — plaintext, compressed, and encrypted (an encrypted version is
-    /// re-read through its own unsealed DEK, so an at-rest/SSE-S3/SSE-KMS node is covered; read-path
-    /// AEAD authentication only ever covers bytes somebody GETs, which is not what a scrub is for) —
-    /// turning silent on-disk bit-rot into a logged `cairn_scrub_corruption_total` event instead of
-    /// serving a corrupted byte. Whatever it cannot verify is counted as
-    /// `cairn_scrub_skipped_total{reason}` (an off-ring key mid-rotation, a composite multipart
-    /// ETag), never silently dropped. It is bounded (paged enumeration) but reads every blob, so it is
-    /// I/O-heavy — schedule it for quiet periods. A checksumming filesystem remains defense-in-depth.
+    /// Integrity scrub interval (`CAIRN_SCRUB_INTERVAL_SECS`, ARCH 8.6/26.4); zero disables it.
+    /// Re-reads plaintext, compressed, and encrypted blobs through their declared cipher. Content
+    /// verification prefers internal ingest SHA-256, then legacy full-object checksums or single-
+    /// part MD5. Corruption is logged/counted; unavailable keys and legacy composite-only baselines
+    /// remain explicit coverage skips. Enumeration is paged, but every blob is read, so schedule
+    /// for quiet periods or configure byte pacing. A checksumming filesystem remains defense-in-depth.
     pub scrub_interval_secs: u64,
+    /// Maximum logical scrub bytes per second (`CAIRN_SCRUB_BYTES_PER_SEC`, ARCH 28).
+    /// Zero retains unthrottled scrubbing; positive values pace each streamed chunk.
+    pub scrub_bytes_per_sec: u64,
     /// How often the master-key re-wrap worker re-seals secrets onto the active key, in seconds
     /// (`CAIRN_KEY_REWRAP_INTERVAL_SECS`, audit #29 Phase D; `0` disables). SQLite backend only.
     pub key_rewrap_interval_secs: u64,
@@ -460,6 +459,7 @@ impl Default for Config {
             multipart_max_active_uploads_per_principal: 1_000,
             multipart_max_parts_per_upload: 10_000,
             scrub_interval_secs: 0,
+            scrub_bytes_per_sec: 0,
             key_rewrap_interval_secs: 300,
             key_counter_sync_secs: 60,
             multipart_upload_lifetime_secs: 86_400,
@@ -1900,9 +1900,20 @@ mod tests {
     #[test]
     fn load_reads_scrub_interval_from_env() {
         assert_eq!(Config::default().scrub_interval_secs, 0);
+        assert_eq!(Config::default().scrub_bytes_per_sec, 0);
         figment::Jail::expect_with(|jail| {
             jail.set_env("CAIRN_SCRUB_INTERVAL_SECS", "86400");
+            jail.set_env("CAIRN_SCRUB_BYTES_PER_SEC", "1048576");
+            assert_eq!(
+                Config::load().expect("loads").scrub_bytes_per_sec,
+                1_048_576
+            );
             assert_eq!(Config::load().expect("loads").scrub_interval_secs, 86_400);
+            jail.set_env("CAIRN_SCRUB_BYTES_PER_SEC", "-1");
+            assert!(
+                Config::load().is_err(),
+                "negative byte rates must be rejected"
+            );
             Ok(())
         });
     }

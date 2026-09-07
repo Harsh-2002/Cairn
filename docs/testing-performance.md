@@ -39,6 +39,15 @@ The decisive tests run real S3 clients against a running Cairn. The boto3 AWS SD
 
 ### 29.6 Benchmarks and load
 
+Internal-integrity regressions cover all full-object supplementary checksum algorithms on
+plaintext, compressed, and encrypted multipart content, legacy composite-only coverage skips,
+malformed baselines, ingest/assembly digest persistence, and cancellable byte pacing. A manual
+warm-page-cache contention measurement is available with
+`cargo test -p cairn-server scrub_foreground_io_measurement -- --ignored --nocapture`: it compares
+100 foreground 1-MiB reads with no scrub, an unthrottled 32-MiB scrub, and a 16-MiB/s paced scrub.
+Record host load and cache state with results; this is not a cold-device or production benchmark
+and is intentionally excluded from timing-sensitive CI acceptance.
+
 Micro-benchmarks confirm that hashing, compression, and chunked decoding are not the bottleneck on the ingest path. Macro load tests drive concurrent puts and gets for both large-object bandwidth-bound and small-object rate-bound profiles using a standard object-storage load tool, report throughput and latency percentiles, and characterise the single-writer ceiling by observing the write-queue-depth metric as concurrency rises, which is how the group-commit benefit and its limit are quantified rather than assumed.
 
 ---

@@ -80,7 +80,7 @@ pub struct ChecksumValue {
 pub struct ChecksumSet(pub Vec<ChecksumAlgorithm>);
 
 impl ChecksumSet {
-    /// An empty set (only the MD5/ETag is computed).
+    /// No client supplementary checksums (internal MD5/SHA-256 still run during ingest).
     #[must_use]
     pub fn none() -> Self {
         Self(Vec::new())
@@ -241,6 +241,10 @@ pub struct ObjectVersionRow {
     /// (sealed) under the master key, and the wrapping nonce. `None` for unencrypted objects
     /// (ARCH 27, SSE-S3). The raw DEK is never stored; only its sealed form lives here.
     pub sse_descriptor: Option<String>,
+    /// Internal plaintext SHA-256 recorded at ingest. None means no trusted legacy baseline.
+    /// Not an S3 checksum and never emitted through serialized object responses.
+    #[serde(skip)]
+    pub internal_sha256: Option<String>,
     /// Replication status for replication-enabled buckets.
     pub replication_status: Option<crate::meta::ReplicationStatus>,
     /// When this version was last **successfully shipped** to a replication destination — stamped

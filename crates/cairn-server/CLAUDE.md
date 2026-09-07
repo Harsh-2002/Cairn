@@ -186,3 +186,8 @@ CLI. This is the **only crate that names concrete impls** — everything else is
 - Spec: `docs/configuration.md` (28), `docs/control-plane.md` (22–24), `docs/data-plane.md` (6–7),
   `docs/delivery.md` (31). #29 key-rotation runbook: `docs/operations.md`.
 - See the root `../../CLAUDE.md` for the gate, the 4(+1)-site mutation rule, and workspace invariants.
+
+- Scrub prefers the internal ingest SHA-256, then legacy FULL_OBJECT checksums, then single-part
+  MD5. Composite-only legacy rows remain counted skips; never invent a baseline by scrubbing.
+  `CAIRN_SCRUB_BYTES_PER_SEC=0` preserves unthrottled behavior; positive values pace logical bytes
+  and shutdown cancels both reads and sleeps.

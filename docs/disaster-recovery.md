@@ -118,10 +118,11 @@ What the scrub does **not** verify is counted, not hidden. Alert on both series:
   now (mid-rotation). Deliberately **not** reported as corruption; it is retried on the next pass. A
   sustained non-zero value means part of the store is going unverified — check the master-key ring
   (`operations.md`, rotation runbook).
-- `cairn_scrub_skipped_total{reason="composite_etag"}` — a known limit: a multipart object's
-  `{md5}-{n}` ETag is a hash of hashes, so those objects are read and authenticated (a rotted block
-  still fails) but their content hash is not compared. Whole-object verification of composite ETags
-  is not implemented. For multipart-heavy data, rely on the storage layer (ZFS/RAID scrub) as well.
+- `cairn_scrub_skipped_total{reason="composite_etag"}` — a legacy multipart row lacks both an
+  internal ingest SHA-256 and a full-object supplementary checksum. Its composite ETag/checksum
+  cannot prove whole-content integrity, so it is read and authenticated but counted as unverified.
+  New multipart objects carry an internal digest; legacy FULL_OBJECT checksums are also verified.
+  Never generate a trusted baseline by scrubbing old bytes: they may already be corrupt.
 - `cairn_scrub_skipped_total{reason="io_error"}` — a transient filesystem failure (fd exhaustion, a
   full or flaky disk) prevented the re-read. Like `key_unavailable`, deliberately **not** reported as
   corruption — the bytes are most likely fine and the condition clears — and retried next pass. A
@@ -135,9 +136,10 @@ What the scrub does **not** verify is counted, not hidden. Alert on both series:
 **Cost on an encrypted node.** The scrub now re-reads *and decrypts* every version, so on a
 `CAIRN_ENCRYPT_AT_REST` / heavily-SSE store its per-pass CPU and duration scale with stored bytes
 (AES-GCM over the whole dataset) where before it did nearly nothing — the earlier behaviour was the
-bug, not a feature. There is **no rate limiter**; it takes one blob-read permit at a time (so live
-GETs are not starved) but a full pass is I/O- and CPU-heavy. Schedule `CAIRN_SCRUB_INTERVAL_SECS` for
-quiet periods and size it well above a single pass's duration.
+bug, not a feature. Set `CAIRN_SCRUB_BYTES_PER_SEC` to pace logical bytes (zero, the default,
+retains unthrottled behavior). The scrub holds one read permit; buffering and decompression may
+read ahead, so pacing is not a physical IOPS limit. A full pass remains I/O- and CPU-heavy. Schedule
+`CAIRN_SCRUB_INTERVAL_SECS` for quiet periods and size it above a single pass's duration.
 
 ## 5. Pre-disaster checklist
 

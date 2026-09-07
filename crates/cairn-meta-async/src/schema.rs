@@ -751,6 +751,11 @@ UPDATE replication_outbox SET status='pending', lease_until=NULL WHERE status='c
         name: "authenticated multipart replica intent",
         sql: "ALTER TABLE multipart_uploads ADD COLUMN replica_intent TEXT;",
     },
+    Migration {
+        version: 32,
+        name: "internal full-object integrity digest",
+        sql: "ALTER TABLE object_versions ADD COLUMN internal_sha256 TEXT;",
+    },
 ];
 
 /// Run all pending migrations on the write driver, recording each as applied. Each migration is
@@ -1158,6 +1163,7 @@ mod tests {
                      applied_at INTEGER NOT NULL
                  );
                  INSERT INTO schema_migrations VALUES (28, 'legacy fixture', 0);
+                 CREATE TABLE object_versions (id TEXT PRIMARY KEY);
                  CREATE TABLE replication_outbox (id TEXT PRIMARY KEY, status TEXT NOT NULL, lease_until INTEGER);
                  CREATE TABLE multipart_uploads (
                      id TEXT PRIMARY KEY,
@@ -1321,6 +1327,46 @@ mod tests {
         let driver = TursoDriver::new(conn);
         assert_v29_resets_unowned_legacy_completion_claims(&driver).await;
     }
+    async fn assert_internal_digest_preserves_legacy_null(driver: &dyn AsyncSqlDriver) {
+        driver
+            .execute_batch(
+                "CREATE TABLE object_versions (id TEXT PRIMARY KEY);
+            INSERT INTO object_versions VALUES ('legacy-multipart');",
+            )
+            .await
+            .unwrap();
+        let migration = MIGRATIONS
+            .iter()
+            .find(|m| m.name == "internal full-object integrity digest")
+            .unwrap();
+        driver.execute_batch(migration.sql).await.unwrap();
+        let rows = driver
+            .query("SELECT internal_sha256 FROM object_versions", vec![])
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get_opt_text(0), None);
+    }
+
+    #[tokio::test]
+    async fn internal_digest_preserves_legacy_null_in_libsql() {
+        let name = format!(
+            "file:cairn-libsql-digest-{}?mode=memory&cache=shared",
+            uuid::Uuid::new_v4().simple()
+        );
+        #[allow(deprecated)]
+        let db = Database::open(name).unwrap();
+        let driver = LibsqlDriver::new(db.connect().unwrap());
+        assert_internal_digest_preserves_legacy_null(&driver).await;
+    }
+
+    #[tokio::test]
+    async fn internal_digest_preserves_legacy_null_in_turso() {
+        let db = turso::Builder::new_local(":memory:").build().await.unwrap();
+        let driver = TursoDriver::new(db.connect().unwrap());
+        assert_internal_digest_preserves_legacy_null(&driver).await;
+    }
+
     async fn assert_v30_resets_legacy_replication_claims(driver: &dyn AsyncSqlDriver) {
         driver.execute_batch("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at INTEGER NOT NULL);").await.unwrap();
         // A complete historical schema stays a valid upgrade fixture as later migrations arrive.

@@ -28,7 +28,7 @@ metadata commit is **the single linearization point of every mutation** (ARCH 11
   abort, exact-token claim release, and final `status='completing'` plus token verification must
   remain in the writer savepoint. **Mirror any change in `cairn-meta-async/src/apply.rs`**
   (4(+1)-site).
-- `schema.rs` — migrations: **append-only**, monotonic `version` (latest is 30 — multipart SSE
+- `schema.rs` — migrations: **append-only**, monotonic `version` (latest is 32 — multipart SSE
   columns: `multipart_uploads.sse_requested` v15, `.encrypt_parts` + `multipart_parts.part_dek` v21,
   `.sse_kms_requested`/`sse_kms_key_id`/`sse_bucket_key_enabled` v22; `object_versions.replicated_at`
   + `idx_outbox_bucket_key` v23; bounded import scheduling/history/retention indexes v24; hash-only
@@ -92,6 +92,9 @@ Replication outbox migration v30 adds exact attempt ownership. Done/fail/defer/r
 claimed status, token, and lease inside the writer savepoint; every backend and shard fan-out must
 preserve the typed applied result. Recovery invalidates tokens before new workers can claim.
 
-Multipart sessions persist nullable `replica_intent` (source identity, response headers and expected
+Migration v31 adds nullable multipart `replica_intent` (source identity, response headers and expected
 whole-object checksums). Decode it strictly and preserve it through claim/release/restart recovery;
 ordinary and legacy uploads have no replica capability.
+
+- The append-only v32 internal-integrity migration adds nullable `object_versions.internal_sha256`.
+  Preserve it on every object read/write and snapshot; legacy NULL is intentionally not backfilled.

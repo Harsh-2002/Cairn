@@ -17,7 +17,7 @@ mod commit;
 #[allow(missing_debug_implementations)]
 pub mod compress;
 mod crc64nvme;
-mod hash;
+pub mod hash;
 // Safe file-placement hints (preallocation + access advice) for the write fast path (ARCH 7.5).
 mod raw_io;
 #[cfg(feature = "io-uring")]
@@ -383,6 +383,7 @@ async fn write_staged(
         String,
         Vec<cairn_types::object::ChecksumValue>,
         CompressionDescriptor,
+        String,
     ),
     BlobError,
 > {
@@ -425,7 +426,7 @@ async fn write_staged(
         let tail = enc.finish()?;
         file.write_all(&tail).await?;
         physical += tail.len() as u64;
-        let (md5, checks) = hashers.finalize();
+        let (md5, checks, internal_sha256) = hashers.finalize();
         // The descriptor records the logical compression of the object. Encryption is recorded on
         // the metadata row's sse_descriptor, not here, so an uncompressed-but-encrypted object is
         // still `Uncompressed` to readers that only care about the compression algorithm.
@@ -436,7 +437,7 @@ async fn write_staged(
             },
             None => CompressionDescriptor::Uncompressed,
         };
-        Ok((logical, physical, md5, checks, descriptor))
+        Ok((logical, physical, md5, checks, descriptor, internal_sha256))
     } else {
         while let Some(chunk) = body.next().await {
             let chunk = chunk?;
@@ -448,13 +449,14 @@ async fn write_staged(
             file.write_all(&chunk).await?;
             physical += chunk.len() as u64;
         }
-        let (md5, checks) = hashers.finalize();
+        let (md5, checks, internal_sha256) = hashers.finalize();
         Ok((
             logical,
             physical,
             md5,
             checks,
             CompressionDescriptor::Uncompressed,
+            internal_sha256,
         ))
     }
 }
@@ -743,7 +745,7 @@ impl BlobStore for LocalBlobStore {
 
         let mut sink = Staging::create(staging, self.use_uring, opts.content_length).await?;
         let outcome = write_staged(&mut sink, body, &opts).await;
-        let (logical, physical, md5, checksums, descriptor) = match outcome {
+        let (logical, physical, md5, checksums, descriptor, internal_sha256) = match outcome {
             Ok(v) => v,
             Err(e) => {
                 sink.abort().await;
@@ -772,6 +774,7 @@ impl BlobStore for LocalBlobStore {
             etag: ETag::from_md5_hex(md5.clone()),
             md5_hex: md5,
             checksums,
+            internal_sha256,
             compression: descriptor,
         };
         cleanup.disarm();
@@ -1016,14 +1019,14 @@ impl BlobStore for LocalBlobStore {
         // A part's length is not known to this seam, so no preallocation here; the assembled blob
         // (whose size is the sum of the parts) is preallocated in `assemble`.
         let mut sink = Staging::create(path, self.use_uring, None).await?;
-        let (logical, _phys, md5, checks, _desc) = match write_staged(&mut sink, body, &opts).await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                sink.abort().await;
-                return Err(e);
-            }
-        };
+        let (logical, _phys, md5, checks, _desc, _internal_sha256) =
+            match write_staged(&mut sink, body, &opts).await {
+                Ok(v) => v,
+                Err(e) => {
+                    sink.abort().await;
+                    return Err(e);
+                }
+            };
         sink.fsync_in_place().await?;
         // fsync the session directory so the new part's directory entry is durable. Without this, a
         // part that was acknowledged 200 OK could lose its dirent on power loss even though its bytes
@@ -1166,7 +1169,7 @@ impl BlobStore for LocalBlobStore {
         self.dir_sync.sync_dir(&bucket_dir).await?;
         fail::fail_point!("blob_after_assemble");
 
-        let (md5_hex, checksums) = hashers.finalize();
+        let (md5_hex, checksums, internal_sha256) = hashers.finalize();
         let staged = StagedBlob {
             storage_path,
             size_logical: logical,
@@ -1174,6 +1177,7 @@ impl BlobStore for LocalBlobStore {
             etag: ETag::from_md5_hex(md5_hex.clone()),
             md5_hex,
             checksums,
+            internal_sha256,
             compression: descriptor,
         };
         cleanup.disarm();

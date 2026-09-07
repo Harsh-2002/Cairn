@@ -114,6 +114,7 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
                 checksums: Vec::new(),
                 sse_descriptor: None,
                 replication_status: None,
+                internal_sha256: None,
                 replicated_at: None,
                 created_at: now,
                 updated_at: now,
@@ -2248,8 +2249,8 @@ async fn insert_version(driver: &dyn AsyncSqlDriver, row: &ObjectVersionRow) -> 
              (id, bucket_name, key, version_id, is_latest, is_delete_marker, size_logical, size_physical,
               etag, content_type, storage_path, compression, storage_class, cold_locator, owner_id,
               user_metadata, acl, checksums, sse_descriptor, replication_status, created_at, updated_at,
-              content_encoding, cache_control, content_disposition, content_language, expires)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27)",
+              content_encoding, cache_control, content_disposition, content_language, expires, internal_sha256)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28)",
             vec![
                 Value::Text(row.id.clone()),
                 Value::Text(row.bucket.as_str().to_owned()),
@@ -2278,6 +2279,7 @@ async fn insert_version(driver: &dyn AsyncSqlDriver, row: &ObjectVersionRow) -> 
                 opt_text(row.content_disposition.clone()),
                 opt_text(row.content_language.clone()),
                 opt_text(row.expires.clone()),
+                opt_text(row.internal_sha256.clone()),
             ],
         )
         .await?;
