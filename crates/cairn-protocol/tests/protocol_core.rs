@@ -16951,3 +16951,226 @@ async fn sse_per_version_deks_are_distinct_and_addressable() {
     );
     assert_eq!(b1_again, v1_bytes);
 }
+
+/// Every object-producing path must distinguish unavailable intent from absent configuration.
+/// Persisted malformed XML also exercises the production SQLite backend, bypassing only the
+/// validated configuration API to model corruption/legacy state.
+#[tokio::test]
+async fn replication_intent_errors_prevent_commits_and_preserve_multipart_retry() {
+    use cairn_types::bucket::{ConfigAspect, ConfigDoc};
+    use cairn_types::meta::Mutation;
+    use cairn_types::time::Timestamp;
+    for mode in 0..3 {
+        let (h, faults) = if mode == 2 {
+            (harness().await, None)
+        } else {
+            let (h, meta) = in_memory_harness().await;
+            (h, Some(meta))
+        };
+        versioned_bucket(&h, "intent-errors").await;
+        let bucket = BucketName::parse("intent-errors").unwrap();
+        let (status, headers, _) = drain(
+            send(
+                &h.svc,
+                req(
+                    Method::PUT,
+                    Some("intent-errors"),
+                    Some("source"),
+                    &[],
+                    &[],
+                    b"source".to_vec(),
+                ),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let source_version = header(&headers, "x-amz-version-id").unwrap().to_owned();
+        let upload = initiate(&h.svc, "intent-errors", "multipart", &[]).await;
+        let etag = upload_part(
+            &h.svc,
+            "intent-errors",
+            "multipart",
+            &upload,
+            1,
+            b"part".to_vec(),
+        )
+        .await;
+        let files_before = blob_file_count(h._dir.path());
+        if mode == 0 {
+            faults
+                .as_ref()
+                .unwrap()
+                .set_replication_config_reads_failing(true);
+        } else {
+            h.meta
+                .submit(Mutation::SetBucketConfig {
+                    bucket: bucket.clone(),
+                    aspect: ConfigAspect::Replication,
+                    doc: Some(ConfigDoc("<broken".to_owned())),
+                })
+                .await
+                .unwrap();
+        }
+        for (key, headers, body) in [
+            ("put", vec![], b"new".to_vec()),
+            (
+                "copy",
+                vec![("x-amz-copy-source", "/intent-errors/source")],
+                vec![],
+            ),
+        ] {
+            let (status, _, response) = drain(
+                send(
+                    &h.svc,
+                    req(
+                        Method::PUT,
+                        Some("intent-errors"),
+                        Some(key),
+                        &[],
+                        &headers,
+                        body,
+                    ),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "mode {mode}: {response:?}"
+            );
+            assert!(
+                h.meta
+                    .current_version(&bucket, &ObjectKey::parse(key).unwrap())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                blob_file_count(h._dir.path()),
+                files_before,
+                "failed write leaked a blob"
+            );
+        }
+        let (status, _, _) =
+            complete(&h.svc, "intent-errors", "multipart", &upload, &[(1, &etag)]).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            h.meta
+                .current_version(&bucket, &ObjectKey::parse("multipart").unwrap())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let session = h
+            .meta
+            .get_multipart(&cairn_types::UploadId::from_string(upload.clone()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.status, cairn_types::meta::MultipartStatus::Active);
+        assert_eq!(
+            blob_file_count(h._dir.path()),
+            files_before,
+            "failed completion leaked assembled data"
+        );
+        let (status, _, _) = drain(
+            send(
+                &h.svc,
+                req(
+                    Method::DELETE,
+                    Some("intent-errors"),
+                    Some("source"),
+                    &[],
+                    &[],
+                    vec![],
+                ),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            h.meta
+                .current_version(&bucket, &ObjectKey::parse("source").unwrap())
+                .await
+                .unwrap()
+                .unwrap()
+                .version_id
+                .as_str(),
+            source_version
+        );
+        // Both bare keys fail, while a named version remains independently deletable.
+        let xml = format!(
+            "<Delete><Object><Key>source</Key></Object><Object><Key>other</Key></Object><Object><Key>source</Key><VersionId>{source_version}</VersionId></Object></Delete>"
+        );
+        let (status, _, response) = drain(
+            send(
+                &h.svc,
+                req(
+                    Method::POST,
+                    Some("intent-errors"),
+                    None,
+                    &[("delete", "")],
+                    &[],
+                    xml.into_bytes(),
+                ),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let response = String::from_utf8(response).unwrap();
+        assert_eq!(
+            response.matches("<Code>InternalError</Code>").count(),
+            2,
+            "{response}"
+        );
+        assert_eq!(response.matches("<Deleted>").count(), 1, "{response}");
+        assert!(
+            h.meta
+                .current_version(&bucket, &ObjectKey::parse("other").unwrap())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            h.meta
+                .get_version(
+                    &bucket,
+                    &ObjectKey::parse("source").unwrap(),
+                    &VersionId::from_string(source_version)
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            h.meta
+                .claim_replication_batch(100, Timestamp(i64::MAX / 2))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        if let Some(meta) = &faults {
+            meta.set_replication_config_reads_failing(false);
+        }
+        set_replication(&h, "intent-errors", "", true).await;
+        let (status, _, _) =
+            complete(&h.svc, "intent-errors", "multipart", &upload, &[(1, &etag)]).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "completion can retry after configuration recovery"
+        );
+        assert_eq!(
+            h.meta
+                .claim_replication_batch(100, Timestamp(i64::MAX / 2))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+}

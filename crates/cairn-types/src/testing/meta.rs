@@ -473,6 +473,7 @@ impl State {
 pub struct InMemoryMetadataStore {
     state: Mutex<State>,
     fail_user_policy_reads: AtomicBool,
+    fail_replication_config_reads: AtomicBool,
     hang_next_claim_ack: AtomicBool,
     fail_next_complete_ack: AtomicBool,
     hang_next_replication_config_read: AtomicBool,
@@ -511,6 +512,12 @@ impl InMemoryMetadataStore {
     /// transaction committed.
     pub fn fail_next_multipart_complete_ack(&self) {
         self.fail_next_complete_ack.store(true, Ordering::Release);
+    }
+
+    /// Simulate a metadata read outage for replication intent resolution.
+    pub fn set_replication_config_reads_failing(&self, failing: bool) {
+        self.fail_replication_config_reads
+            .store(failing, Ordering::Release);
     }
 
     /// Leave the next replication-config read pending forever.
@@ -2233,6 +2240,13 @@ impl MetadataStore for InMemoryMetadataStore {
         name: &BucketName,
         aspect: ConfigAspect,
     ) -> Result<Option<ConfigDoc>, MetaError> {
+        if aspect == ConfigAspect::Replication
+            && self.fail_replication_config_reads.load(Ordering::Acquire)
+        {
+            return Err(MetaError::Engine(
+                "injected replication configuration read failure".to_owned(),
+            ));
+        }
         if aspect == ConfigAspect::Replication
             && self
                 .hang_next_replication_config_read

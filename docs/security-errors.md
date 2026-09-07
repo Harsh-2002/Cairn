@@ -61,6 +61,7 @@ The principal mappings are as follows.
 | Missing or unparseable credentials | 400 / 403 | AccessDenied / InvalidAccessKeyId |
 | Signature mismatch or invalid signature | 403 | SignatureDoesNotMatch |
 | Authenticated identity policy unavailable or corrupt | 500 | InternalError |
+| Replication intent configuration unavailable or corrupt during a write | 500 | InternalError |
 | Authorization denied by policy, ACL, or public-access block | 403 | AccessDenied |
 | Range not satisfiable | 416 | InvalidRange |
 | Operation not implemented | 501 | NotImplemented |

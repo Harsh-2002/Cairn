@@ -1419,7 +1419,7 @@ impl S3Service {
         // a normal create enqueues when an enabled rule matches the key and the object's inline
         // tags (the `x-amz-tagging` header tag set, applied to this version below).
         let replication = if is_replica {
-            Vec::new()
+            Ok(Vec::new())
         } else {
             self.replication_outbox(
                 &bucket,
@@ -1429,6 +1429,14 @@ impl S3Service {
                 &initial_tags,
             )
             .await
+        };
+        let replication = match replication {
+            Ok(entries) => entries,
+            Err(error) => {
+                self.discard_unsubmitted_object(&staged.storage_path, &mut write_guard)
+                    .await;
+                return Err(error);
+            }
         };
         let enqueued_repl = !replication.is_empty();
         match self
@@ -1724,7 +1732,7 @@ impl S3Service {
                             ReplicationOp::DeleteMarker,
                             &[],
                         )
-                        .await;
+                        .await?;
                     let enqueued_repl = !replication.is_empty();
                     self.meta
                         .submit(Mutation::CreateDeleteMarker {
@@ -1772,7 +1780,7 @@ impl S3Service {
                     .governance_bypass_capability(req, &bucket, &key, &VersionId::null())
                     .await?;
                 // A Suspended bucket inserts a NULL-version marker; replication requires
-                // Enabled versioning, so `replication_outbox` returns None here by construction.
+                // Enabled versioning, so `replication_outbox` returns an empty list here by construction.
                 let replication = self
                     .replication_outbox(
                         &bucket,
@@ -1781,7 +1789,7 @@ impl S3Service {
                         ReplicationOp::DeleteMarker,
                         &[],
                     )
-                    .await;
+                    .await?;
                 let outcome = self
                     .meta
                     .submit(Mutation::CreateDeleteMarker {
@@ -2906,6 +2914,20 @@ impl S3Service {
                 &session.initial_tags,
             )
             .await;
+        let replication = match replication {
+            Ok(entries) => entries,
+            Err(error) => {
+                claim_guard.mark_assembled_blob_unreferenced();
+                return Err(self
+                    .multipart_failure_after_claim(
+                        &upload_id,
+                        &claim_token,
+                        error,
+                        &mut claim_guard,
+                    )
+                    .await);
+            }
+        };
         let enqueued_repl = !replication.is_empty();
         match self
             .meta
@@ -3386,6 +3408,14 @@ impl S3Service {
                 &dest_tags,
             )
             .await;
+        let replication = match replication {
+            Ok(entries) => entries,
+            Err(error) => {
+                self.discard_unsubmitted_object(&staged.storage_path, &mut write_guard)
+                    .await;
+                return Err(error);
+            }
+        };
         let enqueued_repl = !replication.is_empty();
         match self
             .meta
@@ -3503,6 +3533,15 @@ impl S3Service {
             error: Option<(String, String, String)>,
             repl_enqueued: bool,
         }
+        // Share one resolution across marker entries, but keep permanent version deletes
+        // independent of replication availability. Each key still authorizes before exposing errors.
+        let replication_config = if bucket.versioning == VersioningState::Enabled
+            && keys.iter().any(|(_, version)| version.is_none())
+        {
+            self.replication_config(&bucket).await
+        } else {
+            Ok(None)
+        };
         let mut group_of: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
         let mut groups: Vec<Vec<(usize, String, Option<String>)>> = Vec::new();
@@ -3515,6 +3554,7 @@ impl S3Service {
         }
         let process_key = |key_s: String, version: Option<String>| {
             let bucket = &bucket;
+            let replication_config = &replication_config;
             async move {
                 let mut out = KeyOutcome {
                     deleted: None,
@@ -3603,15 +3643,27 @@ impl S3Service {
                     match bucket.versioning {
                         VersioningState::Enabled => {
                             let mid = VersionId::generate();
-                            let replication = self
-                                .replication_outbox(
-                                    bucket,
-                                    &key,
-                                    &mid,
-                                    ReplicationOp::DeleteMarker,
-                                    &[],
-                                )
-                                .await;
+                            let cfg = match replication_config {
+                                Ok(cfg) => cfg.as_ref(),
+                                Err(error) => {
+                                    let (code, message) = delete_objects_error_fields(
+                                        error,
+                                        &req.request_id,
+                                        bucket.name.as_str(),
+                                        &key_s,
+                                    );
+                                    out.error = Some((key_s, code, message));
+                                    return out;
+                                }
+                            };
+                            let replication = self.replication_outbox_for_config(
+                                bucket,
+                                &key,
+                                &mid,
+                                ReplicationOp::DeleteMarker,
+                                &[],
+                                cfg,
+                            );
                             out.repl_enqueued |= !replication.is_empty();
                             self.meta
                                 .submit(Mutation::CreateDeleteMarker {
@@ -5238,14 +5290,28 @@ impl S3Service {
         }
     }
 
-    /// Build a replication outbox entry for a write when the bucket has an enabled replication
-    /// rule matching the key (ARCH 20). Replication requires versioning. The entry rides the same
-    /// commit transaction as the write, so enqueue is atomic with the version.
-    ///
-    /// For an object-create the rule must match the key AND the object's `tags` (the full
-    /// [`Filter::matches`] predicate, ARCH 20). For a [`ReplicationOp::DeleteMarker`] the rule
-    /// must additionally have `delete_marker_replication` enabled (ARCH 20.3/21.5); delete
-    /// markers carry no tags, so an empty tag set is used for the prefix-only match.
+    /// Resolve replication intent without confusing missing configuration with a read/parse
+    /// failure. Every matching ordinary write must record intent in its metadata commit (ARCH 20.3).
+    async fn replication_config(
+        &self,
+        bucket: &Bucket,
+    ) -> Result<Option<cairn_replication::ReplicationConfig>> {
+        if bucket.versioning != VersioningState::Enabled {
+            return Ok(None);
+        }
+        self.meta
+            .get_bucket_config(&bucket.name, ConfigAspect::Replication)
+            .await?
+            .map(|doc| {
+                cairn_replication::parse_replication(doc.0.as_bytes()).map_err(|_| {
+                    Error::Internal("stored replication configuration is malformed".to_owned())
+                })
+            })
+            .transpose()
+    }
+
+    /// Build entries for every matching destination. Delete markers additionally require the
+    /// rule's delete-marker setting; object creates match the effective initial tag set.
     async fn replication_outbox(
         &self,
         bucket: &Bucket,
@@ -5253,20 +5319,21 @@ impl S3Service {
         version_id: &VersionId,
         op: ReplicationOp,
         tags: &[(String, String)],
+    ) -> Result<Vec<OutboxEntry>> {
+        let cfg = self.replication_config(bucket).await?;
+        Ok(self.replication_outbox_for_config(bucket, key, version_id, op, tags, cfg.as_ref()))
+    }
+
+    fn replication_outbox_for_config(
+        &self,
+        bucket: &Bucket,
+        key: &ObjectKey,
+        version_id: &VersionId,
+        op: ReplicationOp,
+        tags: &[(String, String)],
+        cfg: Option<&cairn_replication::ReplicationConfig>,
     ) -> Vec<OutboxEntry> {
-        if bucket.versioning != VersioningState::Enabled {
-            return Vec::new();
-        }
-        let Some(doc) = self
-            .meta
-            .get_bucket_config(&bucket.name, ConfigAspect::Replication)
-            .await
-            .ok()
-            .flatten()
-        else {
-            return Vec::new();
-        };
-        let Ok(cfg) = cairn_replication::parse_replication(doc.0.as_bytes()) else {
+        let Some(cfg) = cfg else {
             return Vec::new();
         };
         let is_marker = op == ReplicationOp::DeleteMarker;
