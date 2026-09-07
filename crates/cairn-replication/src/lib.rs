@@ -357,11 +357,10 @@ impl ReplicationEngine {
                             lease_secs: 300,
                         })
                         .await
-                        .map_err(|error| {
+                        .inspect_err(|_| {
                             self.claim_failures
                                 .renewal
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            error
                         })?;
                     // A snapshot may include an entry that began settling during the await.
                     // No remote operation remains for that entry, so only still-active claims
