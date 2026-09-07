@@ -83,6 +83,10 @@ Clock/Crypto>`) — never a concrete engine.
   leaves the upload retryable). Mandatory-SSE buckets refuse a plaintext client PUT — transparent
   `AtRest` satisfies the data goal but NOT the client contract, so it is force-upgraded to
   advertised SSE-S3.
+- **Replication intent fails closed.** A failed replication-config read or malformed stored XML
+  must not become an empty outbox. PUT/copy/Complete and marker deletes propagate errors before
+  commit; preserve exact-path cleanup and release completion ownership. Bulk delete shares one
+  resolution across marker entries while keeping named-version deletes independent.
 - **Session credentials never short-circuit.** In `authorize`, `is_session` principals are always
   `AuthenticatedMember` — they get no owner/admin bypass (least-privilege STS, ARCH 14).
 - **Owner/admin privilege retains the user id.** Ordinary privileged principals map to
