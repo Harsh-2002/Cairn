@@ -127,7 +127,7 @@ proxy. It holds successful initiation, part, and (with `--cleanup-lease`) abort 
 source, then compares every durable row across offline backup and restore. It checks unknown-ID
 incident retention, known-ID cleanup, startup release of abandoned cleanup ownership, and exact
 native version identity after redelivery. This harness requires the schema-v33 streaming sender;
-all three fault arms passed against the integrated v33 implementation at `eb3a83b`.
+all three fault arms passed against the final v33 sender implementation at `5a9a9b1`.
 
 ## Database-path upgrade requirement
 
