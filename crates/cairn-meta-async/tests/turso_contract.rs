@@ -60,6 +60,7 @@ fn row(
         checksums: Vec::new(),
         sse_descriptor: None,
         replication_status: None,
+        internal_sha256: None,
         replicated_at: None,
         created_at: Timestamp(1),
         updated_at: Timestamp(1),
@@ -3706,4 +3707,42 @@ mod multipart_replica;
 async fn multipart_replica_intent_survives_claim_recovery() {
     let store = cairn_meta_async::open_turso_in_memory().await.unwrap();
     multipart_replica::preserves_replica_intent(&store).await;
+}
+
+#[tokio::test]
+async fn internal_integrity_digest_round_trips_without_entering_s3_checksums() {
+    let (a, b) = both().await;
+    for store in [&a as &dyn MetadataStore, &b as &dyn MetadataStore] {
+        let bk = BucketName::parse("digest-bucket").unwrap();
+        for digest in [
+            None,
+            Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".to_owned()),
+        ] {
+            let mut version = row(&bk, "key", VersionId::null(), "etag-2", 3);
+            version.internal_sha256 = digest.clone();
+            store
+                .submit(put(version, Precondition::default()))
+                .await
+                .unwrap();
+            let current = store
+                .current_version(&bk, &ObjectKey::parse("key").unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(current.internal_sha256, digest);
+            let exact = store
+                .get_version(&bk, &current.key, &current.version_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(exact.internal_sha256, digest);
+            assert!(exact.checksums.is_empty());
+            assert!(
+                serde_json::to_value(&exact)
+                    .unwrap()
+                    .get("internal_sha256")
+                    .is_none()
+            );
+        }
+    }
 }

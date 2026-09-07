@@ -217,6 +217,7 @@ The schema below is the reference for the SQLite store. Types are given in the e
 | user_metadata | text | The user-defined metadata entries. |
 | acl | text | Nullable; the object ACL where ownership keeps ACLs in force. |
 | checksums | text | Nullable; any client-supplied checksums. |
+| internal_sha256 | text | Nullable; internal hex SHA-256 of the logical plaintext, recorded during new ingest/assembly. Legacy NULL is never backfilled by scrub. Independent of S3 checksums; native snapshots preserve it. |
 | replication_status | text | Nullable; pending, completed, failed, or replica, for replication-enabled buckets. |
 | replicated_at | integer | Nullable; unix seconds MarkReplicationDone last stamped this version completed (migration v23); NULL = never shipped from this node or shipped pre-v23 (treated as suspect by the encrypted-replica audit). |
 | created_at, updated_at | timestamp | Not null. |

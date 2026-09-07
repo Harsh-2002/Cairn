@@ -63,6 +63,8 @@ pub struct StagedBlob {
     pub etag: ETag,
     /// The raw hex MD5 (for content-MD5 verification).
     pub md5_hex: String,
+    /// Always-computed internal plaintext SHA-256 (hex), independent of S3 checksums.
+    pub internal_sha256: String,
     /// The computed supplementary checksums.
     pub checksums: Vec<ChecksumValue>,
     /// How the blob was physically stored.

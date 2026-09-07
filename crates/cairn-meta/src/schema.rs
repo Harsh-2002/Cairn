@@ -815,6 +815,11 @@ UPDATE replication_outbox SET status='pending', lease_until=NULL WHERE status='c
         name: "authenticated multipart replica intent",
         sql: "ALTER TABLE multipart_uploads ADD COLUMN replica_intent TEXT;",
     },
+    Migration {
+        version: 32,
+        name: "internal full-object integrity digest",
+        sql: "ALTER TABLE object_versions ADD COLUMN internal_sha256 TEXT;",
+    },
 ];
 
 /// Highest schema version understood by this build.
@@ -1763,6 +1768,7 @@ mod tests {
                  applied_at INTEGER NOT NULL
              );
              INSERT INTO schema_migrations VALUES (28, 'legacy fixture', 0);
+                 CREATE TABLE object_versions (id TEXT PRIMARY KEY);
              CREATE TABLE multipart_uploads (
                  id TEXT PRIMARY KEY,
                  status TEXT NOT NULL
@@ -1846,5 +1852,27 @@ mod tests {
                 ("worker".to_owned(), "pending".to_owned(), None, None)
             ]
         );
+    }
+    #[test]
+    fn internal_digest_migration_does_not_invent_legacy_baselines() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE object_versions (id TEXT PRIMARY KEY);
+            INSERT INTO object_versions VALUES ('legacy-multipart');",
+        )
+        .unwrap();
+        let migration = MIGRATIONS
+            .iter()
+            .find(|m| m.name == "internal full-object integrity digest")
+            .unwrap();
+        conn.execute_batch(migration.sql).unwrap();
+        let digest: Option<String> = conn
+            .query_row(
+                "SELECT internal_sha256 FROM object_versions WHERE id='legacy-multipart'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(digest, None);
     }
 }

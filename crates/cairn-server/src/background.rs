@@ -399,6 +399,7 @@ pub(crate) fn spawn(
             scrub_loop(
                 stack.clone(),
                 Duration::from_secs(cfg.scrub_interval_secs),
+                cfg.scrub_bytes_per_sec,
                 shutdown.clone(),
             ),
         );
@@ -1909,8 +1910,8 @@ enum SkipReason {
     KeyUnavailable,
     /// A multipart ETag (`{md5}-{n}`) is a hash OF HASHES, not a whole-object digest, so the
     /// re-read bytes cannot be compared to it. The blob is still read end-to-end (readability +
-    /// AEAD/CRNB authentication), but the content hash is NOT verified. Composite-ETag
-    /// verification is deliberately out of scope for this pass.
+    /// AEAD/CRNB authentication), but no internal digest or full-object supplementary checksum
+    /// exists for this legacy row. New multipart rows have an internal ingest digest.
     CompositeEtag,
     /// The row carries no `storage_path` (nothing on this node's disk to re-read).
     NoBlob,
@@ -2054,7 +2055,12 @@ async fn update_check_loop(
     }
 }
 
-async fn scrub_loop(stack: Arc<AppStack>, interval: Duration, mut shutdown: watch::Receiver<bool>) {
+async fn scrub_loop(
+    stack: Arc<AppStack>,
+    interval: Duration,
+    bytes_per_sec: u64,
+    mut shutdown: watch::Receiver<bool>,
+) {
     use cairn_types::meta::ListQuery;
     while wait_for_interval_or_shutdown(interval, &mut shutdown).await {
         let started = std::time::Instant::now();
@@ -2115,7 +2121,10 @@ async fn scrub_loop(stack: Arc<AppStack>, interval: Duration, mut shutdown: watc
                             .await
                         {
                             Ok(Some(row)) => {
-                                scrub_version(&*stack.blob, &*stack.crypto, &row).await
+                                tokio::select! {
+                                    outcome = scrub_version_paced(&*stack.blob, &*stack.crypto, &row, bytes_per_sec) => outcome,
+                                    _ = shutdown.changed() => return,
+                                }
                             }
                             Ok(None) => ScrubOutcome::Skipped(SkipReason::MetadataUnavailable),
                             Err(e) => {
@@ -2199,10 +2208,9 @@ async fn scrub_loop(stack: Arc<AppStack>, interval: Duration, mut shutdown: watc
 /// Re-read one object version and verify it, decrypting through its own DEK when it is encrypted.
 ///
 /// The read decompresses a CRNB-compressed blob and authenticates an encrypted one (so a corrupt
-/// container or a flipped ciphertext byte fails the AEAD tag here), and for a single-part object the
-/// recomputed PLAINTEXT MD5 is compared to the stored ETag — the right comparand under encryption
-/// too, because the blob store hashes the plaintext BEFORE compressing/encrypting it, so the ETag is
-/// the plaintext digest either way.
+/// container or a flipped ciphertext byte fails the AEAD tag here). Content verification prefers
+/// internal ingest SHA-256, then legacy full-object supplementary checksums, then single-part MD5.
+/// Every baseline is over plaintext before compression/encryption.
 ///
 /// Error classification (deliberate — see [`SkipReason::KeyUnavailable`]):
 ///   * DEK sealed under an off-ring key (`UnknownKeyId`/`Key`/`KeyRotationRequired`) → **skipped**,
@@ -2210,14 +2218,27 @@ async fn scrub_loop(stack: Arc<AppStack>, interval: Duration, mut shutdown: watc
 ///   * A malformed descriptor or a tampered/undersized envelope (`Decrypt` and friends) → **corrupt**:
 ///     it can never succeed, and it means the row's key material has been damaged.
 ///   * Open/read/hash failure → **corrupt**. Fails closed: no path returns "verified" on an error.
+#[cfg(test)]
 async fn scrub_version(
     blobs: &dyn cairn_types::traits::BlobStore,
     crypto: &dyn cairn_types::traits::Crypto,
     row: &cairn_types::object::ObjectVersionRow,
 ) -> ScrubOutcome {
+    scrub_version_paced(blobs, crypto, row, 0).await
+}
+
+/// Pace logical bytes between chunks without accumulating credit while another object is opened.
+/// The caller selects shutdown against the complete future, including blocked reads and sleeps.
+async fn scrub_version_paced(
+    blobs: &dyn cairn_types::traits::BlobStore,
+    crypto: &dyn cairn_types::traits::Crypto,
+    row: &cairn_types::object::ObjectVersionRow,
+    bytes_per_sec: u64,
+) -> ScrubOutcome {
+    use base64::Engine;
     use cairn_types::error::{BlobError, CryptoError};
+    use cairn_types::object::{ChecksumAlgorithm, ChecksumSet};
     use futures_util::StreamExt;
-    use md5::{Digest, Md5};
 
     let Some(path) = row.storage_path.as_ref() else {
         return ScrubOutcome::Skipped(SkipReason::NoBlob);
@@ -2257,11 +2278,64 @@ async fn scrub_version(
         }
         Err(_) => return ScrubOutcome::Corrupt("open_failed"),
     };
-    let mut hasher = Md5::new();
+    // Internal ingest digests take precedence. A malformed baseline is damage, never absence.
+    if row
+        .internal_sha256
+        .as_ref()
+        .is_some_and(|digest| digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        return ScrubOutcome::Corrupt("invalid_digest");
+    }
+    let mut full_checksums = Vec::new();
+    if row.internal_sha256.is_none() {
+        for checksum in &row.checksums {
+            let expected_len = match checksum.algorithm {
+                ChecksumAlgorithm::Crc32 | ChecksumAlgorithm::Crc32c => 4,
+                ChecksumAlgorithm::Crc64Nvme => 8,
+                ChecksumAlgorithm::Sha1 => 20,
+                ChecksumAlgorithm::Sha256 => 32,
+            };
+            let (encoded, composite) = match checksum.value.rsplit_once('-') {
+                Some((digest, count)) => {
+                    if count.parse::<u32>().ok().filter(|n| *n > 0).is_none()
+                        || checksum.algorithm == ChecksumAlgorithm::Crc64Nvme
+                    {
+                        return ScrubOutcome::Corrupt("invalid_digest");
+                    }
+                    (digest, true)
+                }
+                None => (checksum.value.as_str(), false),
+            };
+            if !base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .is_ok_and(|digest| digest.len() == expected_len)
+            {
+                return ScrubOutcome::Corrupt("invalid_digest");
+            }
+            if !composite {
+                full_checksums.push(checksum);
+            }
+        }
+    }
+    let set = ChecksumSet(full_checksums.iter().map(|c| c.algorithm).collect());
+    let mut hasher = cairn_blob::hash::Hashers::new(&set);
+    let mut logical_bytes = 0u64;
     let mut body = handle.body;
     while let Some(chunk) = body.next().await {
         match chunk {
-            Ok(bytes) => hasher.update(&bytes),
+            Ok(bytes) => {
+                logical_bytes = match logical_bytes.checked_add(bytes.len() as u64) {
+                    Some(total) if total <= row.size_logical => total,
+                    _ => return ScrubOutcome::Corrupt("length_mismatch"),
+                };
+                hasher.update(&bytes);
+                if bytes_per_sec > 0 && !bytes.is_empty() {
+                    tokio::time::sleep(Duration::from_secs_f64(
+                        bytes.len() as f64 / bytes_per_sec as f64,
+                    ))
+                    .await;
+                }
+            }
             // A decrypt/CRNB failure mid-stream is corruption; a bare I/O read error is transient.
             Err(BlobError::Io(_) | BlobError::OutOfSpace) => {
                 return ScrubOutcome::Skipped(SkipReason::IoError);
@@ -2269,15 +2343,33 @@ async fn scrub_version(
             Err(_) => return ScrubOutcome::Corrupt("read_failed"),
         }
     }
-    // Single-part ETag is a bare hex MD5; multipart is "{md5}-{partcount}" — a hash of hashes, not
-    // re-hashable from the assembled bytes. Those got the readability/AEAD check above but NOT a
-    // content-hash check, so they are reported skipped-with-reason rather than counted as verified.
-    let etag = row.etag.as_str();
-    if etag.contains('-') {
+    if logical_bytes != row.size_logical {
+        return ScrubOutcome::Corrupt("length_mismatch");
+    }
+    let (md5, checksums, internal_sha256) = hasher.finalize();
+    if let Some(expected) = &row.internal_sha256 {
+        return if internal_sha256.eq_ignore_ascii_case(expected) {
+            ScrubOutcome::Verified
+        } else {
+            ScrubOutcome::Corrupt("hash_mismatch")
+        };
+    }
+    if !full_checksums.is_empty() {
+        return if full_checksums
+            .iter()
+            .all(|expected| checksums.contains(expected))
+        {
+            ScrubOutcome::Verified
+        } else {
+            ScrubOutcome::Corrupt("hash_mismatch")
+        };
+    }
+    // Legacy multipart rows without an ingest baseline remain explicitly unverified. Never hash
+    // existing bytes into a new baseline: they may already be damaged.
+    if row.etag.is_multipart() {
         return ScrubOutcome::Skipped(SkipReason::CompositeEtag);
     }
-    let computed = hex::encode(hasher.finalize());
-    if computed.eq_ignore_ascii_case(etag.trim_matches('"')) {
+    if md5.eq_ignore_ascii_case(row.etag.as_str().trim_matches('"')) {
         ScrubOutcome::Verified
     } else {
         ScrubOutcome::Corrupt("hash_mismatch")
@@ -2802,6 +2894,7 @@ mod tests {
                 checksums: Vec::new(),
                 sse_descriptor,
                 replication_status: None,
+                internal_sha256: None,
                 replicated_at: None,
                 created_at: Timestamp(0),
                 updated_at: Timestamp(0),
@@ -2837,13 +2930,15 @@ mod tests {
                 )
                 .await
                 .expect("stage");
-            row_for(
+            let mut row = row_for(
                 staged.storage_path,
                 staged.etag,
                 staged.size_logical,
                 staged.compression,
                 descriptor,
-            )
+            );
+            row.internal_sha256 = Some(staged.internal_sha256);
+            row
         }
 
         /// Flip one byte of the blob's on-disk representation — simulated bit rot.
@@ -2982,7 +3077,13 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let blobs = LocalBlobStore::open(dir.path()).await.unwrap();
             let crypto = crypto_with_key_id(1, 0xa1);
-            let row = staged_row(&blobs, b"plain bytes on disk", None, None, None).await;
+            let mut row = staged_row(&blobs, b"plain bytes on disk", None, None, None).await;
+            assert_eq!(
+                scrub_version(&blobs, &crypto, &row).await,
+                ScrubOutcome::Verified
+            );
+            // The pre-migration single-part MD5 fallback remains covered independently.
+            row.internal_sha256 = None;
             assert_eq!(
                 scrub_version(&blobs, &crypto, &row).await,
                 ScrubOutcome::Verified
@@ -3003,10 +3104,187 @@ mod tests {
             let crypto = crypto_with_key_id(1, 0xa1);
             let mut row = staged_row(&blobs, b"assembled body", None, None, None).await;
             row.etag = ETag::from_md5_hex(format!("{}-2", "0".repeat(32)));
+            row.internal_sha256 = None;
             assert_eq!(
                 scrub_version(&blobs, &crypto, &row).await,
                 ScrubOutcome::Skipped(SkipReason::CompositeEtag)
             );
+        }
+
+        /// A multipart ETag does not suppress an independent full-object baseline. Exercise
+        /// every supported algorithm with trusted legacy checksums and with the new internal hash.
+        #[tokio::test]
+        async fn multipart_digests_verify_plain_compressed_and_encrypted_content() {
+            use cairn_types::ChecksumAlgorithm;
+            let algorithms = [
+                ChecksumAlgorithm::Crc32,
+                ChecksumAlgorithm::Crc32c,
+                ChecksumAlgorithm::Crc64Nvme,
+                ChecksumAlgorithm::Sha1,
+                ChecksumAlgorithm::Sha256,
+            ];
+            for mode in 0..3 {
+                for algorithm in algorithms {
+                    let dir = tempfile::tempdir().unwrap();
+                    let blobs = LocalBlobStore::open(dir.path()).await.unwrap();
+                    let crypto = crypto_with_key_id(1, 0xa1);
+                    let body = b"multipart full content ".repeat(4096);
+                    let dek = (mode == 2).then_some([3u8; 32]);
+                    let mut row = staged_row(
+                        &blobs,
+                        &body,
+                        dek.map(Into::into),
+                        dek.map(|key| descriptor_for(&crypto, &key)),
+                        (mode == 1).then(cairn_types::bucket::CompressionPolicy::default),
+                    )
+                    .await;
+                    row.etag = ETag::multipart("0".repeat(32), 2);
+                    assert_eq!(
+                        scrub_version(&blobs, &crypto, &row).await,
+                        ScrubOutcome::Verified
+                    );
+                    // Legacy rows may carry a FULL_OBJECT checksum but have no internal baseline.
+                    row.internal_sha256 = None;
+                    let mut hashes = cairn_blob::hash::Hashers::new(&ChecksumSet(vec![algorithm]));
+                    hashes.update(&body);
+                    row.checksums = hashes.finalize().1;
+                    assert_eq!(
+                        scrub_version(&blobs, &crypto, &row).await,
+                        ScrubOutcome::Verified
+                    );
+                    flip_a_byte(dir.path(), &row);
+                    assert!(matches!(
+                        scrub_version(&blobs, &crypto, &row).await,
+                        ScrubOutcome::Corrupt(_)
+                    ));
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn internal_multipart_digest_detects_plaintext_rot_and_bad_metadata() {
+            let dir = tempfile::tempdir().unwrap();
+            let blobs = LocalBlobStore::open(dir.path()).await.unwrap();
+            let crypto = crypto_with_key_id(1, 0xa1);
+            let mut row = staged_row(&blobs, b"multipart plaintext", None, None, None).await;
+            row.etag = ETag::multipart("0".repeat(32), 2);
+            let digest = row.internal_sha256.clone();
+            row.internal_sha256 = Some("not a digest".to_owned());
+            assert_eq!(
+                scrub_version(&blobs, &crypto, &row).await,
+                ScrubOutcome::Corrupt("invalid_digest")
+            );
+            row.internal_sha256 = digest;
+            flip_a_byte(dir.path(), &row);
+            assert_eq!(
+                scrub_version(&blobs, &crypto, &row).await,
+                ScrubOutcome::Corrupt("hash_mismatch")
+            );
+        }
+
+        #[tokio::test]
+        async fn composite_checksums_are_not_full_object_baselines() {
+            use cairn_types::{ChecksumAlgorithm, ChecksumValue};
+            let dir = tempfile::tempdir().unwrap();
+            let blobs = LocalBlobStore::open(dir.path()).await.unwrap();
+            let crypto = crypto_with_key_id(1, 0xa1);
+            let mut row = staged_row(&blobs, b"assembled body", None, None, None).await;
+            row.internal_sha256 = None;
+            row.etag = ETag::multipart("0".repeat(32), 2);
+            row.checksums = vec![ChecksumValue {
+                algorithm: ChecksumAlgorithm::Crc32,
+                value: "NSRBwg==-2".to_owned(),
+            }];
+            assert_eq!(
+                scrub_version(&blobs, &crypto, &row).await,
+                ScrubOutcome::Skipped(SkipReason::CompositeEtag)
+            );
+            row.checksums[0].value = "malformed".to_owned();
+            assert_eq!(
+                scrub_version(&blobs, &crypto, &row).await,
+                ScrubOutcome::Corrupt("invalid_digest")
+            );
+        }
+
+        #[tokio::test]
+        async fn scrub_pacing_is_cancellable_and_unthrottled_by_default() {
+            let dir = tempfile::tempdir().unwrap();
+            let blobs = LocalBlobStore::open(dir.path()).await.unwrap();
+            let crypto = crypto_with_key_id(1, 0xa1);
+            let row = staged_row(&blobs, &[42; 100], None, None, None).await;
+            // One byte/s cannot verify 100 bytes within 20 ms. Dropping the pending future
+            // (the shutdown path) releases its reader immediately, allowing another scrub.
+            assert!(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(20),
+                    super::super::scrub_version_paced(&blobs, &crypto, &row, 1)
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(
+                scrub_version(&blobs, &crypto, &row).await,
+                ScrubOutcome::Verified
+            );
+        }
+
+        /// An opt-in local measurement, not a timing-sensitive CI assertion. The files are warm
+        /// in the page cache; report the host/workload when interpreting these read latencies.
+        #[tokio::test]
+        #[ignore = "manual scrub/foreground I/O measurement"]
+        async fn scrub_foreground_io_measurement() {
+            use cairn_types::{BlobCipher, ByteRange};
+            use futures_util::StreamExt;
+            let dir = tempfile::tempdir().unwrap();
+            let blobs = LocalBlobStore::open(dir.path()).await.unwrap();
+            let crypto = crypto_with_key_id(1, 0xa1);
+            let row = staged_row(&blobs, &vec![42; 32 * 1024 * 1024], None, None, None).await;
+            for rate in [None, Some(0), Some(16 * 1024 * 1024)] {
+                let background = async {
+                    if let Some(rate) = rate {
+                        assert_eq!(
+                            super::super::scrub_version_paced(&blobs, &crypto, &row, rate).await,
+                            ScrubOutcome::Verified
+                        );
+                    }
+                };
+                let foreground = async {
+                    let mut timings = Vec::new();
+                    for i in 0..100 {
+                        let started = std::time::Instant::now();
+                        let mut body = blobs
+                            .open_raw(
+                                row.storage_path.as_ref().unwrap(),
+                                Some(ByteRange {
+                                    offset: (i % 32) * 1024 * 1024,
+                                    length: 1024 * 1024,
+                                }),
+                                BlobCipher::KnownPlaintext,
+                                &row.compression,
+                                row.size_logical,
+                            )
+                            .await
+                            .unwrap()
+                            .body;
+                        let mut count = 0usize;
+                        while let Some(chunk) = body.next().await {
+                            count += chunk.unwrap().len();
+                        }
+                        assert_eq!(count, 1024 * 1024);
+                        timings.push(started.elapsed());
+                    }
+                    timings.sort_unstable();
+                    timings
+                };
+                let started = std::time::Instant::now();
+                let (_, timings) = tokio::join!(background, foreground);
+                eprintln!(
+                    "warm-cache scrub_rate={rate:?} bytes/s read_1MiB_p50_ms={:.3} p95_ms={:.3} total_secs={:.3}",
+                    timings[50].as_secs_f64() * 1000.0,
+                    timings[95].as_secs_f64() * 1000.0,
+                    started.elapsed().as_secs_f64()
+                );
+            }
         }
 
         /// A row with no blob is counted, not dropped.

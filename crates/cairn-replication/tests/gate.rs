@@ -103,6 +103,7 @@ fn version_row(
         checksums: Vec::new(),
         sse_descriptor: None,
         replication_status: Some(status),
+        internal_sha256: None,
         replicated_at: None,
         created_at: now,
         updated_at: now,

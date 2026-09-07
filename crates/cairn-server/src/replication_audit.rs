@@ -674,6 +674,7 @@ mod tests {
             checksums: Vec::new(),
             sse_descriptor: descriptor.map(ToOwned::to_owned),
             replication_status: Some(status),
+            internal_sha256: None,
             replicated_at,
             created_at,
             updated_at: created_at,

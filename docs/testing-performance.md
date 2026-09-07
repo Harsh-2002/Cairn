@@ -37,7 +37,22 @@ A test-only fault seam injects a failure in the window between blob durability a
 
 The decisive tests run real S3 clients against a running Cairn. The boto3 AWS SDK drives a matrix covering the object operations including plain, unsigned-payload, and streaming-chunked puts so that the chunked path and real SigV4 are exercised by a real client, ranged and conditional gets, heads, deletes, bulk deletes, copies, the full multipart cycle including abort and out-of-order completion, and presigned URLs, together with versioning behaviour and version listing, tagging, and copy. Independently, the MinIO warp macro benchmark drives the server as a second real client across get, put, and mixed profiles in strict mode with a zero-error gate, so a genuinely different client validates the wire under load. Beyond driving Cairn alone, a per-commit CI job (`conformance/bench_compare.sh`) stands up Cairn **and** a pinned MinIO server binary on the same runner and runs the identical warp matrix against each side by side — put, get, stat, delete, list, and mixed at small and large object sizes — reporting the Cairn-versus-MinIO throughput ratio together with each engine's CPU and resident memory while serving. It is a *reported* comparison rather than a throughput gate, because a shared runner's absolute numbers vary run to run, so it fails only on warp operation errors and never on who is faster; the ratio, not the absolute rate, is the signal. The boto3 conformance script runs as a CI gate covering the core object lifecycle, versioning, tagging, multipart, copy, and bulk delete, and it is joined by dedicated live-client gates for the surfaces it does not touch: `authz.sh` exercises policy and public-access-block, `buckets.sh` drives a real CORS preflight, `lifecycle.sh` drives expiry enforcement and transition-rule handling, and `mesh.sh`, `replication_chaos.sh`, and `soak.sh` exercise replication round-trips end to end — all CI gates alongside the boto3 script, and backed by the unit and integration suites. Replication is tested end to end between two Cairn instances and with a fake sink that can simulate failures to exercise retry and backoff; lifecycle is tested with a controllable clock so that expiry, transition, and abort timing are deterministic; and compression is tested for round-trip fidelity, for correct ranged reads against compressed blobs, for the incompressibility heuristic, and for ETag invariance between compressed and uncompressed storage of the same content.
 
+The live `conformance/scrub.sh` gate isolates plaintext, at-rest encryption, client SSE-S3,
+compression and multipart content on separate nodes. Its multipart arm disables optional SDK
+checksums, verifies the intact assembled object first, and then proves byte corruption is detected
+through the internal SHA-256 without a composite-ETag coverage skip. Legacy rows without a content
+baseline retain their explicit skip coverage in the server unit suite.
+
 ### 29.6 Benchmarks and load
+
+Internal-integrity regressions cover all full-object supplementary checksum algorithms on
+plaintext, compressed, and encrypted multipart content, legacy composite-only coverage skips,
+malformed baselines, ingest/assembly digest persistence, and cancellable byte pacing. A manual
+warm-page-cache contention measurement is available with
+`cargo test -p cairn-server scrub_foreground_io_measurement -- --ignored --nocapture`: it compares
+100 foreground 1-MiB reads with no scrub, an unthrottled 32-MiB scrub, and a 16-MiB/s paced scrub.
+Record host load and cache state with results; this is not a cold-device or production benchmark
+and is intentionally excluded from timing-sensitive CI acceptance.
 
 Micro-benchmarks confirm that hashing, compression, and chunked decoding are not the bottleneck on the ingest path. Macro load tests drive concurrent puts and gets for both large-object bandwidth-bound and small-object rate-bound profiles using a standard object-storage load tool, report throughput and latency percentiles, and characterise the single-writer ceiling by observing the write-queue-depth metric as concurrency rises, which is how the group-commit benefit and its limit are quantified rather than assumed.
 

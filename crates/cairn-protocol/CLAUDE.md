@@ -140,3 +140,6 @@ Clock/Crypto>`) — never a concrete engine.
   decoder bench `benches/decode.rs`. service.rs has no inline `#[test]`s.
 - Spec: `docs/s3-api.md` (13, 16–19, 21; decoder = 21.7); auth `docs/auth.md` (14–15); errors
   `docs/security-errors.md` (25). See the root `../../CLAUDE.md` for the gate and conventions.
+
+- PUT, copy, and multipart completion persist the staged internal plaintext SHA-256 with the
+  object row. Imports and replicas share these paths. Do not surface it as an unsolicited S3 checksum.

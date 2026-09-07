@@ -17,7 +17,7 @@ plain files under opaque IDs; metadata is someone else's job (`cairn-meta`).
   fsyncs into one syscall (group-commit for the directory fsync, ARCH 8.2). Shared across store clones.
 - `compress.rs` — the CRNB block format: `BlockEncoder` (write) / `CompressedReader` (ranged read),
   per-block zstd/lz4, per-block AES-256-GCM. **`pub` + `#[doc(hidden)]`** only so `fuzz/` can drive it.
-- `hash.rs` — `Hashers`: the always-on MD5 (→ ETag) plus requested CRC32/CRC32C/SHA1/SHA256, over
+- `hash.rs` — `Hashers`: the always-on MD5 (→ ETag) and internal SHA-256 plus requested supplementary checksums, over
   plaintext, in one streaming pass.
 - `raw_io.rs` — safe `fallocate`/`fadvise` placement hints (ARCH 7.5) via `rustix` (keeps `forbid(unsafe_code)`).
 - `uring.rs` — the optional `io-uring`-feature staging backend (EXPERIMENTAL, Linux-only, off by default).
@@ -121,5 +121,8 @@ plain files under opaque IDs; metadata is someone else's job (`cairn-meta`).
 - Failpoint seams (`--features failpoints`): `blob_after_durable`, `blob_after_assemble`,
   `blob_after_multipart_session_dir` — exercised by crate tests,
   `conformance/crash_consistency.sh`, and `crash_multipoint.sh`. CRNB-reader fuzz target in `fuzz/`.
+- New `StagedBlob` values always carry `internal_sha256`, computed over logical plaintext in the
+  same ingest/assembly pass. It never adds an unrequested S3 checksum. `hash::Hashers` is shared with
+  the scrubber so full-object supplementary checksum algorithms use the ingest implementations.
 - Tests: unit tests in each module; integration in `tests/blob.rs`. Spec: `docs/storage-durability.md`
   (8–10), SSE-S3 in `docs/security-errors.md` 27. Gate: see the root `../../CLAUDE.md`.
