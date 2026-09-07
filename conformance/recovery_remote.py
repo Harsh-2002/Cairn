@@ -33,7 +33,6 @@ class FaultProxy(http.server.ThreadingHTTPServer):
         self.peer_port, self.stage = peer_port, stage
         self.held, self.release = threading.Event(), threading.Event()
         self.lock = threading.Lock()
-        self.remote_id = None
         self.errors = []
         threading.Thread(target=self.serve_forever, daemon=True).start()
 
@@ -67,8 +66,6 @@ class Forward(http.server.BaseHTTPRequestHandler):
             assert len(body) <= MIB, "unexpectedly large control response"
             query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query, keep_blank_values=True)
             initiation = self.command == "POST" and "uploads" in query
-            if initiation and response.status == 200:
-                self.server.remote_id = ET.fromstring(body).findtext(f"{NS}UploadId")
             with self.server.lock:
                 hold = ((self.server.stage == "initiation" and initiation)
                         or (self.server.stage == "part" and self.command == "PUT" and query.get("partNumber") == ["1"])
@@ -79,11 +76,22 @@ class Forward(http.server.BaseHTTPRequestHandler):
                     self.server.held.set()
             if hold:
                 self.server.release.wait(400)
+            # This fixture needs only protocol result headers, never arbitrary peer header names.
+            # Validate before writing the status line; the explicit normalization also keeps the
+            # bytes sent to http.server free of line breaks without silently accepting a mutation.
+            headers = []
+            for name in ("etag", "content-type", "x-amz-version-id"):
+                value = response.getheader(name)
+                if value is not None:
+                    clean = value.replace("\r", "").replace("\n", "")
+                    if clean != value:
+                        raise ValueError("peer response header contains a line break")
+                    headers.append((name, clean))
+            length = int(response.getheader("content-length", "0")) if self.command == "HEAD" else len(body)
             self.send_response(response.status)
-            for key, value in response.getheaders():
-                if key.lower() not in ("connection", "transfer-encoding", "content-length"):
-                    self.send_header(key, value)
-            self.send_header("content-length", str(len(body)))
+            for name, value in headers:
+                self.send_header(name, value)
+            self.send_header("content-length", str(length))
             self.end_headers()
             self.wfile.write(body)
         except (BrokenPipeError, ConnectionResetError):
@@ -188,7 +196,11 @@ def scenario(binary, work, stage, cleanup_lease):
         assert len(journal) == 1 and journal[0]["origin_token"]
         owner = next(row for row in rows(database, "replication_outbox") if row["id"] == journal[0]["outbox_id"])
         assert owner["status"] == "claimed" and owner["claim_token"] == journal[0]["origin_token"], "journal must bind the exact live delivery attempt"
-        attempt, remote_id = journal[0]["id"], proxy.remote_id
+        # The response stays opaque in the proxy. Read the peer's authoritative row instead of
+        # adding an XML parser solely to learn the upload ID for this fixture's assertions.
+        peer_uploads = rows(peer_data / "cairn.db", "multipart_uploads")
+        assert len(peer_uploads) == 1, "peer must durably own exactly one upload"
+        attempt, remote_id = journal[0]["id"], peer_uploads[0]["id"]
         assert remote_id, "peer must actually create an upload"
         assert (journal[0]["upload_id"] is None) == (stage == "initiation")
         if stage == "part":

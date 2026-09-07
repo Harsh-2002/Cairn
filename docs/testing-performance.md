@@ -59,6 +59,11 @@ baseline retain their explicit skip coverage in the server unit suite.
 
 ### 29.6 Benchmarks and load
 
+A deferred post-merge million-object and mixed large-file capacity campaign is recorded in
+[the implementation tracker](implementation-phases-2026-09.md#deferred-final-phase-capacity-sustained-load-and-regression-campaign).
+It requires a separately scheduled run; existing CI and multi-GiB transfer checks do not establish
+that capacity envelope.
+
 Internal-integrity regressions cover all full-object supplementary checksum algorithms on
 plaintext, compressed, and encrypted multipart content, legacy composite-only coverage skips,
 malformed baselines, ingest/assembly digest persistence, and cancellable byte pacing. A manual
