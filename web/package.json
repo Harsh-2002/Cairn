@@ -9,7 +9,8 @@
     "build": "tsc -b && vite build",
     "e2e": "node scripts/console-e2e.mjs",
     "preview": "vite preview",
-    "lint": "eslint . && node scripts/browser-path-regression.mjs"
+    "lint": "eslint . && node scripts/browser-path-regression.mjs",
+    "test:performance": "node scripts/console-performance.mjs"
   },
   "dependencies": {
     "@fontsource/geist-mono": "^5.2.8",

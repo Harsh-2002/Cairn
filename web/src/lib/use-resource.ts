@@ -23,7 +23,8 @@ export interface Resource<T> {
  * while a refresh is in flight, so the page never tears down to a skeleton.
  *
  * `deps` re-runs the load from scratch (e.g. a bucket-name route param);
- * stale responses are discarded via a sequence counter.
+ * each generation allows one active load and one queued refresh. Cleanup
+ * invalidates its responses and drops queued work.
  */
 export function useResource<T>(
   load: () => Promise<T>,
@@ -34,46 +35,67 @@ export function useResource<T>(
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
 
-  const seq = useRef(0);
   const loadRef = useRef(load);
   loadRef.current = load;
-  const hasData = useRef(false);
-
-  const run = useCallback(async (fresh: boolean) => {
-    const ticket = ++seq.current;
-    if (fresh || !hasData.current) {
-      hasData.current = false;
-      setData(undefined);
-      setLoading(true);
-      setRefreshing(false);
-    } else {
-      setRefreshing(true);
-    }
-    setError(null);
-    try {
-      const next = await loadRef.current();
-      if (ticket !== seq.current) return;
-      hasData.current = true;
-      setData(next);
-    } catch (e) {
-      if (ticket !== seq.current) return;
-      setError(errorMessage(e, "Couldn't load this. Refresh to try again."));
-    } finally {
-      if (ticket === seq.current) {
-        setLoading(false);
-        setRefreshing(false);
-      }
-    }
-  }, []);
+  const refreshRef = useRef<(() => void) | null>(null);
 
   useEffect(() => {
-    void run(true);
+    // State belongs to this dependency generation. Old requests may still finish,
+    // but cannot publish data or start queued work after cleanup (also in StrictMode).
+    let disposed = false;
+    let running = false;
+    let queued = false;
+    let hasData = false;
+    setData(undefined);
+    setError(null);
+    setLoading(true);
+    setRefreshing(false);
+
+    async function run() {
+      if (disposed) return;
+      if (running) {
+        queued = true;
+        return;
+      }
+      running = true;
+      setLoading(!hasData);
+      setRefreshing(hasData);
+      setError(null);
+      try {
+        const next = await loadRef.current();
+        if (disposed) return;
+        hasData = true;
+        setData(next);
+      } catch (e) {
+        if (disposed) return;
+        setError(errorMessage(e, "Couldn't load this. Refresh to try again."));
+      } finally {
+        running = false;
+        if (!disposed) {
+          if (queued) {
+            queued = false;
+            void run();
+          } else {
+            setLoading(false);
+            setRefreshing(false);
+          }
+        }
+      }
+    }
+
+    refreshRef.current = () => { void run(); };
+    void run();
+    return () => {
+      disposed = true;
+      queued = false;
+      refreshRef.current = null;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, deps);
 
   const refresh = useCallback(() => {
-    void run(false);
-  }, [run]);
+    refreshRef.current?.();
+  }, []);
 
   return { data, error, loading, refreshing, refresh };
 }
