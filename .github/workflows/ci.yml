@@ -98,6 +98,7 @@ jobs:
         run: |
           npm ci
           npm run lint
+          npm run test:performance
           npm audit --omit=dev --audit-level=moderate
           npm audit --audit-level=high
 

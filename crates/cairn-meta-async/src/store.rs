@@ -1310,11 +1310,10 @@ impl MetadataStore for AsyncMetadataStore {
         .await?
         .unwrap_or_default();
         let (versions, logical, physical) = (agg.get_i64(0), agg.get_i64(1), agg.get_i64(2));
-        // The current-visible object count is an index-only scan of the partial current-version
-        // index (idx_ov_latest_cover): one entry per live object, not every version.
+        // Current visibility is maintained in the same writer savepoint (schema v34).
         let objects = query_one(
             driver,
-            "SELECT COUNT(*) FROM object_versions WHERE is_latest=1 AND is_delete_marker=0",
+            "SELECT COALESCE(SUM(objects),0) FROM bucket_stats",
             vec![],
         )
         .await?
@@ -1329,23 +1328,17 @@ impl MetadataStore for AsyncMetadataStore {
     }
 
     async fn bucket_counts(&self) -> Result<Vec<BucketCounts>, MetaError> {
-        // Byte totals from the maintained roll-up (LEFT JOIN so empty buckets show zeros); the
-        // current-object count joins a GROUP BY over the partial current-version index. Neither
-        // path scans historical versions for the byte sums.
+        // All counts use maintained roll-ups; the LEFT JOIN includes empty buckets.
         let rows = self
             .reader()
             .await
             .query(
                 "SELECT b.name,
-                    COALESCE(o.objects, 0),
+                    COALESCE(s.objects, 0),
                     COALESCE(s.logical_bytes, 0),
                     COALESCE(s.physical_bytes, 0)
                  FROM buckets b
                  LEFT JOIN bucket_stats s ON s.bucket_name = b.name
-                 LEFT JOIN (
-                    SELECT bucket_name, COUNT(*) AS objects FROM object_versions
-                    WHERE is_latest=1 AND is_delete_marker=0 GROUP BY bucket_name
-                 ) o ON o.bucket_name = b.name
                  ORDER BY b.name",
                 vec![],
             )

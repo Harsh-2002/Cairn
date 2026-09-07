@@ -21,6 +21,12 @@ bucket/user fixtures, visits every top-level and nested route at desktop and mob
 requires valid landmarks and ARIA relationships, unique ids, correct titles/headings, no horizontal
 overflow, no accessibility violations, and no browser exceptions before removing its fixtures.
 
+The focused console scaling regression (`cd web && npm run test:performance`) runs the real
+React components against mocked API responses in Chrome, at desktop and mobile widths. It covers
+2,000 buckets with a 50-row DOM bound, page selection/deletion, refresh coalescing, stale responses,
+unmount, and StrictMode. It creates no Cairn object data and runs in the web CI job. Set `CHROME_BIN`
+when Chrome is not named `google-chrome`; temporary profiles and the Vite listener are removed on exit.
+
 ### 29.2 Property-based tests
 
 Property tests assert invariants over randomised inputs. The key sanitiser never panics and never accepts a key that resolves outside the data root. Listing is correct: the concatenation of pages equals a single unbounded listing, results are sorted and free of duplicates, common-prefix grouping matches a simple reference oracle, and pagination is gap-free and repeat-free across boundaries, tested over randomised key sets, prefixes, delimiters, and page sizes. SigV4 canonicalisation matches a reference for randomised paths and queries including reserved and multibyte characters. The authorization engine satisfies its precedence properties, for instance that an explicit deny always overrides any allow and that enabling public-access blocking never broadens access.

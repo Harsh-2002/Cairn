@@ -13,6 +13,12 @@ For a live browser pass against a disposable running node, set `CAIRN_E2E_BASE_U
 creates isolated bucket/user fixtures, covers every route at desktop and mobile widths, and removes
 those fixtures before exit.
 
+`npm run test:performance` runs bounded Chrome regressions against a temporary Vite server with
+mocked management calls: resource lifecycle/refresh races and 2,000-bucket pagination at desktop
+and mobile widths. It needs Chrome (`CHROME_BIN` overrides the executable), creates no Cairn
+data, and removes its browser profile on exit, including startup failures. Browser shutdown
+waits two seconds after SIGTERM before falling back to SIGKILL with a second two-second deadline.
+
 ## Layout (`src/`)
 - `main.tsx` / `app.tsx` / `routes.tsx` — entry, provider shell (`ThemeProvider` → `AuthProvider` →
   router), routing. Add a page here.
@@ -67,7 +73,8 @@ those fixtures before exit.
 
 ## Notes
 - Fetch data with `useResource(load, deps)`: it keeps stale data on screen during a refresh
-  (`refreshing` vs first-load `loading`) and discards out-of-order responses. Surface errors via
+  (`refreshing` vs first-load `loading`) and coalesces refresh bursts into one pending reload per dependency generation. Cleanup discards
+  stale responses and queued work on navigation or unmount. Surface errors via
   `errorMessage(e, fallback)` from `lib/api.ts` — the humanizer maps S3/control `<Code>`s to
   operator-readable copy; don't render raw server strings.
 - Live updates: subscribe a view with `useLiveTopic` (`lib/live.ts`), one multiplexed `EventSource`

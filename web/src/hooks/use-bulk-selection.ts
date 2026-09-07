@@ -20,6 +20,26 @@ export function useBulkSelection() {
     setSelected(on ? new Set(ids) : new Set());
   }, []);
 
+  // Update only the visible page, preserving explicit selections on other pages.
+  const setSome = useCallback((ids: string[], on: boolean) => {
+    setSelected((cur) => {
+      const next = new Set(cur);
+      for (const id of ids) {
+        if (on) next.add(id);
+        else next.delete(id);
+      }
+      return next;
+    });
+  }, []);
+
+  const retain = useCallback((ids: string[]) => {
+    const valid = new Set(ids);
+    setSelected((cur) => {
+      const next = new Set([...cur].filter((id) => valid.has(id)));
+      return next.size === cur.size ? cur : next;
+    });
+  }, []);
+
   const clear = useCallback(() => setSelected(new Set()), []);
 
   return useMemo(
@@ -29,8 +49,10 @@ export function useBulkSelection() {
       has: (id: string) => selected.has(id),
       toggle,
       setAll,
+      setSome,
+      retain,
       clear,
     }),
-    [selected, toggle, setAll, clear],
+    [selected, toggle, setAll, setSome, retain, clear],
   );
 }

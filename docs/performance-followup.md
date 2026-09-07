@@ -5,8 +5,8 @@ Five sequential PRs address the September 2026 capacity campaign findings. Histo
 | Phase | Change | Status |
 | --- | --- | --- |
 | 1 | TCP_NODELAY on both accepted listeners | PR #76 merged after green CI; 16 focused server tests passed |
-| 2 | Reap completed connection tasks | Implemented; focused selector/shutdown tests passed |
-| 3 | Bounded bucket rendering, coalesced refresh, maintained visible counts | Pending |
+| 2 | Reap completed connection tasks | PR #77 merged after green CI |
+| 3 | Bounded bucket rendering, coalesced refresh, maintained visible counts | Implemented; focused checks passed; CI gates merge |
 | 4 | Bounded write-stage diagnostics | Pending |
 | 5 | Reuse multipart buffers and measure assembly stages | Pending |
 
@@ -23,6 +23,24 @@ new accepts, pending shutdown and sender closure, and forced-drain accounting. T
 server tests passed; after adding pending-shutdown coverage, all seven focused shutdown tests passed.
 No new RSS comparison was run: removal of completed task retention is structurally tested, while
 allocator/cache retention and other unexplained memory growth remain separate questions.
+
+## Phase 3
+
+Bucket pages render at most 50 rows, preserve explicit selections across pages, and clamp after
+deletions. Refreshes allow one active load plus one queued refresh per dependency generation;
+old generations cannot publish or schedule work after disposal. The browser regression runs in CI
+with 2,000 mocked buckets at desktop/mobile widths and creates no Cairn data. Startup failures and
+forced browser termination also clean up test profiles/listeners.
+
+Schema v34 backfills exact current-visible counters once. Both SQL backends update visibility
+inside writer savepoints; overview reads use per-bucket rollups while byte/version meanings stay
+unchanged. Focused local validation passed: four counter tests, populated migration/idempotence,
+nine sharding tests, console lint/build/audits and browser tests. CI exposed legacy migration
+fixtures missing pre-existing rollup tables; those fixtures were corrected in both SQL backends,
+and all 23 default-backend migration tests then passed locally. Async-backend parity tests are
+included for CI. The bounded 100,000-row query comparison and its limitations are in
+[benchmarks.md](benchmarks.md#maintained-visible-counts-bounded-query-comparison-2026-09-08).
+Client-side pagination bounds rendering; existing bucket-list API payloads still contain all buckets.
 
 ## Remaining limitations
 

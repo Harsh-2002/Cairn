@@ -2027,11 +2027,10 @@ impl MetadataStore for SqliteMetadataStore {
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )
                 .map_err(engine_err)?;
-            // The current-visible object count is an index-only scan of the partial current-version
-            // index (idx_ov_latest_cover), so it visits one entry per live object, not every version.
+            // Current visibility is maintained in the same writer savepoint (schema v34).
             let objects: i64 = conn
                 .query_row(
-                    "SELECT COUNT(*) FROM object_versions WHERE is_latest=1 AND is_delete_marker=0",
+                    "SELECT COALESCE(SUM(objects),0) FROM bucket_stats",
                     [],
                     |r| r.get(0),
                 )
@@ -2049,21 +2048,15 @@ impl MetadataStore for SqliteMetadataStore {
 
     async fn bucket_counts(&self) -> Result<Vec<BucketCounts>, MetaError> {
         self.with_read(move |conn| {
-            // Byte totals come from the maintained roll-up (LEFT JOIN so buckets with no objects
-            // still appear with zeros); the current-object count joins a GROUP BY over the partial
-            // current-version index. Neither path scans historical versions for the byte sums.
+            // All counts use maintained roll-ups; the LEFT JOIN includes empty buckets.
             let mut stmt = conn
                 .prepare_cached(
                     "SELECT b.name,
-                        COALESCE(o.objects, 0),
+                        COALESCE(s.objects, 0),
                         COALESCE(s.logical_bytes, 0),
                         COALESCE(s.physical_bytes, 0)
                      FROM buckets b
                      LEFT JOIN bucket_stats s ON s.bucket_name = b.name
-                     LEFT JOIN (
-                        SELECT bucket_name, COUNT(*) AS objects FROM object_versions
-                        WHERE is_latest=1 AND is_delete_marker=0 GROUP BY bucket_name
-                     ) o ON o.bucket_name = b.name
                      ORDER BY b.name",
                 )
                 .map_err(engine_err)?;

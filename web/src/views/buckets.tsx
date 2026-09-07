@@ -37,6 +37,8 @@ import { bytes, count, whenMs } from "@/lib/format";
 import { useResource } from "@/lib/use-resource";
 import { useLiveTopic } from "@/lib/live";
 
+const PAGE_SIZE = 50;
+
 const NAME_RULE =
   "3–63 characters: lowercase letters, digits, hyphens, and dots; must start and end with a letter or digit.";
 
@@ -87,9 +89,21 @@ export function Buckets() {
 
   // ---- bulk selection ------------------------------------------------------
   const sel = useBulkSelection();
-  const allIds = buckets.map((b) => b.name);
+  const [page, setPage] = useState(0);
+  const lastPage = Math.max(0, Math.ceil(buckets.length / PAGE_SIZE) - 1);
+  const currentPage = Math.min(page, lastPage);
+  const visibleBuckets = buckets.slice(currentPage * PAGE_SIZE, (currentPage + 1) * PAGE_SIZE);
+  const allIds = visibleBuckets.map((b) => b.name);
+  // Keep the page and selection valid when a refresh observes deleted buckets.
+  useEffect(() => {
+    setPage(currentPage);
+  }, [currentPage]);
+  const retainSelection = sel.retain;
+  useEffect(() => {
+    if (list.data) retainSelection(list.data.buckets.map((b) => b.name));
+  }, [list.data, retainSelection]);
   const allSelected = allIds.length > 0 && allIds.every((id) => sel.has(id));
-  const someSelected = sel.count > 0 && !allSelected;
+  const someSelected = allIds.some((id) => sel.has(id)) && !allSelected;
   const [bulkDeleting, setBulkDeleting] = useState(false);
   const [confirmBulk, setConfirmBulk] = useState(false);
 
@@ -102,8 +116,8 @@ export function Buckets() {
       label: (
         <Checkbox
           checked={allSelected ? true : someSelected ? "indeterminate" : false}
-          onCheckedChange={(v) => sel.setAll(allIds, v === true)}
-          aria-label="Select all buckets"
+          onCheckedChange={(v) => sel.setSome(allIds, v === true)}
+          aria-label="Select all buckets on this page"
         />
       ),
     },
@@ -262,7 +276,7 @@ export function Buckets() {
             </Button>
           </BulkBar>
           <DataTable columns={columns} minWidth={760}>
-            {buckets.map((b) => (
+            {visibleBuckets.map((b) => (
               <TableRow
                 key={b.name}
                 data-state={sel.has(b.name) ? "selected" : undefined}
@@ -344,6 +358,20 @@ export function Buckets() {
             </TableRow>
           ))}
           </DataTable>
+          <nav aria-label="Bucket pages" className="mt-3 flex flex-wrap items-center justify-between gap-3 text-sm">
+            <p className="text-muted-foreground tabular-nums" aria-live="polite">
+              {buckets.length === 0 ? 0 : currentPage * PAGE_SIZE + 1}–{Math.min((currentPage + 1) * PAGE_SIZE, buckets.length)} of {count(buckets.length)} buckets
+            </p>
+            <div className="flex items-center gap-2">
+              <Button variant="outline" size="sm" disabled={currentPage === 0} onClick={() => setPage(currentPage - 1)}>
+                Previous
+              </Button>
+              <span className="tabular-nums">Page {currentPage + 1} of {lastPage + 1}</span>
+              <Button variant="outline" size="sm" disabled={currentPage === lastPage} onClick={() => setPage(currentPage + 1)}>
+                Next
+              </Button>
+            </div>
+          </nav>
         </>
       )}
 

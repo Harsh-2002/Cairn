@@ -509,3 +509,20 @@ BIN=/tmp/cairn-fastio BASELINE_BIN=/tmp/cairn-base OBJ_SIZE=64MiB DURATION=30s \
   pre-staged outside it), so PUT/compression cost does not contaminate the read measurement.
 - This path is **plaintext only**; zero-copy over HTTPS needs the (not-yet-built) kTLS takeover, so
   benchmark over `http://`, not `https://`.
+
+## Maintained visible counts: bounded query comparison (2026-09-08)
+
+An in-memory SQLite 3.46.1 comparison used 100,000 current object rows across 1,000 buckets
+(24,805,376 database bytes), with eleven warm repetitions per query. Scan and maintained-counter
+results matched exactly. These are query costs, excluding API authorization, connection-pool waits,
+writer contention, network, and browser rendering.
+
+| Query | Old scan median ms | Maintained counter median ms |
+| --- | ---: | ---: |
+| Global visible objects | 6.5381 | 0.0620 |
+| Per-bucket visible objects | 11.5506 | 0.5523 |
+
+Query plans changed from scanning the current-object covering index to reading `bucket_stats`.
+This supports the removal of per-refresh object-cardinality work; it does not establish production
+request throughput. The one-time migration still scans current metadata, and writes now maintain
+visibility deltas transactionally. No object payloads or persistent test database were created.
