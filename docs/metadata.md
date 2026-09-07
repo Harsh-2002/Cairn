@@ -150,3 +150,15 @@ A cryptography interface provides the envelope encryption and decryption of SigV
 The abstraction layer adds indirection, and indirection has a cost in ceremony and sometimes in a virtual call. The cost is justified three times over. It makes the entire engine unit-testable without a disk or a database, so the protocol, authorization, versioning, lifecycle, and replication logic are tested in milliseconds against in-memory doubles, which is the difference between a test suite engineers run constantly and one they avoid. It makes backends swappable, so the io_uring blob engine, the remote cold tier, and a future pure-Rust metadata engine are drop-in rather than rewrites. And it forces clean seams that keep the protocol layer free of storage detail, which is the discipline that keeps the storage model's good instincts intact while everything around them is purpose-built for production. These are the same reasons the boundary is the single most important structural decision in the design (F-21).
 
 ---
+
+### Bounded writer diagnostic
+
+The opt-in ignored test `bounded_writer_queue_diagnostic` exercises a real in-memory Writer with
+16 workers and 512 creates plus 512 deletes per leg. In the September 2026 development-host check,
+a control leg took 67.546 ms (queue median 0.108 ms, maximum 1.599 ms; maximum COMMIT 0.011 ms).
+With a controlled 50 ms writer blockage, the leg took 105.943 ms (queue median 0.098 ms, maximum
+50.596 ms; maximum COMMIT 0.004 ms). All 2,048 mutations succeeded, with no stage-sample eviction.
+This validates queue-versus-transaction attribution under a controlled delay; an in-memory COMMIT
+has no disk durability barrier and these results do not identify the historical five-second stall.
+The diagnostic finishes in under a second and creates no persistent data. Run explicitly with
+`cargo test -p cairn-meta bounded_writer_queue_diagnostic -- --ignored --nocapture`.
