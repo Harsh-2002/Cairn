@@ -33,6 +33,20 @@ The chunked decoder is the foremost fuzz target, fed arbitrary bytes and arbitra
 
 A test-only fault seam injects a failure in the window between blob durability and metadata commit. The process-crash harness proves that a blob left after a true process exit is reclaimed on restart. The multi-point task-panic harness covers both ordinary PUT and multipart assembly and accepts only the two safe outcomes: the retained exact-path cancellation worker reclaims the blob before shutdown, or startup reconciliation reclaims the observable orphan. In either case no half-committed object or unreferenced final blob may remain; when an encrypted orphan is observable before reconciliation, the harness additionally proves it is a current authenticated CRNB container with no plaintext marker. Multipart regressions make `RecordPart` commit and then lose or withhold its acknowledgement for both UploadPart and UploadPartCopy, proving that error and request cancellation preserve the authoritative attempt. Exact resolver contract suites cover SQLite, libSQL/Turso, the in-memory double, and nonzero-shard routing; a delayed old recovery after a same-number retry deletes only the old artifact, and a capacity-one retained queue proves admission stays bounded until worker resolution. Reconciliation tests also create an unrecorded attempt beside an authoritative path in a live session and require deletion of only the former, after which orphaned accounting recovery is permitted. These tests make the durability claims real rather than asserted (F-4).
 
+Offline recovery conformance exercises the canonical SQLite/one-shard snapshot with complete
+metadata rows, encrypted history and multipart parts, tags/ACLs/Object Lock, and an interrupted
+replication claim. An admitted partial UploadPart supplies non-empty staging reservations;
+restore/startup must recover the accounting and permit completion. The failpoint arm pauses a
+multipart Complete after durable assembly and SIGKILLs the process, then snapshots the still-owned
+claim before startup recovery. Restored startup clears ownership, removes the assembled orphan,
+and preserves authoritative parts for a successful retry. Missing referenced parts, a live node
+lock, wrong master-key material, and unsupported shard topology are explicit rejection cases.
+The remote multipart recovery drill adds successful initiation/part/abort response loss through a
+bounded forwarding proxy and a real Cairn peer. It compares complete offline journal rows, asserts
+exact origin-token binding, retains unknown-ID orphan incidents, reclaims known IDs, and verifies
+startup invalidates abandoned cleanup claims before exact-version redelivery. Its third abort arm
+uses no timing shortcut or production failpoint.
+
 ### 29.5 Conformance against real clients and the standard suite
 
 The decisive tests run real S3 clients against a running Cairn. The boto3 AWS SDK drives a matrix covering the object operations including plain, unsigned-payload, and streaming-chunked puts so that the chunked path and real SigV4 are exercised by a real client, ranged and conditional gets, heads, deletes, bulk deletes, copies, the full multipart cycle including abort and out-of-order completion, and presigned URLs, together with versioning behaviour and version listing, tagging, and copy. Independently, the MinIO warp macro benchmark drives the server as a second real client across get, put, and mixed profiles in strict mode with a zero-error gate, so a genuinely different client validates the wire under load. Beyond driving Cairn alone, a per-commit CI job (`conformance/bench_compare.sh`) stands up Cairn **and** a pinned MinIO server binary on the same runner and runs the identical warp matrix against each side by side — put, get, stat, delete, list, and mixed at small and large object sizes — reporting the Cairn-versus-MinIO throughput ratio together with each engine's CPU and resident memory while serving. It is a *reported* comparison rather than a throughput gate, because a shared runner's absolute numbers vary run to run, so it fails only on warp operation errors and never on who is faster; the ratio, not the absolute rate, is the signal. The boto3 conformance script runs as a CI gate covering the core object lifecycle, versioning, tagging, multipart, copy, and bulk delete, and it is joined by dedicated live-client gates for the surfaces it does not touch: `authz.sh` exercises policy and public-access-block, `buckets.sh` drives a real CORS preflight, `lifecycle.sh` drives expiry enforcement and transition-rule handling, and `mesh.sh`, `replication_chaos.sh`, and `soak.sh` exercise replication round-trips end to end — all CI gates alongside the boto3 script, and backed by the unit and integration suites. Replication is tested end to end between two Cairn instances and with a fake sink that can simulate failures to exercise retry and backoff; lifecycle is tested with a controllable clock so that expiry, transition, and abort timing are deterministic; and compression is tested for round-trip fidelity, for correct ranged reads against compressed blobs, for the incompressibility heuristic, and for ETag invariance between compressed and uncompressed storage of the same content.
@@ -44,6 +58,11 @@ through the internal SHA-256 without a composite-ETag coverage skip. Legacy rows
 baseline retain their explicit skip coverage in the server unit suite.
 
 ### 29.6 Benchmarks and load
+
+A deferred post-merge million-object and mixed large-file capacity campaign is recorded in
+[the implementation tracker](implementation-phases-2026-09.md#deferred-final-phase-capacity-sustained-load-and-regression-campaign).
+It requires a separately scheduled run; existing CI and multi-GiB transfer checks do not establish
+that capacity envelope.
 
 Internal-integrity regressions cover all full-object supplementary checksum algorithms on
 plaintext, compressed, and encrypted multipart content, legacy composite-only coverage skips,

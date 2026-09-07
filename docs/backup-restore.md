@@ -51,7 +51,9 @@ new snapshot. Source and destination trees may not overlap.
 
 The **master key is deliberately excluded**. Store `CAIRN_MASTER_KEY` or the complete
 `CAIRN_MASTER_KEY_RING` separately in the secret manager and backup system. A database-and-blob
-snapshot without the required key material is intentionally unreadable.
+snapshot without the required key material is intentionally unreadable. Preserve the service's
+effective `CAIRN_*` environment separately as well, including any environment-defined replication
+targets and their credentials; restoring database rows does not recreate that external configuration.
 
 ## Restore
 
@@ -86,6 +88,46 @@ replaced. Reconciliation runs while the exclusive node lock remains held; target
 referenced by restored metadata are reclaimed. Any non-zero reconciliation error count makes
 restore fail even when the reconciliation call itself returned a report, matching the pre-bind
 startup gate rather than declaring a partially checked generation ready.
+
+## Recovery verification and durable work
+
+The SQLite image preserves complete metadata rows, including historical versions and delete
+markers, tags, ACLs, Object Lock retention/legal hold, sealed object and multipart-part data keys,
+and multipart reservations, cleanup records, replication outbox work, and remote multipart journals. These are database state;
+there is no second manifest inventory that can replace them. Restoring the database does not restore
+the external master-key ring or recreate the outcome of an ambiguous remote request.
+
+Before serving, startup releases interrupted multipart completion ownership and replication claims
+through the canonical Writer, then reconciles files. A restored active upload must retain its staged
+parts and captured tags/lock/encryption intent so the client can retry Complete. Replication work may
+be attempted again: generic S3 destinations can gain another version after an ambiguous prior
+success. Isolate an old primary before resuming a restored node to avoid two independent sources
+replaying the same backlog.
+
+The live `conformance/backup_restore.sh` gate includes `recovery_state.py`, which writes this state
+through the S3 API, interrupts a real replication request, checks every table's complete rows across
+snapshot/restore, verifies versioned reads and protection, and completes a restored encrypted upload.
+It also rejects backup under a live node lock, sharded topology, a snapshot missing an authoritative
+part, and startup with the wrong master key. The failpoints `crash_multipoint.sh` gate additionally
+pauses Complete after durable assembly, kills the process with an exact completion claim persisted,
+and verifies that restoration/restart makes the upload retryable without leaking the assembled blob.
+These checks are distinct from the database-publication unit tests that pin the old/new generations
+on either side of the atomic rename.
+
+Remote multipart journals preserve the exact destination identity and any upload ID received before
+the crash. On startup, the Writer invalidates abandoned delivery and cleanup ownership; existing
+replication workers reclaim known upload IDs using the saved target route. A missing initiation
+receipt is different: the destination may already hold an upload whose ID the source never learned.
+That journal row remains an explicit orphan incident and requires destination lifecycle cleanup;
+a successful retry of the object does not make that old remote upload disappear. Preserve the
+original target configuration until known cleanup debt drains.
+
+The additional `conformance/recovery_remote.py` drill uses a real Cairn destination behind an HTTP
+proxy. It holds successful initiation, part, and (with `--cleanup-lease`) abort responses, kills the
+source, then compares every durable row across offline backup and restore. It checks unknown-ID
+incident retention, known-ID cleanup, startup release of abandoned cleanup ownership, and exact
+native version identity after redelivery. This harness requires the schema-v33 streaming sender;
+all three fault arms passed against the final v33 sender implementation at `5a9a9b1`.
 
 ## Database-path upgrade requirement
 

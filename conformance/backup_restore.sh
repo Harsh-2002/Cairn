@@ -195,3 +195,6 @@ stop_node
 
 echo "BACKUP/RESTORE OK — snapshot fidelity + reconcile baseline + surgical integrity --repair"
 echo "PASS: backup/restore/integrity holds end-to-end"
+
+# The complementary stdlib driver populates durable state beyond current plaintext objects.
+BIN="$BIN" "${PY:-python3}" "$ROOT/conformance/recovery_state.py"
