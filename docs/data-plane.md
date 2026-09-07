@@ -71,6 +71,8 @@ Cairn serves HTTP/1.1 and HTTP/2. It can terminate TLS itself using a Rust TLS s
 
 ### 7.8 Backpressure, limits, and fairness
 
+Each listener continuously joins completed connection tasks, including while no clients arrive. Its task set retains active connections rather than the process-lifetime connection history. Shutdown takes priority, drains remaining tasks, and includes previously observed panics/cancellations in its final report. This bounds task retention; it does not imply RSS returns to startup levels after load.
+
 A global concurrency limit caps the number of in-flight S3, management, and console requests so that overload sheds cleanly rather than collapsing; excess requests are rejected with a retryable status. The unauthenticated infrastructure endpoints do not consume that application budget, because an orchestrator must still observe a saturated node, but they are not an unbounded bypass: health, readiness, and metrics share a fixed four-request infrastructure budget and fail fast when it is full. Metrics rendering has a two-request sub-limit, permanently leaving infrastructure capacity for health and readiness during a scrape flood. Per-request timeouts bound how long any single request can hold resources. The bounded blob pool and the streamed, backpressured transfers ensure that a small number of very large transfers cannot monopolise memory or threads. These mechanisms together give the server a defined behaviour at and beyond saturation, which is a production requirement a naive single-node server does not address.
 
 ---
