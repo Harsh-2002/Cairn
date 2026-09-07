@@ -2739,15 +2739,27 @@ mod tests {
             let (socket, _) = listener.accept().await.unwrap();
             let service = hyper::service::service_fn(
                 |request: http::Request<hyper::body::Incoming>| async move {
-                    assert_eq!(request.method(), http::Method::DELETE);
-                    assert_eq!(
-                        request.uri().path_and_query().unwrap().as_str(),
-                        "/dest/key?uploadId=receipt"
-                    );
+                    let (status, body) = if request.method() == http::Method::DELETE {
+                        assert_eq!(
+                            request.uri().path_and_query().unwrap().as_str(),
+                            "/dest/key?uploadId=receipt"
+                        );
+                        (204, "")
+                    } else {
+                        assert_eq!(request.method(), http::Method::GET);
+                        assert_eq!(
+                            request.uri().path_and_query().unwrap().as_str(),
+                            "/dest/key?max-parts=1&uploadId=receipt"
+                        );
+                        (
+                            200,
+                            "<ListPartsResult><IsTruncated>false</IsTruncated></ListPartsResult>",
+                        )
+                    };
                     Ok::<_, std::convert::Infallible>(
                         http::Response::builder()
-                            .status(204)
-                            .body(Full::new(bytes::Bytes::new()))
+                            .status(status)
+                            .body(Full::new(bytes::Bytes::from_static(body.as_bytes())))
                             .unwrap(),
                     )
                 },
