@@ -577,6 +577,98 @@ fn commit_batch(
 mod tests {
     use super::*;
 
+    /// Small opt-in diagnostic; no S3 listener, disk corpus, or sustained workload.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "bounded writer timing comparison; run explicitly with --nocapture"]
+    async fn bounded_writer_queue_diagnostic() {
+        for delay_ms in [0, 50] {
+            let conn = Connection::open_in_memory().unwrap();
+            crate::schema::run_migrations(&conn).unwrap();
+            let writer = Writer::spawn(conn, None);
+            let (entered_tx, entered_rx) = oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let blocker = writer.clone();
+            let blocked = tokio::spawn(async move {
+                blocker
+                    .run_exec(move |_| {
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                        std::thread::sleep(Duration::from_millis(delay_ms));
+                        Ok(())
+                    })
+                    .await
+                    .unwrap();
+            });
+            entered_rx.await.unwrap();
+            let started = Instant::now();
+            let mut jobs = tokio::task::JoinSet::new();
+            for worker in 0..16 {
+                let writer = writer.clone();
+                jobs.spawn(async move {
+                    for iteration in 0..32 {
+                        let name =
+                            cairn_types::BucketName::parse(&format!("bench-{worker}-{iteration}"))
+                                .unwrap();
+                        writer
+                            .submit(Mutation::CreateBucket(Box::new(
+                                cairn_types::bucket::Bucket {
+                                    name: name.clone(),
+                                    owner_id: cairn_types::UserId("owner".to_owned()),
+                                    created_at: cairn_types::Timestamp(1),
+                                    versioning: cairn_types::bucket::VersioningState::Enabled,
+                                    ownership_mode: cairn_types::OwnershipMode::BucketOwnerEnforced,
+                                    region: "us-east-1".to_owned(),
+                                    compression: None,
+                                },
+                            )))
+                            .await
+                            .unwrap();
+                        writer.submit(Mutation::DeleteBucket(name)).await.unwrap();
+                    }
+                });
+            }
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while writer.queue_depth() < 16 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            release_tx.send(()).unwrap();
+            blocked.await.unwrap();
+            while let Some(result) = jobs.join_next().await {
+                result.unwrap();
+            }
+            let wall = started.elapsed();
+            let samples = writer.drain_stage_samples();
+            let mut queue: Vec<_> = samples
+                .iter()
+                .filter(|s| s.stage == "queue")
+                .map(|s| s.seconds)
+                .collect();
+            queue.sort_by(f64::total_cmp);
+            let max_commit = samples
+                .iter()
+                .filter(|s| s.stage == "commit")
+                .map(|s| s.seconds)
+                .fold(0.0, f64::max);
+            assert_eq!(queue.len(), 1024);
+            assert!(samples.iter().all(|s| s.success));
+            assert_eq!(writer.dropped_stage_samples(), 0);
+            if delay_ms > 0 {
+                assert!(queue[1023] >= 0.050);
+            }
+            eprintln!(
+                "writer diagnostic: delay_ms={delay_ms} mutations=1024 workers=16 wall_ms={:.3} queue_median_ms={:.3} queue_max_ms={:.3} commit_max_ms={:.3}",
+                wall.as_secs_f64() * 1000.0,
+                queue[512] * 1000.0,
+                queue[1023] * 1000.0,
+                max_commit * 1000.0
+            );
+            writer.checkpoint_and_shutdown().await.unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn cancelled_admission_does_not_inflate_queue_depth() {
         let (tx, _rx) = mpsc::channel(1);
