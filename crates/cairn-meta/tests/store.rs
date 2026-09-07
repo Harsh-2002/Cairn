@@ -1234,6 +1234,7 @@ const ENC_DESCRIPTOR: &str = r#"{"alg":"AES256-GCM","wrapped_dek_b64":"AAAA","no
 /// A pending `ObjectCreate` outbox entry for (bucket, key, version) under a caller-chosen id.
 fn outbox_entry(b: &BucketName, key: &str, version: VersionId, id: &str) -> OutboxEntry {
     OutboxEntry {
+        claim_token: None,
         enqueued_at: Timestamp(0),
         id: id.to_owned(),
         bucket: b.clone(),
@@ -1272,6 +1273,7 @@ async fn plant_outbox(
 
 #[tokio::test]
 async fn list_failed_replication_reports_terminal_entries_only() {
+    let mut replication_claims = cairn_types::testing::ReplicationClaims::default();
     let store = cairn_meta::open_in_memory().unwrap();
     let b = BucketName::parse("bkt").unwrap();
     store
@@ -1290,6 +1292,10 @@ async fn list_failed_replication_reports_terminal_entries_only() {
     // Mark one entry terminally failed (next_attempt_at = None).
     store
         .submit(Mutation::MarkReplicationFailed {
+            claim_token: replication_claims
+                .take(&store, "doomed-1", cairn_types::Timestamp(1))
+                .await,
+            now: cairn_types::Timestamp(1),
             id: "doomed-1".to_owned(),
             error: "destination unreachable".to_owned(),
             next_attempt_at: None,
@@ -1310,6 +1316,10 @@ async fn list_failed_replication_reports_terminal_entries_only() {
     // A retryable failure (next_attempt_at = Some) stays pending and out of the failed list.
     store
         .submit(Mutation::MarkReplicationFailed {
+            claim_token: replication_claims
+                .take(&store, "pending-1", cairn_types::Timestamp(1))
+                .await,
+            now: cairn_types::Timestamp(1),
             id: "pending-1".to_owned(),
             error: "transient".to_owned(),
             next_attempt_at: Some(Timestamp(60_000)),
@@ -1326,6 +1336,7 @@ async fn list_failed_replication_reports_terminal_entries_only() {
 
 #[tokio::test]
 async fn replication_counts_aggregates_by_status_and_target() {
+    let mut replication_claims = cairn_types::testing::ReplicationClaims::default();
     let store = cairn_meta::open_in_memory().unwrap();
     let b = BucketName::parse("rcbkt").unwrap();
     store
@@ -1343,6 +1354,7 @@ async fn replication_counts_aggregates_by_status_and_target() {
     ] {
         let v = VersionId::from_string(vid.to_owned());
         let entry = OutboxEntry {
+            claim_token: None,
             enqueued_at: Timestamp(enq),
             id: id.to_owned(),
             bucket: b.clone(),
@@ -1370,6 +1382,10 @@ async fn replication_counts_aggregates_by_status_and_target() {
     }
     store
         .submit(Mutation::MarkReplicationFailed {
+            claim_token: replication_claims
+                .take(&store, "xf", cairn_types::Timestamp(1))
+                .await,
+            now: cairn_types::Timestamp(1),
             id: "xf".to_owned(),
             error: "x".to_owned(),
             next_attempt_at: None,
@@ -1405,6 +1421,7 @@ async fn prune_reclaims_old_terminal_entries_only() {
         .await
         .unwrap();
     let mk = |id: &str, status: ReplicationStatus, enq: i64| OutboxEntry {
+        claim_token: None,
         enqueued_at: Timestamp(enq),
         id: id.to_owned(),
         bucket: b.clone(),
@@ -1664,6 +1681,7 @@ async fn delete_bucket_rejects_nonempty_inside_the_savepoint() {
 
 #[tokio::test]
 async fn defer_releases_claim_without_consuming_attempts() {
+    let mut replication_claims = cairn_types::testing::ReplicationClaims::default();
     let store = cairn_meta::open_in_memory().unwrap();
     let b = BucketName::parse("deferbkt").unwrap();
     store
@@ -1674,8 +1692,8 @@ async fn defer_releases_claim_without_consuming_attempts() {
     plant_outbox(&store, &b, "k", v.clone(), "d1").await;
 
     // Claim the entry: it goes `claimed` under a lease, so it leaves the due (pending) set.
-    let claimed = store
-        .claim_replication_batch(10, Timestamp(1_000))
+    let claimed = replication_claims
+        .claim(&store, 10, Timestamp(1_000))
         .await
         .unwrap();
     assert_eq!(claimed.len(), 1);
@@ -1690,6 +1708,10 @@ async fn defer_releases_claim_without_consuming_attempts() {
     // Defer it: released back to pending, re-scheduled, attempts untouched, error recorded.
     store
         .submit(Mutation::DeferReplication {
+            claim_token: replication_claims
+                .take(&store, "d1", cairn_types::Timestamp(1))
+                .await,
+            now: cairn_types::Timestamp(1),
             id: "d1".to_owned(),
             next_attempt_at: Timestamp(5_000),
             last_error: Some("target unavailable: down".to_owned()),
@@ -2861,6 +2883,7 @@ async fn writer_records_commit_samples_for_group_committed_batches() {
 /// second pass real; `only_encrypted` keeps it scoped to the blast radius.
 #[tokio::test]
 async fn requeue_replication_versions_reships_completed_encrypted_work() {
+    let mut replication_claims = cairn_types::testing::ReplicationClaims::default();
     let store = cairn_meta::open_in_memory().unwrap();
     let b = BucketName::parse("bkt").unwrap();
     store
@@ -2873,6 +2896,7 @@ async fn requeue_replication_versions_reships_completed_encrypted_work() {
     let mut enc = row(&b, "enc", venc.clone(), "e", true);
     enc.sse_descriptor = Some(ENC_DESCRIPTOR.to_owned());
     let enc_entry = OutboxEntry {
+        claim_token: None,
         enqueued_at: Timestamp(0),
         id: "backfill:r1:enc:00000001".to_owned(),
         bucket: b.clone(),
@@ -2909,13 +2933,14 @@ async fn requeue_replication_versions_reships_completed_encrypted_work() {
     .await;
 
     // Drain both to `completed`, stamping the version ledger.
-    store
-        .claim_replication_batch(10, Timestamp(1))
+    replication_claims
+        .claim(&store, 10, Timestamp(1))
         .await
         .unwrap();
     for id in ["backfill:r1:enc:00000001", "backfill:r1:plain:00000002"] {
         store
             .submit(Mutation::MarkReplicationDone {
+                claim_token: replication_claims.take(&store, id, Timestamp(0)).await,
                 id: id.to_owned(),
                 now: Timestamp(0),
             })
@@ -2972,8 +2997,8 @@ async fn requeue_replication_versions_reships_completed_encrypted_work() {
         "a plaintext version was never corrupt and must not be re-shipped"
     );
     // And the requeued entry is genuinely claimable again (attempts reset, lease cleared).
-    let claimed = store
-        .claim_replication_batch(10, Timestamp(6000))
+    let claimed = replication_claims
+        .claim(&store, 10, Timestamp(6000))
         .await
         .unwrap();
     assert_eq!(claimed.len(), 1);
@@ -2987,6 +3012,7 @@ async fn requeue_replication_versions_reships_completed_encrypted_work() {
 /// never resurrected: that is the only cycle-breaker replication has (ARCH 20.4).
 #[tokio::test]
 async fn requeue_replication_versions_can_widen_and_never_touches_replicas() {
+    let mut replication_claims = cairn_types::testing::ReplicationClaims::default();
     let store = cairn_meta::open_in_memory().unwrap();
     let b = BucketName::parse("bkt").unwrap();
     store
@@ -2996,12 +3022,16 @@ async fn requeue_replication_versions_can_widen_and_never_touches_replicas() {
 
     let v1 = VersionId::from_string("00000001".into());
     plant_outbox(&store, &b, "failed", v1.clone(), "e-failed").await;
-    store
-        .claim_replication_batch(10, Timestamp(1))
+    replication_claims
+        .claim(&store, 10, Timestamp(1))
         .await
         .unwrap();
     store
         .submit(Mutation::MarkReplicationFailed {
+            claim_token: replication_claims
+                .take(&store, "e-failed", cairn_types::Timestamp(1))
+                .await,
+            now: cairn_types::Timestamp(1),
             id: "e-failed".to_owned(),
             error: "down".to_owned(),
             next_attempt_at: None,
@@ -3037,8 +3067,8 @@ async fn requeue_replication_versions_can_widen_and_never_touches_replicas() {
     let counts = store.replication_counts(Some(&b)).await.unwrap();
     assert_eq!(counts.failed, 0, "the terminal entry was requeued");
     assert_eq!(counts.pending, 1);
-    let claimed = store
-        .claim_replication_batch(10, Timestamp(6000))
+    let claimed = replication_claims
+        .claim(&store, 10, Timestamp(6000))
         .await
         .unwrap();
     assert_eq!(claimed[0].attempts, 0, "the attempt budget is reset");
@@ -3062,6 +3092,7 @@ async fn requeue_replication_versions_can_widen_and_never_touches_replicas() {
 /// `has_unreplicated_predecessor` then holds it behind v1 so it lands last.
 #[tokio::test]
 async fn requeue_encrypted_only_also_reships_the_keys_delete_marker() {
+    let mut replication_claims = cairn_types::testing::ReplicationClaims::default();
     let store = cairn_meta::open_in_memory().unwrap();
     let b = BucketName::parse("bkt").unwrap();
     store
@@ -3103,13 +3134,14 @@ async fn requeue_encrypted_only_also_reships_the_keys_delete_marker() {
         .unwrap();
 
     // Both ship successfully.
-    store
-        .claim_replication_batch(10, Timestamp(3))
+    replication_claims
+        .claim(&store, 10, Timestamp(3))
         .await
         .unwrap();
     for id in ["backfill:r1:k:1", "backfill:r1:k:2"] {
         store
             .submit(Mutation::MarkReplicationDone {
+                claim_token: replication_claims.take(&store, id, Timestamp(0)).await,
                 id: id.to_owned(),
                 now: Timestamp(0),
             })
@@ -3128,8 +3160,8 @@ async fn requeue_encrypted_only_also_reships_the_keys_delete_marker() {
         .await
         .unwrap();
 
-    let claimed = store
-        .claim_replication_batch(10, Timestamp(6000))
+    let claimed = replication_claims
+        .claim(&store, 10, Timestamp(6000))
         .await
         .unwrap();
     let ids: Vec<&str> = claimed.iter().map(|e| e.id.as_str()).collect();
@@ -3150,6 +3182,7 @@ async fn requeue_encrypted_only_also_reships_the_keys_delete_marker() {
 /// `CAIRN_ENCRYPT_AT_REST` was on and then rewritten after it was turned off.
 #[tokio::test]
 async fn requeue_encrypted_only_also_reships_a_later_plaintext_version_of_the_same_key() {
+    let mut replication_claims = cairn_types::testing::ReplicationClaims::default();
     let store = cairn_meta::open_in_memory().unwrap();
     let b = BucketName::parse("bkt").unwrap();
     store
@@ -3187,13 +3220,14 @@ async fn requeue_encrypted_only_also_reships_a_later_plaintext_version_of_the_sa
     let v3 = VersionId::from_string("00000003".into());
     plant_outbox(&store, &b, "other", v3.clone(), "backfill:r1:other:3").await;
 
-    store
-        .claim_replication_batch(10, Timestamp(3))
+    replication_claims
+        .claim(&store, 10, Timestamp(3))
         .await
         .unwrap();
     for id in ["backfill:r1:k:1", "backfill:r1:k:2", "backfill:r1:other:3"] {
         store
             .submit(Mutation::MarkReplicationDone {
+                claim_token: replication_claims.take(&store, id, Timestamp(0)).await,
                 id: id.to_owned(),
                 now: Timestamp(0),
             })
@@ -3212,8 +3246,8 @@ async fn requeue_encrypted_only_also_reships_a_later_plaintext_version_of_the_sa
         .await
         .unwrap();
 
-    let claimed = store
-        .claim_replication_batch(10, Timestamp(6000))
+    let claimed = replication_claims
+        .claim(&store, 10, Timestamp(6000))
         .await
         .unwrap();
     let ids: Vec<&str> = claimed.iter().map(|e| e.id.as_str()).collect();
@@ -3253,6 +3287,7 @@ async fn requeue_encrypted_only_also_reships_a_later_plaintext_version_of_the_sa
 /// zero row count.
 #[tokio::test]
 async fn requeue_replication_versions_pages_by_key_and_threads_the_cursor() {
+    let mut replication_claims = cairn_types::testing::ReplicationClaims::default();
     let store = cairn_meta::open_in_memory().unwrap();
     let b = BucketName::parse("bkt").unwrap();
     store
@@ -3264,13 +3299,16 @@ async fn requeue_replication_versions_pages_by_key_and_threads_the_cursor() {
         let v = VersionId::from_string(format!("0000000{i}"));
         plant_outbox(&store, &b, &format!("k{i}"), v, &format!("e{i}")).await;
     }
-    store
-        .claim_replication_batch(10, Timestamp(1))
+    replication_claims
+        .claim(&store, 10, Timestamp(1))
         .await
         .unwrap();
     for i in 1..=5u32 {
         store
             .submit(Mutation::MarkReplicationDone {
+                claim_token: replication_claims
+                    .take(&store, &format!("e{i}"), Timestamp(0))
+                    .await,
                 id: format!("e{i}"),
                 now: Timestamp(0),
             })
@@ -3337,6 +3375,7 @@ async fn requeue_replication_versions_pages_by_key_and_threads_the_cursor() {
 /// Key paging makes a batch key-atomic: `k` is either wholly in a page or wholly absent.
 #[tokio::test]
 async fn requeue_page_never_splits_a_keys_versions_across_batches() {
+    let mut replication_claims = cairn_types::testing::ReplicationClaims::default();
     let store = cairn_meta::open_in_memory().unwrap();
     let b = BucketName::parse("bkt").unwrap();
     store
@@ -3384,12 +3423,16 @@ async fn requeue_page_never_splits_a_keys_versions_across_batches() {
         .await
         .unwrap();
 
-    store
-        .claim_replication_batch(10, Timestamp(1))
+    replication_claims
+        .claim(&store, 10, Timestamp(1))
         .await
         .unwrap();
     store
         .submit(Mutation::MarkReplicationFailed {
+            claim_token: replication_claims
+                .take(&store, "k:1", cairn_types::Timestamp(1))
+                .await,
+            now: cairn_types::Timestamp(1),
             id: "k:1".to_owned(),
             error: "BadDigest".to_owned(),
             next_attempt_at: None,
@@ -3399,6 +3442,7 @@ async fn requeue_page_never_splits_a_keys_versions_across_batches() {
     for id in ["a:1", "k:2"] {
         store
             .submit(Mutation::MarkReplicationDone {
+                claim_token: replication_claims.take(&store, id, Timestamp(2)).await,
                 id: id.to_owned(),
                 now: Timestamp(2),
             })
@@ -3421,8 +3465,8 @@ async fn requeue_page_never_splits_a_keys_versions_across_batches() {
         panic!("expected a paged outcome, got {outcome:?}");
     };
     assert_eq!(page_end.as_deref(), Some("a"));
-    let claimed = store
-        .claim_replication_batch(10, Timestamp(5001))
+    let claimed = replication_claims
+        .claim(&store, 10, Timestamp(5001))
         .await
         .unwrap();
     let ids: Vec<&str> = claimed.iter().map(|e| e.id.as_str()).collect();
@@ -3449,8 +3493,8 @@ async fn requeue_page_never_splits_a_keys_versions_across_batches() {
         panic!("expected a paged outcome, got {outcome:?}");
     };
     assert_eq!(page_end.as_deref(), Some("k"));
-    let claimed = store
-        .claim_replication_batch(10, Timestamp(6001))
+    let claimed = replication_claims
+        .claim(&store, 10, Timestamp(6001))
         .await
         .unwrap();
     let mut ids: Vec<&str> = claimed.iter().map(|e| e.id.as_str()).collect();
@@ -3468,6 +3512,7 @@ async fn requeue_page_never_splits_a_keys_versions_across_batches() {
 /// mirror**.
 #[tokio::test]
 async fn requeue_page_never_splits_a_key_whose_newer_version_is_a_delete_marker() {
+    let mut replication_claims = cairn_types::testing::ReplicationClaims::default();
     let store = cairn_meta::open_in_memory().unwrap();
     let b = BucketName::parse("bkt").unwrap();
     store
@@ -3518,12 +3563,16 @@ async fn requeue_page_never_splits_a_key_whose_newer_version_is_a_delete_marker(
         .await
         .unwrap();
 
-    store
-        .claim_replication_batch(10, Timestamp(1))
+    replication_claims
+        .claim(&store, 10, Timestamp(1))
         .await
         .unwrap();
     store
         .submit(Mutation::MarkReplicationFailed {
+            claim_token: replication_claims
+                .take(&store, "k:1", cairn_types::Timestamp(1))
+                .await,
+            now: cairn_types::Timestamp(1),
             id: "k:1".to_owned(),
             error: "BadDigest".to_owned(),
             next_attempt_at: None,
@@ -3533,6 +3582,7 @@ async fn requeue_page_never_splits_a_key_whose_newer_version_is_a_delete_marker(
     for id in ["a:1", "k:2"] {
         store
             .submit(Mutation::MarkReplicationDone {
+                claim_token: replication_claims.take(&store, id, Timestamp(2)).await,
                 id: id.to_owned(),
                 now: Timestamp(2),
             })
@@ -3554,8 +3604,8 @@ async fn requeue_page_never_splits_a_key_whose_newer_version_is_a_delete_marker(
         panic!("expected a paged outcome, got {outcome:?}");
     };
     assert_eq!(page_end.as_deref(), Some("a"));
-    let claimed = store
-        .claim_replication_batch(10, Timestamp(5001))
+    let claimed = replication_claims
+        .claim(&store, 10, Timestamp(5001))
         .await
         .unwrap();
     let ids: Vec<&str> = claimed.iter().map(|e| e.id.as_str()).collect();
@@ -3579,8 +3629,8 @@ async fn requeue_page_never_splits_a_key_whose_newer_version_is_a_delete_marker(
         panic!("expected a paged outcome, got {outcome:?}");
     };
     assert_eq!(page_end.as_deref(), Some("k"));
-    let claimed = store
-        .claim_replication_batch(10, Timestamp(6001))
+    let claimed = replication_claims
+        .claim(&store, 10, Timestamp(6001))
         .await
         .unwrap();
     let mut ids: Vec<&str> = claimed.iter().map(|e| e.id.as_str()).collect();
@@ -3594,6 +3644,7 @@ async fn requeue_page_never_splits_a_key_whose_newer_version_is_a_delete_marker(
 /// never rewritten — so its gauge can never fall back to zero after a successful repair.
 #[tokio::test]
 async fn mark_replication_done_stamps_replicated_at() {
+    let mut replication_claims = cairn_types::testing::ReplicationClaims::default();
     let store = cairn_meta::open_in_memory().unwrap();
     let b = BucketName::parse("bkt").unwrap();
     store
@@ -3616,12 +3667,15 @@ async fn mark_replication_done_stamps_replicated_at() {
         "a version that has never shipped carries no completion stamp"
     );
 
-    store
-        .claim_replication_batch(10, Timestamp(1))
+    replication_claims
+        .claim(&store, 10, Timestamp(1))
         .await
         .unwrap();
     store
         .submit(Mutation::MarkReplicationDone {
+            claim_token: replication_claims
+                .take(&store, "e1", Timestamp(9_000))
+                .await,
             id: "e1".to_owned(),
             now: Timestamp(9_000),
         })
@@ -3658,12 +3712,15 @@ async fn mark_replication_done_stamps_replicated_at() {
         Some(Timestamp(9_000)),
         "a requeue must NOT advance or clear the stamp — the re-ship has not happened yet"
     );
-    store
-        .claim_replication_batch(10, Timestamp(9_600))
+    replication_claims
+        .claim(&store, 10, Timestamp(9_600))
         .await
         .unwrap();
     store
         .submit(Mutation::MarkReplicationDone {
+            claim_token: replication_claims
+                .take(&store, "e1", Timestamp(10_000))
+                .await,
             id: "e1".to_owned(),
             now: Timestamp(10_000),
         })
@@ -3685,6 +3742,7 @@ async fn mark_replication_done_stamps_replicated_at() {
 /// at all.
 #[tokio::test]
 async fn mark_replication_done_leaves_a_replica_row_entirely_alone() {
+    let mut replication_claims = cairn_types::testing::ReplicationClaims::default();
     let store = cairn_meta::open_in_memory().unwrap();
     let b = BucketName::parse("bkt").unwrap();
     store
@@ -3705,6 +3763,9 @@ async fn mark_replication_done_leaves_a_replica_row_entirely_alone() {
         .unwrap();
     store
         .submit(Mutation::MarkReplicationDone {
+            claim_token: replication_claims
+                .take(&store, "e1", Timestamp(9_000))
+                .await,
             id: "e1".to_owned(),
             now: Timestamp(9_000),
         })
@@ -3740,6 +3801,7 @@ async fn mark_replication_done_leaves_a_replica_row_entirely_alone() {
 /// destination bucket.
 #[tokio::test]
 async fn requeue_ledger_skips_a_non_current_version_no_queue_can_ever_ship() {
+    let mut replication_claims = cairn_types::testing::ReplicationClaims::default();
     let store = cairn_meta::open_in_memory().unwrap();
     let b = BucketName::parse("bkt").unwrap();
     store
@@ -3761,6 +3823,7 @@ async fn requeue_ledger_skips_a_non_current_version_no_queue_can_ever_ship() {
                 precondition: Precondition::default(),
                 initial_state: InitialObjectState::default(),
                 replication: vec![OutboxEntry {
+                    claim_token: None,
                     enqueued_at: if key == "pruned" {
                         Timestamp(0)
                     } else {
@@ -3777,6 +3840,7 @@ async fn requeue_ledger_skips_a_non_current_version_no_queue_can_ever_ship() {
                 precondition: Precondition::default(),
                 initial_state: InitialObjectState::default(),
                 replication: vec![OutboxEntry {
+                    claim_token: None,
                     enqueued_at: Timestamp(1_000),
                     ..outbox_entry(&b, key, v2.clone(), &format!("{key}:2"))
                 }],
@@ -3784,13 +3848,14 @@ async fn requeue_ledger_skips_a_non_current_version_no_queue_can_ever_ship() {
             .await
             .unwrap();
     }
-    store
-        .claim_replication_batch(10, Timestamp(1))
+    replication_claims
+        .claim(&store, 10, Timestamp(1))
         .await
         .unwrap();
     for id in ["pruned:1", "pruned:2", "kept:1", "kept:2"] {
         store
             .submit(Mutation::MarkReplicationDone {
+                claim_token: replication_claims.take(&store, id, Timestamp(2)).await,
                 id: id.to_owned(),
                 now: Timestamp(2),
             })
@@ -3841,8 +3906,8 @@ async fn requeue_ledger_skips_a_non_current_version_no_queue_can_ever_ship() {
 
     // KEY ATOMICITY IS UNCHANGED: the OUTBOX half still moves every terminal row of every paged
     // key. Only the ledger half narrowed.
-    let claimed = store
-        .claim_replication_batch(10, Timestamp(5_001))
+    let claimed = replication_claims
+        .claim(&store, 10, Timestamp(5_001))
         .await
         .unwrap();
     let mut ids: Vec<&str> = claimed.iter().map(|e| e.id.as_str()).collect();
@@ -4976,4 +5041,25 @@ async fn multipart_explicit_lock_survives_late_failure_and_retry() {
         },
         "pinned explicit retention must win over the new completion-time default"
     );
+}
+
+#[tokio::test]
+async fn replication_attempts_are_fenced() {
+    let store = cairn_meta::open_in_memory().unwrap();
+    let b = BucketName::parse("claims").unwrap();
+    store
+        .submit(Mutation::CreateBucket(Box::new(bucket("claims"))))
+        .await
+        .unwrap();
+    let object = row(&b, "key", VersionId::generate(), "e", true);
+    store
+        .submit(Mutation::PutObjectVersion {
+            row: Box::new(object.clone()),
+            precondition: Precondition::default(),
+            initial_state: InitialObjectState::default(),
+            replication: vec![],
+        })
+        .await
+        .unwrap();
+    cairn_types::testing::assert_replication_claim_fencing(&store, &object).await;
 }

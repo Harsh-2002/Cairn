@@ -476,6 +476,7 @@ impl CachedMetadataStore {
             | Mutation::PruneReplicationOutbox { .. }
             | Mutation::PruneEventsOutbox { .. }
             | Mutation::DeferReplication { .. }
+            | Mutation::RenewReplicationClaim { .. }
             | Mutation::RecoverClaimedReplication
             | Mutation::EnqueueReplication(_)
             // Touches only `replication_outbox` and `object_versions.replication_status`; this

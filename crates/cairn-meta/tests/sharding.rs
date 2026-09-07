@@ -392,6 +392,7 @@ async fn n3_multipart_rides_the_bucket_shard_via_encoded_id() {
 // A pending replication outbox entry with the source shard encoded in its id, for the fairness test.
 fn outbox(shard: usize, j: usize) -> OutboxEntry {
     OutboxEntry {
+        claim_token: None,
         id: format!("s{shard}-{j}"),
         bucket: BucketName::parse("obx").unwrap(),
         key: ObjectKey::parse("k").unwrap(),
@@ -494,4 +495,15 @@ async fn delete_bucket_purges_request_metrics_on_shard_zero() {
         after.total, 0,
         "deleted bucket's analytics purged from shard 0"
     );
+}
+
+#[tokio::test]
+async fn replication_attempts_are_fenced_on_every_shard() {
+    let (store, _) = shards(3);
+    for name in NAMES {
+        store.submit(bucket(name)).await.unwrap();
+        let object = row(name, "key", 1);
+        store.submit(put(object.clone())).await.unwrap();
+        cairn_types::testing::assert_replication_claim_fencing(&store, &object).await;
+    }
 }

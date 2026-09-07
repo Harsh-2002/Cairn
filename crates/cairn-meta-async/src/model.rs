@@ -52,7 +52,7 @@ pub const USER_COLS: &str = "id, display_name, access_key_id, secret_hash, sigv4
 
 /// `replication_outbox` columns in mapper order.
 pub const OUTBOX_COLS: &str = "id, bucket_name, key, version_id, operation, rule_id, target_arn, \
-     attempts, next_attempt_at, status, last_error, priority, lease_until, enqueued_at";
+     attempts, next_attempt_at, status, last_error, priority, lease_until, enqueued_at, claim_token";
 
 /// `events_outbox` (webhook) columns in mapper order.
 pub const WEBHOOK_COLS: &str = "id, bucket_name, key, version_id, event_type, endpoint_id, payload, \
@@ -531,6 +531,9 @@ pub fn import_job_summary_from_row(row: &Row) -> Result<ImportJobSummary, MetaEr
 
 pub fn outbox_from_row(row: &Row) -> Result<OutboxEntry, MetaError> {
     Ok(OutboxEntry {
+        claim_token: row
+            .get_opt_text(14)
+            .map(cairn_types::id::ReplicationClaimToken::from_string),
         id: row.get_text(0),
         bucket: BucketName::parse(&row.get_text(1)).unwrap_or_else(|_| unreachable_bucket()),
         key: ObjectKey::parse(&row.get_text(2)).unwrap_or_else(|_| unreachable_key()),

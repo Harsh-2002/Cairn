@@ -139,8 +139,8 @@ impl RunReport {
 /// The outbox-driven replication engine, generic over the metadata store, the source blob
 /// store, the destination sink, and the clock.
 ///
-/// It holds no mutable state of its own: the durable outbox is the source of truth, so an
-/// engine is cheap to construct and safe to run from many workers concurrently.
+/// Delivery state lives in the durable outbox; the engine retains only diagnostic counters.
+/// It is cheap to construct and safe to run from many workers concurrently.
 #[derive(Clone)]
 pub struct ReplicationEngine {
     opts: ReplicationOpts,
@@ -151,6 +151,7 @@ pub struct ReplicationEngine {
     /// the version row for every object read — never cached across passes, since the re-wrap worker
     /// re-seals descriptors underneath us.
     crypto: Arc<dyn Crypto>,
+    claim_failures: Arc<ClaimFailures>,
 }
 
 impl std::fmt::Debug for ReplicationEngine {
@@ -162,12 +163,72 @@ impl std::fmt::Debug for ReplicationEngine {
     }
 }
 
+#[derive(Default)]
+struct ClaimFailures {
+    stale: std::sync::atomic::AtomicU64,
+    renewal: std::sync::atomic::AtomicU64,
+}
+
+// An entry leaves renewal before its settlement is submitted. Its remote I/O has already
+// finished; waiting for the writer acknowledgement must not make a successful settlement look
+// like a stolen claim to the concurrent heartbeat. Other queued entries keep renewing.
+struct ActiveClaim<'a> {
+    entry: &'a OutboxEntry,
+    pending: &'a std::sync::Mutex<Vec<OutboxEntry>>,
+}
+
+impl std::ops::Deref for ActiveClaim<'_> {
+    type Target = OutboxEntry;
+    fn deref(&self) -> &Self::Target {
+        self.entry
+    }
+}
+
+impl ActiveClaim<'_> {
+    fn settling(&self) -> Result<(), MetaError> {
+        self.pending
+            .lock()
+            .map_err(|_| MetaError::Engine("replication batch lock poisoned".to_owned()))?
+            .retain(|claim| claim.id != self.entry.id);
+        Ok(())
+    }
+}
+
 impl ReplicationEngine {
     /// Construct an engine with the given options and the master-key facility used to unseal
     /// encrypted source versions.
     #[must_use]
     pub fn new(opts: ReplicationOpts, crypto: Arc<dyn Crypto>) -> Self {
-        Self { opts, crypto }
+        Self {
+            opts,
+            crypto,
+            claim_failures: Arc::default(),
+        }
+    }
+
+    /// Drain bounded ownership counters, including passes cancelled before a run report exists.
+    #[must_use]
+    pub fn take_claim_failures(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering;
+        (
+            self.claim_failures.stale.swap(0, Ordering::Relaxed),
+            self.claim_failures.renewal.swap(0, Ordering::Relaxed),
+        )
+    }
+
+    fn check_claim_update(
+        &self,
+        outcome: cairn_types::meta::MutationOutcome,
+    ) -> Result<(), MetaError> {
+        if matches!(
+            outcome,
+            cairn_types::meta::MutationOutcome::ReplicationClaimUpdated { applied: false }
+        ) {
+            self.claim_failures
+                .stale
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        check_claim_update(outcome)
     }
 
     /// The options this engine runs with.
@@ -201,76 +262,133 @@ impl ReplicationEngine {
             .claim_replication_batch(self.opts.batch_size, now)
             .await?;
 
-        let mut report = RunReport {
-            claimed: batch.len(),
-            ..RunReport::default()
-        };
+        let pending = std::sync::Mutex::new(batch.clone());
+        let work = async {
+            let mut report = RunReport {
+                claimed: batch.len(),
+                ..RunReport::default()
+            };
 
-        // Group by (key, target) so a key's versions to a given target are processed strictly
-        // oldest-first, and a stalled earlier version blocks the later ones for THAT target only
-        // (per-key, per-target ordering — a slow target never holds up a healthy one under
-        // fan-out). Version ids are time-sortable (uuid v7), so ascending string order is
-        // chronological order.
-        let mut by_key: BTreeMap<(String, String, Option<String>), Vec<OutboxEntry>> =
-            BTreeMap::new();
-        for entry in batch {
-            by_key
-                .entry((
-                    entry.bucket.as_str().to_owned(),
-                    entry.key.as_str().to_owned(),
-                    entry.target_arn.clone(),
-                ))
-                .or_default()
-                .push(entry);
-        }
+            // Group by (key, target) so a key's versions to a given target are processed strictly
+            // oldest-first, and a stalled earlier version blocks the later ones for THAT target only
+            // (per-key, per-target ordering — a slow target never holds up a healthy one under
+            // fan-out). Version ids are time-sortable (uuid v7), so ascending string order is
+            // chronological order.
+            let mut by_key: BTreeMap<(String, String, Option<String>), Vec<OutboxEntry>> =
+                BTreeMap::new();
+            for entry in batch {
+                by_key
+                    .entry((
+                        entry.bucket.as_str().to_owned(),
+                        entry.key.as_str().to_owned(),
+                        entry.target_arn.clone(),
+                    ))
+                    .or_default()
+                    .push(entry);
+            }
 
-        for entries in by_key.values_mut() {
-            entries.sort_by(|a, b| a.version_id.as_str().cmp(b.version_id.as_str()));
-            let mut blocked = false;
-            for entry in entries.iter() {
-                if blocked {
-                    // An earlier version of this key has not yet shipped this pass; defer the rest
-                    // so writes never reorder at the destination. Release the claim (short re-check)
-                    // rather than holding it under the 300 s lease.
-                    self.defer_for_ordering(meta, entry, now).await?;
-                    report.deferred += 1;
-                    continue;
-                }
-                match self
-                    .process_entry(meta, router, blobs, clock, now, entry)
-                    .await?
-                {
-                    EntryOutcome::Completed { bytes } => {
-                        report.completed += 1;
-                        report.bytes += bytes;
-                    }
-                    EntryOutcome::Retried { dek_unavailable } => {
-                        // A retry/unavailable reschedule for THIS version: a later version of the
-                        // same key+target must wait for it, so block the rest of the group.
-                        report.retried += 1;
-                        if dek_unavailable {
-                            report.dek_resolve_failures += 1;
-                        }
-                        blocked = true;
-                    }
-                    EntryOutcome::Failed => {
-                        // A *terminal* failure is settled — it will not ship without an operator
-                        // retry — so it must NOT freeze the key+target forever. Let later versions
-                        // proceed (best-effort/at-least-once, ARCH 20.4); the cross-batch predecessor
-                        // guard agrees (it skips `failed`).
-                        report.failed += 1;
-                    }
-                    EntryOutcome::Deferred => {
-                        // A predecessor in another batch is still in flight (process_entry already
-                        // released this entry's claim): block the rest of this key's versions too.
+            for entries in by_key.values_mut() {
+                entries.sort_by(|a, b| a.version_id.as_str().cmp(b.version_id.as_str()));
+                let mut blocked = false;
+                for entry in entries.iter() {
+                    let claim = ActiveClaim {
+                        entry,
+                        pending: &pending,
+                    };
+                    let entry = &claim;
+                    if blocked {
+                        // An earlier version of this key has not yet shipped this pass; defer the rest
+                        // so writes never reorder at the destination. Release the claim (short re-check)
+                        // rather than holding it under the 300 s lease.
+                        self.defer_for_ordering(meta, entry, clock.now()).await?;
                         report.deferred += 1;
-                        blocked = true;
+                        continue;
+                    }
+                    match self
+                        .process_entry(meta, router, blobs, clock, entry)
+                        .await?
+                    {
+                        EntryOutcome::Completed { bytes } => {
+                            report.completed += 1;
+                            report.bytes += bytes;
+                        }
+                        EntryOutcome::Retried { dek_unavailable } => {
+                            // A retry/unavailable reschedule for THIS version: a later version of the
+                            // same key+target must wait for it, so block the rest of the group.
+                            report.retried += 1;
+                            if dek_unavailable {
+                                report.dek_resolve_failures += 1;
+                            }
+                            blocked = true;
+                        }
+                        EntryOutcome::Failed => {
+                            // A *terminal* failure is settled — it will not ship without an operator
+                            // retry — so it must NOT freeze the key+target forever. Let later versions
+                            // proceed (best-effort/at-least-once, ARCH 20.4); the cross-batch predecessor
+                            // guard agrees (it skips `failed`).
+                            report.failed += 1;
+                        }
+                        EntryOutcome::Deferred => {
+                            // A predecessor in another batch is still in flight (process_entry already
+                            // released this entry's claim): block the rest of this key's versions too.
+                            report.deferred += 1;
+                            blocked = true;
+                        }
                     }
                 }
             }
+            Ok(report)
+        };
+        let renew = async {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                let claims = pending
+                    .lock()
+                    .map_err(|_| MetaError::Engine("replication batch lock poisoned".to_owned()))?
+                    .clone();
+                for entry in claims {
+                    let outcome = meta
+                        .submit(Mutation::RenewReplicationClaim {
+                            id: entry.id.clone(),
+                            claim_token: entry.claim_token.clone().ok_or_else(|| {
+                                MetaError::Engine("replication entry has no claim token".to_owned())
+                            })?,
+                            now: clock.now(),
+                            lease_secs: 300,
+                        })
+                        .await
+                        .map_err(|error| {
+                            self.claim_failures
+                                .renewal
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            error
+                        })?;
+                    // A snapshot may include an entry that began settling during the await.
+                    // No remote operation remains for that entry, so only still-active claims
+                    // can make this heartbeat cancel the batch.
+                    if pending
+                        .lock()
+                        .map_err(|_| {
+                            MetaError::Engine("replication batch lock poisoned".to_owned())
+                        })?
+                        .iter()
+                        .any(|claim| claim.id == entry.id)
+                    {
+                        if let Err(error) = self.check_claim_update(outcome) {
+                            self.claim_failures
+                                .renewal
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            return Err(error);
+                        }
+                    }
+                }
+            }
+        };
+        futures_util::pin_mut!(work, renew);
+        match futures_util::future::select(work, renew).await {
+            futures_util::future::Either::Left((result, _))
+            | futures_util::future::Either::Right((result, _)) => result,
         }
-
-        Ok(report)
     }
 
     /// Drive the engine in a loop, draining the outbox a batch at a time until a pass finds
@@ -322,8 +440,7 @@ impl ReplicationEngine {
         router: &R,
         blobs: &Arc<B>,
         clock: &C,
-        now: Timestamp,
-        entry: &OutboxEntry,
+        entry: &ActiveClaim<'_>,
     ) -> Result<EntryOutcome, MetaError>
     where
         M: MetadataStore + ?Sized,
@@ -331,6 +448,20 @@ impl ReplicationEngine {
         B: BlobStore + ?Sized,
         C: Clock + ?Sized,
     {
+        let now = clock.now();
+        // Revalidate a waiting claim immediately before starting local reads or remote I/O.
+        // A delayed heartbeat or a forward wall-clock jump must not start an expired attempt.
+        self.check_claim_update(
+            meta.submit(Mutation::RenewReplicationClaim {
+                id: entry.id.clone(),
+                claim_token: entry.claim_token.clone().ok_or_else(|| {
+                    MetaError::Engine("replication entry has no claim token".to_owned())
+                })?,
+                now,
+                lease_secs: 300,
+            })
+            .await?,
+        )?;
         // Load the version this entry concerns.
         let row = meta
             .get_version(&entry.bucket, &entry.key, &entry.version_id)
@@ -338,8 +469,14 @@ impl ReplicationEngine {
         let Some(row) = row else {
             // The version was permanently deleted out from under us: nothing to ship and no
             // amount of retrying will bring it back. Terminate the entry.
-            self.mark_failed(meta, entry, "object version no longer exists", None)
-                .await?;
+            self.mark_failed(
+                meta,
+                entry,
+                "object version no longer exists",
+                None,
+                clock.now(),
+            )
+            .await?;
             return Ok(EntryOutcome::Failed);
         };
 
@@ -352,11 +489,17 @@ impl ReplicationEngine {
         // target re-ships, which is harmless because the destination overwrites identical bytes
         // (at-least-once, ARCH 20.4).
         if row.replication_status == Some(ReplicationStatus::Replica) {
-            meta.submit(Mutation::MarkReplicationDone {
-                id: entry.id.clone(),
-                now,
-            })
-            .await?;
+            entry.settling()?;
+            self.check_claim_update(
+                meta.submit(Mutation::MarkReplicationDone {
+                    claim_token: entry.claim_token.clone().ok_or_else(|| {
+                        MetaError::Engine("replication entry has no claim token".to_owned())
+                    })?,
+                    id: entry.id.clone(),
+                    now: clock.now(),
+                })
+                .await?,
+            )?;
             return Ok(EntryOutcome::Completed { bytes: 0 });
         }
 
@@ -380,7 +523,7 @@ impl ReplicationEngine {
             // Hand the claim back (status='pending', short re-check) instead of holding it under
             // the 300 s lease, so this version ships promptly once its predecessor clears rather
             // than waiting out the lease (no attempt is burned — deferral is not a failure).
-            self.defer_for_ordering(meta, entry, now).await?;
+            self.defer_for_ordering(meta, entry, clock.now()).await?;
             return Ok(EntryOutcome::Deferred);
         }
 
@@ -397,7 +540,7 @@ impl ReplicationEngine {
             // with backoff instead; the attempt budget still turns a genuinely-removed or
             // misconfigured target terminal after a few tries.
             return self
-                .retry_or_exhaust(meta, entry, now, "no replication sink for target")
+                .retry_or_exhaust(meta, entry, clock.now(), "no replication sink for target")
                 .await;
         };
 
@@ -434,7 +577,7 @@ impl ReplicationEngine {
                             .reschedule_unavailable(
                                 meta,
                                 entry,
-                                now,
+                                clock.now(),
                                 &msg,
                                 UnavailableCause::SourceKey,
                             )
@@ -453,6 +596,7 @@ impl ReplicationEngine {
                 .map(|()| 0u64),
         };
 
+        let now = clock.now();
         match sink_result {
             Ok(bytes) => {
                 // SHIP-COMPLETION time, not the batch-start `now`. `replicated_at` is documented as
@@ -480,7 +624,7 @@ impl ReplicationEngine {
             // distinct variant only so the operator audit can tell "never landed" from "landed
             // wrong" without pattern-matching on a message string.
             Err(ReplicationError::NotFound(msg) | ReplicationError::Terminal(msg)) => {
-                self.mark_failed(meta, entry, &msg, None).await?;
+                self.mark_failed(meta, entry, &msg, None, now).await?;
                 Ok(EntryOutcome::Failed)
             }
         }
@@ -554,7 +698,7 @@ impl ReplicationEngine {
     async fn mark_done<M>(
         &self,
         meta: &M,
-        entry: &OutboxEntry,
+        entry: &ActiveClaim<'_>,
         now: Timestamp,
     ) -> Result<(), MetaError>
     where
@@ -566,11 +710,17 @@ impl ReplicationEngine {
         // the ship window, or resurrect one deleted meanwhile (audit 2026-07).
         // `now` also stamps the version's `replicated_at` (schema v23) — the replication-owned
         // clock the audit needs to tell a fresh, correct ship from a stale pre-fix one.
-        meta.submit(Mutation::MarkReplicationDone {
-            id: entry.id.clone(),
-            now,
-        })
-        .await?;
+        entry.settling()?;
+        self.check_claim_update(
+            meta.submit(Mutation::MarkReplicationDone {
+                claim_token: entry.claim_token.clone().ok_or_else(|| {
+                    MetaError::Engine("replication entry has no claim token".to_owned())
+                })?,
+                id: entry.id.clone(),
+                now,
+            })
+            .await?,
+        )?;
         Ok(())
     }
 
@@ -580,9 +730,10 @@ impl ReplicationEngine {
     async fn mark_failed<M>(
         &self,
         meta: &M,
-        entry: &OutboxEntry,
+        entry: &ActiveClaim<'_>,
         error: &str,
         next_attempt_at: Option<Timestamp>,
+        now: Timestamp,
     ) -> Result<(), MetaError>
     where
         M: MetadataStore + ?Sized,
@@ -597,12 +748,19 @@ impl ReplicationEngine {
         // MarkReplicationFailed stamps the version's replication_status=Failed itself (via a targeted
         // UPDATE) when the failure is terminal (next_attempt_at is None) — no whole-row re-upsert
         // here, which would force is_latest (audit 2026-07).
-        meta.submit(Mutation::MarkReplicationFailed {
-            id: entry.id.clone(),
-            error: error.to_owned(),
-            next_attempt_at,
-        })
-        .await?;
+        entry.settling()?;
+        self.check_claim_update(
+            meta.submit(Mutation::MarkReplicationFailed {
+                claim_token: entry.claim_token.clone().ok_or_else(|| {
+                    MetaError::Engine("replication entry has no claim token".to_owned())
+                })?,
+                now,
+                id: entry.id.clone(),
+                error: error.to_owned(),
+                next_attempt_at,
+            })
+            .await?,
+        )?;
         Ok(())
     }
 
@@ -612,7 +770,7 @@ impl ReplicationEngine {
     async fn retry_or_exhaust<M>(
         &self,
         meta: &M,
-        entry: &OutboxEntry,
+        entry: &ActiveClaim<'_>,
         now: Timestamp,
         msg: &str,
     ) -> Result<EntryOutcome, MetaError>
@@ -620,8 +778,14 @@ impl ReplicationEngine {
         M: MetadataStore + ?Sized,
     {
         if entry.attempts.saturating_add(1) >= self.opts.max_attempts {
-            self.mark_failed(meta, entry, &format!("max attempts exhausted: {msg}"), None)
-                .await?;
+            self.mark_failed(
+                meta,
+                entry,
+                &format!("max attempts exhausted: {msg}"),
+                None,
+                now,
+            )
+            .await?;
             Ok(EntryOutcome::Failed)
         } else {
             let delay = next_backoff(
@@ -630,7 +794,7 @@ impl ReplicationEngine {
                 self.opts.max_backoff_secs,
             );
             let next = now.plus_secs(delay as i64);
-            self.mark_failed(meta, entry, msg, Some(next)).await?;
+            self.mark_failed(meta, entry, msg, Some(next), now).await?;
             Ok(EntryOutcome::Retried {
                 dek_unavailable: false,
             })
@@ -644,18 +808,25 @@ impl ReplicationEngine {
     async fn defer_for_ordering<M>(
         &self,
         meta: &M,
-        entry: &OutboxEntry,
+        entry: &ActiveClaim<'_>,
         now: Timestamp,
     ) -> Result<(), MetaError>
     where
         M: MetadataStore + ?Sized,
     {
-        meta.submit(Mutation::DeferReplication {
-            id: entry.id.clone(),
-            next_attempt_at: now.plus_secs(ORDERING_DEFER_RECHECK_SECS as i64),
-            last_error: None,
-        })
-        .await?;
+        entry.settling()?;
+        self.check_claim_update(
+            meta.submit(Mutation::DeferReplication {
+                claim_token: entry.claim_token.clone().ok_or_else(|| {
+                    MetaError::Engine("replication entry has no claim token".to_owned())
+                })?,
+                now,
+                id: entry.id.clone(),
+                next_attempt_at: now.plus_secs(ORDERING_DEFER_RECHECK_SECS as i64),
+                last_error: None,
+            })
+            .await?,
+        )?;
         Ok(())
     }
 
@@ -679,7 +850,7 @@ impl ReplicationEngine {
     async fn reschedule_unavailable<M>(
         &self,
         meta: &M,
-        entry: &OutboxEntry,
+        entry: &ActiveClaim<'_>,
         now: Timestamp,
         msg: &str,
         cause: UnavailableCause,
@@ -707,17 +878,24 @@ impl ReplicationEngine {
                  budget — if the key id was removed permanently this object will never ship"
             ),
         }
-        meta.submit(Mutation::DeferReplication {
-            id: entry.id.clone(),
-            next_attempt_at: now.plus_secs(delay as i64),
-            last_error: Some(match cause {
-                UnavailableCause::Destination => format!("target unavailable: {msg}"),
-                UnavailableCause::SourceKey => {
-                    format!("source data key unavailable on this node's master ring: {msg}")
-                }
-            }),
-        })
-        .await?;
+        entry.settling()?;
+        self.check_claim_update(
+            meta.submit(Mutation::DeferReplication {
+                claim_token: entry.claim_token.clone().ok_or_else(|| {
+                    MetaError::Engine("replication entry has no claim token".to_owned())
+                })?,
+                now,
+                id: entry.id.clone(),
+                next_attempt_at: now.plus_secs(delay as i64),
+                last_error: Some(match cause {
+                    UnavailableCause::Destination => format!("target unavailable: {msg}"),
+                    UnavailableCause::SourceKey => {
+                        format!("source data key unavailable on this node's master ring: {msg}")
+                    }
+                }),
+            })
+            .await?,
+        )?;
         Ok(EntryOutcome::Retried { dek_unavailable })
     }
 }
@@ -846,6 +1024,7 @@ pub fn outbox_entry_for(
     priority: i64,
 ) -> OutboxEntry {
     OutboxEntry {
+        claim_token: None,
         id: id.into(),
         bucket,
         key,
@@ -916,6 +1095,22 @@ pub fn backfill_outbox_entries(
 /// the entry type-checks, but it is reserved (no real Cairn bucket may take it) so an unsubstituted
 /// entry is recognisable rather than silently shippable.
 pub const BACKFILL_PLACEHOLDER_BUCKET: &str = "cairn-backfill-placeholder";
+
+/// A stale worker must not report successful bookkeeping or advance its key's successor.
+fn check_claim_update(outcome: cairn_types::meta::MutationOutcome) -> Result<(), MetaError> {
+    match outcome {
+        cairn_types::meta::MutationOutcome::ReplicationClaimUpdated { applied: true } => Ok(()),
+        cairn_types::meta::MutationOutcome::ReplicationClaimUpdated { applied: false } => {
+            tracing::warn!("replication attempt lost ownership; cancelling the batch");
+            Err(MetaError::Engine(
+                "replication attempt lost ownership".to_owned(),
+            ))
+        }
+        _ => Err(MetaError::Engine(
+            "unexpected replication claim update outcome".to_owned(),
+        )),
+    }
+}
 
 #[cfg(test)]
 mod tests {

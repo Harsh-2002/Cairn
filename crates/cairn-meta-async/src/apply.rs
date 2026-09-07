@@ -819,7 +819,7 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
                 Some(b) => {
                     driver
                         .execute(
-                            "UPDATE replication_outbox SET status='pending', next_attempt_at=?2, attempts=0, lease_until=NULL \
+                            "UPDATE replication_outbox SET claim_token=NULL, status='pending', next_attempt_at=?2, attempts=0, lease_until=NULL \
                              WHERE status='failed' AND bucket_name=?1",
                             vec![Value::Text(b.as_str().to_owned()), Value::Int(now.0)],
                         )
@@ -828,7 +828,7 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
                 None => {
                     driver
                         .execute(
-                            "UPDATE replication_outbox SET status='pending', next_attempt_at=?1, attempts=0, lease_until=NULL \
+                            "UPDATE replication_outbox SET claim_token=NULL, status='pending', next_attempt_at=?1, attempts=0, lease_until=NULL \
                              WHERE status='failed'",
                             vec![Value::Int(now.0)],
                         )
@@ -884,7 +884,7 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
             };
             let outbox = driver
                 .execute(
-                    "UPDATE replication_outbox SET status='pending', next_attempt_at=?2, attempts=0, lease_until=NULL \
+                    "UPDATE replication_outbox SET claim_token=NULL, status='pending', next_attempt_at=?2, attempts=0, lease_until=NULL \
                      WHERE bucket_name=?1 AND status IN ('completed','failed') \
                        AND (?3 IS NULL OR key > ?3) AND key <= ?4 \
                        AND (?5 = 0 OR EXISTS ( \
@@ -1213,12 +1213,44 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
                 .await?;
             Ok(MutationOutcome::ImportJobsPruned(rows))
         }
+        Mutation::RenewReplicationClaim {
+            id,
+            claim_token,
+            now,
+            lease_secs,
+        } => {
+            let until = lease_secs
+                .checked_mul(1000)
+                .and_then(|delta| now.0.checked_add(delta))
+                .filter(|_| lease_secs > 0)
+                .ok_or_else(|| {
+                    MetaError::Engine("invalid replication renewal duration".to_owned())
+                })?;
+            if !owns_replication_claim(driver, &id, &claim_token, now).await? {
+                return Ok(MutationOutcome::ReplicationClaimUpdated { applied: false });
+            }
+            driver
+                .execute(
+                    "UPDATE replication_outbox SET lease_until=?2 WHERE id=?1",
+                    vec![Value::Text(id), Value::Int(until)],
+                )
+                .await?;
+            Ok(MutationOutcome::ReplicationClaimUpdated { applied: true })
+        }
         Mutation::ClaimReplicationBatch {
             limit,
             now,
             lease_secs,
         } => claim_replication_batch(driver, limit, now, lease_secs).await,
-        Mutation::MarkReplicationDone { id, now } => {
+        Mutation::MarkReplicationDone {
+            id,
+            now,
+            claim_token,
+        } => {
+            if !owns_replication_claim(driver, &id, &claim_token, now).await? {
+                return Ok(MutationOutcome::ReplicationClaimUpdated { applied: false });
+            }
+
             if let Some(row) = query_one(
                 driver,
                 "SELECT bucket_name, key, version_id FROM replication_outbox WHERE id=?1",
@@ -1248,22 +1280,28 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
             }
             driver
                 .execute(
-                    "UPDATE replication_outbox SET status='completed' WHERE id=?1",
+                    "UPDATE replication_outbox SET claim_token=NULL, lease_until=NULL, status='completed' WHERE id=?1",
                     vec![Value::Text(id)],
                 )
                 .await?;
-            Ok(MutationOutcome::Ack)
+            Ok(MutationOutcome::ReplicationClaimUpdated { applied: true })
         }
         Mutation::MarkReplicationFailed {
+            claim_token,
+            now,
             id,
             error,
             next_attempt_at,
         } => {
+            if !owns_replication_claim(driver, &id, &claim_token, now).await? {
+                return Ok(MutationOutcome::ReplicationClaimUpdated { applied: false });
+            }
+
             match next_attempt_at {
                 Some(t) => {
                     driver
                         .execute(
-                            "UPDATE replication_outbox SET attempts=attempts+1, last_error=?2, next_attempt_at=?3, status='pending' WHERE id=?1",
+                            "UPDATE replication_outbox SET claim_token=NULL, lease_until=NULL, attempts=attempts+1, last_error=?2, next_attempt_at=?3, status='pending' WHERE id=?1",
                             vec![Value::Text(id), Value::Text(error), Value::Int(t.0)],
                         )
                         .await?;
@@ -1271,7 +1309,7 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
                 None => {
                     driver
                         .execute(
-                            "UPDATE replication_outbox SET attempts=attempts+1, last_error=?2, status='failed' WHERE id=?1",
+                            "UPDATE replication_outbox SET claim_token=NULL, lease_until=NULL, attempts=attempts+1, last_error=?2, status='failed' WHERE id=?1",
                             vec![Value::Text(id.clone()), Value::Text(error)],
                         )
                         .await?;
@@ -1299,15 +1337,15 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
                     }
                 }
             }
-            Ok(MutationOutcome::Ack)
+            Ok(MutationOutcome::ReplicationClaimUpdated { applied: true })
         }
         Mutation::EnqueueReplication(e) => {
             // Idempotent (INSERT OR IGNORE on the deterministic backfill id); see the sync store.
             driver
                 .execute(
                     "INSERT OR IGNORE INTO replication_outbox
-                     (id, bucket_name, key, version_id, operation, rule_id, target_arn, attempts, next_attempt_at, status, last_error, priority, lease_until, enqueued_at)
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                     (id, bucket_name, key, version_id, operation, rule_id, target_arn, attempts, next_attempt_at, status, last_error, priority, lease_until, enqueued_at, claim_token)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
                     vec![
                         Value::Text(e.id.clone()),
                         Value::Text(e.bucket.as_str().to_owned()),
@@ -1323,23 +1361,30 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
                         Value::Int(e.priority),
                         e.lease_until.map_or(Value::Null, |t| Value::Int(t.0)),
                         Value::Int(e.enqueued_at.0),
+                opt_text(e.claim_token.as_ref().map(|token| token.as_str().to_owned())),
                     ],
                 )
                 .await?;
             Ok(MutationOutcome::Ack)
         }
         Mutation::DeferReplication {
+            claim_token,
+            now,
             id,
             next_attempt_at,
             last_error,
         } => {
+            if !owns_replication_claim(driver, &id, &claim_token, now).await? {
+                return Ok(MutationOutcome::ReplicationClaimUpdated { applied: false });
+            }
+
             // Mirrors cairn-meta: release the claim and re-schedule without touching `attempts`
             // (a deferral/unavailability is not a failure). COALESCE keeps the prior error when no
             // new one is supplied.
             driver
                 .execute(
                     "UPDATE replication_outbox \
-                     SET status='pending', lease_until=NULL, next_attempt_at=?2, \
+                     SET status='pending', claim_token=NULL, lease_until=NULL, next_attempt_at=?2, \
                          last_error=COALESCE(?3, last_error) \
                      WHERE id=?1",
                     vec![
@@ -1349,13 +1394,13 @@ pub async fn apply(driver: &dyn AsyncSqlDriver, m: Mutation) -> R<MutationOutcom
                     ],
                 )
                 .await?;
-            Ok(MutationOutcome::Ack)
+            Ok(MutationOutcome::ReplicationClaimUpdated { applied: true })
         }
         Mutation::RecoverClaimedReplication => {
             // Mirrors cairn-meta: release orphaned `claimed` rows to `pending` at startup.
             driver
                 .execute(
-                    "UPDATE replication_outbox SET status='pending', lease_until=NULL WHERE status='claimed'",
+                    "UPDATE replication_outbox SET claim_token=NULL, status='pending', lease_until=NULL WHERE status='claimed'",
                     vec![],
                 )
                 .await?;
@@ -2974,8 +3019,8 @@ async fn enqueue(driver: &dyn AsyncSqlDriver, e: &OutboxEntry) -> R<()> {
     driver
         .execute(
             "INSERT INTO replication_outbox
-             (id, bucket_name, key, version_id, operation, rule_id, target_arn, attempts, next_attempt_at, status, last_error, priority, lease_until, enqueued_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+             (id, bucket_name, key, version_id, operation, rule_id, target_arn, attempts, next_attempt_at, status, last_error, priority, lease_until, enqueued_at, claim_token)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
             vec![
                 Value::Text(e.id.clone()),
                 Value::Text(e.bucket.as_str().to_owned()),
@@ -2991,6 +3036,7 @@ async fn enqueue(driver: &dyn AsyncSqlDriver, e: &OutboxEntry) -> R<()> {
                 Value::Int(e.priority),
                 e.lease_until.map_or(Value::Null, |t| Value::Int(t.0)),
                 Value::Int(e.enqueued_at.0),
+                opt_text(e.claim_token.as_ref().map(|token| token.as_str().to_owned())),
             ],
         )
         .await?;
@@ -3020,10 +3066,11 @@ async fn claim_replication_batch(
     let ids: Vec<String> = id_rows.iter().map(|r| r.get_text(0)).collect();
     let mut claimed = Vec::with_capacity(ids.len());
     for id in &ids {
+        let token = cairn_types::id::ReplicationClaimToken::generate();
         driver
             .execute(
-                "UPDATE replication_outbox SET status='claimed', lease_until=?2 WHERE id=?1",
-                vec![Value::Text(id.clone()), Value::Int(lease_until)],
+                "UPDATE replication_outbox SET claim_token=?3, status='claimed', lease_until=?2 WHERE id=?1",
+                vec![Value::Text(id.clone()), Value::Int(lease_until), Value::Text(token.as_str().to_owned())],
             )
             .await?;
         let row = query_one(
@@ -3127,4 +3174,16 @@ fn config_aspect_str(a: cairn_types::bucket::ConfigAspect) -> &'static str {
 /// The string form of a config aspect (shared with the read path).
 pub fn aspect_str(a: cairn_types::bucket::ConfigAspect) -> &'static str {
     config_aspect_str(a)
+}
+
+async fn owns_replication_claim(
+    driver: &dyn AsyncSqlDriver,
+    id: &str,
+    token: &cairn_types::id::ReplicationClaimToken,
+    now: Timestamp,
+) -> R<bool> {
+    Ok(query_one(driver,
+        "SELECT id FROM replication_outbox WHERE id=?1 AND status='claimed' AND claim_token=?2 AND lease_until>=?3",
+        vec![Value::Text(id.to_owned()), Value::Text(token.as_str().to_owned()), Value::Int(now.0)]
+    ).await?.is_some())
 }

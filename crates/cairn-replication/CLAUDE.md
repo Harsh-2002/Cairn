@@ -2,8 +2,8 @@
 
 The outbox-driven asynchronous bucket-replication engine (ARCH 20): eventually consistent,
 at-least-once, idempotent. A durable outbox in the `MetadataStore` records what remains to ship;
-this engine drains it. It holds no mutable state — the outbox is the source of truth, so an engine
-is cheap to construct and safe to run from many workers at once.
+this engine drains it. Delivery state stays in the outbox; the engine retains only diagnostic
+counters. It is cheap to construct and safe to run from many workers at once.
 
 ## Layout (`src/`)
 - `lib.rs` — `ReplicationEngine`. `run_once` claims a batch of *due* entries, groups by
@@ -142,3 +142,9 @@ is cheap to construct and safe to run from many workers at once.
   `conformance/replication_chaos.sh`; two-node soak: `conformance/soak.sh`.
 - Spec: `docs/replication.md` (20). Env knobs/wiring: `cairn-server` `config.rs`/`background.rs`.
   See the root `../../CLAUDE.md` for the gate.
+
+Claims renew every 60 seconds for a five-minute lease, including queued batch entries. Every status
+mutation carries its exact attempt token and a fresh clock; rejected bookkeeping cancels the batch.
+The heartbeat is polled by the existing worker, not a detached task. Remove settling entries before
+awaiting final bookkeeping so delayed acknowledgements cannot cause false ownership loss. Keep
+stale/renewal-failure counters observable even on an aborted batch.

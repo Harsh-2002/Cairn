@@ -452,6 +452,8 @@ pub enum Mutation {
     /// correctly, which is precisely what the replication audit has to decide. A `replica` row
     /// (inbound, loop prevention ARCH 20.4) is left untouched by both.
     MarkReplicationDone {
+        /// Current delivery attempt.
+        claim_token: crate::id::ReplicationClaimToken,
         /// The outbox entry id.
         id: String,
         /// The completion time to stamp on the version row.
@@ -459,6 +461,10 @@ pub enum Mutation {
     },
     /// Mark a replication outbox entry failed/retry with backoff.
     MarkReplicationFailed {
+        /// Current delivery attempt.
+        claim_token: crate::id::ReplicationClaimToken,
+        /// Time at which ownership is checked.
+        now: Timestamp,
         /// The entry id.
         id: String,
         /// The last error.
@@ -619,6 +625,10 @@ pub enum Mutation {
     /// `next_attempt_at`. `last_error` records the reason when `Some` (an ordering defer passes
     /// `None`, leaving the prior error intact).
     DeferReplication {
+        /// Current delivery attempt.
+        claim_token: crate::id::ReplicationClaimToken,
+        /// Time at which ownership is checked.
+        now: Timestamp,
         /// The entry id.
         id: String,
         /// When the entry next becomes due (claimable).
@@ -633,6 +643,17 @@ pub enum Mutation {
     /// mid-drain would take minutes to resume the objects it was actively shipping. Idempotent and
     /// safe because each node owns its own metadata store. Does not touch `attempts`.
     RecoverClaimedReplication,
+    /// Extend one still-owned, unexpired replication claim.
+    RenewReplicationClaim {
+        /// Outbox identity.
+        id: String,
+        /// Exact current attempt.
+        claim_token: crate::id::ReplicationClaimToken,
+        /// Current time.
+        now: Timestamp,
+        /// New lease duration in seconds.
+        lease_secs: i64,
+    },
     /// Enqueue a batch of event-notification (webhook) outbox entries idempotently (INSERT OR
     /// IGNORE on the deterministic entry id). Emitted by the protocol layer right after an object
     /// commit succeeds; delivery is best-effort at-least-once (a crash in the gap drops the
@@ -741,6 +762,8 @@ pub enum Mutation {
 /// The typed result of applying a [`Mutation`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MutationOutcome {
+    /// Whether a replication update still owned its exact attempt.
+    ReplicationClaimUpdated { applied: bool },
     /// A put committed.
     Put {
         /// Any superseded blob to reclaim.
@@ -1509,6 +1532,8 @@ pub enum ReplicationOp {
 /// A durable replication outbox entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboxEntry {
+    /// Exact delivery attempt while claimed; absent before claim or after settlement.
+    pub claim_token: Option<crate::id::ReplicationClaimToken>,
     /// Entry id.
     pub id: String,
     /// The bucket.

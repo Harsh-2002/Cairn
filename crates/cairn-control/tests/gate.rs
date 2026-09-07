@@ -1974,6 +1974,7 @@ async fn failed_replication_lists_empty_and_is_gated() {
 
 #[tokio::test]
 async fn failed_replication_reflects_a_planted_terminal_entry() {
+    let mut replication_claims = cairn_types::testing::ReplicationClaims::default();
     let h = harness();
     let a = admin();
 
@@ -1983,6 +1984,7 @@ async fn failed_replication_reflects_a_planted_terminal_entry() {
     let key = ObjectKey::parse("photo.jpg").unwrap();
     let version = VersionId::from_string("00000001".to_owned());
     let entry = cairn_types::meta::OutboxEntry {
+        claim_token: None,
         enqueued_at: cairn_types::time::Timestamp(0),
         id: "outbox-1".to_owned(),
         bucket: bucket.clone(),
@@ -2042,6 +2044,10 @@ async fn failed_replication_reflects_a_planted_terminal_entry() {
         .unwrap();
     h.meta
         .submit(Mutation::MarkReplicationFailed {
+            claim_token: replication_claims
+                .take(&*h.meta, "outbox-1", cairn_types::Timestamp(1))
+                .await,
+            now: cairn_types::Timestamp(1),
             id: "outbox-1".to_owned(),
             error: "destination unreachable".to_owned(),
             next_attempt_at: None,
@@ -2825,6 +2831,7 @@ async fn replication_target_add_list_hides_secret_and_delete_round_trip() {
 
 #[tokio::test]
 async fn replication_retry_endpoint_requeues_failed_for_bucket() {
+    let mut replication_claims = cairn_types::testing::ReplicationClaims::default();
     let h = harness();
     let a = admin();
 
@@ -2833,6 +2840,7 @@ async fn replication_retry_endpoint_requeues_failed_for_bucket() {
     let key = ObjectKey::parse("photo.jpg").unwrap();
     let version = VersionId::from_string("00000001".to_owned());
     let entry = cairn_types::meta::OutboxEntry {
+        claim_token: None,
         enqueued_at: cairn_types::time::Timestamp(0),
         id: "outbox-1".to_owned(),
         bucket: bucket.clone(),
@@ -2892,6 +2900,10 @@ async fn replication_retry_endpoint_requeues_failed_for_bucket() {
         .unwrap();
     h.meta
         .submit(Mutation::MarkReplicationFailed {
+            claim_token: replication_claims
+                .take(&*h.meta, "outbox-1", cairn_types::Timestamp(1))
+                .await,
+            now: cairn_types::Timestamp(1),
             id: "outbox-1".to_owned(),
             error: "destination unreachable".to_owned(),
             next_attempt_at: None,
@@ -3266,6 +3278,7 @@ async fn list_objects_with_delimiter_folds_folders() {
 /// is what makes the second pass real. This is the whole remediation, so it is gated here.
 #[tokio::test]
 async fn forced_resync_requeues_completed_work_while_an_unforced_resync_is_a_no_op() {
+    let mut replication_claims = cairn_types::testing::ReplicationClaims::default();
     let h = harness();
     let a = admin();
     make_bucket(&h, &a, "repl").await;
@@ -3296,6 +3309,7 @@ async fn forced_resync_requeues_completed_work_while_an_unforced_resync_is_a_no_
     let version = VersionId::from_string("00000001".to_owned());
     let id = "backfill:r1:photo.jpg:00000001";
     let entry = cairn_types::meta::OutboxEntry {
+        claim_token: None,
         enqueued_at: cairn_types::time::Timestamp(0),
         id: id.to_owned(),
         bucket: bucket.clone(),
@@ -3355,12 +3369,15 @@ async fn forced_resync_requeues_completed_work_while_an_unforced_resync_is_a_no_
         })
         .await
         .unwrap();
-    h.meta
-        .claim_replication_batch(10, cairn_types::time::Timestamp(1))
+    replication_claims
+        .claim(&*h.meta, 10, cairn_types::time::Timestamp(1))
         .await
         .unwrap();
     h.meta
         .submit(Mutation::MarkReplicationDone {
+            claim_token: replication_claims
+                .take(&*h.meta, id, cairn_types::time::Timestamp(0))
+                .await,
             id: id.to_owned(),
             now: cairn_types::time::Timestamp(0),
         })
@@ -3385,8 +3402,8 @@ async fn forced_resync_requeues_completed_work_while_an_unforced_resync_is_a_no_
         tokio::task::yield_now().await;
     }
     assert!(
-        h.meta
-            .claim_replication_batch(10, h.clock.now())
+        replication_claims
+            .claim(&*h.meta, 10, h.clock.now())
             .await
             .unwrap()
             .is_empty(),
@@ -3421,9 +3438,8 @@ async fn forced_resync_requeues_completed_work_while_an_unforced_resync_is_a_no_
         "the durable ledger stops claiming this version is replicated"
     );
     // The requeue schedules at the service clock's `now`, so claim at that instant.
-    let claimed = h
-        .meta
-        .claim_replication_batch(10, h.clock.now())
+    let claimed = replication_claims
+        .claim(&*h.meta, 10, h.clock.now())
         .await
         .unwrap();
     assert_eq!(claimed.len(), 1, "the corrupt version is re-shipped");

@@ -738,6 +738,14 @@ SET status='active', completion_claim_token=NULL
 WHERE status='completing';
 "#,
     },
+    Migration {
+        version: 30,
+        name: "replication attempt ownership",
+        sql: r#"
+ALTER TABLE replication_outbox ADD COLUMN claim_token TEXT;
+UPDATE replication_outbox SET status='pending', lease_until=NULL WHERE status='claimed';
+"#,
+    },
 ];
 
 /// Run all pending migrations on the write driver, recording each as applied. Each migration is

@@ -278,6 +278,7 @@ The schema below is the reference for the SQLite store. Types are given in the e
 | priority | integer | Not null, default 0; higher dispatches first, carried from the matching rule. |
 | status | text | Not null; pending, claimed, completed, or failed. |
 | lease_until | integer | Nullable; the claim-lease expiry, set with the claimed status by the atomic claim so a stalled claim can be reclaimed. |
+| claim_token | text | Nullable internal per-attempt token, generated at claim and cleared at settlement/recovery. All settlement and renewal require exact ownership and an unexpired lease (migration v30). |
 | last_error | text | Nullable. |
 | enqueued_at | integer | Not null, default 0; the wall-clock millis an entry was first enqueued, so lag is the age of the oldest still-unreplicated entry's enqueue time rather than its backed-off next-attempt time. A value of 0 (rows predating the column) is treated as unknown by the lag query (migration v19). |
 | Index | | Over status and next-attempt time, for due-entry claiming, and over status and enqueue time, for the per-status aggregate and lag; a third index over (bucket_name, key) on replication_outbox (idx_outbox_bucket_key, migration v23) backing the key-paged forced-resync requeue seek. |

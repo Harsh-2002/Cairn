@@ -159,3 +159,7 @@ cargo run --bin cairn -- serve               # S3 on :7373, console on :7374
   iterating, and run the full workspace gate before finishing.
 - Heavier conformance harnesses live in `conformance/`: `run.sh` (boto3 / real AWS SDK),
   `crash_consistency.sh` (the F-4 durability harness), `soak.sh` (two-node replication), `warp.sh`.
+
+Replication outbox migration v30 adds exact attempt ownership. Done/fail/defer/renew validate the
+claimed status, token, and lease inside the writer savepoint; every backend and shard fan-out must
+preserve the typed applied result. Recovery invalidates tokens before new workers can claim.

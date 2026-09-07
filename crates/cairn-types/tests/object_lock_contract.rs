@@ -131,6 +131,7 @@ fn session(
 
 fn outbox(bucket: &BucketName, key: &ObjectKey, version_id: &VersionId, id: &str) -> OutboxEntry {
     OutboxEntry {
+        claim_token: None,
         id: id.to_owned(),
         bucket: bucket.clone(),
         key: key.clone(),

@@ -565,6 +565,9 @@ pub fn import_job_summary_from_row(row: &Row) -> rusqlite::Result<ImportJobSumma
 
 pub fn outbox_from_row(row: &Row) -> rusqlite::Result<OutboxEntry> {
     Ok(OutboxEntry {
+        claim_token: row
+            .get::<_, Option<String>>("claim_token")?
+            .map(cairn_types::id::ReplicationClaimToken::from_string),
         id: row.get("id")?,
         bucket: BucketName::parse(&row.get::<_, String>("bucket_name")?)
             .unwrap_or_else(|_| unreachable_bucket()),

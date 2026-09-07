@@ -475,6 +475,9 @@ pub struct InMemoryMetadataStore {
     fail_user_policy_reads: AtomicBool,
     fail_replication_config_reads: AtomicBool,
     hang_next_claim_ack: AtomicBool,
+    hang_next_replication_done_ack: AtomicBool,
+    replication_done_ack_hanging: AtomicBool,
+    fail_next_replication_renew: AtomicBool,
     fail_next_complete_ack: AtomicBool,
     hang_next_replication_config_read: AtomicBool,
     replication_config_read_hanging: AtomicBool,
@@ -496,6 +499,26 @@ impl InMemoryMetadataStore {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Apply the next replication completion, then withhold its writer acknowledgement.
+    pub fn hang_next_replication_done_ack(&self) {
+        self.replication_done_ack_hanging
+            .store(false, Ordering::Release);
+        self.hang_next_replication_done_ack
+            .store(true, Ordering::Release);
+    }
+
+    /// Whether the committed replication completion is waiting for its lost acknowledgement.
+    #[must_use]
+    pub fn replication_done_ack_is_hanging(&self) -> bool {
+        self.replication_done_ack_hanging.load(Ordering::Acquire)
+    }
+
+    /// Fail the next replication renewal before applying it.
+    pub fn fail_next_replication_renew(&self) {
+        self.fail_next_replication_renew
+            .store(true, Ordering::Release);
     }
 
     /// Apply the next successful multipart claim, then leave its submit future pending forever.
@@ -907,6 +930,32 @@ fn page_rows(
 #[async_trait::async_trait]
 impl MetadataStore for InMemoryMetadataStore {
     async fn submit(&self, mutation: Mutation) -> Result<MutationOutcome, MetaError> {
+        if matches!(&mutation, Mutation::RenewReplicationClaim { .. })
+            && self
+                .fail_next_replication_renew
+                .swap(false, Ordering::AcqRel)
+        {
+            return Err(MetaError::Engine(
+                "injected replication renewal failure".to_owned(),
+            ));
+        }
+        if matches!(&mutation, Mutation::MarkReplicationDone { .. })
+            && self
+                .hang_next_replication_done_ack
+                .swap(false, Ordering::AcqRel)
+        {
+            // Re-enter with the injection disarmed, then hang outside the state mutex.
+            let outcome = self.submit(mutation).await?;
+            if matches!(
+                outcome,
+                MutationOutcome::ReplicationClaimUpdated { applied: true }
+            ) {
+                self.replication_done_ack_hanging
+                    .store(true, Ordering::Release);
+                return std::future::pending().await;
+            }
+            return Ok(outcome);
+        }
         let mutation = match mutation {
             Mutation::ClaimMultipart {
                 upload_id,
@@ -1658,6 +1707,7 @@ impl MetadataStore for InMemoryMetadataStore {
                             .is_none_or(|b| e.bucket.as_str() == b.as_str())
                     {
                         e.status = ReplicationStatus::Pending;
+                        e.claim_token = None;
                         e.next_attempt_at = now;
                         e.attempts = 0;
                         e.lease_until = None;
@@ -1747,6 +1797,7 @@ impl MetadataStore for InMemoryMetadataStore {
                         continue;
                     }
                     e.status = ReplicationStatus::Pending;
+                    e.claim_token = None;
                     e.next_attempt_at = now;
                     e.attempts = 0;
                     e.lease_until = None;
@@ -1939,6 +1990,32 @@ impl MetadataStore for InMemoryMetadataStore {
                 st.session_creds.remove(&access_key_id);
                 Ok(MutationOutcome::Ack)
             }
+            Mutation::RenewReplicationClaim {
+                id,
+                claim_token,
+                now,
+                lease_secs,
+            } => {
+                let until = lease_secs
+                    .checked_mul(1000)
+                    .and_then(|delta| now.0.checked_add(delta))
+                    .filter(|_| lease_secs > 0)
+                    .ok_or_else(|| {
+                        MetaError::Engine("invalid replication renewal duration".to_owned())
+                    })?;
+                let entry = st.outbox.iter_mut().find(|entry| {
+                    entry.id == id
+                        && entry.status == ReplicationStatus::Claimed
+                        && entry.claim_token.as_ref() == Some(&claim_token)
+                        && entry.lease_until.is_some_and(|until| until >= now)
+                });
+                if let Some(entry) = entry {
+                    entry.lease_until = Some(Timestamp(until));
+                    Ok(MutationOutcome::ReplicationClaimUpdated { applied: true })
+                } else {
+                    Ok(MutationOutcome::ReplicationClaimUpdated { applied: false })
+                }
+            }
             Mutation::ClaimReplicationBatch {
                 limit,
                 now,
@@ -1970,15 +2047,31 @@ impl MetadataStore for InMemoryMetadataStore {
                 for i in due {
                     let e = &mut st.outbox[i];
                     e.status = ReplicationStatus::Claimed;
+                    e.claim_token = Some(crate::id::ReplicationClaimToken::generate());
                     e.lease_until = Some(lease_until);
                     claimed.push(e.clone());
                 }
                 Ok(MutationOutcome::ReplicationBatch(claimed))
             }
-            Mutation::MarkReplicationDone { id, now } => {
+            Mutation::MarkReplicationDone {
+                id,
+                now,
+                claim_token,
+            } => {
+                if !st.outbox.iter().any(|entry| {
+                    entry.id == id
+                        && entry.status == ReplicationStatus::Claimed
+                        && entry.claim_token.as_ref() == Some(&claim_token)
+                        && entry.lease_until.is_some_and(|until| until >= now)
+                }) {
+                    return Ok(MutationOutcome::ReplicationClaimUpdated { applied: false });
+                }
+
                 let mut coords = None;
                 if let Some(e) = st.outbox.iter_mut().find(|e| e.id == id) {
                     e.status = ReplicationStatus::Completed;
+                    e.claim_token = None;
+                    e.lease_until = None;
                     coords = Some((e.bucket.clone(), e.key.clone(), e.version_id.clone()));
                 }
                 // Stamp the version's replication_status too, mirroring the SQL engines' targeted
@@ -2001,13 +2094,24 @@ impl MetadataStore for InMemoryMetadataStore {
                         }
                     }
                 }
-                Ok(MutationOutcome::Ack)
+                Ok(MutationOutcome::ReplicationClaimUpdated { applied: true })
             }
             Mutation::MarkReplicationFailed {
+                claim_token,
+                now,
                 id,
                 error,
                 next_attempt_at,
             } => {
+                if !st.outbox.iter().any(|entry| {
+                    entry.id == id
+                        && entry.status == ReplicationStatus::Claimed
+                        && entry.claim_token.as_ref() == Some(&claim_token)
+                        && entry.lease_until.is_some_and(|until| until >= now)
+                }) {
+                    return Ok(MutationOutcome::ReplicationClaimUpdated { applied: false });
+                }
+
                 let mut terminal_coords = None;
                 if let Some(e) = st.outbox.iter_mut().find(|e| e.id == id) {
                     e.attempts += 1;
@@ -2018,10 +2122,13 @@ impl MetadataStore for InMemoryMetadataStore {
                         Some(t) => {
                             e.next_attempt_at = t;
                             e.status = ReplicationStatus::Pending;
+                            e.claim_token = None;
                             e.lease_until = None;
                         }
                         None => {
                             e.status = ReplicationStatus::Failed;
+                            e.claim_token = None;
+                            e.lease_until = None;
                             terminal_coords =
                                 Some((e.bucket.clone(), e.key.clone(), e.version_id.clone()));
                         }
@@ -2040,7 +2147,7 @@ impl MetadataStore for InMemoryMetadataStore {
                         }
                     }
                 }
-                Ok(MutationOutcome::Ack)
+                Ok(MutationOutcome::ReplicationClaimUpdated { applied: true })
             }
             Mutation::EnqueueReplication(entry) => {
                 // Idempotent on the entry id (mirrors INSERT OR IGNORE in the SQLite stores).
@@ -2050,27 +2157,40 @@ impl MetadataStore for InMemoryMetadataStore {
                 Ok(MutationOutcome::Ack)
             }
             Mutation::DeferReplication {
+                claim_token,
+                now,
                 id,
                 next_attempt_at,
                 last_error,
             } => {
+                if !st.outbox.iter().any(|entry| {
+                    entry.id == id
+                        && entry.status == ReplicationStatus::Claimed
+                        && entry.claim_token.as_ref() == Some(&claim_token)
+                        && entry.lease_until.is_some_and(|until| until >= now)
+                }) {
+                    return Ok(MutationOutcome::ReplicationClaimUpdated { applied: false });
+                }
+
                 // Release the claim and re-schedule WITHOUT touching `attempts` (mirrors the SQL
                 // DeferReplication). COALESCE: a None last_error leaves the prior value intact.
                 if let Some(e) = st.outbox.iter_mut().find(|e| e.id == id) {
                     e.status = ReplicationStatus::Pending;
+                    e.claim_token = None;
                     e.lease_until = None;
                     e.next_attempt_at = next_attempt_at;
                     if last_error.is_some() {
                         e.last_error = last_error;
                     }
                 }
-                Ok(MutationOutcome::Ack)
+                Ok(MutationOutcome::ReplicationClaimUpdated { applied: true })
             }
             Mutation::RecoverClaimedReplication => {
                 // Startup recovery: release every orphaned `claimed` row back to `pending`.
                 for e in st.outbox.iter_mut() {
                     if e.status == ReplicationStatus::Claimed {
                         e.status = ReplicationStatus::Pending;
+                        e.claim_token = None;
                         e.lease_until = None;
                     }
                 }
