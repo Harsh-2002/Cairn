@@ -45,17 +45,20 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   version-id identity, concurrent same-key, crash resiliency, delete-marker mesh, no-cascade,
   integrity. The driver owns all five node processes and self-tears-down. `mesh.sh [scenario-ids...]`.
 - `crash_consistency.sh` — the F-4 durability property at one crash seam (orphan-blob reclaim).
-- `scrub.sh` — integrity scrub, **four arms, one throwaway node each**: corrupt a stored blob on disk
+- `scrub.sh` — integrity scrub, **five arms, one throwaway node each**: corrupt a stored blob on disk
   and assert the background scrub (`CAIRN_SCRUB_INTERVAL_SECS`) flags it
   (`cairn_scrub_corruption_total`) for a **plaintext**, a **transparently at-rest encrypted**
   (`CAIRN_ENCRYPT_AT_REST=true` — the boolean `true`, Figment rejects `1`), a **client SSE-S3**, and a
-  **compressed** object. The middle two are THE REGRESSION GUARD for the encrypted scrub: the pass
+  **compressed** object, plus an isolated **multipart** object with optional SDK checksums disabled.
+  The multipart arm proves healthy verification before corruption, then detection through the
+  internal SHA-256 with zero composite-ETag skips. The middle two are THE REGRESSION GUARD for the encrypted scrub: the pass
   used to skip any version carrying an `sse_descriptor`, so on an at-rest node it verified 0% of the
   store while logging `scanned=0 corrupt=0 "scrub pass complete"` — indistinguishable from an empty
   store. Every arm also gates the ACCOUNTING: a non-zero `cairn_scrub_objects_total` (no vacuous
-  pass), a zero `cairn_scrub_skipped_total{reason="key_unavailable"}` on a healthy ring, and — arm 4 —
-  a non-zero `{reason="composite_etag"}`, pinning that the un-hashable multipart ETag is *counted*
-  rather than silently skipped. Do not soften these back to "reported".
+  pass) and a zero `cairn_scrub_skipped_total{reason="key_unavailable"}` on a healthy ring.
+  Legacy multipart rows without an internal digest or full-object supplementary checksum remain
+  counted `{reason="composite_etag"}` skips; the server's unit tests cover that compatibility case.
+  Do not soften these assertions back to "reported".
 - `object_lock.sh` — Object Lock / WORM across both listeners: immutable creation enablement +
   required versioning; atomic explicit/default PUT, Copy, and multipart state (including
   completion-time default resolution and no source-lock copy); COMPLIANCE/legal hold immutable,

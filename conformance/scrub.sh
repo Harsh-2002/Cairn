@@ -4,15 +4,16 @@
 # `cairn_scrub_corruption_total` — turning silent bit-rot into an observable event rather than a
 # corrupted byte served to a client.
 #
-# FOUR ARMS, one server each, because the scrub used to cover exactly one of them:
+# FIVE ARMS, one server each, because the scrub used to cover exactly one of them:
 #   1. plaintext    — an incompressible object on a plain node (the original arm).
 #   2. at-rest      — CAIRN_ENCRYPT_AT_REST=true. Every version on such a node carries an
 #                     `sse_descriptor`; the pre-fix scrub skipped all of them, so it verified 0% of
 #                     the store while logging `scanned=0 corrupt=0 "scrub pass complete"`.
 #   3. sse-s3       — a CLIENT-encrypted object (`x-amz-server-side-encryption: AES256`) on an
 #                     otherwise plaintext node: same skip, on any node, for any SSE object.
-#   4. compressed   — a zstd-compressed object (the CRNB container must fail its own integrity
-#                     check), plus a multipart object asserting the composite-ETag SKIP is COUNTED.
+#   4. compressed   — a zstd-compressed object (the CRNB container must fail its own integrity check).
+#   5. multipart    — a composite-ETag object with no client full-object checksum: the internal
+#                     SHA-256 must verify healthy content and detect corruption, with no skip.
 #
 # Every arm also asserts the accounting is coherent — a non-zero `cairn_scrub_objects_total`
 # (scanned) so no arm can pass vacuously by verifying nothing, and a zero
@@ -79,8 +80,8 @@ start_node() {
   env "${ENVS[@]}" "$BIN" serve >"$TMPROOT/$arm/server.log" 2>&1 &
   SRV=$!
   PIDS+=("$SRV")
-  local i
-  for i in $(seq 1 100); do
+  local _attempt
+  for _attempt in $(seq 1 100); do
     curl -fsS -o /dev/null "http://127.0.0.1:$port/healthz" 2>/dev/null && break
     kill -0 "$SRV" 2>/dev/null || fail "[$arm] server exited at startup; log: $(cat "$TMPROOT/$arm/server.log")"
     sleep 0.1
@@ -221,7 +222,7 @@ print(f"  put {size}-byte object s3://{bucket}/{key}" + (f" (SSE={sse})" if sse 
 PY
 }
 
-echo "=== arm 1/4: plaintext (an uncompressed, unencrypted blob) ==="
+echo "=== arm 1/5: plaintext (an uncompressed, unencrypted blob) ==="
 start_node plaintext "$PORT" "$UIPORT"
 put_object scrub obj 100000 ""
 corrupt_blob scrub
@@ -229,7 +230,7 @@ assert_pass plaintext
 stop_node
 echo "PASS: the scrub detected corruption of a plaintext blob"
 
-echo "=== arm 2/4: transparent at-rest encryption (CAIRN_ENCRYPT_AT_REST=true) ==="
+echo "=== arm 2/5: transparent at-rest encryption (CAIRN_ENCRYPT_AT_REST=true) ==="
 # Pre-fix this arm FAILS: every version on this node carries an sse_descriptor, so the scrub skipped
 # the whole store and reported scanned=0 corrupt=0.
 start_node atrest "$((PORT + 1))" "$((UIPORT + 1))" CAIRN_ENCRYPT_AT_REST=true
@@ -249,7 +250,7 @@ corrupt="$(metric '^cairn_scrub_corruption_total')"
 stop_node
 echo "PASS: the scrub detected corruption of a transparently-encrypted blob and verified an intact one"
 
-echo "=== arm 3/4: client SSE-S3 (x-amz-server-side-encryption: AES256) ==="
+echo "=== arm 3/5: client SSE-S3 (x-amz-server-side-encryption: AES256) ==="
 start_node ssesd "$((PORT + 2))" "$((UIPORT + 2))"
 # A plaintext object too, so `scanned` cannot come only from the encrypted one and the corruption
 # assertion is unambiguously about the SSE object (only its blob is corrupted).
@@ -261,7 +262,7 @@ assert_pass ssesd
 stop_node
 echo "PASS: the scrub detected corruption of a client-SSE-S3 blob"
 
-echo "=== arm 4/4: compressed blob + the counted composite-ETag skip ==="
+echo "=== arm 4/5: compressed blob ==="
 start_node compressed "$((PORT + 3))" "$((UIPORT + 3))"
 "$PY" - "$AK" "$SK" "http://127.0.0.1:$ARMPORT" <<'PY'
 import sys, boto3
@@ -270,14 +271,7 @@ ak, sk, ep = sys.argv[1], sys.argv[2], sys.argv[3]
 s3 = boto3.client("s3", endpoint_url=ep, aws_access_key_id=ak, aws_secret_access_key=sk,
                   region_name="us-east-1", config=Config(s3={"addressing_style": "path"}))
 s3.create_bucket(Bucket="scrub")
-s3.create_bucket(Bucket="mpart")
-# A single-part multipart upload: its ETag is the composite "{md5}-1" form, which is a hash OF
-# HASHES and therefore NOT re-hashable from the assembled bytes. The scrub must COUNT that skip.
-up = s3.create_multipart_upload(Bucket="mpart", Key="assembled")["UploadId"]
-part = s3.upload_part(Bucket="mpart", Key="assembled", UploadId=up, PartNumber=1, Body=b"x" * 4096)
-s3.complete_multipart_upload(Bucket="mpart", Key="assembled", UploadId=up,
-                             MultipartUpload={"Parts": [{"ETag": part["ETag"], "PartNumber": 1}]})
-print("  completed a 1-part multipart upload (composite ETag)")
+
 PY
 # Turn on zstd compression for `scrub` (management API, Bearer-authenticated) and PUT a highly
 # compressible body so the blob is stored as a CRNB container.
@@ -297,10 +291,48 @@ print(f"  put a compressible object ({head['ContentLength']} logical bytes)")
 PY
 corrupt_blob scrub
 assert_pass compressed
-composite="$(metric '^cairn_scrub_skipped_total.reason="composite_etag"')"
-echo "  [compressed] skipped{composite_etag}=$composite"
-ge1 "$composite" || fail "[compressed] the multipart object's un-hashable ETag was not counted as a skip (=$composite) — a silent skip is the defect this harness guards"
 stop_node
-echo "PASS: the scrub detected corruption of a compressed blob and counted the composite-ETag skip"
+echo "PASS: the scrub detected corruption of a compressed blob"
 
-echo "PASS: all four scrub arms"
+echo "=== arm 5/5: multipart plaintext SHA-256 coverage ==="
+start_node multipart "$((PORT + 4))" "$((UIPORT + 4))"
+"$PY" - "$AK" "$SK" "http://127.0.0.1:$ARMPORT" <<'PY'
+import sys, boto3
+from botocore.config import Config
+ak, sk, ep = sys.argv[1:4]
+s3 = boto3.client("s3", endpoint_url=ep, aws_access_key_id=ak, aws_secret_access_key=sk,
+                  region_name="us-east-1", config=Config(s3={"addressing_style": "path"},
+                  request_checksum_calculation="when_required"))
+s3.create_bucket(Bucket="mpart")
+# Disable optional SDK checksums so the assembled composite ETag cannot stand in for a
+# full-object digest. Only the new internal SHA-256 can establish this content baseline.
+up = s3.create_multipart_upload(Bucket="mpart", Key="assembled")["UploadId"]
+part = s3.upload_part(Bucket="mpart", Key="assembled", UploadId=up, PartNumber=1, Body=b"x" * 4096)
+completed = s3.complete_multipart_upload(Bucket="mpart", Key="assembled", UploadId=up,
+                             MultipartUpload={"Parts": [{"ETag": part["ETag"], "PartNumber": 1}]})
+assert completed["ETag"].strip('"').endswith("-1"), completed
+assert s3.get_object(Bucket="mpart", Key="assembled")["Body"].read() == b"x" * 4096
+print("  completed a 1-part multipart upload without a client full-object checksum")
+PY
+# The isolated node has exactly one intact object: a counted verification here cannot come
+# from a different object, and a corruption afterward cannot be attributed to another arm.
+deadline=$(( SECONDS + ${SCRUB_POLL_SECS:-60} ))
+scanned=0
+while [ "$SECONDS" -lt "$deadline" ]; do
+  scanned="$(metric '^cairn_scrub_objects_total')"
+  ge1 "$scanned" && break
+  sleep 1
+done
+ge1 "$scanned" || fail "[multipart] the intact multipart object was never verified"
+corrupt="$(metric '^cairn_scrub_corruption_total')"
+[ "${corrupt%.*}" -eq 0 ] 2>/dev/null || fail "[multipart] intact content was reported corrupt"
+composite="$(metric '^cairn_scrub_skipped_total.reason="composite_etag"')"
+[ "${composite%.*}" -eq 0 ] 2>/dev/null || fail "[multipart] a new multipart object was skipped instead of verified"
+corrupt_blob mpart
+assert_pass multipart
+composite="$(metric '^cairn_scrub_skipped_total.reason="composite_etag"')"
+[ "${composite%.*}" -eq 0 ] 2>/dev/null || fail "[multipart] corrupted content was skipped instead of checked"
+stop_node
+echo "PASS: the scrub verified intact multipart content and detected its corruption without skipping"
+
+echo "PASS: all five scrub arms"
