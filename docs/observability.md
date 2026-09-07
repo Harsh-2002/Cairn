@@ -41,6 +41,15 @@ precondition or nonempty bucket; it does not always mean a database failure. Can
 Timings include scheduler delay and I/O waiting; they do not establish CPU leakage or isolate fsync
 from other COMMIT work. Blob assembly/durability timings are documented with the multipart follow-up.
 
+Multipart completion publishes `cairn_blob_multipart_stage_seconds{stage}` with fixed stages
+`permit_wait`, `assembly`, and `durability`. Assembly includes staging creation, part reads,
+hashing, transforms and trailer writes; durability includes bucket creation, file sync, rename
+and directory sync. Metadata commit is excluded. Samples include stages interrupted by errors or
+cancellation and are diagnostic stage durations, not counts of successful completions. The blob
+store retains only the latest 1,024 samples across clones until the existing metrics tick drains
+them; `cairn_blob_multipart_timing_dropped_total` counts older samples evicted when collection falls
+behind. No bucket, key, upload ID, or per-chunk labels/samples are retained.
+
 ### 26.3 Audit log
 
 Mutating actions across both the S3 and management surfaces are recorded in an audit log with the actor, the action, the resource, and the salient attributes, retained in the metadata store and surfaced through the management API and web console. This serves both the operational need to see recent activity and the security need to have a record of who changed or accessed what, and it is distinct from the operational metrics in that it is per-event and attributable rather than aggregate.

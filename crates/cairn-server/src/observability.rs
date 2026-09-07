@@ -116,6 +116,16 @@ fn describe_metrics() {
          consume the attempt budget, so they never surface as failed entries — alert on this."
     );
 
+    describe_histogram!(
+        "cairn_blob_multipart_stage_seconds",
+        Unit::Seconds,
+        "Multipart permit wait, assembly and durability stage durations including interruptions"
+    );
+    describe_counter!(
+        "cairn_blob_multipart_timing_dropped_total",
+        "Multipart timing samples evicted because bounded collection fell behind"
+    );
+
     // Fail-closed plaintext framing/metadata mismatches (ARCH 27).
     describe_counter!(
         "cairn_blob_plaintext_length_mismatch_total",

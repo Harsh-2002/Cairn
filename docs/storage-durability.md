@@ -106,6 +106,14 @@ The default algorithm balances ratio and speed and is the modern general-purpose
 
 ### 10.5 Interaction with the write, read, and multipart paths
 
+Multipart assembly reuses one lazily allocated 64-KiB plaintext read buffer across parts; an
+all-encrypted assembly allocates no such buffer and retains the bounded decrypt-on-read path.
+Hashes and transforms consume only bytes actually read, including the final partial chunk.
+Durable part files are still copied into the final object: this reduces allocation churn, not the
+approximately two payload writes inherent in staging parts followed by final-object assembly.
+Assembly, permit-wait and durability timings are exposed separately (Section 26.2); metadata commit
+occurs afterward and is measured by the metadata writer.
+
 On a single-part write to a compressing bucket, the ingest pass computes the plaintext MD5 and any requested checksums and simultaneously feeds the block compressor, producing the framed blob and its index in one streaming pass with bounded memory, after which the normal durable commit sequence applies to the framed file. On a read, an uncompressed blob takes the ordinary and possibly zero-copy path, while a compressed blob is read by consulting its trailer and index and decompressing the needed blocks through userspace, which is why compressed objects do not use the zero-copy fast path; for a full-object read this is a streaming decompression with bounded memory, and for a ranged read it is the block-selective path of Section 10.3. On multipart completion to a compressing bucket, compression is applied during the assembly pass that concatenates the parts, while the part MD5s used for the ETag were already computed over plaintext at upload time, so the multipart ETag is unaffected. Copy operations that change nothing about the bytes can copy the stored representation directly when source and destination compression policies match, and otherwise decompress and recompress as needed.
 
 ### 10.6 Operability of compression

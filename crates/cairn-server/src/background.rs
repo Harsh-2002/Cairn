@@ -1579,8 +1579,17 @@ async fn metrics_loop(stack: Arc<AppStack>, mut shutdown: watch::Receiver<bool>)
         metrics::counter!("cairn_meta_cache_hits_total").absolute(hits);
         metrics::counter!("cairn_meta_cache_misses_total").absolute(misses);
 
-        // A metadata-declared plaintext file must have exactly its trusted logical length. A
-        // mismatch catches missing encryption metadata and truncated/inconsistent local storage.
+        // Bounded multipart timings include interrupted stages and exclude metadata commit.
+        for sample in stack.blob_local.drain_multipart_timings() {
+            metrics::histogram!(
+                "cairn_blob_multipart_stage_seconds",
+                "stage" => sample.stage.as_str()
+            )
+            .record(sample.elapsed.as_secs_f64());
+        }
+        metrics::counter!("cairn_blob_multipart_timing_dropped_total")
+            .absolute(stack.blob_local.multipart_timings_dropped_total());
+        // Refused reads with inconsistent trusted plaintext lengths.
         metrics::counter!("cairn_blob_plaintext_length_mismatch_total")
             .absolute(stack.blob_local.plaintext_length_mismatch_total());
 

@@ -526,3 +526,35 @@ Query plans changed from scanning the current-object covering index to reading `
 This supports the removal of per-refresh object-cardinality work; it does not establish production
 request throughput. The one-time migration still scans current metadata, and writes now maintain
 visibility deltas transactionally. No object payloads or persistent test database were created.
+
+## Multipart buffer reuse: bounded comparison (2026-09-08)
+
+A focused A/B/A check compared the per-part 64-KiB allocation against the reused buffer in
+`8a5d2ad`. Only buffer placement changed between arms; both retained the new timing instrumentation.
+This used Rust 1.97.1's unoptimized test profile on the shared development host and its `/SSD`
+ext4 filesystem, not `/tmp` (which is tmpfs). A preliminary tmpfs check was excluded.
+
+Each arm staged 256 plaintext parts of 4 KiB, with part `n` containing byte `n % 251`, then ran
+one warm-up and eight sequential durable 1-MiB assemblies. Fixtures and outputs were uncompressed
+and unencrypted. Every measured output's logical length, MD5, internal SHA-256 and CRC64NVME
+matched a single-object ingest of the concatenated bytes. Output deletion followed each timed
+assembly; no server, network, or metadata database participated.
+
+| Arm | Mean assembly ms | Median ms | Min–max ms | Process CPU seconds, eight iterations | Process write bytes |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| A1: per-part buffer | 109.37 | 107.31 | 102.32–121.98 | 0.73 | 8,388,608 |
+| B: reused buffer | 128.61 | 130.55 | 104.94–143.75 | 0.74 | 8,388,608 |
+| A2: per-part buffer | 118.10 | 116.09 | 101.91–155.06 | 0.77 | 8,388,608 |
+
+The bounded check **does not demonstrate a latency or CPU improvement**: B was slower in wall
+time, controls varied, and ranges overlap. CPU came from `/proc/self/stat` at 100 ticks/second;
+CPU and `/proc/self/io` windows include verification and output deletion, while per-assembly wall
+times exclude them. Process write accounting excludes previously staged parts and is not a
+measurement of total device traffic or complete multipart write amplification.
+
+The code change reduces this fixture's explicit plaintext buffer allocations from 256 to one
+per assembly (16 MiB to 64 KiB of requested zero-initialization); allocator calls, peak RSS and
+production throughput were not profiled. No reduced disk-write claim follows. The three measured
+arms took under five seconds including fixture setup, with a 1-MiB input per arm. Temporary test
+code and data were removed after the comparison; this table retains the results without adding a
+permanent benchmark or repeating the large load campaign.

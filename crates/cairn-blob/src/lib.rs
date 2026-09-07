@@ -8,6 +8,8 @@
 #![forbid(unsafe_code)]
 
 mod commit;
+mod timing;
+pub use timing::{MultipartStage, MultipartTiming};
 // Public only so the fuzz target (an external crate under `fuzz/`) can drive `CompressedReader`
 // against arbitrary bytes; `#[doc(hidden)]` keeps it out of the published API surface. Not part of
 // the supported interface — internal callers still go through the re-exports below. The reader /
@@ -180,6 +182,7 @@ pub struct LocalBlobStore {
     ///
     /// [`open_raw`]: cairn_types::traits::BlobStore::open_raw
     plaintext_length_mismatch: Arc<std::sync::atomic::AtomicU64>,
+    multipart_timings: Arc<timing::MultipartTimings>,
 }
 
 /// Default upper bound (bytes) for the small-object GET fast path — see [`LocalBlobStore`]'s
@@ -224,7 +227,21 @@ impl LocalBlobStore {
             dir_sync: Arc::new(commit::DirSyncCoalescer::spawn()),
             small_read_max: SMALL_READ_MAX,
             plaintext_length_mismatch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            multipart_timings: Arc::default(),
         })
+    }
+
+    /// Drain up to 1,024 recent multipart stage durations for the server metrics tick.
+    /// Includes stages ended by errors or cancellation; samples are shared across clones.
+    #[must_use]
+    pub fn drain_multipart_timings(&self) -> Vec<MultipartTiming> {
+        self.multipart_timings.drain()
+    }
+
+    /// Cumulative samples evicted when metrics collection falls behind.
+    #[must_use]
+    pub fn multipart_timings_dropped_total(&self) -> u64 {
+        self.multipart_timings.dropped_total()
     }
 
     /// Cumulative number of metadata-declared plaintext reads refused because the file's physical
@@ -651,6 +668,9 @@ impl LocalBlobStore {
         size_ceiling: u64,
     ) -> Result<(), BlobError> {
         use tokio::io::AsyncReadExt;
+        // Allocate only for the first plaintext part, then reuse across part boundaries. An
+        // entirely encrypted upload keeps its existing bounded decoder buffers without this one.
+        let mut plaintext_buf = None;
         for part in parts {
             let part_path = self.resolve(&part.storage_path)?;
             match part.cipher.clone() {
@@ -659,9 +679,9 @@ impl LocalBlobStore {
                     let mut f = tokio::fs::File::open(&part_path)
                         .await
                         .map_err(|_| BlobError::NotFound)?;
-                    let mut buf = vec![0u8; READ_CHUNK];
+                    let buf = plaintext_buf.get_or_insert_with(|| vec![0u8; READ_CHUNK]);
                     loop {
-                        let n = f.read(&mut buf).await.map_err(io_err)?;
+                        let n = f.read(buf).await.map_err(io_err)?;
                         if n == 0 {
                             break;
                         }
@@ -1118,7 +1138,10 @@ impl BlobStore for LocalBlobStore {
     ) -> Result<StagedBlob, BlobError> {
         // As in `stage`, the copy permit is released before the coalesced directory-fsync barrier
         // (Phase 2.4) so the assembly does not hold blob-I/O concurrency through its fsync wait.
+        let permit_timing = self.multipart_timings.start(MultipartStage::PermitWait);
         let copy_permit = self.acquire_io().await?;
+        drop(permit_timing);
+        let assembly_timing = self.multipart_timings.start(MultipartStage::Assembly);
         let id = uuid::Uuid::new_v4().simple().to_string();
         let staging = self.data_root.join(STAGING).join(format!("{id}.tmp"));
         let bucket_dir = self.data_root.join(bucket.as_str());
@@ -1204,11 +1227,14 @@ impl BlobStore for LocalBlobStore {
             CompressionDescriptor::Uncompressed
         };
 
+        drop(assembly_timing);
+        let durability_timing = self.multipart_timings.start(MultipartStage::Durability);
         ensure_bucket_dir(&self.data_root, &bucket_dir).await?;
         sink.commit(&final_path).await?;
         // Release the copy permit before parking on the coalesced directory-fsync barrier.
         drop(copy_permit);
         self.dir_sync.sync_dir(&bucket_dir).await?;
+        drop(durability_timing);
         fail::fail_point!("blob_after_assemble");
 
         let (md5_hex, checksums, internal_sha256) = hashers.finalize();
