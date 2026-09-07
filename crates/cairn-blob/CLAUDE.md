@@ -11,6 +11,8 @@ plain files under opaque IDs; metadata is someone else's job (`cairn-meta`).
   the safe rustix-backed `open_readonly_nofollow`/`open_lock_file_nofollow` and
   `try_lock_exclusive` syscall seams used by snapshot input and node-local command exclusion. The
   failpoint seams live here.
+- `timing.rs` — bounded multipart permit/assembly/durability observations, mirrored by the server
+  metrics tick; includes interrupted stages and reports sample eviction.
 - `staging.rs` — `Staging`: the backend-agnostic durable single-object write handle (create tmp →
   stream → `commit` / `abort`). One enum dispatching `tokio::fs` vs. the io_uring backend.
 - `commit.rs` — `DirSyncCoalescer`: a single coordinator task that batches concurrent same-directory

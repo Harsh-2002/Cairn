@@ -4,11 +4,11 @@ Five sequential PRs address the September 2026 capacity campaign findings. Histo
 
 | Phase | Change | Status |
 | --- | --- | --- |
-| 1 | TCP_NODELAY on both accepted listeners | PR #76 merged after green CI; 16 focused server tests passed |
-| 2 | Reap completed connection tasks | PR #77 merged after green CI |
-| 3 | Bounded bucket rendering, coalesced refresh, maintained visible counts | PR #78 merged after green CI |
-| 4 | Bounded write-stage diagnostics | Implemented; focused checks passed; CI gates merge |
-| 5 | Reuse multipart buffers and measure assembly stages | Pending |
+| 1 | TCP_NODELAY on both accepted listeners | [PR #76](https://github.com/Harsh-2002/Cairn/pull/76) merged after green CI; 16 focused server tests passed |
+| 2 | Reap completed connection tasks | [PR #77](https://github.com/Harsh-2002/Cairn/pull/77) merged after green CI |
+| 3 | Bounded bucket rendering, coalesced refresh, maintained visible counts | [PR #78](https://github.com/Harsh-2002/Cairn/pull/78) merged after green CI |
+| 4 | Bounded write-stage diagnostics | [PR #79](https://github.com/Harsh-2002/Cairn/pull/79) merged after green CI |
+| 5 | Reuse multipart buffers and measure assembly stages | [PR #80](https://github.com/Harsh-2002/Cairn/pull/80); implementation and focused validation complete; CI-gated delivery |
 
 ## Phase 1
 
@@ -58,6 +58,33 @@ completed 2,048 mutations and attributed a controlled 50 ms blockage to queue wa
 [metadata.md](metadata.md#bounded-writer-diagnostic) for method and limitations. The existing dashboard
 is regenerated from its source. This closes attribution gaps without claiming the historical
 five-second stall was reproduced or fixed; ordinary blob-path profiling remains follow-up work.
+
+## Phase 5
+
+Assembly lazily allocates one 64-KiB plaintext buffer and reuses it across parts. Fully encrypted
+part sets retain their existing bounded decoder path. Fixed-label timings separate blob permit
+wait, assembly and durability; the existing metrics task drains at most 1,024 recent samples with
+explicit eviction accounting. Samples include interrupted/error stages and exclude metadata commit.
+
+Validation passed: 43 blob unit tests, 36 blob integration tests, focused Clippy and formatting.
+Integration compilation and 19 server tests passed; the mixed-part checksum/range regression also
+passed after switching its test keys to fresh generated values. Cases include mixed plaintext and
+encrypted parts, short final reads, compressed/encrypted output, missing/tampered parts, cancellation,
+size ceilings and cleanup. The bounded A/B/A comparison's mean times were 109.37 / 128.61 / 118.10 ms:
+**no speedup was demonstrated**. One reused allocation replaces 256 explicit allocations for that
+fixture, but durable part storage plus final assembly still requires approximately two payload
+writes. Full measurements and limitations are in
+[benchmarks.md](benchmarks.md#multipart-buffer-reuse-bounded-comparison-2026-09-08).
+
+## Handoff and cleanup
+
+The large capacity campaign was not restarted. The bounded diagnostics created no persistent
+metadata corpus; multipart fixtures, temporary benchmark code and browser profiles were removed.
+The focused browser harness also verifies cleanup on startup failure and forced browser termination.
+Temporary worktrees, merged phase branches and local build outputs are removed at final handoff,
+after CI passes; committed implementation, regression tests, documentation and the generated
+dashboard are retained. Shared installed tool caches are preserved. The intended final branch set
+is `main` and `website`.
 
 ## Remaining limitations
 
