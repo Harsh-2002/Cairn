@@ -802,6 +802,14 @@ SET status='active', completion_claim_token=NULL
 WHERE status='completing';
 "#,
     },
+    Migration {
+        version: 30,
+        name: "replication attempt ownership",
+        sql: r#"
+ALTER TABLE replication_outbox ADD COLUMN claim_token TEXT;
+UPDATE replication_outbox SET status='pending', lease_until=NULL WHERE status='claimed';
+"#,
+    },
 ];
 
 /// Highest schema version understood by this build.
@@ -1473,6 +1481,7 @@ mod tests {
                  PRAGMA foreign_keys=ON;",
             )
             .unwrap();
+            conn.execute_batch("CREATE TABLE replication_outbox (id TEXT PRIMARY KEY, status TEXT NOT NULL, lease_until INTEGER);").unwrap();
             run_migrations(&conn).unwrap();
 
             assert!(!column_exists(&conn, "object_shares", "token"));
@@ -1633,6 +1642,7 @@ mod tests {
         )
         .unwrap();
 
+        conn.execute_batch("CREATE TABLE replication_outbox (id TEXT PRIMARY KEY, status TEXT NOT NULL, lease_until INTEGER);").unwrap();
         run_migrations(&conn).unwrap();
         let locks: Vec<(String, String)> = conn
             .prepare("SELECT key, lock_mode FROM object_locks ORDER BY key")
@@ -1694,6 +1704,7 @@ mod tests {
         )
         .unwrap();
 
+        conn.execute_batch("CREATE TABLE replication_outbox (id TEXT PRIMARY KEY, status TEXT NOT NULL, lease_until INTEGER);").unwrap();
         run_migrations(&conn).unwrap();
         let columns = conn
             .prepare("SELECT name FROM pragma_index_info('idx_ov_latest_cover') ORDER BY seqno")
@@ -1756,6 +1767,7 @@ mod tests {
         )
         .unwrap();
 
+        conn.execute_batch("CREATE TABLE replication_outbox (id TEXT PRIMARY KEY, status TEXT NOT NULL, lease_until INTEGER);").unwrap();
         run_migrations(&conn).unwrap();
         let rows = conn
             .prepare(
@@ -1778,6 +1790,55 @@ mod tests {
             [
                 ("active-upload".to_owned(), "active".to_owned(), None),
                 ("orphaned-completer".to_owned(), "active".to_owned(), None),
+            ]
+        );
+    }
+    #[test]
+    fn migration_v30_invalidates_legacy_replication_claims() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at INTEGER NOT NULL);").unwrap();
+        // Build the complete historical schema so future migrations can extend this fixture.
+        for migration in MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= 29)
+        {
+            conn.execute_batch(migration.sql).unwrap();
+            conn.execute(
+                "INSERT INTO schema_migrations VALUES (?1, ?2, 0)",
+                rusqlite::params![migration.version, migration.name],
+            )
+            .unwrap();
+        }
+        conn.execute_batch("INSERT INTO replication_outbox
+            (id, bucket_name, key, version_id, operation, rule_id, next_attempt_at, status, lease_until)
+            VALUES ('pending','bucket','key','version','put','rule',0,'pending',NULL),
+                   ('worker','bucket','key','version','put','rule',0,'claimed',900000),
+                   ('done','bucket','key','version','put','rule',0,'completed',NULL);").unwrap();
+        run_migrations(&conn).unwrap();
+        run_migrations(&conn).unwrap();
+        let mut statement = conn
+            .prepare(
+                "SELECT id, status, lease_until, claim_token FROM replication_outbox ORDER BY id",
+            )
+            .unwrap();
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("done".to_owned(), "completed".to_owned(), None, None),
+                ("pending".to_owned(), "pending".to_owned(), None, None),
+                ("worker".to_owned(), "pending".to_owned(), None, None)
             ]
         );
     }

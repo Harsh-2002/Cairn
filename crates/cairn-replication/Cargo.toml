@@ -37,7 +37,7 @@ tokio = { workspace = true, features = ["sync", "time"] }
 
 [dev-dependencies]
 cairn-types = { workspace = true, features = ["testing"] }
-tokio = { workspace = true, features = ["rt", "rt-multi-thread", "net", "macros", "sync", "time"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "net", "macros", "sync", "time", "test-util"] }
 hyper = { workspace = true, features = ["server", "http1"] }
 hyper-util = { workspace = true, features = ["server-auto", "tokio"] }
 http-body-util.workspace = true

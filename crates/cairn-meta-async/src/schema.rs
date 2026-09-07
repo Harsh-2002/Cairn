@@ -738,6 +738,14 @@ SET status='active', completion_claim_token=NULL
 WHERE status='completing';
 "#,
     },
+    Migration {
+        version: 30,
+        name: "replication attempt ownership",
+        sql: r#"
+ALTER TABLE replication_outbox ADD COLUMN claim_token TEXT;
+UPDATE replication_outbox SET status='pending', lease_until=NULL WHERE status='claimed';
+"#,
+    },
 ];
 
 /// Run all pending migrations on the write driver, recording each as applied. Each migration is
@@ -893,6 +901,7 @@ mod tests {
                      applied_at INTEGER NOT NULL
                  );
                  INSERT INTO schema_migrations VALUES (24, 'legacy fixture', 0);
+                 CREATE TABLE replication_outbox (id TEXT PRIMARY KEY, status TEXT NOT NULL, lease_until INTEGER);
                  CREATE TABLE buckets (name TEXT PRIMARY KEY);
                  INSERT INTO buckets VALUES ('photos');
                  CREATE TABLE object_shares (
@@ -1009,6 +1018,7 @@ mod tests {
                      applied_at INTEGER NOT NULL
                  );
                  INSERT INTO schema_migrations VALUES (26, 'legacy fixture', 0);
+                 CREATE TABLE replication_outbox (id TEXT PRIMARY KEY, status TEXT NOT NULL, lease_until INTEGER);
                  CREATE TABLE object_versions (
                      id TEXT PRIMARY KEY,
                      bucket_name TEXT NOT NULL,
@@ -1080,6 +1090,7 @@ mod tests {
                      applied_at INTEGER NOT NULL
                  );
                  INSERT INTO schema_migrations VALUES (27, 'legacy fixture', 0);
+                 CREATE TABLE replication_outbox (id TEXT PRIMARY KEY, status TEXT NOT NULL, lease_until INTEGER);
                  CREATE TABLE object_versions (
                      id TEXT PRIMARY KEY,
                      bucket_name TEXT NOT NULL,
@@ -1142,6 +1153,7 @@ mod tests {
                      applied_at INTEGER NOT NULL
                  );
                  INSERT INTO schema_migrations VALUES (28, 'legacy fixture', 0);
+                 CREATE TABLE replication_outbox (id TEXT PRIMARY KEY, status TEXT NOT NULL, lease_until INTEGER);
                  CREATE TABLE multipart_uploads (
                      id TEXT PRIMARY KEY,
                      status TEXT NOT NULL
@@ -1303,5 +1315,61 @@ mod tests {
         let conn = db.connect().unwrap();
         let driver = TursoDriver::new(conn);
         assert_v29_resets_unowned_legacy_completion_claims(&driver).await;
+    }
+    async fn assert_v30_resets_legacy_replication_claims(driver: &dyn AsyncSqlDriver) {
+        driver.execute_batch("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at INTEGER NOT NULL);").await.unwrap();
+        // A complete historical schema stays a valid upgrade fixture as later migrations arrive.
+        for migration in MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= 29)
+        {
+            apply_migration(driver, migration).await.unwrap();
+        }
+        driver.execute_batch("INSERT INTO replication_outbox
+            (id, bucket_name, key, version_id, operation, rule_id, next_attempt_at, status, lease_until)
+            VALUES ('pending','bucket','key','version','put','rule',0,'pending',NULL),
+                   ('worker','bucket','key','version','put','rule',0,'claimed',900000),
+                   ('done','bucket','key','version','put','rule',0,'completed',NULL);").await.unwrap();
+        run_migrations(driver).await.unwrap();
+        run_migrations(driver).await.unwrap();
+        let rows = driver
+            .query(
+                "SELECT id, status, lease_until, claim_token FROM replication_outbox ORDER BY id",
+                vec![],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        for (row, (id, status)) in rows.iter().zip([
+            ("done", "completed"),
+            ("pending", "pending"),
+            ("worker", "pending"),
+        ]) {
+            assert_eq!(row.get_text(0), id);
+            assert_eq!(row.get_text(1), status);
+            assert!(row.get_opt_i64(2).is_none());
+            assert!(row.get_opt_text(3).is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn migration_v30_resets_legacy_replication_claims_in_libsql() {
+        let db = libsql::Builder::new_local(":memory:")
+            .build()
+            .await
+            .unwrap();
+        let driver = LibsqlDriver::new(db.connect().unwrap());
+        assert_v30_resets_legacy_replication_claims(&driver).await;
+    }
+
+    #[tokio::test]
+    async fn migration_v30_resets_legacy_replication_claims_in_turso() {
+        let db = turso::Builder::new_local(":memory:")
+            .experimental_vacuum(true)
+            .build()
+            .await
+            .unwrap();
+        let driver = TursoDriver::new(db.connect().unwrap());
+        assert_v30_resets_legacy_replication_claims(&driver).await;
     }
 }

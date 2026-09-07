@@ -322,6 +322,36 @@ pub enum InvalidName {
     IpAddress,
 }
 
+/// Exact ownership of a replication delivery attempt; never reusable after re-claim.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ReplicationClaimToken(String);
+
+impl ReplicationClaimToken {
+    /// Mint a fresh replication-attempt token.
+    #[must_use]
+    pub fn generate() -> Self {
+        Self(uuid::Uuid::new_v4().simple().to_string())
+    }
+
+    /// Reconstruct from a stored string.
+    #[must_use]
+    pub fn from_string(s: String) -> Self {
+        Self(s)
+    }
+
+    /// The borrowed string form.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for ReplicationClaimToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ReplicationClaimToken([REDACTED])")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -372,6 +402,15 @@ mod tests {
             "uuid v7 must sort by creation time"
         );
         assert!(VersionId::null().is_null());
+    }
+
+    #[test]
+    fn replication_claim_token_is_fresh_and_redacted() {
+        let first = ReplicationClaimToken::generate();
+        assert_ne!(first, ReplicationClaimToken::generate());
+        let debug = format!("{first:?}");
+        assert!(!debug.contains(first.as_str()));
+        assert!(debug.contains("REDACTED"));
     }
 
     #[test]

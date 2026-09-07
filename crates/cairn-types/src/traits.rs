@@ -312,7 +312,9 @@ pub trait MetadataStore: Send + Sync {
     ) -> Result<bool, MetaError>;
     /// Claim a batch of due replication entries (a write; routed through the writer
     /// internally by the implementation, exposed here for the worker pool). Claiming marks the
-    /// entries `Claimed` with a lease so a concurrent worker cannot also process them.
+    /// entries `Claimed` with a five-minute lease and a fresh exact attempt token. Settlement
+    /// and renewal must present that token while the lease remains valid; re-claim invalidates
+    /// earlier workers. The engine renews active and waiting entries every 60 seconds.
     async fn claim_replication_batch(
         &self,
         limit: u32,

@@ -1127,10 +1127,13 @@ async fn drain_with_router(
         if *shutdown.borrow() {
             return;
         }
-        match engine
+        let result = engine
             .run_once(&*stack.meta, router, &stack.blob, clock)
-            .await
-        {
+            .await;
+        let (stale, renewal_failed) = engine.take_claim_failures();
+        metrics::counter!("cairn_replication_stale_claim_total").increment(stale);
+        metrics::counter!("cairn_replication_claim_renew_failed_total").increment(renewal_failed);
+        match result {
             Ok(report) if report.is_idle() => return,
             Ok(report) => {
                 metrics::counter!("cairn_replication_completed_total")

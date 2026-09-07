@@ -1225,6 +1225,7 @@ async fn guarded_delete_marker_rejects_stale_current_without_side_effects_parity
         s.submit(put(fresh, Precondition::default())).await.unwrap();
 
         let outbox = |id: &str, version: &VersionId| OutboxEntry {
+            claim_token: None,
             id: id.to_owned(),
             bucket: bucket.clone(),
             key: key.clone(),
@@ -2346,6 +2347,7 @@ async fn object_acl_parity() {
 
 #[tokio::test]
 async fn replication_outbox_parity() {
+    let mut replication_claims = cairn_types::testing::ReplicationClaims::default();
     let (a, b) = both().await;
     for s in [&a as &dyn MetadataStore, &b as &dyn MetadataStore] {
         let bk = BucketName::parse("bkt").unwrap();
@@ -2357,6 +2359,7 @@ async fn replication_outbox_parity() {
         .unwrap();
         let v = VersionId::from_string("v1".into());
         let entry = OutboxEntry {
+            claim_token: None,
             enqueued_at: Timestamp(0),
             id: "out-1".to_owned(),
             bucket: bk.clone(),
@@ -2382,12 +2385,13 @@ async fn replication_outbox_parity() {
         .unwrap();
 
         // Claim due entries.
-        let claimed = s.claim_replication_batch(10, Timestamp(1)).await.unwrap();
+        let claimed = replication_claims.claim(s, 10, Timestamp(1)).await.unwrap();
         assert_eq!(claimed.len(), 1);
         assert_eq!(claimed[0].id, "out-1");
 
         // Mark done updates the version status to completed.
         s.submit(Mutation::MarkReplicationDone {
+            claim_token: replication_claims.take(s, "out-1", Timestamp(0)).await,
             id: "out-1".to_owned(),
             now: Timestamp(0),
         })
@@ -2403,6 +2407,7 @@ async fn replication_outbox_parity() {
         // A terminal failure lands on the failed list; a retryable one does not.
         let v2 = VersionId::from_string("v2".into());
         let e2 = OutboxEntry {
+            claim_token: None,
             enqueued_at: Timestamp(0),
             id: "out-2".to_owned(),
             bucket: bk.clone(),
@@ -2427,6 +2432,10 @@ async fn replication_outbox_parity() {
         .await
         .unwrap();
         s.submit(Mutation::MarkReplicationFailed {
+            claim_token: replication_claims
+                .take(s, "out-2", cairn_types::Timestamp(1))
+                .await,
+            now: cairn_types::Timestamp(1),
             id: "out-2".to_owned(),
             error: "down".to_owned(),
             next_attempt_at: None,
@@ -2814,6 +2823,7 @@ async fn group_commit_isolates_failed_mutations_parity() {
 /// carrying an `sse_descriptor`, and an inbound `replica` stamp is untouched.
 #[tokio::test]
 async fn requeue_replication_versions_parity() {
+    let mut replication_claims = cairn_types::testing::ReplicationClaims::default();
     let (a, b) = both().await;
     for s in [&a as &dyn MetadataStore, &b as &dyn MetadataStore] {
         let bk = BucketName::parse("bkt").unwrap();
@@ -2825,6 +2835,7 @@ async fn requeue_replication_versions_parity() {
         .unwrap();
 
         let mk = |key: &str, v: &VersionId, id: &str| OutboxEntry {
+            claim_token: None,
             enqueued_at: Timestamp(0),
             id: id.to_owned(),
             bucket: bk.clone(),
@@ -2863,9 +2874,10 @@ async fn requeue_replication_versions_parity() {
         })
         .await
         .unwrap();
-        s.claim_replication_batch(10, Timestamp(1)).await.unwrap();
+        replication_claims.claim(s, 10, Timestamp(1)).await.unwrap();
         for id in ["backfill:r1:enc:1", "backfill:r1:plain:2"] {
             s.submit(Mutation::MarkReplicationDone {
+                claim_token: replication_claims.take(s, id, Timestamp(0)).await,
                 id: id.to_owned(),
                 now: Timestamp(0),
             })
@@ -2873,7 +2885,8 @@ async fn requeue_replication_versions_parity() {
             .unwrap();
         }
         assert!(
-            s.claim_replication_batch(10, Timestamp(2))
+            replication_claims
+                .claim(s, 10, Timestamp(2))
                 .await
                 .unwrap()
                 .is_empty(),
@@ -2890,8 +2903,8 @@ async fn requeue_replication_versions_parity() {
         .await
         .unwrap();
 
-        let claimed = s
-            .claim_replication_batch(10, Timestamp(6000))
+        let claimed = replication_claims
+            .claim(s, 10, Timestamp(6000))
             .await
             .unwrap();
         assert_eq!(claimed.len(), 1, "only the encrypted version is requeued");
@@ -2921,6 +2934,7 @@ async fn requeue_replication_versions_parity() {
 /// two engines disagree about this, one of them silently corrupts the mirror.
 #[tokio::test]
 async fn requeue_replication_versions_is_key_scoped_parity() {
+    let mut replication_claims = cairn_types::testing::ReplicationClaims::default();
     let (a, b) = both().await;
     for s in [&a as &dyn MetadataStore, &b as &dyn MetadataStore] {
         let bk = BucketName::parse("bkt").unwrap();
@@ -2932,6 +2946,7 @@ async fn requeue_replication_versions_is_key_scoped_parity() {
         .unwrap();
 
         let mk = |key: &str, v: &VersionId, id: &str| OutboxEntry {
+            claim_token: None,
             enqueued_at: Timestamp(0),
             id: id.to_owned(),
             bucket: bk.clone(),
@@ -3010,7 +3025,7 @@ async fn requeue_replication_versions_is_key_scoped_parity() {
         .await
         .unwrap();
 
-        s.claim_replication_batch(10, Timestamp(1)).await.unwrap();
+        replication_claims.claim(s, 10, Timestamp(1)).await.unwrap();
         for id in [
             "backfill:r1:k:1",
             "backfill:r1:k:2",
@@ -3019,6 +3034,7 @@ async fn requeue_replication_versions_is_key_scoped_parity() {
             "backfill:r1:p:5",
         ] {
             s.submit(Mutation::MarkReplicationDone {
+                claim_token: replication_claims.take(s, id, Timestamp(0)).await,
                 id: id.to_owned(),
                 now: Timestamp(0),
             })
@@ -3036,8 +3052,8 @@ async fn requeue_replication_versions_is_key_scoped_parity() {
         .await
         .unwrap();
 
-        let claimed = s
-            .claim_replication_batch(10, Timestamp(6000))
+        let claimed = replication_claims
+            .claim(s, 10, Timestamp(6000))
             .await
             .unwrap();
         let mut ids: Vec<&str> = claimed.iter().map(|e| e.id.as_str()).collect();
@@ -3076,6 +3092,7 @@ const REQUEUE_ENC_DESCRIPTOR: &str =
 /// A pending `ObjectCreate` outbox entry for (bucket, key, version) under a caller-chosen id.
 fn requeue_entry(b: &BucketName, key: &str, version: VersionId, id: &str) -> OutboxEntry {
     OutboxEntry {
+        claim_token: None,
         enqueued_at: Timestamp(0),
         id: id.to_owned(),
         bucket: b.clone(),
@@ -3098,6 +3115,7 @@ fn requeue_entry(b: &BucketName, key: &str, version: VersionId, id: &str) -> Out
 /// UPDATE here would hold one group-commit transaction across a full-table scan.
 #[tokio::test]
 async fn requeue_replication_versions_batching_parity() {
+    let mut replication_claims = cairn_types::testing::ReplicationClaims::default();
     let (a, b) = both().await;
     for s in [&a as &dyn MetadataStore, &b as &dyn MetadataStore] {
         let bk = BucketName::parse("bkt").unwrap();
@@ -3118,9 +3136,12 @@ async fn requeue_replication_versions_batching_parity() {
             .await
             .unwrap();
         }
-        s.claim_replication_batch(10, Timestamp(1)).await.unwrap();
+        replication_claims.claim(s, 10, Timestamp(1)).await.unwrap();
         for i in 1..=5u32 {
             s.submit(Mutation::MarkReplicationDone {
+                claim_token: replication_claims
+                    .take(s, &format!("e{i}"), Timestamp(0))
+                    .await,
                 id: format!("e{i}"),
                 now: Timestamp(0),
             })
@@ -3168,6 +3189,7 @@ async fn requeue_replication_versions_batching_parity() {
 /// row lets the heartbeat ship it first and REVERTS the mirror to the old bytes.
 #[tokio::test]
 async fn requeue_replication_versions_key_atomic_paging_parity() {
+    let mut replication_claims = cairn_types::testing::ReplicationClaims::default();
     let (a, b) = both().await;
     for s in [&a as &dyn MetadataStore, &b as &dyn MetadataStore] {
         let bk = BucketName::parse("bkt").unwrap();
@@ -3212,8 +3234,12 @@ async fn requeue_replication_versions_key_atomic_paging_parity() {
         .await
         .unwrap();
 
-        s.claim_replication_batch(10, Timestamp(1)).await.unwrap();
+        replication_claims.claim(s, 10, Timestamp(1)).await.unwrap();
         s.submit(Mutation::MarkReplicationFailed {
+            claim_token: replication_claims
+                .take(s, "k:1", cairn_types::Timestamp(1))
+                .await,
+            now: cairn_types::Timestamp(1),
             id: "k:1".to_owned(),
             error: "BadDigest".to_owned(),
             next_attempt_at: None,
@@ -3222,6 +3248,7 @@ async fn requeue_replication_versions_key_atomic_paging_parity() {
         .unwrap();
         for id in ["a:1", "k:2"] {
             s.submit(Mutation::MarkReplicationDone {
+                claim_token: replication_claims.take(s, id, Timestamp(2)).await,
                 id: id.to_owned(),
                 now: Timestamp(2),
             })
@@ -3243,8 +3270,8 @@ async fn requeue_replication_versions_key_atomic_paging_parity() {
             panic!("expected a paged outcome, got {outcome:?}");
         };
         assert_eq!(page_end.as_deref(), Some("a"));
-        let claimed = s
-            .claim_replication_batch(10, Timestamp(5001))
+        let claimed = replication_claims
+            .claim(s, 10, Timestamp(5001))
             .await
             .unwrap();
         let ids: Vec<&str> = claimed.iter().map(|e| e.id.as_str()).collect();
@@ -3264,8 +3291,8 @@ async fn requeue_replication_versions_key_atomic_paging_parity() {
             panic!("expected a paged outcome, got {outcome:?}");
         };
         assert_eq!(page_end.as_deref(), Some("k"));
-        let claimed = s
-            .claim_replication_batch(10, Timestamp(6001))
+        let claimed = replication_claims
+            .claim(s, 10, Timestamp(6001))
             .await
             .unwrap();
         let mut ids: Vec<&str> = claimed.iter().map(|e| e.id.as_str()).collect();
@@ -3283,6 +3310,7 @@ async fn requeue_replication_versions_key_atomic_paging_parity() {
 /// stamps an inbound `replica` row. A requeue leaves the stamp alone — the re-ship has not happened.
 #[tokio::test]
 async fn mark_replication_done_stamps_replicated_at_parity() {
+    let mut replication_claims = cairn_types::testing::ReplicationClaims::default();
     let (a, b) = both().await;
     for s in [&a as &dyn MetadataStore, &b as &dyn MetadataStore] {
         let bk = BucketName::parse("bkt").unwrap();
@@ -3311,8 +3339,9 @@ async fn mark_replication_done_stamps_replicated_at_parity() {
             None
         );
 
-        s.claim_replication_batch(10, Timestamp(1)).await.unwrap();
+        replication_claims.claim(s, 10, Timestamp(1)).await.unwrap();
         s.submit(Mutation::MarkReplicationDone {
+            claim_token: replication_claims.take(s, "e1", Timestamp(9_000)).await,
             id: "e1".to_owned(),
             now: Timestamp(9_000),
         })
@@ -3359,6 +3388,7 @@ async fn mark_replication_done_stamps_replicated_at_parity() {
         .await
         .unwrap();
         s.submit(Mutation::MarkReplicationDone {
+            claim_token: replication_claims.take(s, "r1", Timestamp(9_900)).await,
             id: "r1".to_owned(),
             now: Timestamp(9_900),
         })
@@ -3386,6 +3416,7 @@ async fn mark_replication_done_stamps_replicated_at_parity() {
 /// half is unchanged: every surviving terminal row of a paged key still moves together.
 #[tokio::test]
 async fn requeue_ledger_skips_unshippable_non_current_versions_parity() {
+    let mut replication_claims = cairn_types::testing::ReplicationClaims::default();
     let (a, b) = both().await;
     for s in [&a as &dyn MetadataStore, &b as &dyn MetadataStore] {
         let bk = BucketName::parse("bkt").unwrap();
@@ -3412,6 +3443,7 @@ async fn requeue_ledger_skips_unshippable_non_current_versions_parity() {
                 precondition: Precondition::default(),
                 initial_state: InitialObjectState::default(),
                 replication: vec![OutboxEntry {
+                    claim_token: None,
                     enqueued_at: old,
                     ..requeue_entry(&bk, key, v1.clone(), &format!("{key}:1"))
                 }],
@@ -3423,6 +3455,7 @@ async fn requeue_ledger_skips_unshippable_non_current_versions_parity() {
                 precondition: Precondition::default(),
                 initial_state: InitialObjectState::default(),
                 replication: vec![OutboxEntry {
+                    claim_token: None,
                     enqueued_at: Timestamp(1_000),
                     ..requeue_entry(&bk, key, v2.clone(), &format!("{key}:2"))
                 }],
@@ -3430,9 +3463,10 @@ async fn requeue_ledger_skips_unshippable_non_current_versions_parity() {
             .await
             .unwrap();
         }
-        s.claim_replication_batch(10, Timestamp(1)).await.unwrap();
+        replication_claims.claim(s, 10, Timestamp(1)).await.unwrap();
         for id in ["kept:1", "kept:2", "pruned:1", "pruned:2"] {
             s.submit(Mutation::MarkReplicationDone {
+                claim_token: replication_claims.take(s, id, Timestamp(2)).await,
                 id: id.to_owned(),
                 now: Timestamp(2),
             })
@@ -3478,8 +3512,8 @@ async fn requeue_ledger_skips_unshippable_non_current_versions_parity() {
             "ledger scope diverged between engines"
         );
 
-        let claimed = s
-            .claim_replication_batch(10, Timestamp(5_001))
+        let claimed = replication_claims
+            .claim(s, 10, Timestamp(5_001))
             .await
             .unwrap();
         let mut ids: Vec<&str> = claimed.iter().map(|e| e.id.as_str()).collect();
@@ -3489,5 +3523,29 @@ async fn requeue_ledger_skips_unshippable_non_current_versions_parity() {
             vec!["kept:1", "kept:2", "pruned:2"],
             "the OUTBOX half must still move every surviving terminal row of a paged key"
         );
+    }
+}
+
+#[tokio::test]
+async fn replication_attempts_are_fenced_parity() {
+    let (a, b) = both().await;
+    for s in [&a as &dyn MetadataStore, &b as &dyn MetadataStore] {
+        s.submit(Mutation::CreateBucket(Box::new(bucket(
+            "claims",
+            VersioningState::Enabled,
+        ))))
+        .await
+        .unwrap();
+        let object = row(
+            &BucketName::parse("claims").unwrap(),
+            "key",
+            VersionId::generate(),
+            "e",
+            1,
+        );
+        s.submit(put(object.clone(), Precondition::default()))
+            .await
+            .unwrap();
+        cairn_types::testing::assert_replication_claim_fencing(s, &object).await;
     }
 }

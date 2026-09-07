@@ -12,7 +12,7 @@ range-seek, same outcomes. `cairn-meta` is left untouched. Selected at runtime b
   against this trait, engine-agnostic.
 - `libsql_driver.rs` / `turso_driver.rs` — the two concrete drivers behind that seam.
 - `apply.rs` — `Mutation` -> SQL. **One of the four mutation sites** (see below).
-- `schema.rs` — the migration table. Must mirror `cairn-meta/src/schema.rs` (latest is v29 — the
+- `schema.rs` — the migration table. Must mirror `cairn-meta/src/schema.rs` (latest is v30 — the
   multipart SSE columns `sse_requested` v15, `encrypt_parts`/`part_dek` v21, `sse_kms_*` v22;
   `object_versions.replicated_at` + `idx_outbox_bucket_key` v23; bounded import
   scheduling/history/retention indexes v24; hash-only object-share capabilities and retryable
@@ -90,3 +90,7 @@ range-seek, same outcomes. `cairn-meta` is left untouched. Selected at runtime b
 - `OpenOptions` mirrors `cairn-meta`: WAL + `synchronous=NORMAL` by default, `FULL` opt-in.
 - Spec: `docs/metadata.md` (11), concurrency model `docs/data-plane.md` (7.2/7.3). See the root
   `../../CLAUDE.md` for the workspace gate and conventions.
+
+Replication outbox migration v30 adds exact attempt ownership. Done/fail/defer/renew validate the
+claimed status, token, and lease inside the writer savepoint; every backend and shard fan-out must
+preserve the typed applied result. Recovery invalidates tokens before new workers can claim.

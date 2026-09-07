@@ -559,6 +559,7 @@ async fn plant_outbox_entry_at(
     enqueued_at: Timestamp,
 ) {
     let entry = cairn_types::meta::OutboxEntry {
+        claim_token: None,
         enqueued_at,
         id: id.to_owned(),
         bucket: bucket.clone(),
@@ -620,6 +621,7 @@ async fn plant_outbox_entry_at(
 
 #[tokio::test]
 async fn list_failed_replication_returns_only_terminal_entries() {
+    let mut replication_claims = cairn_types::testing::ReplicationClaims::default();
     let meta = InMemoryMetadataStore::new();
     let bucket = BucketName::parse("repl-bucket").unwrap();
     let key = ObjectKey::parse("k").unwrap();
@@ -635,6 +637,10 @@ async fn list_failed_replication_returns_only_terminal_entries() {
 
     // Mark the second entry terminal (next_attempt_at = None per the engine's terminal marking).
     meta.submit(Mutation::MarkReplicationFailed {
+        claim_token: replication_claims
+            .take(&meta, "doomed-1", cairn_types::Timestamp(1))
+            .await,
+        now: cairn_types::Timestamp(1),
         id: "doomed-1".to_owned(),
         error: "destination unreachable".to_owned(),
         next_attempt_at: None,
@@ -654,6 +660,10 @@ async fn list_failed_replication_returns_only_terminal_entries() {
 
     // A retryable failure (next_attempt_at = Some) is NOT terminal and must not be listed.
     meta.submit(Mutation::MarkReplicationFailed {
+        claim_token: replication_claims
+            .take(&meta, "pending-1", cairn_types::Timestamp(1))
+            .await,
+        now: cairn_types::Timestamp(1),
         id: "pending-1".to_owned(),
         error: "transient".to_owned(),
         next_attempt_at: Some(Timestamp::from_secs(60)),
@@ -900,6 +910,7 @@ async fn probe_reports_presence_without_a_dek() {
 /// incident's blast radius, and an inbound `Replica` stamp is never resurrected.
 #[tokio::test]
 async fn requeue_replication_versions_double_matches_the_engines() {
+    let mut replication_claims = cairn_types::testing::ReplicationClaims::default();
     let meta = InMemoryMetadataStore::new();
     let bucket = BucketName::parse("repl-bucket").unwrap();
     let enc_key = ObjectKey::parse("enc").unwrap();
@@ -927,11 +938,13 @@ async fn requeue_replication_versions_double_matches_the_engines() {
     .unwrap();
 
     // Both ship successfully; both entries and both version rows read `completed`.
-    meta.claim_replication_batch(10, Timestamp::from_secs(1))
+    replication_claims
+        .claim(&meta, 10, Timestamp::from_secs(1))
         .await
         .unwrap();
     for id in ["backfill:r1:enc:1", "backfill:r1:plain:2"] {
         meta.submit(Mutation::MarkReplicationDone {
+            claim_token: replication_claims.take(&meta, id, Timestamp(0)).await,
             id: id.to_owned(),
             now: Timestamp(0),
         })
@@ -939,7 +952,8 @@ async fn requeue_replication_versions_double_matches_the_engines() {
         .unwrap();
     }
     assert!(
-        meta.claim_replication_batch(10, Timestamp::from_secs(2))
+        replication_claims
+            .claim(&meta, 10, Timestamp::from_secs(2))
             .await
             .unwrap()
             .is_empty(),
@@ -956,8 +970,8 @@ async fn requeue_replication_versions_double_matches_the_engines() {
     .await
     .unwrap();
 
-    let claimed = meta
-        .claim_replication_batch(10, Timestamp::from_secs(20))
+    let claimed = replication_claims
+        .claim(&meta, 10, Timestamp::from_secs(20))
         .await
         .unwrap();
     assert_eq!(claimed.len(), 1, "only the encrypted version is requeued");
@@ -987,6 +1001,7 @@ async fn requeue_replication_versions_double_matches_the_engines() {
 /// downstream crates trust it as the reference engine.
 #[tokio::test]
 async fn requeue_replication_versions_double_is_key_scoped() {
+    let mut replication_claims = cairn_types::testing::ReplicationClaims::default();
     let meta = InMemoryMetadataStore::new();
     let bucket = BucketName::parse("repl-bucket").unwrap();
     let k = ObjectKey::parse("k").unwrap();
@@ -1011,11 +1026,13 @@ async fn requeue_replication_versions_double_is_key_scoped() {
     .await
     .unwrap();
 
-    meta.claim_replication_batch(10, Timestamp::from_secs(1))
+    replication_claims
+        .claim(&meta, 10, Timestamp::from_secs(1))
         .await
         .unwrap();
     for id in ["k-1", "k-2", "p-3"] {
         meta.submit(Mutation::MarkReplicationDone {
+            claim_token: replication_claims.take(&meta, id, Timestamp(0)).await,
             id: id.to_owned(),
             now: Timestamp(0),
         })
@@ -1033,8 +1050,8 @@ async fn requeue_replication_versions_double_is_key_scoped() {
     .await
     .unwrap();
 
-    let claimed = meta
-        .claim_replication_batch(10, Timestamp::from_secs(20))
+    let claimed = replication_claims
+        .claim(&meta, 10, Timestamp::from_secs(20))
         .await
         .unwrap();
     let mut ids: Vec<&str> = claimed.iter().map(|e| e.id.as_str()).collect();
@@ -1064,6 +1081,7 @@ async fn requeue_replication_versions_double_is_key_scoped() {
 /// caller's drain loop (`cairn-control`'s forced resync) terminates identically against it.
 #[tokio::test]
 async fn requeue_replication_versions_double_pages_by_key_and_threads_the_cursor() {
+    let mut replication_claims = cairn_types::testing::ReplicationClaims::default();
     let meta = InMemoryMetadataStore::new();
     let bucket = BucketName::parse("repl-bucket").unwrap();
     for i in 1..=5u32 {
@@ -1071,11 +1089,15 @@ async fn requeue_replication_versions_double_pages_by_key_and_threads_the_cursor
         let v = VersionId::from_string(format!("0000000{i}"));
         plant_outbox_entry(&meta, &bucket, &key, &v, &format!("e{i}")).await;
     }
-    meta.claim_replication_batch(10, Timestamp::from_secs(1))
+    replication_claims
+        .claim(&meta, 10, Timestamp::from_secs(1))
         .await
         .unwrap();
     for i in 1..=5u32 {
         meta.submit(Mutation::MarkReplicationDone {
+            claim_token: replication_claims
+                .take(&meta, &format!("e{i}"), Timestamp(0))
+                .await,
             id: format!("e{i}"),
             now: Timestamp(0),
         })
@@ -1124,6 +1146,7 @@ async fn requeue_replication_versions_double_pages_by_key_and_threads_the_cursor
 /// the reference engine, so it has to reproduce the guarantee, not just the outcome.
 #[tokio::test]
 async fn requeue_replication_versions_double_never_splits_a_key_across_pages() {
+    let mut replication_claims = cairn_types::testing::ReplicationClaims::default();
     let meta = InMemoryMetadataStore::new();
     let bucket = BucketName::parse("repl-bucket").unwrap();
     let a = ObjectKey::parse("a").unwrap();
@@ -1150,10 +1173,15 @@ async fn requeue_replication_versions_double_never_splits_a_key_across_pages() {
         .unwrap();
     }
 
-    meta.claim_replication_batch(10, Timestamp::from_secs(1))
+    replication_claims
+        .claim(&meta, 10, Timestamp::from_secs(1))
         .await
         .unwrap();
     meta.submit(Mutation::MarkReplicationFailed {
+        claim_token: replication_claims
+            .take(&meta, "k:1", cairn_types::Timestamp(1))
+            .await,
+        now: cairn_types::Timestamp(1),
         id: "k:1".to_owned(),
         error: "BadDigest".to_owned(),
         next_attempt_at: None,
@@ -1162,6 +1190,9 @@ async fn requeue_replication_versions_double_never_splits_a_key_across_pages() {
     .unwrap();
     for id in ["a:1", "k:2"] {
         meta.submit(Mutation::MarkReplicationDone {
+            claim_token: replication_claims
+                .take(&meta, id, Timestamp::from_secs(2))
+                .await,
             id: id.to_owned(),
             now: Timestamp::from_secs(2),
         })
@@ -1183,8 +1214,8 @@ async fn requeue_replication_versions_double_never_splits_a_key_across_pages() {
         panic!("expected a paged outcome, got {outcome:?}");
     };
     assert_eq!(page_end.as_deref(), Some("a"), "pages are ordered by key");
-    let claimed = meta
-        .claim_replication_batch(10, Timestamp::from_secs(11))
+    let claimed = replication_claims
+        .claim(&meta, 10, Timestamp::from_secs(11))
         .await
         .unwrap();
     let ids: Vec<&str> = claimed.iter().map(|e| e.id.as_str()).collect();
@@ -1208,8 +1239,8 @@ async fn requeue_replication_versions_double_never_splits_a_key_across_pages() {
         panic!("expected a paged outcome, got {outcome:?}");
     };
     assert_eq!(page_end.as_deref(), Some("k"));
-    let claimed = meta
-        .claim_replication_batch(10, Timestamp::from_secs(21))
+    let claimed = replication_claims
+        .claim(&meta, 10, Timestamp::from_secs(21))
         .await
         .unwrap();
     let mut ids: Vec<&str> = claimed.iter().map(|e| e.id.as_str()).collect();
@@ -1226,6 +1257,7 @@ async fn requeue_replication_versions_double_never_splits_a_key_across_pages() {
 /// `Replica`, and never advance the stamp on a mere requeue.
 #[tokio::test]
 async fn mark_replication_done_double_stamps_replicated_at() {
+    let mut replication_claims = cairn_types::testing::ReplicationClaims::default();
     let meta = InMemoryMetadataStore::new();
     let bucket = BucketName::parse("repl-bucket").unwrap();
     let k = ObjectKey::parse("k").unwrap();
@@ -1241,10 +1273,14 @@ async fn mark_replication_done_double_stamps_replicated_at() {
     );
     let before = meta.get_version(&bucket, &k, &v).await.unwrap().unwrap();
 
-    meta.claim_replication_batch(10, Timestamp::from_secs(1))
+    replication_claims
+        .claim(&meta, 10, Timestamp::from_secs(1))
         .await
         .unwrap();
     meta.submit(Mutation::MarkReplicationDone {
+        claim_token: replication_claims
+            .take(&meta, "e1", Timestamp::from_secs(9_000))
+            .await,
         id: "e1".to_owned(),
         now: Timestamp::from_secs(9_000),
     })
@@ -1295,6 +1331,9 @@ async fn mark_replication_done_double_stamps_replicated_at() {
     .await
     .unwrap();
     meta.submit(Mutation::MarkReplicationDone {
+        claim_token: replication_claims
+            .take(&meta, "r1", Timestamp::from_secs(9_900))
+            .await,
         id: "r1".to_owned(),
         now: Timestamp::from_secs(9_900),
     })
@@ -1321,6 +1360,7 @@ async fn mark_replication_done_double_stamps_replicated_at() {
 /// bug rather than reveal it.
 #[tokio::test]
 async fn requeue_replication_versions_double_skips_unshippable_non_current_versions() {
+    let mut replication_claims = cairn_types::testing::ReplicationClaims::default();
     let meta = InMemoryMetadataStore::new();
     let bucket = BucketName::parse("repl-bucket").unwrap();
     let v1 = VersionId::from_string("00000001".to_owned());
@@ -1357,11 +1397,13 @@ async fn requeue_replication_versions_double_skips_unshippable_non_current_versi
         )
         .await;
     }
-    meta.claim_replication_batch(10, Timestamp::from_secs(1))
+    replication_claims
+        .claim(&meta, 10, Timestamp::from_secs(1))
         .await
         .unwrap();
     for id in ["kept:1", "kept:2", "pruned:1", "pruned:2"] {
         meta.submit(Mutation::MarkReplicationDone {
+            claim_token: replication_claims.take(&meta, id, Timestamp(2)).await,
             id: id.to_owned(),
             now: Timestamp(2),
         })
@@ -1409,8 +1451,8 @@ async fn requeue_replication_versions_double_skips_unshippable_non_current_versi
 
     // The OUTBOX half is untouched by the narrowing: every surviving terminal row of a paged key
     // still moves in the same pass.
-    let claimed = meta
-        .claim_replication_batch(10, Timestamp::from_secs(20))
+    let claimed = replication_claims
+        .claim(&meta, 10, Timestamp::from_secs(20))
         .await
         .unwrap();
     let mut ids: Vec<&str> = claimed.iter().map(|e| e.id.as_str()).collect();

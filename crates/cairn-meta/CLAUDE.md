@@ -28,7 +28,7 @@ metadata commit is **the single linearization point of every mutation** (ARCH 11
   abort, exact-token claim release, and final `status='completing'` plus token verification must
   remain in the writer savepoint. **Mirror any change in `cairn-meta-async/src/apply.rs`**
   (4(+1)-site).
-- `schema.rs` — migrations: **append-only**, monotonic `version` (latest is 29 — multipart SSE
+- `schema.rs` — migrations: **append-only**, monotonic `version` (latest is 30 — multipart SSE
   columns: `multipart_uploads.sse_requested` v15, `.encrypt_parts` + `multipart_parts.part_dek` v21,
   `.sse_kms_requested`/`sse_kms_key_id`/`sse_bucket_key_enabled` v22; `object_versions.replicated_at`
   + `idx_outbox_bucket_key` v23; bounded import scheduling/history/retention indexes v24; hash-only
@@ -87,3 +87,7 @@ metadata commit is **the single linearization point of every mutation** (ARCH 11
 - Spec: `docs/metadata.md` (11), durability `docs/storage-durability.md` (8), sharding `docs/testing-performance.md`
   (30). Tests: `tests/store.rs`, `tests/sharding.rs`, `tests/listing_oracle.rs`.
 - See the root `../../CLAUDE.md` for the gate, env-only config, and the 4(+1)-site mutation rule.
+
+Replication outbox migration v30 adds exact attempt ownership. Done/fail/defer/renew validate the
+claimed status, token, and lease inside the writer savepoint; every backend and shard fan-out must
+preserve the typed applied result. Recovery invalidates tokens before new workers can claim.

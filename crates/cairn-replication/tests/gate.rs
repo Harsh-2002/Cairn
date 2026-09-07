@@ -1603,3 +1603,261 @@ async fn replicated_at_is_stamped_at_ship_completion_not_batch_start() {
          batch-start clock ({batch_start:?})"
     );
 }
+
+#[tokio::test]
+async fn memory_replication_attempts_are_fenced() {
+    let meta = InMemoryMetadataStore::new();
+    let blobs = InMemoryBlobStore::new();
+    let v = put_with_outbox(
+        &meta,
+        &blobs,
+        "seed",
+        "key",
+        b"bytes",
+        Timestamp(0),
+        Timestamp(0),
+    )
+    .await;
+    let object = meta
+        .get_version(&bucket(), &ObjectKey::parse("key").unwrap(), &v)
+        .await
+        .unwrap()
+        .unwrap();
+    cairn_types::testing::assert_replication_claim_fencing(&meta, &object).await;
+}
+
+struct HeldSink {
+    started: tokio::sync::Notify,
+    release: tokio::sync::Semaphore,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl BucketRoutedSink for HeldSink {
+    async fn put_object(
+        &self,
+        _bucket: &BucketName,
+        _object: cairn_types::replication::ReplicatedObject,
+    ) -> Result<(), cairn_types::ReplicationError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.started.notify_one();
+        self.release.acquire().await.unwrap().forget();
+        Ok(())
+    }
+    async fn delete_marker(
+        &self,
+        _bucket: &BucketName,
+        _key: &ObjectKey,
+        _version: &VersionId,
+    ) -> Result<(), cairn_types::ReplicationError> {
+        Ok(())
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn heartbeat_renews_active_and_waiting_entries_and_cancels_on_loss() {
+    for loss in 0..3 {
+        let meta = Arc::new(InMemoryMetadataStore::new());
+        let blobs = Arc::new(InMemoryBlobStore::new());
+        let clock = Arc::new(TestClock::at_secs(1_000));
+        for (id, key) in [("first", "a"), ("waiting", "b")] {
+            put_with_outbox(&meta, &blobs, id, key, b"bytes", clock.now(), clock.now()).await;
+        }
+        let sink = Arc::new(HeldSink {
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Semaphore::new(0),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let engine = ReplicationEngine::new(ReplicationOpts::default(), Arc::new(StubCrypto));
+        let task = tokio::spawn({
+            let (meta, blobs, clock, sink, engine) = (
+                meta.clone(),
+                blobs.clone(),
+                clock.clone(),
+                sink.clone(),
+                engine.clone(),
+            );
+            async move { engine.run_once(&*meta, &*sink, &blobs, &*clock).await }
+        });
+        sink.started.notified().await;
+        if loss != 0 {
+            if loss == 1 {
+                meta.submit(Mutation::RecoverClaimedReplication)
+                    .await
+                    .unwrap();
+                let newer = meta.claim_replication_batch(10, clock.now()).await.unwrap();
+                assert_eq!(newer.len(), 2);
+            } else {
+                meta.fail_next_replication_renew();
+            }
+            clock.advance_secs(60);
+            tokio::time::advance(std::time::Duration::from_secs(60)).await;
+            assert!(task.await.unwrap().is_err());
+            assert_eq!(
+                sink.calls.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "waiting entry must never start after ownership loss"
+            );
+            assert_eq!(engine.take_claim_failures(), (u64::from(loss == 1), 1));
+        } else {
+            for _ in 0..7 {
+                clock.advance_secs(60);
+                tokio::time::advance(std::time::Duration::from_secs(60)).await;
+                tokio::task::yield_now().await;
+                assert!(
+                    meta.claim_replication_batch(10, clock.now())
+                        .await
+                        .unwrap()
+                        .is_empty(),
+                    "both active and queued leases must survive beyond the initial five minutes"
+                );
+            }
+            sink.release.add_permits(2);
+            let report = task.await.unwrap().unwrap();
+            assert_eq!(report.completed, 2);
+            assert_eq!(engine.take_claim_failures(), (0, 0));
+        }
+    }
+}
+
+impl SinkRouter for HeldSink {
+    fn sink_for<'a>(&'a self, _target: Option<&str>) -> Option<&'a dyn BucketRoutedSink> {
+        Some(self)
+    }
+}
+
+struct ClockJumpSink<'a> {
+    clock: &'a TestClock,
+    failure: u8,
+}
+
+#[async_trait::async_trait]
+impl BucketRoutedSink for ClockJumpSink<'_> {
+    async fn put_object(
+        &self,
+        _bucket: &BucketName,
+        _object: cairn_types::replication::ReplicatedObject,
+    ) -> Result<(), cairn_types::ReplicationError> {
+        self.clock.advance_secs(301);
+        match self.failure {
+            0 => Ok(()),
+            1 => Err(cairn_types::ReplicationError::Retryable("retry".to_owned())),
+            2 => Err(cairn_types::ReplicationError::Unavailable(
+                "outage".to_owned(),
+            )),
+            _ => Err(cairn_types::ReplicationError::Terminal(
+                "rejected".to_owned(),
+            )),
+        }
+    }
+    async fn delete_marker(
+        &self,
+        _bucket: &BucketName,
+        _key: &ObjectKey,
+        _version: &VersionId,
+    ) -> Result<(), cairn_types::ReplicationError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn every_delivery_result_checks_completion_time_ownership() {
+    for failure in 0..4 {
+        let meta = InMemoryMetadataStore::new();
+        let blobs = Arc::new(InMemoryBlobStore::new());
+        let clock = TestClock::at_secs(1_000);
+        let version = put_with_outbox(
+            &meta,
+            &blobs,
+            "first",
+            "key",
+            b"bytes",
+            clock.now(),
+            clock.now(),
+        )
+        .await;
+        let engine = engine();
+        let router = SingleSink(ClockJumpSink {
+            clock: &clock,
+            failure,
+        });
+        assert!(
+            engine
+                .run_once(&meta, &router, &blobs, &clock)
+                .await
+                .is_err()
+        );
+        assert_eq!(engine.take_claim_failures(), (1, 0));
+        let row = meta
+            .get_version(&bucket(), &ObjectKey::parse("key").unwrap(), &version)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.replication_status, Some(ReplicationStatus::Pending));
+        assert_eq!(row.replicated_at, None);
+        let retried = meta.claim_replication_batch(10, clock.now()).await.unwrap();
+        assert_eq!(retried.len(), 1);
+        assert_eq!(retried[0].attempts, 0);
+        assert_eq!(retried[0].last_error, None);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn settlement_ack_loss_keeps_waiting_leases_alive_until_worker_cancellation() {
+    let meta = Arc::new(InMemoryMetadataStore::new());
+    let blobs = Arc::new(InMemoryBlobStore::new());
+    let clock = Arc::new(TestClock::at_secs(1_000));
+    for (id, key) in [("first", "a"), ("waiting", "b")] {
+        put_with_outbox(&meta, &blobs, id, key, b"bytes", clock.now(), clock.now()).await;
+    }
+    meta.hang_next_replication_done_ack();
+    let engine = engine();
+    let task = tokio::spawn({
+        let (meta, blobs, clock, engine) =
+            (meta.clone(), blobs.clone(), clock.clone(), engine.clone());
+        async move {
+            engine
+                .run_once(
+                    &*meta,
+                    &SingleSink(FakeReplicationSink::new()),
+                    &blobs,
+                    &*clock,
+                )
+                .await
+        }
+    });
+    for _ in 0..20 {
+        if meta.replication_done_ack_is_hanging() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(meta.replication_done_ack_is_hanging());
+    for _ in 0..7 {
+        clock.advance_secs(60);
+        tokio::time::advance(std::time::Duration::from_secs(60)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !task.is_finished(),
+            "committed settlement must not be mistaken for ownership loss"
+        );
+        assert!(
+            meta.claim_replication_batch(10, clock.now())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+    assert_eq!(engine.take_claim_failures(), (0, 0));
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    clock.advance_secs(301);
+    tokio::time::advance(std::time::Duration::from_secs(301)).await;
+    let recovered = meta.claim_replication_batch(10, clock.now()).await.unwrap();
+    assert_eq!(
+        recovered.len(),
+        1,
+        "dropping the worker also drops its heartbeat"
+    );
+    assert_eq!(recovered[0].id, "waiting");
+}

@@ -1183,6 +1183,7 @@ mod sharding_tests {
         for (shard, bucket_name) in bucket_for_shard.iter().enumerate() {
             meta.submit(bucket(bucket_name.as_str())).await.unwrap();
             meta.submit(Mutation::EnqueueReplication(Box::new(OutboxEntry {
+                claim_token: None,
                 id: format!("orphaned-claim-{shard}"),
                 bucket: bucket_name.clone(),
                 key: ObjectKey::parse("object").unwrap(),

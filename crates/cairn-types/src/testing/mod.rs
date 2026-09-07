@@ -12,7 +12,10 @@ pub use blob::InMemoryBlobStore;
 pub use clock::TestClock;
 pub use crypto::{StubCrypto, StubPublicUrl};
 pub use meta::{InMemoryMetadataStore, SetReconcileOracle};
-pub use replication::{FakeReplicationSink, RecordedIntent, SinkBehavior};
+pub use replication::{
+    FakeReplicationSink, RecordedIntent, ReplicationClaims, SinkBehavior,
+    assert_replication_claim_fencing,
+};
 
 use crate::auth::{AuthOutcome, Principal, RequestView};
 use crate::authz::{AuthzInput, Decision, DenyReason};

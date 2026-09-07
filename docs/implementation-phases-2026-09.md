@@ -5,9 +5,9 @@ order. This is a work tracker; entries must not claim completion until validatio
 
 | Phase | Deliverable | Status |
 |---|---|---|
-| 1 | Fail-closed replication intent across writes and marker deletes; cleanup and retry tests | Local gate passed; PR submission pending |
-| 2 | Exact attempt-token fencing and renewal of active/waiting claims; backend parity | Pending |
-| 4A | Required pinned-verifier signature/checksum checks for host and digest-pinned container installs | Pending |
+| 1 | Fail-closed replication intent across writes and marker deletes; cleanup and retry tests | Merged in PR #69 |
+| 2 | Exact attempt-token fencing and renewal of active/waiting claims; backend parity | Implemented; 28 engine and 273 backend tests pass; full gate and draft PR CI pending |
+| 4A | Required pinned-verifier signature/checksum checks for host and digest-pinned container installs | Merged in PR #70 |
 | 3A | Authorized persisted replica multipart intent; identity, loop prevention, encryption and locks | Pending |
 | 3B | Reopenable logical ranges, signed two-pass streaming, multipart delivery, durable remote cleanup | Pending |
 | 4B | Full-object checksum scrub, persisted internal SHA-256, legacy coverage, opt-in scrub pacing | Pending |

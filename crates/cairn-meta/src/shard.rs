@@ -369,10 +369,22 @@ impl MetadataStore for ShardedMetadataStore {
             // --- replication/webhook marks/retry: idempotent, so fan out; only the owner's row changes ---
             Mutation::MarkReplicationDone { .. }
             | Mutation::MarkReplicationFailed { .. }
-            | Mutation::RetryFailedReplication { .. }
+            | Mutation::DeferReplication { .. }
+            | Mutation::RenewReplicationClaim { .. } => {
+                // An id-based update fans out, but a non-owning shard must not erase the owner's
+                // applied result. The unique attempt token prevents unrelated rows from matching.
+                let mut applied = false;
+                for shard in &self.shards {
+                    match shard.submit(mutation.clone()).await? {
+                        MutationOutcome::ReplicationClaimUpdated { applied: changed } => applied |= changed,
+                        _ => return Err(MetaError::Engine("unexpected replication ownership outcome".to_owned())),
+                    }
+                }
+                Ok(MutationOutcome::ReplicationClaimUpdated { applied })
+            }
+            Mutation::RetryFailedReplication { .. }
             | Mutation::PruneReplicationOutbox { .. }
             | Mutation::PruneEventsOutbox { .. }
-            | Mutation::DeferReplication { .. }
             | Mutation::RecoverClaimedReplication
             | Mutation::RecoverMultipartClaims
             | Mutation::MarkWebhookDone(_)
@@ -1007,6 +1019,7 @@ fn mutation_bucket(m: &Mutation) -> Option<String> {
         | Mutation::PruneReplicationOutbox { .. }
         | Mutation::PruneEventsOutbox { .. }
         | Mutation::DeferReplication { .. }
+        | Mutation::RenewReplicationClaim { .. }
         | Mutation::RecoverClaimedReplication
         | Mutation::EnqueueWebhooks(_)
         | Mutation::ClaimWebhookBatch { .. }

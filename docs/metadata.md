@@ -117,6 +117,11 @@ The authorization engine decides whether a given principal may perform a given a
 
 Replication is expressed through two interfaces. A replication source is the outbox-consuming engine that the server runs as a worker pool, claiming due entries and driving them to completion. A replication sink abstracts a destination as an S3-compatible client capable of putting an object and its metadata, deleting an object or propagating a delete marker, and reporting success or a retryable or terminal failure. Separating the sink lets the destination be another Cairn, AWS S3, or any compatible endpoint, and lets tests substitute a fake sink that records what would have been replicated and can simulate failures. Section 20 specifies the engine's behaviour.
 
+Replication claims carry exact attempt tokens from migration v30. Settlement and renewal return a
+writer-confirmed applied/not-applied outcome and validate both token and lease before changing any
+outbox or version-ledger state. Re-claim and startup recovery invalidate every prior token; shard
+fan-out preserves the owning shard's applied result. See Section 20.4 for heartbeat cancellation.
+
 ### 12.6 The cryptography, clock, and public-URL interfaces
 
 A cryptography interface provides the envelope encryption and decryption of SigV4 secrets under the master key, the keyed hashing used for the public-read URL signatures, and the constant-time comparisons used throughout authentication, isolating key handling and algorithm choice. A clock interface provides the current time and is injected wherever time governs behaviour, namely signature skew validation, lifecycle expiry, multipart staleness, and replication backoff, so that those behaviours are tested deterministically with a controllable clock rather than by waiting. A public-URL interface provides the signing and verification of Cairn's signed public-read URLs, which are a Cairn extension rather than an S3 feature, computing a keyed signature over the method, the escaped path, and the expiry and verifying it in constant time with an expiry check. Each of these has a production implementation and a test implementation.

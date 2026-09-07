@@ -704,12 +704,12 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             // requeuing without clearing the count would re-fail on the very next attempt.
             match bucket {
                 Some(b) => conn.execute(
-                    "UPDATE replication_outbox SET status='pending', next_attempt_at=?2, attempts=0, lease_until=NULL \
+                    "UPDATE replication_outbox SET claim_token=NULL, status='pending', next_attempt_at=?2, attempts=0, lease_until=NULL \
                      WHERE status='failed' AND bucket_name=?1",
                     params![b.as_str(), now.0],
                 ),
                 None => conn.execute(
-                    "UPDATE replication_outbox SET status='pending', next_attempt_at=?1, attempts=0, lease_until=NULL \
+                    "UPDATE replication_outbox SET claim_token=NULL, status='pending', next_attempt_at=?1, attempts=0, lease_until=NULL \
                      WHERE status='failed'",
                     params![now.0],
                 ),
@@ -797,7 +797,7 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
             // `attempts=0` matches `RetryFailedReplication`: a `failed` entry sits at the
             // max-attempts boundary and would re-fail on the very next attempt otherwise.
             let outbox = conn.execute(
-                "UPDATE replication_outbox SET status='pending', next_attempt_at=?2, attempts=0, lease_until=NULL \
+                "UPDATE replication_outbox SET claim_token=NULL, status='pending', next_attempt_at=?2, attempts=0, lease_until=NULL \
                  WHERE bucket_name=?1 AND status IN ('completed','failed') \
                    AND (?3 IS NULL OR key > ?3) AND key <= ?4 \
                    AND (?5 = 0 OR EXISTS ( \
@@ -1128,12 +1128,43 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
                 .map_err(engine_err)?;
             Ok(MutationOutcome::ImportJobsPruned(rows as u64))
         }
+        Mutation::RenewReplicationClaim {
+            id,
+            claim_token,
+            now,
+            lease_secs,
+        } => {
+            let until = lease_secs
+                .checked_mul(1000)
+                .and_then(|delta| now.0.checked_add(delta))
+                .filter(|_| lease_secs > 0)
+                .ok_or_else(|| {
+                    MetaError::Engine("invalid replication renewal duration".to_owned())
+                })?;
+            if !owns_replication_claim(conn, &id, &claim_token, now)? {
+                return Ok(MutationOutcome::ReplicationClaimUpdated { applied: false });
+            }
+            conn.execute(
+                "UPDATE replication_outbox SET lease_until=?2 WHERE id=?1",
+                params![id, until],
+            )
+            .map_err(engine_err)?;
+            Ok(MutationOutcome::ReplicationClaimUpdated { applied: true })
+        }
         Mutation::ClaimReplicationBatch {
             limit,
             now,
             lease_secs,
         } => claim_replication_batch(conn, limit, now, lease_secs),
-        Mutation::MarkReplicationDone { id, now } => {
+        Mutation::MarkReplicationDone {
+            id,
+            now,
+            claim_token,
+        } => {
+            if !owns_replication_claim(conn, &id, &claim_token, now)? {
+                return Ok(MutationOutcome::ReplicationClaimUpdated { applied: false });
+            }
+
             if let Some((bucket, key, version)) = conn
                 .query_row(
                     "SELECT bucket_name, key, version_id FROM replication_outbox WHERE id=?1",
@@ -1167,24 +1198,30 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
                 .map_err(engine_err)?;
             }
             conn.execute(
-                "UPDATE replication_outbox SET status='completed' WHERE id=?1",
+                "UPDATE replication_outbox SET claim_token=NULL, lease_until=NULL, status='completed' WHERE id=?1",
                 params![id],
             )
             .map_err(engine_err)?;
-            Ok(MutationOutcome::Ack)
+            Ok(MutationOutcome::ReplicationClaimUpdated { applied: true })
         }
         Mutation::MarkReplicationFailed {
+            claim_token,
+            now,
             id,
             error,
             next_attempt_at,
         } => {
+            if !owns_replication_claim(conn, &id, &claim_token, now)? {
+                return Ok(MutationOutcome::ReplicationClaimUpdated { applied: false });
+            }
+
             match next_attempt_at {
                 Some(t) => conn.execute(
-                    "UPDATE replication_outbox SET attempts=attempts+1, last_error=?2, next_attempt_at=?3, status='pending' WHERE id=?1",
+                    "UPDATE replication_outbox SET claim_token=NULL, lease_until=NULL, attempts=attempts+1, last_error=?2, next_attempt_at=?3, status='pending' WHERE id=?1",
                     params![id, error, t.0],
                 ),
                 None => conn.execute(
-                    "UPDATE replication_outbox SET attempts=attempts+1, last_error=?2, status='failed' WHERE id=?1",
+                    "UPDATE replication_outbox SET claim_token=NULL, lease_until=NULL, attempts=attempts+1, last_error=?2, status='failed' WHERE id=?1",
                     params![id, error],
                 ),
             }
@@ -1219,15 +1256,15 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
                     .map_err(engine_err)?;
                 }
             }
-            Ok(MutationOutcome::Ack)
+            Ok(MutationOutcome::ReplicationClaimUpdated { applied: true })
         }
         Mutation::EnqueueReplication(e) => {
             // Idempotent: a repeated resync of the same (rule, key, version) — which produces the
             // same deterministic entry id — is a no-op rather than a duplicate or a PK error.
             conn.execute(
                 "INSERT OR IGNORE INTO replication_outbox
-                 (id, bucket_name, key, version_id, operation, rule_id, target_arn, attempts, next_attempt_at, status, last_error, priority, lease_until, enqueued_at)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                 (id, bucket_name, key, version_id, operation, rule_id, target_arn, attempts, next_attempt_at, status, last_error, priority, lease_until, enqueued_at, claim_token)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
                 params![
                     e.id,
                     e.bucket.as_str(),
@@ -1243,35 +1280,42 @@ pub fn apply(conn: &Connection, m: Mutation) -> R<MutationOutcome> {
                     e.priority,
                     e.lease_until.map(|t| t.0),
                     e.enqueued_at.0,
+            e.claim_token.as_ref().map(|token| token.as_str()),
                 ],
             )
             .map_err(engine_err)?;
             Ok(MutationOutcome::Ack)
         }
         Mutation::DeferReplication {
+            claim_token,
+            now,
             id,
             next_attempt_at,
             last_error,
         } => {
+            if !owns_replication_claim(conn, &id, &claim_token, now)? {
+                return Ok(MutationOutcome::ReplicationClaimUpdated { applied: false });
+            }
+
             // Release the claim (lease_until=NULL, status='pending') and re-schedule WITHOUT
             // touching `attempts` — a deferral/unavailability is not a failure, so it must never
             // push the entry toward terminal. `COALESCE(?3, last_error)` keeps the prior error when
             // no new one is supplied (an ordering defer).
             conn.execute(
                 "UPDATE replication_outbox \
-                 SET status='pending', lease_until=NULL, next_attempt_at=?2, \
+                 SET status='pending', claim_token=NULL, lease_until=NULL, next_attempt_at=?2, \
                      last_error=COALESCE(?3, last_error) \
                  WHERE id=?1",
                 params![id, next_attempt_at.0, last_error],
             )
             .map_err(engine_err)?;
-            Ok(MutationOutcome::Ack)
+            Ok(MutationOutcome::ReplicationClaimUpdated { applied: true })
         }
         Mutation::RecoverClaimedReplication => {
             // Startup recovery: every `claimed` row is orphaned (no live worker holds it), so release
             // them to `pending` for immediate re-claim instead of waiting out the 300s lease.
             conn.execute(
-                "UPDATE replication_outbox SET status='pending', lease_until=NULL WHERE status='claimed'",
+                "UPDATE replication_outbox SET claim_token=NULL, status='pending', lease_until=NULL WHERE status='claimed'",
                 [],
             )
             .map_err(engine_err)?;
@@ -2805,8 +2849,8 @@ fn check_precondition(
 fn enqueue(conn: &Connection, e: &OutboxEntry) -> R<()> {
     conn.prepare_cached(
         "INSERT INTO replication_outbox
-         (id, bucket_name, key, version_id, operation, rule_id, target_arn, attempts, next_attempt_at, status, last_error, priority, lease_until, enqueued_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+         (id, bucket_name, key, version_id, operation, rule_id, target_arn, attempts, next_attempt_at, status, last_error, priority, lease_until, enqueued_at, claim_token)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
     )
     .map_err(engine_err)?
     .execute(params![
@@ -2824,6 +2868,7 @@ fn enqueue(conn: &Connection, e: &OutboxEntry) -> R<()> {
             e.priority,
             e.lease_until.map(|t| t.0),
             e.enqueued_at.0,
+            e.claim_token.as_ref().map(|token| token.as_str()),
         ])
     .map_err(engine_err)?;
     Ok(())
@@ -2856,9 +2901,10 @@ fn claim_replication_batch(
     };
     let mut claimed = Vec::with_capacity(ids.len());
     for id in &ids {
+        let token = cairn_types::id::ReplicationClaimToken::generate();
         conn.execute(
-            "UPDATE replication_outbox SET status='claimed', lease_until=?2 WHERE id=?1",
-            params![id, lease_until],
+            "UPDATE replication_outbox SET claim_token=?3, status='claimed', lease_until=?2 WHERE id=?1",
+            params![id, lease_until, token.as_str()],
         )
         .map_err(engine_err)?;
         let entry = conn
@@ -2962,6 +3008,18 @@ fn config_aspect_str(a: cairn_types::bucket::ConfigAspect) -> &'static str {
 /// The string form of a config aspect (shared with the read path).
 pub fn aspect_str(a: cairn_types::bucket::ConfigAspect) -> &'static str {
     config_aspect_str(a)
+}
+
+fn owns_replication_claim(
+    conn: &Connection,
+    id: &str,
+    token: &cairn_types::id::ReplicationClaimToken,
+    now: Timestamp,
+) -> R<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM replication_outbox WHERE id=?1 AND status='claimed' AND claim_token=?2 AND lease_until>=?3)",
+        params![id, token.as_str(), now.0], |row| row.get(0),
+    ).map_err(engine_err)
 }
 
 #[cfg(test)]
