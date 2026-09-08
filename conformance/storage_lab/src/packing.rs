@@ -1,8 +1,14 @@
 //! Isolated completed-byte publication diagnostic; no production routing or adoption decision.
+#[path = "packing/gc.rs"]
+pub mod gc;
 #[path = "packing/model.rs"]
 pub mod model;
+#[path = "packing/node.rs"]
+pub mod node;
 #[path = "packing/record.rs"]
 pub mod record;
+#[path = "packing/snapshot.rs"]
+pub mod snapshot;
 #[path = "packing/store.rs"]
 pub mod store;
 
@@ -14,9 +20,8 @@ use model::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::fs::{self, File, OpenOptions};
+use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -99,14 +104,14 @@ struct Counters {
     dedicated: AtomicUsize,
 }
 
-struct Budget {
+pub(crate) struct Budget {
     bytes: Arc<Semaphore>,
     count: Arc<Semaphore>,
     counters: Arc<Counters>,
     lifetime: Arc<dyn Send + Sync>,
 }
 
-struct Admission {
+pub(crate) struct Admission {
     _bytes: OwnedSemaphorePermit,
     _count: OwnedSemaphorePermit,
     charged: usize,
@@ -124,7 +129,7 @@ impl Drop for Admission {
 }
 
 impl Budget {
-    fn new(lifetime: Arc<dyn Send + Sync>) -> Self {
+    pub(crate) fn new(lifetime: Arc<dyn Send + Sync>) -> Self {
         Self {
             bytes: Arc::new(Semaphore::new(ADMISSION_BYTES)),
             count: Arc::new(Semaphore::new(model::MAX_RECORDS)),
@@ -133,7 +138,7 @@ impl Budget {
         }
     }
 
-    async fn acquire(&self, payload: usize, deadline: Instant) -> Result<Admission> {
+    pub(crate) async fn acquire(&self, payload: usize, deadline: Instant) -> Result<Admission> {
         let charged = payload
             .checked_add(IO_RESERVATION)
             .filter(|n| *n <= ADMISSION_BYTES)
@@ -552,23 +557,16 @@ async fn worker(
     Ok(latency)
 }
 
-fn create_root(path: &Path) -> Result<Arc<dyn Send + Sync>> {
-    let parent = path.parent().ok_or("root must have a canonical parent")?;
-    if !path.is_absolute() || parent.canonicalize()? != parent || path.file_name().is_none() {
-        return Err("fresh absolute canonical laboratory root required".into());
+fn create_root(path: &Path) -> Result<Arc<node::Node>> {
+    node::Node::create(path)
+}
+
+fn physical_budget(config: &Config) -> model::PhysicalBudget {
+    // Reserve final bytes, worst-case one-frame segment overhead per object, and one complete
+    // replacement segment. SQLite/WAL and observation headroom remain the coordinator's charge.
+    model::PhysicalBudget {
+        limit_bytes: config.objects as u64 * (config.size as u64 + 120) + model::MAX_SEGMENT_LENGTH,
     }
-    fs::DirBuilder::new().mode(0o700).create(path)?;
-    File::open(parent)?.sync_all()?;
-    let lock = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path.join(".packing.lock"))?;
-    lock.try_lock()?;
-    lock.sync_all()?;
-    File::open(path)?.sync_all()?;
-    Ok(Arc::new(lock))
 }
 
 async fn verify(
@@ -707,13 +705,14 @@ struct Report {
     admission_limit_bytes: usize,
     pending_limit_records: usize,
     timing_scope: &'static str,
+    collection_check: gc::CollectionReport,
 }
 
 async fn run(config: Config) -> Result<Report> {
     config.validate()?;
     let deadline = Instant::now() + Duration::from_secs(config.deadline_seconds);
     let lifetime = create_root(&config.root)?;
-    let store = Store::open(&config.root, lifetime.clone())?;
+    let store = Store::open(lifetime.clone(), physical_budget(&config))?;
     let budget = Arc::new(Budget::new(lifetime));
     let config = Arc::new(config);
     let result = async {
@@ -742,6 +741,15 @@ async fn run(config: Config) -> Result<Report> {
         let publication_seconds = publication_start.elapsed().as_secs_f64();
         let verified = verify(&store, &config, &budget, deadline).await?;
         cleanup(&store, &config.root, deadline).await?;
+        // This append-only diagnostic has no dead records. Exercise bounded enumeration and
+        // require it to preserve every live artifact; churn comparisons have separate fixtures.
+        let collection_check = gc::collect_pass(
+            &config.root, store.clone(), budget.clone(), model::MAX_RECORDS,
+            config.objects.div_ceil(model::MAX_RECORDS) + 1, deadline,
+        ).await?;
+        if !collection_check.completed || collection_check.candidates != 0 {
+            return Err("fully live publication unexpectedly selected collection".into());
+        }
         let stats = store.stats().await?;
         if stats.records != config.objects as u64 || stats.current != config.objects as u64
             || stats.history != 0 || stats.locked != 0 || latency.count != config.objects {
@@ -756,7 +764,7 @@ async fn run(config: Config) -> Result<Report> {
             packed_records: counters.packed.load(Ordering::SeqCst), dedicated_records: counters.dedicated.load(Ordering::SeqCst),
             peak_admitted_bytes: counters.peak_bytes.load(Ordering::SeqCst), peak_pending_records: counters.peak_pending.load(Ordering::SeqCst),
             publication_seconds, publication_latency: latency, admission_limit_bytes: ADMISSION_BYTES,
-            pending_limit_records: model::MAX_RECORDS,
+            pending_limit_records: model::MAX_RECORDS, collection_check,
             timing_scope: "publication includes deterministic fixture generation, admission, filesystem durability/hash validation and SQLite acknowledgement; readback/cleanup excluded; no encoding or S3" })
     }.await;
     let closed = store.close().await;
@@ -809,6 +817,7 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::sync::Barrier;
     use std::sync::atomic::AtomicBool;
 
@@ -1124,7 +1133,7 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let config = Arc::new(config(temporary.path().join("store")));
         let lifetime = create_root(&config.root).unwrap();
-        let store = Store::open(&config.root, lifetime.clone()).unwrap();
+        let store = Store::open(lifetime.clone(), physical_budget(&config)).unwrap();
         let budget = Budget::new(lifetime);
         let (request, _response) = request(&budget, config.size).await;
         let result = tokio::task::spawn_blocking({

@@ -192,3 +192,12 @@ Build with `cargo build --locked --release --manifest-path conformance/storage_l
 correctness fixture in the ordinary Python suite and CI. See
 [`storage-packing-2026-09.md`](../../docs/storage-packing-2026-09.md) for the prototype boundary and
 remaining collection, restore and comparison gates.
+
+Phase 4B adds bounded half-dead segment collection, physical replacement admission and exact
+conditional relocation with shared reader pins. The standalone actor owns append-only laboratory
+schema v2 and physical charges through durable removal of every alias. Typed offline ownership
+gates manifest-last snapshots and metadata-last fresh restore; none of these modules changes
+production backup or placement. Fixed Rust fixtures exercise encrypted protected history,
+relocation races, interrupted work and invalid snapshots. The diagnostic driver additionally
+checks that an entirely live dataset produces no collection candidate. See
+[`storage-collection-2026-09.md`](../../docs/storage-collection-2026-09.md).

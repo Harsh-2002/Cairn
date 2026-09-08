@@ -231,6 +231,54 @@ pub struct PublishedRecord {
     pub is_current: bool,
 }
 
+/// A durable physical-byte ceiling, including pending and retired artifacts.
+#[derive(Clone, Copy, Debug)]
+pub struct PhysicalBudget {
+    pub limit_bytes: u64,
+}
+
+impl Default for PhysicalBudget {
+    fn default() -> Self {
+        Self {
+            limit_bytes: i64::MAX as u64,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GcCandidate {
+    pub artifact: ArtifactIdentity,
+    pub physical_length: u64,
+    /// Exact replacement geometry, including the segment and record headers.
+    pub retained_length: u64,
+    pub records: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CandidatePage {
+    pub candidates: Vec<GcCandidate>,
+    /// Last examined identity, even when this page contains no eligible candidates.
+    pub after: Option<StorageToken>,
+    pub examined: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RelocateRecord {
+    pub row_id: StorageToken,
+    pub expected: Location,
+    pub replacement: Location,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArtifactSnapshot {
+    pub plan: ArtifactPlan,
+    pub state: String,
+    pub physical_length: Option<u64>,
+    pub sha256: Option<[u8; 32]>,
+    pub charge_bytes: u64,
+    pub references: usize,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Rejection {
     Conflict,

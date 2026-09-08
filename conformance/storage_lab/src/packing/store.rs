@@ -4,21 +4,29 @@
 //! readers after that serialized acquisition; no object or segment inventory lives in a heap map.
 
 use super::model::{
-    ArtifactIdentity, ArtifactKind, ArtifactPlan, CipherFormat, CleanupDebt, EncodedFormat,
-    ExpectedCurrent, Location, MAX_RECORDS, PublishRecord, PublishedRecord, RecordMetadata,
-    Rejection, Result,
+    ArtifactIdentity, ArtifactKind, ArtifactPlan, CandidatePage, CipherFormat, CleanupDebt,
+    EncodedFormat, ExpectedCurrent, GcCandidate, Location, MAX_RECORDS, PhysicalBudget,
+    PublishRecord, PublishedRecord, RECORD_HEADER_LENGTH, RecordMetadata, Rejection,
+    RelocateRecord, Result, SEGMENT_HEADER_LENGTH,
 };
-use super::record::{self, CleanupReceipt, DurableArtifact, PinnedRecord, QuiescentArtifact};
+use super::node::{ActiveSession, Node, OfflineRoot};
+use super::record::{
+    self, CleanupReceipt, DurableArtifact, PinnedRecord, PinnedSegment, QuiescentArtifact,
+};
 use cairn_types::storage::StorageToken;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rustix::fs::{Mode, OFlags, ResolveFlags};
 use std::collections::BTreeSet;
+use std::fs::File;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use tokio::sync::{mpsc, oneshot};
 
-const SCHEMA_VERSION: i64 = 1;
+pub use super::model::ArtifactSnapshot;
+
+const SCHEMA_VERSION: i64 = 2;
 const CHANNEL_CAPACITY: usize = 32;
 
 /// Move-only evidence that the exact plan was durably reserved by this actor.
@@ -124,6 +132,26 @@ pub struct Pinned {
     pub pin: PinnedRecord,
 }
 
+pub struct PinnedGcSource {
+    pub candidate: GcCandidate,
+    pub records: Vec<PublishedRecord>,
+    pub pin: PinnedSegment,
+}
+
+pub enum RelocationOutcome {
+    Applied {
+        moved: usize,
+        lost: usize,
+        moved_bytes: u64,
+        lost_bytes: u64,
+        source_retired: bool,
+    },
+    Rejected {
+        reason: Rejection,
+        artifact: DurableArtifact,
+    },
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StoreStats {
     pub records: u64,
@@ -132,6 +160,8 @@ pub struct StoreStats {
     pub locked: u64,
     pub pending: u64,
     pub cleanup: u64,
+    pub physical_charge: u64,
+    pub physical_limit: u64,
 }
 
 type Reply<T> = oneshot::Sender<Result<T>>;
@@ -155,7 +185,14 @@ enum Command {
     Finish(CleanupReceipt, Reply<bool>),
     Release(CleanupClaim, Reply<bool>),
     Stats(Reply<StoreStats>),
-    Close(Reply<()>),
+    Candidates(Option<StorageToken>, usize, Reply<CandidatePage>),
+    PinGc(ArtifactIdentity, Reply<Option<PinnedGcSource>>),
+    Relocate(
+        DurableArtifact,
+        Vec<RelocateRecord>,
+        Reply<RelocationOutcome>,
+    ),
+    Close(Reply<Arc<ActiveSession>>),
     #[cfg(test)]
     FailPublicationAfter(Option<usize>, Reply<()>),
 }
@@ -172,10 +209,14 @@ pub struct Store {
 }
 
 impl Store {
-    /// The caller exclusively owns this laboratory root. `lifetime` retains that node lock;
-    /// admissions and pinned readers keep it alive until their actual filesystem work ends.
-    pub fn open(root: &Path, lifetime: Arc<dyn Send + Sync>) -> Result<Self> {
-        let root = root.to_owned();
+    /// Admissions, actual I/O and pinned readers retain the exclusive active node session.
+    pub fn open(node: Arc<Node>, budget: PhysicalBudget) -> Result<Self> {
+        if budget.limit_bytes > i64::MAX as u64 {
+            return Err("physical budget exceeds SQLite integer range".into());
+        }
+        node.validate()?;
+        let root = node.root().to_owned();
+        let lifetime = node.active()?;
         let generation = StorageToken::generate();
         let actor_generation = generation.clone();
         let (sender, receiver) = mpsc::channel(CHANNEL_CAPACITY);
@@ -183,8 +224,8 @@ impl Store {
         let thread = std::thread::Builder::new()
             .name("packing-lab-writer".into())
             .spawn(
-                move || match Actor::open(root, actor_generation, lifetime) {
-                    Ok(mut actor) => {
+                move || match Actor::open(root, actor_generation, lifetime, budget) {
+                    Ok(actor) => {
                         if ready.send(Ok(())).is_ok() {
                             actor.run(receiver);
                         }
@@ -313,8 +354,32 @@ impl Store {
         self.request(Command::Stats).await
     }
 
+    pub async fn gc_candidates(
+        &self,
+        after: Option<&StorageToken>,
+        limit: usize,
+    ) -> Result<CandidatePage> {
+        validate_limit(limit)?;
+        self.request(|reply| Command::Candidates(after.cloned(), limit, reply))
+            .await
+    }
+
+    pub async fn pin_gc(&self, artifact: &ArtifactIdentity) -> Result<Option<PinnedGcSource>> {
+        self.request(|reply| Command::PinGc(artifact.clone(), reply))
+            .await
+    }
+
+    pub async fn relocate(
+        &self,
+        artifact: DurableArtifact,
+        records: Vec<RelocateRecord>,
+    ) -> Result<RelocationOutcome> {
+        self.request(|reply| Command::Relocate(artifact, records, reply))
+            .await
+    }
+
     pub async fn close(&self) -> Result<()> {
-        self.request(Command::Close).await?;
+        let session = self.request(Command::Close).await?;
         let thread = self
             .inner
             .thread
@@ -327,7 +392,282 @@ impl Store {
             })
             .await??;
         }
+        session.mark_clean()?;
         Ok(())
+    }
+}
+
+/// A read-only, self-contained laboratory database image. No recovery or generation changes.
+pub struct ImageView {
+    connection: Connection,
+    path: PathBuf,
+    generation: StorageToken,
+}
+
+impl ImageView {
+    pub fn open(path: &Path) -> Result<Self> {
+        use std::os::unix::ffi::OsStrExt;
+        let metadata = std::fs::symlink_metadata(path)?;
+        if !metadata.is_file()
+            || metadata.is_symlink()
+            || metadata.nlink() != 1
+            || metadata.len() > 1024 * 1024 * 1024
+        {
+            return Err("packing image is not one regular file".into());
+        }
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let mut name = path.as_os_str().to_owned();
+            name.push(suffix);
+            match std::fs::symlink_metadata(Path::new(&name)) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+                Ok(_) => return Err("packing image has a SQLite sidecar".into()),
+            }
+        }
+        let absolute = std::fs::canonicalize(path)?;
+        let mut uri = String::from("file:");
+        use std::fmt::Write;
+        for byte in absolute.as_os_str().as_bytes() {
+            write!(&mut uri, "%{byte:02X}")?;
+        }
+        uri.push_str("?immutable=1");
+        let connection = Connection::open_with_flags(
+            uri,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )?;
+        let version: i64 = connection.query_row(
+            "SELECT schema_version FROM packing_state WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        if version != SCHEMA_VERSION {
+            return Err("unsupported packing image schema".into());
+        }
+        let integrity: String =
+            connection.query_row("PRAGMA integrity_check(1)", [], |row| row.get(0))?;
+        if integrity != "ok" {
+            return Err("packing image integrity check failed".into());
+        }
+        if connection
+            .prepare("PRAGMA foreign_key_check")?
+            .query([])?
+            .next()?
+            .is_some()
+        {
+            return Err("packing image foreign key check failed".into());
+        }
+        let generation = token(connection.query_row(
+            "SELECT generation FROM packing_state WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?)?;
+        let image = Self {
+            connection,
+            path: path.to_owned(),
+            generation,
+        };
+        image.validate()?;
+        Ok(image)
+    }
+
+    pub fn generation(&self) -> &StorageToken {
+        &self.generation
+    }
+
+    pub fn database_path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn artifact_page(
+        &self,
+        after: Option<&StorageToken>,
+        limit: usize,
+    ) -> Result<Vec<ArtifactSnapshot>> {
+        validate_limit(limit)?;
+        let mut statement = self.connection.prepare(
+            "SELECT id,generation,kind,max_length,state,physical_length,sha256,charge_bytes,
+             (SELECT count(*) FROM records WHERE artifact_id=a.id AND artifact_generation=a.generation)
+             FROM artifacts a WHERE id>?1 ORDER BY id LIMIT ?2",
+        )?;
+        Ok(statement
+            .query_map(
+                params![after.map_or("", StorageToken::as_str), limit as i64],
+                |row| {
+                    let sha256 = row
+                        .get::<_, Option<Vec<u8>>>(6)?
+                        .map(|value| value.try_into().map_err(|_| rusqlite::Error::InvalidQuery))
+                        .transpose()?;
+                    let references = usize::try_from(row.get::<_, i64>(8)?)
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?;
+                    Ok(ArtifactSnapshot {
+                        plan: decode_plan(row)?,
+                        state: row.get(4)?,
+                        physical_length: row
+                            .get::<_, Option<i64>>(5)?
+                            .map(nonnegative)
+                            .transpose()?,
+                        sha256,
+                        charge_bytes: nonnegative(row.get(7)?)?,
+                        references,
+                    })
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn record_page(
+        &self,
+        after: Option<&StorageToken>,
+        limit: usize,
+    ) -> Result<Vec<PublishedRecord>> {
+        validate_limit(limit)?;
+        let mut statement = self.connection.prepare(
+            "SELECT row_id,key,encoded_sha256,encoded_length,logical_size,format,locked,is_current,artifact_id,artifact_generation,location_kind,offset,length,compression,cipher
+             FROM records WHERE row_id>?1 ORDER BY row_id LIMIT ?2",
+        )?;
+        Ok(statement
+            .query_map(
+                params![after.map_or("", StorageToken::as_str), limit as i64],
+                decode_record,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    fn validate(&self) -> Result<()> {
+        let mut after = None;
+        let mut charged = 0u64;
+        let mut artifacts = 0usize;
+        let mut records_count = 0usize;
+        loop {
+            let page = self.artifact_page(after.as_ref(), MAX_RECORDS)?;
+            if page.is_empty() {
+                break;
+            }
+            artifacts += page.len();
+            if artifacts > 16_384 {
+                return Err("packing image exceeds artifact validation bound".into());
+            }
+            for artifact in &page {
+                records_count = records_count
+                    .checked_add(artifact.references)
+                    .ok_or("packing image record count overflow")?;
+                if records_count > 16_384 {
+                    return Err("packing image exceeds record validation bound".into());
+                }
+                if !["pending", "live", "retired"].contains(&artifact.state.as_str())
+                    || artifact.physical_length.is_some() != artifact.sha256.is_some()
+                    || artifact
+                        .physical_length
+                        .is_some_and(|length| length > artifact.plan.max_length())
+                    || artifact.references > MAX_RECORDS
+                {
+                    return Err("packing image artifact geometry is invalid".into());
+                }
+                let debt: bool = self.connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM cleanup WHERE artifact_id=?1 AND artifact_generation=?2)",
+                    params![artifact.plan.artifact().id.as_str(), artifact.plan.artifact().generation.as_str()], |row| row.get(0),
+                )?;
+                let expected_charge = if artifact.state == "retired" && !debt {
+                    0
+                } else {
+                    artifact
+                        .physical_length
+                        .unwrap_or(artifact.plan.max_length())
+                };
+                if artifact.charge_bytes != expected_charge
+                    || (artifact.state == "pending" && artifact.physical_length.is_some())
+                    || (artifact.state == "live"
+                        && (artifact.references == 0 || artifact.physical_length.is_none()))
+                    || (artifact.state != "live" && artifact.references != 0)
+                {
+                    return Err("packing image artifact ownership is inconsistent".into());
+                }
+                charged = charged
+                    .checked_add(artifact.charge_bytes)
+                    .ok_or("packing image charge overflow")?;
+                let records = artifact_records(&self.connection, artifact.plan.artifact())?;
+                let mut end = if artifact.plan.kind() == ArtifactKind::Segment {
+                    SEGMENT_HEADER_LENGTH
+                } else {
+                    0
+                };
+                for record in records {
+                    if record.location.kind() != artifact.plan.kind()
+                        || (artifact.plan.kind() == ArtifactKind::File && artifact.references != 1)
+                        || record.location.offset()
+                            < end
+                                + if artifact.plan.kind() == ArtifactKind::Segment {
+                                    RECORD_HEADER_LENGTH
+                                } else {
+                                    0
+                                }
+                        || record
+                            .location
+                            .offset()
+                            .checked_add(record.location.length())
+                            .is_none_or(|bound| Some(bound) > artifact.physical_length)
+                    {
+                        return Err("packing image record location is inconsistent".into());
+                    }
+                    end = record.location.offset() + record.location.length();
+                    if artifact.plan.kind() == ArtifactKind::File
+                        && Some(end) != artifact.physical_length
+                    {
+                        return Err("packing image file length is inconsistent".into());
+                    }
+                }
+            }
+            after = page
+                .last()
+                .map(|artifact| artifact.plan.artifact().id.clone());
+        }
+        let stats = stats(&self.connection)?;
+        if charged != stats.physical_charge || charged > stats.physical_limit {
+            return Err("packing image physical accounting is inconsistent".into());
+        }
+        let mut after = None;
+        let mut debts = 0usize;
+        loop {
+            let page = debt(&self.connection, after.as_ref(), MAX_RECORDS)?;
+            if page.is_empty() {
+                break;
+            }
+            debts += page.len();
+            if debts > 32_768 {
+                return Err("packing image exceeds cleanup validation bound".into());
+            }
+            after = page.last().map(|debt| debt.id.clone());
+        }
+        Ok(())
+    }
+}
+
+/// Only an exclusive, quiescent node proof authorizes a source snapshot view.
+pub struct OfflineView {
+    image: ImageView,
+    proof: OfflineRoot,
+}
+
+impl OfflineView {
+    pub fn open(proof: OfflineRoot) -> Result<Self> {
+        proof.validate()?;
+        let image = ImageView::open(&proof.root().join("packing.sqlite3"))?;
+        Ok(Self { image, proof })
+    }
+
+    pub fn root(&self) -> &Path {
+        self.proof.root()
+    }
+
+    pub fn lifetime(&self) -> Arc<dyn Send + Sync> {
+        self.proof.lifetime()
+    }
+}
+
+impl std::ops::Deref for OfflineView {
+    type Target = ImageView;
+    fn deref(&self) -> &Self::Target {
+        &self.image
     }
 }
 
@@ -335,30 +675,73 @@ struct Actor {
     connection: Connection,
     root: PathBuf,
     generation: StorageToken,
-    lifetime: Arc<dyn Send + Sync>,
+    lifetime: Arc<ActiveSession>,
     root_identity: (u64, u64),
     #[cfg(test)]
     fail_publication_after: Option<usize>,
+}
+
+fn existing_sqlite_file(directory: &File, root: &Path, name: &str) -> Result<bool> {
+    let metadata = match std::fs::symlink_metadata(root.join(name)) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    let file = File::from(rustix::fs::openat2(
+        directory,
+        name,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_XDEV,
+    )?);
+    let opened = file.metadata()?;
+    if !opened.is_file()
+        || opened.nlink() != 1
+        || (opened.dev(), opened.ino()) != (metadata.dev(), metadata.ino())
+    {
+        return Err("packing SQLite files must be regular, unaliased files".into());
+    }
+    Ok(true)
 }
 
 impl Actor {
     fn open(
         root: PathBuf,
         generation: StorageToken,
-        lifetime: Arc<dyn Send + Sync>,
+        lifetime: Arc<ActiveSession>,
+        budget: PhysicalBudget,
     ) -> Result<Self> {
         let root_metadata = std::fs::symlink_metadata(&root)?;
-        if !root_metadata.is_dir() {
+        if !root_metadata.is_dir()
+            || (root_metadata.dev(), root_metadata.ino()) != lifetime.identity()
+        {
             return Err("packing root is not a real directory".into());
         }
         let path = root.join("packing.sqlite3");
-        match std::fs::symlink_metadata(&path) {
-            Ok(metadata) if !metadata.is_file() || metadata.is_symlink() => {
-                return Err("packing database is not a regular file".into());
+        // A second root lock cannot protect hard-linked or mounted SQLite write surfaces.
+        // Probe without writes before SQLite can recover a journal or change PRAGMAs.
+        let directory = File::from(rustix::fs::open(
+            &root,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?);
+        let directory_metadata = directory.metadata()?;
+        if (directory_metadata.dev(), directory_metadata.ino()) != lifetime.identity() {
+            return Err("packing root changed before database open".into());
+        }
+        if !existing_sqlite_file(&directory, &root, "packing.sqlite3")? {
+            for entry in std::fs::read_dir(&root)? {
+                if entry?.file_name() != ".packing.lock" {
+                    return Err("new packing database requires an otherwise empty node root".into());
+                }
             }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
+        }
+        for name in [
+            "packing.sqlite3-wal",
+            "packing.sqlite3-shm",
+            "packing.sqlite3-journal",
+        ] {
+            existing_sqlite_file(&directory, &root, name)?;
         }
         let mut connection = Connection::open(path)?;
         let tables: i64 = connection.query_row(
@@ -372,7 +755,7 @@ impl Actor {
                 [],
                 |row| row.get(0),
             )?;
-            if version != SCHEMA_VERSION {
+            if !(1..=SCHEMA_VERSION).contains(&version) {
                 return Err("unsupported packing laboratory schema".into());
             }
         }
@@ -384,11 +767,35 @@ impl Actor {
         if tables == 0 {
             connection.execute_batch(SCHEMA)?;
         }
+        let version = if tables == 0 {
+            1
+        } else {
+            connection.query_row(
+                "SELECT schema_version FROM packing_state WHERE singleton=1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?
+        };
+        if version == 1 {
+            connection.execute_batch(MIGRATION_2)?;
+        }
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
             "INSERT INTO packing_state(singleton,schema_version,generation) VALUES(1,?1,?2)
              ON CONFLICT(singleton) DO UPDATE SET generation=excluded.generation",
             params![SCHEMA_VERSION, generation.as_str()],
+        )?;
+        let charged: u64 = nonnegative(transaction.query_row(
+            "SELECT charged_bytes FROM packing_state WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?)?;
+        if charged > budget.limit_bytes {
+            return Err("physical budget is below durable charged bytes".into());
+        }
+        transaction.execute(
+            "UPDATE packing_state SET limit_bytes=?1 WHERE singleton=1",
+            [budget.limit_bytes as i64],
         )?;
         transaction.execute(
             "UPDATE cleanup SET claim_token=NULL,claim_generation=NULL",
@@ -406,7 +813,7 @@ impl Actor {
         })
     }
 
-    fn run(&mut self, mut receiver: mpsc::Receiver<Command>) {
+    fn run(mut self, mut receiver: mpsc::Receiver<Command>) {
         while let Some(command) = receiver.blocking_recv() {
             match command {
                 Command::Plan(kind, length, reply) => {
@@ -462,14 +869,30 @@ impl Actor {
                 Command::Stats(reply) => {
                     let _ = reply.send(stats(&self.connection));
                 }
-                Command::Close(reply) => {
-                    let result = self
-                        .connection
-                        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
-                        .map_err(Into::into);
-                    let _ = reply.send(result);
-                    break;
+                Command::Candidates(after, limit, reply) => {
+                    let _ = reply.send(gc_candidates(&self.connection, after.as_ref(), limit));
                 }
+                Command::PinGc(artifact, reply) => {
+                    let _ = reply.send(self.pin_gc(&artifact));
+                }
+                Command::Relocate(artifact, records, reply) => {
+                    let _ = reply.send(self.relocate(artifact, records));
+                }
+                Command::Close(reply) => match checkpoint(&self.connection) {
+                    Ok(()) => {
+                        let session = self.lifetime.clone();
+                        let result = self
+                            .connection
+                            .close()
+                            .map(|()| session)
+                            .map_err(|(_, error)| error.into());
+                        let _ = reply.send(result);
+                        return;
+                    }
+                    Err(error) => {
+                        let _ = reply.send(Err(error));
+                    }
+                },
                 #[cfg(test)]
                 Command::FailPublicationAfter(count, reply) => {
                     self.fail_publication_after = count;
@@ -491,8 +914,15 @@ impl Actor {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let reserved = transaction.execute(
+            "UPDATE packing_state SET charged_bytes=charged_bytes+?1 WHERE singleton=1 AND ?1<=limit_bytes-charged_bytes",
+            [max_length as i64],
+        )?;
+        if reserved != 1 {
+            return Err("physical artifact budget exhausted".into());
+        }
         transaction.execute(
-            "INSERT INTO artifacts(id,generation,kind,max_length,state) VALUES(?1,?2,?3,?4,'pending')",
+            "INSERT INTO artifacts(id,generation,kind,max_length,state,charge_bytes) VALUES(?1,?2,?3,?4,'pending',?4)",
             params![plan.artifact().id.as_str(), plan.artifact().generation.as_str(), kind_name(kind), max_length as i64],
         )?;
         transaction.commit()?;
@@ -551,6 +981,7 @@ impl Actor {
             "UPDATE artifacts SET state='live',physical_length=?3,sha256=?4 WHERE id=?1 AND generation=?2",
             params![plan.artifact().id.as_str(), plan.artifact().generation.as_str(), artifact.physical_length() as i64, artifact.sha256().as_slice()],
         )?;
+        set_charge(&transaction, plan.artifact(), artifact.physical_length())?;
         for (index, record) in records.iter().enumerate() {
             if let Some(old) = lookup(&transaction, &record.metadata.key, false)? {
                 if record.preserve_previous {
@@ -601,6 +1032,114 @@ impl Actor {
                 Ok(Pinned { record, pin })
             })
             .transpose()
+    }
+
+    fn pin_gc(&self, artifact: &ArtifactIdentity) -> Result<Option<PinnedGcSource>> {
+        let Some(candidate) = gc_candidate(&self.connection, artifact)? else {
+            return Ok(None);
+        };
+        let records = artifact_records(&self.connection, artifact)?;
+        let pin = PinnedSegment::open(
+            &self.root,
+            artifact,
+            candidate.physical_length,
+            self.lifetime.clone(),
+        )?;
+        if pin.root_identity()? != self.root_identity {
+            return Err("pinned GC root identity changed".into());
+        }
+        Ok(Some(PinnedGcSource {
+            candidate,
+            records,
+            pin,
+        }))
+    }
+
+    fn relocate(
+        &mut self,
+        artifact: DurableArtifact,
+        records: Vec<RelocateRecord>,
+    ) -> Result<RelocationOutcome> {
+        validate_relocation(&artifact, &records)?;
+        let plan = artifact.plan();
+        if plan.artifact().generation != self.generation {
+            return Ok(RelocationOutcome::Rejected {
+                reason: Rejection::Stale,
+                artifact,
+            });
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !is_pending(&transaction, plan)? {
+            return Ok(RelocationOutcome::Rejected {
+                reason: Rejection::Stale,
+                artifact,
+            });
+        }
+        let source = records[0].expected.artifact();
+        if artifact_plan(&transaction, source)?.is_none() {
+            return Err("relocation source artifact is missing".into());
+        }
+        transaction.execute(
+            "UPDATE artifacts SET state='live',physical_length=?3,sha256=?4 WHERE id=?1 AND generation=?2",
+            params![plan.artifact().id.as_str(), plan.artifact().generation.as_str(), artifact.physical_length() as i64, artifact.sha256().as_slice()],
+        )?;
+        set_charge(&transaction, plan.artifact(), artifact.physical_length())?;
+        let mut moved = 0;
+        let mut moved_bytes = 0;
+        for (index, (record, span)) in records.iter().zip(artifact.spans()).enumerate() {
+            let Some(old) = lookup(&transaction, record.row_id.as_str(), true)? else {
+                continue;
+            };
+            if old.location != record.expected {
+                continue;
+            }
+            if old.metadata.encoded_sha256 != span.sha256
+                || old.metadata.encoded_length != span.length
+            {
+                return Err("relocation changes immutable record bytes".into());
+            }
+            // Only physical location changes. Current/history status, lock and codec stay intact.
+            let changed = transaction.execute(
+                "UPDATE records SET artifact_id=?2,artifact_generation=?3,location_kind='segment',offset=?4,length=?5
+                 WHERE row_id=?1 AND artifact_id=?6 AND artifact_generation=?7 AND location_kind='segment' AND offset=?8 AND length=?9",
+                params![record.row_id.as_str(), plan.artifact().id.as_str(), plan.artifact().generation.as_str(), record.replacement.offset() as i64, record.replacement.length() as i64,
+                    source.id.as_str(), source.generation.as_str(), record.expected.offset() as i64, record.expected.length() as i64],
+            )?;
+            moved += changed;
+            if changed == 1 {
+                moved_bytes += span.length;
+            }
+            #[cfg(test)]
+            if self.fail_publication_after == Some(index + 1) {
+                transaction.execute(
+                    "INSERT INTO row_ids(id) VALUES(?1)",
+                    [record.row_id.as_str()],
+                )?;
+            }
+            #[cfg(not(test))]
+            let _ = index;
+        }
+        enqueue_cleanup(&transaction, plan, plan.temporary_path())?;
+        retire_if_unreferenced(&transaction, source)?;
+        if moved == 0 {
+            retire_if_unreferenced(&transaction, plan.artifact())?;
+        }
+        let source_retired: bool = transaction.query_row(
+            "SELECT state='retired' FROM artifacts WHERE id=?1 AND generation=?2",
+            params![source.id.as_str(), source.generation.as_str()],
+            |row| row.get(0),
+        )?;
+        transaction.commit()?;
+        let copied_bytes: u64 = artifact.spans().iter().map(|span| span.length).sum();
+        Ok(RelocationOutcome::Applied {
+            moved,
+            lost: records.len() - moved,
+            moved_bytes,
+            lost_bytes: copied_bytes - moved_bytes,
+            source_retired,
+        })
     }
 
     fn delete(&mut self, id: &StorageToken, location: &Location) -> Result<DeleteOutcome> {
@@ -687,6 +1226,17 @@ impl Actor {
                 claim.generation().as_str()
             ],
         )?;
+        if finished && changed == 1 {
+            let releasable: bool = transaction.query_row(
+                "SELECT state='retired' AND NOT EXISTS(SELECT 1 FROM cleanup WHERE artifact_id=?1 AND artifact_generation=?2)
+                 AND NOT EXISTS(SELECT 1 FROM records WHERE artifact_id=?1 AND artifact_generation=?2)
+                 FROM artifacts WHERE id=?1 AND generation=?2",
+                params![claim.artifact().id.as_str(), claim.artifact().generation.as_str()], |row| row.get(0),
+            )?;
+            if releasable {
+                set_charge(&transaction, claim.artifact(), 0)?;
+            }
+        }
         transaction.commit()?;
         Ok(changed == 1)
     }
@@ -697,6 +1247,171 @@ fn validate_limit(limit: usize) -> Result<()> {
         return Err("page limit must be 1..=256".into());
     }
     Ok(())
+}
+
+fn checkpoint(connection: &Connection) -> Result<()> {
+    connection.busy_timeout(std::time::Duration::ZERO)?;
+    let result = connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+    });
+    connection.busy_timeout(std::time::Duration::from_secs(5))?;
+    let (busy, log, checkpointed): (i64, i64, i64) = result?;
+    if busy != 0 || log != 0 || checkpointed != 0 {
+        return Err("packing checkpoint did not produce a self-contained image".into());
+    }
+    Ok(())
+}
+
+fn set_charge(
+    transaction: &Transaction<'_>,
+    artifact: &ArtifactIdentity,
+    charge: u64,
+) -> Result<()> {
+    let old: i64 = transaction.query_row(
+        "SELECT charge_bytes FROM artifacts WHERE id=?1 AND generation=?2",
+        params![artifact.id.as_str(), artifact.generation.as_str()],
+        |row| row.get(0),
+    )?;
+    if charge > nonnegative(old)? {
+        return Err("artifact charge cannot grow after admission".into());
+    }
+    transaction.execute(
+        "UPDATE packing_state SET charged_bytes=charged_bytes-?1 WHERE singleton=1",
+        [old - charge as i64],
+    )?;
+    transaction.execute(
+        "UPDATE artifacts SET charge_bytes=?3 WHERE id=?1 AND generation=?2",
+        params![
+            artifact.id.as_str(),
+            artifact.generation.as_str(),
+            charge as i64
+        ],
+    )?;
+    Ok(())
+}
+
+fn validate_relocation(artifact: &DurableArtifact, records: &[RelocateRecord]) -> Result<()> {
+    if records.is_empty()
+        || records.len() > MAX_RECORDS
+        || records.len() != artifact.spans().len()
+        || artifact.plan().kind() != ArtifactKind::Segment
+        || artifact.physical_length() > artifact.plan().max_length()
+    {
+        return Err("invalid relocation receipt geometry".into());
+    }
+    let source = records[0].expected.artifact();
+    let mut ids = BTreeSet::new();
+    for (record, span) in records.iter().zip(artifact.spans()) {
+        record.expected.validate()?;
+        record.replacement.validate()?;
+        if !ids.insert(record.row_id.as_str())
+            || record.expected.kind() != ArtifactKind::Segment
+            || record.expected.artifact() != source
+            || source == artifact.plan().artifact()
+            || record.replacement.kind() != ArtifactKind::Segment
+            || record.replacement.artifact() != artifact.plan().artifact()
+            || record.replacement.offset() != span.offset
+            || record.replacement.length() != span.length
+            || record.expected.length() != span.length
+            || span
+                .offset
+                .checked_add(span.length)
+                .is_none_or(|end| end > artifact.physical_length())
+        {
+            return Err("relocation does not match exact source and durable spans".into());
+        }
+    }
+    Ok(())
+}
+
+fn gc_candidate(
+    connection: &Connection,
+    artifact: &ArtifactIdentity,
+) -> Result<Option<GcCandidate>> {
+    let physical: Option<i64> = connection.query_row(
+        "SELECT physical_length FROM artifacts WHERE id=?1 AND generation=?2 AND kind='segment' AND state='live'",
+        params![artifact.id.as_str(), artifact.generation.as_str()], |row| row.get(0),
+    ).optional()?;
+    let Some(physical) = physical else {
+        return Ok(None);
+    };
+    let physical_length = nonnegative(physical)?;
+    let (count, payload): (i64, i64) = connection.query_row(
+        "SELECT count(*),coalesce(sum(length),0) FROM records WHERE artifact_id=?1 AND artifact_generation=?2",
+        params![artifact.id.as_str(), artifact.generation.as_str()], |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let count = nonnegative(count)?;
+    if count > MAX_RECORDS as u64 {
+        return Err("segment reference count exceeds hard bound".into());
+    }
+    let retained_length = SEGMENT_HEADER_LENGTH
+        .checked_add(count * RECORD_HEADER_LENGTH)
+        .and_then(|length| length.checked_add(nonnegative(payload).ok()?))
+        .ok_or("segment retained geometry overflow")?;
+    let dead = physical_length
+        .checked_sub(retained_length)
+        .ok_or("segment references exceed physical geometry")?;
+    if count == 0 || dead < physical_length.div_ceil(2) {
+        return Ok(None);
+    }
+    Ok(Some(GcCandidate {
+        artifact: artifact.clone(),
+        physical_length,
+        retained_length,
+        records: count as usize,
+    }))
+}
+
+fn gc_candidates(
+    connection: &Connection,
+    after: Option<&StorageToken>,
+    limit: usize,
+) -> Result<CandidatePage> {
+    // Bound examined rows first; filtering only eligible rows in SQL would hide unbounded work.
+    let mut statement = connection
+        .prepare("SELECT id,generation FROM artifacts WHERE id>?1 ORDER BY id LIMIT ?2")?;
+    let identities = statement
+        .query_map(
+            params![after.map_or("", StorageToken::as_str), limit as i64],
+            |row| {
+                Ok(ArtifactIdentity {
+                    id: token(row.get(0)?)?,
+                    generation: token(row.get(1)?)?,
+                })
+            },
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut candidates = Vec::new();
+    for artifact in &identities {
+        if let Some(candidate) = gc_candidate(connection, artifact)? {
+            candidates.push(candidate);
+        }
+    }
+    Ok(CandidatePage {
+        candidates,
+        after: identities.last().map(|identity| identity.id.clone()),
+        examined: identities.len(),
+    })
+}
+
+fn artifact_records(
+    connection: &Connection,
+    artifact: &ArtifactIdentity,
+) -> Result<Vec<PublishedRecord>> {
+    let mut statement = connection.prepare(
+        "SELECT row_id,key,encoded_sha256,encoded_length,logical_size,format,locked,is_current,artifact_id,artifact_generation,location_kind,offset,length,compression,cipher
+         FROM records WHERE artifact_id=?1 AND artifact_generation=?2 ORDER BY offset LIMIT 257",
+    )?;
+    let records = statement
+        .query_map(
+            params![artifact.id.as_str(), artifact.generation.as_str()],
+            decode_record,
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if records.len() > MAX_RECORDS {
+        return Err("segment reference count exceeds hard bound".into());
+    }
+    Ok(records)
 }
 
 fn validate_publication(artifact: &DurableArtifact, records: &[PublishRecord]) -> Result<()> {
@@ -978,6 +1693,8 @@ fn stats(connection: &Connection) -> Result<StoreStats> {
         locked: count("SELECT count(*) FROM records WHERE locked=1")?,
         pending: count("SELECT count(*) FROM artifacts WHERE state='pending'")?,
         cleanup: count("SELECT count(*) FROM cleanup")?,
+        physical_charge: count("SELECT charged_bytes FROM packing_state WHERE singleton=1")?,
+        physical_limit: count("SELECT limit_bytes FROM packing_state WHERE singleton=1")?,
     })
 }
 
@@ -1040,16 +1757,26 @@ CREATE INDEX cleanup_claimable ON cleanup(claim_token,id);
 COMMIT;
 ";
 
+// The 4A laboratory schema remains unchanged; existing images gain conservative accounting.
+const MIGRATION_2: &str = "
+BEGIN IMMEDIATE;
+ALTER TABLE artifacts ADD COLUMN charge_bytes INTEGER NOT NULL DEFAULT 0 CHECK(charge_bytes>=0);
+ALTER TABLE packing_state ADD COLUMN charged_bytes INTEGER NOT NULL DEFAULT 0 CHECK(charged_bytes>=0);
+ALTER TABLE packing_state ADD COLUMN limit_bytes INTEGER NOT NULL DEFAULT 9223372036854775807 CHECK(limit_bytes>=0 AND charged_bytes<=limit_bytes);
+UPDATE artifacts SET charge_bytes=CASE WHEN state='retired' AND NOT EXISTS(SELECT 1 FROM cleanup WHERE artifact_id=artifacts.id AND artifact_generation=artifacts.generation) THEN 0 ELSE coalesce(physical_length,max_length) END;
+UPDATE packing_state SET schema_version=2,charged_bytes=(SELECT coalesce(sum(charge_bytes),0) FROM artifacts) WHERE singleton=1;
+COMMIT;
+";
+
 #[cfg(test)]
 mod tests {
     use super::super::record::{CleanupResult, publish_file, publish_segment};
     use super::*;
     use cairn_types::CompressionDescriptor;
     use std::io::{Cursor, Read};
-    use std::sync::atomic::{AtomicBool, Ordering};
 
     fn open(root: &Path) -> Store {
-        Store::open(root, Arc::new(())).unwrap()
+        Store::open(Node::open(root).unwrap(), PhysicalBudget::default()).unwrap()
     }
 
     fn records(artifact: &DurableArtifact, keys: &[&str]) -> Vec<PublishRecord> {
@@ -1127,6 +1854,25 @@ mod tests {
         assert!(
             matches!(store.publish(artifact, updates).await.unwrap(), PublicationOutcome::Applied { records } if records == expected)
         );
+    }
+
+    fn relocation_records(
+        source: &[PublishedRecord],
+        artifact: &DurableArtifact,
+    ) -> Vec<RelocateRecord> {
+        source
+            .iter()
+            .zip(artifact.spans())
+            .map(|(old, span)| RelocateRecord {
+                row_id: old.metadata.row_id.clone(),
+                expected: old.location.clone(),
+                replacement: Location::Segment {
+                    artifact: artifact.plan().artifact().clone(),
+                    offset: span.offset,
+                    length: span.length,
+                },
+            })
+            .collect()
     }
 
     async fn reject(
@@ -1269,7 +2015,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn encrypted_crnb_history_keeps_exact_interpretation_after_reopen() {
+    async fn encrypted_crnb_locked_history_relocates_without_changing_interpretation() {
         let key = super::super::model::encryption_test_key();
         use cairn_types::testing::{FixtureBlobStore, fixture_storage_io};
         use cairn_types::{
@@ -1302,8 +2048,11 @@ mod tests {
         let encoded = std::fs::read(source.path().join(staged.storage_path.as_str())).unwrap();
         let root = tempfile::tempdir().unwrap();
         let store = open(root.path());
-        let (artifact, mut updates) =
-            file(&store, root.path(), "encrypted-history", &encoded).await;
+        let garbage = vec![b'g'; 8192];
+        let length = record::segment_length([encoded.len() as u64, garbage.len() as u64]).unwrap();
+        let admission = store.plan(ArtifactKind::Segment, length).await.unwrap();
+        let artifact = publish_segment(root.path(), admission, &[&encoded, &garbage]).unwrap();
+        let mut updates = records(&artifact, &["encrypted-history", "garbage"]);
         updates[0].metadata.format = EncodedFormat::Crnb;
         updates[0].metadata.compression = staged.compression;
         updates[0].metadata.cipher = CipherFormat::AuthenticatedV3;
@@ -1311,6 +2060,14 @@ mod tests {
         updates[0].metadata.locked = true;
         apply(&store, artifact, updates).await;
         let first = store.lookup("encrypted-history").await.unwrap().unwrap();
+        let garbage = store.lookup("garbage").await.unwrap().unwrap();
+        assert_eq!(
+            store
+                .delete(&garbage.metadata.row_id, &garbage.location)
+                .await
+                .unwrap(),
+            DeleteOutcome::Applied
+        );
         let (artifact, mut updates) =
             file(&store, root.path(), "encrypted-history", b"new head").await;
         updates[0].expected = ExpectedCurrent::Exact {
@@ -1319,6 +2076,33 @@ mod tests {
         };
         updates[0].preserve_previous = true;
         apply(&store, artifact, updates).await;
+        let source = store
+            .pin_gc(first.location.artifact())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(source.records.len(), 1);
+        assert!(!source.records[0].is_current);
+        let admission = store
+            .plan(ArtifactKind::Segment, source.candidate.retained_length)
+            .await
+            .unwrap();
+        let artifact =
+            record::copy_segment(root.path(), admission, &source.pin, &source.records).unwrap();
+        let relocations = relocation_records(&source.records, &artifact);
+        let relocated = relocations[0].replacement.clone();
+        assert!(matches!(
+            store.relocate(artifact, relocations).await.unwrap(),
+            RelocationOutcome::Applied {
+                moved: 1,
+                lost: 0,
+                source_retired: true,
+                ..
+            }
+        ));
+        drop(source);
+        drain(&store, root.path()).await;
+        assert!(!root.path().join(first.location.path()).exists());
         store.close().await.unwrap();
         let store = open(root.path());
         let pinned = store
@@ -1328,7 +2112,7 @@ mod tests {
             .unwrap();
         assert!(!pinned.record.is_current);
         assert_eq!(pinned.record.metadata, first.metadata);
-        assert_eq!(pinned.record.location, first.location);
+        assert_eq!(pinned.record.location, relocated);
         let mut reader = cairn_blob::compress::CompressedReader::open_with_dek(
             pinned.pin,
             BlobCipher::AuthenticatedV3(key.clone()),
@@ -1380,10 +2164,299 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn relocation_sql_error_rolls_back_locations_charges_and_retirement() {
+        let root = tempfile::tempdir().unwrap();
+        let store = open(root.path());
+        let garbage = vec![b'g'; 4096];
+        let data: [&[u8]; 3] = [b"first", b"second", &garbage];
+        let length = record::segment_length(data.iter().map(|bytes| bytes.len() as u64)).unwrap();
+        let admission = store.plan(ArtifactKind::Segment, length).await.unwrap();
+        let artifact = publish_segment(root.path(), admission, &data).unwrap();
+        let updates = records(&artifact, &["a", "b", "garbage"]);
+        apply(&store, artifact, updates).await;
+        let garbage = store.lookup("garbage").await.unwrap().unwrap();
+        store
+            .delete(&garbage.metadata.row_id, &garbage.location)
+            .await
+            .unwrap();
+        let before = [
+            store.lookup("a").await.unwrap().unwrap(),
+            store.lookup("b").await.unwrap().unwrap(),
+        ];
+        let source = store
+            .pin_gc(before[0].location.artifact())
+            .await
+            .unwrap()
+            .unwrap();
+        let admission = store
+            .plan(ArtifactKind::Segment, source.candidate.retained_length)
+            .await
+            .unwrap();
+        let artifact =
+            record::copy_segment(root.path(), admission, &source.pin, &source.records).unwrap();
+        let attempt = artifact.plan().clone();
+        let relocations = relocation_records(&source.records, &artifact);
+        let stats = store.stats().await.unwrap();
+        store
+            .request(|reply| Command::FailPublicationAfter(Some(1), reply))
+            .await
+            .unwrap();
+        assert!(store.relocate(artifact, relocations).await.is_err());
+        store
+            .request(|reply| Command::FailPublicationAfter(None, reply))
+            .await
+            .unwrap();
+        assert_eq!(store.stats().await.unwrap(), stats);
+        for record in before {
+            assert_eq!(
+                store.get_version(&record.metadata.row_id).await.unwrap(),
+                Some(record)
+            );
+        }
+        assert_eq!(store.pending(None, 1).await.unwrap(), vec![attempt.clone()]);
+        drop(source);
+        store.close().await.unwrap();
+        let store = open(root.path());
+        assert!(store.recover_pending(attempt).await.unwrap());
+        drain(&store, root.path()).await;
+        assert_eq!(store.stats().await.unwrap().physical_charge, length);
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn physical_quota_retains_every_alias_until_exact_cleanup_finishes() {
+        let root = tempfile::tempdir().unwrap();
+        let node = Node::open(root.path()).unwrap();
+        let budget = PhysicalBudget { limit_bytes: 100 };
+        let store = Store::open(node.clone(), budget).unwrap();
+        let admission = store.plan(ArtifactKind::File, 80).await.unwrap();
+        assert!(store.plan(ArtifactKind::File, 21).await.is_err());
+        assert_eq!(store.stats().await.unwrap().physical_charge, 80);
+        let artifact = publish_file(root.path(), admission, &mut Cursor::new([b'x'; 20])).unwrap();
+        let updates = records(&artifact, &["a"]);
+        apply(&store, artifact, updates).await;
+        assert_eq!(store.stats().await.unwrap().physical_charge, 20);
+        let first = store.lookup("a").await.unwrap().unwrap();
+        store
+            .delete(&first.metadata.row_id, &first.location)
+            .await
+            .unwrap();
+        assert!(store.plan(ArtifactKind::File, 81).await.is_err());
+        let mut claims = store.claim_cleanup(2).await.unwrap();
+        // Settle the final file before the leftover temporary alias.
+        claims.sort_by_key(|claim| claim.path().to_string_lossy().starts_with('.'));
+        let mut claims = claims.into_iter();
+        let claim = claims.next().unwrap();
+        let CleanupResult::Removed(receipt) = record::cleanup(root.path(), claim).unwrap() else {
+            panic!("unexpected pin");
+        };
+        assert!(store.finish_cleanup(receipt).await.unwrap());
+        assert_eq!(store.stats().await.unwrap().physical_charge, 20);
+        let CleanupResult::Removed(receipt) =
+            record::cleanup(root.path(), claims.next().unwrap()).unwrap()
+        else {
+            panic!("unexpected pin");
+        };
+        assert!(store.finish_cleanup(receipt).await.unwrap());
+        assert_eq!(store.stats().await.unwrap().physical_charge, 0);
+        let admission = store.plan(ArtifactKind::File, 90).await.unwrap();
+        let pending = admission.plan().clone();
+        drop(admission);
+        store.close().await.unwrap();
+        let store = Store::open(node, budget).unwrap();
+        assert_eq!(store.stats().await.unwrap().physical_charge, 90);
+        assert!(store.recover_pending(pending).await.unwrap());
+        let claims = store.claim_cleanup(2).await.unwrap();
+        for (index, claim) in claims.into_iter().enumerate() {
+            let CleanupResult::Removed(receipt) = record::cleanup(root.path(), claim).unwrap()
+            else {
+                panic!("unexpected pin");
+            };
+            assert!(store.finish_cleanup(receipt).await.unwrap());
+            assert_eq!(
+                store.stats().await.unwrap().physical_charge,
+                if index == 0 { 90 } else { 0 }
+            );
+        }
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn busy_checkpoint_cannot_authorize_an_offline_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let node = Node::open(root.path()).unwrap();
+        let store = Store::open(node.clone(), PhysicalBudget::default()).unwrap();
+        let clone = store.clone();
+        let reader = Connection::open(root.path().join("packing.sqlite3")).unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        reader
+            .query_row("SELECT count(*) FROM packing_state", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        drop(store.plan(ArtifactKind::File, 0).await.unwrap());
+        assert!(store.close().await.is_err());
+        assert!(node.offline().is_err());
+        assert_eq!(clone.stats().await.unwrap().pending, 1);
+        reader.execute_batch("ROLLBACK").unwrap();
+        drop(reader);
+        store.close().await.unwrap();
+        assert!(clone.stats().await.is_err());
+        let image = OfflineView::open(node.offline().unwrap()).unwrap();
+        assert_eq!(image.artifact_page(None, 1).unwrap().len(), 1);
+        assert!(image.record_page(None, 1).unwrap().is_empty());
+        assert!(Store::open(node.clone(), PhysicalBudget::default()).is_err());
+        assert!(Node::open(root.path()).is_err());
+        drop(image);
+        let store = Store::open(node, PhysicalBudget::default()).unwrap();
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn v1_images_migrate_conservative_pending_charges_without_rewriting_v1() {
+        let root = tempfile::tempdir().unwrap();
+        let connection = Connection::open(root.path().join("packing.sqlite3")).unwrap();
+        connection.execute_batch(SCHEMA).unwrap();
+        let generation = StorageToken::generate();
+        let artifact = ArtifactIdentity {
+            id: StorageToken::generate(),
+            generation: generation.clone(),
+        };
+        connection
+            .execute(
+                "INSERT INTO packing_state VALUES(1,1,?1)",
+                [generation.as_str()],
+            )
+            .unwrap();
+        connection.execute("INSERT INTO artifacts(id,generation,kind,max_length,state) VALUES(?1,?2,'file',75,'pending')", params![artifact.id.as_str(), generation.as_str()]).unwrap();
+        drop(connection);
+        let node = Node::open(root.path()).unwrap();
+        assert!(Store::open(node.clone(), PhysicalBudget { limit_bytes: 74 }).is_err());
+        let store = Store::open(node, PhysicalBudget { limit_bytes: 100 }).unwrap();
+        assert_eq!(store.stats().await.unwrap().physical_charge, 75);
+        let plan = store.pending(None, 1).await.unwrap().pop().unwrap();
+        assert_eq!(plan.artifact(), &artifact);
+        assert!(store.recover_pending(plan).await.unwrap());
+        drain(&store, root.path()).await;
+        assert_eq!(store.stats().await.unwrap().physical_charge, 0);
+        store.close().await.unwrap();
+    }
+
+    #[test]
+    fn partial_restore_without_database_cannot_boot_an_empty_store() {
+        let root = tempfile::tempdir().unwrap();
+        let node = Node::open(root.path()).unwrap();
+        let partial = root.path().join(".restore-metadata.sqlite3");
+        std::fs::write(&partial, b"owned incomplete restore").unwrap();
+        assert!(Store::open(node, PhysicalBudget::default()).is_err());
+        assert!(!root.path().join("packing.sqlite3").exists());
+        assert_eq!(std::fs::read(partial).unwrap(), b"owned incomplete restore");
+    }
+
+    #[tokio::test]
+    async fn hard_linked_database_is_refused_before_sqlite_changes_either_root() {
+        let source = tempfile::tempdir().unwrap();
+        let store = open(source.path());
+        store.close().await.unwrap();
+        let original = source.path().join("packing.sqlite3");
+        let before = std::fs::read(&original).unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let alias = destination.path().join("packing.sqlite3");
+        std::fs::hard_link(&original, &alias).unwrap();
+        let node = Node::open(destination.path()).unwrap();
+        assert!(Store::open(node, PhysicalBudget::default()).is_err());
+        assert_eq!(std::fs::read(&original).unwrap(), before);
+        assert_eq!(std::fs::read(&alias).unwrap(), before);
+        let original_metadata = std::fs::metadata(&original).unwrap();
+        let alias_metadata = std::fs::metadata(&alias).unwrap();
+        assert_eq!(original_metadata.nlink(), 2);
+        assert_eq!(original_metadata.ino(), alias_metadata.ino());
+        for root in [source.path(), destination.path()] {
+            assert!(!root.join("packing.sqlite3-wal").exists());
+            assert!(!root.join("packing.sqlite3-shm").exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn hard_linked_sqlite_sidecars_are_refused_without_modifying_aliases() {
+        for name in [
+            "packing.sqlite3-wal",
+            "packing.sqlite3-shm",
+            "packing.sqlite3-journal",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let store = open(root.path());
+            store.close().await.unwrap();
+            let database = root.path().join("packing.sqlite3");
+            let database_before = std::fs::read(&database).unwrap();
+            let unrelated = tempfile::tempdir().unwrap();
+            let original = unrelated.path().join("owned-by-another-node");
+            std::fs::write(&original, b"must not truncate or recover this alias").unwrap();
+            let alias = root.path().join(name);
+            std::fs::hard_link(&original, &alias).unwrap();
+            assert!(
+                Store::open(Node::open(root.path()).unwrap(), PhysicalBudget::default()).is_err()
+            );
+            assert_eq!(std::fs::read(&database).unwrap(), database_before);
+            assert_eq!(
+                std::fs::read(&original).unwrap(),
+                b"must not truncate or recover this alias"
+            );
+            assert_eq!(
+                std::fs::read(&alias).unwrap(),
+                b"must not truncate or recover this alias"
+            );
+            assert_eq!(std::fs::metadata(&original).unwrap().nlink(), 2);
+            assert_eq!(
+                std::fs::metadata(&alias).unwrap().ino(),
+                std::fs::metadata(&original).unwrap().ino()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn owned_database_and_existing_wal_recover_committed_pending_ownership() {
+        let source = tempfile::tempdir().unwrap();
+        let store = open(source.path());
+        let admission = store.plan(ArtifactKind::File, 75).await.unwrap();
+        let plan = admission.plan().clone();
+        drop(admission);
+        let restored = tempfile::tempdir().unwrap();
+        // No actor commands run during this copy. Preserve a committed WAL image before
+        // clean source shutdown checkpoints it, including its owned shared-memory file.
+        for name in [
+            "packing.sqlite3",
+            "packing.sqlite3-wal",
+            "packing.sqlite3-shm",
+        ] {
+            std::fs::copy(source.path().join(name), restored.path().join(name)).unwrap();
+        }
+        assert!(
+            std::fs::metadata(restored.path().join("packing.sqlite3-wal"))
+                .unwrap()
+                .len()
+                > 0
+        );
+        store.close().await.unwrap();
+        let store = open(restored.path());
+        assert_eq!(store.pending(None, 1).await.unwrap(), vec![plan.clone()]);
+        assert_eq!(store.stats().await.unwrap().physical_charge, 75);
+        assert!(store.recover_pending(plan).await.unwrap());
+        drain(&store, restored.path()).await;
+        assert_eq!(store.stats().await.unwrap().physical_charge, 0);
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn stale_receipt_and_duplicate_row_identity_cannot_publish() {
         let root = tempfile::tempdir().unwrap();
         let store = open(root.path());
-        let (artifact, updates) = file(&store, root.path(), "a", b"stale").await;
+        let mut admission = store.plan(ArtifactKind::File, 5).await.unwrap();
+        // Manufacture an old wire receipt independently of the live node capability.
+        // Real returned receipts retain the active session and prevent this reopen.
+        admission.lifetime = Arc::new(());
+        let artifact = publish_file(root.path(), admission, &mut Cursor::new(b"stale")).unwrap();
+        let updates = records(&artifact, &["a"]);
         let stale_plan = artifact.plan().clone();
         store.close().await.unwrap();
         let store = open(root.path());
@@ -1455,7 +2528,9 @@ mod tests {
         let store = open(root.path());
         let admission = store.plan(ArtifactKind::File, 0).await.unwrap();
         assert!(store.abort(record::abort(admission)).await.unwrap());
-        let old = store.claim_cleanup(1).await.unwrap().pop().unwrap();
+        let mut old = store.claim_cleanup(1).await.unwrap().pop().unwrap();
+        // A retransmitted token has no live I/O lease. Actual claims block generation reuse.
+        old.lifetime = Arc::new(());
         let old_copy = duplicate_claim(&old);
         store.close().await.unwrap();
         let store = open(root.path());
@@ -1536,37 +2611,31 @@ mod tests {
         store.close().await.unwrap();
     }
 
-    struct Lifetime(Arc<AtomicBool>);
-    impl Drop for Lifetime {
-        fn drop(&mut self) {
-            self.0.store(true, Ordering::SeqCst);
-        }
-    }
-
     #[tokio::test]
     async fn node_lifetime_survives_actor_shutdown_until_pinned_reader_finishes() {
         let root = tempfile::tempdir().unwrap();
-        let dropped = Arc::new(AtomicBool::new(false));
-        let store = Store::open(root.path(), Arc::new(Lifetime(dropped.clone()))).unwrap();
+        let node = Node::open(root.path()).unwrap();
+        let store = Store::open(node.clone(), PhysicalBudget::default()).unwrap();
         let (artifact, updates) = file(&store, root.path(), "a", b"owned").await;
         apply(&store, artifact, updates).await;
         let pinned = store.pin("a").await.unwrap().unwrap();
         store.close().await.unwrap();
-        assert!(!dropped.load(Ordering::SeqCst));
+        assert!(node.offline().is_err());
+        assert!(Store::open(node.clone(), PhysicalBudget::default()).is_err());
         drop(pinned);
-        assert!(dropped.load(Ordering::SeqCst));
+        assert!(node.offline().is_ok());
     }
 
     #[tokio::test]
     async fn node_lifetime_survives_a_returned_admission_after_actor_shutdown() {
         let root = tempfile::tempdir().unwrap();
-        let dropped = Arc::new(AtomicBool::new(false));
-        let store = Store::open(root.path(), Arc::new(Lifetime(dropped.clone()))).unwrap();
+        let node = Node::open(root.path()).unwrap();
+        let store = Store::open(node.clone(), PhysicalBudget::default()).unwrap();
         let admission = store.plan(ArtifactKind::File, 0).await.unwrap();
         store.close().await.unwrap();
-        assert!(!dropped.load(Ordering::SeqCst));
+        assert!(node.offline().is_err());
         drop(admission);
-        assert!(dropped.load(Ordering::SeqCst));
+        assert!(node.offline().is_ok());
     }
 
     #[tokio::test]
@@ -1611,9 +2680,9 @@ mod tests {
         store.close().await.unwrap();
         let connection = Connection::open(root.path().join("packing.sqlite3")).unwrap();
         connection
-            .execute("UPDATE packing_state SET schema_version=2", [])
+            .execute("UPDATE packing_state SET schema_version=3", [])
             .unwrap();
-        assert!(Store::open(root.path(), Arc::new(())).is_err());
+        assert!(Store::open(Node::open(root.path()).unwrap(), PhysicalBudget::default()).is_err());
         let found: String = connection
             .query_row("SELECT generation FROM packing_state", [], |row| row.get(0))
             .unwrap();
