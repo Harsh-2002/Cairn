@@ -316,3 +316,19 @@ acknowledgement; deterministic response-boundary regressions and the rebuilt pri
 pending-kernel-write SIGKILL fixture pass. Fifteen terminal-cleanup verifier tests pass.
 The prior web/audit/installer results apply to their unchanged source and dependency inputs.
 New-head CI and the predeclared cost comparison remain pending; no additional experiment ran.
+
+At `0de5b69`, all 54 CI checks completed: 52 passed and two failed. The full-filesystem test
+now passes. The standalone laboratory compile exposed crate-specific test helper imports in the
+source-included coalescer regression; using standard file-lock methods fixes the test without
+adding a dependency. Its local gate passes eight fanout/coalescer tests, two layer-driver fixtures
+and 50 Python tests (two optional live fixtures skipped).
+
+The mixed-feature soak had zero operation errors, byte mismatches or leak-shape violations, but
+its unchanged 30-second cleanup deadline caught a quota-attachment race: a newly attached quota
+owner invalidated the old receipt while leaving its 60-second claim lease in place. Ownership
+changes now invalidate that entire claim tuple atomically for immediate retry, while unchanged
+ownership preserves valid claims. Shared regressions require retries before lease expiry after
+both supersession and terminal abort, preserving the charge until every alias is durably absent.
+The focused nine-case backend/topology and unchanged-claim contracts pass, together with all
+322 owning tests and both complete workspace Clippy configurations. Full workspace tests and
+new-head CI remain pending. Neither rejected candidate was measured; the campaign is unchanged.

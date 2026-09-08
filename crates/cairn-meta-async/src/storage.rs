@@ -602,7 +602,8 @@ async fn enqueue_owned(
 }
 
 /// Transfer all unfinished aliases to the existing byte charge when a part reference disappears.
-/// An outstanding claim with `quota_debt_id=None` becomes stale and cannot retire the new debt.
+/// Changed ownership invalidates the old claim and immediately permits a fresh exact claim;
+/// retaining its lease would delay quota retirement even after physical cleanup succeeds.
 pub async fn link_quota(db: &DB<'_>, bucket: &BucketName, path: &StoragePath, debt: &str) -> R<()> {
     let conflicts = q(db, "SELECT 1 FROM storage_cleanups WHERE quota_owner_path=?1 AND (bucket_name<>?2 OR (quota_debt_id IS NOT NULL AND quota_debt_id<>?3)) LIMIT 1",
         vec![text(path.as_str()),text(bucket.as_str()),text(debt)]).await?;
@@ -611,7 +612,7 @@ pub async fn link_quota(db: &DB<'_>, bucket: &BucketName, path: &StoragePath, de
     }
     x(
         db,
-        "UPDATE storage_cleanups SET quota_debt_id=?2 WHERE quota_owner_path=?1",
+        "UPDATE storage_cleanups SET quota_debt_id=?2,claim_token=NULL,claim_generation=NULL,lease_until=NULL WHERE quota_owner_path=?1 AND quota_debt_id IS NOT ?2",
         vec![text(path.as_str()), text(debt)],
     )
     .await?;
@@ -713,6 +714,67 @@ mod tests {
     use cairn_types::storage::PlannedStorageWrite;
     use cairn_types::storage::io::StorageIoWatch;
     use std::sync::Arc;
+
+    async fn matching_quota_preserves_claim(db: &DB<'_>) {
+        crate::schema::run_migrations(db).await.unwrap();
+        let bucket = BucketName::parse("storage-relinked-claim").unwrap();
+        let generation = StorageToken::generate();
+        let owner = StoragePath::from_string(".staging/multipart/00000000000000000000000000000000/00001-11111111111111111111111111111111".into());
+        let alias =
+            StoragePath::from_string(".staging/22222222222222222222222222222222.index.tmp".into());
+        begin(db, &generation).await.unwrap();
+        enqueue_owned(db, &bucket, &alias, None, Some(&owner))
+            .await
+            .unwrap();
+        link_quota(db, &bucket, &owner, "debt").await.unwrap();
+        let MutationOutcome::StorageCleanupBatch(batch) =
+            claim(db, &generation, 100, Timestamp(0), 60).await.unwrap()
+        else {
+            panic!("cleanup batch expected");
+        };
+        assert_eq!(batch.len(), 2);
+        link_quota(db, &bucket, &owner, "debt").await.unwrap();
+        assert_eq!(
+            claim(db, &generation, 100, Timestamp(1), 60).await.unwrap(),
+            MutationOutcome::StorageCleanupBatch(Vec::new())
+        );
+        for cleanup in batch {
+            assert_eq!(
+                apply(
+                    db,
+                    &bucket,
+                    StorageMutation::FinishCleanup {
+                        cleanup,
+                        now: Timestamp(2)
+                    }
+                )
+                .await
+                .unwrap(),
+                MutationOutcome::StorageUpdated { applied: true }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn libsql_matching_quota_preserves_cleanup_claim() {
+        let db = libsql::Builder::new_local(":memory:")
+            .build()
+            .await
+            .unwrap();
+        let driver = crate::libsql_driver::LibsqlDriver::new(db.connect().unwrap());
+        matching_quota_preserves_claim(&driver).await;
+    }
+
+    #[tokio::test]
+    async fn turso_matching_quota_preserves_cleanup_claim() {
+        let db = turso::Builder::new_local(":memory:")
+            .experimental_vacuum(true)
+            .build()
+            .await
+            .unwrap();
+        let driver = crate::turso_driver::TursoDriver::new(db.connect().unwrap());
+        matching_quota_preserves_claim(&driver).await;
+    }
 
     async fn corruption_contract(db: &DB<'_>) {
         crate::schema::run_migrations(db).await.unwrap();

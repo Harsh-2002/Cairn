@@ -145,7 +145,9 @@ buffers, even if the awaiting caller has already been cancelled.
 
 Protocol-2 storage state matches schema v36 and v37 across the double, SQLite, libSQL, Turso and
 shard routing. Cleanup survives bucket/session deletion, excludes live references and outstanding
-intents, and retains multipart quota until every linked alias is durably reclaimed. Cancellation
+intents, and retains multipart quota until every linked alias is durably reclaimed. A newly
+attached quota owner invalidates the alias's old claim/lease for immediate retry; an unchanged
+owner preserves its claim. Cancellation
 closes child-lease admission; only a drained ownership set creates a quiescence proof. Coverage
 remains incomplete and startup retains full scans; neither the traits nor test helpers enable
 Phase 3D recovery.

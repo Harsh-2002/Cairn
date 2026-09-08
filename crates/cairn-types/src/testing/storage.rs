@@ -261,7 +261,10 @@ fn link_quota_inner(
         if &row.bucket != bucket || row.quota.as_ref().is_some_and(|id| id != debt) {
             return Err(invalid("conflicting multipart alias quota"));
         }
-        row.quota = Some(debt.to_owned());
+        if row.quota.as_deref() != Some(debt) {
+            row.quota = Some(debt.to_owned());
+            row.claim = None;
+        }
     }
     journal.exact_quota_debts.insert(debt.to_owned());
     enqueue_owned(
@@ -550,4 +553,47 @@ pub(super) fn claim(
         batch.push(cleanup);
     }
     Ok(MutationOutcome::StorageCleanupBatch(batch))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn matching_quota_preserves_cleanup_claim() {
+        let mut st = State::default();
+        let bucket = BucketName::parse("storage-relinked-claim").unwrap();
+        let generation = StorageToken::generate();
+        let owner = StoragePath::from_string(".staging/multipart/00000000000000000000000000000000/00001-11111111111111111111111111111111".into());
+        let alias =
+            StoragePath::from_string(".staging/22222222222222222222222222222222.index.tmp".into());
+        begin(&mut st, generation.clone());
+        enqueue_owned(&mut st.storage, &bucket, &alias, None, Some(owner.clone())).unwrap();
+        link_quota_inner(&mut st.storage, &bucket, &owner, "debt").unwrap();
+        let MutationOutcome::StorageCleanupBatch(batch) =
+            claim(&mut st, &generation, 100, Timestamp(0), 60).unwrap()
+        else {
+            panic!("cleanup batch expected");
+        };
+        assert_eq!(batch.len(), 2);
+        link_quota_inner(&mut st.storage, &bucket, &owner, "debt").unwrap();
+        assert_eq!(
+            claim(&mut st, &generation, 100, Timestamp(1), 60).unwrap(),
+            MutationOutcome::StorageCleanupBatch(Vec::new())
+        );
+        for cleanup in batch {
+            assert_eq!(
+                apply(
+                    &mut st,
+                    &bucket,
+                    StorageMutation::FinishCleanup {
+                        cleanup,
+                        now: Timestamp(2)
+                    }
+                )
+                .unwrap(),
+                MutationOutcome::StorageUpdated { applied: true }
+            );
+        }
+    }
 }

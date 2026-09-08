@@ -179,7 +179,8 @@ mod tests {
         impl Wake for Probe {
             fn wake(self: Arc<Self>) {
                 let directory = crate::open_readonly_nofollow(&self.directory).unwrap();
-                crate::try_lock_exclusive(&directory)
+                directory
+                    .try_lock()
                     .expect("completed directory fences must be gone before acknowledgement wake");
                 assert!(
                     self.watch
@@ -211,7 +212,7 @@ mod tests {
             // Separate open descriptions model callers which independently prepared this same
             // directory: dropping one waiter must not leave another completed waiter's fence.
             let file = crate::open_readonly_nofollow(dir.path()).unwrap();
-            rustix::fs::flock(&file, rustix::fs::FlockOperation::LockShared).unwrap();
+            file.lock_shared().unwrap();
             let metadata = file.metadata().unwrap();
             let (done, mut receiver) = oneshot::channel();
             assert!(

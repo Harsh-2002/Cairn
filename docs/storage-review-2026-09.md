@@ -100,3 +100,13 @@ its owned loop device, mount and image were removed, and the original loop inven
 This still proves the observed exclusion through process teardown, not physical power-loss
 behavior or an observed post-exit kernel-reference window. The combined workspace gate passes 1,403 default-feature and 1,429 all-feature tests, two
 doctests, formatting and both all-target Clippy configurations. Final-head CI remains required.
+
+The next CI pass (`0de5b69`) found no operation errors or byte-integrity violations in the mixed
+soak, but one spool alias's quota debt exceeded the original 30-second deadline. Attaching a quota
+owner correctly invalidated its old acknowledgement, yet preserved the old 60-second claim
+lease. The Writer now clears that claim only when ownership changes, so a fresh fenced cleanup
+can retry immediately. Regression coverage requires immediate retry after part supersession and
+terminal abort, rejects old and duplicate acknowledgements, retains quota until alias cleanup,
+and preserves valid claims on unchanged ownership across every backend and the double. The
+standalone lab's source-included coalescer regression now uses standard file-lock methods and
+passes its compile/tests without a new dependency. Final-head CI remains required.

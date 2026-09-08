@@ -641,7 +641,8 @@ fn enqueue_owned(
 }
 
 /// Transfer all unfinished aliases to the existing byte charge when a part reference disappears.
-/// An outstanding claim with `quota_debt_id=None` becomes stale and cannot retire the new debt.
+/// Changed ownership invalidates the old claim and immediately permits a fresh exact claim;
+/// retaining its lease would delay quota retirement even after physical cleanup succeeds.
 pub fn link_quota(db: &DB, bucket: &BucketName, path: &StoragePath, debt: &str) -> R<()> {
     let conflicts = q(
         db,
@@ -653,7 +654,7 @@ pub fn link_quota(db: &DB, bucket: &BucketName, path: &StoragePath, debt: &str) 
     }
     x(
         db,
-        "UPDATE storage_cleanups SET quota_debt_id=?2 WHERE quota_owner_path=?1",
+        "UPDATE storage_cleanups SET quota_debt_id=?2,claim_token=NULL,claim_generation=NULL,lease_until=NULL WHERE quota_owner_path=?1 AND quota_debt_id IS NOT ?2",
         vec![text(path.as_str()), text(debt)],
     )?;
     enqueue_owned(db, bucket, path, Some(debt), Some(path))
@@ -755,6 +756,48 @@ mod tests {
     use cairn_types::storage::PlannedStorageWrite;
     use cairn_types::storage::io::StorageIoWatch;
     use std::sync::Arc;
+
+    fn matching_quota_preserves_claim(db: &DB) {
+        crate::schema::run_migrations(db).unwrap();
+        let bucket = BucketName::parse("storage-relinked-claim").unwrap();
+        let generation = StorageToken::generate();
+        let owner = StoragePath::from_string(".staging/multipart/00000000000000000000000000000000/00001-11111111111111111111111111111111".into());
+        let alias =
+            StoragePath::from_string(".staging/22222222222222222222222222222222.index.tmp".into());
+        begin(db, &generation).unwrap();
+        enqueue_owned(db, &bucket, &alias, None, Some(&owner)).unwrap();
+        link_quota(db, &bucket, &owner, "debt").unwrap();
+        let MutationOutcome::StorageCleanupBatch(batch) =
+            claim(db, &generation, 100, Timestamp(0), 60).unwrap()
+        else {
+            panic!("cleanup batch expected");
+        };
+        assert_eq!(batch.len(), 2);
+        link_quota(db, &bucket, &owner, "debt").unwrap();
+        assert_eq!(
+            claim(db, &generation, 100, Timestamp(1), 60).unwrap(),
+            MutationOutcome::StorageCleanupBatch(Vec::new())
+        );
+        for cleanup in batch {
+            assert_eq!(
+                apply(
+                    db,
+                    &bucket,
+                    StorageMutation::FinishCleanup {
+                        cleanup,
+                        now: Timestamp(2)
+                    }
+                )
+                .unwrap(),
+                MutationOutcome::StorageUpdated { applied: true }
+            );
+        }
+    }
+
+    #[test]
+    fn sqlite_matching_quota_preserves_cleanup_claim() {
+        matching_quota_preserves_claim(&DB::open_in_memory().unwrap());
+    }
 
     async fn corruption_contract(db: &DB) {
         crate::schema::run_migrations(db).unwrap();

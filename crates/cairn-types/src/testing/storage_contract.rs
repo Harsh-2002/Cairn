@@ -691,8 +691,23 @@ async fn assert_storage_multipart_quota(meta: &dyn MetadataStore) {
         meta.submit(reserve_part(&third)).await,
         Err(crate::MetaError::QuotaExceeded)
     ));
-    let debts = claim(meta, &generation, 100, 2).await;
-    assert_eq!(debts.len(), 2);
+    let mut debts = claim(meta, &generation, 100, 2).await;
+    assert_eq!(debts.len(), 3);
+    let alias_index = debts
+        .iter()
+        .position(|row| row.path == old_alias.path)
+        .unwrap();
+    let alias = debts.remove(alias_index);
+    assert_eq!(alias.id, old_alias.id);
+    assert_ne!(alias.claim_token, old_alias.claim_token);
+    assert!(alias.quota_debt_id.is_some());
+    assert!(Timestamp(2) < old_alias.lease_until);
+    assert!(claim(meta, &generation, 100, 2).await.is_empty());
+    let terminal_alias_index = debts
+        .iter()
+        .position(|row| row.quota_debt_id.is_none())
+        .unwrap();
+    let terminal_alias = debts.remove(terminal_alias_index);
     for cleanup in debts {
         update(
             meta,
@@ -712,17 +727,12 @@ async fn assert_storage_multipart_quota(meta: &dyn MetadataStore) {
         ),
         "unlinking the part must not forgive its unsynchronized spool alias"
     );
-    let mut debts = claim(meta, &generation, 100, 100_000).await;
-    assert_eq!(debts.len(), 1);
-    let alias = debts.remove(0);
-    assert_eq!(alias.path, old_alias.path);
-    assert!(alias.quota_debt_id.is_some());
     update(
         meta,
         &bucket,
         StorageMutation::FinishCleanup {
-            cleanup: alias,
-            now: Timestamp(100_001),
+            cleanup: alias.clone(),
+            now: Timestamp(4),
         },
         true,
     )
@@ -731,27 +741,63 @@ async fn assert_storage_multipart_quota(meta: &dyn MetadataStore) {
         meta.submit(reserve_part(&third)).await.unwrap(),
         MutationOutcome::StorageAdmission(StorageAdmission::Granted(_))
     ));
+    update(
+        meta,
+        &bucket,
+        StorageMutation::FinishCleanup {
+            cleanup: alias,
+            now: Timestamp(5),
+        },
+        false,
+    )
+    .await;
+    let another_upload = create_upload(meta, &bucket).await;
+    let another_part = part_plan(&bucket, &generation, &another_upload);
+    assert!(matches!(
+        meta.submit(reserve_part(&another_part)).await,
+        Err(crate::MetaError::QuotaExceeded)
+    ));
+    meta.submit(Mutation::AbortMultipart(another_upload))
+        .await
+        .unwrap();
     // Abort converts both the live part and the active reservation without releasing either charge.
     meta.submit(Mutation::AbortMultipart(upload)).await.unwrap();
+    update(
+        meta,
+        &bucket,
+        StorageMutation::FinishCleanup {
+            cleanup: terminal_alias.clone(),
+            now: Timestamp(6),
+        },
+        false,
+    )
+    .await;
     assert_eq!(
         meta.submit(Mutation::RecoverMultipartStagingAccounting { limit: 100 })
             .await
             .unwrap(),
         MutationOutcome::MultipartAccountingReleased(0)
     );
-    let debts = claim(meta, &generation, 100, 100_002).await;
+    let debts = claim(meta, &generation, 100, 7).await;
     assert_eq!(
         debts.len(),
-        1,
+        2,
         "active part intent must still protect all of its aliases"
     );
+    let reclaimed_alias = debts
+        .iter()
+        .find(|row| row.path == terminal_alias.path)
+        .unwrap();
+    assert_ne!(reclaimed_alias.claim_token, terminal_alias.claim_token);
+    assert!(reclaimed_alias.quota_debt_id.is_some());
+    assert!(Timestamp(7) < terminal_alias.lease_until);
     for cleanup in debts {
         update(
             meta,
             &bucket,
             StorageMutation::FinishCleanup {
                 cleanup,
-                now: Timestamp(100_003),
+                now: Timestamp(8),
             },
             true,
         )
@@ -769,7 +815,7 @@ async fn assert_storage_multipart_quota(meta: &dyn MetadataStore) {
         true,
     )
     .await;
-    let debts = claim(meta, &generation, 100, 100_004).await;
+    let debts = claim(meta, &generation, 100, 9).await;
     assert_eq!(debts.len(), 2);
     assert_eq!(debts[0].quota_debt_id, debts[1].quota_debt_id);
     for cleanup in debts {
@@ -778,13 +824,13 @@ async fn assert_storage_multipart_quota(meta: &dyn MetadataStore) {
             &bucket,
             StorageMutation::FinishCleanup {
                 cleanup,
-                now: Timestamp(100_005),
+                now: Timestamp(10),
             },
             true,
         )
         .await;
     }
-    assert!(claim(meta, &generation, 100, 100_006).await.is_empty());
+    assert!(claim(meta, &generation, 100, 11).await.is_empty());
 }
 
 fn completion_plan(

@@ -123,6 +123,9 @@ raises reader/writer protocol floors to 2, and preserves flat placement/full sta
 Schema v37 adds indexed upload/reservation identity and `quota_owner_path` so unfinished multipart
 aliases follow their final part's sole v26 charge after replacement or terminal removal. All linked
 cleanup rows must retire, and no intent may protect the charged path, before that charge is freed.
+Attaching new quota ownership to a claimed alias invalidates its entire claim tuple immediately;
+stale acknowledgements remain rejected without forcing retry to wait for the old lease. Repeating
+the same quota attachment preserves its current claim. Mirror this in every implementation.
 Legacy cleanup release mutations exclude protocol-2 debts; existing protocol-1 charges are not
 forgiven by migration.
 

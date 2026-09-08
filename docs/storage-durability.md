@@ -58,6 +58,11 @@ barrier. The Writer retires debt and associated quota only after durable absence
 unexpired acknowledgement. Unknown siblings survive; filesystem errors and stale acknowledgements
 retain debt. Request abort and multipart termination do not authorize recursive session deletion.
 
+When multipart termination or replacement attaches quota debt to an already-claimed scratch alias,
+the Writer invalidates that obsolete claim and its lease in the same savepoint. A fresh claim may
+retry immediately; the old acknowledgement remains rejected, and bytes stay charged until the new
+claim proves durable absence. Reattaching the same quota owner preserves an existing valid claim.
+
 Store construction also requires a maintenance `StorageIoLease` retaining the actual exclusive
 node guard. Initialization executes in a leased blocking job, so cancelling construction cannot
 release exclusion ahead of directory creation or synchronization. Serving and offline recovery
