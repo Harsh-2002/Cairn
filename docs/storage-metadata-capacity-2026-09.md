@@ -132,7 +132,8 @@ A retained WAL reader regression requires busy checkpoint attempts to remain eli
 and verifies truncation after reader release. Seed failure closes fresh admission and drains all
 started owners. The coordinator reads final process CPU after exit and before reaping.
 These are correctness checks, not the 100,000-row capacity experiment or a Writer-limit finding.
-The integrated full repository and final-head CI gates remain pending.
+The integrated full repository gate and all 54 final-head CI checks passed; Phase 5 is merged
+in PR #97. The later shared-runner and candidate fixtures are recorded in the final comparison.
 
 Process RSS includes the in-process generator and observation buffers as well as SQLite and
 the runtime. Each worker has at most eighteen pairs of fixed 2,048-bin histograms (589,824 bytes

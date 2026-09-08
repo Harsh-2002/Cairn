@@ -19,8 +19,8 @@ specification. Experiments may correctly conclude **retain the current design**.
 - [x] Complete 3A–3D in order, obtaining the required architectural decision before changing
   the storage-lifecycle protocol and retaining full reconciliation until activation qualifies.
 - [x] Complete the isolated 4A–4C packing evaluation and record its adoption decision.
-- [ ] Complete 5A–5C and publish the supported metadata decision.
-- [ ] Verify the final integration and results record; remove owned temporary artifacts and
+- [x] Complete 5A–5C and publish the supported metadata decision.
+- [x] Verify the final integration and results record; remove owned temporary artifacts and
   merged worktrees/branches, leaving `main` and `website`.
 
 ### Phase acceptance
@@ -100,16 +100,16 @@ specification. Experiments may correctly conclude **retain the current design**.
   Gains must survive overwrite/delete/GC; protect large streaming/ranges. No qualifying threshold
   means retain files. A passing candidate produces a separately reviewed production-format,
   migration/recovery and contract proposal; no automatic production connection.
-- [ ] **5A: real metadata capacity**. FULL-durability Writer traces, including adopted journal
+- [x] **5A: real metadata capacity**. FULL-durability Writer traces, including adopted journal
   costs. Start at 100,000 rows; approach 1 million only within budget. Versions/markers,
   conditions, parts, prefix/delimiter LIST and cleanup/outbox; hot and distributed buckets.
   Separate DB/index/WAL size, service time, throughput, p99, cache and recovery measurements.
-- [ ] **5B: conditional alternative evaluation**. Capability comparison of SQLite, libSQL/Turso,
+- [x] **5B: conditional alternative evaluation**. Capability comparison of SQLite, libSQL/Turso,
   redb, Fjall and RocksDB. Only if SQLite's isolated service demand demonstrably limits the
   workload, test pinned transactional Fjall first with equivalent durability, ordered keys and
   conditional semantics. RocksDB is research-only absent a separate allowance. Never compare
   raw KV insertion with complete Cairn transactions.
-- [ ] **5C: metadata decision**. KEEP SQLite without a demonstrated bottleneck/qualifying gain.
+- [x] **5C: metadata decision**. KEEP SQLite without a demonstrated bottleneck/qualifying gain.
   Laboratory speed alone cannot authorize replacement: complete semantic, migration/restore
   parity and the human architectural decision are required. Bucket sharding is not a hot-bucket
   solution and does not acquire native backup support through this phase.
@@ -479,3 +479,19 @@ The complete campaign charged **1,415.415082 seconds**, including **496.775609 m
 with **1,778,102,272 bytes** recorded peak and no active reservation. All owned measurement data,
 processes and raw artifacts were removed after verified archive export. No retry or new budget.
 All local gates pass; final-head CI and merge remain required before checking Phase 5 delivery.
+
+Phase 5A–5C merged in PR #97 as `30d1f64` after all 54 checks passed for
+`bd9999e455c75a653893ca7fa874ad4fef84392f`; final reviews, inline comments and open branch
+code-scanning alerts were empty. The final integrated local gate and all live laboratory fixtures
+passed. All five approved phases are delivered: bounded encoding/index handling and exact durable
+storage lifecycle accounting are production changes; fanout, packing and alternative metadata
+engines remain laboratory evaluations. Production retains individual files, mandatory full startup
+scans and SQLite. The metadata evidence establishes the declared hot-bucket Writer service limit,
+not a universal full-S3 or pure-SQLite-computation bottleneck. The Fjall comparison ended before
+paired loads; no replacement benefit is claimed.
+
+The campaign ended at **1,415.415082 / 3,600 seconds** and **1,778,102,272 /
+100,000,000,000 bytes** recorded peak combined footprint. Original measurement datasets,
+processes and raw working artifacts are removed; checked raw archives and source/result records
+remain tracked. The implementation worktrees and merged branches were removed, leaving `main`
+and `website` before this completion-record branch. No release was created or published.
