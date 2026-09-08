@@ -76,4 +76,4 @@ snapshot integrity rebinding, allocation headroom, SQLite hardlink/sidecar refus
 owned-WAL recovery. All 76 standalone Rust tests and all 70 Python tests pass with every live
 fixture enabled. The full workspace gate passes 1,466 default and 1,492 all-feature tests, both
 Clippy configurations and two doctests. These are fixed correctness fixtures; no comparative
-packing measurement has run. Final-head CI remains required.
+packing measurement has run. All 54 final-head checks passed at `706d700`; PR #95 merged as `ea553fc`.

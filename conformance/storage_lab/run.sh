@@ -10,6 +10,10 @@ if [ "${1-}" = recovery-cost ]; then
     shift
     exec python3 "$LAB_SCRIPT_DIR/recovery.py" "$@"
 fi
+if [ "${1-}" = packing-measure ]; then
+    shift
+    exec python3 "$LAB_SCRIPT_DIR/packing_measure.py" "$@"
+fi
 if [ "${1-}" = packing ]; then
     shift
     exec python3 "$LAB_SCRIPT_DIR/packing.py" "$@"

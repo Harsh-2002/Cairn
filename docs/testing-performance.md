@@ -150,3 +150,10 @@ Beyond the writer tuning of Section 30.2, a sequence of optimizations removes pe
 One roadmap item remains unrealized and is documented here for honesty. Concurrent multi-writer execution via the Turso engine's `BEGIN CONCURRENT`/MVCC is blocked by the pinned Turso version, which parses the syntax but exposes no supported way to enable MVCC; it remains a future option gated on a Turso release that surfaces the feature. (A separate second metadata database for the high-churn best-effort tables was deprioritized: under the `synchronous=NORMAL` posture there is no per-commit fsync for a second stream to parallelize, and sharding already gives disjoint buckets independent writers.)
 
 ---
+
+Phase 4C extends the isolated packing fixture through exact overwrite/delete, half-dead segment
+collection, complete cleanup, survivor/range verification, offline snapshot and fresh restore.
+The ordinary CI driver runs tiny versions of this whole pipeline. Only a separately admitted,
+complete paired comparison with the predeclared controls may produce a packing threshold
+proposal; production object placement and native backup remain unchanged. See
+[the packing comparison](storage-packing-measurement-2026-09.md).
