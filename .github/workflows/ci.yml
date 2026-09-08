@@ -47,6 +47,26 @@ permissions:
   contents: read
 
 jobs:
+  storage-lab:
+    name: storage laboratory safety and driver regressions
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: ./.github/actions/setup
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: cairn-bin
+          path: target/debug
+      - name: Test laboratory accounting and actual layer fixtures
+        run: |
+          chmod +x target/debug/cairn
+          shellcheck -s sh conformance/storage_lab/run.sh
+          LAB_TEST_SERVER="$PWD/target/debug/cairn" python3 -m unittest discover -s conformance/storage_lab -p 'test_*.py' -v
+          cargo fmt --manifest-path conformance/storage_lab/Cargo.toml --check
+          cargo clippy --locked --manifest-path conformance/storage_lab/Cargo.toml --all-targets -- -D warnings
+          cargo test --locked --manifest-path conformance/storage_lab/Cargo.toml
+
   # Runs before any package installer and encodes the release trust boundary: immutable actions,
   # tools and images; exact job permissions; checksum/provenance handoffs before publication.
   release-policy:
@@ -119,6 +139,7 @@ jobs:
           tar -xzf "$archive" -C "$RUNNER_TEMP"
       - run: |
           "${RUNNER_TEMP}/cargo-audit-x86_64-unknown-linux-musl-v0.22.2/cargo-audit" audit
+          "${RUNNER_TEMP}/cargo-audit-x86_64-unknown-linux-musl-v0.22.2/cargo-audit" audit --file conformance/storage_lab/Cargo.lock
 
   installer:
     name: installer lint + generation regressions
@@ -1004,6 +1025,7 @@ jobs:
       - stress-replication
       - soak-features
       - blob-limits
+      - storage-lab
     if: always()
     runs-on: ubuntu-24.04
     permissions:

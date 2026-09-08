@@ -1,0 +1,32 @@
+[workspace]
+
+[package]
+name = "cairn-storage-lab"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+cairn-blob = { path = "../../crates/cairn-blob" }
+cairn-meta = { path = "../../crates/cairn-meta" }
+cairn-types = { path = "../../crates/cairn-types" }
+bytes = "1.9"
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1.43", features = ["rt-multi-thread", "macros", "time", "sync"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+debug = 2
+strip = false
+lto = "thin"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
