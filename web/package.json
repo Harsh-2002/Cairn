@@ -10,7 +10,7 @@
     "e2e": "node scripts/console-e2e.mjs",
     "preview": "vite preview",
     "lint": "eslint . && node scripts/browser-path-regression.mjs",
-    "test:performance": "node scripts/console-performance.mjs"
+    "test:performance": "node --test scripts/chrome-startup.test.mjs && node scripts/console-performance.mjs"
   },
   "dependencies": {
     "@fontsource/geist-mono": "^5.2.8",
