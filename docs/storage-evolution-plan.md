@@ -16,7 +16,7 @@ specification. Experiments may correctly conclude **retain the current design**.
 - [x] Implement 1C, including authenticated page reuse, prepared-reader handoff and reservation
   ownership; validate and integrate its independent PR.
 - [x] Complete 2A–2B with the persistent campaign ledger and bounded attribution evidence.
-- [ ] Complete 3A–3D in order, obtaining the required architectural decision before changing
+- [x] Complete 3A–3D in order, obtaining the required architectural decision before changing
   the storage-lifecycle protocol and retaining full reconciliation until activation qualifies.
 - [ ] Complete the isolated 4A–4C packing evaluation and record its adoption decision.
 - [ ] Complete 5A–5C and publish the supported metadata decision.
@@ -76,7 +76,7 @@ specification. Experiments may correctly conclude **retain the current design**.
   otherwise preserve intent until exclusive restart. Reuse recovery consumers/sweepers. Cover
   PUT/Copy, import/replication, part/complete/abort, lifecycle and admin deletion across all SQL
   backends, doubles, typed results and shard routing. Measure the extra durable PUT admission.
-- [ ] **3D: offline baseline and recovery activation**. Under the node lock, classify every legacy
+- [x] **3D: offline baseline and recovery activation decision** — PRs #92/#93 merged; retain full startup scans. Under the node lock, classify every legacy
   artifact as live or durable debt before recording coverage. Interrupted scans cannot publish
   completion. Fence old process attempts before readiness; page unfinished work, preserve live
   references and retain exact quota debt. Snapshot/restore journals and use a fresh process
@@ -421,3 +421,20 @@ error. The fixture now generates a fresh key and the refusal prints a constant a
 message. The topology gate is unchanged. The complete Rust gate passed again: 1,466 default and 1,492 all-feature tests,
 both Clippy configurations, doctests and standalone lab checks. Corrected-head CI remains pending. The measured implementation remains `cc542fd`; these diagnostic/test-only fixes do
 not rewrite that historical source identity or create another campaign measurement.
+
+PR #93's corrected head `31436a52d0e2f79b23e5dd5c23a3fd59b7e33c5d` passed all 54 CI checks.
+The final review contained only the two earlier, now-remediated CodeQL comments; the corrected
+branch scan had zero open alerts. It merged as `eb4823341b37795847d4a3e3f6cfce06a3bdb57e`.
+Its owned branch/worktree are removed. Phase 3 is complete with full startup scans retained.
+
+Phase 4A starts from that merged main. The isolated packing binary has one bounded builder,
+explicit immutable locations, a FULL SQLite actor, exact durable publication/cleanup receipts,
+reader descriptor pins and persisted trusted compression/cipher declarations. Its 37 Rust tests
+and all-target Clippy pass under Rust 1.97.1. Twelve coordinator tests pass, including real tiny
+files, packed and unknown-length fixtures; all owned test data/processes are removed. Web
+lint/build/audits, dependency audits, installer and workflow-policy checks pass. The complete
+workspace gate passed, including 1,466 default and 1,492 all-feature tests, both Clippy
+configurations, two doctests and all 47 standalone Rust lab tests. All 70 Python lab tests pass
+with every live fixture enabled (24.628 seconds). Final-head CI and merge remain required. Collection/snapshot/restore
+and paired adoption gates remain 4B/4C. No packing measurement has run, so campaign consumption
+remains **592.146171 seconds / 571,154,432 bytes recorded peak**.

@@ -333,6 +333,10 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
   coordinator with persistent runtime/space accounting and owned process groups. Its README is the
   entry point. `run.sh fanout` compares raw namespace publication and actual BlobStore traversal
   under predeclared paired gates; partial workload matrices cannot select fanout.
+  The isolated `cairn-packing-lab` binary models immutable files/segments, bounded publication
+  ownership and an independent FULL SQLite actor. Its small `LAB_TEST_PACKING_DRIVER` fixture
+  runs in normal CI; `run.sh packing` is a charged single-arm diagnostic, not an adoption gate.
+  See `docs/storage-packing-2026-09.md` for its boundary and remaining collection/restore gates.
   Use one campaign ledger across phases; fixed correctness fixtures run in CI, while
   actual measurements require an explicit prebuilt binary and owned `/SSD` root. Do not run older
   unconstrained drivers as a substitute or infer performance from the correctness fixtures.

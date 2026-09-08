@@ -179,3 +179,16 @@ snapshots, restored data, metadata/WAL, command observations and cleanup share o
 Exact row/byte verification and cleanup success are diagnostic results; this descriptive screen
 cannot activate journal-only startup. Full scans remain mandatory.
 `LAB_TEST_RECOVERY_SERVER` enables its fixed eight-object correctness fixture.
+
+## Isolated packing prototype
+
+`cairn-packing-lab` is the phase 4 laboratory, with a separate bounded SQLite actor and
+explicit immutable file/segment locations. It is not linked into the Cairn server.
+`run.sh packing` runs one diagnostic arm with an explicit prebuilt binary and charges the
+shared campaign ledger before preparation. The coordinator records admission peaks, publication
+count/sum/maximum latency, artifact counts, readback and cleanup. One arm cannot select packing.
+Build with `cargo build --locked --release --manifest-path conformance/storage_lab/Cargo.toml
+--bin cairn-packing-lab`. `LAB_TEST_PACKING_DRIVER` enables the tiny files/packing/unknown-length
+correctness fixture in the ordinary Python suite and CI. See
+[`storage-packing-2026-09.md`](../../docs/storage-packing-2026-09.md) for the prototype boundary and
+remaining collection, restore and comparison gates.

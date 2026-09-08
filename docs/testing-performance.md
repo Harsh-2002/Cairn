@@ -84,6 +84,11 @@ admission until recovery establishes quiescence. CI tests these mechanisms with 
 fixtures, including real metadata/blob operations and signed S3; these tests do not establish
 performance. See its README and `storage-evolution-plan.md` for commands, reservations, remaining
 attribution gaps and the independent adoption gates. No laboratory dependency enters `cairn`.
+The isolated packing driver also checks raw/CRNB record interpretation, exact immutable
+locations, FULL SQLite publication, conditional/history/lock preservation, bounded builder
+admission and retained reader/I/O ownership. `LAB_TEST_PACKING_DRIVER` enables its tiny real
+coordinator fixture in CI. Collection, snapshot/restore and paired adoption remain separately
+gated; see `storage-packing-2026-09.md`.
 Phase 3B uses the actual BlobStore for reads/deletion/reconciliation and a raw publisher that
 compiles the production directory-sync coordinator. Adoption requires the full predeclared
 paired workload matrix; single-case runs cannot qualify. See `storage-fanout-2026-09.md`.

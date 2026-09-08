@@ -10,6 +10,10 @@ publish = false
 name = "cairn-fanout-lab"
 path = "src/fanout.rs"
 
+[[bin]]
+name = "cairn-packing-lab"
+path = "src/packing.rs"
+
 [dependencies]
 cairn-blob = { path = "../../crates/cairn-blob" }
 cairn-meta = { path = "../../crates/cairn-meta" }
@@ -17,8 +21,11 @@ cairn-types = { path = "../../crates/cairn-types", features = ["testing"] }
 async-trait = "0.1"
 bytes = "1.9"
 futures-util = "0.3"
+rusqlite = { version = "=0.32.1", features = ["bundled"] }
+rustix = { version = "=1.1.4", features = ["fs"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "=0.10.9"
 tokio = { version = "1.43", features = ["rt-multi-thread", "macros", "time", "sync"] }
 
 [dev-dependencies]
