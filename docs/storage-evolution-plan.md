@@ -146,3 +146,8 @@ only `main` and `website` at final handoff. Never delete unrelated data or share
 
 2026-09-08: implementation started. Phase 1A active; performance budget used **0 seconds / 0 bytes**.
 No benchmark corpus or server has been started.
+
+Phase 1A: [PR #81](https://github.com/Harsh-2002/Cairn/pull/81) opened. Blob tests: 85 default,
+88 all-feature tests passed (two benchmarks ignored). The preflight regression fails on baseline
+`e38bc6c` and passes with the fix. S3 size-rejection/retry regression passes with the existing
+HTTP 400 `EntityTooLarge` response. Final-head CI and review are pending; no merge claimed.

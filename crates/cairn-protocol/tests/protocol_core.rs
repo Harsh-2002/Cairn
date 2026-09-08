@@ -2797,7 +2797,7 @@ async fn assembly_size_rejection_preserves_parts_and_releases_completion_claim()
         format!("<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part></CompleteMultipartUpload>").into_bytes())
     };
     let (status, _, body) = drain(send(&limited, complete()).await).await;
-    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(String::from_utf8(body).unwrap().contains("EntityTooLarge"));
     let id = cairn_types::UploadId::from_string(upload_id.clone());
     let parts = h.meta.list_parts(&id, 0, 100).await.unwrap();
@@ -2805,7 +2805,7 @@ async fn assembly_size_rejection_preserves_parts_and_releases_completion_claim()
     assert!(h.blob.probe(&parts.items[0].storage_path).await.is_ok());
     assert!(
         h.meta
-            .get_current(
+            .current_version(
                 &cairn_types::BucketName::parse("size-retry").unwrap(),
                 &cairn_types::ObjectKey::parse("obj").unwrap()
             )
