@@ -55,7 +55,7 @@ specification. Experiments may correctly conclude **retain the current design**.
   Record live allocations, anonymous/file memory, cache use, tasks/threads/descriptors, writer
   stages, filesystem waits and device/host pressure. Three equal load/idle cycles; no RSS-only
   leak claim. Further tuning needs a separate evidence-backed fix and regression.
-- [ ] **3A: compatibility and traversal safeguards**. Future startup rejects unsupported newer
+- [x] **3A: compatibility and traversal safeguards** — merged in PR #86 (`acd396f`). Future startup rejects unsupported newer
   schemas before application mutation, including async backends. Introduce explicit protocol
   compatibility state; preserve flat reads and add bounded safe nested traversal/pruning and
   parent-directory durability coverage. Full startup reconciliation remains active. Existing
@@ -253,5 +253,19 @@ Correctness fixtures are separate from experiments; the campaign ledger is uncha
 owning-crate tests pass with all features (five skipped), including SQLite/libSQL/Turso admission,
 all-shard preflight, snapshot refusal and mixed-layout reconciliation. Web lint/build and both npm
 audits pass with zero vulnerabilities; cargo audit passes with allowed rustls-pemfile maintenance
-and pre-existing chacha20 yanked-version warnings. The full workspace gate and final-commit CI
-remain pending.
+and pre-existing chacha20 yanked-version warnings. The full local gate passed 1,350 workspace
+tests (three skipped), two doctests, both Clippy configurations, web and installer checks. Final
+head `82471d9747814c8388ca6102e31ec21c76da0b65` passed all CI/CodeQL checks without review
+findings; PR #86 merged as `acd396f`, and its branch/worktree are removed.
+
+Phase 3B compares flat and lazy fanout only in the laboratory. Its predeclared workload,
+measurements and adoption gates are in `storage-fanout-2026-09.md`. The driver exercises actual
+BlobStore reads, deletion and reconciliation, with exact generated liveness and survivor checks.
+The raw namespace publisher preserves file/rename/directory durability and compiles the production
+directory-sync coordinator. It does not measure complete S3 PUT or the future lifecycle protocol.
+All 30 measured arms passed exact operation/survivor checks. The comparison is INCONCLUSIVE
+because controls drifted beyond the predeclared 20% span; KEEP flat. No default placement changes
+or promotion PR follow. The shared campaign, including reduction and cleanup, has consumed
+390.191882 seconds (6m30s), with 542,654,464 bytes peak and no active process/data reservation.
+Raw owned run artifacts are removed; compact evidence is in `storage-fanout-2026-09.json`.
+Phase 3B final-commit CI and merge remain pending.

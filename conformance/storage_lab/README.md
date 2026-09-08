@@ -133,3 +133,18 @@ cargo fmt --manifest-path conformance/storage_lab/Cargo.toml --check
 cargo clippy --locked --manifest-path conformance/storage_lab/Cargo.toml --all-targets -- -D warnings
 cargo test --locked --manifest-path conformance/storage_lab/Cargo.toml
 ```
+
+## Flat versus directory fanout
+
+`run.sh fanout` runs `fanout.py` with an explicit `cairn-fanout-lab` binary, charging the existing
+campaign's fanout allowance. Build with `cargo build --locked --release --manifest-path
+conformance/storage_lab/Cargo.toml --bin cairn-fanout-lab` from the repository root. The complete
+command, fixed matrix and predeclared gates are in `../../docs/storage-fanout-2026-09.md`.
+Single-case or single-pair runs cannot qualify for adoption. Raw-file publication measures
+namespace durability; GET/delete/reconciliation use LocalBlobStore. This is not S3 throughput.
+`LAB_TEST_FANOUT_DRIVER` supplies the debug binary to tiny deterministic Python fixtures;
+`cargo test` also checks cancellation/failure cleanup and directory synchronization.
+
+`fanout_report.py --root <campaign> --run <comparison-token>` charges reduction/export and
+produces Markdown plus the full provenance/measurement JSON inside the owned campaign.
+The September comparison retained flat placement after predeclared control-drift checks failed.
