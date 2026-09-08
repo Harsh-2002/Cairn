@@ -3,6 +3,7 @@
 
 use super::model::{
     ArtifactAdmission, ArtifactIdentity, ArtifactKind, ArtifactPlan, CleanupClaim, Location,
+    PublishedRecord,
 };
 use rustix::fs::{AtFlags, Mode, OFlags, RenameFlags, ResolveFlags};
 use sha2::{Digest, Sha256};
@@ -149,11 +150,15 @@ impl std::error::Error for PublishError {}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Barrier {
     Create,
+    Reserve,
+    CopyRead,
     Write,
     FileSync,
     Rename,
     DirectorySync,
     Validate,
+    Unlink,
+    CleanupSync,
 }
 
 #[derive(Default)]
@@ -162,6 +167,10 @@ struct Hooks {
     fail: Option<(Barrier, i32)>,
     #[cfg(test)]
     trace: std::sync::Mutex<Vec<Barrier>>,
+    #[cfg(test)]
+    fail_write_after: Option<usize>,
+    #[cfg(test)]
+    writes: std::sync::atomic::AtomicUsize,
 }
 
 impl Hooks {
@@ -169,6 +178,15 @@ impl Hooks {
         #[cfg(test)]
         {
             self.trace.lock().unwrap().push(barrier);
+            if barrier == Barrier::Write
+                && self.fail_write_after.is_some_and(|after| {
+                    self.writes
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                        >= after
+                })
+            {
+                return Err(io::Error::from_raw_os_error(28));
+            }
             if let Some((failed, error)) = self.fail
                 && failed == barrier
             {
@@ -381,6 +399,108 @@ fn publish_segment_with(
     }
 }
 
+/// Copy already encoded records verbatim, reserving the entire replacement allocation before
+/// reading even the first source payload. The caller owns admission and the source pin through
+/// this synchronous job and the subsequent Writer relocation result.
+pub fn copy_segment(
+    root: &Path,
+    admission: ArtifactAdmission,
+    source: &PinnedSegment,
+    records: &[PublishedRecord],
+) -> Result<DurableArtifact, PublishError> {
+    copy_segment_with(root, admission, source, records, &Hooks::default())
+}
+
+fn copy_segment_with(
+    root_path: &Path,
+    admission: ArtifactAdmission,
+    source: &PinnedSegment,
+    records: &[PublishedRecord],
+    hooks: &Hooks,
+) -> Result<DurableArtifact, PublishError> {
+    let result = (|| {
+        let plan = admission.plan();
+        let physical_length =
+            segment_length(records.iter().map(|record| record.location.length()))?;
+        if plan.kind() != ArtifactKind::Segment
+            || physical_length > plan.max_length()
+            || source.root_identity()? != admission.root_identity()
+        {
+            return Err(invalid(
+                "replacement does not match its admitted root or byte bound",
+            ));
+        }
+        let (root, mut file) = create(root_path, &admission, hooks)?;
+        hooks.at(Barrier::Reserve)?;
+        // A sparse set_len or an ignored allocation error does not reserve replacement space.
+        rustix::fs::fallocate(
+            &file,
+            rustix::fs::FallocateFlags::KEEP_SIZE,
+            0,
+            physical_length,
+        )?;
+        let mut header = [0; SEGMENT_HEADER_LEN as usize];
+        header[..8].copy_from_slice(MAGIC);
+        header[8..40].copy_from_slice(plan.artifact().id.as_str().as_bytes());
+        header[40..72].copy_from_slice(plan.artifact().generation.as_str().as_bytes());
+        header[72..76].copy_from_slice(&(records.len() as u32).to_le_bytes());
+        let mut hash = Sha256::new();
+        write_hashed(&mut file, &mut hash, &header, hooks)?;
+        let mut offset = SEGMENT_HEADER_LEN;
+        let mut spans = Vec::with_capacity(records.len());
+        let mut scratch = [0; SCRATCH_LENGTH];
+        for record in records {
+            let length = record.location.length();
+            if length != record.metadata.encoded_length {
+                return Err(invalid("source record length differs from metadata"));
+            }
+            let expected = record.metadata.encoded_sha256;
+            let mut reader = source.record(&record.location, expected)?;
+            let mut prefix = [0; RECORD_HEADER_LEN as usize];
+            prefix[..8].copy_from_slice(&length.to_le_bytes());
+            prefix[8..].copy_from_slice(&expected);
+            write_hashed(&mut file, &mut hash, &prefix, hooks)?;
+            let mut record_hash = Sha256::new();
+            let mut remaining = length;
+            while remaining != 0 {
+                let count = remaining.min(SCRATCH_LENGTH as u64) as usize;
+                hooks.at(Barrier::CopyRead)?;
+                reader.read_exact(&mut scratch[..count])?;
+                record_hash.update(&scratch[..count]);
+                write_hashed(&mut file, &mut hash, &scratch[..count], hooks)?;
+                remaining -= count as u64;
+            }
+            if <[u8; 32]>::from(record_hash.finalize()) != expected {
+                return Err(invalid("collection source hash differs from metadata"));
+            }
+            offset += RECORD_HEADER_LEN;
+            spans.push(DurableSpan {
+                offset,
+                length,
+                sha256: expected,
+            });
+            offset += length;
+        }
+        let sha256 = hash.finalize().into();
+        let (root, file) = finish(root_path, root, file, plan, physical_length, sha256, hooks)?;
+        Ok((root, file, physical_length, sha256, spans))
+    })();
+    match result {
+        Ok((root, file, physical_length, sha256, spans)) => Ok(DurableArtifact {
+            admission: Box::new(admission),
+            physical_length,
+            sha256,
+            spans,
+            root,
+            file,
+        }),
+        Err(error) => Err(PublishError {
+            error,
+            quiescent: abort(admission),
+        }),
+    }
+}
+
 pub fn publish_file(
     root: &Path,
     admission: ArtifactAdmission,
@@ -542,6 +662,15 @@ fn validate_segment(
     physical_length: u64,
     expected_sha256: [u8; 32],
 ) -> io::Result<[u8; 32]> {
+    validate_segment_header(file, identity, physical_length)?;
+    validate_record_prefix(file, offset, length, physical_length, expected_sha256)
+}
+
+fn validate_segment_header(
+    file: &File,
+    identity: &ArtifactIdentity,
+    physical_length: u64,
+) -> io::Result<()> {
     if !(SEGMENT_HEADER_LEN..=MAX_SEGMENT_LENGTH).contains(&physical_length) {
         return Err(invalid("segment physical length exceeds framing bounds"));
     }
@@ -558,6 +687,16 @@ fn validate_segment(
     if !(1..=MAX_SEGMENT_RECORDS).contains(&records) {
         return Err(invalid("segment record count exceeds bounds"));
     }
+    Ok(())
+}
+
+fn validate_record_prefix(
+    file: &File,
+    offset: u64,
+    length: u64,
+    physical_length: u64,
+    expected_sha256: [u8; 32],
+) -> io::Result<[u8; 32]> {
     // SQLite's exact span was matched to the private publication receipt. Read only the
     // selected prefix here; a directory/header inventory must never select a record for us.
     if length > MAX_PACKED_RECORD_LENGTH
@@ -576,6 +715,125 @@ fn validate_segment(
         return Err(invalid("record prefix differs from its trusted metadata"));
     }
     Ok(declared)
+}
+
+/// Whole immutable bytes for an offline snapshot or bounded segment collection. The file is
+/// pinned before its name and trusted physical length are validated, and is never reopened.
+pub struct PinnedArtifact {
+    identity: ArtifactIdentity,
+    kind: ArtifactKind,
+    reader: PinnedRecord,
+}
+
+impl PinnedArtifact {
+    pub fn open(
+        root_path: &Path,
+        identity: &ArtifactIdentity,
+        kind: ArtifactKind,
+        physical_length: u64,
+        lifetime: Arc<dyn Send + Sync>,
+    ) -> io::Result<Self> {
+        let root = open_root(root_path)?;
+        let name = identity.file_name(kind);
+        let file = open_beneath(&root, Path::new(&name), OFlags::RDONLY)?;
+        file.lock_shared()?;
+        if validate_link(&root, Path::new(&name), &file)? != physical_length {
+            return Err(invalid("artifact length differs from trusted metadata"));
+        }
+        if kind == ArtifactKind::Segment {
+            validate_segment_header(&file, identity, physical_length)?;
+        }
+        validate_root_name(root_path, &root)?;
+        Ok(Self {
+            identity: identity.clone(),
+            kind,
+            reader: PinnedRecord {
+                file: Arc::new(file),
+                root: Arc::new(root),
+                _lifetime: lifetime,
+                base: 0,
+                length: physical_length,
+                cursor: 0,
+                declared_sha256: None,
+            },
+        })
+    }
+
+    pub fn root_identity(&self) -> io::Result<(u64, u64)> {
+        self.reader.root_identity()
+    }
+
+    pub fn verify_sha256(&self, expected: [u8; 32]) -> io::Result<()> {
+        self.reader.verify_sha256(expected)
+    }
+}
+
+impl Read for PinnedArtifact {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.reader.read(buffer)
+    }
+}
+
+impl Seek for PinnedArtifact {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        self.reader.seek(position)
+    }
+}
+
+pub struct PinnedSegment {
+    artifact: PinnedArtifact,
+}
+
+impl PinnedSegment {
+    pub fn open(
+        root: &Path,
+        identity: &ArtifactIdentity,
+        physical_length: u64,
+        lifetime: Arc<dyn Send + Sync>,
+    ) -> io::Result<Self> {
+        Ok(Self {
+            artifact: PinnedArtifact::open(
+                root,
+                identity,
+                ArtifactKind::Segment,
+                physical_length,
+                lifetime,
+            )?,
+        })
+    }
+
+    pub fn root_identity(&self) -> io::Result<(u64, u64)> {
+        self.artifact.root_identity()
+    }
+
+    pub fn record(
+        &self,
+        location: &Location,
+        expected_sha256: [u8; 32],
+    ) -> io::Result<PinnedRecord> {
+        if location.artifact() != &self.artifact.identity || location.kind() != self.artifact.kind {
+            return Err(invalid(
+                "record does not belong to the pinned segment generation",
+            ));
+        }
+        let pinned = &self.artifact.reader;
+        let declared_sha256 = validate_record_prefix(
+            &pinned.file,
+            location.offset(),
+            location.length(),
+            pinned.length,
+            expected_sha256,
+        )?;
+        Ok(PinnedRecord {
+            file: pinned.file.clone(),
+            root: pinned.root.clone(),
+            _lifetime: pinned._lifetime.clone(),
+            base: location.offset(),
+            length: location.length(),
+            cursor: 0,
+            declared_sha256: Some(declared_sha256),
+        })
+    }
 }
 
 /// Only the SQLite actor admits stored locations, after matching publication against a private
@@ -668,6 +926,14 @@ impl std::fmt::Display for CleanupError {
 impl std::error::Error for CleanupError {}
 
 pub fn cleanup(root_path: &Path, claim: CleanupClaim) -> Result<CleanupResult, CleanupError> {
+    cleanup_with(root_path, claim, &Hooks::default())
+}
+
+fn cleanup_with(
+    root_path: &Path,
+    claim: CleanupClaim,
+    hooks: &Hooks,
+) -> Result<CleanupResult, CleanupError> {
     let result = (|| {
         let root = open_root(root_path)?;
         let identity = rustix::fs::fstat(&root)?;
@@ -686,8 +952,10 @@ pub fn cleanup(root_path: &Path, claim: CleanupClaim) -> Result<CleanupResult, C
                 Err(std::fs::TryLockError::Error(error)) => return Err(error),
             }
             validate_link(&root, claim.path(), &file)?;
+            hooks.at(Barrier::Unlink)?;
             rustix::fs::unlinkat(&root, basename(claim.path())?, AtFlags::empty())?;
         }
+        hooks.at(Barrier::CleanupSync)?;
         root.sync_all()?;
         validate_root_name(root_path, &root)?;
         Ok(true)
@@ -716,7 +984,11 @@ mod tests {
     use std::io::Cursor;
 
     fn store(root: &Path) -> Store {
-        Store::open(root, Arc::new(())).unwrap()
+        Store::open(
+            super::super::node::Node::open(root).unwrap(),
+            Default::default(),
+        )
+        .unwrap()
     }
 
     async fn segment(root: &Path, store: &Store, records: &[&[u8]]) -> DurableArtifact {
@@ -754,6 +1026,194 @@ mod tests {
             }
         }
         pinned
+    }
+
+    fn source_records(artifact: &DurableArtifact) -> Vec<PublishedRecord> {
+        artifact
+            .spans()
+            .iter()
+            .enumerate()
+            .map(|(index, span)| PublishedRecord {
+                metadata: RecordMetadata {
+                    row_id: cairn_types::storage::StorageToken::generate(),
+                    key: format!("copy-{index}"),
+                    encoded_sha256: span.sha256,
+                    encoded_length: span.length,
+                    logical_size: span.length,
+                    format: EncodedFormat::Raw,
+                    compression: cairn_types::CompressionDescriptor::Uncompressed,
+                    cipher: CipherFormat::Plaintext,
+                    locked: false,
+                },
+                location: location(artifact, index),
+                is_current: true,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn collection_reserves_before_reading_and_streams_unchanged_records() {
+        let root = tempfile::tempdir().unwrap();
+        let store = store(root.path());
+        let data = vec![31; 200_017];
+        let artifact = segment(root.path(), &store, &[&data, b"tail-CRNB"]).await;
+        let records = source_records(&artifact);
+        let source = PinnedSegment::open(
+            root.path(),
+            artifact.plan().artifact(),
+            artifact.physical_length(),
+            artifact.admission.lifetime(),
+        )
+        .unwrap();
+        let length = artifact.physical_length();
+        let admission = store.plan(ArtifactKind::Segment, length).await.unwrap();
+        let hooks = Hooks::default();
+        let replacement =
+            copy_segment_with(root.path(), admission, &source, &records, &hooks).unwrap();
+        assert_eq!(replacement.spans(), artifact.spans());
+        assert_eq!(replacement.physical_length(), artifact.physical_length());
+        {
+            let trace = hooks.trace.lock().unwrap();
+            assert!(
+                trace.iter().position(|stage| *stage == Barrier::Reserve)
+                    < trace.iter().position(|stage| *stage == Barrier::CopyRead)
+            );
+            assert!(
+                trace
+                    .iter()
+                    .filter(|stage| **stage == Barrier::CopyRead)
+                    .count()
+                    >= 5
+            );
+        }
+        let mut pinned = PinnedArtifact::open(
+            root.path(),
+            replacement.plan().artifact(),
+            ArtifactKind::Segment,
+            length,
+            replacement.admission.lifetime(),
+        )
+        .unwrap();
+        pinned.verify_sha256(replacement.sha256()).unwrap();
+        pinned
+            .seek(SeekFrom::Start(replacement.spans()[0].offset))
+            .unwrap();
+        let mut copied = vec![0; data.len()];
+        pinned.read_exact(&mut copied).unwrap();
+        assert_eq!(copied, data);
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn collection_allocation_copy_and_barrier_failures_keep_source_bytes() {
+        // ENOSPC here is injected at the real allocation/write boundary. It is a command-error
+        // model and does not claim a filled-device, process-kill or power-loss experiment.
+        let root = tempfile::tempdir().unwrap();
+        let store = store(root.path());
+        let data = vec![29; 200_017];
+        let artifact = segment(root.path(), &store, &[&data]).await;
+        let records = source_records(&artifact);
+        let source_path = root.path().join(artifact.plan().final_path());
+        let original = std::fs::read(&source_path).unwrap();
+        let source = PinnedSegment::open(
+            root.path(),
+            artifact.plan().artifact(),
+            artifact.physical_length(),
+            artifact.admission.lifetime(),
+        )
+        .unwrap();
+        for stage in [
+            Barrier::Reserve,
+            Barrier::CopyRead,
+            Barrier::FileSync,
+            Barrier::Rename,
+            Barrier::DirectorySync,
+            Barrier::Validate,
+        ] {
+            let admission = store
+                .plan(ArtifactKind::Segment, artifact.physical_length())
+                .await
+                .unwrap();
+            let hooks = Hooks {
+                fail: Some((stage, if stage == Barrier::Reserve { 28 } else { 5 })),
+                ..Default::default()
+            };
+            let failure =
+                copy_segment_with(root.path(), admission, &source, &records, &hooks).unwrap_err();
+            if stage == Barrier::Reserve {
+                assert!(!hooks.trace.lock().unwrap().contains(&Barrier::CopyRead));
+                assert_eq!(failure.error.raw_os_error(), Some(28));
+            }
+            assert!(store.abort(failure.into_parts().1).await.unwrap());
+            assert_eq!(drain(root.path(), &store).await, 0);
+            assert_eq!(std::fs::read(&source_path).unwrap(), original);
+        }
+        let admission = store
+            .plan(ArtifactKind::Segment, artifact.physical_length())
+            .await
+            .unwrap();
+        let hooks = Hooks {
+            fail_write_after: Some(3),
+            ..Default::default()
+        };
+        let failure =
+            copy_segment_with(root.path(), admission, &source, &records, &hooks).unwrap_err();
+        assert_eq!(failure.error.raw_os_error(), Some(28));
+        assert!(hooks.trace.lock().unwrap().contains(&Barrier::CopyRead));
+        assert!(store.abort(failure.into_parts().1).await.unwrap());
+        assert_eq!(drain(root.path(), &store).await, 0);
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&source_path)
+            .unwrap();
+        writer
+            .write_all_at(b"corrupt", artifact.spans()[0].offset)
+            .unwrap();
+        let admission = store
+            .plan(ArtifactKind::Segment, artifact.physical_length())
+            .await
+            .unwrap();
+        let failure = copy_segment(root.path(), admission, &source, &records).unwrap_err();
+        assert!(failure.error.to_string().contains("source hash"));
+        assert!(store.abort(failure.into_parts().1).await.unwrap());
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cleanup_unlink_and_directory_sync_errors_retain_exact_retryable_debt() {
+        for failed in [Barrier::Unlink, Barrier::CleanupSync] {
+            let root = tempfile::tempdir().unwrap();
+            let store = store(root.path());
+            let artifact = segment(root.path(), &store, &[b"obsolete"]).await;
+            let path = artifact.plan().final_path().to_owned();
+            assert!(store.abort(artifact.into_quiescent()).await.unwrap());
+            let mut final_claim = None;
+            for claim in store.claim_cleanup(32).await.unwrap() {
+                if claim.path() == path {
+                    final_claim = Some(claim);
+                } else if let CleanupResult::Removed(receipt) = cleanup(root.path(), claim).unwrap()
+                {
+                    assert!(store.finish_cleanup(receipt).await.unwrap());
+                }
+            }
+            let failure = cleanup_with(
+                root.path(),
+                final_claim.unwrap(),
+                &Hooks {
+                    fail: Some((failed, 5)),
+                    ..Default::default()
+                },
+            )
+            .err()
+            .unwrap();
+            assert!(store.release_cleanup(failure.into_parts().1).await.unwrap());
+            assert_eq!(root.path().join(&path).exists(), failed == Barrier::Unlink);
+            assert_eq!(store.stats().await.unwrap().cleanup, 1);
+            assert_eq!(drain(root.path(), &store).await, 0);
+            assert_eq!(store.stats().await.unwrap().cleanup, 0);
+            assert!(!root.path().join(path).exists());
+            store.close().await.unwrap();
+        }
     }
 
     #[test]
@@ -1071,9 +1531,9 @@ mod tests {
     #[tokio::test]
     async fn durable_receipt_and_reader_retain_root_lifetime_after_store_close() {
         let root = tempfile::tempdir().unwrap();
-        let lifetime = Arc::new(());
+        let lifetime = super::super::node::Node::open(root.path()).unwrap();
         let observed = Arc::downgrade(&lifetime);
-        let store = Store::open(root.path(), lifetime.clone()).unwrap();
+        let store = Store::open(lifetime.clone(), Default::default()).unwrap();
         drop(lifetime);
         let admission = store.plan(ArtifactKind::Segment, 124).await.unwrap();
         let hooks = Hooks::default();

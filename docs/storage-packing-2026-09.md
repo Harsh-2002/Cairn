@@ -65,7 +65,7 @@ files, packed and unknown-length modes. These fixed tests are not performance me
 power-loss evidence. The complete workspace gate passes (1,466 default / 1,492 all-feature tests, both Clippy
 configurations and two doctests), as do all 47 standalone Rust tests and all 70 Python tests
 with every live fixture enabled. Web checks, audits, installer and workflow policy pass.
-Final-head CI remains pending.
+Final-head CI passed all 54 checks at `825d543`; PR #94 merged as `3b2edbd`.
 
 CI run 34262375515 first failed before Chrome exposed DevTools, and the same startup failure
 recurred on its isolated retry. The helper now gives initialization a fixed 30 seconds, retains

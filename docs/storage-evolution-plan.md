@@ -83,7 +83,7 @@ specification. Experiments may correctly conclude **retain the current design**.
   generation. Full reconcile/integrity remain available. Activate journal boot only after crash,
   coverage, restore and performance gates; otherwise retain full boot scans. Recovery scales with
   unfinished work, not constant time.
-- [ ] **4A: isolated hybrid prototype**. No production routing/feature flag. Large or unknown
+- [x] **4A: isolated hybrid prototype**. No production routing/feature flag. Large or unknown
   lengths use dedicated files. Completed small encoded records use one bounded builder, a
   32-MiB admission budget, and immutable segments sealed at 4 MiB, 256 records or 1 ms. File sync,
   rename and directory sync precede SQLite location publication. Explicit file versus segment
@@ -438,3 +438,8 @@ configurations, two doctests and all 47 standalone Rust lab tests. All 70 Python
 with every live fixture enabled (24.628 seconds). Final-head CI and merge remain required. Collection/snapshot/restore
 and paired adoption gates remain 4B/4C. No packing measurement has run, so campaign consumption
 remains **592.146171 seconds / 571,154,432 bytes recorded peak**.
+
+Phase 4A merged in PR #94 as `3b2edbd` after all 54 checks passed for `825d543`; review comments
+and open branch code-scanning alerts were empty. Phase 4B locally passes the full gate, 66
+packing tests and all 70 live-enabled Python fixtures; its final-head CI is still required.
+No packing comparison or metadata capacity measurement has been charged yet.
