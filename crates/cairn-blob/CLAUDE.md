@@ -19,6 +19,8 @@ plain files under opaque IDs; metadata is someone else's job (`cairn-meta`).
   fsyncs into one syscall (group-commit for the directory fsync, ARCH 8.2). Shared across store clones.
 - `compress.rs` — the CRNB block format: `BlockEncoder` (write) / `CompressedReader` (ranged read),
   per-block zstd/lz4, per-block AES-256-GCM. **`pub` + `#[doc(hidden)]`** only so `fuzz/` can drive it.
+- `encode.rs` — bounded CRNB staging adapter; 64-KiB index buffer spills to immediately unlinked
+  scratch on the data filesystem, then streams into the final blob before its durability barrier.
 - `hash.rs` — `Hashers`: the always-on MD5 (→ ETag) and internal SHA-256 plus requested supplementary checksums, over
   plaintext, in one streaming pass.
 - `raw_io.rs` — safe `fallocate`/`fadvise` placement hints (ARCH 7.5) via `rustix` (keeps `forbid(unsafe_code)`).
@@ -86,8 +88,8 @@ plain files under opaque IDs; metadata is someone else's job (`cairn-meta`).
   logical size before buffering input; finalization also fails after a rejected feed. Known encoded
   lengths fail before staging/preallocation, and multipart totals use checked addition. Effective
   limits depend on block geometry (ARCH 9.3); raw files retain their configured ceiling. This does
-  not provide 5-TiB encrypted-object support or remove the still-resident index; see the tracked
-  `docs/storage-evolution-plan.md` for subsequent spool/paged-reader PRs.
+  not provide 5-TiB encrypted-object support. Writes drain entries to the bounded `encode.rs` spool;
+  readers still retain the complete index. See `docs/storage-evolution-plan.md` for the reader work.
 - **Block allocations obey trusted metadata on every CRNB version.** Trailer algorithm, block
   size and logical total must match metadata for v1/v2/v3. Every raw payload is exactly logical
   length and every compressed payload is nonempty and shorter, excluding the encrypted GCM tag.

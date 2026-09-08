@@ -62,9 +62,23 @@ with overflow-safe addition before assembly and still checks streamed bytes. Rej
 
 This prevents new writers from publishing a container the reader refuses for index size. It does
 not repair an existing oversized container or promise 5-TiB encoded-object support. The current
-encoder/reader still hold index state proportional to block count up to that cap; bounded index
-spooling and paged reader bookkeeping are tracked in the
-[storage evolution plan](storage-evolution-plan.md).
+reader still holds index state proportional to block count up to that cap; paged reader bookkeeping
+is tracked in the [storage evolution plan](storage-evolution-plan.md).
+
+The encoder drains serialized entries after each 64-KiB input batch and updates the v3 metadata
+HMAC incrementally. An index of at most 64 KiB stays in a bounded request-owned buffer. Larger
+indexes spill to a buffered temporary file on the data filesystem; its unique `.staging` name is
+unlinked before the file descriptor leaves the create task. Cancellation and detached writes thus
+cannot leave a named scratch file. A crash between create and unlink can leave an ordinary staging
+artifact, reclaimed by the existing full startup reconciliation. The spool is flushed and copied
+in 64-KiB batches into the final blob, followed by its unchanged MAC and trailer, **before** that
+blob's existing file-sync/rename/directory-sync sequence. Scratch data has no separate fsync or
+committed sidecar. Errors, including ENOSPC during spool flush/copy, abort publication.
+
+Encoder payload buffers depend on trusted block geometry and a bounded feed batch, not object
+length; the caller's incoming body chunk and kernel file cache are separate resource costs. The
+spool can occupy up to the existing 64-MiB format cap on disk. This removes per-block heap state
+from writes, but adds scratch I/O for larger indexes; no throughput gain is claimed without measurement.
 
 An uncompressed object is stored as exactly its bytes, with no header and no framing, so the simplicity and the byte-for-byte promise are preserved for the default case and an operator can read a blob directly if they ever need to. A compressed object is stored in a self-describing format: a sequence of independently-compressed logical blocks followed by an index that records, for each block, its size and offset, followed by a fixed trailer that records the index's location, the block size, the compression algorithm, the logical (plaintext) length, a magic marker, and a format-version byte. The same self-describing container also holds objects that are encrypted at rest: the version byte then marks the blob encrypted, each block carries its own AES-GCM authentication tag, and current format v3 carries an additional authentication tag over the index and trailer semantics (Section 10.7). This makes such a blob self-contained for layout and range reads, but the file is not allowed to choose its own compatibility parser: the object row's SSE descriptor (or a multipart part's sealed-DEK marker) independently declares legacy v2 or authenticated v3, and the reader requires an exact match before returning bytes. Reconciliation and backup treat the whole file as one artifact; there is no sidecar to keep in sync. Whether a blob is compressed, which algorithm it uses, and its logical block size are also recorded in the metadata row and threaded into the reader. For legacy encrypted v2, whose trailer is not authenticated, the reader requires the trailer algorithm and block geometry to equal that trusted descriptor before it may drive decompression or range mapping. Section 10 specifies the compression scheme in full.
 

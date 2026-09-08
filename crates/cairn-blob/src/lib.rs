@@ -19,6 +19,7 @@ pub use timing::{MultipartStage, MultipartTiming};
 #[allow(missing_debug_implementations)]
 pub mod compress;
 mod crc64nvme;
+mod encode;
 pub mod hash;
 // Safe file-placement hints (preallocation + access advice) for the write fast path (ARCH 7.5).
 mod raw_io;
@@ -29,7 +30,8 @@ mod uring;
 // streamed writes → commit (fsync file → rename → fsync dir) / abort with the same ordering.
 mod staging;
 
-use crate::compress::{BlockEncoder, CompressedReader, is_precompressed};
+use crate::compress::{CompressedReader, is_precompressed};
+use crate::encode::StagedEncoder;
 use crate::hash::Hashers;
 use crate::staging::{Staging, UncommittedBlobCleanup};
 use async_trait::async_trait;
@@ -422,6 +424,7 @@ async fn write_staged(
     file: &mut Staging,
     mut body: cairn_types::BodyStream,
     opts: &StageOptions,
+    spool_dir: &Path,
 ) -> Result<
     (
         u64,
@@ -445,10 +448,7 @@ async fn write_staged(
     // over the plaintext (here, via `hashers`) before any transform, so it is identical with or
     // without compression/encryption (ARCH 21.1, 27).
     if let Some(pol) = block_pol {
-        let mut enc = match opts.encryption.clone() {
-            Some(dek) => BlockEncoder::new_encrypted(pol.algorithm, pol.block_size, dek),
-            None => BlockEncoder::new(pol.algorithm, pol.block_size),
-        };
+        let mut enc = StagedEncoder::new(pol, opts.encryption.clone(), spool_dir);
         while let Some(chunk) = body.next().await {
             let chunk = chunk?;
             logical = logical
@@ -458,13 +458,9 @@ async fn write_staged(
                 return Err(BlobError::SizeExceeded);
             }
             hashers.update(&chunk);
-            let phys = enc.feed(&chunk)?;
-            file.write_all(&phys).await?;
-            physical += phys.len() as u64;
+            physical += enc.feed(&chunk, file).await?;
         }
-        let tail = enc.finish()?;
-        file.write_all(&tail).await?;
-        physical += tail.len() as u64;
+        physical += enc.finish(file).await?;
         let (md5, checks, internal_sha256) = hashers.finalize();
         // The descriptor records the logical compression of the object. Encryption is recorded on
         // the metadata row's sse_descriptor, not here, so an uncompressed-but-encrypted object is
@@ -645,7 +641,7 @@ async fn feed_assembled_chunk(
     sink: &mut Staging,
     chunk: &[u8],
     hashers: &mut Hashers,
-    enc: &mut Option<BlockEncoder>,
+    enc: &mut Option<StagedEncoder>,
     logical: &mut u64,
     physical: &mut u64,
     size_ceiling: u64,
@@ -661,9 +657,7 @@ async fn feed_assembled_chunk(
     hashers.update(chunk);
     match enc {
         Some(e) => {
-            let phys = e.feed(chunk)?;
-            sink.write_all(&phys).await?;
-            *physical += phys.len() as u64;
+            *physical += e.feed(chunk, sink).await?;
         }
         None => {
             sink.write_all(chunk).await?;
@@ -687,7 +681,7 @@ impl LocalBlobStore {
         sink: &mut Staging,
         parts: &[PartRef],
         hashers: &mut Hashers,
-        enc: &mut Option<BlockEncoder>,
+        enc: &mut Option<StagedEncoder>,
         logical: &mut u64,
         physical: &mut u64,
         size_ceiling: u64,
@@ -970,7 +964,7 @@ impl BlobStore for LocalBlobStore {
         let mut cleanup = UncommittedBlobCleanup::new(staging.clone(), final_path.clone());
 
         let mut sink = Staging::create(staging, self.use_uring, opts.content_length).await?;
-        let outcome = write_staged(&mut sink, body, &opts).await;
+        let outcome = write_staged(&mut sink, body, &opts, &self.data_root.join(STAGING)).await;
         let (logical, physical, md5, checksums, descriptor, internal_sha256) = match outcome {
             Ok(v) => v,
             Err(e) => {
@@ -1108,7 +1102,7 @@ impl BlobStore for LocalBlobStore {
         // (whose size is the sum of the parts) is preallocated in `assemble`.
         let mut sink = Staging::create(path, self.use_uring, None).await?;
         let (logical, _phys, md5, checks, _desc, _internal_sha256) =
-            match write_staged(&mut sink, body, &opts).await {
+            match write_staged(&mut sink, body, &opts, &self.data_root.join(STAGING)).await {
                 Ok(v) => v,
                 Err(e) => {
                     sink.abort().await;
@@ -1197,10 +1191,8 @@ impl BlobStore for LocalBlobStore {
         let mut hashers = Hashers::new(&opts.extra_checksums);
         let mut logical: u64 = 0;
         let mut physical: u64 = 0;
-        let mut enc = block_pol.map(|p| match opts.encryption {
-            Some(dek) => BlockEncoder::new_encrypted(p.algorithm, p.block_size, dek),
-            None => BlockEncoder::new(p.algorithm, p.block_size),
-        });
+        let mut enc = block_pol
+            .map(|p| StagedEncoder::new(p, opts.encryption, &self.data_root.join(STAGING)));
 
         // The assemble write path mirrors `stage`: on any error before commit, unlink the staged
         // tmp via the same backend that created it, then propagate. A small closure keeps the
@@ -1221,12 +1213,13 @@ impl BlobStore for LocalBlobStore {
             return Err(e);
         }
         let descriptor = if let Some(e) = enc {
-            let tail = e.finish()?;
-            if let Err(err) = sink.write_all(&tail).await {
-                sink.abort().await;
-                return Err(err);
+            match e.finish(&mut sink).await {
+                Ok(bytes) => physical += bytes,
+                Err(err) => {
+                    sink.abort().await;
+                    return Err(err);
+                }
             }
-            physical += tail.len() as u64;
             // Record `Compressed` only when a compression policy was actually in force; an
             // encryption-only block container leaves the logical compression as `Uncompressed`.
             match compress {
@@ -1805,7 +1798,14 @@ mod tests {
         let store = LocalBlobStore::open(dir.path()).await.unwrap();
         let tmp = dir.path().join(STAGING).join("orphan.tmp");
         tokio::fs::write(&tmp, b"leftover").await.unwrap();
-        let mtime = file_mtime_secs(&tmp).await;
+        // Model a process crash in the scratch create/unlink window.
+        let index_tmp = dir.path().join(STAGING).join("orphan.index.tmp");
+        tokio::fs::write(&index_tmp, b"index entries")
+            .await
+            .unwrap();
+        let mtime = file_mtime_secs(&tmp)
+            .await
+            .max(file_mtime_secs(&index_tmp).await);
 
         let opts = ReconcileOpts {
             staging_safety_margin_secs: 0,
@@ -1819,7 +1819,9 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(report.staging_cleaned, 1);
+        assert_eq!(report.staging_cleaned, 2);
+        assert!(!tmp.exists());
+        assert!(!index_tmp.exists());
     }
 
     /// `ensure_bucket_dir` is a no-op-and-still-Ok on an existing directory and creates a missing

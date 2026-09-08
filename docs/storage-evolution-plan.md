@@ -13,7 +13,8 @@ specification. Experiments may correctly conclude **retain the current design**.
   addition, unknown streams abort safely. Preserve raw-file limits and the existing S3 error.
   Test exact and exceeded limits, overflow, chunk boundaries, synthetic small encoder ceilings,
   cleanup and retryable multipart completion. Document actual encoded-object ceilings.
-- [ ] **1B: bounded encoder index spool**. Replace the complete index vector/final output copy
+- [ ] **1B: bounded encoder index spool** — implementation/testing active on
+  `codex/storage-01b-index-spool`. Replace the complete index vector/final output copy
   with an owned temporary spool and bounded payload/index sinks. Preserve v1–v3 bytes and block
   identities. Append the spool and existing authentication before the final file's durability
   barrier; no independently committed sidecar. Cover spool failures, ENOSPC, cancellation,
@@ -151,3 +152,8 @@ Phase 1A: [PR #81](https://github.com/Harsh-2002/Cairn/pull/81) opened. Blob tes
 88 all-feature tests passed (two benchmarks ignored). The preflight regression fails on baseline
 `e38bc6c` and passes with the fix. S3 size-rejection/retry regression passes with the existing
 HTTP 400 `EntityTooLarge` response. Final-head CI and review are pending; no merge claimed.
+
+Phase 1B: bounded index spooling implemented in an isolated checkout; 91 default and 94 all-feature blob tests pass (two benchmarks ignored); all-feature blob Clippy passes.
+Wire-reference comparison covers plaintext/encrypted and all three algorithms across chunk and
+partial-block boundaries. Spool tests cover threshold/roundtrip, cancellation, create/read errors
+and real ENOSPC via `/dev/full` without filling a disk. CI, review and merge remain pending.
