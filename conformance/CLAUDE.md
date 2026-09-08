@@ -316,7 +316,9 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
 ## Notes
 - `storage_lab/` is the bounded storage-evolution laboratory: standalone Rust workspace + Python
   coordinator with persistent runtime/space accounting and owned process groups. Its README is the
-  entry point. Use one campaign ledger across phases; fixed correctness fixtures run in CI, while
+  entry point. `run.sh fanout` compares raw namespace publication and actual BlobStore traversal
+  under predeclared paired gates; partial workload matrices cannot select fanout.
+  Use one campaign ledger across phases; fixed correctness fixtures run in CI, while
   actual measurements require an explicit prebuilt binary and owned `/SSD` root. Do not run older
   unconstrained drivers as a substitute or infer performance from the correctness fixtures.
   `analyze.py` and `summarize.py` charge profile decoding/reduction to the same ledger. Keep

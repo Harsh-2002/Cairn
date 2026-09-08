@@ -6,10 +6,15 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
+[[bin]]
+name = "cairn-fanout-lab"
+path = "src/fanout.rs"
+
 [dependencies]
 cairn-blob = { path = "../../crates/cairn-blob" }
 cairn-meta = { path = "../../crates/cairn-meta" }
 cairn-types = { path = "../../crates/cairn-types" }
+async-trait = "0.1"
 bytes = "1.9"
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }

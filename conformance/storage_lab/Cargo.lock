@@ -146,6 +146,7 @@ dependencies = [
 name = "cairn-storage-lab"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bytes",
  "cairn-blob",
  "cairn-meta",

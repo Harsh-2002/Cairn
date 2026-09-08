@@ -1,8 +1,10 @@
 //! Bounded layer drivers. These call the real blob store and canonical SQLite Writer/WAL pool.
+mod common;
 use bytes::Bytes;
 use cairn_blob::LocalBlobStore;
 use cairn_types::traits::{BlobStore, MetadataStore};
 use cairn_types::*;
+use common::{distribution, emit, payload};
 use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::json;
@@ -27,18 +29,6 @@ struct Config {
     idle: u64,
     cycles: usize,
     max_ops: u64,
-}
-
-fn payload(size: usize, seed: u64) -> Vec<u8> {
-    let mut state = seed;
-    (0..size)
-        .map(|_| {
-            state = state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            (state >> 32) as u8
-        })
-        .collect()
 }
 
 fn row(bucket: &BucketName, key: ObjectKey, id: String, size: usize) -> ObjectVersionRow {
@@ -73,27 +63,6 @@ fn row(bucket: &BucketName, key: ObjectKey, id: String, size: usize) -> ObjectVe
         created_at: Timestamp(1),
         updated_at: Timestamp(1),
     }
-}
-
-fn emit(mut value: serde_json::Value) {
-    value["unix_seconds"] = json!(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("laboratory clock predates the Unix epoch")
-            .as_secs_f64()
-    );
-    println!("{value}");
-}
-
-fn distribution(values: &mut [f64]) -> serde_json::Value {
-    values.sort_by(f64::total_cmp);
-    if values.is_empty() {
-        return json!({"count": 0});
-    }
-    json!({"count": values.len(), "sum_seconds": values.iter().sum::<f64>(),
-        "p50_seconds": values[(values.len() - 1) / 2],
-        "p99_seconds": (values.len() >= 10_000).then(|| values[(values.len() * 99).div_ceil(100) - 1]),
-        "max_seconds": values.last()})
 }
 
 async fn blob_operation(

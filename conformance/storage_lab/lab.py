@@ -44,7 +44,8 @@ def manifest(args, binary, launch):
     return {"declared_commit": args.commit, "binary": str(binary), "sha256": digest,
             "build_settings": args.build_settings, "coordinator_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
             "harness_sources_sha256": {str(path.relative_to(HERE)): hashlib.sha256(path.read_bytes()).hexdigest()
-                                       for path in sorted([*HERE.glob("*.py"), HERE / "src/main.rs", HERE / "Cargo.lock"])},
+                                       for path in sorted([*HERE.glob("*.py"), *HERE.glob("src/*.rs"), HERE / "Cargo.lock"])},
+            "production_coalescer_sha256": hashlib.sha256((HERE / "../../crates/cairn-blob/src/commit.rs").read_bytes()).hexdigest(),
             "platform": platform.platform(), "python": sys.version, "cpu": tool_output(["lscpu", "--json"], launch),
             "filesystem": tool_output(["findmnt", "-J", "-T", args.root], launch),
             "devices": tool_output(["lsblk", "-J", "-o", "NAME,TYPE,SIZE,ROTA,MOUNTPOINTS"], launch),
