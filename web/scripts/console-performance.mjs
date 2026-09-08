@@ -4,6 +4,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "vite";
+import { debuggerUrl } from "./chrome-startup.mjs";
 
 let profileDir;
 let server;
@@ -68,33 +69,8 @@ chrome = spawn(process.env.CHROME_BIN ?? "google-chrome", [
 // before cleanup starts. Keep the error listener after startup to avoid uncaught events.
 chrome.on("error", (error) => { failure ??= error; });
 chromeClosed = new Promise((resolve) => chrome.once("close", resolve));
-function debuggerUrl() {
-  return new Promise((resolve, reject) => {
-    let output = "";
-    const finish = (error, url) => {
-      clearTimeout(timer);
-      chrome.stderr.off("data", onData);
-      chrome.off("error", onError);
-      chrome.off("exit", onExit);
-      if (error) reject(error);
-      else resolve(url);
-    };
-    const onError = (error) => finish(error);
-    const onExit = (code, signal) => finish(new Error(`Chrome exited before DevTools was ready (${signal ?? code})`));
-    const onData = (chunk) => {
-      output += chunk;
-      const match = output.match(/DevTools listening on (ws:\/\/[^\s]+)/);
-      if (match) finish(null, match[1]);
-    };
-    const timer = setTimeout(() => finish(new Error("Chrome did not expose DevTools")), 10_000);
-    chrome.stderr.setEncoding("utf8");
-    chrome.stderr.on("data", onData);
-    chrome.once("error", onError);
-    chrome.once("exit", onExit);
-  });
-}
 
-const browserWsUrl = new URL(await debuggerUrl());
+const browserWsUrl = new URL(await debuggerUrl(chrome));
 const target = await fetch(
   `http://${browserWsUrl.host}/json/new?${encodeURIComponent("about:blank")}`,
   { method: "PUT", signal: AbortSignal.timeout(10_000) },

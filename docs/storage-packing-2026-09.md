@@ -66,3 +66,12 @@ power-loss evidence. The complete workspace gate passes (1,466 default / 1,492 a
 configurations and two doctests), as do all 47 standalone Rust tests and all 70 Python tests
 with every live fixture enabled. Web checks, audits, installer and workflow policy pass.
 Final-head CI remains pending.
+
+CI run 34262375515 first failed before Chrome exposed DevTools, and the same startup failure
+recurred on its isolated retry. The helper now gives initialization a fixed 30 seconds, retains
+the last 4 KiB of stderr on failure and rejects partial debugger URLs; six focused fixtures
+cover deadlines, chunks, child errors/exits and listener ownership. Product assertions are
+unchanged. The first mixed-feature soak also exceeded its existing 512-MiB WAL ceiling
+(680,694,072 bytes), despite zero correctness errors and a last-third WAL minimum of zero.
+The unchanged shared binary and dependent jobs were rerun; the soak passed. This intermittent
+WAL high-water result remains recorded for metadata capacity analysis; no ceiling was widened.
