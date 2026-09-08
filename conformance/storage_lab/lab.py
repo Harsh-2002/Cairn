@@ -293,6 +293,8 @@ def run_case(args, campaign):
         if args.profile != "none":
             # Collection is evidence availability, not an attribution conclusion. Decoding and
             # correlating stacks is a separate charged invocation in the results phase.
+            if server:
+                server.finish_profiled_target(binary, min(deadline - 8, time.monotonic() + 8))
             profile_files = list(artifacts.glob("cpu.perf" if args.profile == "cpu" else "heap*"))
             if not profile_files or not any(path.stat().st_size for path in profile_files):
                 raise Unavailable("profiler produced no usable artifact")
