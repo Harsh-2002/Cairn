@@ -84,7 +84,8 @@ artifacts or 8 GiB for profiling, and 1 GB of cleanup headroom. This bounds the 
 replacement data, metadata/index/WAL amplification, staging, copies, profiles and logs; future
 snapshot/packing drivers must supply their own complete reservations before use. Comparison
 stores run sequentially; anything retained from an earlier arm stays counted. A footprint watcher
-stops the child group at reserved headroom, output is capped at 16 MiB per stream, and each
+stops the child group at reserved headroom, `TMPDIR` points inside the owned artifact directory
+(including profiler FIFO/scratch work), output is capped at 16 MiB per stream, and each
 database/profile file is capped at 2 GiB. This is a cooperative lab workload limit, not a filesystem
 quota for arbitrary or hostile executables. Symlinks and unexpected mounts refuse admission;
 cleanup never follows a symlink or crosses a device.

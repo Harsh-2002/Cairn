@@ -94,7 +94,7 @@ def profile_command(profile, directory, command):
         return ["perf", "record", "-F", "99", "--call-graph", "dwarf", "-o", str(directory / "cpu.perf"), "--", *command]
     if shutil.which("heaptrack") is None:
         raise Unavailable("heaptrack is unavailable; live allocation owners unresolved")
-    return ["heaptrack", "-o", str(directory / "heap"), *command]
+    return ["heaptrack", "--record-only", "-o", str(directory / "heap"), *command]
 
 
 def recover(campaign):
@@ -188,13 +188,15 @@ def run_case(args, campaign):
         directory.mkdir(mode=0o700)
         artifacts = directory / "artifacts"
         artifacts.mkdir(mode=0o700)
+        scratch = artifacts / "scratch"
+        scratch.mkdir(mode=0o700)
         config["root"] = str(directory / "data")
         atomic_json(artifacts / "config.json", config)
         binary = Path(args.binary).resolve(strict=True)
         if not binary.is_file() or not os.access(binary, os.X_OK):
             raise ValueError("explicit binary must be an executable regular file")
         command = [str(binary), str(artifacts / "config.json")]
-        env = clean_environment()
+        env = {**clean_environment(), "TMPDIR": str(scratch)}
         port = None
         server = None
 
