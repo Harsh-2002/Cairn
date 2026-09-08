@@ -314,6 +314,11 @@ red, so treat a passing local run as load-bearing. Two kinds — keep them disti
 - `sendfile_bench.sh` — `fast-io` plaintext sendfile A/B (CPU/GiB + engage rate); **NOT a gate.**
 
 ## Notes
+- `storage_lab/` is the bounded storage-evolution laboratory: standalone Rust workspace + Python
+  coordinator with persistent runtime/space accounting and owned process groups. Its README is the
+  entry point. Use one campaign ledger across phases; fixed correctness fixtures run in CI, while
+  actual measurements require an explicit prebuilt binary and owned `/SSD` root. Do not run older
+  unconstrained drivers as a substitute or infer performance from the correctness fixtures.
 - Invoke as `BIN=target/debug/cairn PY=python3 bash conformance/<name>.sh` (the CI form). Most
   default `BIN` to `$ROOT/target/debug/cairn`, so they run from any cwd; a few (`run`, `share`,
   `rotation`, `concurrency`, `warp*`) want `target/debug/cairn` relative to the repo root.

@@ -65,6 +65,16 @@ baseline retain their explicit skip coverage in the server unit suite.
 
 ### 29.6 Benchmarks and load
 
+The bounded storage laboratory lives in `conformance/storage_lab/` (launcher, Python campaign
+coordinator and separately locked Rust layer drivers). Its shared 3,600-second/100-GB ledger
+includes preparation, verification, profiles, retained artifacts and cleanup. Missing profilers,
+insufficient samples or exhausted allowances produce INCONCLUSIVE. Owned process groups cannot
+exec before their identities are persisted; interrupted runs retain their reservation and block
+admission until recovery establishes quiescence. CI tests these mechanisms with small fixed
+fixtures, including real metadata/blob operations and signed S3; these tests do not establish
+performance. See its README and `storage-evolution-plan.md` for commands, reservations, remaining
+attribution gaps and the independent adoption gates. No laboratory dependency enters `cairn`.
+
 A deferred post-merge million-object and mixed large-file capacity campaign is recorded in
 [the implementation tracker](implementation-phases-2026-09.md#deferred-final-phase-capacity-sustained-load-and-regression-campaign).
 It requires a separately scheduled run; existing CI and multi-GiB transfer checks do not establish

@@ -13,7 +13,7 @@ specification. Experiments may correctly conclude **retain the current design**.
   and review status for the interrupted work.
 - [x] Integrate 1A after its correctness checks; update 1B onto merged main, finish its review
   and validation, and integrate it independently.
-- [ ] Implement 1C, including authenticated page reuse, prepared-reader handoff and reservation
+- [x] Implement 1C, including authenticated page reuse, prepared-reader handoff and reservation
   ownership; validate and integrate its independent PR.
 - [ ] Complete 2A–2B with the persistent campaign ledger and bounded attribution evidence.
 - [ ] Complete 3A–3D in order, obtaining the required architectural decision before changing
@@ -31,13 +31,12 @@ specification. Experiments may correctly conclude **retain the current design**.
   addition, unknown streams abort safely. Preserve raw-file limits and the existing S3 error.
   Test exact and exceeded limits, overflow, chunk boundaries, synthetic small encoder ceilings,
   cleanup and retryable multipart completion. Document actual encoded-object ceilings.
-- [ ] **1B: bounded encoder index spool** — implementation/testing active on
-  `codex/storage-01b-index-spool`. Replace the complete index vector/final output copy
+- [x] **1B: bounded encoder index spool** — merged in PR #82 (`f092a81`). Replace the complete index vector/final output copy
   with an owned temporary spool and bounded payload/index sinks. Preserve v1–v3 bytes and block
   identities. Append the spool and existing authentication before the final file's durability
   barrier; no independently committed sidecar. Cover spool failures, ENOSPC, cancellation,
   detached filesystem work and startup cleanup. Input and output batches must also be bounded.
-- [ ] **1C: bounded verified index reader** — active on `codex/storage-01c-index-reader`. Keep the 64-MiB cap; use 65,529-byte pages
+- [x] **1C: bounded verified index reader** — merged in PR #83 (`1eed10f`). Keep the 64-MiB cap; use 65,529-byte pages
   (7,281 entries). Stream initial structural/HMAC validation, retaining provisional SHA-256 page
   fingerprints and physical starting offsets. Publish a usable reader only after full validation.
   Reread the same descriptor, verify a whole page before interpreting it, retain trusted geometry,
@@ -214,3 +213,20 @@ Phase 1C commands: `cargo nextest run -p cairn-blob --all-features` (107 passed,
 the final additional test checks the existing zstd bulk decoder's native workspace against its
 fixed allowance. Page fixtures use deterministic seed `0x5eed` and fresh test encryption keys;
 no benchmark dataset or server was created.
+
+PR #83 final head `2fc2baeb7217bfa98e609f0998e8d9347c0beb74` passed every CI/CodeQL job
+with no posted review findings and merged as `1eed10f`. The full local `make check-all` passed
+1,340 workspace tests (three skipped), two doctests, both Clippy configurations, formatting,
+the web build and installer checks. Web lint and both npm audits passed separately. The
+merged reader branch/worktree are removed. Phase 1 is integrated; its format limits remain.
+
+Phase 2A starts from merged `1eed10f` on `codex/storage-02a-lab`. The standalone laboratory
+workspace, Python campaign ledger and gated process launcher are implemented. Correctness
+fixtures exercise FULL-durability metadata writes/WAL reads, byte-exact blob round trips and
+real signed S3 requests. Operation-capped fixtures deliberately produce INCONCLUSIVE rather
+than performance evidence. Fifteen Python regressions and both Rust driver tests pass, as do standalone Clippy,
+formatting, shellcheck, release-policy tests, actionlint 1.7.12 (verified release checksum),
+and the lab lockfile audit (one allowed pre-existing yanked-package warning). Full final-commit
+CI remains the integration gate. Production Rust and
+console sources are unchanged. The campaign still has **0 seconds / 0 bytes** of experiments;
+compilation, tool installation and fixed correctness fixtures are tracked separately.
